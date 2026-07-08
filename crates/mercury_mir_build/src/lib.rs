@@ -3701,6 +3701,9 @@ impl FnLowerer<'_> {
     /// for i in 0..N { x[i] = x[i] * inv; }    // normalize
     /// ```
     ///
+    /// The normalize tail also accepts the textbook divide `for i { x[i] = x[i] / s; }` with no
+    /// reciprocal binding (6 statements) — see [`Self::match_softmax_normalize`].
+    ///
     /// Every loop must range over the identical `0..N` and index the *same* array `x` exactly by its
     /// loop variable; the scalars must chain (max → exp, sum → reciprocal, reciprocal → scale) and the
     /// internal scalars must not be read after the window (the kernel hides them). Pure: returns
@@ -3713,7 +3716,7 @@ impl FnLowerer<'_> {
         batch: Option<Symbol>,
     ) -> Option<(usize, Symbol, Expr)> {
         let stmts = &b.stmts[at..];
-        if stmts.len() < 7 {
+        if stmts.len() < 6 {
             return None;
         }
         let (m, seed) = Self::let_init(&stmts[0])?;
@@ -3740,27 +3743,91 @@ impl FnLowerer<'_> {
             return None;
         }
         self.match_sum_body(body4, v4, x, s, data_batch)?;
-        let inv = self.match_recip(&stmts[5], s)?;
-        let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
-        if !exprs_struct_eq(n6, n_expr) {
-            return None;
-        }
-        // softmax's normalize is a plain `x[i] *= inv`; reject any affine wrapper (softmax has no
-        // gamma/beta), and require it in-place (`dst == x`): the exp-sub pass above already rewrote `x`
-        // in place, so an out-of-place final scale would be an unsound hybrid (the kernel preserves the
-        // source, the source program would not). Out-of-place softmax simply isn't recognized here.
-        if self.match_scale_body(body6, v6, x, inv, data_batch)? != (x, None, None) {
-            return None;
-        }
-        // The three internal scalars must not be read after the window — the kernel hides them.
-        let rest = &b.stmts[at + 7..];
-        let tail = b.tail.as_deref();
-        for sc in [m, s, inv] {
-            if block_mentions(rest, tail, sc) {
+        let (tail, inv) = self.match_softmax_normalize(&stmts[5..], x, s, n_expr, data_batch)?;
+        // The internal scalars must not be read after the window — the kernel hides them.
+        let total = 5 + tail;
+        let rest = &b.stmts[at + total..];
+        let btail = b.tail.as_deref();
+        for sc in [Some(m), Some(s), inv].into_iter().flatten() {
+            if block_mentions(rest, btail, sc) {
                 return None;
             }
         }
-        Some((7, x, n_expr.clone()))
+        Some((total, x, n_expr.clone()))
+    }
+
+    /// The softmax **normalize tail** at `stmts[0..]`: either the reciprocal-multiply pair
+    /// `let inv = 1.0 / s; for i { x[i] = x[i] * inv; }` (2 statements) or the textbook divide
+    /// `for i { x[i] = x[i] / s; }` (1 statement, incl. `x[i] /= s`). Returns
+    /// `(consumed, Option<inv_sym>)`. Shared by the split and fused softmax windows.
+    ///
+    /// The divide spelling dispatches to the same kernel, which computes `inv = 1/s` once and
+    /// multiplies (see `mercury_runtime/norm.rs`) — a ≤1-ULP-per-element deviation from the scalar
+    /// divide, strictly smaller than the documented kernel-reassociation exception the sum pass
+    /// already relies on; both backends call the identical kernel, so the differential gate and
+    /// `-O0 == -O2` hold exactly as for the multiply spelling. In-place, no affine (softmax has no
+    /// gamma/beta; the exp pass already rewrote `x`, so an out-of-place tail would be an unsound
+    /// hybrid). Pure.
+    fn match_softmax_normalize(
+        &self,
+        stmts: &[Stmt],
+        x: Symbol,
+        s: Symbol,
+        n_expr: &Expr,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(usize, Option<Symbol>)> {
+        // Reciprocal-multiply spelling: `let inv = 1/s; for { x[i] *= inv }`.
+        if let Some(inv) = stmts.first().and_then(|st| self.match_recip(st, s)) {
+            let (v, ne, body) = self.as_range0_for(stmts.get(1)?)?;
+            if !exprs_struct_eq(ne, n_expr) {
+                return None;
+            }
+            if self.match_scale_body(body, v, x, inv, batch)? != (x, None, None) {
+                return None;
+            }
+            return Some((2, Some(inv)));
+        }
+        // Textbook divide spelling: `for { x[i] = x[i] / s }` (or `x[i] /= s`).
+        let (v, ne, body) = self.as_range0_for(stmts.first()?)?;
+        if !exprs_struct_eq(ne, n_expr) {
+            return None;
+        }
+        self.match_div_body(body, v, x, s, batch)?;
+        Some((1, None))
+    }
+
+    /// Body `x[v] = x[v] / s` (or `x[v] /= s`) — the in-place divide-by-scalar normalize. Pure.
+    fn match_div_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        s: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<()> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return None;
+        };
+        if self.index_off(target, v, batch) != Some(x) {
+            return None;
+        }
+        match op {
+            ast::AssignOp::Div => (single_path(value) == Some(s)).then_some(()),
+            ast::AssignOp::Assign => {
+                let ExprKind::Binary {
+                    op: ast::BinOp::Div,
+                    lhs,
+                    rhs,
+                } = &value.kind
+                else {
+                    return None;
+                };
+                (self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(s))
+                    .then_some(())
+            }
+            _ => None,
+        }
     }
 
     /// Recognize the **fused-window** numerically-stable softmax (6 statements): the exp-of-centered
@@ -3785,7 +3852,8 @@ impl FnLowerer<'_> {
         batch: Option<Symbol>,
     ) -> Option<(usize, Symbol, Expr)> {
         let stmts = &b.stmts[at..];
-        if stmts.len() < 6 {
+        // 5 with the divide normalize, 6 with the reciprocal-multiply pair.
+        if stmts.len() < 5 {
             return None;
         }
         let (m, seed) = Self::let_init(&stmts[0])?;
@@ -3805,25 +3873,20 @@ impl FnLowerer<'_> {
             return None;
         }
         self.match_exp_store_sum_body(body3, v3, x, m, s, data_batch)?;
-        let inv = self.match_recip(&stmts[4], s)?;
-        let (v5, n5, body5) = self.as_range0_for(&stmts[5])?;
-        if !exprs_struct_eq(n5, n_expr) {
-            return None;
-        }
-        // softmax's normalize is a plain in-place `x[i] *= inv` — no affine, `dst == x` (see the
-        // un-fused `match_softmax` for why out-of-place softmax is unsound).
-        if self.match_scale_body(body5, v5, x, inv, data_batch)? != (x, None, None) {
-            return None;
-        }
-        // The three internal scalars must not be read after the window — the kernel hides them.
-        let rest = &b.stmts[at + 6..];
-        let tail = b.tail.as_deref();
-        for sc in [m, s, inv] {
-            if block_mentions(rest, tail, sc) {
+        // Normalize tail: reciprocal-multiply (2 stmts) or the textbook divide (1 stmt) — see
+        // `match_softmax_normalize` (in-place, no affine; divide dispatches to the same kernel
+        // under the documented ≤1-ULP reciprocal canonicalization).
+        let (tail, inv) = self.match_softmax_normalize(&stmts[4..], x, s, n_expr, data_batch)?;
+        // The internal scalars must not be read after the window — the kernel hides them.
+        let total = 4 + tail;
+        let rest = &b.stmts[at + total..];
+        let btail = b.tail.as_deref();
+        for sc in [Some(m), Some(s), inv].into_iter().flatten() {
+            if block_mentions(rest, btail, sc) {
                 return None;
             }
         }
-        Some((6, x, n_expr.clone()))
+        Some((total, x, n_expr.clone()))
     }
 
     /// The FUSED middle pass of a stable softmax — one loop that BOTH writes the exp-of-centered value
