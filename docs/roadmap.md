@@ -356,8 +356,13 @@ backend (`GpuLower`) lowers the *whole* program's MIR to PTX, so arbitrary non-r
 GPU-side too; an eligible program is fused into a single-block cooperative **megakernel** (one launch,
 no host round-trips). It is tolerance-gated against the interpreter oracle and optimization-invariant
 (`-O0` ≡ `-O3`), the same contract as the offload path. Coverage is **partial** (UNSUPPORTED ops
-skip), and two general programs (`hadamard`, `log_softmax_fused`) are known to miscompile on this
-path — the documented residual gap in the general MIR→PTX lowering.
+skip). The two documented device-kernel miscompiles are now **fixed**: the `velem` Hadamard/Div
+binary modes and the `norm` log-softmax/L2 ops are implemented in the static PTX device kernels
+(`lower.rs`), which both the single-thread and megakernel paths share — so `hadamard`,
+`log_softmax_fused`, `l2norm`, `norm_divide`, and `norm_out_of_place` now match the interp oracle.
+A handful of *unrelated* general-lowering gaps remain in the corpus (a float→int narrowing cast, a
+parallel reduction, and a `tensor_1d_kernels` megakernel illegal-address) — separate from the
+recognized-kernel device helpers.
 
 ## Automatic differentiation (`mercury_autodiff`)
 

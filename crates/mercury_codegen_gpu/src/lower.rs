@@ -2641,10 +2641,12 @@ I8_EI:
 }
 "#;
 
-/// `mercury_norm_f32(x, out, rows, cols, eps_bits, op)`: row-wise softmax(0)/layernorm(1)/rmsnorm(2)
-/// over an `[rows, cols]` matrix. `exp` uses the SFU `ex2.approx` (matches the offload path; the
-/// CPU oracle's Cephes `exp` differs by <~1e-6, inside the tolerance gate). `eps_bits` is the f32
-/// bits of epsilon. Sequential per-row reductions (CPU uses an 8-lane tree) — tolerance-gated.
+/// `mercury_norm_f32(x, out, rows, cols, eps_bits, op)`: row-wise softmax(0)/layernorm(1)/rmsnorm(2)/
+/// log-softmax(3)/l2norm(4) over an `[rows, cols]` matrix. `exp` uses the SFU `ex2.approx` and `log`
+/// uses `lg2.approx·ln2` (both match the offload path; the CPU oracle's Cephes `exp`/`log` differ by
+/// <~1e-6, inside the tolerance gate). `eps_bits` is the f32 bits of epsilon (used by layernorm/
+/// rmsnorm/l2norm; softmax/log-softmax ignore it). Sequential per-row reductions (CPU uses an 8-lane
+/// tree) — tolerance-gated. The dispatch has an explicit branch for each op (0..4), no wrong fall-through.
 const PTX_NORM: &str = r#".func mrt_norm (.param .b64 px, .param .b64 pout, .param .b64 prows, .param .b64 pcols, .param .b64 peps, .param .b64 pop)
 {
     .reg .b64 %rd<16>;
@@ -2671,7 +2673,11 @@ NORM_ROW:
     @%p1 bra NORM_SM;
     setp.eq.s64 %p1, %rd5, 1;
     @%p1 bra NORM_LN;
-    bra NORM_RMS;
+    setp.eq.s64 %p1, %rd5, 2;
+    @%p1 bra NORM_RMS;
+    setp.eq.s64 %p1, %rd5, 3;
+    @%p1 bra NORM_LS;
+    bra NORM_L2;
 NORM_SM:
     mov.f32 %f0, 0fFF800000;
     mov.b64 %rd11, 0;
@@ -2792,6 +2798,78 @@ RMS_S3:
     st.f32 [%rd14], %f3;
     add.s64 %rd11, %rd11, 1;
     bra RMS_S3;
+NORM_LS:
+    mov.f32 %f0, 0fFF800000;
+    mov.b64 %rd11, 0;
+LS_MAX:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra LS_MAXE;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    max.f32 %f0, %f0, %f1;
+    add.s64 %rd11, %rd11, 1;
+    bra LS_MAX;
+LS_MAXE:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+LS_EXP:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra LS_EXPE;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f0;
+    mul.f32 %f3, %f3, 0f3FB8AA3B;
+    ex2.approx.f32 %f4, %f3;
+    add.f32 %f2, %f2, %f4;
+    add.s64 %rd11, %rd11, 1;
+    bra LS_EXP;
+LS_EXPE:
+    lg2.approx.f32 %f5, %f2;
+    mul.f32 %f5, %f5, 0f3F317218;
+    add.f32 %f6, %f0, %f5;
+    mov.b64 %rd11, 0;
+LS_OUT:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f6;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f3;
+    add.s64 %rd11, %rd11, 1;
+    bra LS_OUT;
+NORM_L2:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+L2_S1:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra L2_S1E;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    fma.rn.f32 %f2, %f1, %f1, %f2;
+    add.s64 %rd11, %rd11, 1;
+    bra L2_S1;
+L2_S1E:
+    add.f32 %f9, %f2, %f15;
+    sqrt.rn.f32 %f9, %f9;
+    mov.f32 %f6, 0f3F800000;
+    div.rn.f32 %f10, %f6, %f9;
+    mov.b64 %rd11, 0;
+L2_S3:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    mul.f32 %f3, %f1, %f10;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f3;
+    add.s64 %rd11, %rd11, 1;
+    bra L2_S3;
 NORM_NEXT:
     add.s64 %rd6, %rd6, 1;
     bra NORM_ROW;
@@ -3157,9 +3235,12 @@ V2_DONE:
 }
 "#;
 
-/// `mercury_velem_f32(x, y, out, n, a, b, c, op)`: streaming elementwise `out[i] = act(a·x[i] + inner)`
-/// where `inner = (op & 256) ? b·y[i] + c : c` and `act = op & 0xff` is identity(0)/relu(1)/relu6(2).
-/// The two-fma chain matches the CPU kernel (e.g. the residual add `x + y` is `op=256, a=b=1, c=0`).
+/// `mercury_velem_f32(x, y, out, n, a, b, c, op)`: streaming elementwise `out[i] = act(base)` where
+/// `base` is the **binary** product `x·y` (`op & 512`, VE_HADAMARD) or quotient `x/y` (`op & 1024`,
+/// VE_DIV) — both read `y` — else the **affine** `a·x[i] + inner` with `inner = (op & 256) ? b·y[i]+c :
+/// c`; `act = op & 0xff` is identity(0)/relu(1)/relu6(2). `div.rn.f32` is correctly-rounded IEEE
+/// division, matching the CPU kernel's `x / y` bit-for-bit within the gate. The two-fma affine chain
+/// matches the CPU kernel (e.g. the residual add `x + y` is `op=256, a=b=1, c=0`).
 const PTX_VELEM: &str = r#".func mrt_velem (.param .b64 px, .param .b64 py, .param .b64 pout, .param .b64 pn, .param .f32 pa, .param .f32 pb, .param .f32 pc, .param .b64 pop)
 {
     .reg .b64 %rd<12>;
@@ -3175,6 +3256,10 @@ const PTX_VELEM: &str = r#".func mrt_velem (.param .b64 px, .param .b64 py, .par
     ld.param.u64 %rd4, [pop];
     and.b64 %rd5, %rd4, 256;
     and.b64 %rd6, %rd4, 255;
+    and.b64 %rd10, %rd4, 512;
+    and.b64 %rd11, %rd4, 1024;
+    or.b64 %rd5, %rd5, %rd10;
+    or.b64 %rd5, %rd5, %rd11;
     mov.b64 %rd7, 0;
 VE_LOOP:
     setp.ge.s64 %p0, %rd7, %rd3;
@@ -3188,6 +3273,10 @@ VE_LOOP:
     @%p1 ld.f32 %f2, [%rd9];
     @%p1 fma.rn.f32 %f7, %f5, %f2, %f6;
     fma.rn.f32 %f3, %f4, %f1, %f7;
+    setp.ne.s64 %p2, %rd10, 0;
+    setp.ne.s64 %p3, %rd11, 0;
+    @%p2 mul.f32 %f3, %f1, %f2;
+    @%p3 div.rn.f32 %f3, %f1, %f2;
     setp.eq.s64 %p1, %rd6, 1;
     setp.eq.s64 %p2, %rd6, 2;
     @%p1 max.f32 %f3, %f3, 0f00000000;
