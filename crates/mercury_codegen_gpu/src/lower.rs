@@ -2316,9 +2316,10 @@ fn vmath_supported(op: i128) -> bool {
     matches!(op, 0..=35)
 }
 
-/// `mercury_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6).
-/// Sequential fold (not the CPU's fixed-chunk tree) — additive ops differ only by reduction order
-/// (tolerance-gated); max/min/maxabs are order-independent and exact.
+/// `mercury_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6)/
+/// sumabs(9, Σ|x|)/absdiff(10, Σ|x−y|). (Codes 7/8 are the arg-reductions — a separate `-> i64` ABI —
+/// so they never reach here.) Sequential fold (not the CPU's fixed-chunk tree) — additive ops differ
+/// only by reduction order (tolerance-gated); max/min/maxabs are order-independent and exact.
 const PTX_SREDUCE: &str = r#".func (.param .f32 _r) mrt_sreduce (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop)
 {
     .reg .b64 %rd<8>;
@@ -2360,6 +2361,13 @@ RED_LOOP:
     setp.eq.s64 %p3, %rd3, 6;
     @%p3 abs.f32 %f4, %f1;
     @%p3 max.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 9;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 10;
+    @%p3 sub.rn.f32 %f5, %f1, %f2;
+    @%p3 abs.f32 %f5, %f5;
+    @%p3 add.rn.f32 %f0, %f0, %f5;
     add.s64 %rd4, %rd4, 1;
     bra RED_LOOP;
 RED_DONE:
@@ -2378,7 +2386,8 @@ const PTX_MEGA_SMEM: &str = ".shared .align 4 .b32 mrt_red_smem[1024];\n";
 /// the single-thread `mrt_sreduce`), then a fixed shared-memory **tree** combines the partials and
 /// broadcasts the result to all threads. Deterministic (no atomics, M12); the tree's reassociation vs
 /// the sequential fold is covered by the CPU<->GPU tolerance gate. Block size must be a power of two
-/// (the launcher uses 256). Combine: add for dot/ssd/sum/sumsq (op<4), max for max/maxabs, min for min.
+/// (the launcher uses 256). Combine: add for the additive ops dot/ssd/sum/sumsq (op<4) *and*
+/// sumabs/absdiff (op>=9), max for max/maxabs, min for min.
 const PTX_SREDUCE_COOP: &str = r#".func (.param .f32 _r) mrt_sreduce_coop (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop)
 {
     .reg .b64 %rd<12>;
@@ -2424,6 +2433,13 @@ RC_LOOP:
     setp.eq.s64 %p3, %rd3, 6;
     @%p3 abs.f32 %f4, %f1;
     @%p3 max.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 9;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 10;
+    @%p3 sub.rn.f32 %f4, %f1, %f2;
+    @%p3 abs.f32 %f4, %f4;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
     add.s64 %rd4, %rd4, %rd5;
     bra RC_LOOP;
 RC_DONE:
@@ -2450,6 +2466,8 @@ RC_TREE:
     setp.eq.s64 %p7, %rd3, 5;
     @%p7 min.f32 %f5, %f5, %f6;
     setp.lt.s64 %p6, %rd3, 4;
+    setp.ge.s64 %p7, %rd3, 9;
+    or.pred %p6, %p6, %p7;
     @%p6 add.rn.f32 %f5, %f5, %f6;
     st.shared.f32 [%r4], %f5;
 RC_TREE_SYNC:
