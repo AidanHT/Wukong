@@ -16958,14 +16958,26 @@ impl FnLowerer<'_> {
         let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c1, x));
         let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c2, r));
 
-        // Degree-5 minimax polynomial for e^r on the reduced range, by Horner with fmas.
-        let mut p = self.splat_const_f(EXP_P[0], fty);
-        for &c in &EXP_P[1..] {
-            let cc = self.splat_const_f(c, fty);
-            p = self.builder.build(fty.clone(), Op::Fma(p, r, cc));
-        }
-        // e^r = p*r^2 + r + 1
+        // Degree-5 minimax polynomial for e^r on the reduced range, in **Estrin form** (mirrors the
+        // runtime kernel `exp1`/`exp8` op-for-op — the documented consistency promise): three
+        // independent pair-fmas qᵢ = P₂ᵢ·r + P₂ᵢ₊₁, then two r²-combines ((q0·r²+q1)·r²+q2) — the
+        // same polynomial and op count (r² feeds the e^r reconstruction anyway) at a 3-FMA critical
+        // path instead of Horner's 5, so the native FMA ports stay fed. Estrin only *reassociates*
+        // (≤~1 ULP vs Horner, the reassociated-reduction doctrine); both backends run this same op
+        // sequence, so they still agree bit-for-bit.
         let r2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, r, r));
+        let p0c = self.splat_const_f(EXP_P[0], fty);
+        let p1c = self.splat_const_f(EXP_P[1], fty);
+        let q0 = self.builder.build(fty.clone(), Op::Fma(p0c, r, p1c));
+        let p2c = self.splat_const_f(EXP_P[2], fty);
+        let p3c = self.splat_const_f(EXP_P[3], fty);
+        let q1 = self.builder.build(fty.clone(), Op::Fma(p2c, r, p3c));
+        let p4c = self.splat_const_f(EXP_P[4], fty);
+        let p5c = self.splat_const_f(EXP_P[5], fty);
+        let q2 = self.builder.build(fty.clone(), Op::Fma(p4c, r, p5c));
+        let p = self.builder.build(fty.clone(), Op::Fma(q0, r2, q1));
+        let p = self.builder.build(fty.clone(), Op::Fma(p, r2, q2));
+        // e^r = p*r^2 + r + 1
         let p = self.builder.build(fty.clone(), Op::Fma(p, r2, r));
         let one = self.splat_const_f(1.0, fty);
         let p = self
@@ -17089,13 +17101,33 @@ impl FnLowerer<'_> {
             .build(fty.clone(), Op::Bin(BinOp::FSub, e, one)); // e - 1
         e = self.builder.build(fty.clone(), Op::Select(lt, e_dec, e));
 
-        // Degree-8 minimax poly for log(m) on the reduced range, Horner via fmas, then × m × z.
+        // Degree-8 minimax poly for log(m) on the reduced range, in **Estrin form** (mirrors the
+        // runtime kernel `log1`/`log8` op-for-op — the documented consistency promise), then × m × z:
+        // two parallel sub-chains — lo = (P5·m+P6)·z+(P7·m+P8), hi = (P0·z+(P1·m+P2))·z+(P3·m+P4) —
+        // combined as p = hi·z²+lo with z² = m⁴. A 4-FMA critical path instead of Horner's 8 serial
+        // FMAs for one extra mul (z²; z is needed below anyway), and few enough live temporaries
+        // that the kernel's ×4-unrolled loop fits the 16 ymm registers. Estrin only *reassociates*
+        // (≤~1 ULP vs Horner, the reassociated-reduction doctrine); both backends run this same op
+        // sequence, so they still agree bit-for-bit.
         let z = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, m, m));
-        let mut p = self.splat_const_f(LOG_P[0], fty);
-        for &c in &LOG_P[1..] {
-            let cc = self.splat_const_f(c, fty);
-            p = self.builder.build(fty.clone(), Op::Fma(p, m, cc));
-        }
+        let p5c = self.splat_const_f(LOG_P[5], fty);
+        let p6c = self.splat_const_f(LOG_P[6], fty);
+        let l1 = self.builder.build(fty.clone(), Op::Fma(p5c, m, p6c));
+        let p7c = self.splat_const_f(LOG_P[7], fty);
+        let p8c = self.splat_const_f(LOG_P[8], fty);
+        let l2 = self.builder.build(fty.clone(), Op::Fma(p7c, m, p8c));
+        let lo = self.builder.build(fty.clone(), Op::Fma(l1, z, l2));
+        let p1c = self.splat_const_f(LOG_P[1], fty);
+        let p2c = self.splat_const_f(LOG_P[2], fty);
+        let h1 = self.builder.build(fty.clone(), Op::Fma(p1c, m, p2c));
+        let p3c = self.splat_const_f(LOG_P[3], fty);
+        let p4c = self.splat_const_f(LOG_P[4], fty);
+        let h2 = self.builder.build(fty.clone(), Op::Fma(p3c, m, p4c));
+        let p0c = self.splat_const_f(LOG_P[0], fty);
+        let hz = self.builder.build(fty.clone(), Op::Fma(p0c, z, h1));
+        let hi = self.builder.build(fty.clone(), Op::Fma(hz, z, h2));
+        let z2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, z, z));
+        let p = self.builder.build(fty.clone(), Op::Fma(hi, z2, lo));
         let pm = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, p, m));
         let mut y = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, pm, z));
 
