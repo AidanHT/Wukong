@@ -36,10 +36,12 @@ Current standing (recorded):
 - *Compute-bound, CPU*: f32 GEMM ≈102–103% of oneMKL single-core at ≤512³, **85–86% at
   1024–2048³, ~77% roofline at 4096³** (loss); multicore **60–70% of MKL at 512–1024³**
   (loss), 86–129% at ≥2048³. int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
-- *Compute-bound, GPU (RTX 4050, sm_89)*: fp16 GEMM ~90–97% cuBLAS at 2048³, ~77–83% at
-  4096³ (loss); int8 ~62–70% cuBLAS IMMA at 4096³ (loss); int4 W4A16 documented lead (no
-  library peer exists); attention **0.29–0.80× cuDNN at S≥2048** (loss), wins fused-RoPE
-  S≤512 and short-S causal.
+- *Compute-bound, GPU (RTX 4050, sm_89)*: fp16/bf16 GEMM ~101% cuBLAS ≤1024³, **~87–90% at
+  2048³, ~83% at 4096³** (past the prior 77% PTX ceiling; 4096³ a SASS-level loss); int8 GEMM
+  **96–105% at 2048³ (beats IMMA), 86–88% at 1024³, ~70% at 4096³** (HBM-bound loss); fused int8
+  GEMM+dequant **1.1–2.2×** the cuBLAS chain; int4 W4A16 documented lead (no library peer exists);
+  attention **0.37–0.66× cuDNN at S≥2048** (loss), wins fused-RoPE S≤512, causal D=64 S=512
+  (beats cuDNN+cutlass), and D=128 ldmatrix S≤1024.
 - *Memory-bound, CPU*: streaming elementwise ≈1.1–1.6× C (NT-store dispatch), honest
   physics-ties at L3-resident sizes (relu, biasadd, hadamard); reductions/norms/scans/column
   family 1.4–107× vs scalar-left-by-gcc patterns — but note these are IEEE-serial C baselines
@@ -50,8 +52,9 @@ Current standing (recorded):
 **M2. End-to-end model performance.** A compiler is judged on composed graphs, not op zoos:
 fusion, no round-trips, layer-stack throughput. GPT-2-class `.mer` models exist and dispatch
 to recognized kernels; GPU-resident 12-layer decode runs under CUDA-graph capture.
-Standing: **previously unmeasured vs any peer on CPU — the largest single gap in the
-benchmark suite** (being closed by `bench_model`); GPU training step still loses to eager
+Standing: the CPU end-to-end model bench (`bench_model`) now runs — a 12-layer GPT-2-class stack
+at **~26–32× idiomatic C / ~4.9–9.4× `-ffast-math` C (PRELIMINARY, ratios only)**, with
+eager-PyTorch-CPU peer columns (T1/Tn sdpa+manual) wired; GPU training step still loses to eager
 PyTorch (GEMM-bound); serving-stack (paged KV, continuous batching) measured GPU-only.
 
 **M3. Multicore scaling** of M1 with G4 preserved. Standing: strong (dot ~7.9×, max ~25×,
@@ -61,8 +64,8 @@ have no multithreaded peer — treat them as scaling demonstrations, not peer wi
 ## Tier 2 — what makes it a language, not a kernel library
 
 **M4. Compile time.** Standing: the most defensible headline — `compile-vs` (all four
-languages as subprocesses, compile-to-object at -O2) shows ~9–12× vs gcc/g++/rustc;
-in-process JIT latency ~0.3–1.5 ms/kernel and ~13 ms for a full GPT-2 block source→optimized
+languages as subprocesses, compile-to-object at -O2) shows ~7–12× vs gcc/g++/rustc (measured
+~7–9× this session, ~9–12× on faster-clock runs); in-process JIT latency ~0.3–1.5 ms/kernel and ~13 ms for a full GPT-2 block source→optimized
 MIR; GPU cold JIT 0.76 ms / warm cubin 0.16 ms (~10⁴–10⁵× vs Triton cold).
 
 **M5. Static shape safety at zero runtime cost.** Tensor shapes are types; static dims unify
@@ -74,15 +77,18 @@ language gap (see M6).
 **M6. Expressiveness for real ML code.** Can a user write a transformer fwd+bwd+train loop in
 pure Mercury without escaping? Standing: forward blocks yes (statically-shaped, recognized
 idioms); training via `--train` (CLI transform, not in-language); **known blockers**: no heap
-allocation / returned tensors, runtime `?` dims don't run, single-file only (imports are
-no-ops), tensors can't be element-generic (`Tensor[T,M,N]` rejected → dtype kernels
-duplicated), no fn pointers/closures, no file I/O (weights must be synthesized). These bound
+allocation / returned tensors, runtime `?` dims don't run, tensors can't be element-generic
+(`Tensor[T,M,N]` rejected → dtype kernels duplicated), no fn pointers/closures, no file I/O
+(weights must be synthesized). (Multi-file `import a.b` *does* work — it splices items with
+cycle/diamond dedup; only aliased/selective `import as` / `import x.{a,b}` stay partial.) These bound
 how far "general programs a real user writes" can go today and are first-class improvement
 targets, not footnotes.
 
 **M7. Portability.** Same `.mer` → interp (oracle), Cranelift native, GPU offload,
 GPU-native (whole-program MIR→PTX megakernel). Standing: real; GPU-native covers a subset
-(UNSUPPORTED=skip) with 97/97 green on the eligible corpus.
+(UNSUPPORTED=skip) — it passes the eligible corpus except **2 documented general-lowering
+miscompiles** (`hadamard`, `log_softmax_fused` in `lower.rs`/`megakernel.rs`); the
+recognizer-offload GPU path and both CPU backends are unaffected and bit/tolerance-exact.
 
 ## Tier 3 — supporting qualities
 
@@ -95,7 +101,7 @@ in-harness cross-checks that can only *fail* Mercury, never inflate it.
 1. End-to-end CPU model bench vs strong peers (closes M2's measurement hole).
 2. vmath exp/log core vs MKL VML (~1.7–2× loss; propagates into every composed op).
 3. Large-GEMM regime vs MKL (≥1024³ single-core 85%, mid-size multicore 60–70%).
-4. GPU attention long-S vs cuDNN (0.29–0.80×).
+4. GPU attention long-S vs cuDNN (0.37–0.66×).
 5. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
    tensors, imports, file I/O (M6).
 6. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).

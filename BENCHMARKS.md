@@ -82,9 +82,13 @@ where gcc/rustc won't vectorize — disclosed per section, never a rigged baseli
 [below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): fp16 tensor-core GEMM reaches **cuBLAS parity
 (~101%) at ≤1024³**, and the ldmatrix+XOR-swizzle workhorse lifts the large regime to **~87–90% at
 2048³, ~83% at 4096³** (past the prior 77% PTX ceiling);
-**95.7% of the 192 GB/s HBM hardware peak** on the saxpy triad; the fused flash-attention is **3.6–5×
-a cuBLAS unfused attention chain** (205–738× naive CUDA-C); int8 tensor-core GEMM is **~180–237× naive
-CUDA-C** (~44–53% of cuBLAS int8 IMMA); the **fused GEMM+activation beats the cuBLAS GEMM+act chain
+**95.7% of the 192 GB/s HBM hardware peak** on the saxpy triad; the fused flash-attention **beats the genuinely-fused cuDNN + cutlass mem-efficient fMHA** in the
+causal-D64-S=512 (**1.03–1.16×**), fused-RoPE-S≤512 (**1.8–5.7×**), and D=128-ldmatrix-S≤1024 (**1.11–1.20×**
+vs cutlass-efficient) regimes, is competitive through S≤1024, and **trails cuDNN at long context S≥2048
+(0.37–0.66×)** — and is **3.6–5× a cuBLAS *unfused* attention chain** (205–738× naive CUDA-C, the older,
+weaker library bar); int8 tensor-core GEMM is **~180–237× naive CUDA-C** and reaches **96–105% of cuBLAS
+int8 IMMA @2048³ (beating it), 86–88% @1024³, ~70% @4096³** (the 64×64 warp-tile, ldmatrix + XOR-swizzle),
+with the **fused int8 GEMM+dequant 1.1–2.2× the cuBLAS chain**; the **fused GEMM+activation beats the cuBLAS GEMM+act chain
 1.18–2.41×** (the fusion cuBLAS structurally can't express); and GPU compile is **0.76 ms cold vs
 Triton's 30–120 s** (~4×10⁴–1.6×10⁵×).
 
@@ -105,7 +109,7 @@ negative results**, live in [`prompts/results/`](prompts/results/).
 | CPU GEMM | oneMKL | 1-core **102–104%** @256/512³, **84–95%** @1024–4096³; `@parallel` **86–129%** of all-threads @≥2048³ | vmath loses to MKL VML (exp ~1.7×, log ~2×) — algorithmic; AVX-512 projected only |
 | fp16/bf16 GEMM | cuBLAS | **~101%** ≤1024³, **~87–90%** @2048³, **~83%** @4096³ (past the prior 77% `mma.sync` ceiling) | 4096³ residual is SASS-level; occupancy/pipeline/prefetch levers all measured losses |
 | int8/fp8 GEMM | cuBLAS IMMA / cuBLASLt | int8 **96–105%** @2048³ (**beats IMMA**), 86–88% @1024³; **fused GEMM+dequant 1.1–2.2×** the cuBLAS chain; fp8 82–151% of cuBLASLt | int8 ~70% @4096³ (HBM-bound) |
-| Attention | cuDNN / cutlass fused fMHA | fused-RoPE **1.8–5.7×** & causal D=64 **1.03–1.16×** (beats both) @S≤512; D=128 ldmatrix beats cutlass @S≤1024 | non-causal long-S (≥2048) 0.40–0.80× cuDNN's throughput scaling |
+| Attention | cuDNN / cutlass fused fMHA | fused-RoPE **1.8–5.7×** & causal D=64 **1.03–1.16×** (beats both) @S≤512; D=128 ldmatrix beats cutlass @S≤1024 | non-causal long-S (≥2048) 0.37–0.66× cuDNN's throughput scaling |
 | Conv | cuDNN-9 | 1×1 **3.5–5.6×**, 3×3/5×5 deep-channel **0.93–1.21×**, Winograd F(4×4,3×3) **1.2–2.2×** over implicit-GEMM | Winograd loses at low channel count; depthwise/dilated not yet covered |
 | Serving | (no vLLM/TRT-LLM installable — vs Mercury's own eager) | **39.1× continuous-batching goodput** @fill=64; decode CUDA graph 1.07–1.35×; int8 KV **3.88×** footprint | multi-GPU collective (NCCL) unmeasured on one device |
 
@@ -299,7 +303,8 @@ function per translation unit — no headers, no `main`, matching work across al
 native object, best-of-N minimum, same-run. Every column pays process startup, so this is the
 apples-to-apples "how fast does each compiler compile the same kernel" figure. Its numbers are
 recorded in dedicated benchmarking sessions (this laptop's clock state makes ad-hoc absolute numbers
-unreliable); the ratio is a single-digit-× Mercury win, not the 2–3-order figure below.
+unreliable); the ratio is a **~7–12× Mercury win (measured ~7–9× this session)** — single-digit-×, not
+the 2–3-order figure below.
 
 **The xbench per-kernel "compile (ms)" figure is in-process JIT/embedding latency**, not a
 process-to-process compiler comparison:
@@ -1149,18 +1154,24 @@ peers: **naive** int8 CUDA-C, a strong **`dp4a.u32.s32`** hand-written CUDA-C, a
 `cublasGemmEx`; all four first gated to *equal* the `i32` oracle — classic GemmEx int8 is `s8×s8`, so
 the peer cross-check uses `[0,127]` activations where `u8≡s8`, the full-range `[0,255]` gate is separate):
 
-| size | Mercury `_smdb` (best) | % of cuBLAS int8 | × vs naive CUDA-C | × vs dp4a CUDA-C |
-|------|------------------------|------------------|-------------------|------------------|
-| 1024³ | 22.8 TFLOP/s (64-tile) | ~44% | ~182× | ~34× |
-| 2048³ | 39.8 TFLOP/s (64-tile) | ~53% | ~237× | ~58× |
-| 4096³ | 39.0 TFLOP/s (128-tile) | ~52% | ~228× | ~57× |
+| size | dispatched w64 kernel | % of cuBLAS int8 IMMA | × vs naive CUDA-C | × vs dp4a CUDA-C |
+|------|-----------------------|-----------------------|-------------------|------------------|
+| 1024³ | w64 (64×64 warp-tile, ldmatrix + XOR-swizzle) | **~86–88%** | ~182× | ~34× |
+| 2048³ | w64 (64×64 warp-tile, ldmatrix + XOR-swizzle) | **~96–105% (beats IMMA)** | ~237× | ~58× |
+| 4096³ | w64 → 128-tile (HBM-bound) | **~70%** | ~228× | ~57× |
+
+(The retired hand-placed single-tile `_smdb` path measured only ~44–53% of IMMA at these sizes —
+22.8 / 39.8 / 39.0 TFLOP/s @1024³/2048³/4096³; the shipped 64×64 warp-tile with `ldmatrix` + XOR-swizzled
+SMEM is the standing above. Absolute TFLOP/s are clock-bound — only the same-run ratios are stable.)
 
 **M6 is a decisive, sustained win — ~180–237× the naive hand-written int8 CUDA-C and ~34–58× the dp4a
 SIMD-int8 kernel** across re-runs (the literal "beat C on the GPU" for the quantized path). The SMEM
 pipeline is **1.6–2.1× the `_mt` fragment-reuse path**, and the dispatch is regime-aware (64×64 tile —
 2× occupancy — wins small/medium; the 128×128 tile — more reuse — wins at 4096³), the same split the
-fp16 GEMM uses. Against cuBLAS the honest standing is **~44–53% of its int8 IMMA** — a real gap; the
-remaining levers are the same ones open on fp16 (multi-stage `cp.async`, `ldmatrix`, swizzled SMEM).
+fp16 GEMM uses. Against cuBLAS the honest standing is now **~86–88% of its int8 IMMA @1024³, ~96–105%
+@2048³ (beating IMMA), and ~70% @4096³ (HBM-bound)** — the 64×64 warp-tile with `ldmatrix` + XOR-swizzled
+SMEM (the same levers that lifted fp16) closed the gap the prior hand-placed `_smdb` path (~44–53%) left
+open; the residual loss is the 4096³ HBM-bound regime.
 
 **Beating cuBLAS by fusion (int8 dequant).** cuBLAS int8 outputs raw `i32`; a real quantized pipeline
 then dequantizes, which cuBLAS **cannot fuse** — it needs a *second* kernel that re-reads the whole
@@ -1169,7 +1180,9 @@ then dequantizes, which cuBLAS **cannot fuse** — it needs a *second* kernel th
 per-column scale happen in registers before the write. It is **exact** vs the CPU reference (`max_abs=0`,
 the shared single f32 rounding), and measured same-run (`int8_dequant_fusion`) the f32-output dequant
 kernel costs **~0 over the plain `i32` kernel** (−5%, within noise) — i.e. Mercury gets the dequant free,
-exactly the HBM round-trip + launch cuBLAS structurally must pay. Reproduce: `int8_gemm_vs_peers` /
+exactly the HBM round-trip + launch cuBLAS structurally must pay — so against the cuBLAS int8 GEMM +
+separate dequant chain, the fused kernel runs **1.1–2.2× same-run** (the competitive GEMM plus the
+eliminated HBM round-trip). Reproduce: `int8_gemm_vs_peers` /
 `int8_dequant_fusion` in `mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH.
 
 **Honest peer scoreboard — vs cuBLAS and naive CUDA-C.** A GPU kernel's only meaningful rivals run on
@@ -1196,7 +1209,9 @@ laptop's clock state; the 4096³ cliff does not):
 The honest standing: at L2-resident sizes Mercury's fp16 tensor-core GEMM now **reaches cuBLAS parity
 (~101% at 1024³)** — the plan's M1 isolated target (≥95%) is met there — on top of a **wide Tier-A win**
 (tens-to-100×+ over the naive hand-written CUDA-C kernel, the same way it beats naive CPU-C). The large
-4096³ case is improved but **still short of cuBLAS** (~34%); closing it is ongoing.
+regime — **~74% @2048³ / ~34% @4096³ at this cp.async-only milestone** (the table above) — was
+subsequently lifted to **~87–90% @2048³ and ~83% @4096³** by the `ldmatrix` + XOR-swizzle workhorse (the
+headline figure, past the prior 77% PTX ceiling); the cp.async table is retained as the Phase-1 record.
 
 **Phase-1 progress — `cp.async` software pipelining.** The shared-memory-staged kernel's `{load-all;
 sync; compute-all; sync}` K-loop stalls on global-load latency once the working set spills L2. Two
@@ -1212,8 +1227,9 @@ levers were measured same-run against cuBLAS:
   best large-GEMM path (**1.15× @2048³, ~1.07× @4096³ over `_sm`**).
 
 `gemm_nt_f16` now **dispatches by regime**: the 64-tile pipeline ≤1024², the 128-tile pipeline ≥2048²,
-the plain staged 64-tile otherwise — each the measured winner in its range. Remaining levers toward
-≥95% at 4096³: deeper (3+-stage) pipelines, `ldmatrix`, swizzled SMEM, warp-tiling, split-K. Reproduce:
+the plain staged 64-tile otherwise — each the measured winner in its range. The `ldmatrix` +
+swizzled-SMEM workhorse has since lifted the large regime to **~87–90% @2048³ / ~83% @4096³** (headline);
+remaining levers toward ≥95% at 4096³ are deeper (3+-stage) pipelines, warp-tiling, and split-K. Reproduce:
 `gemm_vs_peers` in `mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in
 `baselines.rs`).
 
@@ -1313,18 +1329,24 @@ honest figure). **The `cp.async` pipeline — the lever this section previously 
 now implemented and shipping.** `flash_pipe_vs_mma` times `flash_d64_mp` against `flash_d64_m` back-to-back
 under one pinned clock: **0.28× / 0.34× / 0.53× / 0.88× the time single-head at S=512 / 1024 / 2048 / 4096**
 (1.14–3.6× faster, largest where the warp was purely latency-bound) and **0.84–0.90× at the H=12 filled
-regime** (1.1–1.2×, the per-warp latency bound). **M5 (vs a tensor-core library): Mercury's fused flash is 3.6–5.0× the cuBLAS unfused attention chain**,
-same-run, single-head — the gap widening at long S where the materialized S×S scores hurt the chain most.
+regime** (1.1–1.2×, the per-warp latency bound). **M5 (vs the genuinely-fused libraries): against cuDNN and cutlass mem-efficient fMHA** (reached through
+PyTorch's SDPA backends, measured same-run and clock-pinned — `prompts/results/attention.md`), Mercury's
+flash **wins the causal-D64-S=512 (1.03–1.16×, beating both peers), fused-RoPE-S≤512 (1.8–5.7×), and
+D=128-ldmatrix-S≤1024 (1.11–1.20× vs cutlass-efficient) regimes, is competitive through S≤1024, and trails
+cuDNN at long context S≥2048 (0.37–0.66×)** — this is the honest fused-peer bar. Against the older, weaker
+**cuBLAS *unfused* attention chain** it is **3.6–5.0×** same-run, single-head — the gap widening at long S
+where the materialized S×S scores hurt the chain most.
 The chain is the canonical *pre-FlashAttention* attention (Q·Kᵀ and P·V on tensor-core cuBLAS, the S×S
 scores spilled to HBM with a softmax between), so the gap **is** the value of fusion, measured against the
-gold-standard library for the matmuls — not a strawman. Two honesty caveats: **(1)** this is **not "% of
-FA2"** — a genuinely *fused* FA2 kernel (cuDNN / FlashAttention) is faster than the unfused cuBLAS chain, so
-beating the chain 3.6–5× is the *library-bar* result, not parity with the best fused kernel; **(2)** a fused
+gold-standard library for the matmuls — not a strawman. Two honesty caveats: **(1)** the fused-peer win is
+**regime-specific** — Mercury beats the fused cuDNN/cutlass peers at short/causal/RoPE context but **trails
+cuDNN at long S≥2048** (above), so this is not a uniform "% of FA2" parity claim, and beating the *unfused*
+cuBLAS chain 3.6–5× is only the weaker library bar; **(2)** a fused
 FA2-class CUDA-C peer is **not buildable on this toolkit-free box** — the `nvrtc_wmma_probe` test shows NVRTC
 has *no header search path at all* (even `#include <cuda_fp16.h>` fails to open), so `nvcuda::wmma` cannot be
 compiled. (An earlier cross-process re-measure against torch SDPA was **uninterpretable** — torch's *own*
 throughput swung ~2× run-to-run on this power-capped part, 66% vs 112% on clock alone — which is exactly why
-the in-process cuBLAS chain is the reportable Tier-B bar.) The register-resident core was itself **1.5–5.9×
+the fused-peer SDPA standing above is taken **same-run and clock-pinned**, not cross-process.) The register-resident core was itself **1.5–5.9×
 the prior WMMA flash** (`flash_mma_vs_wmma`), and `flash_d64_mp` compounds the `cp.async` win on top
 (**1.1–3.6× `flash_d64_m`**, **205–738× naive CUDA-C** = M6).
 
@@ -1340,9 +1362,10 @@ this filled regime (and up to 3.6× single-head, where the latency was unhidden)
 sharing was then tried** (`flash_d64_mp4`/`_mp8`, W warps sharing one cooperatively-staged K/V block;
 `flash_mw_vs_mp`) and is **only marginal** — ~6–8% at the H=12 filled regime and a *regression* single-head
 — so the kernel is **not** strongly K/V-bandwidth-bound (`mp`'s per-warp pipelining already captures it).
-With the cuBLAS unfused chain now the same-run Tier-B bar, Mercury's flash is already **3.6–5.0× the best
-library attention buildable on this box** — and there is no *fused* FA2 peer measurable here to set a ≥90%
-target against. `ldmatrix` conflict-free fragment loads (the strided V `u16` pairs at a 128-byte SMEM stride
+Against the cuBLAS unfused chain Mercury's flash is **3.6–5.0×** same-run, and against the genuinely-fused
+cuDNN/cutlass SDPA peers it **wins the short/causal/RoPE regimes and trails only cuDNN at long S≥2048** (the
+fused-peer standing above) — the honest bar, even though a hand-written fused FA2-class CUDA-C peer can't be
+compiled on this toolkit-free box. `ldmatrix` conflict-free fragment loads (the strided V `u16` pairs at a 128-byte SMEM stride
 are the prime bank-conflict suspect — a *per-warp throughput* issue, consistent with the not-bandwidth-bound
 finding) remain the one untried kernel lever, but it is an uncertain further squeeze with no
 locally-measurable FA2 denominator to chase.
@@ -1436,18 +1459,19 @@ fusion):
 
 **Honest finding:** at the real GPT-2 shape the fused layer is **~par with the cuBLAS-chain layer
 (0.96–1.01×)** — *not* the clearer win the D=64 toy shows. The decomposition says why: Mercury's WMMA GEMM
-is **0.90–0.93× of cuBLAS at D=768** (the GEMM cliff — the same large-size gap `gemm_vs_peers` reports,
-~34% @4096³), and the fused residual/SiLU epilogues (**1.03–1.09×**, which cuBLAS structurally can't do)
-nearly but not fully offset it. **Closing the GEMM cliff flips this to a clear win** — the single
-highest-leverage GPU item, exactly what the parallel GEMM-cliff workstream targets. (A cross-process
+is **0.90–0.93× of cuBLAS at D=768** (the residual large-GEMM gap — the same one `gemm_vs_peers` reports,
+~83% @4096³ after the swizzle workhorse), and the fused residual/SiLU epilogues (**1.03–1.09×**, which cuBLAS structurally can't do)
+nearly but not fully offset it. **Closing the remaining large-GEMM gap flips this to a clear win** — the
+single highest-leverage GPU item, exactly what the parallel large-GEMM workstream targets. (A cross-process
 PyTorch comparison at this shape, like the D=64 table above, remains a documentation follow-up.)
 
 Honest caveats: **eager** PyTorch only — `torch.compile`/Inductor needs Triton, which has no working Windows
 install (`torch.compile` raised `Cannot find a working triton installation` here). Cross-process and
 **clock-noisy** at this ~1–2 ms scale (the laptop GPU boosts ~7×), so treat the ratios as order-of-magnitude
 and the **direction** — Mercury faster at every S, by a margin growing toward small S — as the robust signal.
-The clock-invariant backbones are the same-run `flash_vs_peers` (Tier-A 172–305×, Tier-B 59–77% of FA2) and
-the `cublas_chain_vs_mercury` same-run layer table above.
+The clock-invariant backbones are the same-run `flash_vs_peers` (Tier-A 172–305× vs naive CUDA-C; Tier-B the
+3.6–5.0× cuBLAS-unfused-chain and the fused cuDNN/cutlass SDPA standings above) and the
+`cublas_chain_vs_mercury` same-run layer table above.
 
 **Determinism, every kernel (M12).** Not just the layer: `gpu_kernels_bit_reproducible` asserts every
 reduction-bearing family — `gemm_nt_f16` and its `_sm`/`_sm_db` variants, the three fused row norms,
@@ -1603,7 +1627,8 @@ open is the *end-to-end full-model* measurement, not the per-op kernels.
 - **Compile time:** the xbench figure — ~100–680× faster than gcc/rustc (latest full-board geomean
   **306×**; drifts ~150–310× with the C/Rust toolchain's spawn time) — is **in-process JIT/embedding
   latency** vs spawning a toolchain; the both-subprocess `compile-vs` mode is the headline
-  compiler-to-compiler comparison (a single-digit-× win on bare equivalent kernels). Robust every
+  compiler-to-compiler comparison (a **~7–12× win, measured ~7–9× this session**, on bare equivalent
+  kernels). Robust every
   run; the metric that dominates ML iteration.
 - **Matmul / nn.Linear (the flagship ML kernels):** Mercury **wins single-thread (~3–26×) and
   dominates parallel (~9–104×)**, and the lead **grows with matrix size** — the compiler tiles,
@@ -1684,9 +1709,11 @@ open is the *end-to-end full-model* measurement, not the per-op kernels.
   fp16/bf16 in the same run (realizing Ada's ~2× fp8 rate once it's compute-bound). **`cp.async`-pipelined
   register-resident `mma.sync` flash-attention** (online softmax, O/m/l in registers, K/V prefetched into
   double-buffered SMEM under the MMA) runs **1.1–3.6× the un-pipelined kernel same-run**
-  (`flash_pipe_vs_mma`), **205–738× a naive CUDA-C flash** (M6), and **3.6–5.0× a cuBLAS unfused attention
-  chain** (M5, same-run — the gold-standard *library* bar; a fused FA2-class CUDA-C peer can't be compiled
-  here, NVRTC has no headers, and cross-process torch SDPA swings ~2× run-to-run so it isn't reportable);
+  (`flash_pipe_vs_mma`), **205–738× a naive CUDA-C flash** (M6), **3.6–5.0× a cuBLAS *unfused* attention
+  chain** (M5, the older/weaker library bar), and — vs the genuinely-fused cuDNN/cutlass SDPA peers, same-run
+  clock-pinned — **winning the causal-S=512 (1.03–1.16×), fused-RoPE-S≤512 (1.8–5.7×) and D=128-ldmatrix-S≤1024
+  regimes while trailing cuDNN at long context S≥2048 (0.37–0.66×)** (a hand-written fused FA2-class CUDA-C
+  peer can't be built here — NVRTC has no headers);
   a **whole pre-norm transformer layer runs end-to-end GPU-resident**
   (matching a CPU f64 reference to max_rel 2.7e-4, deterministic run-to-run) and now **beats PyTorch eager
   at every S, including S=4096 (1.35×)**. Numbers are honest for a power-capped 6 GB

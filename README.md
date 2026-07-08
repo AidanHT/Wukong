@@ -18,7 +18,7 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
 
 - **compiles fast** — the metric that dominates real ML edit-run iteration. Apples-to-apples
   *compiler-to-object* (`mercuryc --emit=obj -O2` vs `gcc/g++/rustc -O2 -c`, same artifact, same
-  machine): **~6–14× faster** (`mercury_bench compile-vs`). The larger **~100–680× (geomean ~305×)**
+  machine): **~7–12× faster** (`mercury_bench compile-vs`; ~7–9× measured this run). The larger **~100–680× (geomean ~305×)**
   figure is *time-to-running-code*: Mercury JIT-compiles in-process while C/Rust must spawn a full
   toolchain **and link a shared object** — a real advantage for the JIT/embedding workflow, but not a
   compiler-vs-compiler number, so it is disclosed as such, never as the headline;
@@ -28,9 +28,9 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
   **oneMKL parity**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
   (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*. Against
-  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM is **~55–75%** (its
-  weakest CPU spot: small/medium GEMMs on this P+E hybrid don't amortize the cross-core sync, so the
-  win is single-core parity + big-vs-naive-C, not beating MKL's threaded pack);
+  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM is **60–70% at
+  512–1024³ but reaches parity-to-winning (86–129%) at ≥2048³**, the large-matrix ML regime (the
+  residual mid-size gap is cross-core sync/packing overhead on this P+E hybrid, not the kernel);
 - **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
   over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
   column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
@@ -56,7 +56,8 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   which gcc/rustc leave serial — and **~7.9–8.6× under `@parallel`** (up to ~25× for `max`/`absmax`);
 - and ships a **GPU backend** (`--features gpu`, NVIDIA RTX 4050; PTX + cudarc driver-JIT, no CUDA
   toolkit): fp16 tensor-core GEMM at **cuBLAS parity (~101%) ≤1024³**, a fused **flash-attention**
-  **3.6–5× a cuBLAS unfused attention chain** (and faster than PyTorch eager at every sequence length),
+  that **beats the genuinely-fused cuDNN + cutlass fMHA in the causal-S≤512 and fused-RoPE regimes**
+  (and is 3.6–5× the unfused cuBLAS chain), trailing cuDNN only at long context (S≥2048),
   int8 GEMM **~180–237× naive CUDA-C**, **95.7% of the 192 GB/s HBM peak**, and **0.76 ms cold GPU
   compile vs Triton's 30–120 s**.
 
@@ -83,8 +84,8 @@ Where Mercury is built to win for the ML/DL niche:
   **reductions** to SIMD, contracts `x + y*z` to a **fused multiply-add**, **fuses** adjacent
   elementwise loops, and **auto-parallelizes** `@parallel` loops across cores — things a
   general-purpose C compiler won't do to naively-written source. Underneath, an SSA optimizer
-  (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM) removes ~48% of IR ops on the benchmark kernels
-  (54–60% on the heavy ones). Op-graph fusion across tensor ops is still planned.
+  (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM) removes ~42% of IR ops on the benchmark kernels
+  (~48–54% on the heavy transformer/GEMM kernels). Op-graph fusion across tensor ops is still planned.
 - **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
   BLAS/cuBLAS and embed Mercury kernels in C/C++/CUDA stacks. The attributes parse and validate
   today; symbol export/import is not yet wired (see the roadmap).

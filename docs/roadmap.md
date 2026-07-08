@@ -309,8 +309,8 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   leaf functions, **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
   with block merging, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
   forwarding, DSE, and **loop-invariant code motion**. Guarded by an `-O0`-vs-`-O{1,2,3}` differential
-  test and post-pass MIR verification; across the run suite and kernels it removes ~48% of IR ops
-  (54–60% on the heavy kernels) and runs ~1.5–2.5x faster than `-O0`.
+  test and post-pass MIR verification; across the run suite and kernels it removes ~42% of IR ops
+  (~48–54% on the heavy transformer/GEMM kernels) and runs ~1.5–2.5x faster than `-O0`.
 
 ## GPU backend (NVIDIA RTX 4050, behind `--features gpu`)
 
@@ -327,8 +327,9 @@ mobile 4050 (see `BENCHMARKS.md`):
   16×8 tiles per warp) is now the **fastest** tensor-core path — ~2.1–2.4× the naive single-tile fp8 and
   ~1.3–2.3× fp16/bf16 in the same run (single-tile retained as the fallback for non-divisible shapes).
 - **Fused flash-attention** (online softmax, never materializes the `S×S` scores — the kernel that
-  *loses* on CPU): warp-per-query-row + `cp.async` double-buffering, **3.6–5.0× a cuBLAS unfused
-  attention chain** (205–738× naive CUDA-C), and faster than PyTorch eager at every sequence length.
+  *loses* on CPU): warp-per-query-row + `cp.async` double-buffering — **beats the genuinely-fused
+  cuDNN + cutlass fMHA in the causal-S≤512 and fused-RoPE regimes** (and is 3.6–5.0× the unfused
+  cuBLAS chain, 205–738× naive CUDA-C), trailing cuDNN only at long context (S≥2048).
 - **Fused row norms** (softmax/LayerNorm/RMSNorm, one warp per row), **activations** (SFU), **reductions**
   (deterministic; max bit-exact), **conv2d**, and elementwise.
 - **A whole pre-norm transformer layer runs end-to-end GPU-resident** — RMSNorm → QKV → flash-attn →
@@ -354,7 +355,9 @@ GPU).
 backend (`GpuLower`) lowers the *whole* program's MIR to PTX, so arbitrary non-recognized kernels run
 GPU-side too; an eligible program is fused into a single-block cooperative **megakernel** (one launch,
 no host round-trips). It is tolerance-gated against the interpreter oracle and optimization-invariant
-(`-O0` ≡ `-O3`), the same contract as the offload path.
+(`-O0` ≡ `-O3`), the same contract as the offload path. Coverage is **partial** (UNSUPPORTED ops
+skip), and two general programs (`hadamard`, `log_softmax_fused`) are known to miscompile on this
+path — the documented residual gap in the general MIR→PTX lowering.
 
 ## Automatic differentiation (`mercury_autodiff`)
 
