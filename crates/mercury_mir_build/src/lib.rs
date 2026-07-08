@@ -23653,6 +23653,134 @@ mod tests {
         (prog, diags, interner)
     }
 
+    /// Cross-check: the `emit_exp_f32` inlined-MIR table/constants (the f64 literals `splat_const_f`
+    /// rounds to f32) must land on the EXACT f32 bit patterns the runtime `vmath::exp1`/`exp8` kernel
+    /// holds — the documented value-consistency promise (a dispatched `exp` loop and a composed/scalar
+    /// `exp` must agree). The differential gate can't see a one-sided drift here: both backends run
+    /// whichever path a given call site took, so a dispatched-vs-inlined mismatch is silent. This test
+    /// is the emitter-side twin of the runtime's `vmath_exp_tables_consistent`: it re-derives every
+    /// entry from first principles the identical way and pins `mir_build`'s literals to it, so editing
+    /// one side alone fails one of the two crates' tests. (These consts are used verbatim by the
+    /// emitter above, so the test pins what is actually emitted.)
+    #[test]
+    fn exp_table_literals_match_kernel_bits() {
+        // T[j] = 2^(j/8) rounded once to f32 (T[0] pinned exactly 1.0 → exp(0) = 1.0).
+        for j in 0..8usize {
+            let want = ((j as f64) / 8.0).exp2() as f32;
+            assert_eq!((EXP_TBL_T[j] as f32).to_bits(), want.to_bits(), "T[{j}]");
+        }
+        assert_eq!(
+            (EXP_TBL_T[0] as f32).to_bits(),
+            1.0f32.to_bits(),
+            "T[0] must be exactly 1"
+        );
+        // SCALE = 8/ln2 rounded once; MAGIC = 1.5·2^23; MBIAS folds the 127·8 exponent bias into the
+        // magic-bits subtract (bits of the f32 magic − 1016).
+        assert_eq!(
+            (EXP_TBL_SCALE as f32).to_bits(),
+            ((8.0f64 / std::f64::consts::LN_2) as f32).to_bits(),
+            "SCALE"
+        );
+        assert_eq!((EXP_MAGIC as f32).to_bits(), 12582912.0f32.to_bits(), "MAGIC");
+        assert_eq!(
+            EXP_TBL_MBIAS,
+            (EXP_MAGIC as f32).to_bits() as i128 - 127 * 8,
+            "MBIAS"
+        );
+        // Cody-Waite /8 split: TBL_C1 = f32(EXP_C1)/8, TBL_C2 = f32(EXP_C2)/8 (a /8 is exact). C1 must
+        // keep ≥10 trailing mantissa zero bits so n·C1 stays exact over the |n| ≤ 1020 clamp range
+        // (checked with 2× headroom), and hi+lo must reproduce ln2/8 — the whole hi/lo argument.
+        assert_eq!(
+            (EXP_TBL_C1 as f32).to_bits(),
+            ((EXP_C1 as f32) / 8.0).to_bits(),
+            "C1"
+        );
+        assert_eq!(
+            (EXP_TBL_C2 as f32).to_bits(),
+            ((EXP_C2 as f32) / 8.0).to_bits(),
+            "C2"
+        );
+        assert!(
+            (EXP_TBL_C1 as f32).to_bits().trailing_zeros() >= 10,
+            "C1 lost its trailing zeros"
+        );
+        for n in -2047i32..=2047 {
+            let prod = (n as f32) * (EXP_TBL_C1 as f32);
+            assert_eq!(
+                prod as f64,
+                (n as f64) * (EXP_TBL_C1 as f32 as f64),
+                "n·C1 inexact at n={n}"
+            );
+        }
+        let resid = ((EXP_TBL_C1 as f32 as f64) + (EXP_TBL_C2 as f32 as f64)
+            - std::f64::consts::LN_2 / 8.0)
+            .abs();
+        assert!(resid < 1e-12, "Cody-Waite pair drifted off ln2/8: {resid:e}");
+        // P2 = 1/2 + (√2−1)/12·h² (h = ln2/16), the Chebyshev-shifted r² coefficient; P3 = 1/6.
+        let h = std::f64::consts::LN_2 / 16.0;
+        let want_p2 = (0.5 + (2f64.sqrt() - 1.0) / 12.0 * h * h) as f32;
+        assert_eq!((EXP_TBL_P2 as f32).to_bits(), want_p2.to_bits(), "P2");
+        assert_eq!(
+            (EXP_TBL_P3 as f32).to_bits(),
+            ((1.0f64 / 6.0) as f32).to_bits(),
+            "P3"
+        );
+    }
+
+    /// Cross-check: the `emit_log_f32` inlined-MIR table/constants must land on the EXACT f32 bits the
+    /// runtime `vmath::log1`/`log8` kernel holds — same value-consistency promise, same silent-drift
+    /// risk, same remedy as `exp_table_literals_match_kernel_bits`. The emitter-side twin of the
+    /// runtime's `vmath_log_tables_consistent`: it re-derives the 8 buckets (R = 1/bucket-midpoint,
+    /// bucket 4 straddling 1.0 pinned to R = 1 / L = 0; L = −ln(R_f32) rounded once) and the poly tail
+    /// from first principles and pins `mir_build`'s literals to the result.
+    #[test]
+    fn log_table_literals_match_kernel_bits() {
+        let off = LOG_OFF as u32;
+        for j in 0..8u32 {
+            let lo = f32::from_bits(off + j * 0x0010_0000) as f64;
+            let hi = f32::from_bits(off + (j + 1) * 0x0010_0000) as f64;
+            let (want_r, want_l) = if j == 4 {
+                assert!(lo < 1.0 && 1.0 < hi, "bucket 4 must straddle 1.0");
+                (1.0f32, 0.0f32)
+            } else {
+                let r = (1.0 / (0.5 * (lo + hi))) as f32;
+                (r, (-((r as f64).ln())) as f32)
+            };
+            assert_eq!(
+                (LOG_TBL_R[j as usize] as f32).to_bits(),
+                want_r.to_bits(),
+                "R[{j}]"
+            );
+            assert_eq!(
+                (LOG_TBL_L[j as usize] as f32).to_bits(),
+                want_l.to_bits(),
+                "L[{j}]"
+            );
+        }
+        // ln(1+s) − s degree-5 Taylor tail: −1/2, 1/3, −1/4, 1/5 (the odd ones rounded once to f32).
+        assert_eq!((LOG_C1 as f32).to_bits(), (-0.5f32).to_bits(), "C1");
+        assert_eq!(
+            (LOG_C2 as f32).to_bits(),
+            ((1.0f64 / 3.0) as f32).to_bits(),
+            "C2"
+        );
+        assert_eq!((LOG_C3 as f32).to_bits(), (-0.25f32).to_bits(), "C3");
+        assert_eq!(
+            (LOG_C4 as f32).to_bits(),
+            ((1.0f64 / 5.0) as f32).to_bits(),
+            "C4"
+        );
+        // INV_2P23 = 2^-23 exact (scales the masked k·2^23 field to a count). And the shared ln2 hi/lo
+        // split the log reconstruction reuses (`EXP_C1`/`EXP_C2`, same as exp) must sum back to ln2.
+        assert_eq!(
+            (INV_2P23 as f32).to_bits(),
+            (1.0f32 / 8_388_608.0).to_bits(),
+            "INV_2P23"
+        );
+        let resid = ((EXP_C1 as f32 as f64) + (EXP_C2 as f32 as f64) - std::f64::consts::LN_2).abs();
+        assert!(resid < 1e-7, "ln2 hi/lo split drifted off ln2: {resid:e}");
+    }
+
     #[test]
     fn lowers_and_verifies_loop_sum() {
         let src = "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
