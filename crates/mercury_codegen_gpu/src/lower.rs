@@ -1310,7 +1310,18 @@ impl<'a> FnEmit<'a> {
         match ty {
             MirType::F32 => self.emit(&format!("{g}st.f32 [{addr}], {v};")),
             MirType::F64 => self.emit(&format!("{g}st.f64 [{addr}], {v};")),
-            MirType::I64 | MirType::Ptr => self.emit(&format!("{g}st.u64 [{addr}], {v};")),
+            MirType::I64 => self.emit(&format!("{g}st.u64 [{addr}], {v};")),
+            // A pointer homed in the shared frame (an inlined function's Tensor/array param slot) is a
+            // UNIFORM value across the SPMD threads — it is frame-base / kernel-param derived, never a
+            // loaded, per-thread-varying value. It must be stored *unconditionally* (no `@tid0` guard):
+            // in a megakernel the scalar glue can `load` that slot on **every** thread and dereference
+            // it (e.g. a non-recognized reduction over a Tensor param), so a `tid==0`-only store would
+            // leave the zero-initialized slot on threads != 0 and their deref of that null pointer
+            // faults (CUDA_ERROR_ILLEGAL_ADDRESS) — even though the result is ultimately discarded.
+            // Writing the same pointer from all threads is a benign identical-data race (a pointer slot
+            // is homed once, never read-modify-written), so every thread reads the correct base. In the
+            // single-thread lowering `st_guard` is empty anyway, so this is a no-op there.
+            MirType::Ptr => self.emit(&format!("st.u64 [{addr}], {v};")),
             // bf16/f16 storage is 2 bytes; narrow the f32 value to 16 bits, store the raw u16.
             MirType::BF16 => {
                 let h = self.fresh_r16();
