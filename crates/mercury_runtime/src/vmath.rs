@@ -171,13 +171,19 @@ pub(crate) fn exp1(x: f32) -> f32 {
     let n = t - EXP_MAGIC;
     let r = n.mul_add(-EXP_C1, x);
     let r = n.mul_add(-EXP_C2, r);
-    let mut p = EXP_P[0];
-    p = p.mul_add(r, EXP_P[1]);
-    p = p.mul_add(r, EXP_P[2]);
-    p = p.mul_add(r, EXP_P[3]);
-    p = p.mul_add(r, EXP_P[4]);
-    p = p.mul_add(r, EXP_P[5]);
+    // Degree-5 minimax poly in **Estrin form**: three independent coefficient pairs qᵢ = P₂ᵢ·r+P₂ᵢ₊₁
+    // (one FMA each, all parallel), then two r²-combines — ((q0·r²+q1)·r²+q2) = the same polynomial,
+    // at the same 5-FMA count (r² feeds the e^r reconstruction below anyway) but a 3-FMA critical
+    // path instead of Horner's 5 serial FMAs, so the OoO core can fill both FMA ports. Estrin only
+    // *reassociates* the additions (≤~1 ULP vs Horner — the same doctrine as the documented
+    // reassociated-reduction exception); the scalar twin, the AVX2 lanes, and the inlined MIR all use
+    // this identical order, so every path still agrees bit-for-bit.
     let r2 = r * r;
+    let q0 = EXP_P[0].mul_add(r, EXP_P[1]);
+    let q1 = EXP_P[2].mul_add(r, EXP_P[3]);
+    let q2 = EXP_P[4].mul_add(r, EXP_P[5]);
+    let p = q0.mul_add(r2, q1);
+    let p = p.mul_add(r2, q2);
     let p = p.mul_add(r2, r) + 1.0;
     let pow2 = f32::from_bits((((n as i32) + 127) << 23) as u32);
     p * pow2
@@ -203,10 +209,24 @@ pub(crate) fn log1(x: f32) -> f32 {
         e -= 1.0;
     }
     let z = m * m;
-    let mut p = LOG_P[0];
-    for &c in &LOG_P[1..] {
-        p = p.mul_add(m, c);
-    }
+    // Degree-8 minimax poly in **Estrin form**: two parallel sub-chains — lo = (P5·m+P6)·z+(P7·m+P8)
+    // (degree 3) and hi = (P0·z+(P1·m+P2))·z+(P3·m+P4) (degree 4) — combined as p = hi·z²+lo with
+    // z² = m⁴. That is a 4-FMA critical path instead of Horner's 8 serial FMAs (~32 cycles, the
+    // reason `log` trailed `exp`) for one extra mul (z², since z is needed below anyway), and each
+    // vector keeps ≤5 temporaries live — unlike four interleaved 8-deep Horner chains, which is what
+    // the ×4-unrolled dispatch loop needed to fill the FMA ports and which oversubscribed the 16 ymm
+    // registers. Estrin only *reassociates* (≤~1 ULP vs Horner — the reassociated-reduction
+    // doctrine); the scalar twin, the AVX2 lanes, and the inlined MIR share this identical order,
+    // so every path still agrees bit-for-bit.
+    let l1 = LOG_P[5].mul_add(m, LOG_P[6]);
+    let l2 = LOG_P[7].mul_add(m, LOG_P[8]);
+    let lo = l1.mul_add(z, l2);
+    let h1 = LOG_P[1].mul_add(m, LOG_P[2]);
+    let h2 = LOG_P[3].mul_add(m, LOG_P[4]);
+    let hz = LOG_P[0].mul_add(z, h1);
+    let hi = hz.mul_add(z, h2);
+    let z2 = z * z;
+    let p = hi.mul_add(z2, lo);
     let pm = p * m;
     let mut y = pm * z;
     y = e.mul_add(EXP_C2, y);
@@ -750,11 +770,13 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
             }
         };
     }
-    // Unroll ×4 (32 elements/step): run four *independent* load→poly→store chains at once. Each per-op
-    // 8-lane function is a long **dependent** SIMD chain (~13 ops for exp8, 8 serial Horner FMAs for
-    // log8), so a single-vector step is latency-bound and idles the two FMA ports; four data-independent
-    // vectors overlap in the out-of-order window and fill the ports (the same lever `velem`/`vhorner`
-    // pull). Every lane still runs the identical `f`, and these are pure elementwise ops with no
+    // Unroll ×4 (32 elements/step): run four *independent* load→poly→store chains at once. Even with
+    // the polys in Estrin form (3-FMA-deep exp, 4-FMA-deep log — half Horner's serial depth), each
+    // 8-lane function is still a mostly **dependent** SIMD chain, so a single-vector step is
+    // latency-bound and idles the two FMA ports; four data-independent vectors overlap in the
+    // out-of-order window and fill them (the same lever `velem`/`vhorner` pull), and Estrin's smaller
+    // live set keeps the ×4 window inside the 16 ymm registers where four 8-deep Horner chains
+    // spilled. Every lane still runs the identical `f`, and these are pure elementwise ops with no
     // cross-lane/cross-vector state, so the output is bit-for-bit identical to the one-at-a-time loop.
     while i + 32 <= n {
         let r0 = f(_mm256_loadu_ps(x.add(i)));
@@ -1376,13 +1398,15 @@ pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
     let n = _mm256_sub_ps(t, _mm256_set1_ps(EXP_MAGIC));
     let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_C1), x);
     let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_C2), r);
-    let mut p = _mm256_set1_ps(EXP_P[0]);
-    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[1]));
-    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[2]));
-    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[3]));
-    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[4]));
-    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[5]));
+    // Estrin form, mirroring `exp1` op-for-op (see the rationale there): three parallel pair-FMAs,
+    // then two r²-combines — a 3-FMA critical path vs Horner's 5 at the same op count, which the
+    // ×4-unrolled dispatch loop multiplies into enough independent FMAs to saturate both ports.
     let r2 = _mm256_mul_ps(r, r);
+    let q0 = _mm256_fmadd_ps(_mm256_set1_ps(EXP_P[0]), r, _mm256_set1_ps(EXP_P[1]));
+    let q1 = _mm256_fmadd_ps(_mm256_set1_ps(EXP_P[2]), r, _mm256_set1_ps(EXP_P[3]));
+    let q2 = _mm256_fmadd_ps(_mm256_set1_ps(EXP_P[4]), r, _mm256_set1_ps(EXP_P[5]));
+    let p = _mm256_fmadd_ps(q0, r2, q1);
+    let p = _mm256_fmadd_ps(p, r2, q2);
     let p = _mm256_fmadd_ps(p, r2, r);
     let p = _mm256_add_ps(p, _mm256_set1_ps(1.0));
     // 2^n = bitcast((n + 127) << 23). n is an exact integer in f32, so the truncating convert is exact.
@@ -1410,10 +1434,18 @@ pub(crate) unsafe fn log8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
     m = _mm256_blendv_ps(m_ge, m_lt, lt);
     e = _mm256_blendv_ps(e, _mm256_sub_ps(e, one), lt);
     let z = _mm256_mul_ps(m, m);
-    let mut p = _mm256_set1_ps(LOG_P[0]);
-    for &c in &LOG_P[1..] {
-        p = _mm256_fmadd_ps(p, m, _mm256_set1_ps(c));
-    }
+    // Estrin form, mirroring `log1` op-for-op (see the rationale there): the two sub-chains run in
+    // parallel and combine through z² = m⁴ — a 4-FMA critical path vs Horner's 8, and ≤5 live ymm
+    // temporaries per vector, so the ×4-unrolled dispatch loop no longer spills to fill the ports.
+    let l1 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[5]), m, _mm256_set1_ps(LOG_P[6]));
+    let l2 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[7]), m, _mm256_set1_ps(LOG_P[8]));
+    let lo = _mm256_fmadd_ps(l1, z, l2);
+    let h1 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[1]), m, _mm256_set1_ps(LOG_P[2]));
+    let h2 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[3]), m, _mm256_set1_ps(LOG_P[4]));
+    let hz = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[0]), z, h1);
+    let hi = _mm256_fmadd_ps(hz, z, h2);
+    let z2 = _mm256_mul_ps(z, z);
+    let p = _mm256_fmadd_ps(hi, z2, lo);
     let pm = _mm256_mul_ps(p, m);
     let mut y = _mm256_mul_ps(pm, z);
     y = _mm256_fmadd_ps(e, _mm256_set1_ps(EXP_C2), y);
