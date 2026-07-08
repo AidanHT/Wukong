@@ -16167,6 +16167,115 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **Same-run A/B: single-buffered vs double-buffered D=64 flash** (`flash_single_vs_double`).
+    /// `flash_d64_m1` uses ONE staged K+V slab (smem = 2·ksz = 4 KB/CTA → hits the 24-block/SM cap,
+    /// ~50% occupancy) but forgoes the `cp.async` compute/load overlap; `flash_d64_mp` double-buffers
+    /// (smem = 4·ksz = 8 KB → ~12 blocks/SM, ~25% occupancy) and prefetches block `kb+1` under block
+    /// `kb`'s tensor-core compute. Identical online-softmax math (bit-cross-checked first), so the ratio
+    /// isolates *occupancy vs pipeline overlap* at the long-S plateau. Clock-cancelled exactly as
+    /// `flash_lm_vs_mp` (pin the clock, warm both, time each twice in opposite order, min per kernel,
+    /// median of ROUNDS). H=12 (GPU-filled), D=64, non-causal, S=2048/4096. Diagnostic ONLY — decides
+    /// whether the long-S plateau is occupancy-bound (`m1/mp` moves below 1) or SFU/serial-softmax-bound
+    /// (flat ~1). Not a shipped dispatch. Run:
+    /// `… --features gpu --release -- --ignored --nocapture flash_single_vs_double`.
+    #[test]
+    #[ignore = "same-run flash occupancy probe; needs a GPU"]
+    fn flash_single_vs_double() {
+        use half::f16;
+        with_gpu("flash_single_vs_double", |g| {
+            let mut rng = crate::diff::Rng::new(0x51_9B1E);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            let pin = |g: &mut Gpu| {
+                for _ in 0..40 {
+                    gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                }
+            };
+            const ROUNDS: usize = 9;
+            let (heads, d) = (12usize, 64usize);
+            let f_mp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp").unwrap();
+            let f_m1 = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m1").unwrap();
+            eprintln!(
+                "--- flash_single_vs_double: flash_d64_m1 (single/4KB, ~50% occ) vs flash_d64_mp \
+                 (double/8KB, ~25% occ), H={heads} D={d}, clock-cancelled median of {ROUNDS} ---"
+            );
+            for &s in &[2048usize, 4096] {
+                let n = heads * s * d;
+                let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(f);
+                    b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                    unsafe { b.launch(cfg).unwrap() };
+                };
+                // checksum cross-check: single-buffered must agree with the double-buffered baseline.
+                run(g, &f_mp, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let s_mp: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                run(g, &f_m1, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let s_m1: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                assert!(
+                    (s_m1 - s_mp).abs() / s_mp.max(1.0) < 3e-2,
+                    "S={s}: m1 vs mp checksum disagree mp={s_mp:.3e} m1={s_m1:.3e}"
+                );
+                let mut ratios = Vec::new();
+                let mut t_mp_best = f64::INFINITY;
+                for _ in 0..ROUNDS {
+                    pin(g);
+                    for _ in 0..30 {
+                        run(g, &f_mp, &mut o_d);
+                        run(g, &f_m1, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                        let t0 = Instant::now();
+                        for _ in 0..50 {
+                            let mut b = g.stream.launch_builder(f);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    };
+                    let a1 = time1(g, &f_mp, &mut o_d);
+                    let b1 = time1(g, &f_m1, &mut o_d);
+                    let b2 = time1(g, &f_m1, &mut o_d);
+                    let a2 = time1(g, &f_mp, &mut o_d);
+                    let tmp = a1.min(a2);
+                    let tm1 = b1.min(b2);
+                    ratios.push(tm1 / tmp);
+                    t_mp_best = t_mp_best.min(tmp);
+                }
+                ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = ratios[ratios.len() / 2];
+                let flop = 4.0 * heads as f64 * s as f64 * s as f64 * d as f64;
+                eprintln!(
+                    "  S={s:>4}: mp(double) {:>6.0} GF/s | m1/mp {:.3}×  {} (clock-cancelled)",
+                    flop / t_mp_best / 1e9,
+                    med,
+                    if med < 0.98 {
+                        "<- single wins => occupancy-bound"
+                    } else if med > 1.02 {
+                        "(double wins => overlap helps / not occupancy-bound)"
+                    } else {
+                        "(flat => SFU/serial-softmax-bound, not occupancy-bound)"
+                    },
+                );
+            }
+        });
+    }
+
     /// **Same-run A/B: software-pipelined vs base flash** (`flash_sp_vs_mp`). `flash_d64_msp` (QKᵀ(i+1)
     /// issued ahead to overlap the softmax(i) SFU stall) vs `flash_d64_mp`, identical launch geometry,
     /// clock-cancelled exactly as `flash_lm_vs_mp` (warm both, time both orders, min per kernel, median of
