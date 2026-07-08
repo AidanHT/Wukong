@@ -126,17 +126,18 @@ fn gemm_forkjoin() -> bool {
     *V.get_or_init(|| std::env::var("MERCURY_GEMM_FORKJOIN").is_ok_and(|v| v == "1"))
 }
 
-/// A/B opt-in (`MERCURY_GEMM_2D=1`, read once): route the parallel GEMM through the BLIS-style
-/// **2D block-parallel** path ([`sgemm_2d_blocks`]) — per-thread L2-resident C blocks with
-/// per-worker packing and no barriers — instead of the shipped persistent-region path. Default
-/// OFF: with the env unset every existing path is byte-for-byte untouched. The same adjacent-run
-/// instrument discipline as `MERCURY_GEMM_FORKJOIN`: the central session A/Bs this against the
-/// shipped path and flips the default in a follow-up commit only if it wins.
+/// The BLIS-style **2D block-parallel** path ([`sgemm_2d_blocks`]) — per-thread L2-resident C
+/// blocks with per-worker packing and no barriers — is the DEFAULT parallel GEMM: it A/B-measured
+/// a decisive win over the row-panel/shared-B paths in BOTH ABBA orderings (gemm_scaling,
+/// 2026-07-08: 512³ ~182→~305 GF/s ≈1.65×, 1024³ ~365→~460 ≈1.26×, 512×768×3072 ~290→~473),
+/// exactly the per-thread-B-reuse mechanism the three refuted scheduling levers pointed to.
+/// `MERCURY_GEMM_2D=0` (read once) opts OUT to the persistent-region path, keeping the win
+/// adjacent-run-measurable — the same instrument discipline as `MERCURY_GEMM_FORKJOIN`.
 #[cfg(target_arch = "x86_64")]
 fn gemm_2d() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("MERCURY_GEMM_2D").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| !std::env::var("MERCURY_GEMM_2D").is_ok_and(|v| v == "0"))
 }
 
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
@@ -410,14 +411,12 @@ unsafe fn gemm_dispatch(
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
                 match (par, gemm_pool()) {
-                    // Parallel: ONE persistent parallel region per call (`sgemm_persistent_region`)
-                    // — the pool (the private physical-core one when it exists, else the caller's
-                    // default pool) is entered once via `broadcast`, and the block schedule
-                    // synchronizes with lightweight in-region barriers instead of paying a full
-                    // fork-join per pack/compute region per K-block. `MERCURY_GEMM_FORKJOIN=1`
-                    // (read once) routes to the legacy fork-join shape unchanged so the region win
-                    // stays A/B-measurable adjacent-run, and `MERCURY_GEMM_2D=1` (read once) routes
-                    // to the BLIS-style 2D block-parallel candidate (`sgemm_2d_blocks`, default OFF).
+                    // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path
+                    // (`sgemm_2d_blocks` — per-thread L2-resident C blocks, per-worker packing, no
+                    // barriers; the measured ~1.25–1.65× mid-size win, see `gemm_2d`).
+                    // `MERCURY_GEMM_2D=0` opts out to the persistent-broadcast-region shape
+                    // (`sgemm_persistent_region`), and `MERCURY_GEMM_FORKJOIN=1` further routes to
+                    // the legacy fork-join shape — both retained as adjacent-run A/B instruments.
                     (true, pool) => {
                         let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
                         if gemm_2d() {
