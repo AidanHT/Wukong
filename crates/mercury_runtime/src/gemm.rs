@@ -126,6 +126,19 @@ fn gemm_forkjoin() -> bool {
     *V.get_or_init(|| std::env::var("MERCURY_GEMM_FORKJOIN").is_ok_and(|v| v == "1"))
 }
 
+/// A/B opt-in (`MERCURY_GEMM_2D=1`, read once): route the parallel GEMM through the BLIS-style
+/// **2D block-parallel** path ([`sgemm_2d_blocks`]) — per-thread L2-resident C blocks with
+/// per-worker packing and no barriers — instead of the shipped persistent-region path. Default
+/// OFF: with the env unset every existing path is byte-for-byte untouched. The same adjacent-run
+/// instrument discipline as `MERCURY_GEMM_FORKJOIN`: the central session A/Bs this against the
+/// shipped path and flips the default in a follow-up commit only if it wins.
+#[cfg(target_arch = "x86_64")]
+fn gemm_2d() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("MERCURY_GEMM_2D").is_ok_and(|v| v == "1"))
+}
+
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
 /// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
 /// returns, so the pointers outlive the call — identical to the lifetime discipline of the kernel's
@@ -403,10 +416,13 @@ unsafe fn gemm_dispatch(
                     // synchronizes with lightweight in-region barriers instead of paying a full
                     // fork-join per pack/compute region per K-block. `MERCURY_GEMM_FORKJOIN=1`
                     // (read once) routes to the legacy fork-join shape unchanged so the region win
-                    // stays A/B-measurable adjacent-run.
+                    // stays A/B-measurable adjacent-run, and `MERCURY_GEMM_2D=1` (read once) routes
+                    // to the BLIS-style 2D block-parallel candidate (`sgemm_2d_blocks`, default OFF).
                     (true, pool) => {
                         let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
-                        if gemm_forkjoin() {
+                        if gemm_2d() {
+                            sgemm_2d_blocks(pool, args);
+                        } else if gemm_forkjoin() {
                             match pool {
                                 // Legacy: run the whole fork-join kernel inside the private pool so
                                 // its nested `into_par_iter`s (pack + compute) use physical-core
@@ -1285,6 +1301,216 @@ unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
             }
         }
         jc += NC;
+    }
+}
+
+// --- 2D block-parallel path (MERCURY_GEMM_2D=1) ------------------------------------------------
+
+// Reusable per-WORKER pack scratch for the 2D block path: each rayon worker thread keeps one
+// (A-slice, B-slice) buffer pair and reuses it across every block it claims (and across calls —
+// pool workers are process-lifetime threads), so a block costs zero mallocs after each worker's
+// first. Same take/put-back discipline as `PACK_SCRATCH`; a separate thread-local keeps the two
+// paths' buffer sizing independent. The packers fully overwrite every element they own (real data
+// + edge-padding zeros), so reuse needs no re-zeroing.
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static PACK_SCRATCH_2D: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Block-shape policy for the 2D block-parallel path: pick `(BM, BN)` — the C-block height/width —
+/// for an `m×n` output on an `nworkers`-thread pool. **The one tunable of the 2D path**; pure, so
+/// an A/B sweep can retune it without touching the kernel.
+///
+/// Constraints, in priority order:
+/// * `BM % MR == 0` and `BN % NR == 0` — every interior block boundary lands on a micropanel
+///   boundary, which is what makes the per-block packs byte-identical to the serial kernel's
+///   full-panel packs (zero-padding can then only occur at the true matrix edge; see
+///   [`sgemm_2d_blocks`]).
+/// * **L2 residency**: the block's packed B slice (`BN×kc` f32, `kc ≤ KC = 384`) plus A slice
+///   (`BM×kc`) must fit a per-core L2 with room left for the C-tile stream. The dev box's P-core
+///   L2 is 2 MB (not hardcoded — the candidates are sized conservatively so they also fit the
+///   E-core cluster's per-core share): the largest candidate (192, 256) packs at most
+///   192·384·4 ≈ 288 KB of A + 256·384·4 ≈ 384 KB of B ≈ 672 KB.
+/// * **Load balance**: at least ~3× `nworkers` blocks, so rayon work-stealing can absorb this
+///   asymmetric 6P+8E+2LPE pool's core-speed imbalance. Candidates are tried largest-first (bigger
+///   blocks amortize the per-block redundant packing better) and the first that yields enough
+///   blocks wins; if even the smallest can't (small m·n), the smallest is used as-is — below that
+///   the block count is bounded by the matrix, not the policy.
+#[cfg(target_arch = "x86_64")]
+fn select_2d_block_shape(m: usize, n: usize, nworkers: usize) -> (usize, usize) {
+    // (BM, BN) regimes, largest first. All BM ∈ 24..=192 are multiples of MR=6, all BN ∈ 48..=256
+    // multiples of NR=16. Examples on the 16-worker dev pool (target = 48 blocks):
+    // 2048³ → (192, 256); 1024³ → (144, 192); 512³ → (48, 96).
+    const CANDIDATES: &[(usize, usize)] = &[(192, 256), (144, 192), (96, 128), (48, 96), (24, 48)];
+    let target = 3 * nworkers.max(1);
+    for &(bm, bn) in CANDIDATES {
+        if m.div_ceil(bm) * n.div_ceil(bn) >= target {
+            return (bm, bn);
+        }
+    }
+    *CANDIDATES.last().unwrap()
+}
+
+/// The **BLIS/MKL-style 2D block-parallel** GEMM (opt-in via `MERCURY_GEMM_2D=1` — see
+/// [`gemm_2d`]; default OFF, shipped path untouched).
+///
+/// **Why this exists.** The shipped parallel decomposition splits C by MR=6-row panels: every
+/// worker streams the ENTIRE shared packed B panel from L3 on every K-block — 16 workers
+/// hammering shared L3 with zero per-thread L2 reuse of B. Three scheduling hypotheses for the
+/// mid-size gap vs threaded MKL (42–46% @512³, 67–72% @1024³ same-run) were refuted by adjacent
+/// A/B (fewer workers: slower; persistent broadcast region: wash; hard pinning: 25–35% slower —
+/// all documented above), leaving the *structural* explanation: MKL/BLIS give each thread a 2D C
+/// block whose B slice stays L2-resident. This path implements that:
+///
+/// * C is partitioned into `BM×BN` blocks ([`select_2d_block_shape`]) on MR/NR-aligned
+///   boundaries; a flat `0..nbi·nbj` index space is one rayon task per block on the existing
+///   private pool — plain work-stealing, **no barriers, no phase sync**: each block is fully
+///   independent because its owner runs the WHOLE ascending-`pc` K loop for its block.
+/// * Per K-block the owner packs THIS block's A slice (`BM×kc`) and B slice (`BN×kc`, honoring
+///   `bt`) into per-worker scratch ([`PACK_SCRATCH_2D`]) with the same `pack_a`/`pack_b_block`
+///   building blocks the serial kernel uses, offset to the block's row/col origin, then runs the
+///   same [`macro_kernel`] with `ldc = n`. Packing is redundant across blocks sharing rows/cols
+///   (an O(n²) cost buying O(n³) locality) — that is the deliberate BLIS trade.
+///
+/// **Bit-exactness (the hard invariant).** Each C element is accumulated by exactly ONE owner,
+/// over the same [`select_kc`] groups, in the same ascending-`pc` order, with the same
+/// `beta_eff = if pc == 0 { beta } else { 1.0 }` rule, the same final-K-block-only epilogue
+/// shifted to the block's global column origin (the serial `shift(jc + j0)` discipline), through
+/// the same [`micro_6x16`] — on packed panels whose BYTES are identical to the serial kernel's
+/// for those rows/cols: `BM`/`BN` are MR/NR multiples, so every interior block boundary is a
+/// micropanel boundary and `pack_a_panel`/`pack_b_panel`/`pack_b_trans_panel` zero-pad only at
+/// the true matrix edge — exactly where the serial full-panel pack pads. Serial == 2D-parallel
+/// bit-for-bit REGARDLESS of block shape (pinned by `sgemm_2d_blocks_matches_serial`).
+///
+/// # Safety
+/// Operand-size contract of [`sgemm_avx2_parallel`]; AVX2/FMA must be available (verified by
+/// [`gemm_dispatch`]).
+#[cfg(target_arch = "x86_64")]
+unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
+    use rayon::prelude::*;
+    let (m, k, n) = (args.m, args.k, args.n);
+    let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
+    let (bm, bn) = select_2d_block_shape(m, n, nworkers);
+    let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
+    // Per-worker scratch caps: one block's A/B slices (not whole-matrix panels), rounded up to
+    // full micropanels exactly as the other kernels size their scratch.
+    let ap_cap = round_up(bm.min(m), MR) * k.min(KC);
+    let bp_cap = round_up(bn.min(n), NR) * k.min(KC);
+    // Send-safe scalar captures — the same raw-pointer-as-usize idiom `sgemm_avx2_parallel` and
+    // `pack_ab_par` already use (the closure outlives nothing: `install`/`for_each` join before
+    // this frame returns).
+    let (a_addr, b_addr, c_addr) = (args.a as usize, args.b as usize, args.c as usize);
+    let (beta, bt) = (args.beta, args.bt);
+    let (epi_on, epi_bias_addr, epi_act, epi_alpha) = match args.epi {
+        Some(e) => (true, e.bias as usize, e.act, e.alpha),
+        None => (false, 0usize, 0u32, 1.0f32),
+    };
+    let body = move || {
+        (0..nbi * nbj).into_par_iter().for_each(|t| {
+            let (bi, bj) = (t / nbj, t % nbj);
+            let (i0, j0) = (bi * bm, bj * bn);
+            // A null bias-addr (0) stays null; the block body shifts to its global column origin.
+            let epi = epi_on.then(|| Epilogue {
+                bias: epi_bias_addr as *const f32,
+                act: epi_act,
+                alpha: epi_alpha,
+            });
+            // This worker's reusable scratch, taken out and put back so no borrow spans the kernel.
+            let (mut ap, mut bp) = PACK_SCRATCH_2D.with(|s| {
+                let mut g = s.borrow_mut();
+                (std::mem::take(&mut g.0), std::mem::take(&mut g.1))
+            });
+            if ap.len() < ap_cap {
+                ap.resize(ap_cap, 0.0);
+            }
+            if bp.len() < bp_cap {
+                bp.resize(bp_cap, 0.0);
+            }
+            // SAFETY: each (bi, bj) C block has exactly one owner (disjoint writes); A/B are read-
+            // only; scratch is worker-private; avx2+fma verified by `gemm_dispatch`.
+            unsafe {
+                sgemm_2d_block(
+                    a_addr as *const f32,
+                    b_addr as *const f32,
+                    c_addr as *mut f32,
+                    k,
+                    n,
+                    beta,
+                    bt,
+                    epi,
+                    i0,
+                    j0,
+                    (m - i0).min(bm),
+                    (n - j0).min(bn),
+                    ap.as_mut_ptr(),
+                    bp.as_mut_ptr(),
+                );
+            }
+            PACK_SCRATCH_2D.with(|s| {
+                let mut g = s.borrow_mut();
+                g.0 = ap;
+                g.1 = bp;
+            });
+        });
+    };
+    match pool {
+        Some(p) => p.install(body),
+        None => body(),
+    }
+}
+
+/// One 2D block's whole-K GEMM: the owner walks every K-block ascending — pack this block's A/B
+/// slices (offset to the block's row/col origin `i0`/`j0`), then [`macro_kernel`] into the block's
+/// C region with `ldc = n`. `beta` on the first K-block, accumulate after, epilogue (shifted to
+/// the block's global column origin) on the final K-block only — the serial kernel's exact rules,
+/// so per-(i,j) accumulation is bit-identical (see [`sgemm_2d_blocks`]).
+///
+/// # Safety
+/// `a`/`b` valid per the [`mercury_sgemm`]/[`mercury_sgemm_nt`] contract with `k`/`n` the full
+/// matrix dims; `[i0, i0+bm) × [j0, j0+bn)` in range of C; `ap`/`bp` sized for
+/// `round_up(bm,MR)·min(k,KC)` / `round_up(bn,NR)·min(k,KC)` f32; avx2+fma available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_2d_block(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    k: usize,
+    n: usize,
+    beta: f32,
+    bt: bool,
+    epi: Option<Epilogue>,
+    i0: usize,
+    j0: usize,
+    bm: usize,
+    bn: usize,
+    ap: *mut f32,
+    bp: *mut f32,
+) {
+    let mut pc = 0;
+    while pc < k {
+        let kc = (k - pc).min(select_kc(k));
+        // First K-block honors the caller's beta; later blocks accumulate — and the epilogue folds
+        // into the C writeback on the FINAL K-block only, bias base shifted to this block's global
+        // column origin (macro_kernel adds the tile-local j0 shift, mirroring the serial
+        // `shift(jc)`-then-`shift(j0)` double shift bit-for-bit).
+        let beta_eff = if pc == 0 { beta } else { 1.0 };
+        let block_epi = if pc + kc == k {
+            epi.map(|e| e.shift(j0))
+        } else {
+            None
+        };
+        // The serial kernel's own packers, offset to this block's origin: `pack_a` reads rows
+        // [i0, i0+bm) × cols [pc, pc+kc) of A (lda = k), `pack_b_block` reads the (pc, j0) slice of
+        // B honoring `bt` — both contracts take an arbitrary base/leading-dim, and bm/bn smaller
+        // than m/n only shortens their row/col loops. Same source values, same panel layout, same
+        // matrix-edge-only zero padding ⇒ byte-identical micropanels.
+        pack_a(a.add(i0 * k + pc), k, bm, kc, ap);
+        pack_b_block(b, k, n, pc, j0, kc, bn, bt, bp);
+        macro_kernel(bm, bn, kc, ap, bp, c.add(i0 * n + j0), n, beta_eff, block_epi);
+        pc += kc;
     }
 }
 
@@ -2742,6 +2968,88 @@ mod tests {
             }
             assert_eq!(serial, per, "persistent nt+epi != serial");
             assert_eq!(serial, fj, "fork-join nt+epi != serial");
+        }
+    }
+
+    /// The 2D block-parallel path (`MERCURY_GEMM_2D=1` routes here — see [`sgemm_2d_blocks`],
+    /// called DIRECTLY so the test is immune to the process env) must be **bit-for-bit** identical
+    /// to the serial kernel: each C block has one owner running the whole ascending-pc K loop with
+    /// the serial kernel's `select_kc` grouping, packers, and epilogue discipline. Shapes exercise
+    /// multiple blocks in both grid dims for every policy candidate (520×4200: even the largest
+    /// (192, 256) regime gives a 3×17 grid), MR/NR remainders at the matrix edges (520 % 6 = 4,
+    /// 4200 % 16 = 8; 214 % 6 = 4, 616 % 16 = 8), a `k` spanning multiple UNEVEN K-blocks
+    /// (901 → 304+304+293), `bt` false and true, `beta` 0 and 1 (accumulate onto a nonzero C), a
+    /// single-block degenerate grid, and a skinny-m one-row-block grid. The epilogue leg pins the
+    /// final-K-block-only bias+activation rule and the block-origin bias shift across all four
+    /// activations, with k > KC.
+    #[test]
+    fn sgemm_2d_blocks_matches_serial() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            println!("no avx2/fma — skipping");
+            return;
+        }
+        // (m, k, n, bt combos, beta combos): the big multi-block shape runs once (bt=false,
+        // beta=0); the mid shape sweeps the full bt × beta matrix; two degenerate grids.
+        let shapes: &[(usize, usize, usize, &[bool], &[i64])] = &[
+            (520, 901, 4200, &[false], &[0]),          // multi-block both dims, 3 uneven K-blocks
+            (214, 901, 616, &[false, true], &[0, 1]),  // edge remainders, full bt × beta sweep
+            (100, 130, 96, &[false, true], &[0, 1]),   // single/degenerate grid
+            (13, 700, 530, &[false, true], &[0, 1]),   // skinny m: 1 row-block, several col-blocks
+        ];
+        for &(m, k, n, bts, betas) in shapes {
+            for &bt in bts {
+                for &beta in betas {
+                    let a = fill(81, m * k);
+                    let b = fill(82, k * n); // same length either way: bt reads it as [n, k]
+                    let base = fill(83, m * n); // beta=1 must accumulate onto a nonzero C
+                    let mut serial = base.clone();
+                    let mut got2d = base.clone();
+                    let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+                    unsafe {
+                        if bt {
+                            mercury_sgemm_nt(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, beta);
+                        } else {
+                            mercury_sgemm(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, beta);
+                        }
+                        let args = GemmArgs {
+                            a: a.as_ptr(), b: b.as_ptr(), c: got2d.as_mut_ptr(),
+                            m, k, n, beta: beta as f32, bt, epi: None,
+                        };
+                        sgemm_2d_blocks(gemm_pool(), args);
+                    }
+                    assert_eq!(serial, got2d, "2d != serial (m{m} k{k} n{n} bt{bt} beta{beta})");
+                }
+            }
+        }
+        // Fused-epilogue leg: bias + every activation on the nt form, k = 901 > KC (3 uneven
+        // K-blocks) — a per-K-block epilogue bug would fold the bias/activation three times, and a
+        // missing block-origin shift would read the wrong bias entries in every column block.
+        {
+            let (m, k, n) = (214usize, 901usize, 616usize);
+            assert!(k > select_kc(k), "epi leg must span multiple K-blocks");
+            let a = fill(84, m * k);
+            let b = fill(85, n * k);
+            let bias = fill(86, n);
+            for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
+                for use_bias in [false, true] {
+                    let bias_ptr = if use_bias { bias.as_ptr() } else { std::ptr::null() };
+                    let mut serial = vec![0.0f32; m * n];
+                    let mut got2d = vec![0.0f32; m * n];
+                    unsafe {
+                        mercury_sgemm_nt_epi(
+                            a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
+                            m as i64, k as i64, n as i64, 0, bias_ptr, act as i64,
+                        );
+                        let args = GemmArgs {
+                            a: a.as_ptr(), b: b.as_ptr(), c: got2d.as_mut_ptr(),
+                            m, k, n, beta: 0.0, bt: true,
+                            epi: Some(Epilogue { bias: bias_ptr, act, alpha: 1.0 }),
+                        };
+                        sgemm_2d_blocks(gemm_pool(), args);
+                    }
+                    assert_eq!(serial, got2d, "2d nt+epi != serial (act{act} bias{use_bias})");
+                }
+            }
         }
     }
 
