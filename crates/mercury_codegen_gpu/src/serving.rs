@@ -596,8 +596,10 @@ impl Scheduler {
     /// both executes that step and stabilizes the pool sub-allocation addresses the recording bakes
     /// in) and captures; every later call replays. No recapture is ever needed — see the `graph`
     /// field docs. Requirements the caller owns (as for [`crate::graph::Graph::capture`]): `stream`
-    /// is a dedicated non-NULL stream, event tracking is disabled, and `x_d`/`out` are the same
-    /// buffers every call (asserted).
+    /// is a dedicated non-NULL stream, event tracking is disabled, `x_d`/`out` are the same buffers
+    /// every call (asserted), and any prior NULL-stream work (weight upload, cache zeroing at model
+    /// construction) has been synchronized before the first call — a non-blocking stream does *not*
+    /// implicitly wait on the NULL stream, so an unsynchronized first step would race the uploads.
     pub fn step_graphed(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -1384,7 +1386,10 @@ mod tests {
                     for &r in &reqs {
                         sched.enqueue(r);
                     }
-                    // The graphed loop needs a dedicated capturable stream; eager runs on the default.
+                    // The graphed loop needs a dedicated capturable stream; eager runs on the
+                    // default. Retire the construction-time NULL-stream work (weight upload, slab
+                    // zeroing) first — a non-blocking stream does not implicitly wait on it.
+                    g.stream.synchronize().unwrap();
                     let stream = if graphed { g.ctx.new_stream().unwrap() } else { g.stream.clone() };
                     let x_d = stream.memcpy_stod(&x).unwrap();
                     let mut out = stream.alloc_zeros::<f32>(bcap * d).unwrap();
@@ -1503,6 +1508,9 @@ mod tests {
                         let act = vec![1u32; bcap];
                         model.upload_metadata(&cap, &table, &cl, &wpos, &act).unwrap();
                     }
+                    // Retire the NULL-stream construction work (weights, slabs, x) before the
+                    // dedicated stream reads it — no implicit NULL-stream ordering here.
+                    g.stream.synchronize().unwrap();
                     model.run_layers_on(&cap, &x_d, &mut out_c).unwrap();
                     cap.synchronize().unwrap();
                     let graph = crate::graph::Graph::capture(cap.clone(), || model.run_layers_on(&cap, &x_d, &mut out_c)).unwrap();
