@@ -539,9 +539,20 @@ impl Scheduler {
         self.waiting.is_empty() && self.num_active() == 0
     }
 
-    /// Admit waiting requests into free slots, prefilling each prompt into the paged cache (FIFO; stops
-    /// at the first request that doesn't fit — head-of-line, the standard simple policy). Returns the
-    /// number admitted this call.
+    /// Bounded look-ahead of the first-fit admission scan: how deep into the waiting queue
+    /// [`admit`](Self::admit) searches for a request that fits when the queue front doesn't. Keeps
+    /// the per-step admission cost O(free_slots · LOOKAHEAD) and the reordering window finite.
+    pub const ADMIT_LOOKAHEAD: usize = 64;
+
+    /// Admit waiting requests into free slots, prefilling each prompt into the paged cache.
+    /// **Deterministic first-fit with bounded look-ahead**: for each free slot, scan the first
+    /// [`ADMIT_LOOKAHEAD`](Self::ADMIT_LOOKAHEAD) waiting requests front-to-back and admit the first
+    /// that fits the block pool — so one large request at the queue head no longer head-of-line-blocks
+    /// every smaller request behind it into idle slots. FIFO is preserved among requests that fit
+    /// (the lowest-index fitting request always wins). **Fairness trade-off (standard for
+    /// first-fit):** under sustained block pressure a large head request can be overtaken repeatedly
+    /// by smaller arrivals until pressure eases — the price of maximizing fill; the bounded window
+    /// keeps the scan cheap and the reordering finite. Returns the number admitted this call.
     pub fn admit(&mut self) -> Result<usize, DriverError> {
         let bcap = self.model.bcap();
         let mut n = 0;
@@ -549,17 +560,30 @@ impl Scheduler {
             if self.slots[slot].is_some() {
                 continue;
             }
-            let Some(req) = self.waiting.front().copied() else { break };
-            let mgr = self.model.cache_mut().manager();
-            if !mgr.can_grow(slot, req.prompt_len.max(1)) {
-                break; // out of blocks → leave the request queued
+            if self.waiting.is_empty() {
+                break;
             }
+            let mgr = self.model.cache_mut().manager();
+            // First fitting request within the look-ahead window. Every free slot has an empty
+            // table, so fit depends only on the request — a whole-window miss is a miss for every
+            // remaining free slot, and the scan stops.
+            let Some(pick) = self
+                .waiting
+                .iter()
+                .take(Self::ADMIT_LOOKAHEAD)
+                .position(|req| mgr.can_grow(slot, req.prompt_len.max(1)))
+            else {
+                break; // nothing in the window fits → leave the queue intact
+            };
+            let req = self.waiting.remove(pick).expect("position() index is in range");
             // Prefill: bulk-reserve the prompt's cache positions (≥1 so the slot owns a block; the
             // attention/append kernels then see a non-empty, non-padding row).
-            mgr.reserve(slot, req.prompt_len.max(1))
+            self.model
+                .cache_mut()
+                .manager()
+                .reserve(slot, req.prompt_len.max(1))
                 .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
             self.slots[slot] = Some(Inflight { remaining: req.gen_len });
-            self.waiting.pop_front();
             self.admitted += 1;
             n += 1;
         }
