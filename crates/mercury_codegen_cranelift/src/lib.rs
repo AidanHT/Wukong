@@ -108,6 +108,9 @@ const RT_PRINT_U64: &str = "mercury_rt_print_u64";
 const RT_PRINT_F64: &str = "mercury_rt_print_f64";
 const RT_PRINT_STR: &str = "mercury_rt_print_str";
 const RT_ASSERT: &str = "mercury_rt_assert";
+// The heap builtins: zeroed allocation (count, elem_size, elem_is_float) -> ptr, and its release.
+const RT_ALLOC: &str = "mercury_rt_alloc";
+const RT_FREE: &str = "mercury_rt_free";
 const RT_PARALLEL_FOR: &str = "mercury_parallel_for";
 const RT_SGEMM: &str = "mercury_sgemm";
 const RT_SGEMM_PARALLEL: &str = "mercury_sgemm_parallel";
@@ -1426,6 +1429,23 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[x, out, n, coeffs, ncoeff]);
             return None;
         }
+        // The heap builtins. mercury_rt_alloc(count, elem_size, elem_is_float) -> ptr returns the
+        // zeroed data pointer (a value-returning runtime call, bound like sreduce below);
+        // mercury_rt_free(ptr) is void.
+        if name == RT_ALLOC && args.len() == 3 {
+            let count = self.coerce_to_i64(args[0]);
+            let esize = self.coerce_to_i64(args[1]);
+            let isf = self.coerce_to_i64(args[2]);
+            let fref = self.rt_refs[RT_ALLOC];
+            let call = self.builder.ins().call(fref, &[count, esize, isf]);
+            return self.builder.inst_results(call).first().copied();
+        }
+        if name == RT_FREE && args.len() == 1 {
+            let data = self.val(args[0]);
+            let fref = self.rt_refs[RT_FREE];
+            self.builder.ins().call(fref, &[data]);
+            return None;
+        }
         // The deterministic reduction kernel: mercury_sreduce_f32[_parallel](x, y, n, op) -> f32 —
         // two pointers, two i64, and an f32 scalar result (the dot/ssd/sum a `@parallel` reduction
         // loop lowers to). Unlike the void kernels above, this returns the accumulated value.
@@ -1777,6 +1797,8 @@ struct RtFuncs {
     print_f64: FuncId,
     print_str: FuncId,
     assert: FuncId,
+    rt_alloc: FuncId,
+    rt_free: FuncId,
     parallel_for: FuncId,
     sgemm: FuncId,
     sgemm_parallel: FuncId,
@@ -2212,6 +2234,15 @@ fn populate_module<M: Module>(
     // mercury_rt_print_str(ptr) — render a NUL-terminated string buffer. Void.
     let mut sig_print_str = Signature::new(call_conv);
     sig_print_str.params.push(AbiParam::new(ptr_ty));
+    // mercury_rt_alloc(count, elem_size, elem_is_float: i64) -> ptr — zeroed heap allocation
+    // backing the `alloc_<T>(n)` builtins; mercury_rt_free(ptr) releases it. Void free.
+    let mut sig_rt_alloc = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_rt_alloc.params.push(AbiParam::new(types::I64));
+    }
+    sig_rt_alloc.returns.push(AbiParam::new(ptr_ty));
+    let mut sig_rt_free = Signature::new(call_conv);
+    sig_rt_free.params.push(AbiParam::new(ptr_ty));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -2227,6 +2258,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         assert: module
             .declare_function(RT_ASSERT, Linkage::Import, &sig_i)
+            .map_err(|e| e.to_string())?,
+        rt_alloc: module
+            .declare_function(RT_ALLOC, Linkage::Import, &sig_rt_alloc)
+            .map_err(|e| e.to_string())?,
+        rt_free: module
+            .declare_function(RT_FREE, Linkage::Import, &sig_rt_free)
             .map_err(|e| e.to_string())?,
         parallel_for: module
             .declare_function(RT_PARALLEL_FOR, Linkage::Import, &sig_par)
@@ -2783,6 +2820,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_ASSERT,
                 module.declare_func_in_func(rt.assert, builder.func),
+            );
+            rt_refs.insert(
+                RT_ALLOC,
+                module.declare_func_in_func(rt.rt_alloc, builder.func),
+            );
+            rt_refs.insert(
+                RT_FREE,
+                module.declare_func_in_func(rt.rt_free, builder.func),
             );
             rt_refs.insert(
                 RT_PARALLEL_FOR,
@@ -3498,6 +3543,8 @@ pub fn jit_compile(
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
+    builder.symbol(RT_ALLOC, mercury_runtime::mercury_rt_alloc as *const u8);
+    builder.symbol(RT_FREE, mercury_runtime::mercury_rt_free as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
         mercury_runtime::mercury_parallel_for as *const u8,
@@ -4054,6 +4101,8 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
+    builder.symbol(RT_ALLOC, mercury_runtime::mercury_rt_alloc as *const u8);
+    builder.symbol(RT_FREE, mercury_runtime::mercury_rt_free as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
         mercury_runtime::mercury_parallel_for as *const u8,

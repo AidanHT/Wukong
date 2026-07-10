@@ -108,6 +108,24 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   native bit-for-bit and -O0 == -O3 (`tests/run/slice_basics.mer`). The element types must match on
   the unsizing coercion, and a scalar passed where a slice is expected is E0401; slice indexing is a
   runtime-length view (unchecked, like a pointer — a slice has no static length to bounds-check).
+- **Heap allocation (v1)** — `alloc_<T>(n) -> []T` and `free(s)`: the first *runtime-sized* buffers
+  (every other buffer is a fixed-size stack array). The surface is the typed per-scalar family
+  `alloc_f32`/`f64`/`i32`/`i64`/`i8`/`u8`/`f16`/`bf16` (chosen over a generic `alloc<T>` — sema types
+  builtins nominally in one place, and the diff stays small; a user fn of the same name shadows the
+  builtin). Semantics: any integer count (a negative count clamps to an **empty** slice);
+  contents **zero-initialized on both backends** (calloc'd bytes on native, typed zero `Value`s in
+  the interpreter — the determinism contract); the result is an ordinary slice (`s[i]`, `s.len()`,
+  `for x in s`, fn-boundary passing and mutation through a `mut` slice param). Lowered to opaque
+  `mercury_rt_alloc`/`mercury_rt_free` runtime calls plus fat-pointer construction — **no new MIR
+  op**, and the optimizer's conservative call handling (no CSE/DSE/LICM across calls) keeps stores
+  to alloc'd memory and allocation identity sound at every `-O` level. Misuse is a compile error
+  (non-integer count / freeing a non-slice E0401, arity E0503 — `tests/fail/heap_*.mer`);
+  double-free, freeing a non-alloc slice, or use-after-free is **undefined on native** and
+  mark-and-forget (harmless, never a crash) in the interpreter. interp == native bit-for-bit and
+  -O0 == -O3 (`tests/run/heap_{alloc,alloc_fn,zero_init,len}.mer`, `differential_heap_alloc`, and
+  `heap_alloc.mer` in the linked-exe AOT gate — the rustc link resolves the two runtime symbols
+  from the `mercury_runtime` rlib). Loops over alloc'd slices currently take the scalar path (the
+  auto-vectorizer declines a slice base — a future perf lever, correctness unaffected).
 - **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
   digit separators and type suffixes (`tests/run/radix_literals.mer`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,

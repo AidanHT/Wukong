@@ -19,6 +19,25 @@ use mercury_diag::Diagnostic;
 use mercury_span::{Interner, Span, Symbol};
 use mercury_types::{Dim, Layout, Scalar, Shape, Ty};
 
+/// The element scalar of a typed heap-allocation builtin (`alloc_f32` → `F32`), or `None` for any
+/// other name. The v1 heap surface is this per-scalar `alloc_<T>(n) -> []T` family plus `free(s)`
+/// (not a generic `alloc<T>`): sema types builtins nominally in one place, and `mir_build` — which
+/// shares this table — needs only the element's byte size and float-ness to lower the call. A
+/// user-defined function of the same name shadows the builtin (checked before the builtin path).
+pub fn heap_alloc_elem(name: &str) -> Option<Scalar> {
+    Some(match name {
+        "alloc_f32" => Scalar::F32,
+        "alloc_f64" => Scalar::F64,
+        "alloc_i32" => Scalar::I32,
+        "alloc_i64" => Scalar::I64,
+        "alloc_i8" => Scalar::I8,
+        "alloc_u8" => Scalar::U8,
+        "alloc_f16" => Scalar::F16,
+        "alloc_bf16" => Scalar::Bf16,
+        _ => return None,
+    })
+}
+
 /// A resolved top-level definition.
 #[derive(Clone, Debug)]
 pub struct FnSig {
@@ -3608,6 +3627,44 @@ mod tests {
             "expected a type mismatch: {:?}",
             errors(bad)
         );
+    }
+
+    #[test]
+    fn heap_builtins_are_typed() {
+        // `alloc_<T>(n)` types as `[]T` (so it binds/passes as a slice) and `free(s)` as unit; any
+        // integer length is accepted, including one inferred from an unsuffixed literal.
+        let ok = "fn take(s: []f32) -> i64 { return s.len(); } \
+                  fn f() -> i64 { let n: i64 = 12; let s: []f32 = alloc_f32(n); \
+                  let t = alloc_i32(4); let r = take(s); free(s); free(t); return r; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+    }
+
+    #[test]
+    fn slice_len_is_typed_i64() {
+        // `s.len()` is a modeled builtin method on slices (result `i64`), so binding it to a
+        // conflicting annotation errors — distinguishing it from the lenient `Unknown` fallback
+        // (under which `for i in 0..s.len()` ICE'd on a mixed-width Cmp in MIR).
+        let ok = "fn f(s: []f32) -> i64 { let n: i64 = s.len(); return n; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        let bad = "fn f(s: []f32) { let n: f32 = s.len(); }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected a type mismatch: {:?}",
+            errors(bad)
+        );
+    }
+
+    #[test]
+    fn heap_builtin_misuse_is_rejected() {
+        // A non-integer length is an E0401 (the `alloc("x")` class of misuse) …
+        assert!(errors("fn f() { let s = alloc_f32(\"x\"); }").contains(&"E0401"));
+        assert!(errors("fn f() { let s = alloc_i32(1.5); }").contains(&"E0401"));
+        // … the wrong arity is an E0503 …
+        assert!(errors("fn f() { let s = alloc_f32(); }").contains(&"E0503"));
+        assert!(errors("fn f() { let s = alloc_f32(1, 2); }").contains(&"E0503"));
+        assert!(errors("fn f() { free(); }").contains(&"E0503"));
+        // … and freeing a non-slice is an E0401.
+        assert!(errors("fn f() { free(5); }").contains(&"E0401"));
     }
 
     #[test]

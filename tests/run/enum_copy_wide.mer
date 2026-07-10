@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 123456789012345
+module tests.run.enum_copy_wide
+
+// A whole-enum assignment (`let b = a`) is a variant-agnostic byte-wise buffer copy
+// (`emit_copy_bytes`): the active variant is unknown at copy time, so each byte/slot moves through
+// an `I8`-typed load/store pair. The interpreter's slot memory keeps one *typed value* per scalar
+// slot, and its loads return the slot verbatim (exempt from the integer width mask) — masking the
+// `I8` load truncated a wider payload slot to its low byte (payload 5000 read back as -120 on the
+// interpreter while native reassembled the real bytes: interp != native on the base revision).
+
+enum E {
+    A(i64),
+    B,
+}
+
+fn main() -> i32 {
+    let a: E = E::A(5000);
+    let b: E = a;                 // whole-enum copy: the i64 payload must survive
+    match b {
+        E::A(v) => {
+            print(v);             // 5000
+        }
+        E::B => {
+            print(0);
+        }
+    }
+    let w: E = E::A(123456789012345);
+    let x: E = w;                 // a payload wider than 32 bits survives too
+    match x {
+        E::A(v) => {
+            print(v);             // 123456789012345
+        }
+        E::B => {
+            print(0);
+        }
+    }
+    return 0;
+}

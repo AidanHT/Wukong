@@ -364,9 +364,95 @@ pub unsafe extern "C" fn mercury_parallel_for(
     });
 }
 
+/// The hidden allocation header preceding every `mercury_rt_alloc` data pointer: 16 bytes storing
+/// the total layout size (so `mercury_rt_free` can reconstruct the `Layout` Rust's allocator API
+/// requires at deallocation) while keeping the returned data pointer 16-byte aligned.
+const HEAP_HDR: usize = 16;
+
+/// Zero-initialized heap allocation — the runtime backing of the Mercury `alloc_<T>(n)` builtins.
+///
+/// Allocates `count * elem_size` bytes, **zeroed** (the determinism contract: both backends must
+/// observe identical initial contents — zero bits decode to `0`/`0.0` for every Mercury element
+/// type), and returns a 16-byte-aligned pointer to the data. `elem_is_float` is part of the shared
+/// call ABI but consumed only by the interpreter's typed-zero slot model; it is ignored here.
+///
+/// Returns **null** for a zero/negative byte count (a zero-length slice has no dereferenceable
+/// element, so the null is never read through by a well-formed program), on multiply overflow, or
+/// on allocator exhaustion. The compiler clamps a negative `count` to 0 before the call; the clamp
+/// here is defense in depth.
+#[no_mangle]
+pub extern "C" fn mercury_rt_alloc(count: i64, elem_size: i64, _elem_is_float: i64) -> *mut u8 {
+    let bytes = (count.max(0) as u128).saturating_mul(elem_size.max(0) as u128);
+    if bytes == 0 || bytes > (isize::MAX as u128) - (HEAP_HDR as u128) {
+        return std::ptr::null_mut();
+    }
+    let total = bytes as usize + HEAP_HDR;
+    let Ok(layout) = std::alloc::Layout::from_size_align(total, HEAP_HDR) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: `layout` has a non-zero size and a valid power-of-two alignment.
+    unsafe {
+        let base = std::alloc::alloc_zeroed(layout);
+        if base.is_null() {
+            return std::ptr::null_mut();
+        }
+        (base as *mut usize).write(total);
+        base.add(HEAP_HDR)
+    }
+}
+
+/// Release an allocation previously returned by [`mercury_rt_alloc`] (the Mercury `free(s)`
+/// builtin). Null — the zero-length or failed allocation — is a no-op. Passing any other pointer,
+/// double-freeing, or touching the slice after the free is **undefined behavior** on the native
+/// backend; the interpreter's mark-and-forget model (its run-scoped memory is never reclaimed)
+/// keeps such programs from crashing there, but they are outside the differential contract.
+#[no_mangle]
+pub extern "C" fn mercury_rt_free(data: *mut u8) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: `data` came from `mercury_rt_alloc`, whose header records the total layout size.
+    unsafe {
+        let base = data.sub(HEAP_HDR);
+        let total = (base as *const usize).read();
+        if let Ok(layout) = std::alloc::Layout::from_size_align(total, HEAP_HDR) {
+            std::alloc::dealloc(base, layout);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rt_alloc_zeroes_and_frees() {
+        // A fresh allocation is fully zeroed, 16-byte aligned, writable, and freeable.
+        let n = 1000usize;
+        let p = mercury_rt_alloc(n as i64, 4, 1);
+        assert!(!p.is_null());
+        assert_eq!(p as usize % 16, 0, "data pointer must be 16-byte aligned");
+        // SAFETY: p points at n*4 zeroed bytes owned by this test.
+        unsafe {
+            let f = p as *mut f32;
+            for i in 0..n {
+                assert_eq!(*f.add(i), 0.0, "alloc must zero-initialize");
+            }
+            for i in 0..n {
+                *f.add(i) = i as f32;
+            }
+            assert_eq!(*f.add(n - 1), (n - 1) as f32);
+        }
+        mercury_rt_free(p);
+    }
+
+    #[test]
+    fn rt_alloc_degenerate_counts_are_null_and_free_ignores_null() {
+        assert!(mercury_rt_alloc(0, 4, 0).is_null());
+        assert!(mercury_rt_alloc(-5, 8, 1).is_null());
+        assert!(mercury_rt_alloc(i64::MAX, i64::MAX, 0).is_null(), "overflow must yield null");
+        mercury_rt_free(std::ptr::null_mut()); // must be a no-op, not a crash
+    }
 
     #[test]
     fn bf16_exact_values_roundtrip() {

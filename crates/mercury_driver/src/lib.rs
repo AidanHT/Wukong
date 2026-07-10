@@ -452,7 +452,15 @@ void mercury_rt_print_u64(unsigned long long x) { printf(\"%llu\\n\", x); }\n\
 void mercury_rt_print_f64(double x) { printf(\"%g\\n\", x); }\n\
 void mercury_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(101); } }\n\
 double mercury_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
-float mercury_rt_fmod_f32(float a, float b) { return fmodf(a, b); }\n";
+float mercury_rt_fmod_f32(float a, float b) { return fmodf(a, b); }\n\
+/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract — and\n\
+   handles the count*size overflow; a negative count clamps to an empty (null) allocation. */\n\
+void* mercury_rt_alloc(long long count, long long elem_size, long long elem_is_float) {\n\
+    (void)elem_is_float;\n\
+    if (count < 0 || elem_size <= 0) return 0;\n\
+    return calloc((size_t)count, (size_t)elem_size);\n\
+}\n\
+void mercury_rt_free(void* p) { free(p); }\n";
 
 /// Emit a native object via Cranelift (no LLVM) and, for `--emit=exe`, link it with a small C
 /// runtime using the system C compiler. `CC` overrides the compiler (default `cc`).
