@@ -17475,16 +17475,61 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
-    /// **Clock-cancelling internal A/B: the warp-specialized ping-pong flash vs the production
-    /// single-warp pipeline** (`flash_d64_ws` vs `flash_d64_mp`, `flash_d128_ws_lm` vs
-    /// `flash_d128_mp_lm`) — the measurement that decides whether `MERCURY_FLASH_WS=1` becomes the
-    /// default long-S dispatch. Same protocol as [`flash_mp4_vs_mp`]: checksum cross-check first, then
-    /// per-round pin the clock, warm BOTH kernels, time each twice in opposite order (base,ws,ws,base),
+    /// **Correctness gate (law #1) for the Stage-B 3-stage ring ws flash** (`flash_d64_ws3` /
+    /// `flash_d128_ws3_lm`, non-causal probes). Same phase machine and math as the double-buffered ws
+    /// kernels gated above; what changes — and what this gates — is the deeper pipeline: the two-group
+    /// prologue, the stage-two-ahead into the third ring slot, the relaxed `wait_group 1` drain, and the
+    /// 3-way buffer rotation. A rotation slip or an early ring overwrite scatters O at S >= 48 (first
+    /// wrap of the 3-ring); S=16 exercises the empty-tail commit groups from body 0.
+    #[test]
+    fn ws3_flash_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("ws3_flash", |g| {
+            let mut rng = crate::diff::Rng::new(0x775F3B);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for &(d, entry) in &[(64usize, "flash_d64_ws3"), (128, "flash_d128_ws3_lm")] {
+                let (abs_tol, rel_tol) = if d == 64 { (2e-3, 2e-2) } else { (3e-3, 3e-2) };
+                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                for &s in &[16usize, 32, 48, 64, 256, 512, 2048] {
+                    let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                    let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                    let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                    let s32 = s as u32;
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    unsafe { bld.launch(ws_flash_cfg(s)).unwrap() };
+                    let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                    let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
+                    let st = crate::diff::assert_close(
+                        &format!("{entry} s={s}"),
+                        &got,
+                        &oracle,
+                        abs_tol,
+                        rel_tol,
+                    );
+                    eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                }
+            }
+        });
+    }
+
+    /// **Clock-cancelling internal A/B: the warp-specialized ping-pong flash (Stage A `ws`, Stage B
+    /// `ws3` ring) vs the production single-warp pipeline** (`flash_d64_{ws,ws3}` vs `flash_d64_mp`,
+    /// `flash_d128_{ws,ws3}_lm` vs `flash_d128_mp_lm`) — the measurement that decides whether
+    /// `MERCURY_FLASH_WS=1` becomes the default long-S dispatch (and whether the deeper ring beats the
+    /// double buffer). Same protocol as [`flash_mp4_vs_mp`]: checksum cross-check first, then per-round
+    /// pin the clock, warm ALL kernels, time each twice in opposite order (base,ws,ws3,ws3,ws,base),
     /// min per kernel, median ratio over ROUNDS (`ws/base < 1.0` ⇒ warp specialization wins). Each kernel
-    /// runs its OWN launch geometry (base: 1 warp / grid `S/16`; ws: 2 warps / grid `ceil((S/16)/2)`) —
-    /// that geometry difference (occupancy 2x, K/V traffic 0.5x) plus the named-barrier anti-phase IS the
-    /// experiment. H=8, S=512..4096 (the dispatch regime is S>=2048 d64 / S>=1024 d128; 512/1024 locate
-    /// the crossover). Run:
+    /// runs its OWN launch geometry (base: 1 warp / grid `S/16`; ws/ws3: 2 warps / grid
+    /// `ceil((S/16)/2)`) — that geometry difference (occupancy 2x, K/V traffic 0.5x) plus the
+    /// named-barrier anti-phase IS the experiment. H=8, S=512..4096 (the dispatch regime is S>=2048 d64 /
+    /// S>=1024 d128; 512/1024 locate the crossover). Run:
     /// `cargo test -p mercury_codegen_gpu --features gpu --release flash_ws_vs_mp -- --ignored --nocapture`.
     #[test]
     #[ignore = "tuning A/B; run explicitly"]
@@ -17502,14 +17547,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             };
             const ROUNDS: usize = 9;
             let heads = 8usize;
-            let pairs = [
-                ("d64", "flash_d64_mp", "flash_d64_ws", 64usize),
-                ("d128", "flash_d128_mp_lm", "flash_d128_ws_lm", 128usize),
+            let triples = [
+                ("d64", "flash_d64_mp", "flash_d64_ws", "flash_d64_ws3", 64usize),
+                ("d128", "flash_d128_mp_lm", "flash_d128_ws_lm", "flash_d128_ws3_lm", 128usize),
             ];
-            for &(label, base_e, ws_e, d) in &pairs {
+            for &(label, base_e, ws_e, ws3_e, d) in &triples {
                 let f_base = g.function("flash", crate::ptx_flash::flash_ptx(), base_e).unwrap();
                 let f_ws = g.function("flash", crate::ptx_flash::flash_ptx(), ws_e).unwrap();
-                eprintln!("--- {label}: {ws_e} vs {base_e} (clock-cancelled, median of {ROUNDS}) ---");
+                let f_ws3 = g.function("flash", crate::ptx_flash::flash_ptx(), ws3_e).unwrap();
+                eprintln!("--- {label}: {ws_e}/{ws3_e} vs {base_e} (clock-cancelled, median of {ROUNDS}) ---");
                 for &s in &[512usize, 1024, 2048, 4096] {
                     let n = heads * s * d;
                     let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
@@ -17527,26 +17573,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
                         unsafe { b.launch(cfg).unwrap() };
                     };
-                    // checksum cross-check: ws must agree with the production baseline.
-                    run(g, &f_base, cfg_base, &mut o_d);
-                    g.stream.synchronize().unwrap();
-                    let s_b: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
-                    run(g, &f_ws, cfg_ws, &mut o_d);
-                    g.stream.synchronize().unwrap();
-                    let s_w: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    // checksum cross-check: ws and ws3 must agree with the production baseline.
+                    let mut sums = [0f64; 3];
+                    for (i, (f, cfg)) in
+                        [(&f_base, cfg_base), (&f_ws, cfg_ws), (&f_ws3, cfg_ws)].into_iter().enumerate()
+                    {
+                        run(g, f, cfg, &mut o_d);
+                        g.stream.synchronize().unwrap();
+                        sums[i] = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    }
                     assert!(
-                        (s_w - s_b).abs() / s_b.max(1.0) < 3e-2,
-                        "{label} S={s}: ws vs base checksum disagree base={s_b:.3e} ws={s_w:.3e}"
+                        (sums[1] - sums[0]).abs() / sums[0].max(1.0) < 3e-2
+                            && (sums[2] - sums[0]).abs() / sums[0].max(1.0) < 3e-2,
+                        "{label} S={s}: ws/ws3 vs base checksum disagree {sums:?}"
                     );
-                    let mut ratios = Vec::new();
+                    let mut r_ws = Vec::new();
+                    let mut r_ws3 = Vec::new();
                     let mut t_base_best = f64::INFINITY;
                     for _ in 0..ROUNDS {
                         pin(g);
-                        // Warm BOTH kernels post-pin so neither eats the clock ramp (flash_mp4_vs_mp's
+                        // Warm ALL kernels post-pin so none eats the clock ramp (flash_mp4_vs_mp's
                         // documented bias), then time each twice in opposite order, min per kernel.
-                        for _ in 0..30 {
+                        for _ in 0..20 {
                             run(g, &f_base, cfg_base, &mut o_d);
                             run(g, &f_ws, cfg_ws, &mut o_d);
+                            run(g, &f_ws3, cfg_ws, &mut o_d);
                         }
                         g.stream.synchronize().unwrap();
                         let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
@@ -17561,21 +17612,29 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         };
                         let a1 = time1(g, &f_base, cfg_base, &mut o_d);
                         let b1 = time1(g, &f_ws, cfg_ws, &mut o_d);
+                        let c1 = time1(g, &f_ws3, cfg_ws, &mut o_d);
+                        let c2 = time1(g, &f_ws3, cfg_ws, &mut o_d);
                         let b2 = time1(g, &f_ws, cfg_ws, &mut o_d);
                         let a2 = time1(g, &f_base, cfg_base, &mut o_d);
                         let tb = a1.min(a2);
                         let tw = b1.min(b2);
-                        ratios.push(tw / tb);
+                        let t3 = c1.min(c2);
+                        r_ws.push(tw / tb);
+                        r_ws3.push(t3 / tb);
                         t_base_best = t_base_best.min(tb);
                     }
-                    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let med = ratios[ratios.len() / 2];
+                    r_ws.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    r_ws3.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med = |v: &[f64]| v[v.len() / 2];
+                    let (mw, m3) = (med(&r_ws), med(&r_ws3));
                     let flop = 4.0 * heads as f64 * s as f64 * s as f64 * d as f64;
                     eprintln!(
-                        "  {label} S={s:>4}: base {:>6.0} GF/s | ws/base {:.3}x  {} (clock-cancelled)",
+                        "  {label} S={s:>4}: base {:>6.0} GF/s | ws/base {:.3}x {} | ws3/base {:.3}x {} (clock-cancelled)",
                         flop / t_base_best / 1e9,
-                        med,
-                        if med < 0.98 { "<- ws wins" } else if med > 1.02 { "(base wins)" } else { "(tie)" },
+                        mw,
+                        if mw < 0.98 { "<- ws wins" } else if mw > 1.02 { "(base wins)" } else { "(tie)" },
+                        m3,
+                        if m3 < 0.98 { "<- ws3 wins" } else if m3 > 1.02 { "(base wins)" } else { "(tie)" },
                     );
                 }
             }
