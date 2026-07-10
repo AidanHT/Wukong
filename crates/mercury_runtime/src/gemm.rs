@@ -205,6 +205,20 @@ fn gemm_2d_shared(macs: u64) -> bool {
     .unwrap_or(macs < SHARED_MAX_MACS)
 }
 
+/// C-tile prefetch in the [`micro_6x16`] prologue is ON by default: the up-to-6 C rows the
+/// writeback reads/modifies sit `ldc` apart (a page-scale stride at large N), so no hardware
+/// prefetcher covers them, and at ≥2048³ C is far out of cache — every micro-tile writeback
+/// otherwise eats ~6–12 demand misses that the ~kc-deep FMA loop could have hidden.
+/// `MERCURY_GEMM_PF_C=0` (read once) opts out, keeping the win adjacent-run-measurable — the
+/// same instrument discipline as the path gates above. A prefetch is architecturally a hint:
+/// the computed bits are identical either way.
+#[cfg(target_arch = "x86_64")]
+fn gemm_pf_c() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::var("MERCURY_GEMM_PF_C").is_ok_and(|v| v == "0"))
+}
+
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
 /// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
 /// returns, so the pointers outlive the call — identical to the lifetime discipline of the kernel's
@@ -2224,6 +2238,17 @@ unsafe fn micro_6x16(
     epi: Option<Epilogue>,
 ) {
     use std::arch::x86_64::*;
+    // Prefetch the C tile this call's writeback will read/modify: `mr` rows of `nr` f32, rows
+    // `ldc` apart — a stride no hardware prefetcher tracks — touching the first and last line of
+    // each row. Issued before the K loop so the demand misses resolve under ~kc·12 FMAs of shadow
+    // instead of stalling the writeback (the dominant uncovered miss at ≥2048³, where C never
+    // fits cache and every K-block re-reads it).
+    if gemm_pf_c() {
+        for r in 0..mr {
+            _mm_prefetch::<_MM_HINT_T0>(c.add(r * ldc) as *const i8);
+            _mm_prefetch::<_MM_HINT_T0>(c.add(r * ldc + nr - 1) as *const i8);
+        }
+    }
     // AVX-512 fast path: the full-tile, no-epilogue case (the bulk of a large GEMM's tiles). Wider
     // 512-bit lanes, half the FMA instructions, and BIT-IDENTICAL accumulation order to the AVX2 body
     // below (see `micro_6x16_avx512`). Gated on `avx512f` — FALSE on this development box, so the
