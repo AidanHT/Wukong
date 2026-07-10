@@ -132,21 +132,29 @@ if a hook is added to `wukong_codegen_cranelift`.)
 
 ### Provisional shares (clock-invariant; smoke-test only — NOT authoritative)
 
-> These are shape observations from a battery-state smoke run over `examples` + `bench/kernels` (13
-> files), kept only because *ratios* survive clock swing. The absolute times are NOT reportable and
-> are omitted. Replace with a release central run over the full corpus.
+> These are shape observations from battery-state smoke runs, kept only because *ratios* survive
+> clock swing. The absolute times are NOT reportable and are omitted. Replace with a release
+> central run.
 
-- **Stage-share ordering, whole-to-object (largest → smallest):**
-  `codegen+obj (~74%) > optimize (~19%) > mir_build (~5%) > sema (~1.1%) ≈ parse (~1.0%) > lex (~0.2%)`.
-  The headline shape: **once the backend is included, the Cranelift `codegen+obj` stage — not the
-  optimizer — is the dominant cost.** This is the whole-pipeline correction to the optimizer-only
-  view; `compile-time`'s "optimizer is ~80–85%" is a statement about *front→O2 only* (excludes the
-  backend), and it cross-checks: optimize's share of the front→O2 subtotal here is ≈ 19 / (19 + 5 +
-  1.1 + 1.0 + 0.2) ≈ **72%**, in the same ballpark.
+- **Stage-share ordering, whole-to-object, full corpus (295 files compiled, 4 skipped;
+  `tests/run` + `examples` + `bench/kernels`):**
+  `codegen+obj (~80%) > optimize (~12%) > mir_build (~5%) > sema (~1.3%) ≈ parse (~1.2%) > lex (~0.2%)`.
+  On the model-kernel subset alone (`examples` + `bench/kernels`, 13 files) the same ordering holds
+  at `~74% / ~19% / ~5% / ~1.1% / ~1.0% / ~0.2%`. The headline shape: **once the backend is
+  included, the Cranelift `codegen+obj` stage — not the optimizer — is the dominant cost.** This is
+  the whole-pipeline correction to the optimizer-only view; `compile-time`'s "optimizer is ~80–85%"
+  is a statement about *front→O2 only* (excludes the backend). Cross-check: optimize's share of the
+  front→O2 subtotal is ~72% on the model-kernel subset and ~62% over the full corpus — the full
+  corpus's many tiny `tests/run` fixtures dilute the optimizer, which is exactly the
+  fixed-backend-floor effect below.
 - **A fixed object-container floor.** Every file — even a 400-byte `fib_rec.wk` — emits ~6.5 KB of
-  object. The `codegen+obj` per-file time barely falls below a floor (~0.4 ms in the smoke run) for
-  the smallest inputs, consistent with a fixed COFF-container + symbol/reloc-table cost that
+  object, and the `codegen+obj` per-file time barely falls below a floor (~0.4 ms in the smoke run)
+  for the smallest inputs, consistent with a fixed COFF-container + symbol/reloc-table cost that
   dominates small objects and is the first thing to characterize when the backend split lands.
+- **Throughput sanity (work/stage-time ratios, full corpus):** lex ran at hundreds of MB/s
+  (memcpy-class, plausibly at floor), parse at tens of Mtok/s, sema at ~10 Mnode/s, mir_build at
+  ~3 Mnode/s, optimize at ~1–2 Mop/s, codegen+obj at ~9 MB-obj/s. These are the provisional inputs
+  to the §4 "at floor?" column; re-derive from the central run before judging any stage.
 
 ## 5. The reference comparison (why gcc/rustc -O2)
 
@@ -221,11 +229,11 @@ From the model and what the instrumentation exposes, ranked by expected payoff. 
 elimination worklist the floor exercise exists to produce; confirm each against the measured tables
 before acting.
 
-> **Provisional priority correction (smoke run).** Once the backend is counted, `codegen+obj`
-> (~74%) — not the optimizer (~19%) — is the largest *wall-time* stage. So while the optimizer is
-> the biggest *avoidable front-end* cost (items 1–2), the backend/object-emit items (4, promoted
-> below) may hold more total wall time. Confirm against the central run, then re-rank if the shares
-> hold.
+> **Provisional priority correction (smoke runs).** Once the backend is counted, `codegen+obj`
+> (~80% full corpus, ~74% model-kernel subset) — not the optimizer (~12% / ~19%) — is the largest
+> *wall-time* stage. So while the optimizer is the biggest *avoidable front-end* cost (items 1–2),
+> the backend/object-emit items (4, promoted below) may hold more total wall time. Confirm against
+> the central run, then re-rank if the shares hold.
 
 1. **Optimizer pass redundancy (biggest front-end lever, already the focus).** The optimizer is the
    largest *front-end* in-process stage and is HashMap-bound (per `compile-time`). Any pass that
