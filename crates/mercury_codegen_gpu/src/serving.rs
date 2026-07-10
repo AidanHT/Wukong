@@ -391,6 +391,31 @@ impl DecodeModel {
         Ok(wpos)
     }
 
+    /// Upload **caller-crafted** metadata contents into the four device buffers the kernels read —
+    /// the bench/gate seam for staging a specific fill/mask scenario without mutating the host
+    /// allocator. Contents-only: a captured graph bakes these buffers' *pointers*, so a re-upload
+    /// re-steers every subsequent replay (a fill level is data, not a shape). Lengths must match the
+    /// `Bcap` geometry.
+    pub fn upload_metadata(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        table: &[u32],
+        cl: &[u32],
+        wpos: &[u32],
+        active: &[u32],
+    ) -> Result<(), DriverError> {
+        let bcap = self.cfg.num_slots;
+        assert_eq!(table.len(), bcap * self.cfg.max_blocks_per_seq, "flat block table must be [Bcap, max_blocks_per_seq]");
+        assert_eq!(cl.len(), bcap, "context lengths must be one per slot");
+        assert_eq!(wpos.len(), bcap, "write positions must be one per slot");
+        assert_eq!(active.len(), bcap, "active mask must be one per slot");
+        stream.memcpy_htod(table, &mut self.bt_d)?;
+        stream.memcpy_htod(cl, &mut self.cl_d)?;
+        stream.memcpy_htod(wpos, &mut self.wpos_d)?;
+        stream.memcpy_htod(active, &mut self.active_d)?;
+        Ok(())
+    }
+
     /// The two ping-pong activation buffers (a graph bakes their pointers — keep alive).
     pub fn buffers(&self) -> &[CudaSlice<f32>; 2] {
         &self.bufs
@@ -956,7 +981,13 @@ mod tests {
     }
 
     fn graph_cfg(depth: usize) -> (KvConfig, usize, Vec<usize>, usize, usize) {
-        let (heads, hd, dff, bsz, bcap) = (8usize, 64usize, 2048usize, 16usize, 64usize);
+        graph_cfg_at(depth, 64)
+    }
+
+    /// [`graph_cfg`] at an arbitrary decode batch (the Bcap-scaling sweep): same layer geometry
+    /// (D=512, Dff=2048), block pool and ragged 32..95 contexts sized off `bcap`.
+    fn graph_cfg_at(depth: usize, bcap: usize) -> (KvConfig, usize, Vec<usize>, usize, usize) {
+        let (heads, hd, dff, bsz) = (8usize, 64usize, 2048usize, 16usize);
         let ctx0: Vec<usize> = (0..bcap).map(|b| 32 + (b * 7) % 64).collect();
         let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
         let num_blocks = bcap * max_bps + 8;
@@ -1236,17 +1267,20 @@ mod tests {
         });
     }
 
-    /// **P5 throughput — continuous-batching goodput vs batch fill.** The fixed-shape decode step computes
-    /// all `Bcap` rows regardless of how many carry a live request, so per-step latency is ~independent of
-    /// the active count: a server running one sequence at a time wastes `Bcap-1` rows of compute every
-    /// step, while continuous batching fills them, turning otherwise-idle rows into goodput.
+    /// **P5 throughput — continuous-batching goodput vs batch fill, swept over Bcap.** The fixed-shape
+    /// decode step computes all `Bcap` rows regardless of how many carry a live request, and at these
+    /// sizes it is weight-HBM-bound (every GEMM streams the same weights whatever M is), so per-step
+    /// latency grows far slower than the batch: goodput scales ~linearly with fill *and keeps scaling
+    /// as Bcap itself grows* until M reaches the low hundreds. The sweep measures both levers: fill at
+    /// fixed Bcap (the continuous-batching win) and Bcap itself (the batch-shape headroom).
     ///
-    /// **Measurement honesty (the laptop clock swings ~7×).** All fills' graphs are captured up front and
-    /// kept alive, then timed **interleaved, best-of-N**: each round times every fill back-to-back so they
-    /// share the same clock state, and the per-fill minimum picks its boosted time. A naive sequential
-    /// sweep (measure fill=1 fully, then fill=64) is *invalid* here — it catches fill=1 at a cold clock and
-    /// fill=64 boosted, inflating the ratio. The interleaved ratio is the honest continuous-batching win.
-    /// Named peer = Mercury's own single-sequence (fill=1) decode. --ignored.
+    /// **Measurement honesty (the laptop clock swings ~7×).** One model + ONE captured graph per Bcap —
+    /// a fill level is *contents* of the metadata buffers (ctx/wpos/active), not a shape, so every fill
+    /// replays the same graph after a small re-upload. All (Bcap, fill) points are then timed
+    /// **interleaved, best-of-N**: each round times every point back-to-back so they share the same
+    /// clock state, and the per-point minimum picks its boosted time. A naive sequential sweep is
+    /// *invalid* here — it catches early points cold and late points boosted, skewing every ratio.
+    /// Named peer = Mercury's own single-sequence (fill=1) decode at the same Bcap. --ignored.
     #[test]
     #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
     fn serving_continuous_batching_goodput() {
@@ -1255,82 +1289,153 @@ mod tests {
             with_event_tracking_disabled(g, |g| {
                 use std::time::Instant;
                 let depth = 12usize;
-                let (cfg, dff, ctx0, d, bcap) = graph_cfg(depth);
+                // KV budget: cap the resident f16 slabs well under the 6 GB part (weights, pools,
+                // activations, and the desktop share the rest). All three Bcaps stay resident at once
+                // (~1.4 GiB of KV total) so the timing rounds can interleave under one clock.
+                const KV_BUDGET: usize = 4 << 30;
+                let bcaps = [64usize, 128, 256];
                 let mut rng = crate::diff::Rng::new(0x9100);
+                // Same layer geometry at every Bcap (D=512, Dff=2048) ⇒ one weight set serves all.
+                let (_, dff, _, d, _) = graph_cfg_at(depth, bcaps[0]);
                 let wdata = layer_weights(&mut rng, depth, d, dff);
                 let weights = weights_view(&wdata);
-                let x = rng.vec(bcap * d, -1.0, 1.0);
+                let x_all = rng.vec(bcaps[bcaps.len() - 1] * d, -1.0, 1.0);
 
-                // A captured decode-step graph at a given fill, with everything it references kept alive.
-                struct Held {
-                    fill: usize,
+                // A Bcap's model + its one captured graph + per-fill best latencies, kept alive.
+                struct HeldB {
+                    bcap: usize,
                     cap: Arc<CudaStream>,
                     graph: crate::graph::Graph,
-                    _model: DecodeModel,
+                    model: DecodeModel,
                     _x: CudaSlice<f32>,
                     _out: CudaSlice<f32>,
+                    table: Vec<u32>,
+                    ctx0: Vec<usize>,
+                    fills: Vec<usize>,
+                    best: Vec<f64>,
                 }
-                let fills = [1usize, 4, 16, 32, 64];
-                let mut held: Vec<Held> = Vec::new();
-                for &fill in &fills {
-                    let mut model = DecodeModel::new(g, &weights, cfg, dff, 48 * 1024 * 1024).unwrap();
-                    for b in 0..fill {
+                impl HeldB {
+                    /// Steer the shared graph to `fill` active slots: slots < fill carry their ragged
+                    /// context (+1 for the appended token), the rest read as empty and masked.
+                    fn set_fill(&mut self, fill: usize) {
+                        let cl: Vec<u32> =
+                            (0..self.bcap).map(|b| if b < fill { self.ctx0[b] as u32 + 1 } else { 0 }).collect();
+                        let wpos: Vec<u32> = self.ctx0.iter().map(|&c| c as u32).collect();
+                        let act: Vec<u32> = (0..self.bcap).map(|b| (b < fill) as u32).collect();
+                        self.model.upload_metadata(&self.cap, &self.table, &cl, &wpos, &act).unwrap();
+                    }
+                }
+                let mut held: Vec<HeldB> = Vec::new();
+                for &bcap in &bcaps {
+                    let (cfg, dff, ctx0, d, _) = graph_cfg_at(depth, bcap);
+                    let kv = cfg.assert_kv_budget(2, KV_BUDGET);
+                    let pool_bytes = 48 * 1024 * 1024 * (bcap / 64);
+                    let mut model = DecodeModel::new(g, &weights, cfg, dff, pool_bytes).unwrap();
+                    for b in 0..bcap {
                         model.cache_mut().manager().reserve(b, ctx0[b]).unwrap();
                     }
-                    let active: Vec<bool> = (0..bcap).map(|b| b < fill).collect();
-                    model.advance_and_upload_masked(&g.stream.clone(), &active).unwrap();
+                    let table = model.cache().manager_ref().flat_block_table();
                     let cap = g.ctx.new_stream().unwrap();
-                    let x_d = g.stream.memcpy_stod(&x).unwrap();
+                    let x_d = g.stream.memcpy_stod(&x_all[..bcap * d]).unwrap();
                     let mut out_c = cap.alloc_zeros::<f32>(bcap * d).unwrap();
-                    model.run_layers_on(&cap, &x_d, &mut out_c).unwrap(); // warmup (stable pool pointers)
+                    // Stage all-active metadata, warm up once (stable pool pointers), capture. The
+                    // graph bakes buffer pointers + Bcap-shaped grids; the fill stays re-steerable.
+                    {
+                        let cl: Vec<u32> = ctx0.iter().map(|&c| c as u32 + 1).collect();
+                        let wpos: Vec<u32> = ctx0.iter().map(|&c| c as u32).collect();
+                        let act = vec![1u32; bcap];
+                        model.upload_metadata(&cap, &table, &cl, &wpos, &act).unwrap();
+                    }
+                    model.run_layers_on(&cap, &x_d, &mut out_c).unwrap();
                     cap.synchronize().unwrap();
                     let graph = crate::graph::Graph::capture(cap.clone(), || model.run_layers_on(&cap, &x_d, &mut out_c)).unwrap();
-                    held.push(Held { fill, cap, graph, _model: model, _x: x_d, _out: out_c });
+                    eprintln!(
+                        "  Bcap={bcap:3}: KV slabs {:6.1} MiB (budget {:.1} GiB) | pool {} MiB | ctx 32..95",
+                        kv as f64 / (1 << 20) as f64,
+                        KV_BUDGET as f64 / (1u64 << 30) as f64,
+                        pool_bytes / (1 << 20)
+                    );
+                    let fills = vec![1usize, bcap / 4, bcap / 2, bcap];
+                    let n_fills = fills.len();
+                    held.push(HeldB { bcap, cap, graph, model, _x: x_d, _out: out_c, table, ctx0, fills, best: vec![f64::MAX; n_fills] });
                 }
 
-                // Global warmup on the largest fill to lock the boost clock high before any timing.
-                let big = held.len() - 1;
-                for _ in 0..200 {
-                    held[big].graph.launch().unwrap();
+                // Global warmup on the largest point to lock the boost clock high before any timing.
+                {
+                    let last = held.len() - 1;
+                    let full = *held[last].fills.last().unwrap();
+                    held[last].set_fill(full);
+                    for _ in 0..200 {
+                        held[last].graph.launch().unwrap();
+                    }
+                    held[last].cap.synchronize().unwrap();
                 }
-                held[big].cap.synchronize().unwrap();
 
-                // Interleaved best-of-N: every round times all fills adjacently (shared clock), min per fill.
+                // Interleaved best-of-N: every round times all (Bcap, fill) points adjacently (shared
+                // clock), min per point. The fill re-upload happens outside the timed region.
                 const ROUNDS: usize = 15;
                 const ITERS: usize = 20;
-                let mut best = vec![f64::MAX; held.len()];
                 for _ in 0..ROUNDS {
-                    for (i, h) in held.iter().enumerate() {
-                        let t = Instant::now();
-                        for _ in 0..ITERS {
-                            h.graph.launch().unwrap();
+                    for hi in 0..held.len() {
+                        for fi in 0..held[hi].fills.len() {
+                            let fill = held[hi].fills[fi];
+                            held[hi].set_fill(fill);
+                            held[hi].cap.synchronize().unwrap();
+                            let t = Instant::now();
+                            for _ in 0..ITERS {
+                                held[hi].graph.launch().unwrap();
+                            }
+                            held[hi].cap.synchronize().unwrap();
+                            let dt = t.elapsed().as_secs_f64() / ITERS as f64;
+                            if dt < held[hi].best[fi] {
+                                held[hi].best[fi] = dt;
+                            }
                         }
-                        h.cap.synchronize().unwrap();
-                        best[i] = best[i].min(t.elapsed().as_secs_f64() / ITERS as f64);
                     }
                 }
 
-                let l1 = best[0];
-                let g1 = 1.0 / l1; // fill=1 goodput: one useful token per step
-                eprintln!("continuous-batching goodput (graphed {depth}-layer decode step, D={d} Dff={dff}, Bcap={bcap}; interleaved best-of-N):");
-                for (i, h) in held.iter().enumerate() {
-                    let l = best[i];
-                    let gp = h.fill as f64 / l;
+                eprintln!(
+                    "continuous-batching goodput (graphed {depth}-layer decode step, D={d} Dff={dff}; \
+                     interleaved best-of-N across every (Bcap, fill) point):"
+                );
+                for h in &held {
+                    let l1 = h.best[0];
+                    for (fi, &fill) in h.fills.iter().enumerate() {
+                        let l = h.best[fi];
+                        let gp = fill as f64 / l;
+                        eprintln!(
+                            "  Bcap={:3} fill {:3}: step {:7.1} us | goodput {:8.0} tok/s | {:5.1}x vs fill=1 (step latency {:.2}x)",
+                            h.bcap,
+                            fill,
+                            l * 1e6,
+                            gp,
+                            gp * l1,
+                            l / l1
+                        );
+                    }
+                }
+                // Bcap-scaling table: each Bcap's full-fill point against Bcap=64's.
+                let base = *held[0].best.last().unwrap();
+                eprintln!("Bcap scaling (full fill):");
+                for h in &held {
+                    let l = *h.best.last().unwrap();
+                    let gp = h.bcap as f64 / l;
                     eprintln!(
-                        "  fill {:2}/{bcap}: step {:7.1} us | goodput {:8.0} tok/s | {:5.1}x vs fill=1 (step latency {:.2}x)",
-                        h.fill,
+                        "  Bcap={:3}: step {:7.1} us | goodput {:8.0} tok/s | {:.2}x vs Bcap=64 (step latency {:.2}x)",
+                        h.bcap,
                         l * 1e6,
                         gp,
-                        gp / g1,
-                        l / l1
+                        gp / (64.0 / base),
+                        l / base
                     );
                 }
-                let lf = best[big];
+                let hb = held.last().unwrap();
+                let lf = *hb.best.last().unwrap();
                 eprintln!(
-                    "HEADLINE: fill={} vs fill=1 → {:.1}x goodput at {:.2}x step latency (same-clock interleaved; constant-cost step ⇒ batching is ~free goodput)",
-                    held[big].fill,
-                    (held[big].fill as f64 / lf) / g1,
-                    lf / l1
+                    "HEADLINE: Bcap={} full fill → {:.0} tok/s goodput | {:.1}x vs fill=1 at the same Bcap (same-clock interleaved)",
+                    hb.bcap,
+                    hb.bcap as f64 / lf,
+                    (hb.bcap as f64 / lf) * hb.best[0]
                 );
             });
         });
