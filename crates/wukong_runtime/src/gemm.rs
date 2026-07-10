@@ -205,6 +205,41 @@ fn gemm_2d_shared(macs: u64) -> bool {
     .unwrap_or(macs < SHARED_MAX_MACS)
 }
 
+/// Grain-size tuning surface (`WUKONG_GEMM_TASK_MACS`, read once, **default unset = current
+/// behavior**): when set to a per-task MAC budget `T`, the **per-block** 2D paths
+/// ([`sgemm_2d_blocks`] / [`sgemm_2d_blocks_dyn`]) aim for `clamp(macs / T, 1, 2^20)` grid blocks
+/// instead of the default `3 × nworkers`, so the block granularity can be swept externally
+/// (smaller tasks improve P/E-core balance but raise pack redundancy — every A element is packed
+/// once per block column and every B element once per block row — plus queue/scheduling traffic;
+/// the sweep decides, not this code). Scope: the per-block paths only — the shared-pack small
+/// band keeps its own budget (`WUKONG_GEMM_MIN_TASK_MACS`, see [`min_task_macs`]), so the two
+/// knobs never fight over one path. Zero/unparsable values are ignored (= unset). Grid shape is
+/// throughput-only: bit-exactness holds for every value (see [`select_2d_block_shape`]).
+#[cfg(target_arch = "x86_64")]
+fn gemm_task_macs() -> Option<u64> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("WUKONG_GEMM_TASK_MACS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+    })
+}
+
+/// The load-balance target block count for the per-block 2D paths: `default_target`
+/// (`3 × nworkers` at both call sites) unless [`gemm_task_macs`] overrides it. Pure in
+/// `task_macs` so the policy is unit-testable without env state; the `2^20` cap keeps a
+/// pathological budget from asking [`select_2d_block_shape`] for an absurd grid (the policy's
+/// smallest candidate bounds the real block count by the matrix anyway).
+#[cfg(target_arch = "x86_64")]
+fn blocks_target_from(macs: u64, task_macs: Option<u64>, default_target: usize) -> usize {
+    match task_macs {
+        Some(t) => (macs / t).clamp(1, 1 << 20) as usize,
+        None => default_target,
+    }
+}
+
 /// C-tile prefetch in the [`micro_6x16`] prologue is ON by default: the up-to-6 C rows the
 /// writeback reads/modifies sit `ldc` apart (a page-scale stride at large N), so no hardware
 /// prefetcher covers them, and at ≥2048³ C is far out of cache — every micro-tile writeback
@@ -1519,7 +1554,11 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     use rayon::prelude::*;
     let (m, k, n) = (args.m, args.k, args.n);
     let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
-    let (bm, bn) = select_2d_block_shape(m, n, 3 * nworkers.max(1));
+    // Load-balance target: 3 blocks per worker, unless `WUKONG_GEMM_TASK_MACS` overrides the
+    // grain (see [`gemm_task_macs`]) — the default is byte-for-byte the old `3 × nworkers`.
+    let macs = m as u64 * n as u64 * k as u64;
+    let target = blocks_target_from(macs, gemm_task_macs(), 3 * nworkers.max(1));
+    let (bm, bn) = select_2d_block_shape(m, n, target);
     let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
     // Per-worker scratch caps: one block's A/B slices (not whole-matrix panels), rounded up to
     // full micropanels exactly as the other kernels size their scratch.
@@ -3385,6 +3424,24 @@ mod tests {
         assert_eq!(select_2d_block_shape(512, 512, 48), (48, 96));
         assert_eq!(select_2d_block_shape(1024, 1024, 48), (132, 176));
         assert_eq!(select_2d_block_shape(128, 768, 48), (132, 32));
+    }
+
+    /// [`blocks_target_from`] — the `WUKONG_GEMM_TASK_MACS` grain policy, tested through its pure
+    /// form (the env is resolved once by the caller): unset keeps the caller's default exactly
+    /// (the byte-for-byte "current behavior" contract of the knob), set divides the problem's
+    /// MACs by the budget with a floor of 1 block and the 2^20 sanity cap.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn blocks_target_grain_policy() {
+        // Unset → the caller's default (3 × nworkers at both call sites), regardless of size.
+        assert_eq!(blocks_target_from(1 << 30, None, 48), 48);
+        assert_eq!(blocks_target_from(1, None, 7), 7);
+        // Set → macs / budget: a 2^30-MAC problem at a 2^24 budget is 64 tasks.
+        assert_eq!(blocks_target_from(1 << 30, Some(1 << 24), 48), 64);
+        // Budget above the whole problem floors at one block (never zero).
+        assert_eq!(blocks_target_from(1 << 20, Some(1 << 30), 48), 1);
+        // Pathological budget hits the cap instead of demanding a u64-sized grid.
+        assert_eq!(blocks_target_from(u64::MAX, Some(1), 48), 1 << 20);
     }
 
     /// The shared-pack 2D path ([`sgemm_2d_shared`] — the DEFAULT parallel GEMM; called DIRECTLY
