@@ -481,10 +481,16 @@ pub struct Scheduler {
     /// re-read every replay, and every grid shape is a function of the fixed `Bcap` alone — so no
     /// admission/eviction/growth ever invalidates the recording.
     graph: Option<(crate::graph::Graph, u64, u64)>,
+    /// **Static batching** (the classic peer continuous batching is measured against): admit a full
+    /// batch, then admit nothing more until the whole batch has drained — no mid-flight refill of
+    /// freed slots. Same kernels, same step; only the admission policy differs, which is exactly
+    /// what makes the continuous-vs-static goodput ratio the honest scheduling win.
+    static_batching: bool,
 }
 
 impl Scheduler {
-    /// Wrap a built [`DecodeModel`]; all `Bcap` slots start free.
+    /// Wrap a built [`DecodeModel`]; all `Bcap` slots start free. Continuous batching (the default
+    /// policy: freed slots are refilled every iteration).
     pub fn new(model: DecodeModel) -> Self {
         let bcap = model.bcap();
         Self {
@@ -495,7 +501,15 @@ impl Scheduler {
             admitted: 0,
             completed: 0,
             graph: None,
+            static_batching: false,
         }
+    }
+
+    /// As [`new`](Self::new) but with **static batching** (see the field docs): the honest peer the
+    /// goodput bench measures continuous batching against — identical kernels and step machinery,
+    /// admission only when the previous batch has fully drained.
+    pub fn new_static(model: DecodeModel) -> Self {
+        Self { static_batching: true, ..Self::new(model) }
     }
 
     /// Queue a request for admission.
@@ -554,6 +568,10 @@ impl Scheduler {
     /// by smaller arrivals until pressure eases — the price of maximizing fill; the bounded window
     /// keeps the scan cheap and the reordering finite. Returns the number admitted this call.
     pub fn admit(&mut self) -> Result<usize, DriverError> {
+        // Static batching: no mid-flight refill — wait for the whole batch to drain.
+        if self.static_batching && self.num_active() > 0 {
+            return Ok(0);
+        }
         let bcap = self.model.bcap();
         let mut n = 0;
         for slot in 0..bcap {
@@ -1453,6 +1471,62 @@ mod tests {
         });
     }
 
+    /// **Static-batching policy gate.** A [`Scheduler::new_static`] scheduler must (a) admit ONLY
+    /// when the previous batch has fully drained — never refill a freed slot mid-flight (the policy
+    /// that defines the goodput bench's honest peer), and (b) still drain every request and conserve
+    /// every block. Verified by snapshotting the admission counter each step and requiring the
+    /// active count to have been zero whenever it moves.
+    #[test]
+    fn serving_static_batching_admits_only_when_drained() {
+        with_gpu("serving_static_batching_admits_only_when_drained", |g| {
+            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 1usize);
+            let d = heads * hd;
+            let max_bps = (40usize + 24).div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 32;
+            let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut rng = crate::diff::Rng::new(0x57A7);
+            let wdata = layer_weights(&mut rng, depth, d, dff);
+            let weights = weights_view(&wdata);
+            let x = rng.vec(bcap * d, -1.0, 1.0);
+            const NREQ: usize = 96;
+            let reqs: Vec<Request> =
+                (0..NREQ).map(|i| Request { prompt_len: 1 + (i * 7) % 40, gen_len: 1 + (i * 5) % 24 }).collect();
+            let total_gen: usize = reqs.iter().map(|r| r.gen_len).sum();
+
+            let model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
+            let init_free = model.cache().manager_ref().free_blocks();
+            let mut sched = Scheduler::new_static(model);
+            for &r in &reqs {
+                sched.enqueue(r);
+            }
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let mut out = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+            let (mut steps, mut batches) = (0usize, 0usize);
+            let mut prev_active_after = 0usize; // active slots after the previous step's retirements
+            let mut prev_admitted = 0usize;
+            while !sched.is_idle() {
+                sched.step(&g.stream.clone(), &x_d, &mut out).unwrap();
+                if sched.admitted() > prev_admitted {
+                    assert_eq!(prev_active_after, 0, "static batching refilled a slot mid-flight");
+                    prev_admitted = sched.admitted();
+                    batches += 1;
+                }
+                prev_active_after = sched.num_active();
+                steps += 1;
+                assert!(steps < 100_000, "static scheduler failed to drain (liveness)");
+            }
+            g.stream.synchronize().unwrap();
+            assert_eq!(sched.completed(), NREQ, "every request completes");
+            assert_eq!(sched.emitted(), total_gen, "useful tokens == Σ gen_len");
+            assert_eq!(sched.free_blocks(), init_free, "all KV blocks returned to the pool");
+            assert!(batches >= NREQ / bcap, "at least ceil(NREQ/Bcap) admission waves");
+            eprintln!(
+                "static batching drained {NREQ} reqs in {steps} steps across {batches} full-drain batches — \
+                 zero mid-flight refills (the honest peer policy holds)"
+            );
+        });
+    }
+
     /// **P5 throughput — continuous-batching goodput vs batch fill, swept over Bcap.** The fixed-shape
     /// decode step computes all `Bcap` rows regardless of how many carry a live request, and at these
     /// sizes it is weight-HBM-bound (every GEMM streams the same weights whatever M is), so per-step
@@ -1618,13 +1692,83 @@ mod tests {
                         l / base
                     );
                 }
-                let hb = held.last().unwrap();
-                let lf = *hb.best.last().unwrap();
+                // Sweep-derived legacy multiples (full fill vs fill=1 per Bcap), then free the
+                // sweep's models/graphs before the drains below re-allocate.
+                let sweep: Vec<(usize, f64)> = held
+                    .iter()
+                    .map(|h| {
+                        let lf = *h.best.last().unwrap();
+                        (h.bcap, (h.bcap as f64 / lf) * h.best[0])
+                    })
+                    .collect();
+                drop(held);
+
+                // ---- Continuous vs STATIC batching over the REAL scheduler loop (same kernels) ----
+                // The fill sweep above prices the M-amortization win (a fuller fixed batch beats an
+                // emptier one). The *scheduling* win is separate: continuous batching refills freed
+                // slots mid-flight; static batching (the classic peer) admits a full batch and waits
+                // for its LAST straggler before refilling, idling slots on ragged gen lengths.
+                // Identical kernels, identical graph-driven step, identical request stream — the
+                // ratio below is continuous batching's true scheduling contribution, with all host
+                // scheduling + metadata-upload costs included (this times the real Scheduler drain,
+                // not a bare graph replay). Adjacent same-run A/B per Bcap (the clock-honesty rule).
+                eprintln!("continuous vs static batching (graph-driven Scheduler drain, depth {depth}, ragged gen 8..63):");
+                let mut last_line = None;
+                for &bcap in &bcaps {
+                    let (cfg, dff, _, d, _) = graph_cfg_at(depth, bcap);
+                    let nreq = 3 * bcap;
+                    let reqs: Vec<Request> = (0..nreq)
+                        .map(|i| Request { prompt_len: 8 + (i * 11) % 56, gen_len: 8 + (i * 13) % 56 })
+                        .collect();
+                    let mut drain = |static_batching: bool| -> (f64, usize, usize) {
+                        let model = DecodeModel::new(g, &weights, cfg, dff, 48 * 1024 * 1024 * (bcap / 64)).unwrap();
+                        let mut sched =
+                            if static_batching { Scheduler::new_static(model) } else { Scheduler::new(model) };
+                        for &r in &reqs {
+                            sched.enqueue(r);
+                        }
+                        g.stream.synchronize().unwrap(); // retire NULL-stream construction work
+                        let stream = g.ctx.new_stream().unwrap();
+                        let x_d = stream.memcpy_stod(&x_all[..bcap * d]).unwrap();
+                        let mut out = stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                        // Exclude the first WARM steps (graph capture + clock ramp) from the timed
+                        // region; tokens are counted from the same instant.
+                        const WARM: usize = 16;
+                        let mut steps = 0usize;
+                        let mut t0 = Instant::now();
+                        let mut tok0 = 0usize;
+                        while !sched.is_idle() {
+                            sched.step_graphed(&stream, &x_d, &mut out).unwrap();
+                            steps += 1;
+                            if steps == WARM {
+                                stream.synchronize().unwrap();
+                                t0 = Instant::now();
+                                tok0 = sched.emitted();
+                            }
+                            assert!(steps < 1_000_000, "drain liveness");
+                        }
+                        stream.synchronize().unwrap();
+                        (t0.elapsed().as_secs_f64(), sched.emitted() - tok0, steps)
+                    };
+                    let (dt_c, tok_c, steps_c) = drain(false);
+                    let (dt_s, tok_s, steps_s) = drain(true);
+                    let (gp_c, gp_s) = (tok_c as f64 / dt_c, tok_s as f64 / dt_s);
+                    eprintln!(
+                        "  Bcap={bcap:3}: continuous {gp_c:8.0} tok/s ({steps_c:4} steps) | static {gp_s:8.0} tok/s ({steps_s:4} steps) | continuous/static {:.2}x",
+                        gp_c / gp_s
+                    );
+                    last_line = Some((bcap, gp_c, gp_c / gp_s));
+                }
+
+                // The three-number headline: the absolute (real scheduler loop, host costs
+                // included), the M-amortization multiple (legacy fill=1 peer, interleaved sweep),
+                // and the honest scheduling multiple (static-batching peer, same kernels).
+                let (bcap_h, gp_h, vs_static) = last_line.unwrap();
+                let vs_fill1 = sweep.iter().find(|s| s.0 == bcap_h).unwrap().1;
                 eprintln!(
-                    "HEADLINE: Bcap={} full fill → {:.0} tok/s goodput | {:.1}x vs fill=1 at the same Bcap (same-clock interleaved)",
-                    hb.bcap,
-                    hb.bcap as f64 / lf,
-                    (hb.bcap as f64 / lf) * hb.best[0]
+                    "HEADLINE: {gp_h:.0} tok/s decode goodput at Bcap={bcap_h} (graph-driven Scheduler drain, {depth}-layer D={d} model) | \
+                     {vs_fill1:.1}x vs fill=1 same-Bcap (M-amortization, same-clock interleaved) | \
+                     {vs_static:.2}x vs static batching (the scheduling win, same kernels)"
                 );
             });
         });
