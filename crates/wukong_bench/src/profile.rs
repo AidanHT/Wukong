@@ -12,12 +12,11 @@
 //!   exactly as `compile-time` calls `wukong_opt` — no driver hook, so the driver stays a thin
 //!   sequencer with no instrumentation woven through it.
 //!
-//!   The backend is measured as ONE stage (`emit_object`): Cranelift instruction-selection +
-//!   register allocation + machine-code emission, then object-container serialization. Splitting the
-//!   isel cost from the object-bytes-written cost would need a timing hook *inside*
-//!   `wukong_codegen_cranelift` (that crate exposes only the combined `emit_object`); the object-emit
-//!   share is instead reasoned about in `docs/compile-floor.md` from the emitted byte count, which
-//!   this mode reports per file.
+//!   The backend appears as ONE stage (`codegen+obj`) in the stage table — Cranelift
+//!   instruction-selection + register allocation + machine-code emission, then object-container
+//!   serialization — with its internal split (codegen vs object-write) measured via
+//!   `wukong_codegen_cranelift::emit_object_timed` and printed underneath, bounding the fixed
+//!   container cost `docs/compile-floor.md` reasons about.
 //!
 //! * `spawn-overhead` — the same source compiled two ways: (a) the in-process API to an object in
 //!   memory, and (b) spawning the real `wukongc.exe --emit=obj`. The difference is the spawn tax
@@ -584,10 +583,13 @@ fn short(p: &Path) -> String {
     p.file_name().unwrap().to_string_lossy().into_owned()
 }
 
+/// Truncate to at most `w` characters (char-boundary-safe: byte slicing would panic on a multibyte
+/// filename).
 fn trunc(s: &str, w: usize) -> String {
-    if s.len() <= w {
+    if s.chars().count() <= w {
         s.to_string()
     } else {
-        format!("{}…", &s[..w - 1])
+        let cut: String = s.chars().take(w.saturating_sub(1)).collect();
+        format!("{cut}…")
     }
 }
