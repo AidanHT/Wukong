@@ -440,245 +440,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
-name = "mercury_ast"
-version = "0.1.0"
-dependencies = [
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_autodiff"
-version = "0.1.0"
-dependencies = [
- "mercury_interp",
- "mercury_mir",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_backend"
-version = "0.1.0"
-dependencies = [
- "mercury_mir",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_bench"
-version = "0.1.0"
-dependencies = [
- "mercury_codegen_cranelift",
- "mercury_interp",
- "mercury_mir",
- "mercury_mir_build",
- "mercury_opt",
- "mercury_parser",
- "mercury_sema",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_codegen_cranelift"
-version = "0.1.0"
-dependencies = [
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-jit",
- "cranelift-module",
- "cranelift-native",
- "cranelift-object",
- "iced-x86",
- "mercury_backend",
- "mercury_interp",
- "mercury_mir",
- "mercury_mir_build",
- "mercury_opt",
- "mercury_parser",
- "mercury_runtime",
- "mercury_sema",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_codegen_gpu"
-version = "0.1.0"
-dependencies = [
- "cudarc",
- "half",
- "mercury_autodiff",
- "mercury_backend",
- "mercury_interp",
- "mercury_lexer",
- "mercury_mir",
- "mercury_mir_build",
- "mercury_opt",
- "mercury_parser",
- "mercury_runtime",
- "mercury_sema",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_codegen_llvm"
-version = "0.1.0"
-dependencies = [
- "mercury_backend",
- "mercury_mir",
- "mercury_mir_build",
- "mercury_opt",
- "mercury_parser",
- "mercury_sema",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_diag"
-version = "0.1.0"
-dependencies = [
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_driver"
-version = "0.1.0"
-dependencies = [
- "mercury_ast",
- "mercury_autodiff",
- "mercury_backend",
- "mercury_codegen_cranelift",
- "mercury_codegen_gpu",
- "mercury_codegen_llvm",
- "mercury_diag",
- "mercury_interp",
- "mercury_lexer",
- "mercury_mir",
- "mercury_mir_build",
- "mercury_opt",
- "mercury_parser",
- "mercury_sema",
- "mercury_span",
- "mercury_types",
-]
-
-[[package]]
-name = "mercury_interp"
-version = "0.1.0"
-dependencies = [
- "mercury_backend",
- "mercury_mir",
- "mercury_mir_build",
- "mercury_parser",
- "mercury_runtime",
- "mercury_sema",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_lexer"
-version = "0.1.0"
-dependencies = [
- "mercury_diag",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_mir"
-version = "0.1.0"
-dependencies = [
- "mercury_span",
- "mercury_types",
-]
-
-[[package]]
-name = "mercury_mir_build"
-version = "0.1.0"
-dependencies = [
- "mercury_ast",
- "mercury_diag",
- "mercury_mir",
- "mercury_parser",
- "mercury_sema",
- "mercury_span",
- "mercury_types",
-]
-
-[[package]]
-name = "mercury_opt"
-version = "0.1.0"
-dependencies = [
- "mercury_interp",
- "mercury_mir",
- "mercury_mir_build",
- "mercury_parser",
- "mercury_sema",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_parser"
-version = "0.1.0"
-dependencies = [
- "mercury_ast",
- "mercury_diag",
- "mercury_lexer",
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_runtime"
-version = "0.1.0"
-dependencies = [
- "half",
- "num_cpus",
- "rayon",
-]
-
-[[package]]
-name = "mercury_sema"
-version = "0.1.0"
-dependencies = [
- "mercury_ast",
- "mercury_diag",
- "mercury_parser",
- "mercury_span",
- "mercury_types",
-]
-
-[[package]]
-name = "mercury_span"
-version = "0.1.0"
-
-[[package]]
-name = "mercury_types"
-version = "0.1.0"
-dependencies = [
- "mercury_span",
-]
-
-[[package]]
-name = "mercury_xbench"
-version = "0.1.0"
-dependencies = [
- "libloading",
- "matrixmultiply",
- "mercury_codegen_cranelift",
- "mercury_interp",
- "mercury_mir",
- "mercury_mir_build",
- "mercury_opt",
- "mercury_parser",
- "mercury_sema",
- "mercury_span",
-]
-
-[[package]]
-name = "mercuryc"
-version = "0.1.0"
-dependencies = [
- "mercury_driver",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1092,6 +853,245 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wukong_ast"
+version = "0.1.0"
+dependencies = [
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_autodiff"
+version = "0.1.0"
+dependencies = [
+ "wukong_interp",
+ "wukong_mir",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_backend"
+version = "0.1.0"
+dependencies = [
+ "wukong_mir",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_bench"
+version = "0.1.0"
+dependencies = [
+ "wukong_codegen_cranelift",
+ "wukong_interp",
+ "wukong_mir",
+ "wukong_mir_build",
+ "wukong_opt",
+ "wukong_parser",
+ "wukong_sema",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_codegen_cranelift"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-jit",
+ "cranelift-module",
+ "cranelift-native",
+ "cranelift-object",
+ "iced-x86",
+ "wukong_backend",
+ "wukong_interp",
+ "wukong_mir",
+ "wukong_mir_build",
+ "wukong_opt",
+ "wukong_parser",
+ "wukong_runtime",
+ "wukong_sema",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_codegen_gpu"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "half",
+ "wukong_autodiff",
+ "wukong_backend",
+ "wukong_interp",
+ "wukong_lexer",
+ "wukong_mir",
+ "wukong_mir_build",
+ "wukong_opt",
+ "wukong_parser",
+ "wukong_runtime",
+ "wukong_sema",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_codegen_llvm"
+version = "0.1.0"
+dependencies = [
+ "wukong_backend",
+ "wukong_mir",
+ "wukong_mir_build",
+ "wukong_opt",
+ "wukong_parser",
+ "wukong_sema",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_diag"
+version = "0.1.0"
+dependencies = [
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_driver"
+version = "0.1.0"
+dependencies = [
+ "wukong_ast",
+ "wukong_autodiff",
+ "wukong_backend",
+ "wukong_codegen_cranelift",
+ "wukong_codegen_gpu",
+ "wukong_codegen_llvm",
+ "wukong_diag",
+ "wukong_interp",
+ "wukong_lexer",
+ "wukong_mir",
+ "wukong_mir_build",
+ "wukong_opt",
+ "wukong_parser",
+ "wukong_sema",
+ "wukong_span",
+ "wukong_types",
+]
+
+[[package]]
+name = "wukong_interp"
+version = "0.1.0"
+dependencies = [
+ "wukong_backend",
+ "wukong_mir",
+ "wukong_mir_build",
+ "wukong_parser",
+ "wukong_runtime",
+ "wukong_sema",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_lexer"
+version = "0.1.0"
+dependencies = [
+ "wukong_diag",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_mir"
+version = "0.1.0"
+dependencies = [
+ "wukong_span",
+ "wukong_types",
+]
+
+[[package]]
+name = "wukong_mir_build"
+version = "0.1.0"
+dependencies = [
+ "wukong_ast",
+ "wukong_diag",
+ "wukong_mir",
+ "wukong_parser",
+ "wukong_sema",
+ "wukong_span",
+ "wukong_types",
+]
+
+[[package]]
+name = "wukong_opt"
+version = "0.1.0"
+dependencies = [
+ "wukong_interp",
+ "wukong_mir",
+ "wukong_mir_build",
+ "wukong_parser",
+ "wukong_sema",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_parser"
+version = "0.1.0"
+dependencies = [
+ "wukong_ast",
+ "wukong_diag",
+ "wukong_lexer",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_runtime"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
+name = "wukong_sema"
+version = "0.1.0"
+dependencies = [
+ "wukong_ast",
+ "wukong_diag",
+ "wukong_parser",
+ "wukong_span",
+ "wukong_types",
+]
+
+[[package]]
+name = "wukong_span"
+version = "0.1.0"
+
+[[package]]
+name = "wukong_types"
+version = "0.1.0"
+dependencies = [
+ "wukong_span",
+]
+
+[[package]]
+name = "wukong_xbench"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "matrixmultiply",
+ "wukong_codegen_cranelift",
+ "wukong_interp",
+ "wukong_mir",
+ "wukong_mir_build",
+ "wukong_opt",
+ "wukong_parser",
+ "wukong_sema",
+ "wukong_span",
+]
+
+[[package]]
+name = "wukongc"
+version = "0.1.0"
+dependencies = [
+ "wukong_driver",
+]
 
 [[package]]
 name = "zerocopy"

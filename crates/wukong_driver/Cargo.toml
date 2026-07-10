@@ -1,0 +1,35 @@
+[package]
+name = "wukong_driver"
+description = "Pipeline orchestration for the Wukong compiler (Session, options, --emit)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wukong_span = { workspace = true }
+wukong_diag = { workspace = true }
+wukong_lexer = { workspace = true }
+wukong_ast = { workspace = true }
+wukong_parser = { workspace = true }
+wukong_sema = { workspace = true }
+# `--train` reads the loss function's parameter buffer sizes from the resolved semantic types.
+wukong_types = { workspace = true }
+wukong_mir = { workspace = true }
+wukong_mir_build = { workspace = true }
+wukong_backend = { workspace = true }
+wukong_interp = { workspace = true }
+wukong_opt = { workspace = true }
+wukong_codegen_llvm = { workspace = true }
+wukong_codegen_cranelift = { workspace = true }
+# Reverse-mode autodiff: powers the `--emit=grad` stage and `--train` mode (differentiate a `.wk`
+# loss function into its backward MIR, then run fwd→bwd→optimizer training steps).
+wukong_autodiff = { workspace = true }
+# The GPU backend (`--backend=gpu`) is opt-in: behind the driver's `gpu` feature so the default
+# build stays toolchain-free (no `cudarc`, no device needed). Enabling it turns on the offloading
+# interpreter path in `compile()`.
+wukong_codegen_gpu = { workspace = true, optional = true }
+
+[features]
+gpu = ["dep:wukong_codegen_gpu", "wukong_codegen_gpu/gpu"]

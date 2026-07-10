@@ -1,0 +1,22 @@
+[package]
+name = "wukong_bench"
+description = "Benchmark harness: optimizer effectiveness and interpreter timing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wukong-bench"
+path = "src/main.rs"
+
+[dependencies]
+wukong_span = { workspace = true }
+wukong_parser = { workspace = true }
+wukong_sema = { workspace = true }
+wukong_mir = { workspace = true }
+wukong_mir_build = { workspace = true }
+wukong_opt = { workspace = true }
+wukong_interp = { workspace = true }
+wukong_codegen_cranelift = { workspace = true }

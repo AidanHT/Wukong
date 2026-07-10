@@ -1,0 +1,14 @@
+[package]
+name = "wukong_parser"
+description = "The Wukong parser: tokens into an AST (recursive descent + Pratt)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wukong_span = { workspace = true }
+wukong_diag = { workspace = true }
+wukong_lexer = { workspace = true }
+wukong_ast = { workspace = true }
