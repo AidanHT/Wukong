@@ -31,9 +31,12 @@ const KC: usize = 384;
 const NC: usize = 4080;
 
 // Minimum multiply-accumulate count (`m·n·k`) before the parallel kernel is worth its threading
-// overhead. 2^26 ≈ 67M MACs sits between 256^3 (~17M, faster serial) and 512^3 (~134M, ~2.4× on
-// threads) on this machine.
-const PAR_MIN_MACS: u64 = 1 << 26;
+// overhead. Was 2^26 (≈67M) when the only parallel grid was 3×nworkers slivers — 256³ (~17M) ran
+// faster serial then. The work-scaled shared-pack grid (few large blocks near the gate) moved the
+// crossover: 256³ measured ~1.7–2× over serial through it (2026-07-09, adjacent same-run), so the
+// gate now sits at 2^23 ≈ 8.4M, below which cross-core wake/sync on this P+E hybrid still costs
+// more than it saves.
+const PAR_MIN_MACS: u64 = 1 << 23;
 
 /// The parallel gate, env-probe-able: `MERCURY_GEMM_PAR_MIN_MACS` (a MAC count, read once)
 /// overrides [`PAR_MIN_MACS`] so the serial↔parallel crossover — e.g. whether 256³ (~17M MACs)
@@ -53,10 +56,11 @@ fn par_min_macs() -> u64 {
 /// Per-task MAC budget for the shared-pack 2D path's **work-scaled** load-balance target: the
 /// effective worker count is `clamp(macs / min_task_macs(), 1, nworkers)`, so a problem near the
 /// parallel gate gets a few large blocks (each still worth its scheduling) instead of `3×nworkers`
-/// slivers. 4 Mi MACs ≈ the point where one block's compute clearly outweighs a task dispatch on
-/// this pool. Env-overridable (`MERCURY_GEMM_MIN_TASK_MACS`, read once) so the small-problem
-/// crossover can be swept together with `MERCURY_GEMM_PAR_MIN_MACS`. Throughput-only: the grid
-/// shape never changes the bits.
+/// slivers. 1 Mi MACs measured best in the small band this budget governs (256³ swept 1M/4M/16M →
+/// 209/146/90 GF/s, 2026-07-09; the shared path only runs below [`SHARED_MAX_MACS`] by default, so
+/// the finer grid never applies to large problems). Env-overridable
+/// (`MERCURY_GEMM_MIN_TASK_MACS`, read once) so the small-problem crossover can be swept together
+/// with `MERCURY_GEMM_PAR_MIN_MACS`. Throughput-only: the grid shape never changes the bits.
 #[cfg(target_arch = "x86_64")]
 fn min_task_macs() -> u64 {
     use std::sync::OnceLock;
@@ -174,19 +178,31 @@ fn gemm_2d() -> bool {
     *V.get_or_init(|| !std::env::var("MERCURY_GEMM_2D").is_ok_and(|v| v == "0"))
 }
 
-/// The **shared-pack** variant of the 2D block path ([`sgemm_2d_shared`]) is the DEFAULT: it keeps
-/// the 2D grid's per-thread L2-resident C blocks but packs each K-block's A/B panels ONCE into
-/// caller-owned shared buffers (one cooperative pack region per `pc`), where the per-block path
-/// ([`sgemm_2d_blocks`]) re-packs every A element `nbj` times and every B element `nbi` times —
-/// e.g. 512³ → an 11×6 grid packs A 6× and B 11× (~17 MiB copied vs the ~2 MiB minimum), and a
-/// skinny 128×3072×768 packs ~80 MiB for 604 MFLOP. `MERCURY_GEMM_2D_SHARED=0` (read once) opts
-/// OUT to the per-block-packing path, keeping the win adjacent-run-measurable — the same
-/// instrument discipline as `MERCURY_GEMM_2D` / `MERCURY_GEMM_FORKJOIN`.
+/// The shared-pack band ceiling: a parallel GEMM below this MAC count takes [`sgemm_2d_shared`],
+/// at/above it [`sgemm_2d_blocks`]. See [`gemm_2d_shared`] for the measured basis.
+const SHARED_MAX_MACS: u64 = 1 << 26;
+
+/// Which 2D path a parallel GEMM takes is **size-keyed** (measured 2026-07-09, adjacent ABBA in
+/// both orderings): the per-block-packing path ([`sgemm_2d_blocks`]) wins mid/large problems —
+/// its "redundant" packing is each worker warming its OWN L2 with exactly the panels it consumes,
+/// where the shared pack makes consumers read panels another core packed (through L3) and pays a
+/// fork-join barrier per K-block (512³ ~315 vs ~278 GF/s, 1024³ ~462 vs ~385, skinny FFN shapes
+/// up to 1.75×) — while the shared-pack path ([`sgemm_2d_shared`]) wins the small band just above
+/// the parallel gate, where pack redundancy dominates the tiny compute and its work-scaled
+/// few-large-blocks grid fits (256³ ~209 vs ~185 GF/s = 102–123% of the adjacent MKL-all
+/// readings). Crossover at [`SHARED_MAX_MACS`]. `MERCURY_GEMM_2D_SHARED=1` forces shared
+/// everywhere and `=0` per-block everywhere (read once) — the adjacent-run A/B instruments, same
+/// discipline as `MERCURY_GEMM_2D` / `MERCURY_GEMM_FORKJOIN`.
 #[cfg(target_arch = "x86_64")]
-fn gemm_2d_shared() -> bool {
+fn gemm_2d_shared(macs: u64) -> bool {
     use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| !std::env::var("MERCURY_GEMM_2D_SHARED").is_ok_and(|v| v == "0"))
+    static V: OnceLock<Option<bool>> = OnceLock::new();
+    V.get_or_init(|| match std::env::var("MERCURY_GEMM_2D_SHARED").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    })
+    .unwrap_or(macs < SHARED_MAX_MACS)
 }
 
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
@@ -453,25 +469,27 @@ unsafe fn gemm_dispatch(
     // them. The serial AVX2 kernel is the fast path for everything smaller. The epilogue folds into
     // the per-tile writeback on the final K-block, so the parallel path carries it too (each C tile
     // is owned by exactly one task) — a `@parallel` fused FFN runs the bias+activation across cores.
-    let par = par && (m as u64 * n as u64 * k as u64) >= par_min_macs();
+    let macs = m as u64 * n as u64 * k as u64;
+    let par = par && macs >= par_min_macs();
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
                 match (par, gemm_pool()) {
-                    // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path with SHARED
-                    // cooperative packing (`sgemm_2d_shared` — per-thread L2-resident C blocks over
-                    // A/B panels packed once per K-block; see `gemm_2d_shared`).
-                    // `MERCURY_GEMM_2D_SHARED=0` opts out to the per-block-packing 2D shape
-                    // (`sgemm_2d_blocks`), `MERCURY_GEMM_2D=0` to the persistent-broadcast-region
-                    // shape (`sgemm_persistent_region`), and `MERCURY_GEMM_FORKJOIN=1` further
-                    // routes to the legacy fork-join shape — all retained as adjacent-run A/B
+                    // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path, size-keyed
+                    // between its two packing shapes — SHARED cooperative packing
+                    // (`sgemm_2d_shared`) below `SHARED_MAX_MACS`, per-block packing
+                    // (`sgemm_2d_blocks`) at/above it; see `gemm_2d_shared` for the measured
+                    // basis. `MERCURY_GEMM_2D_SHARED=1|0` forces one shape everywhere,
+                    // `MERCURY_GEMM_2D=0` opts out to the persistent-broadcast-region shape
+                    // (`sgemm_persistent_region`), and `MERCURY_GEMM_FORKJOIN=1` further routes
+                    // to the legacy fork-join shape — all retained as adjacent-run A/B
                     // instruments.
                     (true, pool) => {
                         let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
                         if gemm_2d() {
-                            if gemm_2d_shared() {
+                            if gemm_2d_shared(macs) {
                                 sgemm_2d_shared(pool, args);
                             } else {
                                 sgemm_2d_blocks(pool, args);
