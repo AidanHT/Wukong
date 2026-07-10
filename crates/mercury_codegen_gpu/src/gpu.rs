@@ -106,6 +106,15 @@ impl Gpu {
             .unwrap_or(20)
     }
 
+    /// **L2 cache size, bytes** (`0` if unqueryable) — the honest denominator for the GEMM-cliff raster
+    /// tuning. At 4096³ the GEMM is HBM-bound, so the threadblock-rasterization band is sized to keep the
+    /// co-scheduled CTAs' A/B footprint inside L2; the optimal band width keys off the *measured* L2, not
+    /// a hard-coded guess (the cliff comments have carried both 24 MB and 12 MB — this settles it).
+    pub fn l2_cache_size(&self) -> i32 {
+        self.device_attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
+            .unwrap_or(0)
+    }
+
     /// **Theoretical peak HBM bandwidth, GB/s** — the honest M9 denominator. Uses the exact formula
     /// NVIDIA's own `deviceQuery` prints: `2 × memClock × (busWidth/8)` (the ×2 is DDR; for GDDR6 the
     /// reported "memory clock" already folds in the per-pin multiplier, so this matches the spec
@@ -11533,6 +11542,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 return;
             }
             eprintln!("device: {}", g.device_name());
+            eprintln!(
+                "L2 cache: {:.2} MiB ({} SMs) — the raster-band tuning denominator",
+                g.l2_cache_size() as f64 / (1024.0 * 1024.0),
+                g.sm_count(),
+            );
             // Clock warmup — pin the boost clock high before measuring (cf. gemm_pipe_sweep).
             for _ in 0..40 {
                 let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
