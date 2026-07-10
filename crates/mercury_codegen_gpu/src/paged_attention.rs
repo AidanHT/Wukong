@@ -511,6 +511,165 @@ pub fn launch_kv_append(
     Ok(())
 }
 
+/// PTX entry name for the **int8** KV-append (quantize + scatter) kernel.
+pub const KV_APPEND_INT8_ENTRY: &str = "kv_append_int8";
+
+/// `(slot, head)` pairs per CTA for the int8 append — one **warp** each (block_dim = `32 * WARPS`),
+/// because quantization needs a per-(slot, head) amax *reduction* before any value can be written
+/// (the f16 append's thread-per-element scatter has no reduction and needs none).
+pub const KV_APPEND_INT8_WARPS: u32 = 4;
+
+/// Generate the **int8 KV-append** PTX: quantize each active slot's just-projected new-token K and V
+/// (f32 `[bcap, D]`) into the int8 cache at the slot's write position, through its block table — the
+/// device twin of the host [`quantize_kv_int8`] scheme, feeding [`paged_attn_decode_int8_ptx`]. One
+/// **warp per `(slot, head)`**: the 32 lanes stride the head_dim computing a per-lane `|x|` max, a
+/// fixed `shfl.sync.bfly` butterfly merges it (f32 max is order-independent ⇒ bit-equal to the host
+/// fold), lane 0 stores the two f32 scales (`amax/127`, `0 → 1`, IEEE `div.rn` — bit-equal to the
+/// host `/`), then the lanes quantize and scatter `int8 = clamp(rni(x / scale), ±127)`.
+///
+/// **Rounding note:** the device rounds ties-to-even (`cvt.rni`) where the host [`quantize_kv_int8`]
+/// rounds half-away-from-zero — they can differ by 1 int8 LSB only at exact-`.5` quotients
+/// (immaterial under the dequant tolerance; the round-trip gate's host mirror uses
+/// `round_ties_even` so *that* comparison is exact). Inactive (`active_d == 0`) slots are skipped
+/// whole — the padding-block-0 guard, exactly as in the f16 append. `head_dim` stays a runtime param
+/// (strided lane loops need no unroll), so one PTX serves hd = 64 and 128.
+pub fn kv_append_int8_ptx() -> String {
+    let w = KV_APPEND_INT8_WARPS as usize;
+    // f32 literals: 127.0, -127.0, 1.0.
+    let (p127, n127, one) = ("0f42FE0000", "0fC2FE0000", "0f3F800000");
+    // Warp butterfly all-reduce of one f32 register under `op` (every lane ends with the result).
+    let bfly = |reg: &str, op: &str| -> String {
+        let mut t = String::new();
+        for off in [16, 8, 4, 2, 1] {
+            t += &format!("    shfl.sync.bfly.b32 %rt,{reg},{off},0x1f,0xffffffff;\n    {op}.f32 {reg},{reg},%rt;\n");
+        }
+        t
+    };
+    let mut s = String::new();
+    s += ".version 7.8\n.target sm_89\n.address_size 64\n\n";
+    s += &format!(
+        ".visible .entry {KV_APPEND_INT8_ENTRY}(\n\
+        \x20   .param .u64 pKnew,\n\
+        \x20   .param .u64 pVnew,\n\
+        \x20   .param .u64 pK,\n\
+        \x20   .param .u64 pV,\n\
+        \x20   .param .u64 pKsc,\n\
+        \x20   .param .u64 pVsc,\n\
+        \x20   .param .u64 pBT,\n\
+        \x20   .param .u64 pWPos,\n\
+        \x20   .param .u64 pAct,\n\
+        \x20   .param .u32 pBcap,\n\
+        \x20   .param .u32 pHeads,\n\
+        \x20   .param .u32 pHd,\n\
+        \x20   .param .u32 pBsz,\n\
+        \x20   .param .u32 pNblk,\n\
+        \x20   .param .u32 pMbps,\n\
+        \x20   .param .u32 pLayer\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0,%p1;\n";
+    s += "    .reg .f32 %x,%q,%amk,%amv,%sck,%scv,%rt;\n";
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%pos,%logical,%off,%phys,%es,%e,%src,%dd,%tmp,%nq,%qi,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer;\n";
+    s += "    .reg .b64 %Knew,%Vnew,%K,%V,%Ksc,%Vsc,%BT,%WP,%ACT,%addr,%offb,%kdst,%vdst,%ksrc,%vsrc;\n";
+    s += "    ld.param.u64 %Knew,[pKnew]; cvta.to.global.u64 %Knew,%Knew;\n";
+    s += "    ld.param.u64 %Vnew,[pVnew]; cvta.to.global.u64 %Vnew,%Vnew;\n";
+    s += "    ld.param.u64 %K,[pK];       cvta.to.global.u64 %K,%K;\n";
+    s += "    ld.param.u64 %V,[pV];       cvta.to.global.u64 %V,%V;\n";
+    s += "    ld.param.u64 %Ksc,[pKsc];   cvta.to.global.u64 %Ksc,%Ksc;\n";
+    s += "    ld.param.u64 %Vsc,[pVsc];   cvta.to.global.u64 %Vsc,%Vsc;\n";
+    s += "    ld.param.u64 %BT,[pBT];     cvta.to.global.u64 %BT,%BT;\n";
+    s += "    ld.param.u64 %WP,[pWPos];   cvta.to.global.u64 %WP,%WP;\n";
+    s += "    ld.param.u64 %ACT,[pAct];   cvta.to.global.u64 %ACT,%ACT;\n";
+    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %hd,[pHd];\n";
+    s += "    ld.param.u32 %bsz,[pBsz];\n    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    // gid = ctaid.x*WARPS + warp ; one warp per (slot, head) ⇒ every lane of a warp shares the gid,
+    // so the early exits below are warp-uniform (shfl full-mask stays safe).
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
+    s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
+    s += "    div.u32 %slot,%gid,%heads;\n    mul.lo.s32 %tmp,%slot,%heads;\n    sub.u32 %head,%gid,%tmp;\n";
+    // Skip inactive (padding) rows — a free slot's table pads to block 0 (a live block).
+    s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%ACT,%offb;\n    ld.global.u32 %tmp,[%addr];\n    setp.eq.u32 %p0,%tmp,0;\n    @%p0 bra DONE;\n";
+    // pos = WP[slot] ; logical = pos/bsz ; off = pos - logical*bsz ; phys = BT[slot*mbps + logical].
+    s += "    add.s64 %addr,%WP,%offb;\n    ld.global.u32 %pos,[%addr];\n";
+    s += "    div.u32 %logical,%pos,%bsz;\n    mul.lo.s32 %tmp,%logical,%bsz;\n    sub.u32 %off,%pos,%tmp;\n";
+    s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
+    // es = (((layer*nblk + phys)*bsz + off)*heads + head)  (scale-slab index) ; e = es*hd ;
+    // src = gid*hd  (the (slot, head) row base in the [bcap, D] f32 input).
+    s += "    mul.lo.s32 %es,%layer,%nblk;\n    add.u32 %es,%es,%phys;\n    mul.lo.s32 %es,%es,%bsz;\n    add.u32 %es,%es,%off;\n";
+    s += "    mul.lo.s32 %es,%es,%heads;\n    add.u32 %es,%es,%head;\n    mul.lo.s32 %e,%es,%hd;\n    mul.lo.s32 %src,%gid,%hd;\n";
+    s += "    mul.wide.u32 %offb,%src,4;\n    add.s64 %ksrc,%Knew,%offb;\n    add.s64 %vsrc,%Vnew,%offb;\n";
+    s += "    mul.wide.u32 %offb,%e,1;\n    add.s64 %kdst,%K,%offb;\n    add.s64 %vdst,%V,%offb;\n";
+    // Per-lane strided |x| maxima over the head_dim (fold starts at 0, as the host's does).
+    s += "    mov.f32 %amk,0f00000000;\n    mov.f32 %amv,0f00000000;\n";
+    s += "    mov.u32 %dd,%lane;\nAML:\n    setp.ge.u32 %p1,%dd,%hd;\n    @%p1 bra AME;\n";
+    s += "    mul.wide.u32 %offb,%dd,4;\n";
+    s += "    add.s64 %addr,%ksrc,%offb;\n    ld.global.f32 %x,[%addr];\n    abs.f32 %x,%x;\n    max.f32 %amk,%amk,%x;\n";
+    s += "    add.s64 %addr,%vsrc,%offb;\n    ld.global.f32 %x,[%addr];\n    abs.f32 %x,%x;\n    max.f32 %amv,%amv,%x;\n";
+    s += "    add.u32 %dd,%dd,32;\n    bra AML;\nAME:\n";
+    s += &bfly("%amk", "max");
+    s += &bfly("%amv", "max");
+    // scale = amax > 0 ? amax/127 : 1  (IEEE div — bit-equal to the host `/`).
+    s += &format!("    div.rn.f32 %sck,%amk,{p127};\n    setp.gt.f32 %p1,%amk,0f00000000;\n    selp.f32 %sck,%sck,{one},%p1;\n");
+    s += &format!("    div.rn.f32 %scv,%amv,{p127};\n    setp.gt.f32 %p1,%amv,0f00000000;\n    selp.f32 %scv,%scv,{one},%p1;\n");
+    // Lane 0 stores the two scales at the (token, head) scale-slab index.
+    s += "    setp.ne.u32 %p1,%lane,0;\n    @%p1 bra QNT;\n";
+    s += "    mul.wide.u32 %offb,%es,4;\n    add.s64 %addr,%Ksc,%offb;\n    st.global.f32 [%addr],%sck;\n    add.s64 %addr,%Vsc,%offb;\n    st.global.f32 [%addr],%scv;\n";
+    s += "QNT:\n    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,%hd;\n    @%p1 bra DONE;\n";
+    s += "    mul.wide.u32 %offb,%dd,4;\n    add.s64 %addr,%ksrc,%offb;\n    ld.global.f32 %x,[%addr];\n";
+    s += &format!("    div.rn.f32 %q,%x,%sck;\n    cvt.rni.f32.f32 %q,%q;\n    min.f32 %q,%q,{p127};\n    max.f32 %q,%q,{n127};\n    cvt.rzi.s32.f32 %qi,%q;\n");
+    s += "    mul.wide.u32 %offb,%dd,1;\n    add.s64 %addr,%kdst,%offb;\n    st.global.s8 [%addr],%qi;\n";
+    s += "    mul.wide.u32 %offb,%dd,4;\n    add.s64 %addr,%vsrc,%offb;\n    ld.global.f32 %x,[%addr];\n";
+    s += &format!("    div.rn.f32 %q,%x,%scv;\n    cvt.rni.f32.f32 %q,%q;\n    min.f32 %q,%q,{p127};\n    max.f32 %q,%q,{n127};\n    cvt.rzi.s32.f32 %qi,%q;\n");
+    s += "    mul.wide.u32 %offb,%dd,1;\n    add.s64 %addr,%vdst,%offb;\n    st.global.s8 [%addr],%qi;\n";
+    s += "    add.u32 %dd,%dd,32;\n    bra QL;\n";
+    s += "DONE:\n    ret;\n}\n";
+    s
+}
+
+/// Launch the **int8** KV-append for one layer: quantize + scatter the new token K/V (`knew_d`/
+/// `vnew_d`, f32 `[bcap, D]`) into the int8 slabs and the per-(token, head) f32 scale slabs at each
+/// slot's `wpos_d[slot]` position, via the block table. Same contract as [`launch_kv_append`]
+/// (reserved positions, `active_d` mask gating every write); one warp per `(slot, head)`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_int8(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    k_d: &mut CudaSlice<i8>,
+    v_d: &mut CudaSlice<i8>,
+    ksc_d: &mut CudaSlice<f32>,
+    vsc_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    cfg: &KvConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    let nq = (bcap * cfg.heads) as u32;
+    let launch = LaunchConfig {
+        grid_dim: (nq.div_ceil(KV_APPEND_INT8_WARPS), 1, 1),
+        block_dim: (32 * KV_APPEND_INT8_WARPS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (bcap_u, heads, hd, bsz, nblk, mbps, layer_u) = (
+        bcap as u32,
+        cfg.heads as u32,
+        cfg.head_dim as u32,
+        cfg.block_size as u32,
+        cfg.num_blocks as u32,
+        cfg.max_blocks_per_seq as u32,
+        layer as u32,
+    );
+    let mut b = stream.launch_builder(func);
+    b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(ksc_d).arg(vsc_d).arg(bt_d).arg(wpos_d).arg(active_d);
+    b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    unsafe { b.launch(launch)? };
+    Ok(())
+}
+
 /// **f64 full-softmax CPU reference** for the decode attention — the tolerance oracle. `q` is
 /// `[bcap, D]`; `k_slots`/`v_slots[b]` are slot `b`'s contiguous context, each `[ctx_b, heads,
 /// head_dim]` row-major (`ctx_b == ctx_lens[b]`). Returns `out` `[bcap, D]` f32. A slot with `ctx_b ==
@@ -590,6 +749,23 @@ mod tests {
         // The output uses rcp + select (the empty-sequence NaN guard).
         assert!(ptx.contains("rcp.rn.f32") && ptx.contains("selp.f32"));
         // Balanced braces.
+        assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
+    }
+
+    // int8-append PTX shape sanity (no device): warp amax merge, IEEE division (not approx),
+    // ties-even rounding, int8 value + f32 scale stores, ASCII-only, balanced braces.
+    #[test]
+    fn int8_append_ptx_is_well_formed() {
+        let ptx = kv_append_int8_ptx();
+        assert!(ptx.contains(".visible .entry kv_append_int8("));
+        assert!(ptx.contains(".target sm_89"));
+        assert!(ptx.contains("shfl.sync.bfly.b32"), "warp-cooperative amax merge");
+        assert!(ptx.contains("div.rn.f32"), "IEEE-exact scale + quotient (approx would break the host match)");
+        assert!(!ptx.contains("div.approx"), "no approximate division anywhere");
+        assert!(ptx.contains("cvt.rni.f32.f32"), "ties-even rounding");
+        assert!(ptx.contains("st.global.s8"), "int8 value store");
+        assert!(ptx.contains("st.global.f32"), "f32 scale store");
+        assert!(ptx.is_ascii(), "PTX must be pure ASCII");
         assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
     }
 

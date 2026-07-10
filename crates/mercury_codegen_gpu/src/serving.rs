@@ -32,10 +32,12 @@ use half::f16;
 
 use crate::gpu::{Gpu, TransformerWeights};
 use crate::paged_attention::{
-    kv_append_ptx, launch_kv_append, launch_paged_attn_decode, paged_attn_decode_ptx,
-    KV_APPEND_ENTRY, PAGED_ATTN_ENTRY,
+    kv_append_int8_ptx, kv_append_ptx, launch_kv_append, launch_kv_append_int8,
+    launch_paged_attn_decode, launch_paged_attn_decode_int8, paged_attn_decode_int8_ptx,
+    paged_attn_decode_ptx, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY, PAGED_ATTN_ENTRY,
+    PAGED_ATTN_INT8_ENTRY,
 };
-use crate::paged_kv::{KvConfig, PagedKvCache};
+use crate::paged_kv::{KvConfig, KvDtype, KvStorage, PagedKvCache};
 use crate::pool::{DevicePool, PoolBuf};
 
 /// Launch config for the shared-memory-staged WMMA kernels (`*_sm_db`), one CTA per `SM_BM×SM_BN`
@@ -70,6 +72,9 @@ pub struct DecodeLayer {
     dff: usize,
     eps: f32,
     scale: f32,
+    /// Cache storage dtype this layer's append/attention kernels were loaded for — must match the
+    /// [`KvStorage`] arm handed to [`forward_step_on`](Self::forward_step_on).
+    dtype: KvDtype,
 }
 
 impl DecodeLayer {
@@ -84,10 +89,24 @@ impl DecodeLayer {
         self.cfg.num_slots
     }
 
-    /// Upload the weights (narrowed to f16) and load every kernel. `cfg` is the cache geometry; `dff`
-    /// the FFN inner dim. Requires `D % 64 == 0`, `Dff % 64 == 0`, `Bcap % 64 == 0` (the 64×64 WMMA
-    /// tile), and `head_dim ∈ {64, 128}` (the generated paged-attn kernels).
+    /// Upload the weights (narrowed to f16) and load every kernel for **f16 cache storage** (the
+    /// default, bit-exact path). `cfg` is the cache geometry; `dff` the FFN inner dim. Requires
+    /// `D % 64 == 0`, `Dff % 64 == 0`, `Bcap % 64 == 0` (the 64×64 WMMA tile), and
+    /// `head_dim ∈ {64, 128}` (the generated paged-attn kernels).
     pub fn new(g: &mut Gpu, w: &TransformerWeights, cfg: KvConfig, dff: usize) -> Result<Self, DriverError> {
+        Self::new_with_dtype(g, w, cfg, dff, KvDtype::F16)
+    }
+
+    /// As [`new`](Self::new) with an explicit cache storage dtype: `Int8` loads the int8
+    /// append/attention kernel pair instead (distinct module-cache keys — a shared key would hand
+    /// back the wrong cached kernel). Everything else (weights, GEMMs, norms) is dtype-independent.
+    pub fn new_with_dtype(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        cfg: KvConfig,
+        dff: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
         let d = cfg.heads * cfg.head_dim;
         assert!(d % 64 == 0 && dff % 64 == 0, "D and Dff must be multiples of 64 (WMMA tile)");
         assert!(cfg.num_slots % 64 == 0, "Bcap (num_slots) must be a multiple of 64 (WMMA M tile)");
@@ -108,13 +127,30 @@ impl DecodeLayer {
         let f_gemm = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db")?;
         let f_silu = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db_silu")?;
         let f_resid = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db_residual")?;
-        let attn_key: &'static str = match cfg.head_dim {
-            64 => "paged_attn_d64",
-            128 => "paged_attn_d128",
-            _ => unreachable!(),
+        let (f_attn, f_append) = match dtype {
+            KvDtype::F16 => {
+                let attn_key: &'static str = match cfg.head_dim {
+                    64 => "paged_attn_d64",
+                    128 => "paged_attn_d128",
+                    _ => unreachable!(),
+                };
+                (
+                    g.function(attn_key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY)?,
+                    g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)?,
+                )
+            }
+            KvDtype::Int8 => {
+                let attn_key: &'static str = match cfg.head_dim {
+                    64 => "paged_attn_int8_d64",
+                    128 => "paged_attn_int8_d128",
+                    _ => unreachable!(),
+                };
+                (
+                    g.function(attn_key, &paged_attn_decode_int8_ptx(cfg.head_dim), PAGED_ATTN_INT8_ENTRY)?,
+                    g.function("kv_append_int8", &kv_append_int8_ptx(), KV_APPEND_INT8_ENTRY)?,
+                )
+            }
         };
-        let f_attn = g.function(attn_key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY)?;
-        let f_append = g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)?;
         let to16 = |wt: &[f32]| -> Vec<f16> { wt.iter().map(|&v| f16::from_f32(v)).collect() };
         let wq = g.stream.memcpy_stod(&to16(w.wq))?;
         let wk = g.stream.memcpy_stod(&to16(w.wk))?;
@@ -140,21 +176,22 @@ impl DecodeLayer {
             dff,
             eps: 1e-5,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+            dtype,
         })
     }
 
     /// Run one decode step for this layer on `stream`, all scratch from `pool`. `x_d` is the `[Bcap,D]`
-    /// input activation; the new K/V are appended into `(k_cache, v_cache)` at `wpos_d[slot]` (which
-    /// must already be reserved) for layer plane `layer`; attention reads the cache over `cl_d[slot]`
-    /// (= post-append context). The `[Bcap,D]` result is written into `out`. Every pooled buffer is a
-    /// full-overwrite output (uninit `alloc` is safe — proven by the poison gate).
+    /// input activation; the new K/V are appended into `kv` at `wpos_d[slot]` (which must already be
+    /// reserved) for layer plane `layer`; attention reads the cache over `cl_d[slot]` (= post-append
+    /// context). `kv`'s storage dtype must match the dtype this layer was built with (the kernels are
+    /// loaded per dtype — asserted). The `[Bcap,D]` result is written into `out`. Every pooled buffer
+    /// is a full-overwrite output (uninit `alloc` is safe — proven by the poison gate).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_step_on(
         &self,
         stream: &Arc<CudaStream>,
         pool: &mut DevicePool,
-        k_cache: &mut CudaSlice<f16>,
-        v_cache: &mut CudaSlice<f16>,
+        kv: &mut KvStorage,
         x_d: &CudaSlice<f32>,
         bt_d: &CudaSlice<u32>,
         cl_d: &CudaSlice<u32>,
@@ -163,6 +200,7 @@ impl DecodeLayer {
         layer: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
+        assert_eq!(self.dtype, kv.dtype(), "cache storage dtype must match the layer's kernels");
         let (bcap, d, dff, eps) = (self.bcap(), self.d(), self.dff, self.eps);
         debug_assert_eq!(x_d.len(), bcap * d);
         debug_assert_eq!(out.len(), bcap * d);
@@ -207,11 +245,21 @@ impl DecodeLayer {
         let q = gemm16(pool, &self.f_gemm, &h1_16, &self.wq, bcap, d, d)?;
         let k = gemm16(pool, &self.f_gemm, &h1_16, &self.wk, bcap, d, d)?;
         let v = gemm16(pool, &self.f_gemm, &h1_16, &self.wv, bcap, d, d)?;
-        // Append the new token's K/V into this layer's cache plane at each slot's write position.
-        launch_kv_append(stream, &self.f_append, &k, &v, k_cache, v_cache, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
-        // Paged decode attention over the (now-updated) cache.
+        // Append the new token's K/V into this layer's cache plane at each slot's write position,
+        // then paged decode attention over the (now-updated) cache — the one dtype-dispatched pair.
+        // `attn` is pooled *before* the match so the bump sequence is identical on both arms (a
+        // captured graph bakes the pooled addresses).
         let mut attn = pool.alloc::<f32>(bcap * d)?;
-        launch_paged_attn_decode(stream, &self.f_attn, &q, k_cache, v_cache, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
+        match kv {
+            KvStorage::F16 { k: kc, v: vc } => {
+                launch_kv_append(stream, &self.f_append, &k, &v, kc, vc, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
+                launch_paged_attn_decode(stream, &self.f_attn, &q, kc, vc, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
+            }
+            KvStorage::Int8 { k: kc, v: vc, ksc, vsc } => {
+                launch_kv_append_int8(stream, &self.f_append, &k, &v, kc, vc, ksc, vsc, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
+                launch_paged_attn_decode_int8(stream, &self.f_attn, &q, kc, vc, ksc, vsc, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
+            }
+        }
         let attn_16 = cast(pool, &attn, bcap * d)?;
         let x1 = resid_gemm(pool, &attn_16, &self.wo, x_d, bcap, d, d)?; // x + attn·Woᵀ (residual 1)
 
@@ -246,6 +294,12 @@ pub struct DecodeModel {
     /// `[Bcap,D]` ping-pong activations between layers (persistent — outside the pool).
     bufs: [CudaSlice<f32>; 2],
     cfg: KvConfig,
+    /// [`BlockManager::layout_epoch`](crate::paged_kv::BlockManager::layout_epoch) at the last
+    /// `bt_d` upload (`None` = never uploaded). A steady-state decode step whose appends stay
+    /// inside their current blocks leaves the epoch unchanged, so
+    /// [`advance_and_upload_masked`](Self::advance_and_upload_masked) skips the (large) flat
+    /// block-table upload and pushes only the per-slot ctx/wpos/mask vectors.
+    uploaded_epoch: Option<u64>,
 }
 
 impl DecodeModel {
@@ -275,7 +329,8 @@ impl DecodeModel {
     }
 
     /// Build the `N` decode layers (one weight set each), the paged cache (`cfg`), a `pool_bytes`
-    /// scratch arena, and the per-step metadata + ping-pong buffers. All share `g`'s stream.
+    /// scratch arena, and the per-step metadata + ping-pong buffers. All share `g`'s stream. F16
+    /// cache storage (the default, bit-exact path); int8 via [`new_with_dtype`](Self::new_with_dtype).
     pub fn new(
         g: &mut Gpu,
         weights: &[TransformerWeights],
@@ -283,21 +338,35 @@ impl DecodeModel {
         dff: usize,
         pool_bytes: usize,
     ) -> Result<Self, DriverError> {
+        Self::new_with_dtype(g, weights, cfg, dff, pool_bytes, KvDtype::F16)
+    }
+
+    /// As [`new`](Self::new) with an explicit cache storage dtype (`Int8` = half the KV footprint of
+    /// f16, lossy, tolerance-gated; the append/attention kernels are swapped per dtype, everything
+    /// else is unchanged — including graph capture, which sees the same pooled-launch shape).
+    pub fn new_with_dtype(
+        g: &mut Gpu,
+        weights: &[TransformerWeights],
+        cfg: KvConfig,
+        dff: usize,
+        pool_bytes: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
         assert!(!weights.is_empty(), "model needs at least one layer");
         assert_eq!(weights.len(), cfg.layers, "cfg.layers must equal the number of weight sets");
         let d = cfg.heads * cfg.head_dim;
         let mut layers = Vec::with_capacity(weights.len());
         for w in weights {
-            layers.push(DecodeLayer::new(g, w, cfg, dff)?);
+            layers.push(DecodeLayer::new_with_dtype(g, w, cfg, dff, dtype)?);
         }
-        let cache = PagedKvCache::new(g.stream.clone(), cfg)?;
+        let cache = PagedKvCache::new_with_dtype(g.stream.clone(), cfg, dtype)?;
         let pool = DevicePool::new(g.stream.clone(), pool_bytes)?;
         let bt_d = g.stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
         let cl_d = g.stream.alloc_zeros::<u32>(cfg.num_slots)?;
         let wpos_d = g.stream.alloc_zeros::<u32>(cfg.num_slots)?;
         let active_d = g.stream.memcpy_stod(&vec![1u32; cfg.num_slots])?;
         let bufs = [g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?, g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?];
-        Ok(Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, cfg })
+        Ok(Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, cfg, uploaded_epoch: None })
     }
 
     /// Advance **every** slot by one token: append a cache position per slot (host), upload the block
@@ -324,28 +393,28 @@ impl DecodeModel {
         x_d: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
-        // Disjoint field borrows (the launchers need &mut cache slabs + &mut pool + & metadata at once).
+        // Disjoint field borrows (the launchers need &mut cache storage + &mut pool + & metadata at once).
         let Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, .. } = self;
         let n = layers.len();
-        let (ks, vs) = cache.slabs_mut();
+        let kv = cache.storage_mut();
         if n == 1 {
             pool.reset();
-            return layers[0].forward_step_on(stream, pool, ks, vs, x_d, bt_d, cl_d, wpos_d, active_d, 0, out);
+            return layers[0].forward_step_on(stream, pool, kv, x_d, bt_d, cl_d, wpos_d, active_d, 0, out);
         }
         pool.reset();
-        layers[0].forward_step_on(stream, pool, ks, vs, x_d, bt_d, cl_d, wpos_d, active_d, 0, &mut bufs[0])?;
+        layers[0].forward_step_on(stream, pool, kv, x_d, bt_d, cl_d, wpos_d, active_d, 0, &mut bufs[0])?;
         let mut cur = 0usize; // layer i-1's output lives in bufs[cur]
         for (i, layer) in layers.iter().enumerate().take(n - 1).skip(1) {
             pool.reset();
             let (a, b) = bufs.split_at_mut(1);
             let (src, dst) = if cur == 0 { (&a[0], &mut b[0]) } else { (&b[0], &mut a[0]) };
-            layer.forward_step_on(stream, pool, ks, vs, src, bt_d, cl_d, wpos_d, active_d, i, dst)?;
+            layer.forward_step_on(stream, pool, kv, src, bt_d, cl_d, wpos_d, active_d, i, dst)?;
             cur = 1 - cur;
         }
         pool.reset();
         // Last layer reads the current buffer, writes the caller's `out`.
         let src = &bufs[cur];
-        layers[n - 1].forward_step_on(stream, pool, ks, vs, src, bt_d, cl_d, wpos_d, active_d, n - 1, out)
+        layers[n - 1].forward_step_on(stream, pool, kv, src, bt_d, cl_d, wpos_d, active_d, n - 1, out)
     }
 
     /// Upload the current host block table / context lengths / write positions to the device metadata
@@ -382,13 +451,47 @@ impl DecodeModel {
                     .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
             }
         }
-        let table = self.cache.manager_ref().flat_block_table();
+        // The flat block table only changes when a table gains or loses a block (admission, eviction,
+        // block-boundary growth) — the layout epoch tracks exactly that, so the steady-state decode
+        // step (every append inside its current block) uploads just the three per-slot vectors.
+        let epoch = self.cache.manager_ref().layout_epoch();
+        if self.uploaded_epoch != Some(epoch) {
+            let table = self.cache.manager_ref().flat_block_table();
+            stream.memcpy_htod(&table, &mut self.bt_d)?;
+            self.uploaded_epoch = Some(epoch);
+        }
         let lens = self.cache.manager_ref().ctx_lens();
-        stream.memcpy_htod(&table, &mut self.bt_d)?;
         stream.memcpy_htod(&lens, &mut self.cl_d)?;
         stream.memcpy_htod(&wpos, &mut self.wpos_d)?;
         stream.memcpy_htod(&mask, &mut self.active_d)?;
         Ok(wpos)
+    }
+
+    /// Upload **caller-crafted** metadata contents into the four device buffers the kernels read —
+    /// the bench/gate seam for staging a specific fill/mask scenario without mutating the host
+    /// allocator. Contents-only: a captured graph bakes these buffers' *pointers*, so a re-upload
+    /// re-steers every subsequent replay (a fill level is data, not a shape). Lengths must match the
+    /// `Bcap` geometry.
+    pub fn upload_metadata(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        table: &[u32],
+        cl: &[u32],
+        wpos: &[u32],
+        active: &[u32],
+    ) -> Result<(), DriverError> {
+        let bcap = self.cfg.num_slots;
+        assert_eq!(table.len(), bcap * self.cfg.max_blocks_per_seq, "flat block table must be [Bcap, max_blocks_per_seq]");
+        assert_eq!(cl.len(), bcap, "context lengths must be one per slot");
+        assert_eq!(wpos.len(), bcap, "write positions must be one per slot");
+        assert_eq!(active.len(), bcap, "active mask must be one per slot");
+        stream.memcpy_htod(table, &mut self.bt_d)?;
+        stream.memcpy_htod(cl, &mut self.cl_d)?;
+        stream.memcpy_htod(wpos, &mut self.wpos_d)?;
+        stream.memcpy_htod(active, &mut self.active_d)?;
+        // The device table no longer mirrors the manager — force the next masked advance to re-push.
+        self.uploaded_epoch = None;
+        Ok(())
     }
 
     /// The two ping-pong activation buffers (a graph bakes their pointers — keep alive).
@@ -434,10 +537,23 @@ pub struct Scheduler {
     /// Cumulative requests admitted / completed (for accounting gates).
     admitted: usize,
     completed: usize,
+    /// The captured whole-step graph [`step_graphed`](Self::step_graphed) replays, plus the raw
+    /// device pointers of the `x_d`/`out` it was captured against (the graph bakes them — later
+    /// calls must pass the same buffers). Captured once, never re-captured: the active mask, block
+    /// table, context lengths, and write positions are all *contents* of device buffers the kernels
+    /// re-read every replay, and every grid shape is a function of the fixed `Bcap` alone — so no
+    /// admission/eviction/growth ever invalidates the recording.
+    graph: Option<(crate::graph::Graph, u64, u64)>,
+    /// **Static batching** (the classic peer continuous batching is measured against): admit a full
+    /// batch, then admit nothing more until the whole batch has drained — no mid-flight refill of
+    /// freed slots. Same kernels, same step; only the admission policy differs, which is exactly
+    /// what makes the continuous-vs-static goodput ratio the honest scheduling win.
+    static_batching: bool,
 }
 
 impl Scheduler {
-    /// Wrap a built [`DecodeModel`]; all `Bcap` slots start free.
+    /// Wrap a built [`DecodeModel`]; all `Bcap` slots start free. Continuous batching (the default
+    /// policy: freed slots are refilled every iteration).
     pub fn new(model: DecodeModel) -> Self {
         let bcap = model.bcap();
         Self {
@@ -447,7 +563,16 @@ impl Scheduler {
             emitted: 0,
             admitted: 0,
             completed: 0,
+            graph: None,
+            static_batching: false,
         }
+    }
+
+    /// As [`new`](Self::new) but with **static batching** (see the field docs): the honest peer the
+    /// goodput bench measures continuous batching against — identical kernels and step machinery,
+    /// admission only when the previous batch has fully drained.
+    pub fn new_static(model: DecodeModel) -> Self {
+        Self { static_batching: true, ..Self::new(model) }
     }
 
     /// Queue a request for admission.
@@ -491,27 +616,55 @@ impl Scheduler {
         self.waiting.is_empty() && self.num_active() == 0
     }
 
-    /// Admit waiting requests into free slots, prefilling each prompt into the paged cache (FIFO; stops
-    /// at the first request that doesn't fit — head-of-line, the standard simple policy). Returns the
-    /// number admitted this call.
+    /// Bounded look-ahead of the first-fit admission scan: how deep into the waiting queue
+    /// [`admit`](Self::admit) searches for a request that fits when the queue front doesn't. Keeps
+    /// the per-step admission cost O(free_slots · LOOKAHEAD) and the reordering window finite.
+    pub const ADMIT_LOOKAHEAD: usize = 64;
+
+    /// Admit waiting requests into free slots, prefilling each prompt into the paged cache.
+    /// **Deterministic first-fit with bounded look-ahead**: for each free slot, scan the first
+    /// [`ADMIT_LOOKAHEAD`](Self::ADMIT_LOOKAHEAD) waiting requests front-to-back and admit the first
+    /// that fits the block pool — so one large request at the queue head no longer head-of-line-blocks
+    /// every smaller request behind it into idle slots. FIFO is preserved among requests that fit
+    /// (the lowest-index fitting request always wins). **Fairness trade-off (standard for
+    /// first-fit):** under sustained block pressure a large head request can be overtaken repeatedly
+    /// by smaller arrivals until pressure eases — the price of maximizing fill; the bounded window
+    /// keeps the scan cheap and the reordering finite. Returns the number admitted this call.
     pub fn admit(&mut self) -> Result<usize, DriverError> {
+        // Static batching: no mid-flight refill — wait for the whole batch to drain.
+        if self.static_batching && self.num_active() > 0 {
+            return Ok(0);
+        }
         let bcap = self.model.bcap();
         let mut n = 0;
         for slot in 0..bcap {
             if self.slots[slot].is_some() {
                 continue;
             }
-            let Some(req) = self.waiting.front().copied() else { break };
-            let mgr = self.model.cache_mut().manager();
-            if !mgr.can_grow(slot, req.prompt_len.max(1)) {
-                break; // out of blocks → leave the request queued
+            if self.waiting.is_empty() {
+                break;
             }
+            let mgr = self.model.cache_mut().manager();
+            // First fitting request within the look-ahead window. Every free slot has an empty
+            // table, so fit depends only on the request — a whole-window miss is a miss for every
+            // remaining free slot, and the scan stops.
+            let Some(pick) = self
+                .waiting
+                .iter()
+                .take(Self::ADMIT_LOOKAHEAD)
+                .position(|req| mgr.can_grow(slot, req.prompt_len.max(1)))
+            else {
+                break; // nothing in the window fits → leave the queue intact
+            };
+            let req = self.waiting.remove(pick).expect("position() index is in range");
             // Prefill: bulk-reserve the prompt's cache positions (≥1 so the slot owns a block; the
             // attention/append kernels then see a non-empty, non-padding row).
-            mgr.reserve(slot, req.prompt_len.max(1))
+            self.model
+                .cache_mut()
+                .manager()
+                .reserve(slot, req.prompt_len.max(1))
                 .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
             self.slots[slot] = Some(Inflight { remaining: req.gen_len });
-            self.waiting.pop_front();
             self.admitted += 1;
             n += 1;
         }
@@ -537,7 +690,61 @@ impl Scheduler {
         }
         self.model.advance_and_upload_masked(stream, &active)?;
         self.model.run_layers_on(stream, x_d, out)?;
-        // Retire finished sequences (decrement, then free without holding a borrow of the slot).
+        self.retire_finished();
+        Ok(n_active)
+    }
+
+    /// [`step`](Self::step) with the `N`-layer launch half replayed as **one cached
+    /// `cuGraphLaunch`** — the production decode loop: per iteration the host does admission, the
+    /// masked append bookkeeping, three small per-slot uploads (the block table only when the layout
+    /// epoch moved), and a single graph replay. The first active call runs one eager warmup (which
+    /// both executes that step and stabilizes the pool sub-allocation addresses the recording bakes
+    /// in) and captures; every later call replays. No recapture is ever needed — see the `graph`
+    /// field docs. Requirements the caller owns (as for [`crate::graph::Graph::capture`]): `stream`
+    /// is a dedicated non-NULL stream, event tracking is disabled, `x_d`/`out` are the same buffers
+    /// every call (asserted), and any prior NULL-stream work (weight upload, cache zeroing at model
+    /// construction) has been synchronized before the first call — a non-blocking stream does *not*
+    /// implicitly wait on the NULL stream, so an unsynchronized first step would race the uploads.
+    pub fn step_graphed(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x_d: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<usize, DriverError> {
+        use cudarc::driver::DevicePtr;
+        self.admit()?;
+        let active: Vec<bool> = self.slots.iter().map(|s| s.is_some()).collect();
+        let n_active = active.iter().filter(|&&a| a).count();
+        if n_active == 0 {
+            return Ok(0);
+        }
+        self.model.advance_and_upload_masked(stream, &active)?;
+        let (xp, op) = {
+            let (xp, _gx) = x_d.device_ptr(stream);
+            let (op, _go) = out.device_ptr(stream);
+            (xp as u64, op as u64)
+        };
+        if let Some((graph, gx, go)) = &self.graph {
+            assert_eq!((*gx, *go), (xp, op), "step_graphed: x_d/out must be the buffers the graph was captured with");
+            graph.launch()?;
+        } else {
+            // Warmup executes this step eagerly (idempotent kernels: re-running would rewrite the
+            // same K/V bytes and recompute the same output), then the capture records the identical
+            // launch sequence without executing it — so the step still runs exactly once.
+            self.model.run_layers_on(stream, x_d, out)?;
+            stream.synchronize()?;
+            let graph = crate::graph::Graph::capture(stream.clone(), || {
+                self.model.run_layers_on(stream, x_d, out)
+            })?;
+            self.graph = Some((graph, xp, op));
+        }
+        self.retire_finished();
+        Ok(n_active)
+    }
+
+    /// Retire every sequence that has emitted its `gen_len` tokens this step: decrement each active
+    /// slot's remaining count, bump the goodput counter, and free finished slots' blocks.
+    fn retire_finished(&mut self) {
         for slot in 0..self.model.bcap() {
             let remaining = match &mut self.slots[slot] {
                 Some(inf) => {
@@ -553,7 +760,6 @@ impl Scheduler {
                 self.completed += 1;
             }
         }
-        Ok(n_active)
     }
 }
 
@@ -561,7 +767,8 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::paged_attention::{
-        kv_append_ptx, launch_kv_append, reference_decode_attn, KV_APPEND_ENTRY,
+        kv_append_int8_ptx, kv_append_ptx, launch_kv_append, launch_kv_append_int8,
+        quantize_kv_int8, reference_decode_attn, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY,
     };
     use crate::paged_kv::BlockManager;
 
@@ -619,6 +826,27 @@ mod tests {
         dff: usize,
         eps: f32,
     ) -> Vec<f32> {
+        // f16 cache: the new token's K/V round through f16 on the way into the cache.
+        let f16_row = |row: &[f32]| -> Vec<f32> { row.iter().map(|&z| f16r(z)).collect() };
+        ref_decode_step_with(x, w, past_k, past_v, ctx0, heads, hd, dff, eps, &f16_row)
+    }
+
+    /// [`ref_decode_step`] with the **cache rounding of the new token** as a parameter: the f16 path
+    /// rounds through f16, the int8 path quantizes/dequantizes per (token, head) — `past_k`/`past_v`
+    /// carry whatever effective (already-rounded/dequantized) values the cache stores for the past.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_decode_step_with(
+        x: &[f32],
+        w: &TransformerWeights,
+        past_k: &[Vec<f32>],
+        past_v: &[Vec<f32>],
+        ctx0: &[usize],
+        heads: usize,
+        hd: usize,
+        dff: usize,
+        eps: f32,
+        cache_round: &dyn Fn(&[f32]) -> Vec<f32>,
+    ) -> Vec<f32> {
         let bcap = ctx0.len();
         let d = heads * hd;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -629,12 +857,12 @@ mod tests {
             let q = ref_nt_f16(&h1, w.wq, 1, d, d);
             let kk = ref_nt_f16(&h1, w.wk, 1, d, d);
             let vv = ref_nt_f16(&h1, w.wv, 1, d, d);
-            // Full attention context: the cached past ++ the new token (rounded f16, as the cache stores).
+            // Full attention context: the cached past ++ the new token (rounded as the cache stores).
             let ctx = ctx0[b];
             let mut kfull = past_k[b].clone();
             let mut vfull = past_v[b].clone();
-            kfull.extend(kk.iter().map(|&z| f16r(z)));
-            vfull.extend(vv.iter().map(|&z| f16r(z)));
+            kfull.extend(cache_round(&kk));
+            vfull.extend(cache_round(&vv));
             let attn = reference_decode_attn(&q, &[kfull], &[vfull], &[ctx + 1], heads, hd, scale);
             let o = ref_nt_f16(&attn, w.wo, 1, d, d);
             let x1: Vec<f32> = xb.iter().zip(&o).map(|(&a, &b)| a + b).collect();
@@ -790,6 +1018,199 @@ mod tests {
             eprintln!(
                 "decode step vs f64 ref: max_abs={:.2e} max_rel={:.2e} (Bcap={bcap}, heads={heads}, hd={hd}, Dff={dff}, ragged ctx 0..80)",
                 s.max_abs, s.max_rel
+            );
+        });
+    }
+
+    /// Populate a 1-layer **int8** model's cache plane with each slot's per-(token, head) quantized
+    /// past (values + scales, the [`quantize_kv_int8`] scheme), returning the **dequantized**
+    /// `(past_k, past_v)` — the effective values the reference attends over. Reserves `ctx0[b]`
+    /// tokens per slot first. The int8 twin of [`populate_one_layer`].
+    fn populate_one_layer_int8(
+        g: &mut Gpu,
+        model: &mut DecodeModel,
+        ctx0: &[usize],
+        heads: usize,
+        hd: usize,
+        seed: u64,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let d = heads * hd;
+        let cfg = *model.cache_mut().config();
+        let mut rng = crate::diff::Rng::new(seed);
+        let (mut past_k, mut past_v) = (Vec::new(), Vec::new());
+        let mut kq = vec![0i8; cfg.slab_elems()];
+        let mut vq = vec![0i8; cfg.slab_elems()];
+        let mut ks = vec![0f32; cfg.scale_slab_elems()];
+        let mut vs = vec![0f32; cfg.scale_slab_elems()];
+        for b in 0..ctx0.len() {
+            let pk = rng.vec(ctx0[b] * d, -1.0, 1.0);
+            let pv = rng.vec(ctx0[b] * d, -1.0, 1.0);
+            if ctx0[b] > 0 {
+                model.cache_mut().manager().reserve(b, ctx0[b]).unwrap();
+            }
+            let (kqi, ksi) = quantize_kv_int8(&pk, ctx0[b], heads, hd);
+            let (vqi, vsi) = quantize_kv_int8(&pv, ctx0[b], heads, hd);
+            for t in 0..ctx0[b] {
+                let (phys, off) = model.cache_mut().manager_ref().locate(b, t);
+                for h in 0..heads {
+                    ks[cfg.scale_offset(0, phys, off, h)] = ksi[t * heads + h];
+                    vs[cfg.scale_offset(0, phys, off, h)] = vsi[t * heads + h];
+                    for dh in 0..hd {
+                        let idx = cfg.elem_offset(0, phys, off, h, dh);
+                        let src = (t * heads + h) * hd + dh;
+                        kq[idx] = kqi[src];
+                        vq[idx] = vqi[src];
+                    }
+                }
+            }
+            // Dequantized effective past ([t, heads, hd] row-major ⇒ scale index = i / hd).
+            past_k.push((0..ctx0[b] * d).map(|i| kqi[i] as f32 * ksi[i / hd]).collect());
+            past_v.push((0..ctx0[b] * d).map(|i| vqi[i] as f32 * vsi[i / hd]).collect());
+        }
+        match model.cache_mut().storage_mut() {
+            KvStorage::Int8 { k, v, ksc, vsc } => {
+                g.stream.memcpy_htod(&kq, k).unwrap();
+                g.stream.memcpy_htod(&vq, v).unwrap();
+                g.stream.memcpy_htod(&ks, ksc).unwrap();
+                g.stream.memcpy_htod(&vs, vsc).unwrap();
+            }
+            KvStorage::F16 { .. } => unreachable!("int8 populate on a non-int8 cache"),
+        }
+        (past_k, past_v)
+    }
+
+    /// **int8 KV-append round-trip + mask (exact).** The device append must quantize exactly like
+    /// the ties-even host mirror — int8 values equal, f32 scales bit-equal (IEEE `div.rn` + order-
+    /// independent amax make this deterministic) — at exactly the block-table addresses, with
+    /// inactive slots leaving the slabs untouched (the block-0 guard) and zeros everywhere else.
+    #[test]
+    fn serving_kv_append_int8_round_trip_and_mask() {
+        with_gpu("serving_kv_append_int8_round_trip_and_mask", |g| {
+            let (heads, hd, bsz, bcap) = (4usize, 64usize, 16usize, 8usize);
+            let d = heads * hd;
+            let active = [true, false, true, true, false, true, true, false];
+            let wpos = [5usize, 0, 16, 31, 0, 3, 20, 0]; // across block boundaries
+            let max_bps = wpos.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 4;
+            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut mgr = BlockManager::new(num_blocks, bsz, bcap, max_bps);
+            for b in 0..bcap {
+                if active[b] {
+                    mgr.reserve(b, wpos[b] + 1).unwrap();
+                }
+            }
+            let mut rng = crate::diff::Rng::new(0x18A9);
+            let knew = rng.vec(bcap * d, -1.0, 1.0);
+            let vnew = rng.vec(bcap * d, -2.0, 2.0);
+            let knew_d = g.stream.memcpy_stod(&knew).unwrap();
+            let vnew_d = g.stream.memcpy_stod(&vnew).unwrap();
+            let mut k_d = g.stream.alloc_zeros::<i8>(cfg.slab_elems()).unwrap();
+            let mut v_d = g.stream.alloc_zeros::<i8>(cfg.slab_elems()).unwrap();
+            let mut ksc_d = g.stream.alloc_zeros::<f32>(cfg.scale_slab_elems()).unwrap();
+            let mut vsc_d = g.stream.alloc_zeros::<f32>(cfg.scale_slab_elems()).unwrap();
+            let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
+            let wpos_u: Vec<u32> = wpos.iter().map(|&p| p as u32).collect();
+            let wpos_d = g.stream.memcpy_stod(&wpos_u).unwrap();
+            let act_u: Vec<u32> = active.iter().map(|&a| a as u32).collect();
+            let act_d = g.stream.memcpy_stod(&act_u).unwrap();
+            let func = g.function("kv_append_int8", &kv_append_int8_ptx(), KV_APPEND_INT8_ENTRY).unwrap();
+            launch_kv_append_int8(
+                &g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &mut ksc_d, &mut vsc_d, &bt_d, &wpos_d,
+                &act_d, &cfg, 0, bcap,
+            )
+            .unwrap();
+            g.stream.synchronize().unwrap();
+            let kh = g.stream.memcpy_dtov(&k_d).unwrap();
+            let vh = g.stream.memcpy_dtov(&v_d).unwrap();
+            let ksch = g.stream.memcpy_dtov(&ksc_d).unwrap();
+            let vsch = g.stream.memcpy_dtov(&vsc_d).unwrap();
+            // Ties-even host mirror of the device quantization (see the kernel's rounding note).
+            let quant = |row: &[f32]| -> (Vec<i8>, f32) {
+                let amax = row.iter().fold(0f32, |m, &x| m.max(x.abs()));
+                let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                (row.iter().map(|&x| (x / scale).round_ties_even().clamp(-127.0, 127.0) as i8).collect(), scale)
+            };
+            let mut exp_k = vec![0i8; cfg.slab_elems()];
+            let mut exp_v = vec![0i8; cfg.slab_elems()];
+            let mut exp_ks = vec![0f32; cfg.scale_slab_elems()];
+            let mut exp_vs = vec![0f32; cfg.scale_slab_elems()];
+            for b in 0..bcap {
+                if !active[b] {
+                    continue;
+                }
+                let (phys, off) = mgr.locate(b, wpos[b]);
+                for h in 0..heads {
+                    let (qk, sk) = quant(&knew[b * d + h * hd..b * d + (h + 1) * hd]);
+                    let (qv, sv) = quant(&vnew[b * d + h * hd..b * d + (h + 1) * hd]);
+                    exp_ks[cfg.scale_offset(0, phys, off, h)] = sk;
+                    exp_vs[cfg.scale_offset(0, phys, off, h)] = sv;
+                    for dh in 0..hd {
+                        exp_k[cfg.elem_offset(0, phys, off, h, dh)] = qk[dh];
+                        exp_v[cfg.elem_offset(0, phys, off, h, dh)] = qv[dh];
+                    }
+                }
+            }
+            for i in 0..cfg.slab_elems() {
+                assert_eq!(kh[i], exp_k[i], "int8 K slab elem {i} (inactive leak or quant mismatch?)");
+                assert_eq!(vh[i], exp_v[i], "int8 V slab elem {i}");
+            }
+            for i in 0..cfg.scale_slab_elems() {
+                assert_eq!(ksch[i].to_bits(), exp_ks[i].to_bits(), "K scale {i} not bit-equal");
+                assert_eq!(vsch[i].to_bits(), exp_vs[i].to_bits(), "V scale {i} not bit-equal");
+            }
+            let written = active.iter().filter(|&&a| a).count();
+            eprintln!(
+                "int8 kv_append: {written}/{bcap} active slots quantized+scattered EXACTLY (values == host mirror, \
+                 scales bit-equal); every inactive row skipped"
+            );
+        });
+    }
+
+    /// **int8-KV whole decode-step tolerance gate (the first law, lossy path).** One full decode step
+    /// on an int8-cache model (device-quantized append + int8 paged attention) must match the f64
+    /// reference attending over the dequantized cache within tolerance — int8 is lossy, so this is
+    /// the tolerance sibling of the bit-oriented f16 gates; the f16 default path keeps every
+    /// bit-exact invariance gate. Also checks the footprint halves vs f16.
+    #[test]
+    fn serving_decode_step_int8_matches_reference() {
+        with_gpu("serving_decode_step_int8_matches_reference", |g| {
+            let (heads, hd, dff, bsz, bcap) = (4usize, 64usize, 256usize, 16usize, 64usize);
+            let d = heads * hd;
+            let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 13) % 81).collect(); // ragged incl. 0
+            let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 8;
+            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut rng = crate::diff::Rng::new(0x1D8A);
+            let wdata = layer_weights(&mut rng, 1, d, dff);
+            let weights = weights_view(&wdata);
+            let mut model =
+                DecodeModel::new_with_dtype(g, &weights, cfg, dff, 64 * 1024 * 1024, KvDtype::Int8).unwrap();
+            let (past_k, past_v) = populate_one_layer_int8(g, &mut model, &ctx0, heads, hd, 0x9876);
+            let x = rng.vec(bcap * d, -1.0, 1.0);
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+            model.step_on(&g.stream.clone(), &x_d, &mut out_d).unwrap();
+            g.stream.synchronize().unwrap();
+            let got = g.stream.memcpy_dtov(&out_d).unwrap();
+            // Reference: past = dequantized cache; the new token rounds through int8 quant/dequant.
+            // (Device rounds ties-even vs the host's half-away — ≤1 int8 LSB apart, far inside tolerance.)
+            let int8_round = |row: &[f32]| -> Vec<f32> {
+                let (q, sc) = quantize_kv_int8(row, 1, heads, hd);
+                (0..row.len()).map(|i| q[i] as f32 * sc[i / hd]).collect()
+            };
+            let refv =
+                ref_decode_step_with(&x, &weights[0], &past_k, &past_v, &ctx0, heads, hd, dff, 1e-5, &int8_round);
+            let s = crate::diff::assert_close("decode_step_int8", &got, &refv, 5e-2, 5e-2);
+            let (i8b, f16b) = (model.cache().footprint_bytes(), cfg.kv_bytes(2));
+            assert!(i8b < f16b, "int8 cache must be smaller than f16");
+            eprintln!(
+                "int8-KV decode step vs f64 ref: max_abs={:.2e} max_rel={:.2e} (Bcap={bcap}, ragged ctx 0..80); \
+                 cache {:.1} MiB vs f16 {:.1} MiB ({:.2}x)",
+                s.max_abs,
+                s.max_rel,
+                i8b as f64 / (1 << 20) as f64,
+                f16b as f64 / (1 << 20) as f64,
+                f16b as f64 / i8b as f64
             );
         });
     }
@@ -956,7 +1377,13 @@ mod tests {
     }
 
     fn graph_cfg(depth: usize) -> (KvConfig, usize, Vec<usize>, usize, usize) {
-        let (heads, hd, dff, bsz, bcap) = (8usize, 64usize, 2048usize, 16usize, 64usize);
+        graph_cfg_at(depth, 64)
+    }
+
+    /// [`graph_cfg`] at an arbitrary decode batch (the Bcap-scaling sweep): same layer geometry
+    /// (D=512, Dff=2048), block pool and ragged 32..95 contexts sized off `bcap`.
+    fn graph_cfg_at(depth: usize, bcap: usize) -> (KvConfig, usize, Vec<usize>, usize, usize) {
+        let (heads, hd, dff, bsz) = (8usize, 64usize, 2048usize, 16usize);
         let ctx0: Vec<usize> = (0..bcap).map(|b| 32 + (b * 7) % 64).collect();
         let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
         let num_blocks = bcap * max_bps + 8;
@@ -1236,17 +1663,162 @@ mod tests {
         });
     }
 
-    /// **P5 throughput — continuous-batching goodput vs batch fill.** The fixed-shape decode step computes
-    /// all `Bcap` rows regardless of how many carry a live request, so per-step latency is ~independent of
-    /// the active count: a server running one sequence at a time wastes `Bcap-1` rows of compute every
-    /// step, while continuous batching fills them, turning otherwise-idle rows into goodput.
+    /// **Scheduler graph==eager gate (the first law for the production decode loop).** Driving the
+    /// SAME request stream to drain twice — once with the eager per-op [`Scheduler::step`], once with
+    /// the cached whole-step graph [`Scheduler::step_graphed`] — must produce the identical per-step
+    /// active-count schedule, identical accounting, and **bit-for-bit identical** decode output at
+    /// every step (compared by per-step FNV digest over the output bits). The graph changes how the
+    /// launches are issued, never what they compute: masks / block tables / context lengths are
+    /// re-read from device buffers at every replay, so ONE capture serves admissions, evictions, and
+    /// block growth alike — the property that lets the real scheduler loop run graph-driven.
+    #[test]
+    fn serving_scheduler_graph_matches_eager() {
+        with_gpu("serving_scheduler_graph_matches_eager", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 2usize);
+                let d = heads * hd;
+                let max_bps = (40usize + 24).div_ceil(bsz) + 2;
+                let num_blocks = bcap * max_bps + 32;
+                let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+                let mut rng = crate::diff::Rng::new(0x6A6A);
+                let wdata = layer_weights(&mut rng, depth, d, dff);
+                let weights = weights_view(&wdata);
+                let x = rng.vec(bcap * d, -1.0, 1.0);
+                const NREQ: usize = 96;
+                let reqs: Vec<Request> =
+                    (0..NREQ).map(|i| Request { prompt_len: 1 + (i * 7) % 40, gen_len: 1 + (i * 5) % 24 }).collect();
+
+                // FNV-1a over the output bits: digest equality at every step == bit-equality.
+                let digest = |v: &[f32]| -> u64 {
+                    let mut h = 0xcbf29ce484222325u64;
+                    for f in v {
+                        for b in f.to_bits().to_le_bytes() {
+                            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    h
+                };
+                // Drive a full drain; per-step (active, out-digest) trace + accounting.
+                let drive = |g: &mut Gpu, graphed: bool| -> (Vec<(usize, u64)>, usize, usize, usize, usize) {
+                    let model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
+                    let init_free = model.cache().manager_ref().free_blocks();
+                    let mut sched = Scheduler::new(model);
+                    for &r in &reqs {
+                        sched.enqueue(r);
+                    }
+                    // The graphed loop needs a dedicated capturable stream; eager runs on the
+                    // default. Retire the construction-time NULL-stream work (weight upload, slab
+                    // zeroing) first — a non-blocking stream does not implicitly wait on it.
+                    g.stream.synchronize().unwrap();
+                    let stream = if graphed { g.ctx.new_stream().unwrap() } else { g.stream.clone() };
+                    let x_d = stream.memcpy_stod(&x).unwrap();
+                    let mut out = stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                    let mut trace = Vec::new();
+                    while !sched.is_idle() {
+                        let n = if graphed {
+                            sched.step_graphed(&stream, &x_d, &mut out).unwrap()
+                        } else {
+                            sched.step(&stream, &x_d, &mut out).unwrap()
+                        };
+                        stream.synchronize().unwrap();
+                        let bits = stream.memcpy_dtov(&out).unwrap();
+                        trace.push((n, digest(&bits)));
+                        assert!(trace.len() < 100_000, "scheduler failed to drain (liveness)");
+                    }
+                    (trace, sched.completed(), sched.emitted(), sched.free_blocks(), init_free)
+                };
+
+                let (trace_e, comp_e, emit_e, free_e, init_e) = drive(g, false);
+                let (trace_g, comp_g, emit_g, free_g, init_g) = drive(g, true);
+                assert_eq!(comp_e, NREQ, "eager completes every request");
+                assert_eq!(comp_g, NREQ, "graphed completes every request");
+                assert_eq!(emit_e, emit_g, "useful-token accounting diverges");
+                assert_eq!(free_e, init_e, "eager leaks blocks");
+                assert_eq!(free_g, init_g, "graphed leaks blocks");
+                assert_eq!(trace_e.len(), trace_g.len(), "step counts diverge");
+                for (i, (e, gr)) in trace_e.iter().zip(&trace_g).enumerate() {
+                    assert_eq!(e.0, gr.0, "active count diverges at step {i}");
+                    assert_eq!(e.1, gr.1, "decode output diverges at step {i} (graphed != eager)");
+                }
+                eprintln!(
+                    "scheduler drain graph-driven == eager: {} steps, {NREQ} reqs, {emit_e} tokens — \
+                     per-step output BIT-IDENTICAL (digest), one capture across admit/evict/growth",
+                    trace_e.len()
+                );
+            });
+        });
+    }
+
+    /// **Static-batching policy gate.** A [`Scheduler::new_static`] scheduler must (a) admit ONLY
+    /// when the previous batch has fully drained — never refill a freed slot mid-flight (the policy
+    /// that defines the goodput bench's honest peer), and (b) still drain every request and conserve
+    /// every block. Verified by snapshotting the admission counter each step and requiring the
+    /// active count to have been zero whenever it moves.
+    #[test]
+    fn serving_static_batching_admits_only_when_drained() {
+        with_gpu("serving_static_batching_admits_only_when_drained", |g| {
+            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 1usize);
+            let d = heads * hd;
+            let max_bps = (40usize + 24).div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 32;
+            let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut rng = crate::diff::Rng::new(0x57A7);
+            let wdata = layer_weights(&mut rng, depth, d, dff);
+            let weights = weights_view(&wdata);
+            let x = rng.vec(bcap * d, -1.0, 1.0);
+            const NREQ: usize = 96;
+            let reqs: Vec<Request> =
+                (0..NREQ).map(|i| Request { prompt_len: 1 + (i * 7) % 40, gen_len: 1 + (i * 5) % 24 }).collect();
+            let total_gen: usize = reqs.iter().map(|r| r.gen_len).sum();
+
+            let model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
+            let init_free = model.cache().manager_ref().free_blocks();
+            let mut sched = Scheduler::new_static(model);
+            for &r in &reqs {
+                sched.enqueue(r);
+            }
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let mut out = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+            let (mut steps, mut batches) = (0usize, 0usize);
+            let mut prev_active_after = 0usize; // active slots after the previous step's retirements
+            let mut prev_admitted = 0usize;
+            while !sched.is_idle() {
+                sched.step(&g.stream.clone(), &x_d, &mut out).unwrap();
+                if sched.admitted() > prev_admitted {
+                    assert_eq!(prev_active_after, 0, "static batching refilled a slot mid-flight");
+                    prev_admitted = sched.admitted();
+                    batches += 1;
+                }
+                prev_active_after = sched.num_active();
+                steps += 1;
+                assert!(steps < 100_000, "static scheduler failed to drain (liveness)");
+            }
+            g.stream.synchronize().unwrap();
+            assert_eq!(sched.completed(), NREQ, "every request completes");
+            assert_eq!(sched.emitted(), total_gen, "useful tokens == Σ gen_len");
+            assert_eq!(sched.free_blocks(), init_free, "all KV blocks returned to the pool");
+            assert!(batches >= NREQ / bcap, "at least ceil(NREQ/Bcap) admission waves");
+            eprintln!(
+                "static batching drained {NREQ} reqs in {steps} steps across {batches} full-drain batches — \
+                 zero mid-flight refills (the honest peer policy holds)"
+            );
+        });
+    }
+
+    /// **P5 throughput — continuous-batching goodput vs batch fill, swept over Bcap.** The fixed-shape
+    /// decode step computes all `Bcap` rows regardless of how many carry a live request, and at these
+    /// sizes it is weight-HBM-bound (every GEMM streams the same weights whatever M is), so per-step
+    /// latency grows far slower than the batch: goodput scales ~linearly with fill *and keeps scaling
+    /// as Bcap itself grows* until M reaches the low hundreds. The sweep measures both levers: fill at
+    /// fixed Bcap (the continuous-batching win) and Bcap itself (the batch-shape headroom).
     ///
-    /// **Measurement honesty (the laptop clock swings ~7×).** All fills' graphs are captured up front and
-    /// kept alive, then timed **interleaved, best-of-N**: each round times every fill back-to-back so they
-    /// share the same clock state, and the per-fill minimum picks its boosted time. A naive sequential
-    /// sweep (measure fill=1 fully, then fill=64) is *invalid* here — it catches fill=1 at a cold clock and
-    /// fill=64 boosted, inflating the ratio. The interleaved ratio is the honest continuous-batching win.
-    /// Named peer = Mercury's own single-sequence (fill=1) decode. --ignored.
+    /// **Measurement honesty (the laptop clock swings ~7×).** One model + ONE captured graph per Bcap —
+    /// a fill level is *contents* of the metadata buffers (ctx/wpos/active), not a shape, so every fill
+    /// replays the same graph after a small re-upload. All (Bcap, fill) points are then timed
+    /// **interleaved, best-of-N**: each round times every point back-to-back so they share the same
+    /// clock state, and the per-point minimum picks its boosted time. A naive sequential sweep is
+    /// *invalid* here — it catches early points cold and late points boosted, skewing every ratio.
+    /// Named peer = Mercury's own single-sequence (fill=1) decode at the same Bcap. --ignored.
     #[test]
     #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
     fn serving_continuous_batching_goodput() {
@@ -1255,82 +1827,226 @@ mod tests {
             with_event_tracking_disabled(g, |g| {
                 use std::time::Instant;
                 let depth = 12usize;
-                let (cfg, dff, ctx0, d, bcap) = graph_cfg(depth);
+                // KV budget: cap the resident f16 slabs well under the 6 GB part (weights, pools,
+                // activations, and the desktop share the rest). All three Bcaps stay resident at once
+                // (~1.4 GiB of KV total) so the timing rounds can interleave under one clock.
+                const KV_BUDGET: usize = 4 << 30;
+                let bcaps = [64usize, 128, 256];
                 let mut rng = crate::diff::Rng::new(0x9100);
+                // Same layer geometry at every Bcap (D=512, Dff=2048) ⇒ one weight set serves all.
+                let (_, dff, _, d, _) = graph_cfg_at(depth, bcaps[0]);
                 let wdata = layer_weights(&mut rng, depth, d, dff);
                 let weights = weights_view(&wdata);
-                let x = rng.vec(bcap * d, -1.0, 1.0);
+                let x_all = rng.vec(bcaps[bcaps.len() - 1] * d, -1.0, 1.0);
 
-                // A captured decode-step graph at a given fill, with everything it references kept alive.
-                struct Held {
-                    fill: usize,
+                // A Bcap's model + its one captured graph + per-fill best latencies, kept alive.
+                struct HeldB {
+                    bcap: usize,
                     cap: Arc<CudaStream>,
                     graph: crate::graph::Graph,
-                    _model: DecodeModel,
+                    model: DecodeModel,
                     _x: CudaSlice<f32>,
                     _out: CudaSlice<f32>,
+                    table: Vec<u32>,
+                    ctx0: Vec<usize>,
+                    fills: Vec<usize>,
+                    best: Vec<f64>,
                 }
-                let fills = [1usize, 4, 16, 32, 64];
-                let mut held: Vec<Held> = Vec::new();
-                for &fill in &fills {
-                    let mut model = DecodeModel::new(g, &weights, cfg, dff, 48 * 1024 * 1024).unwrap();
-                    for b in 0..fill {
+                impl HeldB {
+                    /// Steer the shared graph to `fill` active slots: slots < fill carry their ragged
+                    /// context (+1 for the appended token), the rest read as empty and masked.
+                    fn set_fill(&mut self, fill: usize) {
+                        let cl: Vec<u32> =
+                            (0..self.bcap).map(|b| if b < fill { self.ctx0[b] as u32 + 1 } else { 0 }).collect();
+                        let wpos: Vec<u32> = self.ctx0.iter().map(|&c| c as u32).collect();
+                        let act: Vec<u32> = (0..self.bcap).map(|b| (b < fill) as u32).collect();
+                        self.model.upload_metadata(&self.cap, &self.table, &cl, &wpos, &act).unwrap();
+                    }
+                }
+                let mut held: Vec<HeldB> = Vec::new();
+                for &bcap in &bcaps {
+                    let (cfg, dff, ctx0, d, _) = graph_cfg_at(depth, bcap);
+                    let kv = cfg.assert_kv_budget(2, KV_BUDGET);
+                    let pool_bytes = 48 * 1024 * 1024 * (bcap / 64);
+                    let mut model = DecodeModel::new(g, &weights, cfg, dff, pool_bytes).unwrap();
+                    for b in 0..bcap {
                         model.cache_mut().manager().reserve(b, ctx0[b]).unwrap();
                     }
-                    let active: Vec<bool> = (0..bcap).map(|b| b < fill).collect();
-                    model.advance_and_upload_masked(&g.stream.clone(), &active).unwrap();
+                    let table = model.cache().manager_ref().flat_block_table();
                     let cap = g.ctx.new_stream().unwrap();
-                    let x_d = g.stream.memcpy_stod(&x).unwrap();
+                    let x_d = g.stream.memcpy_stod(&x_all[..bcap * d]).unwrap();
                     let mut out_c = cap.alloc_zeros::<f32>(bcap * d).unwrap();
-                    model.run_layers_on(&cap, &x_d, &mut out_c).unwrap(); // warmup (stable pool pointers)
+                    // Stage all-active metadata, warm up once (stable pool pointers), capture. The
+                    // graph bakes buffer pointers + Bcap-shaped grids; the fill stays re-steerable.
+                    {
+                        let cl: Vec<u32> = ctx0.iter().map(|&c| c as u32 + 1).collect();
+                        let wpos: Vec<u32> = ctx0.iter().map(|&c| c as u32).collect();
+                        let act = vec![1u32; bcap];
+                        model.upload_metadata(&cap, &table, &cl, &wpos, &act).unwrap();
+                    }
+                    // Retire the NULL-stream construction work (weights, slabs, x) before the
+                    // dedicated stream reads it — no implicit NULL-stream ordering here.
+                    g.stream.synchronize().unwrap();
+                    model.run_layers_on(&cap, &x_d, &mut out_c).unwrap();
                     cap.synchronize().unwrap();
                     let graph = crate::graph::Graph::capture(cap.clone(), || model.run_layers_on(&cap, &x_d, &mut out_c)).unwrap();
-                    held.push(Held { fill, cap, graph, _model: model, _x: x_d, _out: out_c });
+                    eprintln!(
+                        "  Bcap={bcap:3}: KV slabs {:6.1} MiB (budget {:.1} GiB) | pool {} MiB | ctx 32..95",
+                        kv as f64 / (1 << 20) as f64,
+                        KV_BUDGET as f64 / (1u64 << 30) as f64,
+                        pool_bytes / (1 << 20)
+                    );
+                    let fills = vec![1usize, bcap / 4, bcap / 2, bcap];
+                    let n_fills = fills.len();
+                    held.push(HeldB { bcap, cap, graph, model, _x: x_d, _out: out_c, table, ctx0, fills, best: vec![f64::MAX; n_fills] });
                 }
 
-                // Global warmup on the largest fill to lock the boost clock high before any timing.
-                let big = held.len() - 1;
-                for _ in 0..200 {
-                    held[big].graph.launch().unwrap();
+                // Global warmup on the largest point to lock the boost clock high before any timing.
+                {
+                    let last = held.len() - 1;
+                    let full = *held[last].fills.last().unwrap();
+                    held[last].set_fill(full);
+                    for _ in 0..200 {
+                        held[last].graph.launch().unwrap();
+                    }
+                    held[last].cap.synchronize().unwrap();
                 }
-                held[big].cap.synchronize().unwrap();
 
-                // Interleaved best-of-N: every round times all fills adjacently (shared clock), min per fill.
+                // Interleaved best-of-N: every round times all (Bcap, fill) points adjacently (shared
+                // clock), min per point. The fill re-upload happens outside the timed region.
                 const ROUNDS: usize = 15;
                 const ITERS: usize = 20;
-                let mut best = vec![f64::MAX; held.len()];
                 for _ in 0..ROUNDS {
-                    for (i, h) in held.iter().enumerate() {
-                        let t = Instant::now();
-                        for _ in 0..ITERS {
-                            h.graph.launch().unwrap();
+                    for hi in 0..held.len() {
+                        for fi in 0..held[hi].fills.len() {
+                            let fill = held[hi].fills[fi];
+                            held[hi].set_fill(fill);
+                            held[hi].cap.synchronize().unwrap();
+                            let t = Instant::now();
+                            for _ in 0..ITERS {
+                                held[hi].graph.launch().unwrap();
+                            }
+                            held[hi].cap.synchronize().unwrap();
+                            let dt = t.elapsed().as_secs_f64() / ITERS as f64;
+                            if dt < held[hi].best[fi] {
+                                held[hi].best[fi] = dt;
+                            }
                         }
-                        h.cap.synchronize().unwrap();
-                        best[i] = best[i].min(t.elapsed().as_secs_f64() / ITERS as f64);
                     }
                 }
 
-                let l1 = best[0];
-                let g1 = 1.0 / l1; // fill=1 goodput: one useful token per step
-                eprintln!("continuous-batching goodput (graphed {depth}-layer decode step, D={d} Dff={dff}, Bcap={bcap}; interleaved best-of-N):");
-                for (i, h) in held.iter().enumerate() {
-                    let l = best[i];
-                    let gp = h.fill as f64 / l;
+                eprintln!(
+                    "continuous-batching goodput (graphed {depth}-layer decode step, D={d} Dff={dff}; \
+                     interleaved best-of-N across every (Bcap, fill) point):"
+                );
+                for h in &held {
+                    let l1 = h.best[0];
+                    for (fi, &fill) in h.fills.iter().enumerate() {
+                        let l = h.best[fi];
+                        let gp = fill as f64 / l;
+                        eprintln!(
+                            "  Bcap={:3} fill {:3}: step {:7.1} us | goodput {:8.0} tok/s | {:5.1}x vs fill=1 (step latency {:.2}x)",
+                            h.bcap,
+                            fill,
+                            l * 1e6,
+                            gp,
+                            gp * l1,
+                            l / l1
+                        );
+                    }
+                }
+                // Bcap-scaling table: each Bcap's full-fill point against Bcap=64's.
+                let base = *held[0].best.last().unwrap();
+                eprintln!("Bcap scaling (full fill):");
+                for h in &held {
+                    let l = *h.best.last().unwrap();
+                    let gp = h.bcap as f64 / l;
                     eprintln!(
-                        "  fill {:2}/{bcap}: step {:7.1} us | goodput {:8.0} tok/s | {:5.1}x vs fill=1 (step latency {:.2}x)",
-                        h.fill,
+                        "  Bcap={:3}: step {:7.1} us | goodput {:8.0} tok/s | {:.2}x vs Bcap=64 (step latency {:.2}x)",
+                        h.bcap,
                         l * 1e6,
                         gp,
-                        gp / g1,
-                        l / l1
+                        gp / (64.0 / base),
+                        l / base
                     );
                 }
-                let lf = best[big];
+                // Sweep-derived legacy multiples (full fill vs fill=1 per Bcap), then free the
+                // sweep's models/graphs before the drains below re-allocate.
+                let sweep: Vec<(usize, f64)> = held
+                    .iter()
+                    .map(|h| {
+                        let lf = *h.best.last().unwrap();
+                        (h.bcap, (h.bcap as f64 / lf) * h.best[0])
+                    })
+                    .collect();
+                drop(held);
+
+                // ---- Continuous vs STATIC batching over the REAL scheduler loop (same kernels) ----
+                // The fill sweep above prices the M-amortization win (a fuller fixed batch beats an
+                // emptier one). The *scheduling* win is separate: continuous batching refills freed
+                // slots mid-flight; static batching (the classic peer) admits a full batch and waits
+                // for its LAST straggler before refilling, idling slots on ragged gen lengths.
+                // Identical kernels, identical graph-driven step, identical request stream — the
+                // ratio below is continuous batching's true scheduling contribution, with all host
+                // scheduling + metadata-upload costs included (this times the real Scheduler drain,
+                // not a bare graph replay). Adjacent same-run A/B per Bcap (the clock-honesty rule).
+                eprintln!("continuous vs static batching (graph-driven Scheduler drain, depth {depth}, ragged gen 8..63):");
+                let mut last_line = None;
+                for &bcap in &bcaps {
+                    let (cfg, dff, _, d, _) = graph_cfg_at(depth, bcap);
+                    let nreq = 3 * bcap;
+                    let reqs: Vec<Request> = (0..nreq)
+                        .map(|i| Request { prompt_len: 8 + (i * 11) % 56, gen_len: 8 + (i * 13) % 56 })
+                        .collect();
+                    let mut drain = |static_batching: bool| -> (f64, usize, usize) {
+                        let model = DecodeModel::new(g, &weights, cfg, dff, 48 * 1024 * 1024 * (bcap / 64)).unwrap();
+                        let mut sched =
+                            if static_batching { Scheduler::new_static(model) } else { Scheduler::new(model) };
+                        for &r in &reqs {
+                            sched.enqueue(r);
+                        }
+                        g.stream.synchronize().unwrap(); // retire NULL-stream construction work
+                        let stream = g.ctx.new_stream().unwrap();
+                        let x_d = stream.memcpy_stod(&x_all[..bcap * d]).unwrap();
+                        let mut out = stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                        // Exclude the first WARM steps (graph capture + clock ramp) from the timed
+                        // region; tokens are counted from the same instant.
+                        const WARM: usize = 16;
+                        let mut steps = 0usize;
+                        let mut t0 = Instant::now();
+                        let mut tok0 = 0usize;
+                        while !sched.is_idle() {
+                            sched.step_graphed(&stream, &x_d, &mut out).unwrap();
+                            steps += 1;
+                            if steps == WARM {
+                                stream.synchronize().unwrap();
+                                t0 = Instant::now();
+                                tok0 = sched.emitted();
+                            }
+                            assert!(steps < 1_000_000, "drain liveness");
+                        }
+                        stream.synchronize().unwrap();
+                        (t0.elapsed().as_secs_f64(), sched.emitted() - tok0, steps)
+                    };
+                    let (dt_c, tok_c, steps_c) = drain(false);
+                    let (dt_s, tok_s, steps_s) = drain(true);
+                    let (gp_c, gp_s) = (tok_c as f64 / dt_c, tok_s as f64 / dt_s);
+                    eprintln!(
+                        "  Bcap={bcap:3}: continuous {gp_c:8.0} tok/s ({steps_c:4} steps) | static {gp_s:8.0} tok/s ({steps_s:4} steps) | continuous/static {:.2}x",
+                        gp_c / gp_s
+                    );
+                    last_line = Some((bcap, gp_c, gp_c / gp_s));
+                }
+
+                // The three-number headline: the absolute (real scheduler loop, host costs
+                // included), the M-amortization multiple (legacy fill=1 peer, interleaved sweep),
+                // and the honest scheduling multiple (static-batching peer, same kernels).
+                let (bcap_h, gp_h, vs_static) = last_line.unwrap();
+                let vs_fill1 = sweep.iter().find(|s| s.0 == bcap_h).unwrap().1;
                 eprintln!(
-                    "HEADLINE: fill={} vs fill=1 → {:.1}x goodput at {:.2}x step latency (same-clock interleaved; constant-cost step ⇒ batching is ~free goodput)",
-                    held[big].fill,
-                    (held[big].fill as f64 / lf) / g1,
-                    lf / l1
+                    "HEADLINE: {gp_h:.0} tok/s decode goodput at Bcap={bcap_h} (graph-driven Scheduler drain, {depth}-layer D={d} model) | \
+                     {vs_fill1:.1}x vs fill=1 same-Bcap (M-amortization, same-clock interleaved) | \
+                     {vs_static:.2}x vs static batching (the scheduling win, same kernels)"
                 );
             });
         });
