@@ -313,12 +313,74 @@ struct EnvAddr(usize);
 unsafe impl Send for EnvAddr {}
 unsafe impl Sync for EnvAddr {}
 
+/// Build the GLOBAL rayon pool exactly once, with the runtime's required configuration: 16 MiB
+/// worker stacks (a JIT'd parallel-for body carries its per-iteration scratch as ordinary stack
+/// allocas — an outlined `@parallel` head-attention region privatizes ~1.5 MiB of qh/kh/vt/scores
+/// buffers at S=512 — which does not fit reliably in rayon's default 2 MiB stacks; Cranelift
+/// emits inline stack probes, so a big frame is safe exactly when the reserve is big enough) and
+/// `RAYON_NUM_THREADS` honored explicitly (the core-count sweep instrument).
+///
+/// EVERY parallel path in this crate that can be the process's FIRST rayon touch must call this
+/// before forking: the pre-2026-07-10 code initialized only inside `wukong_parallel_for`, but in
+/// a real transformer forward the first parallel op is a `_parallel` norm — rayon then built the
+/// default registry (2 MiB stacks) first and the 16 MiB `build_global` silently lost the race, so
+/// region bodies ran on 2 MiB stacks. Best-effort as ever: if another rayon user in the host
+/// process won the race anyway, `build_global` errors and behavior is as before.
+pub(crate) fn ensure_global_pool() {
+    use std::sync::Once;
+    static POOL_INIT: Once = Once::new();
+    POOL_INIT.call_once(|| {
+        let mut b = rayon::ThreadPoolBuilder::new().stack_size(16 * 1024 * 1024);
+        if let Some(t) = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&t| t > 0)
+        {
+            b = b.num_threads(t);
+        }
+        let _ = b.build_global();
+    });
+}
+
+/// Pool-unification opt-out (`WUKONG_POOL_UNIFY=0`, read once, **default ON**): when ON, the
+/// model-path kernels (`_parallel` norms/velem/reductions and `wukong_parallel_for` regions) run
+/// on the SAME private physical-core pool the parallel GEMM uses, instead of the logical-core
+/// global pool. One pool = no private↔global park/unpark churn between adjacent kernels of a
+/// forward pass (~6–7 pool bounces per transformer layer before this), and no HT-sibling
+/// contention for the compute-bound kernels. Scheduling-only: every kernel routed here chunks its
+/// work independently of the worker count (fixed-chunk reductions/velem, per-row norms,
+/// per-index regions), so serial == parallel stays bit-exact under either pool. `=0` restores the
+/// old global-pool routing as the adjacent-run A/B instrument.
+pub(crate) fn pool_unify() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("WUKONG_POOL_UNIFY").map_or(true, |v| v != "0"))
+}
+
+/// Run `f` on the unified kernel pool: the private physical-core GEMM pool when unification is ON
+/// and the pool exists (see [`pool_unify`] / `gemm::gemm_pool`), the global pool otherwise. The
+/// global pool is configured first in every case ([`ensure_global_pool`]), so a fallback fork
+/// lands on properly-sized stacks. Nested calls from a worker of the same pool run inline
+/// (rayon's `install` semantics) — safe for kernels invoked inside an outlined region body.
+pub(crate) fn run_on_wuk_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    ensure_global_pool();
+    #[cfg(target_arch = "x86_64")]
+    if pool_unify() {
+        if let Some(p) = crate::gemm::gemm_pool() {
+            return p.install(f);
+        }
+    }
+    f()
+}
+
 /// The C-ABI parallel-for the native backend lowers `@parallel for` to. Splits `[0, n)` into one
-/// contiguous chunk per host CPU and runs `body(start, end, env)` on each concurrently (via a
-/// persistent thread pool), returning only once every chunk has completed.
+/// contiguous chunk per worker of the unified kernel pool ([`run_on_wuk_pool`]) and runs
+/// `body(start, end, env)` on each concurrently, returning only once every chunk has completed.
 ///
 /// Bodies must be data-parallel: each index is processed exactly once and the chunks must not have
 /// cross-iteration dependencies (the interpreter runs the whole range sequentially and must agree).
+/// Chunk boundaries derive from the worker count and are therefore pool-dependent — legal exactly
+/// because of that independence contract (bits never depend on which chunk ran an index).
 ///
 /// # Safety
 /// `body` must be a valid `extern "C" fn(i64, i64, *const u8)` and `env` valid for the call.
@@ -329,38 +391,24 @@ pub unsafe extern "C" fn wukong_parallel_for(
     env: *const u8,
 ) {
     use rayon::prelude::*;
-    // Give the global pool's workers stack headroom before the pool is first built. A JIT'd
-    // parallel-for body carries its per-iteration scratch as ordinary stack allocas (an outlined
-    // `@parallel` head-attention region privatizes its qh/kh/vt/scores buffers this way — ~1.5 MiB
-    // at S=512), which does not fit reliably in rayon's default 2 MiB worker stacks. Cranelift
-    // emits inline stack probes, so a big frame is safe exactly when the reserve is big enough.
-    // One-time and best-effort: if the global pool already exists (another rayon user won the
-    // race), `build_global` returns an error we deliberately ignore — behavior is then identical
-    // to before. Worker count is unchanged (rayon's own default, `RAYON_NUM_THREADS` honored);
-    // the reserve is virtual address space, committed page-by-page on use.
-    {
-        use std::sync::Once;
-        static POOL_INIT: Once = Once::new();
-        POOL_INIT.call_once(|| {
-            let _ = rayon::ThreadPoolBuilder::new()
-                .stack_size(16 * 1024 * 1024)
-                .build_global();
-        });
-    }
     if n <= 0 {
         return;
     }
     let n = n as usize;
-    let workers = rayon::current_num_threads().max(1).min(n);
-    let chunk = n.div_ceil(workers);
     let env = EnvAddr(env as usize);
-    (0..workers).into_par_iter().for_each(|w| {
-        let start = w * chunk;
-        if start >= n {
-            return;
-        }
-        let end = (start + chunk).min(n);
-        body(start as i64, end as i64, env.0 as *const u8);
+    run_on_wuk_pool(move || {
+        // Read the worker count INSIDE the installed context so it reflects the pool actually
+        // running the chunks (the private physical-core pool under unification).
+        let workers = rayon::current_num_threads().max(1).min(n);
+        let chunk = n.div_ceil(workers);
+        (0..workers).into_par_iter().for_each(|w| {
+            let start = w * chunk;
+            if start >= n {
+                return;
+            }
+            let end = (start + chunk).min(n);
+            body(start as i64, end as i64, env.0 as *const u8);
+        });
     });
 }
 

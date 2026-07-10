@@ -102,16 +102,28 @@ fn select_kc(k: usize) -> usize {
 /// (the per-(i,j) K-order is fixed), so this changes throughput only, never the bits: serial stays
 /// bit-identical to parallel. `None` (⇒ caller uses the default pool) when physical ≥ logical (no HT
 /// to avoid) or the pool can't be built.
-fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
+/// Since 2026-07-10 this is the crate's UNIFIED kernel pool: `run_on_wuk_pool` (lib.rs) routes
+/// the `_parallel` norms/velem/reductions and `wukong_parallel_for` regions here too (default;
+/// `WUKONG_POOL_UNIFY=0` opts out), so a transformer forward stays on ONE warm pool instead of
+/// bouncing private↔global between adjacent kernels. Worker stacks are 16 MiB for the outlined
+/// region bodies' privatized frames (same rationale as `ensure_global_pool`). The routed kernels
+/// all chunk independently of worker count (fixed-chunk velem/reductions, per-row norms,
+/// per-index regions), so the striping caveat above is moot for them — bits never change.
+pub(crate) fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
     use std::sync::OnceLock;
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| {
+        // Configure the global pool FIRST: `current_num_threads()` below instantiates the default
+        // registry if none exists, and it must come up with the runtime's required configuration
+        // (16 MiB stacks, RAYON_NUM_THREADS honored) rather than rayon's bare defaults.
+        crate::ensure_global_pool();
         let physical = num_cpus::get_physical().max(1);
         if physical >= rayon::current_num_threads() {
             return None; // no HyperThreads to shed (or single pool already this small)
         }
         let mut b = rayon::ThreadPoolBuilder::new()
             .num_threads(physical)
+            .stack_size(16 * 1024 * 1024)
             .thread_name(|i| format!("wukong-gemm-{i}"));
         // A/B probe (`WUKONG_GEMM_AFFINITY=1`): pin worker i to one logical CPU — i<6 to the
         // P-cores' primary siblings (logical 2i on this 6P+8E+2LPE part), the rest to the E/LP-E

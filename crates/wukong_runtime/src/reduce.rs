@@ -271,17 +271,21 @@ pub unsafe extern "C" fn wukong_sreduce_f32_parallel(
         return unsafe { wukong_sreduce_f32(x, y, n as i64, op) };
     }
     // Raw pointers cross the rayon closure boundary as integers (same pattern as the parallel GEMM);
-    // every access is a disjoint read-only chunk.
+    // every access is a disjoint read-only chunk. Forks on the unified kernel pool
+    // (`run_on_wuk_pool`) — the fixed-`RCHUNK` decomposition and the ordered serial fold below are
+    // what make the result thread-count- and pool-independent.
     let (xa, ya) = (x as usize, y as usize);
-    let partials: Vec<f32> = (0..nchunks)
-        .into_par_iter()
-        .map(|c| {
-            let lo = c * RCHUNK;
-            let hi = ((c + 1) * RCHUNK).min(n);
-            // SAFETY: disjoint read-only chunk; pointers valid for n by contract.
-            unsafe { reduce_chunk(xa as *const f32, ya as *const f32, lo, hi, op) }
-        })
-        .collect();
+    let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
+        (0..nchunks)
+            .into_par_iter()
+            .map(|c| {
+                let lo = c * RCHUNK;
+                let hi = ((c + 1) * RCHUNK).min(n);
+                // SAFETY: disjoint read-only chunk; pointers valid for n by contract.
+                unsafe { reduce_chunk(xa as *const f32, ya as *const f32, lo, hi, op) }
+            })
+            .collect()
+    });
     let mut acc = ident(op);
     for p in partials {
         acc = fold2(acc, p, op);
@@ -500,15 +504,19 @@ pub unsafe extern "C" fn wukong_argreduce_f32_parallel(x: *const f32, n: i64, op
         return unsafe { wukong_argreduce_f32(x, n as i64, op) };
     }
     let xa = x as usize;
-    let partials: Vec<(f32, usize)> = (0..nchunks)
-        .into_par_iter()
-        .map(|c| {
-            let lo = c * RCHUNK;
-            let hi = ((c + 1) * RCHUNK).min(n);
-            // SAFETY: disjoint read-only chunk; pointer valid for n.
-            unsafe { argreduce_chunk(xa as *const f32, lo, hi, is_max) }
-        })
-        .collect();
+    // Unified kernel pool; fixed-`RCHUNK` chunks + lowest-index tie-break keep the result
+    // pool- and thread-count-independent (see the module note above).
+    let partials: Vec<(f32, usize)> = crate::run_on_wuk_pool(move || {
+        (0..nchunks)
+            .into_par_iter()
+            .map(|c| {
+                let lo = c * RCHUNK;
+                let hi = ((c + 1) * RCHUNK).min(n);
+                // SAFETY: disjoint read-only chunk; pointer valid for n.
+                unsafe { argreduce_chunk(xa as *const f32, lo, hi, is_max) }
+            })
+            .collect()
+    });
     let mut acc = (ident_v, usize::MAX);
     for p in partials {
         acc = arg_fold(acc, p, is_max);
