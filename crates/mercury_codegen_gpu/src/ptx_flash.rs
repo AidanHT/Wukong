@@ -2487,6 +2487,251 @@ fn entry_mma_reg_pipe_ws(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
     s
 }
 
+/// **Stage B of the warp-specialization campaign: the 3-stage `cp.async` ring** (`flash_d{d}_ws3` /
+/// `flash_d{d}_ws3_lm`, non-causal probe). Identical phase machine, per-warp math, and barrier roles to
+/// [`entry_mma_reg_pipe_ws`] — it deepens ONLY the pipeline. Stage A's double buffer forces the tightest
+/// possible stage schedule: block `i+1`'s copy is issued after bar1(i) and must complete by bar2(i)
+/// (`cp.async.wait_group 0`), so it has just the SM+PV / QK+SM stretch to land and BOTH warps stall on a
+/// late copy. With **three** buffers, block `i+2`'s previous tenant (block `i-1`) is fully read before
+/// bar1(i) (its last reader is B's PV(i-1), which precedes B's bar1(i) arrival), so body `i` can issue
+/// the stage **two blocks ahead** (`stage(i+2)` after bar1(i)) and relax the drain to
+/// `cp.async.wait_group 1` — the copy now has a full extra step (issued at bar1(i), consumed after
+/// bar2(i+1)), restoring the `mp` kernel's whole-step prefetch distance *on top of* the ws anti-phase.
+/// The price is SMEM: 3 buffers = 12 KB/CTA at D=64 (8 CTAs/SM × 2 warps = 16 warps vs Stage A's 24)
+/// and 24 KB at D=128 (4 CTAs × 2 = 8 warps vs 12) — the ring trades occupancy for latency slack, and
+/// `flash_ws_vs_mp` measures which side of that trade this GPU is on. Prologue stages blocks 0 AND 1
+/// (two commit groups) so the steady-state `wait_group 1` invariant holds from body 0; the tail commits
+/// empty groups to keep per-thread group counts uniform. Buffer registers rotate 3-way
+/// (`bufc←bufp←bufn←bufc`). Non-causal only (the A/B probe regime); causal follows if the ring wins.
+fn entry_mma_reg_pipe_ws3(d: usize, pv_ldmatrix: bool) -> String {
+    assert!(d % 32 == 0, "ws3 flash needs D % 32 == 0 (64-thread cooperative stage)");
+    let ktq = d / 16; // Q.Kt contraction tiles (over hdim)
+    let nto = d / 8; // P.V output n-tiles (over hdim)
+    let ksz = 16 * d * 2; // bytes of one staged K block (== one V block)
+    let bufsz = 2 * ksz; // K+V slab per ring buffer
+    let stage_iters = (16 * d / 8) / 64; // 16-byte chunks per tensor / 64 threads (= d/32, exact)
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let name = if pv_ldmatrix {
+        format!("flash_d{d}_ws3_lm")
+    } else {
+        format!("flash_d{d}_ws3")
+    };
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pS,\n    .param .f32 pScale,\n    .param .u64 pQ,\n    .param .u64 pK,\n    .param .u64 pV,\n    .param .u64 pO\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0,%pst,%act;\n";
+    let mut fr = String::from(
+        "%scale,%m0,%m1,%mnew0,%mnew1,%corr0,%corr1,%l0,%l1,%lmax0,%lmax1,%rt,%psum0,%psum1,%pp,%tp0,%tp1,%tp2,%tp3",
+    );
+    for nk in 0..2 {
+        for r in 0..4 {
+            fr += &format!(",%s{nk}_{r}");
+        }
+    }
+    for nt in 0..nto {
+        for r in 0..4 {
+            fr += &format!(",%o{nt}_{r}");
+        }
+    }
+    s += &format!("    .reg .f32 {fr};\n");
+    let mut br = String::new();
+    for kt in 0..ktq {
+        for r in 0..4 {
+            br += &format!("%qa{kt}_{r},");
+        }
+    }
+    br += "%a0,%a1,%a2,%a3,%b0,%b1,%h0,%h1,";
+    s += &format!(
+        "    .reg .b32 {br}%S,%tix,%lane,%warpid,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%next,%nn,%idx,%tmp,%hoff,%bufc,%bufp,%bufn,%sbase,%sk,%chunk,%lkey,%bswap;\n"
+    );
+    s += "    .reg .b64 %Q,%K,%V,%O,%base,%off;\n";
+    s += &format!("    .shared .align 16 .b8 smem_{name}[{}];\n", 3 * bufsz);
+
+    s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
+    s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    s += &format!("    mov.u32 %hoff,%ctaid.y;\n    mul.lo.u32 %hoff,%hoff,%S;\n    mul.lo.u32 %hoff,%hoff,{d};\n");
+    s += "    mul.wide.u32 %off,%hoff,2;\n    add.s64 %Q,%Q,%off;\n    add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;\n";
+    s += "    mul.wide.u32 %off,%hoff,4;\n    add.s64 %O,%O,%off;\n";
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpid,%tix,5;\n    and.b32 %lane,%tix,31;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
+    s += "    mov.u32 %row,%ctaid.x;\n    shl.b32 %row,%row,1;\n    add.u32 %row,%row,%warpid;\n    shl.b32 %row,%row,4;\n    add.u32 %qr0,%row,%grp;\n    add.u32 %qr1,%qr0,8;\n    setp.lt.u32 %act,%row,%S;\n";
+
+    s += &format!("    @!%act bra SKIPQ_{name};\n");
+    for kt in 0..ktq {
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_0,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_2,[%base];\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_1,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_3,[%base];\n");
+    }
+    s += &format!("SKIPQ_{name}:\n");
+    for nt in 0..nto {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %o{nt}_{r},0f00000000;\n");
+        }
+    }
+    s += "    mov.f32 %m0,0fFF800000;\n    mov.f32 %m1,0fFF800000;\n    mov.f32 %l0,0f00000000;\n    mov.f32 %l1,0f00000000;\n";
+
+    // Cooperative 64-thread cp.async stage (identical to entry_mma_reg_pipe_ws).
+    let stage = |kbreg: &str, bufreg: &str, guarded: bool| -> String {
+        let g = if guarded { "@%pst " } else { "" };
+        let mut t = String::new();
+        for ci in 0..stage_iters {
+            t += &format!("    add.u32 %chunk,%tix,{};\n", ci * 64);
+            t += &format!("    mul.lo.u32 %tmp,{kbreg},{d};\n    shl.b32 %sk,%chunk,3;\n    add.u32 %tmp,%tmp,%sk;\n    mul.wide.u32 %off,%tmp,2;\n");
+            t += &format!("    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,{bufreg};\n    shl.b32 %sk,%chunk,4;\n    add.u32 %sbase,%sbase,%sk;\n");
+            t += &format!("    add.s64 %base,%K,%off;\n    {g}cp.async.cg.shared.global [%sbase],[%base],16;\n");
+            t += &format!("    add.u32 %sbase,%sbase,{ksz};\n    add.s64 %base,%V,%off;\n    {g}cp.async.cg.shared.global [%sbase],[%base],16;\n");
+        }
+        t
+    };
+
+    // QK / SM / PV sections — one string each, spliced into both warps' loops (as in the ws kernel).
+    let mut qk = String::new();
+    for nk in 0..2 {
+        for r in 0..4 {
+            qk += &format!("    mov.f32 %s{nk}_{r},0f00000000;\n");
+        }
+        if pv_ldmatrix {
+            for kt in 0..ktq {
+                qk += &format!("    and.b32 %lkey,%lane,7;\n    add.u32 %lkey,%lkey,{};\n", nk * 8);
+                qk += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n");
+                qk += "    shr.u32 %idx,%lane,3;\n    and.b32 %idx,%idx,1;\n    shl.b32 %idx,%idx,3;\n";
+                qk += &format!("    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n", kt * 16);
+                qk += &format!("    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n");
+                qk += "    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%b0,%b1},[%sbase];\n";
+                qk += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+            }
+        } else {
+            qk += &format!("    add.u32 %lkey,%grp,{};\n", nk * 8);
+            for kt in 0..ktq {
+                qk += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n", kt * 16);
+                qk += "    ld.shared.b32 %b0,[%sbase];\n    ld.shared.b32 %b1,[%sbase+16];\n";
+                qk += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+            }
+        }
+    }
+
+    let mut sm = String::new();
+    sm += "    max.f32 %lmax0,%s0_0,%s0_1;\n    max.f32 %lmax0,%lmax0,%s1_0;\n    max.f32 %lmax0,%lmax0,%s1_1;\n    mul.f32 %lmax0,%lmax0,%scale;\n";
+    sm += "    max.f32 %lmax1,%s0_2,%s0_3;\n    max.f32 %lmax1,%lmax1,%s1_2;\n    max.f32 %lmax1,%lmax1,%s1_3;\n    mul.f32 %lmax1,%lmax1,%scale;\n";
+    for off in [1, 2] {
+        sm += &format!("    shfl.sync.bfly.b32 %rt,%lmax0,{off},0x1f,0xffffffff;\n    max.f32 %lmax0,%lmax0,%rt;\n");
+        sm += &format!("    shfl.sync.bfly.b32 %rt,%lmax1,{off},0x1f,0xffffffff;\n    max.f32 %lmax1,%lmax1,%rt;\n");
+    }
+    sm += &format!("    max.f32 %mnew0,%m0,%lmax0;\n    sub.f32 %corr0,%m0,%mnew0;\n    mul.f32 %corr0,%corr0,{log2e};\n    ex2.approx.f32 %corr0,%corr0;\n");
+    sm += &format!("    max.f32 %mnew1,%m1,%lmax1;\n    sub.f32 %corr1,%m1,%mnew1;\n    mul.f32 %corr1,%corr1,{log2e};\n    ex2.approx.f32 %corr1,%corr1;\n");
+    for nt in 0..nto {
+        sm += &format!("    mul.f32 %o{nt}_0,%o{nt}_0,%corr0;\n    mul.f32 %o{nt}_1,%o{nt}_1,%corr0;\n    mul.f32 %o{nt}_2,%o{nt}_2,%corr1;\n    mul.f32 %o{nt}_3,%o{nt}_3,%corr1;\n");
+    }
+    let prob = |dst: &str, sreg: &str, mnew: &str| -> String {
+        format!("    mul.f32 %pp,{sreg},%scale;\n    sub.f32 %pp,%pp,{mnew};\n    mul.f32 %pp,%pp,{log2e};\n    ex2.approx.f32 {dst},%pp;\n")
+    };
+    let pack = |dst: &str, lo: &str, hi: &str| -> String {
+        format!("    cvt.rn.f16.f32 %h0,{lo};\n    and.b32 %h0,%h0,65535;\n    cvt.rn.f16.f32 %h1,{hi};\n    shl.b32 %h1,%h1,16;\n    or.b32 {dst},%h0,%h1;\n")
+    };
+    sm += &prob("%tp0", "%s0_0", "%mnew0");
+    sm += &prob("%tp1", "%s0_1", "%mnew0");
+    sm += &prob("%tp2", "%s1_0", "%mnew0");
+    sm += &prob("%tp3", "%s1_1", "%mnew0");
+    sm += "    add.f32 %psum0,%tp0,%tp1;\n    add.f32 %psum0,%psum0,%tp2;\n    add.f32 %psum0,%psum0,%tp3;\n";
+    sm += &pack("%a0", "%tp0", "%tp1");
+    sm += &pack("%a2", "%tp2", "%tp3");
+    sm += &prob("%tp0", "%s0_2", "%mnew1");
+    sm += &prob("%tp1", "%s0_3", "%mnew1");
+    sm += &prob("%tp2", "%s1_2", "%mnew1");
+    sm += &prob("%tp3", "%s1_3", "%mnew1");
+    sm += "    add.f32 %psum1,%tp0,%tp1;\n    add.f32 %psum1,%psum1,%tp2;\n    add.f32 %psum1,%psum1,%tp3;\n";
+    sm += &pack("%a1", "%tp0", "%tp1");
+    sm += &pack("%a3", "%tp2", "%tp3");
+    for off in [1, 2] {
+        sm += &format!("    shfl.sync.bfly.b32 %rt,%psum0,{off},0x1f,0xffffffff;\n    add.f32 %psum0,%psum0,%rt;\n");
+        sm += &format!("    shfl.sync.bfly.b32 %rt,%psum1,{off},0x1f,0xffffffff;\n    add.f32 %psum1,%psum1,%rt;\n");
+    }
+    sm += "    fma.rn.f32 %l0,%l0,%corr0,%psum0;\n    fma.rn.f32 %l1,%l1,%corr1,%psum1;\n";
+    sm += "    mov.f32 %m0,%mnew0;\n    mov.f32 %m1,%mnew1;\n";
+
+    let mut pv = String::new();
+    if pv_ldmatrix {
+        for nt in 0..nto {
+            pv += &format!("    and.b32 %idx,%lane,15;\n    mul.lo.u32 %tmp,%idx,{d};\n    add.u32 %tmp,%tmp,{};\n    shl.b32 %tmp,%tmp,1;\n", nt * 8);
+            pv += &format!("    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n");
+            pv += "    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%b0,%b1},[%sbase];\n";
+            pv += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%a0,%a1,%a2,%a3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+        }
+    } else {
+        for nt in 0..nto {
+            pv += &format!("    add.u32 %idx,%grp,{};\n", nt * 8);
+            pv += &format!("    mul.lo.u32 %tmp,%tg2,{d};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n");
+            pv += &format!("    ld.shared.u16 %h0,[%sbase];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b0,%h0,%h1;\n", 2 * d);
+            pv += &format!("    ld.shared.u16 %h0,[%sbase+{}];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b1,%h0,%h1;\n", 16 * d, 18 * d);
+            pv += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%a0,%a1,%a2,%a3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+        }
+    }
+
+    // In-loop stage TWO blocks ahead into the free ring slot %bufn + always-commit (uniform counting).
+    let stage_next2 = format!(
+        "    add.u32 %next,%kb,16;\n    add.u32 %nn,%kb,32;\n    setp.lt.u32 %pst,%nn,%S;\n{}    cp.async.commit_group;\n",
+        stage("%nn", "%bufn", true)
+    );
+    // 3-way ring rotation: bufc <- bufp <- bufn <- bufc; advance kb.
+    let rot = "    mov.u32 %bswap,%bufc;\n    mov.u32 %bufc,%bufp;\n    mov.u32 %bufp,%bufn;\n    mov.u32 %bufn,%bswap;\n    mov.u32 %kb,%next;\n";
+
+    // PROLOGUE: stage block 0 AND block 1 (two commit groups — the steady-state `wait_group 1` needs
+    // two groups outstanding from body 0), drain block 0, publish.
+    s += &format!("    mov.u32 %bufc,0;\n    mov.u32 %bufp,{bufsz};\n    mov.u32 %bufn,{};\n    mov.u32 %kb,0;\n", 2 * bufsz);
+    s += &stage("%kb", "%bufc", false);
+    s += "    cp.async.commit_group;\n";
+    // NB: the block index register must survive all chunk passes — the stage closure clobbers %tmp.
+    s += "    mov.u32 %next,16;\n    setp.lt.u32 %pst,%next,%S;\n";
+    s += &stage("%next", "%bufp", true);
+    s += "    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bar.sync 0;\n";
+    s += &format!("    setp.eq.u32 %p0,%warpid,1;\n    @%p0 bra LOOPB_{name};\n");
+
+    // ===== WARP A: QK(i) | bar1 | stage(i+2) | SM(i) PV(i) | wait 1 | bar2.sync | rotate =====
+    s += &format!("LOOPA_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra STORE_{name};\n");
+    s += &format!("    @!%act bra AQ_{name};\n");
+    s += &qk;
+    s += &format!("AQ_{name}:\n");
+    s += "    bar.sync 1,64;\n";
+    s += &stage_next2;
+    s += &format!("    @!%act bra AS_{name};\n");
+    s += &sm;
+    s += &pv;
+    s += &format!("AS_{name}:\n");
+    s += "    cp.async.wait_group 1;\n";
+    s += "    bar.sync 2,64;\n";
+    s += rot;
+    s += &format!("    bra LOOPA_{name};\n");
+
+    // ===== WARP B: bar1 | stage(i+2) | QK(i) SM(i) | wait 1 | bar2.arrive | PV(i) | rotate =====
+    s += &format!("LOOPB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra STORE_{name};\n");
+    s += "    bar.sync 1,64;\n";
+    s += &stage_next2;
+    s += &format!("    @!%act bra BQ_{name};\n");
+    s += &qk;
+    s += &sm;
+    s += &format!("BQ_{name}:\n");
+    s += "    cp.async.wait_group 1;\n";
+    s += "    bar.arrive 2,64;\n";
+    s += &format!("    @!%act bra BP_{name};\n");
+    s += &pv;
+    s += &format!("BP_{name}:\n");
+    s += rot;
+    s += &format!("    bra LOOPB_{name};\n");
+
+    // store O[row][c] = o / l_row (active warps only).
+    s += &format!("STORE_{name}:\n    @!%act bra RET_{name};\n");
+    for nt in 0..nto {
+        s += &format!("    div.rn.f32 %o{nt}_0,%o{nt}_0,%l0;\n    div.rn.f32 %o{nt}_1,%o{nt}_1,%l0;\n    div.rn.f32 %o{nt}_2,%o{nt}_2,%l1;\n    div.rn.f32 %o{nt}_3,%o{nt}_3,%l1;\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_0;\n    st.global.f32 [%base+4],%o{nt}_1;\n", nt * 8);
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_2;\n    st.global.f32 [%base+4],%o{nt}_3;\n", nt * 8);
+    }
+    s += &format!("RET_{name}:\n    ret;\n}}\n");
+    s
+}
+
 /// Flash-attention module: untiled `flash_d{D}` + tiled `flash_d{D}_t` per supported head dim, the
 /// tensor-core `flash_d64_w` (16-key tile) and wide-key `flash_d64_w4` (64-key tile), plus the
 /// register-resident `flash_d64_m` (hand-placed `mma.sync`, O/m/l in registers — no SMEM round-trip).
@@ -2547,6 +2792,11 @@ pub fn flash_ptx() -> &'static str {
         m += &entry_mma_reg_pipe_ws(64, true, false);
         m += &entry_mma_reg_pipe_ws(128, false, true);
         m += &entry_mma_reg_pipe_ws(128, true, true);
+        // Stage B probe: the 3-stage cp.async ring twin of the ws kernels (whole-step prefetch distance
+        // restored via a third buffer + wait_group 1, at 1.5x the SMEM ⇒ lower occupancy). Non-causal
+        // only; A/B'd three-way against mp and ws by `flash_ws_vs_mp`.
+        m += &entry_mma_reg_pipe_ws3(64, false);
+        m += &entry_mma_reg_pipe_ws3(128, true);
         m
     })
     .as_str()
