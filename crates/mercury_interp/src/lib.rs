@@ -2581,15 +2581,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
-            // `mercury_velem_f32(x, y, out, n, a, b, c, op)` — the streaming affine+activation kernel
-            // (saxpy / scale / residual-add / bias / ReLU) a recognized `out[i] = act(a·x[i] + b·y[i]
-            // + c)` map lowers to. Marshal `n` f32 from x and y, call the *identical* runtime kernel
-            // the native backend calls, write the result back — so the differential oracle stays exact
-            // despite the wider lanes / non-temporal stores (which write the same bits). Reading all of
-            // x/y before writing out makes the in-place (x == out) case correct. When `y` is unused the
-            // recognizer passes the x pointer for it (never dereferenced by the kernel), so marshalling
-            // y unconditionally is harmless.
-            "mercury_velem_f32" => {
+            // `mercury_velem_f32[_parallel](x, y, out, n, a, b, c, op)` — the streaming affine+
+            // activation kernel (saxpy / scale / residual-add / bias / ReLU) a recognized `out[i] =
+            // act(a·x[i] + b·y[i] + c)` map lowers to. Marshal `n` f32 from x and y, call the *serial*
+            // runtime kernel (bit-identical to the parallel one the native backend runs under
+            // `@parallel`, since the map is elementwise), write the result back — so the differential
+            // oracle stays exact despite the wider lanes / non-temporal stores (which write the same
+            // bits). Reading all of x/y before writing out makes the in-place (x == out) case correct.
+            // When `y` is unused the recognizer passes the x pointer for it (never dereferenced by the
+            // kernel), so marshalling y unconditionally is harmless.
+            "mercury_velem_f32" | "mercury_velem_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;

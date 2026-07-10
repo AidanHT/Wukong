@@ -208,6 +208,7 @@ const RT_COLL2_PAR: &str = "mercury_coll2_f32_parallel";
 const RT_COLRMS: &str = "mercury_colrms_f32";
 const RT_COLRMS_PAR: &str = "mercury_colrms_f32_parallel";
 const RT_VELEM: &str = "mercury_velem_f32";
+const RT_VELEM_PARALLEL: &str = "mercury_velem_f32_parallel";
 const RT_VHORNER: &str = "mercury_vhorner_f32";
 const RT_BIAS_BCAST: &str = "mercury_bias_bcast_f32";
 const RT_BIAS_BCAST_PAR: &str = "mercury_bias_bcast_f32_parallel";
@@ -1383,10 +1384,11 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[x, dy, gamma, dx, rows, cols, eps]);
             return None;
         }
-        // The streaming affine+activation kernel: mercury_velem_f32(x, y, out, n, a, b, c, op) — three
-        // pointers, one i64 count, three f32 coefficients, one i64 op (256-bit AVX2 + non-temporal
-        // stores, the saxpy/scale/add/bias/ReLU map a recognized streaming loop lowers to). Void.
-        if name == RT_VELEM && args.len() == 8 {
+        // The streaming affine+activation kernel: mercury_velem_f32[_parallel](x, y, out, n, a, b, c,
+        // op) — three pointers, one i64 count, three f32 coefficients, one i64 op (256-bit AVX2 +
+        // non-temporal stores, the saxpy/scale/add/bias/ReLU map a recognized streaming loop lowers
+        // to). The `_parallel` twin has the identical signature and is bit-equal (elementwise). Void.
+        if matches!(name, RT_VELEM | RT_VELEM_PARALLEL) && args.len() == 8 {
             let x = self.val(args[0]);
             let y = self.val(args[1]);
             let out = self.val(args[2]);
@@ -1395,7 +1397,7 @@ impl<'a> FnTranslator<'a> {
             let b = self.val(args[5]);
             let c = self.val(args[6]);
             let op = self.coerce_to_i64(args[7]);
-            let fref = self.rt_refs[RT_VELEM];
+            let fref = self.rt_refs[name];
             self.builder.ins().call(fref, &[x, y, out, n, a, b, c, op]);
             return None;
         }
@@ -1875,6 +1877,7 @@ struct RtFuncs {
     colrms: FuncId,
     colrms_par: FuncId,
     velem: FuncId,
+    velem_par: FuncId,
     vhorner: FuncId,
     bias_bcast: FuncId,
     bias_bcast_par: FuncId,
@@ -2527,6 +2530,9 @@ fn populate_module<M: Module>(
         velem: module
             .declare_function(RT_VELEM, Linkage::Import, &sig_velem)
             .map_err(|e| e.to_string())?,
+        velem_par: module
+            .declare_function(RT_VELEM_PARALLEL, Linkage::Import, &sig_velem)
+            .map_err(|e| e.to_string())?,
         vhorner: module
             .declare_function(RT_VHORNER, Linkage::Import, &sig_vhorner)
             .map_err(|e| e.to_string())?,
@@ -3159,6 +3165,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_VELEM,
                 module.declare_func_in_func(rt.velem, builder.func),
+            );
+            rt_refs.insert(
+                RT_VELEM_PARALLEL,
+                module.declare_func_in_func(rt.velem_par, builder.func),
             );
             rt_refs.insert(
                 RT_VHORNER,
@@ -3823,6 +3833,10 @@ pub fn jit_compile(
     );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
+        RT_VELEM_PARALLEL,
+        mercury_runtime::mercury_velem_f32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_VHORNER,
         mercury_runtime::mercury_vhorner_f32 as *const u8,
     );
@@ -4374,6 +4388,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         mercury_runtime::mercury_colrms_f32_parallel as *const u8,
     );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
+    builder.symbol(
+        RT_VELEM_PARALLEL,
+        mercury_runtime::mercury_velem_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_VHORNER,
         mercury_runtime::mercury_vhorner_f32 as *const u8,

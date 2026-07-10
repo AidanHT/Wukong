@@ -35,7 +35,10 @@ pub use vmath::{
 };
 
 mod velem;
-pub use velem::{mercury_velem_f32, mercury_vhorner_f32, VE_ID, VE_RELU, VE_RELU6, VE_USE_Y};
+pub use velem::{
+    mercury_velem_f32, mercury_velem_f32_parallel, mercury_vhorner_f32, VE_ID, VE_RELU, VE_RELU6,
+    VE_USE_Y,
+};
 
 mod reduce;
 pub use reduce::{

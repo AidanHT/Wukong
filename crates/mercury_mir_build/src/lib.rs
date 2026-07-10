@@ -703,6 +703,7 @@ pub fn lower_program(
         vmath_bf16: interner.intern("mercury_vmath_bf16"),
         vmath_f16: interner.intern("mercury_vmath_f16"),
         velem: interner.intern("mercury_velem_f32"),
+        velem_par: interner.intern("mercury_velem_f32_parallel"),
         vhorner: interner.intern("mercury_vhorner_f32"),
         bias_bcast: interner.intern("mercury_bias_bcast_f32"),
         bias_bcast_par: interner.intern("mercury_bias_bcast_f32_parallel"),
@@ -1736,6 +1737,11 @@ struct GemmSyms {
     /// recognized `out[i] = act(a·x[i] (+ b·y[i]) + c)` map loop (saxpy / scale / residual-add /
     /// bias / ReLU / ReLU6) lowers to this — 256-bit AVX2 + non-temporal stores for a large output.
     velem: Symbol,
+    /// The multicore variant of `mercury_velem_f32` (`mercury_velem_f32_parallel`): a streaming map in
+    /// a *mixed* `@parallel` function (e.g. a transformer layer's residual adds) maps its chunks across
+    /// cores here. Pure elementwise → no cross-chunk combine, so it is bit-identical to the serial
+    /// kernel the interpreter calls; the differential gate holds regardless of thread count.
+    velem_par: Symbol,
     /// The streaming Horner-polynomial kernel (`mercury_vhorner_f32(x, out, n, coeffs, ncoeff)`): a
     /// recognized `r = c0; r = r*x + c1; …; out[i] = r` per-element polynomial lowers to this.
     vhorner: Symbol,
@@ -10997,8 +11003,19 @@ impl FnLowerer<'_> {
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(plan.op as i128, MirType::I64));
+        // A whole-function single-loop `@parallel` map is parallelized by the outliner (chunk workers,
+        // `parallel_fn = false`, each a serial call), so the serial kernel is used there. In a *mixed*
+        // `@parallel` function (not outlined; `parallel_fn = true` — e.g. a transformer layer whose
+        // residual-add loops sit alongside other ops) the map dispatches to the rayon
+        // `mercury_velem_f32_parallel` — bit-identical to serial (elementwise → thread-count-
+        // independent), and the interpreter marshals the serial form. Mirrors the dequant recognizer.
+        let func = if self.parallel_fn {
+            self.gemm.velem_par
+        } else {
+            self.gemm.velem
+        };
         self.builder.build_void(Op::Call {
-            func: self.gemm.velem,
+            func,
             args: vec![xp, yp, outp, n, a, b, c, opv],
         });
     }
