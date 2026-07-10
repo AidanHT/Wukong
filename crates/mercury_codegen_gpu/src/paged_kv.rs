@@ -201,6 +201,11 @@ pub struct BlockManager {
     tables: Vec<Vec<u32>>,
     /// Per slot: tokens currently cached.
     ctx_len: Vec<usize>,
+    /// Monotone counter bumped whenever any slot's block *table* changes (block pushed or freed) —
+    /// context lengths alone don't move it. A device block-table upload is stale iff this differs
+    /// from the epoch it was taken at, so steady-state decode steps (in-block appends) skip the
+    /// `num_slots * max_blocks_per_seq` table re-upload entirely.
+    layout_epoch: u64,
 }
 
 impl BlockManager {
@@ -218,7 +223,15 @@ impl BlockManager {
             free,
             tables: vec![Vec::new(); num_slots],
             ctx_len: vec![0; num_slots],
+            layout_epoch: 0,
         }
+    }
+
+    /// The current block-table layout epoch (see the field docs): compare against the epoch of the
+    /// last device upload to decide whether the flat block table must be re-uploaded.
+    #[inline]
+    pub fn layout_epoch(&self) -> u64 {
+        self.layout_epoch
     }
 
     /// Tokens per block.
@@ -293,6 +306,7 @@ impl BlockManager {
         }
         let b = self.free.pop().ok_or(OutOfBlocks)?;
         self.tables[slot].push(b);
+        self.layout_epoch += 1;
         Ok(b)
     }
 
@@ -332,6 +346,9 @@ impl BlockManager {
     /// fresh pool would — which is precisely the physical re-layout the bit-exact gate wants.
     pub fn free(&mut self, slot: usize) {
         let blocks = std::mem::take(&mut self.tables[slot]);
+        if !blocks.is_empty() {
+            self.layout_epoch += 1;
+        }
         for b in blocks {
             self.free.push(b);
         }
