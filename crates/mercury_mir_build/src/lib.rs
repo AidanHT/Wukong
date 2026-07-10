@@ -832,6 +832,25 @@ pub fn lower_program(
     let (str_table, statics) = collect_static_strings(module, sema, interner);
     mono.strings = str_table;
     program.statics = statics;
+    // Pre-intern the outlined-body symbol pool for mid-function `@parallel` loop regions (the
+    // lowerer itself holds only a shared `&Interner`, so it cannot intern lazily). Only a module
+    // that has at least one `@parallel` item pays for the pool.
+    let any_parallel = module
+        .items
+        .iter()
+        .any(|item| has_parallel_attr(item, interner));
+    let mut par_regions = ParRegions {
+        pfor: interner.intern("mercury_parallel_for"),
+        syms: if any_parallel {
+            (0..PAR_REGION_MAX)
+                .map(|i| interner.intern(&format!("mercury$par${i}")))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        next: 0,
+        funcs: Vec::new(),
+    };
     let no_subst: HashMap<Symbol, Ty> = HashMap::default();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -870,7 +889,7 @@ pub fn lower_program(
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && lowp_matmul_fn(body, sema, interner).is_some()
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -889,7 +908,7 @@ pub fn lower_program(
                             || match_gevm(pat, it, lb, p.sema, p.interner).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -899,7 +918,7 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `mercury_transpose_f32_parallel`. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -909,7 +928,7 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `mercury_{max,avg}pool2d_f32_parallel` (channels
                 // across cores, bit-equal to serial — channels independent, no cross-channel combine).
                 if has_parallel_attr(item, interner) && pool2d_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -918,7 +937,7 @@ pub fn lower_program(
                 // normally with `parallel = true`; the embedded `match_colsum` then emits the multicore
                 // `mercury_colsum_f32_parallel` (disjoint column stripes, bit-equal to serial).
                 if has_parallel_attr(item, interner) && colsum_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -926,7 +945,7 @@ pub fn lower_program(
                 // like the column reduction above. Rows are scanned per disjoint column stripe → the
                 // multicore `mercury_colarg*_i32_parallel` is bit-equal to serial.
                 if has_parallel_attr(item, interner) && colarg_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -935,7 +954,7 @@ pub fn lower_program(
                 // The embedded `match_softmax_bwd` then emits the multicore `mercury_softmax_bwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && softmax_bwd_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -945,7 +964,7 @@ pub fn lower_program(
                 // `mercury_rmsnorm_bwd_f32_parallel` (rows across cores, bit-equal to serial — rows
                 // independent, each row reduces over its own `C` columns).
                 if has_parallel_attr(item, interner) && rmsnorm_bwd_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -953,7 +972,7 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && layernorm_bwd_fn(body, sema, interner).is_some()
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -962,13 +981,13 @@ pub fn lower_program(
                 // kernel). The embedded `match_xent` then emits the multicore `mercury_xent_fwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && xent_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
                 // A `@parallel` whole-function cross-entropy backward: intercept before the outliner.
                 if has_parallel_attr(item, interner) && xent_bwd_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -976,13 +995,13 @@ pub fn lower_program(
                 // the rows into scalar loops and lose the inline-sincos kernel). The embedded
                 // `match_rope` then emits the multicore `mercury_rope_f32_parallel` (rows independent).
                 if has_parallel_attr(item, interner) && rope_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
                 // A `@parallel` whole-function batched log-sum-exp: intercept before the outliner.
                 if has_parallel_attr(item, interner) && logsumexp_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -997,7 +1016,7 @@ pub fn lower_program(
                         p.match_kd_loss(pat, it, lb).is_some()
                     }))
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1009,7 +1028,7 @@ pub fn lower_program(
                         p.match_dequant_perchan(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1021,7 +1040,7 @@ pub fn lower_program(
                         p.match_rowarg(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1032,7 +1051,7 @@ pub fn lower_program(
                         p.match_cumsum(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1043,7 +1062,7 @@ pub fn lower_program(
                         p.match_cumprod(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1054,7 +1073,7 @@ pub fn lower_program(
                         p.match_lrscan(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1064,7 +1083,7 @@ pub fn lower_program(
                         p.match_cumminmax(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1077,7 +1096,7 @@ pub fn lower_program(
                         p.match_embedding(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1089,7 +1108,7 @@ pub fn lower_program(
                         p.match_scatter(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1098,7 +1117,7 @@ pub fn lower_program(
                 // lose the fused-epilogue kernel). Lower it normally with `parallel = true`; the
                 // embedded `match_matmul_residual` in `lower_for` then emits the multicore nt_epi.
                 if has_parallel_attr(item, interner) && matmul_residual_fn(body, sema, interner) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1111,7 +1130,7 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && is_batched_norm_fn(f, body, sema, interner, gemm)
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1124,7 +1143,7 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && is_bias_bcast_fn(f, body, sema, interner, gemm)
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
@@ -1148,12 +1167,12 @@ pub fn lower_program(
                     // A `@parallel` function that is not a single elementwise loop — e.g. a reduction
                     // (`let mut s = 0; for k { s += x[k]*y[k] }; …`). Lower it normally, but with any
                     // recognized reduction loop dispatched to the multicore reduction kernel.
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
                     program.funcs.push(func);
                     continue;
                 }
                 let func =
-                    lower_fn(f, body, sema, interner, gemm, false, &no_subst, f.name.sym, &mono, &mut diags);
+                    lower_fn(f, body, sema, interner, gemm, false, &no_subst, f.name.sym, &mono, &mut diags, None);
                 program.funcs.push(func);
             }
         }
@@ -1170,10 +1189,13 @@ pub fn lower_program(
         .collect();
     for (mangled, orig, subst) in &mono.instances {
         if let Some((f, body)) = fn_decls.get(orig) {
-            let func = lower_fn(f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags);
+            let func = lower_fn(f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags, None);
             program.funcs.push(func);
         }
     }
+    // The outlined bodies of every mid-function `@parallel` loop region, collected while lowering
+    // the functions above. Appended last — backends resolve functions by name, so order is free.
+    program.funcs.append(&mut par_regions.funcs);
     (program, diags)
 }
 
@@ -1280,6 +1302,7 @@ fn is_batched_norm_fn(
         sret: None,
         subst: HashMap::default(),
         mono: None,
+        par: None,
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
 }
@@ -1325,6 +1348,7 @@ fn is_bias_bcast_fn(
         sret: None,
         subst: HashMap::default(),
         mono: None,
+        par: None,
     };
     probe.match_bias_bcast(pat, iter, lb).is_some()
 }
@@ -1341,6 +1365,7 @@ fn lower_fn(
     name: Symbol,
     mono: &Mono,
     diags: &mut Vec<Diagnostic>,
+    par: Option<&mut ParRegions>,
 ) -> Function {
     // Recover the resolved signature for parameter/return types, applying the monomorphization
     // substitution (empty for a non-generic function) so a generic parameter/return lowers at its
@@ -1374,6 +1399,7 @@ fn lower_fn(
         sret: None,
         subst: subst.clone(),
         mono: Some(mono),
+        par,
     };
 
     // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
@@ -1557,6 +1583,7 @@ fn lower_parallel(
             // generic functions, so no monomorphization context is needed.
             subst: HashMap::default(),
             mono: None,
+            par: None,
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -1607,6 +1634,7 @@ fn lower_parallel(
             // generic functions, so no monomorphization context is needed.
             subst: HashMap::default(),
             mono: None,
+            par: None,
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -1653,6 +1681,26 @@ fn lower_parallel(
     };
 
     (outlined, wrapper)
+}
+
+/// Cap on outlined mid-function `@parallel` loop regions per program. The outlined-body symbols
+/// must be interned before lowering starts (the lowerer holds only a shared `&Interner`), so a
+/// fixed pool is pre-interned up front; a program with more independent-iteration loops than this
+/// simply keeps the extras serial (correct, just not parallel).
+const PAR_REGION_MAX: usize = 32;
+
+/// State for outlining mid-function `@parallel` loop regions (see
+/// [`FnLowerer::try_emit_parallel_region`]): the `mercury_parallel_for` runtime symbol, the
+/// pre-interned pool of outlined-body function names (`mercury$par$<n>` — deliberately *not*
+/// `mercury_`-prefixed, so kernel-dispatch scans that grep for runtime symbols don't count them),
+/// and the outlined [`Function`]s collected across the whole program (appended to
+/// `Program::funcs` by `lower_program` once lowering finishes; order is irrelevant, backends
+/// resolve functions by name).
+struct ParRegions {
+    pfor: Symbol,
+    syms: Vec<Symbol>,
+    next: usize,
+    funcs: Vec<Function>,
 }
 
 /// The runtime entry points the recognizers dispatch to: the four GEMM kernels (`C = A·B` and the
@@ -2233,6 +2281,11 @@ struct FnLowerer<'a> {
     /// redirected to the matching specialized copy (`id` -> `id$f32`). `None` for the recognizer
     /// probe lowerers, which never lower a user call.
     mono: Option<&'a Mono>,
+    /// Mid-function `@parallel` region state (pre-interned outlined-body symbols + the outlined
+    /// functions collected so far). `Some` only on the real `lower_fn` path — the recognizer probe
+    /// lowerers and the outlined-body lowerers pass `None`, so a probe can never emit a region and
+    /// an outlined body can never nest one.
+    par: Option<&'a mut ParRegions>,
 }
 
 impl FnLowerer<'_> {
@@ -9729,6 +9782,25 @@ impl FnLowerer<'_> {
             return;
         }
 
+        // Mid-function independent-iteration loop in a `@parallel` fn (the transformer per-head
+        // attention loop is the canonical shape) → outline it into a `mercury_parallel_for` region:
+        // one contiguous chunk of iterations per core, each running the untouched per-iteration
+        // body with its own body-local scratch. Tried LAST, after every kernel recognizer above (a
+        // GEMM / norm / scan / … loop keeps its multicore kernel) and after the elementwise
+        // vectorizer (an elementwise loop keeps its existing serial-SIMD / `velem_parallel`
+        // lowering) — so only compound loops that would otherwise run as a serial chain go wide.
+        // Legality is a conservative structural proof (`match_parallel_region`): every write that
+        // escapes an iteration must land in a per-iteration-disjoint slice of a captured array
+        // (an index carrying the loop var as a mixed-radix digit); anything unprovable declines
+        // and lowers serially below — bit-for-bit the prior behavior.
+        if self.parallel_fn
+            && !inclusive
+            && step.is_none()
+            && self.try_emit_parallel_region(pat, start, end, &ity, body)
+        {
+            return;
+        }
+
         // i = start
         let slot = self.builder.alloca(ity.clone());
         let s0 = self.lower_expr(start);
@@ -9805,6 +9877,645 @@ impl FnLowerer<'_> {
         self.pop_scope();
         self.builder.switch_to(exit);
         self.terminated = false;
+    }
+
+    // ---- mid-function `@parallel` loop regions --------------------------------------------------
+    //
+    // `for hh in 0..N { … }` inside a `@parallel` function, where each iteration is provably
+    // independent, outlines into a `mercury_parallel_for` region: the body becomes its own MIR
+    // function `mercury$par$<n>(start, end, env)` running iterations `[start, end)`, and the loop
+    // statement becomes an env-pack + one `mercury_parallel_for(N, &body, env)` call — the same
+    // runtime contract as the whole-function `@parallel` outliner (`lower_parallel`), so no backend
+    // changes: the interpreter runs the body once over `[0, N)` sequentially, the native runtime
+    // hands contiguous chunks to the core pool.
+    //
+    // Soundness (the differential gates G1/G2/G4 rest on this):
+    //  * Per-iteration scratch is *body-local* (`let` inside the loop body) and therefore private by
+    //    construction — one alloca per task frame, never shared.
+    //  * Every write that escapes an iteration must hit a captured fixed-size array at an index
+    //    carrying the loop var as a **mixed-radix digit**: with N the trip count, the index must
+    //    decompose as `hh*C + Σ outer + Σ inner`, where every `outer` term has a stride that is a
+    //    multiple of `C·N` (so it vanishes mod `C·N` for ANY integer factor value) and the `inner`
+    //    terms' maxima (inner `for` vars with literal `[lo, hi)` ranges, plus non-negative
+    //    constants) sum below `C`. Then `index mod C·N ∈ [hh·C, hh·C + C)` recovers `hh`, so two
+    //    different iterations can never touch the same element — reads of a written array pass the
+    //    same proof (with the array's common `C`), so no iteration reads another's writes either.
+    //  * Anything the proof cannot cover declines (`match_parallel_region` returns `None`) and the
+    //    loop lowers serially exactly as before: captured-scalar writes (loop-carried reductions),
+    //    non-affine / offset indices, `break`/`continue` targeting the region loop, `return`,
+    //    calls other than pure math intrinsics (`print` would reorder output), slices / tensors /
+    //    pointers (may alias), `match` / `loop` expressions, shadowing of classification vars.
+    //  * Inside the outlined body `parallel_fn` is false, so each iteration dispatches the SERIAL
+    //    kernels — the identical per-iteration op sequence the non-`@parallel` spelling runs; only
+    //    cross-iteration scheduling differs, and iterations never overlap writes, so serial ==
+    //    parallel bit-for-bit and the interpreter (sequential `[0, N)`) == native (chunks).
+    //  * Aliasing granularity is the symbol, as everywhere else in the recognizers (two *distinct*
+    //    captured arrays are assumed disjoint buffers — the same contract every kernel dispatch
+    //    already relies on).
+    //
+    // Autodiff note: a function containing a region tapes to an `Op::Call` of
+    // `mercury_parallel_for` (a void call with no VJP rule), so `--emit=grad`/`--train` over such a
+    // function fails loudly ("unrecognized buffer-writing call has no VJP rule") instead of
+    // miscompiling — the same behavior the whole-function `@parallel` wrapper already has.
+
+    /// Recognize + outline a mid-function `@parallel` independent-iteration loop. Returns `true`
+    /// when the loop was outlined (the caller emits nothing further); `false` declines to the
+    /// serial CFG lowering. See the section comment above for the legality argument.
+    fn try_emit_parallel_region(
+        &mut self,
+        pat: &Pattern,
+        start: &Expr,
+        end: &Expr,
+        ity: &MirType,
+        body: &Block,
+    ) -> bool {
+        if self.par.is_none() {
+            return false;
+        }
+        let ast::PatKind::Ident(hh) = pat.kind else {
+            return false;
+        };
+        // The runtime iterates [0, N): require a literal-0 start and a literal trip count. A
+        // 0/1-trip loop gains nothing from threading, so it stays serial.
+        if as_int_lit(start, self.interner) != Some(0) {
+            return false;
+        }
+        let Some(n) = as_int_lit(end, self.interner) else {
+            return false;
+        };
+        if n < 2 {
+            return false;
+        }
+        let Some(captures) = self.match_parallel_region(hh, n as i128, body) else {
+            return false;
+        };
+        self.emit_parallel_region(hh, n, ity, body, &captures)
+    }
+
+    /// The pure legality analysis: walk the loop body, collecting captures (enclosing-scope
+    /// bindings) and every access to a captured array, then prove all writes (and all reads of
+    /// written arrays) per-iteration disjoint via the mixed-radix digit argument. Conservative:
+    /// any construct the walk does not explicitly model declines. Returns the captures in
+    /// first-appearance order (the deterministic env layout) on success.
+    fn match_parallel_region(&self, hh: Symbol, n: i128, body: &Block) -> Option<Vec<Symbol>> {
+        let mut sc = RegionScan {
+            hh,
+            locals: Vec::new(),
+            captures: Vec::new(),
+            accesses: HashMap::default(),
+            written: Vec::new(),
+            env: Vec::new(),
+            depth: 0,
+            ok: true,
+        };
+        self.scan_region_block(body, &mut sc);
+        if !sc.ok {
+            return None;
+        }
+        for arr in &sc.written {
+            let accs = sc.accesses.get(arr)?;
+            // Pass 1: every access must carry `hh` exactly once, as `hh` or `hh * <lit>`, with one
+            // common stride C for this array (reads and writes alike — a read decomposing under a
+            // different C could reach another iteration's slice).
+            let mut c: Option<i128> = None;
+            let mut parsed: Vec<(Vec<&Expr>, &RegionAccess)> = Vec::new();
+            for a in accs {
+                let idx = a.idx?; // opaque access (whole-array / multi-index) to a written array
+                let mut terms = Vec::new();
+                flatten_add_terms(idx, &mut terms);
+                let pos = terms
+                    .iter()
+                    .position(|t| region_hh_stride(t, hh, self.interner).is_some())?;
+                let stride = region_hh_stride(terms[pos], hh, self.interner)?;
+                if stride < 1 {
+                    return None;
+                }
+                terms.remove(pos);
+                // `hh` must not appear anywhere else in the index (a second digit would break the
+                // unique-decomposition argument).
+                if terms.iter().any(|t| expr_uses_sym(t, hh)) {
+                    return None;
+                }
+                match c {
+                    Some(cc) if cc != stride => return None,
+                    _ => c = Some(stride),
+                }
+                parsed.push((terms, a));
+            }
+            let c = c?;
+            let m = c.checked_mul(n)?;
+            // Pass 2: classify every remaining term as outer (stride ≡ 0 mod C·N — erased by the
+            // modulus for any integer factor value) or inner (bounded, non-negative, summing < C).
+            for (terms, a) in parsed {
+                let mut inner: i128 = 0;
+                for t in terms {
+                    match region_term(t, self.interner) {
+                        RegionTerm::Lit(k) => {
+                            if k.rem_euclid(m) == 0 {
+                                continue; // outer constant
+                            }
+                            if k < 0 {
+                                return None;
+                            }
+                            inner = inner.checked_add(k)?;
+                        }
+                        RegionTerm::Var(v, s) => {
+                            if s.rem_euclid(m) == 0 {
+                                continue; // outer: (v*s) mod C·N == 0 for any integer v
+                            }
+                            if s < 1 {
+                                return None;
+                            }
+                            // Inner: v must be an enclosing inner `for` var with a literal
+                            // [lo, hi) range at this access site.
+                            let (lo, hi) = a
+                                .env
+                                .iter()
+                                .rev()
+                                .find(|(sym, _)| *sym == v)
+                                .and_then(|(_, r)| *r)?;
+                            if lo < 0 || hi <= lo {
+                                return None;
+                            }
+                            inner = inner.checked_add(s.checked_mul(hi - 1)?)?;
+                        }
+                        RegionTerm::Opaque => return None,
+                    }
+                }
+                if inner >= c {
+                    return None;
+                }
+            }
+        }
+        Some(sc.captures)
+    }
+
+    /// Walk one block of a candidate region body (its own lexical scope).
+    fn scan_region_block<'e>(&self, b: &'e Block, sc: &mut RegionScan<'e>) {
+        sc.locals.push(HashSet::default());
+        for s in &b.stmts {
+            if !sc.ok {
+                break;
+            }
+            self.scan_region_stmt(s, sc);
+        }
+        if sc.ok {
+            if let Some(t) = &b.tail {
+                self.scan_region_expr(t, sc);
+            }
+        }
+        sc.locals.pop();
+    }
+
+    fn scan_region_stmt<'e>(&self, s: &'e Stmt, sc: &mut RegionScan<'e>) {
+        match &s.kind {
+            StmtKind::Let { pat, ty, init, .. } => {
+                if let Some(e) = init {
+                    self.scan_region_expr(e, sc);
+                    // A local bound to an indirection (slice / pointer / reference) could alias a
+                    // capture and launder writes past the write rules — decline.
+                    if matches!(
+                        self.expr_ty(e),
+                        Ty::Slice(_) | Ty::Ptr { .. } | Ty::Ref { .. }
+                    ) {
+                        sc.ok = false;
+                    }
+                }
+                if let Some(ann) = ty {
+                    if matches!(
+                        ann.kind,
+                        ast::TypeKind::Slice(_)
+                            | ast::TypeKind::Pointer { .. }
+                            | ast::TypeKind::Ref { .. }
+                    ) {
+                        sc.ok = false;
+                    }
+                }
+                if sc.ok {
+                    self.bind_region_pat(pat, sc);
+                }
+            }
+            StmtKind::Assign { target, value, .. } => {
+                self.scan_region_expr(value, sc);
+                if sc.ok {
+                    self.scan_region_write(target, sc);
+                }
+            }
+            StmtKind::Expr(e) => self.scan_region_expr(e, sc),
+            // `return` exits all remaining iterations; `defer` sequencing is not modeled.
+            StmtKind::Return(_) | StmtKind::Defer(_) => sc.ok = false,
+            // An unlabeled break/continue inside an inner loop is that loop's own control flow; one
+            // at region depth would cut short *other* iterations (serial semantics) — decline.
+            // Labels are not matched structurally, so any labeled form declines.
+            StmtKind::Break(label, val) => {
+                if label.is_some() || val.is_some() || sc.depth == 0 {
+                    sc.ok = false;
+                }
+            }
+            StmtKind::Continue(label) => {
+                if label.is_some() || sc.depth == 0 {
+                    sc.ok = false;
+                }
+            }
+            StmtKind::While { cond, body, .. } => {
+                self.scan_region_expr(cond, sc);
+                if sc.ok {
+                    sc.depth += 1;
+                    self.scan_region_block(body, sc);
+                    sc.depth -= 1;
+                }
+            }
+            StmtKind::For {
+                pat, iter, body, ..
+            } => {
+                let mut range = None;
+                match iter {
+                    ForIter::Range {
+                        start,
+                        end,
+                        inclusive,
+                        step,
+                    } => {
+                        self.scan_region_expr(start, sc);
+                        if let Some(e) = end {
+                            self.scan_region_expr(e, sc);
+                        }
+                        if let Some(st) = step {
+                            self.scan_region_expr(st, sc);
+                        }
+                        // A literal `lo..hi` (or `lo..=hi`) unit-step range gives the var a usable
+                        // inner-term bound; anything else leaves it outer-only (`range = None`).
+                        if step.is_none() {
+                            if let (Some(lo), Some(hi0)) = (
+                                as_int_lit(start, self.interner),
+                                end.as_ref().and_then(|e| as_int_lit(e, self.interner)),
+                            ) {
+                                let lo = lo as i128;
+                                let hi = hi0 as i128 + i128::from(*inclusive);
+                                if lo >= 0 && hi > lo {
+                                    range = Some((lo, hi));
+                                }
+                            }
+                        }
+                    }
+                    ForIter::Expr(e) => self.scan_region_expr(e, sc),
+                }
+                if !sc.ok {
+                    return;
+                }
+                sc.locals.push(HashSet::default());
+                let pushed_env = match &pat.kind {
+                    ast::PatKind::Ident(v) => {
+                        self.region_bind(*v, sc);
+                        sc.env.push((*v, range));
+                        true
+                    }
+                    ast::PatKind::Wildcard => false,
+                    _ => {
+                        sc.ok = false;
+                        false
+                    }
+                };
+                if sc.ok {
+                    sc.depth += 1;
+                    self.scan_region_block(body, sc);
+                    sc.depth -= 1;
+                }
+                if pushed_env {
+                    sc.env.pop();
+                }
+                sc.locals.pop();
+            }
+        }
+    }
+
+    /// Classify an assignment target. Body-local places are private; a captured fixed-size array
+    /// element write is recorded for the disjointness proof; everything else declines.
+    fn scan_region_write<'e>(&self, target: &'e Expr, sc: &mut RegionScan<'e>) {
+        match &target.kind {
+            ExprKind::Path(p) if p.is_single() => {
+                let sym = p.first().sym;
+                // A body-local scalar/aggregate is private; writing the region var, a captured
+                // scalar (a loop-carried accumulator), or a captured whole array declines.
+                if sym != sc.hh && sc.is_local(sym) {
+                    return;
+                }
+                sc.ok = false;
+            }
+            ExprKind::Index { base, indices } => {
+                for ix in indices {
+                    self.scan_region_expr(ix, sc);
+                }
+                if !sc.ok {
+                    return;
+                }
+                let Some(bsym) = single_path(base) else {
+                    sc.ok = false;
+                    return;
+                };
+                if sc.is_local(bsym) {
+                    return; // body-local array: private
+                }
+                if !self.region_capture(bsym, sc)
+                    || !matches!(self.expr_ty(base), Ty::Array { .. })
+                    || indices.len() != 1
+                {
+                    sc.ok = false;
+                    return;
+                }
+                sc.record(bsym, Some(&indices[0]), true);
+            }
+            _ => sc.ok = false,
+        }
+    }
+
+    fn scan_region_expr<'e>(&self, e: &'e Expr, sc: &mut RegionScan<'e>) {
+        if !sc.ok {
+            return;
+        }
+        match &e.kind {
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::SizeOf(_)
+            | ExprKind::AlignOf(_) => {}
+            ExprKind::Path(p) => {
+                if p.is_single() {
+                    self.scan_region_read_path(p.first().sym, sc);
+                }
+                // A multi-segment path (enum variant, namespaced const) is a compile-time value.
+            }
+            ExprKind::Unary { op, expr } => match op {
+                ast::UnOp::Deref | ast::UnOp::Ref | ast::UnOp::RefMut => sc.ok = false,
+                _ => self.scan_region_expr(expr, sc),
+            },
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.scan_region_expr(lhs, sc);
+                self.scan_region_expr(rhs, sc);
+            }
+            // Only pure scalar math intrinsics: a user call could write captured buffers, and
+            // `print`/`assert` have cross-iteration-ordered side effects.
+            ExprKind::Call { callee, args, .. } => {
+                let pure_math = single_path(callee)
+                    .map(|s| math_intrinsic(self.interner.resolve(s)).is_some())
+                    .unwrap_or(false);
+                if !pure_math {
+                    sc.ok = false;
+                    return;
+                }
+                for a in args {
+                    self.scan_region_expr(a, sc);
+                }
+            }
+            ExprKind::Index { base, indices } => {
+                for ix in indices {
+                    self.scan_region_expr(ix, sc);
+                }
+                if !sc.ok {
+                    return;
+                }
+                let Some(bsym) = single_path(base) else {
+                    sc.ok = false;
+                    return;
+                };
+                if bsym == sc.hh || sc.is_local(bsym) {
+                    return;
+                }
+                if self.lookup(bsym).is_none() {
+                    sc.ok = false; // indexing something that is not a runtime binding
+                    return;
+                }
+                if !self.region_capture(bsym, sc)
+                    || !matches!(self.expr_ty(base), Ty::Array { .. })
+                {
+                    sc.ok = false;
+                    return;
+                }
+                let idx = if indices.len() == 1 {
+                    Some(&indices[0])
+                } else {
+                    None // multi-index read: opaque (fine unless the array is written)
+                };
+                sc.record(bsym, idx, false);
+            }
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.scan_region_expr(base, sc);
+            }
+            ExprKind::Cast { expr, .. } => self.scan_region_expr(expr, sc),
+            ExprKind::ArrayLit(elems) | ExprKind::TupleLit(elems) => {
+                for el in elems {
+                    self.scan_region_expr(el, sc);
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                self.scan_region_expr(value, sc);
+                self.scan_region_expr(count, sc);
+            }
+            ExprKind::StructLit { fields, rest, .. } => {
+                for f in fields {
+                    self.scan_region_expr(&f.value, sc);
+                }
+                if let Some(r) = rest {
+                    self.scan_region_expr(r, sc);
+                }
+            }
+            ExprKind::Block(b) => self.scan_region_block(b, sc),
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.scan_region_expr(cond, sc);
+                self.scan_region_block(then_branch, sc);
+                if let Some(el) = else_branch {
+                    self.scan_region_expr(el, sc);
+                }
+            }
+            // `match` arms bind patterns and `loop` carries break values — not modeled; decline.
+            // The catch-all keeps any future expression kind conservative by default.
+            _ => sc.ok = false,
+        }
+    }
+
+    /// A bare read of a name: region var and body-locals are free; a name that is not a runtime
+    /// binding (top-level const, enum variant, intrinsic) inlines at lowering; anything else is a
+    /// capture — a whole-array read records an opaque access (fatal only if that array is written).
+    fn scan_region_read_path(&self, sym: Symbol, sc: &mut RegionScan<'_>) {
+        if sym == sc.hh || sc.is_local(sym) {
+            return;
+        }
+        let Some((_, mty)) = self.lookup(sym) else {
+            return;
+        };
+        if !self.region_capture(sym, sc) {
+            sc.ok = false;
+            return;
+        }
+        if matches!(mty, MirType::Array(..)) {
+            sc.record(sym, None, false);
+        }
+    }
+
+    /// Register `sym` as a capture if its binding shape is supported: a fixed-size array (base
+    /// pointer) or an int/float scalar (slot pointer, read-only inside the region). A `Ptr`-slot
+    /// binding (tensor, raw pointer) or vector declines — it may alias other captures.
+    fn region_capture(&self, sym: Symbol, sc: &mut RegionScan<'_>) -> bool {
+        if sc.captures.contains(&sym) {
+            return true;
+        }
+        let Some((_, mty)) = self.lookup(sym) else {
+            return false;
+        };
+        if matches!(mty, MirType::Array(..)) || mty.is_int() || mty.is_float() {
+            sc.captures.push(sym);
+            return true;
+        }
+        false
+    }
+
+    /// Bind a body-local name. Shadowing the region var or an enclosing inner-loop var would
+    /// poison the index-term classification (a term `hh`/`i` would no longer mean the loop var),
+    /// so those decline the region.
+    fn region_bind(&self, sym: Symbol, sc: &mut RegionScan<'_>) {
+        if sym == sc.hh || sc.env.iter().any(|(v, _)| *v == sym) {
+            sc.ok = false;
+            return;
+        }
+        sc.locals.last_mut().expect("region scope").insert(sym);
+    }
+
+    fn bind_region_pat(&self, pat: &Pattern, sc: &mut RegionScan<'_>) {
+        match &pat.kind {
+            ast::PatKind::Ident(v) => self.region_bind(*v, sc),
+            ast::PatKind::Wildcard => {}
+            ast::PatKind::Tuple(ps) => {
+                for p in ps {
+                    self.bind_region_pat(p, sc);
+                }
+            }
+            _ => sc.ok = false,
+        }
+    }
+
+    /// Outline the proven-independent loop: pack the captures into an env pointer table, call
+    /// `mercury_parallel_for(N, &outlined, env)` here, and build the outlined body function (the
+    /// untouched loop body under `lower_ranged_loop`, captures re-bound from env). Mirrors
+    /// [`lower_parallel`]'s two halves, but as a *statement* inside a larger function.
+    fn emit_parallel_region(
+        &mut self,
+        hh: Symbol,
+        n: i64,
+        ity: &MirType,
+        body: &Block,
+        captures: &[Symbol],
+    ) -> bool {
+        // Reserve an outlined-body symbol from the pool (pool exhausted -> stay serial).
+        let (par_sym, pfor) = match self.par.as_deref_mut() {
+            Some(p) if p.next < p.syms.len() => {
+                let s = p.syms[p.next];
+                p.next += 1;
+                (s, p.pfor)
+            }
+            _ => return false,
+        };
+        // A captured array's bound ValueId IS its base pointer; a captured scalar's is its alloca
+        // slot pointer. Both are pointer-shaped, so the env is a uniform pointer table. Scalars are
+        // read-only inside the region (matcher-enforced), so sharing the slot is race-free.
+        let caps: Vec<(Symbol, ValueId, MirType)> = captures
+            .iter()
+            .map(|s| {
+                let (v, t) = self.lookup(*s).expect("region capture must be in scope");
+                (*s, v, t)
+            })
+            .collect();
+
+        // ---- call site: env pack + mercury_parallel_for(N, &body, env) ----
+        let k = caps.len().max(1) as u32;
+        let env = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::Ptr), k));
+        for (i, (_, vid, _)) in caps.iter().enumerate() {
+            let kidx = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
+            let slot = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: env,
+                    index: kidx,
+                    elem: MirType::Ptr,
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: *vid,
+            });
+        }
+        let nv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64));
+        let addr = self.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
+        self.builder.build_void(Op::Call {
+            func: pfor,
+            args: vec![nv, addr, env],
+        });
+
+        // ---- outlined body: par_sym(start: i64, end: i64, env: ptr) ----
+        let mut tmp_diags: Vec<Diagnostic> = Vec::new();
+        let outlined = {
+            let mut fl = FnLowerer {
+                builder: Builder::new(par_sym, MirType::Void),
+                sema: self.sema,
+                interner: self.interner,
+                diags: &mut tmp_diags,
+                scopes: vec![HashMap::default()],
+                terminated: false,
+                loops: Vec::new(),
+                gemm: self.gemm,
+                // The region supplies the threading; each iteration dispatches the SERIAL kernels —
+                // the identical per-iteration op sequence the non-`@parallel` spelling runs, so
+                // serial == parallel stays bit-exact (only cross-iteration scheduling differs, and
+                // iterations never overlap writes).
+                parallel_fn: false,
+                vec_loads: HashMap::default(),
+                sret: None,
+                subst: self.subst.clone(),
+                mono: self.mono,
+                par: None,
+            };
+            let start = fl.builder.add_param(MirType::I64);
+            let end = fl.builder.add_param(MirType::I64);
+            let envp = fl.builder.add_param(MirType::Ptr);
+            for (i, (sym, _, mty)) in caps.iter().enumerate() {
+                let kidx = fl
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
+                let slot = fl.builder.build(
+                    MirType::Ptr,
+                    Op::Gep {
+                        ptr: envp,
+                        index: kidx,
+                        elem: MirType::Ptr,
+                    },
+                );
+                let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
+                fl.bind(*sym, base, mty.clone());
+            }
+            fl.lower_ranged_loop(hh, start, end, ity.clone(), body);
+            if !fl.terminated {
+                fl.builder.ret(None);
+            }
+            fl.builder.finish()
+        };
+        self.diags.extend(tmp_diags);
+        self.par
+            .as_deref_mut()
+            .expect("reserved above")
+            .funcs
+            .push(outlined);
+        true
     }
 
     /// Desugar `for <pat> in <array>` — iterate the elements of a fixed-size array — into the same
@@ -17939,6 +18650,85 @@ fn match_row_col(idx: &Expr, row: Symbol, interner: &Interner) -> Option<(Dim, S
 /// Flatten the additive terms of `e`, recursing only through `+`. `i*K + k + h*S*D` yields the three
 /// terms `[i*K, k, h*S*D]` (left-association is irrelevant). Used to peel a batch/base offset off a
 /// flattened tensor index.
+/// One recorded access (read or write) to a captured array inside a candidate `@parallel` region.
+struct RegionAccess<'a> {
+    /// The flat index expression; `None` for an opaque access (whole-array read, multi-index).
+    idx: Option<&'a Expr>,
+    /// Snapshot of the *inner* `for` variables in scope at the access site (innermost last), each
+    /// with its literal `[lo, hi)` range when the bounds are literals (`None` = outer-terms-only).
+    env: Vec<(Symbol, Option<(i128, i128)>)>,
+}
+
+/// Walker state for [`FnLowerer::match_parallel_region`]: body-local scopes, captures in
+/// first-appearance order, every captured-array access, and the conservative `ok` flag any
+/// unmodeled construct clears.
+struct RegionScan<'a> {
+    hh: Symbol,
+    locals: Vec<HashSet<Symbol>>,
+    captures: Vec<Symbol>,
+    accesses: HashMap<Symbol, Vec<RegionAccess<'a>>>,
+    written: Vec<Symbol>,
+    env: Vec<(Symbol, Option<(i128, i128)>)>,
+    /// Loop-nesting depth *inside* the region body (break/continue legality).
+    depth: usize,
+    ok: bool,
+}
+
+impl<'a> RegionScan<'a> {
+    fn is_local(&self, sym: Symbol) -> bool {
+        self.locals.iter().any(|s| s.contains(&sym))
+    }
+
+    fn record(&mut self, sym: Symbol, idx: Option<&'a Expr>, write: bool) {
+        if write && !self.written.contains(&sym) {
+            self.written.push(sym);
+        }
+        self.accesses.entry(sym).or_default().push(RegionAccess {
+            idx,
+            env: self.env.clone(),
+        });
+    }
+}
+
+/// A classified non-`hh` index term of a region access: a literal constant, a single variable
+/// times a literal stride (`v`, `v*s`, `s*v`), or anything else (opaque — declines).
+enum RegionTerm {
+    Lit(i128),
+    Var(Symbol, i128),
+    Opaque,
+}
+
+fn region_term(t: &Expr, interner: &Interner) -> RegionTerm {
+    if let Some(k) = as_int_lit(t, interner) {
+        return RegionTerm::Lit(k as i128);
+    }
+    if let Some(v) = single_path(t) {
+        return RegionTerm::Var(v, 1);
+    }
+    if let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &t.kind
+    {
+        if let (Some(v), Some(s)) = (single_path(lhs), as_int_lit(rhs, interner)) {
+            return RegionTerm::Var(v, s as i128);
+        }
+        if let (Some(s), Some(v)) = (as_int_lit(lhs, interner), single_path(rhs)) {
+            return RegionTerm::Var(v, s as i128);
+        }
+    }
+    RegionTerm::Opaque
+}
+
+/// `t == hh` (stride 1) or `t == hh * <lit>` / `<lit> * hh` (that literal); `None` otherwise.
+fn region_hh_stride(t: &Expr, hh: Symbol, interner: &Interner) -> Option<i128> {
+    match region_term(t, interner) {
+        RegionTerm::Var(v, s) if v == hh => Some(s),
+        _ => None,
+    }
+}
+
 fn flatten_add_terms<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     if let ExprKind::Binary {
         op: ast::BinOp::Add,
@@ -20114,6 +20904,7 @@ fn lower_matmul_fn(
         sret: None,
         subst: HashMap::default(),
         mono: None,
+        par: None,
     };
     // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
     // whole-function path too. Bind its hidden runtime-dim params first (leading, before the real
@@ -21732,6 +22523,7 @@ fn xent_bwd_fn(
         sret: None,
         subst: HashMap::default(),
         mono: None,
+        par: None,
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
 }
@@ -21772,6 +22564,7 @@ fn xent_fn(
         sret: None,
         subst: HashMap::default(),
         mono: None,
+        par: None,
     };
     probe.match_xent(pat, iter, lb).is_some()
 }
@@ -21820,6 +22613,7 @@ fn logsumexp_fn(
         sret: None,
         subst: HashMap::default(),
         mono: None,
+        par: None,
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
 }
@@ -21950,6 +22744,7 @@ fn probe_single_for(
         sret: None,
         subst: HashMap::default(),
         mono: None,
+        par: None,
     };
     check(&probe, pat, iter, lb)
 }
@@ -22952,6 +23747,7 @@ fn lower_i8matmul_fn(
         sret: None,
         subst: HashMap::default(),
         mono: None,
+        par: None,
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
@@ -23668,6 +24464,155 @@ mod tests {
         assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
         let (prog, diags) = lower_program(&module, &sema, &mut interner);
         (prog, diags, interner)
+    }
+
+    /// Does function `f` contain a call to a function named `callee`?
+    fn fn_calls(f: &Function, interner: &Interner, callee: &str) -> bool {
+        f.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == callee))
+        })
+    }
+
+    fn prog_calls(prog: &Program, interner: &Interner, callee: &str) -> bool {
+        prog.funcs.iter().any(|f| fn_calls(f, interner, callee))
+    }
+
+    /// The canonical mid-function `@parallel` head loop (body-local scratch, disjoint `hh`-sliced
+    /// output writes) must outline into a `mercury_parallel_for` region whose outlined body
+    /// dispatches the SERIAL kernels (the region supplies the threading; per-iteration op order is
+    /// identical to the serial spelling, which is what keeps serial == parallel bit-exact).
+    fn head_loop_src(attr: &str) -> String {
+        format!(
+            "module m
+{attr}fn heads(q: [f32; 32], k: [f32; 32], v: [f32; 32], mut attn: [f32; 32], mut y: [f32; 32]) {{
+    for i in 0..32 {{ y[i] = q[i]; }}
+    for hh in 0..2 {{
+        let mut qh: [f32; 16] = [0.0; 16];
+        let mut kh: [f32; 16] = [0.0; 16];
+        let mut scores: [f32; 16] = [0.0; 16];
+        for i in 0..4 {{ for p in 0..4 {{ qh[i*4+p] = q[i*8 + hh*4 + p]; }} }}
+        for i in 0..4 {{ for p in 0..4 {{ kh[i*4+p] = k[i*8 + hh*4 + p]; }} }}
+        for i in 0..4 {{ for j in 0..4 {{
+            let mut acc: f32 = 0.0;
+            for p in 0..4 {{ acc = acc + qh[i*4+p] * kh[j*4+p]; }}
+            scores[i*4+j] = acc;
+        }} }}
+        for i in 0..4 {{ for j in 0..4 {{ attn[i*8 + hh*4 + j] = scores[i*4+j] + v[i*8 + hh*4 + j]; }} }}
+    }}
+}}
+"
+        )
+    }
+
+    #[test]
+    fn parallel_region_outlines_head_loop() {
+        let (prog, diags, interner) = lower(&head_loop_src("@parallel\n"));
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        // The wrapper hands the head loop to the runtime...
+        assert!(
+            prog_calls(&prog, &interner, "mercury_parallel_for"),
+            "head loop must outline into a mercury_parallel_for region"
+        );
+        // ...the outlined body exists, verifies, and runs its kernels SERIAL (bit-identical
+        // per-iteration op sequence to the serial spelling — the G4 argument).
+        let outlined = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name).starts_with("mercury$par$"))
+            .expect("outlined region body function");
+        assert!(
+            fn_calls(outlined, &interner, "mercury_sgemm_nt"),
+            "the per-head QK^T nest must dispatch the SERIAL GEMM inside the region"
+        );
+        assert!(
+            !fn_calls(outlined, &interner, "mercury_sgemm_nt_parallel"),
+            "the outlined body must not nest the multicore GEMM"
+        );
+        for f in &prog.funcs {
+            let errs = mercury_mir::verify::verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    #[test]
+    fn parallel_region_only_under_parallel_attr() {
+        // The identical source WITHOUT `@parallel` must lower the head loop serially — the region
+        // mechanism is opt-in via the attribute, so the serial spelling is untouched.
+        let (prog, diags, interner) = lower(&head_loop_src(""));
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "mercury_parallel_for"),
+            "a non-@parallel fn must not outline regions"
+        );
+    }
+
+    #[test]
+    fn parallel_region_declines_cross_iteration_dep() {
+        // `out[(h+1)*2 + j]` reads what iteration h wrote and writes what iteration h+1 reads — a
+        // genuine loop-carried chain. The write index has no `hh*C` digit ((h+1)*2 is not a bare
+        // `h * lit` term), so the region matcher declines and the loop stays serial.
+        let src = "module m
+@parallel
+fn scan(x: [f32; 16], mut out: [f32; 16]) {
+    for i in 0..16 { out[i] = x[i]; }
+    for h in 0..3 {
+        for j in 0..2 { out[(h+1)*2 + j] = out[h*2 + j] + x[h*2 + j]; }
+    }
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "mercury_parallel_for"),
+            "a cross-iteration-dependent loop must stay serial"
+        );
+    }
+
+    #[test]
+    fn parallel_region_declines_captured_scalar_write() {
+        // A loop-carried accumulator declared OUTSIDE the loop is a captured-scalar write —
+        // iterations are ordered through it, so the region matcher must decline.
+        let src = "module m
+@parallel
+fn acc(x: [f32; 8], mut out: [f32; 8]) {
+    for i in 0..8 { out[i] = x[i]; }
+    let mut s: f32 = 0.0;
+    for h in 0..4 {
+        for j in 0..2 { s = s + x[h*2 + j]; }
+        out[h] = s;
+    }
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "mercury_parallel_for"),
+            "a captured-scalar (reduction) loop must stay serial"
+        );
+    }
+
+    #[test]
+    fn parallel_region_declines_overlapping_slices() {
+        // The write stride (2) times the trip count (4) is 8, but the inner column term reaches 3
+        // >= C=2 — iterations overlap (`out[h*2 + j]` with j in 0..4 spans two heads' slices). The
+        // mixed-radix bound must reject it.
+        let src = "module m
+@parallel
+fn overlap(x: [f32; 16], mut out: [f32; 16]) {
+    for i in 0..16 { out[i] = x[i]; }
+    for h in 0..4 {
+        for j in 0..4 { out[h*2 + j] = x[h*2 + j]; }
+    }
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "mercury_parallel_for"),
+            "overlapping per-iteration write slices must stay serial"
+        );
     }
 
     /// Cross-check: the `emit_exp_f32` inlined-MIR table/constants (the f64 literals `splat_const_f`
