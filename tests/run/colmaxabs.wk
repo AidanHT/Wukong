@@ -9,7 +9,7 @@ module tests.run.colmaxabs
 // Column abs-max out[j] = max_i |x[i,j]| — the per-channel symmetric int8-quantization scale (amax_j,
 // from which the scale s_j = amax_j / 127). The abs-max sibling of colmax: like colsum/colmax the
 // strided data index gcc/rustc leave scalar (verified: no packed vmaxps at -O3), dispatched to the SIMD
-// mercury_colmaxabs_f32, which abs's each element (sign-mask andnot) then folds by max, seeded by the
+// wukong_colmaxabs_f32, which abs's each element (sign-mask andnot) then folds by max, seeded by the
 // first row's |x[0,j]|. Its own oracle (i-ascending |·|-then-max fold), so interp == native, -O0 ==
 // -O3 by construction. The data has negatives so abs matters — without it col0 would be max(-9,1,5)=5.
 fn main() -> i32 {

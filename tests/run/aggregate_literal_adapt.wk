@@ -11,7 +11,7 @@ module tests.run.aggregate_literal_adapt
 // can be built straight from literals: `[i8; N]`, `(u8, u8)`, a wide `[i64; N]`, an `[v; N]` repeat,
 // and nested array-of-struct. Before, every one was rejected as an `[i32; N]` / `(i32, i32)` element
 // mismatch (E0401). Out-of-range elements are still a hard error (see
-// tests/fail/array_literal_elem_out_of_range.mer).
+// tests/fail/array_literal_elem_out_of_range.wk).
 
 struct S { x: i8 }
 

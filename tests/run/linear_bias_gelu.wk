@@ -7,14 +7,14 @@
 module tests.run.linear_bias_gelu
 
 // A transformer FFN first layer: out = gelu(x · Wᵀ + bias). The matmul nest and the following
-// bias+GELU loop fuse into one mercury_sgemm_nt_epi call with act = GELU (the epilogue folded into
+// bias+GELU loop fuse into one wukong_sgemm_nt_epi call with act = GELU (the epilogue folded into
 // the GEMM C writeback, so C is written once with the activation already applied) — the canonical
 // BERT/GPT-2 feed-forward shape.
 //
 // x = [[1,2],[3,4]], W = I (so x·Wᵀ = x), bias = [-1,-4]:
 //   row0: gelu([1,2] + [-1,-4]) = gelu([ 0, -2]) = [0,        gelu(-2)]
 //   row1: gelu([3,4] + [-1,-4]) = gelu([ 2,  0]) = [gelu(2),  0       ]
-// gelu(0)=0; gelu(-2)≈-0.0454; gelu(2)≈1.9546 (tanh approx) — cross-checked against gelu.mer.
+// gelu(0)=0; gelu(-2)≈-0.0454; gelu(2)≈1.9546 (tanh approx) — cross-checked against gelu.wk.
 // Printed as (out*1000) as i32: 0 / -45 / 1954 / 0.
 fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], mut out: [f32; 4]) {
     for i in 0..2 {

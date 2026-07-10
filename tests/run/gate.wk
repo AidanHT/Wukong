@@ -12,7 +12,7 @@ module tests.run.gate
 
 // Gated-FFN activation out[i] = act(a[i]) * b[i] — the SwiGLU (silu gate) / GeGLU (gelu gate) feed-
 // forward of Llama/PaLM/Gemma. The recognizer folds each `out[i] = act(a[i]) * b[i]` loop to one
-// mercury_vmath2_f32 call with a VM2_*_GATE op code (riding the existing two-input kernel — zero new
+// wukong_vmath2_f32 call with a VM2_*_GATE op code (riding the existing two-input kernel — zero new
 // symbol, like the activation backwards). The activation folds an exp C/Rust keep scalar, so the
 // 256-bit gate wins. Pure elementwise → the differential gate (interp == native) is trivially exact.
 fn main() -> i32 {

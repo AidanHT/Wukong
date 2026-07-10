@@ -7,7 +7,7 @@
 module tests.run.linear_bias_relu
 
 // A fused nn.Linear layer: out = relu(x · Wᵀ + bias). The matmul nest and the following bias+ReLU
-// loop fuse into one mercury_sgemm_nt_epi call (the epilogue folded into the GEMM C writeback).
+// loop fuse into one wukong_sgemm_nt_epi call (the epilogue folded into the GEMM C writeback).
 //
 // x = [[1,2],[3,4]], W = I (so x·Wᵀ = x), bias = [-10,-1]:
 //   row0: relu([1,2] + [-10,-1]) = relu([-9, 1]) = [0, 1]

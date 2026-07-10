@@ -9,8 +9,8 @@ module tests.run.f16
 // Real f16 (IEEE half) storage: `[f16; N]` holds 2-byte values rounded to the f16 grid
 // (round-to-nearest-even, 10 mantissa bits — finer than bf16's 7). Casts and array load/store all
 // round through the single shared `half`-crate conversion; the native backend calls the identical
-// `mercury_f32_to_f16_bits`/`mercury_f16_bits_to_f32` shims the interpreter uses, so the two agree
-// bit-for-bit (the mercury_bench gate proves it). The runtime f16 reductions widen with F16C.
+// `wukong_f32_to_f16_bits`/`wukong_f16_bits_to_f32` shims the interpreter uses, so the two agree
+// bit-for-bit (the wukong_bench gate proves it). The runtime f16 reductions widen with F16C.
 fn main() -> i32 {
     // f16-exact values are unchanged.
     let one: f16 = 1.0 as f16;

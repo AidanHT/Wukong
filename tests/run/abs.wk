@@ -8,7 +8,7 @@
 module tests.run.abs
 
 // `abs(x)` is a primitive intrinsic lowered to `max(x, -x)` (compare + select) — scalar or
-// vectorized, bit-identical across the interpreter and native backend (the mercury_bench gate proves
+// vectorized, bit-identical across the interpreter and native backend (the wukong_bench gate proves
 // it). A `fmax(m, abs(x[i]))` loop is the per-tensor absmax dynamic int8 quantization uses to compute
 // a symmetric scale (scale = absmax/127).
 

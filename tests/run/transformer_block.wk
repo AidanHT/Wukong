@@ -8,7 +8,7 @@ module tests.run.transformer_block
 // A full pre-norm (Llama-style) transformer block in one function:
 //   h   = x + Attention(RMSNorm(x))
 //   out = h + FFN(RMSNorm(h))
-// composing every Mercury win — all four matmul nests dispatch to the GEMM kernel (the self-attention
+// composing every Wukong win — all four matmul nests dispatch to the GEMM kernel (the self-attention
 // Q·Kᵀ, which here shares one array as both Q and K; P·V; and the two FFN linears), two RMSNorm
 // reductions (sum-of-squares + rsqrt + scale), a row softmax (fmax reduction + vectorized exp + sum +
 // normalize), a vectorized GELU, and residual adds. S=8 tokens, D=8 model dim, H=16 FFN hidden. The

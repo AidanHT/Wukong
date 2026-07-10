@@ -4,9 +4,9 @@
 // EXPECT-OUT: 5000
 module tests.run.parallel_argmax
 
-// `@parallel` global argmax / argmin -> mercury_argreduce_f32_parallel (the multicore variant of the
+// `@parallel` global argmax / argmin -> wukong_argreduce_f32_parallel (the multicore variant of the
 // greedy-decode top-1). The kernel folds a FIXED chunk decomposition (RCHUNK=8192) in ascending order,
-// so the returned index is bit-identical to the serial mercury_argreduce_f32 the interpreter calls —
+// so the returned index is bit-identical to the serial wukong_argreduce_f32 the interpreter calls —
 // serial == parallel == interp regardless of thread count. N=20000 spans 3 chunks, and the argmax tie
 // (9.0 at index 12345 in chunk 1 AND 17000 in chunk 2) verifies the cross-chunk fold keeps the LOWEST
 // index. gcc/rustc run a branchy serial scalar loop; this dispatches the whole array across cores.

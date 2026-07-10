@@ -9,7 +9,7 @@ module tests.run.scaled_gemm_batched
 /// Batched (multi-head) α-scaled attention scores `scores[h] = (Q[h]·K[h]ᵀ)·scale` over H=2 heads with
 /// a **literal** scale `0.5`. The recognizer peels the per-head base offset `h*4` off each flattened
 /// index (as in `batched_matmul`) AND the loop-invariant `0.5` off the store, dispatching every head to
-/// `mercury_sgemm_nt_alpha` (GEP-ing the base pointers per head). Exercises the batched-offset path and
+/// `wukong_sgemm_nt_alpha` (GEP-ing the base pointers per head). Exercises the batched-offset path and
 /// the literal-scale (`AlphaScale::Lit`) branch; the gate proves interp == native and -O0 == -O3.
 ///
 /// head 0: Q=[[1,2],[3,4]], K=[[5,6],[7,8]] ⇒ QKᵀ=[[17,23],[39,53]], ·0.5 = [[8.5,11.5],[19.5,26.5]].

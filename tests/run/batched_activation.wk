@@ -6,10 +6,10 @@
 module tests.run.batched_activation
 
 // Batched activation `out[r*C + j] = silu(x[r*C + j])` (the real [tokens, hidden] FFN/attention
-// shape) dispatches to one flat 256-bit `mercury_vmath_f32` over the whole [0, R*C) buffer — the same
+// shape) dispatches to one flat 256-bit `wukong_vmath_f32` over the whole [0, R*C) buffer — the same
 // kernel the flat `for i in 0..N { out[i] = silu(x[i]) }` form uses, so the two are bit-identical
 // element-for-element (the recognizer just restored the full 256-bit width the offset-indexed inner
-// loop would otherwise lose to the 128-bit generic vectorizer). The mercury_bench / cranelift
+// loop would otherwise lose to the 128-bit generic vectorizer). The wukong_bench / cranelift
 // differential gate proves interp == native bit-for-bit through the dispatched kernel.
 
 fn main() -> i32 {

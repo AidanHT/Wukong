@@ -7,8 +7,8 @@ module tests.run.lrscan
 
 // First-order linear recurrence / selective scan `out[r,t] = a[r,t]*h_{t-1} + b[r,t]` (h resets to 0
 // each row) — the state-space sequence-model step (Mamba / S4 / RWKV / EMA). The carried `h` makes the
-// inner time loop a true loop-carried dependency gcc/rustc keep scalar; Mercury folds the nest to one
-// `mercury_lrscan_f32` call (the `_parallel` one maps independent rows across cores). The recurrence is
+// inner time loop a true loop-carried dependency gcc/rustc keep scalar; Wukong folds the nest to one
+// `wukong_lrscan_f32` call (the `_parallel` one maps independent rows across cores). The recurrence is
 // inherently sequential within a row, so there is no reassociation — the dispatched kernel is bit-
 // identical to the scalar nest, and the interp == native differential gate holds by construction.
 

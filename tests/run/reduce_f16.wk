@@ -7,7 +7,7 @@
 module tests.run.reduce_f16
 
 // IEEE-f16 reductions: `s += (x[k] as f32) [* (y[k] as f32)]` and `m = fmax/fmin(m, (x[k] as f32))`
-// over `[f16]` arrays dispatch to the F16C kernels (mercury_dot_f16 / sum_f16 / reduce_f16) — f16
+// over `[f16]` arrays dispatch to the F16C kernels (wukong_dot_f16 / sum_f16 / reduce_f16) — f16
 // storage, f32 accumulate / exact max-fold. The kernel widens with `vcvtph2ps`; the interpreter
 // reconstructs the f16 bits and calls the identical kernel, so interp and native agree bit-for-bit.
 fn main() -> i32 {

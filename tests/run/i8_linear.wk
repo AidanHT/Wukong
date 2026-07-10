@@ -8,7 +8,7 @@ module tests.run.i8_linear
 
 // int8 quantized nn.Linear: C = A·Bᵀ with u8 activations, i8 weights, an i32 accumulator — the
 // QNNPACK/oneDNN quantized-inference layout. The compiler recognizes this nest and dispatches it to
-// the AVX2 int8 GEMM kernel (mercury_i8gemm_nt). Integer arithmetic, so the fused kernel equals this
+// the AVX2 int8 GEMM kernel (wukong_i8gemm_nt). Integer arithmetic, so the fused kernel equals this
 // scalar nest bit-for-bit — no reassociation, no tolerance: the differential gate is exact, and
 // -O0 == -O3. A is [3,4], B is [3,4] (its rows are the weight vectors), so C is [3,3].
 fn main() -> i32 {

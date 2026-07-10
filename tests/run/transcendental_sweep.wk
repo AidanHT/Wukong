@@ -5,7 +5,7 @@ module tests.run.transcendental_sweep
 
 // A breadth sweep over the 2026-06 transcendental additions, exercising the paths that the
 // per-function tests don't combine: a **fused multi-statement body** (several distinct activations
-// over the same range → one `mercury_vmath_f32` call each, in source order) and an **@parallel**
+// over the same range → one `wukong_vmath_f32` call each, in source order) and an **@parallel**
 // body (each thread's chunk dispatched). Every op composes the shared exp/log/sin/cos/atan/√, so the
 // dispatched kernel, the scalar tail, and the inlined MIR all agree — this pins interp == native and
 // -O0 == -O3 across the whole expanded set at once.

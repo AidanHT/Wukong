@@ -6,7 +6,7 @@
 module tests.run.bias_bcast_parallel
 
 // The `@parallel` broadcast-bias `out[i*C+j] = relu(x[i*C+j] + b[j])` dispatches to the multicore
-// `mercury_bias_bcast_f32_parallel`: the whole-function interceptor (`is_bias_bcast_fn`) routes it
+// `wukong_bias_bcast_f32_parallel`: the whole-function interceptor (`is_bias_bcast_fn`) routes it
 // through normal lowering *before* the generic `@parallel` outliner (which would split the rows into
 // per-row 1-D loops and lose the whole-nest recognizer). Rows are independent, so the multicore kernel
 // is bit-identical to the serial one the interpreter calls — so -O0..-O3 and interp/native all agree.

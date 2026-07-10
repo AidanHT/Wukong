@@ -8,7 +8,7 @@ module tests.run.matmul_f16_tn
 
 // f16 mixed-precision C = Aᵀ·B — the dW = dYᵀ·X weight-gradient GEMM, in IEEE f16 (the F16C widen is
 // exact for these small integers). Same transposed-A / normal-B nest as the bf16 twin; the recognizer
-// dispatches to mercury_sgemm_f16_tn (lossless f16 widen prepass → the f32 mercury_sgemm_tn). The
+// dispatches to wukong_sgemm_f16_tn (lossless f16 widen prepass → the f32 wukong_sgemm_tn). The
 // differential gate is bit-for-bit (interp == native, -O0 == -O3). A is stored [K=3, M=2], B is
 // [K=3, N=3], C is [M=2, N=3].
 fn main() -> i32 {

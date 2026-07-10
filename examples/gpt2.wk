@@ -1,7 +1,7 @@
 module examples.gpt2
 
 // =====================================================================================
-// GPT-2 transformer block, written in Mercury's surface as recognized op-forms.
+// GPT-2 transformer block, written in Wukong's surface as recognized op-forms.
 // =====================================================================================
 //
 // This is one **pre-LayerNorm** GPT-2 decoder block — the unit the 124M model stacks 12×:
@@ -12,7 +12,7 @@ module examples.gpt2
 // Every sub-op is spelled in the form the compiler RECOGNIZES and dispatches to a tuned
 // kernel (the same lowering XLA/TVM use for a matmul/softmax/norm op, not the naive nest
 // gcc/rustc emit):
-//   * the LayerNorms are the batched `for r { mean; var; rsqrt; affine }` form  -> mercury_norm_affine_f32
+//   * the LayerNorms are the batched `for r { mean; var; rsqrt; affine }` form  -> wukong_norm_affine_f32
 //   * the Q/K/V/O/FFN projections are the `nn.Linear` C = A·Bᵀ dot-product nest -> the tuned GEMM
 //   * the causal attention is Q·Kᵀ -> masked row-softmax -> P·V                 -> GEMM + fused norm
 //   * the GELU is the tanh-approximation elementwise loop                       -> the 256-bit vmath kernel

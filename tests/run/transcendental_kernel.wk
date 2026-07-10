@@ -4,9 +4,9 @@
 // EXPECT-OUT: 1.6487213373184204
 module tests.run.transcendental_kernel
 
-// An `out[i] = exp(x[i])` loop dispatches to the 256-bit `mercury_vmath_f32` microkernel (the same
+// An `out[i] = exp(x[i])` loop dispatches to the 256-bit `wukong_vmath_f32` microkernel (the same
 // symbol on both backends — the differential gate is bit-exact). It also exercises `--emit=exe`
-// linking the `mercury_runtime` kernels: this program links to a runnable executable whose output
+// linking the `wukong_runtime` kernels: this program links to a runnable executable whose output
 // matches `--run` (see the `exe.rs` gate).
 fn main() -> i32 {
     let n: i32 = 16;

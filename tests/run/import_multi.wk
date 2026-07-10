@@ -1,5 +1,5 @@
 // Multi-file program: `main` lives here; a struct, a const, and fns come from imported files.
-// `lib/mathlib.mer` itself imports `lib/deep.mer` (transitive load), and deep imports mathlib
+// `lib/mathlib.wk` itself imports `lib/deep.wk` (transitive load), and deep imports mathlib
 // BACK (an A<->B cycle the loader must break by never reloading a loaded file). All items land in
 // one merged flat namespace, so `seven()` resolves here without a direct import.
 // EXPECT-OUT: 25
@@ -13,9 +13,9 @@ import lib.mathlib;
 
 fn main() -> i32 {
     let p = Point { x: 3, y: 4 };
-    print(dot_self(p));   // fn + struct from lib/mathlib.mer
-    print(ANSWER);        // const from lib/mathlib.mer
+    print(dot_self(p));   // fn + struct from lib/mathlib.wk
+    print(ANSWER);        // const from lib/mathlib.wk
     print(triple(ANSWER));
-    print(seven());       // fn from lib/deep.mer — imported transitively by mathlib
+    print(seven());       // fn from lib/deep.wk — imported transitively by mathlib
     return 0;
 }

@@ -5,7 +5,7 @@
 module tests.run.matmul_f32
 
 /// A small f32 matmul C[3,2] = A[3,4]·B[4,2]. The compiler recognizes the nest and lowers it to the
-/// `mercury_sgemm` microkernel; under `--run` the interpreter executes that same kernel (marshalling
+/// `wukong_sgemm` microkernel; under `--run` the interpreter executes that same kernel (marshalling
 /// its memory), so this exercises the GEMM-dispatch path end-to-end through the real binary.
 fn main() -> i32 {
     let mut a: [f32; 12] = [0.0; 12];

@@ -9,7 +9,7 @@ module tests.run.linear_residual
 // The transformer skip connection: x = x + (h·Wᵀ + bias) — a residual projection. The matmul's result
 // is added in place to its own output x (the residual). This accumulate store (`x = x + dot + bias`,
 // not the bare `x = dot`) blocks the matmul recognizer, so without dispatch the whole nest falls to a
-// scalar loop. The recognizer (match_matmul_residual) folds it to mercury_sgemm_nt_epi with beta=1:
+// scalar loop. The recognizer (match_matmul_residual) folds it to wukong_sgemm_nt_epi with beta=1:
 // the kernel computes beta·x_old + h·Wᵀ + bias = x_residual + h·Wᵀ + bias, reusing the exact fused-
 // epilogue kernel (no new symbol, no backend change). Small integers, so exact; the differential gate
 // (interp == native, -O0 == -O3) is bit-for-bit. M=2 tokens, K=3 in-dim, N=2 out-dim; identity act.

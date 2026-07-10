@@ -13,7 +13,7 @@ module tests.run.mut_param
 // in-place write is visible to the caller — the idiomatic output-buffer kernel. A `mut` SCALAR
 // parameter is a private copy (no leak). A pointer parameter may write through its pointee without
 // `mut`. Both backends agree bit-for-bit, at every opt level. (Mutating a non-`mut` parameter is
-// rejected — see tests/fail/param_field_mutation_no_mut.mer and tests/fail/param_rebind_no_mut.mer.)
+// rejected — see tests/fail/param_field_mutation_no_mut.wk and tests/fail/param_rebind_no_mut.wk.)
 
 struct S { a: i32, b: i32 }
 

@@ -14,7 +14,7 @@ module tests.run.gemv_scaled
 /// α-scaled GEMV — the single-token KV-decode attention score `scores = (K·q)·scale`
 /// (`scale = 1/√d`), written the idiomatic per-row-dot way with a loop-invariant scale on the
 /// store. Without the α peel the `* 0.125` blocks the GEMV recognizer and the whole nest falls to
-/// a scalar loop; here it dispatches to `mercury_sgemv_alpha`, which computes the identical row
+/// a scalar loop; here it dispatches to `wukong_sgemv_alpha`, which computes the identical row
 /// dot and applies the scale exactly once on the store (the same single multiply the scalar store
 /// performs). `--run` marshals that same kernel through the interpreter, so this gates
 /// interp == native and -O0 == -O3 on the scaled path. All inputs are exactly-representable

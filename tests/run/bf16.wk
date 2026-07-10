@@ -9,7 +9,7 @@ module tests.run.bf16
 
 // Real bf16 storage: `[bf16; N]` holds 2-byte values rounded to bf16 (round-to-nearest-even).
 // Casts and array load/store all round through the single shared conversion, so the interpreter
-// and native backend agree bit-for-bit (the mercury_bench gate proves it).
+// and native backend agree bit-for-bit (the wukong_bench gate proves it).
 fn main() -> i32 {
     // scalar cast rounds to the bf16 grid.
     let third: bf16 = 0.333333 as bf16;

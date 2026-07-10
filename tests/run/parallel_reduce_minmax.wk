@@ -5,10 +5,10 @@
 module tests.run.parallel_reduce_minmax
 
 // `@parallel` max/min reductions dispatch to the multicore deterministic reduction kernel
-// (mercury_sreduce_f32_parallel, RED_MAX/RED_MIN): the per-tensor max/min that softmax stability and
+// (wukong_sreduce_f32_parallel, RED_MAX/RED_MIN): the per-tensor max/min that softmax stability and
 // dynamic int8 quantization scale-computation need. The kernel folds by fmax/fmin over fixed chunks
 // and the outer combine is a compare+select, so serial == parallel == interpreter bit-for-bit (the
-// mercury_bench gate proves it); this pins the values and opt-invariance. Max/min pick an actual
+// wukong_bench gate proves it); this pins the values and opt-invariance. Max/min pick an actual
 // element, so the values are exact.
 
 @parallel

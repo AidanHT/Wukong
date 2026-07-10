@@ -13,7 +13,7 @@ enum Color { Red, Green, Blue }
 // dead (one variant always matches at runtime). That block now terminates in `Unreachable` instead of
 // branching a zero default into the merge, so it stays well-typed at every opt level and both backends
 // agree. (A *non*-exhaustive value match is rejected at compile time by sema, E0405 — see
-// tests/fail/match_nonexhaustive.mer.) Also covers an exhaustive `bool` match (both cases, no `_`).
+// tests/fail/match_nonexhaustive.wk.) Also covers an exhaustive `bool` match (both cases, no `_`).
 fn rank(c: Color) -> i32 {
     return match c {
         Color::Red => 1,

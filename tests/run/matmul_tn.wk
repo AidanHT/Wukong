@@ -7,7 +7,7 @@ module tests.run.matmul_tn
 // C = Aᵀ·B — the dW = dYᵀ·X weight-gradient GEMM of a training backward pass. A is stored [K, M]
 // (the contraction/batch axis K is the OUTER index of A's storage), so its logical [M, K] operand is
 // the transpose of its layout. The ijk recognizer detects `a[k*M + i] * b[k*N + j]` and dispatches to
-// mercury_sgemm_tn; gcc/rustc compile the column-strided A reads as a scalar loop. interp == native
+// wukong_sgemm_tn; gcc/rustc compile the column-strided A reads as a scalar loop. interp == native
 // and -O0 == -O3 (the differential gate) because both backends marshal the identical kernel, which is
 // the tuned NN kernel run on a once-transposed A.
 fn main() -> i32 {

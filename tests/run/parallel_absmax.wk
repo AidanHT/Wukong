@@ -7,7 +7,7 @@ module tests.run.parallel_absmax
 // `@parallel` absmax: `fmax(m, abs(x[k]))` dispatches to the multicore RED_MAXABS reduction kernel —
 // the per-tensor absmax dynamic symmetric int8 quantization uses to compute the scale
 // (scale = absmax/127). The kernel abs's each element (sign-bit clear) then folds by fmax; serial ==
-// parallel == interpreter bit-for-bit (the mercury_bench gate proves it). absmax picks |an element|,
+// parallel == interpreter bit-for-bit (the wukong_bench gate proves it). absmax picks |an element|,
 // so the value is exact.
 
 @parallel

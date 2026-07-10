@@ -7,7 +7,7 @@
 module tests.run.selu_parallel
 
 // A whole-function `@parallel` activation: each per-core chunk of the `out[i] = selu(x[i])` loop is
-// itself dispatched to the 256-bit AVX2 mercury_vmath_f32 kernel, so the work runs multicore × SIMD.
+// itself dispatched to the 256-bit AVX2 wukong_vmath_f32 kernel, so the work runs multicore × SIMD.
 // The chunking is deterministic, so serial == parallel == interpreter bit-for-bit (the differential
 // gate and -O0==-O3 both check this); the values equal the serial selu over the same inputs.
 //   x[i] = (i % 8) − 4, so: selu(-4)≈-1.726 → -1725; selu(0)=0; selu(1)≈1.0507 → 1050;

@@ -8,9 +8,9 @@ module tests.run.rmsnorm_const_eps
 // RMSNorm with the epsilon written as a top-level `const` — the near-universal transformer spelling
 // (`const EPS: f32 = 1e-5;` shared across every norm) rather than an inline literal. The fused-norm
 // recognizer resolves the `const` eps via `sema.consts` (it is immutable and always in scope), so this
-// still folds into one `mercury_norm_f32(.., NORM_RMSNORM)` call — grep the `-O2` MIR for the symbol.
+// still folds into one `wukong_norm_f32(.., NORM_RMSNORM)` call — grep the `-O2` MIR for the symbol.
 // A local binding of the same name would shadow the const (the recognizer checks `lookup` first), so a
-// runtime eps still correctly declines to the scalar path. Same value as tests/run/rmsnorm.mer, so the
+// runtime eps still correctly declines to the scalar path. Same value as tests/run/rmsnorm.wk, so the
 // output is identical; the differential + opt-invariance gates prove the fused kernel matches bit-for-bit.
 const EPS: f32 = 0.00001;
 

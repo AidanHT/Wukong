@@ -9,7 +9,7 @@ module tests.run.colsum
 // Column reduction out[j] = Σ_i x[i,j] — the sum over the outer (batch/row) axis of a [M=3, N=4]
 // matrix into a per-column [N=4] result (the bias gradient db = Σ_batch dY, batch sum, reduce-along-
 // axis-0). The data index x[i*N+j] strides by N over the inner loop, so gcc/rustc leave it scalar
-// (verified: no packed vaddps at -O3); the recognizer dispatches to the SIMD mercury_colsum_f32, which
+// (verified: no packed vaddps at -O3); the recognizer dispatches to the SIMD wukong_colsum_f32, which
 // streams x row-major + 8 columns at a time. The accumulation is i-ascending per column — exactly the
 // scalar nest's order — so the kernel is bit-exact: the differential gate (interp == native, -O0 ==
 // -O3) holds by construction (no reassociation).

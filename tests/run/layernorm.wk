@@ -9,7 +9,7 @@ module tests.run.layernorm
 // LayerNorm over a fixed vector (gamma=1, beta=0, eps=1e-5), in the supported subset (fixed
 // [f32; N] arrays + literal `for` loops). This is the canonical multi-pass form — mean, then the
 // squared-deviation variance (its addend FMA-contracts), then `(x-mean) * rsqrt(var+eps)` in place
-// — which the compiler folds into one `mercury_norm_f32(.., NORM_LAYERNORM)` call (each element
+// — which the compiler folds into one `wukong_norm_f32(.., NORM_LAYERNORM)` call (each element
 // loaded once + 256-bit AVX2). The differential gate proves the fused kernel matches the
 // interpreter bit-for-bit, and the opt-invariance gate proves -O0 == -O3.
 //

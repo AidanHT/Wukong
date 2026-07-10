@@ -9,7 +9,7 @@ module tests.run.softmax
 // Numerically-stable softmax over a fixed vector, in the supported subset (fixed [f32; N]
 // arrays + literal `for` loops). Each pass is an elementwise/reduction loop: the exp pass and
 // the normalize pass vectorize (128-bit x 4); the max and sum passes are reductions. The
-// mercury_bench gate proves the whole thing matches the interpreter bit-for-bit.
+// wukong_bench gate proves the whole thing matches the interpreter bit-for-bit.
 fn main() -> i32 {
     let mut x: [f32; 16] = [0.0; 16];
     for i in 0..16 {

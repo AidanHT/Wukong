@@ -14,7 +14,7 @@ module tests.run.rmsnorm_bwd
 // — the gradient that flows through every RMSNorm in a transformer's backward pass (Llama/Mistral/Qwen).
 // Each row needs TWO reductions (Σx², Σ g·x) that gcc/rustc keep scalar at -O3 (they won't reassociate
 // the float sums), then a fused elementwise apply. The recognizer folds the [R=2,C=4] nest to one
-// mercury_rmsnorm_bwd_f32 call (the kernel folds both reductions 8-wide, then applies). The reductions
+// wukong_rmsnorm_bwd_f32 call (the kernel folds both reductions 8-wide, then applies). The reductions
 // reassociate (the documented exception), but both backends run the same kernel, so the differential
 // gate (interp == native, -O0 == -O3) holds. Values chosen so every f32 is exact (r ∈ {0.5, 1}).
 fn main() -> i32 {

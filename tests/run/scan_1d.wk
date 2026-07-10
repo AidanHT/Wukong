@@ -16,7 +16,7 @@ module tests.run.scan_1d
 // first-order linear recurrence (lrscan / SSM). Only the batched `for r { <scan over x[r*C+i]> }`
 // form was recognized before; the flat form is not an outer loop, so it fell to fully-scalar code
 // (the loop-carried recurrence also defeats the generic vectorizer). These now fold to
-// `mercury_{cumsum,cumprod,lrscan}_f32(.., 1, N)` (serial; 1 row) — grep the `-O2` MIR for the symbol.
+// `wukong_{cumsum,cumprod,lrscan}_f32(.., 1, N)` (serial; 1 row) — grep the `-O2` MIR for the symbol.
 // cumsum reassociates (documented reduction exception, both backends run the identical kernel);
 // cumprod and lrscan are bit-identical to the scalar nest. interp == native, -O0 == -O2.
 

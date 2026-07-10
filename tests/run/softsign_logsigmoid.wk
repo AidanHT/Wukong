@@ -11,7 +11,7 @@ module tests.run.softsign_logsigmoid
 // tanh, fatter gradient tails). `logsigmoid(x) = ln(σ(x)) = −softplus(−x)` — the numerically-stable
 // log-sigmoid behind binary-cross-entropy-with-logits and contrastive/RL losses. Both compose
 // existing kernels (abs/div; the stable softplus), so a dispatched `out[i] = f(x[i])` loop lowers to
-// the 256-bit `mercury_vmath_f32` and agrees with the composed/scalar form — interp == native,
+// the 256-bit `wukong_vmath_f32` and agrees with the composed/scalar form — interp == native,
 // -O0 == -O3. C/Rust can vectorize neither (softsign is a libm-free div but logsigmoid is two scalar
 // libm calls, and a loop with a call won't vectorize at all).
 fn main() -> i32 {

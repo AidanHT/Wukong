@@ -19,7 +19,7 @@
 module tests.run.cummax
 
 // Batched per-row cumulative max / min (running-extreme scan): out[r,i] = max/min_{k<=i} x[r,k]. The
-// recognizer folds each [R=2,C=4] nest to one mercury_cum{max,min}_f32 call — gcc/rustc keep the
+// recognizer folds each [R=2,C=4] nest to one wukong_cum{max,min}_f32 call — gcc/rustc keep the
 // loop-carried fmax/fmin recurrence scalar, while the SIMD in-lane scan vectorizes it. max/min select an
 // input value (no float arithmetic), so the kernel is BIT-EXACT vs the scalar scan — interp == native
 // trivially, with no reassociation exception (unlike cumsum).

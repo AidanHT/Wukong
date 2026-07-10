@@ -8,7 +8,7 @@ module tests.run.linear_f16_ffn
 
 // f16 mixed-precision fused FFN projection: C = A·Bᵀ + bias — an f16 nn.Linear matmul immediately
 // followed by its bias-add loop over the same C, with the identity activation (the bias-only
-// projection). The compiler fuses the two into one mercury_sgemm_f16_nt_epi call: the lossless f16
+// projection). The compiler fuses the two into one wukong_sgemm_f16_nt_epi call: the lossless f16
 // (F16C) widen prepass feeds the tuned f32 GEMM, which folds the bias into the C writeback. Identity
 // requires a bias (a bare C = C copy is a no-op), and unlike the ReLU sibling it keeps the negative
 // outputs — so this fixture exercises the f16 path AND the identity-with-bias epilogue. Small

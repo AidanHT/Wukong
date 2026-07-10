@@ -10,7 +10,7 @@ module tests.run.i8_linear_dequant
 // f32 in one pass — out[i,j] = (C[i,j] as f32) * scale_a * scale_b[j] + bias[j] — the standard
 // quantized-inference decode (per-tensor activation scale, per-channel weight scale, bias). The
 // compiler recognizes the int8 GEMM immediately followed by this per-channel dequant loop over the
-// same accumulator and fuses both into one mercury_i8gemm_nt_deq call: the i32 tile is dequanted in
+// same accumulator and fuses both into one wukong_i8gemm_nt_deq call: the i32 tile is dequanted in
 // registers, so it never touches memory (the fusion cuBLAS/oneDNN can't express — they emit the i32
 // GEMM and the dequant as two passes). Both backends marshal the identical kernel, so the differential
 // gate is exact and -O0 == -O3. A is [3,4] (u8), B is [3,4] (i8, rows = weight vectors), C is [3,3].

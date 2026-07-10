@@ -9,7 +9,7 @@ module tests.run.vec256_while
 // A counting `while i < N { …; i += 1 }` with a vectorizable elementwise body normalizes to the
 // for-range vectorizer (`try_normalize_counting_while`), so it reaches the 256-bit path — either the
 // general AVX2 recipe or a recognized kernel (e.g. `a[k]*b[k]` and the ReLU below dispatch to
-// `mercury_velem_f32`) — instead of a scalar loop. The rewrite preserves the while's post-loop
+// `wukong_velem_f32`) — instead of a scalar loop. The rewrite preserves the while's post-loop
 // counter value exactly — `N` if the loop ran, else the untouched start — so code after the loop is
 // unchanged. Bit-exact across interp/native and -O0..-O3.
 

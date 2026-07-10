@@ -11,7 +11,7 @@ module tests.run.int_literal_widen
 // shared MIR, so BOTH backends agreed on the wrong value — invisible to the interp-vs-native gate. The
 // default now widens to i64 when the value does not fit i32, so a return / field / cast / bare context
 // lowers the true value; a pinned-i32 annotation still re-adapts and range-checks (a hard E0401, see
-// tests/fail/return_literal_out_of_range.mer).
+// tests/fail/return_literal_out_of_range.wk).
 
 struct Big { v: i64 }
 

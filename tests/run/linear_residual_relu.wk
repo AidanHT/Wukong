@@ -7,9 +7,9 @@
 module tests.run.linear_residual_relu
 
 // A residual projection wrapped in an activation: x = relu(x + h·Wᵀ + bias). The activation wraps the
-// whole residual sum, so it dispatches to mercury_sgemm_nt_epi with beta=1 AND act=ReLU (the kernel
+// whole residual sum, so it dispatches to wukong_sgemm_nt_epi with beta=1 AND act=ReLU (the kernel
 // applies relu(beta·x_old + h·Wᵀ + bias) in its writeback). One output goes negative before the relu,
-// so it exercises the fused clipping. Same shape as linear_residual.mer; small integers → exact, the
+// so it exercises the fused clipping. Same shape as linear_residual.wk; small integers → exact, the
 // differential gate (interp == native, -O0 == -O3) is bit-for-bit. ReLU is written as fmax(_, 0).
 fn main() -> i32 {
     let mut x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];

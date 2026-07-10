@@ -5,7 +5,7 @@ module tests.fail.chained_equality
 // outer `== 0` silently compared a bool against an int (the bool coerced to 0/1) — `5 == 3 == 0`
 // returned true (`false == 0` is `0 == 0`). Equality between a bool and a non-bool scalar is now
 // rejected, completing the chained-comparison guard (the ordered `< <= > >=` chains were already
-// caught by tests/fail/chained_comparison.mer).
+// caught by tests/fail/chained_comparison.wk).
 fn main() -> i32 {
     let a = 5;
     if a == 3 == 0 {

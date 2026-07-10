@@ -2,7 +2,7 @@
 module tests.fail.matmul_dim
 
 /// The shared inner dimension K disagrees (512 vs 513): a compile-time shape error, not a runtime
-/// fault. This is Mercury's headline guarantee.
+/// fault. This is Wukong's headline guarantee.
 fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N]) {}
 
 fn main() -> i32 {

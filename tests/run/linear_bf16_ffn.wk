@@ -8,7 +8,7 @@ module tests.run.linear_bf16_ffn
 
 // bf16 mixed-precision fused FFN projection: C = relu(A·Bᵀ + bias) — a bf16 nn.Linear matmul
 // immediately followed by its bias-add + activation loop over the same C. The compiler fuses the two
-// into one mercury_sgemm_bf16_nt_epi call: the lossless bf16 widen prepass feeds the tuned f32 GEMM,
+// into one wukong_sgemm_bf16_nt_epi call: the lossless bf16 widen prepass feeds the tuned f32 GEMM,
 // which folds the bias + ReLU into the C writeback (C is written once — no separate epilogue pass).
 // Small integers are bf16-exact, so the result is exact and the differential gate is bit-for-bit
 // (interp == native, -O0 == -O3). A is [2,3], B is [4,3] (rows are weight vectors), C is [2,4],

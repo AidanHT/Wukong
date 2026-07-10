@@ -13,7 +13,7 @@ module tests.run.rope
 // RoPE (rotary position embedding), the half-split Llama/GPT-NeoX form over x[R=2, D=4] (D = 2·H,
 // H=2): each (row r, pair j) rotates (x[r,j], x[r,j+H]) by the angle theta = r·inv_freq[j], with
 // cos/sin computed INLINE. Row 0 has theta=0 (identity); row 1 is a real rotation. The recognizer folds
-// the nest to one mercury_rope_f32 call (the 8-wide sin8/cos8 — C/Rust keep sinf/cosf scalar). A
+// the nest to one wukong_rope_f32 call (the 8-wide sin8/cos8 — C/Rust keep sinf/cosf scalar). A
 // rotation is pure data movement, so the kernel is bit-identical to the scalar nest; the differential
 // gate (interp == native, -O0 == -O3) is trivial.
 fn main() -> i32 {

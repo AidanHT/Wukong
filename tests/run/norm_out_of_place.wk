@@ -12,7 +12,7 @@ module tests.run.norm_out_of_place
 
 // Out-of-place normalizations `out = norm(x)` (the residual-stream transformer pattern: the normalized
 // activations go to a fresh buffer while `x` — the residual — is preserved). The same fused
-// `mercury_norm_f32(x, out, .., NORM_*)` the in-place form uses, but the kernel reads `x` and writes a
+// `wukong_norm_f32(x, out, .., NORM_*)` the in-place form uses, but the kernel reads `x` and writes a
 // distinct `out` (the ABI's two pointers, which both backends already marshal separately). RMSNorm /
 // LayerNorm / L2-norm accept the out-of-place form; the differential gate proves interp == native and
 // opt-invariance proves -O0 == -O3. Each `out` here equals the in-place result (same math), and the

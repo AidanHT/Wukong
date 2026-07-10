@@ -5,10 +5,10 @@
 module tests.run.parallel_abssum
 
 // `@parallel` L1 reductions dispatch to the multicore deterministic reduction kernel
-// (mercury_sreduce_f32_parallel): abssum `sum(|x[k]|)` (the L1 norm — RED_SUMABS, unary, y == x) and
+// (wukong_sreduce_f32_parallel): abssum `sum(|x[k]|)` (the L1 norm — RED_SUMABS, unary, y == x) and
 // MAE `sum(|x[k]-y[k]|)` (RED_ABSDIFF, the two-array L1 distance / mean-absolute-error numerator).
 // Both fold by `+` over the abs of each element — the kernel clears the sign bit (bit-identical to
-// f32::abs), so serial == parallel == interpreter (the mercury_bench gate proves it). Values are
+// f32::abs), so serial == parallel == interpreter (the wukong_bench gate proves it). Values are
 // f32-exact (integers well below 2^24) so the reassociated sum is unambiguous.
 
 @parallel

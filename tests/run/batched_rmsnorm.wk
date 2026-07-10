@@ -8,7 +8,7 @@ module tests.run.batched_rmsnorm
 // Batched RMSNorm over a flat [R, C] matrix: each row r is normalized by its own RMS,
 // x[r*C+i] /= sqrt(mean(x[r*C+·]²) + eps). The `for r { ...row r... }` outer loop dispatches to the
 // fused single-pass norm kernel with rows = R (each row normalized independently) — the real
-// transformer shape (norm over [batch*seq, hidden]). The mercury_bench gate proves interp == native.
+// transformer shape (norm over [batch*seq, hidden]). The wukong_bench gate proves interp == native.
 
 fn rmsnorm_batch(mut x: [f32; 12]) { // R = 3 rows, C = 4 cols
     for r in 0..3 {

@@ -15,7 +15,7 @@ module tests.run.rounding
 // round / floor / ceil / trunc lower to one hardware round-to-integral op (roundss/roundps), scalar
 // or vectorized. round is round-to-nearest-ties-to-EVEN (matching the native `nearest` and the
 // interpreter's `round_ties_even`), so 2.5 → 2 and 3.5 → 4. Bit-identical across backends (the
-// mercury_bench gate proves it); a `round(x / scale)` is the quantization step that pairs with absmax.
+// wukong_bench gate proves it); a `round(x / scale)` is the quantization step that pairs with absmax.
 
 fn main() -> i32 {
     let a: f32 = 2.5;

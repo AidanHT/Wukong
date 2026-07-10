@@ -20,7 +20,7 @@ module tests.run.elu_softplus_backward
 
 // ELU/softplus backward — elu_backward(x,dy)=dy·(x>0?1:eˣ) and softplus_backward(x,dy)=dy·σ(x) (softplus'
 // is the sigmoid). Both fold an expf C/Rust keep scalar, so each elementwise loop folds to one 256-bit
-// mercury_vmath2_f32 call. elu_backward's branch is the same Cmp(Fogt)+Select the forward elu uses; pure
+// wukong_vmath2_f32 call. elu_backward's branch is the same Cmp(Fogt)+Select the forward elu uses; pure
 // elementwise → bit-identical lane-for-lane, so the differential gate (interp == native, -O0 == -O3) is
 // trivial. Frozen deterministic kernel output (×1000, truncated).
 fn main() -> i32 {

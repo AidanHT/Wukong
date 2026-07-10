@@ -10,7 +10,7 @@ module tests.run.trig_inverse
 // `tan`/`asin`/`acos` complete the trig family (sin/cos/atan): geometry, 3D vision, graphics ML
 // (rotations, NeRF/SLAM angles). All compose the shared sin/cos/atan kernels (tan = sin/cos;
 // asin = atan(x/√(1−x²)); acos = π/2 − asin), so a dispatched `out[i] = f(x[i])` loop lowers to the
-// 256-bit `mercury_vmath_f32` and agrees with the composed/scalar form — interp == native, -O0 == -O3.
+// 256-bit `wukong_vmath_f32` and agrees with the composed/scalar form — interp == native, -O0 == -O3.
 // C/Rust call scalar libm tanf/asinf/acosf, which won't vectorize inside a loop.
 fn main() -> i32 {
     // asin(sin(t)) = t and acos(cos(t)) = t for t in [-π/2, π/2] (round-trip identities).

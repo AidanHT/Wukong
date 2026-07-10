@@ -1,7 +1,7 @@
 // RUN: --run
 // The memory-accumulator ijk matmul — the FIRST matmul anyone writes, accumulating straight into
 // the output element (`c[i*N+j] = c[i*N+j] + a[i*K+k]*b[k*N+j]`, or `+=`) instead of a scalar temp
-// — must dispatch to the same mercury_sgemm kernel the `let s` form reaches. It used to fall
+// — must dispatch to the same wukong_sgemm kernel the `let s` form reaches. It used to fall
 // through BOTH the GEMM recognizer AND the vectorizer (a loop-carried memory accumulate) to fully
 // scalar code: ~10x slower end-to-end at 256^3 (measured adjacent same-run, release), kernel-only
 // gap larger. The f32 store/load round-trip is exact, so the k-ascending add chain is bit-for-bit

@@ -9,7 +9,7 @@ module tests.run.colmean
 // Column mean out[j] = (Σ_i x[i,j]) / rows — the per-channel mean over the outer (batch/row) axis of a
 // [M=2, N=4] matrix (the BatchNorm running mean / per-feature batch mean). Like colsum the data index
 // x[i*N+j] strides by N over the inner loop, so gcc/rustc leave it scalar; the recognizer folds the
-// nest to the SIMD mercury_colmean_f32 (the colsum fold + a `/rows` per-column finalize). The fold is
+// nest to the SIMD wukong_colmean_f32 (the colsum fold + a `/rows` per-column finalize). The fold is
 // i-ascending per column and the finalize is column-disjoint (the kernel is its own oracle), so the
 // differential gate (interp == native, -O0 == -O3) holds by construction.
 fn main() -> i32 {

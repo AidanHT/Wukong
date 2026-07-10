@@ -9,9 +9,9 @@ module tests.run.bias_bcast
 
 // Broadcast-bias add `out[i*C + j] = act(x[i*C + j] + b[j])` — a `cols`-long bias `b` added across
 // every row of a `[rows, cols]` matrix (the pre-activation `+ bias` add every FFN/attention projection
-// ends with). Dispatches to the 256-bit `mercury_bias_bcast_f32`: the row-broadcast operand `b[j]`
+// ends with). Dispatches to the 256-bit `wukong_bias_bcast_f32`: the row-broadcast operand `b[j]`
 // (indexed by the inner loop var alone) is what the affine `velem` recognizer declines, so without this
-// the nest would fall to the 128-bit generic vectorizer / scalar. The mercury_bench / cranelift
+// the nest would fall to the 128-bit generic vectorizer / scalar. The wukong_bench / cranelift
 // differential gate proves interp == native bit-for-bit through the dispatched kernel, at every opt
 // level; the internal cross-checks below pin the add/ReLU against an independent scalar reference.
 
@@ -25,7 +25,7 @@ fn main() -> i32 {
     let mut j0: usize = 0;
     while j0 < 12 { b[j0] = (j0 as f32) - 3.0; j0 = j0 + 1; }
 
-    // --- (1) identity broadcast-bias add → mercury_bias_bcast_f32 (pure add) ---
+    // --- (1) identity broadcast-bias add → wukong_bias_bcast_f32 (pure add) ---
     let mut out: [f32; 96] = [0.0; 96];
     for i in 0..8 {
         for j in 0..12 {
@@ -48,7 +48,7 @@ fn main() -> i32 {
     for k in 0..96 { if out[k] != refb[k] { mism = mism + 1; } }
     print(mism); // 0 — dispatched add == scalar reference
 
-    // --- (2) fused ReLU broadcast-bias → mercury_bias_bcast_f32 (VM_RELU) ---
+    // --- (2) fused ReLU broadcast-bias → wukong_bias_bcast_f32 (VM_RELU) ---
     let mut outr: [f32; 96] = [0.0; 96];
     for i in 0..8 {
         for j in 0..12 {
@@ -72,7 +72,7 @@ fn main() -> i32 {
     // ReLU clamp: row 0, col 0 → x[0]+b[0] = -20 + -3 = -23 → relu = 0.
     print(round(outr[0] * 1000.0) as i32); // 0
 
-    // --- (3) fused GELU broadcast-bias → mercury_bias_bcast_f32 (VM_GELU) ---
+    // --- (3) fused GELU broadcast-bias → wukong_bias_bcast_f32 (VM_GELU) ---
     let mut outg: [f32; 96] = [0.0; 96];
     for i in 0..8 {
         for j in 0..12 {

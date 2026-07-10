@@ -7,10 +7,10 @@
 module tests.run.linear_bias_relu_parallel
 
 // The `@parallel` fused FFN: out = relu(x · Wᵀ + bias), the matmul nest and the bias+ReLU loop fused
-// into ONE `mercury_sgemm_nt_epi_parallel` call — the bias+activation folded into the GEMM C
+// into ONE `wukong_sgemm_nt_epi_parallel` call — the bias+activation folded into the GEMM C
 // writeback AND run across cores. Before, the epilogue forced the serial kernel, so a `@parallel`
 // fused FFN got the fusion or the cores but not both. The parallel kernel is bit-identical to the
-// serial `mercury_sgemm_nt_epi` the interpreter calls (each C tile owned by one task, same per-(i,j)
+// serial `wukong_sgemm_nt_epi` the interpreter calls (each C tile owned by one task, same per-(i,j)
 // accumulation order), so -O0..-O3 and interp/native all agree.
 //
 // Same data as the serial linear_bias_relu: x=[[1,2],[3,4]], W=I, bias=[-10,-1]

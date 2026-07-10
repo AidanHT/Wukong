@@ -8,8 +8,8 @@ module tests.run.batched_affine_rmsnorm
 // Batched AFFINE RMSNorm — the real transformer form — over a flat [R, C] matrix: each row r is
 // normalized by its own RMS, then scaled by a learned per-COLUMN gamma shared across rows:
 // x[r*C+i] = x[r*C+i] * inv_r * g[i]. The outer `for r` loop dispatches to the fused affine norm
-// kernel mercury_norm_affine_f32 with rows = R; the data is row-offset-indexed x[r*C+i] while gamma
-// stays column-indexed g[i]. mercury_bench proves interp == native.
+// kernel wukong_norm_affine_f32 with rows = R; the data is row-offset-indexed x[r*C+i] while gamma
+// stays column-indexed g[i]. wukong_bench proves interp == native.
 
 fn rmsnorm_affine_batch(mut x: [f32; 12], g: [f32; 4]) { // R = 3 rows, C = 4 cols
     for r in 0..3 {

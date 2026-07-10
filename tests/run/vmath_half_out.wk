@@ -7,27 +7,27 @@
 module tests.run.vmath_half_out
 
 // Half-**output** activation: `out[i] = act(x[i] as f32) as bf16` over a `[bf16]` input with a **bf16
-// output** (and the f16 twin) lowers to mercury_vmath_{bf16,f16}_out — half in AND out, so 4 bytes/elem
+// output** (and the f16 twin) lowers to wukong_vmath_{bf16,f16}_out — half in AND out, so 4 bytes/elem
 // vs the half-in/f32-out activation's 6 (the narrowing store halves the write traffic; the KV-cache /
 // activation-store path). The activation is the shared vmath kernel and the narrowing store the shared
 // f32_to_{bf16,f16}_bits shim, so the dispatched half-out result equals the half-in/f32-out activation
-// (mercury_vmath_bf16) narrowed with `as bf16` bit-for-bit — a robust cross-check (both apply the same
+// (wukong_vmath_bf16) narrowed with `as bf16` bit-for-bit — a robust cross-check (both apply the same
 // vmath kernel; the SIMD narrow == the `as bf16` shim, twin-tested). Interp == native, -O0 == -O2.
 
 fn main() -> i32 {
-    // bf16 half-output activation (silu): out[i] = (silu(x[i] as f32)) as bf16 → mercury_vmath_bf16_out.
+    // bf16 half-output activation (silu): out[i] = (silu(x[i] as f32)) as bf16 → wukong_vmath_bf16_out.
     let mut xb: [bf16; 64] = [0.0 as bf16; 64];
     for i in 0..64 { xb[i] = (((i as f32) - 32.0) * 0.25) as bf16; } // ~[-8, 8)
     let mut ob: [bf16; 64] = [0.0 as bf16; 64];
     for i in 0..64 { ob[i] = (silu(xb[i] as f32)) as bf16; }
-    // Reference: the half-in / f32-out activation (mercury_vmath_bf16), then narrow with `as bf16`.
+    // Reference: the half-in / f32-out activation (wukong_vmath_bf16), then narrow with `as bf16`.
     let mut of: [f32; 64] = [0.0; 64];
     for i in 0..64 { of[i] = silu(xb[i] as f32); }
     let mut mb: i32 = 0;
     for i in 0..64 { if (ob[i] as f32) != ((of[i] as bf16) as f32) { mb = mb + 1; } }
     print(mb); // 0 — bf16 half-out == f32-out narrowed
 
-    // f16 twin (gelu): out[i] = (gelu(x[i] as f32)) as f16 → mercury_vmath_f16_out.
+    // f16 twin (gelu): out[i] = (gelu(x[i] as f32)) as f16 → wukong_vmath_f16_out.
     let mut xf: [f16; 64] = [0.0 as f16; 64];
     for i in 0..64 { xf[i] = (((i as f32) - 32.0) * 0.25) as f16; }
     let mut oh: [f16; 64] = [0.0 as f16; 64];

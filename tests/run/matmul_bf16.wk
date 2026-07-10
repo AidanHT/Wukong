@@ -8,7 +8,7 @@ module tests.run.matmul_bf16
 
 // bf16 inputs, f32 accumulation — the standard ML mixed-precision matmul. Small integer values are
 // bf16-exact, so C = A·I must reproduce A exactly. Proves bf16 storage + widening work end-to-end
-// through a matmul nest; the mercury_bench gate proves the interpreter and native backend agree.
+// through a matmul nest; the wukong_bench gate proves the interpreter and native backend agree.
 fn main() -> i32 {
     let mut a: [bf16; 16] = [0.0 as bf16; 16]; // row i is all (i+1)
     let mut b: [bf16; 16] = [0.0 as bf16; 16]; // identity

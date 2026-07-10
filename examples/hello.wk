@@ -1,6 +1,6 @@
 module examples.hello
 
-/// Smallest runnable Mercury program with output. `print` is a built-in intrinsic.
+/// Smallest runnable Wukong program with output. `print` is a built-in intrinsic.
 fn main() -> i32 {
     print(42);
     print(7 * 6);

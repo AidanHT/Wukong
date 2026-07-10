@@ -7,7 +7,7 @@ module tests.run.scaled_gemm
 /// α-scaled `nn.Linear` — the attention score matmul `scores = (Q·Kᵀ)·scale` (`scale = 1/√d`), written
 /// the idiomatic `ijk` dot-product way with a loop-invariant scalar `scale` on the store. Without the
 /// α recognizer the `* scale` on the store blocks the matmul matcher and the whole nest falls to a
-/// scalar loop; here it dispatches to `mercury_sgemm_nt_alpha`, which folds the scale into the GEMM
+/// scalar loop; here it dispatches to `wukong_sgemm_nt_alpha`, which folds the scale into the GEMM
 /// C-tile writeback. `--run` executes that same kernel via the interpreter, so this gates interp ==
 /// native and -O0 == -O3 on the scaled path.
 ///

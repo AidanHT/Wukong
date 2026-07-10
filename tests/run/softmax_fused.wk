@@ -1,7 +1,7 @@
 // RUN: --run
 // The FUSED-window softmax spelling — the exp-of-centered store and the running sum share ONE loop
 // (`for i { let e = exp(x[i]-m); x[i] = e; s = s + e }`), one fewer memory pass than the canonical
-// split form — must dispatch to the same mercury_norm_f32(NORM_SOFTMAX) kernel. This is the spelling
+// split form — must dispatch to the same wukong_norm_f32(NORM_SOFTMAX) kernel. This is the spelling
 // every efficient hand-written softmax uses; it used to fall to the generic velem path (~1.8x slower
 // than the fused kernel at [256,256], measured adjacent same-run). Covers both the single-row and the
 // batched [R,C] form, and the batched max seed written as the explicit column-zero `x[r*C+0]` (what

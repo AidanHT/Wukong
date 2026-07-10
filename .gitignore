@@ -15,7 +15,7 @@ CLAUDE.md
 # Session/prompt notes (kept local, not committed)
 prompts/*.md
 
-# Mercury / native build outputs
+# Wukong / native build outputs
 *.exe
 *.obj
 *.o
@@ -50,6 +50,6 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
-scratch_*.mer
+scratch_*.wk
 *.o
 *_rt.c

@@ -13,7 +13,7 @@ module tests.run.generic_shape_matmul
 // A symbolic-DIM matmul still dispatches to the tuned GEMM microkernel. The matmul recognizer
 // already compares strides by `Dim::Var` identity (so a symbolic nest is recognized); once the dims
 // are threaded in as hidden runtime params, `emit_sgemm` materializes each `Dim::Var(M/N/K)` from
-// its bound value and emits one `mercury_sgemm` call — so `matmul<M, N, K>` runs on the AVX2/FMA
+// its bound value and emits one `wukong_sgemm` call — so `matmul<M, N, K>` runs on the AVX2/FMA
 // kernel at ANY runtime size, bit-identical to the constant-shape matmul on both backends. The
 // `<M, N, K>` declaration order deliberately differs from the shape-appearance order `[M, K, N]`
 // (the hidden-param ABI), so the non-square case below also checks the call-site order mapping.
@@ -30,7 +30,7 @@ fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], mut c: Tensor[f32
 }
 
 fn main() -> i32 {
-    // 2x2 · 2x2 (matches the constant-shape `tensor_matmul.mer` reference: 19, 22, 43, 50).
+    // 2x2 · 2x2 (matches the constant-shape `tensor_matmul.wk` reference: 19, 22, 43, 50).
     let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
     let b: [f32; 4] = [5.0, 6.0, 7.0, 8.0];
     let mut c: [f32; 4] = [0.0; 4];

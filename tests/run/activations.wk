@@ -10,7 +10,7 @@
 module tests.run.activations
 
 // tanh and sigmoid as first-class intrinsics (built on the exp polynomial). They vectorize, so
-// SiLU/swish (x*sigmoid(x)) and tanh activations lower to 128-bit x 4 SIMD; the mercury_bench gate
+// SiLU/swish (x*sigmoid(x)) and tanh activations lower to 128-bit x 4 SIMD; the wukong_bench gate
 // proves the interpreter and native backend agree bit-for-bit.
 fn main() -> i32 {
     // scalar

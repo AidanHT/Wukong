@@ -7,8 +7,8 @@
 // EXPECT-OUT: 9
 module tests.run.vec256_general
 
-// Exercises the general 256-bit AVX2 vectorizer recipe path — `mercury_mir_build::build_vec_recipe`
-// → `Op::VecKernelCall` → the raw-AVX2 kernel (`mercury_codegen_cranelift::avx2`) — for f32
+// Exercises the general 256-bit AVX2 vectorizer recipe path — `wukong_mir_build::build_vec_recipe`
+// → `Op::VecKernelCall` → the raw-AVX2 kernel (`wukong_codegen_cranelift::avx2`) — for f32
 // elementwise bodies the recognized-kernel dispatchers (vmath/velem/vhorner) do *not* claim: a
 // stream×stream product, an in-place if/else ReLU, and `sqrt` composed with arithmetic. The
 // interpreter marshals the *same* `VecKernel` recipe the native backend assembles, so all of

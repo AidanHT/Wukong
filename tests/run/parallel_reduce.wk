@@ -6,8 +6,8 @@
 module tests.run.parallel_reduce
 
 // `@parallel` reduction loops dispatch to the multicore deterministic reduction kernel
-// (mercury_sreduce_f32_parallel): dot, sum-of-squared-differences, and the unary sum — the
-// reductions transformer math leans on (attention scores, L2 loss, LayerNorm sums). The mercury_bench
+// (wukong_sreduce_f32_parallel): dot, sum-of-squared-differences, and the unary sum — the
+// reductions transformer math leans on (attention scores, L2 loss, LayerNorm sums). The wukong_bench
 // gate proves the interpreter and native backend agree bit-for-bit; this pins the values and
 // opt-invariance. Values are f32-exact so the reassociated sum is unambiguous.
 

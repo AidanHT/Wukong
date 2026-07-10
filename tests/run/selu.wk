@@ -7,7 +7,7 @@
 module tests.run.selu
 
 // SELU (scaled ELU, self-normalizing networks): out[i] = λ·(x>0 ? x : α·(eˣ−1)) with the fixed
-// λ≈1.0507, α≈1.6733. An `out[i] = selu(x[i])` loop dispatches to the 256-bit AVX2 mercury_vmath_f32
+// λ≈1.0507, α≈1.6733. An `out[i] = selu(x[i])` loop dispatches to the 256-bit AVX2 wukong_vmath_f32
 // kernel (op = SELU); the negative branch reuses the shared ≈1-ULP exp poly, bit-identical across
 // backends.
 //   selu(-2)=λα(e^-2−1)≈-1.520 → -1520; selu(-0.5)≈-0.6915 → -691;

@@ -8,7 +8,7 @@ module tests.run.i8_linear_parallel
 
 // A whole-function `@parallel` int8 quantized nn.Linear kernel with RUNTIME dims. Because the
 // function's whole body is the matmul nest, lower_program dispatches it to the multicore int8 GEMM
-// (mercury_i8gemm_nt_parallel) — the same recognizer as the embedded form, but checked *before* the
+// (wukong_i8gemm_nt_parallel) — the same recognizer as the embedded form, but checked *before* the
 // @parallel outliner so a parallel int8 kernel reaches the multicore path instead of being outlined
 // to a scalar loop. Rows are independent and integer math is exact, so serial == parallel
 // bit-for-bit and the differential gate stays exact. A is [2,4] u8, B is [2,4] i8 (its rows are the

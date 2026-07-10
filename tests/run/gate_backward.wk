@@ -20,7 +20,7 @@ module tests.run.gate_backward
 
 // The foundational gate gradients sigmoid_backward(x,dy)=dy·σ(x)(1−σ(x)) and tanh_backward(x,dy)=
 // dy·(1−tanh²(x)) — the backward through every LSTM/GRU/attention gate. Both fold an expf (in
-// sigmoid/tanh) C/Rust keep scalar, so each elementwise loop folds to one 256-bit mercury_vmath2_f32
+// sigmoid/tanh) C/Rust keep scalar, so each elementwise loop folds to one 256-bit wukong_vmath2_f32
 // call. Pure elementwise (no reduction) → bit-identical lane-for-lane, so the differential gate
 // (interp == native, -O0 == -O3) is trivial. Frozen deterministic kernel output (×1000, truncated).
 fn main() -> i32 {
@@ -29,7 +29,7 @@ fn main() -> i32 {
     let mut ds: [f32; 8] = [0.0; 8];
     let mut dt: [f32; 8] = [0.0; 8];
 
-    // Each recognized → mercury_vmath2_f32(x, dy, _, 8, VM2_{SIGMOID,TANH}_BWD).
+    // Each recognized → wukong_vmath2_f32(x, dy, _, 8, VM2_{SIGMOID,TANH}_BWD).
     for i in 0..8 {
         ds[i] = sigmoid_backward(x[i], dy[i]);
     }

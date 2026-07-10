@@ -10,7 +10,7 @@ module tests.run.cumprod
 
 // Inclusive per-row prefix product `out[r,i] = Π_{k<=i} x[r,k]` (cumulative product). The loop-carried
 // `out[i] = out[i-1] * x[i]` recurrence won't auto-vectorize (gcc/rustc keep it scalar, like the prefix
-// sum); Mercury folds the nest to one `mercury_cumprod_f32` call (4-row-interleaved ILP). A bare product
+// sum); Wukong folds the nest to one `wukong_cumprod_f32` call (4-row-interleaved ILP). A bare product
 // is not fused, so each row folds strictly left-to-right == the scalar nest — bit-exact, no reassociation,
 // so the differential gate (interp == native) and `-O0 == -O3` are trivial.
 fn main() -> i32 {

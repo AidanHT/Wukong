@@ -10,7 +10,7 @@ module tests.run.rowargmax
 
 // Batched per-row argmax / argmin returning the INDEX (the classification-head / greedy-decode top-1):
 // out[r] = {argmax,argmin}_j x[r,j], lowest index wins on a value tie. The recognizer folds each [R=3,
-// C=4] nest to one mercury_rowarg{max,min}_i32 call — the (value,index) bookkeeping gcc/rustc keep
+// C=4] nest to one wukong_rowarg{max,min}_i32 call — the (value,index) bookkeeping gcc/rustc keep
 // scalar, while the AVX2 kernel tracks 8 (value,index) lanes via blend. It is a pure selection (no
 // reassociation), so the differential gate (interp == native) is bit-exact, and out is an i32 buffer.
 fn main() -> i32 {

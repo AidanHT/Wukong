@@ -13,7 +13,7 @@ module tests.run.gevm_f32
 /// Vector·matrix product `out = wᵀ·V` — the single-token KV-decode attention read-out
 /// `out[d] = Σ_s scores[s]·v[s*D+d]` (a weighted sum of the rows of V), written the idiomatic
 /// column-outer way. The j-outer source reads `v` column-strided (the access gcc/rustc leave
-/// scalar); the compiler dispatches it to `mercury_sgevm_f32`, which restructures to i-outer and
+/// scalar); the compiler dispatches it to `wukong_sgevm_f32`, which restructures to i-outer and
 /// streams `v` row-major while keeping the identical per-element ascending-i FMA chain — bit-exact,
 /// no reassociation. `--run` marshals that same kernel through the interpreter, gating
 /// interp == native and -O0 == -O3. Inputs are exactly-representable halves/quarters, so the

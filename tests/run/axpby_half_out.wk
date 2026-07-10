@@ -9,7 +9,7 @@
 module tests.run.axpby_half_out
 
 // All-half streaming axpby: `out[i] = (a*(x[i] as f32) + b*(y[i] as f32)) as bf16` over `[bf16]`
-// inputs with a **bf16 output** (and the f16 twin) lowers to mercury_axpby_{bf16,f16}_out — half in AND
+// inputs with a **bf16 output** (and the f16 twin) lowers to wukong_axpby_{bf16,f16}_out — half in AND
 // out, so 6 bytes/elem vs an all-f32 axpby's 12 (the narrowing store halves the write traffic). The
 // narrowing round goes through the shared f32_to_{bf16,f16}_bits shim (== a scalar `as bf16` store), so
 // interp and native agree bit-for-bit and -O0 == -O3. x=[1,2,3,4], y=[10,20,30,40] (half-exact), a=2,

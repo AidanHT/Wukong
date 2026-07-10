@@ -1,4 +1,4 @@
-// Loader unit-test fixture: the other half of the import cycle with cycle_a.mer.
+// Loader unit-test fixture: the other half of the import cycle with cycle_a.wk.
 module cycle_b
 
 import cycle_a;

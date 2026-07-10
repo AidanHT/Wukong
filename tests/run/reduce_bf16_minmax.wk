@@ -6,7 +6,7 @@
 module tests.run.reduce_bf16_minmax
 
 // bf16 max-family reductions: `m = fmax(m, (x[k] as f32))` / `fmin` / `fmax(m, abs((x[k] as f32)))`
-// over a `[bf16]` array dispatch to mercury_reduce_bf16 (RED_MAX/RED_MIN/RED_MAXABS). The widen is
+// over a `[bf16]` array dispatch to wukong_reduce_bf16 (RED_MAX/RED_MIN/RED_MAXABS). The widen is
 // lossless and max/min round nothing, so the result is the exact reduction of the widened values; the
 // interpreter calls the identical kernel, so interp and native agree bit-for-bit. The per-tensor
 // absmax is the symmetric-quantization scale a bf16 weight tensor's int8 export needs.
