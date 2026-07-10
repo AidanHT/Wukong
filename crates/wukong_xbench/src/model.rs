@@ -1838,11 +1838,15 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             }
         })
     } else {
-        println!(
-            "  -> C(gcc) omitted at S={} (naive-dot forward is tens of seconds per call; its loss \
-             is already shown at S=128). Set XBENCH_MODEL_NAIVE to force it.",
-            cfg.s
-        );
+        // Only explain the naive-dot omission when C would otherwise have run; under WUK_ONLY /
+        // TORCH_ONLY the C columns are dropped on purpose and need no per-size note.
+        if !no_c {
+            println!(
+                "  -> C(gcc) omitted at S={} (naive-dot forward is tens of seconds per call; its \
+                 loss is already shown at S=128). Set XBENCH_MODEL_NAIVE to force it.",
+                cfg.s
+            );
+        }
         None
     };
 
