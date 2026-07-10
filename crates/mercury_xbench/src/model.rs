@@ -47,7 +47,15 @@
 //! * **The layer loop lives in this harness** for both languages: one JIT'd/compiled block
 //!   function is called 12× per forward with per-layer weight pointers (ping-ponging two
 //!   activation buffers), then the final LayerNorm — the way a real runtime drives a layer stack.
-//!   Scratch buffers are host-allocated and passed as pointers (same buffers to both languages).
+//!   Whole-layer scratch (nrm/q/k/v/attn/a/ff1) is host-allocated and passed as pointers to both
+//!   languages. The *per-head* scratch (qh/kh/vt/scores/ah) differs by design: the Mercury source
+//!   declares it inside the head loop — the natural spelling for independent iterations, which is
+//!   what lets `@parallel` run heads concurrently (each iteration's scratch is private stack) —
+//!   while C keeps the caller-scratch convention. Both spellings do the same per-head fills and
+//!   compute; the Mercury one also zero-initializes its locals each head (~1% of the forward's
+//!   work at these shapes — a cost Mercury pays, not hides). The Mercury calls run on a 64 MiB
+//!   worker thread (spawned outside the timed region) because that loop-local scratch is
+//!   ~1.5 MiB of stack frame at S=512.
 //! * **Correctness**: the Mercury and C final outputs are cross-checked elementwise over the whole
 //!   `[S, 768]` buffer with a magnitude-normalized relative tolerance (float reassociation and
 //!   poly-vs-libm transcendentals differ, compounding over 12 layers). Additionally the
@@ -59,14 +67,18 @@
 //! * Mercury's GEMMs go to the tuned AVX2/FMA microkernel; C's stay whatever gcc makes of the
 //!   idiomatic nests. That *is* the product claim being measured (a shape-safe tensor language
 //!   whose compiler lowers to tuned kernels), the same basis as `bench_matmul`/`bench_linear`.
-//! * The `@parallel` Mercury column is fully multicore: the batched norms, the fused-GELU FFN
-//!   GEMM, *and* the embedded plain matmul nests (Q/K/V/O/PV/down-proj) all dispatch `_parallel`
-//!   kernels (each bit-identical to its serial twin) — `lower_for`'s statement path honors the
-//!   enclosing `@parallel` for embedded GEMMs. The run-time dispatch scan prints the `@parallel`
-//!   variant's kernel set (and a unit test pins it), so a regression back to serial is visible,
-//!   not silent. Both C columns are single-threaded idiomatic code, as everywhere in this suite;
-//!   the torch `Tn(sdpa)` column is PyTorch's own all-thread path — the only other multicore
-//!   column, disclosed as such.
+//! * The `@parallel` Mercury column is fully multicore, in two tiers: the whole-`[S,D]` ops
+//!   outside the head loop (LayerNorms, Q/K/V/WO/down-proj GEMMs, fused-GELU FFN, residual adds)
+//!   dispatch `_parallel` kernels (each bit-identical to its serial twin), and the per-head
+//!   attention loop outlines into ONE `mercury_parallel_for` region — heads across cores, each
+//!   head running the identical SERIAL kernel sequence (QKᵀ·α GEMM, batched softmax, PV GEMM) the
+//!   serial column runs, with its loop-local scratch private per head. Head slices are disjoint
+//!   (`attn[i*D + hh*HD + j]`), so serial == `@parallel` stays bit-exact. The run-time dispatch
+//!   scan prints the `@parallel` variant's kernel set (and a unit test pins both the region and
+//!   the per-function serial/parallel split), so a regression back to a serial head chain is
+//!   visible, not silent. Both C columns are single-threaded idiomatic code, as everywhere in
+//!   this suite; the torch `Tn(sdpa)` column is PyTorch's own all-thread path — the only other
+//!   multicore column, disclosed as such.
 
 use std::cell::Cell;
 use std::io::Write;
@@ -125,6 +137,32 @@ type BlockFn = unsafe extern "C" fn(
     *mut f32,   // vt       [hd,S]
     *mut f32,   // scores   [S,S]
     *mut f32,   // ah       [S,hd]
+    *mut f32,   // attn     [S,D]
+    *mut f32,   // a        [S,D]
+    *mut f32,   // ff1      [S,Dff]
+    *mut f32,   // out      [S,D]
+);
+
+/// The Mercury block ABI: like [`BlockFn`] but WITHOUT the five per-head scratch pointers
+/// (qh/kh/vt/scores/ah) — the Mercury source declares that scratch inside the head loop (private
+/// per iteration, which is what lets `@parallel` run heads concurrently), so it never crosses the
+/// ABI. The C implementation keeps the caller-scratch convention above.
+type MerBlockFn = unsafe extern "C" fn(
+    *const f32, // x        [S,D]
+    *const f32, // ln1g     [D]
+    *const f32, // ln1b     [D]
+    *const f32, // wq       [D,D]
+    *const f32, // wk       [D,D]
+    *const f32, // wv       [D,D]
+    *const f32, // wo       [D,D]
+    *const f32, // ln2g     [D]
+    *const f32, // ln2b     [D]
+    *const f32, // w1       [Dff,D]
+    *const f32, // w2       [D,Dff]
+    *mut f32,   // nrm      [S,D]
+    *mut f32,   // q        [S,D]
+    *mut f32,   // k        [S,D]
+    *mut f32,   // v        [S,D]
     *mut f32,   // attn     [S,D]
     *mut f32,   // a        [S,D]
     *mut f32,   // ff1      [S,Dff]
@@ -233,7 +271,11 @@ fn make_weights(cfg: Cfg, seed: &mut u64) -> Vec<LayerW> {
 ///  * GEMM + `gelu` epilogue    -> `mercury_sgemm_nt_epi`
 ///  * residual adds             -> `mercury_velem_f32`
 /// Attention runs per head over contiguous slices (extract Qh/Kh, V transposed) so each head's
-/// scores / PV products are plain NT GEMMs — the same structure the C implementation uses.
+/// scores / PV products are plain NT GEMMs — the same structure the C implementation uses. The
+/// head loop is spelled the natural way for independent iterations: its scratch (qh/kh/vt/scores/
+/// ah) is declared INSIDE the loop body, private per head. Under `@parallel` the compiler outlines
+/// the loop into a `mercury_parallel_for` region — heads across cores, each running the identical
+/// serial per-head kernel sequence — instead of a serial chain of small multicore kernels.
 fn mer_block(cfg: Cfg, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let (s, d, h, dff, hd) = (cfg.s, cfg.d, cfg.h, cfg.dff, cfg.hd());
@@ -249,9 +291,6 @@ fn mer_block(cfg: Cfg, parallel: bool) -> String {
     w1: [f32; {dffd}], w2: [f32; {dffd}],
     mut nrm: [f32; {sd}],
     mut q: [f32; {sd}], mut k: [f32; {sd}], mut v: [f32; {sd}],
-    mut qh: [f32; {shd}], mut kh: [f32; {shd}], mut vt: [f32; {shd}],
-    mut scores: [f32; {ss}],
-    mut ah: [f32; {shd}],
     mut attn: [f32; {sd}],
     mut a: [f32; {sd}],
     mut ff1: [f32; {sdff}],
@@ -284,8 +323,16 @@ fn mer_block(cfg: Cfg, parallel: bool) -> String {
         for p in 0..{d} {{ acc = acc + nrm[i*{d}+p] * wv[j*{d}+p]; }}
         v[i*{d}+j] = acc;
     }} }}
-    // 3. Multi-head causal attention (H = {h}, hd = {hd})
+    // 3. Multi-head causal attention (H = {h}, hd = {hd}). Iterations are independent — each head
+    // reads/writes only its own hh-sliced column band and the scratch is loop-body-local (private
+    // per head) — so under @parallel the compiler outlines this loop into ONE parallel region
+    // (heads across cores, the identical serial kernel sequence inside each).
     for hh in 0..{h} {{
+        let mut qh: [f32; {shd}] = [0.0; {shd}];
+        let mut kh: [f32; {shd}] = [0.0; {shd}];
+        let mut vt: [f32; {shd}] = [0.0; {shd}];
+        let mut scores: [f32; {ss}] = [0.0; {ss}];
+        let mut ah: [f32; {shd}] = [0.0; {shd}];
         for i in 0..{s} {{ for p in 0..{hd} {{ qh[i*{hd}+p] = q[i*{d} + hh*{hd} + p]; }} }}
         for i in 0..{s} {{ for p in 0..{hd} {{ kh[i*{hd}+p] = k[i*{d} + hh*{hd} + p]; }} }}
         for j in 0..{hd} {{ for p in 0..{s} {{ vt[j*{s}+p] = v[p*{d} + hh*{hd} + j]; }} }}
@@ -631,7 +678,9 @@ fn compile_c_model(
 // -------------------------------------------------------------------------------------------
 
 /// One full forward: restore the pristine input, run the block 12× with per-layer weights
-/// (ping-ponging the two activation buffers), then the final LayerNorm into `y`.
+/// (ping-ponging the two activation buffers), then the final LayerNorm into `y`. This is the
+/// C-ABI driver ([`BlockFn`], caller-provided per-head scratch); the Mercury columns use the
+/// otherwise-identical [`run_forward_mer`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn run_forward(
     block: BlockFn,
@@ -681,6 +730,74 @@ unsafe fn run_forward(
     }
     // LAYERS is even, so the last block wrote xa.
     lnf(xa.as_ptr(), lnf_g.as_ptr(), lnf_b.as_ptr(), y.as_mut_ptr());
+}
+
+/// [`run_forward`] for the Mercury ABI ([`MerBlockFn`]): identical layer loop, minus the five
+/// per-head scratch pointers the Mercury block now owns as loop-body-locals.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_forward_mer(
+    block: MerBlockFn,
+    lnf: LnFn,
+    weights: &[LayerW],
+    sc: &mut Scratch,
+    x0: &[f32],
+    xa: &mut [f32],
+    xb: &mut [f32],
+    lnf_g: &[f32],
+    lnf_b: &[f32],
+    y: &mut [f32],
+) {
+    xa.copy_from_slice(x0);
+    for (l, w) in weights.iter().enumerate() {
+        let (xi, xo) = if l % 2 == 0 {
+            (xa.as_ptr(), xb.as_mut_ptr())
+        } else {
+            (xb.as_ptr(), xa.as_mut_ptr())
+        };
+        block(
+            xi,
+            w.ln1g.as_ptr(),
+            w.ln1b.as_ptr(),
+            w.wq.as_ptr(),
+            w.wk.as_ptr(),
+            w.wv.as_ptr(),
+            w.wo.as_ptr(),
+            w.ln2g.as_ptr(),
+            w.ln2b.as_ptr(),
+            w.w1.as_ptr(),
+            w.w2.as_ptr(),
+            sc.nrm.as_mut_ptr(),
+            sc.q.as_mut_ptr(),
+            sc.k.as_mut_ptr(),
+            sc.v.as_mut_ptr(),
+            sc.attn.as_mut_ptr(),
+            sc.a.as_mut_ptr(),
+            sc.ff1.as_mut_ptr(),
+            xo,
+        );
+    }
+    // LAYERS is even, so the last block wrote xa.
+    lnf(xa.as_ptr(), lnf_g.as_ptr(), lnf_b.as_ptr(), y.as_mut_ptr());
+}
+
+/// Run `f` on a worker thread with a large stack, re-raising any panic — the Mercury block's
+/// per-head scratch is loop-body-local (stack allocas: ~1.5 MiB at S=512, probed by Cranelift's
+/// inline stack probes), which does not fit the host main thread's default ~1 MiB Windows stack.
+/// The serial column runs the whole frame on this one thread; the `@parallel` column's region
+/// bodies run on the runtime pool's own 16 MiB-stack workers. The spawn sits OUTSIDE the timed
+/// region (one spawn per measured column, not per iteration), so the instrument is unchanged.
+fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        let handle = std::thread::Builder::new()
+            .name("xbench-model".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn_scoped(s, f)
+            .expect("spawn model worker thread");
+        match handle.join() {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 /// Best-of-N timing sized for calls that cost 0.1–60 s (the whole-forward scale, where
@@ -1035,7 +1152,12 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
         ),
     }
 
-    interp_gate();
+    if interp_gate() != Some(0.0) {
+        println!(
+            "  ! MODEL GATE NOT BIT-EXACT — see the gate messages above; the timings below are \
+             not trustworthy until this is fixed"
+        );
+    }
 
     for s in [128usize, 512] {
         bench_model_size(
@@ -1056,8 +1178,15 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
 /// The differential gate: the interpreter oracle runs the *identical* 12-layer forward (same MIR,
 /// same weights, same harness layer loop) at a reduced config and must agree with the Cranelift
 /// JIT bit-for-bit — the recognized kernels are marshalled identically by both backends, and the
-/// glue (extractions, mask, scatter) executes the same vectorized MIR.
-fn interp_gate() {
+/// glue (extractions, mask, scatter) executes the same vectorized MIR. The `@parallel` variant is
+/// gated too: its native forward (multicore kernels + the outlined per-head region) must ALSO
+/// equal the serial interpreter oracle bit-for-bit — heads write disjoint slices and each head
+/// runs the identical serial kernel sequence, so any divergence is a real bug.
+///
+/// Returns the worst max-relative-error across the gated variants (`Some(0.0)` = bit-exact, the
+/// only acceptable value — asserted by the `interp_gate_bit_exact` unit test), or `None` when a
+/// stage failed to compile/run (reported on stdout).
+fn interp_gate() -> Option<f64> {
     let cfg = Cfg {
         s: 16,
         d: 64,
@@ -1072,7 +1201,7 @@ fn interp_gate() {
         build_program(&ln_src, &mut interner),
     ) else {
         println!("  ! interp gate: reduced-config model failed to compile — skipping gate\n");
-        return;
+        return None;
     };
     let entry = interner.intern("kbench");
 
@@ -1096,7 +1225,7 @@ fn interp_gate() {
         } else {
             (&mut xb, &mut xa)
         };
-        let mut bufs: [&mut [f32]; 24] = [
+        let mut bufs: [&mut [f32]; 19] = [
             xi,
             &mut w.ln1g,
             &mut w.ln1b,
@@ -1112,11 +1241,6 @@ fn interp_gate() {
             &mut sc.q,
             &mut sc.k,
             &mut sc.v,
-            &mut sc.qh,
-            &mut sc.kh,
-            &mut sc.vt,
-            &mut sc.scores,
-            &mut sc.ah,
             &mut sc.attn,
             &mut sc.a,
             &mut sc.ff1,
@@ -1137,7 +1261,7 @@ fn interp_gate() {
         }
     }
     if !ok {
-        return;
+        return None;
     }
 
     // --- native (Cranelift JIT) forward over the identical MIR + inputs ---
@@ -1146,38 +1270,74 @@ fn interp_gate() {
         mercury_codegen_cranelift::jit_module(&ln_prog, &interner),
     ) else {
         println!("  ! interp gate: JIT failed — skipping gate\n");
-        return;
+        return None;
     };
     let (Some(bp), Some(lp)) = (block_jit.func_ptr(entry), ln_jit.func_ptr(entry)) else {
         println!("  ! interp gate: kbench symbol missing — skipping gate\n");
-        return;
+        return None;
     };
-    let block_fn: BlockFn = unsafe { std::mem::transmute(bp) };
+    let block_fn: MerBlockFn = unsafe { std::mem::transmute(bp) };
     let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
     let mut sc2 = Scratch::new(cfg);
     let (mut xa2, mut xb2) = (vec![0.0f32; sd], vec![0.0f32; sd]);
     let mut y_native = vec![0.0f32; sd];
     unsafe {
-        run_forward(
+        run_forward_mer(
             block_fn, ln_fn, &weights, &mut sc2, &x0, &mut xa2, &mut xb2, &lnf_g, &lnf_b,
             &mut y_native,
         );
     }
 
     let (rel, at) = max_rel_err(&y_interp, &y_native);
-    if rel == 0.0 {
-        println!(
-            "  interp gate (S={} D={} H={} Dff={}, {LAYERS} layers): interpreter == native \
-             BIT-EXACT over all {sd} outputs\n",
-            cfg.s, cfg.d, cfg.h, cfg.dff
-        );
-    } else {
+    if rel != 0.0 {
         println!(
             "  ! interp gate: interpreter vs native max rel err {rel:.2e} at [{at}] \
              (interp={} native={})\n",
             y_interp[at], y_native[at]
         );
     }
+
+    // --- native @parallel forward (multicore kernels + the outlined per-head region) must ALSO
+    // equal the serial interpreter oracle bit-for-bit: each head runs the identical serial kernel
+    // sequence over a disjoint slice, so cross-head scheduling cannot change a single bit.
+    let Some(par_prog) = build_program(&mer_block(cfg, true), &mut interner) else {
+        println!("  ! interp gate: @parallel reduced-config model failed to compile\n");
+        return None;
+    };
+    let Ok(par_jit) = mercury_codegen_cranelift::jit_module(&par_prog, &interner) else {
+        println!("  ! interp gate: @parallel JIT failed — skipping gate\n");
+        return None;
+    };
+    let Some(pp) = par_jit.func_ptr(entry) else {
+        println!("  ! interp gate: @parallel kbench symbol missing — skipping gate\n");
+        return None;
+    };
+    let par_fn: MerBlockFn = unsafe { std::mem::transmute(pp) };
+    let mut sc3 = Scratch::new(cfg);
+    let (mut xa3, mut xb3) = (vec![0.0f32; sd], vec![0.0f32; sd]);
+    let mut y_par = vec![0.0f32; sd];
+    unsafe {
+        run_forward_mer(
+            par_fn, ln_fn, &weights, &mut sc3, &x0, &mut xa3, &mut xb3, &lnf_g, &lnf_b, &mut y_par,
+        );
+    }
+    let (prel, pat) = max_rel_err(&y_interp, &y_par);
+    if prel != 0.0 {
+        println!(
+            "  ! interp gate: interpreter vs @parallel native max rel err {prel:.2e} at [{pat}] \
+             (interp={} par={})\n",
+            y_interp[pat], y_par[pat]
+        );
+    }
+    let worst = rel.max(prel);
+    if worst == 0.0 {
+        println!(
+            "  interp gate (S={} D={} H={} Dff={}, {LAYERS} layers): interpreter == native == \
+             @parallel native BIT-EXACT over all {sd} outputs\n",
+            cfg.s, cfg.d, cfg.h, cfg.dff
+        );
+    }
+    Some(worst)
 }
 
 fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
@@ -1224,15 +1384,19 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                 println!("  ! mercury kbench symbol missing");
                 return;
             };
-            let block_fn: BlockFn = unsafe { std::mem::transmute(bp) };
+            let block_fn: MerBlockFn = unsafe { std::mem::transmute(bp) };
             let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
-            let mut run = || unsafe {
-                run_forward(
-                    block_fn, ln_fn, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
-                    &mut y,
-                )
-            };
-            let ns = time_forward(&mut run);
+            // Big stack: the per-head scratch is loop-body-local in the Mercury block, so the
+            // serial column runs the whole ~1.5 MiB (at S=512) frame on the calling thread.
+            let ns = on_big_stack(|| {
+                let mut run = || unsafe {
+                    run_forward_mer(
+                        block_fn, ln_fn, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g,
+                        &lnf_b, &mut y,
+                    )
+                };
+                time_forward(&mut run)
+            });
             Some(MeasureModel {
                 compile: m.compile + l.compile,
                 ns_per_fwd: ns,
@@ -1323,6 +1487,15 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                  embedded GEMMs are running serial"
             );
         }
+        // The head loop must have outlined into a parallel region (heads across cores). Without
+        // it the block is still correct — the heads just run as the old serial chain — so only
+        // this scan makes the regression visible.
+        if !calls.iter().any(|(k, _)| k == "mercury_parallel_for") {
+            println!(
+                "  ! WARNING: @parallel block did NOT outline the head loop into a \
+                 mercury_parallel_for region — heads are running serially"
+            );
+        }
         let lnf = lnf_mod.as_ref()?;
         let (Some(bp), Some(lp)) = (
             m.func(&mut interner, "kbench"),
@@ -1330,14 +1503,17 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         ) else {
             return None;
         };
-        let block_fn: BlockFn = unsafe { std::mem::transmute(bp) };
+        let block_fn: MerBlockFn = unsafe { std::mem::transmute(bp) };
         let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
-        let mut run = || unsafe {
-            run_forward(
-                block_fn, ln_fn, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b, &mut y,
-            )
-        };
-        let ns = time_forward(&mut run);
+        let ns = on_big_stack(|| {
+            let mut run = || unsafe {
+                run_forward_mer(
+                    block_fn, ln_fn, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
+                    &mut y,
+                )
+            };
+            time_forward(&mut run)
+        });
         Some(MeasureModel {
             compile: m.compile,
             ns_per_fwd: ns,
@@ -1564,18 +1740,65 @@ mod tests {
                 "serial block lost dispatch {need}; got {calls:?}"
             );
         }
+        // The natural per-head-scratch spelling must NOT parallelize without the attribute.
+        assert!(
+            !calls.iter().any(|(k, _)| k == "mercury_parallel_for"),
+            "serial block must not outline a parallel region; got {calls:?}"
+        );
 
         let par = compile_mercury(&mer_block(cfg, true), &mut interner)
             .expect("@parallel block must compile");
         let pcalls = kernel_calls(&par.mir);
+        // The head loop outlines into ONE parallel region per layer call...
+        assert!(
+            pcalls.iter().any(|(k, _)| k == "mercury_parallel_for"),
+            "@parallel block did not outline the head loop into a region; got {pcalls:?}"
+        );
+        // ...while the non-head GEMMs (Q/K/V, WO, FFN down-proj) stay multicore.
         assert!(
             pcalls.iter().any(|(k, _)| k == "mercury_sgemm_nt_parallel"),
             "@parallel block's embedded GEMMs regressed to serial; got {pcalls:?}"
         );
-        // No plain-serial NT GEMM may remain in the @parallel variant.
+        // Split the MIR into the outlined region body vs everything else: per-head kernels run
+        // SERIAL inside the region (the region supplies the threading — the identical op sequence
+        // the serial spelling runs, which is the serial == @parallel bit-exactness argument), and
+        // NO serial NT GEMM may appear outside it.
+        let start = par
+            .mir
+            .find("fn mercury$par$")
+            .expect("outlined head-region body missing from @parallel MIR");
+        let after = &par.mir[start..];
+        let end = after[3..].find("\nfn ").map(|i| i + 4).unwrap_or(after.len());
+        let region = &after[..end];
+        let rest = format!("{}{}", &par.mir[..start], &after[end..]);
+        let rcalls = kernel_calls(region);
+        for need in ["mercury_sgemm_nt", "mercury_sgemm_nt_alpha", "mercury_norm_f32"] {
+            assert!(
+                rcalls.iter().any(|(k, _)| k == need),
+                "region body lost per-head serial dispatch {need}; got {rcalls:?}"
+            );
+        }
         assert!(
-            !pcalls.iter().any(|(k, _)| k == "mercury_sgemm_nt"),
-            "@parallel block still emits serial mercury_sgemm_nt calls; got {pcalls:?}"
+            !rcalls.iter().any(|(k, _)| k.ends_with("_parallel")),
+            "region body must not nest multicore kernels; got {rcalls:?}"
+        );
+        let restc = kernel_calls(&rest);
+        assert!(
+            !restc.iter().any(|(k, _)| k == "mercury_sgemm_nt"),
+            "@parallel block emits serial mercury_sgemm_nt outside the region; got {restc:?}"
+        );
+    }
+
+    /// The reduced-config differential gate the bench prints must be BIT-exact, as a `cargo test`
+    /// invariant (not only a bench-time printout): interpreter oracle == native serial == native
+    /// `@parallel` (multicore kernels + the outlined per-head region) over the full 12-layer
+    /// forward.
+    #[test]
+    fn interp_gate_bit_exact() {
+        assert_eq!(
+            interp_gate(),
+            Some(0.0),
+            "model interp/native/@parallel differential gate is not bit-exact"
         );
     }
 }
