@@ -280,7 +280,7 @@ naively-written source:
   OpenMP support is **probed at runtime** (compile a probe DLL, load it, require ≥2 threads inside a
   parallel region — verified working on this MSYS2 gcc: 22 threads, and the OpenMP dot runs ~3× its
   serial twin); if the probe fails the columns are skipped with a note. The parallel-GEMM peers in
-  matmul/linear/transpose/colsum are measured inside the all-core thermal group *before* `Mer(par)`,
+  matmul/linear/transpose/colsum are measured inside the all-core thermal group *before* `Wuk(par)`,
   so any residual heat lands on Wukong, never the peer.
 - **Matmul dispatch is the value proposition, stated plainly.** The C/Rust columns are the *naive
   nest a programmer writes*; Wukong's compiler optimizes it the way a tensor compiler should. The
@@ -439,18 +439,18 @@ equivalent TU; tokens/sec = S ÷ ms/forward.
 recognizer hardcoded the serial kernel (`lower_for`: `emit_sgemm(&nest, false)`), so inside a
 multi-statement `@parallel` function only the batched norms and the fused-GELU FFN GEMM dispatched
 `_parallel` kernels while the six plain GEMMs stayed single-threaded, and multicore bursts dragged the
-package clock for the still-serial phases (so `Mer(par)` could read *slower* than `Mer(1c)`). That
+package clock for the still-serial phases (so `Wuk(par)` could read *slower* than `Wuk(1c)`). That
 site now passes the function's `@parallel` flag (`emit_sgemm(&nest, self.parallel_fn)`); combined with
 the velem-parallel residual-add dispatch and the head-loop region above, the whole block is genuinely
 multicore. The parallel GEMM is bit-identical to serial, so the differential gate was never at risk.
 
 GFLOP/s (higher is better), naive `ikj` nest in each language. Measurement ordering is thermal
 hygiene: the naive C/Rust (and `C(fast)`) nests are measured in the **same single-core thermal group
-as Mer(1c)** — after the library peers, before any all-core burst — so they are never read
-heat-throttled (they previously ran dead-last, after the all-core `Mer(par)`/`MKL(all)` bursts, which
-could understate them); `Mer(par)` still runs last of all (we throttle ourselves, never a peer).
+as Wuk(1c)** — after the library peers, before any all-core burst — so they are never read
+heat-throttled (they previously ran dead-last, after the all-core `Wuk(par)`/`MKL(all)` bursts, which
+could understate them); `Wuk(par)` still runs last of all (we throttle ourselves, never a peer).
 
-| size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+| size | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
 | 256³ | 80–100 | 86–99 † | 21–41 | 21–42 | **~2.8–4.3×** | **~3.4–4.1×** |
 | 512³ | 110–126 | 328–462 | 30–41 | 38–45 | **~3.0–3.1×** | **~9×** |
@@ -470,7 +470,7 @@ re-allocated per K-block).
 work threshold where cross-core wake/sync pays off on this P+E hybrid, so "@parallel" ≈ single-core
 there (a measured fix — naive threading at that size was a net *loss*).
 
-*2026-07-08 note*: the `Mer @parallel` ranges above predate the **2D block-parallel path** (now the
+*2026-07-08 note*: the `Wuk @parallel` ranges above predate the **2D block-parallel path** (now the
 default), which A/B-measured **1.65× @512³ and 1.26× @1024³** over the path that produced them —
 absolute GFLOP/s swing ~3× with this laptop's power state, so the ranges are not re-baselined from a
 throttled day; the same-run vs-MKL ratios in the library table above are the current standing.
@@ -483,7 +483,7 @@ See the library table above for the current same-run vs-MKL standings.
 
 ### `nn.Linear` `C = A·Bᵀ` — Wukong dispatches to GEMM; naive C is latency-bound
 
-| size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+| size | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
 | 512² | 81–112 | 251–348 | ~4.0–4.8 | ~3.4–4.5 | **~19–25×** | **~52–76×** |
 | 1024²| 88–108 | 258–457 | ~3.5–4.4 | ~3.4–4.3 | **~22–26×** | **~67–104×** |
@@ -511,7 +511,7 @@ activation is computed in-register on the GEMM's C-tile writeback, so C is writt
 C/Rust do the GEMM, then a *second* full pass that reads C back and applies silu with scalar libm
 `expf` (which they cannot vectorize).
 
-| size  | Mer 1-core | Mer @parallel | C (gcc) | 1-core vs C | parallel vs C |
+| size  | Wuk 1-core | Wuk @parallel | C (gcc) | 1-core vs C | parallel vs C |
 |-------|-----------|---------------|---------|-------------|---------------|
 | 512²  | ~115 | ~227 | ~4.8 | **~24×** | **~48×** |
 | 1024² | ~107 | ~389 | ~4.1 | **~26×** | **~95×** |
@@ -530,7 +530,7 @@ operands, so A is stored `[k,m]` and the idiomatic nest reads it **column-stride
 cache line per element). Wukong recognizes `a[k*M+i]·b[k*N+j]` and dispatches to `wukong_sgemm_tn`,
 which transposes A into scratch once (O(m·k), ~1/n of the GEMM) then runs the *same* tuned NN kernel.
 
-| size  | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+| size  | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |-------|-----------|---------------|---------|------|-------------|---------------|
 | 256²  | ~46 | ~48 | ~1.1 | ~1.1 | **~42×** | **~44×** |
 | 512²  | ~55 | ~84 | ~1.1 | ~1.2 | **~48×** | **~74×** |
@@ -552,7 +552,7 @@ gather builds the `[Cin·K·K, OH·OW]` column matrix, then the conv is a matmul
 recognizer dispatches to the tuned GEMM. C and Rust run the idiomatic **six-deep direct-convolution
 nest** (the loop everyone writes by hand).
 
-| kernel | Mer (im2col+GEMM) | C (direct) | Rust (direct) | Wukong vs C |
+| kernel | Wuk (im2col+GEMM) | C (direct) | Rust (direct) | Wukong vs C |
 |--------|-------------------|------------|---------------|--------------|
 | conv2d 3×3 | ~30–40 GFLOP/s | ~3.6–6.6 | ~3.7–6.5 | **~6–7× faster** |
 
@@ -756,7 +756,7 @@ agrees within a tight tolerance (the three reassociate the f32 sum differently).
 
 GB/s (higher is better) — input traffic over `[bf16; N]` arrays:
 
-| op | N=2²⁰ Mer · C · Rust | N=2²⁴ Mer · C · Rust | Wukong vs C |
+| op | N=2²⁰ Wuk · C · Rust | N=2²⁴ Wuk · C · Rust | Wukong vs C |
 |----|----------------------|----------------------|--------------|
 | dot Σx·y | **10.2** · 3.4 · 3.2 | **10.2** · 2.9 · 3.0 | **~3.0× → 3.5×** |
 | sum Σx   | **12.3** · 1.5 · 1.7 | **10.5** · 1.7 · 1.7 | **~8.3× → 6.1×** |
@@ -791,7 +791,7 @@ Wukong recognizes the half-precision dot-product nest (`s += (a[..] as f32) * (b
 lossless widen prepass (O(m·k + n·k), ~1/n of the GEMM) feeding the *identical* tuned AVX2 f32 GEMM.
 C and Rust store bf16 as `uint16_t` and widen each element inline inside the triple loop.
 
-| size  | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+| size  | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |-------|-----------|---------------|---------|------|-------------|---------------|
 | 512²  | ~52–53 | ~98–103 | ~2.1 | ~2.2 | **~24–25×** | **~47×** |
 | 1024² | ~50–55 | ~208–219 | ~2.0 | ~2.1 | **~25×** | **~98–109×** |
@@ -846,7 +846,7 @@ the `B=32` cache-blocked **`wukong_transpose_f32`**, which keeps a `B×B` tile o
 L1-resident. Transpose is a *permutation* (no arithmetic), so the cross-language check is **bit-exact**
 — a stronger bar than the GEMM tolerance gate.
 
-| size  | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+| size  | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |-------|-----------|---------------|---------|------|-------------|---------------|
 | 1024² | ~2.1–2.2 | ~13.8–14.1 | ~1.4–1.6 | ~1.3–1.5 | **~1.35–1.49×** | **~8.8–10×** |
 | 2048² | ~2.0–2.2 | ~16.3–17.5 | ~1.2–1.4 | ~1.2 | **~1.52–1.65×** | **~11.4–14.2×** |
@@ -870,7 +870,7 @@ a cache-resident `out[]` (`out[j..j+8] += x[i, j..j+8]`), winning on **both** SI
 behavior. Each `out[j]` still sums `x[0,j], x[1,j], …` in `i`-ascending order — identical to the scalar
 twin and the disjoint-stripe `@parallel` form — so the cross-language check is **bit-exact**.
 
-| size      | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+| size      | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |-----------|-----------|---------------|---------|------|-------------|---------------|
 | 1024×1024 | ~19.4 | ~21.3 | ~0.4 | ~0.5 | **~47×** | **~52×** |
 | 4096×1024 | ~8.2 | ~15.7 | ~0.3 | ~0.3 | **~29×** | **~55×** |
@@ -892,7 +892,7 @@ strided fold even with `-march=native`). Wukong folds them to **`wukong_colmax_f
 row-major-streaming 8-wide fold with `_mm256_max_ps`/`_mm256_min_ps`; abs-max clears each sign bit with
 `_mm256_andnot_ps` first), bit-exact with the scalar `s > v ? s : v` twin (and `fabsf`) on finite data:
 
-| op | size | Mer 1-core | Mer @parallel | C (gcc) | 1-core vs C | parallel vs C |
+| op | size | Wuk 1-core | Wuk @parallel | C (gcc) | 1-core vs C | parallel vs C |
 |----|------|-----------|---------------|---------|-------------|---------------|
 | max | 1024×1024 | ~19.8 | ~19.9 | ~0.5 | **~37×** | **~37×** |
 | max | 4096×1024 | ~11.0 | ~16.1 | ~0.2 | **~50×** | **~73×** |
@@ -916,7 +916,7 @@ nest to **`wukong_softmax_bwd_f32`**, which delegates the dot to the proven bit-
 `y·(dy − s)` 8-wide. This is a **different gap** from the column reductions (the per-row dot, not a
 strided access), so the win is more modest — gcc already vectorizes the apply:
 
-| size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+| size | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
 | 1024×1024 | ~45–49 | ~110–124 | ~24 | ~23 | **~1.9–2.0×** | **~4.5–5.2×** |
 | 4096×512 | ~22–26 | ~133–135 | ~21–22 | ~21 | **~1.0–1.2×** | **~6.1×** |

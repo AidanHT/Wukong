@@ -147,7 +147,7 @@ type BlockFn = unsafe extern "C" fn(
 /// (qh/kh/vt/scores/ah) — the Wukong source declares that scratch inside the head loop (private
 /// per iteration, which is what lets `@parallel` run heads concurrently), so it never crosses the
 /// ABI. The C implementation keeps the caller-scratch convention above.
-type MerBlockFn = unsafe extern "C" fn(
+type WukBlockFn = unsafe extern "C" fn(
     *const f32, // x        [S,D]
     *const f32, // ln1g     [D]
     *const f32, // ln1b     [D]
@@ -539,14 +539,14 @@ __declspec(dllexport) void kfinal(const float* x, const float* g, const float* b
 // Compilation
 // -------------------------------------------------------------------------------------------
 
-struct MerModule {
+struct WukModule {
     handle: wukong_codegen_cranelift::JitModuleHandle,
     compile: Duration,
     /// Optimized-MIR text, for the recognized-kernel dispatch scan.
     mir: String,
 }
 
-impl MerModule {
+impl WukModule {
     fn func(&self, interner: &mut Interner, name: &str) -> Option<*const u8> {
         let sym = interner.intern(name);
         self.handle.func_ptr(sym)
@@ -554,7 +554,7 @@ impl MerModule {
 }
 
 /// The real pipeline, same as `bench_wukong`: parse → sema → mir_build → optimize(-O3) → JIT.
-fn compile_wukong(src: &str, interner: &mut Interner) -> Option<MerModule> {
+fn compile_wukong(src: &str, interner: &mut Interner) -> Option<WukModule> {
     let t = Instant::now();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), interner);
     if pd.iter().any(|d| d.is_error()) {
@@ -581,7 +581,7 @@ fn compile_wukong(src: &str, interner: &mut Interner) -> Option<MerModule> {
         }
     };
     let compile = t.elapsed();
-    Some(MerModule {
+    Some(WukModule {
         handle,
         compile,
         mir,
@@ -732,11 +732,11 @@ unsafe fn run_forward(
     lnf(xa.as_ptr(), lnf_g.as_ptr(), lnf_b.as_ptr(), y.as_mut_ptr());
 }
 
-/// [`run_forward`] for the Wukong ABI ([`MerBlockFn`]): identical layer loop, minus the five
+/// [`run_forward`] for the Wukong ABI ([`WukBlockFn`]): identical layer loop, minus the five
 /// per-head scratch pointers the Wukong block now owns as loop-body-locals.
 #[allow(clippy::too_many_arguments)]
 unsafe fn run_forward_mer(
-    block: MerBlockFn,
+    block: WukBlockFn,
     lnf: LnFn,
     weights: &[LayerW],
     sc: &mut Scratch,
@@ -1276,7 +1276,7 @@ fn interp_gate() -> Option<f64> {
         println!("  ! interp gate: kbench symbol missing — skipping gate\n");
         return None;
     };
-    let block_fn: MerBlockFn = unsafe { std::mem::transmute(bp) };
+    let block_fn: WukBlockFn = unsafe { std::mem::transmute(bp) };
     let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
     let mut sc2 = Scratch::new(cfg);
     let (mut xa2, mut xb2) = (vec![0.0f32; sd], vec![0.0f32; sd]);
@@ -1312,7 +1312,7 @@ fn interp_gate() -> Option<f64> {
         println!("  ! interp gate: @parallel kbench symbol missing — skipping gate\n");
         return None;
     };
-    let par_fn: MerBlockFn = unsafe { std::mem::transmute(pp) };
+    let par_fn: WukBlockFn = unsafe { std::mem::transmute(pp) };
     let mut sc3 = Scratch::new(cfg);
     let (mut xa3, mut xb3) = (vec![0.0f32; sd], vec![0.0f32; sd]);
     let mut y_par = vec![0.0f32; sd];
@@ -1384,7 +1384,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                 println!("  ! wukong kbench symbol missing");
                 return;
             };
-            let block_fn: MerBlockFn = unsafe { std::mem::transmute(bp) };
+            let block_fn: WukBlockFn = unsafe { std::mem::transmute(bp) };
             let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
             // Big stack: the per-head scratch is loop-body-local in the Wukong block, so the
             // serial column runs the whole ~1.5 MiB (at S=512) frame on the calling thread.
@@ -1409,10 +1409,10 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // --- C (gcc, standard suite flags). A single naive-dot forward is tens of seconds at S=512
     // (the serial-FMA-chain regime), so like bench_matmul's naive-at-2048 rule it is skipped
     // there by default (XBENCH_MODEL_NAIVE forces it); correctness at S=512 is checked vs C(fast).
-    // XBENCH_MODEL_MER_ONLY skips every external peer (C, C(fast), PyTorch) so a dev iterating on the
-    // multicore kernels gets Mer(1c) vs Mer(par) + scaling in seconds instead of the ~2 min the peer
+    // XBENCH_MODEL_WUK_ONLY skips every external peer (C, C(fast), PyTorch) so a dev iterating on the
+    // multicore kernels gets Wuk(1c) vs Wuk(par) + scaling in seconds instead of the ~2 min the peer
     // compilation + torch warmups cost. Not for reported numbers — the peers are the honesty bar.
-    let wk_only = std::env::var("XBENCH_MODEL_MER_ONLY").is_ok();
+    let wk_only = std::env::var("XBENCH_MODEL_WUK_ONLY").is_ok();
     let run_c_slow = !wk_only && (cfg.s <= 128 || std::env::var("XBENCH_MODEL_NAIVE").is_ok());
     let c_src = c_model(cfg);
     let c_m = if run_c_slow {
@@ -1503,7 +1503,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         ) else {
             return None;
         };
-        let block_fn: MerBlockFn = unsafe { std::mem::transmute(bp) };
+        let block_fn: WukBlockFn = unsafe { std::mem::transmute(bp) };
         let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
         let ns = on_big_stack(|| {
             let mut run = || unsafe {
@@ -1525,7 +1525,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // invocation (same-run adjacency). It runs in its own process over the just-dumped identical
     // buffers; inside the script the single-thread variants run first and the all-core variant
     // last, so multicore heat pollutes no single-thread torch number. The blob writes + torch
-    // import + its own warmups sit between Mer(par)'s all-core burst and the first timed torch
+    // import + its own warmups sit between Wuk(par)'s all-core burst and the first timed torch
     // iteration.
     let torch_m = if wk_only { None } else { torch }.and_then(|t| {
         println!(
@@ -1535,11 +1535,11 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         );
         bench_torch(t, dir, cfg, &weights, &x0, &lnf_g, &lnf_b)
     });
-    // Same-run Mer(1c) vs Mer(par) scaling — the reliable multicore instrument on this hybrid laptop
+    // Same-run Wuk(1c) vs Wuk(par) scaling — the reliable multicore instrument on this hybrid laptop
     // (both measured adjacently, same thermal state). Printed always; it's the number to move.
     if let (Some(s), Some(p)) = (&wk_m, &wk_par_m) {
         println!(
-            "  Mer scaling: 1c {:.1} ms -> par {:.1} ms = {:.2}x",
+            "  Wuk scaling: 1c {:.1} ms -> par {:.1} ms = {:.2}x",
             s.ns_per_fwd / 1e6,
             p.ns_per_fwd / 1e6,
             s.ns_per_fwd / p.ns_per_fwd
@@ -1568,8 +1568,8 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     };
 
     let cols: [(&str, &Option<MeasureModel>); 7] = [
-        ("Mer(1c)", &wk_m),
-        ("Mer(par)", &wk_par_m),
+        ("Wuk(1c)", &wk_m),
+        ("Wuk(par)", &wk_par_m),
         ("C(gcc)", &c_m),
         ("C(fast)", &cfast_m),
         ("T1(sdpa)", &torch1_m),
@@ -1662,7 +1662,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     if wk_par_m.is_some() {
         println!(
             "     (thread disclosure: both C columns and the T1 torch columns are \
-             single-threaded; Mer(par) and Tn(sdpa) are the two multicore columns — the \
+             single-threaded; Wuk(par) and Tn(sdpa) are the two multicore columns — the \
              @parallel dispatch set is printed above)"
         );
     }
