@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 wukong_span = { workspace = true }
+wukong_lexer = { workspace = true }
 wukong_parser = { workspace = true }
 wukong_sema = { workspace = true }
 wukong_mir = { workspace = true }
