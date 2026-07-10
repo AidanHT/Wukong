@@ -4653,3 +4653,87 @@ fn decode_attention_dispatches_all_kernels() {
         "decode read-out -> mercury_sgevm_f32"
     );
 }
+
+/// A mid-function `@parallel` head-attention loop (per-head scratch declared INSIDE the loop body,
+/// disjoint hh-sliced output writes) must outline into a `mercury_parallel_for` region, and the
+/// result must be bit-exact three ways: the @parallel fn against its serial twin in the same
+/// program (G4 — the fixture compares elementwise and prints the mismatch count), the native
+/// backend against the interpreter oracle (G1), and every opt level against -O0 (G2). A ragged
+/// head count (3 heads across the core pool's uneven chunks) runs the same gate.
+#[test]
+fn parallel_head_region_matches_interpreter() {
+    let body = |d: usize, hd: usize, h: usize, s: usize| {
+        let (shd, ss) = (s * hd, s * s);
+        format!(
+            "for hh in 0..{h} {{ \
+               let mut qh: [f32; {shd}] = [0.0; {shd}]; \
+               let mut kh: [f32; {shd}] = [0.0; {shd}]; \
+               let mut scores: [f32; {ss}] = [0.0; {ss}]; \
+               for i in 0..{s} {{ for p in 0..{hd} {{ qh[i*{hd}+p] = q[i*{d} + hh*{hd} + p]; }} }} \
+               for i in 0..{s} {{ for p in 0..{hd} {{ kh[i*{hd}+p] = k[i*{d} + hh*{hd} + p]; }} }} \
+               for i in 0..{s} {{ for j in 0..{s} {{ \
+                 let mut acc: f32 = 0.0; \
+                 for p in 0..{hd} {{ acc = acc + qh[i*{hd}+p] * kh[j*{hd}+p]; }} \
+                 scores[i*{s}+j] = acc; \
+               }} }} \
+               for i in 0..{s} {{ for j in 0..{hd} {{ \
+                 attn[i*{d} + hh*{hd} + j] = scores[i*{s}] + v[i*{d} + hh*{hd} + j]; \
+               }} }} \
+             }}"
+        )
+    };
+    let src = |d: usize, hd: usize, h: usize, s: usize| {
+        let sd = s * d;
+        let inner = body(d, hd, h, s);
+        format!(
+            "module m \
+             fn heads_serial(q: [f32; {sd}], k: [f32; {sd}], v: [f32; {sd}], mut attn: [f32; {sd}]) {{ {inner} }} \
+             @parallel \
+             fn heads_par(q: [f32; {sd}], k: [f32; {sd}], v: [f32; {sd}], mut attn: [f32; {sd}], mut y: [f32; {sd}]) {{ \
+               for i in 0..{sd} {{ y[i] = q[i]; }} \
+               {inner} \
+             }} \
+             fn main() -> i32 {{ \
+               let mut q: [f32; {sd}] = [0.0; {sd}]; \
+               let mut k: [f32; {sd}] = [0.0; {sd}]; \
+               let mut v: [f32; {sd}] = [0.0; {sd}]; \
+               for i in 0..{sd} {{ \
+                 q[i] = (i as f32) * 0.25; \
+                 k[i] = 8.0 - (i as f32) * 0.5; \
+                 v[i] = (i as f32) - 16.0; \
+               }} \
+               let mut a_s: [f32; {sd}] = [0.0; {sd}]; \
+               let mut a_p: [f32; {sd}] = [0.0; {sd}]; \
+               let mut y: [f32; {sd}] = [0.0; {sd}]; \
+               heads_serial(q, k, v, a_s); \
+               heads_par(q, k, v, a_p, y); \
+               let mut bad: i32 = 0; \
+               for i in 0..{sd} {{ if a_p[i] != a_s[i] {{ bad = bad + 1; }} }} \
+               print(bad); \
+               let mut cs: f32 = 0.0; \
+               for i in 0..{sd} {{ cs = cs + a_p[i]; }} \
+               return (cs as i32) % 100000; \
+             }}"
+        )
+    };
+    // Even (2 heads) and ragged (3 heads) trip counts.
+    for (d, hd, h, s) in [(8usize, 4usize, 2usize, 4usize), (6, 2, 3, 4)] {
+        let program = src(d, hd, h, s);
+        assert!(
+            lowered_calls(&program, "mercury_parallel_for"),
+            "H={h}: the @parallel head loop must outline into a parallel_for region"
+        );
+        let (_, out) = jit_ok(&program);
+        assert!(
+            out.starts_with("0\n"),
+            "H={h}: serial vs @parallel must be bit-exact, got mismatches: {out}"
+        );
+        for opt in [0u8, 1, 2, 3] {
+            assert_eq!(
+                jit(&program, opt).unwrap(),
+                interp(&program, opt).unwrap(),
+                "H={h}: head-region native vs interp mismatch at -O{opt}"
+            );
+        }
+    }
+}

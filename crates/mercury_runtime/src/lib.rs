@@ -329,6 +329,24 @@ pub unsafe extern "C" fn mercury_parallel_for(
     env: *const u8,
 ) {
     use rayon::prelude::*;
+    // Give the global pool's workers stack headroom before the pool is first built. A JIT'd
+    // parallel-for body carries its per-iteration scratch as ordinary stack allocas (an outlined
+    // `@parallel` head-attention region privatizes its qh/kh/vt/scores buffers this way — ~1.5 MiB
+    // at S=512), which does not fit reliably in rayon's default 2 MiB worker stacks. Cranelift
+    // emits inline stack probes, so a big frame is safe exactly when the reserve is big enough.
+    // One-time and best-effort: if the global pool already exists (another rayon user won the
+    // race), `build_global` returns an error we deliberately ignore — behavior is then identical
+    // to before. Worker count is unchanged (rayon's own default, `RAYON_NUM_THREADS` honored);
+    // the reserve is virtual address space, committed page-by-page on use.
+    {
+        use std::sync::Once;
+        static POOL_INIT: Once = Once::new();
+        POOL_INIT.call_once(|| {
+            let _ = rayon::ThreadPoolBuilder::new()
+                .stack_size(16 * 1024 * 1024)
+                .build_global();
+        });
+    }
     if n <= 0 {
         return;
     }

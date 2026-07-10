@@ -1506,3 +1506,59 @@ fn mlp2_adamw_decreases_loss() {
         "AdamW did not reduce the loss enough: {l0} -> {last}"
     );
 }
+
+/// The tape.rs coupling contract for mid-function `@parallel` loop regions (mir_build's
+/// `try_emit_parallel_region`): a forward function containing a region — an `Op::FuncAddr` of the
+/// outlined body plus a void `mercury_parallel_for` call — must DECLINE loudly. The runtime
+/// dispatch writes buffers no VJP rule models, so `grad` must surface the existing
+/// unrecognized-buffer-writing-call error instead of silently emitting a zero gradient. A function
+/// whose backward is wanted must keep its loops in the serial spelling (exactly the behavior the
+/// whole-function `@parallel` wrapper already has).
+#[test]
+fn parallel_region_declines_loudly() {
+    let mut it = Interner::default();
+    let pfor = sym(&mut it, "mercury_parallel_for");
+    let region_body = sym(&mut it, "mercury$par$0");
+    let mut b = Builder::new(sym(&mut it, "region_fwd"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    // The wrapper shape mir_build emits: env pointer-table pack + parallel_for call.
+    let env = b.alloca(MirType::Array(Box::new(PTR), 2));
+    let i0 = ci(&mut b, 0);
+    let s0 = b.build(
+        PTR,
+        Op::Gep {
+            ptr: env,
+            index: i0,
+            elem: PTR,
+        },
+    );
+    b.build_void(Op::Store { ptr: s0, value: x });
+    let i1 = ci(&mut b, 1);
+    let s1 = b.build(
+        PTR,
+        Op::Gep {
+            ptr: env,
+            index: i1,
+            elem: PTR,
+        },
+    );
+    b.build_void(Op::Store { ptr: s1, value: out });
+    let n = ci(&mut b, 4);
+    let addr = b.build(PTR, Op::FuncAddr(region_body));
+    b.build_void(Op::Call {
+        func: pfor,
+        args: vec![n, addr, env],
+    });
+    // The scalar loss a real forward would return (read back from the region output buffer) —
+    // `grad` requires a `ret <loss>` tail before it walks the tape in reverse.
+    let loss = b.build(F64, Op::Load(out, F64));
+    b.ret(Some(loss));
+    let fwd = b.finish();
+
+    let err = grad(&fwd, &[0], &mut it).expect_err("a parallel region must not tape");
+    assert!(
+        err.contains("no VJP rule"),
+        "the decline must be the loud unrecognized-call error, got: {err}"
+    );
+}
