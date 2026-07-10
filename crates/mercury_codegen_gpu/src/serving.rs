@@ -246,6 +246,12 @@ pub struct DecodeModel {
     /// `[Bcap,D]` ping-pong activations between layers (persistent — outside the pool).
     bufs: [CudaSlice<f32>; 2],
     cfg: KvConfig,
+    /// [`BlockManager::layout_epoch`](crate::paged_kv::BlockManager::layout_epoch) at the last
+    /// `bt_d` upload (`None` = never uploaded). A steady-state decode step whose appends stay
+    /// inside their current blocks leaves the epoch unchanged, so
+    /// [`advance_and_upload_masked`](Self::advance_and_upload_masked) skips the (large) flat
+    /// block-table upload and pushes only the per-slot ctx/wpos/mask vectors.
+    uploaded_epoch: Option<u64>,
 }
 
 impl DecodeModel {
@@ -297,7 +303,7 @@ impl DecodeModel {
         let wpos_d = g.stream.alloc_zeros::<u32>(cfg.num_slots)?;
         let active_d = g.stream.memcpy_stod(&vec![1u32; cfg.num_slots])?;
         let bufs = [g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?, g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?];
-        Ok(Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, cfg })
+        Ok(Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, cfg, uploaded_epoch: None })
     }
 
     /// Advance **every** slot by one token: append a cache position per slot (host), upload the block
@@ -382,9 +388,16 @@ impl DecodeModel {
                     .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
             }
         }
-        let table = self.cache.manager_ref().flat_block_table();
+        // The flat block table only changes when a table gains or loses a block (admission, eviction,
+        // block-boundary growth) — the layout epoch tracks exactly that, so the steady-state decode
+        // step (every append inside its current block) uploads just the three per-slot vectors.
+        let epoch = self.cache.manager_ref().layout_epoch();
+        if self.uploaded_epoch != Some(epoch) {
+            let table = self.cache.manager_ref().flat_block_table();
+            stream.memcpy_htod(&table, &mut self.bt_d)?;
+            self.uploaded_epoch = Some(epoch);
+        }
         let lens = self.cache.manager_ref().ctx_lens();
-        stream.memcpy_htod(&table, &mut self.bt_d)?;
         stream.memcpy_htod(&lens, &mut self.cl_d)?;
         stream.memcpy_htod(&wpos, &mut self.wpos_d)?;
         stream.memcpy_htod(&mask, &mut self.active_d)?;
@@ -413,6 +426,8 @@ impl DecodeModel {
         stream.memcpy_htod(cl, &mut self.cl_d)?;
         stream.memcpy_htod(wpos, &mut self.wpos_d)?;
         stream.memcpy_htod(active, &mut self.active_d)?;
+        // The device table no longer mirrors the manager — force the next masked advance to re-push.
+        self.uploaded_epoch = None;
         Ok(())
     }
 
@@ -459,6 +474,13 @@ pub struct Scheduler {
     /// Cumulative requests admitted / completed (for accounting gates).
     admitted: usize,
     completed: usize,
+    /// The captured whole-step graph [`step_graphed`](Self::step_graphed) replays, plus the raw
+    /// device pointers of the `x_d`/`out` it was captured against (the graph bakes them — later
+    /// calls must pass the same buffers). Captured once, never re-captured: the active mask, block
+    /// table, context lengths, and write positions are all *contents* of device buffers the kernels
+    /// re-read every replay, and every grid shape is a function of the fixed `Bcap` alone — so no
+    /// admission/eviction/growth ever invalidates the recording.
+    graph: Option<(crate::graph::Graph, u64, u64)>,
 }
 
 impl Scheduler {
@@ -472,6 +494,7 @@ impl Scheduler {
             emitted: 0,
             admitted: 0,
             completed: 0,
+            graph: None,
         }
     }
 
@@ -562,7 +585,59 @@ impl Scheduler {
         }
         self.model.advance_and_upload_masked(stream, &active)?;
         self.model.run_layers_on(stream, x_d, out)?;
-        // Retire finished sequences (decrement, then free without holding a borrow of the slot).
+        self.retire_finished();
+        Ok(n_active)
+    }
+
+    /// [`step`](Self::step) with the `N`-layer launch half replayed as **one cached
+    /// `cuGraphLaunch`** — the production decode loop: per iteration the host does admission, the
+    /// masked append bookkeeping, three small per-slot uploads (the block table only when the layout
+    /// epoch moved), and a single graph replay. The first active call runs one eager warmup (which
+    /// both executes that step and stabilizes the pool sub-allocation addresses the recording bakes
+    /// in) and captures; every later call replays. No recapture is ever needed — see the `graph`
+    /// field docs. Requirements the caller owns (as for [`crate::graph::Graph::capture`]): `stream`
+    /// is a dedicated non-NULL stream, event tracking is disabled, and `x_d`/`out` are the same
+    /// buffers every call (asserted).
+    pub fn step_graphed(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x_d: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<usize, DriverError> {
+        use cudarc::driver::DevicePtr;
+        self.admit()?;
+        let active: Vec<bool> = self.slots.iter().map(|s| s.is_some()).collect();
+        let n_active = active.iter().filter(|&&a| a).count();
+        if n_active == 0 {
+            return Ok(0);
+        }
+        self.model.advance_and_upload_masked(stream, &active)?;
+        let (xp, op) = {
+            let (xp, _gx) = x_d.device_ptr(stream);
+            let (op, _go) = out.device_ptr(stream);
+            (xp as u64, op as u64)
+        };
+        if let Some((graph, gx, go)) = &self.graph {
+            assert_eq!((*gx, *go), (xp, op), "step_graphed: x_d/out must be the buffers the graph was captured with");
+            graph.launch()?;
+        } else {
+            // Warmup executes this step eagerly (idempotent kernels: re-running would rewrite the
+            // same K/V bytes and recompute the same output), then the capture records the identical
+            // launch sequence without executing it — so the step still runs exactly once.
+            self.model.run_layers_on(stream, x_d, out)?;
+            stream.synchronize()?;
+            let graph = crate::graph::Graph::capture(stream.clone(), || {
+                self.model.run_layers_on(stream, x_d, out)
+            })?;
+            self.graph = Some((graph, xp, op));
+        }
+        self.retire_finished();
+        Ok(n_active)
+    }
+
+    /// Retire every sequence that has emitted its `gen_len` tokens this step: decrement each active
+    /// slot's remaining count, bump the goodput counter, and free finished slots' blocks.
+    fn retire_finished(&mut self) {
         for slot in 0..self.model.bcap() {
             let remaining = match &mut self.slots[slot] {
                 Some(inf) => {
@@ -578,7 +653,6 @@ impl Scheduler {
                 self.completed += 1;
             }
         }
-        Ok(n_active)
     }
 }
 
@@ -1264,6 +1338,89 @@ mod tests {
                 "scheduler drained {NREQ} reqs in {} steps: {emitted} tokens (=Σgen_len), peak batch {peak}/{bcap}, blocks conserved {init_free}→{free_end}",
                 trace1.len()
             );
+        });
+    }
+
+    /// **Scheduler graph==eager gate (the first law for the production decode loop).** Driving the
+    /// SAME request stream to drain twice — once with the eager per-op [`Scheduler::step`], once with
+    /// the cached whole-step graph [`Scheduler::step_graphed`] — must produce the identical per-step
+    /// active-count schedule, identical accounting, and **bit-for-bit identical** decode output at
+    /// every step (compared by per-step FNV digest over the output bits). The graph changes how the
+    /// launches are issued, never what they compute: masks / block tables / context lengths are
+    /// re-read from device buffers at every replay, so ONE capture serves admissions, evictions, and
+    /// block growth alike — the property that lets the real scheduler loop run graph-driven.
+    #[test]
+    fn serving_scheduler_graph_matches_eager() {
+        with_gpu("serving_scheduler_graph_matches_eager", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 2usize);
+                let d = heads * hd;
+                let max_bps = (40usize + 24).div_ceil(bsz) + 2;
+                let num_blocks = bcap * max_bps + 32;
+                let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+                let mut rng = crate::diff::Rng::new(0x6A6A);
+                let wdata = layer_weights(&mut rng, depth, d, dff);
+                let weights = weights_view(&wdata);
+                let x = rng.vec(bcap * d, -1.0, 1.0);
+                const NREQ: usize = 96;
+                let reqs: Vec<Request> =
+                    (0..NREQ).map(|i| Request { prompt_len: 1 + (i * 7) % 40, gen_len: 1 + (i * 5) % 24 }).collect();
+
+                // FNV-1a over the output bits: digest equality at every step == bit-equality.
+                let digest = |v: &[f32]| -> u64 {
+                    let mut h = 0xcbf29ce484222325u64;
+                    for f in v {
+                        for b in f.to_bits().to_le_bytes() {
+                            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    h
+                };
+                // Drive a full drain; per-step (active, out-digest) trace + accounting.
+                let drive = |g: &mut Gpu, graphed: bool| -> (Vec<(usize, u64)>, usize, usize, usize, usize) {
+                    let model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
+                    let init_free = model.cache().manager_ref().free_blocks();
+                    let mut sched = Scheduler::new(model);
+                    for &r in &reqs {
+                        sched.enqueue(r);
+                    }
+                    // The graphed loop needs a dedicated capturable stream; eager runs on the default.
+                    let stream = if graphed { g.ctx.new_stream().unwrap() } else { g.stream.clone() };
+                    let x_d = stream.memcpy_stod(&x).unwrap();
+                    let mut out = stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                    let mut trace = Vec::new();
+                    while !sched.is_idle() {
+                        let n = if graphed {
+                            sched.step_graphed(&stream, &x_d, &mut out).unwrap()
+                        } else {
+                            sched.step(&stream, &x_d, &mut out).unwrap()
+                        };
+                        stream.synchronize().unwrap();
+                        let bits = stream.memcpy_dtov(&out).unwrap();
+                        trace.push((n, digest(&bits)));
+                        assert!(trace.len() < 100_000, "scheduler failed to drain (liveness)");
+                    }
+                    (trace, sched.completed(), sched.emitted(), sched.free_blocks(), init_free)
+                };
+
+                let (trace_e, comp_e, emit_e, free_e, init_e) = drive(g, false);
+                let (trace_g, comp_g, emit_g, free_g, init_g) = drive(g, true);
+                assert_eq!(comp_e, NREQ, "eager completes every request");
+                assert_eq!(comp_g, NREQ, "graphed completes every request");
+                assert_eq!(emit_e, emit_g, "useful-token accounting diverges");
+                assert_eq!(free_e, init_e, "eager leaks blocks");
+                assert_eq!(free_g, init_g, "graphed leaks blocks");
+                assert_eq!(trace_e.len(), trace_g.len(), "step counts diverge");
+                for (i, (e, gr)) in trace_e.iter().zip(&trace_g).enumerate() {
+                    assert_eq!(e.0, gr.0, "active count diverges at step {i}");
+                    assert_eq!(e.1, gr.1, "decode output diverges at step {i} (graphed != eager)");
+                }
+                eprintln!(
+                    "scheduler drain graph-driven == eager: {} steps, {NREQ} reqs, {emit_e} tokens — \
+                     per-step output BIT-IDENTICAL (digest), one capture across admit/evict/growth",
+                    trace_e.len()
+                );
+            });
         });
     }
 
