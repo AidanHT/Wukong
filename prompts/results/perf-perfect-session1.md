@@ -107,3 +107,12 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
 - Process lesson re-learned the hard way: a background `cargo test 2>&1 | tail` reported tail's
   exit code — the gate was re-run unpiped before committing (the standing rule exists for a
   reason).
+- **parallel_for dynamic granule claiming shipped** (fe7fd04, WUKONG_PFOR_DYN=0 A/B escape):
+  region iterations claimed from a padded atomic counter in ceil(n/(workers·8)) granules — the
+  runtime half of the attention-tiling lever. Full gate green.
+- **Head×row-tile respelling DE-RISKED end-to-end** (scratchpad probe through the real wukongc):
+  the outliner ACCEPTS `hh = t/T; tile = t%T; r0 = tile·(S/T)` disjoint slicing (emits
+  `attn_tiled$par` + one parallel_for), the per-tile nests still dispatch
+  sgemm_nt_alpha/norm_f32/sgemm_nt, and interp == native exactly. Cost: kh/vt pack redundancy
+  ×T (~4 ms/forward @S=512 T=4, memory-bound) buys 48 claims over 16 workers instead of 12.
+  Model-source application queued behind the torch-peer merge (same file).
