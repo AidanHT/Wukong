@@ -9932,6 +9932,22 @@ impl FnLowerer<'_> {
     //    constants) sum below `C`. Then `index mod C·N ∈ [hh·C, hh·C + C)` recovers `hh`, so two
     //    different iterations can never touch the same element — reads of a written array pass the
     //    same proof (with the array's common `C`), so no iteration reads another's writes either.
+    //  * **Tiled iteration spaces** spelled with div/mod by a literal (`for t in 0..H*T { let hh =
+    //    t / T; let tile = t % T; … }`) pass a two-digit form of the same proof. `t ↦ (t/C, t%C)`
+    //    is injective (`t = (t/C)·C + t%C`), so an index decomposing as `(t/C)·qc + (t%C)·rc +
+    //    Σ outer + Σ rest` pins `t` whenever BOTH digits are recoverable from the index value.
+    //    Ordering the digit terms by coefficient — `H` the larger, `L` the smaller, with digit
+    //    ranges `h_max`/`l_max` derived from N and C — the walk checks the single-digit
+    //    obligations once per radix level: `outer` strides vanish mod `H·(h_max+1)`; every other
+    //    term is non-negative and bounded; the terms that are NOT multiples of `L·(l_max+1)` sum
+    //    below `L` (they live inside the L digit's slot); and everything below the H digit —
+    //    including the L digit's own reach `l_max·L` — sums below `H`. Then `index mod H·(h_max+1)`
+    //    recovers the H digit and its remainder mod `L·(l_max+1)` recovers the L digit, so distinct
+    //    `t` never collide. Digit terms come from inline `t/C` / `t%C` atoms or from body-locals
+    //    `let`-bound to affine combinations of them (`let r0 = tile * SROWS;`), resolved against a
+    //    per-access snapshot so rebinding/assignment can never mislabel a value, and `(a+b)*k`
+    //    distributes before classification. A non-constant divisor, a missing / negative / equal
+    //    coefficient pair, mixed direct-`t`-and-digit indices, and any unprovable extent decline.
     //  * Anything the proof cannot cover declines (`match_parallel_region` returns `None`) and the
     //    loop lowers serially exactly as before: captured-scalar writes (loop-carried reductions),
     //    non-affine / offset indices, `break`/`continue` targeting the region loop, `return`,
@@ -9986,9 +10002,10 @@ impl FnLowerer<'_> {
 
     /// The pure legality analysis: walk the loop body, collecting captures (enclosing-scope
     /// bindings) and every access to a captured array, then prove all writes (and all reads of
-    /// written arrays) per-iteration disjoint via the mixed-radix digit argument. Conservative:
-    /// any construct the walk does not explicitly model declines. Returns the captures in
-    /// first-appearance order (the deterministic env layout) on success.
+    /// written arrays) per-iteration disjoint via the mixed-radix digit argument — the single
+    /// direct `hh*C` digit, or the tiled two-digit `(hh/C)·qc + (hh%C)·rc` form (see the section
+    /// comment above). Conservative: any construct the walk does not explicitly model declines.
+    /// Returns the captures in first-appearance order (the deterministic env layout) on success.
     fn match_parallel_region(&self, hh: Symbol, n: i128, body: &Block) -> Option<Vec<Symbol>> {
         let mut sc = RegionScan {
             hh,
@@ -9997,6 +10014,7 @@ impl FnLowerer<'_> {
             accesses: HashMap::default(),
             written: Vec::new(),
             env: Vec::new(),
+            derived: HashMap::default(),
             depth: 0,
             ok: true,
         };
@@ -10006,76 +10024,57 @@ impl FnLowerer<'_> {
         }
         for arr in &sc.written {
             let accs = sc.accesses.get(arr)?;
-            // Pass 1: every access must carry `hh` exactly once, as `hh` or `hh * <lit>`, with one
-            // common stride C for this array (reads and writes alike — a read decomposing under a
-            // different C could reach another iteration's slice).
-            let mut c: Option<i128> = None;
-            let mut parsed: Vec<(Vec<&Expr>, &RegionAccess)> = Vec::new();
+            // Pass 1: every access must carry the loop var under ONE common signature for this
+            // array, reads and writes alike (a read decomposing under a different signature could
+            // reach another iteration's slice): a single direct `hh`/`hh * <lit>` digit, or the
+            // tiled `(hh/C)·qc + (hh%C)·rc` digit pair.
+            let mut sig: Option<RegionSig> = None;
+            let mut parsed: Vec<(Vec<RegionRest>, &RegionAccess)> = Vec::new();
             for a in accs {
                 let idx = a.idx?; // opaque access (whole-array / multi-index) to a written array
-                let mut terms = Vec::new();
-                flatten_add_terms(idx, &mut terms);
-                let pos = terms
-                    .iter()
-                    .position(|t| region_hh_stride(t, hh, self.interner).is_some())?;
-                let stride = region_hh_stride(terms[pos], hh, self.interner)?;
-                if stride < 1 {
-                    return None;
+                let (asig, rest) = region_access_sig(idx, a, hh, self.interner)?;
+                match sig {
+                    Some(s) if s != asig => return None,
+                    _ => sig = Some(asig),
                 }
-                terms.remove(pos);
-                // `hh` must not appear anywhere else in the index (a second digit would break the
-                // unique-decomposition argument).
-                if terms.iter().any(|t| expr_uses_sym(t, hh)) {
-                    return None;
-                }
-                match c {
-                    Some(cc) if cc != stride => return None,
-                    _ => c = Some(stride),
-                }
-                parsed.push((terms, a));
+                parsed.push((rest, a));
             }
-            let c = c?;
-            let m = c.checked_mul(n)?;
-            // Pass 2: classify every remaining term as outer (stride ≡ 0 mod C·N — erased by the
-            // modulus for any integer factor value) or inner (bounded, non-negative, summing < C).
-            for (terms, a) in parsed {
-                let mut inner: i128 = 0;
-                for t in terms {
-                    match region_term(t, self.interner) {
-                        RegionTerm::Lit(k) => {
-                            if k.rem_euclid(m) == 0 {
-                                continue; // outer constant
-                            }
-                            if k < 0 {
-                                return None;
-                            }
-                            inner = inner.checked_add(k)?;
+            // Pass 2: classify every remaining term at each radix level — outer (stride ≡ 0 mod
+            // the level's modulus, erased for ANY integer factor value) or bounded (non-negative
+            // constants and inner `for` vars with literal ranges) — and bound each digit's slot.
+            match sig? {
+                RegionSig::T(c) => {
+                    let m = c.checked_mul(n)?;
+                    for (rest, a) in &parsed {
+                        // Everything that is not outer must stay inside the digit's stride C.
+                        let (total, _) = region_extent(rest, a, m, None)?;
+                        if total >= c {
+                            return None;
                         }
-                        RegionTerm::Var(v, s) => {
-                            if s.rem_euclid(m) == 0 {
-                                continue; // outer: (v*s) mod C·N == 0 for any integer v
-                            }
-                            if s < 1 {
-                                return None;
-                            }
-                            // Inner: v must be an enclosing inner `for` var with a literal
-                            // [lo, hi) range at this access site.
-                            let (lo, hi) = a
-                                .env
-                                .iter()
-                                .rev()
-                                .find(|(sym, _)| *sym == v)
-                                .and_then(|(_, r)| *r)?;
-                            if lo < 0 || hi <= lo {
-                                return None;
-                            }
-                            inner = inner.checked_add(s.checked_mul(hi - 1)?)?;
-                        }
-                        RegionTerm::Opaque => return None,
                     }
                 }
-                if inner >= c {
-                    return None;
+                RegionSig::DivMod { c, qc, rc } => {
+                    // Digit ranges from the trip count: q = hh/c ∈ [0, q_max], r = hh%c ∈
+                    // [0, r_max]. H/L order the two digit terms by coefficient.
+                    let q_max = (n - 1) / c;
+                    let r_max = (c - 1).min(n - 1);
+                    let (h, h_max, l, l_max) = if rc > qc {
+                        (rc, r_max, qc, q_max)
+                    } else {
+                        (qc, q_max, rc, r_max)
+                    };
+                    let m = h.checked_mul(h_max.checked_add(1)?)?;
+                    let sm = l.checked_mul(l_max.checked_add(1)?)?;
+                    for (rest, a) in &parsed {
+                        let (total, low) = region_extent(rest, a, m, Some(sm))?;
+                        // The sub-`L` terms must fit inside the L digit's stride, and everything
+                        // below the H digit — the L digit's own reach `l_max·L` included — inside
+                        // H's: then `index mod H·(h_max+1)` recovers the H digit and its remainder
+                        // mod `L·(l_max+1)` the L digit, pinning `hh = q·c + r`.
+                        if low >= l || total.checked_add(l.checked_mul(l_max)?)? >= h {
+                            return None;
+                        }
+                    }
                 }
             }
         }
@@ -10096,7 +10095,7 @@ impl FnLowerer<'_> {
                 self.scan_region_expr(t, sc);
             }
         }
-        sc.locals.pop();
+        sc.pop_scope();
     }
 
     fn scan_region_stmt<'e>(&self, s: &'e Stmt, sc: &mut RegionScan<'e>) {
@@ -10124,7 +10123,25 @@ impl FnLowerer<'_> {
                     }
                 }
                 if sc.ok {
+                    // A binding whose initializer is an affine combination of the region var's
+                    // div/mod digits (`let hh = t / 4; let r0 = (t % 4) * SROWS;`) becomes a
+                    // modeled digit value that index classification substitutes (the tiled-loop
+                    // legality). Evaluated BEFORE the bind — the initializer sees the enclosing
+                    // binding of any name it mentions, exactly like the language does. Plain
+                    // constants and anything unrecognized stay unmodeled, as before.
+                    let digits = match (&pat.kind, init) {
+                        (ast::PatKind::Ident(_), Some(e)) => {
+                            region_digit_affine(e, sc, self.interner)
+                                .filter(|d| d.qc != 0 || d.rc != 0)
+                        }
+                        _ => None,
+                    };
                     self.bind_region_pat(pat, sc);
+                    if sc.ok {
+                        if let (ast::PatKind::Ident(v), Some(d)) = (&pat.kind, digits) {
+                            sc.derived.insert(*v, d);
+                        }
+                    }
                 }
             }
             StmtKind::Assign { target, value, .. } => {
@@ -10216,7 +10233,7 @@ impl FnLowerer<'_> {
                 if pushed_env {
                     sc.env.pop();
                 }
-                sc.locals.pop();
+                sc.pop_scope();
             }
         }
     }
@@ -10230,6 +10247,9 @@ impl FnLowerer<'_> {
                 // A body-local scalar/aggregate is private; writing the region var, a captured
                 // scalar (a loop-carried accumulator), or a captured whole array declines.
                 if sym != sc.hh && sc.is_local(sym) {
+                    // Assigning a digit-derived local invalidates its modeled value from here on;
+                    // accesses recorded earlier keep their (correct-at-the-time) snapshot.
+                    sc.derived.remove(&sym);
                     return;
                 }
                 sc.ok = false;
@@ -10415,6 +10435,10 @@ impl FnLowerer<'_> {
             sc.ok = false;
             return;
         }
+        // Rebinding a name sheds any digit-derived model the OLD binding had — the name now means
+        // a different value. (An enclosing binding shadowed by an inner scope stays shed after the
+        // scope pops: conservative, never wrong.)
+        sc.derived.remove(&sym);
         sc.locals.last_mut().expect("region scope").insert(sym);
     }
 
@@ -18776,6 +18800,9 @@ struct RegionAccess<'a> {
     /// Snapshot of the *inner* `for` variables in scope at the access site (innermost last), each
     /// with its literal `[lo, hi)` range when the bounds are literals (`None` = outer-terms-only).
     env: Vec<(Symbol, Option<(i128, i128)>)>,
+    /// Snapshot of the digit-derived locals live at the access site (see [`RegionScan::derived`]),
+    /// so a later rebind/assignment of a name can never mislabel THIS access's value.
+    derived: HashMap<Symbol, RegionDigits>,
 }
 
 /// Walker state for [`FnLowerer::match_parallel_region`]: body-local scopes, captures in
@@ -18788,6 +18815,11 @@ struct RegionScan<'a> {
     accesses: HashMap<Symbol, Vec<RegionAccess<'a>>>,
     written: Vec<Symbol>,
     env: Vec<(Symbol, Option<(i128, i128)>)>,
+    /// Body-locals currently `let`-bound to an affine combination of the region var's div/mod
+    /// digits (`let hh = t / T; let r0 = (t % T) * SROWS;`). Maintained flow- and scope-correctly
+    /// (entries die on rebind, assignment, and scope exit) and snapshotted into every recorded
+    /// access, so classification always sees the value the access actually computed.
+    derived: HashMap<Symbol, RegionDigits>,
     /// Loop-nesting depth *inside* the region body (break/continue legality).
     depth: usize,
     ok: bool,
@@ -18805,47 +18837,309 @@ impl<'a> RegionScan<'a> {
         self.accesses.entry(sym).or_default().push(RegionAccess {
             idx,
             env: self.env.clone(),
+            derived: self.derived.clone(),
         });
     }
-}
 
-/// A classified non-`hh` index term of a region access: a literal constant, a single variable
-/// times a literal stride (`v`, `v*s`, `s*v`), or anything else (opaque — declines).
-enum RegionTerm {
-    Lit(i128),
-    Var(Symbol, i128),
-    Opaque,
-}
-
-fn region_term(t: &Expr, interner: &Interner) -> RegionTerm {
-    if let Some(k) = as_int_lit(t, interner) {
-        return RegionTerm::Lit(k as i128);
-    }
-    if let Some(v) = single_path(t) {
-        return RegionTerm::Var(v, 1);
-    }
-    if let ExprKind::Binary {
-        op: ast::BinOp::Mul,
-        lhs,
-        rhs,
-    } = &t.kind
-    {
-        if let (Some(v), Some(s)) = (single_path(lhs), as_int_lit(rhs, interner)) {
-            return RegionTerm::Var(v, s as i128);
-        }
-        if let (Some(s), Some(v)) = (as_int_lit(lhs, interner), single_path(rhs)) {
-            return RegionTerm::Var(v, s as i128);
+    /// Leave a lexical scope: names bound in it die, and their digit-derived models must die with
+    /// them — after the pop the same name means an enclosing binding (or nothing), a DIFFERENT
+    /// value.
+    fn pop_scope(&mut self) {
+        if let Some(popped) = self.locals.pop() {
+            for s in &popped {
+                self.derived.remove(s);
+            }
         }
     }
-    RegionTerm::Opaque
 }
 
-/// `t == hh` (stride 1) or `t == hh * <lit>` / `<lit> * hh` (that literal); `None` otherwise.
-fn region_hh_stride(t: &Expr, hh: Symbol, interner: &Interner) -> Option<i128> {
-    match region_term(t, interner) {
-        RegionTerm::Var(v, s) if v == hh => Some(s),
+/// The modeled value of a **digit-derived** body-local: `value = (hh/c)·qc + (hh%c)·rc + k` with
+/// `c ≥ 2` a literal divisor. While folding an initializer, `c == 0` means "no digit part yet" (a
+/// plain constant); only values with a live digit part (`qc != 0 || rc != 0`, which forces
+/// `c ≥ 2`) are recorded in [`RegionScan::derived`], so constants and unrelated locals stay
+/// unmodeled exactly as before.
+#[derive(Clone, Copy)]
+struct RegionDigits {
+    c: i128,
+    qc: i128,
+    rc: i128,
+    k: i128,
+}
+
+/// Fold a `let` initializer into a [`RegionDigits`] affine value over the region var's div/mod
+/// digits: integer literals, digit-derived locals, `hh / <lit ≥ 2>`, `hh % <lit ≥ 2>`, `+`, and
+/// `*` by a constant. Anything else — a non-constant divisor, a nested `(hh%C)/D`, floats, casts,
+/// an already-invalidated local — yields `None` and the binding simply stays unmodeled (which
+/// later declines any written-array index that leans on it).
+fn region_digit_affine(e: &Expr, sc: &RegionScan<'_>, interner: &Interner) -> Option<RegionDigits> {
+    if let Some(k) = as_int_lit(e, interner) {
+        return Some(RegionDigits {
+            c: 0,
+            qc: 0,
+            rc: 0,
+            k: k as i128,
+        });
+    }
+    if let Some(v) = single_path(e) {
+        return sc.derived.get(&v).copied();
+    }
+    let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
+        return None;
+    };
+    match op {
+        // Only the direct tiling digits of the region var itself: `hh` ranges over [0, N), so the
+        // truncating `/`/`%` ARE the euclidean digits (no negative-operand cases to model).
+        ast::BinOp::Div | ast::BinOp::Rem => {
+            if single_path(lhs) != Some(sc.hh) {
+                return None;
+            }
+            let c = as_int_lit(rhs, interner)? as i128;
+            if c < 2 {
+                return None;
+            }
+            let (qc, rc) = if matches!(op, ast::BinOp::Div) {
+                (1, 0)
+            } else {
+                (0, 1)
+            };
+            Some(RegionDigits { c, qc, rc, k: 0 })
+        }
+        ast::BinOp::Add => {
+            let a = region_digit_affine(lhs, sc, interner)?;
+            let b = region_digit_affine(rhs, sc, interner)?;
+            let c = match (a.c, b.c) {
+                (0, c) | (c, 0) => c,
+                (ca, cb) if ca == cb => ca,
+                _ => return None, // digits of different divisors do not mix
+            };
+            Some(RegionDigits {
+                c,
+                qc: a.qc.checked_add(b.qc)?,
+                rc: a.rc.checked_add(b.rc)?,
+                k: a.k.checked_add(b.k)?,
+            })
+        }
+        ast::BinOp::Mul => {
+            let a = region_digit_affine(lhs, sc, interner)?;
+            let b = region_digit_affine(rhs, sc, interner)?;
+            let (d, s) = if a.c == 0 && a.qc == 0 && a.rc == 0 {
+                (b, a.k)
+            } else if b.c == 0 && b.qc == 0 && b.rc == 0 {
+                (a, b.k)
+            } else {
+                return None; // digit × digit is not affine
+            };
+            Some(RegionDigits {
+                c: d.c,
+                qc: d.qc.checked_mul(s)?,
+                rc: d.rc.checked_mul(s)?,
+                k: d.k.checked_mul(s)?,
+            })
+        }
         _ => None,
     }
+}
+
+/// The per-array common decomposition of the region var across every access index: `T(c)` — one
+/// direct `hh*c` digit (the untiled head-loop form) — or `DivMod { c, qc, rc }` — the tiled
+/// two-digit form `(hh/c)·qc + (hh%c)·rc`. All reads and writes of one written array must share
+/// one signature: the disjointness proof is "the index value pins `hh`", and two accesses
+/// decomposing differently would pin it two different ways.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegionSig {
+    T(i128),
+    DivMod { c: i128, qc: i128, rc: i128 },
+}
+
+/// A non-digit index term after distribution: a literal constant or a single variable times a
+/// literal stride. Anything else is opaque and declines during [`region_access_sig`].
+#[derive(Clone, Copy)]
+enum RegionRest {
+    Lit(i128),
+    Var(Symbol, i128),
+}
+
+/// Decompose one flat index of a written captured array into its region-var [`RegionSig`] and the
+/// remaining additive terms. Distributes literal multiplication (`(r0+i)*64` → `r0*64 + i*64`),
+/// substitutes digit-derived locals from the access's snapshot, and recognizes inline `hh / C` /
+/// `hh % C` atoms. Declines (`None`) on any atom it cannot classify, a duplicated direct digit,
+/// mixed direct-`hh`-and-digit forms, a divisor mismatch, or digit coefficients that are absent,
+/// non-positive, or equal (`(hh/C)·k + (hh%C)·k` is not injective in `hh`).
+fn region_access_sig(
+    idx: &Expr,
+    a: &RegionAccess<'_>,
+    hh: Symbol,
+    interner: &Interner,
+) -> Option<(RegionSig, Vec<RegionRest>)> {
+    let mut atoms = Vec::new();
+    if !flatten_scaled_terms(idx, 1, interner, &mut atoms) {
+        return None;
+    }
+    let mut t: Option<i128> = None;
+    let mut dig: Option<(i128, i128, i128)> = None; // (c, qc, rc), summed over digit atoms
+    let mut rest = Vec::new();
+    for (atom, s) in atoms {
+        if let Some(k) = as_int_lit(atom, interner) {
+            rest.push(RegionRest::Lit((k as i128).checked_mul(s)?));
+            continue;
+        }
+        if let Some(v) = single_path(atom) {
+            if v == hh {
+                if t.is_some() {
+                    return None; // a second direct digit breaks unique decomposition
+                }
+                t = Some(s);
+            } else if let Some(d) = a.derived.get(&v) {
+                dig = Some(region_merge_digit(
+                    dig,
+                    d.c,
+                    d.qc.checked_mul(s)?,
+                    d.rc.checked_mul(s)?,
+                )?);
+                if d.k != 0 {
+                    rest.push(RegionRest::Lit(d.k.checked_mul(s)?));
+                }
+            } else {
+                rest.push(RegionRest::Var(v, s));
+            }
+            continue;
+        }
+        // Inline `hh / C` / `hh % C` (literal C ≥ 2) atoms.
+        if let ExprKind::Binary { op, lhs, rhs } = &atom.kind {
+            if matches!(op, ast::BinOp::Div | ast::BinOp::Rem)
+                && single_path(lhs) == Some(hh)
+            {
+                if let Some(c) = as_int_lit(rhs, interner) {
+                    let c = c as i128;
+                    if c >= 2 {
+                        let (dq, dr) = if matches!(op, ast::BinOp::Div) {
+                            (s, 0)
+                        } else {
+                            (0, s)
+                        };
+                        dig = Some(region_merge_digit(dig, c, dq, dr)?);
+                        continue;
+                    }
+                }
+            }
+        }
+        return None; // opaque atom in a written array's index
+    }
+    match (t, dig) {
+        (Some(c), None) if c >= 1 => Some((RegionSig::T(c), rest)),
+        (None, Some((c, qc, rc))) if qc >= 1 && rc >= 1 && qc != rc => {
+            Some((RegionSig::DivMod { c, qc, rc }, rest))
+        }
+        _ => None,
+    }
+}
+
+/// Accumulate one digit atom into an access's running `(c, qc, rc)`; the divisors must agree
+/// (digits of different divisors do not form a mixed radix together).
+fn region_merge_digit(
+    cur: Option<(i128, i128, i128)>,
+    c: i128,
+    qc: i128,
+    rc: i128,
+) -> Option<(i128, i128, i128)> {
+    match cur {
+        None => Some((c, qc, rc)),
+        Some((c0, _, _)) if c0 != c => None,
+        Some((c0, q0, r0)) => Some((c0, q0.checked_add(qc)?, r0.checked_add(rc)?)),
+    }
+}
+
+/// Bound the non-digit terms of one region access. Each term is either **outer** — stride ≡ 0 mod
+/// `m` (the full modulus), erased for ANY integer factor value — or **bounded**: a non-negative
+/// literal, or an inner `for` var with a literal `[lo, hi)` range at the access site (max reach
+/// `s·(hi-1)`). Returns `(total, low)`: the summed maxima of all bounded terms, and of the subset
+/// whose stride is NOT a multiple of `sm` (the sub-digit modulus — those live inside the low
+/// digit's slot; `sm = None` for the single-digit form, where the split is unused). `None` when
+/// any term is unbounded, negative, or overflows.
+fn region_extent(
+    rest: &[RegionRest],
+    a: &RegionAccess<'_>,
+    m: i128,
+    sm: Option<i128>,
+) -> Option<(i128, i128)> {
+    let mut total: i128 = 0;
+    let mut low: i128 = 0;
+    for term in rest {
+        let (stride, mx) = match *term {
+            RegionRest::Lit(k) => {
+                if k.rem_euclid(m) == 0 {
+                    continue; // outer constant
+                }
+                if k < 0 {
+                    return None;
+                }
+                (k, k)
+            }
+            RegionRest::Var(v, s) => {
+                if s.rem_euclid(m) == 0 {
+                    continue; // outer: (v*s) mod m == 0 for any integer v
+                }
+                if s < 1 {
+                    return None;
+                }
+                // Bounded: v must be an enclosing inner `for` var with a literal [lo, hi)
+                // range at this access site.
+                let (lo, hi) = a
+                    .env
+                    .iter()
+                    .rev()
+                    .find(|(sym, _)| *sym == v)
+                    .and_then(|(_, r)| *r)?;
+                if lo < 0 || hi <= lo {
+                    return None;
+                }
+                (s, s.checked_mul(hi - 1)?)
+            }
+        };
+        total = total.checked_add(mx)?;
+        if sm.map_or(true, |sm| stride.rem_euclid(sm) != 0) {
+            low = low.checked_add(mx)?;
+        }
+    }
+    Some((total, low))
+}
+
+/// [`flatten_add_terms`] extended to **distribute literal multiplication over `+`**:
+/// `(r0 + i)*64` yields the atoms `[(r0, 64), (i, 64)]`, `hh*4*4` yields `[(hh, 16)]`.
+/// Distribution is exact even for wrapping integer arithmetic (multiplying by a constant
+/// distributes over addition mod 2^w), so classification never reasons about a value the program
+/// didn't compute. Returns `false` on i128 scale overflow (the caller declines).
+fn flatten_scaled_terms<'a>(
+    e: &'a Expr,
+    scale: i128,
+    interner: &Interner,
+    out: &mut Vec<(&'a Expr, i128)>,
+) -> bool {
+    if let ExprKind::Binary { op, lhs, rhs } = &e.kind {
+        match op {
+            ast::BinOp::Add => {
+                return flatten_scaled_terms(lhs, scale, interner, out)
+                    && flatten_scaled_terms(rhs, scale, interner, out);
+            }
+            ast::BinOp::Mul => {
+                if let Some(k) = as_int_lit(rhs, interner) {
+                    return match scale.checked_mul(k as i128) {
+                        Some(s) => flatten_scaled_terms(lhs, s, interner, out),
+                        None => false,
+                    };
+                }
+                if let Some(k) = as_int_lit(lhs, interner) {
+                    return match scale.checked_mul(k as i128) {
+                        Some(s) => flatten_scaled_terms(rhs, s, interner, out),
+                        None => false,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    out.push((e, scale));
+    true
 }
 
 fn flatten_add_terms<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -24669,15 +24963,19 @@ mod tests {
 
     #[test]
     fn parallel_region_declines_cross_iteration_dep() {
-        // `out[(h+1)*2 + j]` reads what iteration h wrote and writes what iteration h+1 reads — a
-        // genuine loop-carried chain. The write index has no `hh*C` digit ((h+1)*2 is not a bare
-        // `h * lit` term), so the region matcher declines and the loop stays serial.
+        // `out[(h+1)*2 + …]` writes what iteration h+1 reads — a genuine loop-carried chain. The
+        // write index distributes to `h*2 + 2 + …`: the +2 offset is not a multiple of C·N = 6,
+        // so it counts toward the in-slot extent, which reaches C = 2 — the mixed-radix bound
+        // rejects it and the loop stays serial. (Spelled without an inner `for j` loop: for a
+        // FIXED h the two element updates are mutually disjoint, so a j-loop would itself be a
+        // legal — if useless — 2-trip region, masking what this test pins.)
         let src = "module m
 @parallel
 fn scan(x: [f32; 16], mut out: [f32; 16]) {
     for i in 0..16 { out[i] = x[i]; }
     for h in 0..3 {
-        for j in 0..2 { out[(h+1)*2 + j] = out[h*2 + j] + x[h*2 + j]; }
+        out[(h+1)*2] = out[h*2] + x[h*2];
+        out[(h+1)*2 + 1] = out[h*2 + 1] + x[h*2 + 1];
     }
 }
 ";
