@@ -7,14 +7,18 @@
 module tests.run.parallel_region_decline
 
 // A genuine cross-iteration dependence: iteration h READS the slice iteration h-1 WROTE
-// (`out[(h+1)*2+j] = out[h*2+j] + x[h*2+j]`). The region matcher must decline (the write index
-// (h+1)*2+j carries no bare h*C digit), so the loop stays a serial chain and the prefix-style
-// values below are the only correct answer — a wrong parallelization would race and diverge.
+// (`out[(h+1)*2+…] = out[h*2+…] + x[h*2+…]`). The region matcher must decline: the write index
+// distributes to `h*2 + 2 + …` and the +2 offset (not a multiple of C·N) fills the whole C=2
+// slot, failing the mixed-radix bound. The loop stays a serial chain and the prefix-style values
+// below are the only correct answer — a wrong parallelization would race and diverge. (Spelled
+// without an inner `for j` loop: for a FIXED h the two element updates are disjoint, so a j-loop
+// would itself be a legal 2-trip region, masking what this fixture pins.)
 @parallel
 fn scan(x: [f32; 16], mut out: [f32; 16]) {
     for i in 0..16 { out[i] = x[i]; }
     for h in 0..3 {
-        for j in 0..2 { out[(h+1)*2 + j] = out[h*2 + j] + x[h*2 + j]; }
+        out[(h+1)*2] = out[h*2] + x[h*2];
+        out[(h+1)*2 + 1] = out[h*2 + 1] + x[h*2 + 1];
     }
 }
 
