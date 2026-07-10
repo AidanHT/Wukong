@@ -584,10 +584,13 @@ fn short(p: &Path) -> String {
     p.file_name().unwrap().to_string_lossy().into_owned()
 }
 
+/// Truncate to at most `w` characters (char-boundary-safe: byte slicing would panic on a multibyte
+/// filename).
 fn trunc(s: &str, w: usize) -> String {
-    if s.len() <= w {
+    if s.chars().count() <= w {
         s.to_string()
     } else {
-        format!("{}…", &s[..w - 1])
+        let cut: String = s.chars().take(w.saturating_sub(1)).collect();
+        format!("{cut}…")
     }
 }
