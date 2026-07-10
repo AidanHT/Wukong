@@ -106,7 +106,7 @@ existing `time_ns` (5 warmup + scale-to-50ms + best-of-14). An AVX-512 number is
 
 `wukong-xbench matmul`, roofline ~106 GFLOP/s this run, MKL = `mkl_rt.2.dll` (ILP64). GFLOP/s:
 
-| size | Mer(1c) | MKL(1c) | Mer/MKL 1c | Mer(par) | MKL(all) | tuned(mm) | C(gcc) |
+| size | Wuk(1c) | MKL(1c) | Wuk/MKL 1c | Wuk(par) | MKL(all) | tuned(mm) | C(gcc) |
 |------|--------:|--------:|-----------:|---------:|---------:|----------:|-------:|
 | 256³ | 93.2 | 96.6 | **97%** | 86.5† | 218.5 | 74.4 | 28.0 |
 | 512³ | 82.2 | 97.0 | **85%** | 183.3 | 371.6 | 73.0 | 32.5 |
@@ -119,7 +119,7 @@ multi-second naive C/Rust 2048³ nests run immediately before `MKL(all)` and hea
 fix (peers adjacent + skip the naive pollution at ≥2048) before its gap is trustworthy.
 
 **Findings:**
-- **Floor cleared:** Mer(1c) beats tuned `matrixmultiply` 1.13–1.25× and naive C 2.5–8.7× at every size.
+- **Floor cleared:** Wuk(1c) beats tuned `matrixmultiply` 1.13–1.25× and naive C 2.5–8.7× at every size.
 - **Single-core gap to MKL widens with size** (97%→85%→88%→82%): MKL holds ~94–97 GFLOP/s flat
   (≈90% roofline, resident), Wukong **erodes 93→77** as the matrices spill L2/L3 — the classic
   re-streaming loss. *This is the Phase-1 target: lift 512³–2048³ from ~82–88% toward MKL's ~95%.*
@@ -138,10 +138,10 @@ B + 9 KB A micropanels stay L1-resident): k=512 → 2×256 (even, no thin tail),
 Both kernels call it, so **serial stays bit-identical to parallel**; the grouping differs from KC=256
 only in low f32 bits (within the √k·ε tolerance the gemm tests assert). 18/18 gemm + 134/134 runtime tests green.
 
-`wukong-xbench matmul` (XBENCH_HUGE=1), roofline ~102 GFLOP/s this run. **Mer(1c) is measured first
+`wukong-xbench matmul` (XBENCH_HUGE=1), roofline ~102 GFLOP/s this run. **Wuk(1c) is measured first
 in each block, before any heating → the trustworthy single-core series:**
 
-| size | Mer(1c) KC=256 | Mer(1c) `select_kc` | Δ | roofline% | MKL(1c) | Mer/MKL 1c |
+| size | Wuk(1c) KC=256 | Wuk(1c) `select_kc` | Δ | roofline% | MKL(1c) | Wuk/MKL 1c |
 |------|--------:|--------:|--------:|--------:|--------:|-----------:|
 | 256³ | 93.2 | 89.3 | −4%* | 87% | 87.6 | **102%** |
 | 512³ | 82.2 | **88.0** | **+7%** | 86% | 85.6 | **103%** |
@@ -151,17 +151,17 @@ in each block, before any heating → the trustworthy single-core series:**
 
 \*256³ has k<384 ⇒ a single K-block either way; the −4% is run-to-run thermal noise (roofline was 106
 vs 102 between runs), not a regression — the computation is byte-identical. ‡**4096³ MKL is thermally
-invalid**: MKL(1c) runs *after* `Mer(par)` (a multi-second all-core 307 GFLOP/s burst) which throttles
+invalid**: MKL(1c) runs *after* `Wuk(par)` (a multi-second all-core 307 GFLOP/s burst) which throttles
 the chip — MKL cannot truly be 32 GFLOP/s at 4096³ when it holds 97 at 2048³. The honest 4096³ datum is
-**Mer(1c)=79 (77% roofline)**; the MKL ratio there awaits the Phase-2 harness fix.
+**Wuk(1c)=79 (77% roofline)**; the MKL ratio there awaits the Phase-2 harness fix.
 
 **Result:** the eroding curve `93→82→83→77` flattened to `89→88→84→84→79` — the kernel now holds
 **77–87% of roofline from L2-resident (256³) out to a 512 MB working set (4096³)**, beats MKL single-core
 at 256³/512³, and is 85–86% of it at 1024³/2048³. The 512³ L2-spill dip (the old worst point) is gone.
-Mer(1c) still beats tuned `matrixmultiply` 1.11–1.85× and naive C 2.4–12.5× at every size.
+Wuk(1c) still beats tuned `matrixmultiply` 1.11–1.85× and naive C 2.4–12.5× at every size.
 
 **Measurement-ordering confound found (→ Phase 2):** within a size block the column order is
-Mer(1c), **Mer(par)**, MKL(1c), MKL(all), tuned, C, Rust. The all-core `Mer(par)` burst heats the chip
+Wuk(1c), **Wuk(par)**, MKL(1c), MKL(all), tuned, C, Rust. The all-core `Wuk(par)` burst heats the chip
 *before* MKL(1c)/MKL(all), and the multi-second naive C/Rust nests heat it before the *next* size — so
 every peer after the first all-core run at ≥2048³ is throttled. Phase 2 must measure all single-core
 variants adjacent (and re-warm / skip naive ≥2048) before any large-size MKL ratio is trustworthy.
@@ -175,11 +175,11 @@ This phase is two parts: first **make the multicore measurement trustworthy** (i
 all-core MKL peer was measured *after* Wukong's all-core burst + two multi-second naive nests had
 heat-throttled the chip — at 2048³/4096³ it read **below its own single-thread number** (a bogus
 ~8–32 GFLOP/s), once even printing "1245% of MKL". Four fixes:
-- **Thermal-grouped ordering, coolest-first:** single-core peers adjacent (Mer 1c, MKL 1c, tuned) →
+- **Thermal-grouped ordering, coolest-first:** single-core peers adjacent (Wuk 1c, MKL 1c, tuned) →
   all-core peers → naive C/Rust LAST (the dominant heat source; skipped ≥2048³, `XBENCH_NAIVE_HUGE`
   to force). The 1-core ratio is now taken near-cold at every size.
-- **MKL(all) measured BEFORE Mer(par):** Mer 1c/tuned use serial kernels that never touch rayon, so
-  rayon's pool is dormant and MKL(all) runs on idle cores in the coolest state. Mer(par) runs after, so
+- **MKL(all) measured BEFORE Wuk(par):** Wuk 1c/tuned use serial kernels that never touch rayon, so
+  rayon's pool is dormant and MKL(all) runs on idle cores in the coolest state. Wuk(par) runs after, so
   the ratio is a *conservative lower bound* on Wukong (throttle ourselves, never the peer). An earlier
   interleaved A/B timer was abandoned — alternating two live thread pools (rayon + MKL's OpenMP)
   thrashes the scheduler and parks MKL's workers, reading worse than sequential.
@@ -189,7 +189,7 @@ heat-throttled the chip — at 2048³/4096³ it read **below its own single-thre
   real pathology on this loaded hybrid); the ratio is omitted with a reason instead of a fake multiple.
   Also reports Wukong's own @parallel scaling (robust to power state).
 
-With this, clean same-run all-core ratios are reproducible — e.g. (roofline 92) **Mer(par)/MKL(all) =
+With this, clean same-run all-core ratios are reproducible — e.g. (roofline 92) **Wuk(par)/MKL(all) =
 25 / 64 / 70 / 129%** at 256/512/1024/2048³ (Wukong *wins* at 2048³), and mm6 measured 55/49/71/86/124%
 at 256→4096³. The gap is concentrated at small sizes (threading overhead) and closes — to a win — by 2048³.
 
@@ -343,5 +343,5 @@ scaling 1.9-3.8x (was 1.5-2.1x); the all-threads-torch gap at S=512 is now STABL
 torch's win at 1.5-1.9x — the model's skinny M=128 GEMMs make each 2D row-block re-pack its B
 slice (a shared-B pack for skinny-M shapes is the identified follow-up), and 128x768x768 sits
 just above the parallel-payoff gate. One matmul-preheated round was discarded as instrument
-failure: Mer(1c) read 2.3x below its own adjacent standing while the in-run roofline column
+failure: Wuk(1c) read 2.3x below its own adjacent standing while the in-run roofline column
 read 93 vs the valid rounds' 118-128 GF/s (the established discard-warm-up rule).
