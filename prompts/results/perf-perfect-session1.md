@@ -110,9 +110,14 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
 - **parallel_for dynamic granule claiming shipped** (fe7fd04, WUKONG_PFOR_DYN=0 A/B escape):
   region iterations claimed from a padded atomic counter in ceil(n/(workers·8)) granules — the
   runtime half of the attention-tiling lever. Full gate green.
-- **Head×row-tile respelling DE-RISKED end-to-end** (scratchpad probe through the real wukongc):
-  the outliner ACCEPTS `hh = t/T; tile = t%T; r0 = tile·(S/T)` disjoint slicing (emits
-  `attn_tiled$par` + one parallel_for), the per-tile nests still dispatch
-  sgemm_nt_alpha/norm_f32/sgemm_nt, and interp == native exactly. Cost: kh/vt pack redundancy
-  ×T (~4 ms/forward @S=512 T=4, memory-bound) buys 48 claims over 16 workers instead of 12.
-  Model-source application queued behind the torch-peer merge (same file).
+- **Head×row-tile respelling: probe PASSED but the conclusion was WRONG — corrected.** The
+  standalone probe (whole `@parallel` fn = single top-level loop) takes the fn-level chunking
+  path (`<fn>$par`), which handles div/mod fine and is interp==native exact. But the model's
+  MID-FUNCTION loop uses the region outliner (`wukong$par$N`), whose affine-disjointness legality
+  DECLINES `hh=t/T; tile=t%T` — the tiled loop then degenerates into a serial t-loop of
+  `_parallel` kernels (~7 fork-joins per tile per layer — far WORSE than untiled). Caught by the
+  `block_dispatch_sets_pinned` test (the reason that test exists); model.rs tiling reverted.
+  Fix in flight: `feat/outliner-divmod-tiling` extends the legality to the 2-coordinate
+  (t/C, t%C) bijection decomposition — a general compiler improvement; the model respelling
+  re-lands after it. LESSON: the whole-fn and mid-function @parallel paths have DIFFERENT
+  legality analyses — a probe must exercise the exact path the real code takes.
