@@ -537,8 +537,12 @@ pub fn gemm_nt_f16(
     //     `pipe_64_s6` ≤1024³ (~90% of cuBLAS), `pipe_128_s4` ~2048³ (~94%).
     //   • Larger (≥ ~2048³, A+B ≳ L2): the `mma.sync.m16n8k16` kernel with conflict-free padded SMEM and
     //     threadblock rasterization wins both the L2-resident (2048³ ~92%, padding-bound) and the
-    //     HBM-bound (4096³ ~74%, raster-bound) sub-regimes — `mma_nt_f16_128_bk32_s2_r8`.
+    //     HBM-bound (4096³ ~74%, raster-bound) sub-regimes — `mma_nt_f16_128_bk32_s2_r16`.
     // Anything not matching a pipeline variant's divisibility falls through to the older SMEM kernels.
+    // PENDING (perf/gpu-gemm-4096): the 4096³ arm is being re-tuned — the `CLIFF_VARIANTS` sweep
+    // (`gemm_cliff_ab`) is measuring a 3-stage pipeline, an L2-keyed raster band, forced launch-bounds,
+    // and a vectorized `st.global.v2.f32` epilogue against the f32-out cuBLAS peer; the winner will
+    // replace the swz w24 selected below for the ≥ ~4096³ (A+B ≥ 16 MB) regime.
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
     if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {

@@ -2041,11 +2041,12 @@ pub fn wmma_f16_ptx() -> &'static str {
                 0,
                 Store::Scalar,
             );
-            // **w22 swizzle workhorse** — the GEMM-cliff win. The 2×2 warp grid (vs the w24 base's 2×4)
-            // gives each warp a 64×64 tile = 32 mma/warp (2× the ILP to hide tensor-core + ldmatrix latency)
-            // AND 128 threads/CTA ⇒ 3 CTAs/SM (vs 2). Measured ~81%→84% of cuBLAS @4096³ (1.04–1.07× the w24
-            // swz, reproduced same-run, bit-gated). `gemm_nt_f16` dispatches it for A+B ≥ 48 MB; the padded
-            // 16–48 MB regime keeps w24 (padded w22 regresses 2048³ ~86%→70%).
+            // **w22 swizzle workhorse** — the 2×2 warp grid (vs the w24 base's 2×4) gives each warp a 64×64
+            // tile = 32 mma/warp (2× the ILP) AND 128 threads/CTA ⇒ 3 CTAs/SM (vs 2). Kept emitted +
+            // correctness-gated (`gemm_cliff_w22swz_matches_reference`) and swept by `gemm_cliff_ab`, but
+            // **NOT dispatched**: a clean round-robin best-of-N re-measure showed w22 is only a noise-level
+            // tie with the w24 swz at 4096³ (0.97–1.02×) and *loses* at 2048³, so `gemm_nt_f16` routes the
+            // whole A+B ≥ 16 MB regime to the w24 swz (see the dispatch comment in `gemm_nt_f16`).
             m += &entry_mma_pipe(
                 &format!("{}_w22swz", wh.name),
                 "f16",
@@ -2254,8 +2255,9 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // bf16 ldmatrix+XOR-swizzle+no-pad twin (`_swz`) — the HBM-bound-4096³ win carried to the training
         // dtype (the swz path is dtype-agnostic; `gemm_nt_bf16` regime-dispatches it for A+B ≳ 2×L2).
         m += &entry_mma_pipe(&format!("{}_swz", v.name), "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, true, 0, Store::Scalar);
-        // bf16 w22 swizzle workhorse (the GEMM-cliff win carried to the training dtype): 2×2 warp grid =
-        // 32 mma/warp + 3 CTAs/SM; `gemm_nt_bf16` dispatches it for A+B ≥ 48 MB.
+        // bf16 w22 swizzle twin: 2×2 warp grid = 32 mma/warp + 3 CTAs/SM. Emitted + correctness-gated but
+        // **NOT dispatched** — like its fp16 twin, w22 only noise-ties w24 at 4096³ and loses at 2048³, so
+        // `gemm_nt_bf16` routes the whole A+B ≥ 16 MB regime to the w24 `_swz` (see the gpu.rs dispatch).
         m += &entry_mma_pipe(&format!("{}_w22swz", v.name), "bf16", v.bm, v.bn, v.bk, 2, 2, v.stages, v.raster, v.pad, Act::None, false, false, true, 0, Store::Scalar);
         // Fused-epilogue variants on the **fast bf16 mma workhorse** — the register-level `act(x·Wᵀ+bias)`
         // (bias added to the f32 accumulators via the known D-fragment column map, no SMEM scratch) carried
