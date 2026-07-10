@@ -57,8 +57,12 @@
 //!   cross-checked against Wukong's with the suite's magnitude-normalized metric at the same 1e-3
 //!   tolerance (the GELU flavor matches exactly, so no loosening is needed), plus a
 //!   compiled-vs-eager max|Δ| line — a fast-but-wrong compiled path fails loudly and reports no
-//!   time rather than a bogus win. On a `fullgraph=True` graph break the script retries
-//!   `fullgraph=False` and discloses the break count from `torch._dynamo.explain`.
+//!   time rather than a bogus win. Compile failures fall through a disclosed retry ladder: some
+//!   torch builds' Inductor CPP GEMM template (`cpp_CppMicroGemmFP32Vec`) is broken on
+//!   Windows/MSVC, so on a lowering failure the GEMM autotune backend is pinned to ATEN (= MKL,
+//!   torch's strongest CPU GEMM — the strongest WORKING config, not a handicap) and fullgraph
+//!   retried; a remaining `fullgraph=True` break falls back to `fullgraph=False` with the break
+//!   count from `torch._dynamo.explain` disclosed.
 //! * **The layer loop lives in this harness** for both languages: one JIT'd/compiled block
 //!   function is called 12× per forward with per-layer weight pointers (ping-ponging two
 //!   activation buffers), then the final LayerNorm — the way a real runtime drives a layer stack.
@@ -1114,9 +1118,11 @@ fn dump_f32_le(path: &Path, parts: &[&[f32]]) -> std::io::Result<()> {
 /// variants are built first (untimed; compile wall printed separately as `*_COMPILE`), then timing
 /// runs coolest-first (T1 eager → T1 compiled → Tn eager → Tn compiled). The compiled output is
 /// cross-checked against the eager reference (`TORCH_COMPILED_VS_EAGER_*`); if it diverges the
-/// variant is marked `TORCH_COMPILED_BAD_*` and NOT timed. A `fullgraph=True` graph break is
-/// disclosed (`TORCH_COMPILE_DISCLOSE`, with the `torch._dynamo.explain` break count) and retried
-/// `fullgraph=False`; a total failure prints `TORCH_COMPILE_FAIL` and skips the variant.
+/// variant is marked `TORCH_COMPILED_BAD_*` and NOT timed. Compile failures fall through a
+/// disclosed retry ladder (each tier printing `TORCH_COMPILE_DISCLOSE`): stock max-autotune
+/// fullgraph → GEMM autotune backend pinned to ATEN/MKL (works around the Inductor CPP GEMM
+/// template being broken on Windows/MSVC) → `fullgraph=False` (with the `torch._dynamo.explain`
+/// break count); a total failure prints `TORCH_COMPILE_FAIL` and skips the variant.
 fn torch_script(
     cfg: Cfg,
     w_path: &Path,
@@ -1226,28 +1232,55 @@ def bench_call(fn):
         ts[i] = time.perf_counter() - t0
     return min(ts) * 1e3, statistics.median(ts) * 1e3
 
-# Build one compiled variant: torch.compile fullgraph, first-call to force compilation (its wall
-# time is the cold-start cost, returned separately). On a fullgraph graph break, disclose the break
-# count and retry fullgraph=False; any other exception propagates to the caller (total failure).
-def build_compiled(tag):
-    fn = torch.compile(forward_sdpa, mode="max-autotune", fullgraph=True)
+def try_build(fullgraph):
+    fn = torch.compile(forward_sdpa, mode="max-autotune", fullgraph=fullgraph)
     t0 = time.perf_counter()
+    out = fn()  # first call forces compilation; its wall time is the cold-start cost
+    return fn, out, (time.perf_counter() - t0) * 1e3
+
+# Whether the Inductor GEMM autotune backend has been pinned to ATEN. It is a GLOBAL inductor
+# config, so once pinned it applies to every subsequent compile in this process (the disclosure
+# line says so).
+GEMM_PINNED = False
+
+# Build one compiled variant, three tiers:
+#  1. stock mode="max-autotune", fullgraph=True;
+#  2. on failure, pin max_autotune_gemm_backends="ATEN" and retry fullgraph=True — some torch
+#     builds' Inductor CPP GEMM template (cpp_CppMicroGemmFP32Vec) is broken on Windows/MSVC,
+#     and ATen GEMM = MKL is torch's strongest CPU GEMM anyway, so this is the strongest
+#     WORKING config, not a handicap (disclosed);
+#  3. on a remaining fullgraph failure, disclose the torch._dynamo.explain break count and retry
+#     fullgraph=False. Any exception past that propagates to the caller (total failure -> the
+#     compiled columns stay n/a; eager unaffected).
+def build_compiled(tag):
+    global GEMM_PINNED
     try:
-        out = fn()
-        return fn, out, (time.perf_counter() - t0) * 1e3
-    except Exception as e:
+        return try_build(True)
+    except Exception as e1:
+        torch._dynamo.reset()
+        if not GEMM_PINNED:
+            try:
+                import torch._inductor.config as icfg
+                icfg.max_autotune_gemm_backends = "ATEN"
+                GEMM_PINNED = True
+                print("TORCH_COMPILE_DISCLOSE %s inductor CPP GEMM template broken on "
+                      "Windows/MSVC -> max_autotune_gemm_backends pinned to ATEN (MKL) for all "
+                      "compiled variants; first error: %s" % (tag, repr(str(e1))[:120]),
+                      flush=True)
+            except Exception:
+                pass
+    try:
+        return try_build(True)
+    except Exception as e2:
         gb = None
         try:
             gb = getattr(torch._dynamo.explain(forward_sdpa)(), "graph_break_count", None)
         except Exception:
             gb = None
         print("TORCH_COMPILE_DISCLOSE %s fullgraph-break gb=%s reason=%s"
-              % (tag, gb, repr(str(e))[:140]), flush=True)
+              % (tag, gb, repr(str(e2))[:140]), flush=True)
         torch._dynamo.reset()
-        fn = torch.compile(forward_sdpa, mode="max-autotune", fullgraph=False)
-        t0 = time.perf_counter()
-        out = fn()
-        return fn, out, (time.perf_counter() - t0) * 1e3
+        return try_build(False)
 
 with torch.inference_mode():
     print("TORCH_VERSION %s" % torch.__version__, flush=True)
