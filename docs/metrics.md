@@ -1,7 +1,7 @@
-# Metrics that matter — and Mercury's honest standing
+# Metrics that matter — and Wukong's honest standing
 
 This document defines, from first principles, the metrics an ML/DL kernel language and its
-compiler must win at, and records Mercury's current standing on each — including the losses.
+compiler must win at, and records Wukong's current standing on each — including the losses.
 It is the north star for optimization work: a change that doesn't move one of these metrics
 (or protect a gate) is not worth its complexity. Numbers cited here are *recorded ratios* from
 `BENCHMARKS.md` and `prompts/results/*`; absolute GFLOP/s are deliberately absent (this
@@ -17,11 +17,11 @@ what one of them pays for.
 
 | Gate | Definition | Enforcement |
 |---|---|---|
-| G1 backend agreement | interp == native (== GPU within `c·√K·ε`) bit-for-bit on the differential suite | `cargo test` differential tests; `mercury_bench` equivalence gate |
+| G1 backend agreement | interp == native (== GPU within `c·√K·ε`) bit-for-bit on the differential suite | `cargo test` differential tests; `wukong_bench` equivalence gate |
 | G2 opt invariance | `-O0` == `-O1/2/3` observable behavior (stdout + exit) on every run fixture | `optimization_is_observationally_invariant` |
 | G3 numerical trust | vmath/norm kernels within documented tolerance of an f64 reference (33/36 vmath ops covered) | `vmath_kernels_match_f64_reference`, `norm.rs` f64 gates |
 | G4 deterministic parallelism | `@parallel` == serial bit-for-bit (fixed chunking, ordered folds) | differential `@parallel` tests |
-| G5 benchmark honesty | measured path = the real pipeline (parse→sema→MIR→opt→Cranelift JIT); recognizers structural, never workload-keyed; strongest-reasonable peer flags; same-run interleaved A/B | fairness audits; cross-checks inside `mercury_xbench` |
+| G5 benchmark honesty | measured path = the real pipeline (parse→sema→MIR→opt→Cranelift JIT); recognizers structural, never workload-keyed; strongest-reasonable peer flags; same-run interleaved A/B | fairness audits; cross-checks inside `wukong_xbench` |
 
 The documented exception to G1/G2: reassociated float reductions (vectorized/recognized) make
 the *reassociated form* the oracle — both backends execute the identical reassociated IR.
@@ -55,7 +55,7 @@ Current standing (recorded):
   long-S gap is honestly bounded, not closable by scheduling), wins fused-RoPE S≤512, causal
   D=64 S=512 (beats cuDNN+cutlass), and D=128 ldmatrix S≤1024. The 4096³ GEMM ships the
   **v2cs streaming epilogue** (+2.7%): **76.8% of cuBLAS-f16 / 80.4% of the honest f32-out
-  peer** (the f16-out peer hides ~half of Mercury's f32 C-write traffic — both columns now
+  peer** (the f16-out peer hides ~half of Wukong's f32 C-write traffic — both columns now
   printed; the residual is SASS-level).
 - *Memory-bound, CPU*: streaming elementwise ≈1.1–1.6× C (NT-store dispatch), honest
   physics-ties at L3-resident sizes (relu, biasadd, hadamard); reductions/norms/scans/column
@@ -72,7 +72,7 @@ Current standing (recorded):
   Composites inherit the wins: log2 9.9×, log1p 7.7× vs C.
 
 **M2. End-to-end model performance.** A compiler is judged on composed graphs, not op zoos:
-fusion, no round-trips, layer-stack throughput. GPT-2-class `.mer` models exist and dispatch
+fusion, no round-trips, layer-stack throughput. GPT-2-class `.wk` models exist and dispatch
 to recognized kernels; GPU-resident 12-layer decode runs under CUDA-graph capture.
 Standing (2026-07-09/10, three valid full-peer rounds — roofline 130–133, all cross-checks
 <2e-6 rel, serial==@parallel bit-exact, interp gate bit-exact): the 12-layer GPT-2-class
@@ -80,10 +80,10 @@ stack runs **~19–21× idiomatic C and 3.6–4.9× `-ffast-math` C single-core*
 CPU eager** it is 1.03–1.09× behind torch-1T @S=128 and **1.12–1.22× FASTER @S=512**
 single-thread. Multicore, the campaign's closing move — the **`@parallel` head-loop region**
 (2026-07-10: an independent-iteration `for` loop with body-local scratch inside an
-`@parallel` fn outlines into a `mercury_parallel_for` region; conservative affine-disjointness
+`@parallel` fn outlines into a `wukong_parallel_for` region; conservative affine-disjointness
 legality, serial kernels inside each iteration so serial==parallel stays bit-exact; the model
 spells its attention head loop that way naturally) — **flipped the all-threads-torch
-comparison at S=512: Mercury @parallel is 1.10–1.24× FASTER** (two roofline-validated
+comparison at S=512: Wukong @parallel is 1.10–1.24× FASTER** (two roofline-validated
 rounds; par ~440 → ~312 ms) **and holds parity at S=128** (1.19× faster / 1.02× behind at
 the round-noise floor; was 1.5–1.9× behind at campaign start). Model @parallel scaling:
 **3.1–3.6×** (was ~1.5–2.1×); the multicore stack is **~61–69× idiomatic single-thread C**.
@@ -112,7 +112,7 @@ runtime `?` dim does not *execute* (C0001), which limits real serving code — a
 language gap (see M6).
 
 **M6. Expressiveness for real ML code.** Can a user write a transformer fwd+bwd+train loop in
-pure Mercury without escaping? Standing: forward blocks yes (statically-shaped, recognized
+pure Wukong without escaping? Standing: forward blocks yes (statically-shaped, recognized
 idioms); training via `--train` (CLI transform, not in-language); **known blockers**: no heap
 allocation / returned tensors, runtime `?` dims don't run, tensors can't be element-generic
 (`Tensor[T,M,N]` rejected → dtype kernels duplicated), no fn pointers/closures, no file I/O
@@ -121,11 +121,11 @@ cycle/diamond dedup; only aliased/selective `import as` / `import x.{a,b}` stay 
 how far "general programs a real user writes" can go today and are first-class improvement
 targets, not footnotes.
 
-**M7. Portability.** Same `.mer` → interp (oracle), Cranelift native, GPU offload,
+**M7. Portability.** Same `.wk` → interp (oracle), Cranelift native, GPU offload,
 GPU-native (whole-program MIR→PTX megakernel). Standing: real; GPU-native covers a subset
 (UNSUPPORTED=skip). The previously documented general-lowering gaps are all **fixed**:
 `PTX_VELEM` implements the Hadamard/Div binary modes and `PTX_NORM` the log-softmax/L2 ops;
-`mrt_sreduce`/`mrt_sreduce_coop` implement the full `mercury_sreduce_f32` op set including
+`mrt_sreduce`/`mrt_sreduce_coop` implement the full `wukong_sreduce_f32` op set including
 sumabs(9)/absdiff(10) (`parallel_abssum`); float→narrow-int casts saturate (Rust-`as`/Cranelift
 semantics, `float_cast_narrow`); and pointer slots in the megakernel's shared frame are stored
 unconditionally so SPMD threads no longer dereference a null base (`tensor_1d_kernels@O3`
@@ -143,8 +143,8 @@ bit/tolerance-exact.
 ## Tier 3 — supporting qualities
 
 Stable diagnostic codes with `--explain`; single-binary toolchain (no LLVM needed to build,
-test, or run natively); reproducible benches (`mercury_xbench`, `mercury_bench`) with
-in-harness cross-checks that can only *fail* Mercury, never inflate it.
+test, or run natively); reproducible benches (`wukong_xbench`, `wukong_bench`) with
+in-harness cross-checks that can only *fail* Wukong, never inflate it.
 
 ## Current top improvement targets (ranked by user impact × measured gap)
 

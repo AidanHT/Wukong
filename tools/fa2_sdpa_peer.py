@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Fused FlashAttention-2 peer for Mercury's GPU flash-attention benchmark.
+"""Fused FlashAttention-2 peer for Wukong's GPU flash-attention benchmark.
 
 Drives PyTorch's *fused* `scaled_dot_product_attention` backends — FLASH_ATTENTION
 (FlashAttention-2), EFFICIENT_ATTENTION (cutlass mem-efficient fMHA), and
 CUDNN_ATTENTION (cuDNN's fused flash) — each a genuinely fused FA-class kernel on
 Ada sm_89, plus MATH (the unfused materialized softmax chain) as an in-process
-anchor. It runs them over the SAME Q/K/V buffers Mercury's `flash_d64_mp` runs, so
+anchor. It runs them over the SAME Q/K/V buffers Wukong's `flash_d64_mp` runs, so
 the timing is a same-shape ratio and the output is cross-checked by the Rust caller
-against the same CPU f64 reference Mercury's flash is gated against.
+against the same CPU f64 reference Wukong's flash is gated against.
 
 Q/K/V are read as raw little-endian float16, shape [B,H,S,D] row-major (head-major,
-the layout Mercury's multi-head flash uses). O of the fastest successful *fused*
+the layout Wukong's multi-head flash uses). O of the fastest successful *fused*
 backend is written as raw little-endian float32. A JSON report (per-backend sec/iter
 + output checksum + the chosen fused backend) is printed to stdout.
 
@@ -101,7 +101,7 @@ def main():
         # avoids the eager path's `stack` alloc+scatter, doing one complex elementwise multiply over
         # zero-copy `view_as_complex`/`view_as_real` views (rotation `cos+i·sin` precomputed once, since
         # it's position- not data-dependent). Taking the min over variants keeps the peer as strong as
-        # possible — the conservative direction for any Mercury claim. Guarded: view_as_complex needs an
+        # possible — the conservative direction for any Wukong claim. Guarded: view_as_complex needs an
         # f32 last-dim-2 contiguous tensor, so we pay one f16→f32 cast in-loop (still fewer launches).
         try:
             rot = torch.view_as_complex(
