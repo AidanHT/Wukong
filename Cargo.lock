@@ -884,6 +884,7 @@ version = "0.1.0"
 dependencies = [
  "wukong_codegen_cranelift",
  "wukong_interp",
+ "wukong_lexer",
  "wukong_mir",
  "wukong_mir_build",
  "wukong_opt",
