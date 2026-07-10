@@ -539,12 +539,23 @@ pub fn gemm_nt_f16(
     //     threadblock rasterization wins both the L2-resident (2048³ ~92%, padding-bound) and the
     //     HBM-bound (4096³ ~74%, raster-bound) sub-regimes — `mma_nt_f16_128_bk32_s2_r16`.
     // Anything not matching a pipeline variant's divisibility falls through to the older SMEM kernels.
-    // PENDING (perf/gpu-gemm-4096): the 4096³ arm is being re-tuned — the `CLIFF_VARIANTS` sweep
-    // (`gemm_cliff_ab`) is measuring a 3-stage pipeline, an L2-keyed raster band, forced launch-bounds,
-    // and a vectorized `st.global.v2.f32` epilogue against the f32-out cuBLAS peer; the winner will
-    // replace the swz w24 selected below for the ≥ ~4096³ (A+B ≥ 16 MB) regime.
+    // RESOLVED (perf/gpu-gemm-4096, swept 2026-07-09): of the CLIFF_VARIANTS re-tune candidates
+    // (3-stage pipeline, L2-keyed raster bands, forced launch-bounds, vectorized epilogues) only the
+    // `_v2cs` epilogue beat the swz base, and only at ≥48 MB — it is dispatched by the first arm
+    // below; everything else measured a loss at both 2048³ and 4096³ and stays bench-only.
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
+    if ws_bytes >= 48 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+        // **Largest regime (A+B ≥ 48 MB, ~4096³ up): the `_v2cs` epilogue variant** — the same swz
+        // s2 body as the w24 workhorse below, with C written as paired-column `st.global.cs.v2.f32`
+        // (half the store count + the evict-first streaming hint keeps the one-shot C out of the
+        // raster band's L2 working set). `gemm_cliff_ab` (round-robin best-of-10, 2026-07-09):
+        // 1.027× the s2 base at 4096³ = 76.8% / 80.4% of the f16-/f32-out cuBLAS peers. At 2048³
+        // every cliff variant LOSES to the plain swz base (v2cs 0.75× — C is L2-scale there and
+        // the .cs hint forfeits reuse), so this arm keys strictly on the ≥48 MB working set and
+        // the [16, 48) MB band below keeps the plain swz w24.
+        return gemm_nt_f16_cliff(g, a, b, m, k, n, "cliff_swz_s2_v2cs");
+    }
     if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
         let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
         // **Large regime (A+B ≥ 16 MB, ≥2048³):** the no-pad `ldmatrix`+XOR-swizzle **w24** workhorse is the
@@ -1062,6 +1073,51 @@ pub fn gemm_nt_f16_pipe(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
     unsafe { bld.launch(pipe_cfg(v, m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ` via a named [`CLIFF_VARIANTS`](crate::ptx_wmma::CLIFF_VARIANTS) kernel — the
+/// production route into the cliff table for regimes where its sweep found a winner over the
+/// `PIPE_VARIANTS` workhorse (currently the ≥48 MB `_v2cs` arm of [`gemm_nt_f16`]). Same PTX
+/// module, entry, and launch shape as the `gemm_cliff_matches_reference` gate (which pins every
+/// variant to the f64 oracle) and the `gemm_cliff_ab` bench, so a dispatched variant is exactly
+/// the gated kernel.
+pub(crate) fn gemm_nt_f16_cliff(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    name: &str,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{gemm_cliff_ptx, CLIFF_VARIANTS};
+    use half::f16;
+    let v = CLIFF_VARIANTS
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("unknown cliff variant {name}"));
+    assert!(
+        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        "{} requires M%{}==0, N%{}==0, K%{}==0",
+        v.name, v.bm, v.bn, v.bk
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("gemm_cliff", gemm_cliff_ptx(), v.name)?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    // r16-rasterized ⇒ a 1-D grid of (M/bm)·(N/bn) blocks; all SMEM static.
+    let cfg = LaunchConfig {
+        grid_dim: (((m / v.bm) * (n / v.bn)) as u32, 1, 1),
+        block_dim: (v.threads() as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -1896,7 +1952,8 @@ pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
 ///
 /// This function stays env-flag-free on purpose: external pairings (e.g. `baselines::ResidentAttn`)
 /// combine it with [`wmma_flash_cfg`], and the warp-specialized kernels need a different launch shape.
-/// The `MERCURY_FLASH_WS=1` long-S override lives in [`wmma_flash_plan`] (entry + config together).
+/// The warp-specialized S≥4096 override (default ON, `MERCURY_FLASH_WS=0` kill-switch) lives in
+/// [`wmma_flash_plan`] (entry + config together).
 pub(crate) fn wmma_flash_entry(d: usize, _s: usize) -> &'static str {
     if d == 128 {
         "flash_d128_mp_lm"
@@ -1914,20 +1971,26 @@ pub(crate) fn wmma_flash_cfg(s: usize) -> LaunchConfig {
     }
 }
 
-/// Whether the **warp-specialized ping-pong flash** routing is enabled: `MERCURY_FLASH_WS=1`. Read once
-/// (`OnceLock`, the crate's env idiom) so every dispatch site in a process agrees — an entry picked at
-/// `ResidentLayerF16` construction and a launch config rebuilt later must not disagree mid-run. Default
-/// OFF: the production dispatch is unchanged until the central A/B (`flash_ws_vs_mp`) proves the win.
+/// Whether the **warp-specialized ping-pong flash** routing is enabled. Default ON —
+/// `MERCURY_FLASH_WS=0` opts out (read once; `OnceLock`, the crate's env idiom) so every dispatch
+/// site in a process agrees — an entry picked at `ResidentLayerF16` construction and a launch
+/// config rebuilt later must not disagree mid-run. The default flipped ON once the central A/B
+/// (`flash_ws_vs_mp`, clock-cancelled median-of-9, 2026-07-09) proved the win — but ONLY at
+/// S ≥ 4096 (see [`ws_flash_route_with`] for the measured table).
 pub(crate) fn ws_flash_enabled() -> bool {
     static WS: OnceLock<bool> = OnceLock::new();
-    *WS.get_or_init(|| std::env::var("MERCURY_FLASH_WS").is_ok_and(|v| v == "1"))
+    *WS.get_or_init(|| !std::env::var("MERCURY_FLASH_WS").is_ok_and(|v| v == "0"))
 }
 
-/// The env-gated **warp-specialized** flash route: `Some(entry)` iff [`ws_flash_enabled`] and the shape
-/// is in the regime the ws kernel targets — `D == 64` at `S >= 2048` (the measured 0.46×/0.43×-of-cuDNN
-/// loss) and `D == 128` at `S >= 1024`. The `S <= 512` win kernels (fused-RoPE, causal-512, D=128 ≤ 1024
-/// vs cutlass) are **structurally unreachable**: no `(d, s)` in their regimes can return `Some` here.
-/// A `Some` entry must be launched with [`ws_flash_cfg`] (2 warps/CTA), never [`wmma_flash_cfg`].
+/// The **warp-specialized** flash route: `Some(entry)` iff [`ws_flash_enabled`] and the shape is in
+/// the regime the ws kernels measured a WIN — `S >= 4096` only, where the anti-phase mma/SFU
+/// overlap is worth its barrier cost: `flash_ws_vs_mp` (clock-cancelled, median-of-9) read d64 ws
+/// 0.944× / d128 ws3 0.950× of the mp baseline at S=4096, a TIE at S=2048 (1.00–1.02×), and a
+/// 10–52% LOSS at S ≤ 1024 — so the earlier provisional S≥2048/S≥1024 regime would have shipped a
+/// regression and is gone. Per-d winners: d64 → the 2-buffer `ws`, d128 → the 3-stage-ring `ws3`
+/// (`_lm`). The `S <= 512` win kernels (fused-RoPE, causal-512, D=128 ≤ 1024 vs cutlass) remain
+/// **structurally unreachable**: no `(d, s)` in their regimes can return `Some` here. A `Some`
+/// entry must be launched with [`ws_flash_cfg`] (2 warps/CTA), never [`wmma_flash_cfg`].
 pub(crate) fn ws_flash_route(d: usize, s: usize) -> Option<&'static str> {
     ws_flash_route_with(ws_flash_enabled(), d, s)
 }
@@ -1939,8 +2002,8 @@ pub(crate) fn ws_flash_route_with(enabled: bool, d: usize, s: usize) -> Option<&
         return None;
     }
     match d {
-        64 if s >= 2048 => Some("flash_d64_ws"),
-        128 if s >= 1024 => Some("flash_d128_ws_lm"),
+        64 if s >= 4096 => Some("flash_d64_ws"),
+        128 if s >= 4096 => Some("flash_d128_ws3_lm"),
         _ => None,
     }
 }
@@ -1958,7 +2021,8 @@ pub(crate) fn ws_flash_cfg(s: usize) -> LaunchConfig {
 
 /// **The matched (entry, config) seam for the tensor-core flash dispatch** — [`wmma_flash_entry`] +
 /// [`wmma_flash_cfg`] by default, overridden by the env-gated [`ws_flash_route`] + [`ws_flash_cfg`]
-/// pair when `MERCURY_FLASH_WS=1` and the shape is in the ws regime. Entry and config are returned
+/// pair when [`ws_flash_enabled`] (default ON; `MERCURY_FLASH_WS=0` opts out) and the shape is in
+/// the measured S≥4096 win regime. Entry and config are returned
 /// together because the two families need different launch geometry (1 warp / grid `S/16` vs 2 warps /
 /// grid `ceil((S/16)/2)`): callers that pair them independently would deadlock a 64-thread named-barrier
 /// kernel on a 32-thread launch. `heads` lands in `grid_dim.1` (1 for single-head).
@@ -17409,18 +17473,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn ws_flash_matches_reference_within_tol() {
         use half::f16;
         with_gpu("ws_flash", |g| {
-            // Dispatch wiring (pure, no GPU): default route untouched, ws route regime-exact.
-            assert_eq!(ws_flash_route_with(false, 64, 4096), None, "flag off must never route ws");
-            assert_eq!(ws_flash_route_with(false, 128, 4096), None, "flag off must never route ws");
-            assert_eq!(ws_flash_route_with(true, 64, 2048), Some("flash_d64_ws"));
+            // Dispatch wiring (pure, no GPU): ws routes ONLY the measured S>=4096 win regime
+            // (flash_ws_vs_mp: 4-6% win @4096, tie @2048, 10-52% LOSS at S<=1024 — the pins below
+            // are what keep a regressing regime out of the route).
+            assert_eq!(ws_flash_route_with(false, 64, 4096), None, "kill-switch must never route ws");
+            assert_eq!(ws_flash_route_with(false, 128, 4096), None, "kill-switch must never route ws");
             assert_eq!(ws_flash_route_with(true, 64, 4096), Some("flash_d64_ws"));
-            assert_eq!(ws_flash_route_with(true, 64, 1024), None, "d64 ws starts at S=2048");
-            assert_eq!(ws_flash_route_with(true, 128, 1024), Some("flash_d128_ws_lm"));
+            assert_eq!(ws_flash_route_with(true, 128, 4096), Some("flash_d128_ws3_lm"), "d128 winner is the ws3 ring");
+            assert_eq!(ws_flash_route_with(true, 64, 2048), None, "S=2048 is a measured tie — mp stays");
+            assert_eq!(ws_flash_route_with(true, 128, 2048), None, "S=2048 is a measured tie — mp stays");
+            assert_eq!(ws_flash_route_with(true, 64, 1024), None, "ws LOSES at S<=1024");
+            assert_eq!(ws_flash_route_with(true, 128, 1024), None, "ws LOSES at S<=1024 (1.14-1.32x)");
             assert_eq!(ws_flash_route_with(true, 128, 512), None, "S<=512 win kernels stay unreachable");
             assert_eq!(ws_flash_route_with(true, 64, 512), None, "S<=512 win kernels stay unreachable");
             assert_eq!(ws_flash_route_with(true, 32, 4096), None, "no ws kernel below d=64");
-            assert_eq!(wmma_flash_entry(64, 4096), "flash_d64_mp", "default D=64 dispatch must not change");
-            assert_eq!(wmma_flash_entry(128, 4096), "flash_d128_mp_lm", "default D=128 dispatch must not change");
+            assert_eq!(wmma_flash_entry(64, 4096), "flash_d64_mp", "non-ws D=64 entry must not change");
+            assert_eq!(wmma_flash_entry(128, 4096), "flash_d128_mp_lm", "non-ws D=128 entry must not change");
             let cfg = ws_flash_cfg(2048);
             assert_eq!(cfg.grid_dim, (64, 1, 1), "ws grid must be ceil((S/16)/2)");
             assert_eq!(cfg.block_dim, (64, 1, 1), "ws block must be 2 warps");
