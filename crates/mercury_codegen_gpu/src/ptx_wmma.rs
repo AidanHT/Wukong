@@ -294,6 +294,8 @@ pub struct CliffCfg {
     pub swz: bool,
     pub pad: usize,
     pub min_ctas: usize,
+    /// Epilogue global-store mode ([`Store`]) — bit-identical C, scalar vs vectorized `st.global.v2.f32`.
+    pub store: Store,
 }
 
 impl CliffCfg {
@@ -323,9 +325,30 @@ pub const CLIFF_VARIANTS: &[CliffCfg] = &[
     //  - `cliff_swz_w22` : no-pad swizzle, w22 (2×2) — the 4096³ warp-tile winner (3 CTAs/SM, +ILP).
     //  - `cliff_pad_w24` : padded (pad=8), w24 — byte-identical to the production `mma_nt_f16_128_bk32_s2_r16`
     //    that the 16–48 MB arm dispatches; here to settle **swz-vs-padded @2048³ same-run** (the open floor).
-    CliffCfg { name: "cliff_swz_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0 },
-    CliffCfg { name: "cliff_swz_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0 },
-    CliffCfg { name: "cliff_pad_w24", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: false, pad: 8, min_ctas: 0 },
+    CliffCfg { name: "cliff_swz_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg { name: "cliff_swz_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg { name: "cliff_pad_w24", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: false, pad: 8, min_ctas: 0, store: Store::Scalar },
+    // ---- 4096³ re-tune levers (perf/gpu-gemm-4096) — all w24, no-pad swizzle unless noted; auto-gated by
+    // `gemm_cliff_matches_reference`, A/B-timed by `gemm_cliff_ab`. The central sweep picks winners. ----
+    //  * **3-stage pipeline** (`_s3`): CUTLASS's SM80 floor is 3 stages; the no-pad swizzle frees the SMEM
+    //    for it — s3 no-pad = 48 KiB *exactly* (s3 padded = 60 KiB > the 48 KiB static cap). More cp.async
+    //    buffers deepen the prefetch window to hide the HBM latency the 4096³ GEMM is bound by.
+    CliffCfg { name: "cliff_swz_s3", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    //  * **s3 raster-band re-tune** (`_r8`/`_r32`): the rasterization window sets the co-scheduled CTAs'
+    //    A/B footprint; re-tune it against the *measured* L2 at 4096³ (the r16 optimum was found at s2).
+    CliffCfg { name: "cliff_swz_s3_r8", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 8, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg { name: "cliff_swz_s3_r32", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 32, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    //  * **launch-bounds** (`_mc3`/`_mc2`): force the occupancy ptxas leaves on the table. The 128×128 tile
+    //    carries 64 f32 accumulators/thread, so the JIT defaults to ~2 CTAs/SM (register-bound). `_s2_mc3`
+    //    caps registers to fit 3 CTAs/SM on the 32 KiB s2 tile (may spill — that's what the A/B measures);
+    //    `_s3_mc2` pins 2 CTAs/SM on the 48 KiB s3 tile (2×48 = 96 KiB ≤ the 100 KiB SM carveout).
+    CliffCfg { name: "cliff_swz_s2_mc3", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 3, store: Store::Scalar },
+    CliffCfg { name: "cliff_swz_s3_mc2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 16, swz: true, pad: 0, min_ctas: 2, store: Store::Scalar },
+    //  * **epilogue store vectorization** (`_v2`/`_v2cs`): fold each lane's adjacent-column D-fragment pair
+    //    into one `st.global.v2.f32` (half the C-write store count); `_v2cs` adds the `.cs` streaming hint so
+    //    the write-once C stream does not evict the L2-resident A/B raster band. Bit-identical to `cliff_swz_s2`.
+    CliffCfg { name: "cliff_swz_s2_v2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::V2 },
+    CliffCfg { name: "cliff_swz_s2_v2cs", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::V2Cs },
 ];
 
 /// Emit the cliff candidate PTX module (separate from `wmma_f16_ptx` so experiments never perturb the
@@ -337,7 +360,7 @@ pub fn gemm_cliff_ptx() -> &'static str {
         for v in CLIFF_VARIANTS {
             m += &entry_mma_pipe(
                 v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false,
-                false, v.swz, v.min_ctas,
+                false, v.swz, v.min_ctas, v.store,
             );
         }
         m
@@ -1168,6 +1191,22 @@ fn entry_smem_pipe(
     s
 }
 
+/// Epilogue global-store mode for the `mma.sync` D-fragments — **bit-identical output**, differing only
+/// in the store *instruction*. Each lane's four f32 accumulators land as two adjacent-column pairs (d0,d1
+/// at row `grp`; d2,d3 at row `grp+8`), so each pair is contiguous in C and folds into one vector store.
+///   * `Scalar` — four `st.global.f32` (the historical epilogue).
+///   * `V2`     — two `st.global.v2.f32`: half the store instructions / memory transactions.
+///   * `V2Cs`   — two `st.global.cs.v2.f32`; the `.cs` (cache-streaming, evict-first) hint keeps the
+///     write-once C stream from evicting the L2-resident A/B raster band it competes with at 4096³.
+/// The pair base is 8-byte aligned (`gcol` is always even and the dispatched tiles have `N` a 128-multiple
+/// ⇒ `(row·N+gcol)·4` is a multiple of 8), so the `v2.f32` stores are legal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Store {
+    Scalar,
+    V2,
+    V2Cs,
+}
+
 /// Generate an **`mma.sync.m16n8k16`** multi-stage `cp.async` GEMM (`_mma`) — the route past the WMMA
 /// ceiling. Same CTA tiling, cp.async pipeline, and rasterization as [`entry_smem_pipe`], but the inner
 /// tensor-core path uses the native Ada `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` with
@@ -1202,6 +1241,9 @@ fn entry_mma_pipe(
     // carries 64 f32 accumulators/thread, so the JIT defaults to ~2 CTAs/SM (register-limited) even
     // when SMEM would allow 3 — forcing the occupancy is the HBM-latency-hiding lever for ≥4096³.
     min_ctas: usize,
+    // Epilogue store mode ([`Store`]): scalar `st.global.f32` (historical) vs vectorized `st.global.v2.f32`
+    // (± `.cs` streaming hint). Bit-identical output; the `v2` forms halve the C-write store count.
+    store: Store,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
@@ -1468,7 +1510,15 @@ fn entry_mma_pipe(
     s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
 
     // Store: D fragment → C. Lane holds C[grow0..][gcol0..]: d0=(grp,2tg) d1=(grp,2tg+1)
-    // d2=(grp+8,2tg) d3=(grp+8,2tg+1), per (mi,ni) sub-tile.
+    // d2=(grp+8,2tg) d3=(grp+8,2tg+1), per (mi,ni) sub-tile. Each row's two accumulators are adjacent
+    // columns ⇒ contiguous in C, so `Store::V2{,Cs}` folds them into one `st.global.v2.f32` (bit-identical).
+    let store_pair = |dst: &str, lo: &str, hi: &str| -> String {
+        match store {
+            Store::Scalar => format!("    st.global.f32 [{dst}],{lo};\n    st.global.f32 [{dst}+4],{hi};\n"),
+            Store::V2 => format!("    st.global.v2.f32 [{dst}],{{{lo},{hi}}};\n"),
+            Store::V2Cs => format!("    st.global.cs.v2.f32 [{dst}],{{{lo},{hi}}};\n"),
+        }
+    };
     s += &format!("KEND_{name}:\n");
     for mi in 0..tm {
         for ni in 0..tn {
@@ -1495,14 +1545,14 @@ fn entry_mma_pipe(
                 s += "    add.s64 %cptr2,%Resid,%off;\n    ld.global.f32 %resv0,[%cptr2];\n    ld.global.f32 %resv1,[%cptr2+4];\n";
                 s += &format!("    add.f32 %d{mi}_{ni}_0,%d{mi}_{ni}_0,%resv0;\n    add.f32 %d{mi}_{ni}_1,%d{mi}_{ni}_1,%resv1;\n");
             }
-            s += &format!("    st.global.f32 [%cptr],%d{mi}_{ni}_0;\n    st.global.f32 [%cptr+4],%d{mi}_{ni}_1;\n");
+            s += &store_pair("%cptr", &format!("%d{mi}_{ni}_0"), &format!("%d{mi}_{ni}_1"));
             // row grp+8: C[(grow+8)·N+gcol] = d2, [+1] = d3 (residual scratch in the now-free %cptr).
             s += "    add.u32 %tmp,%grow,8;\n    mul.lo.s32 %tmp,%tmp,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr2,%C,%off;\n";
             if residual {
                 s += "    add.s64 %cptr,%Resid,%off;\n    ld.global.f32 %resv0,[%cptr];\n    ld.global.f32 %resv1,[%cptr+4];\n";
                 s += &format!("    add.f32 %d{mi}_{ni}_2,%d{mi}_{ni}_2,%resv0;\n    add.f32 %d{mi}_{ni}_3,%d{mi}_{ni}_3,%resv1;\n");
             }
-            s += &format!("    st.global.f32 [%cptr2],%d{mi}_{ni}_2;\n    st.global.f32 [%cptr2+4],%d{mi}_{ni}_3;\n");
+            s += &store_pair("%cptr2", &format!("%d{mi}_{ni}_2"), &format!("%d{mi}_{ni}_3"));
         }
     }
     s += "    ret;\n}\n";
@@ -1970,7 +2020,7 @@ pub fn wmma_f16_ptx() -> &'static str {
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
             m += &if v.mma {
-                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false, 0)
+                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false, 0, Store::Scalar)
             } else {
                 entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, Act::None, false, false)
             };
@@ -1989,6 +2039,7 @@ pub fn wmma_f16_ptx() -> &'static str {
                 wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
                 Act::None, false, false, true,
                 0,
+                Store::Scalar,
             );
             // **w22 swizzle workhorse** — the GEMM-cliff win. The 2×2 warp grid (vs the w24 base's 2×4)
             // gives each warp a 64×64 tile = 32 mma/warp (2× the ILP to hide tensor-core + ldmatrix latency)
@@ -2001,6 +2052,7 @@ pub fn wmma_f16_ptx() -> &'static str {
                 wh.bm, wh.bn, wh.bk, 2, 2, wh.stages, wh.raster, wh.pad,
                 Act::None, false, false, true,
                 0,
+                Store::Scalar,
             );
         }
         // Fused epilogues on the **deep WMMA pipe `pipe_64_s6`** — the ≤1024³ GEMM champion. The `mma.sync`
@@ -2052,6 +2104,7 @@ pub fn wmma_f16_ptx() -> &'static str {
                 false,
                 false,
                 0,
+                Store::Scalar,
             );
             // The **no-pad swizzle** twin of each fused-epilogue kernel (`..._swz_bias{,_relu,_silu,_gelu}`).
             // The bias-add + activation apply register-level to the `mma.sync` D-fragments — independent of
@@ -2069,6 +2122,7 @@ pub fn wmma_f16_ptx() -> &'static str {
                 false,
                 true,
                 0,
+                Store::Scalar,
             );
         }
         // Fused **bias + residual** (no activation) on the same fast mma workhorse — the transformer
@@ -2085,6 +2139,7 @@ pub fn wmma_f16_ptx() -> &'static str {
             true,
             false,
             0,
+            Store::Scalar,
         );
         // The no-pad swizzle twin — the bias-add + residual-add apply register-level to the `mma.sync`
         // D-fragments (orthogonal to SMEM staging ⇒ bit-identical output) on the faster swz base, so the
@@ -2099,6 +2154,7 @@ pub fn wmma_f16_ptx() -> &'static str {
             true,
             true,
             0,
+            Store::Scalar,
         );
         // Fused **gated-FFN (GLU-family)** kernels `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the SwiGLU/GeGLU gate
         // every modern LLM FFN runs, the fusion cuBLAS needs THREE kernels + two HBM round-trips for. The
@@ -2194,13 +2250,13 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // bf16 large-GEMM workhorse (mma.sync + padded conflict-free SMEM + r16 raster) — the cliff fix
         // carried to the training precision; `gemm_nt_bf16` dispatches A+B ≳ L2 here.
         let v = PIPE_BF16;
-        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false, 0);
+        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false, 0, Store::Scalar);
         // bf16 ldmatrix+XOR-swizzle+no-pad twin (`_swz`) — the HBM-bound-4096³ win carried to the training
         // dtype (the swz path is dtype-agnostic; `gemm_nt_bf16` regime-dispatches it for A+B ≳ 2×L2).
-        m += &entry_mma_pipe(&format!("{}_swz", v.name), "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, true, 0);
+        m += &entry_mma_pipe(&format!("{}_swz", v.name), "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, true, 0, Store::Scalar);
         // bf16 w22 swizzle workhorse (the GEMM-cliff win carried to the training dtype): 2×2 warp grid =
         // 32 mma/warp + 3 CTAs/SM; `gemm_nt_bf16` dispatches it for A+B ≥ 48 MB.
-        m += &entry_mma_pipe(&format!("{}_w22swz", v.name), "bf16", v.bm, v.bn, v.bk, 2, 2, v.stages, v.raster, v.pad, Act::None, false, false, true, 0);
+        m += &entry_mma_pipe(&format!("{}_w22swz", v.name), "bf16", v.bm, v.bn, v.bk, 2, 2, v.stages, v.raster, v.pad, Act::None, false, false, true, 0, Store::Scalar);
         // Fused-epilogue variants on the **fast bf16 mma workhorse** — the register-level `act(x·Wᵀ+bias)`
         // (bias added to the f32 accumulators via the known D-fragment column map, no SMEM scratch) carried
         // to the training dtype. The bf16 twin of the fp16 `mma_nt_f16_128_bk32_s2_r16_bias*` champions.
@@ -2214,6 +2270,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 false,
                 false,
                 0,
+                Store::Scalar,
             );
             // The no-pad swizzle twin (`..._swz_bias*`) — the register-level epilogue composes orthogonally
             // with the SMEM swizzle (bit-identical output) and inherits the swizzle GEMM's 1.13–1.23× speed.
@@ -2227,6 +2284,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 false,
                 true,
                 0,
+                Store::Scalar,
             );
         }
         // bf16 fused bias + residual (training down-proj / output-proj): out = x·Wᵀ + bias + residual.
@@ -2239,6 +2297,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
             true,
             false,
             0,
+            Store::Scalar,
         );
         // The no-pad swizzle twin (bit-identical register-level epilogue, faster swz base) — the training
         // down-proj / output-proj inherits the swz GEMM speed. `gemm_nt_bf16_mma_bias_residual` routes here.
@@ -2251,6 +2310,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
             true,
             true,
             0,
+            Store::Scalar,
         );
         // bf16 gated-FFN (GLU-family) gate `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — SwiGLU/GeGLU carried to the
         // training dtype (the dual-B generator is precision-generic, keying the mma type off `ty`).
