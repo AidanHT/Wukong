@@ -35,6 +35,40 @@ const NC: usize = 4080;
 // threads) on this machine.
 const PAR_MIN_MACS: u64 = 1 << 26;
 
+/// The parallel gate, env-probe-able: `MERCURY_GEMM_PAR_MIN_MACS` (a MAC count, read once)
+/// overrides [`PAR_MIN_MACS`] so the serial↔parallel crossover — e.g. whether 256³ (~17M MACs)
+/// pays for threads under the work-scaled 2D grid — can be swept without rebuilds. Gate-only:
+/// which path runs never changes the bits (serial == parallel bit-for-bit).
+fn par_min_macs() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MERCURY_GEMM_PAR_MIN_MACS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(PAR_MIN_MACS)
+    })
+}
+
+/// Per-task MAC budget for the shared-pack 2D path's **work-scaled** load-balance target: the
+/// effective worker count is `clamp(macs / min_task_macs(), 1, nworkers)`, so a problem near the
+/// parallel gate gets a few large blocks (each still worth its scheduling) instead of `3×nworkers`
+/// slivers. 4 Mi MACs ≈ the point where one block's compute clearly outweighs a task dispatch on
+/// this pool. Env-overridable (`MERCURY_GEMM_MIN_TASK_MACS`, read once) so the small-problem
+/// crossover can be swept together with `MERCURY_GEMM_PAR_MIN_MACS`. Throughput-only: the grid
+/// shape never changes the bits.
+#[cfg(target_arch = "x86_64")]
+fn min_task_macs() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MERCURY_GEMM_MIN_TASK_MACS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(4 << 20)
+    })
+}
+
 #[inline]
 fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
@@ -419,7 +453,7 @@ unsafe fn gemm_dispatch(
     // them. The serial AVX2 kernel is the fast path for everything smaller. The epilogue folds into
     // the per-tile writeback on the final K-block, so the parallel path carries it too (each C tile
     // is owned by exactly one task) — a `@parallel` fused FFN runs the bias+activation across cores.
-    let par = par && (m as u64 * n as u64 * k as u64) >= PAR_MIN_MACS;
+    let par = par && (m as u64 * n as u64 * k as u64) >= par_min_macs();
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -1612,7 +1646,14 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     use rayon::prelude::*;
     let (m, k, n) = (args.m, args.k, args.n);
     let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
-    let (bm, bn) = select_2d_block_shape(m, n, 3 * nworkers.max(1));
+    // Work-scaled load-balance target: a problem near the parallel gate can't feed 3×nworkers
+    // blocks each worth a task dispatch, so the effective worker count is capped by the per-task
+    // MAC budget ([`min_task_macs`]). At the default gate (2^26 MACs) w_eff == nworkers for every
+    // parallel shape on the 16-worker pool; it engages when `MERCURY_GEMM_PAR_MIN_MACS` lowers
+    // the gate (the 256³ crossover sweep), giving small problems a few large blocks.
+    let macs = m as u64 * n as u64 * k as u64;
+    let w_eff = (macs / min_task_macs()).clamp(1, nworkers.max(1) as u64) as usize;
+    let (bm, bn) = select_2d_block_shape(m, n, 3 * w_eff);
     let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
     // The shared buffers hold the WHOLE matrices' panels for one K-block — not one C block's
     // slice, and (unlike the NC-blocked kernels) not capped at NC: every block column reads the
