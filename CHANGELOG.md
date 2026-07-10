@@ -5,6 +5,54 @@ All notable changes to Mercury are documented here. The format is loosely based 
 
 ## [Unreleased]
 
+### Performance + honest measurement — perf-sota session 3 (2026-07-09/10)
+Ten-target directive round; every baseline re-proven before optimizing, every win from the real
+pipeline via same-run/adjacent instruments (full ledger: `prompts/results/perf-sota-session3.md`).
+- **Size-keyed 2D parallel GEMM dispatch**: the cooperative shared-pack redesign
+  (`sgemm_2d_shared` — panels packed once per K-block) was built, gated bit-exact, and then
+  **refuted at mid/large shapes by adjacent ABBA in both orderings** (per-block packing wins
+  1024³ ~462 vs ~385 GF/s; its "redundant" packing is each worker warming its own L2, while a
+  shared pack hands consumers panels another core packed, plus a per-K-block barrier). Shipped
+  as a size-keyed default: per-block ≥2²⁶ MACs, shared-pack + 1 Mi-MAC work-scaled tasks in the
+  small band, parallel gate 2²⁶→2²³ (256³ engages at **1.7–2× over serial = 102–123% of
+  adjacent MKL-all**; was ~39–52% deliberately-serial). Mid-size standing: **70–83% of MKL-all
+  @512–1024³, 88–93% @2048³ vs a healthy peer**. New skinny-M/row-rebalance block-shape policy
+  (+16–25% at the model's skinny FFN shapes, MKL-anchored vs the old binary).
+- **C-tile prefetch in the GEMM microkernel prologue**: 2048³ single-core
+  **86–88% → 96–99% of MKL-1c** (MKL-anchored ABBA, both orderings; `MERCURY_GEMM_PF_C=0`
+  reproduces the old tail). Hint-only — bits unchanged everywhere.
+- **`@parallel` streaming maps go multicore**: `mercury_velem_f32_parallel` (fixed-chunk,
+  serial==parallel bit-for-bit) + recognizer/interp/cranelift/autodiff-tape wiring, so a mixed
+  `@parallel` function's residual-add/saxpy loops (the transformer block's hot elementwise ops)
+  no longer run serial; e2e fixture pins interp==native at every opt level.
+- **Model bench (3 valid rounds)**: `@parallel` scaling **S=128 2.19→2.96×**; vs all-threads
+  torch **S=128 1.08–1.20× behind (was 1.5–1.9×)**, S=512 an honest **1.01–1.63× range — the
+  width is the peer's power-state swing** (torch-Tn 443→271 ms across rounds; Mercury held
+  ~440 ms in all of them — the parallel path does not yet ride clock upside; head-loop
+  parallelism is the named open lever). Single-thread: 1.10–1.16× faster than torch-1T @S=512.
+- **exp ldexp restructure reverted on measurement**: the bit-identical exponent-field-add tail
+  (exhaustively verified over 2³²) measured a consistent ~10–15% throughput **loss in BOTH
+  thermal states** (old-vs-new binary interleaved ABBA; tanh, which composes exp8, confirmed
+  independently) — port rebalancing cannot beat a clock throttle that slows every port.
+  Honest vmath standing vs VML across states: **tanh 2.7–2.9× faster; exp 1.23–1.45× and log
+  ~1.25× slower** (the earlier single-session "exp 1.05× faster / log 1.14×" did not reproduce).
+- **GPU: warp-specialized flash shipped where it wins**: 2-warp named-barrier anti-phase
+  (`flash_d64_ws`) + 3-stage-ring (`flash_d128_ws3_lm`) kernels, tolerance-gated vs the f64
+  oracle; the clock-cancelled A/B wins **only 4–6% @S=4096** (tie @2048, 10–52% loss @≤1024),
+  so the default route is exactly S≥4096 with pins keeping the losing regimes unroutable
+  (`MERCURY_FLASH_WS=0` kill-switch). The long-S cuDNN gap is structural (SFU-bound) and now
+  measured shut as a scheduling problem.
+- **GPU 4096³ GEMM: v2cs streaming epilogue** (+2.7% round-robin over the swz base →
+  **76.8% of cuBLAS-f16 / 80.4% of the honest f32-out peer**) dispatched at A+B ≥ 48 MB; the
+  new `f32-out cuBLAS peer column` makes the C-write dtype asymmetry visible (~10pp of the old
+  "gap" was peer flattery). 3-stage pipe / raster re-tunes / launch-bounds all measured losses.
+- **Serving goodput ceiling doubled**: Bcap parameterized end-to-end with KV-budget guards,
+  graph-driven scheduler (one cached `cuGraphLaunch` per step, **bit-identical to eager** over a
+  96-request drain), bounded-look-ahead first-fit admission, an honest static-batching peer, and
+  opt-in int8-KV (1.88× smaller cache; exact round-trip gate). **Bcap=256: 85.6× goodput vs
+  fill=1** (33.1k tok/s; old ceiling 38–39× @Bcap=64, reproduced), scheduler drain **1.14–1.27×
+  vs static batching** with the amortization-vs-scheduling decomposition disclosed.
+
 ### Performance + correctness — perf-sota session 2 (2026-07-08)
 - **vmath exp/log to (near-)VML parity**: the transcendental dispatch loop gained a ×4 ILP unroll +
   an NT-store streaming regime, then both cores were rewritten as 8-bucket in-register-LUT

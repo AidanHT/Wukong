@@ -28,14 +28,17 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
   **oneMKL parity**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
   (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*. Against
-  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM now runs a
-  **BLIS/MKL-style 2D block-parallel decomposition** (per-thread L2-resident C blocks, per-worker
-  packing, no barriers; adjacent-run ABBA **1.26–1.65×** over the previous row-panel path) and
-  stands at **~66–69% at 512–1024³** (up from ~46–72%, and now power-state-stable: 66/68%
-  throttled, 66/69% cool in the two 2026-07-08 confirmation rounds) and **parity-to-winning
-  (86–129%, most recently 127%) at ≥2048³**, the large-matrix ML regime. (Disclosure: threaded
-  MKL itself swings ~1.4× with this laptop's power state, so ratios are same-run only; the
-  residual mid-size ~30% is MKL's remaining lead at parallel grain, honestly open);
+  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM runs a
+  **size-keyed BLIS/MKL-style 2D block-parallel decomposition** (per-thread L2-resident C blocks;
+  per-worker packing at mid/large — measured the right locality trade in both ABBA orderings —
+  and a cooperative shared-pack small band just above the parallel gate) and stands at
+  **70–83% at 512–1024³** (from 66–69%), **88–93% at 2048³ against a healthy peer** (and
+  176–186% against MKL's own degraded rounds), and **102–123% at 256³** (engaged at 1.7–2× over
+  serial; was deliberately-serial at ~39–52%). Single-core, the 2026-07-10 C-tile microkernel
+  prefetch closed the large-matrix tail: **96–99% of MKL-1c at 2048³** (was 83–88%).
+  (Disclosure: threaded MKL itself swings ~1.4–2× with this laptop's power state, so ratios are
+  same-run only and reported as ranges; the residual mid-size gap is parallel-grain scaling,
+  honestly open);
 - **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
   over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
   column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
@@ -43,10 +46,12 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   (bias-grad / per-channel quant stats) **~29–50×**, and the training-backward kernels
   (activation/softmax/LayerNorm-RMSNorm backward, cross-entropy) **~3–13×**;
 - **wins the transcendental/activation family ~4.7–12× vs C** (**~28× under `@parallel`**) — the
-  cleanest compute-bound win — and now stands **at or near Intel oneMKL VML**, the hand-tuned
-  vector-math SOTA: same-run, **tanh 2.4–3× FASTER than VML, log 1.14× slower, exp from 1.05×
-  faster (cool) to ~1.3× slower (thermally throttled)** after 8-bucket in-register-LUT rewrites
-  of both cores (exp ~1.3 ULP, log ≤6.9e-7 rel — exhaustively swept). Mercury dispatches a pure
+  cleanest compute-bound win — and stands near Intel oneMKL VML, the hand-tuned
+  vector-math SOTA: same-run across thermal states, **tanh 2.7–2.9× FASTER than VML**, with
+  **exp 1.23–1.45× and log ~1.25× slower** after 8-bucket in-register-LUT rewrites of both cores
+  (exp ~1.3 ULP, log ≤6.9e-7 rel — exhaustively swept; the residual gap is algorithmic — VML's
+  cheaper core — and the earlier single-session "exp 1.05× faster / log 1.14×" readings did not
+  reproduce across states, so the range is the honest claim). Mercury dispatches a pure
   `out[i]=f(x[i])` loop for **35** functions
   (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/`silu`/
   `softplus`/`softsign`/`logsigmoid`/`mish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf` plus the
