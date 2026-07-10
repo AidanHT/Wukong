@@ -74,3 +74,36 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
   header + WUK_ONLY/TORCH_ONLY sweep knobs), perf/gemm-grain (dynamic block scheduling, env-gated,
   bit-exact), perf/compile-floor (compile-profile + spawn-overhead modes + floor draft),
   serial-fraction analysis (read-only report).
+
+### 2026-07-10 (cont.) — analysis results, feasibility probes, first merges
+- **Serial-fraction analysis landed** (prompts/results/serial-fraction.md): literal serial code is
+  ~1% — the bound is the parallel work's own hybrid ceiling (~9.3 P-equivalents) PLUS ~108-132
+  fork-joins/forward bouncing private↔global pools ~6-7×/layer, which parks cores and blocks clock
+  ramp (the "no clock upside" mechanism). Ranked levers: persistent hot team (+20-50%, HIGH risk),
+  pool unification (+10-20%, LOW), finer skinny-M grid @S=128 (+10-15%), head×row-tile attention
+  grain (+5% @S=512), residual fusion + parallel ln_f (+1-3%).
+- **torch.compile fullgraph feasibility PROVEN on the exact model** (bench-generated script +
+  blobs): 0 graph breaks. Inductor's CPP GEMM template is broken on Windows/MSVC
+  (`cpp_CppMicroGemmFP32Vec not found`) → strongest WORKING config = max-autotune with
+  `max_autotune_gemm_backends="ATEN"` (MKL GEMMs + Inductor fusion; disclosed, and ATen-MKL is
+  torch's strongest CPU GEMM anyway). DEV-GRADE (battery, same-run ratio): compiled/eager =
+  **1.86× @S=128**, 1.04× @S=512; correctness 8.7e-7. Implication: the eager-torch "flip" likely
+  becomes a ~1.5-1.9× LOSS at S=128 against the true Target-B bar; S=512 roughly carries over.
+  compile wall ≈70-90s (cold-start regime, reported separately).
+- **Merged perf/gemm-grain** (3 commits, gemm.rs only, gate 500 green): WUKONG_GEMM_DYN atomic
+  claim-queue scheduler (default OFF pending A/B), WUKONG_GEMM_TASK_MACS grain sweep,
+  WUKONG_GEMM_STEAL_ORDER LPT probe, unconditional BN tail rebalance (1024³ (144,192)→(132,176)).
+- **Pool unification shipped** (40d49a7, lever #2): run_on_wuk_pool routes _parallel norms/velem/
+  reductions + parallel_for regions onto the physical-core GEMM pool (WUKONG_POOL_UNIFY=0 A/B
+  escape). Also fixed a latent init-order bug — the 16 MiB-stack build_global lost the race to
+  the first _parallel norm, so region bodies (~1.5 MiB frames) had been running on rayon's
+  default 2 MiB stacks. Full 45-suite gate green (unpiped).
+- **Merged perf/compile-floor**: `compile-profile` (per-stage pipeline breakdown) +
+  `spawn-overhead` (in-process vs CLI spawn vs exe-link) bench modes + docs/compile-floor.md
+  draft. PROVISIONAL shape finding (battery, shares only): **codegen+obj ≈74% of code→object**,
+  optimize ≈19%, front-end ≈7% — the full-pipeline correction to "optimizer is 80-85%" (that was
+  front→O2 only). Fixed ~6.5 KB COFF floor dominates small objects; --emit=exe is ~95% link
+  (rustc subprocess). Target C's lever is the BACKEND, not the optimizer.
+- Process lesson re-learned the hard way: a background `cargo test 2>&1 | tail` reported tail's
+  exit code — the gate was re-run unpiped before committing (the standing rule exists for a
+  reason).
