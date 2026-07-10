@@ -1,0 +1,80 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -137
+// EXPECT-OUT: -50
+// EXPECT-OUT: -1004
+module tests.run.parallel_divmod_tiling
+
+// The TILED transformer head loop: ONE flat loop over head x row-tile pairs, `hh = t / T` (head)
+// and `tile = t % T` (row tile) — the div/mod-tiled iteration space. Each iteration writes the
+// disjoint block rows [tile*4, tile*4+4) x cols [hh*4, hh*4+4) of the row-major [8, 8] `attn`:
+// the write index (tile*4 + i)*8 + hh*4 + j recovers BOTH digits of t (the two-digit mixed-radix
+// proof), so under `@parallel` the loop outlines into ONE wukong_parallel_for region (tiles
+// across cores, serial kernels per tile). The serial twin below runs the identical per-iteration
+// op sequence, so the elementwise comparison must report ZERO mismatches — the serial ==
+// @parallel bit-exactness gate, checked here across both backends and every opt level by the
+// e2e runner.
+// Serial twin: identical body, no @parallel.
+fn tiled_serial(q: [f32; 64], k: [f32; 64], v: [f32; 64], mut attn: [f32; 64]) {
+    for t in 0..4 {
+        let hh = t / 2;
+        let tile = t % 2;
+        let r0 = tile * 4;
+        let mut qh: [f32; 16] = [0.0; 16];
+        let mut kh: [f32; 16] = [0.0; 16];
+        let mut scores: [f32; 16] = [0.0; 16];
+        for i in 0..4 { for p in 0..4 { qh[i*4+p] = q[(r0+i)*8 + hh*4 + p]; } }
+        for i in 0..4 { for p in 0..4 { kh[i*4+p] = k[(r0+i)*8 + hh*4 + p]; } }
+        for i in 0..4 { for j in 0..4 {
+            let mut acc: f32 = 0.0;
+            for p in 0..4 { acc = acc + qh[i*4+p] * kh[j*4+p]; }
+            scores[i*4+j] = acc;
+        } }
+        for i in 0..4 { for j in 0..4 { attn[(r0+i)*8 + hh*4 + j] = scores[i*4+j] + v[(r0+i)*8 + hh*4 + j]; } }
+    }
+}
+
+@parallel
+fn tiled_par(q: [f32; 64], k: [f32; 64], v: [f32; 64], mut attn: [f32; 64], mut y: [f32; 64]) {
+    for i in 0..64 { y[i] = q[i]; }
+    for t in 0..4 {
+        let hh = t / 2;
+        let tile = t % 2;
+        let r0 = tile * 4;
+        let mut qh: [f32; 16] = [0.0; 16];
+        let mut kh: [f32; 16] = [0.0; 16];
+        let mut scores: [f32; 16] = [0.0; 16];
+        for i in 0..4 { for p in 0..4 { qh[i*4+p] = q[(r0+i)*8 + hh*4 + p]; } }
+        for i in 0..4 { for p in 0..4 { kh[i*4+p] = k[(r0+i)*8 + hh*4 + p]; } }
+        for i in 0..4 { for j in 0..4 {
+            let mut acc: f32 = 0.0;
+            for p in 0..4 { acc = acc + qh[i*4+p] * kh[j*4+p]; }
+            scores[i*4+j] = acc;
+        } }
+        for i in 0..4 { for j in 0..4 { attn[(r0+i)*8 + hh*4 + j] = scores[i*4+j] + v[(r0+i)*8 + hh*4 + j]; } }
+    }
+}
+
+fn main() -> i32 {
+    let mut q: [f32; 64] = [0.0; 64];
+    let mut k: [f32; 64] = [0.0; 64];
+    let mut v: [f32; 64] = [0.0; 64];
+    for i in 0..64 {
+        q[i] = (i as f32) * 0.25 - 4.0;
+        k[i] = 8.0 - (i as f32) * 0.5;
+        v[i] = (i as f32) - 32.0;
+    }
+    let mut a_serial: [f32; 64] = [0.0; 64];
+    let mut a_par: [f32; 64] = [0.0; 64];
+    let mut y: [f32; 64] = [0.0; 64];
+    tiled_serial(q, k, v, a_serial);
+    tiled_par(q, k, v, a_par, y);
+    let mut bad: i32 = 0;
+    for i in 0..64 { if a_par[i] != a_serial[i] { bad = bad + 1; } }
+    print(bad);
+    print(a_par[0] as i32);
+    print(a_par[27] as i32);
+    print(a_par[63] as i32);
+    return 0;
+}

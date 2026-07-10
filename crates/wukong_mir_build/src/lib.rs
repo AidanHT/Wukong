@@ -25032,6 +25032,213 @@ fn overlap(x: [f32; 16], mut out: [f32; 16]) {
         );
     }
 
+    fn count_parallel_for(prog: &Program, interner: &Interner) -> usize {
+        prog.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter(
+                |i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == "wukong_parallel_for"),
+            )
+            .count()
+    }
+
+    /// The TILED head loop — one flat `for t in 0..H*T` with `hh = t / T` (head) and `tile = t %
+    /// T` (row tile) — must outline into ONE `wukong_parallel_for` region: `t ↦ (t/T, t%T)` is
+    /// injective and the write index `(tile*SROWS + i)*D + hh*HD + j` recovers both digits (the
+    /// two-digit mixed-radix proof), so iterations never overlap. The outlined body must still
+    /// dispatch the SERIAL kernels — α-scaled QKᵀ GEMM, fused row softmax, PV GEMM — never the
+    /// multicore variants and never a nested region: the region supplies the threading, and the
+    /// per-iteration op sequence stays identical to the serial spelling (the G4 argument).
+    #[test]
+    fn parallel_region_outlines_divmod_tiling() {
+        let src = "module m
+@parallel
+fn tiled(q: [f32; 64], k: [f32; 64], v: [f32; 64], mut attn: [f32; 64], mut y: [f32; 64]) {
+    for i in 0..64 { y[i] = q[i]; }
+    for t in 0..4 {
+        let hh = t / 2;
+        let tile = t % 2;
+        let r0 = tile * 4;
+        let mut qh: [f32; 16] = [0.0; 16];
+        let mut kh: [f32; 16] = [0.0; 16];
+        let mut vt: [f32; 16] = [0.0; 16];
+        let mut scores: [f32; 16] = [0.0; 16];
+        let mut ah: [f32; 16] = [0.0; 16];
+        for i in 0..4 { for p in 0..4 { qh[i*4+p] = q[(r0+i)*8 + hh*4 + p]; } }
+        for i in 0..4 { for p in 0..4 { kh[i*4+p] = k[(r0+i)*8 + hh*4 + p]; } }
+        for i in 0..4 { for p in 0..4 { vt[p*4+i] = v[(r0+i)*8 + hh*4 + p]; } }
+        for i in 0..4 { for j in 0..4 {
+            let mut acc: f32 = 0.0;
+            for p in 0..4 { acc = acc + qh[i*4+p] * kh[j*4+p]; }
+            scores[i*4+j] = acc * 0.5;
+        } }
+        for i in 0..4 {
+            let mut m: f32 = scores[i*4];
+            for j in 0..4 { m = fmax(m, scores[i*4+j]); }
+            let mut s: f32 = 0.0;
+            for j in 0..4 { let e = exp(scores[i*4+j] - m); scores[i*4+j] = e; s = s + e; }
+            let inv = 1.0 / s;
+            for j in 0..4 { scores[i*4+j] = scores[i*4+j] * inv; }
+        }
+        for i in 0..4 { for j in 0..4 {
+            let mut acc: f32 = 0.0;
+            for p in 0..4 { acc = acc + scores[i*4+p] * vt[j*4+p]; }
+            ah[i*4+j] = acc;
+        } }
+        for i in 0..4 { for j in 0..4 { attn[(r0+i)*8 + hh*4 + j] = ah[i*4+j]; } }
+    }
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert_eq!(
+            count_parallel_for(&prog, &interner),
+            1,
+            "the tiled loop must outline into exactly ONE wukong_parallel_for region \
+             (not a serial chain of per-op fork-joins)"
+        );
+        let outlined = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name).starts_with("wukong$par$"))
+            .expect("outlined region body function");
+        for kernel in ["wukong_sgemm_nt_alpha", "wukong_norm_f32", "wukong_sgemm_nt"] {
+            assert!(
+                fn_calls(outlined, &interner, kernel),
+                "the per-tile op sequence must dispatch the SERIAL {kernel} inside the region"
+            );
+        }
+        for kernel in [
+            "wukong_sgemm_nt_alpha_parallel",
+            "wukong_norm_f32_parallel",
+            "wukong_sgemm_nt_parallel",
+            "wukong_parallel_for",
+        ] {
+            assert!(
+                !fn_calls(outlined, &interner, kernel),
+                "the outlined body must not nest {kernel}"
+            );
+        }
+        for f in &prog.funcs {
+            let errs = wukong_mir::verify::verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    #[test]
+    fn parallel_region_declines_divmod_overlapping_extent() {
+        // The remainder digit's coefficient (tile*3) is SMALLER than the inner extent (j reaches
+        // 3, so Σ low = 3 ≥ L = 3): tile=0 writes columns {0..3} of its head and tile=1 writes
+        // {3..6} — a genuine overlap at column 3. The low-digit slot bound must reject it. (The
+        // inner j loop cannot outline on its own either: `tile` is not one of ITS inner range
+        // vars, so its stride-3 term is unbounded there.)
+        let src = "module m
+@parallel
+fn overlap(x: [f32; 64], mut out: [f32; 64]) {
+    for i in 0..64 { out[i] = x[i]; }
+    for t in 0..8 {
+        let hh = t / 4;
+        let tile = t % 4;
+        for j in 0..4 { out[hh*32 + tile*3 + j] = x[hh*32 + tile*3 + j]; }
+    }
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_parallel_for"),
+            "an overlapping div/mod tiling must stay serial"
+        );
+    }
+
+    #[test]
+    fn parallel_region_declines_divmod_nonconst_divisor() {
+        // `t / d` with a runtime divisor: the quotient/remainder locals stay unmodeled, the write
+        // index then carries the region var under NO recognized signature, and the loop must stay
+        // serial — the digit argument only holds for a literal C.
+        let src = "module m
+@parallel
+fn nc(x: [f32; 64], mut out: [f32; 64], d: i64) {
+    for i in 0..64 { out[i] = x[i]; }
+    for t in 0..8 {
+        let hh = t / d;
+        let tile = t % d;
+        out[hh*32 + tile*4] = x[t*8];
+        out[hh*32 + tile*4 + 1] = x[t*8 + 1];
+    }
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_parallel_for"),
+            "a non-constant divisor must stay serial"
+        );
+    }
+
+    #[test]
+    fn parallel_region_declines_div_only_and_mod_only() {
+        // A div-only index (no remainder digit) cannot separate iterations sharing a quotient
+        // (t=0..3 all have t/4 == 0 and hit the SAME cells), and a mod-only index cannot separate
+        // iterations a period apart (t and t+4 share t%4) — both must decline no matter the
+        // stride: one digit alone never pins t.
+        let div_only = "module m
+@parallel
+fn donly(x: [f32; 64], mut out: [f32; 64]) {
+    for i in 0..64 { out[i] = x[i]; }
+    for t in 0..8 {
+        let hh = t / 4;
+        out[hh*4] = out[hh*4] + x[t*4];
+        out[hh*4 + 1] = out[hh*4 + 1] + x[t*4 + 1];
+    }
+}
+";
+        let mod_only = "module m
+@parallel
+fn monly(x: [f32; 64], mut out: [f32; 64]) {
+    for i in 0..64 { out[i] = x[i]; }
+    for t in 0..8 {
+        let tile = t % 4;
+        out[tile*4] = out[tile*4] + x[t*4];
+        out[tile*4 + 2] = out[tile*4 + 2] + x[t*4 + 2];
+    }
+}
+";
+        for src in [div_only, mod_only] {
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                !prog_calls(&prog, &interner, "wukong_parallel_for"),
+                "a single div/mod digit never pins the iteration — must stay serial"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_region_declines_divmod_equal_coefficients() {
+        // qc == rc: `(t/2)*8 + (t%2)*8` is not injective in t (t=1 → 8 and t=2 → 8), so distinct
+        // iterations hit the same cells — the signature check must reject the pair outright.
+        let src = "module m
+@parallel
+fn eqc(x: [f32; 64], mut out: [f32; 64]) {
+    for i in 0..64 { out[i] = x[i]; }
+    for t in 0..4 {
+        let hh = t / 2;
+        let tile = t % 2;
+        out[hh*8 + tile*8] = out[hh*8 + tile*8] + x[t*16];
+        out[hh*8 + tile*8 + 1] = out[hh*8 + tile*8 + 1] + x[t*16 + 1];
+    }
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_parallel_for"),
+            "equal digit coefficients are not injective in t — must stay serial"
+        );
+    }
+
     /// Cross-check: the `emit_exp_f32` inlined-MIR table/constants (the f64 literals `splat_const_f`
     /// rounds to f32) must land on the EXACT f32 bit patterns the runtime `vmath::exp1`/`exp8` kernel
     /// holds — the documented value-consistency promise (a dispatched `exp` loop and a composed/scalar
