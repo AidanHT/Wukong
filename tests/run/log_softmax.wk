@@ -10,7 +10,7 @@ module tests.run.log_softmax
 // reason to want a fast `log`. It composes every transcendental advantage in one pass:
 //   logsoftmax(x)[i] = (x[i] - m) - log(sum_j exp(x[j] - m)),   m = max_j x[j]
 // the fmax reduction, the vectorized exp, the sum reduction, one scalar log, and a vectorized
-// subtract. The mercury_bench gate proves the whole chain matches the interpreter bit-for-bit.
+// subtract. The wukong_bench gate proves the whole chain matches the interpreter bit-for-bit.
 fn main() -> i32 {
     let mut x: [f32; 16] = [0.0; 16];
     let mut out: [f32; 16] = [0.0; 16];
@@ -37,7 +37,7 @@ fn main() -> i32 {
     }
 
     // log-prob of the max logit, and exp() of it == the softmax probability (cross-checks
-    // softmax.mer's p(max) == 632). The least likely class is far more negative.
+    // softmax.wk's p(max) == 632). The least likely class is far more negative.
     print((out[15] * 1000.0) as i32); // log p(max)
     print((out[14] * 1000.0) as i32); // log p(2nd)
     print((out[0] * 1000.0) as i32); // log p(min), very negative

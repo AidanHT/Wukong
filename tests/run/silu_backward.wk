@@ -13,16 +13,16 @@ module tests.run.silu_backward
 // SiLU/swish backward dx[i] = dy[i] * silu'(x[i]), silu'(x) = s + x·s·(1−s) with s = sigmoid(x) — the
 // training gradient through a SiLU gate (Llama/modern-transformer FFNs). silu' folds a sigmoid (an
 // expf) that C/Rust keep scalar (a loop with the libm call won't vectorize), so the recognizer folds
-// the elementwise `dx[i] = silu_backward(x[i], dy[i])` loop to one 256-bit mercury_vmath2_f32 call.
+// the elementwise `dx[i] = silu_backward(x[i], dy[i])` loop to one 256-bit wukong_vmath2_f32 call.
 // The derivative is pure elementwise (no reduction), so the kernel is bit-identical lane-for-lane —
 // the differential gate (interp == native, -O0 == -O3) is trivial. Transcendental, so values are the
-// frozen deterministic kernel output (×1000, truncated), the same convention as activations.mer.
+// frozen deterministic kernel output (×1000, truncated), the same convention as activations.wk.
 fn main() -> i32 {
     let x: [f32; 8] = [-3.0, -1.0, 0.0, 1.0, 2.0, 3.0, 0.5, -0.5];
     let dy: [f32; 8] = [1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 2.0, 4.0];
     let mut dx: [f32; 8] = [0.0; 8];
 
-    // Recognized → mercury_vmath2_f32(x, dy, dx, 8, VM2_SILU_BWD).
+    // Recognized → wukong_vmath2_f32(x, dy, dx, 8, VM2_SILU_BWD).
     for i in 0..8 {
         dx[i] = silu_backward(x[i], dy[i]);
     }

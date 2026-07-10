@@ -1,4 +1,4 @@
-# Mercury targets a recent stable Rust (MSRV 1.94, declared as `rust-version` in Cargo.toml).
+# Wukong targets a recent stable Rust (MSRV 1.94, declared as `rust-version` in Cargo.toml).
 # We track `stable` so contributors and CI use the same components; the MSRV is what we promise to
 # keep compiling. `rustfmt` and `clippy` are required by the test/CI workflow.
 [toolchain]

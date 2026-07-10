@@ -10,7 +10,7 @@ module tests.run.scatter_add
 // Scatter-add — the embedding-gradient backward, the dual of the gather: each upstream-gradient row is
 // routed back to the weight row its token came from and ACCUMULATED. grad_w[ids[t],:] += grad_out[t,:]
 // over a [V=2, H=3] table and length-T=4 i32 ids. Colliding tokens (a row hit twice) sum — the whole
-// point of an embedding gradient. The recognizer folds the 2-deep nest to one `mercury_scatter_add_f32`
+// point of an embedding gradient. The recognizer folds the 2-deep nest to one `wukong_scatter_add_f32`
 // call (deriving V=2 from grad_w's [f32; 6] length / H=3); collisions fold in ascending token order
 // (== the scalar nest), so the differential gate (interp == native) is bit-exact with no reassociation.
 fn main() -> i32 {

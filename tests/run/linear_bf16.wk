@@ -9,7 +9,7 @@ module tests.run.linear_bf16
 // bf16 mixed-precision nn.Linear: C = A·Bᵀ with bf16 activations and bf16 weights, each widened to f32
 // and accumulated in an f32 s — the standard mixed-precision transformer matmul. The compiler
 // recognizes this dot-product nest (the half-precision twin of the f32 / int8 nn.Linear forms) and
-// dispatches it to the mercury_sgemm_bf16_nt kernel: a lossless widen prepass feeding the tuned AVX2
+// dispatches it to the wukong_sgemm_bf16_nt kernel: a lossless widen prepass feeding the tuned AVX2
 // f32 GEMM. Without it the half nest falls to a scalar widening loop. Small integers are bf16-exact,
 // so the result is exact and the differential gate is bit-for-bit (interp == native, -O0 == -O3).
 // A is [3,4], B is [3,4] (its rows are the weight vectors), so C is [3,3].

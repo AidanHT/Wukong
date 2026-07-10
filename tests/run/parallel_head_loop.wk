@@ -10,7 +10,7 @@ module tests.run.parallel_head_loop
 // iterations: the per-head scratch (qh/kh/scores) is declared INSIDE the loop body, so each
 // iteration is private by construction, and each head writes a disjoint hh-sliced column band of
 // `attn` (index i*D + hh*HD + j — the mixed-radix digit proof). Under `@parallel` the loop
-// outlines into a mercury_parallel_for region (heads across cores, serial kernels per head); the
+// outlines into a wukong_parallel_for region (heads across cores, serial kernels per head); the
 // serial twin below runs the identical per-iteration op sequence, so the elementwise comparison
 // must report ZERO mismatches — the serial == @parallel bit-exactness gate, checked here across
 // both backends and every opt level by the e2e runner.

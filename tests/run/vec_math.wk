@@ -10,7 +10,7 @@
 module tests.run.vec_math
 
 // Element-wise sqrt/rsqrt/fmax/fmin in unit-stride loops — these vectorize (128-bit x 4 unroll).
-// The mercury_bench gate proves the vectorized MIR matches the interpreter bit-for-bit.
+// The wukong_bench gate proves the vectorized MIR matches the interpreter bit-for-bit.
 fn main() -> i32 {
     let mut a: [f32; 64] = [0.0; 64];
     let mut out: [f32; 64] = [0.0; 64];

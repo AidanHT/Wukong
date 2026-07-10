@@ -8,7 +8,7 @@ module tests.run.colrms
 
 // Column RMS out[j] = sqrt((Σ_i x[i,j]²) / rows) — the per-channel root-mean-square (per-feature
 // magnitude, the RMSNorm-style scale) over the outer axis of a [M=2, N=4] matrix. The strided square
-// fold gcc/rustc leave scalar; the recognizer folds the nest to the SIMD mercury_colrms_f32 (the colsum
+// fold gcc/rustc leave scalar; the recognizer folds the nest to the SIMD wukong_colrms_f32 (the colsum
 // machinery with a square fold + a `sqrt(_/rows)` per-column finalize, divisor pinned to the row count).
 // Both backends marshal the identical kernel, so the differential gate (interp == native, -O0 == -O3) holds.
 fn main() -> i32 {

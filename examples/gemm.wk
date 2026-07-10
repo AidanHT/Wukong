@@ -3,12 +3,12 @@ module examples.gemm
 // Runnable f32 matmul C[2,2] = A[2,3] · B[3,2], written as the textbook `ikj` nest over flat arrays.
 //
 // The compiler RECOGNIZES this loop nest and lowers the whole thing to its tuned, register-blocked,
-// cache-tiled, packed AVX2/FMA GEMM microkernel (`mercury_sgemm`) — the way XLA/TVM/oneDNN lower a
+// cache-tiled, packed AVX2/FMA GEMM microkernel (`wukong_sgemm`) — the way XLA/TVM/oneDNN lower a
 // matmul op, not the naive triple loop gcc/rustc would emit. Under `--run` the interpreter executes
 // that *same* kernel (marshalling its memory), so what you run here is the real fast path.
 //
-//   cargo run -p mercuryc -- --run        examples/gemm.mer     # -> 4 5 10 11
-//   cargo run -p mercuryc -- --emit=mir   examples/gemm.mer     # see the `call mercury_sgemm`
+//   cargo run -p wukongc -- --run        examples/gemm.wk     # -> 4 5 10 11
+//   cargo run -p wukongc -- --emit=mir   examples/gemm.wk     # see the `call wukong_sgemm`
 //
 //   A = [1 2 3]      B = [1 0]            C = A·B = [ 4  5]
 //       [4 5 6]          [0 1]                      [10 11]

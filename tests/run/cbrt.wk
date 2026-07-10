@@ -9,7 +9,7 @@ module tests.run.cbrt
 
 // `cbrt(x)` — the all-real cube root (LAB color space, variance-stabilizing transforms, physics).
 // `cbrt(x) = copysign(exp(ln|x|/3), x)` composes the shared exp/log, with a `|x|==0 → 0` guard, so a
-// dispatched `out[i] = cbrt(x[i])` loop lowers to the 256-bit `mercury_vmath_f32` and agrees with the
+// dispatched `out[i] = cbrt(x[i])` loop lowers to the 256-bit `wukong_vmath_f32` and agrees with the
 // composed/scalar form — interp == native, -O0 == -O3. C/Rust call scalar libm `cbrtf`, unvectorizable
 // in a loop. Completes the root family alongside `sqrt`/`rsqrt`.
 fn main() -> i32 {

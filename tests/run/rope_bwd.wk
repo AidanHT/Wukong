@@ -12,7 +12,7 @@ module tests.run.rope_bwd
 
 // RoPE backward (the gradient through the rotary embedding): the transpose/inverse rotation of the
 // upstream gradient g, dx[r,j] = a·c + b·s, dx[r,j+H] = b·c − a·s (vs the forward a·c−b·s / b·c+a·s).
-// The recognizer folds the [R=2,D=4] nest to one mercury_rope_bwd_f32 call (inline sin8/cos8 — C/Rust
+// The recognizer folds the [R=2,D=4] nest to one wukong_rope_bwd_f32 call (inline sin8/cos8 — C/Rust
 // keep sinf/cosf scalar). A rotation is pure data movement, bit-identical to the scalar nest, so the
 // differential gate (interp == native, -O0 == -O3) is trivial.
 fn main() -> i32 {

@@ -10,7 +10,7 @@
 // EXPECT-OUT: 126
 module tests.run.generic_shape
 
-// Symbolic-generic tensor shapes EXECUTE — the capstone of Mercury's shape-safety story. A function
+// Symbolic-generic tensor shapes EXECUTE — the capstone of Wukong's shape-safety story. A function
 // `f<M, N>(a: Tensor[f32, M, N])` type-checks with full compile-time shape safety (the dims M, N are
 // rigid generics inside the body) AND runs at any per-call size: the dims are threaded in as hidden
 // runtime `i64` parameters, so the row-major index stride (`a[i, j]` → `i*N + j` with N a runtime

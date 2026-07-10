@@ -8,10 +8,10 @@ module tests.run.transpose_f32
 
 // Matrix transpose dst = srcᵀ: src is [R=2, C=3], dst is [C=3, R=2]. The recognizer detects the `for`
 // nest `dst[j*R + i] = src[i*C + j]` over f32 and dispatches it to the cache-blocked
-// mercury_transpose_f32 (the naive nest writes dst with stride R — a cache miss per element for large
+// wukong_transpose_f32 (the naive nest writes dst with stride R — a cache miss per element for large
 // R — which gcc/rustc do not tile at -O3). Pure data movement (a permutation), so the kernel is
 // bit-identical to the scalar nest: the differential gate (interp == native, -O0 == -O3) is trivial —
-// there is no float reassociation. (The sibling transpose.mer is the i32 `while`-loop form.)
+// there is no float reassociation. (The sibling transpose.wk is the i32 `while`-loop form.)
 fn main() -> i32 {
     let src: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // [[1,2,3],[4,5,6]]
     let mut dst: [f32; 6] = [0.0; 6];

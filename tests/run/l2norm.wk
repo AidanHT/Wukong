@@ -8,7 +8,7 @@ module tests.run.l2norm
 // L2 / unit normalization `out = x / ‖x‖₂` (cosine similarity, normalized embeddings) is RMSNorm
 // without the `1/N` mean divisor: `inv = 1/sqrt(Σ x² + eps)` instead of `1/sqrt(mean(x²) + eps)`.
 // Both the batched `[R, C]` nested form and the single-row flat form are recognized and dispatched to
-// one fused `mercury_norm_f32(…, NORM_L2NORM)` — the same kernel softmax/LayerNorm/RMSNorm use, so the
+// one fused `wukong_norm_f32(…, NORM_L2NORM)` — the same kernel softmax/LayerNorm/RMSNorm use, so the
 // interp == native differential gate is bit-for-bit exact (it just forwards the new op code).
 // The fused-norm `eps` must be statically known: an inline float literal, or — within the *same*
 // block — a non-`mut` `let eps = <literal>`. The single-row window below binds eps with such a `let`;
@@ -22,7 +22,7 @@ fn main() -> i32 {
 
     // Batched L2-normalize over a [4, 8] matrix, in place over `out` (seeded from `x`) — the dispatched
     // nested form `out[r*8+i] = out[r*8+i] / sqrt(Σ_i out[r*8+i]² + eps)`. (The fused norm kernel is
-    // in-place, `mercury_norm_f32(p, p, ..)`, so the recognized window normalizes a buffer into itself;
+    // in-place, `wukong_norm_f32(p, p, ..)`, so the recognized window normalizes a buffer into itself;
     // an out-of-place `out = x/‖x‖` is left to the generic vectorizer.)
     let mut out: [f32; 32] = [0.0; 32];
     for i in 0..32 { out[i] = x[i]; }

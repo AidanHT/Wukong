@@ -7,7 +7,7 @@
 module tests.run.log_softmax_fused
 
 // In-place numerically-stable log-softmax — the classification / LM-training loss epilogue. The
-// 6-statement window (max → Σexp(x-m) → log → (x-m)-ls) folds to ONE mercury_norm_f32(NORM_LOGSOFTMAX)
+// 6-statement window (max → Σexp(x-m) → log → (x-m)-ls) folds to ONE wukong_norm_f32(NORM_LOGSOFTMAX)
 // call: each row loaded once, 256-bit AVX2, the hand-vectorized exp, and one scalar log of the row
 // sum. gcc/rustc keep the float reductions serial and call scalar expf/logf. Both backends marshal
 // the identical kernel, so the differential oracle stays bit-for-bit exact.

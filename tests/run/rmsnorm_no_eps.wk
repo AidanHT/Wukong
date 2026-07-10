@@ -9,9 +9,9 @@ module tests.run.rmsnorm_no_eps
 // reference implementations omit eps. The fused-norm recognizer previously required the `+ eps` add
 // (`match_inv_rstd` matched only a `Binary{Add}` argument), so the no-eps form dropped to
 // velem + a separate reduction — even though L2-norm's matcher already accepted the bare no-eps
-// `1/sqrt(Σx²)`. It now folds to `mercury_norm_f32` with eps = 0.0 (`mean + 0.0 == mean` bit-for-bit
+// `1/sqrt(Σx²)`. It now folds to `wukong_norm_f32` with eps = 0.0 (`mean + 0.0 == mean` bit-for-bit
 // for the non-negative mean-square), so the fused kernel matches the scalar `rsqrt(ss/N)`. Same value
-// as tests/run/rmsnorm.mer (eps = 1e-5 is negligible at this scale), so the output is identical; the
+// as tests/run/rmsnorm.wk (eps = 1e-5 is negligible at this scale), so the output is identical; the
 // differential + opt-invariance gates prove the fused kernel agrees bit-for-bit.
 fn main() -> i32 {
     let mut x: [f32; 16] = [0.0; 16];

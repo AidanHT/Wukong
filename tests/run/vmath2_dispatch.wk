@@ -6,7 +6,7 @@
 module tests.run.vmath2_dispatch
 
 // The two-input transcendentals (`pow`/`atan2`/`hypot`) in a `for j { out[j] = f(x[j], y[j]) }` loop
-// dispatch to the **256-bit** `mercury_vmath2_f32` kernel (vs the generic vectorizer's inlined
+// dispatch to the **256-bit** `wukong_vmath2_f32` kernel (vs the generic vectorizer's inlined
 // 128-bit poly). The kernel mirrors the inlined MIR op-for-op (pow = exp(y·ln x); atan2 = atan(y/x)
 // + quadrant fix; hypot = m·√((a/m)²+(b/m)²)), and the interpreter marshals through that very kernel,
 // so interp == native and -O0 == -O3. C/Rust call scalar libm here — a loop with the call won't

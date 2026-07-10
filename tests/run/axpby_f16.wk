@@ -7,7 +7,7 @@
 module tests.run.axpby_f16
 
 // f16→f32 streaming axpby: `out[i] = a*(x[i] as f32) + b*(y[i] as f32)` over `[f16]` inputs (f32
-// output) lowers to mercury_axpby_f16 — f16 in (F16C widen), f32 out, f32 math. The interpreter
+// output) lowers to wukong_axpby_f16 — f16 in (F16C widen), f32 out, f32 math. The interpreter
 // marshals through the identical kernel, so interp and native agree bit-for-bit.
 //
 // x = [1,2,3,4], y = [10,20,30,40] (f16-exact), a=2, b=1 → out = 2x + y = [12, 24, 36, 48].

@@ -12,7 +12,7 @@ module tests.run.colargmax
 
 // Per-COLUMN argmax / argmin returning the ROW index (axis-0 top-1): out[j] = {argmax,argmin}_i x[i,j],
 // lowest row index wins on a value tie. The recognizer folds each [R=3,C=4] nest to one
-// mercury_colarg{max,min}_i32 call — the STRIDED column-outer (value,index) scan gcc/rustc leave fully
+// wukong_colarg{max,min}_i32 call — the STRIDED column-outer (value,index) scan gcc/rustc leave fully
 // scalar (the column-reduction lever). A pure selection (no reassociation), so interp == native is
 // bit-exact, and out is an i32 buffer of length C.
 fn main() -> i32 {

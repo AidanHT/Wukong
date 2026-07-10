@@ -4,7 +4,7 @@ module tests.fail.param_rebind_no_mut
 // A parameter is immutable by default, like a `let` without `mut`: it may be read but not
 // reassigned. Rebinding one (`x = …`) is rejected; declaring `fn f(mut x: i32)` allows it (and, for
 // a scalar, mutates a private copy that does not leak to the caller). This mirrors the `let`
-// reassignment rule in tests/fail/assign_immutable.mer.
+// reassignment rule in tests/fail/assign_immutable.wk.
 fn f(x: i32) -> i32 {
     x = 5; // reassigning an immutable parameter
     return x;

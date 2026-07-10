@@ -1,6 +1,6 @@
 // RUN: --run
 // EXPECT-EXIT: 0
-// EXPECT-OUT: hello, mercury
+// EXPECT-OUT: hello, wukong
 // EXPECT-OUT: yes
 // EXPECT-OUT: no
 // EXPECT-OUT: greet: hi there
@@ -16,7 +16,7 @@ module tests.run.string_return
 
 // Returns a string created inside the callee — the classic dangling case.
 fn greeting() -> *u8 {
-    return "hello, mercury";
+    return "hello, wukong";
 }
 
 // A string returned from different control-flow arms (each arm's literal is its own `.rodata` blob).

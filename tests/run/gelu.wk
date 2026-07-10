@@ -9,7 +9,7 @@ module tests.run.gelu
 
 // GELU (tanh approximation) over a fixed vector, in the supported subset. tanh is built from
 // exp: tanh(z) = 1 - 2/(exp(2z)+1), so the whole body is one vectorizable elementwise loop
-// (cube polynomial + exp + divide). The mercury_bench gate proves it matches the interpreter
+// (cube polynomial + exp + divide). The wukong_bench gate proves it matches the interpreter
 // bit-for-bit.
 fn main() -> i32 {
     let mut x: [f32; 16] = [0.0; 16];

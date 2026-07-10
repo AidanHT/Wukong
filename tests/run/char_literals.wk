@@ -15,7 +15,7 @@
 module tests.run.char_literals
 
 // A char literal lowers to its Unicode scalar value (sema types it `char`, a 32-bit code point that
-// is interconvertible with the integer types via `as`; see char_type.mer). Covers ASCII, the
+// is interconvertible with the integer types via `as`; see char_type.wk). Covers ASCII, the
 // one-character escapes, `\x` hex and `\u{…}` Unicode escapes, ordering, and arithmetic. Each value
 // is a compile-time constant, so the interpreter and native backend agree.
 fn main() -> i32 {

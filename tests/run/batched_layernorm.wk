@@ -8,7 +8,7 @@ module tests.run.batched_layernorm
 // Batched LayerNorm over a flat [R, C] matrix: each row r is normalized by its own mean/variance,
 // x[r*C+i] = (x[r*C+i] - mean_r) / sqrt(var_r + eps). The `for r { ...row r... }` outer loop dispatches
 // to the fused single-pass norm kernel with rows = R (each row independent) — the real transformer
-// shape (LayerNorm over [batch*seq, hidden]). The mercury_bench gate proves interp == native.
+// shape (LayerNorm over [batch*seq, hidden]). The wukong_bench gate proves interp == native.
 
 fn layernorm_batch(mut x: [f32; 12]) { // R = 3 rows, C = 4 cols
     for r in 0..3 {

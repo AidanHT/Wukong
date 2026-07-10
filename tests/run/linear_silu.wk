@@ -7,7 +7,7 @@
 module tests.run.linear_silu
 
 // A LLaMA/Mistral SwiGLU FFN projection: out = silu(x · Wᵀ) — a bias-free nn.Linear followed by a
-// SiLU activation. The matmul nest and the SiLU loop fuse into one mercury_sgemm_nt_epi call with
+// SiLU activation. The matmul nest and the SiLU loop fuse into one wukong_sgemm_nt_epi call with
 // act = SiLU and a *null* bias (the bias-free epilogue), so C is written once with the activation
 // already applied.
 //

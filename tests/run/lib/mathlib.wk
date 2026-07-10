@@ -1,5 +1,5 @@
-// Library imported by tests/run/import_multi.mer — NOT a standalone program (no `fn main`).
-// The run/emit/exe harnesses scan tests/run/*.mer non-recursively, so files in this subdirectory
+// Library imported by tests/run/import_multi.wk — NOT a standalone program (no `fn main`).
+// The run/emit/exe harnesses scan tests/run/*.wk non-recursively, so files in this subdirectory
 // are only ever compiled through the root that imports them.
 module lib.mathlib
 

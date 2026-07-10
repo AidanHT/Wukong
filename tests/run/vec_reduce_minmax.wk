@@ -7,7 +7,7 @@ module tests.run.vec_reduce_minmax
 
 // Max/min reductions vectorize (128-bit x 4 unroll) just like sum reductions: lane accumulators
 // seeded with -inf/+inf, folded with a compare+select, then reduced horizontally. The all-negative
-// array proves the -inf seed never lets an empty tail lane win. The mercury_bench gate proves the
+// array proves the -inf seed never lets an empty tail lane win. The wukong_bench gate proves the
 // vectorized fold matches the interpreter bit-for-bit.
 fn main() -> i32 {
     // 70 elements exercises the 4x-unrolled main loop (64), the single-vector strip (4), and the

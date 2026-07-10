@@ -1,5 +1,5 @@
-// Imported by tests/fail/import_duplicate.mer: defines the same `clash` as the root file.
-// (The fail harness scans tests/fail/*.mer non-recursively, so this library is never compiled
+// Imported by tests/fail/import_duplicate.wk: defines the same `clash` as the root file.
+// (The fail harness scans tests/fail/*.wk non-recursively, so this library is never compiled
 // standalone.)
 module lib.dup
 

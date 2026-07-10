@@ -5,7 +5,7 @@
 module tests.run.gemv_parallel
 
 /// A `@parallel` whole-function GEMV `y[4] = A[4,4]·x[4]`. Intercepted before the elementwise outliner
-/// and dispatched to `mercury_sgemv_parallel` — the independent rows map across cores. The parallel
+/// and dispatched to `wukong_sgemv_parallel` — the independent rows map across cores. The parallel
 /// kernel is bit-identical to the serial one the interpreter marshals (each row computed by the same
 /// per-row routine, no cross-row combine), so -O0..-O3 and interp/native all agree.
 @parallel

@@ -1,7 +1,7 @@
 // RUN: --run
 // The textbook divide-normalize softmax — `for i { x[i] = x[i] / s; }` with NO reciprocal binding —
-// must dispatch to the same mercury_norm_f32(NORM_SOFTMAX) kernel as the `let inv = 1/s; x[i]*inv`
-// spelling. The kernel computes the reciprocal once and multiplies (mercury_runtime/norm.rs), a
+// must dispatch to the same wukong_norm_f32(NORM_SOFTMAX) kernel as the `let inv = 1/s; x[i]*inv`
+// spelling. The kernel computes the reciprocal once and multiplies (wukong_runtime/norm.rs), a
 // <=1-ULP-per-element deviation from the scalar divide — strictly smaller than the documented
 // kernel-reassociation exception the sum pass already relies on; both backends call the identical
 // kernel, so the differential gate and -O0 == -O2 hold exactly. Covers the split window (divide

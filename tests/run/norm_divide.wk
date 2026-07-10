@@ -1,10 +1,10 @@
 // RUN: --run
 // The textbook divide-normalize spellings of the three scale-normalizations — RMSNorm `x[i]/rms`
 // (rms = sqrt(ms+eps)), LayerNorm `(x[i]-mean)/std` (std = sqrt(var+eps)), and L2-normalize
-// `x[i]/nrm` (nrm = sqrt(sum-sq)) — must dispatch to the same mercury_norm kernels as the
+// `x[i]/nrm` (nrm = sqrt(sum-sq)) — must dispatch to the same wukong_norm kernels as the
 // reciprocal-multiply spellings (`let inv = 1/sqrt(...); x[i]*inv`). The textbook math IS a divide;
 // requiring the reciprocal was a spelling tax. The kernel computes the reciprocal once and
-// multiplies (mercury_runtime/norm.rs), a <=1-ULP-per-element deviation strictly smaller than the
+// multiplies (wukong_runtime/norm.rs), a <=1-ULP-per-element deviation strictly smaller than the
 // documented kernel-reassociation exception the sums already rely on; both backends call the
 // identical kernel. A MIXED window (`let inv = 1/sqrt(...)` then `x[i]/inv` — multiply-by-std, not
 // a norm) is verified NOT to match.

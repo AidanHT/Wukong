@@ -7,7 +7,7 @@
 module tests.run.mish
 
 // Mish (self-gated smooth activation, YOLOv4 / modern vision): out[i] = x · tanh(softplus(x)). An
-// `out[i] = mish(x[i])` loop dispatches to the 256-bit AVX2 mercury_vmath_f32 kernel (op = MISH),
+// `out[i] = mish(x[i])` loop dispatches to the 256-bit AVX2 wukong_vmath_f32 kernel (op = MISH),
 // composed from the shared softplus + tanh, so bit-identical across backends.
 //   mish(-3)=-3·tanh(0.0486)≈-0.1457 → -145; mish(-1)=-tanh(0.3133)≈-0.3035 → -303;
 //   mish(1)=tanh(1.3133)≈0.8654 → 865; mish(4)=4·tanh(4.0181)≈3.9973 → 3997.

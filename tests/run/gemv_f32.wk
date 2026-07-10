@@ -6,7 +6,7 @@ module tests.run.gemv_f32
 
 /// GEMV `y[3] = A[3,4]·x[4]` (matrix-times-vector — the decode-time attention/projection shape, batch
 /// 1), written the idiomatic per-row dot way. The compiler recognizes the 2-deep nest and dispatches to
-/// the `mercury_sgemv` microkernel; under `--run` the interpreter marshals its memory and calls that
+/// the `wukong_sgemv` microkernel; under `--run` the interpreter marshals its memory and calls that
 /// same kernel, so this exercises the GEMV-dispatch path end-to-end and gates interp == native.
 fn main() -> i32 {
     let mut a: [f32; 12] = [0.0; 12];

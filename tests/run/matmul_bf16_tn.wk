@@ -10,7 +10,7 @@ module tests.run.matmul_bf16_tn
 // in bf16 (the standard mixed-precision training layout: activations/gradients in bf16, accumulate in
 // f32). A is stored [K, M] (the contraction K is the OUTER index of A's storage), B is [K, N], C is
 // [M, N]. The recognizer detects `(a[p*M + i] as f32) * (b[p*N + j] as f32)` — transposed A, normal B —
-// and dispatches to mercury_sgemm_bf16_tn: a lossless bf16 widen prepass feeding the f32 mercury_sgemm_tn
+// and dispatches to wukong_sgemm_bf16_tn: a lossless bf16 widen prepass feeding the f32 wukong_sgemm_tn
 // (transpose A once + the tuned NN kernel). gcc/rustc lose twice on the naive nest — the inline widen
 // won't vectorize AND A's column-strided reads defeat it. Small integers are bf16-exact, so the result
 // is exact and the differential gate is bit-for-bit (interp == native, -O0 == -O3). M=2, K=3, N=3.

@@ -2,7 +2,7 @@
 module tests.fail.array_tensor_size_mismatch
 
 // An array argument decays to a tensor parameter (the lenient array↔tensor unify that
-// `tests/run/tensor_add.mer` relies on), but the buffer must actually be big enough: a
+// `tests/run/tensor_add.wk` relies on), but the buffer must actually be big enough: a
 // `Tensor[f32, 4, 4]` needs 16 elements, so a `[f32; 4]` cannot satisfy it. Without this check a
 // too-small array silently satisfies any tensor and every in-tensor-bounds index becomes an
 // out-of-bounds read that the interpreter traps on but native codegen does not — a backend

@@ -7,7 +7,7 @@
 // EXPECT-OUT: 86
 // Ragged head count: 3 heads never divide evenly across a power-of-two core pool, so the runtime's
 // contiguous chunking is exercised with uneven chunks (and one head per chunk on wide machines).
-// Same natural spelling and same serial-twin bit-exactness gate as parallel_head_loop.mer.
+// Same natural spelling and same serial-twin bit-exactness gate as parallel_head_loop.wk.
 module tests.run.parallel_head_ragged
 
 @parallel

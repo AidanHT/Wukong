@@ -6,7 +6,7 @@ module tests.run.scaled_gemm_parallel
 
 /// A `@parallel` whole-function α-scaled attention score matmul `scores = (Q·Kᵀ)·scale`. Intercepted as
 /// a whole-function matmul and lowered with `parallel = true`, so the α store dispatches to
-/// `mercury_sgemm_nt_alpha_parallel` — the scale folded into each C tile's writeback AND the tiles spread
+/// `wukong_sgemm_nt_alpha_parallel` — the scale folded into each C tile's writeback AND the tiles spread
 /// across cores. The parallel α kernel is bit-identical to the serial one the interpreter marshals (each
 /// C tile owned by one task, same per-(i,j) accumulation order), so -O0..-O3 and interp/native agree.
 ///

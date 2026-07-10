@@ -10,7 +10,7 @@ module tests.run.colmax
 // into a per-column [N=4] result (per-channel max for quantization, axis-0 max-pool). Like colsum the
 // data index x[i*N+j] strides by N over the inner loop, so gcc/rustc leave it scalar (verified: no
 // packed vmaxps at -O3 — fmax is non-associative, so they will not reassociate it); the recognizer
-// dispatches to the SIMD mercury_colmax_f32, which streams x row-major + 8 columns at a time, seeded by
+// dispatches to the SIMD wukong_colmax_f32, which streams x row-major + 8 columns at a time, seeded by
 // the first row. The fold is i-ascending per column (the kernel is its own oracle), so the differential
 // gate (interp == native, -O0 == -O3) holds by construction.
 fn main() -> i32 {

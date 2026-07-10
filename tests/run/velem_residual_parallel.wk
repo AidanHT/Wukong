@@ -8,11 +8,11 @@ module tests.run.velem_residual_parallel
 
 // A *mixed* `@parallel` function (a reduction plus an isolated residual-add loop, so it is not a
 // single outlinable loop) dispatches its residual add `out[i] = x[i] + attn[i]` — the transformer
-// layer's hot loop — to the multicore `mercury_velem_f32_parallel` streaming kernel instead of the
-// serial `mercury_velem_f32`. The map is pure elementwise (no cross-chunk combine), so serial ==
+// layer's hot loop — to the multicore `wukong_velem_f32_parallel` streaming kernel instead of the
+// serial `wukong_velem_f32`. The map is pure elementwise (no cross-chunk combine), so serial ==
 // parallel bit-for-bit and the native `@parallel` path agrees with the interpreter oracle at every
 // optimization level (checked by the run suite's differential + -O0==-O{1,2,3} gates). The
-// sum-of-squares reduction (dispatched to `mercury_sreduce_f32_parallel`) is only there to make the
+// sum-of-squares reduction (dispatched to `wukong_sreduce_f32_parallel`) is only there to make the
 // body mixed so `parallel_fn` is set and the residual add takes the parallel arm.
 //   x[i] = i % 8 (0..7 repeating), attn[i] = 10  ⇒  out[i] = (i % 8) + 10, in 10..17.
 //     out[0]    = 0 + 10 = 10

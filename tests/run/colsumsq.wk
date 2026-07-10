@@ -8,7 +8,7 @@ module tests.run.colsumsq
 
 // Column sum-of-squares out[j] = Σ_i x[i,j]² — the per-channel 2nd moment / energy over the outer
 // axis of a [M=2, N=4] matrix. The strided fold `s += x[i*N+j]*x[i*N+j]` (a square) gcc/rustc leave
-// scalar; the recognizer folds it to the SIMD mercury_colsumsq_f32 (the colsum machinery with a square
+// scalar; the recognizer folds it to the SIMD wukong_colsumsq_f32 (the colsum machinery with a square
 // fold, no finalize). The square is `mul` then `add`, matching the kernel's scalar twin and AVX2 path
 // bit-for-bit, so the differential gate (interp == native, -O0 == -O3) holds.
 fn main() -> i32 {

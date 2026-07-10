@@ -7,7 +7,7 @@ module tests.run.rmsnorm
 
 // RMSNorm — the normalization in Llama/Mistral/modern LLMs: y = x · rsqrt(mean(x²)+eps). It composes
 // a sum-of-squares reduction (its addend FMA-contracts), a hardware rsqrt, and a scale. The compiler
-// folds the canonical in-place form into one `mercury_norm_f32(.., NORM_RMSNORM)` call (each element
+// folds the canonical in-place form into one `wukong_norm_f32(.., NORM_RMSNORM)` call (each element
 // loaded once + 256-bit AVX2/FMA). The differential gate proves the fused kernel matches the
 // interpreter bit-for-bit; the opt-invariance gate proves -O0 == -O3. (Over this 16-wide group the
 // reductions are exact integers, so the fused and generic lowerings agree to the bit here regardless.)

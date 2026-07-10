@@ -7,7 +7,7 @@
 module tests.run.vmath_bf16
 
 // The **bf16-input** activation dispatch: `out[i] = f((x[i] as f32))` over a `[bf16]` array (f32
-// output) lowers to `mercury_vmath_bf16` — the same 256-bit AVX2 transcendental kernel as the f32
+// output) lowers to `wukong_vmath_bf16` — the same 256-bit AVX2 transcendental kernel as the f32
 // path, but reading half the input bytes (a lossless bf16→f32 widen) and writing f32. The kernel is
 // the f32 kernel run on the widened inputs bit-for-bit, and the interpreter marshals through it
 // (reconstructing the bf16 bits), so interp and native agree on the differential gate.

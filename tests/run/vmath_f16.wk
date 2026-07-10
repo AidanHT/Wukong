@@ -7,7 +7,7 @@
 module tests.run.vmath_f16
 
 // The f16-input activation dispatch: `out[i] = f((x[i] as f32))` over a `[f16]` array (f32 output)
-// lowers to `mercury_vmath_f16` — the same 256-bit transcendental kernel as the f32/bf16 paths, but
+// lowers to `wukong_vmath_f16` — the same 256-bit transcendental kernel as the f32/bf16 paths, but
 // the 8-lane load is F16C `vcvtph2ps` (lossless). interp marshals through the identical kernel.
 //
 // Inputs are multiples of 0.125 in [-4, 4) — all f16-exact — so widen(f16(x)) is exactly x and the

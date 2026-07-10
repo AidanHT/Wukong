@@ -8,7 +8,7 @@ module tests.run.exp10_log10
 
 // `exp10(x) = 10ˣ` and `log10(x) = log₁₀(x)` — base-10 exp/log. Both compose the shared exp/log
 // polynomials (`exp10 = exp(x·ln10)`, `log10 = log(x)·log₁₀e`), so both vectorize to the same
-// 256-bit `mercury_vmath_f32` kernel and both backends agree bit-for-bit. Base-10 shows up in
+// 256-bit `wukong_vmath_f32` kernel and both backends agree bit-for-bit. Base-10 shows up in
 // dB / log-scale features and decibel/SPL audio front-ends. C's scalar `exp10f`/`log10f` can't
 // vectorize a loop with a call, so the dispatched form is a structural win.
 fn main() -> i32 {

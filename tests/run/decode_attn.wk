@@ -9,9 +9,9 @@ module tests.run.decode_attn
 /// Single-token KV-decode attention — the CPU LLM serving hot path (q[D], K[S,D], V[S,D] with
 /// S = 128, D = 64): scores = softmax((K·q)·(1/√D)); out = scoresᵀ·V. All three stages dispatch to
 /// recognized kernels:
-///   (1) the scaled score GEMV  -> mercury_sgemv_alpha   (the α peeled off `acc * 0.125`),
-///   (2) the in-place softmax   -> mercury_norm_f32      (the fused single-pass window),
-///   (3) the weighted row-sum   -> mercury_sgevm_f32     (the vector·matrix read-out).
+///   (1) the scaled score GEMV  -> wukong_sgemv_alpha   (the α peeled off `acc * 0.125`),
+///   (2) the in-place softmax   -> wukong_norm_f32      (the fused single-pass window),
+///   (3) the weighted row-sum   -> wukong_sgevm_f32     (the vector·matrix read-out).
 /// `--run` marshals the identical kernels through the interpreter, so this fixture gates
 /// interp == native and -O0 == -O3 across the whole fused decode step. The printed values are
 /// pinned from the oracle (both backends call the same kernels bit-for-bit).

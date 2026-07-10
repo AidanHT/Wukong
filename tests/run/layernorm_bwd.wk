@@ -13,7 +13,7 @@ module tests.run.layernorm_bwd
 // Batched LayerNorm backward (input gradient) dx = rstd·(g − mean(g) − xhat·mean(g·xhat)), g = dy·γ,
 // xhat = (x−mean)·rstd — the gradient through every LayerNorm (GPT-2/BERT/ViT). The recognizer folds
 // the [R=2,C=4] nest (four per-row reductions: Σx, Σ(x−mean)², Σg, Σg·xhat — which gcc/rustc keep
-// scalar) to one mercury_layernorm_bwd_f32 call. The reductions reassociate (the documented exception —
+// scalar) to one wukong_layernorm_bwd_f32 call. The reductions reassociate (the documented exception —
 // both backends run the same kernel), so the differential gate (interp == native, -O0 == -O3) holds.
 fn main() -> i32 {
     let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 1.0, 3.0, 2.0, 4.0];

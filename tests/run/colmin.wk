@@ -9,7 +9,7 @@ module tests.run.colmin
 // Column min out[j] = min_i x[i,j] — the min over the outer (batch/row) axis of a [M=3, N=4] matrix
 // into a per-column [N=4] result (per-channel min for quantization range, axis-0 min-pool). The min
 // sibling of colmax: the strided data index gcc/rustc leave scalar (verified: no packed vminps at -O3),
-// dispatched to the SIMD mercury_colmin_f32 (first-row seed, i-ascending fmin fold = _mm256_min_ps).
+// dispatched to the SIMD wukong_colmin_f32 (first-row seed, i-ascending fmin fold = _mm256_min_ps).
 // Its own oracle, so interp == native and -O0 == -O3 by construction.
 fn main() -> i32 {
     let x: [f32; 12] = [9.0, 2.0, 7.0, 4.0, 1.0, 6.0, 3.0, 8.0, 5.0, 10.0, 11.0, 0.0];

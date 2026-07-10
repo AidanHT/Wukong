@@ -11,7 +11,7 @@ module tests.run.maxpool
 // 2D max-pooling over a [C=2, H=4, W=4] row-major input, 2x2 window, stride 2x2, no padding →
 // [C=2, OH=2, OW=2]. The recognizer detects the idiomatic 5-deep nest (channel × out-y × out-x ×
 // window-dy × window-dx, seeding the accumulator with the window's first cell, folding the rest by fmax)
-// and dispatches it to the AVX2 `mercury_maxpool2d_f32`. Max is idempotent/associative, so the
+// and dispatches it to the AVX2 `wukong_maxpool2d_f32`. Max is idempotent/associative, so the
 // kernel is bit-identical to this nest — the differential gate (interp == native, -O0 == -O3) is
 // trivial (no float reassociation).
 //

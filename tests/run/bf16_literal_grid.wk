@@ -9,8 +9,8 @@ module tests.run.bf16_literal_grid
 // The rounding must not live only in a store the optimizer can forward past: before, mem2reg/CSE
 // promoted a bf16 slot and deleted the rounding store, so `let b: bf16 = 0.1` lowered the raw f32 0.1
 // at -O2 (≈10000 below) instead of the bf16-grid 0.10009765625 (10009) — a -O0 ≠ -O2 violation. Printed
-// as scaled integers so the grid value is distinguishable from the raw f32 (the existing bf16.mer /
-// f16.mer use explicit `as bf16` casts and ×1000 truncation that happen to mask this). Covers the
+// as scaled integers so the grid value is distinguishable from the raw f32 (the existing bf16.wk /
+// f16.wk use explicit `as bf16` casts and ×1000 truncation that happen to mask this). Covers the
 // implicit-literal form, an f16 literal, a folded bf16 const sum, and an f16 constant.
 
 fn main() -> i32 {

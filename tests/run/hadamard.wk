@@ -6,7 +6,7 @@
 // EXPECT-OUT: 0
 module tests.run.hadamard
 
-// Elementwise binary maps dispatch to the 256-bit `mercury_velem_f32` kernel (VE_HADAMARD / VE_DIV),
+// Elementwise binary maps dispatch to the 256-bit `wukong_velem_f32` kernel (VE_HADAMARD / VE_DIV),
 // the width Cranelift's generic vectorizer can't reach — the same domain-aware lowering as the affine
 // saxpy form. Hadamard `x*y` is the gating / attention-mask / residual-scaling primitive; the quotient
 // `x/y` is normalize-by-per-element-scale; an activation may wrap the product (`relu(x*y)`). Both

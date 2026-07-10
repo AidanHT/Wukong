@@ -8,7 +8,7 @@ module tests.run.generic_shape_parallel
 
 // A `@parallel` symbolic-shape function composes with the hidden runtime-dim ABI. The whole-function
 // matmul interceptor runs *before* the loop outliner, binds the hidden dims (`bind_dim_params` in
-// `lower_matmul_fn`), and dispatches to the multicore `mercury_sgemm_parallel` — so a symbolic matmul
+// `lower_matmul_fn`), and dispatches to the multicore `wukong_sgemm_parallel` — so a symbolic matmul
 // parallelizes across cores at any runtime size, bit-identical to serial (the parallel kernel uses
 // deterministic fixed chunking). A `@parallel` symbolic elementwise nest runs correctly through the
 // ordinary path (tensor params don't match the array-only outliner, exactly like a constant-shape

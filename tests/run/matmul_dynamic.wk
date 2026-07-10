@@ -9,7 +9,7 @@ module tests.run.matmul_dynamic
 // A matmul with RUNTIME dimensions (m, n, k are i64 params, not literals). The recognizer now
 // dispatches this to the tuned GEMM kernel — strides are checked symbolically (a's row stride is
 // the same variable k as the contraction bound, etc.), so the win applies to general code, not
-// just fixed-size kernels. The mercury_bench gate proves native and interp agree (both marshal the
+// just fixed-size kernels. The wukong_bench gate proves native and interp agree (both marshal the
 // identical kernel with the runtime dims).
 fn mm(a: [f32; 6], b: [f32; 6], mut c: [f32; 4], m: i64, n: i64, k: i64) {
     for i in 0..m {

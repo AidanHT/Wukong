@@ -49,7 +49,7 @@ fn main() -> i32 {
     print((ys[5] * 10000.0) as i32); // sin(0.5) = 0.4794 -> 4794
 
     // A pure `out[i] = cos(x[i])` / `erf(x[i])` loop now dispatches to the 256-bit AVX2
-    // `mercury_vmath_f32` kernel (the same play as `exp`); both backends marshal the identical kernel
+    // `wukong_vmath_f32` kernel (the same play as `exp`); both backends marshal the identical kernel
     // so the differential oracle stays exact. cos(0.5) = 0.8776 -> 8775; erf(0.3) = 0.3286 -> 3286.
     let mut cz: [f32; 16] = [0.0; 16];
     for i in 0..16 {

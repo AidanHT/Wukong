@@ -8,7 +8,7 @@ module tests.run.linear_f16
 
 // IEEE f16 mixed-precision nn.Linear: C = A·Bᵀ with f16 activations and f16 weights widened to f32 and
 // accumulated in an f32 s. The f16 twin of linear_bf16 — same recognizer, dispatched to
-// mercury_sgemm_f16_nt (the widen is F16C-exact). Small integers are f16-exact, so the result is exact
+// wukong_sgemm_f16_nt (the widen is F16C-exact). Small integers are f16-exact, so the result is exact
 // and the differential gate is bit-for-bit. A is [3,4], B is [3,4], C is [3,3].
 fn main() -> i32 {
     let mut a: [f16; 12] = [0.0 as f16; 12];

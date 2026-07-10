@@ -7,7 +7,7 @@ module tests.run.bf16_loop_carried
 // every opt level. The rounding must live at the VALUE (an FpTrunc on the op result), not only in
 // the store: mem2reg promotes the scalar's slot and forwards the raw f32 past the deleted store,
 // which made -O2 accumulate in full f32 (90234/19443) while -O0 stepped on the bf16/f16 grid
-// (90625/19433). The literal/const twin lives in bf16_literal_grid.mer; this covers the runtime,
+// (90625/19433). The literal/const twin lives in bf16_literal_grid.wk; this covers the runtime,
 // non-const-foldable loop-carried form for both an add chain (bf16) and a mul chain (f16).
 
 fn main() -> i32 {

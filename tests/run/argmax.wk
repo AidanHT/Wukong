@@ -5,7 +5,7 @@
 // EXPECT-OUT: 3
 module tests.run.argmax
 
-// argmax / argmin reductions -> mercury_argreduce_f32 (a branchless reconcile of the deterministic
+// argmax / argmin reductions -> wukong_argreduce_f32 (a branchless reconcile of the deterministic
 // kernel result against the running best). Lowest index wins on ties (serial == parallel == interp).
 // The greedy-decode hot path: next_token = argmax(logits). gcc/rustc run a branchy scalar loop.
 fn main() -> i32 {

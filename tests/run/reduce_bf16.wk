@@ -5,9 +5,9 @@
 module tests.run.reduce_bf16
 
 // bf16 mixed-precision reductions: `s += (x[k] as f32) [* (y[k] as f32)]` over `[bf16; _]` arrays
-// with an f32 accumulator dispatches to mercury_dot_bf16 / mercury_sum_bf16 (bf16 storage, f32
+// with an f32 accumulator dispatches to wukong_dot_bf16 / wukong_sum_bf16 (bf16 storage, f32
 // accumulate — the standard ML contract). The values here are bf16-exact small integers, so the
-// fused kernel and a naive sum agree exactly; the mercury_bench gate proves the interpreter and the
+// fused kernel and a naive sum agree exactly; the wukong_bench gate proves the interpreter and the
 // native backend agree bit-for-bit (both call the identical kernel).
 fn main() -> i32 {
     let mut x: [bf16; 8] = [0.0 as bf16; 8];

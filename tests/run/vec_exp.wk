@@ -7,7 +7,7 @@
 module tests.run.vec_exp
 
 // exp over a unit-stride loop vectorizes (the f32 polynomial, expanded per lane). The
-// mercury_bench gate proves the vectorized exp matches the interpreter bit-for-bit.
+// wukong_bench gate proves the vectorized exp matches the interpreter bit-for-bit.
 fn main() -> i32 {
     let mut a: [f32; 64] = [0.0; 64];
     let mut out: [f32; 64] = [0.0; 64];

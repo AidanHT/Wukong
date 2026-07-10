@@ -7,7 +7,7 @@
 module tests.run.parallel_lowp
 
 // `@parallel` mixed-precision streaming: the half-precision activation and axpby kernels dispatch
-// per-thread chunk too (each chunk is one `mercury_vmath_{bf16,f16}` / `mercury_axpby_{bf16,f16}`
+// per-thread chunk too (each chunk is one `wukong_vmath_{bf16,f16}` / `wukong_axpby_{bf16,f16}`
 // call over `[s, e)`), so a mixed-precision activation/residual-add runs multicore — the bandwidth
 // payoff is largest here (≫ L3). Elementwise + a fixed chunking, so each per-chunk pass agrees with
 // the interpreter's whole-range marshal of the identical kernel: interp == native, -O0 == -O3.

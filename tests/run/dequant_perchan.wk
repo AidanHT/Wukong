@@ -10,7 +10,7 @@ module tests.run.dequant_perchan
 
 // Per-channel dequant: out[i*C+j] = act((q[i*C+j] as f32) * scale[j]) over a [R, C] matrix with a
 // per-output-column scale (the shape a quantized nn.Linear writeback takes — one scale per output
-// channel). The compiler recognizes the 2D nest and lowers it to one mercury_dequant_perchan_f32 call
+// channel). The compiler recognizes the 2D nest and lowers it to one wukong_dequant_perchan_f32 call
 // (256-bit widen + per-column scale broadcast; the strided per-channel scale keeps gcc/rustc scalar).
 // Integer→f32 is exact, so it equals the scalar nest bit-for-bit; -O0 == -O3 and interp == native.
 // Powers-of-two scales + multiples of 8 in q keep the printed values exact. R = 4, C = 8.

@@ -11,7 +11,7 @@
 module tests.run.transcendental
 
 // Scalar transcendental intrinsics. exp is a polynomial (≈1 ULP), so values are scaled and
-// truncated to integers that are robust to the approximation. The mercury_bench gate separately
+// truncated to integers that are robust to the approximation. The wukong_bench gate separately
 // proves the interpreter and native backend agree bit-for-bit.
 fn main() -> i32 {
     print(sqrt(16.0) as i32); // 4.0           -> 4

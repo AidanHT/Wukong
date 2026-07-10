@@ -9,8 +9,8 @@
 module tests.run.parallel_reduce_lowp
 
 // `@parallel` bf16/f16 reductions dispatch to the multicore deterministic low-precision reduction
-// kernels (mercury_{sum,dot,reduce}_{bf16,f16}_parallel) instead of the serial symbols — the bf16/f16
-// twins of the f32 `mercury_sreduce_f32_parallel` path. Each cuts the array on a fixed RCHUNK boundary
+// kernels (wukong_{sum,dot,reduce}_{bf16,f16}_parallel) instead of the serial symbols — the bf16/f16
+// twins of the f32 `wukong_sreduce_f32_parallel` path. Each cuts the array on a fixed RCHUNK boundary
 // and folds the per-chunk partials in ascending order, so the result is deterministic (independent of
 // thread count); the interpreter marshals the identical parallel kernel, so interp == native bit-for-bit
 // and -O0 == -O3. The small arrays fold in a single chunk (so the value also equals the serial

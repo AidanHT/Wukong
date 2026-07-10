@@ -8,7 +8,7 @@ module tests.run.coll2
 
 // Column L2 norm out[j] = sqrt(Σ_i x[i,j]²) — the per-channel vector norm (weight-column norms,
 // per-feature energy) over the outer axis of a [M=2, N=4] matrix. The strided square fold gcc/rustc
-// leave scalar; the recognizer folds the nest to the SIMD mercury_coll2_f32 (the colsum machinery with
+// leave scalar; the recognizer folds the nest to the SIMD wukong_coll2_f32 (the colsum machinery with
 // a square fold + a `sqrt` per-column finalize). Both backends marshal the identical kernel, so the
 // differential gate (interp == native, -O0 == -O3) holds. Columns are Pythagorean so the norms are whole.
 fn main() -> i32 {

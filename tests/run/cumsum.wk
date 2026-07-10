@@ -11,7 +11,7 @@
 module tests.run.cumsum
 
 // Batched per-row inclusive prefix sum (cumsum / scan): out[r,i] = Σ_{k<=i} x[r,k]. The recognizer
-// folds the [R=2,C=4] nest to one mercury_cumsum_f32 call — gcc/rustc keep the loop-carried
+// folds the [R=2,C=4] nest to one wukong_cumsum_f32 call — gcc/rustc keep the loop-carried
 // out[i]=out[i-1]+x[i] recurrence scalar (a prefix sum does not auto-vectorize), while the SIMD
 // Hillis-Steele scan + per-row carry vectorizes it. The in-lane tree reassociates the float sum (the
 // documented reduction exception — both backends run the identical kernel, so interp == native holds);

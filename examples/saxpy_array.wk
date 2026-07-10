@@ -1,7 +1,7 @@
 module examples.saxpy_array
 
 /// SAXPY over fixed-size arrays: out = a*x + y, computed elementwise.
-/// Run: mercuryc --run examples/saxpy_array.mer   (prints out[0..4])
+/// Run: wukongc --run examples/saxpy_array.wk   (prints out[0..4])
 fn main() -> i32 {
     let a: f32 = 2.0;
     let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];

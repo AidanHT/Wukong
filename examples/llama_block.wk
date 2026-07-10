@@ -1,7 +1,7 @@
 module examples.llama_block
 
 // =====================================================================================
-// Llama-style transformer block in Mercury's surface — RMSNorm + RoPE + SwiGLU FFN.
+// Llama-style transformer block in Wukong's surface — RMSNorm + RoPE + SwiGLU FFN.
 // =====================================================================================
 //
 // The modern decoder block (Llama / Mistral / Qwen). One block, pre-norm:
@@ -9,8 +9,8 @@ module examples.llama_block
 //     a   = x + Wo · Attn( RoPE( RMSNorm1(x) ) )                 // attention + residual
 //     out = a + Wd · ( SiLU(Wg · RMSNorm2(a)) ⊙ (Wu · RMSNorm2(a)) )   // SwiGLU FFN + residual
 //
-// Differences from GPT-2 (`examples/gpt2.mer`), all spelled in recognized op-forms:
-//   * RMSNorm (no mean-subtraction, gain only) instead of LayerNorm  -> mercury_norm_affine_f32
+// Differences from GPT-2 (`examples/gpt2.wk`), all spelled in recognized op-forms:
+//   * RMSNorm (no mean-subtraction, gain only) instead of LayerNorm  -> wukong_norm_affine_f32
 //   * Rotary Position Embedding (RoPE) on Q and K                     -> sin/cos vmath
 //   * SwiGLU gated FFN  down(silu(gate) ⊙ up)  instead of a single GELU MLP
 //                                                                     -> 3 GEMMs + a gated elementwise
@@ -144,7 +144,7 @@ fn llama_block(
     } }
     // SiLU(gate) in place, then the gated product  h = silu(gate) ⊙ up.
     // The activation uses the `silu` intrinsic so the `for i { g[i] = silu(g[i]) }` form is
-    // recognized and dispatched to the tuned 256-bit vmath kernel (mercury_vmath_f32); the gate
+    // recognized and dispatched to the tuned 256-bit vmath kernel (wukong_vmath_f32); the gate
     // is a plain elementwise product.  silu(z) = z·sigmoid(z).
     for i in 0..2048 { gate[i] = silu(gate[i]); }
     for i in 0..2048 { h[i] = gate[i] * up[i]; }
