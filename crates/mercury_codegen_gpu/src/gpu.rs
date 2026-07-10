@@ -106,6 +106,15 @@ impl Gpu {
             .unwrap_or(20)
     }
 
+    /// **L2 cache size, bytes** (`0` if unqueryable) — the honest denominator for the GEMM-cliff raster
+    /// tuning. At 4096³ the GEMM is HBM-bound, so the threadblock-rasterization band is sized to keep the
+    /// co-scheduled CTAs' A/B footprint inside L2; the optimal band width keys off the *measured* L2, not
+    /// a hard-coded guess (the cliff comments have carried both 24 MB and 12 MB — this settles it).
+    pub fn l2_cache_size(&self) -> i32 {
+        self.device_attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
+            .unwrap_or(0)
+    }
+
     /// **Theoretical peak HBM bandwidth, GB/s** — the honest M9 denominator. Uses the exact formula
     /// NVIDIA's own `deviceQuery` prints: `2 × memClock × (busWidth/8)` (the ×2 is DDR; for GDDR6 the
     /// reported "memory clock" already folds in the per-pin multiplier, so this matches the spec
@@ -528,8 +537,12 @@ pub fn gemm_nt_f16(
     //     `pipe_64_s6` ≤1024³ (~90% of cuBLAS), `pipe_128_s4` ~2048³ (~94%).
     //   • Larger (≥ ~2048³, A+B ≳ L2): the `mma.sync.m16n8k16` kernel with conflict-free padded SMEM and
     //     threadblock rasterization wins both the L2-resident (2048³ ~92%, padding-bound) and the
-    //     HBM-bound (4096³ ~74%, raster-bound) sub-regimes — `mma_nt_f16_128_bk32_s2_r8`.
+    //     HBM-bound (4096³ ~74%, raster-bound) sub-regimes — `mma_nt_f16_128_bk32_s2_r16`.
     // Anything not matching a pipeline variant's divisibility falls through to the older SMEM kernels.
+    // PENDING (perf/gpu-gemm-4096): the 4096³ arm is being re-tuned — the `CLIFF_VARIANTS` sweep
+    // (`gemm_cliff_ab`) is measuring a 3-stage pipeline, an L2-keyed raster band, forced launch-bounds,
+    // and a vectorized `st.global.v2.f32` epilogue against the f32-out cuBLAS peer; the winner will
+    // replace the swz w24 selected below for the ≥ ~4096³ (A+B ≥ 16 MB) regime.
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
     if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
@@ -11587,6 +11600,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn gemm_cliff_ab() {
         use crate::baselines::{
             cublas_gemm_nt_f16, gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+            time_cublas_gemm_nt_f16_f32out,
         };
         use crate::ptx_wmma::{gemm_cliff_ptx, CLIFF_VARIANTS};
         use half::f16;
@@ -11596,6 +11610,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 return;
             }
             eprintln!("device: {}", g.device_name());
+            eprintln!(
+                "L2 cache: {:.2} MiB ({} SMs) — the raster-band tuning denominator",
+                g.l2_cache_size() as f64 / (1024.0 * 1024.0),
+                g.sm_count(),
+            );
             // Clock warmup — pin the boost clock high before measuring (cf. gemm_pipe_sweep).
             for _ in 0..40 {
                 let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
@@ -11645,14 +11664,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // once per round so all sample the same clock evolution; the min over rounds converges to
                 // each kernel's peak-clock time. cuBLAS is timed in two slots as a noise sentinel — its
                 // self-ratio should be ~1.00; a larger value means the clock was still drifting (distrust).
+                // cuBLAS is timed in three slots: two f16-out (a self-noise sentinel — its self-ratio
+                // should be ~1.00; a larger value means the clock was still drifting) and one f32-out
+                // (`gemm_ex_nt_f16_f32out`) — the **apples-to-apples** peer for Mercury's f32-C kernels,
+                // since the f16-out peer writes C at half the width and so hides ~half the epilogue
+                // traffic Mercury pays. Both peer columns print per variant.
                 let mut best: Vec<f64> = vec![f64::INFINITY; variants.len()];
-                let (mut best_cub, mut best_cub2) = (f64::INFINITY, f64::INFINITY);
+                let (mut best_cub, mut best_cub2, mut best_cub_f32) =
+                    (f64::INFINITY, f64::INFINITY, f64::INFINITY);
                 for _ in 0..rounds {
                     for (i, (_, f, _, _, vcfg)) in variants.iter().enumerate() {
                         best[i] = best[i].min(time_wmma(g, f, *vcfg, dims, &a_d, &b_d, &mut c_d, iters));
                     }
                     best_cub = best_cub.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
                     best_cub2 = best_cub2.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
+                    best_cub_f32 =
+                        best_cub_f32.min(time_cublas_gemm_nt_f16_f32out(g, m, k, n, iters as u32).unwrap());
                 }
                 let base_i = variants.iter().position(|v| v.0 == "cliff_swz_s2").unwrap();
                 let base_t = best[base_i];
@@ -11660,12 +11687,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     "\n{sz}³ fp16 GEMM-cliff A/B (best-of-{rounds} round-robin; base=cliff_swz_s2; cuBLAS self-noise {:.3}×):",
                     best_cub2 / best_cub
                 );
+                eprintln!(
+                    "  cuBLAS peers: f16-out {:>7.0} GFLOP/s | f32-out {:>7.0} GFLOP/s (f32-out is the apples-to-apples peer for Mercury's f32-C kernels; the {:.2}× is the C-write dtype asymmetry)",
+                    flop / best_cub / 1e9,
+                    flop / best_cub_f32 / 1e9,
+                    best_cub_f32 / best_cub,
+                );
                 for (i, (name, _, occ, smem, _)) in variants.iter().enumerate() {
                     eprintln!(
-                        "  {:<24}: {:>7.0} GFLOP/s | {:>5.1}% cuBLAS | {:>6.3}× base | {} CTAs/SM, {}KiB",
+                        "  {:<24}: {:>7.0} GFLOP/s | {:>5.1}% cuBLAS(f16) | {:>5.1}% cuBLAS(f32) | {:>6.3}× base | {} CTAs/SM, {}KiB",
                         name,
                         flop / best[i] / 1e9,
                         100.0 * best_cub / best[i],
+                        100.0 * best_cub_f32 / best[i],
                         base_t / best[i],
                         occ,
                         smem / 1024,
