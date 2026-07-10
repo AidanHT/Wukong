@@ -19,6 +19,15 @@
 //! float value is identical; only the cache path differs), and the scalar tail/fallback mirrors the
 //! AVX2 lanes op-for-op (the `act_avx`/`act1` pair share the `maxps`/`minps` semantics), so every lane
 //! of every path agrees — pinned by `velem_tail_matches_lanes` and `velem_scalar_matches_avx`.
+//!
+//! **Determinism (the `_parallel` twin).** The map is pure elementwise (no reduction), so element `i`
+//! depends only on its own `x[i]`/`y[i]`/`a`/`b`/`c`/`op`. The multicore entry just cuts `[0, n)` into
+//! FIXED-size chunks (count independent of thread count, the same discipline as reduce.rs's `RCHUNK`)
+//! and runs the identical per-span routine over each — so `serial == parallel` bit-for-bit with no
+//! cross-chunk combine (pinned by `serial_matches_parallel_bit_for_bit`), and the interpreter (which
+//! calls the serial form) agrees regardless of core count.
+
+use rayon::prelude::*;
 
 // --- op codes (shared with the recognizer in mercury_mir_build) ------------------------------------
 // The low byte is the activation; `VE_USE_Y` (bit 8) flags that `y` is read (so a scale/ReLU that
@@ -56,6 +65,44 @@ const NT_MIN_BYTES: usize = 10 * 1024 * 1024;
 #[inline]
 fn use_nt(n: usize, streams: usize) -> bool {
     streams.saturating_mul(n).saturating_mul(4) >= NT_MIN_BYTES
+}
+
+/// The number of live f32 streams a call touches — the output and `x`, plus `y` when the op reads it
+/// (`VE_USE_Y` / Hadamard / Div) — the count the non-temporal-store decision keys on (see [`use_nt`]).
+/// Pulled out so the serial entry, the parallel entry, and the AVX2 kernel all agree on the NT policy.
+#[inline]
+fn velem_streams(op: i64) -> usize {
+    if op & (VE_USE_Y | VE_HADAMARD | VE_DIV) != 0 {
+        3
+    } else {
+        2
+    }
+}
+
+/// Fixed chunk size (elements) for the multicore [`mercury_velem_f32_parallel`] — a constant
+/// independent of thread count, so the chunk decomposition is deterministic (the same discipline as
+/// reduce.rs's `RCHUNK`). For a pure elementwise map bit-exactness does not actually depend on the
+/// boundary (there is no cross-chunk combine), so this is purely a load-balancing knob: a multiple of
+/// 8 keeps every chunk boundary 8-lane aligned (and 32-byte aligned when the base is), so the AVX2
+/// body needs no extra per-chunk realignment. 8192 f32 = 32 KB gives plenty of chunks for rayon's
+/// work-stealing to balance the P+E hybrid at the sizes past [`velem_par_min`].
+const VCHUNK: usize = 8192;
+
+/// Minimum element count for [`mercury_velem_f32_parallel`] to actually spread work across cores.
+/// Below it the fork-join wake/join cost (worst on the P+E hybrid, where a parked E-core is slow to
+/// arrive) outweighs a single core's streaming map — which already saturates a good fraction of store
+/// bandwidth on its own — so the call runs the serial kernel instead. Env-overridable
+/// (`MERCURY_VELEM_PAR_MIN`, read once) so the crossover stays A/B-measurable on other machines;
+/// default ~256 Ki elements (a ~1 MiB output), to be tuned centrally later.
+fn velem_par_min() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MERCURY_VELEM_PAR_MIN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(256 * 1024)
+    })
 }
 
 /// Software-prefetch distance (elements ahead). A prefetch of an address past the buffer end is a
@@ -139,14 +186,49 @@ pub unsafe extern "C" fn mercury_velem_f32(
         return;
     }
     let n = n as usize;
+    // The non-temporal-store decision keys on the whole working set (see `use_nt`), so make it once
+    // here from the total length and pass it down — the parallel entry makes the *same* decision from
+    // the same total `n`, keeping the store policy identical across the serial and parallel forms.
+    let nt = use_nt(n, velem_streams(op));
+    // SAFETY: buffers valid for n by the caller contract (y only when the op reads it).
+    unsafe { velem_span(x, y, out, n, a, b, c, op, nt) };
+}
+
+/// Run the streaming map over `[0, n)` at the given base pointers, with the non-temporal store
+/// decision `nt` supplied by the caller (decided from the *total* working set — see [`use_nt`] — so a
+/// parallel call can split `[0, n)` into chunks that all inherit the whole-array store policy rather
+/// than each small chunk re-deciding on its own sub-length). Dispatches to the 256-bit AVX2/FMA kernel
+/// when available, else a scalar fallback (which never streams, so it ignores `nt`). The result is
+/// bit-for-bit identical for every element however `[0, n)` is chunked: the op is elementwise, so
+/// element `i` depends only on `x[i]`/`y[i]`/`a`/`b`/`c`/`op`, the AVX2 lanes agree with the scalar
+/// tail (see [`elem1`]), and `nt` only changes the cache path, never the stored bits.
+///
+/// # Safety
+/// `x`/`out` valid for `n` f32; `y` valid for `n` f32 when the op reads it (`VE_USE_Y`/Hadamard/Div).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn velem_span(
+    x: *const f32,
+    y: *const f32,
+    out: *mut f32,
+    n: usize,
+    a: f32,
+    b: f32,
+    c: f32,
+    op: i64,
+    nt: bool,
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features detected; buffers valid for n by the caller contract.
-            unsafe { velem_avx2(x, y, out, n, a, b, c, op) };
+            unsafe { velem_avx2(x, y, out, n, a, b, c, op, nt) };
             return;
         }
     }
+    // The scalar fallback never streams, so `nt` is consulted only by the AVX2 path above; bind it so
+    // the parameter is used on every target (no-op on x86_64, silences the unused warning elsewhere).
+    let _ = nt;
     let use_y = op & (VE_USE_Y | VE_HADAMARD | VE_DIV) != 0;
     for i in 0..n {
         // SAFETY: i < n; buffers valid for n (y only when use_y).
@@ -159,6 +241,7 @@ pub unsafe extern "C" fn mercury_velem_f32(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn velem_avx2(
     x: *const f32,
     y: *const f32,
@@ -168,6 +251,7 @@ unsafe fn velem_avx2(
     b: f32,
     c: f32,
     op: i64,
+    nt: bool,
 ) {
     use std::arch::x86_64::*;
     let va = _mm256_set1_ps(a);
@@ -185,9 +269,9 @@ unsafe fn velem_avx2(
     // (matching `elem1`'s scalar fast path), turning a recognized ReLU into gcc's bare `maxps` loop at
     // true 256-bit width instead of paying a wasted multiply per 8 lanes. (Never set for a binary op.)
     let id_affine = !use_y && a == 1.0 && c == 0.0;
-    // Streams = output + x (+ y when read). The non-temporal decision keys on the whole working set,
-    // so a 2-input saxpy spills L3 (and wants `vmovntps`) at a length where a 1-input map still fits.
-    let nt = use_nt(n, if use_y { 3 } else { 2 });
+    // `nt` (whether to use non-temporal stores) is decided by the caller from the *total* working set
+    // — output + x (+ y when read) — so a serial call and every chunk of a parallel call stream with
+    // the identical store policy (see `velem_streams`/`use_nt`).
     let mut i = 0usize;
     // For the streaming store, peel a scalar prologue until `out` is 32-byte aligned (vmovntps faults
     // on a misaligned address); after that each 8-lane step keeps it aligned.
@@ -272,6 +356,69 @@ unsafe fn velem_avx2(
         *out.add(i) = elem1(op, *x.add(i), yi, a, b, c);
         i += 1;
     }
+}
+
+/// Multicore streaming elementwise map — **bit-identical** to [`mercury_velem_f32`]. The op is pure
+/// elementwise (`out[i] = act(a·x[i] (+ b·y[i]) + c)`, no reduction), so element `i`'s result depends
+/// only on its own inputs. Cutting `[0, n)` into FIXED-size [`VCHUNK`] chunks (count independent of
+/// thread count — the reduce.rs `RCHUNK` discipline) and running each chunk through the same
+/// [`velem_span`] therefore reproduces, for every element, the exact bits the whole-range serial pass
+/// writes: there is no cross-chunk combine, so the result never depends on how many cores ran it, and
+/// the interpreter (which calls the serial form) agrees with this `@parallel` path. The non-temporal
+/// store decision is made ONCE from the total `n` (as in the serial entry) and shared by every chunk,
+/// so the store policy matches too — and NT stores write the same bits regardless.
+///
+/// Below [`velem_par_min`] elements the fork-join wake/join cost outweighs a single-core streaming
+/// map, so the call falls back to the serial kernel (still bit-identical).
+///
+/// # Safety
+/// `x`/`out` valid for `n` f32; `y` valid for `n` f32 when the op reads it (`VE_USE_Y`/Hadamard/Div).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mercury_velem_f32_parallel(
+    x: *const f32,
+    y: *const f32,
+    out: *mut f32,
+    n: i64,
+    a: f32,
+    b: f32,
+    c: f32,
+    op: i64,
+) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    // Small arrays don't amortize the pool wake — run the serial kernel (bit-identical).
+    if n < velem_par_min() {
+        // SAFETY: same contract as this function.
+        unsafe { mercury_velem_f32(x, y, out, n as i64, a, b, c, op) };
+        return;
+    }
+    let use_y = op & (VE_USE_Y | VE_HADAMARD | VE_DIV) != 0;
+    // Whole-array NT decision, shared by every chunk (see the serial entry).
+    let nt = use_nt(n, velem_streams(op));
+    let nchunks = n.div_ceil(VCHUNK);
+    // Raw pointers cross the rayon closure boundary as integers (the same pattern as the parallel
+    // reduce/norm); each chunk touches a disjoint output sub-slice and `y` is shared read-only.
+    let (xa, ya, oa) = (x as usize, y as usize, out as usize);
+    (0..nchunks).into_par_iter().for_each(|ck| {
+        let lo = ck * VCHUNK;
+        let hi = ((ck + 1) * VCHUNK).min(n);
+        // SAFETY: disjoint output sub-slice [lo, hi) ⊆ [0, n); x/out valid for n. `y` is offset only
+        // when the op reads it — a scale/relu passes a null (or aliased) `y` the kernel never touches,
+        // and `null.add(lo)` would be UB, so an unread `y` is left unoffset.
+        unsafe {
+            let xp = (xa as *const f32).add(lo);
+            let yp = if use_y {
+                (ya as *const f32).add(lo)
+            } else {
+                ya as *const f32
+            };
+            let outp = (oa as *mut f32).add(lo);
+            velem_span(xp, yp, outp, hi - lo, a, b, c, op, nt);
+        }
+    });
 }
 
 /// One element of a Horner polynomial `((c[0]·x + c[1])·x + …)·x + c[n-1]`, the fused `mul_add` chain
@@ -579,6 +726,64 @@ mod tests {
         for i in 0..n {
             let want = elem1(VE_DIV, x[i], y[i], 1.0, 1.0, 0.0);
             assert_eq!(got[i].to_bits(), want.to_bits(), "div i {i}");
+        }
+    }
+
+    /// The multicore entry must equal the serial one **bit-for-bit** for every element and op — the
+    /// pure-elementwise map has no cross-chunk combine, so chunking is transparent. Covers: `n` below
+    /// the parallel gate (falls back to serial), `n` at/above it (real multicore), ragged tails
+    /// (non-multiple-of-8), lengths whose last `VCHUNK` chunk is partial (chunk-boundary straddling),
+    /// and the NT threshold crossed differently by 2-stream vs 3-stream ops. Runs with the default
+    /// `MERCURY_VELEM_PAR_MIN` (~256 Ki) so both the serial-fallback and the parallel branch fire.
+    #[test]
+    fn serial_matches_parallel_bit_for_bit() {
+        // Reuse the op set from `velem_tail_matches_lanes`, plus a Div (3-stream binary) case.
+        let cases: &[(i64, f32, f32, f32)] = &[
+            (VE_ID | VE_USE_Y, 2.0, 1.0, 0.0), // saxpy (3 streams → crosses NT sooner)
+            (VE_ID, 3.5, 0.0, 0.0),            // scale (2 streams; y unread)
+            (VE_ID | VE_USE_Y, 1.0, 1.0, 0.0), // residual add — the GPT-2 layer's hot loop
+            (VE_ID, 1.0, 0.0, 0.75),           // bias (2 streams)
+            (VE_RELU, 1.0, 0.0, 0.0),          // relu (identity-affine fast path)
+            (VE_RELU, 2.0, 0.0, 1.0),          // fused linear→relu
+            (VE_RELU6, 1.0, 0.0, 0.0),         // relu6
+            (VE_RELU6 | VE_USE_Y, 1.0, 1.0, 0.0),
+            (VE_HADAMARD, 1.0, 1.0, 0.0),      // hadamard x*y
+            (VE_RELU | VE_HADAMARD, 1.0, 1.0, 0.0), // relu(x*y)
+            (VE_DIV, 1.0, 1.0, 0.0),           // quotient x/y
+        ];
+        // Sizes: below the ~256 Ki gate (serial fallback), then above it — 300 003 is past the gate
+        // but under NT for both stream counts; 900 001 crosses NT for 3-stream ops (10.8 MiB) but not
+        // 2-stream (7.2 MiB); 1 500 001 crosses NT for both. Odd sizes force ragged tails and partial
+        // final chunks; the divisor never hits 0 (y is kept ≥ 1.5).
+        for &n in &[
+            1_000usize, 8_195, 65_537, 262_144, 262_151, 300_003, 900_001, 1_500_001,
+        ] {
+            let x: Vec<f32> = (0..n).map(|i| (i as f32 % 19.0) - 7.0).collect();
+            let y: Vec<f32> = (0..n).map(|i| (i as f32 % 13.0) + 1.5).collect(); // 1.5..=14.5
+            for &(op, a, b, c) in cases {
+                let mut s = vec![0.0f32; n];
+                let mut p = vec![0.0f32; n];
+                unsafe {
+                    mercury_velem_f32(x.as_ptr(), y.as_ptr(), s.as_mut_ptr(), n as i64, a, b, c, op);
+                    mercury_velem_f32_parallel(
+                        x.as_ptr(),
+                        y.as_ptr(),
+                        p.as_mut_ptr(),
+                        n as i64,
+                        a,
+                        b,
+                        c,
+                        op,
+                    );
+                }
+                for i in 0..n {
+                    assert_eq!(
+                        s[i].to_bits(),
+                        p[i].to_bits(),
+                        "serial != parallel n={n} op={op} i={i}"
+                    );
+                }
+            }
         }
     }
 }
