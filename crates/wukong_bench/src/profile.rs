@@ -93,6 +93,10 @@ struct Prof {
     obj_bytes: usize,
     /// Indexed by `Stage::ALL` order.
     stage: [Duration; 6],
+    /// Backend split (from `wukong_codegen_cranelift::emit_object_timed`): Cranelift codegen
+    /// (isel/regalloc/machine-code emit) vs object-container serialization. Sub-slices of `stage[5]`.
+    bk_codegen: Duration,
+    bk_obj_write: Duration,
 }
 
 impl Prof {
@@ -154,6 +158,18 @@ pub fn report(files: &[PathBuf]) {
     }
     println!("{}", "-".repeat(72));
     println!("{:<14} {:>11} {:>6.1}%", "TOTAL", fmt(grand), 100.0);
+
+    // Backend split (isel/regalloc/emit vs object-container serialization). Bounds the object-emit
+    // share §4/§7.4 reasons about analytically — now measured directly via `emit_object_timed`.
+    let bk_cg: Duration = profs.iter().map(|p| p.bk_codegen).sum();
+    let bk_ow: Duration = profs.iter().map(|p| p.bk_obj_write).sum();
+    let bk = (bk_cg + bk_ow).as_secs_f64().max(1e-12);
+    println!(
+        "  of which codegen+obj:  Cranelift codegen (isel/regalloc/emit) {:>6.1}%   object-write (container) {:>5.1}%",
+        100.0 * bk_cg.as_secs_f64() / bk,
+        100.0 * bk_ow.as_secs_f64() / bk,
+    );
+
     println!(
         "\nwork totals: {} src bytes, {tokens} tokens, {ast_nodes} AST nodes, {mir_ops} MIR ops, \
          {} object bytes.",
@@ -268,6 +284,19 @@ fn measure_one(path: &Path) -> Option<Prof> {
         let _ = wukong_codegen_cranelift::emit_object(&p_opt, &interner);
         t.elapsed()
     });
+    // Backend split (isel/regalloc/emit vs object-container write). `emit_object_timed` returns the
+    // two halves from *inside* the backend; take a best-of-N min of each independently so the split
+    // reflects the same warm steady-state as the combined `backend` stage above.
+    let bk_codegen = best_of(|| {
+        wukong_codegen_cranelift::emit_object_timed(&p_opt, &interner)
+            .map(|(_, t)| t.codegen)
+            .unwrap_or(Duration::ZERO)
+    });
+    let bk_obj_write = best_of(|| {
+        wukong_codegen_cranelift::emit_object_timed(&p_opt, &interner)
+            .map(|(_, t)| t.object_write)
+            .unwrap_or(Duration::ZERO)
+    });
 
     Some(Prof {
         name: short(path),
@@ -277,6 +306,8 @@ fn measure_one(path: &Path) -> Option<Prof> {
         mir_ops,
         obj_bytes,
         stage: [lex, parse, sema_t, mir, optimize, backend],
+        bk_codegen,
+        bk_obj_write,
     })
 }
 
