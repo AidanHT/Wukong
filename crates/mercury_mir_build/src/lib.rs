@@ -17037,8 +17037,13 @@ impl FnLowerer<'_> {
         let q = self.builder.build(fty.clone(), Op::Fma(r, q, one));
         let p = self.builder.build(fty.clone(), Op::Fma(r, q, one));
 
-        // 2^e: mc = max(m, 0) (the kernel's pmaxsd — flushes e ≤ −127 to +0.0), then
-        // (mc & ~7)·2^20 == (mc >> 3) << 23 with vector-legal ops only.
+        // Final scale = a bit-identical ldexp: `e^x = 2^E·(T[j]·e^r)` realized as ONE FMul
+        // (T[j]·e^r, a normal float near 1) plus an integer add of `E` into the exponent field.
+        // Multiplying a normal f32 by the exact power-of-two 2^E is, by IEEE, an exact add of E<<23
+        // to its bits (no rounding), so this equals the old `·pow2` multiply bit-for-bit on every
+        // input whose result is a normal float. mc = max(m,0) (the kernel's pmaxsd); the addend is
+        // `((mc & ~7) − 127·8)·2^20 == E<<23`, built with vector-legal ops only (Mul by 2^20, not a
+        // shift). The runtime `exp8` header carries the full port-math / bit-identity argument.
         let neg = self
             .builder
             .build(mty.clone(), Op::Cmp(CmpOp::Slt, m, zero_i));
@@ -17047,19 +17052,34 @@ impl FnLowerer<'_> {
         let mhi = self
             .builder
             .build(ity.clone(), Op::Bin(BinOp::And, mc, low3));
-        let pow = self.splat_const_i(1_048_576, &ity); // 2^20
-        let shifted = self
-            .builder
-            .build(ity.clone(), Op::Bin(BinOp::Mul, mhi, pow));
-        let pow2 = self.builder.build(
-            fty.clone(),
-            Op::Cast(CastKind::Bitcast, shifted, fty.clone()),
-        );
+        let bias = self.splat_const_i(1016, &ity); // 127·8, so (mhi − 1016) = 8·E
+        let e8 = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, mhi, bias));
+        let pow = self.splat_const_i(1_048_576, &ity); // 2^20: e8·2^20 == E<<23
+        let addend = self.builder.build(ity.clone(), Op::Bin(BinOp::Mul, e8, pow));
 
-        // T[j]·p first (both near 1), the exact power-of-two scale last — the kernel's order.
+        // T[j]·e^r — the one kept multiply (both near 1) — then add the exponent field into its bits.
         let tp = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, tj, p));
+        let tpb = self
+            .builder
+            .build(ity.clone(), Op::Cast(CastKind::Bitcast, tp, ity.clone()));
+        let combined = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, tpb, addend));
+
+        // Flush the denormal/underflow tail to +0.0: `combined` is a normal-float bit pattern iff it
+        // exceeds 0x007F_FFFF as a signed int (normals are 0x0080_0000..0x7F7F_FFFF). This zeroes both
+        // the old flush band (e ≤ −127) and the < 2^−126 sub-normal tail (x ∈ [−87.380, −87.337)) that
+        // a pure exponent add can't round — the same uniform FTZ the runtime kernels take, out of
+        // every gate's domain (exhaustively pinned by the runtime's `vmath_exp_ldexp_sweep`).
+        let thr = self.splat_const_i(0x007F_FFFF, &ity);
+        let keep = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Sgt, combined, thr));
+        let kept = self
+            .builder
+            .build(ity.clone(), Op::Select(keep, combined, zero_i));
         self.builder
-            .build(fty.clone(), Op::Bin(BinOp::FMul, tp, pow2))
+            .build(fty.clone(), Op::Cast(CastKind::Bitcast, kept, fty.clone()))
     }
 
     /// `log(x)` (natural log) as a fast, deterministic polynomial (≈1 ULP of the true `log`). Always
