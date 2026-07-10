@@ -120,6 +120,67 @@ impl KvConfig {
     pub fn kv_bytes_int8(&self) -> usize {
         2 * self.slab_elems() + 2 * self.scale_slab_elems() * 4
     }
+
+    /// Geometry for a serving cache in which **every one** of `num_slots` sequences can reach
+    /// `max_ctx` tokens simultaneously (the worst case a scheduler must plan for): the block-table
+    /// width is `ceil(max_ctx / block_size)` and the pool holds exactly `num_slots` such sequences.
+    /// Size the result against the device budget with [`assert_kv_budget`](Self::assert_kv_budget).
+    pub fn for_serving(
+        layers: usize,
+        heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_slots: usize,
+        max_ctx: usize,
+    ) -> KvConfig {
+        let max_blocks_per_seq = max_ctx.div_ceil(block_size).max(1);
+        KvConfig {
+            layers,
+            heads,
+            head_dim,
+            block_size,
+            num_blocks: num_slots * max_blocks_per_seq,
+            num_slots,
+            max_blocks_per_seq,
+        }
+    }
+
+    /// Assert the K+V cache at `elem_size` bytes/element ([`kv_bytes`](Self::kv_bytes)) fits inside
+    /// `budget_bytes` of device memory, returning the bytes needed. The Bcap-scaling lever's guard:
+    /// growing `num_slots` (or `max_ctx` via `num_blocks`) must stay inside the 6 GB part's budget
+    /// *before* the slabs are allocated, not fail as a mid-run `CUDA_ERROR_OUT_OF_MEMORY`.
+    pub fn assert_kv_budget(&self, elem_size: usize, budget_bytes: usize) -> usize {
+        let need = self.kv_bytes(elem_size);
+        assert!(
+            need <= budget_bytes,
+            "KV cache needs {need} B ({:.2} GiB) for {} slots x {} blocks/seq x {} layers at {elem_size} B/elem \
+             — exceeds the {budget_bytes} B ({:.2} GiB) device budget",
+            need as f64 / (1u64 << 30) as f64,
+            self.num_slots,
+            self.max_blocks_per_seq,
+            self.layers,
+            budget_bytes as f64 / (1u64 << 30) as f64,
+        );
+        need
+    }
+
+    /// Largest per-sequence context (tokens, rounded down to whole blocks) for which
+    /// `for_serving(..)`'s cache still fits `budget_bytes` at `elem_size` bytes/element — the
+    /// Bcap↔context trade-off table in one call. Returns 0 if even one block per slot is over budget.
+    pub fn max_ctx_within_budget(
+        layers: usize,
+        heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_slots: usize,
+        elem_size: usize,
+        budget_bytes: usize,
+    ) -> usize {
+        // Bytes per cached token position (K and V, all layers).
+        let per_tok = 2 * layers * heads * head_dim * elem_size;
+        let per_slot_blocks = budget_bytes / (per_tok * block_size * num_slots);
+        per_slot_blocks * block_size
+    }
 }
 
 /// The **host-side** block allocator + per-slot block tables. No device handle — this is pure policy,
@@ -438,6 +499,41 @@ mod tests {
             "KV footprint (32L, 8h×128, 4096×16 blocks): f32 {:.2} GiB | f16 {:.2} GiB | int8 {:.2} GiB → {:.2}x vs f16, {:.2}x vs f32",
             gib(f32b), gib(f16b), gib(i8b), vs_f16, vs_f32
         );
+    }
+
+    /// **Bcap-scaling budget table (the 6 GB lever, pure geometry).** For the goodput-bench layer
+    /// geometry (12 layers, 8 heads × 64, 16-token blocks, f16 KV), every swept Bcap must fit its
+    /// worst-case simultaneous context inside a 4 GiB KV budget with room for the bench's 96-token
+    /// contexts, and the exact `for_serving` config at that context must round-trip its own budget
+    /// assert. No device needed.
+    #[test]
+    fn serving_bcap_budget_table() {
+        let budget = 4usize << 30; // KV slice of the 6 GB part (weights/pool/desktop take the rest)
+        let (layers, heads, hd, bsz) = (12, 8, 64, 16);
+        for &bcap in &[64usize, 128, 256] {
+            let max_ctx = KvConfig::max_ctx_within_budget(layers, heads, hd, bsz, bcap, 2, budget);
+            assert!(max_ctx >= 96, "Bcap={bcap} must fit the bench's 96-token contexts (got {max_ctx})");
+            let cfg = KvConfig::for_serving(layers, heads, hd, bsz, bcap, max_ctx);
+            let bytes = cfg.assert_kv_budget(2, budget);
+            eprintln!(
+                "Bcap={bcap:3}: max simultaneous ctx {max_ctx:5} tok/seq → KV {:.2} GiB of {:.1} GiB budget",
+                bytes as f64 / (1u64 << 30) as f64,
+                budget as f64 / (1u64 << 30) as f64
+            );
+        }
+    }
+
+    /// The budget assert must fire (panic, pre-allocation) when the requested geometry exceeds the
+    /// device budget — the guard that turns a mid-run `CUDA_ERROR_OUT_OF_MEMORY` into a clear error.
+    #[test]
+    #[should_panic(expected = "exceeds")]
+    fn over_budget_kv_config_is_rejected() {
+        // One block over: for_serving at max_ctx+block_size cannot fit the same budget it saturates.
+        let budget = 4usize << 30;
+        let (layers, heads, hd, bsz) = (12, 8, 64, 16);
+        let max_ctx = KvConfig::max_ctx_within_budget(layers, heads, hd, bsz, 256, 2, budget);
+        let cfg = KvConfig::for_serving(layers, heads, hd, bsz, 256, max_ctx + bsz);
+        cfg.assert_kv_budget(2, budget);
     }
 
     // ---- pure host allocator: runs on a GPU-less box (the policy is device-independent) ----
