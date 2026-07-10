@@ -29,21 +29,40 @@
 //!   flags-only C column.
 //! * **PyTorch (the industry peer)** — when `python` + `torch` import (probed gracefully; a
 //!   printed note + skipped columns otherwise), the harness dumps the *exact* weight/input
-//!   buffers as little-endian f32 blobs and generates a self-contained eager-PyTorch script
-//!   that rebuilds the identical forward: `F.linear` computes `x·Wᵀ` over the same `[out,in]`
+//!   buffers as little-endian f32 blobs and generates a self-contained PyTorch script that
+//!   rebuilds the identical forward: `F.linear` computes `x·Wᵀ` over the same `[out,in]`
 //!   row-major weights Wukong/C use (the layouts coincide — no transposition), `F.layer_norm`
 //!   at the same eps=1e-5, the same tanh-approx GELU via `F.gelu(approximate="tanh")`, and
 //!   multi-head causal attention two ways — `F.scaled_dot_product_attention(is_causal=True)`
 //!   (the fused industry path) *and* a manual matmul+softmax variant — under
-//!   `torch.inference_mode()`, float32, **eager only** (`torch.compile` is not attempted on
-//!   Windows). Each variant warms ≥3 then times ≥10 forwards (min + median; the timing loop is
-//!   one bare forward per iteration — no per-iteration allocation/IO beyond what eager torch
-//!   does inside the forward), at `torch.set_num_threads(1)` and at the default all-threads.
-//!   Torch runs in the same bench invocation immediately after the Wukong columns (same-run
-//!   adjacency); its single-thread variants run first inside the script and the all-core one
-//!   last, so multicore heat pollutes no single-thread torch number. Torch's SDPA output is
-//!   cross-checked against Wukong's with the suite's magnitude-normalized metric at the same
-//!   1e-3 tolerance (the GELU flavor matches exactly, so no loosening is needed).
+//!   `torch.inference_mode()`, float32. Two regimes are timed: **eager** (`T1`/`Tn`) and
+//!   **`torch.compile(..., mode="max-autotune", fullgraph=True)`** (TorchInductor, the `T1(comp)`/
+//!   `Tn(comp)` columns) — the strongest fair PyTorch baseline: Inductor fuses the whole 12-layer
+//!   forward + final LayerNorm into one graph and autotunes its CPU GEMM/reduction kernels. The
+//!   compiled path is real on Windows: the harness locates the newest `vcvars64.bat`, captures the
+//!   MSVC build environment (`cmd /c call vcvars64 && set`, parsed + cached), appends the chosen
+//!   interpreter's `<base_prefix>\libs` to `LIB` (else Inductor's link step fails `LNK1104` on
+//!   `pythonNNN.lib`), and spawns the peer under that env. If no `vcvars64.bat` is found the
+//!   compiled columns degrade to `n/a (MSVC not found)` and eager runs exactly as before. Of the
+//!   two candidate interpreters (`python` on PATH and `tools/torch-venv/Scripts/python.exe`;
+//!   `PYTHON` env still wins) the one with the newest torch is chosen, and which/what-version is
+//!   printed. Each timed variant warms then times ≥10 forwards (min + median; the timed loop body
+//!   is one bare forward — no per-iteration allocation/IO beyond what torch does inside the
+//!   forward), at `torch.set_num_threads(1)` and at the default all-threads. The compile
+//!   wall-clock is a cold-start cost, printed separately (the `compile ms` row) and never mixed
+//!   into a per-forward number. Torch runs in the same bench invocation immediately after the
+//!   Wukong columns (same-run adjacency); both compiled variants are built first (untimed), then
+//!   timing runs coolest-first — T1 eager → T1 compiled → Tn eager → Tn compiled — so multicore
+//!   heat pollutes no single-thread torch number. Both the eager-SDPA and the compiled outputs are
+//!   cross-checked against Wukong's with the suite's magnitude-normalized metric at the same 1e-3
+//!   tolerance (the GELU flavor matches exactly, so no loosening is needed), plus a
+//!   compiled-vs-eager max|Δ| line — a fast-but-wrong compiled path fails loudly and reports no
+//!   time rather than a bogus win. Compile failures fall through a disclosed retry ladder: some
+//!   torch builds' Inductor CPP GEMM template (`cpp_CppMicroGemmFP32Vec`) is broken on
+//!   Windows/MSVC, so on a lowering failure the GEMM autotune backend is pinned to ATEN (= MKL,
+//!   torch's strongest CPU GEMM — the strongest WORKING config, not a handicap) and fullgraph
+//!   retried; a remaining `fullgraph=True` break falls back to `fullgraph=False` with the break
+//!   count from `torch._dynamo.explain` disclosed.
 //! * **The layer loop lives in this harness** for both languages: one JIT'd/compiled block
 //!   function is called 12× per forward with per-layer weight pointers (ping-ponging two
 //!   activation buffers), then the final LayerNorm — the way a real runtime drives a layer stack.
@@ -77,13 +96,14 @@
 //!   scan prints the `@parallel` variant's kernel set (and a unit test pins both the region and
 //!   the per-function serial/parallel split), so a regression back to a serial head chain is
 //!   visible, not silent. Both C columns are single-threaded idiomatic code, as everywhere in
-//!   this suite; the torch `Tn(sdpa)` column is PyTorch's own all-thread path — the only other
-//!   multicore column, disclosed as such.
+//!   this suite; the torch `Tn(sdpa)` and `Tn(comp)` columns are PyTorch's own all-thread paths
+//!   (eager and TorchInductor-compiled) — the other multicore columns, disclosed as such.
 
 use std::cell::Cell;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use wukong_span::{Interner, SourceId};
@@ -840,24 +860,27 @@ struct MeasureModel {
 // The PyTorch CPU peer (industry baseline)
 // -------------------------------------------------------------------------------------------
 
-/// The probed PyTorch environment: interpreter path, version/thread info, and whether the
-/// (config-invariant) weight blob has already been dumped this run.
+/// The probed PyTorch environment: interpreter path, version/thread info, the interpreter's
+/// `sys.base_prefix` (whose `\libs` is appended to `LIB` so Inductor can link `pythonNNN.lib`),
+/// and whether the (config-invariant) weight blob has already been dumped this run.
 struct TorchCtx {
     py: String,
     version: String,
+    /// Numeric version tuple (e.g. `[2, 12, 1]`) used to pick the newest torch across candidates.
+    version_key: Vec<u32>,
     threads: usize,
+    base_prefix: String,
     weights_written: Cell<bool>,
 }
 
-/// Probe `python` (override with `PYTHON`) for an importable torch. Graceful: any failure —
-/// no python on PATH, torch not installed — returns `None`; the bench prints a note and the
-/// torch columns show `n/a`.
-fn detect_torch() -> Option<TorchCtx> {
-    let py = std::env::var("PYTHON").unwrap_or_else(|_| "python".to_string());
-    let out = Command::new(&py)
+/// Probe one interpreter for an importable torch, returning its version / thread count / base
+/// prefix. Any failure (no such interpreter, torch not installed) → `None`.
+fn probe_python(py: &str) -> Option<TorchCtx> {
+    let out = Command::new(py)
         .args([
             "-c",
-            "import torch; print(torch.__version__); print(torch.get_num_threads())",
+            "import torch,sys; print(torch.__version__); \
+             print(torch.get_num_threads()); print(sys.base_prefix)",
         ])
         .output()
         .ok()?;
@@ -868,12 +891,202 @@ fn detect_torch() -> Option<TorchCtx> {
     let mut lines = s.lines();
     let version = lines.next()?.trim().to_string();
     let threads = lines.next()?.trim().parse().ok()?;
+    let base_prefix = lines.next()?.trim().to_string();
+    let version_key = version
+        .split('+')
+        .next()
+        .unwrap_or(&version)
+        .split('.')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect();
     Some(TorchCtx {
-        py,
+        py: py.to_string(),
         version,
+        version_key,
         threads,
+        base_prefix,
         weights_written: Cell::new(false),
     })
+}
+
+/// Probe the candidate interpreters for an importable torch and pick the one with the NEWEST
+/// version (a weak/old peer is forbidden — it is the honesty bar for the "beat PyTorch" claim).
+/// `PYTHON` (if set) wins outright; otherwise `python` on PATH and the repo's
+/// `tools/torch-venv/Scripts/python.exe` are both probed. Graceful: no importable torch anywhere
+/// returns `None`; the bench prints a note and the torch columns show `n/a`.
+fn detect_torch() -> Option<TorchCtx> {
+    let candidates: Vec<String> = match std::env::var("PYTHON") {
+        Ok(p) => vec![p],
+        Err(_) => vec![
+            "python".to_string(),
+            "tools/torch-venv/Scripts/python.exe".to_string(),
+        ],
+    };
+    candidates
+        .iter()
+        .filter_map(|py| probe_python(py))
+        .max_by(|a, b| a.version_key.cmp(&b.version_key))
+}
+
+// -------------------------------------------------------------------------------------------
+// MSVC environment bootstrap — TorchInductor's CPU backend shells out to `cl`/`link`, which only
+// work under a vcvars64 environment. We locate the newest vcvars64.bat, run it in a throwaway cmd,
+// snapshot the resulting environment, and spawn the peer python under it (plus the interpreter's
+// `\libs` appended to LIB so the Inductor link step can find `pythonNNN.lib`). Cached once per run.
+// -------------------------------------------------------------------------------------------
+
+/// A parsed MSVC build environment: the full `KEY=VALUE` set emitted by `vcvars64.bat && set`.
+type VcEnv = Vec<(String, String)>;
+
+/// Parse an integer-dotted version like `14.50.35717` into a comparable tuple.
+fn version_tuple(s: &str) -> Vec<u32> {
+    s.trim()
+        .split('.')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect()
+}
+
+/// Glob for every `vcvars64.bat` under `C:\Program Files*\Microsoft Visual Studio\*\*\VC\...` and
+/// return the one whose MSVC tools version (read from the sibling
+/// `Microsoft.VCToolsVersion.default.txt`) is highest — the newest compiler, not the newest VS
+/// product-folder name (which sorts wrong: "2017" > "18").
+fn find_vcvars() -> Option<PathBuf> {
+    let mut best: Option<(Vec<u32>, PathBuf)> = None;
+    for pf in ["C:\\Program Files", "C:\\Program Files (x86)"] {
+        let vs_root = Path::new(pf).join("Microsoft Visual Studio");
+        let Ok(products) = std::fs::read_dir(&vs_root) else {
+            continue;
+        };
+        for product in products.flatten() {
+            let Ok(editions) = std::fs::read_dir(product.path()) else {
+                continue;
+            };
+            for edition in editions.flatten() {
+                let build = edition.path().join("VC").join("Auxiliary").join("Build");
+                let vcvars = build.join("vcvars64.bat");
+                if !vcvars.is_file() {
+                    continue;
+                }
+                // Prefer the real MSVC tools version as the sort key; fall back to 0 if absent.
+                let ver = std::fs::read_to_string(build.join("Microsoft.VCToolsVersion.default.txt"))
+                    .map(|s| version_tuple(&s))
+                    .unwrap_or_default();
+                if best.as_ref().is_none_or(|(bv, _)| ver > *bv) {
+                    best = Some((ver, vcvars));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// The cached MSVC build environment (or `None` if no vcvars64.bat is installed / could not be
+/// captured). We drive it through a throwaway `.bat` (`call "<vcvars64>" >nul & set`) run under
+/// `cmd /c <batfile>` — passing the complex quoted `call ... && set` string straight to `cmd /c`
+/// hits cmd's quote-stripping and mangles the path, so the batfile indirection is the robust route.
+/// The batfile silences vcvars' banner so only clean `KEY=VALUE` lines from `set` reach stdout.
+fn vcvars_env() -> Option<&'static VcEnv> {
+    static CACHE: OnceLock<Option<VcEnv>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let vcvars = find_vcvars()?;
+            let bat = std::env::temp_dir().join("wukong_xbench_vcvars.bat");
+            std::fs::write(
+                &bat,
+                format!(
+                    "@echo off\r\ncall \"{}\" >nul 2>&1\r\nset\r\n",
+                    vcvars.display()
+                ),
+            )
+            .ok()?;
+            let out = Command::new("cmd").arg("/c").arg(&bat).output().ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            let env: VcEnv = text
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.trim_end().to_string(), v.trim_end().to_string()))
+                .collect();
+            // A valid vcvars environment always defines LIB/INCLUDE; if it did not parse, treat
+            // it as unavailable rather than spawning a half-configured child.
+            env.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("LIB"))
+                .then_some(env)
+        })
+        .as_ref()
+}
+
+/// Build the peer-python `Command` spawning `script`. When an MSVC environment is available the
+/// child runs under it with `<base_prefix>\libs` appended to `LIB` (so Inductor links
+/// `pythonNNN.lib`); otherwise it inherits the parent environment (eager still runs; the script's
+/// compile phase is disabled up front via `TRY_COMPILE`).
+fn peer_command(ctx: &TorchCtx, script: &Path) -> Command {
+    let mut cmd = Command::new(&ctx.py);
+    cmd.arg(script);
+    if let Some(env) = vcvars_env() {
+        cmd.env_clear();
+        let libs = format!("{}\\libs", ctx.base_prefix);
+        let mut lib_set = false;
+        for (k, v) in env {
+            if k.eq_ignore_ascii_case("LIB") {
+                cmd.env(k, format!("{v};{libs}"));
+                lib_set = true;
+            } else {
+                cmd.env(k, v);
+            }
+        }
+        if !lib_set {
+            cmd.env("LIB", libs);
+        }
+    }
+    cmd
+}
+
+// -------------------------------------------------------------------------------------------
+// Power-state disclosure — sustained-load timings taken on battery are not comparable to AC runs
+// (aggressive DVFS / power caps). Queried via the Win32 `GetSystemPowerStatus`, same `extern
+// "system"` pattern as `pin_worker_to_cpu` in wukong_runtime/src/gemm.rs.
+// -------------------------------------------------------------------------------------------
+
+/// `power: AC` / `power: BATTERY — ...` / `power: unknown`, for the bench headers.
+#[cfg(windows)]
+pub(crate) fn power_status_line() -> String {
+    #[repr(C)]
+    struct SystemPowerStatus {
+        ac_line_status: u8,
+        battery_flag: u8,
+        battery_life_percent: u8,
+        system_status_flag: u8,
+        battery_life_time: u32,
+        battery_full_life_time: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+    }
+    let mut st = SystemPowerStatus {
+        ac_line_status: 255,
+        battery_flag: 255,
+        battery_life_percent: 255,
+        system_status_flag: 0,
+        battery_life_time: 0,
+        battery_full_life_time: 0,
+    };
+    let ok = unsafe { GetSystemPowerStatus(&mut st) };
+    if ok == 0 {
+        return "power: unknown".to_string();
+    }
+    match st.ac_line_status {
+        1 => "power: AC".to_string(),
+        0 => "power: BATTERY — sustained-load results not comparable to AC runs".to_string(),
+        _ => "power: unknown".to_string(),
+    }
+}
+#[cfg(not(windows))]
+pub(crate) fn power_status_line() -> String {
+    "power: n/a".to_string()
 }
 
 /// Concatenate f32 slices into one little-endian binary file — the exact bytes the generated
@@ -891,30 +1104,54 @@ fn dump_f32_le(path: &Path, parts: &[&[f32]]) -> std::io::Result<()> {
     w.flush()
 }
 
-/// The self-contained eager-PyTorch peer script for one config. Layout facts it relies on
+/// The self-contained PyTorch peer script for one config. Layout facts it relies on
 /// (verified against `wk_block`/`c_model`): `F.linear(x, W)` computes `x·Wᵀ` over a `[out,in]`
 /// row-major `W` — exactly the `w[j*K+p]` layout Wukong and C dot against, so the dumped bytes
 /// are used as-is; LayerNorm eps is 1e-5 in all three; the GELU is the tanh approximation
 /// (√(2/π), 0.044715) — torch's `approximate="tanh"`; SDPA's default scale `1/√hd` equals
 /// Wukong's inline `scale` (hd is a power of 4, exact in f32); Wukong's `-1e30` mask and
 /// torch's `-inf`/`is_causal` agree after softmax (both underflow to exactly 0).
-fn torch_script(cfg: Cfg, w_path: &Path, io_path: &Path, out_path: &Path) -> String {
+///
+/// Timed regimes: **eager** (`TORCH1`/`TORCH1M`/`TORCHN`) and, when `try_compile` (MSVC present),
+/// **`torch.compile(..., mode="max-autotune", fullgraph=True)`** (`TORCH1C`/`TORCHNC`) — the whole
+/// 12-layer SDPA forward + final LayerNorm as one Inductor-fused, autotuned graph. Both compiled
+/// variants are built first (untimed; compile wall printed separately as `*_COMPILE`), then timing
+/// runs coolest-first (T1 eager → T1 compiled → Tn eager → Tn compiled). The compiled output is
+/// cross-checked against the eager reference (`TORCH_COMPILED_VS_EAGER_*`); if it diverges the
+/// variant is marked `TORCH_COMPILED_BAD_*` and NOT timed. Compile failures fall through a
+/// disclosed retry ladder (each tier printing `TORCH_COMPILE_DISCLOSE`): stock max-autotune
+/// fullgraph → GEMM autotune backend pinned to ATEN/MKL (works around the Inductor CPP GEMM
+/// template being broken on Windows/MSVC) → `fullgraph=False` (with the `torch._dynamo.explain`
+/// break count); a total failure prints `TORCH_COMPILE_FAIL` and skips the variant.
+fn torch_script(
+    cfg: Cfg,
+    w_path: &Path,
+    io_path: &Path,
+    out_path: &Path,
+    cout_path: &Path,
+    try_compile: bool,
+) -> String {
     let (s, d, h, hd, dff) = (cfg.s, cfg.d, cfg.h, cfg.hd(), cfg.dff);
     format!(
         r#"# Auto-generated by wukong_xbench `model` — the PyTorch CPU peer for the 12-layer
 # GPT-2-class forward. Reads the exact little-endian f32 weight/input bytes the Wukong and C
-# columns use, rebuilds the identical eager float32 forward, and times it under
-# torch.inference_mode(). Eager ONLY — torch.compile is not attempted (Windows).
+# columns use, rebuilds the identical float32 forward, and times it under torch.inference_mode()
+# in two regimes: eager, and torch.compile(mode="max-autotune", fullgraph=True) (TorchInductor —
+# the strongest fair CPU baseline, the whole forward fused + autotuned).
 import sys, time, array, statistics
 import torch
 import torch.nn.functional as F
 
 S = {s}; D = {d}; H = {h}; HD = {hd}; DFF = {dff}; LAYERS = {layers}
+TRY_COMPILE = {try_compile}
 W_PATH = r"{w}"
 IO_PATH = r"{io}"
 OUT_PATH = r"{out}"
+COUT_PATH = r"{cout}"
 WARMUP = 3
 ITERS = 10
+CWARMUP = 6          # >=5 steady calls after the first (compiling) call
+CTOL = 1e-3          # compiled-vs-eager tolerance; above this the compiled path is not timed
 LNSHAPE = (D,)
 DEFAULT_THREADS = torch.get_num_threads()
 
@@ -922,6 +1159,13 @@ def load(path):
     with open(path, "rb") as f:
         data = f.read()
     return torch.frombuffer(bytearray(data), dtype=torch.float32)
+
+def dump(t, path):
+    a = array.array("f", t.reshape(-1).tolist())
+    if sys.byteorder != "little":
+        a.byteswap()
+    with open(path, "wb") as f:
+        f.write(a.tobytes())
 
 wbuf = load(W_PATH)
 sizes = [D, D, D * D, D * D, D * D, D * D, D, D, DFF * D, D * DFF]
@@ -972,40 +1216,131 @@ def forward(manual):
         x = block(x, w, manual)
     return F.layer_norm(x, LNSHAPE, lnf_g, lnf_b, 1e-5)
 
-# Warm WARMUP forwards, then time ITERS. The timed loop body is exactly one forward — no
-# per-iteration allocation or IO beyond what eager torch itself does inside the forward.
-def bench(manual):
+# The whole forward via the fused SDPA path — the callable torch.compile specializes on.
+def forward_sdpa():
+    return forward(False)
+
+# Warm WARMUP calls, then time ITERS. The timed loop body is exactly one forward — no per-iteration
+# allocation or IO beyond what torch itself does inside the forward.
+def bench_call(fn):
     for _ in range(WARMUP):
-        forward(manual)
+        fn()
     ts = [0.0] * ITERS
     for i in range(ITERS):
         t0 = time.perf_counter()
-        forward(manual)
+        fn()
         ts[i] = time.perf_counter() - t0
     return min(ts) * 1e3, statistics.median(ts) * 1e3
+
+def try_build(fullgraph):
+    fn = torch.compile(forward_sdpa, mode="max-autotune", fullgraph=fullgraph)
+    t0 = time.perf_counter()
+    out = fn()  # first call forces compilation; its wall time is the cold-start cost
+    return fn, out, (time.perf_counter() - t0) * 1e3
+
+# Whether the Inductor GEMM autotune backend has been pinned to ATEN. It is a GLOBAL inductor
+# config, so once pinned it applies to every subsequent compile in this process (the disclosure
+# line says so).
+GEMM_PINNED = False
+
+# Build one compiled variant, three tiers:
+#  1. stock mode="max-autotune", fullgraph=True;
+#  2. on failure, pin max_autotune_gemm_backends="ATEN" and retry fullgraph=True — some torch
+#     builds' Inductor CPP GEMM template (cpp_CppMicroGemmFP32Vec) is broken on Windows/MSVC,
+#     and ATen GEMM = MKL is torch's strongest CPU GEMM anyway, so this is the strongest
+#     WORKING config, not a handicap (disclosed);
+#  3. on a remaining fullgraph failure, disclose the torch._dynamo.explain break count and retry
+#     fullgraph=False. Any exception past that propagates to the caller (total failure -> the
+#     compiled columns stay n/a; eager unaffected).
+def build_compiled(tag):
+    global GEMM_PINNED
+    try:
+        return try_build(True)
+    except Exception as e1:
+        torch._dynamo.reset()
+        if not GEMM_PINNED:
+            try:
+                import torch._inductor.config as icfg
+                icfg.max_autotune_gemm_backends = "ATEN"
+                GEMM_PINNED = True
+                print("TORCH_COMPILE_DISCLOSE %s inductor CPP GEMM template broken on "
+                      "Windows/MSVC -> max_autotune_gemm_backends pinned to ATEN (MKL) for all "
+                      "compiled variants; first error: %s" % (tag, repr(str(e1))[:120]),
+                      flush=True)
+            except Exception:
+                pass
+    try:
+        return try_build(True)
+    except Exception as e2:
+        gb = None
+        try:
+            gb = getattr(torch._dynamo.explain(forward_sdpa)(), "graph_break_count", None)
+        except Exception:
+            gb = None
+        print("TORCH_COMPILE_DISCLOSE %s fullgraph-break gb=%s reason=%s"
+              % (tag, gb, repr(str(e2))[:140]), flush=True)
+        torch._dynamo.reset()
+        return try_build(False)
 
 with torch.inference_mode():
     print("TORCH_VERSION %s" % torch.__version__, flush=True)
     print("TORCH_THREADS %d" % DEFAULT_THREADS, flush=True)
-    # Cross-check outputs first, at 1 thread (doubles as cache warmup for the timed 1t runs).
+    # Eager reference + cross-checks at 1 thread (doubles as cache warmup for the timed 1t runs).
     torch.set_num_threads(1)
     y = forward(False)
     ym = forward(True)
     scale = max(y.abs().max().item(), 1e-6)
     print("TORCH_MANUAL_VS_SDPA %.3e" % ((ym - y).abs().max().item() / scale), flush=True)
-    a = array.array("f", y.reshape(-1).tolist())
-    if sys.byteorder != "little":
-        a.byteswap()
-    with open(OUT_PATH, "wb") as f:
-        f.write(a.tobytes())
-    mn, med = bench(False)
+    dump(y, OUT_PATH)
+
+    # --- compile phase: build BOTH variants first (untimed except the printed compile wall) ---
+    comp1 = None
+    compN = None
+    if TRY_COMPILE:
+        for tag, nth in (("1T", 1), ("NT", DEFAULT_THREADS)):
+            wall_tag = "1C" if tag == "1T" else "NC"
+            try:
+                torch.set_num_threads(nth)
+                fn, out, cw = build_compiled(tag)
+                for _ in range(CWARMUP):
+                    fn()
+                delta = (out - y).abs().max().item() / scale
+                print("TORCH%s_COMPILE %.1f" % (wall_tag, cw), flush=True)
+                print("TORCH_COMPILED_VS_EAGER_%s %.3e" % (tag, delta), flush=True)
+                if delta <= CTOL:
+                    if tag == "1T":
+                        comp1 = fn
+                        dump(out, COUT_PATH)   # the compiled output for the vs-Wukong cross-check
+                    else:
+                        compN = fn
+                else:
+                    # A fast-but-wrong compiled path must fail loudly and report NO time.
+                    print("TORCH_COMPILED_BAD_%s %.3e" % (tag, delta), flush=True)
+            except Exception as e:
+                print("TORCH_COMPILE_FAIL %s reason=%s" % (tag, repr(str(e))[:160]), flush=True)
+                try:
+                    torch._dynamo.reset()
+                except Exception:
+                    pass
+    else:
+        print("TORCH_COMPILE_SKIP msvc-not-found", flush=True)
+
+    # --- timing phase, coolest-first: T1 eager -> T1 compiled -> Tn eager -> Tn compiled ---
+    torch.set_num_threads(1)
+    mn, med = bench_call(lambda: forward(False))
     print("TORCH1 %.3f %.3f" % (mn, med), flush=True)
-    mn, med = bench(True)
+    mn, med = bench_call(lambda: forward(True))
     print("TORCH1M %.3f %.3f" % (mn, med), flush=True)
-    # All-core variant LAST so its heat pollutes no single-thread torch number.
+    if comp1 is not None:
+        mn, med = bench_call(comp1)
+        print("TORCH1C %.3f %.3f" % (mn, med), flush=True)
+    # All-core variants LAST so their heat pollutes no single-thread torch number.
     torch.set_num_threads(DEFAULT_THREADS)
-    mn, med = bench(False)
+    mn, med = bench_call(lambda: forward(False))
     print("TORCHN %.3f %.3f" % (mn, med), flush=True)
+    if compN is not None:
+        mn, med = bench_call(compN)
+        print("TORCHNC %.3f %.3f" % (mn, med), flush=True)
 print("TORCH_OK", flush=True)
 "#,
         s = s,
@@ -1014,20 +1349,34 @@ print("TORCH_OK", flush=True)
         hd = hd,
         dff = dff,
         layers = LAYERS,
+        try_compile = if try_compile { "True" } else { "False" },
         w = w_path.display(),
         io = io_path.display(),
         out = out_path.display(),
+        cout = cout_path.display(),
     )
 }
 
-/// Parsed torch timings — `(min, median)` ns/forward per variant — plus the SDPA output for the
-/// cross-check and the script's own manual-vs-SDPA agreement figure.
+/// Parsed torch timings — `(min, median)` ns/forward per variant — plus the SDPA + compiled outputs
+/// for the cross-checks, the compile wall-clocks (ms; cold-start, kept out of per-forward numbers),
+/// the compiled-vs-eager agreement figures, and any compile disclosures to echo.
 struct TorchMeasure {
     sdpa_1t: Option<(f64, f64)>,
     manual_1t: Option<(f64, f64)>,
     sdpa_nt: Option<(f64, f64)>,
+    comp_1t: Option<(f64, f64)>,
+    comp_nt: Option<(f64, f64)>,
+    compile_ms_1t: Option<f64>,
+    compile_ms_nt: Option<f64>,
+    compiled_vs_eager_1t: Option<f64>,
+    compiled_vs_eager_nt: Option<f64>,
     manual_vs_sdpa: Option<f64>,
+    /// Eager-SDPA final output (for the vs-Wukong cross-check).
     out: Vec<f32>,
+    /// Compiled final output (for the vs-Wukong cross-check); empty if compilation was skipped/bad.
+    comp_out: Vec<f32>,
+    /// `TORCH_COMPILE_DISCLOSE` / `TORCH_COMPILE_FAIL` / `TORCH_COMPILED_BAD_*` lines to echo.
+    disclosures: Vec<String>,
 }
 
 /// Dump the shared buffers, generate + run the peer script, parse its machine-readable lines.
@@ -1066,9 +1415,22 @@ fn bench_torch(
         return None;
     }
     let out_path = dir.join(format!("model_torch_out_s{}.bin", cfg.s));
+    let cout_path = dir.join(format!("model_torch_cout_s{}.bin", cfg.s));
     let script_path = dir.join(format!("model_torch_s{}.py", cfg.s));
-    std::fs::write(&script_path, torch_script(cfg, &w_path, &io_path, &out_path)).ok()?;
-    let run = Command::new(&ctx.py).arg(&script_path).output().ok()?;
+    // The compiled variants are only attempted when the MSVC build environment could be captured;
+    // without it Inductor's cl/link step can't run, so the script skips compilation entirely and
+    // the compiled columns degrade to `n/a (MSVC not found)`.
+    let try_compile = vcvars_env().is_some();
+    // Stale outputs from a previous run must not masquerade as this run's results.
+    let _ = std::fs::remove_file(&cout_path);
+    std::fs::write(
+        &script_path,
+        torch_script(cfg, &w_path, &io_path, &out_path, &cout_path, try_compile),
+    )
+    .ok()?;
+    // Spawn under the captured MSVC environment (with <base_prefix>\libs on LIB) so TorchInductor
+    // can compile + link its CPU kernels; falls back to the inherited env when MSVC is absent.
+    let run = peer_command(ctx, &script_path).output().ok()?;
     let stdout = String::from_utf8_lossy(&run.stdout);
     if !run.status.success() || !stdout.contains("TORCH_OK") {
         eprintln!(
@@ -1088,14 +1450,35 @@ fn bench_torch(
         }
         None
     };
-    let manual_vs_sdpa = stdout
+    let grab1 = |tag: &str| -> Option<f64> {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(tag)?.trim().parse().ok())
+    };
+    let manual_vs_sdpa = grab1("TORCH_MANUAL_VS_SDPA ");
+    // Disclosures the operator should see verbatim: graph breaks, total-failure reasons, and any
+    // compiled-vs-eager divergence that suppressed a compiled timing.
+    let disclosures: Vec<String> = stdout
         .lines()
-        .find_map(|l| l.strip_prefix("TORCH_MANUAL_VS_SDPA ")?.trim().parse().ok());
-    let bytes = std::fs::read(&out_path).ok()?;
-    let out: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .filter(|l| {
+            l.starts_with("TORCH_COMPILE_DISCLOSE")
+                || l.starts_with("TORCH_COMPILE_FAIL")
+                || l.starts_with("TORCH_COMPILE_SKIP")
+                || l.starts_with("TORCH_COMPILED_BAD")
+        })
+        .map(|l| l.to_string())
         .collect();
+    let read_f32 = |path: &Path| -> Vec<f32> {
+        std::fs::read(path)
+            .map(|bytes| {
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let out = read_f32(&out_path);
     if out.len() != cfg.s * cfg.d {
         eprintln!(
             "model: torch peer: output size mismatch ({} vs {})",
@@ -1104,12 +1487,28 @@ fn bench_torch(
         );
         return None;
     }
+    // Only accept a compiled output of the right size (it exists only if the compiled path passed
+    // its own vs-eager check); otherwise leave it empty so no compiled column reports a time.
+    let comp_out = read_f32(&cout_path);
+    let comp_out = if comp_out.len() == cfg.s * cfg.d {
+        comp_out
+    } else {
+        Vec::new()
+    };
     Some(TorchMeasure {
         sdpa_1t: grab("TORCH1"),
         manual_1t: grab("TORCH1M"),
         sdpa_nt: grab("TORCHN"),
+        comp_1t: grab("TORCH1C"),
+        comp_nt: grab("TORCHNC"),
+        compile_ms_1t: grab1("TORCH1C_COMPILE "),
+        compile_ms_nt: grab1("TORCHNC_COMPILE "),
+        compiled_vs_eager_1t: grab1("TORCH_COMPILED_VS_EAGER_1T "),
+        compiled_vs_eager_nt: grab1("TORCH_COMPILED_VS_EAGER_NT "),
         manual_vs_sdpa,
         out,
+        comp_out,
+        disclosures,
     })
 }
 
@@ -1135,20 +1534,30 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
         "  (the suite's standard basis); C(fast) = same source with -ffast-math (the llama2.c \
          -Ofast basis). Lower ms is better;"
     );
-    println!("  absolute numbers are thermal-bound — the Wukong/C ratio is the stable metric.\n");
+    println!("  absolute numbers are thermal-bound — the Wukong/C ratio is the stable metric.");
+    // Power state: sustained-load timings taken on battery are not comparable to AC runs.
+    println!("  {}\n", power_status_line());
 
     let torch = detect_torch();
     match &torch {
-        Some(t) => println!(
-            "  PyTorch peer: torch {} — CPU EAGER float32 under torch.inference_mode() (NOT \
-             torch.compile), {} threads available.\n  Same weights/inputs via little-endian f32 \
-             blobs; T1 = torch.set_num_threads(1), Tn = default all threads;\n  sdpa = \
-             F.scaled_dot_product_attention (fused industry path), man = manual matmul+softmax \
-             attention.\n",
-            t.version, t.threads
-        ),
+        Some(t) => {
+            let compile_env = match vcvars_env() {
+                Some(_) => "torch.compile ENABLED (vcvars64 MSVC env captured)".to_string(),
+                None => "torch.compile disabled (MSVC vcvars64 env unavailable)".to_string(),
+            };
+            println!(
+                "  PyTorch peer: torch {} via {} ({} threads) — CPU float32 under \
+                 torch.inference_mode().\n  Regimes: EAGER (T1/Tn) and torch.compile(\
+                 mode=\"max-autotune\", fullgraph=True) (T1c/Tnc). {compile_env}.\n  Same \
+                 weights/inputs via little-endian f32 blobs; T1 = set_num_threads(1), Tn = default \
+                 all threads;\n  sdpa = F.scaled_dot_product_attention (fused industry path), man = \
+                 manual matmul+softmax; comp = TorchInductor-compiled whole forward.\n",
+                t.version, t.py, t.threads
+            );
+        }
         None => println!(
-            "  PyTorch peer: python + torch not importable on PATH — torch columns skipped.\n"
+            "  PyTorch peer: no importable torch on `python` or tools/torch-venv (PYTHON overrides) \
+             — torch columns skipped.\n"
         ),
     }
 
@@ -1159,7 +1568,17 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
         );
     }
 
-    for s in [128usize, 512] {
+    // XBENCH_MODEL_S=<n> restricts the sweep to a single seq length (a smoke/iteration knob — the
+    // compiled peer's max-autotune warmup is minutes per S, so one S keeps a mechanism check fast).
+    let sizes: Vec<usize> = match std::env::var("XBENCH_MODEL_S") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect::<Vec<_>>(),
+        Err(_) => vec![128, 512],
+    };
+    let sizes = if sizes.is_empty() { vec![128, 512] } else { sizes };
+    for s in sizes {
         bench_model_size(
             cc,
             dir,
@@ -1360,10 +1779,26 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     let (mut xa, mut xb) = (vec![0.0f32; sd], vec![0.0f32; sd]);
     let mut y = vec![0.0f32; sd];
 
+    // Sweep knobs (both purely additive; default behaviour unchanged):
+    //  * XBENCH_MODEL_WUK_ONLY skips every external peer (C, C(fast), PyTorch) — a dev iterating on
+    //    the multicore kernels gets Wuk(1c) vs Wuk(par) + scaling in seconds instead of the minutes
+    //    the peer compilation + torch warmups cost. Not for reported numbers.
+    //  * XBENCH_MODEL_TORCH_ONLY skips the Wukong and C columns and runs only the torch peer variants
+    //    — for anchoring the peer's own machine state (e.g. an external thread sweep of the peer).
+    //  They are mutually exclusive; WUK_ONLY (which also drops torch) wins if both are set.
+    let wk_only = std::env::var("XBENCH_MODEL_WUK_ONLY").is_ok();
+    let torch_only = !wk_only && std::env::var("XBENCH_MODEL_TORCH_ONLY").is_ok();
+
     // --- Wukong (serial), through the real pipeline ---
     let mut interner = Interner::new();
-    let wuk = compile_wukong(&wk_block(cfg, false), &mut interner);
-    let lnf_mod = compile_wukong(&wk_final_ln(cfg), &mut interner);
+    let (wuk, lnf_mod) = if torch_only {
+        (None, None)
+    } else {
+        (
+            compile_wukong(&wk_block(cfg, false), &mut interner),
+            compile_wukong(&wk_final_ln(cfg), &mut interner),
+        )
+    };
     let wk_m = match (&wuk, &lnf_mod) {
         (Some(m), Some(l)) => {
             // Mechanism transparency: print exactly which recognized kernels the block dispatches.
@@ -1409,11 +1844,9 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // --- C (gcc, standard suite flags). A single naive-dot forward is tens of seconds at S=512
     // (the serial-FMA-chain regime), so like bench_matmul's naive-at-2048 rule it is skipped
     // there by default (XBENCH_MODEL_NAIVE forces it); correctness at S=512 is checked vs C(fast).
-    // XBENCH_MODEL_WUK_ONLY skips every external peer (C, C(fast), PyTorch) so a dev iterating on the
-    // multicore kernels gets Wuk(1c) vs Wuk(par) + scaling in seconds instead of the ~2 min the peer
-    // compilation + torch warmups cost. Not for reported numbers — the peers are the honesty bar.
-    let wk_only = std::env::var("XBENCH_MODEL_WUK_ONLY").is_ok();
-    let run_c_slow = !wk_only && (cfg.s <= 128 || std::env::var("XBENCH_MODEL_NAIVE").is_ok());
+    // The C columns are dropped entirely under WUK_ONLY (Wukong-only) or TORCH_ONLY (peer-only).
+    let no_c = wk_only || torch_only;
+    let run_c_slow = !no_c && (cfg.s <= 128 || std::env::var("XBENCH_MODEL_NAIVE").is_ok());
     let c_src = c_model(cfg);
     let c_m = if run_c_slow {
         compile_c_model(
@@ -1438,16 +1871,20 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             }
         })
     } else {
-        println!(
-            "  -> C(gcc) omitted at S={} (naive-dot forward is tens of seconds per call; its loss \
-             is already shown at S=128). Set XBENCH_MODEL_NAIVE to force it.",
-            cfg.s
-        );
+        // Only explain the naive-dot omission when C would otherwise have run; under WUK_ONLY /
+        // TORCH_ONLY the C columns are dropped on purpose and need no per-size note.
+        if !no_c {
+            println!(
+                "  -> C(gcc) omitted at S={} (naive-dot forward is tens of seconds per call; its \
+                 loss is already shown at S=128). Set XBENCH_MODEL_NAIVE to force it.",
+                cfg.s
+            );
+        }
         None
     };
 
     // --- C(fast): identical source, -ffast-math ---
-    let cfast_m = if wk_only { None } else { compile_c_model(
+    let cfast_m = if no_c { None } else { compile_c_model(
         &c_src,
         dir,
         &format!("model_s{}_fast", cfg.s),
@@ -1470,7 +1907,12 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     }) };
 
     // --- Wukong @parallel, measured LAST so its all-core heat pollutes no single-core column ---
-    let wk_par_m = compile_wukong(&wk_block(cfg, true), &mut interner).and_then(|m| {
+    let wk_par_compiled = if torch_only {
+        None
+    } else {
+        compile_wukong(&wk_block(cfg, true), &mut interner)
+    };
+    let wk_par_m = wk_par_compiled.and_then(|m| {
         // Same mechanism transparency as the serial column: print the @parallel dispatch set and
         // warn if the embedded GEMMs regressed to serial (they would still be *correct*, so only
         // this scan would catch it).
@@ -1529,8 +1971,8 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // iteration.
     let torch_m = if wk_only { None } else { torch }.and_then(|t| {
         println!(
-            "  running PyTorch peer (torch {}, eager f32, inference_mode; warmup 3 + timed 10 \
-             per variant)...",
+            "  running PyTorch peer (torch {}, f32 inference_mode; eager + torch.compile \
+             max-autotune; timed 10 per variant)...",
             t.version
         );
         bench_torch(t, dir, cfg, &weights, &x0, &lnf_g, &lnf_b)
@@ -1547,10 +1989,12 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     }
 
     // --- report ---
-    // Torch columns are eager PyTorch (no compile step): T1(sdpa)/Tn(sdpa) = fused
-    // F.scaled_dot_product_attention at 1/all threads, T1(man) = manual matmul+softmax at 1
-    // thread. Column value is the min of the timed iterations (the suite's best-observed
-    // convention); medians are printed below the table.
+    // Torch eager columns (no compile step): T1(sdpa)/Tn(sdpa) = fused
+    // F.scaled_dot_product_attention at 1/all threads, T1(man) = manual matmul+softmax at 1 thread.
+    // Torch compiled columns: T1(comp)/Tn(comp) = torch.compile(max-autotune, fullgraph) of the
+    // whole forward — their `compile ms` cell is the Inductor cold-start wall, kept OUT of the
+    // per-forward numbers. Column value is the min of the timed iterations (the suite's
+    // best-observed convention); medians are printed below the table.
     let mk_torch = |v: Option<(f64, f64)>, out: &[f32]| {
         v.map(|(mn, _)| MeasureModel {
             compile: Duration::ZERO, // sentinel: eager, no compile step — printed as "eager"
@@ -1558,23 +2002,37 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             out: out.to_vec(),
         })
     };
-    let (torch1_m, torchman_m, torchn_m) = match &torch_m {
+    // Compiled column: carries the Inductor compile wall in `compile` (printed in the compile-ms
+    // row, separate from ns/forward). A missing wall falls back to a 1ns marker so the cell never
+    // reads "eager" for a compiled variant.
+    let mk_comp = |v: Option<(f64, f64)>, ms: Option<f64>, out: &[f32]| {
+        v.map(|(mn, _)| MeasureModel {
+            compile: Duration::from_secs_f64((ms.unwrap_or(0.0) / 1e3).max(1e-9)),
+            ns_per_fwd: mn,
+            out: out.to_vec(),
+        })
+    };
+    let (torch1_m, torchman_m, torchn_m, torch1c_m, torchnc_m) = match &torch_m {
         Some(t) => (
             mk_torch(t.sdpa_1t, &t.out),
             mk_torch(t.manual_1t, &[]),
             mk_torch(t.sdpa_nt, &[]),
+            mk_comp(t.comp_1t, t.compile_ms_1t, &t.comp_out),
+            mk_comp(t.comp_nt, t.compile_ms_nt, &[]),
         ),
-        None => (None, None, None),
+        None => (None, None, None, None, None),
     };
 
-    let cols: [(&str, &Option<MeasureModel>); 7] = [
+    let cols: [(&str, &Option<MeasureModel>); 9] = [
         ("Wuk(1c)", &wk_m),
         ("Wuk(par)", &wk_par_m),
         ("C(gcc)", &c_m),
         ("C(fast)", &cfast_m),
         ("T1(sdpa)", &torch1_m),
         ("T1(man)", &torchman_m),
+        ("T1(comp)", &torch1c_m),
         ("Tn(sdpa)", &torchn_m),
+        ("Tn(comp)", &torchnc_m),
     ];
     let row = |label: &str, f: &dyn Fn(&MeasureModel) -> String| {
         print!("  {:<22}", label);
@@ -1612,13 +2070,49 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!(
-            "  torch detail: sdpa-1t {}; manual-1t {}; sdpa-all {}",
+            "  torch detail (eager): sdpa-1t {}; manual-1t {}; sdpa-all {}",
             fmt(&t.sdpa_1t),
             fmt(&t.manual_1t),
             fmt(&t.sdpa_nt)
         );
+        // Compiled timings + the cold-start compile wall (printed separately so it never pollutes
+        // any per-forward number).
+        if t.comp_1t.is_some() || t.comp_nt.is_some() {
+            let wall = |ms: &Option<f64>| ms.map(|m| format!("{m:.0} ms")).unwrap_or_else(|| "n/a".into());
+            println!(
+                "  torch detail (compiled, max-autotune): comp-1t {} (compile {}); comp-all {} (compile {})",
+                fmt(&t.comp_1t),
+                wall(&t.compile_ms_1t),
+                fmt(&t.comp_nt),
+                wall(&t.compile_ms_nt),
+            );
+        }
         if let Some(r) = t.manual_vs_sdpa {
             println!("  torch-internal manual-attn vs SDPA: max|Δ|/max|out| = {r:.2e}");
+        }
+        // Compiled-vs-eager agreement (the compiled path is only timed when this is within tol).
+        if let Some(r) = t.compiled_vs_eager_1t {
+            println!("  torch-internal compiled vs eager (1t): max|Δ|/max|out| = {r:.2e}");
+        }
+        if let Some(r) = t.compiled_vs_eager_nt {
+            println!("  torch-internal compiled vs eager (all): max|Δ|/max|out| = {r:.2e}");
+        }
+        // Echo any compile disclosures verbatim (graph breaks, total failures, suppressed-timing
+        // divergences, MSVC-absent skip) so the compiled regime's state is never silent.
+        for d in &t.disclosures {
+            if d.starts_with("TORCH_COMPILE_SKIP") {
+                println!(
+                    "  torch.compile skipped: MSVC build env not found — compiled columns n/a \
+                     (eager unaffected)"
+                );
+            } else {
+                println!("  torch.compile disclosure: {d}");
+            }
+        }
+        // If compilation was attempted (MSVC present) yet a compiled variant produced no time, say
+        // so plainly next to the n/a cells.
+        if vcvars_env().is_some() && torch1c_m.is_none() && torchnc_m.is_none() && t.disclosures.is_empty() {
+            println!("  note: T1(comp)/Tn(comp) n/a — torch.compile produced no timed result");
         }
     }
 
@@ -1659,10 +2153,22 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         "@parallel",
         "PyTorch eager SDPA (all threads)",
     );
+    ratio_line(
+        &wk_m,
+        &torch1c_m,
+        "(1 core)",
+        "PyTorch compiled max-autotune (1 thread)",
+    );
+    ratio_line(
+        &wk_par_m,
+        &torchnc_m,
+        "@parallel",
+        "PyTorch compiled max-autotune (all threads)",
+    );
     if wk_par_m.is_some() {
         println!(
             "     (thread disclosure: both C columns and the T1 torch columns are \
-             single-threaded; Wuk(par) and Tn(sdpa) are the two multicore columns — the \
+             single-threaded; Wuk(par), Tn(sdpa) and Tn(comp) are the multicore columns — the \
              @parallel dispatch set is printed above)"
         );
     }
@@ -1694,6 +2200,10 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // Wukong vs torch: same GELU flavor (tanh approx) and eps, so the residual is the same
     // reassociation + poly-vs-libm class as vs C — expect ~1e-5-ish at the standard 1e-3.
     check(&wk_m, &torch1_m, "Wukong vs Torch (eager SDPA)", 1e-3);
+    // The compiled output is cross-checked exactly like the eager SDPA output — vs Wukong at the
+    // same 1e-3 magnitude-normalized tolerance (the script already gated it vs eager, so a
+    // fast-but-wrong compiled path never reached a timed column in the first place).
+    check(&wk_m, &torch1c_m, "Wukong vs Torch (compiled max-autotune)", 1e-3);
     // Serial vs @parallel Wukong: every dispatched _parallel kernel is bit-identical to its serial
     // twin (fixed chunking / row-mapped) and the outlined glue loops are deterministic, so this one
     // stays the strict per-element check — it is expected EXACT.
