@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+module tests.run.parallel_region_decline
+
+// A genuine cross-iteration dependence: iteration h READS the slice iteration h-1 WROTE
+// (`out[(h+1)*2+j] = out[h*2+j] + x[h*2+j]`). The region matcher must decline (the write index
+// (h+1)*2+j carries no bare h*C digit), so the loop stays a serial chain and the prefix-style
+// values below are the only correct answer — a wrong parallelization would race and diverge.
+@parallel
+fn scan(x: [f32; 16], mut out: [f32; 16]) {
+    for i in 0..16 { out[i] = x[i]; }
+    for h in 0..3 {
+        for j in 0..2 { out[(h+1)*2 + j] = out[h*2 + j] + x[h*2 + j]; }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 { x[i] = (i as f32) + 1.0; }
+    let mut out: [f32; 16] = [0.0; 16];
+    scan(x, out);
+    print(out[2] as i32);
+    print(out[4] as i32);
+    print(out[6] as i32);
+    print(out[7] as i32);
+    return 0;
+}
