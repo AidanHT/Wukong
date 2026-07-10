@@ -1,0 +1,69 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -9
+// EXPECT-OUT: 0
+// EXPECT-OUT: 34
+// EXPECT-OUT: 86
+// Ragged head count: 3 heads never divide evenly across a power-of-two core pool, so the runtime's
+// contiguous chunking is exercised with uneven chunks (and one head per chunk on wide machines).
+// Same natural spelling and same serial-twin bit-exactness gate as parallel_head_loop.mer.
+module tests.run.parallel_head_ragged
+
+@parallel
+fn heads(q: [f32; 24], k: [f32; 24], v: [f32; 24], mut attn: [f32; 24], mut y: [f32; 24]) {
+    for i in 0..24 { y[i] = q[i]; }
+    for hh in 0..3 {
+        let mut qh: [f32; 8] = [0.0; 8];
+        let mut kh: [f32; 8] = [0.0; 8];
+        let mut scores: [f32; 16] = [0.0; 16];
+        for i in 0..4 { for p in 0..2 { qh[i*2+p] = q[i*6 + hh*2 + p]; } }
+        for i in 0..4 { for p in 0..2 { kh[i*2+p] = k[i*6 + hh*2 + p]; } }
+        for i in 0..4 { for j in 0..4 {
+            let mut acc: f32 = 0.0;
+            for p in 0..2 { acc = acc + qh[i*2+p] * kh[j*2+p]; }
+            scores[i*4+j] = acc;
+        } }
+        for i in 0..4 { for j in 0..2 { attn[i*6 + hh*2 + j] = scores[i*4+j] + v[i*6 + hh*2 + j]; } }
+    }
+}
+
+fn heads_serial(q: [f32; 24], k: [f32; 24], v: [f32; 24], mut attn: [f32; 24]) {
+    for hh in 0..3 {
+        let mut qh: [f32; 8] = [0.0; 8];
+        let mut kh: [f32; 8] = [0.0; 8];
+        let mut scores: [f32; 16] = [0.0; 16];
+        for i in 0..4 { for p in 0..2 { qh[i*2+p] = q[i*6 + hh*2 + p]; } }
+        for i in 0..4 { for p in 0..2 { kh[i*2+p] = k[i*6 + hh*2 + p]; } }
+        for i in 0..4 { for j in 0..4 {
+            let mut acc: f32 = 0.0;
+            for p in 0..2 { acc = acc + qh[i*2+p] * kh[j*2+p]; }
+            scores[i*4+j] = acc;
+        } }
+        for i in 0..4 { for j in 0..2 { attn[i*6 + hh*2 + j] = scores[i*4+j] + v[i*6 + hh*2 + j]; } }
+    }
+}
+
+fn main() -> i32 {
+    let mut q: [f32; 24] = [0.0; 24];
+    let mut k: [f32; 24] = [0.0; 24];
+    let mut v: [f32; 24] = [0.0; 24];
+    for i in 0..24 {
+        q[i] = (i as f32) * 0.5;
+        k[i] = 6.0 - (i as f32) * 0.25;
+        v[i] = (i as f32) - 12.0;
+    }
+    let mut a_par: [f32; 24] = [0.0; 24];
+    let mut a_ser: [f32; 24] = [0.0; 24];
+    let mut y: [f32; 24] = [0.0; 24];
+    heads(q, k, v, a_par, y);
+    heads_serial(q, k, v, a_ser);
+    let mut bad: i32 = 0;
+    for i in 0..24 { if a_par[i] != a_ser[i] { bad = bad + 1; } }
+    print(bad);
+    print(a_par[0] as i32);
+    print(a_par[3] as i32);
+    print(a_par[11] as i32);
+    print(a_par[23] as i32);
+    return 0;
+}
