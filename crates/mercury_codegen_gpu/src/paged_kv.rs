@@ -120,6 +120,67 @@ impl KvConfig {
     pub fn kv_bytes_int8(&self) -> usize {
         2 * self.slab_elems() + 2 * self.scale_slab_elems() * 4
     }
+
+    /// Geometry for a serving cache in which **every one** of `num_slots` sequences can reach
+    /// `max_ctx` tokens simultaneously (the worst case a scheduler must plan for): the block-table
+    /// width is `ceil(max_ctx / block_size)` and the pool holds exactly `num_slots` such sequences.
+    /// Size the result against the device budget with [`assert_kv_budget`](Self::assert_kv_budget).
+    pub fn for_serving(
+        layers: usize,
+        heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_slots: usize,
+        max_ctx: usize,
+    ) -> KvConfig {
+        let max_blocks_per_seq = max_ctx.div_ceil(block_size).max(1);
+        KvConfig {
+            layers,
+            heads,
+            head_dim,
+            block_size,
+            num_blocks: num_slots * max_blocks_per_seq,
+            num_slots,
+            max_blocks_per_seq,
+        }
+    }
+
+    /// Assert the K+V cache at `elem_size` bytes/element ([`kv_bytes`](Self::kv_bytes)) fits inside
+    /// `budget_bytes` of device memory, returning the bytes needed. The Bcap-scaling lever's guard:
+    /// growing `num_slots` (or `max_ctx` via `num_blocks`) must stay inside the 6 GB part's budget
+    /// *before* the slabs are allocated, not fail as a mid-run `CUDA_ERROR_OUT_OF_MEMORY`.
+    pub fn assert_kv_budget(&self, elem_size: usize, budget_bytes: usize) -> usize {
+        let need = self.kv_bytes(elem_size);
+        assert!(
+            need <= budget_bytes,
+            "KV cache needs {need} B ({:.2} GiB) for {} slots x {} blocks/seq x {} layers at {elem_size} B/elem \
+             — exceeds the {budget_bytes} B ({:.2} GiB) device budget",
+            need as f64 / (1u64 << 30) as f64,
+            self.num_slots,
+            self.max_blocks_per_seq,
+            self.layers,
+            budget_bytes as f64 / (1u64 << 30) as f64,
+        );
+        need
+    }
+
+    /// Largest per-sequence context (tokens, rounded down to whole blocks) for which
+    /// `for_serving(..)`'s cache still fits `budget_bytes` at `elem_size` bytes/element — the
+    /// Bcap↔context trade-off table in one call. Returns 0 if even one block per slot is over budget.
+    pub fn max_ctx_within_budget(
+        layers: usize,
+        heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_slots: usize,
+        elem_size: usize,
+        budget_bytes: usize,
+    ) -> usize {
+        // Bytes per cached token position (K and V, all layers).
+        let per_tok = 2 * layers * heads * head_dim * elem_size;
+        let per_slot_blocks = budget_bytes / (per_tok * block_size * num_slots);
+        per_slot_blocks * block_size
+    }
 }
 
 /// The **host-side** block allocator + per-slot block tables. No device handle — this is pure policy,
@@ -140,6 +201,11 @@ pub struct BlockManager {
     tables: Vec<Vec<u32>>,
     /// Per slot: tokens currently cached.
     ctx_len: Vec<usize>,
+    /// Monotone counter bumped whenever any slot's block *table* changes (block pushed or freed) —
+    /// context lengths alone don't move it. A device block-table upload is stale iff this differs
+    /// from the epoch it was taken at, so steady-state decode steps (in-block appends) skip the
+    /// `num_slots * max_blocks_per_seq` table re-upload entirely.
+    layout_epoch: u64,
 }
 
 impl BlockManager {
@@ -157,7 +223,15 @@ impl BlockManager {
             free,
             tables: vec![Vec::new(); num_slots],
             ctx_len: vec![0; num_slots],
+            layout_epoch: 0,
         }
+    }
+
+    /// The current block-table layout epoch (see the field docs): compare against the epoch of the
+    /// last device upload to decide whether the flat block table must be re-uploaded.
+    #[inline]
+    pub fn layout_epoch(&self) -> u64 {
+        self.layout_epoch
     }
 
     /// Tokens per block.
@@ -232,6 +306,7 @@ impl BlockManager {
         }
         let b = self.free.pop().ok_or(OutOfBlocks)?;
         self.tables[slot].push(b);
+        self.layout_epoch += 1;
         Ok(b)
     }
 
@@ -271,6 +346,9 @@ impl BlockManager {
     /// fresh pool would — which is precisely the physical re-layout the bit-exact gate wants.
     pub fn free(&mut self, slot: usize) {
         let blocks = std::mem::take(&mut self.tables[slot]);
+        if !blocks.is_empty() {
+            self.layout_epoch += 1;
+        }
         for b in blocks {
             self.free.push(b);
         }
@@ -314,14 +392,44 @@ impl BlockManager {
 /// `[layers, num_blocks, block_size, heads, head_dim]`, plus the [`BlockManager`] policy and reusable
 /// device buffers for the block table / context lengths the attention kernel reads. Built only with a
 /// live `Gpu` (the host policy in [`BlockManager`] is what the unit tests cover).
+/// Which dtype the device cache stores the K/V values in. `F16` is the default and the bit-exact
+/// path every existing gate runs; `Int8` (per-(token, head) scaled — the
+/// [`crate::paged_attention::quantize_kv_int8`] scheme) halves the footprint again, lossy and
+/// tolerance-gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvDtype {
+    #[default]
+    F16,
+    Int8,
+}
+
+/// The device K/V slabs, by storage dtype. `Int8` adds the two per-(token, head) f32 **scale slabs**
+/// ([`KvConfig::scale_slab_elems`] each) the int8 append/attention kernels write/read. The value
+/// slabs have the identical `[layers, num_blocks, block_size, heads, head_dim]` layout in both arms.
+#[cfg(feature = "gpu")]
+pub enum KvStorage {
+    F16 { k: CudaSlice<half::f16>, v: CudaSlice<half::f16> },
+    Int8 { k: CudaSlice<i8>, v: CudaSlice<i8>, ksc: CudaSlice<f32>, vsc: CudaSlice<f32> },
+}
+
+#[cfg(feature = "gpu")]
+impl KvStorage {
+    /// The storage dtype of this slab set.
+    pub fn dtype(&self) -> KvDtype {
+        match self {
+            KvStorage::F16 { .. } => KvDtype::F16,
+            KvStorage::Int8 { .. } => KvDtype::Int8,
+        }
+    }
+}
+
 #[cfg(feature = "gpu")]
 pub struct PagedKvCache {
     cfg: KvConfig,
     mgr: BlockManager,
     stream: Arc<CudaStream>,
-    /// K and V slabs, f16, `[layers, num_blocks, block_size, heads, head_dim]`.
-    k: CudaSlice<half::f16>,
-    v: CudaSlice<half::f16>,
+    /// K and V slabs (+ int8 scale slabs), `[layers, num_blocks, block_size, heads, head_dim]`.
+    storage: KvStorage,
     /// Reusable device upload of the flattened block table (`num_slots * max_blocks_per_seq` u32).
     block_table_d: CudaSlice<u32>,
     /// Reusable device upload of per-slot context lengths (`num_slots` u32).
@@ -330,21 +438,58 @@ pub struct PagedKvCache {
 
 #[cfg(feature = "gpu")]
 impl PagedKvCache {
-    /// Allocate the K/V slabs (zeroed) and the block-table / context-length upload buffers on
+    /// Allocate the f16 K/V slabs (zeroed) and the block-table / context-length upload buffers on
     /// `stream`. The slabs are `footprint_bytes()` of device memory — sized by the caller against the
-    /// 6 GB budget.
+    /// 6 GB budget. This is the default (bit-exact) storage; int8 opts in via
+    /// [`new_with_dtype`](Self::new_with_dtype).
     pub fn new(stream: Arc<CudaStream>, cfg: KvConfig) -> Result<Self, DriverError> {
-        let mgr = BlockManager::new(cfg.num_blocks, cfg.block_size, cfg.num_slots, cfg.max_blocks_per_seq);
-        let k = stream.alloc_zeros::<half::f16>(cfg.slab_elems())?;
-        let v = stream.alloc_zeros::<half::f16>(cfg.slab_elems())?;
-        let block_table_d = stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
-        let ctx_len_d = stream.alloc_zeros::<u32>(cfg.num_slots)?;
-        Ok(Self { cfg, mgr, stream, k, v, block_table_d, ctx_len_d })
+        Self::new_with_dtype(stream, cfg, KvDtype::F16)
     }
 
-    /// Total device bytes the two f16 slabs occupy (K + V across all layers) — the serving footprint.
+    /// As [`new`](Self::new) with an explicit storage dtype. `Int8` additionally allocates the two
+    /// per-(token, head) f32 scale slabs (zeroed).
+    pub fn new_with_dtype(stream: Arc<CudaStream>, cfg: KvConfig, dtype: KvDtype) -> Result<Self, DriverError> {
+        let mgr = BlockManager::new(cfg.num_blocks, cfg.block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+        let storage = match dtype {
+            KvDtype::F16 => KvStorage::F16 {
+                k: stream.alloc_zeros::<half::f16>(cfg.slab_elems())?,
+                v: stream.alloc_zeros::<half::f16>(cfg.slab_elems())?,
+            },
+            KvDtype::Int8 => KvStorage::Int8 {
+                k: stream.alloc_zeros::<i8>(cfg.slab_elems())?,
+                v: stream.alloc_zeros::<i8>(cfg.slab_elems())?,
+                ksc: stream.alloc_zeros::<f32>(cfg.scale_slab_elems())?,
+                vsc: stream.alloc_zeros::<f32>(cfg.scale_slab_elems())?,
+            },
+        };
+        let block_table_d = stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
+        let ctx_len_d = stream.alloc_zeros::<u32>(cfg.num_slots)?;
+        Ok(Self { cfg, mgr, stream, storage, block_table_d, ctx_len_d })
+    }
+
+    /// Total device bytes the K + V storage occupies across all layers (int8 includes its scale
+    /// slabs) — the serving footprint against the 6 GB budget.
     pub fn footprint_bytes(&self) -> usize {
-        2 * self.cfg.slab_elems() * std::mem::size_of::<half::f16>()
+        match self.storage {
+            KvStorage::F16 { .. } => self.cfg.kv_bytes(2),
+            KvStorage::Int8 { .. } => self.cfg.kv_bytes_int8(),
+        }
+    }
+
+    /// The storage dtype.
+    pub fn dtype(&self) -> KvDtype {
+        self.storage.dtype()
+    }
+
+    /// The K/V storage (all dtypes).
+    pub fn storage(&self) -> &KvStorage {
+        &self.storage
+    }
+
+    /// Mutable K/V storage — the split-borrow seam the decode step hands to the append/attention
+    /// launchers (dtype-dispatched in `DecodeLayer::forward_step_on`).
+    pub fn storage_mut(&mut self) -> &mut KvStorage {
+        &mut self.storage
     }
 
     /// The static geometry.
@@ -362,28 +507,46 @@ impl PagedKvCache {
         &self.mgr
     }
 
-    /// Device K slab `[layers, num_blocks, block_size, heads, head_dim]` (f16).
+    /// Device K slab `[layers, num_blocks, block_size, heads, head_dim]` (f16 storage only — the
+    /// int8 arm is reached through [`storage`](Self::storage); a wrong-dtype access is a logic bug,
+    /// so it panics rather than corrupting).
     pub fn k(&self) -> &CudaSlice<half::f16> {
-        &self.k
+        match &self.storage {
+            KvStorage::F16 { k, .. } => k,
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage()"),
+        }
     }
-    /// Device V slab (same layout).
+    /// Device V slab (same layout; f16 storage only).
     pub fn v(&self) -> &CudaSlice<half::f16> {
-        &self.v
+        match &self.storage {
+            KvStorage::F16 { v, .. } => v,
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage()"),
+        }
     }
-    /// Mutable device K slab (for the append kernel).
+    /// Mutable device K slab (for the append kernel; f16 storage only).
     pub fn k_mut(&mut self) -> &mut CudaSlice<half::f16> {
-        &mut self.k
+        match &mut self.storage {
+            KvStorage::F16 { k, .. } => k,
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+        }
     }
-    /// Mutable device V slab.
+    /// Mutable device V slab (f16 storage only).
     pub fn v_mut(&mut self) -> &mut CudaSlice<half::f16> {
-        &mut self.v
+        match &mut self.storage {
+            KvStorage::F16 { v, .. } => v,
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+        }
     }
 
-    /// Both slabs mutably at once (`&mut K`, `&mut V`) via a split borrow — the decode step needs to
-    /// pass both to the append kernel in one launch, which two separate `k_mut`/`v_mut` calls (each a
-    /// full `&mut self`) cannot express.
+    /// Both f16 slabs mutably at once (`&mut K`, `&mut V`) via a split borrow — the decode step needs
+    /// to pass both to the append kernel in one launch, which two separate `k_mut`/`v_mut` calls
+    /// (each a full `&mut self`) cannot express. F16 storage only (tests/population helpers);
+    /// dtype-generic code goes through [`storage_mut`](Self::storage_mut).
     pub fn slabs_mut(&mut self) -> (&mut CudaSlice<half::f16>, &mut CudaSlice<half::f16>) {
-        (&mut self.k, &mut self.v)
+        match &mut self.storage {
+            KvStorage::F16 { k, v } => (k, v),
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+        }
     }
 
     /// Push the current host block table + context lengths to the device buffers the attention kernel
@@ -438,6 +601,41 @@ mod tests {
             "KV footprint (32L, 8h×128, 4096×16 blocks): f32 {:.2} GiB | f16 {:.2} GiB | int8 {:.2} GiB → {:.2}x vs f16, {:.2}x vs f32",
             gib(f32b), gib(f16b), gib(i8b), vs_f16, vs_f32
         );
+    }
+
+    /// **Bcap-scaling budget table (the 6 GB lever, pure geometry).** For the goodput-bench layer
+    /// geometry (12 layers, 8 heads × 64, 16-token blocks, f16 KV), every swept Bcap must fit its
+    /// worst-case simultaneous context inside a 4 GiB KV budget with room for the bench's 96-token
+    /// contexts, and the exact `for_serving` config at that context must round-trip its own budget
+    /// assert. No device needed.
+    #[test]
+    fn serving_bcap_budget_table() {
+        let budget = 4usize << 30; // KV slice of the 6 GB part (weights/pool/desktop take the rest)
+        let (layers, heads, hd, bsz) = (12, 8, 64, 16);
+        for &bcap in &[64usize, 128, 256] {
+            let max_ctx = KvConfig::max_ctx_within_budget(layers, heads, hd, bsz, bcap, 2, budget);
+            assert!(max_ctx >= 96, "Bcap={bcap} must fit the bench's 96-token contexts (got {max_ctx})");
+            let cfg = KvConfig::for_serving(layers, heads, hd, bsz, bcap, max_ctx);
+            let bytes = cfg.assert_kv_budget(2, budget);
+            eprintln!(
+                "Bcap={bcap:3}: max simultaneous ctx {max_ctx:5} tok/seq → KV {:.2} GiB of {:.1} GiB budget",
+                bytes as f64 / (1u64 << 30) as f64,
+                budget as f64 / (1u64 << 30) as f64
+            );
+        }
+    }
+
+    /// The budget assert must fire (panic, pre-allocation) when the requested geometry exceeds the
+    /// device budget — the guard that turns a mid-run `CUDA_ERROR_OUT_OF_MEMORY` into a clear error.
+    #[test]
+    #[should_panic(expected = "exceeds")]
+    fn over_budget_kv_config_is_rejected() {
+        // One block over: for_serving at max_ctx+block_size cannot fit the same budget it saturates.
+        let budget = 4usize << 30;
+        let (layers, heads, hd, bsz) = (12, 8, 64, 16);
+        let max_ctx = KvConfig::max_ctx_within_budget(layers, heads, hd, bsz, 256, 2, budget);
+        let cfg = KvConfig::for_serving(layers, heads, hd, bsz, 256, max_ctx + bsz);
+        cfg.assert_kv_budget(2, budget);
     }
 
     // ---- pure host allocator: runs on a GPU-less box (the policy is device-independent) ----
