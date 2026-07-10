@@ -401,23 +401,27 @@ pub unsafe extern "C" fn wukong_velem_f32_parallel(
     let nchunks = n.div_ceil(VCHUNK);
     // Raw pointers cross the rayon closure boundary as integers (the same pattern as the parallel
     // reduce/norm); each chunk touches a disjoint output sub-slice and `y` is shared read-only.
+    // Forks on the unified kernel pool (`run_on_wuk_pool`) — chunks are fixed `VCHUNK` spans, so
+    // the pool/worker count never touches the bits.
     let (xa, ya, oa) = (x as usize, y as usize, out as usize);
-    (0..nchunks).into_par_iter().for_each(|ck| {
-        let lo = ck * VCHUNK;
-        let hi = ((ck + 1) * VCHUNK).min(n);
-        // SAFETY: disjoint output sub-slice [lo, hi) ⊆ [0, n); x/out valid for n. `y` is offset only
-        // when the op reads it — a scale/relu passes a null (or aliased) `y` the kernel never touches,
-        // and `null.add(lo)` would be UB, so an unread `y` is left unoffset.
-        unsafe {
-            let xp = (xa as *const f32).add(lo);
-            let yp = if use_y {
-                (ya as *const f32).add(lo)
-            } else {
-                ya as *const f32
-            };
-            let outp = (oa as *mut f32).add(lo);
-            velem_span(xp, yp, outp, hi - lo, a, b, c, op, nt);
-        }
+    crate::run_on_wuk_pool(move || {
+        (0..nchunks).into_par_iter().for_each(|ck| {
+            let lo = ck * VCHUNK;
+            let hi = ((ck + 1) * VCHUNK).min(n);
+            // SAFETY: disjoint output sub-slice [lo, hi) ⊆ [0, n); x/out valid for n. `y` is offset
+            // only when the op reads it — a scale/relu passes a null (or aliased) `y` the kernel
+            // never touches, and `null.add(lo)` would be UB, so an unread `y` is left unoffset.
+            unsafe {
+                let xp = (xa as *const f32).add(lo);
+                let yp = if use_y {
+                    (ya as *const f32).add(lo)
+                } else {
+                    ya as *const f32
+                };
+                let outp = (oa as *mut f32).add(lo);
+                velem_span(xp, yp, outp, hi - lo, a, b, c, op, nt);
+            }
+        });
     });
 }
 

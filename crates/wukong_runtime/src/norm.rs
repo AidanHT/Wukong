@@ -769,19 +769,22 @@ pub unsafe extern "C" fn wukong_norm_f32_parallel(
     let (rows, cols) = (rows as usize, cols as usize);
     let eps = f32::from_bits(eps_bits as u32);
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/reduce);
-    // each row is a disjoint sub-slice.
+    // each row is a disjoint sub-slice. Forks on the unified kernel pool (`run_on_wuk_pool`) —
+    // per-row work is self-contained, so the pool choice never touches the bits.
     let (xa, oa) = (x as usize, out as usize);
-    (0..rows).into_par_iter().for_each(|r| {
-        // SAFETY: disjoint row; pointers valid for rows*cols by contract.
-        unsafe {
-            norm_row(
-                (xa as *const f32).add(r * cols),
-                (oa as *mut f32).add(r * cols),
-                cols,
-                eps,
-                op,
-            )
-        };
+    crate::run_on_wuk_pool(move || {
+        (0..rows).into_par_iter().for_each(|r| {
+            // SAFETY: disjoint row; pointers valid for rows*cols by contract.
+            unsafe {
+                norm_row(
+                    (xa as *const f32).add(r * cols),
+                    (oa as *mut f32).add(r * cols),
+                    cols,
+                    eps,
+                    op,
+                )
+            };
+        });
     });
 }
 
@@ -848,21 +851,24 @@ pub unsafe extern "C" fn wukong_norm_affine_f32_parallel(
     let (rows, cols) = (rows as usize, cols as usize);
     let eps = f32::from_bits(eps_bits as u32);
     // Pointers cross the rayon boundary as integers (null round-trips through 0); rows are disjoint,
-    // gamma/beta are shared read-only.
+    // gamma/beta are shared read-only. Forks on the unified kernel pool (`run_on_wuk_pool`) —
+    // per-row work is self-contained, so the pool choice never touches the bits.
     let (xa, oa, ga, ba) = (x as usize, out as usize, gamma as usize, beta as usize);
-    (0..rows).into_par_iter().for_each(|r| {
-        // SAFETY: disjoint row; gamma/beta valid for cols by contract.
-        unsafe {
-            norm_affine_row(
-                (xa as *const f32).add(r * cols),
-                (oa as *mut f32).add(r * cols),
-                ga as *const f32,
-                ba as *const f32,
-                cols,
-                eps,
-                op,
-            )
-        };
+    crate::run_on_wuk_pool(move || {
+        (0..rows).into_par_iter().for_each(|r| {
+            // SAFETY: disjoint row; gamma/beta valid for cols by contract.
+            unsafe {
+                norm_affine_row(
+                    (xa as *const f32).add(r * cols),
+                    (oa as *mut f32).add(r * cols),
+                    ga as *const f32,
+                    ba as *const f32,
+                    cols,
+                    eps,
+                    op,
+                )
+            };
+        });
     });
 }
 
