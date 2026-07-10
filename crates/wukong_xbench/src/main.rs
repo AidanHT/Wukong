@@ -343,7 +343,9 @@ fn main() {
     println!(
         "Cross-language kernel benchmark — Wukong (native) vs C (gcc -O3) vs Rust (rustc -Copt-level=3)"
     );
-    println!("N = {N} f32 elements, single-threaded, -march=native. Lower ns is better.\n");
+    println!("N = {N} f32 elements, single-threaded, -march=native. Lower ns is better.");
+    // Power state up front: sustained-load timings on battery are not comparable to AC runs.
+    println!("{}\n", model::power_status_line());
 
     // Optional substring filter (first CLI arg): run only the kernels/sections whose name contains it,
     // for fast single-kernel iteration. No arg → the full suite, byte-for-byte as before.
