@@ -32,10 +32,12 @@ use half::f16;
 
 use crate::gpu::{Gpu, TransformerWeights};
 use crate::paged_attention::{
-    kv_append_ptx, launch_kv_append, launch_paged_attn_decode, paged_attn_decode_ptx,
-    KV_APPEND_ENTRY, PAGED_ATTN_ENTRY,
+    kv_append_int8_ptx, kv_append_ptx, launch_kv_append, launch_kv_append_int8,
+    launch_paged_attn_decode, launch_paged_attn_decode_int8, paged_attn_decode_int8_ptx,
+    paged_attn_decode_ptx, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY, PAGED_ATTN_ENTRY,
+    PAGED_ATTN_INT8_ENTRY,
 };
-use crate::paged_kv::{KvConfig, PagedKvCache};
+use crate::paged_kv::{KvConfig, KvDtype, KvStorage, PagedKvCache};
 use crate::pool::{DevicePool, PoolBuf};
 
 /// Launch config for the shared-memory-staged WMMA kernels (`*_sm_db`), one CTA per `SM_BM×SM_BN`
@@ -70,6 +72,9 @@ pub struct DecodeLayer {
     dff: usize,
     eps: f32,
     scale: f32,
+    /// Cache storage dtype this layer's append/attention kernels were loaded for — must match the
+    /// [`KvStorage`] arm handed to [`forward_step_on`](Self::forward_step_on).
+    dtype: KvDtype,
 }
 
 impl DecodeLayer {
@@ -84,10 +89,24 @@ impl DecodeLayer {
         self.cfg.num_slots
     }
 
-    /// Upload the weights (narrowed to f16) and load every kernel. `cfg` is the cache geometry; `dff`
-    /// the FFN inner dim. Requires `D % 64 == 0`, `Dff % 64 == 0`, `Bcap % 64 == 0` (the 64×64 WMMA
-    /// tile), and `head_dim ∈ {64, 128}` (the generated paged-attn kernels).
+    /// Upload the weights (narrowed to f16) and load every kernel for **f16 cache storage** (the
+    /// default, bit-exact path). `cfg` is the cache geometry; `dff` the FFN inner dim. Requires
+    /// `D % 64 == 0`, `Dff % 64 == 0`, `Bcap % 64 == 0` (the 64×64 WMMA tile), and
+    /// `head_dim ∈ {64, 128}` (the generated paged-attn kernels).
     pub fn new(g: &mut Gpu, w: &TransformerWeights, cfg: KvConfig, dff: usize) -> Result<Self, DriverError> {
+        Self::new_with_dtype(g, w, cfg, dff, KvDtype::F16)
+    }
+
+    /// As [`new`](Self::new) with an explicit cache storage dtype: `Int8` loads the int8
+    /// append/attention kernel pair instead (distinct module-cache keys — a shared key would hand
+    /// back the wrong cached kernel). Everything else (weights, GEMMs, norms) is dtype-independent.
+    pub fn new_with_dtype(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        cfg: KvConfig,
+        dff: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
         let d = cfg.heads * cfg.head_dim;
         assert!(d % 64 == 0 && dff % 64 == 0, "D and Dff must be multiples of 64 (WMMA tile)");
         assert!(cfg.num_slots % 64 == 0, "Bcap (num_slots) must be a multiple of 64 (WMMA M tile)");
@@ -108,13 +127,30 @@ impl DecodeLayer {
         let f_gemm = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db")?;
         let f_silu = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db_silu")?;
         let f_resid = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db_residual")?;
-        let attn_key: &'static str = match cfg.head_dim {
-            64 => "paged_attn_d64",
-            128 => "paged_attn_d128",
-            _ => unreachable!(),
+        let (f_attn, f_append) = match dtype {
+            KvDtype::F16 => {
+                let attn_key: &'static str = match cfg.head_dim {
+                    64 => "paged_attn_d64",
+                    128 => "paged_attn_d128",
+                    _ => unreachable!(),
+                };
+                (
+                    g.function(attn_key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY)?,
+                    g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)?,
+                )
+            }
+            KvDtype::Int8 => {
+                let attn_key: &'static str = match cfg.head_dim {
+                    64 => "paged_attn_int8_d64",
+                    128 => "paged_attn_int8_d128",
+                    _ => unreachable!(),
+                };
+                (
+                    g.function(attn_key, &paged_attn_decode_int8_ptx(cfg.head_dim), PAGED_ATTN_INT8_ENTRY)?,
+                    g.function("kv_append_int8", &kv_append_int8_ptx(), KV_APPEND_INT8_ENTRY)?,
+                )
+            }
         };
-        let f_attn = g.function(attn_key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY)?;
-        let f_append = g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)?;
         let to16 = |wt: &[f32]| -> Vec<f16> { wt.iter().map(|&v| f16::from_f32(v)).collect() };
         let wq = g.stream.memcpy_stod(&to16(w.wq))?;
         let wk = g.stream.memcpy_stod(&to16(w.wk))?;
@@ -140,21 +176,22 @@ impl DecodeLayer {
             dff,
             eps: 1e-5,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+            dtype,
         })
     }
 
     /// Run one decode step for this layer on `stream`, all scratch from `pool`. `x_d` is the `[Bcap,D]`
-    /// input activation; the new K/V are appended into `(k_cache, v_cache)` at `wpos_d[slot]` (which
-    /// must already be reserved) for layer plane `layer`; attention reads the cache over `cl_d[slot]`
-    /// (= post-append context). The `[Bcap,D]` result is written into `out`. Every pooled buffer is a
-    /// full-overwrite output (uninit `alloc` is safe — proven by the poison gate).
+    /// input activation; the new K/V are appended into `kv` at `wpos_d[slot]` (which must already be
+    /// reserved) for layer plane `layer`; attention reads the cache over `cl_d[slot]` (= post-append
+    /// context). `kv`'s storage dtype must match the dtype this layer was built with (the kernels are
+    /// loaded per dtype — asserted). The `[Bcap,D]` result is written into `out`. Every pooled buffer
+    /// is a full-overwrite output (uninit `alloc` is safe — proven by the poison gate).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_step_on(
         &self,
         stream: &Arc<CudaStream>,
         pool: &mut DevicePool,
-        k_cache: &mut CudaSlice<f16>,
-        v_cache: &mut CudaSlice<f16>,
+        kv: &mut KvStorage,
         x_d: &CudaSlice<f32>,
         bt_d: &CudaSlice<u32>,
         cl_d: &CudaSlice<u32>,
@@ -163,6 +200,7 @@ impl DecodeLayer {
         layer: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
+        assert_eq!(self.dtype, kv.dtype(), "cache storage dtype must match the layer's kernels");
         let (bcap, d, dff, eps) = (self.bcap(), self.d(), self.dff, self.eps);
         debug_assert_eq!(x_d.len(), bcap * d);
         debug_assert_eq!(out.len(), bcap * d);
@@ -207,11 +245,21 @@ impl DecodeLayer {
         let q = gemm16(pool, &self.f_gemm, &h1_16, &self.wq, bcap, d, d)?;
         let k = gemm16(pool, &self.f_gemm, &h1_16, &self.wk, bcap, d, d)?;
         let v = gemm16(pool, &self.f_gemm, &h1_16, &self.wv, bcap, d, d)?;
-        // Append the new token's K/V into this layer's cache plane at each slot's write position.
-        launch_kv_append(stream, &self.f_append, &k, &v, k_cache, v_cache, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
-        // Paged decode attention over the (now-updated) cache.
+        // Append the new token's K/V into this layer's cache plane at each slot's write position,
+        // then paged decode attention over the (now-updated) cache — the one dtype-dispatched pair.
+        // `attn` is pooled *before* the match so the bump sequence is identical on both arms (a
+        // captured graph bakes the pooled addresses).
         let mut attn = pool.alloc::<f32>(bcap * d)?;
-        launch_paged_attn_decode(stream, &self.f_attn, &q, k_cache, v_cache, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
+        match kv {
+            KvStorage::F16 { k: kc, v: vc } => {
+                launch_kv_append(stream, &self.f_append, &k, &v, kc, vc, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
+                launch_paged_attn_decode(stream, &self.f_attn, &q, kc, vc, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
+            }
+            KvStorage::Int8 { k: kc, v: vc, ksc, vsc } => {
+                launch_kv_append_int8(stream, &self.f_append, &k, &v, kc, vc, ksc, vsc, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
+                launch_paged_attn_decode_int8(stream, &self.f_attn, &q, kc, vc, ksc, vsc, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
+            }
+        }
         let attn_16 = cast(pool, &attn, bcap * d)?;
         let x1 = resid_gemm(pool, &attn_16, &self.wo, x_d, bcap, d, d)?; // x + attn·Woᵀ (residual 1)
 
@@ -281,7 +329,8 @@ impl DecodeModel {
     }
 
     /// Build the `N` decode layers (one weight set each), the paged cache (`cfg`), a `pool_bytes`
-    /// scratch arena, and the per-step metadata + ping-pong buffers. All share `g`'s stream.
+    /// scratch arena, and the per-step metadata + ping-pong buffers. All share `g`'s stream. F16
+    /// cache storage (the default, bit-exact path); int8 via [`new_with_dtype`](Self::new_with_dtype).
     pub fn new(
         g: &mut Gpu,
         weights: &[TransformerWeights],
@@ -289,14 +338,28 @@ impl DecodeModel {
         dff: usize,
         pool_bytes: usize,
     ) -> Result<Self, DriverError> {
+        Self::new_with_dtype(g, weights, cfg, dff, pool_bytes, KvDtype::F16)
+    }
+
+    /// As [`new`](Self::new) with an explicit cache storage dtype (`Int8` = half the KV footprint of
+    /// f16, lossy, tolerance-gated; the append/attention kernels are swapped per dtype, everything
+    /// else is unchanged — including graph capture, which sees the same pooled-launch shape).
+    pub fn new_with_dtype(
+        g: &mut Gpu,
+        weights: &[TransformerWeights],
+        cfg: KvConfig,
+        dff: usize,
+        pool_bytes: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
         assert!(!weights.is_empty(), "model needs at least one layer");
         assert_eq!(weights.len(), cfg.layers, "cfg.layers must equal the number of weight sets");
         let d = cfg.heads * cfg.head_dim;
         let mut layers = Vec::with_capacity(weights.len());
         for w in weights {
-            layers.push(DecodeLayer::new(g, w, cfg, dff)?);
+            layers.push(DecodeLayer::new_with_dtype(g, w, cfg, dff, dtype)?);
         }
-        let cache = PagedKvCache::new(g.stream.clone(), cfg)?;
+        let cache = PagedKvCache::new_with_dtype(g.stream.clone(), cfg, dtype)?;
         let pool = DevicePool::new(g.stream.clone(), pool_bytes)?;
         let bt_d = g.stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
         let cl_d = g.stream.alloc_zeros::<u32>(cfg.num_slots)?;
@@ -330,28 +393,28 @@ impl DecodeModel {
         x_d: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
-        // Disjoint field borrows (the launchers need &mut cache slabs + &mut pool + & metadata at once).
+        // Disjoint field borrows (the launchers need &mut cache storage + &mut pool + & metadata at once).
         let Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, .. } = self;
         let n = layers.len();
-        let (ks, vs) = cache.slabs_mut();
+        let kv = cache.storage_mut();
         if n == 1 {
             pool.reset();
-            return layers[0].forward_step_on(stream, pool, ks, vs, x_d, bt_d, cl_d, wpos_d, active_d, 0, out);
+            return layers[0].forward_step_on(stream, pool, kv, x_d, bt_d, cl_d, wpos_d, active_d, 0, out);
         }
         pool.reset();
-        layers[0].forward_step_on(stream, pool, ks, vs, x_d, bt_d, cl_d, wpos_d, active_d, 0, &mut bufs[0])?;
+        layers[0].forward_step_on(stream, pool, kv, x_d, bt_d, cl_d, wpos_d, active_d, 0, &mut bufs[0])?;
         let mut cur = 0usize; // layer i-1's output lives in bufs[cur]
         for (i, layer) in layers.iter().enumerate().take(n - 1).skip(1) {
             pool.reset();
             let (a, b) = bufs.split_at_mut(1);
             let (src, dst) = if cur == 0 { (&a[0], &mut b[0]) } else { (&b[0], &mut a[0]) };
-            layer.forward_step_on(stream, pool, ks, vs, src, bt_d, cl_d, wpos_d, active_d, i, dst)?;
+            layer.forward_step_on(stream, pool, kv, src, bt_d, cl_d, wpos_d, active_d, i, dst)?;
             cur = 1 - cur;
         }
         pool.reset();
         // Last layer reads the current buffer, writes the caller's `out`.
         let src = &bufs[cur];
-        layers[n - 1].forward_step_on(stream, pool, ks, vs, src, bt_d, cl_d, wpos_d, active_d, n - 1, out)
+        layers[n - 1].forward_step_on(stream, pool, kv, src, bt_d, cl_d, wpos_d, active_d, n - 1, out)
     }
 
     /// Upload the current host block table / context lengths / write positions to the device metadata
@@ -704,7 +767,8 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::paged_attention::{
-        kv_append_ptx, launch_kv_append, reference_decode_attn, KV_APPEND_ENTRY,
+        kv_append_int8_ptx, kv_append_ptx, launch_kv_append, launch_kv_append_int8,
+        quantize_kv_int8, reference_decode_attn, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY,
     };
     use crate::paged_kv::BlockManager;
 
@@ -762,6 +826,27 @@ mod tests {
         dff: usize,
         eps: f32,
     ) -> Vec<f32> {
+        // f16 cache: the new token's K/V round through f16 on the way into the cache.
+        let f16_row = |row: &[f32]| -> Vec<f32> { row.iter().map(|&z| f16r(z)).collect() };
+        ref_decode_step_with(x, w, past_k, past_v, ctx0, heads, hd, dff, eps, &f16_row)
+    }
+
+    /// [`ref_decode_step`] with the **cache rounding of the new token** as a parameter: the f16 path
+    /// rounds through f16, the int8 path quantizes/dequantizes per (token, head) — `past_k`/`past_v`
+    /// carry whatever effective (already-rounded/dequantized) values the cache stores for the past.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_decode_step_with(
+        x: &[f32],
+        w: &TransformerWeights,
+        past_k: &[Vec<f32>],
+        past_v: &[Vec<f32>],
+        ctx0: &[usize],
+        heads: usize,
+        hd: usize,
+        dff: usize,
+        eps: f32,
+        cache_round: &dyn Fn(&[f32]) -> Vec<f32>,
+    ) -> Vec<f32> {
         let bcap = ctx0.len();
         let d = heads * hd;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -772,12 +857,12 @@ mod tests {
             let q = ref_nt_f16(&h1, w.wq, 1, d, d);
             let kk = ref_nt_f16(&h1, w.wk, 1, d, d);
             let vv = ref_nt_f16(&h1, w.wv, 1, d, d);
-            // Full attention context: the cached past ++ the new token (rounded f16, as the cache stores).
+            // Full attention context: the cached past ++ the new token (rounded as the cache stores).
             let ctx = ctx0[b];
             let mut kfull = past_k[b].clone();
             let mut vfull = past_v[b].clone();
-            kfull.extend(kk.iter().map(|&z| f16r(z)));
-            vfull.extend(vv.iter().map(|&z| f16r(z)));
+            kfull.extend(cache_round(&kk));
+            vfull.extend(cache_round(&vv));
             let attn = reference_decode_attn(&q, &[kfull], &[vfull], &[ctx + 1], heads, hd, scale);
             let o = ref_nt_f16(&attn, w.wo, 1, d, d);
             let x1: Vec<f32> = xb.iter().zip(&o).map(|(&a, &b)| a + b).collect();
@@ -933,6 +1018,199 @@ mod tests {
             eprintln!(
                 "decode step vs f64 ref: max_abs={:.2e} max_rel={:.2e} (Bcap={bcap}, heads={heads}, hd={hd}, Dff={dff}, ragged ctx 0..80)",
                 s.max_abs, s.max_rel
+            );
+        });
+    }
+
+    /// Populate a 1-layer **int8** model's cache plane with each slot's per-(token, head) quantized
+    /// past (values + scales, the [`quantize_kv_int8`] scheme), returning the **dequantized**
+    /// `(past_k, past_v)` — the effective values the reference attends over. Reserves `ctx0[b]`
+    /// tokens per slot first. The int8 twin of [`populate_one_layer`].
+    fn populate_one_layer_int8(
+        g: &mut Gpu,
+        model: &mut DecodeModel,
+        ctx0: &[usize],
+        heads: usize,
+        hd: usize,
+        seed: u64,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let d = heads * hd;
+        let cfg = *model.cache_mut().config();
+        let mut rng = crate::diff::Rng::new(seed);
+        let (mut past_k, mut past_v) = (Vec::new(), Vec::new());
+        let mut kq = vec![0i8; cfg.slab_elems()];
+        let mut vq = vec![0i8; cfg.slab_elems()];
+        let mut ks = vec![0f32; cfg.scale_slab_elems()];
+        let mut vs = vec![0f32; cfg.scale_slab_elems()];
+        for b in 0..ctx0.len() {
+            let pk = rng.vec(ctx0[b] * d, -1.0, 1.0);
+            let pv = rng.vec(ctx0[b] * d, -1.0, 1.0);
+            if ctx0[b] > 0 {
+                model.cache_mut().manager().reserve(b, ctx0[b]).unwrap();
+            }
+            let (kqi, ksi) = quantize_kv_int8(&pk, ctx0[b], heads, hd);
+            let (vqi, vsi) = quantize_kv_int8(&pv, ctx0[b], heads, hd);
+            for t in 0..ctx0[b] {
+                let (phys, off) = model.cache_mut().manager_ref().locate(b, t);
+                for h in 0..heads {
+                    ks[cfg.scale_offset(0, phys, off, h)] = ksi[t * heads + h];
+                    vs[cfg.scale_offset(0, phys, off, h)] = vsi[t * heads + h];
+                    for dh in 0..hd {
+                        let idx = cfg.elem_offset(0, phys, off, h, dh);
+                        let src = (t * heads + h) * hd + dh;
+                        kq[idx] = kqi[src];
+                        vq[idx] = vqi[src];
+                    }
+                }
+            }
+            // Dequantized effective past ([t, heads, hd] row-major ⇒ scale index = i / hd).
+            past_k.push((0..ctx0[b] * d).map(|i| kqi[i] as f32 * ksi[i / hd]).collect());
+            past_v.push((0..ctx0[b] * d).map(|i| vqi[i] as f32 * vsi[i / hd]).collect());
+        }
+        match model.cache_mut().storage_mut() {
+            KvStorage::Int8 { k, v, ksc, vsc } => {
+                g.stream.memcpy_htod(&kq, k).unwrap();
+                g.stream.memcpy_htod(&vq, v).unwrap();
+                g.stream.memcpy_htod(&ks, ksc).unwrap();
+                g.stream.memcpy_htod(&vs, vsc).unwrap();
+            }
+            KvStorage::F16 { .. } => unreachable!("int8 populate on a non-int8 cache"),
+        }
+        (past_k, past_v)
+    }
+
+    /// **int8 KV-append round-trip + mask (exact).** The device append must quantize exactly like
+    /// the ties-even host mirror — int8 values equal, f32 scales bit-equal (IEEE `div.rn` + order-
+    /// independent amax make this deterministic) — at exactly the block-table addresses, with
+    /// inactive slots leaving the slabs untouched (the block-0 guard) and zeros everywhere else.
+    #[test]
+    fn serving_kv_append_int8_round_trip_and_mask() {
+        with_gpu("serving_kv_append_int8_round_trip_and_mask", |g| {
+            let (heads, hd, bsz, bcap) = (4usize, 64usize, 16usize, 8usize);
+            let d = heads * hd;
+            let active = [true, false, true, true, false, true, true, false];
+            let wpos = [5usize, 0, 16, 31, 0, 3, 20, 0]; // across block boundaries
+            let max_bps = wpos.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 4;
+            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut mgr = BlockManager::new(num_blocks, bsz, bcap, max_bps);
+            for b in 0..bcap {
+                if active[b] {
+                    mgr.reserve(b, wpos[b] + 1).unwrap();
+                }
+            }
+            let mut rng = crate::diff::Rng::new(0x18A9);
+            let knew = rng.vec(bcap * d, -1.0, 1.0);
+            let vnew = rng.vec(bcap * d, -2.0, 2.0);
+            let knew_d = g.stream.memcpy_stod(&knew).unwrap();
+            let vnew_d = g.stream.memcpy_stod(&vnew).unwrap();
+            let mut k_d = g.stream.alloc_zeros::<i8>(cfg.slab_elems()).unwrap();
+            let mut v_d = g.stream.alloc_zeros::<i8>(cfg.slab_elems()).unwrap();
+            let mut ksc_d = g.stream.alloc_zeros::<f32>(cfg.scale_slab_elems()).unwrap();
+            let mut vsc_d = g.stream.alloc_zeros::<f32>(cfg.scale_slab_elems()).unwrap();
+            let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
+            let wpos_u: Vec<u32> = wpos.iter().map(|&p| p as u32).collect();
+            let wpos_d = g.stream.memcpy_stod(&wpos_u).unwrap();
+            let act_u: Vec<u32> = active.iter().map(|&a| a as u32).collect();
+            let act_d = g.stream.memcpy_stod(&act_u).unwrap();
+            let func = g.function("kv_append_int8", &kv_append_int8_ptx(), KV_APPEND_INT8_ENTRY).unwrap();
+            launch_kv_append_int8(
+                &g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &mut ksc_d, &mut vsc_d, &bt_d, &wpos_d,
+                &act_d, &cfg, 0, bcap,
+            )
+            .unwrap();
+            g.stream.synchronize().unwrap();
+            let kh = g.stream.memcpy_dtov(&k_d).unwrap();
+            let vh = g.stream.memcpy_dtov(&v_d).unwrap();
+            let ksch = g.stream.memcpy_dtov(&ksc_d).unwrap();
+            let vsch = g.stream.memcpy_dtov(&vsc_d).unwrap();
+            // Ties-even host mirror of the device quantization (see the kernel's rounding note).
+            let quant = |row: &[f32]| -> (Vec<i8>, f32) {
+                let amax = row.iter().fold(0f32, |m, &x| m.max(x.abs()));
+                let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                (row.iter().map(|&x| (x / scale).round_ties_even().clamp(-127.0, 127.0) as i8).collect(), scale)
+            };
+            let mut exp_k = vec![0i8; cfg.slab_elems()];
+            let mut exp_v = vec![0i8; cfg.slab_elems()];
+            let mut exp_ks = vec![0f32; cfg.scale_slab_elems()];
+            let mut exp_vs = vec![0f32; cfg.scale_slab_elems()];
+            for b in 0..bcap {
+                if !active[b] {
+                    continue;
+                }
+                let (phys, off) = mgr.locate(b, wpos[b]);
+                for h in 0..heads {
+                    let (qk, sk) = quant(&knew[b * d + h * hd..b * d + (h + 1) * hd]);
+                    let (qv, sv) = quant(&vnew[b * d + h * hd..b * d + (h + 1) * hd]);
+                    exp_ks[cfg.scale_offset(0, phys, off, h)] = sk;
+                    exp_vs[cfg.scale_offset(0, phys, off, h)] = sv;
+                    for dh in 0..hd {
+                        exp_k[cfg.elem_offset(0, phys, off, h, dh)] = qk[dh];
+                        exp_v[cfg.elem_offset(0, phys, off, h, dh)] = qv[dh];
+                    }
+                }
+            }
+            for i in 0..cfg.slab_elems() {
+                assert_eq!(kh[i], exp_k[i], "int8 K slab elem {i} (inactive leak or quant mismatch?)");
+                assert_eq!(vh[i], exp_v[i], "int8 V slab elem {i}");
+            }
+            for i in 0..cfg.scale_slab_elems() {
+                assert_eq!(ksch[i].to_bits(), exp_ks[i].to_bits(), "K scale {i} not bit-equal");
+                assert_eq!(vsch[i].to_bits(), exp_vs[i].to_bits(), "V scale {i} not bit-equal");
+            }
+            let written = active.iter().filter(|&&a| a).count();
+            eprintln!(
+                "int8 kv_append: {written}/{bcap} active slots quantized+scattered EXACTLY (values == host mirror, \
+                 scales bit-equal); every inactive row skipped"
+            );
+        });
+    }
+
+    /// **int8-KV whole decode-step tolerance gate (the first law, lossy path).** One full decode step
+    /// on an int8-cache model (device-quantized append + int8 paged attention) must match the f64
+    /// reference attending over the dequantized cache within tolerance — int8 is lossy, so this is
+    /// the tolerance sibling of the bit-oriented f16 gates; the f16 default path keeps every
+    /// bit-exact invariance gate. Also checks the footprint halves vs f16.
+    #[test]
+    fn serving_decode_step_int8_matches_reference() {
+        with_gpu("serving_decode_step_int8_matches_reference", |g| {
+            let (heads, hd, dff, bsz, bcap) = (4usize, 64usize, 256usize, 16usize, 64usize);
+            let d = heads * hd;
+            let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 13) % 81).collect(); // ragged incl. 0
+            let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 8;
+            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut rng = crate::diff::Rng::new(0x1D8A);
+            let wdata = layer_weights(&mut rng, 1, d, dff);
+            let weights = weights_view(&wdata);
+            let mut model =
+                DecodeModel::new_with_dtype(g, &weights, cfg, dff, 64 * 1024 * 1024, KvDtype::Int8).unwrap();
+            let (past_k, past_v) = populate_one_layer_int8(g, &mut model, &ctx0, heads, hd, 0x9876);
+            let x = rng.vec(bcap * d, -1.0, 1.0);
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+            model.step_on(&g.stream.clone(), &x_d, &mut out_d).unwrap();
+            g.stream.synchronize().unwrap();
+            let got = g.stream.memcpy_dtov(&out_d).unwrap();
+            // Reference: past = dequantized cache; the new token rounds through int8 quant/dequant.
+            // (Device rounds ties-even vs the host's half-away — ≤1 int8 LSB apart, far inside tolerance.)
+            let int8_round = |row: &[f32]| -> Vec<f32> {
+                let (q, sc) = quantize_kv_int8(row, 1, heads, hd);
+                (0..row.len()).map(|i| q[i] as f32 * sc[i / hd]).collect()
+            };
+            let refv =
+                ref_decode_step_with(&x, &weights[0], &past_k, &past_v, &ctx0, heads, hd, dff, 1e-5, &int8_round);
+            let s = crate::diff::assert_close("decode_step_int8", &got, &refv, 5e-2, 5e-2);
+            let (i8b, f16b) = (model.cache().footprint_bytes(), cfg.kv_bytes(2));
+            assert!(i8b < f16b, "int8 cache must be smaller than f16");
+            eprintln!(
+                "int8-KV decode step vs f64 ref: max_abs={:.2e} max_rel={:.2e} (Bcap={bcap}, ragged ctx 0..80); \
+                 cache {:.1} MiB vs f16 {:.1} MiB ({:.2}x)",
+                s.max_abs,
+                s.max_rel,
+                i8b as f64 / (1 << 20) as f64,
+                f16b as f64 / (1 << 20) as f64,
+                f16b as f64 / i8b as f64
             );
         });
     }

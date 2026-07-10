@@ -392,14 +392,44 @@ impl BlockManager {
 /// `[layers, num_blocks, block_size, heads, head_dim]`, plus the [`BlockManager`] policy and reusable
 /// device buffers for the block table / context lengths the attention kernel reads. Built only with a
 /// live `Gpu` (the host policy in [`BlockManager`] is what the unit tests cover).
+/// Which dtype the device cache stores the K/V values in. `F16` is the default and the bit-exact
+/// path every existing gate runs; `Int8` (per-(token, head) scaled — the
+/// [`crate::paged_attention::quantize_kv_int8`] scheme) halves the footprint again, lossy and
+/// tolerance-gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvDtype {
+    #[default]
+    F16,
+    Int8,
+}
+
+/// The device K/V slabs, by storage dtype. `Int8` adds the two per-(token, head) f32 **scale slabs**
+/// ([`KvConfig::scale_slab_elems`] each) the int8 append/attention kernels write/read. The value
+/// slabs have the identical `[layers, num_blocks, block_size, heads, head_dim]` layout in both arms.
+#[cfg(feature = "gpu")]
+pub enum KvStorage {
+    F16 { k: CudaSlice<half::f16>, v: CudaSlice<half::f16> },
+    Int8 { k: CudaSlice<i8>, v: CudaSlice<i8>, ksc: CudaSlice<f32>, vsc: CudaSlice<f32> },
+}
+
+#[cfg(feature = "gpu")]
+impl KvStorage {
+    /// The storage dtype of this slab set.
+    pub fn dtype(&self) -> KvDtype {
+        match self {
+            KvStorage::F16 { .. } => KvDtype::F16,
+            KvStorage::Int8 { .. } => KvDtype::Int8,
+        }
+    }
+}
+
 #[cfg(feature = "gpu")]
 pub struct PagedKvCache {
     cfg: KvConfig,
     mgr: BlockManager,
     stream: Arc<CudaStream>,
-    /// K and V slabs, f16, `[layers, num_blocks, block_size, heads, head_dim]`.
-    k: CudaSlice<half::f16>,
-    v: CudaSlice<half::f16>,
+    /// K and V slabs (+ int8 scale slabs), `[layers, num_blocks, block_size, heads, head_dim]`.
+    storage: KvStorage,
     /// Reusable device upload of the flattened block table (`num_slots * max_blocks_per_seq` u32).
     block_table_d: CudaSlice<u32>,
     /// Reusable device upload of per-slot context lengths (`num_slots` u32).
@@ -408,21 +438,58 @@ pub struct PagedKvCache {
 
 #[cfg(feature = "gpu")]
 impl PagedKvCache {
-    /// Allocate the K/V slabs (zeroed) and the block-table / context-length upload buffers on
+    /// Allocate the f16 K/V slabs (zeroed) and the block-table / context-length upload buffers on
     /// `stream`. The slabs are `footprint_bytes()` of device memory — sized by the caller against the
-    /// 6 GB budget.
+    /// 6 GB budget. This is the default (bit-exact) storage; int8 opts in via
+    /// [`new_with_dtype`](Self::new_with_dtype).
     pub fn new(stream: Arc<CudaStream>, cfg: KvConfig) -> Result<Self, DriverError> {
-        let mgr = BlockManager::new(cfg.num_blocks, cfg.block_size, cfg.num_slots, cfg.max_blocks_per_seq);
-        let k = stream.alloc_zeros::<half::f16>(cfg.slab_elems())?;
-        let v = stream.alloc_zeros::<half::f16>(cfg.slab_elems())?;
-        let block_table_d = stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
-        let ctx_len_d = stream.alloc_zeros::<u32>(cfg.num_slots)?;
-        Ok(Self { cfg, mgr, stream, k, v, block_table_d, ctx_len_d })
+        Self::new_with_dtype(stream, cfg, KvDtype::F16)
     }
 
-    /// Total device bytes the two f16 slabs occupy (K + V across all layers) — the serving footprint.
+    /// As [`new`](Self::new) with an explicit storage dtype. `Int8` additionally allocates the two
+    /// per-(token, head) f32 scale slabs (zeroed).
+    pub fn new_with_dtype(stream: Arc<CudaStream>, cfg: KvConfig, dtype: KvDtype) -> Result<Self, DriverError> {
+        let mgr = BlockManager::new(cfg.num_blocks, cfg.block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+        let storage = match dtype {
+            KvDtype::F16 => KvStorage::F16 {
+                k: stream.alloc_zeros::<half::f16>(cfg.slab_elems())?,
+                v: stream.alloc_zeros::<half::f16>(cfg.slab_elems())?,
+            },
+            KvDtype::Int8 => KvStorage::Int8 {
+                k: stream.alloc_zeros::<i8>(cfg.slab_elems())?,
+                v: stream.alloc_zeros::<i8>(cfg.slab_elems())?,
+                ksc: stream.alloc_zeros::<f32>(cfg.scale_slab_elems())?,
+                vsc: stream.alloc_zeros::<f32>(cfg.scale_slab_elems())?,
+            },
+        };
+        let block_table_d = stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
+        let ctx_len_d = stream.alloc_zeros::<u32>(cfg.num_slots)?;
+        Ok(Self { cfg, mgr, stream, storage, block_table_d, ctx_len_d })
+    }
+
+    /// Total device bytes the K + V storage occupies across all layers (int8 includes its scale
+    /// slabs) — the serving footprint against the 6 GB budget.
     pub fn footprint_bytes(&self) -> usize {
-        2 * self.cfg.slab_elems() * std::mem::size_of::<half::f16>()
+        match self.storage {
+            KvStorage::F16 { .. } => self.cfg.kv_bytes(2),
+            KvStorage::Int8 { .. } => self.cfg.kv_bytes_int8(),
+        }
+    }
+
+    /// The storage dtype.
+    pub fn dtype(&self) -> KvDtype {
+        self.storage.dtype()
+    }
+
+    /// The K/V storage (all dtypes).
+    pub fn storage(&self) -> &KvStorage {
+        &self.storage
+    }
+
+    /// Mutable K/V storage — the split-borrow seam the decode step hands to the append/attention
+    /// launchers (dtype-dispatched in `DecodeLayer::forward_step_on`).
+    pub fn storage_mut(&mut self) -> &mut KvStorage {
+        &mut self.storage
     }
 
     /// The static geometry.
@@ -440,28 +507,46 @@ impl PagedKvCache {
         &self.mgr
     }
 
-    /// Device K slab `[layers, num_blocks, block_size, heads, head_dim]` (f16).
+    /// Device K slab `[layers, num_blocks, block_size, heads, head_dim]` (f16 storage only — the
+    /// int8 arm is reached through [`storage`](Self::storage); a wrong-dtype access is a logic bug,
+    /// so it panics rather than corrupting).
     pub fn k(&self) -> &CudaSlice<half::f16> {
-        &self.k
+        match &self.storage {
+            KvStorage::F16 { k, .. } => k,
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage()"),
+        }
     }
-    /// Device V slab (same layout).
+    /// Device V slab (same layout; f16 storage only).
     pub fn v(&self) -> &CudaSlice<half::f16> {
-        &self.v
+        match &self.storage {
+            KvStorage::F16 { v, .. } => v,
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage()"),
+        }
     }
-    /// Mutable device K slab (for the append kernel).
+    /// Mutable device K slab (for the append kernel; f16 storage only).
     pub fn k_mut(&mut self) -> &mut CudaSlice<half::f16> {
-        &mut self.k
+        match &mut self.storage {
+            KvStorage::F16 { k, .. } => k,
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+        }
     }
-    /// Mutable device V slab.
+    /// Mutable device V slab (f16 storage only).
     pub fn v_mut(&mut self) -> &mut CudaSlice<half::f16> {
-        &mut self.v
+        match &mut self.storage {
+            KvStorage::F16 { v, .. } => v,
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+        }
     }
 
-    /// Both slabs mutably at once (`&mut K`, `&mut V`) via a split borrow — the decode step needs to
-    /// pass both to the append kernel in one launch, which two separate `k_mut`/`v_mut` calls (each a
-    /// full `&mut self`) cannot express.
+    /// Both f16 slabs mutably at once (`&mut K`, `&mut V`) via a split borrow — the decode step needs
+    /// to pass both to the append kernel in one launch, which two separate `k_mut`/`v_mut` calls
+    /// (each a full `&mut self`) cannot express. F16 storage only (tests/population helpers);
+    /// dtype-generic code goes through [`storage_mut`](Self::storage_mut).
     pub fn slabs_mut(&mut self) -> (&mut CudaSlice<half::f16>, &mut CudaSlice<half::f16>) {
-        (&mut self.k, &mut self.v)
+        match &mut self.storage {
+            KvStorage::F16 { k, v } => (k, v),
+            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+        }
     }
 
     /// Push the current host block table + context lengths to the device buffers the attention kernel
