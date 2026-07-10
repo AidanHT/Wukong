@@ -1351,38 +1351,59 @@ thread_local! {
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
-/// Block-shape policy for the 2D block-parallel path: pick `(BM, BN)` — the C-block height/width —
-/// for an `m×n` output on an `nworkers`-thread pool. **The one tunable of the 2D path**; pure, so
-/// an A/B sweep can retune it without touching the kernel.
+/// Block-shape policy for the 2D block-parallel paths: pick `(BM, BN)` — the C-block height/width
+/// — for an `m×n` output, aiming for at least `target_blocks` grid blocks (the caller's
+/// load-balance budget: `3×` its effective worker count, so rayon work-stealing can absorb this
+/// asymmetric 6P+8E+2LPE pool's core-speed imbalance). **The one tunable of the 2D paths**; pure,
+/// so an A/B sweep can retune it without touching the kernels.
 ///
 /// Constraints, in priority order:
 /// * `BM % MR == 0` and `BN % NR == 0` — every interior block boundary lands on a micropanel
-///   boundary, which is what makes the per-block packs byte-identical to the serial kernel's
+///   boundary, which is what makes each block's pack slice byte-identical to the serial kernel's
 ///   full-panel packs (zero-padding can then only occur at the true matrix edge; see
-///   [`sgemm_2d_blocks`]).
+///   [`sgemm_2d_blocks`] / [`sgemm_2d_shared`]). Bit-exactness holds REGARDLESS of the shape
+///   picked here — this policy is throughput-only.
 /// * **L2 residency**: the block's packed B slice (`BN×kc` f32, `kc ≤ KC = 384`) plus A slice
 ///   (`BM×kc`) must fit a per-core L2 with room left for the C-tile stream. The dev box's P-core
 ///   L2 is 2 MB (not hardcoded — the candidates are sized conservatively so they also fit the
 ///   E-core cluster's per-core share): the largest candidate (192, 256) packs at most
 ///   192·384·4 ≈ 288 KB of A + 256·384·4 ≈ 384 KB of B ≈ 672 KB.
-/// * **Load balance**: at least ~3× `nworkers` blocks, so rayon work-stealing can absorb this
-///   asymmetric 6P+8E+2LPE pool's core-speed imbalance. Candidates are tried largest-first (bigger
-///   blocks amortize the per-block redundant packing better) and the first that yields enough
-///   blocks wins; if even the smallest can't (small m·n), the smallest is used as-is — below that
-///   the block count is bounded by the matrix, not the policy.
+/// * **Skinny M** (`m ≤ MC = 144`): one row of blocks (`BM = round_up(m, MR)`) — a second row
+///   would split the K reuse of an already-L2-resident A stripe for no locality gain — with `BN`
+///   the largest NR multiple still yielding `~target_blocks/2` column blocks. The general
+///   candidates mis-shape these: 128×768 output picked (24, 48) → a 6×16 grid whose blocks are
+///   too short to amortize anything; the rule gives 1×24 at (132, 32).
+/// * **Load balance**: candidates are tried largest-first (bigger blocks reuse their packed
+///   slices longer) and the first yielding `>= target_blocks` wins; if even the smallest can't
+///   (small m·n), the smallest is used — below that the block count is bounded by the matrix, not
+///   the policy. The chosen `BM` is then rebalanced to `round_up(ceil(m / nbi), MR)`, which
+///   equalizes row-block heights without changing the row count `nbi` (e.g. 1024³: (144, 192)
+///   gave 7×144 + a 16-row straggler; rebalanced BM = 132 gives 7×132 + 100).
 #[cfg(target_arch = "x86_64")]
-fn select_2d_block_shape(m: usize, n: usize, nworkers: usize) -> (usize, usize) {
+fn select_2d_block_shape(m: usize, n: usize, target_blocks: usize) -> (usize, usize) {
     // (BM, BN) regimes, largest first. All BM ∈ 24..=192 are multiples of MR=6, all BN ∈ 48..=256
     // multiples of NR=16. Examples on the 16-worker dev pool (target = 48 blocks):
-    // 2048³ → (192, 256); 1024³ → (144, 192); 512³ → (48, 96).
+    // 2048³ → (192, 256); 1024³ → (144, 192) → 8×6 grid; 512³ → (48, 96) → 11×6.
     const CANDIDATES: &[(usize, usize)] = &[(192, 256), (144, 192), (96, 128), (48, 96), (24, 48)];
-    let target = 3 * nworkers.max(1);
-    for &(bm, bn) in CANDIDATES {
-        if m.div_ceil(bm) * n.div_ceil(bn) >= target {
-            return (bm, bn);
-        }
+    let target = target_blocks.max(1);
+    if m <= MC {
+        // Skinny M: nbi = 1; the largest NR-multiple BN with >= ~target/2 column blocks. Column
+        // blocks alone must carry the load balance, so the divisor is halved (1.5× workers at the
+        // callers' 3× budget). Floored at NR; capped at round_up(n, NR) (whole-matrix block).
+        let col_target = target.div_ceil(2);
+        let bn = ((n / col_target) / NR * NR).clamp(NR, round_up(n, NR));
+        return (round_up(m, MR), bn);
     }
-    *CANDIDATES.last().unwrap()
+    let (bm, bn) = CANDIDATES
+        .iter()
+        .copied()
+        .find(|&(bm, bn)| m.div_ceil(bm) * n.div_ceil(bn) >= target)
+        .unwrap_or(*CANDIDATES.last().unwrap());
+    // Rebalance the row-block height: nbi is preserved (round_up(ceil(m/nbi), MR)·nbi >= m and
+    // the result is <= bm, so ceil(m/·) lands back on nbi), only the straggler row-block grows
+    // toward the others' height.
+    let nbi = m.div_ceil(bm);
+    (round_up(m.div_ceil(nbi), MR), bn)
 }
 
 /// The **BLIS/MKL-style 2D block-parallel** GEMM with per-block packing (the
@@ -1426,7 +1447,7 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     use rayon::prelude::*;
     let (m, k, n) = (args.m, args.k, args.n);
     let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
-    let (bm, bn) = select_2d_block_shape(m, n, nworkers);
+    let (bm, bn) = select_2d_block_shape(m, n, 3 * nworkers.max(1));
     let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
     // Per-worker scratch caps: one block's A/B slices (not whole-matrix panels), rounded up to
     // full micropanels exactly as the other kernels size their scratch.
@@ -1591,7 +1612,7 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     use rayon::prelude::*;
     let (m, k, n) = (args.m, args.k, args.n);
     let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
-    let (bm, bn) = select_2d_block_shape(m, n, nworkers);
+    let (bm, bn) = select_2d_block_shape(m, n, 3 * nworkers.max(1));
     let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
     // The shared buffers hold the WHOLE matrices' panels for one K-block — not one C block's
     // slice, and (unlike the NC-blocked kernels) not capped at NC: every block column reads the
