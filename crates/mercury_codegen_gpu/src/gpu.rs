@@ -11523,6 +11523,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn gemm_cliff_ab() {
         use crate::baselines::{
             cublas_gemm_nt_f16, gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+            time_cublas_gemm_nt_f16_f32out,
         };
         use crate::ptx_wmma::{gemm_cliff_ptx, CLIFF_VARIANTS};
         use half::f16;
@@ -11581,14 +11582,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // once per round so all sample the same clock evolution; the min over rounds converges to
                 // each kernel's peak-clock time. cuBLAS is timed in two slots as a noise sentinel — its
                 // self-ratio should be ~1.00; a larger value means the clock was still drifting (distrust).
+                // cuBLAS is timed in three slots: two f16-out (a self-noise sentinel — its self-ratio
+                // should be ~1.00; a larger value means the clock was still drifting) and one f32-out
+                // (`gemm_ex_nt_f16_f32out`) — the **apples-to-apples** peer for Mercury's f32-C kernels,
+                // since the f16-out peer writes C at half the width and so hides ~half the epilogue
+                // traffic Mercury pays. Both peer columns print per variant.
                 let mut best: Vec<f64> = vec![f64::INFINITY; variants.len()];
-                let (mut best_cub, mut best_cub2) = (f64::INFINITY, f64::INFINITY);
+                let (mut best_cub, mut best_cub2, mut best_cub_f32) =
+                    (f64::INFINITY, f64::INFINITY, f64::INFINITY);
                 for _ in 0..rounds {
                     for (i, (_, f, _, _, vcfg)) in variants.iter().enumerate() {
                         best[i] = best[i].min(time_wmma(g, f, *vcfg, dims, &a_d, &b_d, &mut c_d, iters));
                     }
                     best_cub = best_cub.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
                     best_cub2 = best_cub2.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
+                    best_cub_f32 =
+                        best_cub_f32.min(time_cublas_gemm_nt_f16_f32out(g, m, k, n, iters as u32).unwrap());
                 }
                 let base_i = variants.iter().position(|v| v.0 == "cliff_swz_s2").unwrap();
                 let base_t = best[base_i];
@@ -11596,12 +11605,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     "\n{sz}³ fp16 GEMM-cliff A/B (best-of-{rounds} round-robin; base=cliff_swz_s2; cuBLAS self-noise {:.3}×):",
                     best_cub2 / best_cub
                 );
+                eprintln!(
+                    "  cuBLAS peers: f16-out {:>7.0} GFLOP/s | f32-out {:>7.0} GFLOP/s (f32-out is the apples-to-apples peer for Mercury's f32-C kernels; the {:.2}× is the C-write dtype asymmetry)",
+                    flop / best_cub / 1e9,
+                    flop / best_cub_f32 / 1e9,
+                    best_cub_f32 / best_cub,
+                );
                 for (i, (name, _, occ, smem, _)) in variants.iter().enumerate() {
                     eprintln!(
-                        "  {:<24}: {:>7.0} GFLOP/s | {:>5.1}% cuBLAS | {:>6.3}× base | {} CTAs/SM, {}KiB",
+                        "  {:<24}: {:>7.0} GFLOP/s | {:>5.1}% cuBLAS(f16) | {:>5.1}% cuBLAS(f32) | {:>6.3}× base | {} CTAs/SM, {}KiB",
                         name,
                         flop / best[i] / 1e9,
                         100.0 * best_cub / best[i],
+                        100.0 * best_cub_f32 / best[i],
                         base_t / best[i],
                         occ,
                         smem / 1024,

@@ -659,6 +659,34 @@ pub fn cublas_gemm_nt_f16_f32out(
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
+/// Time cuBLAS fp16 GEMM with an **f32 output** ([`gemm_ex_nt_f16_f32out`]): `iters` resident calls, one
+/// warm-up, one trailing sync — the same timing shape as [`time_cublas_gemm_nt_f16`], but storing C as
+/// f32. This is the **apples-to-apples** peer for Mercury's WMMA kernel, which also accumulates and stores
+/// C as f32. The f16-out sibling writes C at half the width (33.5 MB vs 67 MB at 4096³), so on this
+/// ~192 GB/s bus it moves *half* the epilogue write traffic Mercury pays — timing both isolates how much
+/// of the Mercury-vs-cuBLAS gap is that C-dtype asymmetry rather than GEMM quality. Returns seconds/call.
+pub fn time_cublas_gemm_nt_f16_f32out(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let a_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.01); m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.01); n * k])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let stream = g.stream.clone();
+    unsafe { gemm_ex_nt_f16_f32out(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? }; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe { gemm_ex_nt_f16_f32out(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? };
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
 /// The **cuBLAS-GEMM call-chain transformer layer** — Tier-B peer to [`ResidentLayerF16`]. Same resident
 /// f16 weights, same `[S,D]` f32 activation contract, same pre-norm encoder math; the six projections
 /// (Q/K/V/O, W1, W2) run on cuBLAS ([`gemm_ex_nt_f16_f32out`]) and the skip-connection adds + SiLU run as
