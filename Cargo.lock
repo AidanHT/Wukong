@@ -904,6 +904,7 @@ dependencies = [
  "cranelift-native",
  "cranelift-object",
  "iced-x86",
+ "rayon",
  "wukong_backend",
  "wukong_interp",
  "wukong_mir",
