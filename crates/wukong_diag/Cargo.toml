@@ -1,0 +1,11 @@
+[package]
+name = "wukong_diag"
+description = "Compiler diagnostics and a rustc-style terminal renderer for Wukong."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wukong_span = { workspace = true }

@@ -1,0 +1,80 @@
+[package]
+name = "wukong_codegen_gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# The GPU backend: Wukong emits PTX text and driver-JIT-loads it via `cudarc`
+# (`cuModuleLoadData` — the NVIDIA driver's built-in PTX→SASS JIT needs no `nvcc`/`ptxas`).
+# All GPU code is behind the `gpu` feature so the toolchain-free CPU core (`cargo test`) never
+# pulls in `cudarc` or needs a GPU. `cudarc` uses `dynamic-loading` (dlopens `nvcuda.dll`), so even
+# with the feature on, building needs no CUDA toolkit — only running needs the driver + a device.
+
+[dependencies]
+cudarc = { version = "0.16", default-features = false, features = [
+    "driver",
+    "dynamic-loading",
+    "cuda-12060",
+    "f16",
+    # `std` gates cudarc's `impl std::error::Error` for DriverError/CublasError/CompileError, so the
+    # peer baselines can unify the three error families behind one boxed error with `?`.
+    "std",
+    # Honest GPU peer baselines (Phase 0 of the GPU plan): cuBLAS is the Tier-B gold-standard
+    # GEMM peer; NVRTC compiles the Tier-A naive CUDA-C baseline at runtime. Both dlopen their
+    # redistributable DLLs (cublas64_12.dll / nvrtc64_120_0.dll) exactly like the driver does for
+    # nvcuda.dll — so *building* still needs no toolkit; only *running the peer benches* needs the
+    # DLLs reachable (we point at a local `tools/cuda-redist` via PATH; see baselines.rs).
+    "cublas",
+    # cuBLASLt — the only cuBLAS surface that does **fp8 (E4M3) matmul** (`cublasLtMatmul`); the
+    # classic `cublasGemmEx` (the `cublas` feature) has no fp8 path. cudarc's *safe* LT wrapper is
+    # f32/f16/bf16-only, so the fp8 peer (baselines.rs) drives the raw `cublaslt::{sys,result}` layer
+    # directly. dlopens `cublasLt64_12.dll` like the others — building still needs no toolkit.
+    "cublaslt",
+    "nvrtc",
+    # cuDNN — the Tier-B gold-standard **convolution** peer (`cudnnConvolutionForward` with the
+    # `cudnnGetConvolutionForwardAlgorithm_v7` autotuner heuristic). cudarc's safe `cudnn` module
+    # (gated only on `driver`) drives the descriptor graph; it dlopens `cudnn64_9.dll` + the cuDNN-9
+    # sublibraries (cudnn_graph/ops/cnn/engines/heuristic) exactly like the other redist DLLs — so
+    # *building* still needs no toolkit; only *running the conv peer bench* needs the cuDNN redist on
+    # PATH (one extra `pip install nvidia-cudnn-cu12` into tools/cuda-redist; see baselines.rs).
+    "cudnn",
+], optional = true }
+# Used (only under `gpu`) by the tolerance harness as the CPU oracle: the GPU kernels are diffed
+# against the *identical* runtime kernels the interpreter marshals (vmath / sreduce / norm).
+wukong_runtime = { workspace = true, optional = true }
+# f16/bf16 host-side conversion for the tensor-core path (low-precision in, f32 accumulate).
+half = { version = "2", optional = true }
+# General MIR->PTX lowering (`src/lower.rs`, Phase 4): consume MIR and implement the `Backend`
+# seam, so *any* Wukong program runs on the GPU (not just the recognizer-offload kernel menu).
+# Behind the `gpu` feature so plain `cargo test` stays toolchain-free and the crate is ~empty.
+wukong_mir = { workspace = true, optional = true }
+wukong_backend = { workspace = true, optional = true }
+wukong_span = { workspace = true, optional = true }
+
+[features]
+gpu = [
+    "dep:cudarc",
+    "dep:wukong_runtime",
+    "dep:half",
+    "dep:wukong_mir",
+    "dep:wukong_backend",
+    "dep:wukong_span",
+]
+
+# Dev-deps for the GPU gates. All toolchain-free, so a plain `cargo test` builds them; the gpu-gated
+# tests that use them are cfg'd out without `--features gpu` (and wukong_mir/span are reached through
+# the feature-gated optional deps above, so they need no dev-dep entry):
+#  - lexer/parser/sema/mir_build/opt: the MIR->PTX lowering gate (`src/lower.rs`) builds `.wk` source.
+#  - wukong_interp: the interpreter oracle the GPU kernels are diffed against.
+#  - wukong_autodiff: the CPU autodiff reference for the GPU training kernels (Session I / M8) — the
+#    fused AdamW MIR kernel + the backward the resident step is differentiated against.
+[dev-dependencies]
+wukong_lexer = { workspace = true }
+wukong_parser = { workspace = true }
+wukong_sema = { workspace = true }
+wukong_mir_build = { workspace = true }
+wukong_opt = { workspace = true }
+wukong_interp = { workspace = true }
+wukong_autodiff = { path = "../wukong_autodiff" }

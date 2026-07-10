@@ -1,0 +1,19 @@
+[package]
+name = "wukong_codegen_llvm"
+description = "LLVM backend for Wukong: lowers MIR to textual LLVM IR (native via clang/llc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wukong_span = { workspace = true }
+wukong_mir = { workspace = true }
+wukong_backend = { workspace = true }
+
+[dev-dependencies]
+wukong_parser = { workspace = true }
+wukong_sema = { workspace = true }
+wukong_mir_build = { workspace = true }
+wukong_opt = { workspace = true }

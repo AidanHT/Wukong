@@ -1,0 +1,12 @@
+[package]
+name = "wukong_lexer"
+description = "The Wukong lexer: source text into a token stream."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wukong_span = { workspace = true }
+wukong_diag = { workspace = true }

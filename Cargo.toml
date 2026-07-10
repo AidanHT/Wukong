@@ -1,4 +1,4 @@
-# Mercury — virtual cargo workspace.
+# Wukong — virtual cargo workspace.
 #
 # Crates are added under `crates/` as each compiler stage is implemented. The default build needs no
 # external toolchain: the interpreter and the Cranelift native backend are pure Rust, and the LLVM
@@ -14,29 +14,29 @@ edition = "2021"
 license = "MIT"
 authors = ["Aidan <aidantran120@gmail.com>"]
 rust-version = "1.94"
-repository = "https://github.com/aidan/mercury"
+repository = "https://github.com/aidan/wukong"
 
 [workspace.dependencies]
 # Internal crates are registered here as they are created, so members can depend on them
 # with `{ workspace = true }`.
-mercury_span = { path = "crates/mercury_span" }
-mercury_diag = { path = "crates/mercury_diag" }
-mercury_lexer = { path = "crates/mercury_lexer" }
-mercury_driver = { path = "crates/mercury_driver" }
-mercury_ast = { path = "crates/mercury_ast" }
-mercury_parser = { path = "crates/mercury_parser" }
-mercury_types = { path = "crates/mercury_types" }
-mercury_sema = { path = "crates/mercury_sema" }
-mercury_mir = { path = "crates/mercury_mir" }
-mercury_mir_build = { path = "crates/mercury_mir_build" }
-mercury_backend = { path = "crates/mercury_backend" }
-mercury_interp = { path = "crates/mercury_interp" }
-mercury_opt = { path = "crates/mercury_opt" }
-mercury_codegen_llvm = { path = "crates/mercury_codegen_llvm" }
-mercury_codegen_cranelift = { path = "crates/mercury_codegen_cranelift" }
-mercury_codegen_gpu = { path = "crates/mercury_codegen_gpu" }
-mercury_runtime = { path = "crates/mercury_runtime" }
-mercury_autodiff = { path = "crates/mercury_autodiff" }
+wukong_span = { path = "crates/wukong_span" }
+wukong_diag = { path = "crates/wukong_diag" }
+wukong_lexer = { path = "crates/wukong_lexer" }
+wukong_driver = { path = "crates/wukong_driver" }
+wukong_ast = { path = "crates/wukong_ast" }
+wukong_parser = { path = "crates/wukong_parser" }
+wukong_types = { path = "crates/wukong_types" }
+wukong_sema = { path = "crates/wukong_sema" }
+wukong_mir = { path = "crates/wukong_mir" }
+wukong_mir_build = { path = "crates/wukong_mir_build" }
+wukong_backend = { path = "crates/wukong_backend" }
+wukong_interp = { path = "crates/wukong_interp" }
+wukong_opt = { path = "crates/wukong_opt" }
+wukong_codegen_llvm = { path = "crates/wukong_codegen_llvm" }
+wukong_codegen_cranelift = { path = "crates/wukong_codegen_cranelift" }
+wukong_codegen_gpu = { path = "crates/wukong_codegen_gpu" }
+wukong_runtime = { path = "crates/wukong_runtime" }
+wukong_autodiff = { path = "crates/wukong_autodiff" }
 
 [profile.release]
 opt-level = 3

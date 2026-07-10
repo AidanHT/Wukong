@@ -1,0 +1,28 @@
+[package]
+name = "wukong_xbench"
+description = "Cross-language benchmark: Wukong (native) vs C (gcc) vs Rust (rustc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wukong-xbench"
+path = "src/main.rs"
+
+[dependencies]
+wukong_span = { workspace = true }
+wukong_parser = { workspace = true }
+wukong_sema = { workspace = true }
+wukong_mir = { workspace = true }
+wukong_mir_build = { workspace = true }
+wukong_opt = { workspace = true }
+wukong_codegen_cranelift = { workspace = true }
+# The interpreter oracle: bench_model runs the identical 12-layer forward on it and requires
+# bit-exact agreement with the Cranelift JIT (the differential gate, in-benchmark).
+wukong_interp = { workspace = true }
+libloading = "0.8"
+# A pure-Rust, cache-tiled, SIMD sgemm (the engine behind ndarray) — the tuned-library baseline that
+# proves Wukong's GEMM is SOTA-parity, not merely beating naive C/Rust nests. No external toolchain.
+matrixmultiply = "0.3"

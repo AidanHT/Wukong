@@ -1,0 +1,11 @@
+[package]
+name = "wukong_types"
+description = "Wukong's type vocabulary: scalars, SIMD vectors, shape-typed tensors, layouts."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wukong_span = { workspace = true }
