@@ -76,15 +76,18 @@ fusion, no round-trips, layer-stack throughput. GPT-2-class `.mer` models exist 
 to recognized kernels; GPU-resident 12-layer decode runs under CUDA-graph capture.
 Standing (2026-07-09/10, three valid full-peer rounds — roofline 130–133, all cross-checks
 <2e-6 rel, serial==@parallel bit-exact, interp gate bit-exact): the 12-layer GPT-2-class
-stack runs **~19–21× idiomatic C and 3.6–4.5× `-ffast-math` C single-core**; vs **PyTorch
-CPU eager** it is 1.11–1.20× behind torch-1T @S=128 and **1.10–1.16× FASTER @S=512**
-single-thread. Multicore: **S=128 closed from 1.5–1.9× behind all-threads torch to
-1.08–1.20×** (velem-parallel dispatch + skinny-M block policy + per-block default + gate
-retune), @parallel scaling up to **2.96× @S=128** / 2.4–2.5× @S=512. @S=512 vs torch-Tn the
-honest reading is a **1.01–1.63× range whose width is the PEER's power-state swing**
-(torch-Tn moved 443→271 ms across rounds while Mercury @parallel held ~440 ms in all of
-them) — the structural finding: Mercury's parallel path does not yet ride clock upside
-(sync/serial-fraction bound; the attention head loop is the named next lever). GPU training
+stack runs **~19–21× idiomatic C and 3.6–4.9× `-ffast-math` C single-core**; vs **PyTorch
+CPU eager** it is 1.03–1.09× behind torch-1T @S=128 and **1.12–1.22× FASTER @S=512**
+single-thread. Multicore, the campaign's closing move — the **`@parallel` head-loop region**
+(2026-07-10: an independent-iteration `for` loop with body-local scratch inside an
+`@parallel` fn outlines into a `mercury_parallel_for` region; conservative affine-disjointness
+legality, serial kernels inside each iteration so serial==parallel stays bit-exact; the model
+spells its attention head loop that way naturally) — **flipped the all-threads-torch
+comparison at S=512: Mercury @parallel is 1.10–1.24× FASTER** (two roofline-validated
+rounds; par ~440 → ~312 ms) **and holds parity at S=128** (1.19× faster / 1.02× behind at
+the round-noise floor; was 1.5–1.9× behind at campaign start). Model @parallel scaling:
+**3.1–3.6×** (was ~1.5–2.1×); the multicore stack is **~61–69× idiomatic single-thread C**.
+Residual scaling headroom vs 16 physical cores is the parallel-GEMM grain (M1). GPU training
 step still loses to eager PyTorch (GEMM-bound); the serving stack's continuous-batching
 goodput ceiling doubled 2026-07-10: **Bcap=256 full-fill 85.6× vs fill=1** (33.1k tok/s;
 graph-driven scheduler bit-identical to eager, **1.14–1.27× over the honest static-batching
@@ -157,11 +160,11 @@ GEMM (v2cs +2.7%; ~80% of the honest peer, residual is SASS-level), exp/log vs V
 (algorithmic; the ldexp lever was built, measured a loss both thermal states, reverted).
 Remaining, ranked:
 
-1. Multicore parallel efficiency at model shapes — @parallel scaling is 2.4–3.0× on 16
-   physical cores and, tellingly, Mercury's parallel path holds a flat ~440 ms @S=512 across
-   power states while MKL-all/torch-Tn ride the same states 1.4–1.6× — a sync/serial-fraction
-   bound. The attention head loop (private-scratch head-level parallelism) is the named lever
-   in flight; the residual mid-size GEMM gap (70–83% of MKL-all at 512–1024³) shares the root.
+1. Multicore parallel-GEMM grain — the head-loop region landed (model @parallel now beats
+   all-threads torch @S=512), so the remaining scaling headroom (3.1–3.6× on 16 physical
+   cores) concentrates in the mid-size GEMM gap vs MKL-all's parallel grain (70–83% at
+   512–1024³; shared-pack, mid-pool, persistent-region, and fork-join alternatives are all
+   measured/refuted in gemm.rs — a genuinely new decomposition idea is required).
 2. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
    tensors, file I/O (M6).
 3. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).

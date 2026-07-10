@@ -8,6 +8,21 @@ All notable changes to Mercury are documented here. The format is loosely based 
 ### Performance + honest measurement — perf-sota session 3 (2026-07-09/10)
 Ten-target directive round; every baseline re-proven before optimizing, every win from the real
 pipeline via same-run/adjacent instruments (full ledger: `prompts/results/perf-sota-session3.md`).
+- **`@parallel` head-loop regions — the model now beats all-threads PyTorch at S=512**: an
+  independent-iteration `for` loop with body-local scratch inside an `@parallel` fn outlines into
+  its own MIR fn + one `mercury_parallel_for` region (the whole-fn outliner's exact contract —
+  zero backend changes; 16 MiB worker stacks for the privatized frames). Legality is a
+  conservative affine-disjointness proof (one `hh*C` term per written array, outer strides erased
+  mod C·N, inner terms bounded below C; declines to serial on anything unproven — captured-scalar
+  writes, opaque indices, calls, `print`, slices, cross-iteration deps), each iteration runs the
+  SERIAL kernels (identical per-iteration op order ⇒ serial == parallel bit-exact), and autodiff
+  declines loudly (no silent zero gradients). The model bench spells its attention head loop that
+  way naturally; e2e fixtures pin interp == native == @parallel at every opt level, even + ragged
+  head counts, and the decline case. Result (two roofline-validated rounds, all cross-checks
+  green): S=512 `@parallel` **440 → ~312 ms** ⇒ **1.10–1.24× FASTER than all-threads eager
+  torch** (was 1.01–1.63× behind); S=128 parity (1.19× faster / 1.02× behind at round noise; was
+  1.5–1.9× behind); model `@parallel` scaling **3.1–3.6×** (campaign start: ~1.5–2.1×); the
+  multicore stack ~61–69× idiomatic single-thread C.
 - **Size-keyed 2D parallel GEMM dispatch**: the cooperative shared-pack redesign
   (`sgemm_2d_shared` — panels packed once per K-block) was built, gated bit-exact, and then
   **refuted at mid/large shapes by adjacent ABBA in both orderings** (per-block packing wins

@@ -40,7 +40,22 @@ ldc apart — no hardware prefetcher tracks that stride). MKL(1c)-anchored ABBA,
 83–86% baseline, pinning the instrument). ≤1024³ a wash (C is cache-resident there). Hint-only —
 bits unchanged on every path.
 
-### T1/T3 — model @parallel and vs PyTorch
+### T1/T3 — FINAL (wave-2): head-loop parallel region → torch-Tn FLIPPED at S=512
+The `@parallel` head-loop region (merge `8a64d8c`: mid-function independent-iteration loop
+outliner, conservative affine-disjointness legality, serial kernels per iteration ⇒ bit-exact,
+autodiff declines loudly, model spelled with loop-body-local head scratch) landed after the
+mid-session standings below. Two roofline-validated rounds (141/139 GF/s; interp == native ==
+@parallel bit-exact; serial==@parallel bit-exact; cross-checks <2e-6):
+- **S=512: Mercury @parallel 311.9/313.4 ms vs torch-Tn 344.6/389.5 ms = 1.10–1.24× FASTER**
+  (par was ~440 ms before the region — the head loop was worth 1.4×).
+- **S=128: 77.8 ms vs 92.7 (1.19× faster) then 88.3 vs 86.4 (1.02× behind)** — parity at the
+  round-noise floor (was 1.5–1.9× behind at campaign start).
+- Scaling 3.14–3.61× @S=128, 3.27–3.36× @S=512; multicore vs C(gcc) ~61–69× @S=128.
+- One interference-invalidated round (roofline 61 — 1 AM system activity + fresh-binary scan)
+  was caught by the validity protocol and discarded; its healthy columns (par 77.5, torch-Tn
+  90.7) match the valid rounds.
+
+### T1/T3 — mid-session standings (pre-region, kept for the audit trail)
 Three valid rounds (roofline 130–133; interp gate bit-exact; serial==@parallel bit-exact;
 all cross-checks ≤2e-6):
 - @parallel scaling: **S=128 2.19× → 2.34× → 2.96×** across the session's fixes (velem-parallel

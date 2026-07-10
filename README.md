@@ -63,11 +63,15 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   **~1.9–6.6×** and **convolution** (im2col + GEMM) **~6–7×**;
 - **runs a full 12-layer GPT-2-class transformer end-to-end** (d=768, 12 heads, causal attention,
   GELU MLP — ordinary Mercury source through the real pipeline, gated bit-exact against the
-  interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~20–21× idiomatic C,
-  3.6–4.9× `-ffast-math` C, and at parity with PyTorch CPU eager single-thread** (0.93–1.07×
-  @S=128, **1.08–1.49× faster @S=512**); all-threads eager torch still wins multicore, but the
-  2D-parallel GEMM stabilized the gap: **~1.1× @S=512** (was a 1.05–2.5× thermal lottery) and
-  1.5–1.9× @S=128, with model `@parallel` scaling up from ~1.5–2.1× to **1.9–3.8×**;
+  interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~19–21× idiomatic C,
+  3.6–4.9× `-ffast-math` C, and at parity-to-faster vs PyTorch CPU eager single-thread**
+  (1.03–1.09× behind @S=128, **1.12–1.22× faster @S=512**); multicore, since the `@parallel`
+  head-loop region shipped (2026-07-10 — independent-iteration loops with body-local scratch
+  outline to a parallel region, bit-exact by construction), Mercury **beats all-threads eager
+  torch at S=512 (1.10–1.24× faster, two valid rounds)** and holds parity at S=128
+  (1.19×-faster-to-1.02×-behind at the round-noise floor; was 1.5–1.9× behind), with model
+  `@parallel` scaling at **3.1–3.6×** (was ~1.5–2.1×) and the multicore stack **~61–69× idiomatic
+  single-thread C** end-to-end;
 - **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~4.6–14.7× parallel**, and runs a full
   **bf16 *and* f16 mixed-precision CPU suite** — `dot` (**~3×**) / `sum` (**~6–8×**), `max`/`min`/`absmax`
   (the symmetric-quant scale), streaming `axpby`, the `nn.Linear` GEMM (**~24–25×**), and the 36-op
