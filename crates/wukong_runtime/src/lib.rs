@@ -379,8 +379,17 @@ pub(crate) fn run_on_wuk_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 ///
 /// Bodies must be data-parallel: each index is processed exactly once and the chunks must not have
 /// cross-iteration dependencies (the interpreter runs the whole range sequentially and must agree).
-/// Chunk boundaries derive from the worker count and are therefore pool-dependent — legal exactly
-/// because of that independence contract (bits never depend on which chunk ran an index).
+/// Chunk boundaries derive from the worker count / claim order and are therefore pool- and
+/// schedule-dependent — legal exactly because of that independence contract (bits never depend on
+/// which chunk ran an index).
+///
+/// **Scheduling** (`WUKONG_PFOR_DYN=0` opts out to the old static split, read once): iterations
+/// are claimed DYNAMICALLY from a shared atomic counter in granules of `ceil(n / (workers·8))`
+/// (min 1), so on this asymmetric 6P+8E+2LPE part a P-core that finishes its granule pulls the
+/// next one instead of idling while E-cores straggle — the same self-scheduling shape as the
+/// GEMM's `WUKONG_GEMM_DYN` claim queue, at one `fetch_add` per granule. When `n ≤ workers`
+/// dynamic and static degenerate to the same one-granule-per-worker shape, so the knob only
+/// matters when there is imbalance to absorb.
 ///
 /// # Safety
 /// `body` must be a valid `extern "C" fn(i64, i64, *const u8)` and `env` valid for the call.
@@ -400,16 +409,50 @@ pub unsafe extern "C" fn wukong_parallel_for(
         // Read the worker count INSIDE the installed context so it reflects the pool actually
         // running the chunks (the private physical-core pool under unification).
         let workers = rayon::current_num_threads().max(1).min(n);
-        let chunk = n.div_ceil(workers);
-        (0..workers).into_par_iter().for_each(|w| {
-            let start = w * chunk;
-            if start >= n {
-                return;
-            }
-            let end = (start + chunk).min(n);
-            body(start as i64, end as i64, env.0 as *const u8);
-        });
+        if pfor_dyn() && workers > 1 {
+            // Dynamic claim queue: granules small enough to absorb P/E-core speed asymmetry,
+            // big enough that the per-granule fetch_add is noise even for huge n. The counter is
+            // cache-line-isolated (128 B: line + adjacent-line-prefetch pair) so the one shared
+            // write bounces only for the claims themselves.
+            #[repr(align(128))]
+            struct Claims(std::sync::atomic::AtomicUsize);
+            let g = n.div_ceil(workers * 8).max(1);
+            let ntasks = n.div_ceil(g);
+            let claims = Claims(std::sync::atomic::AtomicUsize::new(0));
+            let claims_ref = &claims;
+            (0..workers).into_par_iter().for_each(|_| loop {
+                // Relaxed suffices: the counter only hands out unique granules; the fork-join's
+                // join publishes every write the body made.
+                let c = claims_ref.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c >= ntasks {
+                    break;
+                }
+                let start = c * g;
+                let end = (start + g).min(n);
+                body(start as i64, end as i64, env.0 as *const u8);
+            });
+        } else {
+            let chunk = n.div_ceil(workers);
+            (0..workers).into_par_iter().for_each(|w| {
+                let start = w * chunk;
+                if start >= n {
+                    return;
+                }
+                let end = (start + chunk).min(n);
+                body(start as i64, end as i64, env.0 as *const u8);
+            });
+        }
     });
+}
+
+/// `WUKONG_PFOR_DYN` (read once, default ON): dynamic granule claiming in
+/// [`wukong_parallel_for`]; `=0` restores the static one-chunk-per-worker split as the
+/// adjacent-run A/B instrument. Scheduling-only — the independence contract makes the bits
+/// identical either way.
+fn pfor_dyn() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("WUKONG_PFOR_DYN").map_or(true, |v| v != "0"))
 }
 
 /// The hidden allocation header preceding every `wukong_rt_alloc` data pointer: 16 bytes storing
