@@ -74,12 +74,13 @@ stage order the driver uses, minus the driver's I/O and diagnostics front-matter
 the in-process "work only" quantity the floor is about (and the spawn tax below is what re-adds the
 driver's front-matter).
 
-**One boundary is not split:** the Cranelift backend is measured as a single `codegen+obj` stage
-because `wukong_codegen_cranelift` exposes only the combined `emit_object` (ISA build → `populate_module`
-isel/regalloc/machine-code → object-container `emit`). Splitting instruction-selection from
-object-byte serialization would need a timing hook inside that crate. The object-serialization share
-is instead bounded analytically in §4 from the emitted byte count, which `compile-profile` reports
-per file.
+**The backend boundary is split via one crate hook.** The Cranelift backend appears as a single
+`codegen+obj` stage in the stage table (its headline time is the clean best-of-N of the production
+`emit_object`: ISA build → `populate_module` isel/regalloc/machine-code → object-container `emit`),
+and its internal split — Cranelift codegen vs object-container write — is measured through
+`wukong_codegen_cranelift::emit_object_timed` (a measurement-only twin of `emit_object`) and printed
+underneath the stage table. §4's analytic bound on the object-write share is therefore corroborated
+by a direct measurement.
 
 ## 3. The irreducible work (what genuinely must happen)
 
@@ -123,12 +124,14 @@ For each stage, the ceiling is set by its access pattern. Fill the measured thro
 | Optimize | `-O2` fixpoint; HashMap-bound (see `compile-time`) | pass-count × op scan | `[fill]` | `[fill]` |
 | Codegen+obj | Cranelift isel/regalloc/emit + object serialize | O(MIR ops), small const | `[fill]` | `[fill]` |
 
-**Object-emit sub-share (analytic).** Object serialization writes `object bytes` into a COFF/ELF
-container: a linear memcpy-class write of the machine-code, relocation, and symbol tables. At a
-conservative ~1 GB/s container-write rate, a typical kernel object of `[obj bytes]` costs on the
-order of `[obj bytes] / 1e9` s — i.e. object-emit is a small fraction of the `codegen+obj` stage;
-the stage's time is dominated by isel + register allocation. (Promote this to a measured split only
-if a hook is added to `wukong_codegen_cranelift`.)
+**Object-emit sub-share (analytic, now corroborated by measurement).** Object serialization writes
+`object bytes` into a COFF/ELF container: a linear memcpy-class write of the machine-code,
+relocation, and symbol tables — analytically a small fraction of the `codegen+obj` stage, whose time
+should be dominated by isel + register allocation. The `emit_object_timed` split that
+`compile-profile` prints under the stage table measures this directly; the provisional smoke figure
+is **object-write ≈ 7–8% of the backend stage** (i.e. the analytic expectation holds — the backend's
+cost is Cranelift codegen, not container serialization). Confirm in the central run:
+`[fill: codegen % / object-write % of codegen+obj]`.
 
 ### Provisional shares (clock-invariant; smoke-test only — NOT authoritative)
 
@@ -136,9 +139,10 @@ if a hook is added to `wukong_codegen_cranelift`.)
 > clock swing. The absolute times are NOT reportable and are omitted. Replace with a release
 > central run.
 
-- **Stage-share ordering, whole-to-object, full corpus (295 files compiled, 4 skipped;
-  `tests/run` + `examples` + `bench/kernels`):**
-  `codegen+obj (~80%) > optimize (~12%) > mir_build (~5%) > sema (~1.3%) ≈ parse (~1.2%) > lex (~0.2%)`.
+- **Stage-share ordering, whole-to-object, full corpus (~296 files compiled, 4 skipped;
+  `tests/run` + `examples` + `bench/kernels`; stable across two smoke runs, before and after the
+  backend release-verifier-off + parallel-codegen change):**
+  `codegen+obj (~76–80%) > optimize (~12–16%) > mir_build (~5–6%) > sema (~1.3%) ≈ parse (~1.2–1.3%) > lex (~0.2%)`.
   On the model-kernel subset alone (`examples` + `bench/kernels`, 13 files) the same ordering holds
   at `~74% / ~19% / ~5% / ~1.1% / ~1.0% / ~0.2%`. The headline shape: **once the backend is
   included, the Cranelift `codegen+obj` stage — not the optimizer — is the dominant cost.** This is
@@ -147,14 +151,17 @@ if a hook is added to `wukong_codegen_cranelift`.)
   front→O2 subtotal is ~72% on the model-kernel subset and ~62% over the full corpus — the full
   corpus's many tiny `tests/run` fixtures dilute the optimizer, which is exactly the
   fixed-backend-floor effect below.
+- **Backend split (measured):** Cranelift codegen (isel/regalloc/emit) **~92–93%** vs object-write
+  (container serialization) **~7–8%** of the `codegen+obj` stage — the fixed floor is codegen-side
+  bookkeeping, not serialization bandwidth.
 - **A fixed object-container floor.** Every file — even a 400-byte `fib_rec.wk` — emits ~6.5 KB of
   object, and the `codegen+obj` per-file time barely falls below a floor (~0.4 ms in the smoke run)
-  for the smallest inputs, consistent with a fixed COFF-container + symbol/reloc-table cost that
-  dominates small objects and is the first thing to characterize when the backend split lands.
+  for the smallest inputs. With object-write measured small (above), that floor lives in per-module
+  backend setup + per-function codegen bookkeeping, not the COFF write itself.
 - **Throughput sanity (work/stage-time ratios, full corpus):** lex ran at hundreds of MB/s
-  (memcpy-class, plausibly at floor), parse at tens of Mtok/s, sema at ~10 Mnode/s, mir_build at
-  ~3 Mnode/s, optimize at ~1–2 Mop/s, codegen+obj at ~9 MB-obj/s. These are the provisional inputs
-  to the §4 "at floor?" column; re-derive from the central run before judging any stage.
+  (memcpy-class, plausibly at floor), parse at tens of Mtok/s, sema at ~8–11 Mnode/s, mir_build at
+  ~2–3 Mnode/s, optimize at ~1–2 Mop/s, codegen+obj at ~7–9 MB-obj/s. These are the provisional
+  inputs to the §4 "at floor?" column; re-derive from the central run before judging any stage.
 
 ## 5. The reference comparison (why gcc/rustc -O2)
 
@@ -230,10 +237,10 @@ elimination worklist the floor exercise exists to produce; confirm each against 
 before acting.
 
 > **Provisional priority correction (smoke runs).** Once the backend is counted, `codegen+obj`
-> (~80% full corpus, ~74% model-kernel subset) — not the optimizer (~12% / ~19%) — is the largest
+> (~76–80% full corpus, ~74% model-kernel subset) — not the optimizer (~12–19%) — is the largest
 > *wall-time* stage. So while the optimizer is the biggest *avoidable front-end* cost (items 1–2),
-> the backend/object-emit items (4, promoted below) may hold more total wall time. Confirm against
-> the central run, then re-rank if the shares hold.
+> the backend items (4, promoted below) may hold more total wall time. Confirm against the central
+> run, then re-rank if the shares hold.
 
 1. **Optimizer pass redundancy (biggest front-end lever, already the focus).** The optimizer is the
    largest *front-end* in-process stage and is HashMap-bound (per `compile-time`). Any pass that
@@ -245,13 +252,15 @@ before acting.
    `NodeId` would beat a `HashMap` if `NodeId`s are contiguous.
 3. **Redundant MIR re-derivation between mir_build and codegen.** If codegen re-derives layout/size
    facts mir_build already computed (e.g. `size_of` recomputed per `gep`), caching them is a win.
-4. **Backend fixed-object floor (promoted — likely large for small units).** The smoke run shows
-   `codegen+obj` dominating wall time and a per-file floor that barely moves for tiny inputs, matching
-   a fixed COFF-container + symbol/relocation-table cost (~6.5 KB object even for a 400-byte source).
-   For a workload of many small compiles this fixed cost, not the isel of the actual ops, is the
-   backend floor — the first thing a `codegen`-vs-`object-emit` split (a hook in
-   `wukong_codegen_cranelift`) should quantify. Analytically the *byte-write* is memcpy-class (§4), so
-   if the fixed cost is real it is container/symbol bookkeeping, not raw serialization bandwidth.
+4. **Backend fixed floor for small units (promoted — now partially localized).** The smoke runs show
+   `codegen+obj` dominating wall time with a per-file floor that barely moves for tiny inputs
+   (~6.5 KB object even for a 400-byte source). The `emit_object_timed` split localizes it: object-
+   write is only ~7–8% of the stage, so the fixed cost is **codegen-side** — per-module backend
+   setup (ISA/module construction, runtime-symbol declaration) plus per-function
+   isel/regalloc/bookkeeping — not container serialization. The release-verifier-off +
+   parallel-per-function-codegen change already attacks the per-function term; the per-module setup
+   term (paid once per compile regardless of size) is the remaining candidate for a small-unit
+   workload.
 5. **Spawn tax for many-unit workloads.** Not a per-compile cost but an integration choice: exposing
    a stable in-process compile-to-object API (the bench already calls it) lets multi-unit callers
    avoid N process spawns. This is the highest-leverage *product* change if the workload is many small
@@ -266,7 +275,7 @@ The floor claim is **substantiated** when, in a warm-steady-state release run:
 
 - each front-end stage's throughput (§4) sits at the ceiling its access pattern allows (linear scans
   near memory bandwidth; hash-bound stages near the hash's throughput), AND
-- `codegen+obj` is O(MIR ops) with object-emit a small analytic fraction, AND
+- `codegen+obj` is O(MIR ops) with object-write a small measured fraction (provisionally ~7–8%), AND
 - the `compile-vs` advantage survives subtracting the `spawn-overhead` process cost — i.e. it is
   real backend weight (no LLVM), not merely faster startup.
 
