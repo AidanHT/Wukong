@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 17
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 10
+module tests.run.heap_len
+
+// `s.len()` on an alloc'd slice is the runtime element count (an i64, usable directly as a range
+// bound). Degenerate lengths are well-defined: `alloc_<T>(0)` and a *negative* count both yield
+// an empty slice (len 0, nothing dereferenceable), iterating an empty slice runs zero times, and
+// freeing one is a no-op — deterministic on both backends.
+
+fn main() -> i32 {
+    let a: []f32 = alloc_f32(17);
+    print(a.len());     // 17
+    let z: []i32 = alloc_i32(0);
+    print(z.len());     // 0
+    let e: []f32 = alloc_f32(-8);
+    print(e.len());     // 0 — a negative count clamps to an empty slice
+    let mut hits: i32 = 0;
+    for x in e {
+        hits = hits + 1;
+    }
+    print(hits);        // 0 — iterating an empty slice runs zero times
+    let mut s: []i32 = alloc_i32(5);
+    for i in 0..s.len() {
+        s[i] = 2;
+    }
+    let mut t: i32 = 0;
+    for x in s {
+        t = t + x;
+    }
+    print(t);           // 10 — len() as an i64 range bound
+    free(a);
+    free(z);
+    free(e);
+    free(s);
+    return 0;
+}

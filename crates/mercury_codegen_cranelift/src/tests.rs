@@ -534,6 +534,49 @@ fn differential_against_interpreter() {
     }
 }
 
+/// Heap allocation (`alloc_<T>(n)` / `free(s)`): an alloc'd slice must behave identically on
+/// native and the interpreter at every opt level — zero-initialized contents (read before any
+/// write), fill/reduce over a vectorizer-territory buffer, mutation across a fn boundary through
+/// the `mut` slice param, the negative-length clamp to an empty slice, fat-pointer re-binding of a
+/// length past 127 (the I8-byte-copy masking regression), and a store immediately followed by
+/// `free` with no intervening read (the pointer escapes into the call, so DSE must keep the
+/// store — deleting it would be observable only through the allocator, but the conservatism is
+/// what this pins).
+#[test]
+fn differential_heap_alloc() {
+    let programs = [
+        // Fill + reduce past the vectorizer thresholds, plus len() and read-before-write.
+        "fn main() -> i32 { let n: i64 = 5000; let mut s: []f32 = alloc_f32(n); \
+         print(s.len()); print(s[4999]); \
+         for i in 0..n { s[i] = (i % 7i64) as f32; } \
+         let mut acc: f32 = 0.0; for i in 0..n { acc = acc + s[i]; } \
+         print(acc); free(s); return 0; }",
+        // Mutation through a fn boundary + zero-init tail + i64/u8 elements.
+        "fn fill(mut s: []i64, v: i64) { for i in 0..s.len() { s[i] = v; } } \
+         fn main() -> i32 { let s: []i64 = alloc_i64(200); fill(s, 41); \
+         print(s[0]); print(s[199]); let b: []u8 = alloc_u8(3); print(b[2]); \
+         free(b); free(s); return 0; }",
+        // Negative length clamps to an empty slice; iterating it runs zero times.
+        "fn main() -> i32 { let e: []f32 = alloc_f32(-8); \
+         print(e.len()); let mut hits: i32 = 0; for x in e { hits += 1; } \
+         print(hits); free(e); return 0; }",
+        // Fat-pointer re-binding with a length past 127, and store->free with no read between.
+        "fn main() -> i32 { let big: []f32 = alloc_f32(300); let view: []f32 = big; \
+         print(view.len()); let mut d: []f32 = alloc_f32(10); d[3] = 9.5; free(d); \
+         free(big); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "heap-alloc native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
 /// Tuples lower to a padded byte buffer with byte-offset field GEPs (no aggregate MIR type). The
 /// native backend writes the real packed layout; the interpreter indexes the byte offset as a slot.
 /// Distinct field offsets never alias, so both must agree on the observed field values — including a

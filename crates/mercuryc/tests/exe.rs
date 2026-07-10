@@ -68,6 +68,7 @@ fn exe_matches_run() {
         "string_return.mer",        // read-only string `.rodata`, returned/threaded `*u8`
         "transcendental_kernel.mer", // `mercury_vmath_f32` linked into the exe
         "tensor_matmul.mer",        // `mercury_sgemm` linked into the exe
+        "heap_alloc.mer",           // `mercury_rt_alloc`/`mercury_rt_free` linked into the exe
     ];
     let tmp = std::env::temp_dir().join("mercury_exe_gate");
     std::fs::create_dir_all(&tmp).expect("create temp dir for exe gate");

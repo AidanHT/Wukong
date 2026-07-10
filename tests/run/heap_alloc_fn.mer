@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 41
+// EXPECT-OUT: 41
+// EXPECT-OUT: 8200
+// EXPECT-OUT: 200
+module tests.run.heap_alloc_fn
+
+// An alloc'd slice composes with the existing slice machinery: passed across a fn boundary (by
+// its 16-byte fat pointer) and mutated there (`mut` param — writes land in the caller-visible
+// heap storage), iterated with `for x in s`, and re-bound (`let view = s` copies the fat pointer
+// FIELD-WISE — a length past 127 must survive the copy; a byte-wise copy used to mask it to its
+// low byte in the interpreter). The trailing store→free with no intervening read pins the
+// optimizer's conservatism: the pointer escapes into the `free` call, so DSE must keep the store.
+
+fn fill(mut s: []i64, v: i64) {
+    for i in 0..s.len() {
+        s[i] = v;
+    }
+}
+
+fn sum(s: []i64) -> i64 {
+    let mut t: i64 = 0;
+    for x in s {
+        t = t + x;
+    }
+    return t;
+}
+
+fn main() -> i32 {
+    let s: []i64 = alloc_i64(200);
+    fill(s, 41);
+    print(s[0]);        // 41 — the callee's writes alias the caller's heap buffer
+    print(s[199]);      // 41
+    print(sum(s));      // 200 * 41 = 8200
+    let view: []i64 = s;
+    print(view.len());  // 200 — the re-bound fat pointer keeps the full runtime length
+    let mut d: []f32 = alloc_f32(10);
+    d[3] = 9.5;         // never read back —
+    free(d);            // — but the store must survive DSE (the pointer escapes into free)
+    free(s);
+    return 0;
+}

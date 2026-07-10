@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 0
+// EXPECT-OUT: 14995
+module tests.run.heap_alloc
+
+// Heap allocation v1: `alloc_f32(n)` returns a zero-initialized `[]f32` of runtime length `n`
+// (the first runtime-sized buffer in the language — every prior buffer was a fixed-size stack
+// array), and `free(s)` releases it. Contents are deterministically zero on BOTH backends
+// (calloc'd bytes on native, typed zero `Value`s in the interpreter), so the read-before-write
+// below is well-defined. The 5000-element buffer crosses the vectorizer-territory sizes; the
+// fill/reduce loops must agree native == interp and -O0 == -O3 regardless of which loop path the
+// backend picks.
+
+fn main() -> i32 {
+    let n: i64 = 5000;
+    let mut s: []f32 = alloc_f32(n);
+    print(s.len());     // 5000
+    print(s[4999]);     // 0 — zero-initialized, read before any write
+    for i in 0..n {
+        s[i] = (i % 7i64) as f32;
+    }
+    let mut acc: f32 = 0.0;
+    for i in 0..n {
+        acc = acc + s[i];
+    }
+    print(acc);         // 714 full 0..6 cycles (21 each) + 0 + 1 = 14995 (exact in f32)
+    free(s);
+    return 0;
+}
