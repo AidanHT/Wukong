@@ -1442,9 +1442,13 @@ thread_local! {
 /// * **Load balance**: candidates are tried largest-first (bigger blocks reuse their packed
 ///   slices longer) and the first yielding `>= target_blocks` wins; if even the smallest can't
 ///   (small m·n), the smallest is used — below that the block count is bounded by the matrix, not
-///   the policy. The chosen `BM` is then rebalanced to `round_up(ceil(m / nbi), MR)`, which
-///   equalizes row-block heights without changing the row count `nbi` (e.g. 1024³: (144, 192)
-///   gave 7×144 + a 16-row straggler; rebalanced BM = 132 gives 7×132 + 100).
+///   the policy. Both chosen dims are then rebalanced to `round_up(ceil(dim / nblocks), unit)`,
+///   which equalizes block heights AND widths without changing the grid (e.g. 1024³: (144, 192)
+///   gave 7×144 + a 16-row straggler; rebalanced BM = 132 gives 7×132 + 100, and rebalanced
+///   BN = 176 gives 5×176 + 144 instead of 5×192 + a 64-wide straggler column). Tail balancing is
+///   an M/N-dimension-only move — it can never regroup the K reduction, which is what keeps it
+///   unconditionally bit-safe (a K-dimension rebalance would change accumulation order and is
+///   forbidden).
 #[cfg(target_arch = "x86_64")]
 fn select_2d_block_shape(m: usize, n: usize, target_blocks: usize) -> (usize, usize) {
     // (BM, BN) regimes, largest first. All BM ∈ 24..=192 are multiples of MR=6, all BN ∈ 48..=256
@@ -1452,24 +1456,26 @@ fn select_2d_block_shape(m: usize, n: usize, target_blocks: usize) -> (usize, us
     // 2048³ → (192, 256); 1024³ → (144, 192) → 8×6 grid; 512³ → (48, 96) → 11×6.
     const CANDIDATES: &[(usize, usize)] = &[(192, 256), (144, 192), (96, 128), (48, 96), (24, 48)];
     let target = target_blocks.max(1);
+    // Equalize block sizes along one dim without changing its block count: `nb` is preserved
+    // (round_up(ceil(d/nb), unit) ≤ bd since bd is a unit multiple with nb·bd ≥ d, and
+    // nb·round_up(ceil(d/nb), unit) ≥ d, so ceil(d/·) lands back on nb) — the remainder is spread
+    // across every block instead of one thin straggler that pays a whole task dispatch (and, under
+    // dynamic scheduling, a whole claim) for a sliver of work.
+    let rebalance = |d: usize, bd: usize, unit: usize| round_up(d.div_ceil(d.div_ceil(bd)), unit);
     if m <= MC {
         // Skinny M: nbi = 1; the largest NR-multiple BN with >= ~target/2 column blocks. Column
         // blocks alone must carry the load balance, so the divisor is halved (1.5× workers at the
         // callers' 3× budget). Floored at NR; capped at round_up(n, NR) (whole-matrix block).
         let col_target = target.div_ceil(2);
         let bn = ((n / col_target) / NR * NR).clamp(NR, round_up(n, NR));
-        return (round_up(m, MR), bn);
+        return (round_up(m, MR), rebalance(n, bn, NR));
     }
     let (bm, bn) = CANDIDATES
         .iter()
         .copied()
         .find(|&(bm, bn)| m.div_ceil(bm) * n.div_ceil(bn) >= target)
         .unwrap_or(*CANDIDATES.last().unwrap());
-    // Rebalance the row-block height: nbi is preserved (round_up(ceil(m/nbi), MR)·nbi >= m and
-    // the result is <= bm, so ceil(m/·) lands back on nbi), only the straggler row-block grows
-    // toward the others' height.
-    let nbi = m.div_ceil(bm);
-    (round_up(m.div_ceil(nbi), MR), bn)
+    (rebalance(m, bm, MR), rebalance(n, bn, NR))
 }
 
 /// The **BLIS/MKL-style 2D block-parallel** GEMM with per-block packing (the
@@ -3354,15 +3360,30 @@ mod tests {
                     if m <= MC {
                         assert_eq!(m.div_ceil(bm), 1, "skinny m must give one block row (m{m} n{n} t{target})");
                     }
+                    // Tail balance: after the rebalance, every non-edge block is full-size and the
+                    // edge remainder is at least `block − unit` short of one extra block — i.e. the
+                    // grid can't shrink a whole block dim further without changing the block count.
+                    let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
+                    assert!(nbi * bm >= m && nbj * bn >= n, "grid must cover the matrix (m{m} n{n} t{target})");
+                    assert!(
+                        (bm - MR) * nbi < m,
+                        "BM {bm} not minimal for its row count (m{m} n{n} t{target})"
+                    );
+                    assert!(
+                        (bn - NR) * nbj < n,
+                        "BN {bn} not minimal for its column count (m{m} n{n} t{target})"
+                    );
                 }
             }
         }
         // Documented grids at the 16-worker default target (48): 512³ stays (48, 96) → 11×6;
-        // 1024³ rebalances (144, 192) → (132, 192) → still 8×6, but 7×132 + 100 instead of
-        // 7×144 + a 16-row straggler; skinny 128-row outputs get one block row of 32-wide
+        // 1024³ rebalances (144, 192) → (132, 176) → still 8×6, but 7×132 + 100 instead of
+        // 7×144 + a 16-row straggler, and 5×176 + 144 instead of 5×192 + a 64-wide straggler
+        // column (the BN rebalance is the tail-balancing extension of the BM one — a deliberate
+        // policy diff, pinned here); skinny 128-row outputs get one block row of 32-wide
         // blocks → 1×24 (was a 6×16 grid of (24, 48) slivers).
         assert_eq!(select_2d_block_shape(512, 512, 48), (48, 96));
-        assert_eq!(select_2d_block_shape(1024, 1024, 48), (132, 192));
+        assert_eq!(select_2d_block_shape(1024, 1024, 48), (132, 176));
         assert_eq!(select_2d_block_shape(128, 768, 48), (132, 32));
     }
 
