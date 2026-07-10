@@ -19,6 +19,7 @@ use wukong_span::{Interner, SourceId};
 
 mod compile_time;
 mod compile_vs;
+mod profile;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,7 +38,18 @@ fn main() {
         args.first().map(String::as_str),
         Some("compile-time" | "--compile-time" | "ctime")
     );
-    if ctime {
+    // `compile-profile` — full-pipeline per-stage breakdown; `spawn-overhead` — in-process vs
+    // process-spawn characterization. Both consume the same corpus dirs as `compile-time`, so they
+    // are detected here (after `compile-vs`'s early return) and dispatched once `files` is built.
+    let profile = matches!(
+        args.first().map(String::as_str),
+        Some("compile-profile" | "profile")
+    );
+    let spawn = matches!(
+        args.first().map(String::as_str),
+        Some("spawn-overhead" | "spawn")
+    );
+    if ctime || profile || spawn {
         args.remove(0);
     }
 
@@ -64,6 +76,14 @@ fn main() {
 
     if ctime {
         compile_time::report(&files);
+        return;
+    }
+    if profile {
+        profile::report(&files);
+        return;
+    }
+    if spawn {
+        profile::spawn_report(&files);
         return;
     }
 

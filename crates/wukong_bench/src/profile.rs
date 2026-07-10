@@ -1,0 +1,562 @@
+//! Whole-pipeline stage profiling and in-process-vs-spawn characterization.
+//!
+//! Two modes live here, both aimed at the "compile-time floor" question — how close is code→object
+//! to the irreducible work, and what does the process-spawn path cost on top of the in-process API.
+//!
+//! * `compile-profile` — a per-STAGE wall-time breakdown of the full pipeline (lex, parse, sema,
+//!   mir_build, optimize, and the Cranelift codegen+object-emit backend) measured in-process,
+//!   best-of-N per stage per file, over a corpus. `compile-time` mode already dissects the optimizer
+//!   pass-by-pass; this frames the optimizer against every *other* stage so the whole shape of the
+//!   compile is visible and the floor of each stage is exposed. Stage boundaries are timed at the
+//!   bench level by calling the stage crates directly (`wukong_lexer` … `wukong_codegen_cranelift`),
+//!   exactly as `compile-time` calls `wukong_opt` — no driver hook, so the driver stays a thin
+//!   sequencer with no instrumentation woven through it.
+//!
+//!   The backend is measured as ONE stage (`emit_object`): Cranelift instruction-selection +
+//!   register allocation + machine-code emission, then object-container serialization. Splitting the
+//!   isel cost from the object-bytes-written cost would need a timing hook *inside*
+//!   `wukong_codegen_cranelift` (that crate exposes only the combined `emit_object`); the object-emit
+//!   share is instead reasoned about in `docs/compile-floor.md` from the emitted byte count, which
+//!   this mode reports per file.
+//!
+//! * `spawn-overhead` — the same source compiled two ways: (a) the in-process API to an object in
+//!   memory, and (b) spawning the real `wukongc.exe --emit=obj`. The difference is the spawn tax
+//!   (process creation + runtime init + file I/O + the driver's own front-matter). Reported both
+//!   cold-start (first call — Windows image/page-cache cold) and warm steady-state (best-of-N min),
+//!   plus the `--emit=exe` path broken into compile vs the rustc-driven link.
+//!
+//! ```text
+//! cargo run -p wukong_bench --release -- compile-profile tests/run examples bench/kernels
+//! cargo run -p wukong_bench --release -- spawn-overhead   tests/run examples bench/kernels
+//! ```
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use wukong_span::{Interner, SourceId};
+
+/// Optimization level the profile measures. `-O2` is the heaviest pipeline (`-O3` ≡ `-O2` here) and
+/// the level `compile-vs` compares against, so code→object numbers line up across the harness.
+const LEVEL: u8 = 2;
+
+/// Per-stage wall budget for the best-of-N minimum, and a hard rep floor/ceiling. Small enough to
+/// keep a full-corpus run brisk, big enough that the minimum settles.
+const BUDGET: Duration = Duration::from_millis(40);
+const MIN_REPS: u32 = 5;
+const MAX_REPS: u32 = 3000;
+
+// ===================================================================================================
+// compile-profile
+// ===================================================================================================
+
+/// The seven pipeline stages, in order. `Backend` is Cranelift codegen + object serialization
+/// together (see the module docs for why they are not split here).
+#[derive(Clone, Copy)]
+enum Stage {
+    Lex,
+    Parse,
+    Sema,
+    MirBuild,
+    Optimize,
+    Backend,
+}
+
+impl Stage {
+    const ALL: [Stage; 6] = [
+        Stage::Lex,
+        Stage::Parse,
+        Stage::Sema,
+        Stage::MirBuild,
+        Stage::Optimize,
+        Stage::Backend,
+    ];
+    fn name(self) -> &'static str {
+        match self {
+            Stage::Lex => "lex",
+            Stage::Parse => "parse",
+            Stage::Sema => "sema",
+            Stage::MirBuild => "mir_build",
+            Stage::Optimize => "optimize",
+            Stage::Backend => "codegen+obj",
+        }
+    }
+}
+
+/// One file's per-stage timings and the size counters that set each stage's floor.
+struct Prof {
+    name: String,
+    src_bytes: usize,
+    tokens: usize,
+    ast_nodes: u32,
+    mir_ops: usize,
+    obj_bytes: usize,
+    /// Indexed by `Stage::ALL` order.
+    stage: [Duration; 6],
+}
+
+impl Prof {
+    fn total(&self) -> Duration {
+        self.stage.iter().copied().sum()
+    }
+}
+
+pub fn report(files: &[PathBuf]) {
+    let mut profs: Vec<Prof> = Vec::new();
+    let mut skipped = 0u32;
+    for path in files {
+        match measure_one(path) {
+            Some(p) => profs.push(p),
+            None => skipped += 1,
+        }
+    }
+
+    if profs.is_empty() {
+        println!("compile-profile: no corpus file compiled to object (measured 0, skipped {skipped})");
+        return;
+    }
+
+    // --- Stage totals + shares ---
+    let mut stage_tot = [Duration::ZERO; 6];
+    for p in &profs {
+        for i in 0..6 {
+            stage_tot[i] += p.stage[i];
+        }
+    }
+    let grand: Duration = stage_tot.iter().copied().sum();
+
+    // Aggregate size counters (context for the throughput a stage floor implies).
+    let src_bytes: usize = profs.iter().map(|p| p.src_bytes).sum();
+    let tokens: usize = profs.iter().map(|p| p.tokens).sum();
+    let ast_nodes: u64 = profs.iter().map(|p| p.ast_nodes as u64).sum();
+    let mir_ops: usize = profs.iter().map(|p| p.mir_ops).sum();
+    let obj_bytes: usize = profs.iter().map(|p| p.obj_bytes).sum();
+
+    println!(
+        "full-pipeline stage breakdown  [regime: warm steady-state, in-process, best-of-N min]\n\
+         corpus: {} file(s) compiled to object, {skipped} skipped; -O{LEVEL}; best-of-N per stage.\n",
+        profs.len()
+    );
+    println!("{:<14} {:>11} {:>7}   {}", "stage", "total", "%", "throughput (work / stage-time)");
+    println!("{}", "-".repeat(72));
+    for (i, s) in Stage::ALL.iter().enumerate() {
+        let t = stage_tot[i];
+        let share = 100.0 * t.as_secs_f64() / grand.as_secs_f64().max(1e-12);
+        let thru = match s {
+            Stage::Lex => rate(src_bytes as f64, t, "MB/s", 1e6),
+            Stage::Parse => rate(tokens as f64, t, "Mtok/s", 1e6),
+            Stage::Sema => rate(ast_nodes as f64, t, "Mnode/s", 1e6),
+            Stage::MirBuild => rate(ast_nodes as f64, t, "Mnode/s", 1e6),
+            Stage::Optimize => rate(mir_ops as f64, t, "Mop/s", 1e6),
+            Stage::Backend => rate(obj_bytes as f64, t, "MB-obj/s", 1e6),
+        };
+        println!("{:<14} {:>11} {:>6.1}%   {}", s.name(), fmt(t), share, thru);
+    }
+    println!("{}", "-".repeat(72));
+    println!("{:<14} {:>11} {:>6.1}%", "TOTAL", fmt(grand), 100.0);
+    println!(
+        "\nwork totals: {} src bytes, {tokens} tokens, {ast_nodes} AST nodes, {mir_ops} MIR ops, \
+         {} object bytes.",
+        src_bytes, obj_bytes
+    );
+
+    // --- Heaviest files ---
+    let mut heavy: Vec<&Prof> = profs.iter().collect();
+    heavy.sort_by(|a, b| b.total().cmp(&a.total()));
+    let n = heavy.len().min(10);
+    println!(
+        "\nheaviest {n} file(s) by total pipeline time  [regime: warm steady-state, best-of-N min]"
+    );
+    println!(
+        "{:<24} {:>7} {:>6} {:>6} {:>7} {:>7}  {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}",
+        "file", "bytes", "toks", "ast", "mirops", "obj", "lex", "parse", "sema", "mir", "opt",
+        "cg+obj", "total"
+    );
+    println!("{}", "-".repeat(139));
+    for p in &heavy[..n] {
+        println!(
+            "{:<24} {:>7} {:>6} {:>6} {:>7} {:>7}  {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}",
+            trunc(&p.name, 24),
+            p.src_bytes,
+            p.tokens,
+            p.ast_nodes,
+            p.mir_ops,
+            p.obj_bytes,
+            fmt(p.stage[0]),
+            fmt(p.stage[1]),
+            fmt(p.stage[2]),
+            fmt(p.stage[3]),
+            fmt(p.stage[4]),
+            fmt(p.stage[5]),
+            fmt(p.total()),
+        );
+    }
+}
+
+/// Run each stage in isolation on a fixed upstream artifact, timing only that stage. A stage whose
+/// input the previous stage mutated (parse and mir_build both extend the interner) rebuilds its
+/// input from the fixed tokens each rep, *outside* the timed region, so no `Interner` clone is
+/// needed (it is not `Clone`) and the minimum reflects that stage alone. `None` if the file does not
+/// compile cleanly to an object at `-O{LEVEL}` — not a regression, just outside this measurement.
+fn measure_one(path: &Path) -> Option<Prof> {
+    let src = std::fs::read_to_string(path).ok()?;
+
+    // One clean pass: validate runnability and capture the size counters + reusable artifacts.
+    let (tokens, ld) = wukong_lexer::tokenize(&src, SourceId(0));
+    if ld.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let mut interner = Interner::new();
+    let (module, pd, ast_nodes) =
+        wukong_parser::parse_module_tokens_from(&tokens, &src, &mut interner, 0);
+    if pd.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let (sema, sd) = wukong_sema::check(&module, &interner);
+    if sd.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let (p0, mld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    if mld.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let mir_ops = count_ops(&p0);
+    let mut p_opt = p0.clone();
+    wukong_opt::optimize(&mut p_opt, LEVEL);
+    let obj = wukong_codegen_cranelift::emit_object(&p_opt, &interner).ok()?;
+    let obj_bytes = obj.len();
+
+    // Lex: input is the source text (fixed).
+    let lex = best_of(|| {
+        let t = Instant::now();
+        let _ = wukong_lexer::tokenize(&src, SourceId(0));
+        t.elapsed()
+    });
+    // Parse: input is the fixed token stream; a fresh interner each rep (parse interns identifiers).
+    let parse = best_of(|| {
+        let mut it = Interner::new();
+        let t = Instant::now();
+        let _ = wukong_parser::parse_module_tokens_from(&tokens, &src, &mut it, 0);
+        t.elapsed()
+    });
+    // Sema: reads the fixed module + interner and mutates neither, so time it directly.
+    let sema_t = best_of(|| {
+        let t = Instant::now();
+        let _ = wukong_sema::check(&module, &interner);
+        t.elapsed()
+    });
+    // MIR build: needs a pristine interner (it extends it with kernel symbols). Rebuild module+sema
+    // from the fixed tokens each rep, untimed, then time only `lower_program`.
+    let mir = best_of(|| {
+        let mut it = Interner::new();
+        let (m, _, _) = wukong_parser::parse_module_tokens_from(&tokens, &src, &mut it, 0);
+        let (s, _) = wukong_sema::check(&m, &it);
+        let t = Instant::now();
+        let _ = wukong_mir_build::lower_program(&m, &s, &mut it);
+        t.elapsed()
+    });
+    // Optimize: clone the unoptimized program each rep (untimed), then time `optimize`.
+    let optimize = best_of(|| {
+        let mut p = p0.clone();
+        let t = Instant::now();
+        wukong_opt::optimize(&mut p, LEVEL);
+        t.elapsed()
+    });
+    // Backend: Cranelift codegen + object serialization on the fixed optimized program.
+    let backend = best_of(|| {
+        let t = Instant::now();
+        let _ = wukong_codegen_cranelift::emit_object(&p_opt, &interner);
+        t.elapsed()
+    });
+
+    Some(Prof {
+        name: short(path),
+        src_bytes: src.len(),
+        tokens: tokens.len(),
+        ast_nodes,
+        mir_ops,
+        obj_bytes,
+        stage: [lex, parse, sema_t, mir, optimize, backend],
+    })
+}
+
+// ===================================================================================================
+// spawn-overhead
+// ===================================================================================================
+
+/// How many corpus files to characterize under spawn (each `--emit=exe` rep spawns rustc, so keep
+/// the set small to stay quick).
+const MAX_SPAWN_FILES: usize = 6;
+/// Warm best-of budget/rep-cap for the spawn sweep (spawns are ~ms–100ms, so a bigger budget).
+const SPAWN_BUDGET: Duration = Duration::from_millis(900);
+const SPAWN_MAX_REPS: u32 = 25;
+
+pub fn spawn_report(files: &[PathBuf]) {
+    let mc = default_wukongc();
+    if !mc.exists() {
+        eprintln!(
+            "spawn-overhead: wukongc not found at {} — build it (cargo build --release -p wukongc) \
+             so the spawn path can be measured against the in-process API.",
+            mc.display()
+        );
+        return;
+    }
+    let workdir = std::env::temp_dir().join("wukong_spawn_overhead");
+    let _ = std::fs::create_dir_all(&workdir);
+
+    // Pick the first few corpus files that compile to an object in-process (so both paths are
+    // measuring the same, valid work), copying each into an isolated workdir the child runs in. The
+    // source is kept in memory so the in-process timing never re-reads it from disk (the spawn path's
+    // own file read stays counted in the tax, as it should be).
+    let mut chosen: Vec<(String, PathBuf, String)> = Vec::new();
+    for f in files {
+        if chosen.len() >= MAX_SPAWN_FILES {
+            break;
+        }
+        let Ok(src) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        if compile_to_object(&src).is_none() {
+            continue;
+        }
+        let name = short(f);
+        let wk = workdir.join(&name);
+        if std::fs::write(&wk, &src).is_err() {
+            continue;
+        }
+        chosen.push((name, wk, src));
+    }
+    if chosen.is_empty() {
+        eprintln!("spawn-overhead: no corpus file compiled to object in-process — nothing to compare.");
+        return;
+    }
+
+    println!(
+        "in-process API vs process-spawn, code -> object (and -> exe), -O{LEVEL}\n\
+         wukongc: {}\n\
+         (a) in-proc = lex..emit_object in memory;  (b) spawn = wukongc.exe end-to-end child wall.\n",
+        mc.display()
+    );
+
+    // --- Cold-start table (first call; image/page cache cold) ---
+    println!("[regime: cold-start / first call]");
+    println!(
+        "{:<24} {:>12} {:>12} {:>12}",
+        "file", "in-proc obj", "spawn obj", "spawn exe"
+    );
+    println!("{}", "-".repeat(64));
+    // --- collect warm numbers as we go for the second table ---
+    struct Row {
+        name: String,
+        inproc: Duration,
+        spawn_obj: Duration,
+        spawn_exe: Option<Duration>,
+    }
+    let mut warm_rows: Vec<Row> = Vec::new();
+
+    for (name, wk, src) in &chosen {
+        let out_o = workdir.join("out.o");
+        let out_exe = workdir.join("out.exe");
+
+        let (ip_cold, ip_warm) = cold_warm(|| {
+            let t = Instant::now();
+            let _ = compile_to_object(src);
+            t.elapsed()
+        });
+        // Does `--emit=exe` link cleanly here (needs rustc + the runtime rlib next to wukongc)?
+        let exe_ok = spawn_ok(&mc, wk, &workdir, "exe", &out_exe);
+
+        let (obj_cold, obj_warm) =
+            cold_warm(|| spawn_compile(&mc, wk, &workdir, "obj", &out_o));
+        let (exe_cold, exe_warm) = if exe_ok {
+            let (c, w) = cold_warm(|| spawn_compile(&mc, wk, &workdir, "exe", &out_exe));
+            (Some(c), Some(w))
+        } else {
+            (None, None)
+        };
+
+        println!(
+            "{:<24} {:>12} {:>12} {:>12}",
+            trunc(name, 24),
+            fmt(ip_cold),
+            fmt(obj_cold),
+            exe_cold.map(fmt).unwrap_or_else(|| "n/a".into()),
+        );
+        warm_rows.push(Row {
+            name: name.clone(),
+            inproc: ip_warm,
+            spawn_obj: obj_warm,
+            spawn_exe: exe_warm,
+        });
+    }
+
+    // --- Warm steady-state table ---
+    println!("\n[regime: warm steady-state / best-of-N min]");
+    println!(
+        "{:<24} {:>12} {:>12} {:>11} {:>12} {:>11}",
+        "file", "in-proc obj", "spawn obj", "spawn-tax", "spawn exe", "link(exe-obj)"
+    );
+    println!("{}", "-".repeat(88));
+    for r in &warm_rows {
+        let tax = r.spawn_obj.saturating_sub(r.inproc);
+        let (exe, link) = match r.spawn_exe {
+            Some(e) => (fmt(e), fmt(e.saturating_sub(r.spawn_obj))),
+            None => ("n/a".into(), "n/a".into()),
+        };
+        println!(
+            "{:<24} {:>12} {:>12} {:>11} {:>12} {:>11}",
+            trunc(&r.name, 24),
+            fmt(r.inproc),
+            fmt(r.spawn_obj),
+            fmt(tax),
+            exe,
+            link,
+        );
+    }
+    println!("{}", "-".repeat(88));
+    println!(
+        "spawn-tax = (b) spawn-obj wall - (a) in-process-obj wall: process creation + runtime init + \
+         file I/O\n  + the driver's source-map/diagnostics/import front-matter that the in-process \
+         path skips.\nlink(exe-obj) = the rustc-driven link the driver spawns for --emit=exe \
+         (links wukong_runtime + the\n  platform linker); it is a whole second process, so it \
+         dominates the exe path. 'n/a' = rustc or the\n  runtime rlib was not next to wukongc, so \
+         --emit=exe fell back / did not link."
+    );
+}
+
+/// Full in-process pipeline, source text to object bytes. `None` on any stage error.
+fn compile_to_object(src: &str) -> Option<Vec<u8>> {
+    let (tokens, ld) = wukong_lexer::tokenize(src, SourceId(0));
+    if ld.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let mut interner = Interner::new();
+    let (module, pd, _) = wukong_parser::parse_module_tokens_from(&tokens, src, &mut interner, 0);
+    if pd.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let (sema, sd) = wukong_sema::check(&module, &interner);
+    if sd.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let (mut program, mld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    if mld.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    wukong_opt::optimize(&mut program, LEVEL);
+    wukong_codegen_cranelift::emit_object(&program, &interner).ok()
+}
+
+/// Spawn `wukongc --emit=<emit> -O{LEVEL} <file> -o <out>` from `workdir` and return the child wall
+/// time. Output is discarded. The child writes its intermediates into `workdir`, isolated from the
+/// repo.
+fn spawn_compile(mc: &Path, wk: &Path, workdir: &Path, emit: &str, out: &Path) -> Duration {
+    let file = wk.file_name().unwrap().to_string_lossy().into_owned();
+    let out = out.to_string_lossy().into_owned();
+    let t = Instant::now();
+    let _ = Command::new(mc)
+        .current_dir(workdir)
+        .args([&format!("--emit={emit}"), "-O2", &file, "-o", &out])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    t.elapsed()
+}
+
+/// One spawn to check the child actually succeeded (used to decide whether `--emit=exe` links here).
+fn spawn_ok(mc: &Path, wk: &Path, workdir: &Path, emit: &str, out: &Path) -> bool {
+    let file = wk.file_name().unwrap().to_string_lossy().into_owned();
+    let out = out.to_string_lossy().into_owned();
+    Command::new(mc)
+        .current_dir(workdir)
+        .args([&format!("--emit={emit}"), "-O2", &file, "-o", &out])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn default_wukongc() -> PathBuf {
+    let exe = if cfg!(windows) { "wukongc.exe" } else { "wukongc" };
+    PathBuf::from("target/release").join(exe)
+}
+
+// ===================================================================================================
+// shared helpers
+// ===================================================================================================
+
+/// Best-of-N minimum: warm up, then keep the minimum single-run time until the wall budget or rep
+/// cap, with a hard floor of `MIN_REPS`. The minimum is the run least perturbed by scheduler noise.
+fn best_of<F: FnMut() -> Duration>(mut run: F) -> Duration {
+    run();
+    run();
+    let mut best = Duration::MAX;
+    let mut reps = 0u32;
+    let start = Instant::now();
+    loop {
+        best = best.min(run());
+        reps += 1;
+        if reps >= MAX_REPS || (reps >= MIN_REPS && start.elapsed() >= BUDGET) {
+            break;
+        }
+    }
+    best
+}
+
+/// First call (cold), then a warm best-of-N minimum — the pair the spawn characterization needs.
+fn cold_warm<F: FnMut() -> Duration>(mut run: F) -> (Duration, Duration) {
+    let cold = run();
+    let mut best = Duration::MAX;
+    let mut reps = 0u32;
+    let start = Instant::now();
+    loop {
+        best = best.min(run());
+        reps += 1;
+        if reps >= SPAWN_MAX_REPS || (reps >= MIN_REPS && start.elapsed() >= SPAWN_BUDGET) {
+            break;
+        }
+    }
+    (cold, best)
+}
+
+/// Total MIR operations: instructions plus one terminator per block.
+fn count_ops(p: &wukong_mir::Program) -> usize {
+    p.funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .map(|b| b.insts.len() + 1)
+        .sum()
+}
+
+/// `count / seconds` rendered in `unit`s of `scale` per second, or `-` when the time is zero.
+fn rate(count: f64, t: Duration, unit: &str, scale: f64) -> String {
+    let s = t.as_secs_f64();
+    if s <= 0.0 || count <= 0.0 {
+        return "-".into();
+    }
+    format!("{:.1} {unit}", count / s / scale)
+}
+
+fn fmt(d: Duration) -> String {
+    let ns = d.as_nanos();
+    if ns >= 1_000_000 {
+        format!("{:.2}ms", ns as f64 / 1e6)
+    } else if ns >= 1_000 {
+        format!("{:.2}us", ns as f64 / 1e3)
+    } else {
+        format!("{ns}ns")
+    }
+}
+
+fn short(p: &Path) -> String {
+    p.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+fn trunc(s: &str, w: usize) -> String {
+    if s.len() <= w {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..w - 1])
+    }
+}
