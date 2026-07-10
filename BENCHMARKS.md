@@ -59,11 +59,14 @@ quality, not just beating textbook code:
   **in-process JIT/embedding latency** (Mercury's front-end + Cranelift JIT in-process vs *spawning*
   a toolchain), the right number for JIT-style embedding but not a process-to-process comparison.
 - **Geomean across the elementwise/reduction battery: 4.86× faster than C.**
-- **End-to-end: a 12-layer GPT-2-class transformer stack (768/12/3072, S=128/512) runs ~26–32×
-  faster than idiomatic C and ~4.9–9.4× faster than `-ffast-math` C** (preliminary, first sessions —
-  see the [End-to-end model](#end-to-end-model--a-12-layer-gpt-2-class-transformer-stack-cpu-inference)
-  section), with the whole block compiling in ~3–12 ms vs gcc's ~0.4–0.9 s and the forward
-  interpreter-gated bit-for-bit at a reduced config.
+- **End-to-end: a 12-layer GPT-2-class transformer stack (768/12/3072, S=128/512) runs ~19–21×
+  faster than idiomatic C and 3.6–4.9× faster than `-ffast-math` C single-core** (five valid
+  full-peer rounds — see the [End-to-end model](#end-to-end-model--a-12-layer-gpt-2-class-transformer-stack-cpu-inference)
+  section), at **parity-to-faster vs PyTorch CPU eager single-thread** (1.03–1.09× behind @S=128,
+  **1.12–1.22× faster @S=512**) and — since the `@parallel` head-loop region shipped (2026-07-10) —
+  **1.10–1.24× faster than all-threads eager torch at S=512** with parity at S=128; the whole block
+  compiles in ~3–12 ms vs gcc's ~0.4–0.9 s and the forward is interpreter-gated bit-for-bit at a
+  reduced config.
 
 The largest domain-lowering blowouts (each is multicore-vs-1-core, or vs idiomatic scalar source
 where gcc/rustc won't vectorize — disclosed per section, never a rigged baseline):
@@ -384,8 +387,8 @@ the all-core one last, so multicore heat pollutes no single-thread torch number.
 `T1(sdpa)`, `T1(man)`, `Tn(sdpa)`; the Mercury-vs-Torch ratio lines print alongside the
 Mercury-vs-C ones. Disclosed asymmetry: `Tn(sdpa)` is genuinely multicore while the C columns are
 single-threaded — the printed ratios name the thread counts. As everywhere in this suite, absolute
-ms is clock/thermal-bound; only same-run ratios are meaningful, and no torch numbers are recorded
-here for that reason.
+ms is clock/thermal-bound, so only the **same-run ratios** are recorded (below); raw torch ms is not
+a stable metric and is not reported.
 
 **Correctness.** Four gates run inside the benchmark: (1) the interpreter oracle executes the
 *identical* 12-layer forward (same MIR, same weights, same harness loop) at a reduced config and
@@ -398,33 +401,48 @@ output agrees under the same magnitude-normalized `1e-3` metric (same GELU flavo
 residual is the same reassociation/poly-vs-libm class — no loosening needed), and the script itself
 reports its manual-attention-vs-SDPA agreement.
 
-**First indicative numbers (PRELIMINARY** — two back-to-back sessions on the throttling laptop;
-absolute ms swung ~3× with clock state between them (roofline read 71 GFLOP/s in the cold run vs
-the usual ~117), so ranges are shown and the *ratios* are the only stable metric**):**
+**Measured standings (2026-07-09/10 perf campaign — five valid full-peer rounds).** Absolute ms
+swings ~3× with this laptop's clock state (the valid rounds read roofline 130–141 GFLOP/s; a sixth
+round at roofline 61 — 1 a.m. system activity plus a fresh-binary cache scan — was caught by the
+validity protocol and discarded), so the **ratios are the metric**, not raw ms. All four correctness
+gates passed every round: interp == native bit-exact, serial == `@parallel` bit-exact, and
+Mercury-vs-C / Mercury-vs-torch outputs agree to `max|Δ|/max|out|` ≈ 1–2×10⁻⁶ (tolerance 10⁻³).
 
-| S | metric | Mer (1c) | Mer `@parallel` | C (gcc) | C (fast) |
-|---|---|---|---|---|---|
-| 128 | ms/forward | 294–896 | 623–889 | 9 313–23 096 | 2 606–4 778 |
-| 128 | tokens/sec | 143–436 | 144–206 | 6–14 | 27–49 |
-| 512 | ms/forward | 2 666–3 949 | 3 352–5 485 | n/a (see above) | 19 366–25 102 |
-| 512 | tokens/sec | 130–192 | 93–153 | n/a | 20–26 |
+*Single-core*, the 12-layer stack runs **~19–21× idiomatic C(gcc)** and **3.6–4.9× C(-ffast-math)**,
+and stands **at parity-to-faster vs PyTorch CPU eager single-thread** — 1.03–1.09× behind torch-1T
+@S=128, **1.12–1.22× faster @S=512**.
 
-→ Mercury single-core is **~26–32× faster than idiomatic C** and **~4.9–9.4× faster than
-`-ffast-math` C** end-to-end (preliminary); compiling the whole block takes Mercury **~3–12 ms vs
-gcc's ~0.4–0.9 s** for the equivalent TU. tokens/sec = S tokens per forward ÷ seconds. All four
-correctness gates passed on every run (interp bit-exact; serial-vs-`@parallel` bit-exact; vs C and
-vs C(fast) `max|Δ|/max|out|` ≈ 1–2×10⁻⁶, tolerance 10⁻³).
+*Multicore*, the campaign's closing move was the **`@parallel` head-loop region** (2026-07-10): an
+independent-iteration `for` loop with body-local scratch inside an `@parallel` fn now outlines into a
+`mercury_parallel_for` region — conservative affine-disjointness legality, the serial GEMM/norm
+kernels running inside each iteration so serial == `@parallel` stays **bit-exact**, autodiff
+declining the construct loudly. The model spells its per-head attention loop that way naturally, and
+it **flipped the all-threads-torch comparison**:
 
-**Disclosed limitation (a real compiler finding — since fixed):** when the preliminary table above
-was measured, the `@parallel` column was only partially multicore — `mercury_mir_build`'s
-statement-path matmul recognizer hardcoded the serial kernel (`lower_for`:
-`emit_sgemm(&nest, false)`), so inside a multi-statement `@parallel` function only the batched
-norms and the fused-GELU FFN GEMM dispatched `_parallel` kernels while the six plain GEMMs stayed
-single-threaded; `Mer(par)` accordingly ranged from ≈`Mer(1c)` to **~2× slower** (multicore bursts
-dragged the package clock for the still-serial GEMM phases). That call site now passes the
-function's `@parallel` flag (`emit_sgemm(&nest, self.parallel_fn)`; the parallel GEMM is
-bit-identical to serial, so the differential gate is unaffected) — the table's `Mer(par)` column
-predates the fix.
+| S | Mercury `@parallel` vs all-threads eager torch (`Tn`) | `@parallel` scaling | vs C(gcc) multicore |
+|---|---|---|---|
+| 128 | **parity** — 1.19× faster / 1.02× behind at round noise (was 1.5–1.9× behind) | 3.14–3.61× | ~61–69× |
+| 512 | **1.10–1.24× FASTER** (two valid rounds; par ~440 → ~312 ms — the head loop was worth ~1.4×) | 3.27–3.36× | large |
+
+Before the region, three mid-session rounds had Mercury `@parallel` scaling 2.2–3.0× @S=128 / 2.4×
+@S=512 and sitting **1.01–1.63× *behind* all-threads torch @S=512** — the wide range being the peer's
+power-state swing (torch-Tn ran 443→271 ms across rounds while Mercury `@parallel` held ~440 ms in
+every round). That exposed the structural finding the region then addressed: Mercury's parallel path
+does **not** ride the clock upside peers do, consistent with a sync/serial-fraction bound rather than
+a clock bound. The residual multicore headroom vs 16 physical cores now concentrates in the mid-size
+parallel-GEMM grain (70–83% of MKL-all @512–1024³ — see the library table above), the one
+honestly-open lever. Compiling the whole block takes Mercury **~3–12 ms vs gcc's ~0.4–0.9 s** for the
+equivalent TU; tokens/sec = S ÷ ms/forward.
+
+**A real compiler finding along the way (since resolved):** in the first preliminary sessions the
+`@parallel` column was only *partially* multicore — `mercury_mir_build`'s statement-path matmul
+recognizer hardcoded the serial kernel (`lower_for`: `emit_sgemm(&nest, false)`), so inside a
+multi-statement `@parallel` function only the batched norms and the fused-GELU FFN GEMM dispatched
+`_parallel` kernels while the six plain GEMMs stayed single-threaded, and multicore bursts dragged the
+package clock for the still-serial phases (so `Mer(par)` could read *slower* than `Mer(1c)`). That
+site now passes the function's `@parallel` flag (`emit_sgemm(&nest, self.parallel_fn)`); combined with
+the velem-parallel residual-add dispatch and the head-loop region above, the whole block is genuinely
+multicore. The parallel GEMM is bit-identical to serial, so the differential gate was never at risk.
 
 GFLOP/s (higher is better), naive `ikj` nest in each language. Measurement ordering is thermal
 hygiene: the naive C/Rust (and `C(fast)`) nests are measured in the **same single-core thermal group
@@ -456,6 +474,12 @@ there (a measured fix — naive threading at that size was a net *loss*).
 default), which A/B-measured **1.65× @512³ and 1.26× @1024³** over the path that produced them —
 absolute GFLOP/s swing ~3× with this laptop's power state, so the ranges are not re-baselined from a
 throttled day; the same-run vs-MKL ratios in the library table above are the current standing.
+*2026-07-10 update*: that path is now **size-keyed** — per-block packing at mid/large (it beat the
+shared-cooperative-pack design in both ABBA orderings — each worker warming its own L2 is the win),
+a shared-pack + 1 Mi-MAC-task small band, and the parallel gate lowered 2²⁶→2²³ MACs so 256³ engages
+(**102–123% of MKL-all**, was deliberately serial). A C-tile microkernel prefetch also closed the
+single-core writeback tail (**2048³ 86–88% → 96–99% of MKL-1c**, `MERCURY_GEMM_PF_C=0` kill-switch).
+See the library table above for the current same-run vs-MKL standings.
 
 ### `nn.Linear` `C = A·Bᵀ` — Mercury dispatches to GEMM; naive C is latency-bound
 
