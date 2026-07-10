@@ -110,6 +110,45 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
 - **parallel_for dynamic granule claiming shipped** (fe7fd04, WUKONG_PFOR_DYN=0 A/B escape):
   region iterations claimed from a padded atomic counter in ceil(n/(workers·8)) granules — the
   runtime half of the attention-tiling lever. Full gate green.
+- **256³ small-band lever discovered — PENDING CLEAN CONFIRMATION.** In the AC window,
+  `WUKONG_GEMM_2D_SHARED=0` (per-block packing, bypassing the shared-pack small band) lifted 256³
+  Wuk-par from 185-193 GF/s (67-69% of adjacent MKL-all ~275-282) to **272.7 GF/s = 97% of
+  adjacent MKL-all 281.7**; 512³ unchanged at 97% (already per-block). Hypothesis: the
+  2026-07-09 "shared-pack wins the small band" measurement is obsolete under this session's pool
+  unification — SHARED_MAX_MACS=2^26 is now a wrong default. The ABBA closer (shared default,
+  re-run) came back CONFOUNDED: machine flipped to BATTERY + two concurrent agent cargo builds;
+  MKL-all itself collapsed 282→193 (burst roofline stayed 136 — the all-core interference
+  signature). No default flip until one clean AC ABBA confirms. Note shared-band Wuk-par read
+  ~185-193 GF/s in every state, healthy or degraded — consistent with the shared path being
+  self-limited (caller-thread packing barrier), but that's interpretation, not yet evidence.
+- **Merged perf/backend-compile-time** (023b08f + d962001): Target C's backend attack. (1)
+  Cranelift IR verifier (check-only pass, default ON upstream) now off in release / on in debug
+  tests, WUKONG_CL_VERIFY override — agent-measured geomean **1.20× backend** over the 295-file
+  corpus (provisional: battery-window same-run ratios). (2) Parallel per-function codegen
+  (rayon map_init, shared read-only ISA+Decls, define in source order via define_function_bytes),
+  default ON, WUKONG_PAR_CODEGEN=0 kill-switch: +2% corpus-wide but 15-46% on the 30
+  multi-function programs (gpt2 ~20%). (3) emit_object_timed split: codegen 91.6% /
+  object-write 8.4% — kills the "shrink the COFF container" lever (<9% ceiling). (4) ISA rebuild
+  cost measured 0.3% — caching declined, tried-and-flat. Byte-identity: 296/296 corpus files
+  identical old-binary-vs-new (serial AND parallel), plus 3 unit gates. JIT paths stay serial.
+  Merge gated by my own unpiped full `cargo test` + `cargo check --features gpu --all-targets`.
+- **Merged feat/outliner-divmod-tiling** (51a0f87..cd85919): the @parallel region outliner now
+  accepts div/mod-tiled iteration spaces — `hh=t/C; tile=t%C` digit pairs proven disjoint by a
+  two-level mixed-radix argument (index terms distributed via flatten_scaled_terms; digit atoms
+  incl. flow/scope-tracked derived locals; per-array common RegionSig; H/L slot bounds with i128
+  checked arithmetic). Conservative line pinned by decline tests (non-const divisor, div-only/
+  mod-only, equal coefficients, overlapping extents). New differential fixture
+  tests/run/parallel_divmod_tiling.wk (serial twin == @parallel, interp+native, -O0..-O3);
+  autodiff loud-decline still pinned. I re-verified the DivMod bound arithmetic by hand at the
+  model's shapes (both exactly tight: 255<256 test cfg, 98303<98304 at S=512 — tiles exactly
+  fill their slots). Agent gate + my own post-merge combined gate.
+- **Head×row-tile respelling RE-LANDED in the model** (model.rs wk_block): the head loop is now
+  ONE flat `for t in 0..h*4` with hh=t/4, tile=t%4 — 48 units @H=12 instead of 12 (load balance
+  on 16 workers) and 4× smaller scores scratch (1 MB→256 KB @S=512: L2-resident). Bit-identical
+  per-row math (packing, dot order, mask, softmax unchanged) → outputs identical to untiled.
+  block_dispatch_sets_pinned now PASSES on the tiled form (ONE wukong_parallel_for, serial
+  sgemm_nt/sgemm_nt_alpha/norm_f32 inside, none outside) and interp_gate_bit_exact green.
+  Perf A/B vs untiled DEFERRED to the next AC window (battery now).
 - **Head×row-tile respelling: probe PASSED but the conclusion was WRONG — corrected.** The
   standalone probe (whole `@parallel` fn = single top-level loop) takes the fn-level chunking
   path (`<fn>$par`), which handles div/mod fine and is interp==native exact. But the model's
