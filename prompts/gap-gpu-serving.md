@@ -1,21 +1,21 @@
 # End-to-end serving & multi-GPU — paged-KV + batching + full-model graph vs TensorRT-LLM / vLLM
 
-You are a Claude Code session on **Mercury** (`mercuryc` emits PTX, driver-JIT via `cudarc`, no toolkit).
+You are a Claude Code session on **Wukong** (`wukongc` emits PTX, driver-JIT via `cudarc`, no toolkit).
 Target: **mobile RTX 4050, sm_89 (Ada), 6 GB, ~30–50 W — ONE GPU**. First action:
-`git worktree add ../Mercury-serving -b perf/gpu-serving main` and work inside it (or `git checkout -b`).
+`git worktree add ../Wukong-serving -b perf/gpu-serving main` and work inside it (or `git checkout -b`).
 
 ## Prime Directive (how you work)
 
 **Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
 metric. The gold-standard stack already achieves it, so the performance is physically available on this
-silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you WILL
+silicon and a path to it is guaranteed to exist — your only job is to find Wukong's path, and you WILL
 find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap is
 never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
 done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
 the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
 collected.**
 
-Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
+Continuously iterate through the entire codebase until Wukong performs better than C, C++, and Rust
 **and closes — then beats — the NVIDIA inference-serving stack (TensorRT-LLM / vLLM) on what is testable
 here**. **No scope restrictions.** Remove any blocker; explore options **even outside scope**. Improve
 everything. **No limit.** **Assume the metrics are NOT strong until you PROVE they are** across multiple
@@ -25,7 +25,7 @@ doesn't matter. **Run many sub-agents in parallel.** **Make 10–20 commits, NO 
 
 ## Your mission
 
-Mercury has a device memory **pool** + **CUDA-graph** capture/replay (whole-model decode ~6.5–6.9× vs
+Wukong has a device memory **pool** + **CUDA-graph** capture/replay (whole-model decode ~6.5–6.9× vs
 eager) but **no paged KV-cache, no continuous batching, no multi-GPU** — the things TensorRT-LLM/vLLM are
 built on. **Your job (split by what this hardware can test):**
 - **Testable now (the priority):** **paged KV-cache** (vLLM-style block table), **continuous / in-flight

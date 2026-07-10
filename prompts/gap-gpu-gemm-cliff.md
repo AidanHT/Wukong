@@ -1,22 +1,22 @@
 # Close the large-GEMM cliff vs cuBLAS (fp16/bf16)
 
-You are a Claude Code session working on **Mercury**, a systems language whose compiler `mercuryc`
+You are a Claude Code session working on **Wukong**, a systems language whose compiler `wukongc`
 emits PTX and driver-JIT-loads it via `cudarc` (no CUDA toolkit). Target GPU: **mobile NVIDIA RTX 4050,
-sm_89 (Ada), ~30–50 W**. First action: `git worktree add ../Mercury-gemm2 -b perf/gpu-gemm-cliff-2 main`
+sm_89 (Ada), ~30–50 W**. First action: `git worktree add ../Wukong-gemm2 -b perf/gpu-gemm-cliff-2 main`
 and work entirely inside it (or at least `git checkout -b perf/gpu-gemm-cliff-2`).
 
 ## Prime Directive (this is how you work, not background motivation)
 
 **Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
 metric. The gold-standard library already achieves it, so the performance is physically available on
-this silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you
+this silicon and a path to it is guaranteed to exist — your only job is to find Wukong's path, and you
 WILL find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap
 is never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
 done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
 the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
 collected.**
 
-Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
+Continuously iterate through the entire codebase until Wukong performs better than C, C++, and Rust
 **and closes — then beats — the gap to the NVIDIA gold-standard library on this slice's metric**. There
 are **no scope restrictions**. If something blocks a higher metric, **get rid of that blocker** and
 explore options **even outside the current scope**. Improve everything. **There is no limit.** You must
@@ -30,7 +30,7 @@ co-authored lines.** "Good enough" is failure: 34% of cuBLAS is a **66% deficien
 
 ## Your mission
 
-Mercury's fp16/bf16 tensor-core GEMM reaches **~101% of cuBLAS at ≤1024³** (parity — great) but falls
+Wukong's fp16/bf16 tensor-core GEMM reaches **~101% of cuBLAS at ≤1024³** (parity — great) but falls
 to **~74% at 2048³ and ~34% at 4096³** — the "GEMM cliff." A prior branch hit a **~77% PTX ceiling** at
 4096³ after multi-stage `cp.async` + wide BK + 2D raster were swept. **Your job: break that ceiling.**
 Target: ≥90% of cuBLAS at 2048³ and ≥75% at 4096³, measured same-run, bit-gated. Then push past it.
@@ -51,7 +51,7 @@ Before coding, research (use sub-agents, the web, CUTLASS/cuBLAS literature) and
 - **Deeper software pipelining** — 3–4 stage `cp.async` (not just double-buffer), with the right SMEM
   budget; measure occupancy vs pipeline depth.
 - **`ldmatrix`** for SMEM→register fragment loads + the XOR/swizzle that kills shared-bank conflicts (the
-  single most-cited PTX-level GEMM lever Mercury may not yet use on this path).
+  single most-cited PTX-level GEMM lever Wukong may not yet use on this path).
 - **Larger register/warp tiles** (128×128, 256×128, 128×256) with correct register blocking; sweep
   warp-tile shape and `maxrregcount`.
 - **Threadblock rasterization / L2 swizzle** (boustrophedon / Hilbert tile order) for L2 reuse at large N.
@@ -74,7 +74,7 @@ Before coding, research (use sub-agents, the web, CUTLASS/cuBLAS literature) and
 
 ## Files you own / shared (append-only)
 
-- **Own exclusively:** `crates/mercury_codegen_gpu/src/ptx_wmma.rs`, `ptx_gemm.rs`.
+- **Own exclusively:** `crates/wukong_codegen_gpu/src/ptx_wmma.rs`, `ptx_gemm.rs`.
 - **Append-only (shared):** `baselines.rs` (add/extend the cuBLAS fp16 peer as a uniquely-named fn),
   `lower.rs` (only the dispatch arm that selects your GEMM kernel — additive), `gpu.rs` (add tests named
   `gemm_cliff_*`), `lib.rs` (mod decls at end), `Cargo.toml`. **Do NOT** touch `ptx_int8/fp8/flash/conv.rs`

@@ -1,7 +1,7 @@
 # CPU kernels: library-grade — measure & close the gap to oneMKL / oneDNN / OpenBLAS
 
-Branch: `perf/cpu-library-grade` (worktree `../Mercury-cpu`). Owner files: `crates/mercury_runtime/src/*`,
-`crates/mercury_xbench/src/main.rs`, additive recognizer arms in `crates/mercury_mir_build/src/lib.rs`.
+Branch: `perf/cpu-library-grade` (worktree `../Wukong-cpu`). Owner files: `crates/wukong_runtime/src/*`,
+`crates/wukong_xbench/src/main.rs`, additive recognizer arms in `crates/wukong_mir_build/src/lib.rs`.
 
 ## Headline standing (vs the oneMKL gold standard, measured this session)
 
@@ -19,7 +19,7 @@ measurement law); AVX-512 is a labelled projection (no silicon here). Both bindi
   ML regime.
 - **vs naive C/Rust (the floor): crushed.** GEMM **2.4–12.5×** single-core (and far more `@parallel`);
   vectorized transcendentals **5–6×**.
-- **vmath vs MKL VML: honest open gap.** Mercury's exp/log are ~1.7–2× under VML — *algorithmic* (VML's
+- **vmath vs MKL VML: honest open gap.** Wukong's exp/log are ~1.7–2× under VML — *algorithmic* (VML's
   cheaper ~0.5-ULP approximation), not an ILP deficiency (a 4× unroll measured 0.97×; the kernel is
   already OoO-saturated). Characterised and deferred, bounded by the 1-ULP correctness gate.
 - **AVX-512 (projection):** a gated, twin-tested microkernel, bit-identical-by-construction to the AVX2
@@ -46,7 +46,7 @@ Commits: `select_kc` · honest-harness · physical-pool · AVX-512 · VML-peer (
 
 ## Current GEMM (the thing to beat / match)
 
-`crates/mercury_runtime/src/gemm.rs` — already a BLIS five-loop f32 GEMM:
+`crates/wukong_runtime/src/gemm.rs` — already a BLIS five-loop f32 GEMM:
 - Register tile **MR=6 × NR=16** (12 live `ymm` accumulators), AVX2+FMA `micro_6x16`, K-unroll ×4 with
   `_mm_prefetch(T0)`.
 - Cache blocks **MC=144, KC=256, NC=4080**; packs **both** A (`pack_a`) and B (`pack_b`/`pack_b_trans`)
@@ -54,14 +54,14 @@ Commits: `select_kc` · honest-harness · physical-pool · AVX-512 · VML-peer (
 - Runtime dispatch `is_x86_feature_detected!("avx2"/"fma")` → `sgemm_avx2[_parallel]`, else scalar.
 - `@parallel` = rayon over C row-panels, **fixed per-(i,j) K-order identical to serial** (so
   serial==parallel bit-for-bit; the interpreter oracle calls the serial kernel for both names).
-- Symbols: `mercury_sgemm{,_nt,_tn}{,_parallel}`, `_nt_epi{,_parallel}` (fused bias+act), bf16/f16 twins.
+- Symbols: `wukong_sgemm{,_nt,_tn}{,_parallel}`, `_nt_epi{,_parallel}` (fused bias+act), bf16/f16 twins.
 - Standing today (per repo memory): ~90% of one P-core's AVX2-FMA roofline at 512³; 1.1–1.3× tuned
   `matrixmultiply`. **Unmeasured vs MKL. Unmeasured at 2048³/4096³** (the >L3 regime). AVX2-only.
 
 ## Correctness model (the sacred gate) — what actually protects a kernel change
 
 The interpreter marshals its abstract memory into real buffers and calls the **same**
-`mercury_runtime::mercury_sgemm*` symbol the native backend calls. Consequences:
+`wukong_runtime::wukong_sgemm*` symbol the native backend calls. Consequences:
 1. **interp==native is automatic** for any in-place kernel retune (both sides call the new kernel) — so
    retuning the existing symbol needs **zero** backend/interp/recognizer wiring. (A *new* symbol is the
    8-touchpoint recipe; we avoid it where possible by retuning in place + runtime sub-dispatch.)
@@ -70,7 +70,7 @@ The interpreter marshals its abstract memory into real buffers and calls the **s
    (b) the **gemm.rs unit test vs a naive scalar reference within a √K·ε tolerance** (GEMM reorders the
    sum, so it is *not* bit-identical to a naive nest — tolerance, not bit-equality, is correct here);
    (c) the **xbench cross-check vs MKL/C** (`max_rel_err < 1e-3`) as independent validation.
-- `-O0 ≡ -O3` stdout/exit (`cargo test -p mercuryc --test run`) stays the hard invariant.
+- `-O0 ≡ -O3` stdout/exit (`cargo test -p wukongc --test run`) stays the hard invariant.
 
 ### AVX-512 correctness without AVX-512 silicon
 In GEMM each `C[i,j]` accumulates independently across K; SIMD lanes hold **different output elements**,
@@ -104,7 +104,7 @@ existing `time_ns` (5 warmup + scale-to-50ms + best-of-14). An AVX-512 number is
 
 ### P0 baseline (commit: MKL peer + 2048³) — single-core gap is the clean target
 
-`mercury-xbench matmul`, roofline ~106 GFLOP/s this run, MKL = `mkl_rt.2.dll` (ILP64). GFLOP/s:
+`wukong-xbench matmul`, roofline ~106 GFLOP/s this run, MKL = `mkl_rt.2.dll` (ILP64). GFLOP/s:
 
 | size | Mer(1c) | MKL(1c) | Mer/MKL 1c | Mer(par) | MKL(all) | tuned(mm) | C(gcc) |
 |------|--------:|--------:|-----------:|---------:|---------:|----------:|-------:|
@@ -121,7 +121,7 @@ fix (peers adjacent + skip the naive pollution at ≥2048) before its gap is tru
 **Findings:**
 - **Floor cleared:** Mer(1c) beats tuned `matrixmultiply` 1.13–1.25× and naive C 2.5–8.7× at every size.
 - **Single-core gap to MKL widens with size** (97%→85%→88%→82%): MKL holds ~94–97 GFLOP/s flat
-  (≈90% roofline, resident), Mercury **erodes 93→77** as the matrices spill L2/L3 — the classic
+  (≈90% roofline, resident), Wukong **erodes 93→77** as the matrices spill L2/L3 — the classic
   re-streaming loss. *This is the Phase-1 target: lift 512³–2048³ from ~82–88% toward MKL's ~95%.*
   Prime lever (analytical): KC=256 ⇒ C re-streamed ⌈k/256⌉× (8× at 2048³); MC=144 uses only 144 KB
   of the 2 MB L2. Both are conservative (tuned for ≤1024³).
@@ -138,7 +138,7 @@ B + 9 KB A micropanels stay L1-resident): k=512 → 2×256 (even, no thin tail),
 Both kernels call it, so **serial stays bit-identical to parallel**; the grouping differs from KC=256
 only in low f32 bits (within the √k·ε tolerance the gemm tests assert). 18/18 gemm + 134/134 runtime tests green.
 
-`mercury-xbench matmul` (XBENCH_HUGE=1), roofline ~102 GFLOP/s this run. **Mer(1c) is measured first
+`wukong-xbench matmul` (XBENCH_HUGE=1), roofline ~102 GFLOP/s this run. **Mer(1c) is measured first
 in each block, before any heating → the trustworthy single-core series:**
 
 | size | Mer(1c) KC=256 | Mer(1c) `select_kc` | Δ | roofline% | MKL(1c) | Mer/MKL 1c |
@@ -172,7 +172,7 @@ This phase is two parts: first **make the multicore measurement trustworthy** (i
 **close the scaling gap** with the lever the clean numbers pointed to.
 
 **P2a — measurement (commit `bench(xbench):`).** The harness threw away the multicore signal. The
-all-core MKL peer was measured *after* Mercury's all-core burst + two multi-second naive nests had
+all-core MKL peer was measured *after* Wukong's all-core burst + two multi-second naive nests had
 heat-throttled the chip — at 2048³/4096³ it read **below its own single-thread number** (a bogus
 ~8–32 GFLOP/s), once even printing "1245% of MKL". Four fixes:
 - **Thermal-grouped ordering, coolest-first:** single-core peers adjacent (Mer 1c, MKL 1c, tuned) →
@@ -180,17 +180,17 @@ heat-throttled the chip — at 2048³/4096³ it read **below its own single-thre
   to force). The 1-core ratio is now taken near-cold at every size.
 - **MKL(all) measured BEFORE Mer(par):** Mer 1c/tuned use serial kernels that never touch rayon, so
   rayon's pool is dormant and MKL(all) runs on idle cores in the coolest state. Mer(par) runs after, so
-  the ratio is a *conservative lower bound* on Mercury (throttle ourselves, never the peer). An earlier
+  the ratio is a *conservative lower bound* on Wukong (throttle ourselves, never the peer). An earlier
   interleaved A/B timer was abandoned — alternating two live thread pools (rayon + MKL's OpenMP)
   thrashes the scheduler and parks MKL's workers, reading worse than sequential.
 - **Turbo-ramped roofline:** the ~5 ms fixed-iter warmup measured a cold-clock roofline that warm GEMM
   later *exceeded* (>100% of roofline — an obvious bug). Now warms ≥400 ms of wall time.
 - **Degeneracy guard:** when MKL(all) ≤ 1.2× MKL(1c) its 16 OpenMP workers did not scale that call (a
   real pathology on this loaded hybrid); the ratio is omitted with a reason instead of a fake multiple.
-  Also reports Mercury's own @parallel scaling (robust to power state).
+  Also reports Wukong's own @parallel scaling (robust to power state).
 
 With this, clean same-run all-core ratios are reproducible — e.g. (roofline 92) **Mer(par)/MKL(all) =
-25 / 64 / 70 / 129%** at 256/512/1024/2048³ (Mercury *wins* at 2048³), and mm6 measured 55/49/71/86/124%
+25 / 64 / 70 / 129%** at 256/512/1024/2048³ (Wukong *wins* at 2048³), and mm6 measured 55/49/71/86/124%
 at 256→4096³. The gap is concentrated at small sizes (threading overhead) and closes — to a win — by 2048³.
 
 **P2b — physical-core pool (commit `perf(runtime):`).** The clean numbers said mid-size scaling lagged.
@@ -216,7 +216,7 @@ the *same* kernel in each pool back-to-back best-of-N, so the laptop's ~3× ther
 **≥1.0× at every size in every run** — a Pareto improvement, 1.1–1.4× at the compute-bound mid sizes,
 tapering to parity where the kernel is HBM-bandwidth-bound. Never a regression.
 
-**Honest multicore standing:** Mercury's @parallel GEMM is competitive with oneMKL's threaded GEMM on
+**Honest multicore standing:** Wukong's @parallel GEMM is competitive with oneMKL's threaded GEMM on
 this hybrid — 60–70% of MKL at 512–1024³, **parity-to-winning (86–129%) at ≥2048³** — the large-matrix
 regime that matters for ML. The residual mid-size gap is threading/packing overhead, not the kernel.
 
@@ -255,15 +255,15 @@ broadcasts, **6 FMAs — half** the AVX2 kernel's 12 for the same flops.
 
 Beyond GEMM, the mission asks to measure the gap to MKL for the elementwise/transcendental kernels.
 Added a **oneMKL VML peer** (commit `bench(xbench):`) — `vsExp`/`vsLn` resolved from the same
-`mkl_rt`, single-thread, same buffer, cross-checked against Mercury's output (rel < 1e-3 confirms the
+`mkl_rt`, single-thread, same buffer, cross-checked against Wukong's output (rel < 1e-3 confirms the
 ILP64 ABI and would flag a mismatch). The elementwise analogue of the GEMM-vs-cblas comparison.
 
-| op | Mercury | vs scalar C/Rust | vs oneMKL VML |
+| op | Wukong | vs scalar C/Rust | vs oneMKL VML |
 |----|--------:|-----------------:|--------------:|
 | exp | 256-bit AVX2 poly | **~6× faster** | ~1.7× slower |
 | log | 256-bit AVX2 poly | **~5.5× faster** | ~2.0× slower |
 
-So Mercury's vectorized transcendentals **crush idiomatic scalar C/Rust** (the mission's floor — gcc/rustc
+So Wukong's vectorized transcendentals **crush idiomatic scalar C/Rust** (the mission's floor — gcc/rustc
 can't vectorize a libm call), but trail Intel's VML by ~1.7–2×, *both on AVX2* (MKL dispatches AVX2 on
 Meteor Lake). The natural suspicion was an ILP deficiency — the kernel processed one 8-lane vector
 through a ~15-FMA poly chain at a time. **Tested and refuted:** a 4×-unrolled loop (four independent
@@ -273,13 +273,13 @@ so the kernel is **already throughput-saturated on the FMA units**, not latency-
 reverted (a no-op that only adds code).
 
 The remaining ~1.7–2× is therefore **algorithmic**: VML uses a cheaper approximation (table-assisted
-range reduction / lower-degree poly) and still hits ~0.5 ULP, *better* accuracy than Mercury's ~1 ULP.
+range reduction / lower-degree poly) and still hits ~0.5 ULP, *better* accuracy than Wukong's ~1 ULP.
 Matching it means rewriting the exp/log cores — real numerical work bounded by the `≈1-ULP` f64-reference
 gate (`vmath_kernels_match_f64_reference`), not a quick tune. **Honestly characterised and deferred**:
-this is a disclosed open gap, distinct from GEMM (where Mercury reaches MKL parity), and Mercury's vmath
+this is a disclosed open gap, distinct from GEMM (where Wukong reaches MKL parity), and Wukong's vmath
 remains decisively ahead of the C/C++/Rust baselines the mission targets.
 
-Memory-bound kernels (saxpy / reduce / streaming elementwise) are DRAM-bandwidth-bound — Mercury already
+Memory-bound kernels (saxpy / reduce / streaming elementwise) are DRAM-bandwidth-bound — Wukong already
 streams them with 256-bit + non-temporal stores and sits at ~1.3–1.5× naive C; there a library peer ties
 by physics (both saturate the same bus), the CPU analogue of the GPU HBM-bandwidth result.
 
@@ -311,9 +311,9 @@ sweep tests of their own.
 **Mid-size multicore GEMM: three scheduling hypotheses refuted by adjacent A/B** (all documented
 in gemm.rs): a physical/2 mid-size pool (slower everywhere), a persistent broadcast region
 replacing the 4-fork-joins-per-call shape (wash — order/thermal effects exceed any delta), and
-hard worker pinning MERCURY_GEMM_AFFINITY=1 (25-35% SLOWER than free migration). One real win
+hard worker pinning WUKONG_GEMM_AFFINITY=1 (25-35% SLOWER than free migration). One real win
 kept: fusing the A+B pack into a single region (+7.5% @512^3, +13% @128x768x3072;
-MERCURY_PACK_SPLIT_REGIONS=1 kill-switch). Same-run standing at that point: 46% @512^3,
+WUKONG_PACK_SPLIT_REGIONS=1 kill-switch). Same-run standing at that point: 46% @512^3,
 72% @1024^3, **127% @2048^3 (beats MKL-all)**. MKL(all) itself measured 411 GF/s @512^3 today vs
 ~286 in the P2 session (~1.4x power-state swing) — cross-session ratio comparisons are invalid;
 the honest residual at mid sizes was MKL's per-thread-L2-blocked 2D decomposition, an
@@ -324,7 +324,7 @@ algorithmic difference.
 grid so per-block packs are byte-identical to the serial kernel's, per-worker pack scratch, one
 rayon task per block, no barriers) — the same decomposition MKL uses. ABBA adjacent-run
 (gemm_scaling, both orderings): 512^3 ~182->~305 GF/s (~1.65x), 1024^3 ~365->~460 (~1.26x),
-512x768x3072 ~290->~473. Shipped as the DEFAULT parallel path (MERCURY_GEMM_2D=0 opts out); the
+512x768x3072 ~290->~473. Shipped as the DEFAULT parallel path (WUKONG_GEMM_2D=0 opts out); the
 two confirmation rounds vs MKL(all) read 66/68% (deep-throttled) and 66/69% (cool) at
 512^3/1024^3 — the mid-size standing is now power-state-STABLE at ~66-69% (was a 46-72%
 thermal lottery), with 87% @2048^3 same-run. Bit-exact vs serial by construction (one owner per
@@ -333,7 +333,7 @@ C block, ascending K-blocks, same kc grouping; pinned by sgemm_2d_blocks_matches
 **End-to-end model bench (bench_model), two full-peer rounds**: ~20-21x C(gcc) and 3.6-4.9x
 C(-ffast-math) single-core; **parity vs PyTorch CPU eager 1-thread** (0.93-1.07x @S=128,
 1.08-1.21x FASTER @S=512); behind all-threads eager torch multicore (1.05-2.5x, thermal-swing) —
-Mercury @parallel scaling at model shapes (1.5-2.1x) is the same mid-size parallel-efficiency
+Wukong @parallel scaling at model shapes (1.5-2.1x) is the same mid-size parallel-efficiency
 residual. All rounds: interp gate bit-exact, serial==@parallel bit-exact, outputs <2e-6 vs C and
 torch.
 

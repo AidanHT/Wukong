@@ -1,6 +1,6 @@
 # Conv2d vs cuDNN — implicit-GEMM + Winograd, and a real cuDNN peer
 
-Branch `perf/gpu-conv-2` (worktree `Mercury-conv2`). Target: mobile **RTX 4050, sm_89 (Ada)**, driver
+Branch `perf/gpu-conv-2` (worktree `Wukong-conv2`). Target: mobile **RTX 4050, sm_89 (Ada)**, driver
 592.27, `cudarc` 0.16.6, no CUDA toolkit (PTX driver-JIT + dlopen'd redist DLLs).
 
 Goal: stand up a **real cuDNN peer** (the prior conv work measured only vs naive CUDA-C ≈6×, which
@@ -27,7 +27,7 @@ implicit-GEMM, Winograd, and fused conv+bias+act.
 
 cudarc 0.16.6 ships a full `cudnn` module (`safe`/`result`/`sys`) gated only on `driver`; `dynamic-
 loading` dlopens `cudnn64_9.dll` automatically (the `_9` candidate is in `get_lib_name_candidates`, so
-no rename needed). Added `"cudnn"` to the cudarc feature list in `mercury_codegen_gpu/Cargo.toml`.
+no rename needed). Added `"cudnn"` to the cudarc feature list in `wukong_codegen_gpu/Cargo.toml`.
 
 Redist install (all four together — pip `--target` clobbers the shared `nvidia/` namespace if cuDNN
 goes in separately):
@@ -51,11 +51,11 @@ The legacy forward API (`cudnnConvolutionForward` + `cudnnGetConvolutionForwardA
 `cudnnGetConvolutionForwardWorkspaceSize`) is **deprecated but present** in cuDNN 9. Fast fp16 path:
 `CUDNN_TENSOR_NHWC` for x/w/y, fp16 data (C,K mult of 8), conv compute `f32`, math type
 `CUDNN_TENSOR_OP_MATH`; the v7 heuristic typically returns `IMPLICIT_PRECOMP_GEMM` (3×3/1×1) or
-`WINOGRAD_NONFUSED` (large 3×3). Mercury stores NCHW, so X/W are transposed to NHWC/KRSC once at setup
+`WINOGRAD_NONFUSED` (large 3×3). Wukong stores NCHW, so X/W are transposed to NHWC/KRSC once at setup
 (outside the timed loop) and cuDNN's NHWC output is transposed back to `[K,P,Q]` for the same f64
-cross-check Mercury faces.
+cross-check Wukong faces.
 
-Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture conv_vs_cudnn`.
+Run: `cargo test -p wukong_codegen_gpu --features gpu --release -- --ignored --nocapture conv_vs_cudnn`.
 
 ## Measurements
 
@@ -64,17 +64,17 @@ before timing, each timed `best_of(ROUNDS)` (the fix below). RTX 4050 Laptop, fp
 
 ### The measurement-integrity fix (this is load-bearing)
 
-The first cut timed cuDNN **once** (a single 100-iter window) while Mercury got `best_of(ROUNDS)`. A
+The first cut timed cuDNN **once** (a single 100-iter window) while Wukong got `best_of(ROUNDS)`. A
 single thermal dip in cuDNN's lone window tanked its number and the gap swung **~7× run-to-run** — one
-run read "Mercury 50% of cuDNN", the next "Mercury 343%". That 50% gap was a **phantom**. Wrapping
-cuDNN in `best_of(ROUNDS)` (the same robustness Mercury and the GEMM scoreboard's cuBLAS peer already
-get) is what makes the ratio trustworthy. Even so, the cuDNN/Mercury ratio still carries ±~25%
+run read "Wukong 50% of cuDNN", the next "Wukong 343%". That 50% gap was a **phantom**. Wrapping
+cuDNN in `best_of(ROUNDS)` (the same robustness Wukong and the GEMM scoreboard's cuBLAS peer already
+get) is what makes the ratio trustworthy. Even so, the cuDNN/Wukong ratio still carries ±~25%
 run-to-run clock noise (the two kernels respond differently to the mobile boost ramp), so the honest
 unit is a **range over ≥4 reruns**, not a point.
 
 ### implicit-GEMM conv vs cuDNN (4 reruns, fair `best_of` both; cuDNN algo = IMPLICIT_PRECOMP_GEMM)
 
-| shape (C,H,W,K,R,S)        | Mercury % of cuDNN (range) | × vs naive CUDA-C | verdict |
+| shape (C,H,W,K,R,S)        | Wukong % of cuDNN (range) | × vs naive CUDA-C | verdict |
 |----------------------------|----------------------------|-------------------|---------|
 | C64 56² K64 **3×3**        | 93–103 %                   | 6.6–8.2×          | **parity** |
 | C128 28² K128 **3×3**      | 95–121 %                   | 7.8–8.6×          | **parity / slight win** |
@@ -83,7 +83,7 @@ unit is a **range over ≥4 reruns**, not a point.
 | C32 32² K32 **5×5**        | 93–114 %                   | 1.5–1.9×          | **parity** |
 | C3 64² K64 **3×3** (1st)   | **450–564 %**              | 1.9–2.3×          | **decisive win** |
 
-**Read:** Mercury's static-shape-specialized implicit-GEMM **matches** cuDNN's hand-tuned
+**Read:** Wukong's static-shape-specialized implicit-GEMM **matches** cuDNN's hand-tuned
 IMPLICIT_PRECOMP_GEMM on the bread-and-butter deep-channel 3×3/5×5 (within clock noise), and **beats it
 3.5–5.6×** on 1×1 (pointwise) and the C=3 first layer, where cuDNN's generic conv path carries launch /
 generality overhead the baked-in static shape (fully-unrolled window, no dynamic bounds) avoids. Split-K
@@ -120,7 +120,7 @@ IMPLICIT_PRECOMP_GEMM, not Winograd, on these). Folding the α² planes into `gr
 `α²·4` CTAs in flight) is a **20–50× speedup** and flips it to a win.
 
 Same-run, large feature maps, F(4×4,3×3), 3 reruns. The **Winograd-vs-implicit-GEMM ratio is the
-reliable number** (both are Mercury kernels in the same run → cancels the clock); cuDNN % is the noisier
+reliable number** (both are Wukong kernels in the same run → cancels the clock); cuDNN % is the noisier
 cross-family ratio.
 
 | shape (C,H,W,K) 3×3 | tiles T | Winograd ÷ implicit-GEMM (3 runs) | Winograd % of cuDNN |
@@ -130,7 +130,7 @@ cross-family ratio.
 | C64 112² K64        | 784     | 2.02 / 2.00 / 2.06 → **~2.0×**     | 76–77 %             |
 | C128 28² K128       | 49      | 2.05 / 2.24 / 2.28 → **~2.2×**     | 112–176 %           |
 
-**Read:** batched Winograd is **~1.2–2.2× Mercury's own (already cuDNN-parity) implicit-GEMM** on 3 of 4
+**Read:** batched Winograd is **~1.2–2.2× Wukong's own (already cuDNN-parity) implicit-GEMM** on 3 of 4
 large feature maps, and beats cuDNN outright on C64 56² and C128 28². It **loses only at low channel
 count** (C32, 0.77×): the batched-GEMM reduction is just `GK=C=32` (≈2 WMMA k-steps, low intensity)
 whereas the implicit-GEMM reduces over the full `GK=C·9=288`. So the win is channel-count-gated —
@@ -152,8 +152,8 @@ through the *one* implicit-GEMM kernel (`conv_wmma_ptx_impl`, a `stride`+`pad` a
   ResNet 3×3 s2 p1 + 7×7 s2 p3 stem, 5×5 pad-2 — **bit-close** (max_abs 4.0–7.0e-3).
 * Two padded implementations, measured **same-run A/B** (`conv_affine_vs_cudnn`): the single-kernel
   bounds-checked gather vs **explicit-pad** (`conv2d_wmma_padded_explicit`: scatter X into a zeroed
-  `(H+2p)×(W+2p)` buffer, then the dense valid kernel — no per-tap predication). Reliable Mercury-vs-
-  Mercury, stable across 3 reruns: **the bounds-checked single kernel is ~1.0–1.12× *faster*** — the
+  `(H+2p)×(W+2p)` buffer, then the dense valid kernel — no per-tap predication). Reliable Wukong-vs-
+  Wukong, stable across 3 reruns: **the bounds-checked single kernel is ~1.0–1.12× *faster*** — the
   scatter costs slightly more than the cheap bounds chain it removes (L2-resident convs). So the single
   kernel is the default; explicit-pad stays gated (and as the natural split-K seam).
 
@@ -178,8 +178,8 @@ speedup over the single padded kernel** (auto ÷ explicit-single, stable across 
 moves the C128 s2p1 target from ~60 % to parity-to-win. The auto gate exercises sk 1/3/6/8, all bit-close
 to the f64 oracle (max_abs ≤1.8e-2, the looser split-K-reduce tolerance). **Measurement caveat, reaffirmed
 hard:** the cuDNN cross-family % is *clock-noise-dominated* — C128 s1p1 read **51 % then 108 % on byte-
-identical code** between two back-to-back reruns (one caught cuDNN's window at high boost, Mercury's at
-low). Only the **same-run Mercury-vs-Mercury** ratio (split-K ÷ single, cuDNN ÷ nothing) is trustworthy;
+identical code** between two back-to-back reruns (one caught cuDNN's window at high boost, Wukong's at
+low). Only the **same-run Wukong-vs-Wukong** ratio (split-K ÷ single, cuDNN ÷ nothing) is trustworthy;
 the % column is a range over reruns, never a point. The single genuinely-soft shape is **3×3 s1 p1 C64
 "same"** at mid-size — cuDNN's IMPLICIT_PRECOMP_GEMM is strong there and the base grid (~49 CTAs) is
 already full so split-K can't help; padded-Winograd (≥64-ch lever, currently valid-only) is the follow-up.

@@ -1,6 +1,6 @@
 # End-to-end serving & multi-GPU — paged KV-cache + continuous batching + whole-model decode graph
 
-Branch `perf/gpu-serving` (worktree `Mercury-serving`). Target: **RTX 4050 Laptop, sm_89 (Ada), 6 GB,
+Branch `perf/gpu-serving` (worktree `Wukong-serving`). Target: **RTX 4050 Laptop, sm_89 (Ada), 6 GB,
 ONE GPU**. Goal: close — then beat — the NVIDIA inference-serving stack on what is testable here, single
 GPU; design (unmeasured) multi-GPU.
 
@@ -11,9 +11,9 @@ GPU; design (unmeasured) multi-GPU.
 - **No GPU serving peer is installed**: the local PyTorch is **CPU-only** (`torch 2.12.1+cpu`,
   `torch.cuda.is_available() == False`); **vLLM not installed**; no nvcc. So a *GPU* vLLM / TensorRT-LLM /
   torch `.generate()` peer is **not available out of the box**.
-- **Primary named peer = Mercury's own eager per-op decode** (no pool, no graph), measured **same-run**,
+- **Primary named peer = Wukong's own eager per-op decode** (no pool, no graph), measured **same-run**,
   bit-exact-gated against the paged+batched+graphed path. This is the *established* methodology in this
-  repo: the megakernel headline (M13 ~285×) and `decode_stack_latency` are both measured "vs Mercury's own
+  repo: the megakernel headline (M13 ~285×) and `decode_stack_latency` are both measured "vs Wukong's own
   `--backend=gpu` per-op model, not a library." The pool/graph wins are **ratios** (laptop clock swings
   ~7×; only same-run ratios are reportable).
 - **Stretch external peer**: attempt a CUDA-enabled torch `.generate()` as an honest floor; if a cu-wheel
@@ -134,7 +134,7 @@ with an **int8 KV cache** cutting footprint **3.9×**; multi-GPU partition math 
   are issued, never *what* they compute. Capture runs on a dedicated non-blocking stream with event
   tracking disabled (the NULL stream is un-capturable; cross-stream event waits break capture).
 - **Same-run latency, graphed vs eager per-op** (`serving_decode_graph_throughput`, RTX 4050, named peer
-  = Mercury's own eager per-op decode):
+  = Wukong's own eager per-op decode):
 
   | depth N | eager | graphed | graphed speedup | tokens/s eager → graphed | launches folded |
   |--------:|------:|--------:|----------------:|--------------------------|-----------------|
@@ -189,7 +189,7 @@ with 0, so an unmasked write would scatter into block 0, a *live* block) and rea
   schedule** (deterministic). 62 steps for 3000 tokens.
 
 **Goodput — same-clock interleaved best-of-N** (`serving_continuous_batching_goodput`, RTX 4050,
-graphed 12-layer decode step, D=512 Dff=2048, Bcap=64; named peer = Mercury's own single-sequence decode):
+graphed 12-layer decode step, D=512 Dff=2048, Bcap=64; named peer = Wukong's own single-sequence decode):
 
 | batch fill | step latency | goodput (useful tok/s) | vs fill=1 |
 |-----------:|-------------:|-----------------------:|----------:|

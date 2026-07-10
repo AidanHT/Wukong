@@ -1,8 +1,8 @@
-# Next steps — scoping a GPU backend for Mercury (HISTORICAL / SUPERSEDED)
+# Next steps — scoping a GPU backend for Wukong (HISTORICAL / SUPERSEDED)
 
 > **Status: superseded — the GPU backend scoped here has since been built.** This is the original
 > pre-build scoping note, kept as a design record; the plan below is no longer current. What actually
-> shipped: `mercury_codegen_gpu` (behind `--features gpu`) emits **PTX directly** — the "very high
+> shipped: `wukong_codegen_gpu` (behind `--features gpu`) emits **PTX directly** — the "very high
 > effort" option in the table below, *not* the recommended CUDA-C→`nvcc` route — and driver-JIT-loads
 > it via `cudarc` (`cuModuleLoadData`), so no `nvcc`/CUDA toolkit is needed, only the NVIDIA driver.
 > Phases 0–5 all shipped and were exceeded: tensor-core fp16/bf16/fp8/int8/int4 GEMM, fused
@@ -14,7 +14,7 @@
 
 ## Why GPU is the next frontier
 
-The honest CPU picture (measured mid-2026, vs gcc/rustc `-O3 -march=native`): Mercury already wins on
+The honest CPU picture (measured mid-2026, vs gcc/rustc `-O3 -march=native`): Wukong already wins on
 every metric that matters — compile time **84–525×**; matmul **3–3.8× single / 9–16× parallel**
 (455 GFLOP/s @1024³), nn.Linear **23× single / up to ~102× parallel**; conv **~6×**; vectorized
 transcendentals **5–7.5× single / ~19× parallel**; reductions **2.7× single / 7.9–8.6× parallel**;
@@ -24,7 +24,7 @@ AVX2/FMA GEMM microkernel is at ~90% of the single-core roofline. The CPU path i
 
 - **The last `@parallel` gap is closed.** Reductions were the one kernel class with no multicore path
   (the function-level `@parallel` model can't express a carried-scalar reduction, and it races). They
-  now dispatch to a deterministic multicore reduction kernel (`mercury_sreduce_f32_parallel` —
+  now dispatch to a deterministic multicore reduction kernel (`wukong_sreduce_f32_parallel` —
   dot/ssd/sum/sumsq), taking dot from ~2.7× to ~7.9× and ssd to ~8.6× vs C. That was the last
   *substantial* single-machine CPU win; what's left is marginal.
 - **Flash-attention is not a single-thread CPU win** (measured ~2× *slower* than the GEMM-dispatch
@@ -36,7 +36,7 @@ AVX2/FMA GEMM microkernel is at ~90% of the single-core roofline. The CPU path i
 
 The big ML wins — large-batch training/inference throughput, long-context attention, mixed precision
 that actually pays (tensor cores) — live on the GPU. That is where a tensor-kernel compiler earns its
-keep, and where Mercury's compile-time shape safety + op recognition (matmul→GEMM, conv→im2col,
+keep, and where Wukong's compile-time shape safety + op recognition (matmul→GEMM, conv→im2col,
 fusion) would translate into device kernels that rival hand-written CUDA.
 
 ## The two hard constraints (and what they imply)
@@ -72,14 +72,14 @@ between them after Phase 0.
 
 ## How it slots into the existing pipeline
 
-The seam already exists: `mercury_backend::Backend` is the MIR-to-execution trait the interpreter and
+The seam already exists: `wukong_backend::Backend` is the MIR-to-execution trait the interpreter and
 Cranelift implement. A GPU backend is a third implementer plus a host-side launcher:
 
 ```
 MIR (Low)
-  ├─ mercury_interp            (oracle, CPU)
-  ├─ mercury_codegen_cranelift (fast CPU, today's default)
-  └─ mercury_codegen_gpu       (NEW: MIR → device kernel + host launch stub)
+  ├─ wukong_interp            (oracle, CPU)
+  ├─ wukong_codegen_cranelift (fast CPU, today's default)
+  └─ wukong_codegen_gpu       (NEW: MIR → device kernel + host launch stub)
         ├─ kernelize: pick the parallel axis (the @parallel range / matmul grid) → grid/block
         ├─ emit:      MIR ops → CUDA C (scalars, loads, the recognized GEMM/conv/attention templates)
         └─ launch:    host stub allocates device buffers, H2D copy, launch, D2H copy
@@ -102,7 +102,7 @@ body is already proven data-parallel (the interpreter runs it sequentially as th
   third sanctioned reassociation exception alongside reductions and the shared CPU kernels.
 - **Determinism within the GPU path**: fix block/grid sizes and reduction order per kernel so GPU runs
   are reproducible (no atomics-with-nondeterministic-order in reductions unless explicitly tolerated).
-  The CPU `mercury_sreduce_f32_parallel` is the precedent: fixed-size chunks independent of core count
+  The CPU `wukong_sreduce_f32_parallel` is the precedent: fixed-size chunks independent of core count
   + an ascending partial combine make its result identical regardless of how many lanes ran it — the
   GPU block-reduce should fix its grid/combine order the same way rather than relying on atomic add.
 - **Emit-only CI here**: snapshot the generated CUDA/SPIR-V and lint it (compiles under `nvcc
@@ -110,14 +110,14 @@ body is already proven data-parallel (the interpreter runs it sequentially as th
 
 ## Phased plan (each phase: a running, measured kernel before the next)
 
-- **Phase 0 — spike & decide (small):** stand up `mercury_codegen_gpu` behind a feature flag; emit a
+- **Phase 0 — spike & decide (small):** stand up `wukong_codegen_gpu` behind a feature flag; emit a
   trivial elementwise kernel (saxpy) as CUDA C; compile with `nvcc`; launch via `cudarc` on a cloud
   GPU; tolerance-check vs the interpreter. Decide CUDA-C vs SPIR-V from this spike. Deliverable: one
   green GPU kernel + the differential harness.
 - **Phase 1 — elementwise + reductions:** map `@parallel` ranges and the vectorizer's elementwise/
   reduction shapes (saxpy, relu, dot, softmax row-ops, the transcendental polynomials) to device
   kernels. These are bandwidth-bound — the GPU win over CPU is large and easy to show honestly. The
-  CPU reduction recognizer (`match_reduction_kernel` → `mercury_sreduce_f32_parallel`) already
+  CPU reduction recognizer (`match_reduction_kernel` → `wukong_sreduce_f32_parallel`) already
   identifies dot/ssd/sum and proves them data-parallel; the GPU emits a block-reduce template instead
   of the CPU chunk kernel, reusing the same recognizer and the same fixed-chunk determinism idea.
 - **Phase 2 — tiled GEMM:** the matmul recognizer emits a shared-memory-tiled GEMM (register-blocked,
@@ -143,7 +143,7 @@ body is already proven data-parallel (the interpreter runs it sequentially as th
 
 ## Recommended first milestone
 
-A single command — `mercuryc --backend=gpu --run examples/saxpy_array.mer` on a GPU runner — that
+A single command — `wukongc --backend=gpu --run examples/saxpy_array.wk` on a GPU runner — that
 emits CUDA C, compiles with `nvcc`, launches, and passes a tolerance differential against the
 interpreter. That proves the whole seam (kernelize → emit → compile → launch → verify) end-to-end on
 the simplest kernel, and everything after is filling in op templates.

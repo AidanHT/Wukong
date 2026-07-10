@@ -1,23 +1,23 @@
 # CPU kernels: library-grade — beat naive C/Rust *and* measure/close the gap to oneDNN / oneMKL
 
-You are a Claude Code session on **Mercury** (`mercuryc`; the native path is **Cranelift** + hand-written
+You are a Claude Code session on **Wukong** (`wukongc`; the native path is **Cranelift** + hand-written
 **AVX2/FMA** runtime microkernels — **no LLVM** here; `gcc`/`rustc` exist for baselines). This slice is
 **100% CPU** and touches **separate crates** from every GPU branch — it should never conflict. First
-action: `git worktree add ../Mercury-cpu -b perf/cpu-library-grade main` and work inside it (or
+action: `git worktree add ../Wukong-cpu -b perf/cpu-library-grade main` and work inside it (or
 `git checkout -b`).
 
 ## Prime Directive (how you work)
 
 **Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
 metric. The gold-standard library already achieves it, so the performance is physically available on
-this silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you
+this silicon and a path to it is guaranteed to exist — your only job is to find Wukong's path, and you
 WILL find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap
 is never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
 done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
 the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
 collected.**
 
-Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
+Continuously iterate through the entire codebase until Wukong performs better than C, C++, and Rust
 across the most important ML/DL-compiler metrics **and closes — then beats — the CPU industry-standard
 libraries (oneDNN / oneMKL / OpenBLAS)**. **No scope restrictions.** Remove any blocker; explore options
 **even outside scope**. Improve everything. **No limit.** **Assume the metrics are NOT strong until you
@@ -29,10 +29,10 @@ C/Rust and the tuned `matrixmultiply` crate is the floor we already cleared — 
 
 ## Your mission
 
-Mercury's CPU GEMM hits ~90% of one P-core's AVX2-FMA roofline and beats the tuned `matrixmultiply`
+Wukong's CPU GEMM hits ~90% of one P-core's AVX2-FMA roofline and beats the tuned `matrixmultiply`
 crate 1.1–1.3× — but it is **unmeasured against oneDNN/oneMKL** (Intel's JIT'd, hand-tuned kernels, the
 real CPU standard), and it is **AVX2-only** on this chip (which lacks AVX-512). **Your job:** (a) stand
-up a oneDNN/MKL (or OpenBLAS) peer in `mercury_xbench` and measure the true gap on GEMM and the key ML
+up a oneDNN/MKL (or OpenBLAS) peer in `wukong_xbench` and measure the true gap on GEMM and the key ML
 kernels; (b) close it — multi-level cache blocking for the large/`>L3` regime, better multicore scaling,
 prefetch/packing — and (c) emit **AVX-512** microkernels (runtime-detected; this box can't run them, so
 gate + document the conditional win on AVX-512 hardware). Keep every win bit-exact vs the interpreter
@@ -41,7 +41,7 @@ oracle (the sacred differential gate).
 ## Research first — think very carefully, spawn parallel agents
 
 Plan to `prompts/results/cpu-library.md`. Evaluate:
-- **Real peer:** link/`dlopen` **oneDNN** (or oneMKL `cblas_sgemm`, or OpenBLAS) in `mercury_xbench` for an
+- **Real peer:** link/`dlopen` **oneDNN** (or oneMKL `cblas_sgemm`, or OpenBLAS) in `wukong_xbench` for an
   honest Tier-B CPU peer alongside the existing gcc/rustc columns. Pick whatever installs cleanly on this
   MSYS2 box; document it. Cross-check the checksum.
 - **The `>L3` / large-size regime**: the current kernel is ~90% roofline at 512³ — *measure 2048³/4096³*,
@@ -68,17 +68,17 @@ Plan to `prompts/results/cpu-library.md`. Evaluate:
 
 ## Files you own (no GPU overlap at all)
 
-- **Own:** `crates/mercury_runtime/src/*.rs` (the AVX2/AVX-512 microkernels — `gemm.rs`, `vmath.rs`,
-  `reduce.rs`, etc.) and `crates/mercury_xbench/src/main.rs` (the library-peer harness + new benches).
-- You may also touch the recognizer in `crates/mercury_mir_build/src/lib.rs` **only if** a new kernel
+- **Own:** `crates/wukong_runtime/src/*.rs` (the AVX2/AVX-512 microkernels — `gemm.rs`, `vmath.rs`,
+  `reduce.rs`, etc.) and `crates/wukong_xbench/src/main.rs` (the library-peer harness + new benches).
+- You may also touch the recognizer in `crates/wukong_mir_build/src/lib.rs` **only if** a new kernel
   needs a dispatch arm — additive, and re-run the full differential gate.
-- **Do NOT** touch any `mercury_codegen_gpu` file (GPU branches own those), `BENCHMARKS.md`, or
+- **Do NOT** touch any `wukong_codegen_gpu` file (GPU branches own those), `BENCHMARKS.md`, or
   `CHANGELOG.md`. Numbers → `prompts/results/cpu-library.md`.
 
 ## Build / repro
 
 `cargo build` and `cargo test` (no features — the toolchain-free core). Benchmarks:
-`cargo run -p mercury_xbench --release` (set `CC` to override gcc). Vectorizer ceiling: Cranelift can't
+`cargo run -p wukong_xbench --release` (set `CC` to override gcc). Vectorizer ceiling: Cranelift can't
 legalize `f32x8`, so `VEC_REG_BYTES=16` and the hand-AVX2 kernels are the 256-bit path — your AVX-512
 work is a *runtime-dispatched microkernel*, not a Cranelift width change.
 

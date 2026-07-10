@@ -1,6 +1,6 @@
 # GEMM cliff — closing the large fp16/bf16 GEMM gap to cuBLAS (RTX 4050, sm_89)
 
-Branch `perf/gpu-gemm-cliff-2` (worktree `Mercury-gemm2`). Goal: ≥90% of cuBLAS @2048³, ≥75% @4096³
+Branch `perf/gpu-gemm-cliff-2` (worktree `Wukong-gemm2`). Goal: ≥90% of cuBLAS @2048³, ≥75% @4096³
 (floors, not targets — then push past parity via the fused epilogue cuBLAS can't do).
 
 ## Hardware / constraints
@@ -168,7 +168,7 @@ gather latency. Reverted the codegen (was never committed). **Do not re-attempt 
 - ~~offline ptxas~~ **TESTED → LOSES (lever closed).** Installed standalone CUDA-12.9 `ptxas`
   (`pip install nvidia-cuda-nvcc-cu12`), compiled the swz PTX → cubin, driver-loaded it (checksum-gated
   bit-identical), same-run A/B vs the driver's own `cuLink` compile (`gemm_cliff_ptxas_ab`, set
-  `MERCURY_PTXAS`): **standalone ptxas LOSES — 0.737× driver-jit @2048³ (a big loss), 0.972–0.984× @4096³**,
+  `WUKONG_PTXAS`): **standalone ptxas LOSES — 0.737× driver-jit @2048³ (a big loss), 0.972–0.984× @4096³**,
   and `--allow-expensive-optimizations` makes it *worse* (0.683× @2048³). The **driver's embedded ptxas is
   already the best compiler available here** — a newer standalone toolkit does NOT beat it. So the SASS
   residual is not reachable by swapping compilers; hand-SASS (CuAsmRL-style) is the only remaining path and

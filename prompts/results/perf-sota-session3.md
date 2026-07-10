@@ -46,7 +46,7 @@ outliner, conservative affine-disjointness legality, serial kernels per iteratio
 autodiff declines loudly, model spelled with loop-body-local head scratch) landed after the
 mid-session standings below. Two roofline-validated rounds (141/139 GF/s; interp == native ==
 @parallel bit-exact; serial==@parallel bit-exact; cross-checks <2e-6):
-- **S=512: Mercury @parallel 311.9/313.4 ms vs torch-Tn 344.6/389.5 ms = 1.10–1.24× FASTER**
+- **S=512: Wukong @parallel 311.9/313.4 ms vs torch-Tn 344.6/389.5 ms = 1.10–1.24× FASTER**
   (par was ~440 ms before the region — the head loop was worth 1.4×).
 - **S=128: 77.8 ms vs 92.7 (1.19× faster) then 88.3 vs 86.4 (1.02× behind)** — parity at the
   round-noise floor (was 1.5–1.9× behind at campaign start).
@@ -63,9 +63,9 @@ all cross-checks ≤2e-6):
   met — remaining serial term is the attention head loop (wave-2 lever in flight: head-loop
   privatization).
 - vs all-threads torch: S=128 **1.08–1.20× behind** (was 1.5–1.9×); S=512 **1.01–1.63× behind** —
-  the wide range is the PEER's power-state swing (torch-Tn 443→271 ms across rounds while Mercury
-  @parallel held ~440 ms in every round). Key structural finding: **Mercury's parallel path does
-  not ride power-state upside** — peers gain ~1.6× from the strong evening state, Mercury ~0 —
+  the wide range is the PEER's power-state swing (torch-Tn 443→271 ms across rounds while Wukong
+  @parallel held ~440 ms in every round). Key structural finding: **Wukong's parallel path does
+  not ride power-state upside** — peers gain ~1.6× from the strong evening state, Wukong ~0 —
   consistent with a sync/serial-fraction bound, not a clock bound. NOT flipped to a win; honest.
 - Single-core vs torch-1T @S=512: 1.10–1.16× FASTER (held all rounds).
 
@@ -85,14 +85,14 @@ work is the only remaining lever and is out of this campaign's scope.
 `flash_ws_vs_mp` (clock-cancelled, median-of-9): ws/ws3 **win only at S=4096, by 4–6%**
 (d64 ws 0.944×, d128 ws3 0.950× of mp), tie at S=2048, **lose 10–52% at S≤1024**. The
 provisional route (d64 S≥2048 / d128 S≥1024) would have shipped a d128@1024 regression and was
-corrected before default-on. Shipped: S≥4096 only, per-d winners, `MERCURY_FLASH_WS=0`
+corrected before default-on. Shipped: S≥4096 only, per-d winners, `WUKONG_FLASH_WS=0`
 kill-switch. ~1× cuDNN at long S is NOT reachable via this lever on this 20-SM part — the
 SFU/serial-softmax structural diagnosis stands.
 
 ### T10 — GPU 4096³ GEMM: +2.7% shipped, honest peer landed
 Cliff sweep (round-robin best-of-10): only the **v2cs epilogue** (paired-column
 `st.global.cs.v2.f32`) beats the swz base at 4096³ — 1.027×, **76.8% of cuBLAS-f16 / 80.4% of
-the honest f32-out peer** (the f16-out peer hides ~half of Mercury's f32 C-write traffic; the
+the honest f32-out peer** (the f16-out peer hides ~half of Wukong's f32 C-write traffic; the
 new `time_cublas_gemm_nt_f16_f32out` column makes the asymmetry visible). At 2048³ every
 candidate LOSES to base (v2cs 0.75× — C is L2-scale there), so the arm keys on A+B ≥ 48 MB.
 3-stage pipe, raster re-tunes, launch-bounds: all measured losses, retained bench-only. ~90%
@@ -110,7 +110,7 @@ M-amortization; scheduling adds the 1.14–1.27×.
 - gemm_scaling's serial column drifts run-to-run (~±20% under changing power states); its
   scaling ratio is reliable, cross-run par-column comparisons are NOT. The MKL-anchored xbench
   matmul ratio is the cross-binary instrument.
-- MKL-all and torch-Tn both ride power-state upside ~1.4–1.6×; Mercury @parallel currently does
+- MKL-all and torch-Tn both ride power-state upside ~1.4–1.6×; Wukong @parallel currently does
   not — always report ranges with the peer's state visible (roofline column / MKL-1c column).
 - First xbench/gemm_scaling run after a rebuild reads low (cold page cache) — discard.
 - GPU cliff: cuBLAS self-noise sentinel read 0.916×@2048³ / 1.032×@4096³ — kernel-vs-kernel

@@ -1,6 +1,6 @@
-# The Mercury Language Guide
+# The Wukong Language Guide
 
-This guide describes the Mercury language as it exists today. Mercury is built incrementally; where
+This guide describes the Wukong language as it exists today. Wukong is built incrementally; where
 a feature parses and type-checks but does not yet execute end-to-end, that is called out explicitly.
 
 > **Maturity legend**
@@ -12,7 +12,7 @@ a feature parses and type-checks but does not yet execute end-to-end, that is ca
 
 ## A first program
 
-```mercury
+```wukong
 module hello
 
 fn main() -> i32 {
@@ -23,7 +23,7 @@ fn main() -> i32 {
 ```
 
 ```sh
-mercuryc --run hello.mer       # prints 42 then 42; exits with main's return value
+wukongc --run hello.wk       # prints 42 then 42; exits with main's return value
 ```
 
 Every file begins with a `module` declaration. Execution starts at `fn main() -> i32`, and the
@@ -31,19 +31,19 @@ integer it returns becomes the process exit code.
 
 ## Modules & imports ✅
 
-```mercury
+```wukong
 module examples.matmul
 import lib.mathlib
 ```
 
 A module path is dotted, and `import` makes a program **multi-file**: `import a.b` — in any file of
-the program — loads `a/b.mer`, resolved relative to the directory of the **root** source file passed
-to `mercuryc`, and splices its items into one merged **flat namespace**. Cross-file calls, consts,
-structs, and enums then just work, with no qualification (`tests/run/import_multi.mer`). Each file is
+the program — loads `a/b.wk`, resolved relative to the directory of the **root** source file passed
+to `wukongc`, and splices its items into one merged **flat namespace**. Cross-file calls, consts,
+structs, and enums then just work, with no qualification (`tests/run/import_multi.wk`). Each file is
 loaded exactly once, by canonical path: an import **cycle** (`a` imports `b` imports `a`) or diamond
 is not an error, and every item still lands exactly once. A top-level name defined in two files is
 the ordinary duplicate-name error (E0300), pointing at **both** definitions; an import that resolves
-to no file is **E0305** (`mercuryc --explain E0305`). A diagnostic inside an imported file renders
+to no file is **E0305** (`wukongc --explain E0305`). A diagnostic inside an imported file renders
 with that file's own path and line.
 
 The `module` header itself remains informational — it does not participate in resolution and need
@@ -54,7 +54,7 @@ sees the merged multi-file program.
 
 ## Functions ✅
 
-```mercury
+```wukong
 fn add(a: i32, b: i32) -> i32 {
     return a + b;
 }
@@ -67,7 +67,7 @@ functions may be called with a turbofish `f::<512, 512, 513>(a, b, c)`.
 Parameters are **immutable by default**, the same rule `let` follows — a function may read one but
 not reassign or mutate it. Prefix a parameter with `mut` to opt into mutation:
 
-```mercury
+```wukong
 fn scale(mut w: [f32; 256], k: f32) {      // `w` is mutated in place
     for i in 0..256 { w[i] = w[i] * k; }
 }
@@ -84,7 +84,7 @@ mutates the pointee, not the binding).
 
 ## Bindings ✅
 
-```mercury
+```wukong
 let x: i32 = 10;        // immutable
 let mut acc: i32 = 0;   // mutable
 acc = acc + x;          // reassignment requires `mut`
@@ -96,46 +96,46 @@ An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` i
 threading reaches every position that pins a type (a `let`/`const` annotation, a function argument, a
 `return`, a struct-field initializer, and a plain assignment) and **descends into aggregate
 literals**, so a typed buffer can be built straight from literals: `let a: [i8; 2] = [127, 0]`,
-`let t: (u8, u8) = (200, 1)` (`tests/run/aggregate_literal_adapt.mer`). It also descends into a
+`let t: (u8, u8) = (200, 1)` (`tests/run/aggregate_literal_adapt.wk`). It also descends into a
 **constant binary expression** of literals, so `let v: i64 = 0 - 16` adapts like the unary `-16`
-already did (`tests/run/binary_const_adapt.mer`); the folded value is still range-checked, so
+already did (`tests/run/binary_const_adapt.wk`); the folded value is still range-checked, so
 `let v: i8 = 100 + 100` is rejected. A typed value must match its
 annotation exactly (see error `E0401`). An unsuffixed literal that does not fit the type it adapts to
 is rejected (`E0401`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
 silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that
 overflows `i32` **widens to `i64`** so its value is never silently truncated
-(`tests/run/int_literal_widen.mer`); use a suffix (`9000000000i64`, `3000000000u32`) to pick a
+(`tests/run/int_literal_widen.wk`); use a suffix (`9000000000i64`, `3000000000u32`) to pick a
 specific type.
 
 A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
 wildcard `let (keep, _) = …`, including the result of a tuple-returning call
-(`tests/run/let_destructure.mer`). A top-level **`const` is usable as a value**: its initializer is
+(`tests/run/let_destructure.wk`). A top-level **`const` is usable as a value**: its initializer is
 inlined at every use site — in arithmetic, as an array index, as a loop bound, as an **array length**
 in a type (`let a: [i32; N]`, including a const-references-const chain;
-`tests/run/const_array_length.mer`), and when one `const` references another
-(`tests/run/top_level_const.mer`).
+`tests/run/const_array_length.wk`), and when one `const` references another
+(`tests/run/top_level_const.wk`).
 
 ## Literals ✅
 
 Integer literals may be **decimal, hex `0xFF`, octal `0o17`, or binary `0b1010`**, with `_` digit
-separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix_literals.mer`). A
+separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix_literals.wk`). A
 malformed literal — a mistyped radix like `0z123`, an empty `0x`, a bad digit `0b2`, a garbled float
 `1.5z`, or a value past `u64` — is a compile error (`E0401`), never silently zeroed
-(`tests/fail/malformed_int_literal.mer`). A
+(`tests/fail/malformed_int_literal.wk`). A
 **char literal** `'A'` has type **`char`** (a 32-bit Unicode scalar value) — covering the
 one-character escapes (`\n` `\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes. `char` is a
 usable annotated type (`let c: char = 'A'`) and is interconvertible with the integer types via `as`
-in both directions, so it can be cast, compared, and used in arithmetic (`tests/run/char_literals.mer`,
-`tests/run/char_type.mer`).
+in both directions, so it can be cast, compared, and used in arithmetic (`tests/run/char_literals.wk`,
+`tests/run/char_type.wk`).
 
 A **string literal** `"hello"` is typed `*u8` — the same by-pointer convention as an array. Each
 unique literal is interned once into a read-only **`.rodata`** static blob (deduplicated by content,
 plus a trailing NUL) and its value is that blob's address (`Op::GlobalAddr`). The escapes `\n` `\r`
 `\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode (each code point re-encoded as UTF-8). `print`/`println`
 of a `*u8` — a literal or a `let s = "hi";` binding — renders the bytes, while numeric `print` still
-prints numbers (`tests/run/string_literal.mer`). Because the blob lives in static data (not the
+prints numbers (`tests/run/string_literal.wk`). Because the blob lives in static data (not the
 stack frame), a `*u8` can be **returned from a function and threaded across calls** without dangling
-(`tests/run/string_return.mer`). There is still **no string type beyond `*u8`**: no
+(`tests/run/string_return.wk`). There is still **no string type beyond `*u8`**: no
 concatenation/indexing/length operators — a string is a NUL-terminated `*u8` into `.rodata` (🟡).
 
 ## Types
@@ -164,7 +164,7 @@ spelling. Precedence is the usual C/Rust ordering, resolved by a Pratt parser. C
 
 ## Control flow ✅
 
-```mercury
+```wukong
 if cond { ... } else { ... }
 while cond { ... }
 for i in 0..n { ... }
@@ -182,8 +182,8 @@ Blocks are expressions: the trailing expression of a block (no semicolon) is its
 
 A **loop label** `'name:` on a `loop`/`while`/`for` lets a nested `break 'name` / `continue 'name`
 target that named outer loop instead of the innermost one — the lexer tells a label `'outer` from a
-char literal `'a'` exactly as Rust does (`tests/run/labeled_loop.mer`). A labeled `break`/`continue`
-naming an **undeclared** label is rejected with `E0303` (`tests/fail/break_unknown_label.mer`).
+char literal `'a'` exactly as Rust does (`tests/run/labeled_loop.wk`). A labeled `break`/`continue`
+naming an **undeclared** label is rejected with `E0303` (`tests/fail/break_unknown_label.wk`).
 
 `loop` is a **value-producing expression** and `break` carries a value (`let x = loop { break 5; };` ✅).
 The loop's type is inferred by unifying every `break <value>` (composing with `if`/`match` value merges),
@@ -194,7 +194,7 @@ breaks whose shapes disagree are `E0502` — the same merge rules as `if`/`match
 
 ## Pattern matching ✅
 
-```mercury
+```wukong
 fn classify(n: i32) -> i32 {
     return match n {
         0 => 10,             // literal pattern
@@ -212,17 +212,17 @@ integer/bool **literals**, **or-patterns** `A | B | C`, half-open `lo..hi` / inc
 `(0, _) => …` (each field tested and bound, nesting allowed — and these compose, e.g. `(0 | 1, y)`),
 an **identifier** binding (binds the scrutinee or field), and the wildcard `_`. Any arm may carry an
 optional `if` guard, and `match` works in both value and statement position. See
-`tests/run/{match_expr,match_patterns,match_tuple}.mer`.
+`tests/run/{match_expr,match_patterns,match_tuple}.wk`.
 
 A `match` used in **value position must be exhaustive**, like Rust: an `enum` needs every variant, a
 `bool` needs both cases, and any other scalar (an unbounded domain) needs a `_` catch-all. A
 provably-incomplete value match is rejected at compile time (`E0405`); a guard (`if …`) does not count
 toward coverage. This closes a silent-wrong-answer hole — a non-exhaustive value match used to fall
-through to a zero default (`tests/fail/match_nonexhaustive.mer`).
+through to a zero default (`tests/fail/match_nonexhaustive.wk`).
 
 ## Tuples and structs ✅
 
-```mercury
+```wukong
 struct Point { x: f32, y: f32 }
 
 fn main() -> i32 {
@@ -237,21 +237,21 @@ fn main() -> i32 {
 
 Tuples and structs lower to a flat, padded byte buffer (the local's value *is* its base pointer, the
 same convention arrays follow); field access is a typed load/store at the field's byte offset, and a
-field that is itself a tuple is reached by chaining — `t.0.1`, `t.0.0.0` (`tests/run/nested_tuple_field.mer`).
+field that is itself a tuple is reached by chaining — `t.0.1`, `t.0.0.0` (`tests/run/nested_tuple_field.wk`).
 **Nested aggregates** work too: a struct/tuple field that is itself a struct (any depth), and arrays
 of structs, lay out recursively, and an aggregate field initialized from a non-literal value is
-deep-copied leaf by leaf (`tests/run/struct_nested.mer`). Whole-aggregate **assignment** (`s = other;`)
-deep-copies leaf by leaf as well (`tests/run/struct_assign.mer`). Both run identically on the
+deep-copied leaf by leaf (`tests/run/struct_nested.wk`). Whole-aggregate **assignment** (`s = other;`)
+deep-copies leaf by leaf as well (`tests/run/struct_assign.wk`). Both run identically on the
 interpreter and the native backend. An aggregate passes **into a function by reference** (its base
 pointer, zero-copy) and is **returned by value** through a hidden-pointer (sret) ABI in mir_build, so
-no aggregate ever rides in a register and the two backends agree (`tests/run/{struct_fn,struct_return}.mer`).
+no aggregate ever rides in a register and the two backends agree (`tests/run/{struct_fn,struct_return}.wk`).
 Because a by-reference parameter aliases the caller's storage, mutating an aggregate parameter
 requires `mut` on it (see *Functions* above) — a non-`mut` aggregate parameter is effectively
 read-only, and a `mut` one is the in-place output buffer a kernel writes.
 
 ## Enums ✅
 
-```mercury
+```wukong
 enum Code { Ok = 10, Err = 20 }
 enum Color { Red, Green, Blue }   // 0, 1, 2 (auto-increment from 0)
 enum Step { A = 5, B, C }         // 5, 6, 7 (continue after the last explicit value)
@@ -262,18 +262,18 @@ enum Shape { Circle { r: i32 }, Rect { w: i32, h: i32 } }  // struct-payload var
 A **C-style enum** gives each variant an integer discriminant — explicit (`= 10`) or
 auto-incrementing from the previous. A variant `E::Name` *is* its discriminant, so it can be bound to
 a `let`, compared (`==`), cast (`Code::Ok as i32`), and used as a `match` pattern
-(`tests/run/enum_cstyle.mer`). **Data-carrying (tagged-union) variants** also run: a variant may
+(`tests/run/enum_cstyle.wk`). **Data-carrying (tagged-union) variants** also run: a variant may
 carry a tuple payload (`Num(i32)`, `Add(i32, i32)`) or named struct fields (`Circle { r: i32 }`), is
 constructed as `Expr::Add(3, 4)` / `Shape::Circle { r: 5 }`, and is taken apart by a **payload
 `match`** that binds each field — with literal sub-patterns (`Add(0, y)`), `if` guards, nesting in an
-array of enums, and embedding in a struct field (`tests/run/enum_payload_tuple.mer`,
-`enum_payload_struct.mer`). A value is a 4-byte `i32` discriminant plus a padded payload union
+array of enums, and embedding in a struct field (`tests/run/enum_payload_tuple.wk`,
+`enum_payload_struct.wk`). A value is a 4-byte `i32` discriminant plus a padded payload union
 addressed by base pointer, so the interpreter and the native backend address it identically
 (interp == native, `-O0` == `-O3`).
 
 ## Tensors and compile-time shape checking ✅ shape-check + const- and symbolic-shape exec (the headline feature)
 
-```mercury
+```wukong
 fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], mut c: Tensor[f32, M, N]) { ... }
 ```
 
@@ -285,16 +285,16 @@ faults:
 - `E0502` — dimension mismatch (e.g. calling `matmul::<512, 512, 513>` with `Tensor[f32, 512, 512]`),
   including conflicting bindings of a symbolic dimension.
 
-Run `mercuryc --explain E0502` for a worked example. Dimensions may be integer literals, symbolic
+Run `wukongc --explain E0502` for a worked example. Dimensions may be integer literals, symbolic
 generic names, or `?` for a runtime dimension. Tensor element types must be scalars (`E0302`).
 
 Shape checking is not limited to call arguments: an elementwise binary op `a + b` whose operands
 have different shapes, and a function whose returned value's shape disagrees with its declared
-`-> Tensor[…]`, are both `E0502` (see `tests/fail/shape_binop_mismatch.mer`,
-`shape_return_mismatch.mer`). Inside a **generic** function these body checks treat the function's
+`-> Tensor[…]`, are both `E0502` (see `tests/fail/shape_binop_mismatch.wk`,
+`shape_return_mismatch.wk`). Inside a **generic** function these body checks treat the function's
 own dimension variables as **rigid** — `N` matches only `N`, never another generic or a constant — so
 a generic function cannot lie about its output shape either: `fn f<M, N>(a: Tensor[f32, M, N]) ->
-Tensor[f32, N, 5]` is `E0502` (`tests/fail/generic_return_shape_lie.mer`). Call-site unification is a
+Tensor[f32, N, 5]` is `E0502` (`tests/fail/generic_return_shape_lie.wk`). Call-site unification is a
 different context and still **infers** a callee's dims from its arguments (`matmul::<…>(a, b, c)`
 binds `M, N, K` from the operands). A constant index past a static tensor dimension, like a fixed-size
 array, is `E0501`.
@@ -302,17 +302,17 @@ array, is `E0501`.
 **What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
 backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a
 tensor is passed by base pointer, like an array out-param), so elementwise tensor kernels and tensor
-matmuls run — `tests/run/tensor_*.mer`. A matmul written in tensor notation
+matmuls run — `tests/run/tensor_*.wk`. A matmul written in tensor notation
 (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot-product `s += a[i,k]*b[k,j]` and accumulate
 `c[i,j] += a[i,k]*b[k,j]` spellings, including the `b[j,k]` `nn.Linear` `A·Bᵀ` form) dispatches to the
-same tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` spelling — a 2-index access supplies its
+same tuned `wukong_sgemm` microkernel as the flat `a[i*K+k]` spelling — a 2-index access supplies its
 row stride from the tensor's inner dimension. A **symbolic-generic** shape now executes too (✅):
 `fn add<M, N>(a: Tensor[f32, M, N], …)` runs at any per-call size — the dims are threaded in as
 hidden runtime `i64` parameters, so `a[i, j]`'s row stride (`i*N + j`, with `N` a runtime value) and
 the loop bounds (`0..M`) resolve at run time, and a turbofish supplies them (`add::<2, 3>(…)`)
-(`tests/run/generic_shape.mer`). Because the symbolic address arithmetic matches the constant-shape
+(`tests/run/generic_shape.wk`). Because the symbolic address arithmetic matches the constant-shape
 form, it is byte-identical to the same kernels written with literal dims — and even a matmul with
-runtime `m, n, k` dispatches to the tuned GEMM kernel (`tests/run/matmul_dynamic.mer`).
+runtime `m, n, k` dispatches to the tuned GEMM kernel (`tests/run/matmul_dynamic.wk`).
 
 The turbofish also accepts a **runtime integer value**, not just a literal: `rowsum::<m, n>(a, out)`
 with `n` computed at run time threads the live value through the same hidden dim parameters, so a
@@ -320,18 +320,18 @@ shape-typed kernel serves sizes nobody knew at compile time (the serving-code st
 `seq_len`/`batch`), and a symbolic matmul called this way still dispatches to the tuned GEMM kernel.
 For such dims the compile-time shape checks degrade gracefully to the runtime-`?` level — a wrong
 runtime size is outside the defined contract, like any runtime index
-(`tests/run/generic_shape_runtime.mer`).
+(`tests/run/generic_shape_runtime.wk`).
 
 ## Attributes 🟡
 
-```mercury
+```wukong
 @inline
 @simd
 @tile(64, 64)
 @parallel(grain = 1)
 @align(32)
 @extern("C")
-@export("mercury_saxpy")
+@export("wukong_saxpy")
 ```
 
 Attributes attach to functions, loops, and declarations, and parse/validate today. Several now have
@@ -382,12 +382,12 @@ native backend, by the runtime).
 These intrinsics also accept **integer** operands: `abs`/`round`/`floor`/`ceil`/`trunc` are
 type-preserving on an integer (integer `abs` is `select(x < 0, −x, x)`; rounding an integer is the
 identity), while `sqrt` and the transcendentals promote an integer operand to `f32`
-(`tests/run/int_math.mer`).
+(`tests/run/int_math.wk`).
 
 When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 35**
 transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)
 are **dispatched to a tuned 256-bit
-AVX2/FMA kernel** (`mercury_vmath_f32`) — the same domain-aware lowering as matmul→GEMM — so the
+AVX2/FMA kernel** (`wukong_vmath_f32`) — the same domain-aware lowering as matmul→GEMM — so the
 activation family runs ~2–13× faster than C's scalar `libm`, and ~28× across cores under
 `@parallel`. Composed/scalar uses (and `erf`/`sin`/`cos`) auto-vectorize the inlined poly at 128-bit.
 Every form is bit-identical across the interpreter and native backends.
@@ -403,9 +403,9 @@ place (a user-defined function of the same name shadows the builtin). The count 
 type; a **negative count yields an empty slice** (`len() == 0`). Contents are deterministically
 zero on both backends — calloc'd bytes on native, typed zero values in the interpreter — so a
 read-before-write is well-defined. The result is an ordinary slice: `s[i]`, `s.len()`,
-`for x in s`, and fn-boundary passing/mutation all compose (`tests/run/heap_*.mer`).
+`for x in s`, and fn-boundary passing/mutation all compose (`tests/run/heap_*.wk`).
 
-```mer
+```wukong
 let mut acts: []f32 = alloc_f32(tokens * hidden);   // zero-initialized, runtime-sized
 for i in 0..acts.len() {
     acts[i] = 1.0;
@@ -423,14 +423,14 @@ No garbage collector and no hidden allocations beyond what you `alloc_*`: *named
 selection (`System`, `Arena`, `Scratch`, `Pool` — 🔵) and cleanup via `defer` (🔵) are still being
 wired to the surface. **`@parallel` functions
 execute today** (✅): the native backend outlines the loop body and dispatches it across CPU cores
-via the `mercury_runtime` rayon-backed `parallel_for`, and each per-core chunk is itself
+via the `wukong_runtime` rayon-backed `parallel_for`, and each per-core chunk is itself
 auto-vectorized (parallelism × SIMD). The interpreter runs the same range sequentially, so results
 stay differentially equal.
 
 ## Command-line interface
 
 ```
-mercuryc [OPTIONS] <input.mer>
+wukongc [OPTIONS] <input.wk>
 
 --run                 compile and execute (interpreter by default; see --backend)
 --backend=<b>         interp | native | gpu | gpu-native   (default: interp)
@@ -448,7 +448,7 @@ mercuryc [OPTIONS] <input.mer>
 --color=<when>        auto | always | never
 ```
 
-Use `--emit` to inspect any stage of the pipeline, e.g. `mercuryc --emit=mir -O2 kernel.mer` to see
-the optimized IR, or `mercuryc --emit=ast kernel.mer` to see the parse tree. Reverse-mode autodiff is
-CLI-driven too: `mercuryc --emit=grad --grad-of=loss model.mer` prints the backward MIR of a loss
-function, and `mercuryc --train --train-opt=adamw model.mer` runs its fwd→bwd→optimizer training loop.
+Use `--emit` to inspect any stage of the pipeline, e.g. `wukongc --emit=mir -O2 kernel.wk` to see
+the optimized IR, or `wukongc --emit=ast kernel.wk` to see the parse tree. Reverse-mode autodiff is
+CLI-driven too: `wukongc --emit=grad --grad-of=loss model.wk` prints the backward MIR of a loss
+function, and `wukongc --train --train-opt=adamw model.wk` runs its fwd→bwd→optimizer training loop.

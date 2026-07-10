@@ -1,13 +1,13 @@
-# Mercury Compiler Internals
+# Wukong Compiler Internals
 
-This document describes how `mercuryc` is built: the crate layering, the pipeline, the MIR, and the
+This document describes how `wukongc` is built: the crate layering, the pipeline, the MIR, and the
 key design bets. It is aimed at contributors.
 
 ## Design bets
 
 1. **Interpreter-first, native code without LLVM.** The entire front-end, optimizer, and a
    from-scratch MIR interpreter build and test with plain `cargo test` on any machine — no LLVM
-   required. Native code is produced by a **Cranelift** backend (`mercury_codegen_cranelift`): JIT
+   required. Native code is produced by a **Cranelift** backend (`wukong_codegen_cranelift`): JIT
    for `--run --backend=native` and object/exe for `--emit`, again with no LLVM toolchain. (A textual
    LLVM IR backend also exists for `--emit=llvm-ir`.) The interpreter is the always-available
    execution path and the differential-testing oracle; the native backend is validated bit-for-bit
@@ -23,63 +23,63 @@ key design bets. It is aimed at contributors.
 
 ## Crate layering
 
-The workspace is a virtual cargo workspace; every crate is prefixed `mercury_`. Dependencies flow
+The workspace is a virtual cargo workspace; every crate is prefixed `wukong_`. Dependencies flow
 strictly downward (no cycles):
 
 ```
-mercury_span      Span, SourceMap (line index), string Interner / Symbol
-mercury_diag      Diagnostic, Severity, error-code catalog, JSON + terminal renderers
-mercury_lexer     &str -> tokens (+ @attributes, error recovery)
-mercury_ast       AST nodes, NodeId, pretty-printer
-mercury_parser    recursive-descent + Pratt expressions -> AST
-mercury_types     Ty, Scalar, Shape/Dim/Layout — the shared semantic type vocabulary
-mercury_sema      name resolution + type checking + SHAPE checking
-mercury_mir       MIR data, builder, pretty-printer, verifier, MirLevel
-mercury_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
-mercury_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
+wukong_span      Span, SourceMap (line index), string Interner / Symbol
+wukong_diag      Diagnostic, Severity, error-code catalog, JSON + terminal renderers
+wukong_lexer     &str -> tokens (+ @attributes, error recovery)
+wukong_ast       AST nodes, NodeId, pretty-printer
+wukong_parser    recursive-descent + Pratt expressions -> AST
+wukong_types     Ty, Scalar, Shape/Dim/Layout — the shared semantic type vocabulary
+wukong_sema      name resolution + type checking + SHAPE checking
+wukong_mir       MIR data, builder, pretty-printer, verifier, MirLevel
+wukong_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
+wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
                   mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
-mercury_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
+wukong_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
                   rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
-mercury_backend   `Backend` trait + `Artifact`
-mercury_interp    zero-dependency MIR interpreter backend (+ oracle; lane-wise vector exec)
-mercury_codegen_cranelift  native backend via Cranelift — JIT (--run) + object/exe, no LLVM
-mercury_codegen_llvm  textual LLVM IR backend
-mercury_codegen_gpu   GPU backend (--features gpu): PTX emit + cudarc driver-JIT — recognizer
+wukong_backend   `Backend` trait + `Artifact`
+wukong_interp    zero-dependency MIR interpreter backend (+ oracle; lane-wise vector exec)
+wukong_codegen_cranelift  native backend via Cranelift — JIT (--run) + object/exe, no LLVM
+wukong_codegen_llvm  textual LLVM IR backend
+wukong_codegen_gpu   GPU backend (--features gpu): PTX emit + cudarc driver-JIT — recognizer
                   offload (--backend=gpu) + general MIR→PTX (--backend=gpu-native), no CUDA toolkit
-mercury_runtime   C-ABI arena + rayon parallel_for + the AVX2/FMA microkernels (GEMM, vmath,
+wukong_runtime   C-ABI arena + rayon parallel_for + the AVX2/FMA microkernels (GEMM, vmath,
                   reductions, norms, int8 — the symbols the recognizers dispatch to)
-mercury_driver    Session + compile() pipeline + --emit / --backend handling
-mercuryc          thin CLI binary
-mercury_bench     optimizer-effectiveness + interp-vs-native timing & equivalence gate
-mercury_xbench    cross-language benchmark (Mercury vs C, C++, and Rust) — see BENCHMARKS.md
+wukong_driver    Session + compile() pipeline + --emit / --backend handling
+wukongc          thin CLI binary
+wukong_bench     optimizer-effectiveness + interp-vs-native timing & equivalence gate
+wukong_xbench    cross-language benchmark (Wukong vs C, C++, and Rust) — see BENCHMARKS.md
 ```
 
-`mercury_types` is shared by sema and MIR; `mercury_mir` is independent of the front-end; all
-backends sit behind the `Backend` trait in `mercury_backend`.
+`wukong_types` is shared by sema and MIR; `wukong_mir` is independent of the front-end; all
+backends sit behind the `Backend` trait in `wukong_backend`.
 
 ## Pipeline
 
 ```
 source
-  → lexer        (mercury_lexer::tokenize)
-  → parser       (mercury_parser::parse_module_tokens)  -> AST
-  → sema         (mercury_sema::check)                  name res, types, SHAPE check
-  → mir_build    (mercury_mir_build::lower_program)     -> MIR (High)
-  → opt          (mercury_opt::optimize)                fixpoint passes
+  → lexer        (wukong_lexer::tokenize)
+  → parser       (wukong_parser::parse_module_tokens)  -> AST
+  → sema         (wukong_sema::check)                  name res, types, SHAPE check
+  → mir_build    (wukong_mir_build::lower_program)     -> MIR (High)
+  → opt          (wukong_opt::optimize)                fixpoint passes
   → backend      interpreter (--run) | Cranelift native (--backend=native / --emit=obj|exe)
                  | GPU (--features gpu: --backend=gpu offload, --backend=gpu-native MIR→PTX)
                  | textual LLVM IR (--emit=llvm-ir)
 ```
 
-`mercury_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early and print the
+`wukong_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early and print the
 chosen artifact. Diagnostics from every stage flow through a single `emit_diag` honoring
 `--error-format`.
 
 ## Diagnostics
 
 Every diagnostic has a stable code (`E01xx` lexer, `E02xx` parser, `E03xx` name res, `E04xx` types,
-`E05xx` shapes, `C0xxx` codegen). The catalog in `mercury_diag::catalog` gives each code a title and
-an extended explanation surfaced by `mercuryc --explain <CODE>`. The terminal renderer is
+`E05xx` shapes, `C0xxx` codegen). The catalog in `wukong_diag::catalog` gives each code a title and
+an extended explanation surfaced by `wukongc --explain <CODE>`. The terminal renderer is
 rustc-style (carets, gutters, `--> file:line:col`); `--error-format=json` emits one JSON object per
 diagnostic for tooling.
 
@@ -111,12 +111,12 @@ address, `*p` loads/stores through it, and `mem2reg` refuses to promote a slot w
 so `-O0` ≡ `-O3`. A **constant-shape tensor** lowers like an array — the parameter is a base pointer
 and a multi-dimensional index `a[i, j]` flattens to a row-major `Gep` — so the shape-typed surface
 *executes*, not just shape-checks. A matmul written in that tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`,
-both the dot-product and accumulate spellings) dispatches to the tuned `mercury_sgemm` microkernel
+both the dot-product and accumulate spellings) dispatches to the tuned `wukong_sgemm` microkernel
 just like the flat `a[i*K+k]` form, because a 2-index access supplies its row stride from the
 operand's inner tensor dimension. A *symbolic*-generic nest `matmul<M, N, K>` reaches the same
 kernel too: its symbolic dims are threaded in as hidden runtime `i64` parameters, `emit_sgemm`
 materializes each `Dim::Var` from its bound value, and the result is bit-identical to the
-constant-shape matmul on both backends at any runtime size (`tests/run/generic_shape_matmul.mer`). The aggregate path is differentially gated
+constant-shape matmul on both backends at any runtime size (`tests/run/generic_shape_matmul.wk`). The aggregate path is differentially gated
 bit-for-bit against the interpreter by the `differential_tuple`/`differential_struct`/
 `differential_nested_struct` Cranelift tests. Returning an aggregate *by value* from a function (and a
 by-value aggregate parameter) lowers through a **MIR-level sret ABI** — the callee takes a hidden
@@ -125,12 +125,12 @@ site allocates the buffer, passes it as the hidden first argument, and uses it a
 no aggregate ever rides in a register and the two backends still agree
 (`differential_struct_across_fns`/`differential_struct_return`).
 
-The **verifier** (`mercury_mir::verify`) checks that every used value is defined, types are
+The **verifier** (`wukong_mir::verify`) checks that every used value is defined, types are
 consistent, and CFG edges are valid. It runs in `--emit=mir` and can be enabled after every pass.
 
 ## Optimizer
 
-`mercury_opt::optimize` first runs a whole-program **inliner** (`-O2`), then `PassManager` runs a
+`wukong_opt::optimize` first runs a whole-program **inliner** (`-O2`), then `PassManager` runs a
 list of function-level `Pass`es to a per-function fixpoint. Two shared analyses back them: `cfg`
 (successors/predecessors, reverse postorder, reachability, unreachable-block pruning) and `dom`
 (Cooper–Harvey–Kennedy immediate dominators, dominance frontiers, and the dominator tree).
@@ -160,7 +160,7 @@ always legal; loads, stores, calls, and integer division are never moved. Float 
 folded on self-comparison (NaN != NaN).
 
 The opt pipeline is guarded by a **differential test**: every end-to-end program is run at -O0 and at
--O1/-O2/-O3 and must produce identical stdout and exit code. The `mercury_bench` crate reports, per
+-O1/-O2/-O3 and must produce identical stdout and exit code. The `wukong_bench` crate reports, per
 program, the IR-op reduction and the -O0-vs--O3 interpreter speedup, and exits non-zero if any
 program that lowers cleanly disagrees across optimization levels — a soundness gate over every
 benchmark kernel. Across the run suite and kernels, -O3 removes **~42% of IR ops (~48–54% on the
@@ -168,7 +168,7 @@ heavy transformer/GEMM kernels)** and runs ~1.5–2.5x faster than -O0 under the
 
 ## Interpreter
 
-`mercury_interp` is a zero-dependency CFG walker over MIR. `Value` is `Int(i128) | Float(f64) |
+`wukong_interp` is a zero-dependency CFG walker over MIR. `Value` is `Int(i128) | Float(f64) |
 Ptr(usize) | VecRef(u32) | Unit`; a step limit guards against runaway loops, and the walk runs on a
 scoped 512 MiB-stack worker thread so deep recursion does not overflow the host stack (an uncatchable
 overflow would otherwise abort the oracle). `run_with_output` returns `(exit_code, stdout)`;
@@ -180,15 +180,15 @@ interpreter is the sound oracle for differential testing.
 
 ## Native backend (Cranelift) and the vectorizer
 
-`mercury_codegen_cranelift` lowers Low MIR to Cranelift IR — an almost 1:1 map (block-parameter SSA,
+`wukong_codegen_cranelift` lowers Low MIR to Cranelift IR — an almost 1:1 map (block-parameter SSA,
 signless ints, explicit `alloca`/`load`/`store`/`gep`). It JIT-compiles in-process for
 `--backend=native` and emits a host object for `--emit=obj|exe` — for `exe` it prefers a rustc-driven link that pulls
-in the `mercury_runtime` kernels (so a recognized-kernel program and string `.rodata` both resolve),
+in the `wukong_runtime` kernels (so a recognized-kernel program and string `.rodata` both resolve),
 falling back to a `cc`/`$CC` C-runtime link. The
 only semantic bridges to stay identical to the interpreter: divide-by-zero yields 0, float→int casts
 saturate, and `i1` results are masked to their low bit.
 
-SIMD **auto-vectorization** happens in `mercury_mir_build` while lowering a `for` loop: a
+SIMD **auto-vectorization** happens in `wukong_mir_build` while lowering a `for` loop: a
 straight-line elementwise body over unit-stride array accesses (plus loop-invariant splats, and
 `if`/`else` value-expressions via if-conversion to a vector compare + blend) lowers to vector
 `load`/`store`/`bin`/`cmp`/`select` and `Op::Splat`. The loop is strip-mined into an unrolled main
@@ -203,9 +203,9 @@ Cranelift's CLIF vector ISA still caps at 128-bit — a 256-bit `f32x8` SSA valu
 documented). So for an eligible f32 elementwise body the vectorizer captures the loop as a flat,
 backend-agnostic `VecKernel` recipe and, when register pressure fits, emits one `Op::VecKernelCall`:
 the Cranelift backend assembles that recipe to **true 256-bit AVX2 machine code** via `iced-x86`
-(`mercury_codegen_cranelift::avx2`, VEX-encoded), while the interpreter marshals the *same* recipe
+(`wukong_codegen_cranelift::avx2`, VEX-encoded), while the interpreter marshals the *same* recipe
 lane-wise — so the two stay bit-identical (elementwise lanes carry no reassociation, so the gate
-holds element-for-element). `MERCURY_P4_NO_256` forces the 128-bit path — a same-run A/B knob and a
+holds element-for-element). `WUKONG_P4_NO_256` forces the 128-bit path — a same-run A/B knob and a
 kill-switch. The float-reduction path has an analogous 256-bit kernel, gated to large trips
 (`VEC256_REDUCTION_MIN_TRIP` = 2048 elements) because the out-of-line call loses to the inlined
 128-bit reduction on small arrays.
@@ -223,16 +223,16 @@ never the `@parallel` one (folding into a shared accumulator across threads woul
 ## Matmul recognition → tuned GEMM microkernel
 
 The width that matters most for ML is the matmul inner product, and it is exactly where a 128-bit
-general vectorizer leaves performance on the table. So matmul gets a dedicated path: `mercury_mir_build`
+general vectorizer leaves performance on the table. So matmul gets a dedicated path: `wukong_mir_build`
 **recognizes a matmul loop nest** at the AST level — the `ikj` accumulate form (`c[i*N+j] +=
 a[i*K+k]*b[k*N+j]`, with or without a per-row zero-init or a `let aik` binding) and the textbook `ijk`
 dot-product form (`for j { let s=0; for k s+=a[i,k]*b[..]; c[i*N+j]=s }`), including the `C = A·Bᵀ`
 (`nn.Linear`) spelling where B is indexed `[j*K+k]`. The recognizer (`recognize_matmul`) verifies the
 strides describe contiguous row-major operands, then lowers the *whole nest* to a single call:
-`mercury_sgemm` / `mercury_sgemm_nt` (serial) or their `_parallel` variants, chosen by the `@parallel`
+`wukong_sgemm` / `wukong_sgemm_nt` (serial) or their `_parallel` variants, chosen by the `@parallel`
 attribute and the transpose flag.
 
-The kernel itself (`mercury_runtime::gemm`) is a classic BLIS-style GEMM: a **6×16 register tile**
+The kernel itself (`wukong_runtime::gemm`) is a classic BLIS-style GEMM: a **6×16 register tile**
 (12 live `__m256` accumulators, 12 FMAs per K-step), `MC/KC/NC` **cache blocking**, and **packed**
 A/B panels streamed with unit stride — true **256-bit AVX2 + FMA** (the width Cranelift's IR cannot
 express), runtime-detected with a scalar fallback. The parallel variant packs A and B once per K
@@ -244,14 +244,14 @@ runs the C tile grid across cores. It also **falls back to the serial kernel bel
 it is why the win over gcc/rustc's naive nest *grows* with size (their version falls out of cache; the
 packed kernel does not).
 
-Crucially this stays inside the differential oracle: the interpreter, on a `mercury_sgemm*` call,
+Crucially this stays inside the differential oracle: the interpreter, on a `wukong_sgemm*` call,
 **marshals its abstract `Value` memory into real f32 buffers and calls the identical kernel**, then
 marshals the result back — so native and interpreter agree bit-for-bit despite the reassociated
 accumulation (the parallel kernel is bit-identical to the serial one by construction).
 
 ## GPU backend
 
-`mercury_codegen_gpu` (behind `--features gpu`) is a third execution path: being a compiler, it
+`wukong_codegen_gpu` (behind `--features gpu`) is a third execution path: being a compiler, it
 **emits PTX text** and **driver-JIT-loads it via `cudarc`** (`cuModuleLoadData`), so no `nvcc`/CUDA
 toolkit is needed — only the NVIDIA driver. It offers two modes. `--backend=gpu` runs the program on
 an **offloading interpreter** (the CPU tree-walks every op as the oracle does, but recognized
@@ -265,10 +265,10 @@ GPU analogue of the CPU differential oracle — and the path stays optimization-
 ## Testing strategy
 
 - **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).
-- **End-to-end** (`tests/run/*.mer`): the real `mercuryc` binary compiles and runs each program;
+- **End-to-end** (`tests/run/*.wk`): the real `wukongc` binary compiles and runs each program;
   stdout/exit are checked against `// EXPECT-*` directives embedded in the file.
 - **Differential**: `-O0`-vs-`-O{1,2,3}` invariance, **interpreter-vs-native (Cranelift)** on stdout
-  and exit code (in `mercury_bench`'s equivalence gate and the cranelift unit tests), and vectorized
+  and exit code (in `wukong_bench`'s equivalence gate and the cranelift unit tests), and vectorized
   kernels checked against independent scalar references across remainder-exercising sizes.
 
 All of the above runs with `cargo test` and no external toolchain (Cranelift is a pure-Rust crate).

@@ -1,8 +1,8 @@
-# Mercury
+# Wukong
 
 **A low-level, low-abstraction systems language built for ML/DL compilers and high-performance tensor kernels.**
 
-Mercury is the language you reach for *instead of* C, C++, or Rust when you are writing the
+Wukong is the language you reach for *instead of* C, C++, or Rust when you are writing the
 performance-critical core of a machine-learning stack: fused elementwise kernels, tiled matmuls,
 attention microkernels, custom ops, and the compiler passes that generate them.
 
@@ -10,16 +10,16 @@ It is **not** a high-level framework. There is no garbage collector, no hidden a
 hidden control flow. Every byte of memory comes from an allocator you named, every SIMD lane is one
 you asked for, and every parallel loop has a schedule you chose.
 
-## Why Mercury
+## Why Wukong
 
-Mercury compiles to native code through a **from-scratch [Cranelift](https://cranelift.dev) backend —
+Wukong compiles to native code through a **from-scratch [Cranelift](https://cranelift.dev) backend —
 no LLVM, no external toolchain**. In a head-to-head cross-language benchmark (same kernel in each
-language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
+language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
 
 - **compiles fast** — the metric that dominates real ML edit-run iteration. Apples-to-apples
-  *compiler-to-object* (`mercuryc --emit=obj -O2` vs `gcc/g++/rustc -O2 -c`, same artifact, same
-  machine): **~7–12× faster** (`mercury_bench compile-vs`; ~7–9× measured this run). The larger **~100–680× (geomean ~305×)**
-  figure is *time-to-running-code*: Mercury JIT-compiles in-process while C/Rust must spawn a full
+  *compiler-to-object* (`wukongc --emit=obj -O2` vs `gcc/g++/rustc -O2 -c`, same artifact, same
+  machine): **~7–12× faster** (`wukong_bench compile-vs`; ~7–9× measured this run). The larger **~100–680× (geomean ~305×)**
+  figure is *time-to-running-code*: Wukong JIT-compiles in-process while C/Rust must spawn a full
   toolchain **and link a shared object** — a real advantage for the JIT/embedding workflow, but not a
   compiler-vs-compiler number, so it is disclosed as such, never as the headline;
 - **wins matmul/GEMM**, the flagship ML kernel: the compiler recognizes a matmul nest (incl. the
@@ -28,7 +28,7 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
   **oneMKL parity**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
   (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*. Against
-  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM runs a
+  the honest SOTA bar — **multi-threaded oneMKL** — Wukong's `@parallel` GEMM runs a
   **size-keyed BLIS/MKL-style 2D block-parallel decomposition** (per-thread L2-resident C blocks;
   per-worker packing at mid/large — measured the right locality trade in both ABBA orderings —
   and a cooperative shared-pack small band just above the parallel gate) and stands at
@@ -51,7 +51,7 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   **exp 1.23–1.45× and log ~1.25× slower** after 8-bucket in-register-LUT rewrites of both cores
   (exp ~1.3 ULP, log ≤6.9e-7 rel — exhaustively swept; the residual gap is algorithmic — VML's
   cheaper core — and the earlier single-session "exp 1.05× faster / log 1.14×" readings did not
-  reproduce across states, so the range is the honest claim). Mercury dispatches a pure
+  reproduce across states, so the range is the honest claim). Wukong dispatches a pure
   `out[i]=f(x[i])` loop for **35** functions
   (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/`silu`/
   `softplus`/`softsign`/`logsigmoid`/`mish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf` plus the
@@ -62,12 +62,12 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
 - **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form)
   **~1.9–6.6×** and **convolution** (im2col + GEMM) **~6–7×**;
 - **runs a full 12-layer GPT-2-class transformer end-to-end** (d=768, 12 heads, causal attention,
-  GELU MLP — ordinary Mercury source through the real pipeline, gated bit-exact against the
+  GELU MLP — ordinary Wukong source through the real pipeline, gated bit-exact against the
   interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~19–21× idiomatic C,
   3.6–4.9× `-ffast-math` C, and at parity-to-faster vs PyTorch CPU eager single-thread**
   (1.03–1.09× behind @S=128, **1.12–1.22× faster @S=512**); multicore, since the `@parallel`
   head-loop region shipped (2026-07-10 — independent-iteration loops with body-local scratch
-  outline to a parallel region, bit-exact by construction), Mercury **beats all-threads eager
+  outline to a parallel region, bit-exact by construction), Wukong **beats all-threads eager
   torch at S=512 (1.10–1.24× faster, two valid rounds)** and holds parity at S=128
   (1.19×-faster-to-1.02×-behind at the round-noise floor; was 1.5–1.9× behind), with model
   `@parallel` scaling at **3.1–3.6×** (was ~1.5–2.1×) and the multicore stack **~61–69× idiomatic
@@ -95,7 +95,7 @@ memory-bandwidth-bound elementwise kernels are now small **wins** (saxpy ~1.25�
 widening to ~1.3–1.6× at realistic >L3 tensor sizes via non-temporal stores); the one honest **tie** left is
 `relu` at an L3-resident size, where both languages are pinned to the same cache bandwidth.
 
-Where Mercury is built to win for the ML/DL niche:
+Where Wukong is built to win for the ML/DL niche:
 
 - **Compile-time shape safety.** Tensor shapes live in the type system:
   `Tensor[f32, M, K] * Tensor[f32, K, N] -> Tensor[f32, M, N]`. A shape mismatch is a *type error*,
@@ -114,12 +114,12 @@ Where Mercury is built to win for the ML/DL niche:
   (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM) removes ~42% of IR ops on the benchmark kernels
   (~48–54% on the heavy transformer/GEMM kernels). Op-graph fusion across tensor ops is still planned.
 - **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
-  BLAS/cuBLAS and embed Mercury kernels in C/C++/CUDA stacks. The attributes parse and validate
+  BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. The attributes parse and validate
   today; symbol export/import is not yet wired (see the roadmap).
 
 ## The four signature features
 
-```mercury
+```wukong
 // (1) shape-typed tensors  (2) SIMD vectors  (3) explicit memory/layout  (4) parallelism
 fn saxpy<N>(a: f32, x: Tensor[f32, N], y: Tensor[f32, N], mut out: Tensor[f32, N]) {
     @parallel @simd
@@ -132,7 +132,7 @@ fn saxpy<N>(a: f32, x: Tensor[f32, N], y: Tensor[f32, N], mut out: Tensor[f32, N
 That tensor/`@parallel`/`@simd` form is the target surface (it type- and shape-checks today). The
 same kernel over fixed-size arrays **runs today** on the interpreter:
 
-```mercury
+```wukong
 fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
     let mut i: i32 = 0;
     while i < 4 {
@@ -143,20 +143,20 @@ fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
 ```
 
 ```sh
-mercuryc --run examples/saxpy_array.mer   # -> 12, 24, 36, 48 (one value per line)
-mercuryc --run examples/dot.mer           # 120
+wukongc --run examples/saxpy_array.wk   # -> 12, 24, 36, 48 (one value per line)
+wukongc --run examples/dot.wk           # 120
 ```
 
 ## Architecture
 
 ```
-source.mer
+source.wk
    │  lexer → parser → AST
    │  sema  (name resolution, type inference, COMPILE-TIME SHAPE CHECKING)
    │  mir_build  (lowering + matmul→GEMM dispatch + SIMD auto-vectorization:
    │              elementwise, reductions, FMA, fusion)
    ▼
-Mercury IR (MIR)         one SSA IR that lowers progressively from "High" to "Low"
+Wukong IR (MIR)         one SSA IR that lowers progressively from "High" to "Low"
    │  optimization passes (mem2reg → SSA, const-fold, CSE, DSE, DCE, LICM, simplify-cfg;
    │                       inlining; op-graph fusion across tensor ops is planned)
    ▼
@@ -181,7 +181,7 @@ and `@parallel`, incl. `nn.Linear` `A·Bᵀ`), SIMD auto-vectorization (elementw
 contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array kernels. A
 **GPU backend** (`--features gpu`; NVIDIA, PTX via cudarc driver-JIT) adds tensor-core GEMM, fused
 flash-attention, norms, and a GPU-resident transformer layer, and **reverse-mode autodiff**
-(`mercury_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
+(`wukong_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
 pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop — both gated against the interpreter oracle.
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
@@ -195,9 +195,9 @@ iteration, and array→slice unsizing), top-level **`const`** values, **`let` tu
 a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
 flattens to a row-major GEP, so the shape-typed surface *executes*, not just shape-checks — and a
 matmul written in tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot and accumulate spellings)
-dispatches to the same tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` form. **Symbolic-generic
+dispatches to the same tuned `wukong_sgemm` microkernel as the flat `a[i*K+k]` form. **Symbolic-generic
 tensor dimensions execute too** — `fn f<M, N>(t: Tensor[f32, M, N])` runs at any per-call size via
-hidden runtime dim params (`tests/run/generic_shape.mer`). See the docs:
+hidden runtime dim params (`tests/run/generic_shape.wk`). See the docs:
 
 - [Benchmarks](BENCHMARKS.md) — honest cross-language results vs C, C++, and Rust, with methodology.
 - [Language guide](docs/language-guide.md) — the language surface, with an honest maturity legend.
@@ -210,14 +210,14 @@ hidden runtime dim params (`tests/run/generic_shape.mer`). See the docs:
 ```sh
 cargo build                 # the whole compiler incl. the native Cranelift backend — no LLVM
 cargo test                  # unit + golden + end-to-end + differential (interp vs native) tests
-cargo run -p mercuryc -- --help
-cargo run -p mercuryc -- --run examples/fib.mer
-cargo run -p mercury_bench --release -- tests/run examples bench/kernels   # optimizer report
-cargo run -p mercury_xbench --release      # cross-language benchmark vs C/C++/Rust (needs gcc/g++/rustc)
+cargo run -p wukongc -- --help
+cargo run -p wukongc -- --run examples/fib.wk
+cargo run -p wukong_bench --release -- tests/run examples bench/kernels   # optimizer report
+cargo run -p wukong_xbench --release      # cross-language benchmark vs C/C++/Rust (needs gcc/g++/rustc)
 ```
 
 The native backend (Cranelift) is built in by default and needs no toolchain. The optional LLVM
-backend emits textual IR only (for an external `clang`/`llc`), exposed via `mercuryc --emit=llvm-ir`
+backend emits textual IR only (for an external `clang`/`llc`), exposed via `wukongc --emit=llvm-ir`
 — it is always built and needs no feature flag.
 
 ## License

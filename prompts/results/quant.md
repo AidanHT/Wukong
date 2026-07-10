@@ -1,6 +1,6 @@
 # Quantized-GEMM gap vs cuBLAS IMMA / Transformer Engine (int8 + fp8)
 
-Branch `perf/gpu-quant-2` (worktree `../Mercury-quant2`). Target: mobile RTX 4050, sm_89 (Ada).
+Branch `perf/gpu-quant-2` (worktree `../Wukong-quant2`). Target: mobile RTX 4050, sm_89 (Ada).
 
 ## Mission
 - int8 (W8A8, u8×i8→i32) tensor-core GEMM: **≥75% of cuBLAS IMMA** (a floor — push to parity), bit-exact.
@@ -34,7 +34,7 @@ Branch `perf/gpu-quant-2` (worktree `../Mercury-quant2`). Target: mobile RTX 405
 - [ ] **L4 epilogue**: vectorized i32 stores, register trim.
 - [ ] **L5 split-K / stream-K**: thin-M/small-N decode regime (the real quantized-inference shapes).
 - [ ] **L6 fp8**: tile/stage sweep on fp8_pipe; vs cuBLASLt fp8 / TE-class peer; E5M2.
-- [ ] **L7 fused dequant headline**: GEMM+dequant vs cuBLAS GEMM+dequant chain (Mercury wins by construction).
+- [ ] **L7 fused dequant headline**: GEMM+dequant vs cuBLAS GEMM+dequant chain (Wukong wins by construction).
 - [ ] **L8 autotuner**: extend candidate set, keep bit-exact cross-check.
 
 ## Measurement protocol
@@ -97,14 +97,14 @@ can't fill them, 1 CTA/SM).
   (b) fused dequant headline (now lands — GEMM near parity); (c) fp8 characterization; (d) split-K/Stream-K decode.
 
 ### L7 HEADLINE — fused GEMM+dequant BEATS the cuBLAS GEMM+dequant chain. `quant_int8_fused_dequant_vs_chain` ×3.
-cuBLAS int8 emits raw i32 → needs a 2nd kernel re-reading M×N i32 from HBM + writing M×N f32; Mercury folds
+cuBLAS int8 emits raw i32 → needs a 2nd kernel re-reading M×N i32 from HBM + writing M×N f32; Wukong folds
 `out=f32(Σu8·i8)·scale[j]` into the GEMM store for ~0 cost. Now that the GEMM is near parity, the fusion wins:
-| size  | Mercury fused vs cuBLAS chain (run1/2/3) | dequant tax cuBLAS pays | fused vs cuBLAS GEMM-only |
+| size  | Wukong fused vs cuBLAS chain (run1/2/3) | dequant tax cuBLAS pays | fused vs cuBLAS GEMM-only |
 |-------|------------------------------------------|-------------------------|---------------------------|
 | 1024³ | 1.17× / 1.09× / 1.18×                     | +28–35%                 | ~90% |
 | 2048³ | **1.71× / 2.01× / 2.22×**                 | +80–118%                | **~95%** |
 | 4096³ | 1.51× / 1.46× / 1.53×                     | +53–59%                 | ~95% |
-Mercury's fused kernel (GEMM **+** dequant) runs at ~90–95% of cuBLAS's GEMM-*alone* throughput — the dequant
+Wukong's fused kernel (GEMM **+** dequant) runs at ~90–95% of cuBLAS's GEMM-*alone* throughput — the dequant
 is genuinely free. **Decisive end-to-end win, the lever a closed library can't use.** COMMIT 3. Peer =
 `time_cublas_int8_gemm_dequant_chain` (fair no-rem 2-D dequant kernel). Dequant dispatch upgraded to w64_deq.
 
@@ -148,7 +148,7 @@ GEMM AI≈(2/3)·n ⇒ all sizes far past the memory wall; DRAM ~97% idle). Ledg
 Ada study (spatters.ca, RTX 4090): swizzled-SMEM+vec-loads 37%→83% (have it), **register/warp-tile growth
 + bigger CTA tiles 89.5%→100% (THE remaining lever)**, multistage cp.async only **+3%**.
 - **#1 lever — bigger tiles.** CUTLASS int8 winners on Ada: **256×128×64 / 128×256×64, 8 warps, warp tile
-  64×64**, 128×128×64 (5-stage) mid-fallback. Mercury's 128×128 has a **32×64** warp tile (wm=4,wn=2),
+  64×64**, 128×128×64 (5-stage) mid-fallback. Wukong's 128×128 has a **32×64** warp tile (wm=4,wn=2),
   64×64 has 32×32 — under-reuse. Fix: 256×128 / 128×256 with wm=4,wn=2 ⇒ 64×64 warp tile. Generator
   already supports arbitrary bm/bn/wm/wn. 256×128 BK=64 2-stage = exactly 48 KiB (fits static).
 - **Multistage** secondary (~3%); needs **dynamic-SMEM opt-in** (`cudaFuncAttributeMaxDynamicSharedMemorySize`,
@@ -169,7 +169,7 @@ Ada study (spatters.ca, RTX 4090): swizzled-SMEM+vec-loads 37%→83% (have it), 
   trust the clock-robust internal w22/default ratio (1.09/1.29/1.06×). Tolerance-gated (E4M3 c·√K·ε).
 - **E5M2 (training gradient)** is — by the standard Transformer-Engine split — the *gradient* format, not an
   inference-GEMM format (2-bit mantissa is too lossy for activations/weights; E4M3's 3-bit is the forward
-  format). Mercury uses E5M2 exactly there: the backward GEMM `gemm_nt_fp8_bwd` (`dX = dY·W`, **E5M2 grad ×
+  format). Wukong uses E5M2 exactly there: the backward GEMM `gemm_nt_fp8_bwd` (`dX = dY·W`, **E5M2 grad ×
   E4M3 weight**, f32 accumulate), tolerance-gated vs an f64 reference that decodes the same e5m2/e4m3 bits
   (`fp8_bwd_gemm_matches_reference`), plus the device delayed-scaling quantizer (E5M2/E4M3, ULP-gated). So
   fp8 is honestly characterized across both formats; there is deliberately no E5M2 forward GEMM to "win" at.
@@ -198,7 +198,7 @@ tiles 256×128 (1 CTA/SM). Static-SMEM w64 (2-stage, no raster) is the ceiling; 
 SMEM + a fundamentally better L2 schedule (cuBLAS's edge). Not claimed as solved.
 
 ## Certification (correctness — the hard invariant)
-Full non-ignored `mercury_codegen_gpu --features gpu` suite: **105 passed**, 2 failed. The 2 failures are
+Full non-ignored `wukong_codegen_gpu --features gpu` suite: **105 passed**, 2 failed. The 2 failures are
 `lower::run_corpus_matches_interp_oracle` and `megakernel::mega_corpus_matches_oracle` — **pre-existing**
 gpu-native MIR→PTX miscompiles of two *general* programs (`hadamard`, `log_softmax_fused`), confirmed
 identical at the base commit `8c7afac` *before any quant change* (99/144 coverage, same mismatch values).

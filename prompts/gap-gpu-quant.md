@@ -1,21 +1,21 @@
 # Close the quantized-GEMM gap vs cuBLAS IMMA / Transformer Engine (int8 + fp8)
 
-You are a Claude Code session on **Mercury** (`mercuryc` emits PTX, driver-JIT via `cudarc`, no toolkit).
+You are a Claude Code session on **Wukong** (`wukongc` emits PTX, driver-JIT via `cudarc`, no toolkit).
 Target: **mobile RTX 4050, sm_89 (Ada), ~30–50 W**. First action:
-`git worktree add ../Mercury-quant2 -b perf/gpu-quant-2 main` and work inside it (or `git checkout -b`).
+`git worktree add ../Wukong-quant2 -b perf/gpu-quant-2 main` and work inside it (or `git checkout -b`).
 
 ## Prime Directive (how you work)
 
 **Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
 metric. The gold-standard library already achieves it, so the performance is physically available on
-this silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you
+this silicon and a path to it is guaranteed to exist — your only job is to find Wukong's path, and you
 WILL find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap
 is never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
 done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
 the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
 collected.**
 
-Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
+Continuously iterate through the entire codebase until Wukong performs better than C, C++, and Rust
 **and closes — then beats — the NVIDIA gold-standard library on quantized GEMM**. **No scope
 restrictions.** If something blocks a higher metric, **remove that blocker** and explore options **even
 outside scope**. Improve everything. **No limit.** **Assume the metrics are NOT strong until you PROVE
@@ -27,7 +27,7 @@ deficiency**.
 
 ## Your mission
 
-Mercury's int8 (W8A8, `u8×i8→i32`) tensor-core GEMM **crushes** naive/dp4a CUDA-C (~180–237× / ~34–58×)
+Wukong's int8 (W8A8, `u8×i8→i32`) tensor-core GEMM **crushes** naive/dp4a CUDA-C (~180–237× / ~34–58×)
 but runs at only **~44% (1024³) / ~53% (2048³) of cuBLAS int8 IMMA** — a real ~2× gap. fp8 (E4M3/E5M2)
 GEMM exists but is **unbenched vs the Transformer Engine class**. Targets: int8 ≥75% of cuBLAS IMMA;
 fp8 measured honestly vs the best fp8 peer you can build/`dlopen`, and the fused per-channel **dequant
@@ -47,9 +47,9 @@ Write a plan to `prompts/results/quant.md` first. Note from project memory: int8
   tile/stage; compare vs a Transformer-Engine-style peer if one can be `dlopen`'d, else vs cuBLAS fp8
   (`cublasLtMatmul` fp8) honestly, else document that no library fp8 peer is buildable here.
 - **Fused dequant epilogue** (`out = act((A·Bᵀ)·scale_a·scale_b [+ bias])`): cuBLAS outputs raw `i32` and
-  needs a *second* HBM round-trip kernel to dequant — Mercury folds it for ~0 cost. **Measure the full
+  needs a *second* HBM round-trip kernel to dequant — Wukong folds it for ~0 cost. **Measure the full
   quantized-inference output stage (GEMM+dequant) vs the cuBLAS GEMM+dequant *chain*** — that is where
-  Mercury should *beat* cuBLAS outright (the fusion lever a library can't use). This is your headline win.
+  Wukong should *beat* cuBLAS outright (the fusion lever a library can't use). This is your headline win.
 - The autotuner (`autotune.rs`) — per-shape search over int8 candidates with on-disk cache already exists;
   extend it to cover the new candidates and keep the bit-exact cross-check.
 

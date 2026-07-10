@@ -1,6 +1,6 @@
 # Beating a *genuinely fused* FlashAttention-2 peer — results
 
-Mission: stop measuring Mercury's fused flash against the *unfused* cuBLAS chain (the
+Mission: stop measuring Wukong's fused flash against the *unfused* cuBLAS chain (the
 pre-FlashAttention baseline) and measure it against a **genuinely fused FA2-class kernel**, then close
 and beat the gap. Target: mobile RTX 4050, sm_89 (Ada), ~30–50 W.
 
@@ -8,7 +8,7 @@ and beat the gap. Target: mobile RTX 4050, sm_89 (Ada), ~30–50 W.
 
 NVRTC here has no headers, so `nvcuda::wmma` / CUTLASS / the FlashAttention source won't compile as an
 in-process peer. The path that works: **PyTorch's fused `scaled_dot_product_attention` backends**, driven
-as a subprocess over the *same* f16 Q/K/V bytes Mercury runs.
+as a subprocess over the *same* f16 Q/K/V bytes Wukong runs.
 
 Empirically probed on this box (`torch 2.6.0+cu124`, RTX 4050, driver 592.27):
 
@@ -27,48 +27,48 @@ the unfused chain — cuDNN runs ~15–26× the MATH backend, the signature of a
 - `tools/fa2_sdpa_peer.py` — forces each fused SDPA backend in turn, CUDA-event-times it (so Python's
   per-call dispatch overhead is **excluded** — fair to the peer), writes the chosen backend's O (f32) +
   a flat report. A one-time `tools/torch-cuda-venv` (CUDA torch + numpy) hosts it.
-- `baselines::fa2_sdpa_peer` (append-only) — dumps the identical f16 Q/K/V Mercury runs, drives the
+- `baselines::fa2_sdpa_peer` (append-only) — dumps the identical f16 Q/K/V Wukong runs, drives the
   subprocess, parses the report, returns O + per-backend timings. `fa2_peer_available()` skips (never
   fails) when the venv is absent.
 - `gpu::tests::attn_vs_fused_peer` (append-only, `#[ignore]`) — same f16 bytes to both, output
-  tolerance-gated vs the per-head f64 oracle (small S) + checksum-cross-checked (all S), Mercury
+  tolerance-gated vs the per-head f64 oracle (small S) + checksum-cross-checked (all S), Wukong
   wall-clock vs the peer's CUDA-event time, REPS≥3 on a warmed clock.
 
 Run:
 ```
-MERCURY_FA2_PYTHON=<main>/tools/torch-cuda-venv/Scripts/python.exe \
-  cargo test -p mercury_codegen_gpu --features gpu attn_vs_fused_peer -- --ignored --nocapture --test-threads=1
+WUKONG_FA2_PYTHON=<main>/tools/torch-cuda-venv/Scripts/python.exe \
+  cargo test -p wukong_codegen_gpu --features gpu attn_vs_fused_peer -- --ignored --nocapture --test-threads=1
 ```
 
 ### Honesty notes
 - **Cross-process clock skew** is the one residual risk (the laptop GPU clock swings ~7×). Mitigated by:
-  warm the GPU first, run peer + Mercury back-to-back in one window, REPS≥3 best-of, and report the
-  unfused MATH backend as a cross-anchor (it should track Mercury's known "3.6–5× the cuBLAS chain").
-- The peer's CUDA-event time excludes its launch overhead; Mercury's wall-clock includes its (Rust,
-  <1%) launch overhead — so **any Mercury win is the conservative direction**.
+  warm the GPU first, run peer + Wukong back-to-back in one window, REPS≥3 best-of, and report the
+  unfused MATH backend as a cross-anchor (it should track Wukong's known "3.6–5× the cuBLAS chain").
+- The peer's CUDA-event time excludes its launch overhead; Wukong's wall-clock includes its (Rust,
+  <1%) launch overhead — so **any Wukong win is the conservative direction**.
 - Both sides use the identical `4·H·S²·D` FLOP count; outputs cross-checked within f16 tolerance.
 
-## 2. Honest baseline — Mercury `flash_d64_mp` vs cuDNN fused (H=8, D=64, same-run)
+## 2. Honest baseline — Wukong `flash_d64_mp` vs cuDNN fused (H=8, D=64, same-run)
 
 First measured standing (debug build, REPS=3, warmed clock):
 
-| S | Mercury GF/s | cuDNN GF/s | **Mercury / cuDNN** | efficient GF/s | MATH (unfused) GF/s |
+| S | Wukong GF/s | cuDNN GF/s | **Wukong / cuDNN** | efficient GF/s | MATH (unfused) GF/s |
 |---|---|---|---|---|---|
 | 512 | 5713 | 10411 | **0.55×** | 8182 | 1177 |
 | 1024 | 9357 | 11730 | **0.80×** | 10304 | 782 |
 | 2048 | 9518 | 18742 | **0.51×** | 11796 | 793 |
 | 4096 | 8437 | 21124 | **0.40×** | 12011 | 796 |
 
-Correctness gate at S=512: Mercury max_abs **3.6e-5**, cuDNN max_abs **5.3e-5** vs the f64 oracle ✓.
+Correctness gate at S=512: Wukong max_abs **3.6e-5**, cuDNN max_abs **5.3e-5** vs the f64 oracle ✓.
 
 ### Gap analysis (the lever map)
-- Mercury is **0.40–0.80× cuDNN**, worst at long S. Mercury **plateaus at ~8–9 TFLOP/s** while cuDNN
+- Wukong is **0.40–0.80× cuDNN**, worst at long S. Wukong **plateaus at ~8–9 TFLOP/s** while cuDNN
   **scales up** with S (10.4 → 21.1 TFLOP/s). That divergence is the whole story.
-- Signature: Mercury's production kernel is **1 warp / CTA, 16 query rows, 2-stage cp.async**. At long S
+- Signature: Wukong's production kernel is **1 warp / CTA, 16 query rows, 2-stage cp.async**. At long S
   each CTA streams the full K/V serially with only double-buffered prefetch and ~21% occupancy — the
   K-loop latency is **not hidden**, so throughput falls as S grows. cuDNN keeps the tensor cores fed
   (bigger per-CTA tiles / more warps / deeper pipeline), so it scales the other way.
-- Mercury already runs ~10× the unfused MATH chain — consistent with the documented "3.6–5× the cuBLAS
+- Wukong already runs ~10× the unfused MATH chain — consistent with the documented "3.6–5× the cuBLAS
   chain" (cuBLAS chain ≈ 2× MATH). The *fused-peer* comparison is the new, harder, honest bar.
 
 ### Levers to close → beat (in priority order)
@@ -78,7 +78,7 @@ Correctness gate at S=512: Mercury max_abs **3.6e-5**, cuDNN max_abs **5.3e-5** 
    S=4096; clock-cancelled in-process `flash_mp4_vs_mp`: mp4/mp = 0.99×/1.02× at S≤3072, 0.88×/0.88× at
    S=4096/8192). The single-warp grid already saturates the 20-SM GPU at long S, so packing warps into
    fewer CTAs trades parallelism for the reuse and only nets out at the very largest S. mp stays the
-   production kernel; mp4 is a noted regime-aware option at S≥4096 but still leaves Mercury at ~0.48×
+   production kernel; mp4 is a noted regime-aware option at S≥4096 but still leaves Wukong at ~0.48×
    cuDNN there — it does **not** close the gap.
    - **Measurement cautionary tale (kept in the `flash_mp4_vs_mp` harness):** the *first* in-process A/B
      reported an incoherent, non-monotonic mp4/mp = **0.25/1.02/0.51/0.70** — a false "4× mp4 win." Cause:
@@ -102,7 +102,7 @@ Status: **objective (a) — a named, genuinely fused FA2 peer running same-run �
 A fused-attention library (cuDNN's fused flash, cutlass mem-efficient fMHA) takes Q/K/V and emits O in
 one kernel — it has **no hook to apply RoPE inside**. So a real model running rotary embeddings must run
 a *separate* elementwise RoPE pass over Q and K first (an extra HBM round-trip of both), then the fused
-attention. Mercury's `flash_d64_mprope` folds the interleaved rotation into the `b32` `mma` fragments it
+attention. Wukong's `flash_d64_mprope` folds the interleaved rotation into the `b32` `mma` fragments it
 already loads — one `mma` register packs exactly one `(2t,2t+1)` rotation pair — so RoPE costs ~nothing on
 a kernel that's already tensor-core-bound. **This is a fusion the library cannot do**, regardless of how
 fast its attention is.
@@ -113,84 +113,84 @@ interleaved-RoPE pass over Q,K + the same cuDNN/cutlass fused SDPA from §1. To 
 harness times **two** RoPE implementations and takes the **min**: the eager `(reshape→mul→stack)` form
 *and* a complex-multiply form (`view_as_complex`/`view_as_real`, the fastest RoPE torch produces here
 without triton). It also reports the SDPA-only time, so the **RoPE tax** (pipeline − sdpa) is explicit.
-Same f16 Q/K/V + cos/sin to both sides; Mercury's fused-rope O is gated vs an f64 *rotate-then-attend*
+Same f16 Q/K/V + cos/sin to both sides; Wukong's fused-rope O is gated vs an f64 *rotate-then-attend*
 oracle at small S and checksum-cross-checked against the peer's rope+sdpa O at all S.
 
 ### Result (H=8, D=64, RTX 4050, 3 runs — `gpu::attn_rope_vs_fused_peer`)
 
-**Mercury's one fused kernel vs the peer's RoPE + fused-SDPA pipeline** (median [range] over 3 runs):
+**Wukong's one fused kernel vs the peer's RoPE + fused-SDPA pipeline** (median [range] over 3 runs):
 
-| S | Mercury / (rope+sdpa) | verdict | peer RoPE tax (% of sdpa, within-process) |
+| S | Wukong / (rope+sdpa) | verdict | peer RoPE tax (% of sdpa, within-process) |
 |---|---|---|---|
 | 256 | **2.14×** [1.83–5.71] | **win** | 608–1064% |
 | 512 | **1.76×** [1.31–2.95] | **win** | 25–392% |
 | 1024 | 0.66× [0.45–0.87] | lose | 101–271% |
 | 2048 | 0.29× [0.28–0.32] | lose | **~52%** (48–59%, stable) |
 
-Correctness gate (S≤512): Mercury rope-flash max_abs **3.7e-5–5.5e-5**, peer rope+sdpa **5.0e-5–7.7e-5**,
+Correctness gate (S≤512): Wukong rope-flash max_abs **3.7e-5–5.5e-5**, peer rope+sdpa **5.0e-5–7.7e-5**,
 both vs the f64 oracle ✓.
 
 ### Reading it honestly
-- **Mercury wins at S ≤ 512** (all six small-S data points > 1×): the library-forced RoPE pass is a large
-  fixed cost there, and Mercury erases it. At S=1024–2048 Mercury loses — cuDNN's attention throughput
-  (it scales to ~20 TFLOP/s vs Mercury's ~4 plateau, §2) overtakes the RoPE savings. **Crossover ≈ 512–1024.**
+- **Wukong wins at S ≤ 512** (all six small-S data points > 1×): the library-forced RoPE pass is a large
+  fixed cost there, and Wukong erases it. At S=1024–2048 Wukong loses — cuDNN's attention throughput
+  (it scales to ~20 TFLOP/s vs Wukong's ~4 plateau, §2) overtakes the RoPE savings. **Crossover ≈ 512–1024.**
 - **What's clock-robust vs clock-noisy.** The small-S *pipeline ratio magnitude* is cross-process
-  (Mercury process vs the Python peer process, ~7× laptop-clock swing) — hence the wide [range] and why
+  (Wukong process vs the Python peer process, ~7× laptop-clock swing) — hence the wide [range] and why
   the table leads with the **median** and a verdict, not a point estimate. What *is* clock-robust: the
   **RoPE-tax fraction** (pipeline vs sdpa measured in the *same* peer process, same clock) and the
   **win/lose direction** (consistent across all 3 runs at every S). The honest, stable headline number is
   the **~52% RoPE tax at S=2048**: even where cuDNN's attention dominates, the library still pays a ~50%
-  surcharge to rotate that Mercury doesn't.
+  surcharge to rotate that Wukong doesn't.
 - **Bound on the win.** The peer's RoPE tax is launch/overhead-dominated (~flat 0.2–0.6 ms across S, far
   above the ~tens-of-µs memory-bound floor of a single fused rope kernel). So the win is largest against
   an *eager* rope (a common real deployment) and narrows against a maximally-fused rope; even so, fusing
-  it is strictly free for Mercury, so the direction never reverses — only the magnitude.
+  it is strictly free for Wukong, so the direction never reverses — only the magnitude.
 
-**Takeaway:** objective (b) is met for the **small-S / prefix / RoPE regime** — Mercury's single fused
+**Takeaway:** objective (b) is met for the **small-S / prefix / RoPE regime** — Wukong's single fused
 kernel beats a *genuinely fused* cuDNN/cutlass attention + an optimized RoPE pass at S ≤ 512, a win the
 library is structurally unable to match. Past S=512 the durable lever is closing the raw attention-
 throughput gap itself (multi-warp dispatch at long S, D=128, deeper pipeline — §2 lever map), which is
 the next front.
 
-## 4. The causal win — Mercury beats BOTH fused peers at S=512, ties cutlass-efficient through S=1024
+## 4. The causal win — Wukong beats BOTH fused peers at S=512, ties cutlass-efficient through S=1024
 
 Causal attention (the decoder mask: query `i` attends only to keys `j ≤ i`) is the regime every LLM
-actually runs. Mercury's `flash_d64_mpc` skips every all-masked K-block (the online-softmax K-loop stops
+actually runs. Wukong's `flash_d64_mpc` skips every all-masked K-block (the online-softmax K-loop stops
 at the diagonal `kb==row`) and masks only the diagonal block — ~half the `mma` work at long S. cuDNN and
 cutlass-efficient skip the upper triangle too, so this is a *fair fused-vs-fused* causal comparison
 (`is_causal=true`), same f16 Q/K/V, output gated vs the per-head f64 `ref_attn_causal` oracle.
 
 ### Result (H=8, D=64, RTX 4050, `gpu::attn_causal_vs_fused_peer`, 3 runs at S≤1024 / 2 at S≥2048)
 
-Mercury vs the **fastest** fused peer, and vs **cutlass-efficient** specifically (median [range]):
+Wukong vs the **fastest** fused peer, and vs **cutlass-efficient** specifically (median [range]):
 
-| S | Mercury / best fused peer | Mercury / cutlass-efficient | verdict |
+| S | Wukong / best fused peer | Wukong / cutlass-efficient | verdict |
 |---|---|---|---|
 | 512 | **1.12×** [1.03–1.12] (peer=cuDNN) | **1.14×** [1.01–1.16] | **beats BOTH fused peers** |
 | 1024 | 0.87× [0.85–0.88] (peer=cuDNN) | **~1.01×** [1.00–1.02] | ties cutlass-efficient |
 | 2048 | 0.54× [0.52–0.58] (peer=cuDNN) | 0.90× [0.83–0.93] | competitive w/ efficient |
 | 4096 | 0.54× [0.52–0.62] (peer=cuDNN) | 0.77× [0.76–0.88] | competitive w/ efficient |
 
-Correctness gate at S=512: Mercury causal max_abs **3.3e-4**, peer **4.6e-4** vs the f64 oracle ✓.
+Correctness gate at S=512: Wukong causal max_abs **3.3e-4**, peer **4.6e-4** vs the f64 oracle ✓.
 
 ### Reading it honestly
-- **Mercury beats both fused FA-class peers at S=512** (1.03–1.12× cuDNN *and* 1.01–1.16× efficient,
+- **Wukong beats both fused FA-class peers at S=512** (1.03–1.12× cuDNN *and* 1.01–1.16× efficient,
   consistent across all 3 runs — not a single noisy point) and **ties cutlass mem-efficient fMHA through
   S=1024**. This is a *far* stronger standing than the non-causal §2 baseline (0.40–0.80×): the clean
-  triangular skip roughly doubles Mercury's effective throughput, and at short/medium S Mercury's skip is
+  triangular skip roughly doubles Wukong's effective throughput, and at short/medium S Wukong's skip is
   as efficient as the libraries' — sometimes more.
-- **cuDNN's causal scales ahead at S≥2048** (to ~30 TFLOP/s full-S²) where Mercury plateaus (~16–18k
-  GF/s) — the same single-warp long-S ceiling as §2. vs cutlass-efficient Mercury stays competitive
+- **cuDNN's causal scales ahead at S≥2048** (to ~30 TFLOP/s full-S²) where Wukong plateaus (~16–18k
+  GF/s) — the same single-warp long-S ceiling as §2. vs cutlass-efficient Wukong stays competitive
   (0.83–0.90×) even there; only cuDNN pulls away.
 - **GF/s convention:** both sides use the full `4·H·S²·D` count (so the *ratio* is exact); the absolute
   number is ~2× the useful causal FLOP — a shared, disclosed convention, not a per-side advantage.
-- **Honesty caveats** mirror §1/§3: cross-process (Mercury wall-clock vs peer CUDA-event time, ~7× clock
+- **Honesty caveats** mirror §1/§3: cross-process (Wukong wall-clock vs peer CUDA-event time, ~7× clock
   swing) ⇒ ranges over 3 runs, with the *direction* (win/tie/trail) stable at every S; the peer's
-  launch overhead is excluded so any Mercury win is conservative.
+  launch overhead is excluded so any Wukong win is conservative.
 
 **Takeaway:** a **second** objective-(b) win, and a more important one than RoPE — in the *causal*
-regime that real decoders run, Mercury's fused flash **beats both genuinely-fused peers at S=512 and
-matches cutlass-efficient through S=1024**. Combined with §3 (fused RoPE ≤512) Mercury is
+regime that real decoders run, Wukong's fused flash **beats both genuinely-fused peers at S=512 and
+matches cutlass-efficient through S=1024**. Combined with §3 (fused RoPE ≤512) Wukong is
 competitive-or-ahead of a real FA-2-class kernel across the short/medium-context regime; the residual
 gap is purely cuDNN's long-S (≥2048) attention-throughput scaling.
 
@@ -203,14 +203,14 @@ the generator is fully d-parameterized (ktq=8 QKᵀ tiles, nto=16 PV n-tiles, cp
 
 Standing vs the fused peers (`gpu::attn_d128_vs_fused_peer`, H=8, **single run — indicative**, cross-process):
 
-| S | Mercury GF/s | vs cutlass-efficient | vs cuDNN |
+| S | Wukong GF/s | vs cutlass-efficient | vs cuDNN |
 |---|---|---|---|
 | 512 | 7245 | **0.97×** | 0.66× |
 | 1024 | 7772 | 0.86× | 0.39× |
 | 2048 | 6696 | 0.65× | 0.37× |
 | 4096 | 6496 | 0.64× | 0.44× |
 
-- **Competitive with cutlass mem-efficient fMHA at S≤1024** (0.86–0.97×), behind at long S. Mercury's
+- **Competitive with cutlass mem-efficient fMHA at S≤1024** (0.86–0.97×), behind at long S. Wukong's
   D=128 kernel **plateaus at ~6.5–7.8 TFLOP/s** — *lower* than D=64's ~8–9 — because the single warp now
   holds **64 f32 O-accumulators + 32 Q-fragment regs** (~120/thread), and that register pressure caps
   occupancy. This is the D=128-specific lever (split the head-dim PV n-tiles across warps to relieve
@@ -218,12 +218,12 @@ Standing vs the fused peers (`gpu::attn_d128_vs_fused_peer`, H=8, **single run �
 - Single run ⇒ presented as *indicative* (not a 3-run claim like §3/§4); the direction (competitive with
   efficient at short S, register-bound at long S) is unambiguous and matches the D=64 pattern.
 
-## 6. Overall standing — where Mercury beats a genuinely fused FA-2-class kernel
+## 6. Overall standing — where Wukong beats a genuinely fused FA-2-class kernel
 
 Against **cuDNN's fused flash + cutlass mem-efficient fMHA** (named, genuinely fused FA-class peers,
 same-run via PyTorch SDPA over identical f16 bytes — objective (a), DONE):
 
-| Regime | Mercury vs the fused peer | verdict |
+| Regime | Wukong vs the fused peer | verdict |
 |---|---|---|
 | **Fused RoPE, S≤512** (§3) | 1.8–5.7× the rope+SDPA pipeline | **WIN** (library can't fuse RoPE) |
 | **Causal D=64, S=512** (§4) | 1.03–1.16× — beats **both** cuDNN & efficient | **WIN** |
@@ -234,7 +234,7 @@ same-run via PyTorch SDPA over identical f16 bytes — objective (a), DONE):
 | Causal/non-causal, S≥2048 | 0.37–0.66× cuDNN (efficient closer) | trails (cuDNN scaling) |
 | Multi-warp / wide-Bk / software-pipeline levers | wash or loss | honest negatives (§2 #1, §7) |
 
-**Objective (b) is met and exceeded.** Mercury is **competitive-or-ahead of a genuinely fused FA-2-class
+**Objective (b) is met and exceeded.** Wukong is **competitive-or-ahead of a genuinely fused FA-2-class
 kernel across the entire short/medium-context regime (S≤512–1024)** — outright winning in the two
 regimes a real model spends most of its time in: **causal decode/prefill** (beats both peers at S=512)
 and **RoPE prefill** (the fusion a library structurally cannot do). The one durable gap is **cuDNN's
@@ -272,7 +272,7 @@ SMEM-feed-bound. Adding the K-load ldmatrix both removed the V-only D=64-causal 
 
 ### vs the fused peers (`attn_lm_vs_fused_peer`, H=8, REPS=3, same-run, gated + checksum)
 
-| kernel | S | Mercury / cuDNN | Mercury / cutlass-efficient | verdict |
+| kernel | S | Wukong / cuDNN | Wukong / cutlass-efficient | verdict |
 |---|---|---|---|---|
 | **D=128 `mp_lm`** (non-causal) | 512 | 0.80× | **1.17×** | **beats efficient** |
 | | 1024 | 0.49× | **1.11×** | **beats efficient** |
@@ -284,7 +284,7 @@ SMEM-feed-bound. Adding the K-load ldmatrix both removed the V-only D=64-causal 
 | | 4096 | 0.58× | 0.85× | competitive |
 | D=64 `mpc_lm` (causal) | 512 | ~1.02× | ~1.04× | ≈ base (ldmatrix-neutral at D=64) |
 
-Gates at S=512: Mercury max_abs 3.8e-5 (D=128 noncausal) / 3.3e-4 (causal) vs the f64 oracle ✓.
+Gates at S=512: Wukong max_abs 3.8e-5 (D=128 noncausal) / 3.3e-4 (causal) vs the f64 oracle ✓.
 
 **Before ldmatrix, D=128 was 0.86–0.97× cutlass-efficient — *just behind*. ldmatrix flipped it to *beating*
 efficient at S≤1024** (1.11–1.20×), causal and non-causal, and improved the cuDNN ratio ~+0.1 (0.37–0.66×
@@ -315,7 +315,7 @@ help. Four occupancy/overlap levers now agree (mp4, wide-Bk, software-pipeline, 
 plateau is **not** movable by them. cuDNN's long-S scaling is sophisticated tile/pipeline design at the
 hardware-peak frontier, not a single missing trick.
 
-**Round-2 takeaway:** the `ldmatrix` SMEM-feed win is the concrete close-the-gap result — it makes Mercury
+**Round-2 takeaway:** the `ldmatrix` SMEM-feed win is the concrete close-the-gap result — it makes Wukong
 **beat cutlass mem-efficient fMHA at D=128 for S≤1024** (where it was just behind), the head dim modern
 models use, while staying bit-exact, and improves the cuDNN ratio ~+0.1. The exhaustive negative sweep
 (mp4 / wide-Bk / software-pipeline / head-split — all gated correct, all measured slower-or-tie) is itself

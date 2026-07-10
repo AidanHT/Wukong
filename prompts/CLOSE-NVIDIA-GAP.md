@@ -1,6 +1,6 @@
 # Campaign: close the residual gap to the NVIDIA / industry-standard libraries
 
-The previous waves (sessions A–L) built Mercury's GPU + CPU kernel surface and proved it beats naive
+The previous waves (sessions A–L) built Wukong's GPU + CPU kernel surface and proved it beats naive
 C/Rust and idiomatic CUDA-C, often by 1–2 orders of magnitude. **This campaign attacks what it still
 LOSES** — the measured gaps to the hand-tuned vendor libraries (cuBLAS, cuDNN, the FlashAttention /
 Transformer-Engine class, oneDNN/MKL). Each prompt is a **self-contained kickoff** for a fresh Claude
@@ -29,7 +29,7 @@ function / arm / section at the end; never reformat or move a sibling's code).
 | 2 quant | `ptx_int8.rs`, `ptx_fp8.rs`, `ptx_int4.rs`, `ptx_fp8_train.rs` | `baselines.rs`, `lower.rs`, `gpu.rs` tests |
 | 3 attention | `ptx_flash.rs`, `ptx_norm.rs` | `baselines.rs`, `lower.rs`, `gpu.rs` tests |
 | 4 conv | `ptx_conv.rs` | `baselines.rs`, `lower.rs`, `gpu.rs` tests |
-| 5 cpu | `mercury_runtime/src/*.rs`, `mercury_xbench/src/main.rs` | *(separate crates — zero GPU overlap)* |
+| 5 cpu | `wukong_runtime/src/*.rs`, `wukong_xbench/src/main.rs` | *(separate crates — zero GPU overlap)* |
 | 6 serving | `pool.rs`, `graph.rs`, `train_resident.rs`, new harness files | `lower.rs`, `gpu.rs` tests |
 
 **Off-limits to the sessions:** `BENCHMARKS.md` and `CHANGELOG.md`. Write findings to your own
@@ -44,11 +44,11 @@ hunks). The CPU branch should never conflict.
 
 ## How to start each session
 
-1. `git worktree add ../Mercury-<slice> -b perf/<branch> main` and `cd` into it (worktree = strongest
+1. `git worktree add ../Wukong-<slice> -b perf/<branch> main` and `cd` into it (worktree = strongest
    isolation; if you can't, at least `git checkout -b`). Base on `main`.
 2. Paste the full contents of the slice's `gap-*.md` as the session's first message.
 3. Confirm a green baseline — toolchain-free `cargo test`, and for GPU slices
-   `cargo test -p mercury_codegen_gpu --features gpu --release` — then iterate per the prompt until the
+   `cargo test -p wukong_codegen_gpu --features gpu --release` — then iterate per the prompt until the
    gap is closed and **proven across ≥3 re-runs**.
 
 Every prompt inlines the full Prime Directive, the two binding laws, the measurement protocol, the GPU
