@@ -1970,10 +1970,44 @@ fn signature_of(
     sig
 }
 
+/// Should the Cranelift IR verifier run? It is a **check-only** pass — it inspects the CLIF for
+/// well-formedness and never modifies the function or the emitted machine code, so toggling it is
+/// byte-identical. Cranelift defaults it *on* ("makes compilation slower but catches many bugs"),
+/// which is pure compile-time cost once our lowering is trusted. We keep it on under
+/// `debug_assertions` (so `cargo test` — a debug build — still validates every lowering's IR) and off
+/// in release (the latency path), with an env override for release debugging.
+fn default_verify() -> bool {
+    match std::env::var("WUKONG_CL_VERIFY").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => cfg!(debug_assertions),
+    }
+}
+
+/// Should `emit_object` compile the user functions concurrently? Each function is an independent
+/// compilation unit, so parallel isel + serial in-order definition is byte-identical to serial
+/// codegen (proven by the `serial_parallel_object_bytes_identical` test). Default on; the
+/// `WUKONG_PAR_CODEGEN=0` kill-switch forces serial.
+fn default_parallel() -> bool {
+    !matches!(std::env::var("WUKONG_PAR_CODEGEN").ok().as_deref(), Some("0"))
+}
+
 fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
+    make_isa_verify(pic, default_verify())
+}
+
+fn make_isa_verify(
+    pic: bool,
+    verify: bool,
+) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
     let mut flag_builder = settings::builder();
     flag_builder
         .set("opt_level", "speed")
+        .map_err(|e| e.to_string())?;
+    // The IR verifier is a diagnostic-only pass (see `default_verify`); disabling it in release
+    // trims compile time without changing a single emitted byte.
+    flag_builder
+        .set("enable_verifier", if verify { "true" } else { "false" })
         .map_err(|e| e.to_string())?;
     // The JIT requires non-PIC; the object emitter wants PIC. Configure per caller.
     flag_builder
@@ -2001,6 +2035,7 @@ fn populate_module<M: Module>(
     module: &mut M,
     program: &Program,
     interner: &Interner,
+    parallel: bool,
 ) -> Result<HashMap<Symbol, FuncId>, String> {
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
@@ -2771,12 +2806,45 @@ fn populate_module<M: Module>(
         kernel_ids.push(per_fn);
     }
 
-    let mut ctx = module.make_context();
-    let mut fbctx = FunctionBuilderContext::new();
-    for (fi, f) in program.funcs.iter().enumerate() {
-        ctx.func.signature = signature_of(f, ptr_ty, call_conv);
+    if parallel && program.funcs.len() > 1 {
+        define_functions_parallel(
+            module, program, interner, ptr_ty, call_conv, &rt, &ids, &data_ids, &kernel_ids,
+        )?;
+    } else {
+        define_functions_serial(
+            module, program, interner, ptr_ty, call_conv, &rt, &ids, &data_ids, &kernel_ids,
+        )?;
+    }
+    Ok(ids)
+}
+
+/// Lower one MIR function to a complete Cranelift IR function (the instruction-selection input),
+/// building into `clif`. The module-declarations dependency is a **read-only** [`Decls`] view (named
+/// `module` so the ~150 `module.declare_func_in_func` call sites below are unchanged), so this runs
+/// entirely off the object module's `&mut` mutation path — which is exactly what lets
+/// [`define_functions_parallel`] build and compile many functions concurrently. The CLIF is
+/// byte-for-byte what the previous inline loop produced: `Decls`' shims replicate
+/// `Module::declare_{func,data}_in_func` verbatim.
+#[allow(clippy::too_many_arguments)]
+fn build_function_clif(
+    module: &Decls,
+    f: &Function,
+    fi: usize,
+    program: &Program,
+    interner: &Interner,
+    ptr_ty: Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+    rt: &RtFuncs,
+    ids: &HashMap<Symbol, FuncId>,
+    data_ids: &HashMap<Symbol, DataId>,
+    kernel_ids: &[Vec<FuncId>],
+    fbctx: &mut FunctionBuilderContext,
+    clif: &mut cranelift_codegen::ir::Function,
+) -> Result<(), String> {
+    clif.signature = signature_of(f, ptr_ty, call_conv);
+    {
         {
-            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
+            let mut builder = FunctionBuilder::new(clif, fbctx);
 
             // Pre-declare callee and runtime FuncRefs into this function's DFG. Iterate the
             // `program.funcs` Vec (source order), not the `ids` HashMap — the latter's per-process
@@ -3412,13 +3480,170 @@ fn populate_module<M: Module>(
             }
             t.builder.finalize();
         }
-        let fid = ids[&f.name];
+    }
+    Ok(())
+}
+
+/// A read-only view of a [`Module`]'s declarations, exposing exactly the two ref-import shims the
+/// per-function lowering needs — replicated **verbatim** from `cranelift_module::Module`'s default
+/// methods (which `ObjectModule`/`JITModule` do not override) so the built CLIF is byte-identical.
+/// Because it borrows the declarations `&`, not the module `&mut`, it is `Sync` and can be shared
+/// across the rayon workers in [`define_functions_parallel`].
+struct Decls<'a> {
+    d: &'a cranelift_module::ModuleDeclarations,
+}
+
+impl Decls<'_> {
+    /// Mirror of `Module::declare_func_in_func`.
+    fn declare_func_in_func(
+        &self,
+        func_id: FuncId,
+        func: &mut cranelift_codegen::ir::Function,
+    ) -> FuncRef {
+        let decl = self.d.get_function_decl(func_id);
+        let signature = func.import_signature(decl.signature.clone());
+        let user_name_ref = func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName {
+            namespace: 0,
+            index: func_id.as_u32(),
+        });
+        let colocated = decl.linkage.is_final();
+        func.import_function(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(user_name_ref),
+            signature,
+            colocated,
+        })
+    }
+
+    /// Mirror of `Module::declare_data_in_func`.
+    fn declare_data_in_func(
+        &self,
+        data: DataId,
+        func: &mut cranelift_codegen::ir::Function,
+    ) -> GlobalValue {
+        let decl = self.d.get_data_decl(data);
+        let colocated = decl.linkage.is_final();
+        let user_name_ref = func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName {
+            namespace: 1,
+            index: data.as_u32(),
+        });
+        func.create_global_value(cranelift_codegen::ir::GlobalValueData::Symbol {
+            name: cranelift_codegen::ir::ExternalName::user(user_name_ref),
+            offset: cranelift_codegen::ir::immediates::Imm64::new(0),
+            colocated,
+            tls: decl.tls,
+        })
+    }
+}
+
+/// Serial backend: build every function's CLIF (holding a read-only [`Decls`] view), then compile +
+/// define each in source order via the module's own `define_function`. Two-phase (build all, then
+/// define all) rather than interleaved so the build phase can borrow `module.declarations()` while
+/// the define phase borrows the module `&mut`; byte-identical to the old interleaved loop.
+#[allow(clippy::too_many_arguments)]
+fn define_functions_serial<M: Module>(
+    module: &mut M,
+    program: &Program,
+    interner: &Interner,
+    ptr_ty: Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+    rt: &RtFuncs,
+    ids: &HashMap<Symbol, FuncId>,
+    data_ids: &HashMap<Symbol, DataId>,
+    kernel_ids: &[Vec<FuncId>],
+) -> Result<(), String> {
+    let mut clifs: Vec<(FuncId, cranelift_codegen::ir::Function)> =
+        Vec::with_capacity(program.funcs.len());
+    {
+        let decls = Decls {
+            d: module.declarations(),
+        };
+        let mut fbctx = FunctionBuilderContext::new();
+        for (fi, f) in program.funcs.iter().enumerate() {
+            let mut clif = cranelift_codegen::ir::Function::new();
+            build_function_clif(
+                &decls, f, fi, program, interner, ptr_ty, call_conv, rt, ids, data_ids,
+                kernel_ids, &mut fbctx, &mut clif,
+            )?;
+            clifs.push((ids[&f.name], clif));
+        }
+    }
+    let mut ctx = module.make_context();
+    for (fid, clif) in clifs {
+        ctx.func = clif;
         module
             .define_function(fid, &mut ctx)
-            .map_err(|e| format!("cranelift define `{}`: {e:?}", interner.resolve(f.name)))?;
+            .map_err(|e| format!("cranelift define fn: {e:?}"))?;
         module.clear_context(&mut ctx);
     }
-    Ok(ids)
+    Ok(())
+}
+
+/// Parallel backend: build + compile each function concurrently (independent compilation units,
+/// shared read-only ISA + [`Decls`]), then define them into the object **in source order**. The
+/// object bytes are identical to [`define_functions_serial`] because (a) each function's machine
+/// code is a deterministic function of its CLIF + the ISA (default `ControlPlane`, no chaos), and
+/// (b) `define_function_bytes` records them in the same order with the same declared `FuncId`s.
+/// `WUKONG_PAR_CODEGEN=0` disables this path. Proven equal by `serial_parallel_object_bytes_identical`.
+#[allow(clippy::too_many_arguments)]
+fn define_functions_parallel<M: Module>(
+    module: &mut M,
+    program: &Program,
+    interner: &Interner,
+    ptr_ty: Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+    rt: &RtFuncs,
+    ids: &HashMap<Symbol, FuncId>,
+    data_ids: &HashMap<Symbol, DataId>,
+    kernel_ids: &[Vec<FuncId>],
+) -> Result<(), String> {
+    use cranelift_module::ModuleReloc;
+    use rayon::prelude::*;
+
+    // Each worker owns its FunctionBuilderContext + Cranelift Context; `Decls` and the ISA are shared
+    // immutable borrows of the module (both `Sync`). Produces owned bytes + relocs so nothing borrows
+    // the module past the parallel region.
+    let compiled: Vec<(FuncId, u64, Vec<u8>, Vec<ModuleReloc>)> = {
+        let decls = Decls {
+            d: module.declarations(),
+        };
+        let isa = module.isa();
+        program
+            .funcs
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || (FunctionBuilderContext::new(), cranelift_codegen::Context::new()),
+                |(fbctx, ctx), (fi, f)| -> Result<_, String> {
+                    let fid = ids[&f.name];
+                    ctx.clear();
+                    build_function_clif(
+                        &decls, f, fi, program, interner, ptr_ty, call_conv, rt, ids, data_ids,
+                        kernel_ids, fbctx, &mut ctx.func,
+                    )?;
+                    let mut cp = cranelift_codegen::control::ControlPlane::default();
+                    ctx.compile(isa, &mut cp)
+                        .map_err(|e| format!("cranelift compile fn: {:?}", e.inner))?;
+                    let cc = ctx.compiled_code().unwrap();
+                    let alignment = cc.buffer.alignment as u64;
+                    let bytes = cc.buffer.data().to_vec();
+                    let relocs: Vec<ModuleReloc> = cc
+                        .buffer
+                        .relocs()
+                        .iter()
+                        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, fid))
+                        .collect();
+                    Ok((fid, alignment, bytes, relocs))
+                },
+            )
+            .collect::<Result<Vec<_>, String>>()?
+    };
+
+    for (fid, alignment, bytes, relocs) in compiled {
+        module
+            .define_function_bytes(fid, alignment, &bytes, &relocs)
+            .map_err(|e| format!("cranelift define fn bytes: {e:?}"))?;
+    }
+    Ok(())
 }
 
 /// A JIT-compiled program: holds the executable memory and a pointer to the entry point. Compile
@@ -4037,7 +4262,7 @@ pub fn jit_compile(
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
 
-    let ids = populate_module(&mut module, program, interner)?;
+    let ids = populate_module(&mut module, program, interner, false)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
 
     let entry_fn = program
@@ -4594,7 +4819,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
-    let ids = populate_module(&mut module, program, interner)?;
+    let ids = populate_module(&mut module, program, interner, false)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
     Ok(JitModuleHandle {
         module: Some(module),
@@ -4602,18 +4827,85 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     })
 }
 
+/// Levers that trim `emit_object` compile time **without changing a single emitted byte**. Every
+/// field toggles a check-only or scheduling concern, never the machine code: the differential suite
+/// and the serial-vs-parallel byte-identity test (`tests.rs`) pin that invariant.
+#[derive(Clone, Copy)]
+struct EmitOptions {
+    /// Run the Cranelift IR verifier (diagnostic-only; see [`default_verify`]).
+    verify: bool,
+    /// Compile the user functions concurrently, then define them into the object in source order.
+    /// Byte-identical to serial because each function is an independent compilation unit and the
+    /// object is assembled in the same deterministic order either way (see [`default_parallel`]).
+    parallel: bool,
+}
+
+impl EmitOptions {
+    /// The shipping configuration: verifier per [`default_verify`], parallelism per
+    /// [`default_parallel`].
+    fn production() -> Self {
+        EmitOptions {
+            verify: default_verify(),
+            parallel: default_parallel(),
+        }
+    }
+}
+
+/// Wall-time split of `emit_object`, exposed by [`emit_object_timed`] so `compile-profile` can report
+/// Cranelift codegen (isel/regalloc/machine-code emit) separately from object-container
+/// serialization — the two halves the `codegen+obj` stage previously lumped together.
+pub struct ObjTimings {
+    /// ISA/module setup + `populate_module`: declaration, per-function instruction selection,
+    /// register allocation, and machine-code emission.
+    pub codegen: std::time::Duration,
+    /// `ObjectModule::finish` + `ObjectProduct::emit`: writing the machine code, relocations, and
+    /// symbol table into the COFF/ELF container.
+    pub object_write: std::time::Duration,
+}
+
 /// Compile `program` to a native object file (bytes) for the host target. The runtime symbols are
 /// left as undefined imports for the linker to resolve against a small C runtime.
 pub fn emit_object(program: &Program, interner: &Interner) -> Result<Vec<u8>, String> {
-    use cranelift_object::{ObjectBuilder, ObjectModule};
+    emit_object_ex(program, interner, EmitOptions::production()).map(|(bytes, _)| bytes)
+}
 
-    let isa = make_isa(true)?;
+/// As [`emit_object`], but also returns the codegen-vs-object-write [`ObjTimings`] split. The bytes
+/// are identical to `emit_object`; only measurement is added.
+pub fn emit_object_timed(
+    program: &Program,
+    interner: &Interner,
+) -> Result<(Vec<u8>, ObjTimings), String> {
+    emit_object_ex(program, interner, EmitOptions::production())
+}
+
+fn emit_object_ex(
+    program: &Program,
+    interner: &Interner,
+    opts: EmitOptions,
+) -> Result<(Vec<u8>, ObjTimings), String> {
+    use cranelift_object::{ObjectBuilder, ObjectModule};
+    use std::time::Instant;
+
+    let t_cg = Instant::now();
+    let isa = make_isa_verify(true, opts.verify)?;
     let builder = ObjectBuilder::new(isa, "wukong", cranelift_module::default_libcall_names())
         .map_err(|e| e.to_string())?;
     let mut module = ObjectModule::new(builder);
-    populate_module(&mut module, program, interner)?;
+    populate_module(&mut module, program, interner, opts.parallel)?;
+    let codegen = t_cg.elapsed();
+
+    let t_ow = Instant::now();
     let product = module.finish();
-    product.emit().map_err(|e| e.to_string())
+    let bytes = product.emit().map_err(|e| e.to_string())?;
+    let object_write = t_ow.elapsed();
+
+    Ok((
+        bytes,
+        ObjTimings {
+            codegen,
+            object_write,
+        },
+    ))
 }
 
 #[cfg(test)]

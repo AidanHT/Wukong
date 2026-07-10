@@ -4780,3 +4780,379 @@ fn parallel_head_region_matches_interpreter() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Backend compile-time levers: byte-identity gates
+//
+// Every `emit_object` compile-time lever (IR verifier on/off, serial vs parallel per-function
+// codegen) MUST leave the emitted object bytes bit-for-bit identical. These tests pin that: they
+// compile multi-function programs (parallel codegen only engages with >1 function) every which way
+// and diff the raw object bytes. If any of these ever fails, a lever changed observable output and
+// must not ship.
+// ---------------------------------------------------------------------------------------------------
+
+/// Full front-end + `-O2` to an optimized MIR program (+ its interner) for the byte-identity gates.
+fn program_o2(src: &str) -> (wukong_mir::Program, Interner) {
+    let mut interner = Interner::new();
+    let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+    assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
+    let (sema, sd) = wukong_sema::check(&module, &interner);
+    assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+    let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+    wukong_opt::optimize(&mut program, 2);
+    (program, interner)
+}
+
+/// A handful of multi-function programs with calls, statics (string literals), recursion, and a
+/// recognized GEMM kernel — so relocations, imported symbols, and vector kernels are all exercised.
+/// The two `examples/*.wk` models compile to two functions each (parallel path engages).
+const BYTE_ID_SRCS: &[&str] = &[
+    // Calls + recursion + a string static.
+    r#"
+fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+fn twice(n: i64) -> i64 { return n + n; }
+fn main() {
+    let a: i64 = fib(10);
+    let b: i64 = twice(a);
+    println("fib+twice:");
+    print(b);
+}
+"#,
+    // Two helpers feeding main; mixed float/int arithmetic.
+    r#"
+fn sq(x: f64) -> f64 { return x * x; }
+fn poly(x: f64) -> f64 { return sq(x) + sq(x) * x - 1.0; }
+fn main() { let r: f64 = poly(3.0); print(r); }
+"#,
+    include_str!("../../../examples/gpt2.wk"),
+    include_str!("../../../examples/llama_block.wk"),
+    include_str!("../../../examples/gemm.wk"),
+];
+
+#[test]
+fn serial_parallel_object_bytes_identical() {
+    for (i, src) in BYTE_ID_SRCS.iter().enumerate() {
+        let (program, interner) = program_o2(src);
+        let serial = crate::emit_object_ex(
+            &program,
+            &interner,
+            crate::EmitOptions { verify: false, parallel: false },
+        )
+        .unwrap_or_else(|e| panic!("src {i} serial: {e}"))
+        .0;
+        let parallel = crate::emit_object_ex(
+            &program,
+            &interner,
+            crate::EmitOptions { verify: false, parallel: true },
+        )
+        .unwrap_or_else(|e| panic!("src {i} parallel: {e}"))
+        .0;
+        assert_eq!(
+            serial, parallel,
+            "src {i}: parallel per-function codegen changed the object bytes ({} vs {} bytes)",
+            serial.len(),
+            parallel.len()
+        );
+    }
+}
+
+#[test]
+fn verifier_toggle_object_bytes_identical() {
+    for (i, src) in BYTE_ID_SRCS.iter().enumerate() {
+        let (program, interner) = program_o2(src);
+        let verified = crate::emit_object_ex(
+            &program,
+            &interner,
+            crate::EmitOptions { verify: true, parallel: false },
+        )
+        .unwrap_or_else(|e| panic!("src {i} verify: {e}"))
+        .0;
+        let unverified = crate::emit_object_ex(
+            &program,
+            &interner,
+            crate::EmitOptions { verify: false, parallel: false },
+        )
+        .unwrap_or_else(|e| panic!("src {i} noverify: {e}"))
+        .0;
+        assert_eq!(
+            verified, unverified,
+            "src {i}: disabling the IR verifier changed the object bytes"
+        );
+    }
+}
+
+/// Determinism: the parallel path must emit identical bytes on every run (worker scheduling must not
+/// leak into output). Compile the same program several times in parallel and diff.
+#[test]
+fn parallel_object_bytes_deterministic() {
+    let (program, interner) = program_o2(include_str!("../../../examples/gpt2.wk"));
+    let first = crate::emit_object_ex(
+        &program,
+        &interner,
+        crate::EmitOptions { verify: false, parallel: true },
+    )
+    .unwrap()
+    .0;
+    for _ in 0..8 {
+        let again = crate::emit_object_ex(
+            &program,
+            &interner,
+            crate::EmitOptions { verify: false, parallel: true },
+        )
+        .unwrap()
+        .0;
+        assert_eq!(first, again, "parallel codegen produced nondeterministic object bytes");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Backend compile-time A/B harness (ignored; run in RELEASE with --nocapture).
+//
+//   cargo test -p wukong_codegen_cranelift --release -- --ignored --nocapture backend_compile_ab
+//
+// Same-run interleaved best-of-N ratios only (this laptop's clock is not reportable in absolutes; a
+// ratio measured A/B/A/B adjacently survives clock/thermal drift). Reports, over the corpus:
+//   * verifier off vs on  (the config-audit lever)
+//   * parallel vs serial per-function codegen  (the big lever)
+//   * the codegen-vs-object-write split (attack 3) and the object-container floor (attack 6)
+// It also re-asserts byte-identity per file, so it doubles as a corpus-wide gate.
+// ---------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+fn corpus_files() -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let mut out = Vec::new();
+    for dir in ["tests/run", "examples", "bench/kernels"] {
+        if let Ok(rd) = std::fs::read_dir(root.join(dir)) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("wk") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Best-of-N minimum wall time of `run`, ~`budget_ms` total, min 5 reps. The minimum is the run least
+/// perturbed by scheduler noise.
+#[cfg(test)]
+fn best_of_ms(budget_ms: u64, mut run: impl FnMut() -> std::time::Duration) -> f64 {
+    use std::time::Instant;
+    run();
+    let mut best = f64::MAX;
+    let start = Instant::now();
+    let mut reps = 0u32;
+    loop {
+        best = best.min(run().as_secs_f64() * 1e3);
+        reps += 1;
+        if reps >= 5 && start.elapsed().as_millis() as u64 >= budget_ms {
+            break;
+        }
+        if reps >= 400 {
+            break;
+        }
+    }
+    best
+}
+
+#[test]
+#[ignore]
+fn backend_compile_ab() {
+    use std::time::{Duration, Instant};
+
+    let files = corpus_files();
+    // Compile the front-end once per file; hold the optimized programs in memory so the A/B times
+    // only the backend.
+    let mut progs: Vec<(String, wukong_mir::Program, Interner)> = Vec::new();
+    let mut multi = 0usize;
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // Skip files that don't cleanly reach an object (mirrors compile-profile).
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut interner = Interner::new();
+            let (m, pd) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
+            if pd.iter().any(|d| d.is_error()) {
+                return None;
+            }
+            let (s, sd) = wukong_sema::check(&m, &interner);
+            if sd.iter().any(|d| d.is_error()) {
+                return None;
+            }
+            let (mut p, ld) = wukong_mir_build::lower_program(&m, &s, &mut interner);
+            if ld.iter().any(|d| d.is_error()) {
+                return None;
+            }
+            wukong_opt::optimize(&mut p, 2);
+            crate::emit_object_ex(&p, &interner, crate::EmitOptions { verify: false, parallel: false })
+                .ok()?;
+            Some((p, interner))
+        }))
+        .ok()
+        .flatten();
+        if let Some((p, interner)) = ok {
+            if p.funcs.len() > 1 {
+                multi += 1;
+            }
+            progs.push((
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                p,
+                interner,
+            ));
+        }
+    }
+
+    let ser = crate::EmitOptions { verify: false, parallel: false };
+    let ver = crate::EmitOptions { verify: true, parallel: false };
+    let par = crate::EmitOptions { verify: false, parallel: true };
+    let emit = |p: &wukong_mir::Program, i: &Interner, o: crate::EmitOptions| {
+        crate::emit_object_ex(p, i, o).unwrap()
+    };
+
+    // Geomean accumulators (sum of ln ratio).
+    let (mut ln_ver, mut ln_par, mut n_ver, mut n_par) = (0.0f64, 0.0f64, 0u32, 0u32);
+    let mut tot_cg = Duration::ZERO;
+    let mut tot_ow = Duration::ZERO;
+    let mut tot_obj = 0usize;
+    let mut n_funcs = 0usize;
+
+    // Per-file heavy table.
+    struct Row {
+        name: String,
+        funcs: usize,
+        obj: usize,
+        ver_ratio: f64,
+        par_ratio: f64,
+        ow_share: f64,
+        base_ms: f64,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+
+    for (name, p, i) in &progs {
+        // Byte-identity gate (corpus-wide).
+        let b_ser = emit(p, i, ser).0;
+        let b_ver = emit(p, i, ver).0;
+        let b_par = emit(p, i, par).0;
+        assert_eq!(b_ser, b_ver, "{name}: verifier changed bytes");
+        assert_eq!(b_ser, b_par, "{name}: parallel changed bytes");
+        tot_obj += b_ser.len();
+        n_funcs += p.funcs.len();
+
+        // codegen vs object-write split (verify off = shipping config).
+        let t = emit(p, i, ser).1;
+        tot_cg += t.codegen;
+        tot_ow += t.object_write;
+
+        // A/B: verifier ON vs OFF, adjacent best-of.
+        let t_ver = best_of_ms(30, || {
+            let s = Instant::now();
+            let _ = crate::emit_object_ex(p, i, ver);
+            s.elapsed()
+        });
+        let t_ser = best_of_ms(30, || {
+            let s = Instant::now();
+            let _ = crate::emit_object_ex(p, i, ser);
+            s.elapsed()
+        });
+        // A/B: parallel vs serial (verify off), adjacent best-of.
+        let t_par = best_of_ms(30, || {
+            let s = Instant::now();
+            let _ = crate::emit_object_ex(p, i, par);
+            s.elapsed()
+        });
+        let t_ser2 = best_of_ms(30, || {
+            let s = Instant::now();
+            let _ = crate::emit_object_ex(p, i, ser);
+            s.elapsed()
+        });
+
+        let ver_ratio = t_ser / t_ver; // <1 means verify-off is faster (ser faster than ver)
+        let par_ratio = t_par / t_ser2; // <1 means parallel faster
+        ln_ver += (t_ver / t_ser).ln();
+        n_ver += 1;
+        ln_par += (t_ser2 / t_par).ln();
+        n_par += 1;
+        let ow_share = t.object_write.as_secs_f64()
+            / (t.codegen.as_secs_f64() + t.object_write.as_secs_f64()).max(1e-12);
+        rows.push(Row {
+            name: name.clone(),
+            funcs: p.funcs.len(),
+            obj: b_ser.len(),
+            ver_ratio,
+            par_ratio,
+            ow_share,
+            base_ms: t_ser2,
+        });
+    }
+
+    // ISA-build fixed cost (attack 1: is the ISA worth caching across emit_object calls?).
+    let t_isa = best_of_ms(200, || {
+        let s = Instant::now();
+        let _ = crate::make_isa_verify(true, false).unwrap();
+        s.elapsed()
+    });
+    // A representative small single-function file's full backend time, to size the ISA share of the
+    // fixed floor.
+    let small_ms = rows
+        .iter()
+        .filter(|r| r.funcs == 1)
+        .map(|r| r.base_ms)
+        .fold(f64::MAX, f64::min);
+    println!(
+        "ISA build (make_isa) fixed cost: {t_isa:.4} ms  |  smallest 1-func backend: {small_ms:.4} ms  => ISA is {:.1}% of that floor",
+        100.0 * t_isa / small_ms.max(1e-9)
+    );
+
+    let g_ver = (ln_ver / n_ver.max(1) as f64).exp(); // verify-on / verify-off (>1 = verifier costs)
+    let g_par = (ln_par / n_par.max(1) as f64).exp(); // serial / parallel (>1 = parallel wins)
+    println!("\n================ backend compile A/B (same-run best-of-N ratios) ================");
+    println!(
+        "corpus: {} programs ({} multi-function), {} total funcs, {} object bytes",
+        progs.len(),
+        multi,
+        n_funcs,
+        tot_obj
+    );
+    println!(
+        "codegen vs object-write (verify off): codegen {:.1}% | object-write {:.1}%  (obj-write is the COFF-container floor)",
+        100.0 * tot_cg.as_secs_f64() / (tot_cg + tot_ow).as_secs_f64(),
+        100.0 * tot_ow.as_secs_f64() / (tot_cg + tot_ow).as_secs_f64(),
+    );
+    println!(
+        "VERIFIER lever  (geomean verify-on / verify-off): {:.3}x   => disabling it is {:.1}% faster",
+        g_ver,
+        100.0 * (1.0 - 1.0 / g_ver)
+    );
+    println!(
+        "PARALLEL lever  (geomean serial / parallel):      {:.3}x   => parallel is {:.1}% faster",
+        g_par,
+        100.0 * (1.0 - 1.0 / g_par)
+    );
+
+    rows.sort_by(|a, b| b.base_ms.partial_cmp(&a.base_ms).unwrap());
+    println!(
+        "\n{:<26} {:>5} {:>7} {:>9} {:>9} {:>9} {:>10}",
+        "heaviest file", "funcs", "obj", "base(ms)", "ver x", "par x", "objwr%"
+    );
+    println!("{}", "-".repeat(80));
+    for r in rows.iter().take(14) {
+        println!(
+            "{:<26} {:>5} {:>7} {:>9.3} {:>9.3} {:>9.3} {:>9.1}%",
+            r.name,
+            r.funcs,
+            r.obj,
+            r.base_ms,
+            r.ver_ratio,
+            r.par_ratio,
+            100.0 * r.ow_share
+        );
+    }
+    println!("(ver x = serial/verify: <1 verifier-off faster; par x = parallel/serial: <1 parallel faster)");
+}
