@@ -842,6 +842,19 @@ fn use_nt(n: usize, streams: usize) -> bool {
     streams.saturating_mul(n).saturating_mul(4) >= NT_MIN_BYTES
 }
 
+/// Unroll-factor A/B knob for the elementwise dispatch loop below. Default (unset / anything but
+/// `6`) keeps the shipped ×4 body; `MERCURY_VMATH_UNROLL=6` selects the ×6 (48-elem) variant so the
+/// central measurement pass can probe whether six independent load→poly→store chains fill the FMA-port
+/// out-of-order window better on a throttled clock — or whether the wider live set spills past the 16
+/// ymm registers. Read once, process-wide (the same `OnceLock` discipline the GEMM env knobs use); the
+/// two bodies run the identical `f` per lane, so the output is bit-for-bit identical either way.
+#[cfg(target_arch = "x86_64")]
+fn vmath_unroll6() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("MERCURY_VMATH_UNROLL").is_ok_and(|v| v == "6"))
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
@@ -882,6 +895,27 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
     // live set keeps the ×4 window inside the 16 ymm registers where four 8-deep Horner chains
     // spilled. Every lane still runs the identical `f`, and these are pure elementwise ops with no
     // cross-lane/cross-vector state, so the output is bit-for-bit identical to the one-at-a-time loop.
+    //
+    // ×6 A/B variant (gated by `MERCURY_VMATH_UNROLL=6`, default off): six independent chains, 48
+    // elems/step. Runs ahead of the ×4 body; whatever it leaves (`n % 48`, still ≥ 32 possible) the ×4
+    // body mops up, then the ×8 remainder and scalar tail — so the result is identical for any `n`.
+    if vmath_unroll6() {
+        while i + 48 <= n {
+            let r0 = f(_mm256_loadu_ps(x.add(i)));
+            let r1 = f(_mm256_loadu_ps(x.add(i + 8)));
+            let r2 = f(_mm256_loadu_ps(x.add(i + 16)));
+            let r3 = f(_mm256_loadu_ps(x.add(i + 24)));
+            let r4 = f(_mm256_loadu_ps(x.add(i + 32)));
+            let r5 = f(_mm256_loadu_ps(x.add(i + 40)));
+            store!(out.add(i), r0);
+            store!(out.add(i + 8), r1);
+            store!(out.add(i + 16), r2);
+            store!(out.add(i + 24), r3);
+            store!(out.add(i + 32), r4);
+            store!(out.add(i + 40), r5);
+            i += 48;
+        }
+    }
     while i + 32 <= n {
         let r0 = f(_mm256_loadu_ps(x.add(i)));
         let r1 = f(_mm256_loadu_ps(x.add(i + 8)));
