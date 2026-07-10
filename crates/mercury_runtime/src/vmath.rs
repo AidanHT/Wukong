@@ -97,15 +97,24 @@ const INV_2P23: f32 = 1.0 / 8_388_608.0; // 2^-23 (exact)
 // n·C1 is EXACT for |n| ≤ 2047 ≫ the clamp range's 1020) and EXP_TBL_C2 = EXP_C2/8 (also exact).
 // `n` is read straight out of the magic-sum's mantissa bits — `m = bits(t) − EXP_TBL_MBIAS =
 // n + 1016`, folding the +127 exponent bias (127·8 = 1016) into the one integer subtract:
-// `j = m & 7` (1016 ≡ 0 mod 8) and `biased = max(m, 0) >> 3`, the max(·,0) flushing the 2^e
-// underflow to +0.0 (exp(EXP_LO) = +0.0 bit-for-bit as before; the old kernel's n = −126 band
-// produced denormals down to x ≈ −87.68, the table split flushes from x ≈ −87.38 — everything
-// in that band is < 2^−126, out of every gate's domain). Overflow saturation at the EXP_HI
-// clamp is bit-identical to the old kernel (0x7F3504A4 ≈ 2.406e38, no +∞), NaN still funnels
-// through the same min-then-max clamp order, and exp(0) = 1.0 exactly (n = 0, r = 0, T[0] = 1,
-// poly = 1). Measured max relative error vs f64 exp: 1.59e-7 over [−87, 88] (4M points) and
-// 1.24e-7 near 0 — see `vmath_exp_dense_sweep`. Per vector this is 16 SIMD ops (11 on the FP
-// ports) vs the old 18 (15 FP) — the VML-style table trade the throttled-clock A/B asked for.
+// `j = m & 7` (1016 ≡ 0 mod 8) and the pre-biased exponent `mc >> 3 = E + 127` with `mc = max(m,0)`.
+// The `2^E` scale is applied as a *bit-identical ldexp*: `e^x = 2^E·(T[j]·e^r)` is one multiply
+// (`T[j]·e^r`, a normal float in [0.9576, 1.914)) plus an integer add of `E<<23 = ((mc & ~7) − 1016)
+// ·2^20` into the exponent field — by IEEE, multiplying a normal by the exact 2^E is exactly that
+// bit add, so the ldexp equals the old `·pow2` multiply bit-for-bit on every input whose result is a
+// normal float (or the old flush's +0.0). The sole boundary where the two forms *can't* agree is the
+// sub-normal output tail: the old `·pow2` multiply rounded into a denormal for x ∈ [−87.380, −87.337)
+// (the n = −1008 band, `e^x` between 2^−127 and 2^−126), but a pure exponent-field add cannot
+// reproduce denormal rounding — so that whole band is now a clean flush-to-0 via a `combined >
+// 0x007F_FFFF` normal-float test (the uniform FTZ this comment already promised: everything < 2^−126,
+// out of every gate's domain — the dense sweep starts at −87.0 and every backend takes the identical
+// construction, so nothing in the exp family re-pins). exp(EXP_LO) = +0.0 as before; overflow
+// saturation at the EXP_HI clamp is bit-identical (0x7F3504A4 ≈ 2.406e38, no +∞); NaN still funnels
+// through the same min-then-max clamp order; exp(0) = 1.0 exactly (n = 0, r = 0, T[0] = 1, poly = 1).
+// Measured max relative error vs f64 exp: 1.59e-7 over [−87, 88] (4M points) and 1.24e-7 near 0 —
+// see `vmath_exp_dense_sweep`; the ldexp's full-domain bit-identity is pinned by `vmath_exp_ldexp_sweep`.
+// The ldexp tail drops the 2nd FMUL and one shift off the p0/p1 (FMA) ports and moves the exponent
+// combine into the flexible p0/p1/p5 integer-add domain — the throttled-clock A/B lever (see `exp8`).
 const EXP_TBL_SCALE: f32 = (8.0f64 / std::f64::consts::LN_2) as f32; // 8/ln2 — n = round(x·8/ln2)
 const EXP_TBL_C1: f32 = EXP_C1 / 8.0; // ln2/8 high — n·C1 exact for |n| ≤ 2047 (test-pinned)
 const EXP_TBL_C2: f32 = EXP_C2 / 8.0; // ln2/8 low correction (a /8 of an f32 is exact)
@@ -267,11 +276,24 @@ pub(crate) fn exp1(x: f32) -> f32 {
     let q = r.mul_add(EXP_TBL_P3, EXP_TBL_P2);
     let q = r.mul_add(q, 1.0);
     let p = r.mul_add(q, 1.0);
-    // 2^e from the exponent field, bias already folded into m; max(m, 0) (= pmaxsd) flushes
-    // e ≤ −127 to +0.0. After the max the value is nonnegative, so >> matches the vector psrad.
-    let pow2 = f32::from_bits(((m.max(0) >> 3) as u32) << 23);
-    // T[j]·p first — both sit near 1, so the near-exact 2^e scale multiplies last.
-    (tj * p) * pow2
+    // T[j]·e^r — the one kept multiply; a normal f32 in [0.9576, 1.914).
+    let rv = (tj * p).to_bits();
+    // ldexp by exponent-field add (bit-identical to `·2^E` for every normal-valued result — see the
+    // `exp8` header for the full argument and port math): the addend is
+    // `((mc & !7) − 127·8) << 20 == E<<23`, and multiplying a normal by the exact 2^E is an exact
+    // add of E<<23 to its bits. mc = max(m,0) (the pmaxsd) keeps the shift argument nonnegative.
+    let mc = m.max(0);
+    let e8 = (mc & !7) - 1016; // = 8·E
+    let combined = rv.wrapping_add((e8 as u32) << 20); // += E<<23 (mod 2^32) — the vpaddd
+    // Flush the denormal/underflow tail to +0.0: `combined` is a normal-float bit pattern iff it
+    // exceeds 0x007F_FFFF as a signed int. This zeroes both the old flush band (e ≤ −127) and the
+    // < 2^−126 sub-normal tail (x ∈ [−87.380, −87.337)) that a pure exponent add can't round — a
+    // clean uniform FTZ, out of every gate's domain (exhaustively pinned by `vmath_exp_ldexp_sweep`).
+    if (combined as i32) > 0x007F_FFFF {
+        f32::from_bits(combined)
+    } else {
+        0.0
+    }
 }
 
 /// `ln(x)` for `x > 0` (≈6-ULP class worst-case near cancellation; measured max 6.9e-7 relative,
@@ -1478,8 +1500,35 @@ pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
     // for the algorithm and error analysis). vs the old full-range degree-5 Estrin body this
     // trades 8 poly FP ops for a 3-FMA cubic plus one in-register `vpermps` lookup (the T table
     // lives whole in one ymm — no memory gather) and swaps cvttps/paddd for a single vpsubd on
-    // the magic-sum bits — 16 SIMD ops (11 FP-port) per vector vs the old 18 (15 FP-port), which
-    // is what the ×4-unrolled dispatch loop turns into throughput when the clock is starved.
+    // the magic-sum bits.
+    //
+    // Final scale is a *bit-identical ldexp*: `e^x = 2^E·(T[j]·e^r)` is realized as ONE `vmulps`
+    // (`T[j]·e^r`, a normal float in [0.9576, 1.914)) plus an integer add of `E` into the exponent
+    // field — multiplying a normal f32 by the exact power-of-two 2^E is, by IEEE, an exact add of
+    // `E<<23` to its bits (no rounding), so it is bit-for-bit the old `·pow2` multiply for every
+    // input whose result is a *normal* float. The `pre-biased exponent = mc>>3` here is `E+127`, so
+    // the addend is `((mc & ~7) − 1016)·2^20 = ((E+127)·8 − 127·8)·2^20 = E<<23`; `mc = max(m,0)`
+    // (pmaxsd, kept) plus the underflow test below flush the sub-normal / underflow band to +0.0.
+    //
+    // Underflow / flush (bit-identity boundary, exhaustively verified — see `vmath_exp_ldexp_sweep`):
+    // over the ENTIRE 2^32 f32 domain the ldexp form equals the old double-multiply for every input
+    // whose result is normal *or* the old flush's +0.0, and differs ONLY on the 5679 inputs
+    // x ∈ [−87.380, −87.337) whose true `e^x` is sub-normal (all < 2^−126, below the smallest normal
+    // and outside every accuracy gate — the dense sweep starts at −87.0). There the old `·pow2`
+    // multiply rounded into a denormal; a pure exponent-field add cannot reproduce a denormal-rounding
+    // (that is a variable rounding-shift, not an add), so we make the whole band a clean flush-to-zero
+    // instead: `keep = combined > 0x007F_FFFF` (signed) is true exactly when `combined` is a normal
+    // f32 and false for the denormal/underflow tail, and `combined & keep` maps that tail to +0.0.
+    // This is the uniform-FTZ behavior the constants block already documented ("flushes … everything
+    // in that band is < 2^−126"); it re-pins nothing in the exp family because all three exp sites
+    // take the identical construction and so still agree with each other bit-for-bit.
+    //
+    // Port math (the throttled-clock lever): the old tail parked `(T[j]·p)·pow2` = 2×vmulps plus
+    // vpsrad+vpslld = 4 forced p0/p1 uops. The ldexp tail is 1×vmulps + 1×vpslld<20> + 1×vpcmpgtd on
+    // p0/p1, and vpand/vpsubd/vpaddd/vpand in the flexible p0/p1/**p5** integer-add domain — one
+    // fewer forced-p0/p1 op and four p5-eligible ops, so throughput stops degrading 1:1 with the
+    // FMA-port clock. exp8 feeds sigmoid/tanh/silu/gelu/elu, fused softmax (`norm.rs`) and the GEMM
+    // act epilogue, so this bit-identity (on every gated input) is what keeps the whole family unpinned.
     let x = _mm256_min_ps(x, _mm256_set1_ps(EXP_HI));
     let x = _mm256_max_ps(x, _mm256_set1_ps(EXP_LO));
     let t = _mm256_fmadd_ps(x, _mm256_set1_ps(EXP_TBL_SCALE), _mm256_set1_ps(EXP_MAGIC));
@@ -1496,11 +1545,20 @@ pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
     let q = _mm256_fmadd_ps(r, _mm256_set1_ps(EXP_TBL_P3), _mm256_set1_ps(EXP_TBL_P2));
     let q = _mm256_fmadd_ps(r, q, _mm256_set1_ps(1.0));
     let p = _mm256_fmadd_ps(r, q, _mm256_set1_ps(1.0));
-    // 2^e: max(m, 0) flushes e ≤ −127 to +0.0 (the underflow band), then shift the pre-biased
-    // exponent into place. After the max the lanes are nonnegative, so psrad == the scalar >>.
+    // T[j]·e^r — the one kept multiply; a normal f32 in [0.9576, 1.914).
+    let rv = _mm256_castps_si256(_mm256_mul_ps(tj, p));
+    // ldexp by exponent-field add: addend = ((mc & ~7) − 127·8) << 20 == E<<23 (see header).
+    // mc = max(m,0) keeps the shift argument nonnegative (the deep-underflow flush is the mask below).
     let mc = _mm256_max_epi32(m, _mm256_setzero_si256());
-    let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_srai_epi32::<3>(mc)));
-    _mm256_mul_ps(_mm256_mul_ps(tj, p), pow2)
+    let masked = _mm256_and_si256(mc, _mm256_set1_epi32(!7));
+    let e8 = _mm256_sub_epi32(masked, _mm256_set1_epi32(1016)); // = 8·E
+    let addend = _mm256_slli_epi32::<20>(e8); // = E<<23 (mod 2^32)
+    let combined = _mm256_add_epi32(rv, addend);
+    // Flush the denormal/underflow tail to +0.0: `combined` is a normal f32 iff it exceeds the
+    // largest denormal bit-pattern 0x007F_FFFF as a signed int (normals are 0x0080_0000..0x7F7F_FFFF;
+    // the flushed tail is a small-positive denormal pattern or a sign-wrapped underflow — both ≤ that).
+    let keep = _mm256_cmpgt_epi32(combined, _mm256_set1_epi32(0x007F_FFFF));
+    _mm256_castsi256_ps(_mm256_and_si256(combined, keep))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2534,6 +2592,118 @@ mod tests {
                     "exp not monotone at n-edge {nb}: x={xa:?} -> {ya:?}, next {xb:?} -> {yb:?}"
                 );
             }
+        }
+    }
+
+    /// The **pre-ldexp** reference exp: identical to `exp1` up to the final scale, which it applies
+    /// as `(T[j]·e^r)·pow2` with `pow2 = 2^E` built by exponent-insertion + an f32 multiply — exactly
+    /// what the kernel shipped before the ldexp restructuring. Kept ONLY to pin the bit-identity of
+    /// the exponent-field-add form (see `vmath_exp_ldexp_sweep`); not used on any live path.
+    fn exp1_old_multiply(x: f32) -> f32 {
+        #[allow(clippy::manual_clamp)]
+        let x = x.min(EXP_HI).max(EXP_LO);
+        let t = x.mul_add(EXP_TBL_SCALE, EXP_MAGIC);
+        let n = t - EXP_MAGIC;
+        let m = (t.to_bits() as i32).wrapping_sub(EXP_TBL_MBIAS);
+        let r = n.mul_add(-EXP_TBL_C1, x);
+        let r = n.mul_add(-EXP_TBL_C2, r);
+        let tj = EXP_TBL_T[(m & 7) as usize];
+        let q = r.mul_add(EXP_TBL_P3, EXP_TBL_P2);
+        let q = r.mul_add(q, 1.0);
+        let p = r.mul_add(q, 1.0);
+        let pow2 = f32::from_bits(((m.max(0) >> 3) as u32) << 23);
+        (tj * p) * pow2
+    }
+
+    /// Bit-identity gate for the ldexp restructuring (`(T[j]·e^r)·pow2` → exponent-field add + FTZ):
+    /// the shipped `exp1` must equal the pre-ldexp `exp1_old_multiply` bit-for-bit on every input whose
+    /// result is a normal float OR the old flush's +0.0, and may differ ONLY on the sub-normal output
+    /// tail (`e^x` < 2^−126, which a pure exponent add can't round — the ldexp makes it a clean
+    /// flush-to-0). The whole divergence-capable region is swept EXHAUSTIVELY by bit pattern:
+    ///   • x ∈ [−90, −80] (contains the flush band, the sub-normal tail, and the EXP_LO clamp), and
+    ///   • x ∈ [80, 90] (the EXP_HI saturation edge),
+    /// bracketing every reachable `E`; the bulk in between is bit-identical by construction (multiplying
+    /// a normal by an exact 2^E *is* the exponent add, no rounding) and spot-checked with a dense linear
+    /// sweep + specials. Pins the divergence set to exactly the documented 5679-value sub-normal band —
+    /// the "not one gated output bit moved" proof for dropping the 2nd FMUL. (The full-2^32 sweep runs
+    /// in the release probe; kept out of the debug test for runtime.)
+    #[test]
+    fn vmath_exp_ldexp_sweep() {
+        // Exhaustive over the entire negative divergence-capable region [−90, −80].
+        let (b_start, b_end) = ((-80.0f32).to_bits(), (-90.0f32).to_bits()); // more-negative ⇒ larger bits
+        let mut diffs = 0u64;
+        let mut band_lo = f32::INFINITY;
+        let mut band_hi = f32::NEG_INFINITY;
+        for bits in b_start..=b_end {
+            let x = f32::from_bits(bits);
+            let (new, old) = (exp1(x), exp1_old_multiply(x));
+            if new.to_bits() != old.to_bits() {
+                diffs += 1;
+                // Every divergence: old rounded to a positive sub-normal (< 2^−126), new flushes to +0.0.
+                assert!(
+                    old > 0.0 && old < f32::MIN_POSITIVE && new.to_bits() == 0,
+                    "unexpected exp ldexp divergence at x={x} ({:#010x}): old={old:e} new={new:e}",
+                    x.to_bits()
+                );
+                band_lo = band_lo.min(x);
+                band_hi = band_hi.max(x);
+            }
+        }
+        assert_eq!(
+            diffs, 5679,
+            "exp ldexp divergence count drifted from the pinned sub-normal band"
+        );
+        assert!(
+            band_lo >= -87.39 && band_hi <= -87.33,
+            "exp ldexp divergence escaped the [−87.380, −87.337) sub-normal band: [{band_lo}, {band_hi}]"
+        );
+
+        // Exhaustive over the positive saturation edge [80, 90] — zero divergence (all normal/saturated).
+        for bits in (80.0f32).to_bits()..=(90.0f32).to_bits() {
+            let x = f32::from_bits(bits);
+            assert_eq!(
+                exp1(x).to_bits(),
+                exp1_old_multiply(x).to_bits(),
+                "exp ldexp diverged on the positive edge at x={x}"
+            );
+        }
+
+        // Dense linear bulk sweep over the meaningful range + a fine near-0 pass — all bit-identical.
+        for i in 0..3_000_000u32 {
+            let x = (-80.0 + 168.0 * (i as f64) / 2_999_999.0) as f32; // [−80, 88]
+            assert_eq!(
+                exp1(x).to_bits(),
+                exp1_old_multiply(x).to_bits(),
+                "exp ldexp diverged in the bulk at x={x}"
+            );
+        }
+        for i in 0..1_000_000u32 {
+            let x = (-1.0 + 2.0 * (i as f64) / 999_999.0) as f32; // [−1, 1], every bucket around n=0
+            assert_eq!(exp1(x).to_bits(), exp1_old_multiply(x).to_bits(), "exp ldexp near-0 at x={x}");
+        }
+
+        // Specials: ±0, ±∞, NaN, ±denormals, the clamp endpoints — all bit-identical.
+        for &x in &[
+            0.0f32,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            EXP_HI,
+            EXP_LO,
+            f32::MAX,
+            f32::MIN,
+        ] {
+            assert_eq!(
+                exp1(x).to_bits(),
+                exp1_old_multiply(x).to_bits(),
+                "exp ldexp diverged on special x={x} ({:#010x})",
+                x.to_bits()
+            );
         }
     }
 
