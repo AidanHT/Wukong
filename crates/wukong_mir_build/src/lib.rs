@@ -18790,9 +18790,6 @@ fn match_row_col(idx: &Expr, row: Symbol, interner: &Interner) -> Option<(Dim, S
     None
 }
 
-/// Flatten the additive terms of `e`, recursing only through `+`. `i*K + k + h*S*D` yields the three
-/// terms `[i*K, k, h*S*D]` (left-association is irrelevant). Used to peel a batch/base offset off a
-/// flattened tensor index.
 /// One recorded access (read or write) to a captured array inside a candidate `@parallel` region.
 struct RegionAccess<'a> {
     /// The flat index expression; `None` for an opaque access (whole-array read, multi-index).
@@ -19142,6 +19139,9 @@ fn flatten_scaled_terms<'a>(
     true
 }
 
+/// Flatten the additive terms of `e`, recursing only through `+`. `i*K + k + h*S*D` yields the three
+/// terms `[i*K, k, h*S*D]` (left-association is irrelevant). Used to peel a batch/base offset off a
+/// flattened tensor index.
 fn flatten_add_terms<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     if let ExprKind::Binary {
         op: ast::BinOp::Add,
