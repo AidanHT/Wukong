@@ -69,6 +69,13 @@ pub(crate) struct Syms {
     /// parallel kernel), while the hand-built tape tests use the serial one — the tape accepts both.
     pub sreduce_parallel: Symbol,
     pub velem: Symbol,
+    /// The `@parallel` streaming map — same `(x, y, out, n, a, b, c, op)` ABI and bit-identical
+    /// (elementwise, no cross-chunk combine) result as the serial `velem`, so it differentiates
+    /// through the very same rule. A residual-add / saxpy inside a `@parallel fn` lowers to *this*
+    /// symbol (mir_build's `emit_velem_call` selects it when `parallel_fn`), while single-statement /
+    /// non-parallel tapes use the serial one — the tape accepts both. Without this the backward pass of
+    /// every `@parallel`-fn velem loop would fail with an unrecognized-buffer-writing-call error.
+    pub velem_parallel: Symbol,
     /// The two-input transcendental kernel; the tape emits its `*_BWD` op codes for the smooth
     /// activation backwards (`dx = dy · act'(x)` in one fused pass).
     pub vmath2: Symbol,
@@ -85,6 +92,7 @@ impl Syms {
             sreduce: it.intern("mercury_sreduce_f32"),
             sreduce_parallel: it.intern("mercury_sreduce_f32_parallel"),
             velem: it.intern("mercury_velem_f32"),
+            velem_parallel: it.intern("mercury_velem_f32_parallel"),
             vmath2: it.intern("mercury_vmath2_f32"),
             norm: it.intern("mercury_norm_f32"),
         }
@@ -123,6 +131,7 @@ impl<'a> Vjp<'a> {
             || func == self.syms.sreduce
             || func == self.syms.sreduce_parallel
             || func == self.syms.velem
+            || func == self.syms.velem_parallel
             || func == self.syms.norm
     }
 
@@ -169,7 +178,7 @@ impl<'a> Vjp<'a> {
             self.diff_sgemm_nt(args)
         } else if func == self.syms.vmath {
             self.diff_vmath(args)
-        } else if func == self.syms.velem {
+        } else if func == self.syms.velem || func == self.syms.velem_parallel {
             self.diff_velem(args)
         } else if func == self.syms.norm {
             self.diff_norm(args)
