@@ -140,6 +140,21 @@ fn gemm_2d() -> bool {
     *V.get_or_init(|| !std::env::var("MERCURY_GEMM_2D").is_ok_and(|v| v == "0"))
 }
 
+/// The **shared-pack** variant of the 2D block path ([`sgemm_2d_shared`]) is the DEFAULT: it keeps
+/// the 2D grid's per-thread L2-resident C blocks but packs each K-block's A/B panels ONCE into
+/// caller-owned shared buffers (one cooperative pack region per `pc`), where the per-block path
+/// ([`sgemm_2d_blocks`]) re-packs every A element `nbj` times and every B element `nbi` times —
+/// e.g. 512³ → an 11×6 grid packs A 6× and B 11× (~17 MiB copied vs the ~2 MiB minimum), and a
+/// skinny 128×3072×768 packs ~80 MiB for 604 MFLOP. `MERCURY_GEMM_2D_SHARED=0` (read once) opts
+/// OUT to the per-block-packing path, keeping the win adjacent-run-measurable — the same
+/// instrument discipline as `MERCURY_GEMM_2D` / `MERCURY_GEMM_FORKJOIN`.
+#[cfg(target_arch = "x86_64")]
+fn gemm_2d_shared() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::var("MERCURY_GEMM_2D_SHARED").is_ok_and(|v| v == "0"))
+}
+
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
 /// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
 /// returns, so the pointers outlive the call — identical to the lifetime discipline of the kernel's
@@ -411,16 +426,22 @@ unsafe fn gemm_dispatch(
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
                 match (par, gemm_pool()) {
-                    // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path
-                    // (`sgemm_2d_blocks` — per-thread L2-resident C blocks, per-worker packing, no
-                    // barriers; the measured ~1.25–1.65× mid-size win, see `gemm_2d`).
-                    // `MERCURY_GEMM_2D=0` opts out to the persistent-broadcast-region shape
-                    // (`sgemm_persistent_region`), and `MERCURY_GEMM_FORKJOIN=1` further routes to
-                    // the legacy fork-join shape — both retained as adjacent-run A/B instruments.
+                    // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path with SHARED
+                    // cooperative packing (`sgemm_2d_shared` — per-thread L2-resident C blocks over
+                    // A/B panels packed once per K-block; see `gemm_2d_shared`).
+                    // `MERCURY_GEMM_2D_SHARED=0` opts out to the per-block-packing 2D shape
+                    // (`sgemm_2d_blocks`), `MERCURY_GEMM_2D=0` to the persistent-broadcast-region
+                    // shape (`sgemm_persistent_region`), and `MERCURY_GEMM_FORKJOIN=1` further
+                    // routes to the legacy fork-join shape — all retained as adjacent-run A/B
+                    // instruments.
                     (true, pool) => {
                         let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
                         if gemm_2d() {
-                            sgemm_2d_blocks(pool, args);
+                            if gemm_2d_shared() {
+                                sgemm_2d_shared(pool, args);
+                            } else {
+                                sgemm_2d_blocks(pool, args);
+                            }
                         } else if gemm_forkjoin() {
                             match pool {
                                 // Legacy: run the whole fork-join kernel inside the private pool so
@@ -1317,6 +1338,19 @@ thread_local! {
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
+// Reusable CALLER-side pack scratch for the shared-pack 2D path: the calling thread owns one
+// (A, B) buffer pair holding the whole-matrix packed panels of the current K-block, shared
+// read-only by every worker (pack writes are ordered before compute reads by the phase join —
+// see `sgemm_2d_shared`). Same take/put-back discipline as `PACK_SCRATCH`; a separate
+// thread-local keeps the shared and per-block paths' buffer sizing independent so either can be
+// A/B-selected without resizing churn. The packers fully overwrite every element they own (real
+// data + edge-padding zeros), so reuse needs no re-zeroing.
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static PACK_SCRATCH_2D_SHARED: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 /// Block-shape policy for the 2D block-parallel path: pick `(BM, BN)` — the C-block height/width —
 /// for an `m×n` output on an `nworkers`-thread pool. **The one tunable of the 2D path**; pure, so
 /// an A/B sweep can retune it without touching the kernel.
@@ -1351,8 +1385,10 @@ fn select_2d_block_shape(m: usize, n: usize, nworkers: usize) -> (usize, usize) 
     *CANDIDATES.last().unwrap()
 }
 
-/// The **BLIS/MKL-style 2D block-parallel** GEMM (opt-in via `MERCURY_GEMM_2D=1` — see
-/// [`gemm_2d`]; default OFF, shipped path untouched).
+/// The **BLIS/MKL-style 2D block-parallel** GEMM with per-block packing (the
+/// `MERCURY_GEMM_2D_SHARED=0` instrument path — see [`gemm_2d_shared`]; the default routes to
+/// [`sgemm_2d_shared`], which hoists the redundant per-block packs into shared per-K-block
+/// buffers, keeping this shape intact as its adjacent-run A/B baseline).
 ///
 /// **Why this exists.** The shipped parallel decomposition splits C by MR=6-row panels: every
 /// worker streams the ENTIRE shared packed B panel from L3 on every K-block — 16 workers
@@ -1511,6 +1547,150 @@ unsafe fn sgemm_2d_block(
         macro_kernel(bm, bn, kc, ap, bp, c.add(i0 * n + j0), n, beta_eff, block_epi);
         pc += kc;
     }
+}
+
+/// The **shared-pack 2D block-parallel** GEMM — the DEFAULT parallel path (see
+/// [`gemm_2d_shared`]; `MERCURY_GEMM_2D_SHARED=0` opts out to [`sgemm_2d_blocks`]).
+///
+/// **Why this exists.** The per-block 2D path re-packs each K-block's operands per C block: every
+/// A element is packed once per block *column* (`nbj`×) and every B element once per block *row*
+/// (`nbi`×). Measured grids: 512³ → (48,96) → 11×6 (A 6×, B 11×; ~17 MiB packed vs the ~2 MiB
+/// minimum); 1024³ → (144,192) → 8×6 (56 vs 8 MiB); 128×768×768 → 6×16 (A 16×, B 6× — packing a
+/// plausible 30–50% of the call); 128×3072×768 → A 16× + B 6× ≈ 80 MiB packed for 604 MFLOP.
+/// This path keeps the 2D grid's per-thread L2-resident C blocks but packs each K-block's
+/// whole-matrix A/B panels ONCE:
+///
+/// * The K loop runs sequentially (ascending `pc`, [`select_kc`] groups) inside ONE
+///   `pool.install`. Per K-block, phase 1 packs the full `m×kc` A and `n×kc` B panels
+///   cooperatively via [`pack_ab_par`] (the fused A+B rayon region, `jc = 0` / `nc = n`, with its
+///   serial small-pack fallback) into caller-owned shared buffers ([`PACK_SCRATCH_2D_SHARED`]);
+///   phase 2 is one rayon task per `BM×BN` C block, each pointed at its slice of the shared
+///   packs. Both phases are synchronous `for_each` regions, so every pack write happens-before
+///   every compute read (the implicit join) — no barriers, no phase counters.
+/// * A block's slice of the shared pack is CONTIGUOUS: `BM`/`BN` are MR/NR multiples
+///   ([`select_2d_block_shape`]), so block row `bi`'s A micropanels are exactly global panels
+///   `bi·BM/MR ..` at `ap + (bi·BM/MR)·MR·kc` and block column `bj`'s B panels are global panels
+///   `bj·BN/NR ..` at `bp + (bj·BN/NR)·NR·kc` — [`macro_kernel`] runs on those offsets unchanged.
+///
+/// **Bit-exactness (the hard invariant).** The per-block path's argument, with the pack hoisted:
+/// the shared buffers hold the SAME BYTES `pack_a`/`pack_b_block` produce per block (same
+/// `pack_a_panel`/`pack_b_panel`/`pack_b_trans_panel` on the same sources; interior block
+/// boundaries are micropanel boundaries, so zero-padding occurs only at the true matrix edge —
+/// exactly where the serial full-panel pack pads). Each C element is accumulated by exactly one
+/// owner per K-block, over the same [`select_kc`] groups in ascending `pc`, with
+/// `beta_eff = if pc == 0 { beta } else { 1.0 }`, the epilogue folded on the final K-block only
+/// and shifted to the block's global column origin (the serial `shift` discipline), through the
+/// same [`micro_6x16`]. Serial == shared-2D bit-for-bit REGARDLESS of block shape (pinned by
+/// `sgemm_2d_shared_matches_serial`).
+///
+/// # Safety
+/// Operand-size contract of [`sgemm_avx2_parallel`]; AVX2/FMA must be available (verified by
+/// [`gemm_dispatch`]).
+#[cfg(target_arch = "x86_64")]
+unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
+    use rayon::prelude::*;
+    let (m, k, n) = (args.m, args.k, args.n);
+    let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
+    let (bm, bn) = select_2d_block_shape(m, n, nworkers);
+    let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
+    // The shared buffers hold the WHOLE matrices' panels for one K-block — not one C block's
+    // slice, and (unlike the NC-blocked kernels) not capped at NC: every block column reads the
+    // same pack, so it spans all of n.
+    let ap_cap = round_up(m, MR) * k.min(KC);
+    let bp_cap = round_up(n, NR) * k.min(KC);
+    let (mut ap, mut bp) = PACK_SCRATCH_2D_SHARED.with(|s| {
+        let mut g = s.borrow_mut();
+        (std::mem::take(&mut g.0), std::mem::take(&mut g.1))
+    });
+    if ap.len() < ap_cap {
+        ap.resize(ap_cap, 0.0);
+    }
+    if bp.len() < bp_cap {
+        bp.resize(bp_cap, 0.0);
+    }
+    // Send-safe scalar captures — the raw-pointer-as-usize idiom every parallel kernel here uses
+    // (`install`/`for_each` join before this frame returns, so the pointers outlive every task).
+    let (a_addr, b_addr, c_addr) = (args.a as usize, args.b as usize, args.c as usize);
+    let (ap_addr, bp_addr) = (ap.as_mut_ptr() as usize, bp.as_mut_ptr() as usize);
+    let (beta, bt) = (args.beta, args.bt);
+    let (epi_on, epi_bias_addr, epi_act, epi_alpha) = match args.epi {
+        Some(e) => (true, e.bias as usize, e.act, e.alpha),
+        None => (false, 0usize, 0u32, 1.0f32),
+    };
+    let body = move || {
+        let mut pc = 0;
+        while pc < k {
+            let kc = (k - pc).min(select_kc(k));
+            // First K-block honors the caller's beta; later blocks accumulate — and the epilogue
+            // folds into the C writeback on the FINAL K-block only (shifted per block below).
+            let beta_eff = if pc == 0 { beta } else { 1.0 };
+            let is_last_k = pc + kc == k;
+            // Phase 1 — pack the whole m×kc A and n×kc B panels once, cooperatively. The shared
+            // buffer bytes equal what `pack_a`/`pack_b_block` produce for the blocks they feed:
+            // same panel functions, same sources, same layout.
+            unsafe {
+                pack_ab_par(
+                    (a_addr as *const f32).add(pc),
+                    k,
+                    m,
+                    b_addr as *const f32,
+                    k,
+                    n,
+                    pc,
+                    0,
+                    kc,
+                    n,
+                    bt,
+                    ap_addr as *mut f32,
+                    bp_addr as *mut f32,
+                );
+            }
+            // Phase 2 — one task per C block over the shared packs. Phase 1's region joined
+            // above, so all pack writes happen-before these reads; this `for_each` joins before
+            // the next K-block's pack overwrites the buffers.
+            (0..nbi * nbj).into_par_iter().for_each(|t| {
+                let (bi, bj) = (t / nbj, t % nbj);
+                let (i0, j0) = (bi * bm, bj * bn);
+                // A null bias-addr (0) stays null; shift to this block's global column origin
+                // (macro_kernel adds the tile-local shift — the serial double-shift discipline).
+                let block_epi = (epi_on && is_last_k).then(|| {
+                    Epilogue {
+                        bias: epi_bias_addr as *const f32,
+                        act: epi_act,
+                        alpha: epi_alpha,
+                    }
+                    .shift(j0)
+                });
+                // SAFETY: each (bi, bj) C block has exactly one owner (disjoint writes); the
+                // packed panels are shared read-only (pack writes ordered by the phase join);
+                // block boundaries are MR/NR-aligned so the offsets below address whole global
+                // panels; avx2+fma verified by `gemm_dispatch`.
+                unsafe {
+                    macro_kernel(
+                        (m - i0).min(bm),
+                        (n - j0).min(bn),
+                        kc,
+                        (ap_addr as *const f32).add((i0 / MR) * kc * MR),
+                        (bp_addr as *const f32).add((j0 / NR) * kc * NR),
+                        (c_addr as *mut f32).add(i0 * n + j0),
+                        n,
+                        beta_eff,
+                        block_epi,
+                    );
+                }
+            });
+            pc += kc;
+        }
+    };
+    match pool {
+        Some(p) => p.install(body),
+        None => body(),
+    }
+    PACK_SCRATCH_2D_SHARED.with(|s| {
+        let mut g = s.borrow_mut();
+        g.0 = ap;
+        g.1 = bp;
+    });
 }
 
 /// Portable reference: a straight triple loop (`C = A·B`, or `C = A·Bᵀ` when `bt`). Correct for any
