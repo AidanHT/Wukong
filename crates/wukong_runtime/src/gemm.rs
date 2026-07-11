@@ -57,8 +57,9 @@ fn par_min_macs() -> u64 {
 /// effective worker count is `clamp(macs / min_task_macs(), 1, nworkers)`, so a problem near the
 /// parallel gate gets a few large blocks (each still worth its scheduling) instead of `3×nworkers`
 /// slivers. 1 Mi MACs measured best in the small band this budget governs (256³ swept 1M/4M/16M →
-/// 209/146/90 GF/s, 2026-07-09; the shared path only runs below [`SHARED_MAX_MACS`] by default, so
-/// the finer grid never applies to large problems). Env-overridable
+/// 209/146/90 GF/s, 2026-07-09; the shared path no longer runs by DEFAULT at any size — see
+/// [`gemm_2d_shared`] — so this budget only governs the `=1`/`=band` instrument settings).
+/// Env-overridable
 /// (`WUKONG_GEMM_MIN_TASK_MACS`, read once) so the small-problem crossover can be swept together
 /// with `WUKONG_GEMM_PAR_MIN_MACS`. Throughput-only: the grid shape never changes the bits.
 #[cfg(target_arch = "x86_64")]
@@ -190,31 +191,36 @@ fn gemm_2d() -> bool {
     *V.get_or_init(|| !std::env::var("WUKONG_GEMM_2D").is_ok_and(|v| v == "0"))
 }
 
-/// The shared-pack band ceiling: a parallel GEMM below this MAC count takes [`sgemm_2d_shared`],
-/// at/above it [`sgemm_2d_blocks`]. See [`gemm_2d_shared`] for the measured basis.
+/// The (retired) shared-pack band ceiling: kept for the `WUKONG_GEMM_2D_SHARED=band` instrument
+/// setting, which restores the 2026-07-09 size-keyed dispatch for A/B archaeology. See
+/// [`gemm_2d_shared`] — per-block is now the default at EVERY size.
 const SHARED_MAX_MACS: u64 = 1 << 26;
 
-/// Which 2D path a parallel GEMM takes is **size-keyed** (measured 2026-07-09, adjacent ABBA in
-/// both orderings): the per-block-packing path ([`sgemm_2d_blocks`]) wins mid/large problems —
-/// its "redundant" packing is each worker warming its OWN L2 with exactly the panels it consumes,
-/// where the shared pack makes consumers read panels another core packed (through L3) and pays a
-/// fork-join barrier per K-block (512³ ~315 vs ~278 GF/s, 1024³ ~462 vs ~385, skinny FFN shapes
-/// up to 1.75×) — while the shared-pack path ([`sgemm_2d_shared`]) wins the small band just above
-/// the parallel gate, where pack redundancy dominates the tiny compute and its work-scaled
-/// few-large-blocks grid fits (256³ ~209 vs ~185 GF/s = 102–123% of the adjacent MKL-all
-/// readings). Crossover at [`SHARED_MAX_MACS`]. `WUKONG_GEMM_2D_SHARED=1` forces shared
-/// everywhere and `=0` per-block everywhere (read once) — the adjacent-run A/B instruments, same
-/// discipline as `WUKONG_GEMM_2D` / `WUKONG_GEMM_FORKJOIN`.
+/// Which 2D path a parallel GEMM takes: **per-block packing ([`sgemm_2d_blocks`]) everywhere** —
+/// each worker packs exactly the panels it consumes into its own L2, no cross-core panel reads,
+/// no per-K-block fork-join barrier. The 2026-07-09 measurement had a size-keyed band (shared
+/// pack below [`SHARED_MAX_MACS`], where 256³ then read ~209 vs ~185 GF/s in shared's favor),
+/// but that basis did NOT survive this session's pool unification: re-measured 2026-07-10/11
+/// (AC, quiet machine, adjacent ABBA ×2 plus the prior window's 3 observations — per-block won
+/// all 6 pairings): 256³ shared 137-159 GF/s (53-56% of adjacent MKL-all) vs per-block
+/// 176-230 GF/s (65-70%, one earlier read 97%). Mid/large sizes were per-block all along
+/// (512³ ~315 vs ~278, 1024³ ~462 vs ~385, skinny FFN up to 1.75×). `WUKONG_GEMM_2D_SHARED=1`
+/// forces shared everywhere, `=0` per-block everywhere (now the default), `=band` restores the
+/// retired size-keyed dispatch (read once) — adjacent-run A/B instruments, same discipline as
+/// `WUKONG_GEMM_2D` / `WUKONG_GEMM_FORKJOIN`.
 #[cfg(target_arch = "x86_64")]
 fn gemm_2d_shared(macs: u64) -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<Option<bool>> = OnceLock::new();
-    V.get_or_init(|| match std::env::var("WUKONG_GEMM_2D_SHARED").as_deref() {
+    match V.get_or_init(|| match std::env::var("WUKONG_GEMM_2D_SHARED").as_deref() {
         Ok("1") => Some(true),
         Ok("0") => Some(false),
-        _ => None,
-    })
-    .unwrap_or(macs < SHARED_MAX_MACS)
+        Ok("band") => None,
+        _ => Some(false),
+    }) {
+        Some(v) => *v,
+        None => macs < SHARED_MAX_MACS,
+    }
 }
 
 /// Dynamic block scheduling opt-in (`WUKONG_GEMM_DYN=1`, read once, **default OFF**): route the
@@ -570,16 +576,16 @@ unsafe fn gemm_dispatch(
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
                 match (par, gemm_pool()) {
-                    // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path, size-keyed
-                    // between its two packing shapes — SHARED cooperative packing
-                    // (`sgemm_2d_shared`) below `SHARED_MAX_MACS`, per-block packing
-                    // (`sgemm_2d_blocks`) at/above it; see `gemm_2d_shared` for the measured
-                    // basis. `WUKONG_GEMM_DYN=1` swaps the per-block path's scheduler for the
-                    // atomic claim queue (`sgemm_2d_blocks_dyn`; default OFF pending central
-                    // A/B — with `WUKONG_GEMM_STEAL_ORDER=1` layering the full-blocks-first
-                    // enumeration on top, and `WUKONG_GEMM_TASK_MACS` sweeping the grain of
-                    // both per-block schedulers). `WUKONG_GEMM_2D_SHARED=1|0` forces one
-                    // packing shape everywhere, `WUKONG_GEMM_2D=0` opts out to the
+                    // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path with
+                    // PER-BLOCK packing (`sgemm_2d_blocks`) at every size — see `gemm_2d_shared`
+                    // for the measured basis (the 2026-07-09 shared-pack small band did not
+                    // survive pool unification). `WUKONG_GEMM_DYN=1` swaps the per-block path's
+                    // scheduler for the atomic claim queue (`sgemm_2d_blocks_dyn`; default OFF
+                    // pending central A/B — with `WUKONG_GEMM_STEAL_ORDER=1` layering the
+                    // full-blocks-first enumeration on top, and `WUKONG_GEMM_TASK_MACS` sweeping
+                    // the grain of both per-block schedulers). `WUKONG_GEMM_2D_SHARED=1|band`
+                    // forces the shared packing shape everywhere / restores the retired
+                    // size-keyed band, `WUKONG_GEMM_2D=0` opts out to the
                     // persistent-broadcast-region shape (`sgemm_persistent_region`), and
                     // `WUKONG_GEMM_FORKJOIN=1` further routes to the legacy fork-join shape —
                     // all retained as adjacent-run A/B instruments.
@@ -1914,8 +1920,9 @@ unsafe fn sgemm_2d_blocks_dyn(pool: Option<&rayon::ThreadPool>, args: GemmArgs, 
     }
 }
 
-/// The **shared-pack 2D block-parallel** GEMM — the DEFAULT parallel path (see
-/// [`gemm_2d_shared`]; `WUKONG_GEMM_2D_SHARED=0` opts out to [`sgemm_2d_blocks`]).
+/// The **shared-pack 2D block-parallel** GEMM — RETIRED as a default (see [`gemm_2d_shared`]:
+/// per-block packing won every adjacent pairing after pool unification, 2026-07-10/11), retained
+/// fully tested as the `WUKONG_GEMM_2D_SHARED=1|band` A/B instrument.
 ///
 /// **Why this exists.** The per-block 2D path re-packs each K-block's operands per C block: every
 /// A element is packed once per block *column* (`nbj`×) and every B element once per block *row*
@@ -3901,7 +3908,8 @@ mod tests {
         }
     }
 
-    /// The shared-pack 2D path ([`sgemm_2d_shared`] — the DEFAULT parallel GEMM; called DIRECTLY
+    /// The shared-pack 2D path ([`sgemm_2d_shared`] — retired as a default, kept as the
+    /// `WUKONG_GEMM_2D_SHARED=1|band` instrument; called DIRECTLY
     /// so the test is immune to the process-wide `WUKONG_GEMM_2D*` OnceLock state) must be
     /// **bit-for-bit** identical to the serial kernel: the shared buffers hold the same packed
     /// bytes the serial packers produce, each C block has exactly one owner per K-block, and the
