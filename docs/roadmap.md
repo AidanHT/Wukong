@@ -340,7 +340,8 @@ grids) — the CPU↔GPU analogue of the bit-exact CPU gate. Measured honestly o
 mobile 4050 (see `BENCHMARKS.md`):
 
 - **Tensor-core GEMM** (fp16/bf16/fp8 inputs, f32 accumulate): WMMA `m16n16k16` for fp16/bf16
-  (~9–13 TFLOP/s, ~5–6× the f32 path); **fp8 (E4M3)** via hand-laid `mma.sync.m16n8k32` (no WMMA fp8 on
+  (**~5–6× the f32 path** same-run; absolute TFLOP/s is clock-bound — ~7× GPU-clock swing — so only
+  the ratio is quoted); **fp8 (E4M3)** via hand-laid `mma.sync.m16n8k32` (no WMMA fp8 on
   `sm_89`), validated bit-exact. Its fragment-reuse multi-tile kernel (`fp8_gemm_mt_ptx`, 2×4 block of
   16×8 tiles per warp) is now the **fastest** tensor-core path — ~2.1–2.4× the naive single-tile fp8 and
   ~1.3–2.3× fp16/bf16 in the same run (single-tile retained as the fallback for non-divisible shapes).
