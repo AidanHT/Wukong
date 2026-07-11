@@ -646,6 +646,15 @@ fn bench_matmul(cc: &str, dir: &Path, roof: f64) {
     if std::env::var("XBENCH_HUGE").is_ok() {
         sizes.push(4096);
     }
+    // Size filter for fast lever iteration (`XBENCH_MATMUL_SIZES=512,1024`): an ABBA A/B on one
+    // band shouldn't pay the whole sweep (2048³ dominates a full run's wall time and heat).
+    // Measurement-only — the selected sizes run the identical harness.
+    if let Ok(f) = std::env::var("XBENCH_MATMUL_SIZES") {
+        let want: Vec<usize> = f.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if !want.is_empty() {
+            sizes.retain(|ns| want.contains(ns));
+        }
+    }
     for ns in sizes {
         bench_matmul_size(cc, dir, ns, roof);
         println!();
