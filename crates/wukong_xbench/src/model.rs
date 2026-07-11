@@ -292,25 +292,19 @@ fn make_weights(cfg: Cfg, seed: &mut u64) -> Vec<LayerW> {
 ///  * residual adds             -> `wukong_velem_f32`
 /// Attention runs per head over contiguous slices (extract Qh/Kh, V transposed) so each head's
 /// scores / PV products are plain NT GEMMs — the same structure the C implementation uses. The
-/// head loop is TILED: one flat loop over (head, row-tile) pairs, `hh = t/T` picking the head and
-/// `tile = t%T` its S/T-row band, with all scratch (qh/kh/vt/scores/ah) declared INSIDE the loop
-/// body, private per unit. Under `@parallel` the compiler outlines the loop into ONE
-/// `wukong_parallel_for` region via the div/mod mixed-radix disjointness proof — h·T independent
-/// units across cores (vs h heads untiled: better load balance on a 16-core pool) each running the
-/// identical serial kernel sequence — instead of a serial chain of small multicore kernels. Each
-/// row's arithmetic (dot order, mask, softmax) is exactly the untiled computation, so outputs are
-/// bit-identical to the untiled spelling, serial and parallel alike.
+/// head loop is spelled the natural way for independent iterations: its scratch (qh/kh/vt/scores/
+/// ah) is declared INSIDE the loop body, private per head. Under `@parallel` the compiler outlines
+/// the loop into a `wukong_parallel_for` region — heads across cores, each running the identical
+/// serial per-head kernel sequence — instead of a serial chain of small multicore kernels.
+/// (A (head, row-tile) div/mod respelling — h·4 units via the outliner's mixed-radix legality —
+/// was measured 2026-07-11 in a same-state binary A/B: @parallel was a WASH at S=128 and S=512
+/// (243.7 vs 244.7 ms) and the serial twin paid ~6% (1151.7 vs 1088.0 ms) for the per-tile kh/vt
+/// re-packing, so the untiled spelling stays; the legality extension remains as compiler
+/// infrastructure, exercised by tests/run/parallel_divmod_tiling.wk.)
 fn wk_block(cfg: Cfg, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let (s, d, h, dff, hd) = (cfg.s, cfg.d, cfg.h, cfg.dff, cfg.hd());
-    let (sd, shd, sdff, dd, dffd) = (s * d, s * hd, s * dff, d * d, dff * d);
-    // Head-loop tiling factor: h·T @parallel units, each an S/T-row band of one head. T=4 divides
-    // every bench/test S (16/128/512), keeps the per-unit GEMMs recognizer-sized, and shrinks the
-    // scores scratch 4x (L2-resident at S=512).
-    let tiles = 4;
-    assert!(s % tiles == 0, "head-loop tiling requires tiles | S");
-    let (srows, ht) = (s / tiles, h * tiles);
-    let (tshd, tss) = (srows * hd, srows * s);
+    let (sd, ss, shd, sdff, dd, dffd) = (s * d, s * s, s * hd, s * dff, d * d, dff * d);
     let scale = 1.0 / (hd as f64).sqrt(); // hd is a power of 4 here, so this is exact in f32
     format!(
         "module bench
@@ -354,34 +348,29 @@ fn wk_block(cfg: Cfg, parallel: bool) -> String {
         for p in 0..{d} {{ acc = acc + nrm[i*{d}+p] * wv[j*{d}+p]; }}
         v[i*{d}+j] = acc;
     }} }}
-    // 3. Multi-head causal attention (H = {h}, hd = {hd}), tiled: ONE flat loop over
-    // (head, row-tile) pairs — hh = t/{tiles} picks the head, tile = t%{tiles} its {srows}-row
-    // band. Iterations are independent — each unit reads/writes only its own (row-band x
-    // head-column) block of attn and the scratch is loop-body-local (private per unit) — so under
-    // @parallel the compiler outlines this loop into ONE parallel region ({ht} units across cores,
-    // the identical serial kernel sequence inside each) via the div/mod mixed-radix proof.
-    for t in 0..{ht} {{
-        let hh = t / {tiles};
-        let tile = t % {tiles};
-        let r0 = tile * {srows};
-        let mut qh: [f32; {tshd}] = [0.0; {tshd}];
+    // 3. Multi-head causal attention (H = {h}, hd = {hd}). Iterations are independent — each head
+    // reads/writes only its own hh-sliced column band and the scratch is loop-body-local (private
+    // per head) — so under @parallel the compiler outlines this loop into ONE parallel region
+    // (heads across cores, the identical serial kernel sequence inside each).
+    for hh in 0..{h} {{
+        let mut qh: [f32; {shd}] = [0.0; {shd}];
         let mut kh: [f32; {shd}] = [0.0; {shd}];
         let mut vt: [f32; {shd}] = [0.0; {shd}];
-        let mut scores: [f32; {tss}] = [0.0; {tss}];
-        let mut ah: [f32; {tshd}] = [0.0; {tshd}];
-        for i in 0..{srows} {{ for p in 0..{hd} {{ qh[i*{hd}+p] = q[(r0+i)*{d} + hh*{hd} + p]; }} }}
+        let mut scores: [f32; {ss}] = [0.0; {ss}];
+        let mut ah: [f32; {shd}] = [0.0; {shd}];
+        for i in 0..{s} {{ for p in 0..{hd} {{ qh[i*{hd}+p] = q[i*{d} + hh*{hd} + p]; }} }}
         for i in 0..{s} {{ for p in 0..{hd} {{ kh[i*{hd}+p] = k[i*{d} + hh*{hd} + p]; }} }}
         for j in 0..{hd} {{ for p in 0..{s} {{ vt[j*{s}+p] = v[p*{d} + hh*{hd} + j]; }} }}
-        // scores = (Qh_tile . KhT) * scale
-        for i in 0..{srows} {{ for j in 0..{s} {{
+        // scores = (Qh . KhT) * scale
+        for i in 0..{s} {{ for j in 0..{s} {{
             let mut acc: f32 = 0.0;
             for p in 0..{hd} {{ acc = acc + qh[i*{hd}+p] * kh[j*{hd}+p]; }}
             scores[i*{s}+j] = {scale} * acc;
         }} }}
-        // causal mask (absolute row = r0 + i)
-        for i in 0..{srows} {{ for j in 0..{s} {{ if j > r0 + i {{ scores[i*{s}+j] = 0.0 - 1.0e30; }} }} }}
+        // causal mask
+        for i in 0..{s} {{ for j in 0..{s} {{ if j > i {{ scores[i*{s}+j] = 0.0 - 1.0e30; }} }} }}
         // numerically-stable row softmax, in place
-        for r in 0..{srows} {{
+        for r in 0..{s} {{
             let mut m: f32 = scores[r*{s}];
             for i in 0..{s} {{ m = fmax(m, scores[r*{s}+i]); }}
             for i in 0..{s} {{ scores[r*{s}+i] = exp(scores[r*{s}+i] - m); }}
@@ -390,13 +379,13 @@ fn wk_block(cfg: Cfg, parallel: bool) -> String {
             let inv: f32 = 1.0 / sm;
             for i in 0..{s} {{ scores[r*{s}+i] = scores[r*{s}+i] * inv; }}
         }}
-        // tile output = scores_tile . Vh
-        for i in 0..{srows} {{ for j in 0..{hd} {{
+        // head output = scores . Vh
+        for i in 0..{s} {{ for j in 0..{hd} {{
             let mut acc: f32 = 0.0;
             for p in 0..{s} {{ acc = acc + scores[i*{s}+p] * vt[j*{s}+p]; }}
             ah[i*{hd}+j] = acc;
         }} }}
-        for i in 0..{srows} {{ for j in 0..{hd} {{ attn[(r0+i)*{d} + hh*{hd} + j] = ah[i*{hd}+j]; }} }}
+        for i in 0..{s} {{ for j in 0..{hd} {{ attn[i*{d} + hh*{hd} + j] = ah[i*{hd}+j]; }} }}
     }}
     // 4. Output projection + residual: a = x + attn . WoT
     for i in 0..{s} {{ for j in 0..{d} {{
