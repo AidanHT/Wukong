@@ -177,6 +177,54 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
   model head-loop tiling (reverted), skinny 2-row split, TASK_MACS coarse grain, shared-pack
   small band (superseded).
 
+### 2026-07-11 (session 2) — mid-size variance root-caused; dynamic claiming default; skinny gap closed
+- **Power state**: AC + full (Charging=False, ChargeRate 0) the whole session — the healthy state,
+  re-verified before every measured round.
+- **The A(a) mid-size variance is DECOMPOSED** (new instrument: `gemm_var` example — per-round
+  adjacent Wuk-par/MKL-all batches, order swapped every round, per-call percentiles in solo mode):
+  - 256³: BOTH sides swing together with the clock (CoV 14-17%) — machine state, ratio med ~96%.
+  - 512³: **Wukong-only straggler EPISODES** — 100-500 ms stretches where the per-call MIN stays
+    fast (~0.85 ms) but p50/p90 widen 1.4-2× (batch 305→174-230 GF/s); adjacent MKL steady
+    (CoV 3-4%). NOT the MKL OpenMP spin (KMP_BLOCKTIME=0 changes nothing), NOT package clock
+    (solo runs show identical episodes). Mechanism: OS placement/preemption of pool workers — an
+    in-progress block on a preempted worker cannot be stolen, so every call in the stretch pays a
+    variable straggler tail.
+  - 1024³: both sides tight (CoV ~3-5%), ratio med 92.6-98.7% across rounds.
+- **Dynamic block claiming is now the parallel-GEMM default** (`WUKONG_GEMM_DYN=0` opts out) —
+  the central A/B the code was waiting on, run in a valid power state (S/D/D/S process quartets,
+  gemm_var + gemm_scaling): halves episode damage (512³ solo CoV 14.3/11.8%→8.6/7.5%, batch floor
+  154/177→198/206 GF/s), wins 256³ (~94-96→~103-110% of adjacent MKL-all) and 512³
+  (~93-97→~98-99%), washes-to-wins 1024³, washes 2048³, wins 4/6 skinny NT shapes (128×768·768ᵀ
+  par 292/315→337/339 GF/s) and washes the other 2. Bit-exactness pinned across
+  (threads × steal-order × shared-A) by the extended differential tests; full workspace suite +
+  gpu check green.
+- **xbench matmul_skinny with the new default (2 independent runs, conservative ordering — Wuk-par
+  measured LAST)**: 128×768·768ᵀ **75-80%** (was 70), 128×768·3072ᵀ **98-106%** (was 88),
+  128×3072·768ᵀ **88-108%** (was 96), 512×768·768ᵀ **99-105%** (was 79), 512×768·3072ᵀ
+  **103-112%** (was 85), 512×3072·768ᵀ **85-97%** (was 92). Four of six shapes now straddle or
+  exceed MKL-all parity; the smallest shape improved but stays overhead-bound (151 MFLOP total —
+  MKL itself only scales 2.1× over its own 1c there).
+- **REFUTED with evidence: skinny shared-A pack** (`WUKONG_GEMM_SKINNY_A=1`, default OFF, kept
+  fully tested as the recorded instrument). Hypothesis: a one-block-row grid re-packs the same
+  whole-A slice once per column block (24× at 128×768·768ᵀ) — pack it once, shared. Measured
+  (ON/OFF/OFF/ON adjacent quartet): **loses ~14% at 128×768×3072** (413/407 vs 468/483 GF/s, both
+  pairings), wash at 128×768·768ᵀ, noise elsewhere. Why: the per-block "redundant" A pack is also
+  an L2 PREFETCH — each worker packs the chunk into its own L2 right before computing on it, with
+  zero synchronization — while the shared pack demotes every A read to L3 and stalls the call on
+  a pack-phase join straggler. Same lesson family as the shared-pack band and region-fusion
+  refutations: on this hybrid, per-worker locality + zero sync beats traffic dedup.
+- **Cube table with the new default — PROVISIONAL, power-state compromised**: one xbench matmul
+  run (conservative ordering) read 512³ **96%** (232.7 vs 241.4) and 1024³ **104%** (275.9 vs
+  266.3) of MKL-all — the mid-size band that closed session 1 at 76% — with 2048³ Wuk-par 307.3
+  GF/s (healthy vs own history) against an anomalously low MKL-all 175.9 (MKL's 2048³ read was
+  also low in the gemm_var quartets; instrument question, not a claim). A post-run power check
+  found the machine ON BATTERY (discharge ~42 W) — AC dropped at an unknown point during the run,
+  so per measurement law #1 this cube read needs a verified-AC re-run before A(a) mid-size can be
+  called closed. (Corroboration from the verified-AC window: gemm_var D-config quartets read 512³
+  med 97.8-99.2% and 1024³ med 93.9-98.7% of adjacent MKL-all.) A third same-run skinny table
+  (88/101/96/102/92/92%) sits inside the two verified runs' band.
+- Commits: gemm_var probe (b8dc296), dyn default + shared-A instrument (39b2dfb).
+
 ### 2026-07-10 (cont.) — analysis results, feasibility probes, first merges
 - **Serial-fraction analysis landed** (prompts/results/serial-fraction.md): literal serial code is
   ~1% — the bound is the parallel work's own hybrid ceiling (~9.3 P-equivalents) PLUS ~108-132
