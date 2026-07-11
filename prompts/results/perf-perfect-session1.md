@@ -137,6 +137,46 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
   characterization: DONE; what remains for Target C is deciding whether the ~7 ms driver tax and
   the Cranelift-internal 73% merit further attack.
 
+### 2026-07-11 — final healthy-state window (AC, charge ≥97%, trickle, quiet) + session close
+- **Merged perf/skinny-gemm-grid** (fccfa9d): ONE square candidate (96,96) in the 2D ladder fixes
+  the wide-M/narrow-N mis-shaping (512×768 grid 11×8→6×8, B transpose-packs nearly halved).
+  Agent's ABBA: 512×768·768ᵀ 75→89% (zero overlap), 512×3072 76→87%; model S=512 ~8% faster;
+  cubes provably unchanged (candidate yields <48 blocks at every square — pinned in the policy
+  unit test). Skinny-M 2-row split hypothesis REFUTED and documented in-code. My own post-merge
+  gate: full cargo test + gpu check green.
+- **Target B — THREE independent same-day rounds, all pairings beat compiled torch.** Isolated
+  probes per side (the ordering-bias law), per round vs TorchInductor max-autotune fullgraph
+  (ATEN-pinned, disclosed) all-threads: S=512 **1.39× / 1.41-1.42× / 1.81×** faster; S=128
+  **1.20× / 1.07-1.19× / 1.43×** faster. Vs torch's best EAGER all-threads config: S=512
+  1.07-1.37× faster every round; S=128 0.98-1.23× (one worst-vs-best pairing at parity, all
+  others faster). Vs compiled 1-thread: Wuk-1c faster at both shapes (S=128 274-304 vs 306-330;
+  S=512 1021-1046 vs 1281-1375 healthy reads). Numerics cross-checked every round (compiled vs
+  Wukong ≤1e-6 rel; serial==parallel BIT-EXACT). **The Target-B bar is met at both shapes.**
+- **Target A(b) — final scaling curve (S=512, healthy state, per-T processes + default)**:
+  T=1 **1.00×** (width-1 fast-path parity), T=2 1.70×, T=4 2.13×, T=8 3.00×, T=12 3.68×,
+  T=16 **4.70×** (255.4 ms), default pool 4.44× (254.3 ms); a later same-state round read 5.22×
+  (thermally-elevated 1c denominator — honest range 4.0-5.2×). Monotone, no T=16 inversion in
+  the healthy state (the charging-state inversion was the cap, not structure). Machine ceiling
+  shape (MKL-all/MKL-1c same-run) ≈ 5.0-5.4× — the model's curve tracks the FLOP-weighted
+  kernel-ceiling composition; no Wukong-side sync/serial shortfall is visible in the curve.
+- **Target A(a) — final full table (one conservative-ordering run, Wuk-par measured LAST/hottest
+  per size; % of same-run MKL-all)**: 256³ **94%**, 512³ 76%, 1024³ 76%, 2048³ **91%**, 4096³
+  **93%**; skinny: 128×768·768ᵀ 70%, 128×768·3072ᵀ 88%, 128×3072·768ᵀ **96%**, 512×768·768ᵀ 79%,
+  512×768·3072ᵀ 85%, 512×3072·768ᵀ **92%**. Wuk-1c vs MKL-1c: 80-104% (≥100% at 2048/4096/
+  512×768·768/512×768·3072). Mid-size cubes are RUN-VARIABLE in the healthy state (76-97% today
+  across runs, 94-101% in earlier windows) — the honest statement is a RANGE, and A(a)'s
+  "≈100% at every size" is met at small/large cubes and the best skinny shapes, NOT yet durably
+  at 512³-1024³ (open: 76-97%) nor 128×768·768ᵀ (70%, scaling-limited at 151 MFLOP total).
+- **Session status vs the three bars**: B MET (multiple rounds, break attempts: thread counts,
+  isolated basis, shape variation, ordering discipline). A(b) MET in the physics-honest sense
+  (curve tracks machine ceiling; T=1 parity; monotone). A(a) PARTIAL — mid-size cube variance
+  and the smallest skinny shape remain the quantified gaps. C characterized to floor with
+  instruments + docs (remaining decision recorded). Levers shipped this session: pool
+  unification, pfor dynamic claiming, width==1 fast-path, per-block default, (96,96) candidate,
+  backend verifier-off + parallel codegen, outliner div/mod legality. Refuted-with-evidence:
+  model head-loop tiling (reverted), skinny 2-row split, TASK_MACS coarse grain, shared-pack
+  small band (superseded).
+
 ### 2026-07-10 (cont.) — analysis results, feasibility probes, first merges
 - **Serial-fraction analysis landed** (prompts/results/serial-fraction.md): literal serial code is
   ~1% — the bound is the parallel work's own hybrid ceiling (~9.3 P-equivalents) PLUS ~108-132
