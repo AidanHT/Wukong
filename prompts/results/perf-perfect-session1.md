@@ -75,6 +75,36 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
   bit-exact), perf/compile-floor (compile-profile + spawn-overhead modes + floor draft),
   serial-fraction analysis (read-only report).
 
+### 2026-07-10/11 — AC window #2 (quiet machine: all agents merged, 0 concurrent procs)
+- **Measurement-law addition — the model bench's column ORDER favors Wukong for the B bar.** The
+  torch columns run LAST in a full model round (after minutes of Wuk + C all-core heat): today
+  torch-Tn read 165/226 ms inside the full round vs **78.5/85.1 ms isolated** (two adjacent
+  torch-only probes, stable ±0.5%). The prior rounds' same-run comparisons happened to catch
+  torch healthy, but the ordering bias is structural — for the B bar, use ISOLATED probes both
+  sides (each side coolest) and take torch's BEST observed. Full-round same-run readings remain
+  valid for Wukong-internal columns only.
+- **S=128 isolated basis (this window, tiled+fast-path binary)**: Wuk par 66.0-70.9 ms; torch
+  best Tn(comp) 85.1, Tn(sdpa) 78.5. Conservative (worst-Wuk vs best-torch): **1.20× faster than
+  compiled-Tn, 1.11× vs eager-Tn** — consistent with prior rounds' 1.19-1.21×.
+- **S=512 isolated basis**: Wuk par 266.1 ms; torch best Tn(comp) 370.2, Tn(sdpa) 288.2 (torch's
+  own sdpa-all swung 863↔288 across its two adjacent isolated rounds — instability is torch-side;
+  best taken). **1.39× faster than compiled-Tn, 1.08× vs eager-Tn.** NOTE @S=512 eager-sdpa-Tn
+  BEATS compiled-Tn (288 vs 370) — torch's compiled path is not its best config here; Wukong
+  beats BOTH.
+- **Tiling A/B verdict: REFUTED for the model — reverted.** Same-state adjacent binary A/B
+  (tiled main vs untiled 78bb719 worktree, AC, quiet), S=512 WUK_ONLY: par 243.7 vs 244.7 ms
+  (WASH), 1c 1151.7 vs 1088.0 ms (tiled **5.9% slower** — per-tile kh/vt re-packing + 4× smaller
+  GEMM calls). The load-balance hypothesis (48 vs 12 units) did not materialize: region grain was
+  NOT the S=512 bottleneck. Also resolved: the earlier scary readings (tiled 1c 2204 ms, "8.28×
+  scaling") were HEAT artifacts — 1c cool reads 1088-1152 for both spellings; the ABBA's 4th/5th
+  runs caught the machine flipping to battery mid-experiment (par 487.9/480.1), reinforcing the
+  power-check-every-round law. Model respelling reverted to the untiled head loop (doc comment
+  records the measurement); outliner div/mod legality + differential fixture + skinny bench stay
+  (general infrastructure). LESSON: an optimization that only restructures the ITERATION SPACE
+  (not the arithmetic or locality of the hot kernels) needs the load-imbalance to actually be the
+  bottleneck — measure the wash-vs-win BEFORE landing the respelling next time (a same-state
+  two-binary A/B costs one worktree build).
+
 ### 2026-07-10 (cont.) — analysis results, feasibility probes, first merges
 - **Serial-fraction analysis landed** (prompts/results/serial-fraction.md): literal serial code is
   ~1% — the bound is the parallel work's own hybrid ceiling (~9.3 P-equivalents) PLUS ~108-132
