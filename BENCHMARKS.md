@@ -479,7 +479,13 @@ shared-cooperative-pack design in both ABBA orderings — each worker warming it
 a shared-pack + 1 Mi-MAC-task small band, and the parallel gate lowered 2²⁶→2²³ MACs so 256³ engages
 (**102–123% of MKL-all**, was deliberately serial). A C-tile microkernel prefetch also closed the
 single-core writeback tail (**2048³ 86–88% → 96–99% of MKL-1c**, `WUKONG_GEMM_PF_C=0` kill-switch).
-See the library table above for the current same-run vs-MKL standings.
+*2026-07-11 updates*: the small-size shared-pack band did not survive pool unification — **per-block
+packing is the default at every size** (`WUKONG_GEMM_2D_SHARED` keeps the retired shapes measurable);
+and the per-block blocks are now handed out by an **atomic claim queue** instead of rayon's static
+range-split (`WUKONG_GEMM_DYN=0` opts back) — on this hybrid the OS intermittently strands a worker
+for 100–500 ms stretches, and block-granular self-scheduling halves that episode damage (512³ solo
+CoV 14→8%, floor +28%) while winning or washing every measured shape (skinny NT table:
+75–112% of MKL-all, was 70–96%). See the library table above for current same-run standings.
 
 ### `nn.Linear` `C = A·Bᵀ` — Wukong dispatches to GEMM; naive C is latency-bound
 
