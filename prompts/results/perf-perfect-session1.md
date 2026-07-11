@@ -149,6 +149,23 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
   block_dispatch_sets_pinned now PASSES on the tiled form (ONE wukong_parallel_for, serial
   sgemm_nt/sgemm_nt_alpha/norm_f32 inside, none outside) and interp_gate_bit_exact green.
   Perf A/B vs untiled DEFERRED to the next AC window (battery now).
+- **Width==1 serial fast-path shipped** (T=1 parallel-path tax closed): at `RAYON_NUM_THREADS=1`
+  the parallel entries used to pay 0.62-0.80× of the serial kernels (2D-block packing walked on
+  one worker; pool handoffs with no second core to win). Now `wuk_pool_width() <= 1` routes to
+  the serial sibling — bit-identical by the standing serial==parallel law — at 6 sites:
+  gemm_dispatch (covers ALL f32 GEMM `_parallel` entries), norm_f32/norm_affine_f32, velem_f32
+  (joined its small-N fallback), sreduce/argreduce (joined their 1-chunk fallback).
+  `wukong_parallel_for` deliberately NOT fast-pathed: region bodies need the pool's 16 MiB
+  worker stacks, and its width-1 shape (one par_iter job) is already minimal. Verified same-run
+  (battery-legitimate adjacent A/B): matmul T=1 par/serial 1.08×/1.00×/0.88× @256³/512³/1024³
+  (residual = within-run drift), model T=1 par/serial 0.99×, interp gate + serial-vs-parallel
+  BIT-EXACT end-to-end. The remaining ~55 `_parallel` entries (bf16/col/row/scan families)
+  follow the same recipe if a T=1 read ever shows residual tax — fix-where-measured.
+- **Merged perf/compile-floor follow-up** (4e97e92 + 4aa2ea8): char-safe `trunc` (byte-slice
+  panic on multibyte filenames fixed), docs reconciled with the backend codegen/object-write
+  split; agent's full-corpus PROVISIONAL shares: codegen+obj 76-80% > optimize 12-16% >
+  mir_build 5-6% > sema ≈ parse ~1.3% > lex 0.2%; backend split codegen ~92.5% / object-write
+  ~7.5% (small-unit floor is codegen-side setup, not the COFF container).
 - **Head×row-tile respelling: probe PASSED but the conclusion was WRONG — corrected.** The
   standalone probe (whole `@parallel` fn = single top-level loop) takes the fn-level chunking
   path (`<fn>$par`), which handles div/mod fine and is interp==native exact. But the model's

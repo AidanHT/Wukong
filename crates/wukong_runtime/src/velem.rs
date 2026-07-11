@@ -389,8 +389,9 @@ pub unsafe extern "C" fn wukong_velem_f32_parallel(
         return;
     }
     let n = n as usize;
-    // Small arrays don't amortize the pool wake — run the serial kernel (bit-identical).
-    if n < velem_par_min() {
+    // Small arrays don't amortize the pool wake, and a width-1 pool (RAYON_NUM_THREADS=1) has no
+    // second core to win with — run the serial kernel (bit-identical) in both cases.
+    if n < velem_par_min() || crate::wuk_pool_width() <= 1 {
         // SAFETY: same contract as this function.
         unsafe { wukong_velem_f32(x, y, out, n as i64, a, b, c, op) };
         return;

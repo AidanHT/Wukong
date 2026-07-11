@@ -766,6 +766,12 @@ pub unsafe extern "C" fn wukong_norm_f32_parallel(
     if rows <= 0 || cols <= 0 {
         return;
     }
+    // Width==1 serial fast-path: no second core to win with — skip the pool handoff and run the
+    // serial sibling inline (bit-identical: per-row work, no cross-row combine).
+    if crate::wuk_pool_width() <= 1 {
+        // SAFETY: same contract as this function.
+        return unsafe { wukong_norm_f32(x, out, rows, cols, eps_bits, op) };
+    }
     let (rows, cols) = (rows as usize, cols as usize);
     let eps = f32::from_bits(eps_bits as u32);
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/reduce);
@@ -847,6 +853,12 @@ pub unsafe extern "C" fn wukong_norm_affine_f32_parallel(
 ) {
     if rows <= 0 || cols <= 0 {
         return;
+    }
+    // Width==1 serial fast-path: no second core to win with — skip the pool handoff and run the
+    // serial sibling inline (bit-identical: per-row work, no cross-row combine).
+    if crate::wuk_pool_width() <= 1 {
+        // SAFETY: same contract as this function.
+        return unsafe { wukong_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits, op) };
     }
     let (rows, cols) = (rows as usize, cols as usize);
     let eps = f32::from_bits(eps_bits as u32);

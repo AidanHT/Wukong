@@ -266,7 +266,9 @@ pub unsafe extern "C" fn wukong_sreduce_f32_parallel(
     }
     let n = n as usize;
     let nchunks = n.div_ceil(RCHUNK);
-    if nchunks < 2 {
+    // One chunk, or a width-1 pool (RAYON_NUM_THREADS=1): nothing to parallelize — run the serial
+    // sibling (bit-identical: fixed chunks + ordered fold).
+    if nchunks < 2 || crate::wuk_pool_width() <= 1 {
         // SAFETY: same contract.
         return unsafe { wukong_sreduce_f32(x, y, n as i64, op) };
     }
@@ -499,7 +501,9 @@ pub unsafe extern "C" fn wukong_argreduce_f32_parallel(x: *const f32, n: i64, op
         f32::INFINITY
     };
     let nchunks = n.div_ceil(RCHUNK);
-    if nchunks < 2 {
+    // One chunk, or a width-1 pool (RAYON_NUM_THREADS=1): nothing to parallelize — run the serial
+    // sibling (bit-identical: fixed chunks + ordered fold).
+    if nchunks < 2 || crate::wuk_pool_width() <= 1 {
         // SAFETY: same contract.
         return unsafe { wukong_argreduce_f32(x, n as i64, op) };
     }

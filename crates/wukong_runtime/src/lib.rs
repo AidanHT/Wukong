@@ -373,6 +373,26 @@ pub(crate) fn run_on_wuk_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     f()
 }
 
+/// Worker count of the unified kernel pool ([`run_on_wuk_pool`]'s target) as seen from the calling
+/// thread. `1` means a `_parallel` kernel entry has no second core to win with — the width==1
+/// serial fast-path: run the serial sibling kernel inline instead of paying the pool handoff plus
+/// the parallel schedule's per-chunk/per-block overheads (measured 0.62–0.80× of the serial kernel
+/// at `RAYON_NUM_THREADS=1`). Throughput-only dispatch: every substituted serial sibling is
+/// bit-identical to its parallel form by the standing gate-pinned law, so the bits cannot change.
+/// NOT used by `wukong_parallel_for`: outlined region bodies carry multi-hundred-KB frames that
+/// must stay on the pool's 16 MiB worker stacks, and its width-1 shape (one par_iter job) is
+/// already minimal.
+pub(crate) fn wuk_pool_width() -> usize {
+    ensure_global_pool();
+    #[cfg(target_arch = "x86_64")]
+    if pool_unify() {
+        if let Some(p) = crate::gemm::gemm_pool() {
+            return p.current_num_threads();
+        }
+    }
+    rayon::current_num_threads()
+}
+
 /// The C-ABI parallel-for the native backend lowers `@parallel for` to. Splits `[0, n)` into one
 /// contiguous chunk per worker of the unified kernel pool ([`run_on_wuk_pool`]) and runs
 /// `body(start, end, env)` on each concurrently, returning only once every chunk has completed.
