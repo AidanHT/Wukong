@@ -583,6 +583,17 @@ unsafe fn gemm_dispatch(
                     // persistent-broadcast-region shape (`sgemm_persistent_region`), and
                     // `WUKONG_GEMM_FORKJOIN=1` further routes to the legacy fork-join shape —
                     // all retained as adjacent-run A/B instruments.
+                    // Width==1 serial fast-path: a 1-worker pool (RAYON_NUM_THREADS=1) can win
+                    // nothing from the parallel schedules' per-block packing/claim machinery —
+                    // run the tuned serial kernel instead (bit-identical by the standing
+                    // serial == parallel law, so this is throughput-only dispatch).
+                    (true, pool)
+                        if pool.map_or_else(rayon::current_num_threads, |p| {
+                            p.current_num_threads()
+                        }) <= 1 =>
+                    {
+                        sgemm_avx2(a, b, c, m, k, n, beta, bt, epi)
+                    }
                     (true, pool) => {
                         let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
                         if gemm_2d() {
