@@ -522,6 +522,9 @@ fn main() {
     if want("matmul") {
         bench_matmul(&cc, &dir, roof);
     }
+    if want("matmul_skinny") {
+        bench_matmul_skinny(roof);
+    }
     if want("linear") {
         bench_linear(&cc, &dir, roof);
     }
@@ -645,6 +648,75 @@ fn bench_matmul(cc: &str, dir: &Path, roof: f64) {
     }
     for ns in sizes {
         bench_matmul_size(cc, dir, ns, roof);
+        println!();
+    }
+}
+
+/// The skinny transformer GEMMs: tall-thin activation matrices against the GPT-2 block's weight
+/// shapes in the `nn.Linear` NT layout (`C = A·Bᵀ`) — attention/output projections (K=N=768) and
+/// the FFN up/down projections (768→3072, 3072→768), at S=128 and S=512 rows. The square sweeps
+/// never enter this low-M regime, where the parallel grid's grain (not peak FLOPs) decides the
+/// gap to MKL(all). Library peers only (oneMKL 1c/all — the bar at these shapes; the naive-C
+/// columns of the square section add nothing here). Thermal order follows the standing law:
+/// single-core group first (Wuk(1c), MKL(1c) adjacent), then MKL(all), Wuk(par) LAST — residual
+/// heat lands on Wukong, never the peer.
+fn bench_matmul_skinny(roof: f64) {
+    for (m, k, n) in [
+        (128usize, 768usize, 768usize),
+        (128, 768, 3072),
+        (128, 3072, 768),
+        (512, 768, 768),
+        (512, 768, 3072),
+        (512, 3072, 768),
+    ] {
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
+        let mut c = vec![0.0f32; m * n];
+        let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let gflops = |mm: &Option<Measure>| {
+            mm.as_ref()
+                .map(|x| format!("{:.1}", flops / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!(
+            "=== matmul_skinny {m}x{k} · ({n}x{k})ᵀ (nn.Linear NT; GFLOP/s, higher is better) ==="
+        );
+        let wuk = bench_wukong(&wk_linear_rect(m, k, n, false), &mut c, ap, bp, cp);
+        let mkl_1c = bench_mm_mkl_rect(m, k, n, true, 1, &a, &b, &mut c);
+        let mkl_all = mkl()
+            .map(|api| api.max_threads)
+            .and_then(|t| bench_mm_mkl_rect(m, k, n, true, t, &a, &b, &mut c));
+        let wk_par = bench_wukong(&wk_linear_rect(m, k, n, true), &mut c, ap, bp, cp);
+        println!(
+            "  GFLOP/s     Wuk(1c) {:>7}   Wuk(par) {:>7}   MKL(1c) {:>7}   MKL(all) {:>7}",
+            gflops(&wuk),
+            gflops(&wk_par),
+            gflops(&mkl_1c),
+            gflops(&mkl_all),
+        );
+        if roof > 0.0 {
+            if let Some(w) = &wuk {
+                println!(
+                    "  -> Wukong single-core = {:.0}% of measured roofline",
+                    (flops / w.ns_per_call) / roof * 100.0
+                );
+            }
+        }
+        // The bit-exactness law exercised at the exact shape: serial and @parallel must agree
+        // bit-for-bit (same per-(i,j) K order regardless of the parallel grid).
+        if let (Some(s), Some(p)) = (&wuk, &wk_par) {
+            match s
+                .out
+                .iter()
+                .zip(&p.out)
+                .position(|(x, y)| x.to_bits() != y.to_bits())
+            {
+                Some(at) => println!("  ! serial vs @parallel NOT bit-exact at [{at}]"),
+                None => println!("  cross-check Wukong serial vs @parallel: BIT-EXACT"),
+            }
+        }
+        report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
         println!();
     }
 }
@@ -1357,6 +1429,24 @@ fn wk_linear(ns: usize, parallel: bool) -> String {
          \x20           let mut s: f32 = 0.0;\n\
          \x20           for k in 0..{ns} {{ s = s + a[i * {ns} + k] * b[j * {ns} + k]; }}\n\
          \x20           c[i * {ns} + j] = s;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+/// Rectangular `nn.Linear` NT nest (`C[M,N] = A[M,K] · B[N,K]ᵀ`) — the same dot-product spelling
+/// as [`wk_linear`] (so the recognizer dispatches the identical `wukong_sgemm_nt[_parallel]`),
+/// with independent M/K/N for the skinny transformer shapes.
+fn wk_linear_rect(m: usize, k: usize, n: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let (mk, nk, mn) = (m * k, n * k, m * n);
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {mk}], b: [f32; {nk}], mut c: [f32; {mn}]) {{\n\
+         \x20   for i in 0..{m} {{\n\
+         \x20       for j in 0..{n} {{\n\
+         \x20           let mut s: f32 = 0.0;\n\
+         \x20           for k in 0..{k} {{ s = s + a[i * {k} + k] * b[j * {k} + k]; }}\n\
+         \x20           c[i * {n} + j] = s;\n\
          \x20       }}\n\
          \x20   }}\n}}\n"
     )
@@ -6413,15 +6503,32 @@ fn bench_mm_mkl(
     b: &[f32],
     c: &mut [f32],
 ) -> Option<Measure> {
+    bench_mm_mkl_rect(ns, ns, ns, transpose_b, threads, a, b, c)
+}
+
+/// Rectangular twin of [`bench_mm_mkl`]: `C[M,N] = A[M,K] · B` with `B` stored `[N,K]` when
+/// `transpose_b` (the `nn.Linear` layout) or `[K,N]` otherwise. Row-major leading dimensions
+/// follow the storage: `lda = K`, `ldb = K` (transposed) / `N` (not), `ldc = N`.
+#[allow(clippy::too_many_arguments)]
+fn bench_mm_mkl_rect(
+    m: usize,
+    k: usize,
+    n: usize,
+    transpose_b: bool,
+    threads: i32,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) -> Option<Measure> {
     let api = mkl()?;
-    let (m, n, k) = (ns as i64, ns as i64, ns as i64);
-    let lda = ns as i64;
+    let (m, n, k) = (m as i64, n as i64, k as i64);
+    let lda = k;
     let (transb, ldb) = if transpose_b {
-        (CBLAS_TRANS, ns as i64)
+        (CBLAS_TRANS, k)
     } else {
-        (CBLAS_NO_TRANS, ns as i64)
+        (CBLAS_NO_TRANS, n)
     };
-    let ldc = ns as i64;
+    let ldc = n;
     unsafe {
         (api.set_threads)(threads.max(1));
     }
