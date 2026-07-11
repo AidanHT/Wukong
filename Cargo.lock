@@ -1046,6 +1046,7 @@ name = "wukong_runtime"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libloading",
  "num_cpus",
  "rayon",
 ]
