@@ -33,20 +33,21 @@ Peers in order of strength: vendor libraries (oneMKL, cuBLAS/cuDNN) > tuned crat
 (`matrixmultiply`) > idiomatic C/C++/Rust at `-O3 -march=native` (gcc/g++/rustc).
 Current standing (recorded):
 
-- *Compute-bound, CPU*: f32 GEMM single-core ≈97–100% of oneMKL-1c at ≤1024³ and — since the
-  2026-07-10 **C-tile microkernel prefetch** closed the writeback-miss tail — **96–99% of
-  MKL-1c at 2048³** (was 83–88%; MKL-anchored ABBA, both orderings, the off-switch reproduces
-  the old number). Multicore is **size-keyed 2D block-parallel** (2026-07-10): per-BLOCK
-  packing at mid/large (its "redundant" packing is each worker warming its own L2 — it beat
-  the shared-cooperative-pack design in both ABBA orderings, 1024³ ~462 vs ~385 GF/s, the
-  session's headline refutation), shared-pack + 1 Mi-MAC tasks in the small band, parallel
-  gate lowered 2²⁶→2²³ MACs. Standing vs MKL-all, same-run: **512³ 70–74%, 1024³ 75–83%**
-  (from 66–69%), **2048³ 88–93% vs a healthy peer** (and 176–186% against MKL's degraded
-  rounds — threaded MKL itself swings ~1.4–2× with power state; ranges are the honest form),
-  **256³ 102–123%** (engaged at 1.7–2× over serial; was deliberately-serial at ~39–52%).
-  int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
+- *Compute-bound, CPU*: f32 GEMM single-core **~80–104% of oneMKL-1c across sizes, at or above
+  parity (≥100%) at 2048³/4096³** (MKL-anchored ABBA, both orderings; the 2026-07-10 C-tile
+  prefetch closed the large-matrix writeback-miss tail, the off-switch reproduces the old number).
+  Multicore is **size-keyed 2D block-parallel** with **per-BLOCK packing** (each worker's
+  "redundant" packing warms its own L2 — it beat the shared-cooperative-pack design in every ABBA
+  ordering, the session's headline refutation) and **dynamic block-claiming the 2026-07-11 default**
+  (halved the mid-size straggler variance). Standing vs MKL-all, same-run: **512³ ~98–99%, 1024³
+  ~104%, 2048³ 91%, 4096³ 93%, 256³ ~94–110%** (the dynamic-claiming default closed the old
+  70–83% mid-size gap; against MKL's power-degraded rounds the ratios read far higher — threaded MKL
+  itself swings ~1.4–2× with power state, so only same-run ranges are quoted). Skinny transformer
+  NT shapes **75–112% of MKL-all** (4/6 at or above parity; worst 128×768·768ᵀ 75–80%,
+  overhead-bound at 151 MFLOP). int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
 - *Compute-bound, GPU (RTX 4050, sm_89)*: fp16/bf16 GEMM ~101% cuBLAS ≤1024³, **~87–90% at
-  2048³, ~83% at 4096³** (past the prior 77% PTX ceiling; 4096³ a SASS-level loss); int8 GEMM
+  2048³; the 4096³ GEMM ships the v2cs streaming epilogue at 76.8% of cuBLAS-f16 / 80.4% of the
+  honest f32-out peer** (a SASS-level loss past the prior 77% PTX ceiling — see below); int8 GEMM
   **96–105% at 2048³ (beats IMMA), 86–88% at 1024³, ~70% at 4096³** (HBM-bound loss); fused int8
   GEMM+dequant **1.1–2.2×** the cuBLAS chain; int4 W4A16 documented lead (no library peer exists);
   attention **0.37–0.66× cuDNN at S≥2048** (loss — structural: SFU/serial-softmax bound on 20
@@ -74,25 +75,25 @@ Current standing (recorded):
 **M2. End-to-end model performance.** A compiler is judged on composed graphs, not op zoos:
 fusion, no round-trips, layer-stack throughput. GPT-2-class `.wk` models exist and dispatch
 to recognized kernels; GPU-resident 12-layer decode runs under CUDA-graph capture.
-Standing (2026-07-09/10, three valid full-peer rounds — roofline 130–133, all cross-checks
-<2e-6 rel, serial==@parallel bit-exact, interp gate bit-exact): the 12-layer GPT-2-class
-stack runs **~19–21× idiomatic C and 3.6–4.9× `-ffast-math` C single-core**; vs **PyTorch
-CPU eager** it is 1.03–1.09× behind torch-1T @S=128 and **1.12–1.22× FASTER @S=512**
-single-thread. Multicore, the campaign's closing move — the **`@parallel` head-loop region**
-(2026-07-10: an independent-iteration `for` loop with body-local scratch inside an
-`@parallel` fn outlines into a `wukong_parallel_for` region; conservative affine-disjointness
-legality, serial kernels inside each iteration so serial==parallel stays bit-exact; the model
-spells its attention head loop that way naturally) — **flipped the all-threads-torch
-comparison at S=512: Wukong @parallel is 1.10–1.24× FASTER** (two roofline-validated
-rounds; par ~440 → ~312 ms) **and holds parity at S=128** (1.19× faster / 1.02× behind at
-the round-noise floor; was 1.5–1.9× behind at campaign start). Model @parallel scaling:
-**3.1–3.6×** (was ~1.5–2.1×); the multicore stack is **~61–69× idiomatic single-thread C**.
-Residual scaling headroom vs 16 physical cores is the parallel-GEMM grain (M1). GPU training
-step still loses to eager PyTorch (GEMM-bound); the serving stack's continuous-batching
-goodput ceiling doubled 2026-07-10: **Bcap=256 full-fill 85.6× vs fill=1** (33.1k tok/s;
-graph-driven scheduler bit-identical to eager, **1.14–1.27× over the honest static-batching
-peer** — the decomposition batching-vs-scheduling is disclosed), opt-in int8-KV 1.88×
-smaller cache.
+Standing (2026-07-11, three independent same-day rounds — all cross-checks ≤1e-6 rel,
+serial==@parallel bit-exact, interp gate bit-exact): the 12-layer GPT-2-class stack runs
+**~19–21× idiomatic C and 3.6–4.9× `-ffast-math` C single-core**. The honest PyTorch bar is
+**`torch.compile` (TorchInductor max-autotune, fullgraph, warmed; eager does NOT count)**, run
+same-run at both `set_num_threads(1)` and all-threads. Single-thread, Wukong **beats
+compiled-torch-1T at both S=128 and S=512**. Multicore — after the **`@parallel` head-loop region**
+(2026-07-10: an independent-iteration `for` loop with body-local scratch inside an `@parallel` fn
+outlines into a `wukong_parallel_for` region; conservative affine-disjointness legality, serial
+kernels inside each iteration so serial==parallel stays bit-exact; the model spells its attention
+head loop that way naturally) — Wukong @parallel is **1.39–1.81× FASTER than all-threads compiled
+torch at S=512 and 1.07–1.43× FASTER at S=128** (it also beats torch's strongest *eager* config,
+1.07–1.37× @S=512; isolated per-side probes with torch at its best). Model @parallel scaling
+reaches **4.7× on 16 cores** (default 4.44×, best 5.22×), tracking the ~5.0–5.4× same-run hybrid
+MKL ceiling with T=1 at serial parity; residual headroom vs 16 physical cores is the parallel-GEMM
+grain (M1). GPU training step still loses to eager PyTorch (GEMM-bound); the serving stack's
+continuous-batching goodput ceiling: **Bcap=256 full-fill 85.6× vs fill=1** (graph-driven
+scheduler bit-identical to eager, **1.14–1.27× over the honest static-batching peer** — the
+batching-vs-scheduling decomposition is disclosed), opt-in int8-KV cache **3.88× smaller than
+f32** (1.94× than f16).
 
 **M3. Multicore scaling** of M1 with G4 preserved. Standing: strong (dot ~7.9×, max ~25×,
 GEMM to ~104× vs single-thread C), but until the OpenMP C column lands the multicore rows
@@ -150,21 +151,23 @@ in-harness cross-checks that can only *fail* Wukong, never inflate it.
 
 Closed in the 2026-07-09/10 round (see M1/M2 for the numbers and
 `prompts/results/perf-sota-session3.md` for the full ledger): the large-GEMM single-core
-tail (C-tile prefetch, 2048³ 86–88% → 96–99% of MKL-1c), the 256³ deliberate-serial standing
-(engaged at 102–123% of MKL-all via the size-keyed small band), the serving goodput ceiling
-(Bcap=256, 85.6× + honest static peer), the S=128 model regime (1.5–1.9× → 1.08–1.20× behind
-torch-Tn), and the honest-instrument holes (f32-out cuBLAS peer column; exp/log/model ranges
+tail (C-tile prefetch, 2048³ now at/above MKL-1c parity, see M1), the 256³ deliberate-serial standing
+(now engaged at ~94–110% of MKL-all under the dynamic-claiming default), the serving goodput ceiling
+(Bcap=256, 85.6× + honest static peer), the S=128 model regime (1.5–1.9× behind eager at campaign
+start → now 1.07–1.43× AHEAD of *compiled* torch, see M2), and the honest-instrument holes (f32-out cuBLAS peer column; exp/log/model ranges
 re-based on multi-state measurement). Measured-and-bounded rather than closed: GPU long-S
 attention (warp specialization built; wins only 4–6% @S=4096 — structural SFU bound), 4096³
 GEMM (v2cs +2.7%; ~80% of the honest peer, residual is SASS-level), exp/log vs VML
 (algorithmic; the ldexp lever was built, measured a loss both thermal states, reverted).
 Remaining, ranked:
 
-1. Multicore parallel-GEMM grain — the head-loop region landed (model @parallel now beats
-   all-threads torch @S=512), so the remaining scaling headroom (3.1–3.6× on 16 physical
-   cores) concentrates in the mid-size GEMM gap vs MKL-all's parallel grain (70–83% at
-   512–1024³; shared-pack, mid-pool, persistent-region, and fork-join alternatives are all
-   measured/refuted in gemm.rs — a genuinely new decomposition idea is required).
+1. Multicore parallel-GEMM grain — the head-loop region + dynamic block-claiming landed (model
+   @parallel now beats all-threads *compiled* torch at both S=128 and S=512; scaling 4.44–4.70× on
+   16 cores). Dynamic claiming closed most of the old mid-size MKL-all gap (512³/1024³ now
+   ~98–104%, was 70–83%); the residual is the smallest overhead-bound skinny shape (128×768·768ᵀ
+   75–80%) and a clean verified-AC full-cube table (the 2026-07-11 attempt hit battery mid-run).
+   Shared-pack, mid-pool, persistent-region, and fork-join alternatives are all measured/refuted
+   in gemm.rs — a genuinely new decomposition idea is required for further mid-size gain.
 2. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
    tensors, file I/O (M6).
 3. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).
