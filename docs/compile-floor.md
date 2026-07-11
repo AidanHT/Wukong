@@ -115,14 +115,17 @@ Two structural facts make Wukong's floor unusually low and worth defending:
 For each stage, the ceiling is set by its access pattern. Fill the measured throughput from
 `compile-profile`'s throughput column and mark each stage at/near/above floor.
 
+Central run 2026-07-11 (AC, release, full 296-file corpus, warm best-of-N; whole corpus
+front→object **168.1 ms** total ≈ 0.57 ms/file):
+
 | Stage | Ceiling set by | Expected regime | Measured throughput | At floor? |
 |---|---|---|---|---|
-| Lex | Linear byte scan, branch-predicted; ~memcpy-class | 100s of MB/s | `[fill]` | `[fill]` |
-| Parse | Token scan + AST-node bump-allocation; interner hits | 10s of Mtok/s | `[fill]` | `[fill]` |
-| Sema | Node visit + hash-map side tables (types/consts/defs) keyed by `NodeId` | hash-bound | `[fill]` | `[fill]` |
-| MIR build | Node → op emission + interner extension | alloc-bound | `[fill]` | `[fill]` |
-| Optimize | `-O2` fixpoint; HashMap-bound (see `compile-time`) | pass-count × op scan | `[fill]` | `[fill]` |
-| Codegen+obj | Cranelift isel/regalloc/emit + object serialize | O(MIR ops), small const | `[fill]` | `[fill]` |
+| Lex | Linear byte scan, branch-predicted; ~memcpy-class | 100s of MB/s | 746 MB/s (0.3%) | **yes** — memcpy-class |
+| Parse | Token scan + AST-node bump-allocation; interner hits | 10s of Mtok/s | 24.1 Mtok/s (1.8%) | **yes** |
+| Sema | Node visit + hash-map side tables (types/consts/defs) keyed by `NodeId` | hash-bound | 14.8 Mnode/s (1.7%) | near — hash-bound as modeled |
+| MIR build | Node → op emission + interner extension | alloc-bound | 4.0 Mnode/s (6.5%) | near — alloc-bound as modeled |
+| Optimize | `-O2` fixpoint; HashMap-bound (see `compile-time`) | pass-count × op scan | 2.3 Mop/s (16.3%) | near — post-FxHash (session X1) |
+| Codegen+obj | Cranelift isel/regalloc/emit + object serialize | O(MIR ops), small const | 18.4 MB-obj/s (73.4%) | at the **chosen-backend** floor: verifier off in release, per-function codegen parallelized (multi-fn files), ISA rebuild measured 0.3%, remaining cost is Cranelift isel/regalloc itself |
 
 **Object-emit sub-share (analytic, now corroborated by measurement).** Object serialization writes
 `object bytes` into a COFF/ELF container: a linear memcpy-class write of the machine-code,
@@ -130,14 +133,14 @@ relocation, and symbol tables — analytically a small fraction of the `codegen+
 should be dominated by isel + register allocation. The `emit_object_timed` split that
 `compile-profile` prints under the stage table measures this directly; the provisional smoke figure
 is **object-write ≈ 7–8% of the backend stage** (i.e. the analytic expectation holds — the backend's
-cost is Cranelift codegen, not container serialization). Confirm in the central run:
-`[fill: codegen % / object-write % of codegen+obj]`.
+cost is Cranelift codegen, not container serialization). Central run 2026-07-11 (AC): **Cranelift
+codegen 91.7% / object-write 8.3%** of the `codegen+obj` stage.
 
-### Provisional shares (clock-invariant; smoke-test only — NOT authoritative)
+### Provisional shares (clock-invariant; smoke-test only — SUPERSEDED by the 2026-07-11 central run above)
 
 > These are shape observations from battery-state smoke runs, kept only because *ratios* survive
-> clock swing. The absolute times are NOT reportable and are omitted. Replace with a release
-> central run.
+> clock swing and they document that the ordering was stable before/after the backend change. The
+> central-run figures in §4 are the authoritative ones; the shapes below agree with them.
 
 - **Stage-share ordering, whole-to-object, full corpus (~296 files compiled, 4 skipped;
   `tests/run` + `examples` + `bench/kernels`; stable across two smoke runs, before and after the
@@ -185,13 +188,24 @@ in-process wukongc time (from `compile-profile`) is within a small constant of t
 i.e. the ratio is not a startup artifact but real backend-weight difference. `spawn-overhead`
 isolates exactly that startup so the two halves compose.
 
-Measured (fill from `compile-vs`, same-run ratios only):
+Measured 2026-07-11 (AC, release, same-run best-of-N; wukongc time is the **spawned CLI** wall,
+apples-to-apples with the other CLIs):
 
 | kernel | wukongc | gcc/mc | g++/mc | rustc/mc |
 |---|---|---|---|---|
-| gemm4x4 | `[fill]` | `[fill]` | `[fill]` | `[fill]` |
-| saxpy | `[fill]` | `[fill]` | `[fill]` | `[fill]` |
-| dot | `[fill]` | `[fill]` | `[fill]` | `[fill]` |
+| gemm4x4 | 7.94 ms | 8.40× | 8.69× | 11.40× |
+| saxpy | 8.64 ms | 7.82× | 7.44× | 10.21× |
+| dot | 7.72 ms | 8.02× | 8.21× | 11.66× |
+
+**Composition disclosure (both directions).** Per §6, wukongc's CLI wall is ~90% spawn tax
+(process creation + driver init + I/O ≈ 7–8 ms); its in-process compile core is 0.5–1.0 ms on
+these kernels. So the CLI-to-CLI ratio (~7.4–11.7×, the honest user-visible number) UNDERSTATES
+the pipeline-work difference: in-process wukongc vs the gcc/rustc CLIs would read ~60–130×, but
+that comparison is asymmetric (their in-process cores are not separable) and is disclosed, not
+claimed. The historical "~9–12×" band (session X1) is refined to **7.4–11.7×** on this
+measurement: gcc/g++ ratios came DOWN slightly — not because wukongc got slower (its in-process
+core got ~17% faster this campaign via the release-verifier flip) but because the CLI wall is
+spawn-tax-floored; the remaining C(2) lever is the driver's ~7 ms front-matter, not the compiler.
 
 ## 6. The spawn tradeoff (in-process vs process)
 
@@ -206,10 +220,21 @@ Measured (fill from `compile-vs`, same-run ratios only):
   microkernels + resolves the `.rodata` string relocations; a scalar no-kernel program can fall back
   to a `cc` link). This link is a *whole second process* (rustc), so it dominates the exe path.
 
+Measured 2026-07-11 (AC, release, 6 representative kernels; ranges over the files):
+
 | regime | in-proc obj | spawn obj | spawn-tax | spawn exe | link(exe−obj) |
 |---|---|---|---|---|---|
-| cold-start / first call | `[fill]` | `[fill]` | `[fill]` | `[fill]` | `[fill]` |
-| warm steady-state | `[fill]` | `[fill]` | `[fill]` | `[fill]` | `[fill]` |
+| cold-start / first call | 0.70–1.32 ms | 10.9–16.6 ms | ~10–15 ms | 170–208 ms | ~160–195 ms |
+| warm steady-state | 0.35–1.00 ms | 7.4–8.8 ms | 7.0–8.1 ms | 170–190 ms | 162–182 ms |
+
+**C(2) verdict.** In-process wins code→object by **7–15×** in steady state; the winning path per
+scenario: (a) anything that compiles repeatedly in one process (JIT run, benches, tests, a future
+LSP/watch mode) MUST use the in-process API — and already does (xbench/bench compile in-process;
+the runtime JIT path never spawns); (b) the one-shot CLI necessarily pays one process creation,
+but ~7 ms of tax on a ~0.5 ms compile says the driver's front-matter (source-map/diagnostics/
+import setup + I/O) is the next lever if the CLI wall ever matters; (c) `--emit=exe` is ~95%
+rustc-driven link — a second process by design; eliminating it means an in-house PE linker, out
+of scope while the JIT path exists for latency-sensitive use.
 
 **Structural findings (mechanism, not absolutes; ratios from the battery smoke run):**
 

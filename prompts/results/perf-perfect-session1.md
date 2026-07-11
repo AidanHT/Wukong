@@ -105,6 +105,38 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
   bottleneck — measure the wash-vs-win BEFORE landing the respelling next time (a same-state
   two-binary A/B costs one worktree build).
 
+- **Measurement-law addition #2 — CHARGING is a third instrument state.** After the battery flap,
+  all-core par readings degraded ~25% (S=512 model par 244 → 297-329 ms across 11 runs) while the
+  1c anchor stayed rock-stable (1019-1052 ms, all runs). The per-block flip was exonerated by an
+  adjacent `WUKONG_GEMM_2D_SHARED=band` A/B (310.7 vs 310.5 — identical, as predicted by MAC-size
+  analysis). Root cause: **battery charging at ~42 W (69% charge)** — the charger budget splits
+  between charge and package, capping all-core sustained clocks; single-core fits the remainder.
+  Law: check `PowerOnline` AND `Charging`/`ChargeRate` every round; reportable all-core rounds
+  need AC + charge ≈ full (or explicit disclosure). This also retro-explains "bimodal MKL" and
+  torch's own 863↔288 sdpa-all swing. Also noted: the T-sweep instrument's top point
+  (`RAYON_NUM_THREADS=16`) makes gemm_pool decline (16 ≥ 16) → global-pool scheduling instead of
+  the private physical-core pool; the default-config run is the honest T=16 point (charging-state
+  reads showed no measurable difference, re-check when full).
+- **Scaling sweep (CHARGING state, S=512, both orders + default top point)**: T=1 **1.00×/1.03×
+  (width-1 fast-path parity confirmed in-curve)**, T=2 1.58×, T=4 2.47×, T=8 3.19-3.36×,
+  T=12 3.36-3.51×, T=16 3.19-3.28×, default-pool 3.16-3.52×. Curve valid as SHAPE under charging
+  cap; healthy-state absolute curve to be re-taken at full charge (morning cluster: par 244 ms
+  ≈ 4.4-4.7×).
+
+- **Target C central run landed (AC, single-core — charging-immune; docs/compile-floor.md tables
+  filled).** compile-profile full corpus (296 files): **168.1 ms front→object total ≈ 0.57
+  ms/file**; shares codegen+obj 73.4% (Cranelift codegen 91.7% / object-write 8.3%) > optimize
+  16.3% > mir_build 6.5% > parse 1.8% ≈ sema 1.7% > lex 0.3%; throughputs lex 746 MB/s (floor),
+  parse 24.1 Mtok/s (floor), sema 14.8 Mnode/s, mir_build 4.0 Mnode/s, opt 2.3 Mop/s, backend
+  18.4 MB-obj/s. spawn-overhead: warm in-proc 0.35-1.0 ms vs spawned CLI 7.4-8.8 ms (**tax 7-8 ms
+  fixed**), --emit=exe 170-190 ms of which link 162-182 (~95% rustc-link). compile-vs (CLI vs
+  CLI, same-run): gcc 7.8-8.4×, g++ 7.4-8.7×, rustc 10.2-11.7× — the historical "9-12×" refines
+  to **7.4-11.7×** with the disclosure that wukongc's CLI wall is ~90% spawn tax (its in-process
+  core is 0.5-1.0 ms and got ~17% faster this campaign); the C(2) verdict + remaining
+  driver-front-matter lever are written into the doc. C(1)/C(2) instrumentation and
+  characterization: DONE; what remains for Target C is deciding whether the ~7 ms driver tax and
+  the Cranelift-internal 73% merit further attack.
+
 ### 2026-07-10 (cont.) — analysis results, feasibility probes, first merges
 - **Serial-fraction analysis landed** (prompts/results/serial-fraction.md): literal serial code is
   ~1% — the bound is the parallel work's own hybrid ceiling (~9.3 P-equivalents) PLUS ~108-132
