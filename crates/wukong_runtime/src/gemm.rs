@@ -223,29 +223,39 @@ fn gemm_2d_shared(macs: u64) -> bool {
     }
 }
 
-/// Dynamic block scheduling opt-in (`WUKONG_GEMM_DYN=1`, read once, **default OFF**): route the
-/// per-block 2D path through [`sgemm_2d_blocks_dyn`] — a shared atomic work queue
-/// (`fetch_add` over the fixed block enumeration) instead of rayon's range-split work-stealing —
-/// so faster cores automatically claim more C blocks on this asymmetric 6P+8E+2LPE part (a P-core
-/// that finishes its share keeps pulling blocks instead of idling while E-cores straggle).
-/// Per-worker packing semantics are preserved: a worker packs exactly what it consumes, into its
-/// own [`PACK_SCRATCH_2D`] — the locality the shared-pack refutation showed is the win. Default
-/// OFF until a central adjacent-run A/B flips it on measured evidence (this box's power state is
-/// not currently a valid instrument). Scheduling-only: WHO computes a block never changes the
-/// bits — serial == dynamic bit-for-bit (pinned by `sgemm_2d_dyn_matches_serial`).
+/// Dynamic block scheduling (**default ON** since 2026-07-11; `WUKONG_GEMM_DYN=0` opts out to
+/// the static range-split path, read once): route the per-block 2D path through
+/// [`sgemm_2d_blocks_dyn`] — a shared atomic work queue (`fetch_add` over the fixed block
+/// enumeration) instead of rayon's range-split work-stealing — so faster cores automatically
+/// claim more C blocks on this asymmetric 6P+8E+2LPE part (a P-core that finishes its share keeps
+/// pulling blocks instead of idling while E-cores straggle). Per-worker packing semantics are
+/// preserved: a worker packs exactly what it consumes, into its own [`PACK_SCRATCH_2D`] — the
+/// locality the shared-pack refutation showed is the win.
+///
+/// **The central adjacent-run A/B that flipped it** (2026-07-11, AC+full healthy state, S/D/D/S
+/// process quartets, `gemm_var` + `gemm_scaling` instruments): the box's dominant mid-size
+/// symptom is 100-500 ms *straggler episodes* — per-call min stays fast while the whole
+/// distribution widens (a worker stuck on a slow/preempted core drags every call's join; MKL
+/// adjacent under the identical regime shows no episodes). Dynamic claiming halves that
+/// variance (512³ solo CoV 14.3/11.8% → 8.6/7.5%, batch floor 154/177 → 198/206 GF/s), wins the
+/// vs-MKL(all) medians at 256³ (~94-96 → ~103-110%) and 512³ (~93-97 → ~98-99%), washes-to-wins
+/// 1024³, washes 2048³, and wins 4 of 6 transformer skinny NT shapes (128×768·768ᵀ par 292/315 →
+/// 337/339 GF/s; both S=128 FFN shapes up) with the other 2 a wash. Scheduling-only: WHO computes
+/// a block never changes the bits — serial == dynamic bit-for-bit (pinned by
+/// `sgemm_2d_dyn_matches_serial`).
 #[cfg(target_arch = "x86_64")]
 fn gemm_dyn() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("WUKONG_GEMM_DYN").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| !std::env::var("WUKONG_GEMM_DYN").is_ok_and(|v| v == "0"))
 }
 
 /// Steal-order probe (`WUKONG_GEMM_STEAL_ORDER=1`, read once, **default OFF**): with dynamic
 /// scheduling ([`gemm_dyn`]), enumerate the C blocks full-size-first / edge-tails-last (the
 /// LPT-style order [`dyn_block_order`] builds) instead of plain row-major, so the largest work is
 /// claimed early — and the last blocks claimed (the ones that bound the join straggle) are the
-/// SMALL edge remainders, which even an E-core drains quickly. A no-op without
-/// `WUKONG_GEMM_DYN=1` (the static rayon path has no claim queue to order). A permutation of the
+/// SMALL edge remainders, which even an E-core drains quickly. A no-op under
+/// `WUKONG_GEMM_DYN=0` (the static rayon path has no claim queue to order). A permutation of the
 /// same block set, each block still computed exactly once by one owner — throughput-only, never
 /// the bits.
 #[cfg(target_arch = "x86_64")]
@@ -253,6 +263,32 @@ fn gemm_steal_order() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("WUKONG_GEMM_STEAL_ORDER").is_ok_and(|v| v == "1"))
+}
+
+/// Shared-A pack for single-block-row grids (`WUKONG_GEMM_SKINNY_A=1`, read once, **default OFF
+/// — REFUTED as a win, kept as the recorded instrument**): when the 2D grid has ONE block row
+/// (`nbi == 1` — the skinny-M rule, every transformer activation GEMM at S ≤ 144), all blocks'
+/// A slices are the SAME whole-A rows, and per-block packing re-packs them once per column block
+/// — at 128×768·768ᵀ that is 24 redundant ~0.4 MB A packs on a ~380 µs call. This regime packs A
+/// ONCE per call into a shared call-lifetime buffer (parallel pack phase, joined before any
+/// compute reads it), keeping per-block B packing as-is.
+///
+/// **Measured 2026-07-11 (ON/OFF/OFF/ON adjacent quartet, gemm_scaling, AC+full healthy state):
+/// the traffic argument LOSES.** 128×768×3072 par 413/407 GF/s shared vs 468/483 per-block
+/// (~14% loss, both pairings, far beyond drift); 128×768·768ᵀ a wash (356/334 vs 335/380);
+/// 128×3072×768 within noise (415/430 vs 422/393). Why: the per-block "redundant" A pack is also
+/// a PREFETCH — each worker packs the chunk into its own L2 right before computing with it, with
+/// zero synchronization — while the shared pack demotes every A read to L3 and stalls the whole
+/// call on a pack-phase join straggler (this hybrid's E/LPE cores make phase joins expensive,
+/// the same tax the persistent-region wash exposed). Do not re-flip without a mechanism that
+/// keeps the packed A L2-local per worker. Packed bytes, K grouping, and per-(i,j) order are
+/// unchanged either way — serial == dyn bit-for-bit on both settings (the differential tests
+/// sweep the parameter).
+#[cfg(target_arch = "x86_64")]
+fn gemm_skinny_a() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("WUKONG_GEMM_SKINNY_A").is_ok_and(|v| v == "1"))
 }
 
 /// Grain-size tuning surface (`WUKONG_GEMM_TASK_MACS`, read once, **default unset = current
@@ -577,13 +613,15 @@ unsafe fn gemm_dispatch(
             unsafe {
                 match (par, gemm_pool()) {
                     // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path with
-                    // PER-BLOCK packing (`sgemm_2d_blocks`) at every size — see `gemm_2d_shared`
-                    // for the measured basis (the 2026-07-09 shared-pack small band did not
-                    // survive pool unification). `WUKONG_GEMM_DYN=1` swaps the per-block path's
-                    // scheduler for the atomic claim queue (`sgemm_2d_blocks_dyn`; default OFF
-                    // pending central A/B — with `WUKONG_GEMM_STEAL_ORDER=1` layering the
-                    // full-blocks-first enumeration on top, and `WUKONG_GEMM_TASK_MACS` sweeping
-                    // the grain of both per-block schedulers). `WUKONG_GEMM_2D_SHARED=1|band`
+                    // PER-BLOCK packing at every size — see `gemm_2d_shared` for the measured
+                    // basis (the 2026-07-09 shared-pack small band did not survive pool
+                    // unification) — scheduled by the atomic claim queue
+                    // (`sgemm_2d_blocks_dyn`; the default since the 2026-07-11 central A/B — see
+                    // `gemm_dyn`). `WUKONG_GEMM_DYN=0` swaps the scheduler back to rayon's
+                    // static range-split (`sgemm_2d_blocks`, the adjacent-run baseline), with
+                    // `WUKONG_GEMM_STEAL_ORDER=1` layering the full-blocks-first enumeration on
+                    // top of the queue, and `WUKONG_GEMM_TASK_MACS` sweeping the grain of both
+                    // per-block schedulers. `WUKONG_GEMM_2D_SHARED=1|band`
                     // forces the shared packing shape everywhere / restores the retired
                     // size-keyed band, `WUKONG_GEMM_2D=0` opts out to the
                     // persistent-broadcast-region shape (`sgemm_persistent_region`), and
@@ -606,7 +644,7 @@ unsafe fn gemm_dispatch(
                             if gemm_2d_shared(macs) {
                                 sgemm_2d_shared(pool, args);
                             } else if gemm_dyn() {
-                                sgemm_2d_blocks_dyn(pool, args, gemm_steal_order());
+                                sgemm_2d_blocks_dyn(pool, args, gemm_steal_order(), gemm_skinny_a());
                             } else {
                                 sgemm_2d_blocks(pool, args);
                             }
@@ -1519,6 +1557,26 @@ thread_local! {
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
+// Caller-side scratch for the skinny shared-A pack ([`gemm_skinny_a`]): ALL K-chunks of A packed
+// once per call, shared read-only by every worker (pack writes are ordered before compute reads
+// by the pack region's join). Its own thread-local so the shared-A and per-block paths' buffer
+// sizing stays independent — the same take/put-back discipline as the siblings above. The pack
+// fully overwrites every element it owns (real data + edge-padding zeros), so reuse needs no
+// re-zeroing.
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static PACK_SCRATCH_SKINNY_A: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Cap on the skinny shared-A buffer: `round_up(m, MR) × k` f32 for the WHOLE packed A (every
+/// K-chunk at once, vs one `bm×KC` chunk in the per-block path). 8 MB covers every transformer
+/// shape (132×3072×4 ≈ 1.6 MB) while staying L3-resident — the whole point is that every worker
+/// re-reads the one packed copy from shared L3 instead of re-packing it; a buffer past L3 would
+/// lose that and pay the pack allocation besides, so bigger K falls back to per-block packing.
+#[cfg(target_arch = "x86_64")]
+const SKINNY_A_MAX_BYTES: usize = 8 << 20;
+
 /// Block-shape policy for the 2D block-parallel paths: pick `(BM, BN)` — the C-block height/width
 /// — for an `m×n` output, aiming for at least `target_blocks` grid blocks (the caller's
 /// load-balance budget: `3×` its effective worker count, so rayon work-stealing can absorb this
@@ -1597,10 +1655,10 @@ fn select_2d_block_shape(m: usize, n: usize, target_blocks: usize) -> (usize, us
     (rebalance(m, bm, MR), rebalance(n, bn, NR))
 }
 
-/// The **BLIS/MKL-style 2D block-parallel** GEMM with per-block packing (the
-/// `WUKONG_GEMM_2D_SHARED=0` instrument path — see [`gemm_2d_shared`]; the default routes to
-/// [`sgemm_2d_shared`], which hoists the redundant per-block packs into shared per-K-block
-/// buffers, keeping this shape intact as its adjacent-run A/B baseline).
+/// The **BLIS/MKL-style 2D block-parallel** GEMM with per-block packing under rayon's STATIC
+/// range-split scheduling (the `WUKONG_GEMM_DYN=0` instrument path; the default since 2026-07-11
+/// is the same grid/block body under the atomic claim queue — see [`sgemm_2d_blocks_dyn`] /
+/// [`gemm_dyn`] — keeping this shape intact as its adjacent-run A/B baseline).
 ///
 /// **Why this exists.** The shipped parallel decomposition splits C by MR=6-row panels: every
 /// worker streams the ENTIRE shared packed B panel from L3 on every K-block — 16 workers
@@ -1765,6 +1823,48 @@ unsafe fn sgemm_2d_block(
     }
 }
 
+/// [`sgemm_2d_block`] for the skinny shared-A regime ([`gemm_skinny_a`]): the block's row origin
+/// is 0 (single block row) and its packed A comes pre-packed from the call-shared buffer — the
+/// `chunks` table gives each K-chunk's `(pc, kc, packed offset)`, the same [`select_kc`] walk the
+/// per-block body does, over panels [`pack_a_panel`] laid out exactly as `pack_a` would. Only the
+/// B slice is packed here (per block, per K-chunk — zero redundancy in a one-row grid: each B
+/// column slice has exactly one owner). `beta` / final-K epilogue rules are byte-identical to the
+/// per-block body, so serial == shared-A bit-for-bit.
+///
+/// # Safety
+/// `ap_shared` valid packed-A for the whole `chunks` walk (`round_up(m,MR)·k` f32, fully packed
+/// before this call — the pack phase's join); `b` per the [`wukong_sgemm_nt`] contract;
+/// `[0, m) × [j0, j0+bn)` in range of C; `bp` sized `round_up(bn,NR)·min(k,KC)` f32; avx2+fma.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_2d_block_shared_a(
+    ap_shared: *const f32,
+    chunks: &[(usize, usize, usize)],
+    b: *const f32,
+    c: *mut f32,
+    k: usize,
+    n: usize,
+    beta: f32,
+    bt: bool,
+    epi: Option<Epilogue>,
+    j0: usize,
+    m: usize,
+    bn: usize,
+    bp: *mut f32,
+) {
+    for &(pc, kc, off) in chunks {
+        let beta_eff = if pc == 0 { beta } else { 1.0 };
+        let block_epi = if pc + kc == k {
+            epi.map(|e| e.shift(j0))
+        } else {
+            None
+        };
+        pack_b_block(b, k, n, pc, j0, kc, bn, bt, bp);
+        macro_kernel(m, bn, kc, ap_shared.add(off), bp, c.add(j0), n, beta_eff, block_epi);
+    }
+}
+
 /// A cache-line-isolated claim counter for the dynamic scheduler: 128-byte alignment (a 64 B line
 /// plus its adjacent-line-prefetch pair) keeps the hot `fetch_add` word from false-sharing with
 /// whatever the caller's stack frame packs around it. The counter is the ONE cross-worker write
@@ -1794,8 +1894,9 @@ fn dyn_block_order(m: usize, n: usize, bm: usize, bn: usize, nbi: usize, nbj: us
     order
 }
 
-/// The **dynamic-queue** variant of [`sgemm_2d_blocks`] (`WUKONG_GEMM_DYN=1` routes here — see
-/// [`gemm_dyn`]; default OFF pending central A/B): the same 2D C-block grid, block body
+/// The **dynamic-queue** variant of [`sgemm_2d_blocks`] (the DEFAULT parallel-GEMM scheduler
+/// since the 2026-07-11 central A/B — see [`gemm_dyn`] for the measured basis;
+/// `WUKONG_GEMM_DYN=0` opts back out): the same 2D C-block grid, block body
 /// ([`sgemm_2d_block`]) and per-worker packing, but blocks are handed out by a shared atomic
 /// claim counter instead of rayon's range-split work-stealing. Rayon's parallel iterator deals
 /// the range out in contiguous chunks and rebalances by stealing *halves* of chunks; on this
@@ -1824,18 +1925,24 @@ fn dyn_block_order(m: usize, n: usize, bm: usize, bn: usize, nbi: usize, nbj: us
 /// same — the counter (and the optional steal-order permutation) only choose WHICH worker runs a
 /// block and WHEN, and each index is claimed exactly once (`fetch_add` uniqueness). No result
 /// byte depends on claim order: blocks write disjoint C regions and each block's per-(i,j)
-/// K-accumulation order is fixed inside [`sgemm_2d_block`]. serial == dynamic bit-for-bit for
-/// every (thread count × steal order × grain) combination (pinned by
-/// `sgemm_2d_dyn_matches_serial` / `sgemm_2d_dyn_thread_sweep`).
+/// K-accumulation order is fixed inside [`sgemm_2d_block`] / [`sgemm_2d_block_shared_a`].
+/// serial == dynamic bit-for-bit for every (thread count × steal order × shared-A × grain)
+/// combination (pinned by `sgemm_2d_dyn_matches_serial` / `sgemm_2d_dyn_thread_sweep`).
 ///
-/// `steal_order` is a parameter (not an env read) so the differential tests can exercise both
-/// enumerations regardless of process env; [`gemm_dispatch`] passes [`gemm_steal_order`].
+/// `steal_order` and `skinny_shared_a` are parameters (not env reads) so the differential tests
+/// can exercise every combination regardless of process env; [`gemm_dispatch`] passes
+/// [`gemm_steal_order`] / [`gemm_skinny_a`].
 ///
 /// # Safety
 /// Operand-size contract of [`sgemm_avx2_parallel`]; AVX2/FMA must be available (verified by
 /// [`gemm_dispatch`]).
 #[cfg(target_arch = "x86_64")]
-unsafe fn sgemm_2d_blocks_dyn(pool: Option<&rayon::ThreadPool>, args: GemmArgs, steal_order: bool) {
+unsafe fn sgemm_2d_blocks_dyn(
+    pool: Option<&rayon::ThreadPool>,
+    args: GemmArgs,
+    steal_order: bool,
+    skinny_shared_a: bool,
+) {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let (m, k, n) = (args.m, args.k, args.n);
@@ -1851,6 +1958,38 @@ unsafe fn sgemm_2d_blocks_dyn(pool: Option<&rayon::ThreadPool>, args: GemmArgs, 
     let nblocks = nbi * nbj;
     let ap_cap = round_up(bm.min(m), MR) * k.min(KC);
     let bp_cap = round_up(bn.min(n), NR) * k.min(KC);
+    // Skinny shared-A regime (INSTRUMENT, default OFF — refuted as a win; see the measured
+    // basis at [`gemm_skinny_a`]): ONE block row ⇒ every block's A slice is the same whole-A
+    // rows, so per-block packing is redundant traffic — pack A once per call instead of once per
+    // column block. A single-block grid gains nothing, and past the buffer cap the packed copy
+    // would leave L3 (then per-block chunk packing is the better trade).
+    let a_rows = round_up(m, MR);
+    let use_shared_a =
+        skinny_shared_a && nbi == 1 && nblocks > 1 && a_rows * k * 4 <= SKINNY_A_MAX_BYTES;
+    // The K-chunk walk (pc, kc, packed-A offset) shared by the pack phase and every block body —
+    // the same `select_kc` grouping `sgemm_2d_block` walks, so packed bytes and K order match the
+    // per-block path exactly. Empty (no allocation) outside the shared-A regime.
+    let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
+    if use_shared_a {
+        let (mut pc, mut off) = (0usize, 0usize);
+        while pc < k {
+            let kc = (k - pc).min(select_kc(k));
+            chunks.push((pc, kc, off));
+            off += a_rows * kc;
+            pc += kc;
+        }
+    }
+    // Call-lifetime shared-A buffer, reused across calls via the caller-side thread-local. The
+    // Vec stays in THIS frame (the workers see only the address): `install` joins before the
+    // frame returns, and the buffer is put back after the join.
+    let mut ap_shared: Vec<f32> = Vec::new();
+    if use_shared_a {
+        ap_shared = PACK_SCRATCH_SKINNY_A.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        if ap_shared.len() < a_rows * k {
+            ap_shared.resize(a_rows * k, 0.0);
+        }
+    }
+    let ap_shared_addr = ap_shared.as_mut_ptr() as usize;
     // Optional LPT-style enumeration; `None` = identity (row-major), allocation-free.
     let order: Option<Vec<u32>> = steal_order.then(|| dyn_block_order(m, n, bm, bn, nbi, nbj));
     let order_ref: Option<&[u32]> = order.as_deref();
@@ -1866,11 +2005,52 @@ unsafe fn sgemm_2d_blocks_dyn(pool: Option<&rayon::ThreadPool>, args: GemmArgs, 
         None => (false, 0usize, 0u32, 1.0f32),
     };
     let body = move || {
+        // Shared-A pack phase (shared-A regime only): (K-chunk × MR-panel) granules across the
+        // pool, `pack_a_panel` writing the same bytes the per-block `pack_a` would. The region's
+        // implicit join orders every packed byte before any claim-loop read (the same
+        // happens-before discipline `sgemm_2d_shared` uses — no barriers). Below the fork-join
+        // crossover the whole pack runs serially on one worker: same bytes, no worker wake.
+        if use_shared_a {
+            let mpanels = m.div_ceil(MR);
+            if a_rows * k * 4 < pack_par_min_bytes() {
+                for &(pc, kc, off) in &chunks {
+                    // SAFETY: buffer sized `a_rows·k` above; A read-only; single writer here.
+                    unsafe {
+                        pack_a(
+                            (a_addr as *const f32).add(pc),
+                            k,
+                            m,
+                            kc,
+                            (ap_shared_addr as *mut f32).add(off),
+                        );
+                    }
+                }
+            } else {
+                let chunks_ref = &chunks;
+                (0..chunks_ref.len() * mpanels).into_par_iter().for_each(|u| {
+                    let (ci, ip) = (u / mpanels, u % mpanels);
+                    let (pc, kc, off) = chunks_ref[ci];
+                    // SAFETY: each (chunk, panel) granule owns a disjoint `MR·kc` destination
+                    // slice; A is read-only; buffer sized `a_rows·k` above.
+                    unsafe {
+                        pack_a_panel(
+                            (a_addr as *const f32).add(pc),
+                            k,
+                            m,
+                            kc,
+                            ip,
+                            (ap_shared_addr as *mut f32).add(off + ip * kc * MR),
+                        );
+                    }
+                });
+            }
+        }
         // One claim-loop task per worker — plain fork-join tasks, NOT `broadcast`: the loop never
         // waits on a sibling, so it is correct even if work-stealing runs several loops serially
         // on one thread (they just drain the queue in turn); none of the barrier-width reasoning
         // the persistent region needs applies here, and no nested-broadcast rayon-internals
         // caveat is incurred.
+        let chunks_ref = &chunks;
         (0..nworkers).into_par_iter().for_each(|_| {
             // A null bias-addr (0) stays null; each block shifts to its global column origin.
             let epi = epi_on.then(|| Epilogue {
@@ -1880,12 +2060,13 @@ unsafe fn sgemm_2d_blocks_dyn(pool: Option<&rayon::ThreadPool>, args: GemmArgs, 
             });
             // Per-WORKER scratch, claimed ONCE per claim loop (the static path pays this per
             // block). The loop between take and put-back never re-enters rayon or
-            // PACK_SCRATCH_2D, so take/put pairs cannot interleave on a thread.
+            // PACK_SCRATCH_2D, so take/put pairs cannot interleave on a thread. The shared-A
+            // regime skips the A half — its packed A is the call-shared buffer above.
             let (mut ap, mut bp) = PACK_SCRATCH_2D.with(|s| {
                 let mut g = s.borrow_mut();
                 (std::mem::take(&mut g.0), std::mem::take(&mut g.1))
             });
-            if ap.len() < ap_cap {
+            if !use_shared_a && ap.len() < ap_cap {
                 ap.resize(ap_cap, 0.0);
             }
             if bp.len() < bp_cap {
@@ -1903,25 +2084,43 @@ unsafe fn sgemm_2d_blocks_dyn(pool: Option<&rayon::ThreadPool>, args: GemmArgs, 
                 let (bi, bj) = (t / nbj, t % nbj);
                 let (i0, j0) = (bi * bm, bj * bn);
                 // SAFETY: `fetch_add` hands each block index to exactly one worker (disjoint C
-                // writes); A/B are read-only; scratch is worker-private; avx2+fma verified by
-                // `gemm_dispatch`.
+                // writes); A/B are read-only; scratch is worker-private (the shared packed A is
+                // read-only past its phase join); avx2+fma verified by `gemm_dispatch`.
                 unsafe {
-                    sgemm_2d_block(
-                        a_addr as *const f32,
-                        b_addr as *const f32,
-                        c_addr as *mut f32,
-                        k,
-                        n,
-                        beta,
-                        bt,
-                        epi,
-                        i0,
-                        j0,
-                        (m - i0).min(bm),
-                        (n - j0).min(bn),
-                        ap.as_mut_ptr(),
-                        bp.as_mut_ptr(),
-                    );
+                    if use_shared_a {
+                        sgemm_2d_block_shared_a(
+                            ap_shared_addr as *const f32,
+                            chunks_ref,
+                            b_addr as *const f32,
+                            c_addr as *mut f32,
+                            k,
+                            n,
+                            beta,
+                            bt,
+                            epi,
+                            j0,
+                            m,
+                            (n - j0).min(bn),
+                            bp.as_mut_ptr(),
+                        );
+                    } else {
+                        sgemm_2d_block(
+                            a_addr as *const f32,
+                            b_addr as *const f32,
+                            c_addr as *mut f32,
+                            k,
+                            n,
+                            beta,
+                            bt,
+                            epi,
+                            i0,
+                            j0,
+                            (m - i0).min(bm),
+                            (n - j0).min(bn),
+                            ap.as_mut_ptr(),
+                            bp.as_mut_ptr(),
+                        );
+                    }
                 }
             }
             PACK_SCRATCH_2D.with(|s| {
@@ -1934,6 +2133,9 @@ unsafe fn sgemm_2d_blocks_dyn(pool: Option<&rayon::ThreadPool>, args: GemmArgs, 
     match pool {
         Some(p) => p.install(body),
         None => body(),
+    }
+    if use_shared_a {
+        PACK_SCRATCH_SKINNY_A.with(|s| *s.borrow_mut() = ap_shared);
     }
 }
 
@@ -3753,7 +3955,7 @@ mod tests {
         }
     }
 
-    /// The dynamic-queue 2D path ([`sgemm_2d_blocks_dyn`] — what `WUKONG_GEMM_DYN=1` routes to;
+    /// The dynamic-queue 2D path ([`sgemm_2d_blocks_dyn`] — the default parallel scheduler;
     /// called DIRECTLY so the test is immune to the process-wide env OnceLock state) must be
     /// **bit-for-bit** identical to the serial kernel under BOTH block enumerations
     /// (`steal_order` false/true): the claim counter and the permutation only choose which worker
@@ -3796,41 +3998,52 @@ mod tests {
                         }
                     }
                     for steal_order in [false, true] {
-                        let mut got = base.clone();
-                        unsafe {
-                            let args = GemmArgs {
-                                a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
-                                m, k, n, beta: beta as f32, bt, epi: None,
-                            };
-                            sgemm_2d_blocks_dyn(gemm_pool(), args, steal_order);
+                        for skinny_a in [false, true] {
+                            let mut got = base.clone();
+                            unsafe {
+                                let args = GemmArgs {
+                                    a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
+                                    m, k, n, beta: beta as f32, bt, epi: None,
+                                };
+                                sgemm_2d_blocks_dyn(gemm_pool(), args, steal_order, skinny_a);
+                            }
+                            assert_eq!(
+                                serial, got,
+                                "dyn != serial (m{m} k{k} n{n} bt{bt} beta{beta} order{steal_order} skinnyA{skinny_a})"
+                            );
                         }
-                        assert_eq!(
-                            serial, got,
-                            "dyn != serial (m{m} k{k} n{n} bt{bt} beta{beta} order{steal_order})"
-                        );
                     }
                 }
             }
         }
         // Epilogue leg: final-K-only rule + bias shifts + α through the dynamic claim loop, with
         // 3 uneven K-blocks (901 → 304+304+293) so a per-K-block epilogue bug folds three times.
-        {
-            let (m, k, n) = (214usize, 901usize, 616usize);
+        // Runs at TWO shapes: the edge-remainder grid (nbi > 1, per-block body) and a skinny
+        // single-block-row twin (m = 128 ⇒ nbi == 1) whose `skinny_a` leg pins the epilogue rules
+        // through the shared-A body ([`sgemm_2d_block_shared_a`]) — a per-K-chunk epilogue bug
+        // there would fold the bias three times over.
+        for (m, k, n) in [(214usize, 901usize, 616usize), (128, 901, 616)] {
             assert!(k > select_kc(k), "epi leg must span multiple K-blocks");
             let a = fill(104, m * k);
             let b = fill(105, n * k);
             let bias = fill(106, n);
             let run_dyn = |epi: Epilogue, serial_ref: &[f32], tag: &str| {
                 for steal_order in [false, true] {
-                    let mut got = vec![0.0f32; m * n];
-                    unsafe {
-                        let args = GemmArgs {
-                            a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
-                            m, k, n, beta: 0.0, bt: true, epi: Some(epi),
-                        };
-                        sgemm_2d_blocks_dyn(gemm_pool(), args, steal_order);
+                    for skinny_a in [false, true] {
+                        let mut got = vec![0.0f32; m * n];
+                        unsafe {
+                            let args = GemmArgs {
+                                a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
+                                m, k, n, beta: 0.0, bt: true, epi: Some(epi),
+                            };
+                            sgemm_2d_blocks_dyn(gemm_pool(), args, steal_order, skinny_a);
+                        }
+                        assert_eq!(
+                            serial_ref,
+                            &got[..],
+                            "dyn nt+epi != serial ({tag} m{m} order{steal_order} skinnyA{skinny_a})"
+                        );
                     }
-                    assert_eq!(serial_ref, &got[..], "dyn nt+epi != serial ({tag} order{steal_order})");
                 }
             };
             let mut serial = vec![0.0f32; m * n];
@@ -3909,20 +4122,22 @@ mod tests {
             let (m, k, n) = shapes[(t - 1) % 2];
             let (a, b, serial) = &refs[(t - 1) % 2];
             for steal_order in [false, true] {
-                let mut got = vec![0.0f32; m * n];
-                unsafe {
-                    let args = GemmArgs {
-                        a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
-                        m, k, n, beta: 0.0, bt: false, epi: None,
-                    };
-                    sgemm_2d_blocks_dyn(Some(&pool), args, steal_order);
+                for skinny_a in [false, true] {
+                    let mut got = vec![0.0f32; m * n];
+                    unsafe {
+                        let args = GemmArgs {
+                            a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
+                            m, k, n, beta: 0.0, bt: false, epi: None,
+                        };
+                        sgemm_2d_blocks_dyn(Some(&pool), args, steal_order, skinny_a);
+                    }
+                    assert_eq!(
+                        serial, &got,
+                        "dyn != serial (threads {t} order {steal_order} skinnyA{skinny_a} m{m} k{k} n{n})"
+                    );
                 }
-                assert_eq!(
-                    serial, &got,
-                    "dyn != serial (threads {t} order {steal_order} m{m} k{k} n{n})"
-                );
             }
-            // Dynamic OFF (the shipped default scheduler) at the same width.
+            // The static range-split scheduler (the `WUKONG_GEMM_DYN=0` instrument) at the same width.
             let mut st = vec![0.0f32; m * n];
             unsafe {
                 let args = GemmArgs {
