@@ -50,23 +50,24 @@ quality, not just beating textbook code:
 - **GEMM is near the silicon limit *and* ahead of a tuned library.** The single-core f32 GEMM holds
   **~104–117 GFLOP/s ≈ 90% of one P-core's AVX2-FMA roofline**, and is **1.1–1.3× faster than the
   tuned `matrixmultiply` Rust crate** — a real hand-optimized peer, not a strawman (`117 vs 89`,
-  `115 vs 91`, `104 vs 96` GFLOP/s across 512²–1024²) — with **no LLVM**.
+  `115 vs 91`, `104 vs 96` GFLOP/s across 256²–1024²) — with **no LLVM**.
 - **Compile time leads decisively, every build.** The headline *compiler-to-compiler* figure is the
   **both-subprocess `compile-vs`** comparison (`cargo run -p wukong_bench --release -- compile-vs`:
   `wukongc --emit=obj -O2` vs `gcc/g++/rustc` compiling bare equivalent kernels to objects, all as
   subprocesses, best-of-N same-run). The xbench per-kernel "compile (ms)" figure — **~100–680×
-  faster than C/Rust** (latest full-board geomean ~305×; ~0.3–1.5 ms vs ~125–245 ms) — measures
+  faster than C/Rust** (latest full-board geomean ~306×; ~0.3–1.5 ms vs ~125–245 ms) — measures
   **in-process JIT/embedding latency** (Wukong's front-end + Cranelift JIT in-process vs *spawning*
   a toolchain), the right number for JIT-style embedding but not a process-to-process comparison.
-- **Geomean across the elementwise/reduction battery: 4.86× faster than C.**
+- **Geomean across the elementwise/reduction battery: 4.86× faster than C** (provisional — derivation not shown).
 - **End-to-end: a 12-layer GPT-2-class transformer stack (768/12/3072, S=128/512) runs ~19–21×
-  faster than idiomatic C and 3.6–4.9× faster than `-ffast-math` C single-core** (five valid
-  full-peer rounds — see the [End-to-end model](#end-to-end-model--a-12-layer-gpt-2-class-transformer-stack-cpu-inference)
-  section), at **parity-to-faster vs PyTorch CPU eager single-thread** (1.03–1.09× behind @S=128,
-  **1.12–1.22× faster @S=512**) and — since the `@parallel` head-loop region shipped (2026-07-10) —
-  **1.10–1.24× faster than all-threads eager torch at S=512** with parity at S=128; the whole block
-  compiles in ~3–12 ms vs gcc's ~0.4–0.9 s and the forward is interpreter-gated bit-for-bit at a
-  reduced config.
+  faster than idiomatic C and 3.6–4.9× faster than `-ffast-math` C single-core** (three independent
+  same-day rounds — see the [End-to-end model](#end-to-end-model--a-12-layer-gpt-2-class-transformer-stack-cpu-inference)
+  section), and **beats compiled PyTorch** (`torch.compile` Inductor max-autotune, fullgraph, warmed):
+  single-thread it beats compiled-torch-1T at **both** shapes, and — since the `@parallel` head-loop
+  region shipped (2026-07-10) — it runs **1.39–1.81× faster than all-threads compiled torch at S=512
+  and 1.07–1.43× faster at S=128** (three rounds; it also beats torch's strongest eager config
+  1.07–1.37× @S=512); the whole block compiles in ~3–12 ms vs gcc's ~0.4–0.9 s and the forward is
+  interpreter-gated bit-for-bit at a reduced config.
 
 The largest domain-lowering blowouts (each is multicore-vs-1-core, or vs idiomatic scalar source
 where gcc/rustc won't vectorize — disclosed per section, never a rigged baseline):
@@ -84,7 +85,8 @@ where gcc/rustc won't vectorize — disclosed per section, never a rigged baseli
 **GPU backend** (`--features gpu`, mobile RTX 4050, same-run clock-invariant ratios — full section
 [below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): fp16 tensor-core GEMM reaches **cuBLAS parity
 (~101%) at ≤1024³**, and the ldmatrix+XOR-swizzle workhorse lifts the large regime to **~87–90% at
-2048³, ~83% at 4096³** (past the prior 77% PTX ceiling);
+2048³** (past the prior 77% PTX ceiling) and, with the shipped **v2cs streaming epilogue**, **76.8%
+of cuBLAS-f16 / 80.4% of the honest f32-out peer at 4096³**;
 **95.7% of the 192 GB/s HBM hardware peak** on the saxpy triad; the fused flash-attention **beats the genuinely-fused cuDNN + cutlass mem-efficient fMHA** in the
 causal-D64-S=512 (**1.03–1.16×**), fused-RoPE-S≤512 (**1.8–5.7×**), and D=128-ldmatrix-S≤1024 (**1.11–1.20×**
 vs cutlass-efficient) regimes, is competitive through S≤1024, and **trails cuDNN at long context S≥2048
@@ -92,7 +94,7 @@ vs cutlass-efficient) regimes, is competitive through S≤1024, and **trails cuD
 weaker library bar); int8 tensor-core GEMM is **~180–237× naive CUDA-C** and reaches **96–105% of cuBLAS
 int8 IMMA @2048³ (beating it), 86–88% @1024³, ~70% @4096³** (the 64×64 warp-tile, ldmatrix + XOR-swizzle),
 with the **fused int8 GEMM+dequant 1.1–2.2× the cuBLAS chain**; the **fused GEMM+activation beats the cuBLAS GEMM+act chain
-1.18–2.41×** (the fusion cuBLAS structurally can't express); and GPU compile is **0.76 ms cold vs
+1.18–2.41× at ≤1024³** (the fusion cuBLAS structurally can't express; it washes to a slight loss by 2048³ — 0.94×); and GPU compile is **0.76 ms cold vs
 Triton's 30–120 s** (~4×10⁴–1.6×10⁵×).
 
 Every number is gated bit-for-bit (CPU) or to a `c·√K·ε` tolerance (GPU) against the interpreter
@@ -109,14 +111,14 @@ negative results**, live in [`prompts/results/`](prompts/results/).
 
 | Slice | Peer | Standing | Honest residual gap |
 |---|---|---|---|
-| CPU GEMM | oneMKL | 1-core **97–100%** of MKL-1c @256–1024³ and **96–99% @2048³** (2026-07-10 C-tile microkernel prefetch closed the writeback-miss tail; the `WUKONG_GEMM_PF_C=0` kill-switch reproduces the old 86–88%); `@parallel` via the **size-keyed 2D block-parallel dispatch** (per-block packing mid/large — it beat the shared-cooperative-pack design in both ABBA orderings — shared-pack small band above the 2²³-MAC gate): **70–83%** of MKL-all @512–1024³, **88–93% @2048³ vs a healthy peer** (176–186% vs MKL's degraded rounds), **102–123% @256³** (engaged at 1.7–2× over serial; was deliberately serial at ~39–52%) | mid-size `@parallel` still behind MKL-all's parallel grain @512–1024³ (MKL-all swings ~1.4–2× with power state — ratios same-run, reported as ranges); Wukong's parallel path holds flat wall-time across power states while peers ride them (sync/serial-fraction bound — head-loop parallelism is the open lever) |
+| CPU GEMM | oneMKL | 1-core **~80–104% of MKL-1c across sizes**, at/above parity (≥100%) at 2048³/4096³ (2026-07-10 C-tile microkernel prefetch closed the writeback-miss tail; the `WUKONG_GEMM_PF_C=0` kill-switch reproduces the old 86–88%); `@parallel` via the **size-keyed 2D block-parallel dispatch** (per-block packing mid/large — it beat the shared-cooperative-pack design in both ABBA orderings — shared-pack small band above the 2²³-MAC gate): **~98–99% @512³, ~104% @1024³** of MKL-all, **91% @2048³ / 93% @4096³ vs a healthy peer** (176–186% vs MKL's degraded rounds), **~94–110% @256³** (engaged at 1.7–2× over serial; was deliberately serial at ~39–52%) | large-size `@parallel` a touch behind MKL-all's parallel grain @2048³ (91%; 512³–1024³ at/above parity — MKL-all swings ~1.4–2× with power state, ratios same-run, reported as ranges); Wukong's parallel path holds flat wall-time across power states while peers ride them (sync/serial-fraction bound — head-loop parallelism is the open lever) |
 | CPU vmath | oneMKL VML | **tanh 2.7–2.9× FASTER**; exp **1.23–1.45×** and log **~1.25×** slower across thermal states (2026-07-09 re-measure; the single-session "exp 1.05× faster / log 1.14×" readings did not reproduce — ranges are the honest claim) — still down from the former ~1.7–2× loss via the 8-bucket in-register-LUT rewrites (exp ~1.3 ULP, log ≤6.9e-7, exhaustively swept) | residual exp/log gap is algorithmic (VML's cheaper ~0.5-ULP core); a bit-identical ldexp exp-tail restructure measured a ~10–15% LOSS in both thermal states and was reverted — port rebalancing cannot beat a clock throttle |
-| CPU end-to-end model (12-layer GPT-2-class) | PyTorch CPU eager + gcc C | **~19–21× C(gcc), 3.6–4.9× C(-ffast-math)** 1-core; vs torch 1-thread: 1.03–1.09× behind @S=128, **1.12–1.22× faster @S=512**; multicore, since the `@parallel` head-loop region (2026-07-10): **1.10–1.24× FASTER than all-threads eager torch @S=512** (two valid rounds, roofline-validated) and parity @S=128 (1.19× faster / 1.02× behind at round noise; was 1.5–1.9× behind), scaling **3.1–3.6×**, **~61–69× C(gcc)** multicore; interp gate bit-exact three ways (interp == native == @parallel), serial==@parallel bit-exact, outputs cross-checked <2e-6 vs C and torch | residual scaling headroom vs 16 physical cores is the parallel GEMM grain (70–83% of MKL-all @512–1024³) — the open lever |
-| fp16/bf16 GEMM | cuBLAS | **~101%** ≤1024³, **~88–100% of cuBLAS-f16** @2048³ (99.8% in the 2026-07-09 cliff round); @4096³ the **v2cs streaming epilogue** shipped (+2.7%): **76.8% of cuBLAS-f16 / 80.4% of the honest f32-out peer** (new peer column — the f16-out peer hides ~half of Wukong's f32 C-write traffic) | 4096³ residual is SASS-level; 3-stage pipe, raster re-tunes, launch-bounds, and 2048³ epilogue variants all measured losses (kept bench-only) |
+| CPU end-to-end model (12-layer GPT-2-class) | PyTorch CPU compiled (`torch.compile` max-autotune, fullgraph) + eager + gcc C | **~19–21× C(gcc), 3.6–4.9× C(-ffast-math)** 1-core; vs compiled-torch-1T it wins at **both** shapes; multicore, since the `@parallel` head-loop region (2026-07-10): **1.39–1.81× FASTER than all-threads compiled torch @S=512 and 1.07–1.43× @S=128** (three rounds, roofline-validated; also 1.07–1.37× vs torch's strongest eager config @S=512), scaling to **default 4.44× / best 5.22× (T=16 4.70×)**, **~61–69× C(gcc)** multicore; interp gate bit-exact three ways (interp == native == @parallel), serial==@parallel bit-exact, outputs cross-checked <2e-6 vs C and torch | residual scaling headroom vs 16 physical cores is the parallel-GEMM grain at 2048³/4096³ (91–93% of MKL-all; 512³–1024³ at/above parity) — the open lever |
+| fp16/bf16 GEMM | cuBLAS | **~101%** ≤1024³, **~87–90% of cuBLAS-f16** @2048³; @4096³ the **v2cs streaming epilogue** shipped (+2.7%): **76.8% of cuBLAS-f16 / 80.4% of the honest f32-out peer** (new peer column — the f16-out peer hides ~half of Wukong's f32 C-write traffic) | 4096³ residual is SASS-level; 3-stage pipe, raster re-tunes, launch-bounds, and 2048³ epilogue variants all measured losses (kept bench-only) |
 | int8/fp8 GEMM | cuBLAS IMMA / cuBLASLt | int8 **96–105%** @2048³ (**beats IMMA**), 86–88% @1024³; **fused GEMM+dequant 1.1–2.2×** the cuBLAS chain; fp8 82–151% of cuBLASLt | int8 ~70% @4096³ (HBM-bound) |
 | Attention | cuDNN / cutlass fused fMHA | fused-RoPE **1.8–5.7×** & causal D=64 **1.03–1.16×** (beats both) @S≤512; D=128 ldmatrix beats cutlass @S≤1024 — the production D=128 dispatch; **FA2-style warp-specialized kernels (2-warp named-barrier anti-phase + 3-stage ring) built, gated, and default-routed at S≥4096 where they win 4–6%** (clock-cancelled median-of-9; tie @2048, lose @≤1024 — pins keep the losing regimes unroutable) | non-causal long-S (≥2048) 0.37–0.66× cuDNN stands — warp specialization was the last scheduling lever and moved only the S=4096 point; the loss is structural (SFU/serial-softmax on 20 SMs) |
 | Conv | cuDNN-9 | 1×1 **3.5–5.6×**, 3×3/5×5 deep-channel **0.93–1.21×**, Winograd F(4×4,3×3) **1.2–2.2×** over implicit-GEMM | Winograd loses at low channel count; depthwise/dilated not yet covered |
-| Serving | (no vLLM/TRT-LLM installable — vs Wukong's own eager + an honest static-batching peer) | **85.6× continuous-batching goodput** vs fill=1 @Bcap=256 (2026-07-10 Bcap parameterization; 33.1k tok/s full-fill, same-clock interleaved; the old 39× was the Bcap=64 ceiling, reproduced at 38.2×), graph-driven scheduler drain 27.5k tok/s = **1.14–1.27× vs static batching** (bit-identical outputs; the batching-vs-scheduling decomposition disclosed); decode CUDA graph 1.07–1.35×; int8 KV **3.88×** footprint + opt-in int8 KV storage (1.88× smaller cache) | multi-GPU collective (NCCL) unmeasured on one device |
+| Serving | (no vLLM/TRT-LLM installable — vs Wukong's own eager + an honest static-batching peer) | **85.6× continuous-batching goodput** vs fill=1 @Bcap=256 (2026-07-10 Bcap parameterization; 33.1k tok/s full-fill, same-clock interleaved; the old 39× was the Bcap=64 ceiling, reproduced at 38.2×), graph-driven scheduler drain 27.5k tok/s = **1.14–1.27× vs static batching** (bit-identical outputs; the batching-vs-scheduling decomposition disclosed); decode CUDA graph 1.07–1.35×; int8 KV **3.88× smaller cache than f32** (1.94× than f16), the opt-in int8-KV storage path | multi-GPU collective (NCCL) unmeasured on one device |
 
 ## Scoreboard
 
@@ -138,16 +140,16 @@ tolerance for the reassociated-float ones).
 | **Transpose** (f32 / bf16) | ~1.5× | ~9–14× | `B=32` cache tiling; `-O3` doesn't loop-tile a transpose |
 | **Fused norms** (softmax/LN/RMS) | ~1.9–6.6× | memory-bound | single-pass fusion + 256-bit `exp`; their float reductions stay sequential |
 | **Reductions** (dot / ssd) | ~2.6–2.9× | ~8–26× | lane accumulators; their reduction is a serial `vaddss` chain |
-| **Activations** (35-op `vmath`) | ~2–13× | ~28× | hand-AVX2 256-bit transcendentals vs scalar libm |
+| **Activations** (35-op `vmath`) | ~2–11.5× | ~28× | hand-AVX2 256-bit transcendentals vs scalar libm |
 | **Activation backward** (6: silu/gelu/sigmoid/tanh/elu/softplus grad) | **~3–12×** | **~5.5–25×** | the derivative folds a sigmoid/tanh/exp (`expf`) C/Rust keep scalar — the forward lever, applied to training |
 | **Softmax backward** (`y·(dy−Σy·dy)`) | ~1.0–2.0× | ~4.5–6.1× | vectorizes the per-row dot's accumulation (modest — they vectorize the apply) |
-| **Norm backward** (RMSNorm / LayerNorm grad) | ~2.6–4.0× | ~11–20× | the per-row coupling-term reductions (`Σdy·x̂` etc.) gcc keeps scalar |
-| **Cross-entropy** (softmax xent fwd / bwd) | ~7.8× / ~13.5× | ~32–64× | the fused `expf` log-partition + gather; C's reduction stays scalar |
-| **Row losses** (KL-div / entropy / soft-label xent) | ~3.6–7.5× | ~15–39× | the per-row `logf`/`expf` reduction gcc/rustc keep scalar |
+| **Norm backward** (RMSNorm / LayerNorm grad) | ~2.6–4.0× | ~11–20× | the per-row coupling-term reductions (`Σdy·x̂` etc.) gcc keeps scalar (measured in tests/run; per-size table not reproduced here) |
+| **Cross-entropy** (softmax xent fwd / bwd) | ~7.8× / ~13.5× | ~32–64× | the fused `expf` log-partition + gather; C's reduction stays scalar (measured in tests/run; per-size table not reproduced here) |
+| **Row losses** (KL-div / entropy / soft-label xent) | ~3.6–7.5× | ~15–39× | the per-row `logf`/`expf` reduction gcc/rustc keep scalar (measured in tests/run; per-size table not reproduced here) |
 | **RoPE** (rotary embedding fwd / bwd) | **~29–54×** | **~146–156×** | the per-pair sin/cos — C calls scalar `sincosf`; Wukong one 256-bit `sincos` |
-| **Gate** (SwiGLU / GeGLU `act(a)·b`) | ~5–13× | ~13–27× | the gate's silu/gelu folds an `expf` C/Rust keep scalar |
-| **Argmax/argmin** (global / row / column) | **~2.7–9×** | ~3.4–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize; global + column are AVX2 single-pass |
-| **Scans** (cumsum / cummax / cummin / cumprod) | ~1.4–2.9× | ~6.4–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan, or 4-row-interleaved ILP for cumprod / `lrscan` (cummax/cummin/cumprod bit-exact) |
+| **Gate** (SwiGLU / GeGLU `act(a)·b`) | ~5–13× | ~13–27× | the gate's silu/gelu folds an `expf` C/Rust keep scalar (measured in tests/run; per-size table not reproduced here) |
+| **Argmax/argmin** (global / row / column) | **~2.6–9×** | ~3.4–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize; global + column are AVX2 single-pass |
+| **Scans** (cumsum / cummax / cummin / cumprod) | ~1.4–2.9× | ~5.3–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan, or 4-row-interleaved ILP for cumprod / `lrscan` (cummax/cummin/cumprod bit-exact) |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu / bias-add | ≈tie | — | already bandwidth-bound; no headroom standalone (won when *fused*) |
 
@@ -244,7 +246,7 @@ naively-written source:
   a sibling **`wukong_norm_affine_f32`** and hold the same win (**~1.7–3.7×**) — γ/β fold into the
   writeback for free.
 - **Convolution via im2col + GEMM.** A conv expressed as im2col + matmul has its matmul recognized
-  and dispatched to the GEMM microkernel — so Wukong beats hand-written direct convolution ~5.8×,
+  and dispatched to the GEMM microkernel — so Wukong beats hand-written direct convolution ~6–7×,
   the same way XLA/cuDNN lower conv.
 - **Auto-parallelization** of `@parallel` loops across all cores, with each per-thread chunk itself
   vectorized.
@@ -316,7 +318,7 @@ process-to-process compiler comparison:
 
 | | Wukong (in-process JIT) | C (gcc, spawned) | Rust (rustc, spawned) | ratio |
 |---|---|---|---|---|
-| any kernel | ~0.3–1.5 ms | ~125–245 ms | ~185–250 ms | **~100–680×** (geomean ~305×) |
+| any kernel | ~0.3–1.5 ms | ~125–245 ms | ~185–250 ms | **~100–680×** (geomean ~306×) |
 
 Wukong's number is its front-end + Cranelift JIT running **inside the harness process**, while the
 C/Rust numbers include *spawning* the toolchain — so the ratio measures what a user of Wukong's
@@ -328,8 +330,9 @@ run; the geomean drifts between ~150× and ~310× across sessions, the latest fu
 `compile-vs` above. For an ML compiler — where edit/recompile/run iteration dominates developer
 time — compile latency is the most robust result of all, under either measurement.
 
-The pipeline's own hot stage is the **optimizer** (~80–85% of front-to-`-O2` time; the recognizer
-sweep and sema are negligible). Two output-preserving changes cut it **~31%** (in-process, 400-function
+The pipeline's own hot stage is the **optimizer** (~80–85% of the front→`-O2` time *only*; once the
+Cranelift backend is counted the full-pipeline split is backend 73.4% / optimize 16.3% — see
+`docs/compile-floor.md`; the recognizer sweep and sema are negligible). Two output-preserving changes cut it **~31%** (in-process, 400-function
 `-O2`: **18.0 ms → 12.5 ms**): the CSE value-numbering key became a packed allocation-free `enum`
 instead of a `format!` string built per pure instruction (CSE is the costliest pass), and the fixpoint
 loop now skips passes already at fixpoint — dropping the final all-passes no-op *confirmation* sweep
@@ -368,8 +371,10 @@ tens of seconds per call at S=512, so it is skipped there by default (`XBENCH_MO
 it), the same rule as the ≥2048³ naive matmuls.
 
 **PyTorch peer (the industry baseline).** When `python` + `torch` import (probed gracefully; a
-printed note + `n/a` columns otherwise), the bench adds **eager PyTorch CPU** (MKL/oneDNN-backed;
-explicitly *not* `torch.compile`) as three more columns. The harness dumps the *exact* weight and
+printed note + `n/a` columns otherwise), the bench adds **PyTorch CPU** — both **eager**
+(MKL/oneDNN-backed; `T1`/`Tn`) **and `torch.compile` max-autotune fullgraph** (`T1(comp)`/`Tn(comp)`),
+run same-run at `set_num_threads(1)` and all-threads; the **compiled** columns are the honest bar
+(ATEN-pinned because Inductor's Windows CPP FP32 GEMM template is broken, disclosed). The harness dumps the *exact* weight and
 input buffers every other column reads as little-endian f32 blobs (the config-invariant 12-layer
 weights once per run, the per-config input/final-LN blob per S) and generates a self-contained
 Python script that rebuilds the identical forward: `F.linear` computes `x·Wᵀ` over the *same*
@@ -384,11 +389,11 @@ per-iteration allocation/IO beyond what eager torch does inside a forward), at
 ms/forward + tokens/sec rows. Torch is timed in the *same bench invocation* immediately after the
 Wukong columns (same-run adjacency); inside the script the single-thread variants run first and
 the all-core one last, so multicore heat pollutes no single-thread torch number. Columns:
-`T1(sdpa)`, `T1(man)`, `Tn(sdpa)`; the Wukong-vs-Torch ratio lines print alongside the
+`T1(sdpa)`, `T1(man)`, `Tn(sdpa)`, and the compiled `T1(comp)`/`Tn(comp)`; the Wukong-vs-Torch ratio lines print alongside the
 Wukong-vs-C ones. Disclosed asymmetry: `Tn(sdpa)` is genuinely multicore while the C columns are
 single-threaded — the printed ratios name the thread counts. As everywhere in this suite, absolute
-ms is clock/thermal-bound, so only the **same-run ratios** are recorded (below); raw torch ms is not
-a stable metric and is not reported.
+ms is clock/thermal-bound, so only the **same-run ratios** are recorded (below); cross-run raw torch ms
+is not a stable headline — the same-run interleaved A/B ms below are the honest form.
 
 **Correctness.** Four gates run inside the benchmark: (1) the interpreter oracle executes the
 *identical* 12-layer forward (same MIR, same weights, same harness loop) at a reduced config and
@@ -401,7 +406,7 @@ output agrees under the same magnitude-normalized `1e-3` metric (same GELU flavo
 residual is the same reassociation/poly-vs-libm class — no loosening needed), and the script itself
 reports its manual-attention-vs-SDPA agreement.
 
-**Measured standings (2026-07-09/10 perf campaign — five valid full-peer rounds).** Absolute ms
+**Measured standings (2026-07-11 — three independent same-day rounds for the compiled-torch bar; the earlier 2026-07-09/10 eager campaign ran five valid full-peer rounds).** Absolute ms
 swings ~3× with this laptop's clock state (the valid rounds read roofline 130–141 GFLOP/s; a sixth
 round at roofline 61 — 1 a.m. system activity plus a fresh-binary cache scan — was caught by the
 validity protocol and discarded), so the **ratios are the metric**, not raw ms. All four correctness
@@ -409,8 +414,8 @@ gates passed every round: interp == native bit-exact, serial == `@parallel` bit-
 Wukong-vs-C / Wukong-vs-torch outputs agree to `max|Δ|/max|out|` ≈ 1–2×10⁻⁶ (tolerance 10⁻³).
 
 *Single-core*, the 12-layer stack runs **~19–21× idiomatic C(gcc)** and **3.6–4.9× C(-ffast-math)**,
-and stands **at parity-to-faster vs PyTorch CPU eager single-thread** — 1.03–1.09× behind torch-1T
-@S=128, **1.12–1.22× faster @S=512**.
+and **beats compiled PyTorch single-thread at both shapes** — Wukong-1c is faster than
+compiled-torch-1T (`torch.compile` max-autotune fullgraph) at S=128 and S=512.
 
 *Multicore*, the campaign's closing move was the **`@parallel` head-loop region** (2026-07-10): an
 independent-iteration `for` loop with body-local scratch inside an `@parallel` fn now outlines into a
@@ -419,18 +424,18 @@ kernels running inside each iteration so serial == `@parallel` stays **bit-exact
 declining the construct loudly. The model spells its per-head attention loop that way naturally, and
 it **flipped the all-threads-torch comparison**:
 
-| S | Wukong `@parallel` vs all-threads eager torch (`Tn`) | `@parallel` scaling | vs C(gcc) multicore |
+| S | Wukong `@parallel` vs all-threads compiled torch (`Tn(comp)`) | `@parallel` scaling | vs C(gcc) multicore |
 |---|---|---|---|
-| 128 | **parity** — 1.19× faster / 1.02× behind at round noise (was 1.5–1.9× behind) | 3.14–3.61× | ~61–69× |
-| 512 | **1.10–1.24× FASTER** (two valid rounds; par ~440 → ~312 ms — the head loop was worth ~1.4×) | 3.27–3.36× | large |
+| 128 | **1.07–1.43× FASTER** (three rounds) | default 4.44× / best 5.22× | ~61–69× |
+| 512 | **1.39–1.81× FASTER** (three rounds; the head loop was worth ~1.4×) | 1.00/1.70/2.13/3.00/3.68/4.70× at T=1/2/4/8/12/16 (default 4.44×, best 5.22×, ceiling ~5.0–5.4×) | large |
 
 Before the region, three mid-session rounds had Wukong `@parallel` scaling 2.2–3.0× @S=128 / 2.4×
-@S=512 and sitting **1.01–1.63× *behind* all-threads torch @S=512** — the wide range being the peer's
-power-state swing (torch-Tn ran 443→271 ms across rounds while Wukong `@parallel` held ~440 ms in
+@S=512 and sitting **1.01–1.63× *behind* all-threads eager torch @S=512** — the wide range being the peer's
+power-state swing (eager torch-Tn ran 443→271 ms across rounds while Wukong `@parallel` held ~440 ms in
 every round). That exposed the structural finding the region then addressed: Wukong's parallel path
 does **not** ride the clock upside peers do, consistent with a sync/serial-fraction bound rather than
-a clock bound. The residual multicore headroom vs 16 physical cores now concentrates in the mid-size
-parallel-GEMM grain (70–83% of MKL-all @512–1024³ — see the library table above), the one
+a clock bound. The residual multicore headroom vs 16 physical cores now concentrates in the large-size
+parallel-GEMM grain (2048³/4096³ 91–93% of MKL-all; 512³–1024³ at/above parity — see the library table above), the one
 honestly-open lever. Compiling the whole block takes Wukong **~3–12 ms vs gcc's ~0.4–0.9 s** for the
 equivalent TU; tokens/sec = S ÷ ms/forward.
 
@@ -462,9 +467,11 @@ GFLOP/s as 1024² spills out of cache, so the **single-thread lead widens with s
 single-core kernel also **beats the tuned `matrixmultiply` Rust crate by ~1.1–1.3×** (117 vs 89, 115
 vs 91, 104 vs 96 GFLOP/s at 256²–1024²) — so Wukong is not merely beating naive C; it edges a
 dedicated hand-optimized GEMM library while sitting at ~90% of the AVX2-FMA roofline. The parallel
-kernel reaches **~437–522 GFLOP/s at 1024³** and **~690 at 2048³** (after the `MC=144` cache-block
-widening cut the B-panel's L3 re-streaming, and the pack-scratch is reused across blocks rather than
-re-allocated per K-block).
+kernel's absolute throughput swings ~3× with power state, so its standing is the **same-run vs-MKL
+ratio** in the library table above rather than a fixed GFLOP/s (the pre-2D-path ~437–522 @1024³ /
+~690 @2048³ figures predate the current default parallel path); the `MC=144` cache-block widening cut
+the B-panel's L3 re-streaming, and the pack-scratch is reused across blocks rather than re-allocated
+per K-block.
 
 † At 256³ the parallel kernel deliberately falls back to the serial one: ~17M MACs is below the
 work threshold where cross-core wake/sync pays off on this P+E hybrid, so "@parallel" ≈ single-core
@@ -477,8 +484,8 @@ throttled day; the same-run vs-MKL ratios in the library table above are the cur
 *2026-07-10 update*: that path is now **size-keyed** — per-block packing at mid/large (it beat the
 shared-cooperative-pack design in both ABBA orderings — each worker warming its own L2 is the win),
 a shared-pack + 1 Mi-MAC-task small band, and the parallel gate lowered 2²⁶→2²³ MACs so 256³ engages
-(**102–123% of MKL-all**, was deliberately serial). A C-tile microkernel prefetch also closed the
-single-core writeback tail (**2048³ 86–88% → 96–99% of MKL-1c**, `WUKONG_GEMM_PF_C=0` kill-switch).
+(**~94–110% of MKL-all**, was deliberately serial). A C-tile microkernel prefetch also closed the
+single-core writeback tail (**2048³ 86–88% → ≥100% of MKL-1c**, `WUKONG_GEMM_PF_C=0` kill-switch).
 *2026-07-11 updates*: the small-size shared-pack band did not survive pool unification — **per-block
 packing is the default at every size** (`WUKONG_GEMM_2D_SHARED` keeps the retired shapes measurable);
 and the per-block blocks are now handed out by an **atomic claim queue** instead of rayon's static
@@ -772,8 +779,9 @@ GB/s (higher is better) — input traffic over `[bf16; N]` arrays:
 The **dot** win (~3×) tracks the f32 `dot` — Wukong vectorizes the reduction while C/Rust stay serial.
 The **sum** win is larger (~6–8×) because C's unary f32 sum is a single dependency chain (pure
 latency, no product to fill the pipeline) at ~1.5 GB/s, while Wukong's 8-lane SIMD sum reaches
-~12 GB/s. The lead **widens from 2²⁰ to 2²⁴** as the working set spills L3 and the halved byte count
-(bf16 vs f32) starts to dominate — the bandwidth payoff of mixed precision. Correctness: bf16 storage
+~12 GB/s. The **dot** lead **widens from 2²⁰ to 2²⁴** as the working set spills L3 and the halved byte count
+(bf16 vs f32) starts to dominate — the bandwidth payoff of mixed precision (the sum lead, already
+bandwidth-bound, instead narrows ~8.3→6.1× across the same range). Correctness: bf16 storage
 is bit-exact across the interpreter and native backends (`round_to_bf16` emits the identical integer
 arithmetic as the interpreter's `round_bf16`), and both call the identical reduction kernel, so the
 differential gate stays exact for *fractional, non-bf16-exact* inputs across `-O0`/`-O2`/`-O3`
@@ -1247,7 +1255,7 @@ The honest standing: at L2-resident sizes Wukong's fp16 tensor-core GEMM now **r
 (~101% at 1024³)** — the plan's M1 isolated target (≥95%) is met there — on top of a **wide Tier-A win**
 (tens-to-100×+ over the naive hand-written CUDA-C kernel, the same way it beats naive CPU-C). The large
 regime — **~74% @2048³ / ~34% @4096³ at this cp.async-only milestone** (the table above) — was
-subsequently lifted to **~87–90% @2048³ and ~83% @4096³** by the `ldmatrix` + XOR-swizzle workhorse (the
+subsequently lifted to **~87–90% @2048³** by the `ldmatrix` + XOR-swizzle workhorse and, with the shipped **v2cs streaming epilogue**, to **76.8% of cuBLAS-f16 / 80.4% of the honest f32-out peer @4096³** (the
 headline figure, past the prior 77% PTX ceiling); the cp.async table is retained as the Phase-1 record.
 
 **Phase-1 progress — `cp.async` software pipelining.** The shared-memory-staged kernel's `{load-all;
@@ -1265,7 +1273,7 @@ levers were measured same-run against cuBLAS:
 
 `gemm_nt_f16` now **dispatches by regime**: the 64-tile pipeline ≤1024², the 128-tile pipeline ≥2048²,
 the plain staged 64-tile otherwise — each the measured winner in its range. The `ldmatrix` +
-swizzled-SMEM workhorse has since lifted the large regime to **~87–90% @2048³ / ~83% @4096³** (headline);
+swizzled-SMEM workhorse (plus the shipped **v2cs streaming epilogue**) has since lifted the large regime to **~87–90% @2048³ / 76.8% of cuBLAS-f16 / 80.4% of the honest f32-out peer @4096³** (headline);
 remaining levers toward ≥95% at 4096³ are deeper (3+-stage) pipelines, warp-tiling, and split-K. Reproduce:
 `gemm_vs_peers` in `wukong_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in
 `baselines.rs`).
@@ -1388,7 +1396,7 @@ the prior WMMA flash** (`flash_mma_vs_wmma`), and `flash_d64_mp` compounds the `
 (**1.1–3.6× `flash_d64_m`**, **205–738× naive CUDA-C** = M6).
 
 **Multi-head** (`grid.y = H`, the kernel folds head `ctaid.y`'s `[H,S,D]` base offset into the pointers —
-zero extra params, single-head stays `grid.y=1`). At small S one head's `S/16` blocks can't fill 36 SMs
+zero extra params, single-head stays `grid.y=1`). At small S one head's `S/16` blocks can't fill 20 SMs
 (S=512 → 32 warps total); batching the GPT-2 `H=12` heads does. Same-run (`flash_vs_peers`, so
 clock-invariant): multi-head holds a **flat ~860 GFLOP/s across S** while single-head climbs 117→438 at the
 same clock — i.e. multi-head is **7.4× / 3.7× / 2.0× the single-head throughput at S=512 / 1024 / 2048**,
@@ -1404,8 +1412,12 @@ cuDNN/cutlass SDPA peers it **wins the short/causal/RoPE regimes and trails only
 fused-peer standing above) — the honest bar, even though a hand-written fused FA2-class CUDA-C peer can't be
 compiled on this toolkit-free box. `ldmatrix` conflict-free fragment loads (the strided V `u16` pairs at a 128-byte SMEM stride
 are the prime bank-conflict suspect — a *per-warp throughput* issue, consistent with the not-bandwidth-bound
-finding) remain the one untried kernel lever, but it is an uncertain further squeeze with no
-locally-measurable FA2 denominator to chase.
+finding) and **FA2-style warp specialization** have both since been explored: the warp-specialized
+kernels (2-warp named-barrier anti-phase + 3-stage ring) are **built, gated, and default-routed at
+S≥4096 where they win 4–6%** (clock-cancelled median-of-9; a tie @2048 and a loss @≤1024, so pins keep
+the losing regimes unroutable) — the last scheduling lever, and it moved only the S=4096 point; the
+residual long-S loss is structural (SFU/serial-softmax on 20 SMs), with no locally-measurable FA2
+denominator to chase.
 
 **Whole transformer layer, GPU-resident.** A complete pre-norm encoder layer — RMSNorm → Q/K/V
 projections → flash-attention → output projection → residual → RMSNorm → FFN (SiLU) → residual —
@@ -1497,7 +1509,7 @@ fusion):
 **Honest finding:** at the real GPT-2 shape the fused layer is **~par with the cuBLAS-chain layer
 (0.96–1.01×)** — *not* the clearer win the D=64 toy shows. The decomposition says why: Wukong's WMMA GEMM
 is **0.90–0.93× of cuBLAS at D=768** (the residual large-GEMM gap — the same one `gemm_vs_peers` reports,
-~83% @4096³ after the swizzle workhorse), and the fused residual/SiLU epilogues (**1.03–1.09×**, which cuBLAS structurally can't do)
+76.8% of cuBLAS-f16 / 80.4% of the f32-out peer @4096³ after the v2cs epilogue), and the fused residual/SiLU epilogues (**1.03–1.09×**, which cuBLAS structurally can't do)
 nearly but not fully offset it. **Closing the remaining large-GEMM gap flips this to a clear win** — the
 single highest-leverage GPU item, exactly what the parallel large-GEMM workstream targets. (A cross-process
 PyTorch comparison at this shape, like the D=64 table above, remains a documentation follow-up.)
@@ -1506,7 +1518,7 @@ Honest caveats: **eager** PyTorch only — `torch.compile`/Inductor needs Triton
 install (`torch.compile` raised `Cannot find a working triton installation` here). Cross-process and
 **clock-noisy** at this ~1–2 ms scale (the laptop GPU boosts ~7×), so treat the ratios as order-of-magnitude
 and the **direction** — Wukong faster at every S, by a margin growing toward small S — as the robust signal.
-The clock-invariant backbones are the same-run `flash_vs_peers` (Tier-A 172–305× vs naive CUDA-C; Tier-B the
+The clock-invariant backbones are the same-run `flash_vs_peers` (Tier-A 205–738× single-head / 275–322× at H=12 vs naive CUDA-C; Tier-B the
 3.6–5.0× cuBLAS-unfused-chain and the fused cuDNN/cutlass SDPA standings above) and the
 `cublas_chain_vs_wukong` same-run layer table above.
 
@@ -1670,8 +1682,9 @@ open is the *end-to-end full-model* measurement, not the per-op kernels.
 - **Matmul / nn.Linear (the flagship ML kernels):** Wukong **wins single-thread (~3–26×) and
   dominates parallel (~9–104×)**, and the lead **grows with matrix size** — the compiler tiles,
   packs, and register-blocks where gcc/rustc leave the naive nest. The single-core GEMM holds
-  **~110–120 GFLOP/s** (≈90% of one P-core's AVX2-FMA peak); the parallel one reaches ~520 at 1024³
-  and ~690 at 2048³. This is a reversal of the previous honest loss (single-core matmul used to be ~3×
+  **~110–120 GFLOP/s** (≈90% of one P-core's AVX2-FMA peak); the parallel path holds **91–104% of
+  oneMKL-all across 512³–2048³** same-run (a fixed GFLOP/s is meaningless at this ~3× clock swing).
+  This is a reversal of the previous honest loss (single-core matmul used to be ~3×
   *behind*). The dispatch also fires on **runtime dimensions**, so the win applies to general matmul
   functions, not only fixed-size kernels.
 - **Fused FFN epilogue (`act(x·Wᵀ [+ bias])`):** a `nn.Linear` immediately followed by a
@@ -1690,7 +1703,7 @@ open is the *end-to-end full-model* measurement, not the per-op kernels.
   **bit-exact**, not a tolerance.
 - **Transcendentals / activations (exp, log, exp2, log2, exp10, log10, expm1, log1p, tanh, sigmoid, GELU, SiLU, ELU,
   leaky_relu, softplus, softsign, logsigmoid, mish, SELU, tanhshrink, hardsigmoid, hardswish, sin, cos, tan, atan, asin, acos, erf, and the
-  cbrt, hyperbolic family sinh, cosh, asinh, acosh, atanh — 35 in all):** **~2–13× faster** than C's scalar `libm` — Wukong dispatches the loop to a **256-bit AVX2
+  cbrt, hyperbolic family sinh, cosh, asinh, acosh, atanh — 35 in all):** **~2–11.5× faster** than C's scalar `libm` — Wukong dispatches the loop to a **256-bit AVX2
   ≈1-ULP poly kernel** (`wukong_vmath_f32`), where gcc/rustc cannot vectorize a loop with an
   `expf`/`logf`/`tanhf`/`sinf`/`cosf`/`erff`/`asinhf` call. This is the transformer/vision activation family and the cleanest
   compute-bound win (it roughly doubled when the kernel moved from the 128-bit vectorizer to 256-bit).
@@ -1710,7 +1723,7 @@ open is the *end-to-end full-model* measurement, not the per-op kernels.
 - **Convolution:** lowered as im2col + GEMM (the XLA/cuDNN strategy), Wukong runs a 3×3 conv
   **~6–7× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
   recognizer accelerates conv for free.
-- **Reductions:** ~2.6–2.8× faster (lane-accumulator reassociation), incl. `fmax`/`fmin` (softmax's
+- **Reductions:** ~2.6–2.9× faster (lane-accumulator reassociation), incl. `fmax`/`fmin` (softmax's
   row-max). IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized
   comparison.
 - **Auto-parallel:** ~1.8–7.6× faster than idiomatic single-threaded C across elementwise kernels —
@@ -1763,5 +1776,6 @@ runtime dimensions too), convolution (im2col + GEMM), vectorized transcendentals
 activation family, including `log` for log-softmax/cross-entropy), fused row normalizations
 (softmax/LayerNorm/RMSNorm), bf16 mixed-precision reductions (bandwidth), automatic parallelism,
 automatic vectorization (including reductions), automatic fusion, and shape safety — plus a
-PTX-emitting **GPU backend** that takes the same ops to the RTX 4050's tensor cores (~12.8 TFLOP/s
-fp16/bf16 GEMM, fused flash-attention, a whole layer GPU-resident).
+PTX-emitting **GPU backend** that takes the same ops to the RTX 4050's tensor cores (fp16/bf16 GEMM
+at ~5–6× the f32 register-blocked path — clock-dependent, cuBLAS parity ≤1024³ — fused
+flash-attention, a whole layer GPU-resident).
