@@ -1556,7 +1556,21 @@ fn select_2d_block_shape(m: usize, n: usize, target_blocks: usize) -> (usize, us
     // (BM, BN) regimes, largest first. All BM ∈ 24..=192 are multiples of MR=6, all BN ∈ 48..=256
     // multiples of NR=16. Examples on the 16-worker dev pool (target = 48 blocks):
     // 2048³ → (192, 256); 1024³ → (144, 192) → 8×6 grid; 512³ → (48, 96) → 11×6.
-    const CANDIDATES: &[(usize, usize)] = &[(192, 256), (144, 192), (96, 128), (48, 96), (24, 48)];
+    //
+    // The square candidate (96, 96) sits between (96, 128) and (48, 96): it is the least-B-repack
+    // grid for the **wide-M / narrow-N** rectangle that the pure-square ladder mis-shapes. A
+    // 512×768 output (the GPT-2 attention/output projection at S=512) skips (96, 128) (only 36
+    // blocks < 48) and lands on (48, 96) → an 11×8 grid whose 11 short row-blocks each re-pack the
+    // full B column stripe eleven times — and B here is the transpose-gathered nn.Linear operand,
+    // the expensive pack. (96, 96) instead gives a 6×8 grid (rebalanced (90, 96)): the same 48-block
+    // load balance with **6** row-blocks, cutting the redundant B transpose-packs nearly in half.
+    // Measured (adjacent-run ABBA, same power state, per-block default): 512×768·(768×768)ᵀ 75→89%
+    // and 512×3072·(768×3072)ᵀ 76→87% of MKL(all), with the S=512 model forward ~8% faster; the
+    // insertion never fires for any square (256/512/1024/2048³ each still pick their prior
+    // candidate — (96, 96) yields < target blocks at every cube), so the cube standings are
+    // unchanged (pinned in `select_2d_block_shape_policy`).
+    const CANDIDATES: &[(usize, usize)] =
+        &[(192, 256), (144, 192), (96, 128), (96, 96), (48, 96), (24, 48)];
     let target = target_blocks.max(1);
     // Equalize block sizes along one dim without changing its block count: `nb` is preserved
     // (round_up(ceil(d/nb), unit) ≤ bd since bd is a unit multiple with nb·bd ≥ d, and
@@ -1568,6 +1582,9 @@ fn select_2d_block_shape(m: usize, n: usize, target_blocks: usize) -> (usize, us
         // Skinny M: nbi = 1; the largest NR-multiple BN with >= ~target/2 column blocks. Column
         // blocks alone must carry the load balance, so the divisor is halved (1.5× workers at the
         // callers' 3× budget). Floored at NR; capped at round_up(n, NR) (whole-matrix block).
+        // (A 2-row skinny split to cut column-block A re-packing was A/B-refuted: it doubles the
+        // costlier B transpose-repack, a wash-to-loss on 128×768 — the single L2-resident A stripe
+        // stays the better trade.)
         let col_target = target.div_ceil(2);
         let bn = ((n / col_target) / NR * NR).clamp(NR, round_up(n, NR));
         return (round_up(m, MR), rebalance(n, bn, NR));
@@ -3655,15 +3672,25 @@ mod tests {
                 }
             }
         }
-        // Documented grids at the 16-worker default target (48): 512³ stays (48, 96) → 11×6;
-        // 1024³ rebalances (144, 192) → (132, 176) → still 8×6, but 7×132 + 100 instead of
-        // 7×144 + a 16-row straggler, and 5×176 + 144 instead of 5×192 + a 64-wide straggler
-        // column (the BN rebalance is the tail-balancing extension of the BM one — a deliberate
-        // policy diff, pinned here); skinny 128-row outputs get one block row of 32-wide
-        // blocks → 1×24 (was a 6×16 grid of (24, 48) slivers).
+        // --- Cube grids at the 16-worker default target (48) are UNCHANGED by the (96, 96)
+        // insertion (it yields < 48 blocks at every square, so each cube still selects its prior
+        // candidate): 256³ → (24, 48) → 11×6; 512³ → (48, 96) → 11×6; 1024³ rebalances
+        // (144, 192) → (132, 176) → still 8×6, but 7×132 + 100 instead of 7×144 + a 16-row
+        // straggler, and 5×176 + 144 instead of 5×192 + a 64-wide straggler column; 2048³ →
+        // (192, 256) → 11×8. Pinned so a cube regression shows up here, not only in the noisy bench.
+        assert_eq!(select_2d_block_shape(256, 256, 48), (24, 48));
         assert_eq!(select_2d_block_shape(512, 512, 48), (48, 96));
         assert_eq!(select_2d_block_shape(1024, 1024, 48), (132, 176));
-        assert_eq!(select_2d_block_shape(128, 768, 48), (132, 32));
+        assert_eq!(select_2d_block_shape(2048, 2048, 48), (192, 256));
+        // --- The six skinny transformer bench shapes (m, n), the shapes `matmul_skinny` reports.
+        // The two 128-row shapes stay on the skinny single-row rule; the two 512×768 shapes are
+        // the ones the (96, 96) insertion reshapes from an 11×8 (48, 96) grid (B repacked 11×) to
+        // a 6×8 (90, 96) grid (B repacked 6×) — the measured 512×768 win. 512×3072 is untouched
+        // (it selects (144, 192) before the ladder ever reaches (96, 96)).
+        assert_eq!(select_2d_block_shape(128, 768, 48), (132, 32)); // 128×768·(768/3072×768)ᵀ
+        assert_eq!(select_2d_block_shape(128, 3072, 48), (132, 128)); // 128×768·(3072×768)ᵀ
+        assert_eq!(select_2d_block_shape(512, 768, 48), (90, 96)); // 512×768·(768/3072×768)ᵀ
+        assert_eq!(select_2d_block_shape(512, 3072, 48), (132, 192)); // 512×768·(3072×768)ᵀ
     }
 
     /// [`blocks_target_from`] — the `WUKONG_GEMM_TASK_MACS` grain policy, tested through its pure
