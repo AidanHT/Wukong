@@ -5,6 +5,39 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Performance + honest measurement — perf-perfect session (2026-07-10/11)
+Three-target directive round (A: parallel GEMM ≈ oneMKL + near-linear model scaling; B: beat fused
+`torch.compile`; C: compile-time floor). Same-run/adjacent instruments; full ledger
+`prompts/results/perf-perfect-session1.md`.
+- **Beats fully-optimized `torch.compile`, both batch sizes (Target B MET)**: vs TorchInductor
+  max-autotune, fullgraph, warmed — ATEN-pinned because the Windows Inductor CPP FP32 GEMM template
+  (`cpp_CppMicroGemmFP32Vec`) is broken, so ATEN/MKL is torch's strongest *working* CPU GEMM
+  (disclosed) — all-threads, the 12-layer GPT-2-class stack runs **S=512 1.39–1.81× / S=128
+  1.07–1.43× FASTER** across three independent same-day rounds (isolated per-side probes, torch at
+  its best; ≤1e-6 cross-check, serial==parallel bit-exact). Wukong-1c also beats compiled-torch-1T
+  at both shapes, and beats torch's strongest *eager* config too (S=512 1.07–1.37×). Beating eager
+  does not count — this is the compiled bar.
+- **Dynamic block-claiming is the parallel-GEMM default (`WUKONG_GEMM_DYN`)**: an atomic block-claim
+  queue replaces the static split; root-caused the mid-size variance to OS-preemption straggler
+  episodes on the worker pool (per-call min stays fast, p50/p90 widen) and halved it. Standing vs
+  MKL-all, same-run: **512³ ~98–99%, 1024³ ~104%, 2048³ 91%, 4096³ 93%, 256³ ~94–110%** (was 70–83%
+  @512–1024³); skinny NT shapes **75–112%** (4/6 at/above parity). A `(96,96)` 2D block candidate
+  fixed wide-M/narrow-N mis-shaping (512×768·768ᵀ 75→89%).
+- **Near-linear-as-physics-allows model scaling (Target A(b) MET)**: pool unification + a **width-1
+  serial fast-path** (T=1 now at serial parity, was 0.62–0.80×). S=512 curve
+  **1.00/1.70/2.13/3.00/3.68/4.70× (T=1..16)**, default 4.44×, best 5.22× — tracking the ~5.0–5.4×
+  same-run hybrid MKL ceiling with no Wukong-attributable serial shortfall.
+- **Compile-time floor characterized (Target C)**: central AC run — 296-file corpus **168.1 ms
+  front→object** (0.57 ms/file); backend 73.4% (Cranelift codegen 91.7% / object-write 8.3%),
+  optimize 16.3%. compile-vs **7.4–11.7×** vs gcc/g++/rustc (both subprocess, obj, -O2); in-process
+  vs spawned-toolchain ~306× JIT; `--emit=exe` ~95% rustc-link. Release verifier-off + parallel
+  per-function codegen (byte-identical 296/296). See `docs/compile-floor.md`.
+- **Documentation reconciled to these records**: a five-way doc audit refreshed every stale perf
+  claim (`README.md`, `docs/metrics.md`, `BENCHMARKS.md`, `docs/internals.md`, `docs/compile-floor.md`,
+  `next-steps.md`) to the 2026-07-11 numbers, corrected the model-vs-torch bar from *eager* to
+  *`torch.compile`* everywhere, and replaced bare-absolute-GFLOP/s headlines with %-of-MKL /
+  %-roofline / same-run ratios.
+
 ### Performance + honest measurement — perf-sota session 3 (2026-07-09/10)
 Ten-target directive round; every baseline re-proven before optimizing, every win from the real
 pipeline via same-run/adjacent instruments (full ledger: `prompts/results/perf-sota-session3.md`).
