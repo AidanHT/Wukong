@@ -15,3 +15,7 @@ half = "2"
 # Physical (not logical) core count: the compute-bound GEMM runs in a private pool sized to physical
 # cores — HyperThread siblings only contend for a core's FMA units, scaling worse than 1 thread/core.
 num_cpus = "1"
+
+[dev-dependencies]
+# Dev instrument only (examples/gemm_var.rs): load oneMKL as the adjacent-run variance peer.
+libloading = "0.8"
