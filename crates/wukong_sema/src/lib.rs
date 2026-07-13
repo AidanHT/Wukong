@@ -38,6 +38,23 @@ pub fn heap_alloc_elem(name: &str) -> Option<Scalar> {
     })
 }
 
+/// The buffer-element scalar of a file-I/O intrinsic (`read_f32`/`write_f32` → `F32`), or `None`
+/// for any other name. The v1 file-I/O surface is the per-scalar `read_<T>(path, buf) -> i64` /
+/// `write_<T>(path, buf) -> i64` family over the core dtypes {f32, i32, i64, u8}: sema types these
+/// builtins nominally in one place (like [`heap_alloc_elem`]), validating that `path` is a `*u8`
+/// and `buf` is a `[]T` slice of this element type. `mir_build` shares the same table to select the
+/// runtime symbol and element byte size. A user-defined function of the same name shadows the
+/// builtin (checked before the builtin path).
+pub fn file_io_elem(name: &str) -> Option<Scalar> {
+    Some(match name {
+        "read_f32" | "write_f32" => Scalar::F32,
+        "read_i32" | "write_i32" => Scalar::I32,
+        "read_i64" | "write_i64" => Scalar::I64,
+        "read_u8" | "write_u8" => Scalar::U8,
+        _ => return None,
+    })
+}
+
 /// A resolved top-level definition.
 #[derive(Clone, Debug)]
 pub struct FnSig {
