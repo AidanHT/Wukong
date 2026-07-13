@@ -213,16 +213,25 @@ Windows 11, throttling laptop. AVX2 (MKL dispatches AVX2 here too — apples-to-
   zero synchronization — while the shared pack demotes every A read to L3 and stalls the call on
   a pack-phase join straggler. Same lesson family as the shared-pack band and region-fusion
   refutations: on this hybrid, per-worker locality + zero sync beats traffic dedup.
-- **Cube table with the new default — PROVISIONAL, power-state compromised**: one xbench matmul
-  run (conservative ordering) read 512³ **96%** (232.7 vs 241.4) and 1024³ **104%** (275.9 vs
-  266.3) of MKL-all — the mid-size band that closed session 1 at 76% — with 2048³ Wuk-par 307.3
-  GF/s (healthy vs own history) against an anomalously low MKL-all 175.9 (MKL's 2048³ read was
-  also low in the gemm_var quartets; instrument question, not a claim). A post-run power check
-  found the machine ON BATTERY (discharge ~42 W) — AC dropped at an unknown point during the run,
-  so per measurement law #1 this cube read needs a verified-AC re-run before A(a) mid-size can be
-  called closed. (Corroboration from the verified-AC window: gemm_var D-config quartets read 512³
-  med 97.8-99.2% and 1024³ med 93.9-98.7% of adjacent MKL-all.) A third same-run skinny table
-  (88/101/96/102/92/92%) sits inside the two verified runs' band.
+- **Cube table with the new default — VERIFIED (2026-07-12, two independent healthy-state
+  rounds)**. The first attempt (07-11) was voided by measurement law #1 — a post-run check caught
+  the machine on battery, AC having dropped mid-run (law refined: verify the state before AND
+  after every reportable round; arm a power Monitor for multi-minute runs). Re-run in a verified
+  window (AC + trickle ≤7.6 W held 2 checks, 98% charge, 20 s-poll degradation watcher armed and
+  silent through all cube sections; the watcher caught a fresh AC drop only in round 2's tail —
+  cube sections completed well before it): conservative ordering, Wuk-par measured LAST:
+  - Round 1 (512/1024 targeted, fully clean): 512³ **115%** of MKL-all (306 vs 265 GF/s),
+    1024³ **108%** (319 vs 294).
+  - Round 2 (full sweep; cubes clean, tail sections void): 256³ **106%** (194 vs 183),
+    512³ **108%** (290 vs 268), 1024³ **92%** (304 vs 329), 2048³ Wuk-par 295.1 GF/s vs an
+    anomalously low MKL-all 208.9.
+  **A(a) mid-size is CLOSED at ≈parity**: 512³ at-or-above MKL-all in both rounds (108-115%),
+  1024³ straddling parity (92-108%) within the episode variance dynamic claiming halved —
+  corroborated by the verified-window gemm_var quartets (512³ med 97.8-99.2%, 1024³ 93.9-98.7%).
+  The session-1 76% band is gone. OPEN instrument question (not a Wukong claim): MKL-all's 2048³
+  read was anomalously low in BOTH instruments today (~125-209 GF/s vs its usual ~340-420 and
+  its own 1024³ 294-329 same-run) — resolve the peer's warmup/regime at that size before quoting
+  any 2048³ ratio; Wukong's own 2048³ absolute (295-307 GF/s) is healthy vs history.
 - Commits: gemm_var probe (b8dc296), dyn default + shared-A instrument (39b2dfb).
 
 ### 2026-07-10 (cont.) — analysis results, feasibility probes, first merges
