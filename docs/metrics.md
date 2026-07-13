@@ -116,10 +116,24 @@ pure Wukong without escaping? Standing: forward blocks yes (statically-shaped, r
 idioms); training via `--train` (CLI transform, not in-language); **known blockers**: no heap
 allocation / returned tensors, runtime `?` dims don't run, tensors can't be element-generic
 (`Tensor[T,M,N]` rejected → dtype kernels duplicated), no fn pointers/closures. **File I/O now
-runs** (✅): the `read_<T>`/`write_<T>` family (`T` in {`f32`, `i32`, `i64`, `u8`}) loads and stores
-headerless raw little-endian blobs and is gated interp == native bit-for-bit, so weights can be
-**read off disk rather than synthesized** (a full GPT-2 forward pass from real weights is not yet
-claimed end-to-end). (Multi-file `import a.b` *does* work — it splices items with
+runs** (✅): the `read_<T>`/`write_<T>` family (`T` in {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`})
+loads and stores headerless raw little-endian blobs and is gated interp == native bit-for-bit, so
+weights can be **read off disk rather than synthesized** — and, built on it, **GPT-2 124M inference
+now runs end-to-end** (✅). `examples/gpt2_infer.wk` loads the real pretrained OpenAI GPT-2 weights
+(124,439,808 f32 parameters, exported from HuggingFace `transformers` by `tools/export_gpt2.py`)
+from a flat little-endian blob via `read_f32` (token ids via `read_i32`), runs the full forward
+pass — token + positional embeddings, 12 pre-LayerNorm blocks (biased QKV, 12-head causal
+attention, tanh-GELU MLP, residuals), final LayerNorm, tied LM head → logits `[5, 50257]` — and its
+next-token logits **match HuggingFace's reference to a relative max error of 1.87e-6** (max|Δ| =
+2.44e-4 vs max|ref| = 130.28; **argmax next-token = 1757, " John", for the prompt "Hello, my name
+is" — matching HF exactly**; verified by `tools/verify_gpt2.py`). This is a **numerical-correctness
+/ capability result, inference only — not training, and no speed or throughput claim is made or
+implied**. Two honesty caveats: **tokenization is external** (the `.wk` consumes integer token ids
+the HuggingFace tokenizer produced — Wukong has no tokenizer), and the full run is **native-only** —
+the interpreter cannot hold 124M parameters, so the native Cranelift-JIT backend is what executes it
+(a reduced-config twin, `examples/gpt2_infer_small.wk`, runs **bit-identically on interpreter *and*
+native** under the CI examples differential + opt-invariance gate).
+(Multi-file `import a.b` *does* work — it splices items with
 cycle/diamond dedup; only aliased/selective `import as` / `import x.{a,b}` stay partial.) These bound
 how far "general programs a real user writes" can go today and are first-class improvement
 targets, not footnotes.
