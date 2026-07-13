@@ -1,0 +1,244 @@
+module examples.gpt2_infer_small
+
+// =====================================================================================
+// GPT-2 inference pipeline at a reduced, interpreter-runnable config — the differential
+// correctness gate for examples/gpt2_infer.wk (the full 124M model).
+// =====================================================================================
+//
+// This is the SAME end-to-end forward pass as gpt2_infer.wk — embed (wte + learned wpe) ->
+// 12-shaped decoder blocks (pre-LayerNorm, biased q/k/v/o/c_fc/c_proj, causal attention,
+// tanh-GELU MLP, residuals) -> final LayerNorm -> tied LM head -> argmax — but scaled down
+// (D=64, H=4, DFF=256, SEQ=8, LAYERS=2, VOCAB=32) and driven by SYNTHETIC weights filled by a
+// deterministic in-loop pattern, so NO file I/O is needed and the interpreter oracle can run it.
+//
+// The weights are stored exactly as the full model stores them: ONE flat []f32 buffer plus
+// integer element offsets (computed here by const arithmetic instead of the exporter), indexed
+// with i64 arithmetic — so this exercises the identical indexing/kernel code paths. The examples
+// gate (crates/wukongc/tests/examples.rs) runs this interp-vs-native at -O0/-O2 and asserts
+// identical stdout: proof the whole pipeline is bit-exact across backends and opt-invariant.
+
+// ---- reduced config (GPT-2 shapes, scaled) ----
+const D: i64 = 64;          // model dim
+const H: i64 = 4;           // heads
+const HD: i64 = 16;         // head dim = D / H
+const DFF: i64 = 256;       // FFN hidden = 4*D
+const VOCAB: i64 = 32;      // token embedding rows (also the tied LM head)
+const POS: i64 = 8;         // positional embedding rows (>= SEQ)
+const SEQ: i64 = 8;         // sequence length
+const LAYERS: i64 = 2;
+const SCALE: f32 = 0.25;    // 1/sqrt(HD) = 1/sqrt(16)
+
+// ---- within-layer relative offsets (running sums, same tensor order as the full model) ----
+const REL_LN1G: i64 = 0;
+const REL_LN1B: i64 = REL_LN1G + D;
+const REL_WQ:   i64 = REL_LN1B + D;
+const REL_BQ:   i64 = REL_WQ + D * D;
+const REL_WK:   i64 = REL_BQ + D;
+const REL_BK:   i64 = REL_WK + D * D;
+const REL_WV:   i64 = REL_BK + D;
+const REL_BV:   i64 = REL_WV + D * D;
+const REL_WO:   i64 = REL_BV + D;
+const REL_BO:   i64 = REL_WO + D * D;
+const REL_LN2G: i64 = REL_BO + D;
+const REL_LN2B: i64 = REL_LN2G + D;
+const REL_W1:   i64 = REL_LN2B + D;
+const REL_B1:   i64 = REL_W1 + DFF * D;
+const REL_W2:   i64 = REL_B1 + DFF;
+const REL_B2:   i64 = REL_W2 + D * DFF;
+const LAYER_STRIDE: i64 = REL_B2 + D;
+
+// ---- top-level blob offsets ----
+const OFF_WTE:    i64 = 0;
+const OFF_WPE:    i64 = OFF_WTE + VOCAB * D;
+const OFF_LAYER0: i64 = OFF_WPE + POS * D;
+const OFF_LNFG:   i64 = OFF_LAYER0 + LAYERS * LAYER_STRIDE;
+const OFF_LNFB:   i64 = OFF_LNFG + D;
+const TOTAL:      i64 = OFF_LNFB + D;
+
+fn main() -> i32 {
+    // ---- allocate the flat weight blob + the token ids + scratch + logits ----
+    let mut w:      []f32 = alloc_f32(TOTAL);
+    let mut ids:    []i32 = alloc_i32(SEQ);
+    let mut x:      []f32 = alloc_f32(SEQ * D);      // running hidden state [SEQ, D]
+    let mut nrm:    []f32 = alloc_f32(SEQ * D);      // LayerNorm output [SEQ, D]
+    let mut q:      []f32 = alloc_f32(SEQ * D);
+    let mut k:      []f32 = alloc_f32(SEQ * D);
+    let mut v:      []f32 = alloc_f32(SEQ * D);
+    let mut scores: []f32 = alloc_f32(SEQ * SEQ);    // per-head attention [SEQ, SEQ]
+    let mut attn:   []f32 = alloc_f32(SEQ * D);      // concat head outputs [SEQ, D]
+    let mut a:      []f32 = alloc_f32(SEQ * D);      // residual stream after attention
+    let mut ff:     []f32 = alloc_f32(SEQ * DFF);    // MLP hidden [SEQ, DFF]
+    let mut logits: []f32 = alloc_f32(SEQ * VOCAB);  // [SEQ, VOCAB]
+
+    // ---- synthetic weights: a small bounded deterministic pattern (keeps activations sane) ----
+    for i in 0..TOTAL {
+        w[i] = (((i % 17i64) as f32) - 8.0) * 0.01;   // ~[-0.08, 0.08]
+    }
+    // LayerNorm gains near 1 / biases near 0 so the normalized signal actually propagates.
+    for l in 0..LAYERS {
+        let lb: i64 = OFF_LAYER0 + l * LAYER_STRIDE;
+        for i in 0..D {
+            w[lb + REL_LN1G + i] = 1.0 + ((i % 3i64) as f32) * 0.05;
+            w[lb + REL_LN1B + i] = ((i % 5i64) as f32) * 0.01 - 0.02;
+            w[lb + REL_LN2G + i] = 1.0 - ((i % 4i64) as f32) * 0.03;
+            w[lb + REL_LN2B + i] = ((i % 7i64) as f32) * 0.008 - 0.02;
+        }
+    }
+    for i in 0..D {
+        w[OFF_LNFG + i] = 1.0 + ((i % 3i64) as f32) * 0.02;
+        w[OFF_LNFB + i] = ((i % 5i64) as f32) * 0.005 - 0.01;
+    }
+    // deterministic token ids in [0, VOCAB)
+    for s in 0..SEQ {
+        ids[s] = ((s * 3i64 + 1i64) % VOCAB) as i32;
+    }
+
+    // ---- embed: x[s,d] = wte[ids[s], d] + wpe[s, d] ----
+    for s in 0..SEQ {
+        let id: i64 = ids[s] as i64;
+        for d in 0..D {
+            x[s * D + d] = w[OFF_WTE + id * D + d] + w[OFF_WPE + s * D + d];
+        }
+    }
+
+    // ---- decoder blocks ----
+    for l in 0..LAYERS {
+        let base: i64 = OFF_LAYER0 + l * LAYER_STRIDE;
+
+        // LN1(x) -> nrm  (mean-subtract, population variance, eps 1e-5, affine)
+        for r in 0..SEQ {
+            let mut sm: f32 = 0.0;
+            for i in 0..D { sm = sm + x[r * D + i]; }
+            let mean: f32 = sm / 64.0;
+            let mut vv: f32 = 0.0;
+            for i in 0..D { vv = vv + (x[r * D + i] - mean) * (x[r * D + i] - mean); }
+            let inv: f32 = rsqrt(vv / 64.0 + 0.00001);
+            for i in 0..D {
+                nrm[r * D + i] = (x[r * D + i] - mean) * inv * w[base + REL_LN1G + i]
+                    + w[base + REL_LN1B + i];
+            }
+        }
+
+        // Q/K/V projections + bias:  q[i,j] = bq[j] + sum_p nrm[i,p]*wq[j,p]
+        for i in 0..SEQ { for j in 0..D {
+            let mut s: f32 = 0.0;
+            for p in 0..D { s = s + nrm[i * D + p] * w[base + REL_WQ + j * D + p]; }
+            q[i * D + j] = w[base + REL_BQ + j] + s;
+        } }
+        for i in 0..SEQ { for j in 0..D {
+            let mut s: f32 = 0.0;
+            for p in 0..D { s = s + nrm[i * D + p] * w[base + REL_WK + j * D + p]; }
+            k[i * D + j] = w[base + REL_BK + j] + s;
+        } }
+        for i in 0..SEQ { for j in 0..D {
+            let mut s: f32 = 0.0;
+            for p in 0..D { s = s + nrm[i * D + p] * w[base + REL_WV + j * D + p]; }
+            v[i * D + j] = w[base + REL_BV + j] + s;
+        } }
+
+        // multi-head causal attention (scale, mask j>i, stable row softmax, weighted V)
+        for h in 0..H {
+            for i in 0..SEQ { for j in 0..SEQ {
+                let mut s: f32 = 0.0;
+                for p in 0..HD { s = s + q[i * D + h * HD + p] * k[j * D + h * HD + p]; }
+                scores[i * SEQ + j] = s * SCALE;
+            } }
+            for i in 0..SEQ {
+                for j in 0..SEQ { if j > i { scores[i * SEQ + j] = -1.0e30; } }
+                let mut m: f32 = scores[i * SEQ + 0];
+                for j in 0..SEQ { m = fmax(m, scores[i * SEQ + j]); }
+                let mut den: f32 = 0.0;
+                for j in 0..SEQ {
+                    let e: f32 = exp(scores[i * SEQ + j] - m);
+                    scores[i * SEQ + j] = e;
+                    den = den + e;
+                }
+                let dinv: f32 = 1.0 / den;
+                for j in 0..SEQ { scores[i * SEQ + j] = scores[i * SEQ + j] * dinv; }
+            }
+            for i in 0..SEQ { for d in 0..HD {
+                let mut s: f32 = 0.0;
+                for j in 0..SEQ { s = s + scores[i * SEQ + j] * v[j * D + h * HD + d]; }
+                attn[i * D + h * HD + d] = s;
+            } }
+        }
+
+        // output projection + bias + residual:  a[i,j] = x[i,j] + bo[j] + sum_p attn[i,p]*wo[j,p]
+        for i in 0..SEQ { for j in 0..D {
+            let mut s: f32 = 0.0;
+            for p in 0..D { s = s + attn[i * D + p] * w[base + REL_WO + j * D + p]; }
+            a[i * D + j] = x[i * D + j] + w[base + REL_BO + j] + s;
+        } }
+
+        // LN2(a) -> nrm
+        for r in 0..SEQ {
+            let mut sm: f32 = 0.0;
+            for i in 0..D { sm = sm + a[r * D + i]; }
+            let mean: f32 = sm / 64.0;
+            let mut vv: f32 = 0.0;
+            for i in 0..D { vv = vv + (a[r * D + i] - mean) * (a[r * D + i] - mean); }
+            let inv: f32 = rsqrt(vv / 64.0 + 0.00001);
+            for i in 0..D {
+                nrm[r * D + i] = (a[r * D + i] - mean) * inv * w[base + REL_LN2G + i]
+                    + w[base + REL_LN2B + i];
+            }
+        }
+
+        // MLP up-projection + bias:  ff[i,j] = b1[j] + sum_p nrm[i,p]*w1[j,p]   (j in 0..DFF)
+        for i in 0..SEQ { for j in 0..DFF {
+            let mut s: f32 = 0.0;
+            for p in 0..D { s = s + nrm[i * D + p] * w[base + REL_W1 + j * D + p]; }
+            ff[i * DFF + j] = w[base + REL_B1 + j] + s;
+        } }
+        // tanh-GELU (gelu_new) in place
+        for i in 0..SEQ * DFF {
+            let u: f32 = 0.7978845608 * (ff[i] + 0.044715 * ff[i] * ff[i] * ff[i]);
+            let t: f32 = 1.0 - 2.0 / (exp(2.0 * u) + 1.0);
+            ff[i] = 0.5 * ff[i] * (1.0 + t);
+        }
+        // MLP down-projection + bias + residual:  x[i,j] = a[i,j] + b2[j] + sum_p ff[i,p]*w2[j,p]
+        for i in 0..SEQ { for j in 0..D {
+            let mut s: f32 = 0.0;
+            for p in 0..DFF { s = s + ff[i * DFF + p] * w[base + REL_W2 + j * DFF + p]; }
+            x[i * D + j] = a[i * D + j] + w[base + REL_B2 + j] + s;
+        } }
+    }
+
+    // ---- final LayerNorm (in place over x) ----
+    for r in 0..SEQ {
+        let mut sm: f32 = 0.0;
+        for i in 0..D { sm = sm + x[r * D + i]; }
+        let mean: f32 = sm / 64.0;
+        let mut vv: f32 = 0.0;
+        for i in 0..D { vv = vv + (x[r * D + i] - mean) * (x[r * D + i] - mean); }
+        let inv: f32 = rsqrt(vv / 64.0 + 0.00001);
+        for i in 0..D {
+            x[r * D + i] = (x[r * D + i] - mean) * inv * w[OFF_LNFG + i] + w[OFF_LNFB + i];
+        }
+    }
+
+    // ---- tied LM head:  logits[s,vv] = sum_d x[s,d] * wte[vv,d]  (no bias) ----
+    for s in 0..SEQ { for vv in 0..VOCAB {
+        let mut acc: f32 = 0.0;
+        for d in 0..D { acc = acc + x[s * D + d] * w[OFF_WTE + vv * D + d]; }
+        logits[s * VOCAB + vv] = acc;
+    } }
+
+    // ---- signatures + argmax of the last row ----
+    print(round(logits[0] * 10000.0) as i32);
+    print(round(logits[VOCAB - 1] * 10000.0) as i32);
+    print(round(logits[(SEQ - 1) * VOCAB + 0] * 10000.0) as i32);
+    print(round(logits[(SEQ - 1) * VOCAB + (VOCAB - 1)] * 10000.0) as i32);
+
+    let mut best: f32 = logits[(SEQ - 1) * VOCAB + 0];
+    let mut bi: i64 = 0;
+    for vv in 0i64..VOCAB {
+        let val: f32 = logits[(SEQ - 1) * VOCAB + vv];
+        if val > best { best = val; bi = vv; }
+    }
+    print(bi as i32);
+
+    free(w); free(ids); free(x); free(nrm); free(q); free(k); free(v);
+    free(scores); free(attn); free(a); free(ff); free(logits);
+    return 0;
+}
