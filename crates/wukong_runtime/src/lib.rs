@@ -649,9 +649,33 @@ rt_file_io!(wukong_rt_read_i64, wukong_rt_write_i64, i64);
 rt_file_io!(wukong_rt_read_i8, wukong_rt_write_i8, i8);
 rt_file_io!(wukong_rt_read_u8, wukong_rt_write_u8, u8);
 
+/// `wukong_now_ns() -> i64` — a monotonic, process-lifetime nanosecond clock, backing the `now_ns()`
+/// timing intrinsic used to benchmark Wukong programs in-process (`let t0 = now_ns(); … let t1 =
+/// now_ns();`). Takes no arguments. The epoch is a single [`std::time::Instant`] captured lazily on
+/// the first call (a process-lifetime [`OnceLock`](std::sync::OnceLock)), so successive calls are
+/// non-decreasing and the elapsed nanoseconds fit an `i64` for ~292 years. The interpreter calls
+/// this same function, so both backends read the identical clock.
+///
+/// The value is inherently non-deterministic: a Wukong program must observe only *differences*
+/// between two reads (never the raw stamp) so its stdout stays backend-identical under the
+/// interp==native differential gate.
+#[no_mangle]
+pub extern "C" fn wukong_now_ns() -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn now_ns_is_monotonic() {
+        // The process clock never runs backwards: two successive reads are non-decreasing.
+        let a = wukong_now_ns();
+        let b = wukong_now_ns();
+        assert!(b >= a, "now_ns must be non-decreasing: got {a} then {b}");
+    }
 
     #[test]
     fn rt_alloc_zeroes_and_frees() {

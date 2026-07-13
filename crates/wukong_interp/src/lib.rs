@@ -1001,6 +1001,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpreter; a use-after-free still reads the old values here while being undefined
             // on native — such programs are outside the differential contract (documented UB).
             "wukong_rt_free" => Ok(Value::Unit),
+            // `wukong_now_ns() -> i64` — the `now_ns()` timing intrinsic. Call the *same*
+            // `wukong_runtime` clock the native backend links (a monotonic process-lifetime epoch),
+            // so both backends read one clock. The value is inherently non-deterministic, but a
+            // conforming program observes only *differences* between two reads (never the raw stamp),
+            // so its printed output stays interp==native — the value never reaches a differential
+            // fixture's stdout.
+            "wukong_now_ns" => Ok(Value::Int(wukong_runtime::wukong_now_ns() as i128)),
             // `wukong_rt_read_{f32,i32,i64,u8,f64,i8}(path: *u8, data: *T, len: i64) -> i64` — the read
             // half of the file-I/O intrinsic family. The on-disk format is headerless: raw contiguous
             // little-endian elements (f32=4, i32=4, i64=8, u8=1, f64=8, i8=1 bytes; no magic, no length prefix).

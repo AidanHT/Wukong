@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0503
+module tests.fail.now_ns_arity
+
+// `now_ns()` is the zero-argument timing intrinsic (a monotonic nanosecond clock). Supplying any
+// argument is an arity error (E0503) — caught in sema before lowering, exactly like a user
+// function's wrong argument count or the file-I/O builtins' arity check.
+fn main() -> i32 {
+    let t: i64 = now_ns(0);
+    return 0;
+}

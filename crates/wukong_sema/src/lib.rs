@@ -57,6 +57,16 @@ pub fn file_io_elem(name: &str) -> Option<Scalar> {
     })
 }
 
+/// Whether `name` is the `now_ns()` timing intrinsic: a zero-argument call returning a monotonic
+/// nanosecond `i64` (backed by `wukong_now_ns` in `wukong_runtime`), for benchmarking Wukong
+/// programs in-process. Named here alongside [`file_io_elem`] so sema (which types the call `i64`
+/// and enforces the zero arity) and `mir_build` (which lowers it to the runtime call) share the one
+/// source-level spelling and cannot drift. A user-defined `now_ns` shadows the builtin (checked
+/// before the builtin path).
+pub fn is_now_ns(name: &str) -> bool {
+    name == "now_ns"
+}
+
 /// A resolved top-level definition.
 #[derive(Clone, Debug)]
 pub struct FnSig {

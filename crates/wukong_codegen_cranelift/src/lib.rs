@@ -125,6 +125,9 @@ const RT_WRITE_I32: &str = "wukong_rt_write_i32";
 const RT_WRITE_I64: &str = "wukong_rt_write_i64";
 const RT_WRITE_I8: &str = "wukong_rt_write_i8";
 const RT_WRITE_U8: &str = "wukong_rt_write_u8";
+// The `now_ns()` timing intrinsic: `wukong_now_ns() -> i64`, a monotonic process-lifetime
+// nanosecond clock (no parameters) for in-process benchmarking.
+const RT_NOW_NS: &str = "wukong_now_ns";
 const RT_PARALLEL_FOR: &str = "wukong_parallel_for";
 const RT_SGEMM: &str = "wukong_sgemm";
 const RT_SGEMM_PARALLEL: &str = "wukong_sgemm_parallel";
@@ -1460,6 +1463,14 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[data]);
             return None;
         }
+        // The `now_ns()` timing intrinsic: wukong_now_ns() -> i64, a monotonic process-lifetime
+        // nanosecond clock. No arguments; returns the i64 stamp, bound like the value-returning
+        // runtime calls below.
+        if name == RT_NOW_NS && args.is_empty() {
+            let fref = self.rt_refs[RT_NOW_NS];
+            let call = self.builder.ins().call(fref, &[]);
+            return self.builder.inst_results(call).first().copied();
+        }
         // The file-I/O intrinsics: wukong_rt_{read,write}_{f32,f64,i32,i64,i8,u8}(path, data, len) -> i64.
         // All twelve share one ABI — the NUL-terminated path pointer, the slice's data pointer, and
         // an i64 element count — so one branch keyed on `name` emits the call. Returns the i64
@@ -1852,6 +1863,7 @@ struct RtFuncs {
     rt_write_i64: FuncId,
     rt_write_i8: FuncId,
     rt_write_u8: FuncId,
+    now_ns: FuncId,
     parallel_for: FuncId,
     sgemm: FuncId,
     sgemm_parallel: FuncId,
@@ -2338,6 +2350,10 @@ fn populate_module<M: Module>(
     sig_rt_fileio.params.push(AbiParam::new(ptr_ty));
     sig_rt_fileio.params.push(AbiParam::new(types::I64));
     sig_rt_fileio.returns.push(AbiParam::new(types::I64));
+    // wukong_now_ns() -> i64 — the monotonic process-lifetime nanosecond clock backing `now_ns()`.
+    // No parameters; returns the elapsed nanoseconds as an i64.
+    let mut sig_now_ns = Signature::new(call_conv);
+    sig_now_ns.returns.push(AbiParam::new(types::I64));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -2395,6 +2411,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         rt_write_u8: module
             .declare_function(RT_WRITE_U8, Linkage::Import, &sig_rt_fileio)
+            .map_err(|e| e.to_string())?,
+        now_ns: module
+            .declare_function(RT_NOW_NS, Linkage::Import, &sig_now_ns)
             .map_err(|e| e.to_string())?,
         parallel_for: module
             .declare_function(RT_PARALLEL_FOR, Linkage::Import, &sig_par)
@@ -3040,6 +3059,10 @@ fn build_function_clif(
             rt_refs.insert(
                 RT_WRITE_U8,
                 module.declare_func_in_func(rt.rt_write_u8, builder.func),
+            );
+            rt_refs.insert(
+                RT_NOW_NS,
+                module.declare_func_in_func(rt.now_ns, builder.func),
             );
             rt_refs.insert(
                 RT_PARALLEL_FOR,
@@ -3926,6 +3949,7 @@ pub fn jit_compile(
     builder.symbol(RT_WRITE_I64, wukong_runtime::wukong_rt_write_i64 as *const u8);
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
+    builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
         wukong_runtime::wukong_parallel_for as *const u8,
@@ -4496,6 +4520,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_WRITE_I64, wukong_runtime::wukong_rt_write_i64 as *const u8);
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
+    builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
         wukong_runtime::wukong_parallel_for as *const u8,

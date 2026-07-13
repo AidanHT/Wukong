@@ -263,6 +263,26 @@ impl Sema<'_> {
                     }
                     return Ty::Scalar(Scalar::I64);
                 }
+                // The `now_ns()` timing intrinsic: a zero-argument monotonic nanosecond clock, typed
+                // `i64` here (like the file-I/O family) so `let t = now_ns()` composes in arithmetic —
+                // `t1 - t0` is the elapsed span. `mir_build` lowers it to the `wukong_now_ns` runtime
+                // call. It takes no arguments; any argument is the standard arity error (E0503),
+                // caught before lowering. A user-defined `now_ns` shadows the builtin (handled by the
+                // resolved-callee path above).
+                if crate::is_now_ns(self.sym_str(name)) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    if !args.is_empty() {
+                        self.error(
+                            span,
+                            "E0503",
+                            format!(
+                                "`now_ns` takes no arguments, but {} were supplied",
+                                args.len()
+                            ),
+                        );
+                    }
+                    return Ty::Scalar(Scalar::I64);
+                }
                 // `print`/`println` render exactly one value. Extra arguments were silently dropped
                 // (`print(1, 2)` printed just `1`) — both backends agree, so it is not a divergence,
                 // but a quiet footgun where the programmer expects all arguments to appear. Reject a
