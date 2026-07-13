@@ -1677,12 +1677,13 @@ parameters, a flat little-endian f32 blob exported from HuggingFace `transformer
 blocks (biased QKV, 12-head causal attention, tanh-GELU MLP, residuals), the final LayerNorm, and the
 tied LM head → logits `[5, 50257]`.
 
-`tools/verify_gpt2.py` compares those logits against HuggingFace's authoritative reference:
+`tools/verify_gpt2.py` compares those logits against HuggingFace's authoritative reference. Writing Δ
+for the elementwise difference (wuk − ref) and taking the relative error as `max|Δ| / max|ref|`:
 
 | metric | measured | reference / gate |
 |---|---|---|
-| relative max error `max|Δ| / max|ref|` | **1.87×10⁻⁶** | gate `rel ≤ 1e-3` |
-| `max|Δ|` (absolute) | 2.44×10⁻⁴ | `max|ref|` = 130.28 |
+| relative max error (max abs Δ over max abs ref) | **1.87×10⁻⁶** | gate: rel ≤ 1e-3 |
+| absolute max error (max abs Δ) | 2.44×10⁻⁴ | max abs ref = 130.28 |
 | argmax next-token (prompt *"Hello, my name is"*) | **1757 (" John")** | HuggingFace: 1757 — exact match |
 
 **Honest scope.** It is **inference, not training**. **Tokenization is external** — the `.wk` program
