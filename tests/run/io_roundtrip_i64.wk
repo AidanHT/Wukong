@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: -9223372036854775807
+// EXPECT-OUT: 123456789012345
+// EXPECT-OUT: -987654321098765
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+module tests.run.io_roundtrip_i64
+
+// File-I/O round-trip for `i64`: `write_i64` a known buffer, `read_i64` it back, print each element.
+// The values include `i64::MAX` (9223372036854775807) and its negation (top bit set) plus other
+// values well outside the `i32` range, so all 8 little-endian bytes and the sign must survive the
+// round-trip — a decode that truncated to 32 bits or swapped byte order would print different
+// numbers. Headerless LE per the frozen contract; interpreter and native JIT must agree bit-for-bit.
+// Unique temp file name avoids collisions.
+fn main() -> i32 {
+    let cnt: i64 = 8;
+    let mut wbuf: []i64 = alloc_i64(cnt);
+    wbuf[0] = 0;
+    wbuf[1] = -1;
+    wbuf[2] = 9223372036854775807;
+    wbuf[3] = -9223372036854775807;
+    wbuf[4] = 123456789012345;
+    wbuf[5] = -987654321098765;
+    wbuf[6] = 1;
+    wbuf[7] = 2;
+
+    let wrote: i64 = write_i64("io_test_i64.bin", wbuf);
+    print(wrote); // 8
+
+    let mut rbuf: []i64 = alloc_i64(cnt);
+    let n: i64 = read_i64("io_test_i64.bin", rbuf);
+    print(n); // 8
+
+    for i in 0..cnt {
+        print(rbuf[i]);
+    }
+
+    free(wbuf);
+    free(rbuf);
+    return 0;
+}

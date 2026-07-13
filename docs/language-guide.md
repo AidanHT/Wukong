@@ -427,6 +427,41 @@ via the `wukong_runtime` rayon-backed `parallel_for`, and each per-core chunk is
 auto-vectorized (parallelism × SIMD). The interpreter runs the same range sequentially, so results
 stay differentially equal.
 
+## File I/O ✅
+
+**Reading and writing typed blobs runs today** (✅): a small per-scalar family loads and stores raw
+binary buffers, so a program can pull weights or a dataset **off disk** instead of synthesizing them.
+
+```wukong
+let mut w: []f32 = alloc_f32(768 * 768);       // zero-initialized, runtime-sized
+let n: i64 = read_f32("weights.bin", w);        // n = elements actually read
+if n < 0 { return 1; }                           // -1 = couldn't open, -2 = io error
+// … compute in place …
+let written: i64 = write_f32("out.bin", w);      // flush w as raw little-endian f32
+```
+
+The surface is `read_<T>(path: *u8, buf: []T) -> i64` and `write_<T>(path: *u8, buf: []T) -> i64`
+for **`T` in {`f32`, `i32`, `i64`, `u8`}** — the same typed, declared-in-one-place convention as the
+`alloc_<T>` family. The on-disk format is **headerless raw little-endian**: element `i` of `buf` is
+the `sizeof(T)` bytes at byte offset `i · sizeof(T)`, and nothing else — no shape, dtype tag, or
+length prefix (you carry those out of band, the way a `.bin` weight shard does).
+
+- **`read_<T>(path, buf)`** fills `buf` from the file and returns the **element count read** =
+  `min(buf.len(), file_bytes / sizeof(T))`, so a short file reads only what it has and a long one
+  fills `buf` and stops. It returns **`-1`** if the file can't be opened and **`-2`** on an io
+  error; on either failure — and for the tail `buf[n..]` left over from a short read — the
+  destination slots are **untouched**, so a zero-initialized `alloc_<T>` buffer stays defined.
+- **`write_<T>(path, buf)`** **creates or truncates** `path`, writes all `buf.len()` elements as
+  little-endian bytes, and returns the **count written** (**`-1`** if the file can't be created,
+  **`-2`** on an io error).
+
+`path` is a `*u8` **string literal** — the same NUL-terminated `.rodata` pointer described under
+*Literals*. Both directions are implemented by the `wukong_runtime` layer on the native backend and
+mirrored **byte-for-byte** by the interpreter — the `-1`/`-2`/count return codes, the little-endian
+layout, and the `u8`-narrowing store are identical — so a read/write round-trip is **differentially
+tested to agree bit-for-bit** across the interpreter and the native Cranelift backend, exactly as the
+✅ maturity legend requires.
+
 ## Command-line interface
 
 ```

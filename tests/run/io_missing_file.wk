@@ -1,0 +1,27 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+module tests.run.io_missing_file
+
+// Missing-file read: opening a path that does not exist must return -1 (the open-failure code from
+// the frozen contract) and leave the destination buffer completely untouched. The buffer came from
+// `alloc_f32`, which zero-initializes, so all four elements must still read back as 0 — proving the
+// failed read wrote nothing. No test ever creates this path, so it is reliably absent on both
+// backends; the interpreter and native JIT must both report -1 and the same untouched zeros.
+fn main() -> i32 {
+    let cnt: i64 = 4;
+    let mut rbuf: []f32 = alloc_f32(cnt);
+    let r: i64 = read_f32("io_test_absent_zz.bin", rbuf);
+    print(r); // -1 — open failed
+
+    for i in 0..cnt {
+        print(rbuf[i]); // 0 0 0 0 — buffer left untouched on open failure
+    }
+
+    free(rbuf);
+    return 0;
+}
