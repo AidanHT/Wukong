@@ -1,0 +1,47 @@
+module gemm_fused_bias_slice
+
+// Differential gate for the fused-bias GEMM store `c[i,j] = bias[<invariant offset> + j] + s` — the
+// single-store `q = x·Wᵀ + b` projection GPT-2 writes — dispatched to `wukong_sgemm_nt_epi`, over
+// []f32 HEAP SLICES (the only way to hold a runtime-sized weight blob; the real 124M model is all
+// slices). Exercises a bare bias, a constant blob offset, and a runtime (layer-stride) blob offset —
+// plus the slice base-pointer extraction in `kernel_base_ptr`. Must run bit-identically on the
+// interpreter and native, and at -O0 == -O2 (both call the identical serial kernel the interpreter
+// marshals as the oracle).
+
+fn main() -> i32 {
+    let m: i64 = 3;
+    let k: i64 = 5;
+    let n: i64 = 4;
+    let mut a:  []f32 = alloc_f32(15);
+    let mut bq: []f32 = alloc_f32(4);
+    let mut w:  []f32 = alloc_f32(2048);   // blob: weights @100, bias @200; "layer l" strided by 1024
+    let mut c:  []f32 = alloc_f32(12);
+    for i in 0..15   { a[i]  = ((i % 7)  as f32) * 0.1 - 0.3; }
+    for i in 0..4    { bq[i] = (i as f32) * 0.05; }
+    for i in 0..2048 { w[i]  = ((i % 11) as f32) * 0.05 - 0.2; }
+
+    // (A) bare bias:  c = a·Wᵀ + bq
+    for i in 0..m { for j in 0..n {
+        let mut s: f32 = 0.0;
+        for p in 0..k { s = s + a[i * k + p] * w[100 + j * k + p]; }
+        c[i * n + j] = bq[j] + s;
+    } }
+    for i in 0..12 { print(round(c[i] * 100000.0) as i32); }
+
+    // (B) runtime-base blob bias (base = layer stride):  c = a·W_lᵀ + b_l
+    for l in 0i64..2 {
+        let base: i64 = 1024 * l;
+        for i in 0..m { for j in 0..n {
+            let mut s: f32 = 0.0;
+            for p in 0..k { s = s + a[i * k + p] * w[base + 100 + j * k + p]; }
+            c[i * n + j] = w[base + 200 + j] + s;
+        } }
+        for i in 0..12 { print(round(c[i] * 100000.0) as i32); }
+    }
+
+    free(a);
+    free(bq);
+    free(w);
+    free(c);
+    return 0;
+}
