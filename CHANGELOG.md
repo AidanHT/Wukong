@@ -7,7 +7,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Capability — GPT-2 124M end-to-end inference + typed file-I/O intrinsics (2026-07-13)
 - **File-I/O intrinsics — headerless raw little-endian typed blobs**: `read_<T>` / `write_<T>` for `T`
-  in `{f32, i32, i64, u8}` (the v1 core-dtype surface) read and write a flat file of that element type
+  in `{f32, f64, i32, i64, i8, u8}` read and write a flat file of that element type
   into / out of a `[]T` buffer, with no header. `read_<T>(path, buf)` returns
   `min(buf.len, file_bytes / sizeof T)` on success, `-1` if the file cannot be opened, and `-2` on a
   mid-read I/O error (`0` when the buffer length is `≤ 0`); `write_<T>(path, buf)` creates/truncates the
