@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0503
+module tests.fail.io_arity
+
+// The file-I/O builtins take exactly two arguments: a `*u8` path and a `[]T` buffer. Supplying a
+// third argument is an arity error (E0503) — caught before lowering, like a user function's wrong
+// argument count.
+fn main() -> i32 {
+    let s: []f32 = alloc_f32(4);
+    let n: i64 = write_f32("io_test_arity.bin", s, s);
+    return 0;
+}
