@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: 123456
+// EXPECT-OUT: -654321
+// EXPECT-OUT: 7
+// EXPECT-OUT: 42
+module tests.run.io_roundtrip_i32
+
+// File-I/O round-trip for `i32`: `write_i32` a known buffer, `read_i32` it back, print each element
+// (widened to `i64` so the printed width is unambiguous). The values include `i32::MAX`
+// (2147483647) and `i32::MIN` (-2147483648) to pin the full 4-byte little-endian encoding and the
+// sign bit — a byte-order or sign-extension bug would print a different number. Headerless LE format
+// per the frozen contract; the interpreter and native JIT must agree byte-for-byte. Unique temp file
+// name avoids collisions with the sibling round-trip tests.
+fn main() -> i32 {
+    let cnt: i64 = 8;
+    let mut wbuf: []i32 = alloc_i32(cnt);
+    wbuf[0] = 0;
+    wbuf[1] = -1;
+    wbuf[2] = 2147483647;
+    wbuf[3] = -2147483648;
+    wbuf[4] = 123456;
+    wbuf[5] = -654321;
+    wbuf[6] = 7;
+    wbuf[7] = 42;
+
+    let wrote: i64 = write_i32("io_test_i32.bin", wbuf);
+    print(wrote); // 8
+
+    let mut rbuf: []i32 = alloc_i32(cnt);
+    let n: i64 = read_i32("io_test_i32.bin", rbuf);
+    print(n); // 8
+
+    for i in 0..cnt {
+        print(rbuf[i] as i64);
+    }
+
+    free(wbuf);
+    free(rbuf);
+    return 0;
+}
