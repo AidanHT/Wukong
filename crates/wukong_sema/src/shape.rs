@@ -203,6 +203,66 @@ impl Sema<'_> {
                     }
                     return Ty::Unit;
                 }
+                // The file-I/O builtins: the `read_<T>(path, buf) -> i64` / `write_<T>(path, buf)
+                // -> i64` family over the core dtypes (f32, i32, i64, u8). Typed here (like the heap
+                // builtins) so the result is a concrete `i64` — `let n = read_f32(p, s)` composes
+                // with arithmetic and comparisons — and misuse is rejected with the standard
+                // arity/type codes before the structural lowering in mir_build. `path` is a
+                // NUL-terminated `*u8` (a string literal or a `*u8` binding); `buf` is a `[]T` slice
+                // whose element type must match the name's dtype (a `[]i32` handed to `read_f32`
+                // reads the wrong element stride — a silent backend divergence). A user-defined
+                // function of the same name shadows the builtin (handled by the resolved-callee path
+                // above). `Unknown`/`Error` arguments stay lenient (they already carry an error).
+                if let Some(elem) = crate::file_io_elem(self.sym_str(name)) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    if args.len() != 2 {
+                        self.error(
+                            span,
+                            "E0503",
+                            format!(
+                                "`{}` takes exactly 2 arguments (a `*u8` path and a `[]{}` \
+                                 buffer), but {} were supplied",
+                                self.sym_str(name),
+                                elem.name(),
+                                args.len()
+                            ),
+                        );
+                    } else {
+                        // arg0 — the path: a NUL-terminated `*u8` (a string literal or `*u8` value).
+                        match &arg_tys[0] {
+                            Ty::Ptr { pointee, .. }
+                                if matches!(pointee.as_ref(), Ty::Scalar(Scalar::U8)) => {}
+                            Ty::Unknown | Ty::Error => {}
+                            other => self.error(
+                                span,
+                                "E0401",
+                                format!(
+                                    "`{}` expects a `*u8` path as its first argument, found a value \
+                                     of type `{}`",
+                                    self.sym_str(name),
+                                    other.display(self.interner)
+                                ),
+                            ),
+                        }
+                        // arg1 — the buffer: a `[]T` slice whose element matches the name's dtype.
+                        match &arg_tys[1] {
+                            Ty::Slice(e) if matches!(e.as_ref(), Ty::Scalar(s) if *s == elem) => {}
+                            Ty::Unknown | Ty::Error => {}
+                            other => self.error(
+                                span,
+                                "E0401",
+                                format!(
+                                    "`{}` expects a `[]{}` buffer as its second argument, found a \
+                                     value of type `{}`",
+                                    self.sym_str(name),
+                                    elem.name(),
+                                    other.display(self.interner)
+                                ),
+                            ),
+                        }
+                    }
+                    return Ty::Scalar(Scalar::I64);
+                }
                 // `print`/`println` render exactly one value. Extra arguments were silently dropped
                 // (`print(1, 2)` printed just `1`) — both backends agree, so it is not a divergence,
                 // but a quiet footgun where the programmer expects all arguments to appear. Reject a

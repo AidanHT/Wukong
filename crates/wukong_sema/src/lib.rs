@@ -38,6 +38,23 @@ pub fn heap_alloc_elem(name: &str) -> Option<Scalar> {
     })
 }
 
+/// The buffer-element scalar of a file-I/O intrinsic (`read_f32`/`write_f32` → `F32`), or `None`
+/// for any other name. The v1 file-I/O surface is the per-scalar `read_<T>(path, buf) -> i64` /
+/// `write_<T>(path, buf) -> i64` family over the core dtypes {f32, i32, i64, u8}: sema types these
+/// builtins nominally in one place (like [`heap_alloc_elem`]), validating that `path` is a `*u8`
+/// and `buf` is a `[]T` slice of this element type. `mir_build` shares the same table to select the
+/// runtime symbol and element byte size. A user-defined function of the same name shadows the
+/// builtin (checked before the builtin path).
+pub fn file_io_elem(name: &str) -> Option<Scalar> {
+    Some(match name {
+        "read_f32" | "write_f32" => Scalar::F32,
+        "read_i32" | "write_i32" => Scalar::I32,
+        "read_i64" | "write_i64" => Scalar::I64,
+        "read_u8" | "write_u8" => Scalar::U8,
+        _ => return None,
+    })
+}
+
 /// A resolved top-level definition.
 #[derive(Clone, Debug)]
 pub struct FnSig {
@@ -3665,6 +3682,52 @@ mod tests {
         assert!(errors("fn f() { free(); }").contains(&"E0503"));
         // … and freeing a non-slice is an E0401.
         assert!(errors("fn f() { free(5); }").contains(&"E0401"));
+    }
+
+    #[test]
+    fn file_io_builtins_are_typed() {
+        // `read_<T>(path, buf)` / `write_<T>(path, buf)` type as `i64` (the element count / return
+        // code), so the result composes in arithmetic — mirroring the `alloc_*` heap family. `path`
+        // is a `*u8` (a string literal); `buf` is a `[]T` slice from an `alloc_<T>` builtin.
+        let ok = "fn f() -> i64 { \
+                  let s: []f32 = alloc_f32(4); \
+                  let n: i64 = read_f32(\"in.bin\", s); \
+                  let w = write_i32(\"out.bin\", alloc_i32(8)); \
+                  return n + w; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        // Because the result is `i64` (not the lenient `Unknown`), binding it to a conflicting
+        // annotation must error — this distinguishes the modeled signature from the fallback.
+        let bad = "fn f() { let n: f32 = read_u8(\"in.bin\", alloc_u8(4)); }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected a type mismatch: {:?}",
+            errors(bad)
+        );
+    }
+
+    #[test]
+    fn file_io_builtin_misuse_is_rejected() {
+        // A non-`*u8` path is an E0401 …
+        assert!(
+            errors("fn f() { let s = alloc_f32(4); let n = read_f32(5, s); }").contains(&"E0401")
+        );
+        // … a buffer whose element type does not match the name's dtype is an E0401 …
+        assert!(
+            errors("fn f() { let s = alloc_i32(4); let n = read_f32(\"in.bin\", s); }")
+                .contains(&"E0401")
+        );
+        assert!(
+            errors("fn f() { let s = alloc_f32(4); let n = write_u8(\"o.bin\", s); }")
+                .contains(&"E0401")
+        );
+        // … a non-slice buffer is an E0401 …
+        assert!(errors("fn f() { let n = read_f32(\"in.bin\", 3); }").contains(&"E0401"));
+        // … and the wrong arity is an E0503.
+        assert!(errors("fn f() { let n = read_f32(\"in.bin\"); }").contains(&"E0503"));
+        assert!(
+            errors("fn f() { let s = alloc_f32(4); let n = write_f32(\"o.bin\", s, s); }")
+                .contains(&"E0503")
+        );
     }
 
     #[test]
