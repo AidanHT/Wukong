@@ -16419,6 +16419,11 @@ impl FnLowerer<'_> {
                 if let Some(v) = self.lower_heap_builtin(name, args) {
                     return v;
                 }
+                // The file-I/O builtins `read_<T>(path, buf)` / `write_<T>(path, buf)` lower to one
+                // wukong_rt_{read,write}_<T>(path, data, len) runtime call.
+                if let Some(v) = self.lower_file_io(self.interner.resolve(name), args) {
+                    return v;
+                }
                 // Fused attention `sdpa(...)` lowers to one runtime-kernel call (no S×S scores).
                 if let Some(v) = self.lower_attention(name, args) {
                     return v;
@@ -16586,6 +16591,51 @@ impl FnLowerer<'_> {
             value: count,
         });
         Some(sbuf)
+    }
+
+    /// The raw file-I/O builtins `read_<T>(path, buf)` / `write_<T>(path, buf)` (for T in
+    /// f32/i32/i64/u8) each lower to a single `wukong_rt_{read,write}_<T>(path, data, len)` runtime
+    /// call returning `i64` — the element count on success, or -1 (open/create fail) / -2 (io error).
+    /// `path` lowers to its `*u8` pointer directly (a string literal / `*u8` binding *is* its address,
+    /// exactly like `print_str`); `buf` is a slice whose `{data,len}` are read out of the fat pointer
+    /// (`SLICE_PTR_OFF`/`SLICE_LEN_OFF`). Both backends emit the identical opaque `Op::Call`, so the
+    /// headerless little-endian file format stays byte-for-byte and return-code identical (the same
+    /// differential contract as the heap/GEMM dispatch). A user function of the same name shadows the
+    /// builtin because `lower_call` resolves `DefKind::Fn` before reaching here. Returns `None` for
+    /// any other name or arity so the generic unsupported-call path handles it rather than miscompile.
+    fn lower_file_io(&mut self, name: &str, args: &[Expr]) -> Option<ValueId> {
+        let func = match name {
+            "read_f32" => self.gemm.rt_read_f32,
+            "read_i32" => self.gemm.rt_read_i32,
+            "read_i64" => self.gemm.rt_read_i64,
+            "read_u8" => self.gemm.rt_read_u8,
+            "write_f32" => self.gemm.rt_write_f32,
+            "write_i32" => self.gemm.rt_write_i32,
+            "write_i64" => self.gemm.rt_write_i64,
+            "write_u8" => self.gemm.rt_write_u8,
+            _ => return None,
+        };
+        // Sema guarantees `(path: *u8, buf: []T)` (E0401/E0503 otherwise); decline anything else so
+        // the generic unsupported-call path reports it rather than indexing a missing argument.
+        if args.len() != 2 {
+            return None;
+        }
+        // `path`: the `*u8` pointer value itself (a string literal lowers to a `.rodata` GlobalAddr,
+        // a `*u8` binding to its pointer) — passed straight through as `path: *const u8`.
+        let path = self.lower_expr(&args[0]);
+        // `buf`: pull the base pointer and element count out of the slice's fat pointer {data,len}.
+        let sbuf = self.lower_expr(&args[1]);
+        let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
+        let data = self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr));
+        let lp = self.field_ptr(sbuf, SLICE_LEN_OFF);
+        let len = self.builder.build(MirType::I64, Op::Load(lp, MirType::I64));
+        Some(self.builder.build(
+            MirType::I64,
+            Op::Call {
+                func,
+                args: vec![path, data, len],
+            },
+        ))
     }
 
     /// Recognize `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention —
