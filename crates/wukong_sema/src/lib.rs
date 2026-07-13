@@ -3685,6 +3685,52 @@ mod tests {
     }
 
     #[test]
+    fn file_io_builtins_are_typed() {
+        // `read_<T>(path, buf)` / `write_<T>(path, buf)` type as `i64` (the element count / return
+        // code), so the result composes in arithmetic — mirroring the `alloc_*` heap family. `path`
+        // is a `*u8` (a string literal); `buf` is a `[]T` slice from an `alloc_<T>` builtin.
+        let ok = "fn f() -> i64 { \
+                  let s: []f32 = alloc_f32(4); \
+                  let n: i64 = read_f32(\"in.bin\", s); \
+                  let w = write_i32(\"out.bin\", alloc_i32(8)); \
+                  return n + w; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        // Because the result is `i64` (not the lenient `Unknown`), binding it to a conflicting
+        // annotation must error — this distinguishes the modeled signature from the fallback.
+        let bad = "fn f() { let n: f32 = read_u8(\"in.bin\", alloc_u8(4)); }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected a type mismatch: {:?}",
+            errors(bad)
+        );
+    }
+
+    #[test]
+    fn file_io_builtin_misuse_is_rejected() {
+        // A non-`*u8` path is an E0401 …
+        assert!(
+            errors("fn f() { let s = alloc_f32(4); let n = read_f32(5, s); }").contains(&"E0401")
+        );
+        // … a buffer whose element type does not match the name's dtype is an E0401 …
+        assert!(
+            errors("fn f() { let s = alloc_i32(4); let n = read_f32(\"in.bin\", s); }")
+                .contains(&"E0401")
+        );
+        assert!(
+            errors("fn f() { let s = alloc_f32(4); let n = write_u8(\"o.bin\", s); }")
+                .contains(&"E0401")
+        );
+        // … a non-slice buffer is an E0401 …
+        assert!(errors("fn f() { let n = read_f32(\"in.bin\", 3); }").contains(&"E0401"));
+        // … and the wrong arity is an E0503.
+        assert!(errors("fn f() { let n = read_f32(\"in.bin\"); }").contains(&"E0503"));
+        assert!(
+            errors("fn f() { let s = alloc_f32(4); let n = write_f32(\"o.bin\", s, s); }")
+                .contains(&"E0503")
+        );
+    }
+
+    #[test]
     fn let_annotation_mismatch_errors() {
         let (diags, _) = analyze("fn f() { let x: f32 = true; }");
         assert!(diags.iter().any(|d| d.code == Some("E0401")));
