@@ -3697,6 +3697,14 @@ mod tests {
                   let w = write_i32(\"out.bin\", alloc_i32(8)); \
                   return n + w; }";
         assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        // The later-wave dtypes (f64, i8) type identically: a well-typed `read_f64` / `write_i8`
+        // over a `[]f64` / `[]i8` buffer composes as `i64` just like the core family.
+        let ok2 = "fn f() -> i64 { \
+                   let s: []f64 = alloc_f64(4); \
+                   let n: i64 = read_f64(\"in.bin\", s); \
+                   let w = write_i8(\"out.bin\", alloc_i8(8)); \
+                   return n + w; }";
+        assert!(errors(ok2).is_empty(), "unexpected: {:?}", errors(ok2));
         // Because the result is `i64` (not the lenient `Unknown`), binding it to a conflicting
         // annotation must error — this distinguishes the modeled signature from the fallback.
         let bad = "fn f() { let n: f32 = read_u8(\"in.bin\", alloc_u8(4)); }";
@@ -3720,6 +3728,16 @@ mod tests {
         );
         assert!(
             errors("fn f() { let s = alloc_f32(4); let n = write_u8(\"o.bin\", s); }")
+                .contains(&"E0401")
+        );
+        // … and the later-wave dtypes reject a mismatched buffer element the same way (a `[]f64`
+        // handed to `read_i8`, or a `[]i32` handed to `write_f64`, is an E0401) …
+        assert!(
+            errors("fn f() { let s = alloc_f64(4); let n = read_i8(\"in.bin\", s); }")
+                .contains(&"E0401")
+        );
+        assert!(
+            errors("fn f() { let s = alloc_i32(4); let n = write_f64(\"o.bin\", s); }")
                 .contains(&"E0401")
         );
         // … a non-slice buffer is an E0401 …
