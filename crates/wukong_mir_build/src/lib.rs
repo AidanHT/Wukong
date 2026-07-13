@@ -16617,10 +16617,14 @@ impl FnLowerer<'_> {
             "read_i32" => self.gemm.rt_read_i32,
             "read_i64" => self.gemm.rt_read_i64,
             "read_u8" => self.gemm.rt_read_u8,
+            "read_f64" => self.gemm.rt_read_f64,
+            "read_i8" => self.gemm.rt_read_i8,
             "write_f32" => self.gemm.rt_write_f32,
             "write_i32" => self.gemm.rt_write_i32,
             "write_i64" => self.gemm.rt_write_i64,
             "write_u8" => self.gemm.rt_write_u8,
+            "write_f64" => self.gemm.rt_write_f64,
+            "write_i8" => self.gemm.rt_write_i8,
             _ => return None,
         };
         // Sema guarantees `(path: *u8, buf: []T)` (E0401/E0503 otherwise); decline anything else so
