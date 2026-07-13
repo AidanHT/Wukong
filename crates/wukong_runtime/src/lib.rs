@@ -643,8 +643,10 @@ macro_rules! rt_file_io {
 }
 
 rt_file_io!(wukong_rt_read_f32, wukong_rt_write_f32, f32);
+rt_file_io!(wukong_rt_read_f64, wukong_rt_write_f64, f64);
 rt_file_io!(wukong_rt_read_i32, wukong_rt_write_i32, i32);
 rt_file_io!(wukong_rt_read_i64, wukong_rt_write_i64, i64);
+rt_file_io!(wukong_rt_read_i8, wukong_rt_write_i8, i8);
 rt_file_io!(wukong_rt_read_u8, wukong_rt_write_u8, u8);
 
 #[cfg(test)]
@@ -811,6 +813,19 @@ mod tests {
     }
 
     #[test]
+    fn file_io_roundtrip_f64() {
+        let path = io_tmp("f64");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let src = [1.5f64, -2.25, 0.0, std::f64::consts::PI, 6.022e23, -1.0e-9];
+        assert_eq!(wukong_rt_write_f64(ptr, src.as_ptr(), src.len() as i64), 6);
+        let mut dst = [0f64; 6];
+        assert_eq!(wukong_rt_read_f64(ptr, dst.as_mut_ptr(), 6), 6);
+        assert_eq!(dst, src);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn file_io_roundtrip_i32() {
         let path = io_tmp("i32");
         let cp = cpath(&path);
@@ -832,6 +847,19 @@ mod tests {
         assert_eq!(wukong_rt_write_i64(ptr, src.as_ptr(), src.len() as i64), 5);
         let mut dst = [0i64; 5];
         assert_eq!(wukong_rt_read_i64(ptr, dst.as_mut_ptr(), 5), 5);
+        assert_eq!(dst, src);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_io_roundtrip_i8() {
+        let path = io_tmp("i8");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let src = [0i8, -1, i8::MIN, i8::MAX, 42];
+        assert_eq!(wukong_rt_write_i8(ptr, src.as_ptr(), src.len() as i64), 5);
+        let mut dst = [0i8; 5];
+        assert_eq!(wukong_rt_read_i8(ptr, dst.as_mut_ptr(), 5), 5);
         assert_eq!(dst, src);
         std::fs::remove_file(&path).ok();
     }
