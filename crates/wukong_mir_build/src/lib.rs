@@ -823,6 +823,14 @@ pub fn lower_program(
         attn: interner.intern("wukong_attention_f32"),
         rt_alloc: interner.intern("wukong_rt_alloc"),
         rt_free: interner.intern("wukong_rt_free"),
+        rt_read_f32: interner.intern("wukong_rt_read_f32"),
+        rt_read_i32: interner.intern("wukong_rt_read_i32"),
+        rt_read_i64: interner.intern("wukong_rt_read_i64"),
+        rt_read_u8: interner.intern("wukong_rt_read_u8"),
+        rt_write_f32: interner.intern("wukong_rt_write_f32"),
+        rt_write_i32: interner.intern("wukong_rt_write_i32"),
+        rt_write_i64: interner.intern("wukong_rt_write_i64"),
+        rt_write_u8: interner.intern("wukong_rt_write_u8"),
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -2097,6 +2105,18 @@ struct GemmSyms {
     /// backing the `alloc_<T>(n)` builtins, and its `wukong_rt_free(data)` release twin.
     rt_alloc: Symbol,
     rt_free: Symbol,
+    /// The 8 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8}`) backing
+    /// the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const u8,
+    /// data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
+    /// fail) / -2 (io error). Headerless raw little-endian elements; identical on both backends.
+    rt_read_f32: Symbol,
+    rt_read_i32: Symbol,
+    rt_read_i64: Symbol,
+    rt_read_u8: Symbol,
+    rt_write_f32: Symbol,
+    rt_write_i32: Symbol,
+    rt_write_i64: Symbol,
+    rt_write_u8: Symbol,
 }
 
 // Elementwise-math op codes — must match `wukong_runtime::vmath`'s `VM_*` (mir_build does not depend
