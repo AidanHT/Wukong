@@ -1126,7 +1126,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Int(n as i128))
             }
-            // `wukong_rt_write_{f32,i32,i64,u8}(path: *u8, data: *T, len: i64) -> i64` — the write
+            // `wukong_rt_write_{f32,i32,i64,u8,f64,i8}(path: *u8, data: *T, len: i64) -> i64` — the write
             // half of the file-I/O family. Reconstruct the NUL-terminated `path` (as `print_str`),
             // then create/truncate it: on create failure return -1. Otherwise read back `len` elements
             // from `data[0..len]`, narrow each to `T` (`as f32`/`as i32`/`as i64`/`as u8` — the same
@@ -1137,7 +1137,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_rt_write_f32"
             | "wukong_rt_write_i32"
             | "wukong_rt_write_i64"
-            | "wukong_rt_write_u8" => {
+            | "wukong_rt_write_u8"
+            | "wukong_rt_write_f64"
+            | "wukong_rt_write_i8" => {
                 use std::io::Write;
                 let path_base = match args.first().copied() {
                     Some(Value::Ptr(base)) => base,
@@ -1184,6 +1186,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                         }
                         "wukong_rt_write_i64" => {
                             out.extend_from_slice(&(v.as_int() as i64).to_le_bytes())
+                        }
+                        "wukong_rt_write_f64" => {
+                            out.extend_from_slice(&v.as_float().to_le_bytes())
+                        }
+                        "wukong_rt_write_i8" => {
+                            out.extend_from_slice(&(v.as_int() as i8).to_le_bytes())
                         }
                         // wukong_rt_write_u8
                         _ => out.push(v.as_int() as u8),
