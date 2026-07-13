@@ -1,0 +1,23 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+module tests.run.now_ns_monotonic
+
+// The `now_ns()` timing intrinsic reads a monotonic, process-lifetime nanosecond clock (an `i64`),
+// for benchmarking Wukong programs in-process. This fixture is differential-gate-safe: it prints
+// ONLY the deterministic monotonicity fact `(b >= a)` — always `1` — and never the raw timestamps,
+// which differ run-to-run and interp-vs-native and would break the interp==native and
+// optimization-invariance gates. A small work loop separates the two reads so the elapsed span is a
+// real (but unobserved) quantity; the printed comparison holds regardless of how much time passed.
+fn main() -> i32 {
+    let a: i64 = now_ns();
+    // Some work between the two clock reads (its result is never printed — timing is unobservable).
+    let mut s: i64 = 0;
+    for i in 0..1000 {
+        s = s + i;
+    }
+    let b: i64 = now_ns();
+    // A monotonic clock never runs backwards, so this is `1` on both backends regardless of timing.
+    print((b >= a) as i32);
+    return 0;
+}

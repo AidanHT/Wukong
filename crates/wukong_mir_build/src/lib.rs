@@ -19,7 +19,7 @@ use wukong_mir::{
     BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId, VecBin,
     VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
-use wukong_sema::{heap_alloc_elem, DefKind, EnumVariant, SemaResult, VariantPayload};
+use wukong_sema::{heap_alloc_elem, is_now_ns, DefKind, EnumVariant, SemaResult, VariantPayload};
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
 
@@ -835,6 +835,7 @@ pub fn lower_program(
         rt_write_u8: interner.intern("wukong_rt_write_u8"),
         rt_write_f64: interner.intern("wukong_rt_write_f64"),
         rt_write_i8: interner.intern("wukong_rt_write_i8"),
+        now_ns: interner.intern("wukong_now_ns"),
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -2125,6 +2126,10 @@ struct GemmSyms {
     rt_write_u8: Symbol,
     rt_write_f64: Symbol,
     rt_write_i8: Symbol,
+    /// The `now_ns()` timing intrinsic → `wukong_now_ns() -> i64`, a monotonic process-lifetime
+    /// nanosecond clock for in-process benchmarking. No arguments; both backends read the same
+    /// clock (the interpreter calls `wukong_runtime::wukong_now_ns` directly).
+    now_ns: Symbol,
 }
 
 // Elementwise-math op codes — must match `wukong_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -16470,6 +16475,11 @@ impl FnLowerer<'_> {
                 if let Some(v) = self.lower_file_io(self.interner.resolve(name), args) {
                     return v;
                 }
+                // The `now_ns()` timing intrinsic lowers to one zero-argument `wukong_now_ns() -> i64`
+                // runtime call (a monotonic process-lifetime nanosecond clock).
+                if let Some(v) = self.lower_now_ns(self.interner.resolve(name), args) {
+                    return v;
+                }
                 // Fused attention `sdpa(...)` lowers to one runtime-kernel call (no S×S scores).
                 if let Some(v) = self.lower_attention(name, args) {
                     return v;
@@ -16684,6 +16694,27 @@ impl FnLowerer<'_> {
             Op::Call {
                 func,
                 args: vec![path, data, len],
+            },
+        ))
+    }
+
+    /// Lower the `now_ns()` timing intrinsic to one zero-argument `wukong_now_ns() -> i64` runtime
+    /// call — a monotonic process-lifetime nanosecond clock for in-process benchmarking. Returns
+    /// `None` for any other name or a nonzero arity (sema already rejected the latter with E0503) so
+    /// the generic unsupported-call path handles it rather than miscompile. A user function named
+    /// `now_ns` shadows the builtin because `lower_call` resolves `DefKind::Fn` before reaching here.
+    /// Both backends call the identical clock (the interpreter runs `wukong_runtime::wukong_now_ns`),
+    /// and a program observes only *differences* between reads, so its stdout stays backend-identical
+    /// under the differential gate.
+    fn lower_now_ns(&mut self, name: &str, args: &[Expr]) -> Option<ValueId> {
+        if !is_now_ns(name) || !args.is_empty() {
+            return None;
+        }
+        Some(self.builder.build(
+            MirType::I64,
+            Op::Call {
+                func: self.gemm.now_ns,
+                args: vec![],
             },
         ))
     }
