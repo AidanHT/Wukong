@@ -117,6 +117,40 @@ Where Wukong is built to win for the ML/DL niche:
   BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. The attributes parse and validate
   today; symbol export/import is not yet wired (see the roadmap).
 
+## Runs the real GPT-2 124M end-to-end
+
+Wukong compiles and runs **GPT-2 124M inference end-to-end as an ordinary `.wk` program**
+([`examples/gpt2_infer.wk`](examples/gpt2_infer.wk)) on the native Cranelift-JIT backend. It loads the
+**real pretrained OpenAI GPT-2 weights** — all **124,439,808** parameters — from a flat little-endian
+f32 blob on disk (exported from HuggingFace `transformers` by
+[`tools/export_gpt2.py`](tools/export_gpt2.py)) through the new `read_f32` file-I/O intrinsic, with the
+prompt's token ids read via `read_i32`, and runs the full forward pass in Wukong source: token +
+learned positional embedding, 12 pre-LayerNorm decoder blocks (biased QKV, 12-head causal attention,
+tanh-GELU MLP, residuals), the final LayerNorm, and the tied LM head → logits `[5, 50257]`.
+
+**It matches HuggingFace numerically.** The next-token logits agree with HuggingFace's reference to a
+**relative max error of 1.87×10⁻⁶** (`max|Δ| = 2.44×10⁻⁴` against `max|ref| = 130.28`), and the argmax
+next token is **1757 (" John")** for the prompt *"Hello, my name is"* — matching HuggingFace exactly.
+This is checked by [`tools/verify_gpt2.py`](tools/verify_gpt2.py).
+
+Reproduce it — one export, one run, one check — from the repo root:
+
+```sh
+python tools/export_gpt2.py                             # HF GPT-2 → data/gpt2/*.bin (+ reference logits)
+wukongc --run --backend=native examples/gpt2_infer.wk   # runs the model, writes logits to disk
+python tools/verify_gpt2.py                             # rel 1.87e-6, argmax 1757 → "GPT2 VERIFY PASS"
+```
+
+**Honest scope.** This is a **numerical-correctness and capability** result, not a speed claim — **no
+throughput comparison against PyTorch was measured**, and none is made here. It is **inference, not
+training**. **Tokenization is external**: the `.wk` program consumes integer token ids produced by the
+HuggingFace tokenizer; it does not tokenize text itself. The full 124M run is **native-only** — the
+interpreter's slot memory cannot hold 124M parameters — so a reduced-config twin
+([`examples/gpt2_infer_small.wk`](examples/gpt2_infer_small.wk)) runs the *same* forward pass
+**bit-identically on both the interpreter and the native backend**, the CI differential +
+opt-invariance gate that keeps the full model honest. (This is a new capability, orthogonal to the
+performance results above.)
+
 ## The four signature features
 
 ```wukong

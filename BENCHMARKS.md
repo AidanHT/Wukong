@@ -1659,6 +1659,42 @@ conv2d slice, the int8 GEMM stack (the section above), the whole-program megaker
 large-GEMM-fusion work — the branches this note earlier listed as pending are now merged; what remains
 open is the *end-to-end full-model* measurement, not the per-op kernels.
 
+### GPT-2 124M end-to-end — numerical correctness vs HuggingFace (not a perf benchmark)
+
+**This is a correctness / capability result, not a performance measurement.** No throughput or latency
+comparison against PyTorch (or any other runtime) was run for the full model, and none is claimed here —
+the numbers below are *numerical agreement with a reference*, and say nothing about speed. (The perf
+standings for GPT-2-*shaped* kernels are in the
+[End-to-end model](#end-to-end-model--a-12-layer-gpt-2-class-transformer-stack-cpu-inference) section
+above and are untouched by this; a full-model throughput peer remains unmeasured, per the pending-work
+note above.)
+
+`examples/gpt2_infer.wk` runs **GPT-2 124M inference end-to-end as a Wukong program** on the native
+Cranelift-JIT backend: it loads the **real pretrained OpenAI GPT-2 weights** — all **124,439,808**
+parameters, a flat little-endian f32 blob exported from HuggingFace `transformers` by
+`tools/export_gpt2.py` — through the `read_f32` file-I/O intrinsic, and the prompt's token ids through
+`read_i32`, then executes the full forward: token + learned positional embedding, 12 pre-LayerNorm
+blocks (biased QKV, 12-head causal attention, tanh-GELU MLP, residuals), the final LayerNorm, and the
+tied LM head → logits `[5, 50257]`.
+
+`tools/verify_gpt2.py` compares those logits against HuggingFace's authoritative reference. Writing Δ
+for the elementwise difference (wuk − ref) and taking the relative error as `max|Δ| / max|ref|`:
+
+| metric | measured | reference / gate |
+|---|---|---|
+| relative max error (max abs Δ over max abs ref) | **1.87×10⁻⁶** | gate: rel ≤ 1e-3 |
+| absolute max error (max abs Δ) | 2.44×10⁻⁴ | max abs ref = 130.28 |
+| argmax next-token (prompt *"Hello, my name is"*) | **1757 (" John")** | HuggingFace: 1757 — exact match |
+
+**Honest scope.** It is **inference, not training**. **Tokenization is external** — the `.wk` program
+consumes integer token ids produced by the HuggingFace tokenizer; it does not tokenize text itself. The
+full 124M run is **native-only**: the interpreter cannot hold 124M parameters in its slot memory, so the
+reduced-config twin `examples/gpt2_infer_small.wk` runs the *identical* forward pass **bit-for-bit on the
+interpreter and the native backend** (the CI examples differential + opt-invariance gate) — which is what
+proves the full-scale native run executes the pipeline correctly. Reproduce (repo root):
+`python tools/export_gpt2.py`, then `wukongc --run --backend=native examples/gpt2_infer.wk`, then
+`python tools/verify_gpt2.py`.
+
 ## Honest summary
 
 - **Compile time:** the xbench figure — ~100–680× faster than gcc/rustc (latest full-board geomean
