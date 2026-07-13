@@ -1456,6 +1456,29 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[data]);
             return None;
         }
+        // The file-I/O intrinsics: wukong_rt_{read,write}_{f32,i32,i64,u8}(path, data, len) -> i64.
+        // All eight share one ABI — the NUL-terminated path pointer, the slice's data pointer, and
+        // an i64 element count — so one branch keyed on `name` emits the call. Returns the i64
+        // status (element count / -1 open-fail / -2 io-error), bound like the sreduce kernel below.
+        if matches!(
+            name,
+            RT_READ_F32
+                | RT_READ_I32
+                | RT_READ_I64
+                | RT_READ_U8
+                | RT_WRITE_F32
+                | RT_WRITE_I32
+                | RT_WRITE_I64
+                | RT_WRITE_U8
+        ) && args.len() == 3
+        {
+            let path = self.val(args[0]);
+            let data = self.val(args[1]);
+            let len = self.coerce_to_i64(args[2]);
+            let fref = self.rt_refs[name];
+            let call = self.builder.ins().call(fref, &[path, data, len]);
+            return self.builder.inst_results(call).first().copied();
+        }
         // The deterministic reduction kernel: wukong_sreduce_f32[_parallel](x, y, n, op) -> f32 —
         // two pointers, two i64, and an f32 scalar result (the dot/ssd/sum a `@parallel` reduction
         // loop lowers to). Unlike the void kernels above, this returns the accumulated value.
