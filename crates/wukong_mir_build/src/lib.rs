@@ -827,10 +827,14 @@ pub fn lower_program(
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
         rt_read_u8: interner.intern("wukong_rt_read_u8"),
+        rt_read_f64: interner.intern("wukong_rt_read_f64"),
+        rt_read_i8: interner.intern("wukong_rt_read_i8"),
         rt_write_f32: interner.intern("wukong_rt_write_f32"),
         rt_write_i32: interner.intern("wukong_rt_write_i32"),
         rt_write_i64: interner.intern("wukong_rt_write_i64"),
         rt_write_u8: interner.intern("wukong_rt_write_u8"),
+        rt_write_f64: interner.intern("wukong_rt_write_f64"),
+        rt_write_i8: interner.intern("wukong_rt_write_i8"),
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -2105,18 +2109,22 @@ struct GemmSyms {
     /// backing the `alloc_<T>(n)` builtins, and its `wukong_rt_free(data)` release twin.
     rt_alloc: Symbol,
     rt_free: Symbol,
-    /// The 8 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8}`) backing
-    /// the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const u8,
-    /// data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
+    /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
+    /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
+    /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
     /// fail) / -2 (io error). Headerless raw little-endian elements; identical on both backends.
     rt_read_f32: Symbol,
     rt_read_i32: Symbol,
     rt_read_i64: Symbol,
     rt_read_u8: Symbol,
+    rt_read_f64: Symbol,
+    rt_read_i8: Symbol,
     rt_write_f32: Symbol,
     rt_write_i32: Symbol,
     rt_write_i64: Symbol,
     rt_write_u8: Symbol,
+    rt_write_f64: Symbol,
+    rt_write_i8: Symbol,
 }
 
 // Elementwise-math op codes — must match `wukong_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -16609,10 +16617,14 @@ impl FnLowerer<'_> {
             "read_i32" => self.gemm.rt_read_i32,
             "read_i64" => self.gemm.rt_read_i64,
             "read_u8" => self.gemm.rt_read_u8,
+            "read_f64" => self.gemm.rt_read_f64,
+            "read_i8" => self.gemm.rt_read_i8,
             "write_f32" => self.gemm.rt_write_f32,
             "write_i32" => self.gemm.rt_write_i32,
             "write_i64" => self.gemm.rt_write_i64,
             "write_u8" => self.gemm.rt_write_u8,
+            "write_f64" => self.gemm.rt_write_f64,
+            "write_i8" => self.gemm.rt_write_i8,
             _ => return None,
         };
         // Sema guarantees `(path: *u8, buf: []T)` (E0401/E0503 otherwise); decline anything else so

@@ -1001,9 +1001,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpreter; a use-after-free still reads the old values here while being undefined
             // on native — such programs are outside the differential contract (documented UB).
             "wukong_rt_free" => Ok(Value::Unit),
-            // `wukong_rt_read_{f32,i32,i64,u8}(path: *u8, data: *T, len: i64) -> i64` — the read half
-            // of the file-I/O intrinsic family. The on-disk format is headerless: raw contiguous
-            // little-endian elements (f32=4, i32=4, i64=8, u8=1 bytes; no magic, no length prefix).
+            // `wukong_rt_read_{f32,i32,i64,u8,f64,i8}(path: *u8, data: *T, len: i64) -> i64` — the read
+            // half of the file-I/O intrinsic family. The on-disk format is headerless: raw contiguous
+            // little-endian elements (f32=4, i32=4, i64=8, u8=1, f64=8, i8=1 bytes; no magic, no length prefix).
             // Reconstruct the NUL-terminated `path` by walking `memory` from the base pointer (the
             // same loop as `print_str`), then open it read-only: on open failure return -1 and leave
             // `data` untouched. Otherwise `avail = file_len / sizeof(T)` (floor), `n = min(len, avail)`;
@@ -1016,7 +1016,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_rt_read_f32"
             | "wukong_rt_read_i32"
             | "wukong_rt_read_i64"
-            | "wukong_rt_read_u8" => {
+            | "wukong_rt_read_u8"
+            | "wukong_rt_read_f64"
+            | "wukong_rt_read_i8" => {
                 use std::io::Read;
                 // `path` is a NUL-terminated `*u8`: walk `memory` collecting low bytes until NUL.
                 let path_base = match args.first().copied() {
@@ -1040,8 +1042,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 };
                 let len = args.get(2).map(|v| v.as_int()).unwrap_or(0);
                 let elem: usize = match name {
-                    "wukong_rt_read_i64" => 8,
-                    "wukong_rt_read_u8" => 1,
+                    "wukong_rt_read_i64" | "wukong_rt_read_f64" => 8,
+                    "wukong_rt_read_u8" | "wukong_rt_read_i8" => 1,
                     _ => 4, // f32, i32
                 };
                 let mut file = match std::fs::File::open(&path) {
@@ -1099,6 +1101,24 @@ impl<'a, 'k> Interp<'a, 'k> {
                                 ]);
                                 Value::Int(x as i128)
                             }
+                            "wukong_rt_read_f64" => {
+                                let x = f64::from_le_bytes([
+                                    bytes[off],
+                                    bytes[off + 1],
+                                    bytes[off + 2],
+                                    bytes[off + 3],
+                                    bytes[off + 4],
+                                    bytes[off + 5],
+                                    bytes[off + 6],
+                                    bytes[off + 7],
+                                ]);
+                                Value::Float(x)
+                            }
+                            "wukong_rt_read_i8" => {
+                                // i8 is signed: reinterpret the byte's bit pattern then sign-extend.
+                                let x = bytes[off] as i8;
+                                Value::Int(x as i128)
+                            }
                             // wukong_rt_read_u8
                             _ => Value::Int(bytes[off] as i128),
                         };
@@ -1106,7 +1126,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Int(n as i128))
             }
-            // `wukong_rt_write_{f32,i32,i64,u8}(path: *u8, data: *T, len: i64) -> i64` — the write
+            // `wukong_rt_write_{f32,i32,i64,u8,f64,i8}(path: *u8, data: *T, len: i64) -> i64` — the write
             // half of the file-I/O family. Reconstruct the NUL-terminated `path` (as `print_str`),
             // then create/truncate it: on create failure return -1. Otherwise read back `len` elements
             // from `data[0..len]`, narrow each to `T` (`as f32`/`as i32`/`as i64`/`as u8` — the same
@@ -1117,7 +1137,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_rt_write_f32"
             | "wukong_rt_write_i32"
             | "wukong_rt_write_i64"
-            | "wukong_rt_write_u8" => {
+            | "wukong_rt_write_u8"
+            | "wukong_rt_write_f64"
+            | "wukong_rt_write_i8" => {
                 use std::io::Write;
                 let path_base = match args.first().copied() {
                     Some(Value::Ptr(base)) => base,
@@ -1164,6 +1186,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                         }
                         "wukong_rt_write_i64" => {
                             out.extend_from_slice(&(v.as_int() as i64).to_le_bytes())
+                        }
+                        "wukong_rt_write_f64" => {
+                            out.extend_from_slice(&v.as_float().to_le_bytes())
+                        }
+                        "wukong_rt_write_i8" => {
+                            out.extend_from_slice(&(v.as_int() as i8).to_le_bytes())
                         }
                         // wukong_rt_write_u8
                         _ => out.push(v.as_int() as u8),

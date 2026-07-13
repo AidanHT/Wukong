@@ -29,6 +29,31 @@ The end-to-end test programs under [`../tests/run`](../tests/run) are also runna
 arrays, a flat GEMM, transpose, bubble sort, gcd, casts, floats, and more. Heavier programs for
 the benchmark harness live in [`../bench/kernels`](../bench/kernels).
 
+## GPT-2 124M end-to-end inference
+
+The real pretrained OpenAI GPT-2 124M, run as a Wukong program and verified numerically against
+HuggingFace. This is a **correctness / capability** result — inference only, external tokenization, no
+speed claim (see [../README.md](../README.md) and [../BENCHMARKS.md](../BENCHMARKS.md)).
+
+| File | What it shows | How to run |
+|------|---------------|------------|
+| `gpt2_infer.wk` | Full GPT-2 124M forward: loads the **real pretrained weights** (124,439,808 params) + prompt token ids from disk via the `read_f32` / `read_i32` file-I/O intrinsics, runs embed → 12 pre-LayerNorm blocks (biased QKV, 12-head causal attention, tanh-GELU MLP, residuals) → final LayerNorm → tied LM head → logits `[5, 50257]`, writes them back, and prints the argmax (**1757 " John"** for *"Hello, my name is"*). **Native-only** — the interpreter cannot hold 124M params. | export the weights (below), then `wukongc --run --backend=native examples/gpt2_infer.wk` from the repo root; check with `python tools/verify_gpt2.py` (rel 1.87e-6) |
+| `gpt2_infer_small.wk` | The **same** forward pass at a reduced, interpreter-runnable config (D=64, H=4, DFF=256, SEQ=8, LAYERS=2) with synthetic in-loop weights and no file I/O — the differential gate that runs **bit-identically on interpreter and native** | `cargo run -p wukongc -- --run examples/gpt2_infer_small.wk` |
+| `gpt2_config.wk` | GPT-2 124M layout constants (dims + flat-blob element offsets) imported by `gpt2_infer.wk`; **generated** by `tools/export_gpt2.py` (the single source of truth for the offset table) — not run directly | imported, not run |
+
+**Obtaining the weight blob.** The weights are large and not committed to the repo. Export them from
+HuggingFace `transformers` (needs `torch` + `transformers` + `numpy`):
+
+```sh
+python tools/export_gpt2.py
+```
+
+This downloads `GPT2LMHeadModel.from_pretrained("gpt2")`, writes the flat little-endian f32 weight blob,
+the prompt token ids, and the authoritative HuggingFace reference logits under `data/gpt2/`, and
+regenerates `examples/gpt2_config.wk`. Then run `gpt2_infer.wk` on the native backend and verify with
+`tools/verify_gpt2.py`. Tokenization is performed by the HuggingFace tokenizer inside the exporter; the
+`.wk` program only ever consumes the integer token ids it produces.
+
 ## Shape-checked, not yet executed
 
 These parse and pass compile-time **shape checking** (the headline feature) but use tensor/SIMD/

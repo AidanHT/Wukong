@@ -5,6 +5,31 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Capability — GPT-2 124M end-to-end inference + typed file-I/O intrinsics (2026-07-13)
+- **File-I/O intrinsics — headerless raw little-endian typed blobs**: `read_<T>` / `write_<T>` for `T`
+  in `{f32, i32, i64, u8}` (the v1 core-dtype surface) read and write a flat file of that element type
+  into / out of a `[]T` buffer, with no header. `read_<T>(path, buf)` returns
+  `min(buf.len, file_bytes / sizeof T)` on success, `-1` if the file cannot be opened, and `-2` on a
+  mid-read I/O error (`0` when the buffer length is `≤ 0`); `write_<T>(path, buf)` creates/truncates the
+  file and returns the element count written (`-1` if the file cannot be created, `-2` on a write
+  error). Both are differentially tested **interp == native** (round-trip, partial-read, and
+  missing-file run tests), with compile-fail tests for path / buffer / arity misuse.
+- **GPT-2 124M inference end-to-end, matching HuggingFace**: `examples/gpt2_infer.wk` compiles and runs
+  the **real pretrained OpenAI GPT-2 124M** (124,439,808 parameters) as an ordinary Wukong program on
+  the native Cranelift-JIT backend. It loads the weights from a flat little-endian f32 blob (exported
+  from HuggingFace `transformers` by `tools/export_gpt2.py`) via `read_f32`, and the prompt token ids
+  via `read_i32`, then runs the full forward — token + learned positional embedding, 12 pre-LayerNorm
+  blocks (biased QKV, 12-head causal attention, tanh-GELU MLP, residuals), final LayerNorm, tied LM head
+  → logits `[5, 50257]`. **The next-token logits match HuggingFace's reference to a relative max error
+  of 1.87×10⁻⁶** (`max|Δ| = 2.44×10⁻⁴`, `max|ref| = 130.28`), and the argmax next token is
+  **1757 (" John")** for the prompt *"Hello, my name is"* — matching HuggingFace exactly
+  (`tools/verify_gpt2.py`). This is a **numerical-correctness / capability** result — **inference, not
+  training; no speed comparison was measured or is claimed**. **Tokenization is external** (the `.wk`
+  consumes integer token ids produced by the HuggingFace tokenizer). The full run is **native-only**
+  (the interpreter cannot hold 124M parameters); the reduced-config twin `examples/gpt2_infer_small.wk`
+  runs the same forward pass **bit-identically interp == native** as the CI examples differential +
+  opt-invariance gate.
+
 ### Performance + honest measurement — perf-sota session 3 (2026-07-09/10)
 Ten-target directive round; every baseline re-proven before optimizing, every win from the real
 pipeline via same-run/adjacent instruments (full ledger: `prompts/results/perf-sota-session3.md`).

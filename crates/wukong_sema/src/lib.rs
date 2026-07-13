@@ -39,17 +39,19 @@ pub fn heap_alloc_elem(name: &str) -> Option<Scalar> {
 }
 
 /// The buffer-element scalar of a file-I/O intrinsic (`read_f32`/`write_f32` → `F32`), or `None`
-/// for any other name. The v1 file-I/O surface is the per-scalar `read_<T>(path, buf) -> i64` /
-/// `write_<T>(path, buf) -> i64` family over the core dtypes {f32, i32, i64, u8}: sema types these
-/// builtins nominally in one place (like [`heap_alloc_elem`]), validating that `path` is a `*u8`
-/// and `buf` is a `[]T` slice of this element type. `mir_build` shares the same table to select the
-/// runtime symbol and element byte size. A user-defined function of the same name shadows the
-/// builtin (checked before the builtin path).
+/// for any other name. The file-I/O surface is the per-scalar `read_<T>(path, buf) -> i64` /
+/// `write_<T>(path, buf) -> i64` family over the dtypes {f32, f64, i32, i64, i8, u8}: sema types
+/// these builtins nominally in one place (like [`heap_alloc_elem`]), validating that `path` is a
+/// `*u8` and `buf` is a `[]T` slice of this element type. `mir_build` shares the same table to
+/// select the runtime symbol and element byte size. A user-defined function of the same name
+/// shadows the builtin (checked before the builtin path).
 pub fn file_io_elem(name: &str) -> Option<Scalar> {
     Some(match name {
         "read_f32" | "write_f32" => Scalar::F32,
+        "read_f64" | "write_f64" => Scalar::F64,
         "read_i32" | "write_i32" => Scalar::I32,
         "read_i64" | "write_i64" => Scalar::I64,
+        "read_i8" | "write_i8" => Scalar::I8,
         "read_u8" | "write_u8" => Scalar::U8,
         _ => return None,
     })
@@ -3695,6 +3697,14 @@ mod tests {
                   let w = write_i32(\"out.bin\", alloc_i32(8)); \
                   return n + w; }";
         assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        // The later-wave dtypes (f64, i8) type identically: a well-typed `read_f64` / `write_i8`
+        // over a `[]f64` / `[]i8` buffer composes as `i64` just like the core family.
+        let ok2 = "fn f() -> i64 { \
+                   let s: []f64 = alloc_f64(4); \
+                   let n: i64 = read_f64(\"in.bin\", s); \
+                   let w = write_i8(\"out.bin\", alloc_i8(8)); \
+                   return n + w; }";
+        assert!(errors(ok2).is_empty(), "unexpected: {:?}", errors(ok2));
         // Because the result is `i64` (not the lenient `Unknown`), binding it to a conflicting
         // annotation must error — this distinguishes the modeled signature from the fallback.
         let bad = "fn f() { let n: f32 = read_u8(\"in.bin\", alloc_u8(4)); }";
@@ -3718,6 +3728,16 @@ mod tests {
         );
         assert!(
             errors("fn f() { let s = alloc_f32(4); let n = write_u8(\"o.bin\", s); }")
+                .contains(&"E0401")
+        );
+        // … and the later-wave dtypes reject a mismatched buffer element the same way (a `[]f64`
+        // handed to `read_i8`, or a `[]i32` handed to `write_f64`, is an E0401) …
+        assert!(
+            errors("fn f() { let s = alloc_f64(4); let n = read_i8(\"in.bin\", s); }")
+                .contains(&"E0401")
+        );
+        assert!(
+            errors("fn f() { let s = alloc_i32(4); let n = write_f64(\"o.bin\", s); }")
                 .contains(&"E0401")
         );
         // … a non-slice buffer is an E0401 …
