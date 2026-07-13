@@ -441,7 +441,7 @@ let written: i64 = write_f32("out.bin", w);      // flush w as raw little-endian
 ```
 
 The surface is `read_<T>(path: *u8, buf: []T) -> i64` and `write_<T>(path: *u8, buf: []T) -> i64`
-for **`T` in {`f32`, `i32`, `i64`, `u8`}** — the same typed, declared-in-one-place convention as the
+for **`T` in {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}** — the same typed, declared-in-one-place convention as the
 `alloc_<T>` family. The on-disk format is **headerless raw little-endian**: element `i` of `buf` is
 the `sizeof(T)` bytes at byte offset `i · sizeof(T)`, and nothing else — no shape, dtype tag, or
 length prefix (you carry those out of band, the way a `.bin` weight shard does).
