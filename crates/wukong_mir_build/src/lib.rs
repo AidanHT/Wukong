@@ -7237,7 +7237,16 @@ impl FnLowerer<'_> {
     /// makes a shape-typed `Tensor[..]` operand reach the kernel as its actual base pointer.
     fn kernel_base_ptr(&mut self, sym: Symbol) -> Option<ValueId> {
         let (val, ty) = self.lookup(sym)?;
-        Some(if matches!(ty, MirType::Ptr) {
+        // A pointer/tensor operand keeps its base pointer in the slot; a `[]T` slice keeps a fat
+        // pointer whose *data* pointer is the first word (SLICE_PTR_OFF = 0) — both are read by loading
+        // `Ptr` from the slot. A fixed `[T; N]` array's slot *is* its storage, so its base is the slot
+        // address itself. Without the slice arm a `[]f32` operand (the only way to hold a runtime-sized
+        // weight blob — e.g. GPT-2's 124M params) passed the 16-byte fat-pointer buffer as the base and
+        // the kernel dereferenced garbage ("expected a pointer"); a fixed `[i8; 16]` never reaches a
+        // GEMM operand (sema types these f32), so keying on the slice MIR shape is safe here.
+        let is_slice = matches!(&ty, MirType::Array(elem, n)
+            if matches!(**elem, MirType::I8) && *n as u64 == SLICE_SIZE);
+        Some(if matches!(ty, MirType::Ptr) || is_slice {
             self.builder.build(MirType::Ptr, Op::Load(val, MirType::Ptr))
         } else {
             val
@@ -7282,6 +7291,35 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        // Fused per-column bias `C = A·Bᵀ + bias[j]` in a single store (the GPT-2 projection
+        // `q = x·Wᵀ + b`, its bias a runtime-offset slice of a shared weight blob). Routes to the fused
+        // epilogue kernel `wukong_sgemm_nt_epi` (beta from the nest, act = identity); the bias base is
+        // GEP'd by its invariant offset exactly like a/b/c above. NT only (the epilogue kernel form) —
+        // any other shape (or a coexisting α) declines to the scalar nest, which computes `bias + s`
+        // correctly. Bit-identical to the unfused GEMM-then-bias the interpreter marshals as the oracle.
+        if let Some((bias_base, bias_off)) = &nest.bias {
+            if !(nest.transposed && !nest.transposed_a) || nest.alpha.is_some() {
+                return false;
+            }
+            let Some(bias_p) = self.kernel_base_ptr(*bias_base) else {
+                return false;
+            };
+            let bias_p = self.offset_base(bias_p, bias_off);
+            let act_v = self.builder.build(
+                MirType::I64,
+                Op::ConstInt(EPI_ACT_IDENTITY as i128, MirType::I64),
+            );
+            let func = if parallel {
+                self.gemm.nt_epi_par
+            } else {
+                self.gemm.nt_epi
+            };
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![a, b, c, m, k, n, beta, bias_p, act_v],
+            });
+            return true;
+        }
         // α-scaled `C = alpha·(A·Bᵀ)` (the attention score `QKᵀ/√d`) → `wukong_sgemm_nt_alpha`, which
         // folds the scale into the C-tile writeback (no second pass over C). The α kernel is **NT only**;
         // any other shape (plain `A·B`, TN) declines to the scalar nest — which computes `alpha·s`
@@ -18718,6 +18756,13 @@ struct MatmulNest<'a> {
     /// scale `QKᵀ/√d` and every scaled projection. `None` for an unscaled matmul. Only the `ijk`
     /// dot-product form (NT) populates this; `emit_sgemm` routes it to `wukong_sgemm_nt_alpha`.
     alpha: Option<AlphaScale>,
+    /// A fused per-column bias `bias[<invariant offset> + j]` peeled off the store `c[i,j] = bias + s`
+    /// (the GPT-2 projection `q = x·Wᵀ + b`, the bias itself a runtime-offset slice of a shared weight
+    /// blob — `w[base + REL_BQ + j]`). The offset terms are invariant in the matmul's `(i,j,k)`, so
+    /// `emit_sgemm` GEPs the bias base by their sum and routes to the fused epilogue kernel
+    /// `wukong_sgemm_nt_epi` (beta from the nest, act = identity). `None` for an unbiased matmul; only
+    /// the `ijk` dot-product form (NT) populates it, and it is mutually exclusive with `alpha`.
+    bias: Option<(Symbol, Vec<&'a Expr>)>,
 }
 
 /// A loop-invariant α scale peeled off a matmul store `c[i,j] = alpha·s`: either a runtime f32 symbol
@@ -18777,6 +18822,62 @@ fn match_store_scale(
         return Some(Some(scale_operand(lhs, bound, sema, interner)?));
     }
     None
+}
+
+/// Match a **fused-bias** matmul store `c[i,j] = bias[<invariant offset> + j] + s` (either addend
+/// order): a per-column bias added to the dot in a single store — the GPT-2 projection `q = x·Wᵀ + b`,
+/// where `b` is a runtime-offset slice of a shared weight blob (`w[base + REL_BQ + j]`). Returns the
+/// bias `(base, offset_terms)`; the offset must be invariant in the matmul's `(i,j,k)` (`bound`), the
+/// same guarantee `emit_sgemm` relies on to GEP the bias base once per call. `None` if `cv` is not
+/// `bias + s` with a per-column bias.
+fn match_bias_dot_store<'a>(
+    cv: &'a Expr,
+    s_sym: Symbol,
+    jvar: Symbol,
+    bound: &[Symbol],
+) -> Option<(Symbol, Vec<&'a Expr>)> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs,
+        rhs,
+    } = &cv.kind
+    else {
+        return None;
+    };
+    // One addend is the accumulator `s`; the other is the bias `bias[<offset> + j]`.
+    let bias_expr = if single_path(lhs) == Some(s_sym) {
+        rhs
+    } else if single_path(rhs) == Some(s_sym) {
+        lhs
+    } else {
+        return None;
+    };
+    let (base, off) = match_bias_index(bias_expr, jvar)?;
+    // The bias base offset must not depend on the matmul's own loop vars (else it is not a per-call
+    // constant pointer shift): exactly the `offset_invariant` discipline used for a/b/c offsets.
+    if !offset_invariant(&off, bound) {
+        return None;
+    }
+    Some((base, off))
+}
+
+/// Parse a per-column bias access `bias_base[<offset terms> + col]` → `(base, offset_terms)`. The
+/// flattened index must contain the bare `col` term exactly once; whatever remains is the (checked
+/// loop-invariant) base offset — `w[base + REL_BQ + j]` → `(w, [base, REL_BQ])`, `bias[j]` → `(bias,
+/// [])`. `None` for anything that is not a single-index array read carrying the bare `col`.
+fn match_bias_index<'a>(e: &'a Expr, col: Symbol) -> Option<(Symbol, Vec<&'a Expr>)> {
+    let ExprKind::Index { base, indices } = &e.kind else {
+        return None;
+    };
+    if indices.len() != 1 {
+        return None;
+    }
+    let base_sym = single_path(base)?;
+    let mut terms = Vec::new();
+    flatten_add_terms(&indices[0], &mut terms);
+    let col_pos = terms.iter().position(|t| single_path(t) == Some(col))?;
+    terms.remove(col_pos);
+    Some((base_sym, terms))
 }
 
 /// Canonical text of an affine index/base expression (paths, ints, `+`/`-`/`*`, casts), used to key
@@ -20475,9 +20576,17 @@ fn match_matmul_ijk<'a>(
     else {
         return None;
     };
-    // The store value is `s` (α = 1) or a loop-invariant `alpha·s` (peeled off and folded into the
-    // GEMM writeback by `emit_sgemm`). `match_store_scale` generalizes the old `single_path == s_sym`.
-    let alpha = match_store_scale(cv, s_sym, &[row, jvar, kvar], sema, interner)?;
+    // The store value is `s` (α = 1), a loop-invariant `alpha·s` (folded into the GEMM writeback), or
+    // the fused-bias form `bias[<invariant offset> + j] + s` (the GPT-2 projection `q = x·Wᵀ + b`, its
+    // bias a runtime-offset slice of a shared weight blob). Bias and α are disjoint store shapes; a
+    // fused bias routes to `wukong_sgemm_nt_epi` in `emit_sgemm`.
+    let (alpha, bias) = match match_store_scale(cv, s_sym, &[row, jvar, kvar], sema, interner) {
+        Some(a) => (a, None),
+        None => (
+            None,
+            Some(match_bias_dot_store(cv, s_sym, jvar, &[row, jvar, kvar])?),
+        ),
+    };
     // The output store `c[i*N + j (+ off)] = …` or the shape-typed `c[i, j] = …` (sema-aware).
     let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
     // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
@@ -20518,6 +20627,7 @@ fn match_matmul_ijk<'a>(
         b_off,
         c_off,
         alpha,
+        bias,
     })
 }
 
@@ -20666,6 +20776,7 @@ fn match_matmul_ijk_memacc<'a>(
         b_off,
         c_off,
         alpha: None,
+        bias: None,
     })
 }
 
@@ -20864,6 +20975,7 @@ fn match_matmul_residual<'a>(
         b_off,
         c_off,
         alpha: None, // the residual epilogue kernel carries no α scale
+        bias: None,  // the residual store's per-column bias rides the beta=1 epilogue, not this field
     };
     Some((nest, bias, act))
 }
@@ -21024,6 +21136,7 @@ fn match_matmul<'a>(
         c_off: Vec::new(),
         // The `ikj` accumulate store is `c[i,j] += aik·b[k,j]`, not `c[i,j] = alpha·s` — no α peel.
         alpha: None,
+        bias: None,
     })
 }
 
