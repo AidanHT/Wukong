@@ -532,6 +532,121 @@ pub extern "C" fn wukong_rt_free(data: *mut u8) {
     }
 }
 
+/// Reconstruct an owned filesystem path from the NUL-terminated `*const u8` C string the file-I/O
+/// intrinsics receive as their `path` argument. Returns `None` for a null pointer or a byte
+/// sequence that is not valid UTF-8 — either case is reported to the program as an open failure
+/// (`-1`), never a silent open of the wrong file.
+///
+/// # Safety
+/// `path`, when non-null, must point at a NUL-terminated byte string that stays valid for the
+/// duration of the call (the compiler passes a pointer into the program's static/heap string data).
+unsafe fn rt_path(path: *const u8) -> Option<std::path::PathBuf> {
+    if path.is_null() {
+        return None;
+    }
+    // `CStr::from_ptr` performs the NUL walk; `to_str` validates UTF-8.
+    let cstr = std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char);
+    cstr.to_str().ok().map(std::path::PathBuf::from)
+}
+
+/// Defines one `read`/`write` pair of file-I/O intrinsics for element type `$T`, following the
+/// frozen contract: **headerless, raw contiguous little-endian** elements (no magic, no length
+/// prefix). Both backends (native here, interpreter elsewhere) MUST produce byte-identical files
+/// and identical `-1` / `-2` / `n` return codes, so every element is (de)serialized with
+/// `from_le_bytes` / `to_le_bytes` regardless of host endianness.
+macro_rules! rt_file_io {
+    ($read:ident, $write:ident, $T:ty) => {
+        /// Read up to `len` little-endian `
+        #[doc = stringify!($T)]
+        /// ` elements from `path` into `data`.
+        ///
+        /// Opens `path` read-only (returns `-1` if that fails, leaving `data` untouched), then
+        /// reads `n = min(len, file_size / sizeof)` elements — the file's trailing partial element,
+        /// if any, is ignored. `data[0..n]` receives the decoded values; `data[n..]` is left as the
+        /// caller allocated it (`alloc_*` pre-zeroes). Returns `n` on success, `-2` on a mid-read
+        /// I/O error, and `0` (without touching `data`) when `len <= 0`.
+        ///
+        /// # Safety
+        /// `data` must address at least `len` writable `
+        #[doc = stringify!($T)]
+        /// ` slots, and `path` must satisfy [`rt_path`]'s contract.
+        #[no_mangle]
+        pub extern "C" fn $read(path: *const u8, data: *mut $T, len: i64) -> i64 {
+            use std::io::Read;
+            const SZ: usize = std::mem::size_of::<$T>();
+            if len <= 0 {
+                return 0;
+            }
+            // SAFETY: forwarded from this function's own safety contract.
+            let Some(path) = (unsafe { rt_path(path) }) else {
+                return -1;
+            };
+            let mut file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => return -1,
+            };
+            let avail = match file.metadata() {
+                Ok(m) => (m.len() / SZ as u64) as usize,
+                Err(_) => return -2,
+            };
+            let n = (len as usize).min(avail);
+            if n == 0 {
+                return 0;
+            }
+            let mut bytes = vec![0u8; n * SZ];
+            if file.read_exact(&mut bytes).is_err() {
+                return -2;
+            }
+            for (i, chunk) in bytes.chunks_exact(SZ).enumerate() {
+                let v = <$T>::from_le_bytes(chunk.try_into().unwrap());
+                // SAFETY: `i < n <= len` and the caller guarantees `len` writable slots at `data`.
+                unsafe { *data.add(i) = v };
+            }
+            n as i64
+        }
+
+        /// Write all `len` `
+        #[doc = stringify!($T)]
+        /// ` elements of `data` to `path` as little-endian bytes.
+        ///
+        /// Creates/truncates `path` (returns `-1` if that fails). Returns `len` on success and
+        /// `-2` on a write error. A `len <= 0` writes an empty (truncated) file and returns `0`.
+        ///
+        /// # Safety
+        /// `data` must address at least `len` readable `
+        #[doc = stringify!($T)]
+        /// ` slots, and `path` must satisfy [`rt_path`]'s contract.
+        #[no_mangle]
+        pub extern "C" fn $write(path: *const u8, data: *const $T, len: i64) -> i64 {
+            use std::io::Write;
+            // SAFETY: forwarded from this function's own safety contract.
+            let Some(path) = (unsafe { rt_path(path) }) else {
+                return -1;
+            };
+            let mut file = match std::fs::File::create(&path) {
+                Ok(f) => f,
+                Err(_) => return -1,
+            };
+            let count = len.max(0) as usize;
+            let mut bytes = Vec::with_capacity(count * std::mem::size_of::<$T>());
+            for i in 0..count {
+                // SAFETY: `i < count == len` and the caller guarantees `len` readable slots.
+                let v = unsafe { *data.add(i) };
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            if file.write_all(&bytes).is_err() {
+                return -2;
+            }
+            len.max(0)
+        }
+    };
+}
+
+rt_file_io!(wukong_rt_read_f32, wukong_rt_write_f32, f32);
+rt_file_io!(wukong_rt_read_i32, wukong_rt_write_i32, i32);
+rt_file_io!(wukong_rt_read_i64, wukong_rt_write_i64, i64);
+rt_file_io!(wukong_rt_read_u8, wukong_rt_write_u8, u8);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +776,167 @@ mod tests {
         let second = a.alloc(16, 8).unwrap();
         assert_eq!(first, second);
         assert_eq!(a.capacity(), 32);
+    }
+
+    // ---- file-I/O intrinsics (wukong_rt_{read,write}_{f32,i32,i64,u8}) ----
+
+    /// A collision-free temp path (process id + monotonic counter) so parallel test threads and
+    /// repeated runs never share a file. Not created on disk — the caller writes it.
+    fn io_tmp(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!("wukong_io_{}_{}_{}.bin", tag, std::process::id(), id));
+        p
+    }
+
+    /// NUL-terminated `*const u8` view of a path — the ABI the intrinsics expect. The returned
+    /// `CString` owns the bytes and must outlive every use of the pointer.
+    fn cpath(p: &std::path::Path) -> std::ffi::CString {
+        std::ffi::CString::new(p.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn file_io_roundtrip_f32() {
+        let path = io_tmp("f32");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let src = [1.5f32, -2.25, 0.0, 3.141_592_7, 6.022e23, -1.0e-9];
+        assert_eq!(wukong_rt_write_f32(ptr, src.as_ptr(), src.len() as i64), 6);
+        let mut dst = [0f32; 6];
+        assert_eq!(wukong_rt_read_f32(ptr, dst.as_mut_ptr(), 6), 6);
+        assert_eq!(dst, src);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_io_roundtrip_i32() {
+        let path = io_tmp("i32");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let src = [0i32, -1, i32::MIN, i32::MAX, 123_456];
+        assert_eq!(wukong_rt_write_i32(ptr, src.as_ptr(), src.len() as i64), 5);
+        let mut dst = [0i32; 5];
+        assert_eq!(wukong_rt_read_i32(ptr, dst.as_mut_ptr(), 5), 5);
+        assert_eq!(dst, src);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_io_roundtrip_i64() {
+        let path = io_tmp("i64");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let src = [0i64, -1, i64::MIN, i64::MAX, 9_876_543_210];
+        assert_eq!(wukong_rt_write_i64(ptr, src.as_ptr(), src.len() as i64), 5);
+        let mut dst = [0i64; 5];
+        assert_eq!(wukong_rt_read_i64(ptr, dst.as_mut_ptr(), 5), 5);
+        assert_eq!(dst, src);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_io_roundtrip_u8() {
+        let path = io_tmp("u8");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let src = [0u8, 1, 127, 128, 255, 42];
+        assert_eq!(wukong_rt_write_u8(ptr, src.as_ptr(), src.len() as i64), 6);
+        let mut dst = [0u8; 6];
+        assert_eq!(wukong_rt_read_u8(ptr, dst.as_mut_ptr(), 6), 6);
+        assert_eq!(dst, src);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_is_little_endian_on_disk() {
+        // A round-trip alone would pass even if both sides used big-endian; pin the on-disk bytes.
+        let path = io_tmp("le");
+        let cp = cpath(&path);
+        let src = [0x0102_0304i32, -1];
+        assert_eq!(wukong_rt_write_i32(cp.as_ptr() as *const u8, src.as_ptr(), 2), 2);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw, vec![0x04, 0x03, 0x02, 0x01, 0xff, 0xff, 0xff, 0xff]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_honors_min_len_avail() {
+        let path = io_tmp("minlen");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let src = [10i64, 20, 30, 40];
+        assert_eq!(wukong_rt_write_i64(ptr, src.as_ptr(), 4), 4);
+
+        // buf larger than file: reads the 4 available, leaves the tail untouched.
+        let mut big = [-1i64; 6];
+        assert_eq!(wukong_rt_read_i64(ptr, big.as_mut_ptr(), 6), 4);
+        assert_eq!(&big[..4], &src);
+        assert_eq!(&big[4..], &[-1i64, -1]);
+
+        // buf smaller than file: reads only the first 2.
+        let mut small = [0i64; 2];
+        assert_eq!(wukong_rt_read_i64(ptr, small.as_mut_ptr(), 2), 2);
+        assert_eq!(small, [10, 20]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_ignores_trailing_partial_element() {
+        // A file whose length is not a whole multiple of sizeof: the partial tail is dropped.
+        let path = io_tmp("partial");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        // 9 bytes = two whole i32 (8 bytes) + 1 stray byte.
+        std::fs::write(&path, [1u8, 0, 0, 0, 2, 0, 0, 0, 0xEE]).unwrap();
+        let mut dst = [-1i32; 4];
+        assert_eq!(wukong_rt_read_i32(ptr, dst.as_mut_ptr(), 4), 2);
+        assert_eq!(&dst[..2], &[1, 2]);
+        assert_eq!(&dst[2..], &[-1, -1]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_nonexistent_returns_minus_one() {
+        let path = io_tmp("nope"); // never created
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let mut bf = [0f32; 4];
+        assert_eq!(wukong_rt_read_f32(ptr, bf.as_mut_ptr(), 4), -1);
+        assert_eq!(bf, [0.0; 4], "buf must be untouched on open failure");
+        let mut bi = [0i32; 2];
+        assert_eq!(wukong_rt_read_i32(ptr, bi.as_mut_ptr(), 2), -1);
+        let mut bl = [0i64; 2];
+        assert_eq!(wukong_rt_read_i64(ptr, bl.as_mut_ptr(), 2), -1);
+        let mut bu = [0u8; 2];
+        assert_eq!(wukong_rt_read_u8(ptr, bu.as_mut_ptr(), 2), -1);
+    }
+
+    #[test]
+    fn read_nonpositive_len_returns_zero_without_touching_buf() {
+        let path = io_tmp("zerolen");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        assert_eq!(wukong_rt_write_u8(ptr, [7u8, 8, 9].as_ptr(), 3), 3);
+        let mut buf = [0xAAu8; 3];
+        assert_eq!(wukong_rt_read_u8(ptr, buf.as_mut_ptr(), 0), 0);
+        assert_eq!(buf, [0xAA; 3], "buf must be untouched on len == 0");
+        assert_eq!(wukong_rt_read_u8(ptr, buf.as_mut_ptr(), -5), 0);
+        assert_eq!(buf, [0xAA; 3], "buf must be untouched on negative len");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_empty_truncates_and_returns_zero() {
+        // Pre-populate the path, then a zero-length write must leave an empty file and return 0.
+        let path = io_tmp("empty");
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        assert_eq!(wukong_rt_write_i32(ptr, [1i32, 2, 3].as_ptr(), 3), 3);
+        let empty: [i32; 0] = [];
+        assert_eq!(wukong_rt_write_i32(ptr, empty.as_ptr(), 0), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "file must be truncated");
+        std::fs::remove_file(&path).ok();
     }
 }
