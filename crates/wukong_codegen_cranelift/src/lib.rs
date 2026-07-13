@@ -111,6 +111,16 @@ const RT_ASSERT: &str = "wukong_rt_assert";
 // The heap builtins: zeroed allocation (count, elem_size, elem_is_float) -> ptr, and its release.
 const RT_ALLOC: &str = "wukong_rt_alloc";
 const RT_FREE: &str = "wukong_rt_free";
+// The file-I/O intrinsics: read_/write_ × {f32,i32,i64,u8}, each (path, data, len) -> i64. All
+// eight share one ABI (two pointers + an i64 count) so cranelift declares them from one signature.
+const RT_READ_F32: &str = "wukong_rt_read_f32";
+const RT_READ_I32: &str = "wukong_rt_read_i32";
+const RT_READ_I64: &str = "wukong_rt_read_i64";
+const RT_READ_U8: &str = "wukong_rt_read_u8";
+const RT_WRITE_F32: &str = "wukong_rt_write_f32";
+const RT_WRITE_I32: &str = "wukong_rt_write_i32";
+const RT_WRITE_I64: &str = "wukong_rt_write_i64";
+const RT_WRITE_U8: &str = "wukong_rt_write_u8";
 const RT_PARALLEL_FOR: &str = "wukong_parallel_for";
 const RT_SGEMM: &str = "wukong_sgemm";
 const RT_SGEMM_PARALLEL: &str = "wukong_sgemm_parallel";
@@ -1799,6 +1809,14 @@ struct RtFuncs {
     assert: FuncId,
     rt_alloc: FuncId,
     rt_free: FuncId,
+    rt_read_f32: FuncId,
+    rt_read_i32: FuncId,
+    rt_read_i64: FuncId,
+    rt_read_u8: FuncId,
+    rt_write_f32: FuncId,
+    rt_write_i32: FuncId,
+    rt_write_i64: FuncId,
+    rt_write_u8: FuncId,
     parallel_for: FuncId,
     sgemm: FuncId,
     sgemm_parallel: FuncId,
@@ -2278,6 +2296,13 @@ fn populate_module<M: Module>(
     sig_rt_alloc.returns.push(AbiParam::new(ptr_ty));
     let mut sig_rt_free = Signature::new(call_conv);
     sig_rt_free.params.push(AbiParam::new(ptr_ty));
+    // wukong_rt_{read,write}_{f32,i32,i64,u8}(path: ptr, data: ptr, len: i64) -> i64 — the file-I/O
+    // intrinsics. Identical ABI across all eight dtypes/directions, so one signature declares them.
+    let mut sig_rt_fileio = Signature::new(call_conv);
+    sig_rt_fileio.params.push(AbiParam::new(ptr_ty));
+    sig_rt_fileio.params.push(AbiParam::new(ptr_ty));
+    sig_rt_fileio.params.push(AbiParam::new(types::I64));
+    sig_rt_fileio.returns.push(AbiParam::new(types::I64));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -2299,6 +2324,30 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         rt_free: module
             .declare_function(RT_FREE, Linkage::Import, &sig_rt_free)
+            .map_err(|e| e.to_string())?,
+        rt_read_f32: module
+            .declare_function(RT_READ_F32, Linkage::Import, &sig_rt_fileio)
+            .map_err(|e| e.to_string())?,
+        rt_read_i32: module
+            .declare_function(RT_READ_I32, Linkage::Import, &sig_rt_fileio)
+            .map_err(|e| e.to_string())?,
+        rt_read_i64: module
+            .declare_function(RT_READ_I64, Linkage::Import, &sig_rt_fileio)
+            .map_err(|e| e.to_string())?,
+        rt_read_u8: module
+            .declare_function(RT_READ_U8, Linkage::Import, &sig_rt_fileio)
+            .map_err(|e| e.to_string())?,
+        rt_write_f32: module
+            .declare_function(RT_WRITE_F32, Linkage::Import, &sig_rt_fileio)
+            .map_err(|e| e.to_string())?,
+        rt_write_i32: module
+            .declare_function(RT_WRITE_I32, Linkage::Import, &sig_rt_fileio)
+            .map_err(|e| e.to_string())?,
+        rt_write_i64: module
+            .declare_function(RT_WRITE_I64, Linkage::Import, &sig_rt_fileio)
+            .map_err(|e| e.to_string())?,
+        rt_write_u8: module
+            .declare_function(RT_WRITE_U8, Linkage::Import, &sig_rt_fileio)
             .map_err(|e| e.to_string())?,
         parallel_for: module
             .declare_function(RT_PARALLEL_FOR, Linkage::Import, &sig_par)
@@ -2896,6 +2945,38 @@ fn build_function_clif(
             rt_refs.insert(
                 RT_FREE,
                 module.declare_func_in_func(rt.rt_free, builder.func),
+            );
+            rt_refs.insert(
+                RT_READ_F32,
+                module.declare_func_in_func(rt.rt_read_f32, builder.func),
+            );
+            rt_refs.insert(
+                RT_READ_I32,
+                module.declare_func_in_func(rt.rt_read_i32, builder.func),
+            );
+            rt_refs.insert(
+                RT_READ_I64,
+                module.declare_func_in_func(rt.rt_read_i64, builder.func),
+            );
+            rt_refs.insert(
+                RT_READ_U8,
+                module.declare_func_in_func(rt.rt_read_u8, builder.func),
+            );
+            rt_refs.insert(
+                RT_WRITE_F32,
+                module.declare_func_in_func(rt.rt_write_f32, builder.func),
+            );
+            rt_refs.insert(
+                RT_WRITE_I32,
+                module.declare_func_in_func(rt.rt_write_i32, builder.func),
+            );
+            rt_refs.insert(
+                RT_WRITE_I64,
+                module.declare_func_in_func(rt.rt_write_i64, builder.func),
+            );
+            rt_refs.insert(
+                RT_WRITE_U8,
+                module.declare_func_in_func(rt.rt_write_u8, builder.func),
             );
             rt_refs.insert(
                 RT_PARALLEL_FOR,
@@ -3770,6 +3851,14 @@ pub fn jit_compile(
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
+    builder.symbol(RT_READ_F32, wukong_runtime::wukong_rt_read_f32 as *const u8);
+    builder.symbol(RT_READ_I32, wukong_runtime::wukong_rt_read_i32 as *const u8);
+    builder.symbol(RT_READ_I64, wukong_runtime::wukong_rt_read_i64 as *const u8);
+    builder.symbol(RT_READ_U8, wukong_runtime::wukong_rt_read_u8 as *const u8);
+    builder.symbol(RT_WRITE_F32, wukong_runtime::wukong_rt_write_f32 as *const u8);
+    builder.symbol(RT_WRITE_I32, wukong_runtime::wukong_rt_write_i32 as *const u8);
+    builder.symbol(RT_WRITE_I64, wukong_runtime::wukong_rt_write_i64 as *const u8);
+    builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
         wukong_runtime::wukong_parallel_for as *const u8,
@@ -4328,6 +4417,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
+    builder.symbol(RT_READ_F32, wukong_runtime::wukong_rt_read_f32 as *const u8);
+    builder.symbol(RT_READ_I32, wukong_runtime::wukong_rt_read_i32 as *const u8);
+    builder.symbol(RT_READ_I64, wukong_runtime::wukong_rt_read_i64 as *const u8);
+    builder.symbol(RT_READ_U8, wukong_runtime::wukong_rt_read_u8 as *const u8);
+    builder.symbol(RT_WRITE_F32, wukong_runtime::wukong_rt_write_f32 as *const u8);
+    builder.symbol(RT_WRITE_I32, wukong_runtime::wukong_rt_write_i32 as *const u8);
+    builder.symbol(RT_WRITE_I64, wukong_runtime::wukong_rt_write_i64 as *const u8);
+    builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
         wukong_runtime::wukong_parallel_for as *const u8,
