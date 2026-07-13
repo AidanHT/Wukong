@@ -7,11 +7,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Capability — GPT-2 124M end-to-end inference + typed file-I/O intrinsics (2026-07-13)
 - **File-I/O intrinsics — headerless raw little-endian typed blobs**: `read_<T>` / `write_<T>` for `T`
-  in `{f32, i32, i64, u8, f64, i8}` read and write a flat file of that element type into / out of a
-  `[]T` buffer, with no header. `read_<T>(path, buf)` returns `min(buf.len, file_bytes / sizeof T)` on
-  success, `-1` if the file cannot be opened, and `-2` on an I/O error; `write_<T>(path, buf)` returns
-  the element count written. Both are differentially tested **interp == native** (round-trip,
-  partial-read, and missing-file run tests), with compile-fail tests for path / buffer / arity misuse.
+  in `{f32, i32, i64, u8}` (the v1 core-dtype surface) read and write a flat file of that element type
+  into / out of a `[]T` buffer, with no header. `read_<T>(path, buf)` returns
+  `min(buf.len, file_bytes / sizeof T)` on success, `-1` if the file cannot be opened, and `-2` on a
+  mid-read I/O error (`0` when the buffer length is `≤ 0`); `write_<T>(path, buf)` creates/truncates the
+  file and returns the element count written (`-1` if the file cannot be created, `-2` on a write
+  error). Both are differentially tested **interp == native** (round-trip, partial-read, and
+  missing-file run tests), with compile-fail tests for path / buffer / arity misuse.
 - **GPT-2 124M inference end-to-end, matching HuggingFace**: `examples/gpt2_infer.wk` compiles and runs
   the **real pretrained OpenAI GPT-2 124M** (124,439,808 parameters) as an ordinary Wukong program on
   the native Cranelift-JIT backend. It loads the weights from a flat little-endian f32 blob (exported
