@@ -1001,6 +1001,111 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpreter; a use-after-free still reads the old values here while being undefined
             // on native — such programs are outside the differential contract (documented UB).
             "wukong_rt_free" => Ok(Value::Unit),
+            // `wukong_rt_read_{f32,i32,i64,u8}(path: *u8, data: *T, len: i64) -> i64` — the read half
+            // of the file-I/O intrinsic family. The on-disk format is headerless: raw contiguous
+            // little-endian elements (f32=4, i32=4, i64=8, u8=1 bytes; no magic, no length prefix).
+            // Reconstruct the NUL-terminated `path` by walking `memory` from the base pointer (the
+            // same loop as `print_str`), then open it read-only: on open failure return -1 and leave
+            // `data` untouched. Otherwise `avail = file_len / sizeof(T)` (floor), `n = min(len, avail)`;
+            // read `n * sizeof(T)` bytes, decode each element little-endian and store into `data[0..n]`
+            // as `Value::Float(x as f64)` (f32) / `Value::Int(x as i128)` (the integer widths) — the
+            // identical typed value native's calloc'd load observes — leaving `data[n..]` unchanged. A
+            // read error mid-way returns -2; success returns `n` (>= 0). The LE decode, the min(len,avail)
+            // truncation, and the -1/-2/n codes are byte-identical to `wukong_runtime`, so the
+            // interp==native differential gate holds.
+            "wukong_rt_read_f32"
+            | "wukong_rt_read_i32"
+            | "wukong_rt_read_i64"
+            | "wukong_rt_read_u8" => {
+                use std::io::Read;
+                // `path` is a NUL-terminated `*u8`: walk `memory` collecting low bytes until NUL.
+                let path_base = match args.first().copied() {
+                    Some(Value::Ptr(base)) => base,
+                    _ => return Err("file-io read: path is not a pointer".into()),
+                };
+                let mut path_bytes = Vec::new();
+                let mut i = path_base;
+                while i < self.memory.len() {
+                    let b = self.memory[i].as_int() as u8;
+                    if b == 0 {
+                        break;
+                    }
+                    path_bytes.push(b);
+                    i += 1;
+                }
+                let path = String::from_utf8_lossy(&path_bytes).into_owned();
+                let data_base = match args.get(1).copied() {
+                    Some(Value::Ptr(base)) => base,
+                    _ => return Err("file-io read: data is not a pointer".into()),
+                };
+                let len = args.get(2).map(|v| v.as_int()).unwrap_or(0);
+                let elem: usize = match name {
+                    "wukong_rt_read_i64" => 8,
+                    "wukong_rt_read_u8" => 1,
+                    _ => 4, // f32, i32
+                };
+                let mut file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(Value::Int(-1)),
+                };
+                let file_len = match file.metadata() {
+                    Ok(m) => m.len() as i128,
+                    Err(_) => return Ok(Value::Int(-2)),
+                };
+                let avail = file_len / elem as i128;
+                // n = min(len, avail), clamped to >= 0 (guards a non-positive len — 0 => read nothing).
+                let n = len.min(avail);
+                let n = if n < 0 { 0 } else { n as usize };
+                if n > 0 {
+                    let mut bytes = vec![0u8; n * elem];
+                    if file.read_exact(&mut bytes).is_err() {
+                        return Ok(Value::Int(-2));
+                    }
+                    for k in 0..n {
+                        let off = k * elem;
+                        let slot = data_base + k;
+                        if slot >= self.memory.len() {
+                            return Err("file-io read: data out of bounds".into());
+                        }
+                        self.memory[slot] = match name {
+                            "wukong_rt_read_f32" => {
+                                let x = f32::from_le_bytes([
+                                    bytes[off],
+                                    bytes[off + 1],
+                                    bytes[off + 2],
+                                    bytes[off + 3],
+                                ]);
+                                Value::Float(x as f64)
+                            }
+                            "wukong_rt_read_i32" => {
+                                let x = i32::from_le_bytes([
+                                    bytes[off],
+                                    bytes[off + 1],
+                                    bytes[off + 2],
+                                    bytes[off + 3],
+                                ]);
+                                Value::Int(x as i128)
+                            }
+                            "wukong_rt_read_i64" => {
+                                let x = i64::from_le_bytes([
+                                    bytes[off],
+                                    bytes[off + 1],
+                                    bytes[off + 2],
+                                    bytes[off + 3],
+                                    bytes[off + 4],
+                                    bytes[off + 5],
+                                    bytes[off + 6],
+                                    bytes[off + 7],
+                                ]);
+                                Value::Int(x as i128)
+                            }
+                            // wukong_rt_read_u8
+                            _ => Value::Int(bytes[off] as i128),
+                        };
+                    }
+                }
+                Ok(Value::Int(n as i128))
+            }
             // `wukong_parallel_for(n, body, env)` — run `body(start, end, env)` over the index
             // range. The interpreter executes the whole range sequentially in one call; since
             // parallel-for bodies have no cross-iteration dependencies this is exactly the result
