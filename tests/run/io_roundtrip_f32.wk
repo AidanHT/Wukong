@@ -1,0 +1,49 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0.25
+// EXPECT-OUT: -0.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: -2
+// EXPECT-OUT: 100
+// EXPECT-OUT: -0.75
+// EXPECT-OUT: 4
+module tests.run.io_roundtrip_f32
+
+// File-I/O round-trip for `f32`: `write_f32` a known buffer to a temp file, `read_f32` it back into
+// a fresh (zeroed) buffer, and print every element. The eight values mix zero, exact fractions
+// (0.25, -0.5, -0.75 — nonzero mantissa bits), negatives (sign bit), and a large magnitude (100.0 —
+// nonzero exponent bits), so a byte-swapped or mis-strided decode would print different numbers.
+// The file format is headerless little-endian (the frozen contract), identical on both backends, so
+// the interpreter (which holds each f32 widened to f64) and the native JIT must print byte-identical
+// output. All values are exactly representable in both f32 and f64, so their decimal rendering is
+// unambiguous and backend-independent. Temp file name is unique to this test to avoid collisions.
+fn main() -> i32 {
+    let cnt: i64 = 8;
+    let mut wbuf: []f32 = alloc_f32(cnt);
+    wbuf[0] = 0.0;
+    wbuf[1] = 0.25;
+    wbuf[2] = -0.5;
+    wbuf[3] = 1.0;
+    wbuf[4] = -2.0;
+    wbuf[5] = 100.0;
+    wbuf[6] = -0.75;
+    wbuf[7] = 4.0;
+
+    let wrote: i64 = write_f32("io_test_f32.bin", wbuf);
+    print(wrote); // 8 — every element written
+
+    let mut rbuf: []f32 = alloc_f32(cnt);
+    let n: i64 = read_f32("io_test_f32.bin", rbuf);
+    print(n); // 8 — every element read back
+
+    for i in 0..cnt {
+        print(rbuf[i]);
+    }
+
+    free(wbuf);
+    free(rbuf);
+    return 0;
+}

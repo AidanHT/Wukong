@@ -115,8 +115,11 @@ language gap (see M6).
 pure Wukong without escaping? Standing: forward blocks yes (statically-shaped, recognized
 idioms); training via `--train` (CLI transform, not in-language); **known blockers**: no heap
 allocation / returned tensors, runtime `?` dims don't run, tensors can't be element-generic
-(`Tensor[T,M,N]` rejected → dtype kernels duplicated), no fn pointers/closures, no file I/O
-(weights must be synthesized). (Multi-file `import a.b` *does* work — it splices items with
+(`Tensor[T,M,N]` rejected → dtype kernels duplicated), no fn pointers/closures. **File I/O now
+runs** (✅): the `read_<T>`/`write_<T>` family (`T` in {`f32`, `i32`, `i64`, `u8`}) loads and stores
+headerless raw little-endian blobs and is gated interp == native bit-for-bit, so weights can be
+**read off disk rather than synthesized** (a full GPT-2 forward pass from real weights is not yet
+claimed end-to-end). (Multi-file `import a.b` *does* work — it splices items with
 cycle/diamond dedup; only aliased/selective `import as` / `import x.{a,b}` stay partial.) These bound
 how far "general programs a real user writes" can go today and are first-class improvement
 targets, not footnotes.
@@ -166,5 +169,5 @@ Remaining, ranked:
    512–1024³; shared-pack, mid-pool, persistent-region, and fork-join alternatives are all
    measured/refuted in gemm.rs — a genuinely new decomposition idea is required).
 2. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
-   tensors, file I/O (M6).
+   tensors (M6; **file I/O now runs** — typed read/write blobs, interp == native).
 3. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).

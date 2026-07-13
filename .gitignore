@@ -24,6 +24,10 @@ prompts/*.md
 *.pdb
 a.out
 
+# File-I/O test-suite scratch files: tests/run/io_*.wk write a temp `.bin` in the process cwd and
+# read it back for the differential round-trip. Regenerated on every run; never committed.
+io_test_*.bin
+
 # Local LLVM install (if placed inside the repo)
 /llvm
 /.llvm

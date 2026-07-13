@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 127
+// EXPECT-OUT: 128
+// EXPECT-OUT: 200
+// EXPECT-OUT: 255
+// EXPECT-OUT: 42
+// EXPECT-OUT: 7
+module tests.run.io_roundtrip_u8
+
+// File-I/O round-trip for `u8`: `write_u8` a known buffer, `read_u8` it back, print each element
+// (widened to `i64`). The values span the full unsigned byte range including 127, 128 and 255, so a
+// signed vs unsigned decode of the high-bit bytes would print a negative number instead — the print
+// (unsigned) must round-trip 128 and 255 as themselves. One byte per element, so this pins the
+// element stride at 1. Headerless raw bytes per the frozen contract; interpreter and native JIT must
+// agree byte-for-byte. Unique temp file name avoids collisions.
+fn main() -> i32 {
+    let cnt: i64 = 8;
+    let mut wbuf: []u8 = alloc_u8(cnt);
+    wbuf[0] = 0;
+    wbuf[1] = 1;
+    wbuf[2] = 127;
+    wbuf[3] = 128;
+    wbuf[4] = 200;
+    wbuf[5] = 255;
+    wbuf[6] = 42;
+    wbuf[7] = 7;
+
+    let wrote: i64 = write_u8("io_test_u8.bin", wbuf);
+    print(wrote); // 8
+
+    let mut rbuf: []u8 = alloc_u8(cnt);
+    let n: i64 = read_u8("io_test_u8.bin", rbuf);
+    print(n); // 8
+
+    for i in 0..cnt {
+        print(rbuf[i] as i64);
+    }
+
+    free(wbuf);
+    free(rbuf);
+    return 0;
+}

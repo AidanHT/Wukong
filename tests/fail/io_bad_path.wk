@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.io_bad_path
+
+// The file-I/O builtins take a NUL-terminated `*u8` path as their first argument (a string literal
+// or a `*u8` binding). Passing an integer — whose type is concretely `i32`, not `*u8` — would make
+// the runtime walk an arbitrary address as if it were a C string, so it is a compile-time type error
+// (E0401), never a silent misread.
+fn main() -> i32 {
+    let s: []f32 = alloc_f32(4);
+    let n: i64 = read_f32(5, s);
+    return 0;
+}

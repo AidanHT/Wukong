@@ -1,0 +1,39 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 11
+// EXPECT-OUT: 22
+// EXPECT-OUT: 33
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+module tests.run.io_partial_read
+
+// Partial read: the destination buffer is larger than the file. `read_i32` must return
+// `n = min(buf.len(), file_size / sizeof)` — here min(5, 3) = 3 — decode exactly those 3 elements,
+// and leave the trailing slots untouched (they stay at their `alloc_i32` zero-init). So the printed
+// output is the 3 written values followed by two zeros, and the returned count is 3, not 5. Both
+// backends compute the same min and the same untouched tail, so the interpreter and native JIT agree.
+// Unique temp file name avoids collisions.
+fn main() -> i32 {
+    let wlen: i64 = 3;
+    let mut wbuf: []i32 = alloc_i32(wlen);
+    wbuf[0] = 11;
+    wbuf[1] = 22;
+    wbuf[2] = 33;
+    let wrote: i64 = write_i32("io_test_partial.bin", wbuf);
+    print(wrote); // 3 — file now holds exactly 3 i32 (12 bytes)
+
+    let rlen: i64 = 5;
+    let mut rbuf: []i32 = alloc_i32(rlen);
+    let n: i64 = read_i32("io_test_partial.bin", rbuf);
+    print(n); // 3 — min(5, 3): only the 3 available elements are read
+
+    for i in 0..rlen {
+        print(rbuf[i] as i64); // 11 22 33 0 0 — the tail two stay zero-initialized
+    }
+
+    free(wbuf);
+    free(rbuf);
+    return 0;
+}
