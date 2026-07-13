@@ -204,7 +204,7 @@ impl Sema<'_> {
                     return Ty::Unit;
                 }
                 // The file-I/O builtins: the `read_<T>(path, buf) -> i64` / `write_<T>(path, buf)
-                // -> i64` family over the core dtypes (f32, i32, i64, u8). Typed here (like the heap
+                // -> i64` family over the dtypes (f32, f64, i32, i64, i8, u8). Typed here (like heap
                 // builtins) so the result is a concrete `i64` — `let n = read_f32(p, s)` composes
                 // with arithmetic and comparisons — and misuse is rejected with the standard
                 // arity/type codes before the structural lowering in mir_build. `path` is a
