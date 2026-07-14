@@ -46,18 +46,25 @@ function Get-PowerClass {
     if (-not $online) {
         return [pscustomobject]@{ Class='NON-REPORTABLE'; Detail="battery (Offline, ${pct}%, -${discharge} mW): single-core noisy, all-core meaningless"; Reportable=$false }
     }
-    if ($pct -ge 99 -and $charge -le 100) {
-        return [pscustomobject]@{ Class='REPORTABLE'; Detail="AC + full (${pct}%, ${charge} mW): all-core is a real claim"; Reportable=$true }
+    if ($pct -ge 99 -and $charge -le 2000) {
+        return [pscustomobject]@{ Class='REPORTABLE'; Detail="AC + full (${pct}%, ${charge} mW trickle): all-core is a real claim"; Reportable=$true }
     }
     return [pscustomobject]@{ Class='ALL-CORE CAPPED'; Detail="AC + charging (${pct}%, +${charge} mW): 1c fine, all-core throttled ~25%"; Reportable=$false }
 }
 
-# Run one Wukong vehicle, return @{ Argmax; Ms } taking the min forward-ms over $Outer outer reps.
-# The vehicle itself prints "<argmax> <min_microseconds> <nreps>" (min-of-8 in-program).
+# Rank a power class for "worse of two samples" (lower = worse): battery < capped < reportable.
+function Power-Rank([string]$class) { switch ($class) { 'NON-REPORTABLE' { 0 } 'ALL-CORE CAPPED' { 1 } 'REPORTABLE' { 2 } default { 0 } } }
+
+# Run one Wukong vehicle, return @{ Argmax; Ms; Power } — the min forward-ms over $Outer outer reps and the
+# WORST power class sampled immediately before and after the run. Per-regime sampling matters because a
+# heavy all-core run can knock the machine onto battery mid-sweep (adapter can't cover the draw / battery-
+# care), which would silently corrupt a run the top-of-script banner had labelled reportable. The vehicle
+# prints "<argmax> <min_microseconds> <nreps>" (min-of-8 in-program).
 function Measure-Vehicle {
     param([string]$Wk, [hashtable]$EnvVars, [int]$Reps)
     $bestMs = [double]::PositiveInfinity
     $argmax = $null
+    $before = Get-PowerClass
     for ($i = 0; $i -lt $Reps; $i++) {
         foreach ($k in $EnvVars.Keys) { Set-Item -Path "Env:$k" -Value $EnvVars[$k] }
         $out = & $exe --run --backend=native $Wk 2>$null
@@ -69,7 +76,9 @@ function Measure-Vehicle {
             if ($ms -lt $bestMs) { $bestMs = $ms }
         }
     }
-    return [pscustomobject]@{ Argmax = $argmax; Ms = $bestMs }
+    $after = Get-PowerClass
+    $worst = if ((Power-Rank $before.Class) -le (Power-Rank $after.Class)) { $before } else { $after }
+    return [pscustomobject]@{ Argmax = $argmax; Ms = $bestMs; Power = $worst }
 }
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -89,25 +98,40 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exe)) { throw "release wukongc not found at $exe (drop -SkipBuild)" }
 
+# Order matters: run the LIGHT single-core regimes first (an adapter easily covers ~20 W, so they stay
+# on stable AC and are reportable), and the HEAVY all-core run LAST — it can knock the machine onto
+# battery, but by then the single-core numbers are already captured under their own (clean) power window.
 Write-Host "`n[wukong] serial vehicle, 1 core ..."
 $s1 = Measure-Vehicle -Wk $serial -EnvVars @{ RAYON_NUM_THREADS = '1' } -Reps $Outer
-Write-Host "[wukong] @parallel vehicle, all core ..."
-$pAll = Measure-Vehicle -Wk $par -EnvVars @{} -Reps $Outer
 Write-Host "[wukong] @parallel vehicle, 1 core ..."
 $p1 = Measure-Vehicle -Wk $par -EnvVars @{ RAYON_NUM_THREADS = '1' } -Reps $Outer
+Write-Host "[wukong] @parallel vehicle, all core (heavy — may drop AC) ..."
+$pAll = Measure-Vehicle -Wk $par -EnvVars @{} -Reps $Outer
 
 # Correctness gate: every regime must agree on argmax 338 or the timing is meaningless.
 $argmaxes = @($s1.Argmax, $pAll.Argmax, $p1.Argmax) | Sort-Object -Unique
 $argmaxOk = ($argmaxes.Count -eq 1 -and $argmaxes[0] -eq 338)
 
+# Single-core self-consistency: serial-1c and @parallel-1c are the IDENTICAL computation, so if the
+# machine wasn't throttling they agree tightly. A big gap is a direct throttle detector, independent of
+# the power labels — the honest gate for the single-core numbers.
+$sc1cOk = ($s1.Ms -gt 0 -and $p1.Ms -gt 0 -and [double]::IsFinite($s1.Ms) -and [double]::IsFinite($p1.Ms))
+$sc1cSkew = if ($sc1cOk) { [math]::Abs($s1.Ms - $p1.Ms) / [math]::Min($s1.Ms, $p1.Ms) } else { 1.0 }
+
+# Per-regime reportability: single-core needs only stable AC (light load, charging-immune) => any non-
+# battery class; all-core needs AC+full trickle => REPORTABLE class. Tag each row with what it earned.
+function Tag-1c($p) { if ($p.Class -eq 'NON-REPORTABLE') { 'battery/NR' } else { 'reportable' } }
+function Tag-all($p) { if ($p.Class -eq 'REPORTABLE') { 'reportable' } elseif ($p.Class -eq 'ALL-CORE CAPPED') { 'CAPPED' } else { 'battery/NR' } }
+
 Write-Host ""
-Write-Host ("{0,-34} {1,10}" -f "regime", "ms/fwd")
-Write-Host ("{0,-34} {1,10:N1}" -f "wukong serial          1c", $s1.Ms)
-Write-Host ("{0,-34} {1,10:N1}" -f "wukong @parallel  all-core", $pAll.Ms)
-Write-Host ("{0,-34} {1,10:N1}" -f "wukong @parallel       1c", $p1.Ms)
-if ($p1.Ms -gt 0 -and [double]::IsFinite($p1.Ms)) {
-    Write-Host ("{0,-34} {1,10:N2}x" -f "  -> @parallel scaling (1c/allcore)", ($p1.Ms / $pAll.Ms))
+Write-Host ("{0,-30} {1,10} {2,-12}" -f "regime", "ms/fwd", "power")
+Write-Host ("{0,-30} {1,10:N1} {2,-12}" -f "wukong serial       1c", $s1.Ms, (Tag-1c $s1.Power))
+Write-Host ("{0,-30} {1,10:N1} {2,-12}" -f "wukong @parallel    1c", $p1.Ms, (Tag-1c $p1.Power))
+Write-Host ("{0,-30} {1,10:N1} {2,-12}" -f "wukong @parallel all-core", $pAll.Ms, (Tag-all $pAll.Power))
+if ($p1.Ms -gt 0 -and [double]::IsFinite($p1.Ms) -and $pAll.Ms -gt 0) {
+    Write-Host ("{0,-30} {1,10:N2}x" -f "  -> @parallel scaling", ($p1.Ms / $pAll.Ms))
 }
+Write-Host ("  single-core self-consistency (serial-1c vs par-1c): {0:P1} skew  [{1}]" -f $sc1cSkew, $(if ($sc1cSkew -le 0.05) { 'STABLE' } else { 'THROTTLED — 1c numbers suspect' }))
 
 if (-not $SkipTorch) {
     $py = if (Test-Path $TorchPython) { $TorchPython } else { "python" }
@@ -120,6 +144,12 @@ if (-not $SkipTorch) {
 Write-Host ""
 if ($argmaxOk) { Write-Host "correctness: all Wukong regimes argmax=338  OK" }
 else { Write-Host "correctness: ARGMAX MISMATCH ($($argmaxes -join ',')) — TIMING INVALID until fixed" }
-if ($power.Reportable) { Write-Host "-> REPORTABLE run: these numbers may be published (cross-check torch argmax + rel in the peer output)." }
-else { Write-Host "-> $($power.Class): numbers are DIRECTIONAL ONLY. Re-run at AC + full charge before publishing." }
+
+$scReportable = $argmaxOk -and $sc1cSkew -le 0.05 -and (Tag-1c $s1.Power) -eq 'reportable' -and (Tag-1c $p1.Power) -eq 'reportable'
+$allReportable = $argmaxOk -and (Tag-all $pAll.Power) -eq 'reportable'
+Write-Host ""
+if ($scReportable) { Write-Host "-> SINGLE-CORE: REPORTABLE (stable AC, 1c self-consistent) — serial-1c vs torch eager-1t is a real claim." }
+else { Write-Host "-> SINGLE-CORE: NOT reportable (battery or >5% 1c skew). Re-run on stable AC." }
+if ($allReportable) { Write-Host "-> ALL-CORE: REPORTABLE (AC+full trickle held through the heavy run) — vs torch eager all-thread is a real claim." }
+else { Write-Host "-> ALL-CORE: NOT reportable (needs AC+full that survives the all-core draw — disable battery-care, ensure the adapter covers peak). DIRECTIONAL ONLY." }
 Write-Host ""
