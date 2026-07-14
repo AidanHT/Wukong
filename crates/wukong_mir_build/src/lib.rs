@@ -699,6 +699,7 @@ pub fn lower_program(
         nt_alpha: interner.intern("wukong_sgemm_nt_alpha"),
         nt_alpha_par: interner.intern("wukong_sgemm_nt_alpha_parallel"),
         vmath: interner.intern("wukong_vmath_f32"),
+        vmath_par: interner.intern("wukong_vmath_f32_parallel"),
         vmath2: interner.intern("wukong_vmath2_f32"),
         vmath_bf16: interner.intern("wukong_vmath_bf16"),
         vmath_f16: interner.intern("wukong_vmath_f16"),
@@ -1784,6 +1785,11 @@ struct GemmSyms {
     /// stripes across cores, each doing the full i sweep (never rows-across-cores, which would need
     /// reassociating per-thread partials). Bit-identical to the serial `gevm` the interpreter calls.
     gevm_par: Symbol,
+    /// The multicore twin of `wukong_vmath_f32` (`wukong_vmath_f32_parallel`): the identical
+    /// per-element activation chunked across the pool, selected inside a `@parallel` function (bit-
+    /// identical to serial — the interpreter marshals the serial form). Below its element floor or on a
+    /// width-1 pool the runtime entry itself falls back to serial.
+    vmath_par: Symbol,
     /// The 256-bit AVX2 elementwise-math kernel (`wukong_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
@@ -11071,6 +11077,9 @@ impl FnLowerer<'_> {
             let func = match in_elem {
                 MirType::BF16 => self.gemm.vmath_bf16,
                 MirType::F16 => self.gemm.vmath_f16,
+                // f32 activation inside a `@parallel` function spreads across cores (bit-identical); the
+                // bf16/f16 twins have no multicore variant, so they stay serial.
+                _ if self.parallel_fn => self.gemm.vmath_par,
                 _ => self.gemm.vmath,
             };
             let xp = self.builder.build(
