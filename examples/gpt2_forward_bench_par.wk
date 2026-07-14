@@ -1,0 +1,234 @@
+module examples.gpt2_forward_bench_par
+
+// ===================================================================================================
+// GPT-2 124M forward BENCHMARK, @parallel (multicore) — the all-core companion to the single-core
+// examples/gpt2_forward_bench.wk. Same real pretrained weights, same S=512 forward, same deterministic
+// ids and last-position LM head (so tools/bench_gpt2_torch.py cross-checks the identical logits), but
+// the per-layer block is a `@parallel fn` so every whole-[S,D] op dispatches its multicore `_parallel`
+// kernel and the attention head loop outlines into ONE `wukong_parallel_for` region (heads across
+// cores, each running the identical serial per-head kernel sequence — bit-exact with the serial vehicle
+// because head column-bands are disjoint). The per-head scratch (qh/kh/vt/scores/oh) is declared INSIDE
+// the head loop so it is private per head (the outliner requirement) and lives on the runtime pool
+// workers' 16 MiB stacks. Dims are literals here (the S=512 config), the simplest form the recognizers
+// accept. Runtime OFFSETS into the flat blob stay as gpt2_config consts.
+//
+// Native-only (interp can't hold 124M); gate-safe (early-returns -1 with no data/gpt2/, both backends).
+// Run:  wukongc --run --backend=native examples/gpt2_forward_bench_par.wk   (all cores by default;
+//       RAYON_NUM_THREADS=1 forces one worker for the single-core cross-check of this same program).
+// Prints:  <argmax(last)>  <min forward microseconds>  <NREPS>
+
+import gpt2_config;
+
+// One pre-LayerNorm decoder block over the real weight blob `w` at layer offset `base`. @parallel: the
+// LNs -> wukong_norm_affine_f32_parallel, the six projections -> sgemm_nt_epi_parallel, the head loop ->
+// one parallel_for region, the residual adds -> velem_f32_parallel. Reads x, writes out (= x + block(x)).
+@parallel
+fn gpt2_block(
+    w: []f32, base: i64,
+    mut nrm: []f32, mut q: []f32, mut k: []f32, mut v: []f32,
+    mut attn: []f32, mut a: []f32, mut ff: []f32,
+    x: []f32, mut out: []f32,
+) {
+    // ---- LayerNorm 1:  nrm = layernorm(x) * ln1g + ln1b ----
+    let mut g1: [f32; 768] = [0.0; 768];
+    let mut b1: [f32; 768] = [0.0; 768];
+    for i in 0..768 { g1[i] = w[base + GPT2_REL_LN1G + i]; b1[i] = w[base + GPT2_REL_LN1B + i]; }
+    for r in 0..512 {
+        let mut sm: f32 = 0.0;
+        for i in 0..768 { sm = sm + x[r * 768 + i]; }
+        let mean: f32 = sm / 768.0;
+        let mut vv: f32 = 0.0;
+        for i in 0..768 { vv = vv + (x[r * 768 + i] - mean) * (x[r * 768 + i] - mean); }
+        let inv: f32 = rsqrt(vv / 768.0 + 0.00001);
+        for i in 0..768 { nrm[r * 768 + i] = (x[r * 768 + i] - mean) * inv * g1[i] + b1[i]; }
+    }
+
+    // ---- Q/K/V projections:  q/k/v = nrm · Wᵀ + b  (fused-bias NT GEMM) ----
+    for i in 0..512 { for j in 0..768 {
+        let mut s: f32 = 0.0;
+        for p in 0..768 { s = s + nrm[i * 768 + p] * w[base + GPT2_REL_WQ + j * 768 + p]; }
+        q[i * 768 + j] = w[base + GPT2_REL_BQ + j] + s;
+    } }
+    for i in 0..512 { for j in 0..768 {
+        let mut s: f32 = 0.0;
+        for p in 0..768 { s = s + nrm[i * 768 + p] * w[base + GPT2_REL_WK + j * 768 + p]; }
+        k[i * 768 + j] = w[base + GPT2_REL_BK + j] + s;
+    } }
+    for i in 0..512 { for j in 0..768 {
+        let mut s: f32 = 0.0;
+        for p in 0..768 { s = s + nrm[i * 768 + p] * w[base + GPT2_REL_WV + j * 768 + p]; }
+        v[i * 768 + j] = w[base + GPT2_REL_BV + j] + s;
+    } }
+
+    // ---- multi-head causal attention (H=12, hd=64), heads independent -> parallel_for ----
+    for h in 0..12 {
+        let mut qh:     [f32; 32768]  = [0.0; 32768];   // [512, 64]
+        let mut kh:     [f32; 32768]  = [0.0; 32768];   // [512, 64]
+        let mut vt:     [f32; 32768]  = [0.0; 32768];   // [64, 512]  (V transposed -> NT P·V)
+        let mut scores: [f32; 262144] = [0.0; 262144];  // [512, 512]
+        let mut oh:     [f32; 32768]  = [0.0; 32768];   // [512, 64]
+        // separate, contiguously-written repacks (the combined/transposed form defeats the parallel-
+        // region legality scan, so the whole head loop must stay inline) — matches the outlinable shape.
+        for i in 0..512 { for p in 0..64 { qh[i * 64 + p] = q[i * 768 + h * 64 + p]; } }
+        for i in 0..512 { for p in 0..64 { kh[i * 64 + p] = k[i * 768 + h * 64 + p]; } }
+        for dd in 0..64 { for p in 0..512 { vt[dd * 512 + p] = v[p * 768 + h * 64 + dd]; } }
+        for i in 0..512 { for j in 0..512 {
+            let mut s: f32 = 0.0;
+            for p in 0..64 { s = s + qh[i * 64 + p] * kh[j * 64 + p]; }
+            scores[i * 512 + j] = s * 0.125;
+        } }
+        for i in 0..512 { for j in 0..512 { if j > i { scores[i * 512 + j] = -1.0e30; } } }
+        for i in 0..512 {
+            let mut m: f32 = scores[i * 512];
+            for j in 0..512 { m = fmax(m, scores[i * 512 + j]); }
+            let mut den: f32 = 0.0;
+            for j in 0..512 {
+                let e: f32 = exp(scores[i * 512 + j] - m);
+                scores[i * 512 + j] = e;
+                den = den + e;
+            }
+            let dinv: f32 = 1.0 / den;
+            for j in 0..512 { scores[i * 512 + j] = scores[i * 512 + j] * dinv; }
+        }
+        for i in 0..512 { for dd in 0..64 {
+            let mut s: f32 = 0.0;
+            for j in 0..512 { s = s + scores[i * 512 + j] * vt[dd * 512 + j]; }
+            oh[i * 64 + dd] = s;
+        } }
+        for i in 0..512 { for dd in 0..64 { attn[i * 768 + h * 64 + dd] = oh[i * 64 + dd]; } }
+    }
+
+    // ---- output projection + residual:  a = x + (attn · WOᵀ + BO) ----
+    for i in 0..512 { for j in 0..768 {
+        let mut s: f32 = 0.0;
+        for p in 0..768 { s = s + attn[i * 768 + p] * w[base + GPT2_REL_WO + j * 768 + p]; }
+        a[i * 768 + j] = w[base + GPT2_REL_BO + j] + s;
+    } }
+    for i in 0..512 * 768 { a[i] = x[i] + a[i]; }
+
+    // ---- LayerNorm 2:  nrm = layernorm(a) * ln2g + ln2b ----
+    let mut g2: [f32; 768] = [0.0; 768];
+    let mut b2: [f32; 768] = [0.0; 768];
+    for i in 0..768 { g2[i] = w[base + GPT2_REL_LN2G + i]; b2[i] = w[base + GPT2_REL_LN2B + i]; }
+    for r in 0..512 {
+        let mut sm: f32 = 0.0;
+        for i in 0..768 { sm = sm + a[r * 768 + i]; }
+        let mean: f32 = sm / 768.0;
+        let mut vv: f32 = 0.0;
+        for i in 0..768 { vv = vv + (a[r * 768 + i] - mean) * (a[r * 768 + i] - mean); }
+        let inv: f32 = rsqrt(vv / 768.0 + 0.00001);
+        for i in 0..768 { nrm[r * 768 + i] = (a[r * 768 + i] - mean) * inv * g2[i] + b2[i]; }
+    }
+
+    // ---- MLP up-projection (fused bias) then batched GELU ----
+    for i in 0..512 { for j in 0..3072 {
+        let mut s: f32 = 0.0;
+        for p in 0..768 { s = s + nrm[i * 768 + p] * w[base + GPT2_REL_W1 + j * 768 + p]; }
+        ff[i * 3072 + j] = w[base + GPT2_REL_B1 + j] + s;
+    } }
+    for i in 0..512 * 3072 { ff[i] = gelu(ff[i]); }
+
+    // ---- MLP down-projection + residual:  out = a + (ff · W2ᵀ + B2) ----
+    for i in 0..512 { for j in 0..768 {
+        let mut s: f32 = 0.0;
+        for p in 0..3072 { s = s + ff[i * 3072 + p] * w[base + GPT2_REL_W2 + j * 3072 + p]; }
+        out[i * 768 + j] = w[base + GPT2_REL_B2 + j] + s;
+    } }
+    for i in 0..512 * 768 { out[i] = a[i] + out[i]; }
+}
+
+fn main() -> i32 {
+    let s_len: i64 = 512;
+    let d:     i64 = GPT2_D;
+    let voc:   i64 = GPT2_VOCAB;
+    let nwarm: i64 = 3;
+    let nreps: i64 = 8;
+
+    let mut w: []f32 = alloc_f32(GPT2_TOTAL_WEIGHTS);
+    let wgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", w);
+    if wgot != GPT2_TOTAL_WEIGHTS {
+        print(-1);
+        free(w);
+        return 1;
+    }
+
+    let mut ids: []i32 = alloc_i32(s_len);
+    for s in 0..s_len { ids[s] = ((s * 1009i64 + 7i64) % 50000i64) as i32; }
+
+    // whole-[S,D] scratch + two ping-pong activation buffers (x0/x1)
+    let mut x0:   []f32 = alloc_f32(s_len * d);
+    let mut x1:   []f32 = alloc_f32(s_len * d);
+    let mut nrm:  []f32 = alloc_f32(s_len * d);
+    let mut q:    []f32 = alloc_f32(s_len * d);
+    let mut k:    []f32 = alloc_f32(s_len * d);
+    let mut v:    []f32 = alloc_f32(s_len * d);
+    let mut attn: []f32 = alloc_f32(s_len * d);
+    let mut a:    []f32 = alloc_f32(s_len * d);
+    let mut ff:   []f32 = alloc_f32(s_len * GPT2_DFF);
+    let mut lastrow: []f32 = alloc_f32(voc);
+    let mut gf: []f32 = alloc_f32(d);
+    let mut bf: []f32 = alloc_f32(d);
+
+    let mut best: i64 = 9223372036854775807;
+    for iter in 0..(nwarm + nreps) {
+        let t0: i64 = now_ns();
+
+        // embed into x0
+        for s in 0..s_len {
+            let id: i64 = ids[s] as i64;
+            for dd in 0..d {
+                x0[s * d + dd] = w[GPT2_OFF_WTE + id * d + dd] + w[GPT2_OFF_WPE + s * d + dd];
+            }
+        }
+
+        // 12 blocks, ping-ponging x0 <-> x1 (even #layers => result lands back in x0)
+        for l in 0..GPT2_LAYERS {
+            let base: i64 = GPT2_OFF_LAYER0 + l * GPT2_LAYER_STRIDE;
+            if l % 2i64 == 0i64 {
+                gpt2_block(w, base, nrm, q, k, v, attn, a, ff, x0, x1);
+            } else {
+                gpt2_block(w, base, nrm, q, k, v, attn, a, ff, x1, x0);
+            }
+        }
+
+        // final LayerNorm (in place on x0)
+        for i in 0..d { gf[i] = w[GPT2_OFF_LNFG + i]; bf[i] = w[GPT2_OFF_LNFB + i]; }
+        for r in 0..s_len {
+            let mut sm: f32 = 0.0;
+            for i in 0..d { sm = sm + x0[r * d + i]; }
+            let mean: f32 = sm / (d as f32);
+            let mut vv: f32 = 0.0;
+            for i in 0..d { vv = vv + (x0[r * d + i] - mean) * (x0[r * d + i] - mean); }
+            let inv: f32 = rsqrt(vv / (d as f32) + 0.00001);
+            for i in 0..d { x0[r * d + i] = (x0[r * d + i] - mean) * inv * gf[i] + bf[i]; }
+        }
+
+        // tied LM head, last position only
+        let lastp: i64 = (s_len - 1) * d;
+        for vt in 0..voc {
+            let mut acc: f32 = 0.0;
+            for dd in 0..d { acc = acc + x0[lastp + dd] * w[GPT2_OFF_WTE + vt * d + dd]; }
+            lastrow[vt] = acc;
+        }
+
+        let t1: i64 = now_ns();
+        let dt: i64 = t1 - t0;
+        if iter >= nwarm { if dt < best { best = dt; } }
+    }
+
+    write_f32("data/gpt2/gpt2_bench_lastrow.bin", lastrow);
+
+    let mut best_i: i64 = 0;
+    let mut best_v: f32 = lastrow[0];
+    for vt in 0i64..voc {
+        let val: f32 = lastrow[vt];
+        if val > best_v { best_v = val; best_i = vt; }
+    }
+    print(best_i as i32);
+    print((best / 1000) as i32);
+    print(nreps as i32);
+
+    free(w); free(ids); free(x0); free(x1); free(nrm); free(q); free(k); free(v);
+    free(attn); free(a); free(ff); free(lastrow); free(gf); free(bf);
+    return 0;
+}
