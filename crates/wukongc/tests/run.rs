@@ -11,6 +11,36 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counter handing every spawned `wukongc` a distinct scratch directory.
+static WORK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A unique scratch working directory for a single `wukongc` execution. Fixtures that touch the
+/// filesystem through *relative* paths — the file-I/O round-trip tests write `io_test_*.bin` in the
+/// process CWD — otherwise collide when the four test functions below run concurrently (Cargo runs
+/// each `#[test]` on its own thread), producing nondeterministic clobbered blobs. Anchoring each run
+/// in its own directory removes the shared name entirely. The fixture `.wk` paths are absolute, so
+/// changing CWD never affects locating the program itself.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new() -> ScratchDir {
+        let seq = WORK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("wukongc_run_tests")
+            .join(format!("{}_{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        ScratchDir(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        // Best-effort cleanup; a lingering temp dir must never fail a test.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 struct Expect {
     run_args: Vec<String>,
@@ -52,9 +82,11 @@ fn check_program(path: &Path) {
     let src = std::fs::read_to_string(path).unwrap();
     let expect = parse_directives(&src);
 
+    let scratch = ScratchDir::new();
     let output = Command::new(env!("CARGO_BIN_EXE_wukongc"))
         .args(&expect.run_args)
         .arg(path)
+        .current_dir(&scratch.0)
         .output()
         .expect("failed to spawn wukongc");
 
@@ -132,12 +164,17 @@ fn run_at(path: &Path, opt: &str) -> (Option<i32>, String) {
 /// Run a program at a given optimization level on a chosen execution backend (`None` = the default
 /// interpreter, `Some("native")` = the Cranelift JIT), returning (exit_code, stdout).
 fn run_backend(path: &Path, opt: &str, backend: Option<&str>) -> (Option<i32>, String) {
+    let scratch = ScratchDir::new();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
     cmd.arg("--run").arg(opt);
     if let Some(b) = backend {
         cmd.arg(format!("--backend={b}"));
     }
-    let output = cmd.arg(path).output().expect("failed to spawn wukongc");
+    let output = cmd
+        .arg(path)
+        .current_dir(&scratch.0)
+        .output()
+        .expect("failed to spawn wukongc");
     (
         output.status.code(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
