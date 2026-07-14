@@ -1829,8 +1829,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // (exp/log/tanh/sigmoid) the compiler lowers an `out[i] = f(x[i])` loop to. Marshal `n`
             // f32 from x, call the *identical* runtime kernel the native backend calls, write the
             // result back — so the differential oracle stays exact despite the kernel's wider lanes.
-            // Reading all of x before writing out makes the in-place (x == out) case correct.
-            "wukong_vmath_f32" => {
+            // Reading all of x before writing out makes the in-place (x == out) case correct. The
+            // `_parallel` twin is the same per-element map chunked across cores, so it marshals here
+            // identically (bit-for-bit) — the differential gate sees one kernel.
+            "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = args[2].as_int() as usize;
