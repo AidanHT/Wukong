@@ -1,0 +1,254 @@
+module examples.gpt2_forward_bench
+
+// ===================================================================================================
+// GPT-2 124M forward BENCHMARK — the real pretrained weights, timed at a compute-bound sequence
+// length so the GEMM/attention cost dominates (the S=5 demo in gpt2_infer.wk is load-bound and is a
+// correctness artifact, not a speed one). Identical forward math to examples/gpt2_infer.wk; the
+// differences are (1) S = 512, (2) deterministic synthetic token ids generated in-program — speed is
+// token-value-independent, and tools/bench_gpt2_torch.py replays the SAME id formula so the last-row
+// logits cross-check against real PyTorch GPT-2 is exact — and (3) a warmup + min-of-K timing loop
+// using the now_ns() intrinsic.
+//
+// The model dimensions are bound to local `let`s (d, dff, hd, hh, voc) from the gpt2_config consts:
+// the recognizers key stride/bound/divisor equality on the *binding*, and only literal or local-variable
+// dims resolve (a bare imported-const used directly as a dim does not). Runtime OFFSETS stay as consts.
+// With that binding, every compute-heavy op is spelled in its recognized form and dispatches to the
+// tuned runtime kernel (verify with `wukongc --emit=mir -O2 … | grep wukong_`):
+//   * Q/K/V/O/W1/W2 projections  -> wukong_sgemm_nt_epi   (fused bias epilogue)
+//   * scaled scores  α·(Qh·Khᵀ)  -> wukong_sgemm_nt_alpha
+//   * head output    P·Vᵀ         -> wukong_sgemm_nt       (V repacked transposed so P·V is an NT dot)
+//   * the 3 LayerNorms            -> wukong_norm_affine_f32 (γ/β gathered into [i]-indexed locals)
+//   * the row softmax             -> wukong_norm_f32
+//   * the tanh-approx GELU        -> wukong_vmath_f32       (the gelu() intrinsic)
+//   * the two residual adds       -> wukong_velem_f32
+// The embed gather, the causal-mask write, and the last-position LM head stay scalar/generic-vectorized
+// (the LM head's offset-based GEMV isn't a recognized dispatch yet); at S=512 they are together well
+// under 1% of the forward's arithmetic, so they do not gate the timing.
+//
+// Native-only (the interpreter cannot hold 124M params); gate-safe: run from a CWD without data/gpt2/
+// (as the examples test does) and it early-returns -1 identically on both backends.
+//
+// Run from the repo root:  wukongc --run --backend=native examples/gpt2_forward_bench.wk
+// Prints:  <argmax(last)>  <min forward microseconds>  <NREPS>
+
+import gpt2_config;
+
+fn main() -> i32 {
+    let s_len: i64 = 512;      // prefill sequence length (compute-bound; <= POS = 1024)
+    let d:     i64 = GPT2_D;
+    let dff:   i64 = GPT2_DFF;
+    let hd:    i64 = GPT2_HD;
+    let hh:    i64 = GPT2_H;
+    let voc:   i64 = GPT2_VOCAB;
+    let nwarm: i64 = 3;
+    let nreps: i64 = 8;
+
+    // ---- weights: the real flat blob (gate-guard: absent data => identical -1 on both backends) ----
+    let mut w: []f32 = alloc_f32(GPT2_TOTAL_WEIGHTS);
+    let wgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", w);
+    if wgot != GPT2_TOTAL_WEIGHTS {
+        print(-1);
+        free(w);
+        return 1;
+    }
+
+    // ---- deterministic synthetic token ids (torch peer replays the same formula) ----
+    let mut ids: []i32 = alloc_i32(s_len);
+    for s in 0..s_len { ids[s] = ((s * 1009i64 + 7i64) % 50000i64) as i32; }
+
+    // ---- scratch (sized for s_len) ----
+    let mut x:      []f32 = alloc_f32(s_len * d);
+    let mut nrm:    []f32 = alloc_f32(s_len * d);
+    let mut q:      []f32 = alloc_f32(s_len * d);
+    let mut k:      []f32 = alloc_f32(s_len * d);
+    let mut v:      []f32 = alloc_f32(s_len * d);
+    let mut scores: []f32 = alloc_f32(s_len * s_len);
+    let mut attn:   []f32 = alloc_f32(s_len * d);
+    // per-head contiguous [S, hd] scratch so each head's Q·Kᵀ and P·V are PACKED matmuls (row stride
+    // hd == contraction), which the GEMM recognizer dispatches — the interleaved [S, H*hd] layout has
+    // row stride d != hd and stays scalar. The repack copies are memory-bound and cheap vs the matmuls.
+    let mut qh: []f32 = alloc_f32(s_len * hd);
+    let mut kh: []f32 = alloc_f32(s_len * hd);
+    let mut vt: []f32 = alloc_f32(hd * s_len);   // V transposed to [hd, S] so P·V is an NT dot
+    let mut oh: []f32 = alloc_f32(s_len * hd);
+    let mut a:      []f32 = alloc_f32(s_len * d);
+    let mut ff:      []f32 = alloc_f32(s_len * dff);
+    let mut lastrow: []f32 = alloc_f32(voc);   // logits for the LAST position only (next-token infer)
+    // per-norm gamma/beta gathered from the blob into [i]-indexed locals — the affine-LayerNorm
+    // recognizer keys γ/β on a bare loop-var index (g[i]), which a blob offset (w[base+..+i]) is not.
+    let mut gtmp: []f32 = alloc_f32(d);
+    let mut btmp: []f32 = alloc_f32(d);
+
+    let mut best: i64 = 9223372036854775807;
+    for iter in 0..(nwarm + nreps) {
+        let t0: i64 = now_ns();
+
+        // ---- embed:  x[s,d] = wte[ids[s], d] + wpe[s, d] ----
+        for s in 0..s_len {
+            let id: i64 = ids[s] as i64;
+            for dd in 0..d {
+                x[s * d + dd] =
+                    w[GPT2_OFF_WTE + id * d + dd] + w[GPT2_OFF_WPE + s * d + dd];
+            }
+        }
+
+        // ---- 12 pre-LayerNorm decoder blocks ----
+        for l in 0..GPT2_LAYERS {
+            let base: i64 = GPT2_OFF_LAYER0 + l * GPT2_LAYER_STRIDE;
+
+            for i in 0..d { gtmp[i] = w[base + GPT2_REL_LN1G + i]; btmp[i] = w[base + GPT2_REL_LN1B + i]; }
+            for r in 0..s_len {
+                let mut sm: f32 = 0.0;
+                for i in 0..d { sm = sm + x[r * d + i]; }
+                let mean: f32 = sm / (d as f32);
+                let mut vv: f32 = 0.0;
+                for i in 0..d { vv = vv + (x[r * d + i] - mean) * (x[r * d + i] - mean); }
+                let inv: f32 = rsqrt(vv / (d as f32) + 0.00001);
+                for i in 0..d {
+                    nrm[r * d + i] = (x[r * d + i] - mean) * inv * gtmp[i] + btmp[i];
+                }
+            }
+
+            for i in 0..s_len { for j in 0..d {
+                let mut s: f32 = 0.0;
+                for p in 0..d { s = s + nrm[i * d + p] * w[base + GPT2_REL_WQ + j * d + p]; }
+                q[i * d + j] = w[base + GPT2_REL_BQ + j] + s;
+            } }
+            for i in 0..s_len { for j in 0..d {
+                let mut s: f32 = 0.0;
+                for p in 0..d { s = s + nrm[i * d + p] * w[base + GPT2_REL_WK + j * d + p]; }
+                k[i * d + j] = w[base + GPT2_REL_BK + j] + s;
+            } }
+            for i in 0..s_len { for j in 0..d {
+                let mut s: f32 = 0.0;
+                for p in 0..d { s = s + nrm[i * d + p] * w[base + GPT2_REL_WV + j * d + p]; }
+                v[i * d + j] = w[base + GPT2_REL_BV + j] + s;
+            } }
+
+            for h in 0..hh {
+                // repack head h: Q,K into contiguous [S,hd] panels and V transposed into [hd,S], so
+                // both Q·Kᵀ and P·V are packed NT dots (contraction contiguous in both operands) that
+                // the GEMM recognizer dispatches — the interleaved [S,H*hd] layout has row stride
+                // d != hd and stays scalar. The repack copies are memory-bound and cheap vs the matmuls.
+                for i in 0..s_len { for p in 0..hd {
+                    qh[i * hd + p] = q[i * d + h * hd + p];
+                    kh[i * hd + p] = k[i * d + h * hd + p];
+                    vt[p * s_len + i] = v[i * d + h * hd + p];
+                } }
+                // scores = (Qh · Khᵀ) * 0.125   [S,hd]·[S,hd]ᵀ -> [S,S]  (dispatched, α folded)
+                for i in 0..s_len { for j in 0..s_len {
+                    let mut s: f32 = 0.0;
+                    for p in 0..hd { s = s + qh[i * hd + p] * kh[j * hd + p]; }
+                    scores[i * s_len + j] = s * 0.125;
+                } }
+                // causal mask as its own pass, then the batched in-place row-softmax spelled in the
+                // recognized multi-pass form (max / fused exp+sum / normalize) so it folds to the
+                // vectorized wukong_norm_f32 kernel instead of a scalar exp storm.
+                for i in 0..s_len { for j in 0..s_len {
+                    if j > i { scores[i * s_len + j] = -1.0e30; }
+                } }
+                for i in 0..s_len {
+                    let mut m: f32 = scores[i * s_len];
+                    for j in 0..s_len { m = fmax(m, scores[i * s_len + j]); }
+                    let mut den: f32 = 0.0;
+                    for j in 0..s_len {
+                        let e: f32 = exp(scores[i * s_len + j] - m);
+                        scores[i * s_len + j] = e;
+                        den = den + e;
+                    }
+                    let dinv: f32 = 1.0 / den;
+                    for j in 0..s_len { scores[i * s_len + j] = scores[i * s_len + j] * dinv; }
+                }
+                // oh = scores · Vᵀ   [S,S]·[hd,S]ᵀ -> [S,hd]  (NT dot, dispatched), scatter back to attn
+                for i in 0..s_len { for dd in 0..hd {
+                    let mut s: f32 = 0.0;
+                    for j in 0..s_len { s = s + scores[i * s_len + j] * vt[dd * s_len + j]; }
+                    oh[i * hd + dd] = s;
+                } }
+                for i in 0..s_len { for dd in 0..hd { attn[i * d + h * hd + dd] = oh[i * hd + dd]; } }
+            }
+
+            for i in 0..s_len { for j in 0..d {
+                let mut s: f32 = 0.0;
+                for p in 0..d { s = s + attn[i * d + p] * w[base + GPT2_REL_WO + j * d + p]; }
+                a[i * d + j] = w[base + GPT2_REL_BO + j] + s;
+            } }
+            for i in 0..s_len * d { a[i] = x[i] + a[i]; }
+
+            for i in 0..d { gtmp[i] = w[base + GPT2_REL_LN2G + i]; btmp[i] = w[base + GPT2_REL_LN2B + i]; }
+            for r in 0..s_len {
+                let mut sm: f32 = 0.0;
+                for i in 0..d { sm = sm + a[r * d + i]; }
+                let mean: f32 = sm / (d as f32);
+                let mut vv: f32 = 0.0;
+                for i in 0..d { vv = vv + (a[r * d + i] - mean) * (a[r * d + i] - mean); }
+                let inv: f32 = rsqrt(vv / (d as f32) + 0.00001);
+                for i in 0..d {
+                    nrm[r * d + i] = (a[r * d + i] - mean) * inv * gtmp[i] + btmp[i];
+                }
+            }
+
+            for i in 0..s_len { for j in 0..dff {
+                let mut s: f32 = 0.0;
+                for p in 0..d { s = s + nrm[i * d + p] * w[base + GPT2_REL_W1 + j * d + p]; }
+                ff[i * dff + j] = w[base + GPT2_REL_B1 + j] + s;
+            } }
+            // tanh-approx GELU via the recognized intrinsic (vmath gelu1 — the exact √(2/π),0.044715
+            // approximation GPT-2 uses) so the activation folds to the vectorized wukong_velem_f32
+            // instead of a scalar exp per element.
+            for i in 0..s_len * dff { ff[i] = gelu(ff[i]); }
+            for i in 0..s_len { for j in 0..d {
+                let mut s: f32 = 0.0;
+                for p in 0..dff { s = s + ff[i * dff + p] * w[base + GPT2_REL_W2 + j * dff + p]; }
+                x[i * d + j] = w[base + GPT2_REL_B2 + j] + s;
+            } }
+            for i in 0..s_len * d { x[i] = a[i] + x[i]; }
+        }
+
+        // final LayerNorm (in place on x)
+        for i in 0..d { gtmp[i] = w[GPT2_OFF_LNFG + i]; btmp[i] = w[GPT2_OFF_LNFB + i]; }
+        for r in 0..s_len {
+            let mut sm: f32 = 0.0;
+            for i in 0..d { sm = sm + x[r * d + i]; }
+            let mean: f32 = sm / (d as f32);
+            let mut vv: f32 = 0.0;
+            for i in 0..d { vv = vv + (x[r * d + i] - mean) * (x[r * d + i] - mean); }
+            let inv: f32 = rsqrt(vv / (d as f32) + 0.00001);
+            for i in 0..d {
+                x[r * d + i] = (x[r * d + i] - mean) * inv * gtmp[i] + btmp[i];
+            }
+        }
+
+        // tied LM head, LAST POSITION ONLY (autoregressive next-token inference computes the trunk over
+        // all positions but only the final position's logits): lastrow[vt] = sum_d x[last,d]*wte[vt,d]
+        // — a matrix-vector product (wteᵀ · x_last) the recognizer dispatches to the tuned GEMV.
+        let lastp: i64 = (s_len - 1) * d;
+        for vt in 0..voc {
+            let mut acc: f32 = 0.0;
+            for dd in 0..d { acc = acc + x[lastp + dd] * w[GPT2_OFF_WTE + vt * d + dd]; }
+            lastrow[vt] = acc;
+        }
+
+        let t1: i64 = now_ns();
+        let dt: i64 = t1 - t0;
+        if iter >= nwarm { if dt < best { best = dt; } }
+    }
+
+    // ---- write the last-position logits row for the torch cross-check, report argmax + min time ----
+    write_f32("data/gpt2/gpt2_bench_lastrow.bin", lastrow);
+
+    let mut best_i: i64 = 0;
+    let mut best_v: f32 = lastrow[0];
+    for vt in 0i64..voc {
+        let val: f32 = lastrow[vt];
+        if val > best_v { best_v = val; best_i = vt; }
+    }
+    print(best_i as i32);              // argmax(last) — cross-check vs torch
+    print((best / 1000) as i32);       // min forward time, microseconds
+    print(nreps as i32);
+
+    free(w); free(ids); free(x); free(nrm); free(q); free(k); free(v);
+    free(scores); free(attn); free(qh); free(kh); free(vt); free(oh);
+    free(a); free(ff); free(lastrow); free(gtmp); free(btmp);
+    return 0;
+}
