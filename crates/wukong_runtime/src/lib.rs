@@ -28,7 +28,8 @@ pub use gevm::{wukong_sgevm_f32, wukong_sgevm_f32_parallel};
 
 mod vmath;
 pub use vmath::{
-    wukong_vmath2_f32, wukong_vmath_bf16, wukong_vmath_f16, wukong_vmath_f32, VM_ACOS,
+    wukong_vmath2_f32, wukong_vmath_bf16, wukong_vmath_f16, wukong_vmath_f32,
+    wukong_vmath_f32_parallel, VM_ACOS,
     VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH, VM_CBRT, VM_COS, VM_COSH, VM_ERF, VM_EXP,
     VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU, VM_LOG, VM_LOG10, VM_LOG1P, VM_LOG2, VM_LOGSIGMOID,
     VM_RELU, VM_SIGMOID, VM_SILU, VM_SIN, VM_SINH, VM_SOFTSIGN, VM_TAN, VM_TANH,
