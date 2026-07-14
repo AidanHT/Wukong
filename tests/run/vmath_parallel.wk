@@ -1,0 +1,42 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -364
+// EXPECT-OUT: -1508
+// EXPECT-OUT: 0
+// EXPECT-OUT: 34571
+// EXPECT-OUT: -4540
+// EXPECT-OUT: -15429
+module tests.run.vmath_parallel
+
+// Elementwise transcendental (gelu) inside a MULTI-STATEMENT @parallel fn, over N > the 16384-element
+// parallel floor (VMATH_PAR_MIN). Because the fn body is multi-statement, the region runs with
+// parallel_fn=true, so the `out[i]=gelu(out[i])` loop dispatches wukong_vmath_f32_parallel (the
+// pooled-rayon twin) on native, while interp marshals it to the serial wukong_vmath_f32. The
+// differential gate (interp == native, -O0 == -O2) proves the parallel kernel equals the scalar
+// nest bit-for-bit.
+//
+// REGRESSION GUARD: wukong_vmath_f32_parallel was once wired only as a JIT symbol without its
+// cranelift signature/import (declare_function + declare_func_in_func + the by-name emit arm), so the
+// call fell through and the gelu became a silent NO-OP on native (out stayed x*2, un-gelu'd). gelu is
+// strongly nonlinear, so a no-op would flip every sample below — this fixture catches that exact class.
+
+@parallel
+fn f(x: []f32, mut out: []f32) {
+    for i in 0..20000 { out[i] = x[i] * 2.0; }
+    for i in 0..20000 { out[i] = gelu(out[i]); }
+}
+
+fn main() -> i32 {
+    let mut x:   []f32 = alloc_f32(20000);
+    let mut out: []f32 = alloc_f32(20000);
+    for i in 0..20000 { x[i] = (((i % 13i64) as f32) - 6.0) * 0.25; }
+    f(x, out);
+    print(round(out[0] * 100000.0) as i32);      // x=-1.5  -> gelu(-3.0)
+    print(round(out[1] * 100000.0) as i32);      // x=-1.25 -> gelu(-2.5)
+    print(round(out[6] * 100000.0) as i32);      // x= 0.0  -> gelu(0.0) = 0
+    print(round(out[7] * 100000.0) as i32);      // x= 0.25 -> gelu(0.5)
+    print(round(out[9999] * 100000.0) as i32);
+    print(round(out[19999] * 100000.0) as i32);
+    free(x); free(out);
+    return 0;
+}
