@@ -748,6 +748,54 @@ pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, 
     }
 }
 
+/// Fixed chunk (elements) for the multicore [`wukong_vmath_f32_parallel`] — a constant span so the
+/// pool/worker count never changes which lanes an element lands in (the result stays bit-identical to
+/// the serial kernel regardless of thread count).
+const VMATH_CHUNK: usize = 1 << 14; // 16384 f32 = 64 KiB per chunk
+
+/// Below this many elements a compute-bound activation pass does not amortize the fork/join wake, so
+/// the parallel entry runs the serial kernel instead.
+const VMATH_PAR_MIN: usize = VMATH_CHUNK;
+
+/// Multicore twin of [`wukong_vmath_f32`]: the identical per-element activation, chunked across the
+/// runtime pool. Each chunk is a disjoint `[lo, hi)` sub-span run through the serial kernel, so the
+/// output is bit-for-bit identical to `wukong_vmath_f32` (the interpreter oracle marshals the serial
+/// form). The compiler selects this variant for an activation loop inside a `@parallel` function — a
+/// GELU/SiLU FFN pass over `[S, Dff]` is otherwise a serial Amdahl cap on the whole-forward scaling.
+/// Falls back to serial below [`VMATH_PAR_MIN`] elements or on a width-1 pool (`RAYON_NUM_THREADS=1`).
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+#[no_mangle]
+pub unsafe extern "C" fn wukong_vmath_f32_parallel(x: *const f32, out: *mut f32, n: i64, op: i64) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    if n < VMATH_PAR_MIN || crate::wuk_pool_width() <= 1 {
+        // SAFETY: same operand contract as this function.
+        unsafe { wukong_vmath_f32(x, out, n as i64, op) };
+        return;
+    }
+    use rayon::prelude::*;
+    let nchunks = n.div_ceil(VMATH_CHUNK);
+    // Raw pointers cross the rayon closure as integers (the parallel-reduce/norm/velem pattern); each
+    // chunk owns a disjoint output sub-slice. Fixed `VMATH_CHUNK` spans keep the bits pool-invariant.
+    let (xa, oa) = (x as usize, out as usize);
+    crate::run_on_wuk_pool(move || {
+        (0..nchunks).into_par_iter().for_each(|ck| {
+            let lo = ck * VMATH_CHUNK;
+            let hi = ((ck + 1) * VMATH_CHUNK).min(n);
+            // SAFETY: disjoint sub-span [lo, hi) ⊆ [0, n); x/out valid for n f32.
+            unsafe {
+                let xp = (xa as *const f32).add(lo);
+                let outp = (oa as *mut f32).add(lo);
+                wukong_vmath_f32(xp, outp, (hi - lo) as i64, op);
+            }
+        });
+    });
+}
+
 /// Select the 8-lane AVX2 kernel for op `op` (the `VM_*` codes), or `None` for an unrecognized op.
 /// Shared by the f32 ([`vmath_avx2`]) and bf16-input ([`vmath_bf16_avx2`]) dispatchers so both apply
 /// the *identical* activation — the only difference is how the 8 lanes are loaded (f32 vs widened
