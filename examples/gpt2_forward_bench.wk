@@ -74,6 +74,8 @@ fn main() -> i32 {
     let mut a:      []f32 = alloc_f32(s_len * d);
     let mut ff:      []f32 = alloc_f32(s_len * dff);
     let mut lastrow: []f32 = alloc_f32(voc);   // logits for the LAST position only (next-token infer)
+    let mut xlast:   []f32 = alloc_f32(d);     // the final position's hidden, copied off so the LM-head
+                                               // GEMV indexes the vector by `dd` alone (recognized form)
     // per-norm gamma/beta gathered from the blob into [i]-indexed locals — the affine-LayerNorm
     // recognizer keys γ/β on a bare loop-var index (g[i]), which a blob offset (w[base+..+i]) is not.
     let mut gtmp: []f32 = alloc_f32(d);
@@ -220,12 +222,20 @@ fn main() -> i32 {
         }
 
         // tied LM head, LAST POSITION ONLY (autoregressive next-token inference computes the trunk over
-        // all positions but only the final position's logits): lastrow[vt] = sum_d x[last,d]*wte[vt,d]
-        // — a matrix-vector product (wteᵀ · x_last) the recognizer dispatches to the tuned GEMV.
+        // all positions but only the final position's logits): lastrow[vt] = Σ_d wte[vt,d]·x[last,d] —
+        // a matrix-vector product (wte · x_last) now spelled in the recognized GEMV form so it dispatches
+        // to the tuned wukong_sgemv (AVX2+FMA, memory-bound streaming of the 154 MB wte) instead of the
+        // scalar dot nest. Two shape requirements the recognizer imposes:
+        //   * the vector must be indexed by the inner var alone (`xlast[dd]`, not `x[lastp+dd]`), so the
+        //     final position is copied into a length-d local first (a 3 KB copy, negligible);
+        //   * the matrix index must be exactly `vt*d+dd` with no base offset — which holds here because
+        //     wte is the first block of the blob (GPT2_OFF_WTE == 0, see gpt2_config). If the blob layout
+        //     ever moves wte off zero, restore `w[GPT2_OFF_WTE + …]` and this falls back to the scalar nest.
         let lastp: i64 = (s_len - 1) * d;
+        for dd in 0..d { xlast[dd] = x[lastp + dd]; }
         for vt in 0..voc {
             let mut acc: f32 = 0.0;
-            for dd in 0..d { acc = acc + x[lastp + dd] * w[GPT2_OFF_WTE + vt * d + dd]; }
+            for dd in 0..d { acc = acc + w[vt * d + dd] * xlast[dd]; }
             lastrow[vt] = acc;
         }
 
@@ -249,6 +259,6 @@ fn main() -> i32 {
 
     free(w); free(ids); free(x); free(nrm); free(q); free(k); free(v);
     free(scores); free(attn); free(qh); free(kh); free(vt); free(oh);
-    free(a); free(ff); free(lastrow); free(gtmp); free(btmp);
+    free(a); free(ff); free(lastrow); free(xlast); free(gtmp); free(btmp);
     return 0;
 }
