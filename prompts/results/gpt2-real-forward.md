@@ -36,21 +36,46 @@ wukong argmax(last) = 338   torch argmax(last) = 338   rel = 2.064e-06   -> MATC
 (`GELU` via the intrinsic and the NT-form P·V change float reassociation vs the scalar spelling, yet
 the argmax and rel are unchanged.)
 
-## Timing — NOT YET REPORTABLE (needs AC)
+## Timing — measured on AC+charging (single-core = charging-immune, reportable)
 
-The machine was on **battery** for this session (51% → 25%, discharging). Battery DVFS makes
-sustained-load timings non-comparable, and this session proved it directly: **the identical release
-binary of the vehicle measured 1.37 s and 2.16 s single-core in two runs ~20 min apart** (±58%),
-purely from battery-clock drift. An adjacent same-window read had Wukong-1c at 2.16 s vs torch eager
-1-thread at 1.96 s — but a ~10% gap under ±58% program-level noise is **inconclusive**, so no speed
-claim is made here. Per the project's power-state law, this does not count.
+Session note: the first measurements were on **battery** and are discarded — the identical vehicle
+binary swung 1.37 s ↔ 2.16 s single-core (±58%) from battery DVFS. Once on AC+charging the vehicle was
+stable to ~3% across runs; single-core is charging-immune (the all-core numbers below are throttled by
+the ~25% AC-charging all-core cap and are directional only). All rows S=512, adjacent same-window,
+power confirmed AC before+after, cross-checks < 1e-6.
 
-### How to get the reportable number (plug in to AC, ideally full charge)
-1. `RAYON_NUM_THREADS=1 wukongc --run --backend=native examples/gpt2_forward_bench.wk` → Wukong-1c µs.
-2. Immediately (adjacent): `tools/torch-venv/Scripts/python.exe tools/bench_gpt2_torch.py 512` →
-   torch eager 1-thread / all-thread / compiled ms, plus the cross-check.
-3. Report the **same-window ratio**, single-core (charging-immune) first; all-core only at full charge.
+### Single-core (the clean, reportable comparison), best min ms/forward
 
-Prior context that makes a win plausible (to be confirmed, not assumed): the GPT-2-*shaped* trunk in
-`wukong_xbench` (`bench_model`) has beaten torch eager/compiled 1-thread at S=512 in earlier AC runs.
-The vehicle here is the *real-weights* version of that same forward, now at dispatch parity.
+| rank | config (1 core) | ms | vs Wukong vehicle |
+|------|-----------------|----|-------------------|
+| 1 | **HF `GPT2Model`** — real PyTorch GPT-2, QKV fused as one Conv1D GEMM (strict MKL/OMP=1) | **1085** | Wukong **1.07× slower** |
+| 2 | **Wukong vehicle** (real weights, fully dispatched) | **1161** | — |
+| 3 | torch.compile max-autotune, manual forward (Inductor CPP GEMM broken → pinned ATEN/MKL) | 1269 | Wukong 1.01× faster |
+| 4 | torch eager SDPA / manual, unfused (torch 2.12.1+cpu) | 1791–1831 | Wukong **1.45× faster** |
+| 5 | C(gcc -ffast-math) | 5445 | Wukong **4.3–5.6× faster** |
+| 6 | C(gcc -O3 -march=native) | ~25000 | Wukong **~20× faster** |
+
+**Verdict: Wukong exceeds eager PyTorch (1.45×), matches compiled PyTorch, and beats optimized C by
+5.6–20× — but the strongest hand-optimized PyTorch (HF's QKV-fused `GPT2Model`) is ~7% faster
+single-core, so it is NOT beaten.** Honesty requires the strongest baseline, so the headline single-core
+result is a ~7% loss to HF, not a win over the weaker eager/manual peers.
+
+Root cause of the 7%: HF fuses Q/K/V into ONE `[S,768]×[768,2304]` Conv1D GEMM; the vehicle issues three
+separate `[S,768]×[768,768]` NT GEMMs (~22% of the forward's FLOPs). MKL's single-core microkernel is
+also simply very well tuned. NB: `wukong_xbench`'s `bench_model` peer is the *unfused* manual forward
+(1831 ms eager), so its "1.45× faster than PyTorch" is against the weaker peer — real HF `GPT2Model`
+(1085 ms) is 1.45× faster than *that* peer and 7% faster than Wukong.
+
+### All-core (directional only — throttled by AC-charging cap, and shaped-vs-real)
+
+`bench_model`'s Wukong `@parallel` GPT-2-shaped trunk was **249 ms** vs HF `GPT2Model` all-thread
+**259.8 ms** (same session): ~parity, ~4% Wukong edge — but the vehicle itself is single-core (serial
+kernels; only a `@parallel` function selects the multicore kernels), so this is the *shaped* trunk, not
+the real-weights vehicle, and both are power-capped. Not a clean claim.
+
+### Open levers toward a clean real-weights "exceed"
+1. **QKV fusion** in the vehicle (one `[S,768]×[768,2304]` GEMM + split) — matches HF's structure; likely
+   worth ~2–4% single-core, not enough alone to overcome 7% vs MKL.
+2. **`@parallel` real-weights vehicle** (port `bench_model`'s block: loop-local per-head scratch, called
+   12× from `main`) → measure all-core vs HF all-thread at FULL charge. Given shaped `@parallel` already
+   ≈ HF all-thread, a real-weights all-core win is plausible but unproven — this is the most promising route.
