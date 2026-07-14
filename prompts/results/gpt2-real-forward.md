@@ -21,10 +21,19 @@ tuned kernel — verified by `wukongc --emit=mir -O2 examples/gpt2_forward_bench
 | the row softmax | `wukong_norm_f32` | 1 |
 | tanh-approx GELU (`gelu()` intrinsic) | `wukong_vmath_f32` | 1 |
 | residual adds | `wukong_velem_f32` | 2 |
+| last-position tied LM head (wte · x_last) | `wukong_sgemv` | 1 |
 
-Getting there needed one compiler fix — `emit_norm` passed a `[]f32` slice's 16-byte fat-pointer
-buffer to the norm kernel instead of its data pointer (segfault); now routed through
-`kernel_base_ptr` like the GEMM path (`tests/run/norm_slice.wk` locks it, differential-gated).
+The LM head was the one compute-visible loop still scalar (the emitted MIR had **zero** vector ops
+outside the dispatched kernels). Spelling it in the recognized GEMV form — copy the final position into
+a length-d local so the vector is indexed by the inner var alone, and drop the `GPT2_OFF_WTE` base term
+(`== 0`, wte is the first blob block) — lowers it to `wukong_sgemv` (AVX2+FMA, memory-bound streaming of
+the 154 MB wte). argmax unchanged (338).
+
+Getting there needed two compiler fixes, both the same class (a `[]f32` slice is a 16-byte fat pointer
+whose data pointer is the first word, so kernels must resolve operands through `kernel_base_ptr`, not a
+raw slot read): (1) `emit_norm` for the LayerNorm/softmax operands (`tests/run/norm_slice.wk`); (2)
+`emit_gemv` for the GEMV operands (`tests/run/gemv_slice.wk`) — the LM head was the first GEMV to run over
+slices and segfaulted until fixed. Both differential-gated (interp == native, -O0 == -O2).
 
 **Correctness — exact match with real PyTorch.** With every op dispatched, the forward still
 reproduces HuggingFace GPT-2 bit-for-close:
@@ -66,16 +75,25 @@ also simply very well tuned. NB: `wukong_xbench`'s `bench_model` peer is the *un
 (1831 ms eager), so its "1.45× faster than PyTorch" is against the weaker peer — real HF `GPT2Model`
 (1085 ms) is 1.45× faster than *that* peer and 7% faster than Wukong.
 
-### All-core (directional only — throttled by AC-charging cap, and shaped-vs-real)
+### All-core — the real-weights `@parallel` vehicle now exists (timing pending a clean power window)
 
-`bench_model`'s Wukong `@parallel` GPT-2-shaped trunk was **249 ms** vs HF `GPT2Model` all-thread
-**259.8 ms** (same session): ~parity, ~4% Wukong edge — but the vehicle itself is single-core (serial
-kernels; only a `@parallel` function selects the multicore kernels), so this is the *shaped* trunk, not
-the real-weights vehicle, and both are power-capped. Not a clean claim.
+`examples/gpt2_forward_bench_par.wk` is the real-weights all-core companion (decoder block is a
+`@parallel fn`, so every whole-`[S,D]` op selects its multicore `_parallel` kernel and the batched GELU
+rides `wukong_vmath_f32_parallel`; the 12 attention heads run across cores as disjoint column bands).
+It is **correct** — argmax 338, and its last-position logits match real HF `GPT2Model` at **rel 6.88e-7**
+— so the multicore path is bit-faithful, not just fast. But its *timing* is not yet reportable: on this
+laptop the CPU-heavy all-core run itself knocks the machine off AC (the adapter can't cover the peak draw,
+or battery-care cycles), so every all-core sample so far is battery- or charging-throttled. Across those
+throttled windows the all-core vehicle consistently *finishes* far ahead of the torch peer, but the
+absolute margin swings with the throttle (and even contradicts the prior cleaner "≈ parity" reading), so
+no number is published. Getting a clean one needs stable AC that survives the all-core draw — run
+`tools/measure_gpt2.ps1` (it self-labels each regime REPORTABLE/CAPPED/battery and cross-checks argmax).
 
 ### Open levers toward a clean real-weights "exceed"
-1. **QKV fusion** in the vehicle (one `[S,768]×[768,2304]` GEMM + split) — matches HF's structure; likely
-   worth ~2–4% single-core, not enough alone to overcome 7% vs MKL.
-2. **`@parallel` real-weights vehicle** (port `bench_model`'s block: loop-local per-head scratch, called
-   12× from `main`) → measure all-core vs HF all-thread at FULL charge. Given shaped `@parallel` already
-   ≈ HF all-thread, a real-weights all-core win is plausible but unproven — this is the most promising route.
+1. **QKV fusion** in the vehicle (one `[S,768]×[768,2304]` GEMM + split) — analyzed and **deferred**: the
+   three QKV GEMMs already dispatch, the activation-reuse saving is ~1 ms on an ~1100 ms forward, and the
+   7% vs MKL is microkernel quality not fusion structure — so ~0.1–1%, not worth an 85 MB repack buffer.
+2. **`@parallel` real-weights vehicle** — **DONE** (built + correctness-verified, above). Remaining: a
+   clean-power all-core measurement vs HF all-thread. This is the most promising route to a real "exceed".
+3. **LM head** — **DONE** this session (now dispatches `wukong_sgemv`); its single-core effect is not yet
+   in the table above (that row predates the change), so the 1161 ms is a conservative upper bound.
