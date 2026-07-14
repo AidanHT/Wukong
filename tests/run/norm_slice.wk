@@ -1,0 +1,72 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 86
+// EXPECT-OUT: 372
+// EXPECT-OUT: 41
+// EXPECT-OUT: 502
+// EXPECT-OUT: 849
+// EXPECT-OUT: 45
+// EXPECT-OUT: 94
+// EXPECT-OUT: 12
+// EXPECT-OUT: 86
+// EXPECT-OUT: 372
+// EXPECT-OUT: 41
+// EXPECT-OUT: 502
+module tests.run.norm_slice
+
+// Fused norms over runtime-sized []f32 SLICES (not fixed [f32; N] arrays): the data, the out-of-place
+// destination, and the affine gamma/beta are all heap slices. A slice value is a 16-byte fat pointer
+// whose data pointer is the first word, so the norm dispatch must resolve each operand through the
+// kernel base-pointer path (load the data pointer) rather than passing the fat-pointer buffer — else
+// the kernel dereferences the struct as f32 data and segfaults. This is the exact shape the real
+// GPT-2 forward (examples/gpt2_forward_bench.wk) uses for its LayerNorms; the differential gate
+// (interp == native, -O0 == -O2) proves the dispatched kernel equals the scalar nest bit-for-bit.
+
+fn main() -> i32 {
+    let r: i64 = 3;
+    let c: i64 = 4;
+
+    let mut x:     []f32 = alloc_f32(r * c);
+    let mut nrm:   []f32 = alloc_f32(r * c);   // out-of-place LayerNorm destination (dst != x)
+    let mut gamma: []f32 = alloc_f32(c);
+    let mut beta:  []f32 = alloc_f32(c);
+
+    // deterministic fill
+    for i in 0..(r * c) { x[i] = ((i * 7i64 + 1i64) % 5i64) as f32; }
+    gamma[0] = 2.0; gamma[1] = 0.5; gamma[2] = 1.0; gamma[3] = 1.5;
+    beta[0]  = 0.1; beta[1]  = 0.0; beta[2]  = -0.2; beta[3] = 0.3;
+
+    // batched affine LayerNorm, OUT OF PLACE (nrm = layernorm(x) * gamma + beta), γ/β [i]-indexed
+    // slices — dispatches wukong_norm_affine_f32 with rows = r.
+    for row in 0..r {
+        let mut s: f32 = 0.0;
+        for i in 0..c { s = s + x[row * c + i]; }
+        let mean: f32 = s / (c as f32);
+        let mut v: f32 = 0.0;
+        for i in 0..c { v = v + (x[row * c + i] - mean) * (x[row * c + i] - mean); }
+        let inv: f32 = rsqrt(v / (c as f32) + 0.00001);
+        for i in 0..c {
+            nrm[row * c + i] = (x[row * c + i] - mean) * inv * gamma[i] + beta[i];
+        }
+    }
+
+    // batched row softmax IN PLACE over the normalized slice — dispatches wukong_norm_f32 with rows = r.
+    for row in 0..r {
+        let mut m: f32 = nrm[row * c];
+        for i in 0..c { m = fmax(m, nrm[row * c + i]); }
+        let mut den: f32 = 0.0;
+        for i in 0..c {
+            let e: f32 = exp(nrm[row * c + i] - m);
+            nrm[row * c + i] = e;
+            den = den + e;
+        }
+        let dinv: f32 = 1.0 / den;
+        for i in 0..c { nrm[row * c + i] = nrm[row * c + i] * dinv; }
+    }
+
+    // print a deterministic digest of the softmaxed rows (each row sums to 1, so 1000×each element)
+    for i in 0..(r * c) { print(round(nrm[i] * 1000.0) as i32); }
+
+    free(x); free(nrm); free(gamma); free(beta);
+    return 0;
+}
