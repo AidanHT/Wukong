@@ -6000,7 +6000,7 @@ impl FnLowerer<'_> {
         gamma: Option<Symbol>,
         beta: Option<Symbol>,
     ) -> bool {
-        let Some((xv, _)) = self.lookup(arr) else {
+        let Some(xv) = self.kernel_base_ptr(arr) else {
             return false;
         };
         // The destination buffer: `arr` itself for the in-place form (the args stay `(xv, xv)` — the
@@ -6011,8 +6011,8 @@ impl FnLowerer<'_> {
         let dstv = if dst == arr {
             xv
         } else {
-            match self.lookup(dst) {
-                Some((v, _)) => v,
+            match self.kernel_base_ptr(dst) {
+                Some(v) => v,
                 None => return false,
             }
         };
@@ -6062,7 +6062,11 @@ impl FnLowerer<'_> {
         // real array's `Value::Ptr` by variant) and marshals it as absent → scale-1 / shift-0.
         let ptr_or_null = |me: &mut Self, sym: Option<Symbol>| -> Option<ValueId> {
             match sym {
-                Some(s) => me.lookup(s).map(|(v, _)| v),
+                // Resolve through the kernel base-pointer path (not a raw slot read) so a `[]f32`
+                // slice's gamma/beta pass their *data* pointer (fat-pointer first word), not the
+                // 16-byte fat-pointer buffer — the same resolution the data `x`/`dst` use. A fixed
+                // `[f32; N]` array's base is its slot, unchanged, so the existing corpus is byte-identical.
+                Some(s) => me.kernel_base_ptr(s),
                 None => Some(
                     me.builder
                         .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
