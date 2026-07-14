@@ -21,7 +21,11 @@
 param(
     [int]$Outer = 3,
     [switch]$SkipTorch,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Python with torch(cpu)+transformers for the HF peer. Default: the coalescence conda env
+    # (torch 2.11.0+cpu, transformers 4.41.2 — a CPU build, the honest fp32-CPU peer). Falls back to
+    # `python` on PATH if that interpreter is missing.
+    [string]$TorchPython = "$env:USERPROFILE\Anaconda3\envs\coalescence\python.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -106,9 +110,10 @@ if ($p1.Ms -gt 0 -and [double]::IsFinite($p1.Ms)) {
 }
 
 if (-not $SkipTorch) {
-    Write-Host "`n[torch] HF GPT2Model peer (eager 1t / all-t / compiled) ..."
+    $py = if (Test-Path $TorchPython) { $TorchPython } else { "python" }
+    Write-Host "`n[torch] HF GPT2Model peer (eager 1t / all-t / compiled) via $py ..."
     Push-Location $repo
-    try { python tools/bench_gpt2_torch.py 512 } catch { Write-Host "  torch peer failed: $_" }
+    try { & $py tools/bench_gpt2_torch.py 512 } catch { Write-Host "  torch peer failed: $_" }
     Pop-Location
 }
 
