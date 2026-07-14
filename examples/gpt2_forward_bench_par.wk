@@ -166,6 +166,7 @@ fn main() -> i32 {
     let mut a:    []f32 = alloc_f32(s_len * d);
     let mut ff:   []f32 = alloc_f32(s_len * GPT2_DFF);
     let mut lastrow: []f32 = alloc_f32(voc);
+    let mut xlast:   []f32 = alloc_f32(d);   // final position copied off for the recognized LM-head GEMV
     let mut gf: []f32 = alloc_f32(d);
     let mut bf: []f32 = alloc_f32(d);
 
@@ -203,11 +204,15 @@ fn main() -> i32 {
             for i in 0..d { x0[r * d + i] = (x0[r * d + i] - mean) * inv * gf[i] + bf[i]; }
         }
 
-        // tied LM head, last position only
+        // tied LM head, last position only — recognized GEMV form (wte · x_last) so it dispatches
+        // wukong_sgemv instead of a scalar dot: copy the last position into a length-d local (vector
+        // indexed by dd alone) and drop the GPT2_OFF_WTE base term (== 0, wte is the first blob block)
+        // so the matrix index is the bare vt*d+dd. Removes the scalar LM head from the all-core tail.
         let lastp: i64 = (s_len - 1) * d;
+        for dd in 0..d { xlast[dd] = x0[lastp + dd]; }
         for vt in 0..voc {
             let mut acc: f32 = 0.0;
-            for dd in 0..d { acc = acc + x0[lastp + dd] * w[GPT2_OFF_WTE + vt * d + dd]; }
+            for dd in 0..d { acc = acc + w[vt * d + dd] * xlast[dd]; }
             lastrow[vt] = acc;
         }
 
@@ -229,6 +234,6 @@ fn main() -> i32 {
     print(nreps as i32);
 
     free(w); free(ids); free(x0); free(x1); free(nrm); free(q); free(k); free(v);
-    free(attn); free(a); free(ff); free(lastrow); free(gf); free(bf);
+    free(attn); free(a); free(ff); free(lastrow); free(xlast); free(gf); free(bf);
     return 0;
 }
