@@ -7409,10 +7409,17 @@ impl FnLowerer<'_> {
     /// parallel, which the interpreter marshals as the oracle). The unscaled form emits the exact
     /// pre-α call, so existing GEMV MIR is byte-identical.
     fn emit_gemv(&mut self, nest: &GemvNest, parallel: bool) -> bool {
-        let (Some((a, _)), Some((x, _)), Some((y, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.x),
-            self.lookup(nest.y),
+        // Resolve each operand through `kernel_base_ptr` (not raw `lookup`): a `[]f32` slice keeps a
+        // 16-byte fat pointer in its slot, so the kernel needs the loaded *data* pointer, not the slot
+        // address — the exact slice-vs-array distinction `emit_sgemm` relies on. Passing the fat pointer
+        // straight through (the old `lookup`) made the kernel dereference the fat-pointer struct as f32
+        // data and segfault the moment a GEMV ran over slices (e.g. GPT-2's []f32 weight blob LM head);
+        // for a fixed `[f32; N]` array `kernel_base_ptr` returns the identical slot address, so recognized
+        // fixed-array GEMV MIR is byte-for-byte unchanged.
+        let (Some(a), Some(x), Some(y)) = (
+            self.kernel_base_ptr(nest.a),
+            self.kernel_base_ptr(nest.x),
+            self.kernel_base_ptr(nest.y),
         ) else {
             return false;
         };
