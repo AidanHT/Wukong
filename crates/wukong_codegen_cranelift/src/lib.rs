@@ -158,6 +158,7 @@ const RT_SGEMM_BF16_NT_EPI_PAR: &str = "wukong_sgemm_bf16_nt_epi_parallel";
 const RT_SGEMM_F16_NT_EPI: &str = "wukong_sgemm_f16_nt_epi";
 const RT_SGEMM_F16_NT_EPI_PAR: &str = "wukong_sgemm_f16_nt_epi_parallel";
 const RT_VMATH: &str = "wukong_vmath_f32";
+const RT_VMATH_PARALLEL: &str = "wukong_vmath_f32_parallel";
 const RT_VMATH2: &str = "wukong_vmath2_f32";
 const RT_SOFTMAX_BWD: &str = "wukong_softmax_bwd_f32";
 const RT_SOFTMAX_BWD_PAR: &str = "wukong_softmax_bwd_f32_parallel";
@@ -1184,6 +1185,7 @@ impl<'a> FnTranslator<'a> {
         // Same 4-arg shape for the bf16/f16-input twins (x is a 2-byte-element pointer; the kernel
         // widens losslessly). Identical signature, so just route by name.
         if (name == RT_VMATH
+            || name == RT_VMATH_PARALLEL
             || name == RT_VMATH_BF16
             || name == RT_VMATH_F16
             || name == RT_VMATH_BF16_OUT
@@ -1894,6 +1896,7 @@ struct RtFuncs {
     sgemm_f16_nt_epi: FuncId,
     sgemm_f16_nt_epi_par: FuncId,
     vmath: FuncId,
+    vmath_par: FuncId,
     vmath2: FuncId,
     softmax_bwd: FuncId,
     softmax_bwd_par: FuncId,
@@ -2504,6 +2507,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         vmath: module
             .declare_function(RT_VMATH, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        vmath_par: module
+            .declare_function(RT_VMATH_PARALLEL, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
         vmath2: module
             .declare_function(RT_VMATH2, Linkage::Import, &sig_vmath2)
@@ -3180,6 +3186,10 @@ fn build_function_clif(
             rt_refs.insert(
                 RT_VMATH,
                 module.declare_func_in_func(rt.vmath, builder.func),
+            );
+            rt_refs.insert(
+                RT_VMATH_PARALLEL,
+                module.declare_func_in_func(rt.vmath_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH2,
@@ -4052,6 +4062,10 @@ pub fn jit_compile(
         wukong_runtime::wukong_sgemm_f16_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, wukong_runtime::wukong_vmath_f32 as *const u8);
+    builder.symbol(
+        RT_VMATH_PARALLEL,
+        wukong_runtime::wukong_vmath_f32_parallel as *const u8,
+    );
     builder.symbol(RT_VMATH2, wukong_runtime::wukong_vmath2_f32 as *const u8);
     builder.symbol(
         RT_SOFTMAX_BWD,
@@ -4623,6 +4637,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         wukong_runtime::wukong_sgemm_f16_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, wukong_runtime::wukong_vmath_f32 as *const u8);
+    builder.symbol(
+        RT_VMATH_PARALLEL,
+        wukong_runtime::wukong_vmath_f32_parallel as *const u8,
+    );
     builder.symbol(RT_VMATH2, wukong_runtime::wukong_vmath2_f32 as *const u8);
     builder.symbol(
         RT_SOFTMAX_BWD,
