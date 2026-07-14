@@ -62,6 +62,13 @@ pub(crate) struct Syms {
     /// `parallel_fn`), while single-statement / non-parallel tapes use the serial one — accept both.
     pub sgemm_nt_parallel: Symbol,
     pub vmath: Symbol,
+    /// The `@parallel` elementwise activation — same `(x, out, n, op)` ABI and bit-identical
+    /// (elementwise, no cross-chunk combine) result as the serial `vmath`, so it differentiates
+    /// through the very same rule. An `out[i]=act(x[i])` loop inside a `@parallel fn` lowers to *this*
+    /// symbol (mir_build selects it when `parallel_fn`), while single-statement / non-parallel tapes use
+    /// the serial one — accept both. Without this the backward pass of every `@parallel`-fn activation
+    /// loop fails with an unrecognized-buffer-writing-call error.
+    pub vmath_parallel: Symbol,
     pub sreduce: Symbol,
     /// The `@parallel` reduction — same `(x, y, n, op)` ABI and identical (deterministic, fixed
     /// chunking) result as the serial `sreduce`, so it differentiates through the very same rule.
@@ -89,6 +96,7 @@ impl Syms {
             sgemm_nt: it.intern("wukong_sgemm_nt"),
             sgemm_nt_parallel: it.intern("wukong_sgemm_nt_parallel"),
             vmath: it.intern("wukong_vmath_f32"),
+            vmath_parallel: it.intern("wukong_vmath_f32_parallel"),
             sreduce: it.intern("wukong_sreduce_f32"),
             sreduce_parallel: it.intern("wukong_sreduce_f32_parallel"),
             velem: it.intern("wukong_velem_f32"),
@@ -128,6 +136,7 @@ impl<'a> Vjp<'a> {
         func == self.syms.sgemm_nt
             || func == self.syms.sgemm_nt_parallel
             || func == self.syms.vmath
+            || func == self.syms.vmath_parallel
             || func == self.syms.sreduce
             || func == self.syms.sreduce_parallel
             || func == self.syms.velem
@@ -176,7 +185,7 @@ impl<'a> Vjp<'a> {
             self.diff_sreduce(args, result)
         } else if func == self.syms.sgemm_nt || func == self.syms.sgemm_nt_parallel {
             self.diff_sgemm_nt(args)
-        } else if func == self.syms.vmath {
+        } else if func == self.syms.vmath || func == self.syms.vmath_parallel {
             self.diff_vmath(args)
         } else if func == self.syms.velem || func == self.syms.velem_parallel {
             self.diff_velem(args)
