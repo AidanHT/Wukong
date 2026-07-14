@@ -1,0 +1,55 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 30
+// EXPECT-OUT: 60
+// EXPECT-OUT: 90
+// EXPECT-OUT: 120
+// EXPECT-OUT: 150
+// EXPECT-OUT: 15
+// EXPECT-OUT: 30
+// EXPECT-OUT: 45
+// EXPECT-OUT: 60
+// EXPECT-OUT: 75
+module tests.run.gemv_slice
+
+// GEMV `y[i] = Σ_j a[i*N+j]·x[j]` over runtime-sized []f32 SLICES (not fixed [f32; N] arrays): the
+// matrix, the vector, and the output are all heap slices. A slice value is a 16-byte fat pointer whose
+// data pointer is the first word, so the GEMV dispatch (wukong_sgemv / wukong_sgemv_alpha) must resolve
+// each operand through the kernel base-pointer path (load the data pointer) rather than passing the
+// fat-pointer buffer — else the kernel dereferences the struct as f32 data and segfaults. This is the
+// exact shape the real GPT-2 forward (examples/gpt2_forward_bench.wk) uses for its last-position LM
+// head (wte · x_last over the []f32 weight blob). The differential gate (interp == native, -O0 == -O2)
+// proves the dispatched kernel equals the scalar nest bit-for-bit.
+
+fn main() -> i32 {
+    let m: i64 = 5;
+    let n: i64 = 4;
+
+    let mut a: []f32 = alloc_f32(m * n);
+    let mut x: []f32 = alloc_f32(n);
+    let mut y: []f32 = alloc_f32(m);   // plain GEMV output
+    let mut z: []f32 = alloc_f32(m);   // alpha-scaled GEMV output
+
+    // a[i,j] = (i+1)(j+1),  x[j] = (j+1)  =>  y[i] = (i+1)·Σ_j (j+1)^2 = (i+1)·30
+    for i in 0..m { for j in 0..n { a[i * n + j] = (((i + 1i64) * (j + 1i64)) as f32); } }
+    for j in 0..n { x[j] = ((j + 1i64) as f32); }
+
+    // plain GEMV -> wukong_sgemv(a, x, y, m, n)
+    for i in 0..m {
+        let mut s: f32 = 0.0;
+        for j in 0..n { s = s + a[i * n + j] * x[j]; }
+        y[i] = s;
+    }
+    // alpha-scaled GEMV (loop-invariant scale on the store) -> wukong_sgemv_alpha(a, x, z, m, n, 0.5)
+    for i in 0..m {
+        let mut s: f32 = 0.0;
+        for j in 0..n { s = s + a[i * n + j] * x[j]; }
+        z[i] = s * 0.5;
+    }
+
+    for i in 0..m { print(round(y[i]) as i32); }
+    for i in 0..m { print(round(z[i]) as i32); }
+
+    free(a); free(x); free(y); free(z);
+    return 0;
+}
