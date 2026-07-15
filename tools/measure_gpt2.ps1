@@ -22,6 +22,10 @@ param(
     [int]$Outer = 3,
     [switch]$SkipTorch,
     [switch]$SkipBuild,
+    # Light/fast mode: measure only the single-core regimes (both Wukong 1c + torch), skipping the heavy
+    # Wukong all-core run. Single-core load is ~20 W, which an adapter covers, so this can complete inside
+    # a brief stable-AC window (e.g. a battery-care trickle) without the all-core draw knocking off AC.
+    [switch]$SingleCoreOnly,
     # Python with torch(cpu)+transformers for the HF peer. Default: the coalescence conda env
     # (torch 2.11.0+cpu, transformers 4.41.2 — a CPU build, the honest fp32-CPU peer). Falls back to
     # `python` on PATH if that interpreter is missing.
@@ -105,11 +109,17 @@ Write-Host "`n[wukong] serial vehicle, 1 core ..."
 $s1 = Measure-Vehicle -Wk $serial -EnvVars @{ RAYON_NUM_THREADS = '1' } -Reps $Outer
 Write-Host "[wukong] @parallel vehicle, 1 core ..."
 $p1 = Measure-Vehicle -Wk $par -EnvVars @{ RAYON_NUM_THREADS = '1' } -Reps $Outer
-Write-Host "[wukong] @parallel vehicle, all core (heavy — may drop AC) ..."
-$pAll = Measure-Vehicle -Wk $par -EnvVars @{} -Reps $Outer
+if (-not $SingleCoreOnly) {
+    Write-Host "[wukong] @parallel vehicle, all core (heavy — may drop AC) ..."
+    $pAll = Measure-Vehicle -Wk $par -EnvVars @{} -Reps $Outer
+} else {
+    Write-Host "[wukong] @parallel all-core SKIPPED (-SingleCoreOnly: staying light to hold AC)"
+    $pAll = [pscustomobject]@{ Argmax = 338; Ms = [double]::PositiveInfinity; Power = (Get-PowerClass) }
+}
 
-# Correctness gate: every regime must agree on argmax 338 or the timing is meaningless.
-$argmaxes = @($s1.Argmax, $pAll.Argmax, $p1.Argmax) | Sort-Object -Unique
+# Correctness gate: every measured regime must agree on argmax 338 or the timing is meaningless.
+$measuredArgmax = if ($SingleCoreOnly) { @($s1.Argmax, $p1.Argmax) } else { @($s1.Argmax, $pAll.Argmax, $p1.Argmax) }
+$argmaxes = $measuredArgmax | Sort-Object -Unique
 $argmaxOk = ($argmaxes.Count -eq 1 -and $argmaxes[0] -eq 338)
 
 # Single-core self-consistency: serial-1c and @parallel-1c are the IDENTICAL computation, so if the
@@ -127,9 +137,11 @@ Write-Host ""
 Write-Host ("{0,-30} {1,10} {2,-12}" -f "regime", "ms/fwd", "power")
 Write-Host ("{0,-30} {1,10:N1} {2,-12}" -f "wukong serial       1c", $s1.Ms, (Tag-1c $s1.Power))
 Write-Host ("{0,-30} {1,10:N1} {2,-12}" -f "wukong @parallel    1c", $p1.Ms, (Tag-1c $p1.Power))
-Write-Host ("{0,-30} {1,10:N1} {2,-12}" -f "wukong @parallel all-core", $pAll.Ms, (Tag-all $pAll.Power))
-if ($p1.Ms -gt 0 -and [double]::IsFinite($p1.Ms) -and $pAll.Ms -gt 0) {
-    Write-Host ("{0,-30} {1,10:N2}x" -f "  -> @parallel scaling", ($p1.Ms / $pAll.Ms))
+if (-not $SingleCoreOnly) {
+    Write-Host ("{0,-30} {1,10:N1} {2,-12}" -f "wukong @parallel all-core", $pAll.Ms, (Tag-all $pAll.Power))
+    if ($p1.Ms -gt 0 -and [double]::IsFinite($p1.Ms) -and $pAll.Ms -gt 0 -and [double]::IsFinite($pAll.Ms)) {
+        Write-Host ("{0,-30} {1,10:N2}x" -f "  -> @parallel scaling", ($p1.Ms / $pAll.Ms))
+    }
 }
 Write-Host ("  single-core self-consistency (serial-1c vs par-1c): {0:P1} skew  [{1}]" -f $sc1cSkew, $(if ($sc1cSkew -le 0.05) { 'STABLE' } else { 'THROTTLED — 1c numbers suspect' }))
 
@@ -150,6 +162,7 @@ $allReportable = $argmaxOk -and (Tag-all $pAll.Power) -eq 'reportable'
 Write-Host ""
 if ($scReportable) { Write-Host "-> SINGLE-CORE: REPORTABLE (stable AC, 1c self-consistent) — serial-1c vs torch eager-1t is a real claim." }
 else { Write-Host "-> SINGLE-CORE: NOT reportable (battery or >5% 1c skew). Re-run on stable AC." }
-if ($allReportable) { Write-Host "-> ALL-CORE: REPORTABLE (AC+full trickle held through the heavy run) — vs torch eager all-thread is a real claim." }
+if ($SingleCoreOnly) { Write-Host "-> ALL-CORE: skipped (-SingleCoreOnly). Run the full sweep on AC+full for the all-core claim." }
+elseif ($allReportable) { Write-Host "-> ALL-CORE: REPORTABLE (AC+full trickle held through the heavy run) — vs torch eager all-thread is a real claim." }
 else { Write-Host "-> ALL-CORE: NOT reportable (needs AC+full that survives the all-core draw — disable battery-care, ensure the adapter covers peak). DIRECTIONAL ONLY." }
 Write-Host ""
