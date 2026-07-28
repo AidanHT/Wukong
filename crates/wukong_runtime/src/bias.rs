@@ -234,11 +234,25 @@ mod tests {
 
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element — across several
     /// activations, a `cols` that is not a multiple of 8 (forcing a tail), and a size large enough to
-    /// cross the non-temporal-store threshold (so the NT prologue + fence path is exercised).
+    /// cross the non-temporal-store threshold (so the `vmovntps` alignment prologue, the streaming
+    /// stores and the trailing `sfence` are really executed — narrowing the 32-byte peel to 16 makes
+    /// this test fault, which it did not before the last shape was added).
     #[test]
     fn bias_scalar_matches_avx() {
-        // rows*cols*2*4 = 8 MiB (< NT) for the small case and a big case (> NT) below.
-        for &(rows, cols) in &[(3usize, 5usize), (7, 8), (4, 13), (2, 64), (700, 1500)] {
+        // The last shape is the only one that crosses `NT_MIN_BYTES`: `use_nt` needs
+        // rows*cols >= 1_310_720 elements, so (700, 1500) = 1_050_000 (8.0 MiB of traffic) still
+        // takes the cacheable-store path and (1400, 1501) = 2_101_400 (16.0 MiB) takes the NT one.
+        // 1501 is not a multiple of 8 (forcing the scalar tail) and the row stride 1501*4 = 6004
+        // bytes is not a multiple of 32, so successive rows start at different mod-32 offsets and
+        // the `vmovntps` alignment prologue peels a different amount on each row.
+        for &(rows, cols) in &[
+            (3usize, 5usize),
+            (7, 8),
+            (4, 13),
+            (2, 64),
+            (700, 1500),
+            (1400, 1501),
+        ] {
             let n = rows * cols;
             let x: Vec<f32> = (0..n).map(|i| (i as f32 % 37.0) * 0.1 - 1.8).collect();
             let b: Vec<f32> = (0..cols).map(|j| (j as f32 % 11.0) * 0.25 - 1.3).collect();
