@@ -673,10 +673,13 @@ impl Sema<'_> {
                 pointee: Box::new(self.lower_type(pointee)),
             },
             TypeKind::Slice(e) => Ty::Slice(Box::new(self.lower_type(e))),
-            TypeKind::Array { elem, len } => Ty::Array {
-                elem: Box::new(self.lower_type(elem)),
-                len: self.eval_usize(len),
-            },
+            TypeKind::Array { elem, len } => {
+                let elem = Box::new(self.lower_type(elem));
+                Ty::Array {
+                    elem,
+                    len: self.array_len(len),
+                }
+            }
             TypeKind::Tuple(items) => Ty::Tuple(items.iter().map(|i| self.lower_type(i)).collect()),
             TypeKind::Vector { elem, lanes } => match self.lower_type(elem) {
                 Ty::Scalar(s) => Ty::Vector {
@@ -797,6 +800,29 @@ impl Sema<'_> {
         self.eval_usize_depth(e, 0)
     }
 
+    /// A fixed-size array's compile-time length, bounded to what lowering can represent. mir_build's
+    /// mirrored `const_usize_expr` is `u32` end to end and narrows the folded value with an unchecked
+    /// `as u32`, so a length above `u32::MAX` silently wrapped: `[i32; 0x1_0000_0001]` was bounds
+    /// checked here against 4294967297 while the emitted slot held 1 element. Reject the length
+    /// instead — with the length expression as the primary span — so the truncating path is
+    /// unreachable. Gated on `checking_bodies` exactly like the E0504 dim check, so a signature
+    /// re-lowered by `check_fn` is reported once (see the flag's doc-comment).
+    fn array_len(&mut self, len: &Expr) -> u64 {
+        let n = self.eval_usize(len);
+        if n > u32::MAX as u64 && self.checking_bodies {
+            self.error(
+                len.span,
+                "E0401",
+                format!(
+                    "array length {n} is out of range: a fixed-size array may hold at most {} \
+                     elements",
+                    u32::MAX
+                ),
+            );
+        }
+        n
+    }
+
     /// If `e` is a C-style enum-variant access `E::V` (a `Field` whose base is a single-segment
     /// path naming a declared enum), its integer discriminant — the value the variant lowers to.
     /// Mirrors `mir_build`'s `enum_variant_value` exactly, so compile-time evaluation (array
@@ -828,14 +854,14 @@ impl Sema<'_> {
             return 0;
         }
         match &e.kind {
-            ExprKind::Int(s) => {
-                let text = self.sym_str(*s);
-                text.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0)
-            }
+            // Decode the literal with the SAME rules mir_build's mirrored `const_usize_depth` uses
+            // (`parse_int`): radix prefixes `0x`/`0o`/`0b`, `_` digit separators, an integer type
+            // suffix. Keeping only the leading run of decimal digits desynced the mirror at the
+            // literal leaf — `[i32; 0x10]` was length 0 here and 16 there, `[i32; 1_6]` was 1 here
+            // and 16 there — so the alloca'd slot and these bounds checks disagreed: either a valid
+            // program rejected as "length 0", or (when sema's short length reached a struct layout)
+            // silent stack corruption both backends agreed on.
+            ExprKind::Int(s) => parse_u64_text(self.sym_str(*s)).unwrap_or(0),
             ExprKind::Path(p) if p.is_single() => match self.consts.get(&p.first().sym) {
                 Some(init) => self.eval_usize_depth(init, depth + 1),
                 None => 0,
@@ -3572,7 +3598,7 @@ fn parse_int_text(text: &str) -> Option<i64> {
 /// Parse an integer literal's MAGNITUDE as a `u64` (no sign — a negative value fits `i64` and is
 /// handled by `parse_int_text`). Used to recognize a literal in `(i64::MAX, u64::MAX]` so it defaults
 /// to `u64` instead of silently truncating to i32. Mirrors `parse_int_text`'s radix/suffix handling.
-fn parse_u64_text(text: &str) -> Option<u64> {
+pub(crate) fn parse_u64_text(text: &str) -> Option<u64> {
     let mut s = text.trim();
     if s.starts_with('-') {
         return None;
@@ -4095,5 +4121,74 @@ mod tests {
     fn tensor_index_correct_rank_ok() {
         let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0, 0]; }";
         assert!(errors(src).is_empty(), "unexpected: {:?}", errors(src));
+    }
+
+    #[test]
+    fn const_length_decodes_radix_and_separators() {
+        // §5: const-array-length folding is mirrored with mir_build's `const_usize_depth`, which
+        // decodes the literal with the full radix/`_`/suffix-aware `parse_int`. Decoding only the
+        // leading run of decimal digits here made `[i32; 0x10]` length 0 and `[i32; 1_6]` length 1,
+        // desyncing the bounds check from the emitted slot size.
+        for len in ["0x10", "0o20", "0b10000", "1_6", "16usize"] {
+            let ok = format!("fn f() {{ let mut a: [i32; {len}] = [0; {len}]; a[15] = 7; }}");
+            assert!(
+                errors(&ok).is_empty(),
+                "`[i32; {len}]` must be 16 elements: {:?}",
+                errors(&ok)
+            );
+            // …and still exactly 16, not "anything goes".
+            let bad = format!("fn f() {{ let mut a: [i32; {len}] = [0; {len}]; a[16] = 7; }}");
+            assert!(
+                errors(&bad).contains(&"E0501"),
+                "`[i32; {len}]` must still reject index 16: {:?}",
+                errors(&bad)
+            );
+        }
+        // Via a `const`, and as a tensor dimension (both route through `eval_usize_depth`).
+        let via_const = "const N: usize = 1_6; fn f() { let mut a: [i32; N] = [0; N]; a[15] = 7; }";
+        assert!(errors(via_const).is_empty(), "{:?}", errors(via_const));
+        let dim = "const N: usize = 0x10; fn f(a: Tensor[f32, N]) { let x = a[15]; }";
+        assert!(errors(dim).is_empty(), "{:?}", errors(dim));
+    }
+
+    #[test]
+    fn turbofish_dim_decodes_radix_and_separators() {
+        // The turbofish dim must decode like mir_build's `turbofish_dim_value` (the hidden
+        // symbolic-dim ABI): `::<3_0>` bound 3 in sema while codegen passed 30, so sema shape-checked
+        // one dimension and the callee addressed with another.
+        let bad = "fn get2<M, N>(x: Tensor[f32, M, N], i: i32) -> f32 { return x[i, 0]; } \
+                   fn f(a: Tensor[f32, 6]) { let v = get2::<2, 3_0>(a, 1); }";
+        assert!(
+            errors(bad).contains(&"E0501") || errors(bad).contains(&"E0502"),
+            "a 6-element argument cannot satisfy `::<2, 3_0>` (= 2x30): {:?}",
+            errors(bad)
+        );
+        let ok = "fn get1<N>(x: Tensor[f32, N], i: i32) -> f32 { return x[i]; } \
+                  fn f() { let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; let v = get1::<0x4>(a, 0); }";
+        assert!(
+            errors(ok).is_empty(),
+            "`::<0x4>` must bind N := 4: {:?}",
+            errors(ok)
+        );
+    }
+
+    #[test]
+    fn array_length_above_u32_max_is_rejected() {
+        // mir_build's mirrored `const_usize_expr` is u32 end to end and narrows with an unchecked
+        // `as u32`, so a longer length wrapped to a small slot while sema bounds-checked the full
+        // value. Reject it here so the truncating path is unreachable.
+        let bad = "fn f() { let mut a: [i32; 0x1_0000_0001] = [0; 0x1_0000_0001]; a[0] = 1; }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected an out-of-range array length: {:?}",
+            errors(bad)
+        );
+        // The largest representable length is still accepted (no off-by-one at the boundary).
+        let ok = "fn f(a: [i32; 4294967295]) -> i32 { return a[0]; }";
+        assert!(
+            !errors(ok).contains(&"E0401"),
+            "u32::MAX must remain a legal length: {:?}",
+            errors(ok)
+        );
     }
 }
