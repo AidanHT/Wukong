@@ -1,0 +1,114 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+module tests.run.for_step_gemm
+
+// A recognizer nest whose OUTER loop is STEPPED (`0..4 step 2`) or INCLUSIVE (`0..=3`) must NOT
+// dispatch its kernel: the kernel walks every index of `[start, end)` exactly once, so a stepped loop
+// visits a fraction of them and an inclusive loop one more than `end - start`. `range_bounds` used to
+// match `ForIter::Range { end: Some(end), .. }` and silently discard both fields, so the recognizers
+// ran a *different* loop than the source — identically on both backends and at every optimization
+// level, which is why neither the interp==native gate nor the -O0==-O2 gate could see it. These
+// explicit EXPECT-OUT values are the scalar semantics of the source, hand-computed; they are the only
+// gate that catches this class.
+//
+// Both spellings are real surface syntax, so every one of these programs is ordinary user source.
+
+fn main() -> i32 {
+    // ---- stepped ikj GEMM: only rows 0 and 2 are computed; rows 1 and 3 keep their 7.0 ----
+    // a and b are all-ones with K = 3, so each computed element is 3.
+    let a: [f32; 12] = [1.0; 12];
+    let b: [f32; 12] = [1.0; 12];
+    let mut c: [f32; 16] = [7.0; 16];
+    for i in 0..4 step 2 {
+        for j0 in 0..4 { c[i * 4 + j0] = 0.0; }
+        for k in 0..3 {
+            let aik: f32 = a[i * 3 + k];
+            for j in 0..4 { c[i * 4 + j] = c[i * 4 + j] + aik * b[k * 4 + j]; }
+        }
+    }
+    // rows 0 and 2 = 3; rows 1 and 3 untouched = 7
+    for t in 0..16 { print(c[t] as i32); }
+
+    // ---- inclusive ikj GEMM: `0..=3` covers all FOUR rows, so every element is 3 ----
+    let mut d: [f32; 16] = [7.0; 16];
+    for i in 0..=3 {
+        for j0 in 0..4 { d[i * 4 + j0] = 0.0; }
+        for k in 0..3 {
+            let aik: f32 = a[i * 3 + k];
+            for j in 0..4 { d[i * 4 + j] = d[i * 4 + j] + aik * b[k * 4 + j]; }
+        }
+    }
+    for t in 0..16 { print(d[t] as i32); }
+
+    // ---- stepped GEMV: rows 0 and 2 written (4 = Σ of four 1·1), rows 1 and 3 keep 5.0 ----
+    let m: [f32; 16] = [1.0; 16];
+    let v: [f32; 4] = [1.0; 4];
+    let mut o: [f32; 4] = [5.0; 4];
+    for r in 0..4 step 2 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + m[r * 4 + k] * v[k]; }
+        o[r] = s;
+    }
+    for t in 0..4 { print(o[t] as i32); }
+
+    // ---- stepped transpose: only source rows 0 and 2 are read, so only the EVEN destination
+    // rows (t[j*4+0], t[j*4+2]) are written; the odd ones keep 7.0 ----
+    let x: [f32; 16] = [1.0; 16];
+    let mut tr: [f32; 16] = [7.0; 16];
+    for i in 0..4 step 2 { for j in 0..4 { tr[j * 4 + i] = x[i * 4 + j]; } }
+    for q in 0..16 { print(tr[q] as i32); }
+
+    return 0;
+}
