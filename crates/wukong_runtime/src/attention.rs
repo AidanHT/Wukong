@@ -49,13 +49,23 @@ pub unsafe extern "C" fn wukong_attention_f32(
             return;
         }
     }
-    attention_scalar(q, k, v, o, s, d, scale, causal);
+    // SAFETY: dims validated above; the operand-size contract is this entry point's caller's.
+    unsafe {
+        attention_scalar(q, k, v, o, s, d, scale, causal);
+    }
 }
 
 /// Portable reference: the same online-softmax recurrence, scalar. Used where AVX2 is unavailable;
-/// also the algorithm the AVX2 path vectorizes (over `D`) without changing the reduction order.
+/// also the algorithm the AVX2 path vectorizes (over `D`). The vectorization *does* reassociate the
+/// `q_i·k_j` dot — the AVX2 path accumulates 8 partial sums and horizontally reduces them (:161-175)
+/// where this one sums sequentially — so the two agree to tolerance, not bit-for-bit. Both are gated
+/// against the naive materialized reference, which is the actual oracle.
+///
+/// # Safety
+/// Operand-size contract of [`wukong_attention_f32`]: `q`, `k`, `v` must each be valid for `s*d`
+/// `f32` reads and `o` valid for `s*d` `f32` writes, with `o` not overlapping `q`/`k`/`v`.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn attention_scalar(
+unsafe fn attention_scalar(
     q: *const f32,
     k: *const f32,
     v: *const f32,
@@ -65,6 +75,8 @@ fn attention_scalar(
     scale: f32,
     causal: bool,
 ) {
+    // SAFETY: every pointer read/write below stays inside `s*d` elements of the respective operand,
+    // which the caller guarantees above.
     unsafe {
         let mut acc = vec![0.0f32; d];
         for i in 0..s {
