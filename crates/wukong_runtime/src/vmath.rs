@@ -3176,6 +3176,51 @@ mod tests {
         }
     }
 
+    /// `wukong_vmath_f32_parallel` had no test at all, while every chunked sibling in this crate
+    /// (`velem`, `xent`, `xent_bwd`, `gemm`, `dequant`) carries a `serial_matches_parallel_bit_for_bit`.
+    /// Its whole contract is that fixed `VMATH_CHUNK` spans keep the output bit-identical to the serial
+    /// kernel "regardless of thread count" — the equality the interpreter oracle rests on, since the
+    /// oracle marshals the *serial* form for both symbols.
+    ///
+    /// The 1_500_001 row is the one that matters: 2 streams × 6 MB = 12 MiB is over `NT_MIN_BYTES`, so
+    /// the serial call takes the non-temporal path — scalar alignment peel, `vmovntps`, `sfence` —
+    /// while every 16 Ki parallel chunk re-evaluates `use_nt` on 64 KiB and takes the ordinary
+    /// cacheable path. The two arms therefore run *different store paths over the same data*, and this
+    /// pins that the bits do not move.
+    ///
+    /// Caveat: on a width-1 pool the parallel entry delegates to the serial kernel, and the comparison
+    /// is serial-vs-serial. That is the sibling tests' behaviour too; it under-tests rather than
+    /// false-passes.
+    #[test]
+    fn vmath_serial_matches_parallel_bit_for_bit() {
+        let all: &[i64] = &[VM_EXP, VM_LOG, VM_TANH, VM_GELU, VM_SELU, VM_ERF, VM_RELU];
+        for &(n, ops) in &[
+            (1_000usize, all),                   // < VMATH_PAR_MIN: the entry runs the serial kernel
+            (16_384, all),                       // == VMATH_PAR_MIN: exactly one chunk
+            (16_385, all),                       // one full chunk plus a 1-element chunk
+            (40_961, all),                       // two full chunks plus a ragged final one
+            (1_500_001, &[VM_EXP, VM_GELU][..]), // serial goes non-temporal, the chunks do not
+        ] {
+            // Kept > 0 so the log family stays in domain; a short period spans the poly's regions.
+            let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
+            for &op in ops {
+                let (mut s, mut p) = (vec![0.0f32; n], vec![0.0f32; n]);
+                // SAFETY: xs/s/p are each exactly n f32 long — both kernels' operand contract.
+                unsafe {
+                    wukong_vmath_f32(xs.as_ptr(), s.as_mut_ptr(), n as i64, op);
+                    wukong_vmath_f32_parallel(xs.as_ptr(), p.as_mut_ptr(), n as i64, op);
+                }
+                for i in 0..n {
+                    assert_eq!(
+                        p[i].to_bits(),
+                        s[i].to_bits(),
+                        "serial != parallel n {n} op {op} i {i}"
+                    );
+                }
+            }
+        }
+    }
+
     /// `WUKONG_VMATH_UNROLL=6` selects a second 48-element loop body with six hand-written load offsets
     /// and six hand-written store offsets, and it shipped with **zero** coverage: no test sets the knob,
     /// and it could not, because `vmath_unroll6` caches it in a process-lifetime `OnceLock`. Verified by
