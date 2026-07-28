@@ -437,6 +437,57 @@ mod tests {
         }
     }
 
+    /// A NaN-bearing row must give the SAME bits on the multicore path as on the serial one. Both
+    /// existing serial-vs-parallel checks feed finite data, which cannot reach the new NaN branch at
+    /// all — so the branch that decides between the tree and the scalar recurrence was only ever
+    /// exercised single-threaded. The NaN position is staggered per row (`r % cols`), so across the
+    /// `> CUMMINMAX_PAR_MIN` rows rayon hands to its workers the guard fires at every block offset and
+    /// in the tail, and rows with no NaN take the tree — both sides of the branch, on every core.
+    /// Bits, not `==`: NaN is never equal to itself.
+    #[test]
+    fn serial_equals_parallel_non_finite() {
+        let rows = CUMMINMAX_PAR_MIN + 137; // > threshold so the multicore path runs
+        for &cols in &[1usize, 8, 17, 64] {
+            let mut x = fill(rows * cols);
+            for r in 0..rows {
+                // Every 3rd row stays finite (the tree path); the rest carry a NaN or an infinity.
+                let v = match r % 3 {
+                    0 => continue,
+                    1 => f32::NAN,
+                    _ => {
+                        if r % 6 == 2 {
+                            f32::INFINITY
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    }
+                };
+                x[r * cols + (r % cols)] = v;
+            }
+
+            let mut s_max = vec![0.0f32; rows * cols];
+            let mut p_max = vec![0.0f32; rows * cols];
+            let mut s_min = vec![0.0f32; rows * cols];
+            let mut p_min = vec![0.0f32; rows * cols];
+            unsafe {
+                wukong_cummax_f32(x.as_ptr(), s_max.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummax_f32_parallel(x.as_ptr(), p_max.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummin_f32(x.as_ptr(), s_min.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummin_f32_parallel(x.as_ptr(), p_min.as_mut_ptr(), rows as i64, cols as i64);
+            }
+            assert_eq!(
+                bits(&s_max),
+                bits(&p_max),
+                "cummax serial != parallel on non-finite {rows}x{cols}"
+            );
+            assert_eq!(
+                bits(&s_min),
+                bits(&p_min),
+                "cummin serial != parallel on non-finite {rows}x{cols}"
+            );
+        }
+    }
+
     /// Raw bit patterns — a row that opens with a NaN leaves the twin's `acc` at its identity, so the
     /// expected output can contain `±∞`, and a float `assert_eq!` cannot compare NaN at all. Comparing
     /// bits makes "bit-identical to the scalar twin" mean exactly that on every input.

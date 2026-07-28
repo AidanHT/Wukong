@@ -325,6 +325,44 @@ mod tests {
         }
     }
 
+    /// The same bit-for-bit serial/parallel contract on **non-finite** data. The check above feeds
+    /// finite input, and `assert_eq!` on `f32` silently cannot compare NaN at all — so a NaN-only
+    /// divergence between the two drivers would pass it. Bits make the claim mean what it says: both
+    /// drivers run the *identical* per-row instruction sequence, so even the NaN payload propagated by
+    /// `addps` has to land in the same place. The poison position is staggered per row (`r % cols`) so
+    /// rayon's workers see it at every block offset and in the tail.
+    #[test]
+    fn serial_equals_parallel_non_finite() {
+        let rows = CUMSUM_PAR_MIN + 137; // > threshold so the multicore path runs
+        for &cols in &[1usize, 8, 17, 64] {
+            let mut x = fill(rows * cols);
+            for r in 0..rows {
+                // Every 3rd row stays finite; the rest carry a NaN or an infinity.
+                let v = match r % 3 {
+                    0 => continue,
+                    1 => f32::NAN,
+                    _ => {
+                        if r % 6 == 2 {
+                            f32::INFINITY
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    }
+                };
+                x[r * cols + (r % cols)] = v;
+            }
+            let mut s = vec![0.0f32; rows * cols];
+            let mut p = vec![0.0f32; rows * cols];
+            unsafe {
+                wukong_cumsum_f32(x.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cumsum_f32_parallel(x.as_ptr(), p.as_mut_ptr(), rows as i64, cols as i64);
+            }
+            let sb: Vec<u32> = s.iter().map(|f| f.to_bits()).collect();
+            let pb: Vec<u32> = p.iter().map(|f| f.to_bits()).collect();
+            assert_eq!(sb, pb, "serial != parallel on non-finite {rows}x{cols}");
+        }
+    }
+
     /// Focused check on the cross-128-lane in-lane scan with integer-valued f32 (exact, no rounding):
     /// all-ones → `[1,2,3,4,5,6,7,8]`, and an ascending ramp `[1..=8]` → its prefix sums. This pins the
     /// `_mm256_permutevar8x32_ps` shift + zero-fill blend (the one tricky part) on a single block.
