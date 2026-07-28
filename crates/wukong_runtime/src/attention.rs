@@ -379,7 +379,10 @@ mod tests {
         }
     }
 
-    /// Throughput probe (run: `cargo test -p wukong_runtime --release -- --ignored --nocapture`).
+    /// Throughput probe (run: `cargo test -p wukong_runtime --release attention_throughput --
+    /// --ignored --nocapture --test-threads=1`). The filter and `--test-threads=1` are load-bearing:
+    /// an unfiltered `--ignored` run starts all nine of the crate's throughput probes at once on
+    /// libtest's default thread pool, so each one measures a machine saturated by the other eight.
     /// Compares the fused kernel against Wukong's *own* strongest non-fused path: materialize
     /// `scores = Q·Kᵀ` with the tuned AVX2 GEMM, softmax the rows, then `O = P·V` with the GEMM —
     /// the two-matmul + S×S-intermediate shape. Both paths use the same AVX2 primitives and the same
