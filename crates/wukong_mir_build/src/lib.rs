@@ -15841,21 +15841,29 @@ impl FnLowerer<'_> {
                 if *neg {
                     v = -v;
                 }
-                let c = self
-                    .builder
-                    .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
+                let Some(c) = self.pattern_const(v, scrut_mir, scrut_ty, pat.span) else {
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
                 Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
             }
             // A char-literal pattern compares the scrutinee (a `char` is its integer code point) to
             // the literal's decoded code point — the same equality test as an integer-literal pattern.
             ast::PatKind::Char(sym) => {
                 let v = decode_char_literal(self.interner.resolve(*sym)) as i128;
-                let c = self
-                    .builder
-                    .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
+                let Some(c) = self.pattern_const(v, scrut_mir, scrut_ty, pat.span) else {
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
                 Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
             }
+            // A bool pattern's constant is `i1`, so the scrutinee must be one too: `match x { true =>
+            // .. }` on an `i32` scrutinee emitted `cmp i32, i1`, which the verifier rejected with raw
+            // internal text (`cmp operands differ: i32 vs i1`). That is the match-position mirror of a
+            // rule sema already enforces for `==` (bool compared with a non-bool).
             ast::PatKind::Bool(b) => {
+                if *scrut_mir != MirType::I1 {
+                    self.unsupported(pat.span, "bool pattern on a non-bool scrutinee");
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                }
                 let c = self
                     .builder
                     .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
@@ -15894,14 +15902,22 @@ impl FnLowerer<'_> {
                 inclusive,
             } => {
                 let signed = !matches!(scrut_ty, Ty::Scalar(s) if !s.is_signed());
-                let lo_v = self.pattern_int_value(lo);
-                let hi_v = self.pattern_int_value(hi);
-                let lo_c = self
-                    .builder
-                    .build(scrut_mir.clone(), Op::ConstInt(lo_v, scrut_mir.clone()));
-                let hi_c = self
-                    .builder
-                    .build(scrut_mir.clone(), Op::ConstInt(hi_v, scrut_mir.clone()));
+                // A bound that is not an int/char literal (the parser accepts any pattern as `hi`,
+                // so `3..LIMIT` for a `const LIMIT` parses) used to fold to a silent `0`, compiling
+                // `3..LIMIT` into `3 <= x && x < 0` — an arm that can never fire, with no diagnostic
+                // anywhere. Decline the arm instead, like the unresolved `Path`/tuple arms already do.
+                let (Some(lo_v), Some(hi_v)) =
+                    (self.pattern_int_value(lo), self.pattern_int_value(hi))
+                else {
+                    self.unsupported(span, "non-literal range-pattern bound");
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
+                let (Some(lo_c), Some(hi_c)) = (
+                    self.pattern_const(lo_v, scrut_mir, scrut_ty, lo.span),
+                    self.pattern_const(hi_v, scrut_mir, scrut_ty, hi.span),
+                ) else {
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
                 let ge = self.builder.build(
                     MirType::I1,
                     Op::Cmp(if signed { CmpOp::Sge } else { CmpOp::Uge }, scrut, lo_c),
@@ -15940,20 +15956,66 @@ impl FnLowerer<'_> {
     }
 
     /// The integer value of an int- or char-literal range bound (`lo`/`hi`). A char decodes to its
-    /// code point, so `'a'..='z'` ranges work. A non-literal bound yields 0.
-    fn pattern_int_value(&self, pat: &Pattern) -> i128 {
+    /// code point, so `'a'..='z'` ranges work. A non-literal bound yields `None` — the caller must
+    /// decline the arm rather than substitute a value (it used to fold to `0`, silently turning
+    /// `3..LIMIT` into an arm that never matches).
+    fn pattern_int_value(&self, pat: &Pattern) -> Option<i128> {
         match &pat.kind {
             ast::PatKind::Int { sym, neg } => {
                 let v = parse_int(self.interner.resolve(*sym));
-                if *neg {
-                    -v
-                } else {
-                    v
-                }
+                Some(if *neg { -v } else { v })
             }
-            ast::PatKind::Char(sym) => decode_char_literal(self.interner.resolve(*sym)) as i128,
-            _ => 0,
+            ast::PatKind::Char(sym) => {
+                Some(decode_char_literal(self.interner.resolve(*sym)) as i128)
+            }
+            _ => None,
         }
+    }
+
+    /// The MIR constant a literal pattern compares against, in the scrutinee's own type — or `None`
+    /// (diagnostic already pushed) when the scrutinee cannot hold it.
+    ///
+    /// Building `Op::ConstInt(v, scrut_mir)` unchecked was wrong twice over. A **non-integer**
+    /// scrutinee produced a mistyped constant and a mistyped `Cmp`, which surfaced as raw MIR-verify
+    /// text with no code and no span (`match x { 1 => .. }` on an `f32` scrutinee: "const int has
+    /// non-integer type f32" + "cmp predicate eq mismatches operand type f32"). An **out-of-range**
+    /// literal was silently truncated to the scrutinee's width and then matched a *different* value,
+    /// shadowing the arm that legitimately covers it (on an `i64` scrutinee
+    /// `match x { 18446744073709551616 => 1, 0 => 2, _ => 0 }` answered 1 for `x == 0`). Sema's
+    /// `range_check_int_pattern` already rejects the narrow scrutinees whose whole range fits `i64`
+    /// (`i8`..`u32`); this is the width-general backstop that also covers `i64`/`u64`/`usize`. MIR
+    /// integers are signless, so the accepted band is the union of the signed and unsigned ranges of
+    /// that width — an `i32` pattern may be `-1` and a `u32` one may be `3000000000`.
+    fn pattern_const(
+        &mut self,
+        v: i128,
+        scrut_mir: &MirType,
+        scrut_ty: &Ty,
+        span: Span,
+    ) -> Option<ValueId> {
+        if !scrut_mir.is_int() {
+            self.unsupported(span, "literal pattern on a non-integer scrutinee");
+            return None;
+        }
+        let bits = mir_byte_size(scrut_mir) * 8;
+        let lo = -(1i128 << (bits - 1));
+        let hi = (1i128 << bits) - 1;
+        if v < lo || v > hi {
+            let name = match scrut_ty {
+                Ty::Scalar(s) => s.name().to_string(),
+                _ => scrut_mir.display(),
+            };
+            self.diags.push(
+                Diagnostic::error(format!("literal `{v}` is out of range for `{name}`"))
+                    .with_code("E0401")
+                    .primary(span, "this pattern can never match the scrutinee"),
+            );
+            return None;
+        }
+        Some(
+            self.builder
+                .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone())),
+        )
     }
 
     /// The integer discriminant of variant `vname` of enum `enum_sym`, or `None` if unresolved.
