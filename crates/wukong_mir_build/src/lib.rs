@@ -878,13 +878,20 @@ pub fn lower_program(
                     continue;
                 }
                 // Whole-function matmul: lower the entire nest to a single (optionally parallel)
-                // `wukong_sgemm` call — the tuned 256-bit AVX2/FMA microkernel.
+                // `wukong_sgemm` call — the tuned 256-bit AVX2/FMA microkernel. `emit_sgemm` declines
+                // shapes it has no kernel for (a fused bias or an α on a non-NT store, `Aᵀ·Bᵀ`), so the
+                // wrapper reports that and we fall through to the ordinary `lower_fn` path, exactly as
+                // the sibling interceptions below do. Discarding the decline built a function body of
+                // dead constants and a bare `ret`: `fn lin(a,b,bias,c) { … c[i*2+j] = bias[j] + s; }`
+                // printed `0 0 0 0` on both backends at every opt level where `11 22 15 26` is correct.
                 if let Some(nest) = matmul_fn(body, sema, interner) {
                     let parallel = has_parallel_attr(item, interner);
-                    let func =
-                        lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
-                    program.funcs.push(func);
-                    continue;
+                    if let Some(func) =
+                        lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
+                    {
+                        program.funcs.push(func);
+                        continue;
+                    }
                 }
                 // Whole-function int8 quantized matmul (`u8×i8→i32` `C = A·Bᵀ`) → the int8 GEMM
                 // microkernel. Checked *before* the `@parallel` outliner below so a `@parallel` int8
@@ -893,10 +900,12 @@ pub fn lower_program(
                 // Integer math, so the kernel equals the scalar nest bit-for-bit (no reassoc).
                 if let Some(nest) = i8matmul_fn(body, sema, interner) {
                     let parallel = has_parallel_attr(item, interner);
-                    let func =
-                        lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
-                    program.funcs.push(func);
-                    continue;
+                    if let Some(func) =
+                        lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
+                    {
+                        program.funcs.push(func);
+                        continue;
+                    }
                 }
                 // A `@parallel` whole-function bf16/f16 matmul: intercept before the elementwise
                 // outliner below (which would outline the outer row loop into per-row scalar loops and
@@ -21678,7 +21687,9 @@ fn matmul_fn<'a>(
 }
 
 /// Lower a recognized matmul function to a thin wrapper that binds its array params to base
-/// pointers and tail-calls `wukong_sgemm`/`wukong_sgemm_parallel`.
+/// pointers and tail-calls `wukong_sgemm`/`wukong_sgemm_parallel`. `None` when `emit_sgemm` declines
+/// the shape (it has no kernel for a fused bias or an α on a non-NT store, nor for `Aᵀ·Bᵀ`) — the
+/// caller must then lower the function normally, because the half-built wrapper computes nothing.
 #[allow(clippy::too_many_arguments)]
 fn lower_matmul_fn(
     f: &FnDecl,
@@ -21688,7 +21699,7 @@ fn lower_matmul_fn(
     interner: &Interner,
     gemm: GemmSyms,
     diags: &mut Vec<Diagnostic>,
-) -> Function {
+) -> Option<Function> {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
         Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
@@ -21735,7 +21746,9 @@ fn lower_matmul_fn(
             fl.bind(p.name.sym, slot, mty);
         }
     }
-    fl.emit_sgemm(nest, parallel);
+    if !fl.emit_sgemm(nest, parallel) {
+        return None;
+    }
     if !fl.terminated {
         match ret_mir {
             MirType::Void => fl.builder.ret(None),
@@ -21745,7 +21758,7 @@ fn lower_matmul_fn(
             }
         }
     }
-    fl.builder.finish()
+    Some(fl.builder.finish())
 }
 
 /// Recognize a function whose entire body is an int8 matmul nest (`{ for i in 0..M { … } }`) — the
@@ -24543,7 +24556,8 @@ fn matmul_residual_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> b
 
 /// Lower a recognized int8 matmul function to a thin wrapper that binds its array params to base
 /// pointers and tail-calls `wukong_i8gemm_nt`/`wukong_i8gemm_nt_parallel` — the int8 twin of
-/// `lower_matmul_fn`.
+/// `lower_matmul_fn`, including its `None`-on-decline contract (`emit_i8gemm` bails when an operand
+/// or dim is out of scope, and the half-built wrapper would compute nothing).
 #[allow(clippy::too_many_arguments)]
 fn lower_i8matmul_fn(
     f: &FnDecl,
@@ -24553,7 +24567,7 @@ fn lower_i8matmul_fn(
     interner: &Interner,
     gemm: GemmSyms,
     diags: &mut Vec<Diagnostic>,
-) -> Function {
+) -> Option<Function> {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
         Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
@@ -24593,7 +24607,9 @@ fn lower_i8matmul_fn(
             fl.bind(p.name.sym, slot, mty);
         }
     }
-    fl.emit_i8gemm(nest, parallel);
+    if !fl.emit_i8gemm(nest, parallel) {
+        return None;
+    }
     if !fl.terminated {
         match ret_mir {
             MirType::Void => fl.builder.ret(None),
@@ -24603,7 +24619,7 @@ fn lower_i8matmul_fn(
             }
         }
     }
-    fl.builder.finish()
+    Some(fl.builder.finish())
 }
 
 /// A captured recipe for the 256-bit AVX2 vectorizer (`build_vec_recipe`): the flat op body plus the
