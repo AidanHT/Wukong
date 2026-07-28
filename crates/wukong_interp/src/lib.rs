@@ -671,8 +671,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             // ops round at f32, matching the native backend). Scalar bins go the fast path.
             Op::Bin(b, l, r) => {
                 if let Some(MirType::Vec(lane, n)) = rty {
-                    let av = self.vec_lanes(reg(regs, *l));
-                    let bv = self.vec_lanes(reg(regs, *r));
+                    let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
+                    let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| mask_lane(apply_bin(*b, av[i], bv[i], Some(&lane)), &lane))
@@ -685,8 +685,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Cmp(c, l, r) => {
                 if let Some(MirType::Vec(_, n)) = rty {
                     // Lane-wise compare → a mask vector of 1/0 lanes.
-                    let av = self.vec_lanes(reg(regs, *l));
-                    let bv = self.vec_lanes(reg(regs, *r));
+                    let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
+                    let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| Value::Int(apply_cmp(*c, av[i], bv[i]) as i128))
                         .collect();
@@ -700,7 +700,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     // Lane-wise negate (the autovectorized `-x[k]`). Without this arm a `VecRef`
                     // operand falls into the scalar path below, where `as_int()` yields 0, so every
                     // lane is silently zeroed — a miscompile the native backend does not share.
-                    let xs = self.vec_lanes(reg(regs, *v));
+                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let is_float = lane.is_float();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| {
@@ -725,7 +725,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     // Lane-wise bitwise complement, truncated to the lane width. Latent today (the
                     // vectorizer does not yet emit a vector `Not`), but mirror `Neg` so it can
                     // never silently zero lanes or carry `i128` bits the backend does not have.
-                    let xs = self.vec_lanes(reg(regs, *v));
+                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| mask_lane(Value::Int(!xs[i].as_int()), lane))
                         .collect();
@@ -740,7 +740,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Cast(kind, v, to) => {
                 if let Some(MirType::Vec(to_lane, n)) = rty {
                     // Lane-wise cast (e.g. the vectorized exp's f32->i32 and i32->f32 bitcast).
-                    let xs = self.vec_lanes(reg(regs, *v));
+                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let from_lane = match func.value_type(*v) {
                         MirType::Vec(l, _) => (**l).clone(),
                         other => other.clone(),
@@ -757,9 +757,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Select(c, a, b) => {
                 if let Some(MirType::Vec(_, n)) = rty {
                     // Lane-wise blend by a mask vector.
-                    let m = self.vec_lanes(reg(regs, *c));
-                    let av = self.vec_lanes(reg(regs, *a));
-                    let bv = self.vec_lanes(reg(regs, *b));
+                    let m = self.vec_lanes(reg(regs, *c), *n as usize)?;
+                    let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
+                    let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| if m[i].truthy() { av[i] } else { bv[i] })
                         .collect();
@@ -981,9 +981,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // to the native `fma`. Lane-wise for vectors, each lane rounded to its lane type.
             Op::Fma(a, b, c) => {
                 if let Some(MirType::Vec(lane, n)) = rty {
-                    let av = self.vec_lanes(reg(regs, *a));
-                    let bv = self.vec_lanes(reg(regs, *b));
-                    let cv = self.vec_lanes(reg(regs, *c));
+                    let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
+                    let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
+                    let cv = self.vec_lanes(reg(regs, *c), *n as usize)?;
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| apply_fma(av[i], bv[i], cv[i], Some(&lane)))
@@ -997,7 +997,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // sqrt stays bit-identical to the native `fsqrt`.
             Op::Sqrt(v) => {
                 if let Some(MirType::Vec(lane, n)) = rty {
-                    let xv = self.vec_lanes(reg(regs, *v));
+                    let xv = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| apply_sqrt(xv[i], Some(&lane)))
@@ -1009,7 +1009,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             Op::Round(mode, v) => {
                 if let Some(MirType::Vec(lane, n)) = rty {
-                    let xv = self.vec_lanes(reg(regs, *v));
+                    let xv = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| apply_round(*mode, xv[i], Some(&lane)))
@@ -1029,12 +1029,21 @@ impl<'a, 'k> Interp<'a, 'k> {
         Value::VecRef(i)
     }
 
-    /// The lanes behind a `VecRef` (cloned out so callers can borrow `self` mutably afterwards).
-    fn vec_lanes(&self, v: Value) -> Vec<Value> {
+    /// The `n` lanes behind a `VecRef` (cloned out so callers can borrow `self` mutably afterwards).
+    ///
+    /// An operand that is not an `n`-lane vector is a lowering bug, and every caller indexes
+    /// `0..n` — this used to hand back `vec![other]` for a scalar, so the next index panicked with
+    /// a raw `index out of bounds` instead of producing a diagnostic. The MIR verifier shields the
+    /// `Bin`/`Neg`/`Not`/`Select` arms (it forces operand type == vector result type) but **not**
+    /// `Op::Cast`, whose arm only checks the result: `%r: <4 x i32> = cast sext %s` with a scalar
+    /// `%s` verifies clean and then reached that panic. Report it instead of broadcasting, which
+    /// would hide the lowering bug; the durable fix is an operand check in `wukong_mir::verify`.
+    fn vec_lanes(&self, v: Value, n: usize) -> Result<Vec<Value>, String> {
         match v {
-            Value::VecRef(i) => self.vecs[i as usize].clone(),
-            // A non-vector reaching a vector op is a lowering bug; treat as a single lane.
-            other => vec![other],
+            Value::VecRef(i) if self.vecs[i as usize].len() == n => Ok(self.vecs[i as usize].clone()),
+            _ => Err(format!(
+                "vector op operand is not a {n}-lane vector (MIR invariant violation)"
+            )),
         }
     }
 
@@ -4477,6 +4486,50 @@ mod tests {
         assert_eq!(out[0], 20000.0);
     }
 
+
+
+    /// MIR the verifier accepts must never panic the interpreter. `wukong_mir::verify`'s
+    /// `Op::Cast` arm checks only the *result* type, so `%r: <4 x i32> = cast sext %s` with a
+    /// scalar `%s` verifies clean; the vector cast arm then indexed a one-element lane list and
+    /// raised a raw `index out of bounds: the len is 1 but the index is 1`. It must be an
+    /// `Err(String)`, which the driver renders through its normal `error: {e}` path. (The durable
+    /// fix is an operand-lane-count check in the verifier — see the handoff.)
+    #[test]
+    fn vector_op_with_a_scalar_operand_is_an_error_not_a_panic() {
+        use wukong_mir::{BasicBlock, BlockId, CastKind, Function, Inst, MirLevel, Op, Terminator, ValueId};
+        let mut interner = Interner::new();
+        let name = interner.intern("main");
+        // %0: i32 = const 7 ; %1: <4 x i32> = cast sext %0 ; ret %0
+        let f = Function {
+            name,
+            params: Vec::new(),
+            ret: MirType::I32,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                insts: vec![
+                    Inst { result: Some(ValueId(0)), op: Op::ConstInt(7, MirType::I32) },
+                    Inst {
+                        result: Some(ValueId(1)),
+                        op: Op::Cast(CastKind::SExt, ValueId(0), MirType::Vec(Box::new(MirType::I32), 4)),
+                    },
+                ],
+                term: Terminator::Ret(Some(ValueId(0))),
+            }],
+            value_types: vec![MirType::I32, MirType::Vec(Box::new(MirType::I32), 4)],
+            entry: BlockId(0),
+            vec_kernels: Vec::new(),
+        };
+        let mut program = Program::new();
+        program.funcs.push(f);
+        program.level = MirLevel::Low;
+        assert!(
+            wukong_mir::verify::verify_program(&program).is_empty(),
+            "the verifier accepts this MIR today; that is the point of the test"
+        );
+        let err = run(&program, name, &interner).unwrap_err();
+        assert!(err.contains("not a 4-lane vector"), "got: {err}");
+    }
 
     #[test]
     fn runs_loop_sum() {
