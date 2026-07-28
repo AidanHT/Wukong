@@ -14840,6 +14840,22 @@ impl FnLowerer<'_> {
             // unaffected.
             let zero = self.builder.build(ty.clone(), Op::ConstInt(0, ty.clone()));
             self.builder.build(MirType::I1, Op::Cmp(CmpOp::Ne, v, zero))
+        } else if ty == MirType::Ptr {
+            // A **pointer** condition (`if s { .. }` for a string local — `if (p)` is the canonical
+            // C form) is the same C-like truthiness: `p != null`. It used to fall through here
+            // *unchanged* into `cond_br`, which both backends reject with raw internal text and no
+            // span ("cond_br condition: v2 has type ptr but expected i1") — an ICE on a program the
+            // front end accepts. Compare the address rather than the pointer: `PtrToInt` is the one
+            // pointer cast the interpreter (`Value::Ptr(p) -> p as i128`) and Cranelift (a plain
+            // integer resize) both already implement, so the two agree by construction.
+            let addr = self
+                .builder
+                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, v, MirType::I64));
+            let zero = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+            self.builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Ne, addr, zero))
         } else {
             v
         }
@@ -17197,52 +17213,57 @@ impl FnLowerer<'_> {
             // Activation backward `act_backward(x, dy) = dy · act'(x)` — two args. The non-dispatched
             // path (a `while` loop / standalone call); the elementwise `for` form goes 256-bit via
             // `match_vmath2_stmt`. Inlined form is bit-identical to the kernel (mirrors `*_bwd8`).
+            // Both operands go through `lower_math_arg`, like every *forward* intrinsic: lowering
+            // them with a bare `lower_expr` fed an integer straight into the float ops, so
+            // `gelu_backward(1, 2)` ICEd with raw verifier text ("fmul: v0 has type i32 but expected
+            // f32"). `lower_math_arg` is the identity on an already-`rty` float operand, so every
+            // float call site lowers byte-identically and the `*_bwd8` mirror is untouched.
             MathIntrinsic::SiluBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_silu_backward(x, dy, &rty))
             }
             MathIntrinsic::GeluBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_gelu_backward(x, dy, &rty))
             }
             MathIntrinsic::SigmoidBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_sigmoid_backward(x, dy, &rty))
             }
             MathIntrinsic::TanhBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_tanh_backward(x, dy, &rty))
             }
             MathIntrinsic::EluBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_elu_backward(x, dy, &rty))
             }
             MathIntrinsic::SoftplusBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_softplus_backward(x, dy, &rty))
             }
             MathIntrinsic::Elu => {
