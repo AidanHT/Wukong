@@ -187,44 +187,45 @@ impl BinOp {
     /// bounds-check desync reads out of bounds (native segfault / interp != native). Division/shift by
     /// zero, an over-wide shift, and a non-arithmetic op fold to 0 (an invalid length rejected
     /// downstream) rather than panicking.
+    ///
+    /// The same 0 sentinel covers everything the two consumers cannot represent identically: an
+    /// operand or a result above [`MAX_CONST_ARRAY_LEN`], and arithmetic that wraps in u64. Without
+    /// this, `[i32; 2 - 5]` folded to 2^64-3 (sema believes every index is in bounds; mir_build
+    /// allocas the low 32 bits) and `[i32; 4294967296 + 4]` folded above the u32 slot width, so a
+    /// well-formed program wrote out of bounds on native and trapped in the interpreter.
     pub fn fold_const_len(self, l: u64, r: u64) -> u64 {
         use BinOp::*;
-        match self {
-            Add => l.wrapping_add(r),
-            Sub => l.wrapping_sub(r),
-            Mul => l.wrapping_mul(r),
-            Div => {
-                if r != 0 {
-                    l / r
-                } else {
-                    0
-                }
-            }
-            Rem => {
-                if r != 0 {
-                    l % r
-                } else {
-                    0
-                }
-            }
+        if l > MAX_CONST_ARRAY_LEN || r > MAX_CONST_ARRAY_LEN {
+            return 0;
+        }
+        let folded = match self {
+            Add => l.checked_add(r),
+            Sub => l.checked_sub(r),
+            Mul => l.checked_mul(r),
+            Div => l.checked_div(r),
+            Rem => l.checked_rem(r),
             Shl => {
                 if r < 64 {
-                    l.wrapping_shl(r as u32)
+                    Some(l.wrapping_shl(r as u32))
                 } else {
-                    0
+                    None
                 }
             }
             Shr => {
                 if r < 64 {
-                    l.wrapping_shr(r as u32)
+                    Some(l.wrapping_shr(r as u32))
                 } else {
-                    0
+                    None
                 }
             }
-            BitAnd => l & r,
-            BitOr => l | r,
-            BitXor => l ^ r,
-            Eq | Ne | Lt | Le | Gt | Ge | And | Or => 0,
+            BitAnd => Some(l & r),
+            BitOr => Some(l | r),
+            BitXor => Some(l ^ r),
+            Eq | Ne | Lt | Le | Gt | Ge | And | Or => None,
+        };
+        match folded {
+            Some(n) if n <= MAX_CONST_ARRAY_LEN => n,
+            _ => 0,
         }
     }
 }
