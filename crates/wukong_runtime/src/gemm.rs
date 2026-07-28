@@ -2821,9 +2821,18 @@ unsafe fn micro_6x16(
     // increment/compare otherwise contends with the FMAs for ports 0/1), and the scheduler gets a
     // wider window to overlap loads with the in-flight FMA chains. One prefetch per 4 steps keeps
     // the next B panel rows warm in L1 without flooding the load ports.
+    //
+    // `wrapping_add`, not `add`: the 8-K-step lookahead deliberately runs off the end of the
+    // packed-B buffer near the end of the last micropanel (instrumented against the packed-B
+    // length: exactly 256 bytes past, on every `sgemm_matches_naive_various_sizes` shape).
+    // `<*const T>::add`'s precondition is that the result stays inside the same allocated object,
+    // so it lowers to `getelementptr inbounds` on an address that is not — poison — even though
+    // the prefetch itself is architecturally a hint that issues no load and faults on nothing.
+    // `wrapping_add` carries no such precondition and lowers to the same `lea`, so the emitted
+    // address and every computed bit are unchanged.
     let mut p = 0;
     while p + 4 <= kc {
-        _mm_prefetch::<_MM_HINT_T0>(bp.add(NR * 8) as *const i8);
+        _mm_prefetch::<_MM_HINT_T0>(bp.wrapping_add(NR * 8) as *const i8);
         kstep!();
         kstep!();
         kstep!();
@@ -3010,10 +3019,12 @@ unsafe fn micro_6x16_avx512(
             bp = bp.add(NR);
         }};
     }
-    // Same ×4 K-unroll + one prefetch per 4 steps as the AVX2 kernel.
+    // Same ×4 K-unroll + one prefetch per 4 steps as the AVX2 kernel — including its
+    // `wrapping_add` (the lookahead leaves the packed-B allocation on the last micropanel; see
+    // [`micro_6x16`] for why `add` would be `inbounds` poison there).
     let mut p = 0;
     while p + 4 <= kc {
-        _mm_prefetch::<_MM_HINT_T0>(bp.add(NR * 8) as *const i8);
+        _mm_prefetch::<_MM_HINT_T0>(bp.wrapping_add(NR * 8) as *const i8);
         kstep!();
         kstep!();
         kstep!();
