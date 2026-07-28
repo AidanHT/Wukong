@@ -11,6 +11,14 @@
 > backend (`--backend=gpu-native`) and a whole-program cooperative megakernel. For the **current**
 > state see `docs/roadmap.md` ("GPU backend"), `docs/internals.md`, and the GPU section of
 > `BENCHMARKS.md`. The original scoping note follows unchanged, for historical context.
+>
+> **Also superseded — the CPU numbers below.** The "Why GPU is the next frontier" section quotes a
+> mid-2026 CPU snapshot ("compile time 84–525×", "455 GFLOP/s @1024³", "matmul 3–3.8× single / 9–16×
+> parallel", "23× nn.Linear single", "5–7.5× transcendentals") as present-tense fact. Those figures
+> are **stale**; for current standing see `BENCHMARKS.md` / `docs/metrics.md`: compile is 7.4–11.7×
+> compiler-to-compiler (≈306× in-process JIT vs a spawned toolchain); GEMM is reported as %-of-oneMKL
+> and %-roofline (98–104% of MKL-all at 512–1024³, ~90% of the single-core roofline), never as an
+> absolute GFLOP/s headline.
 
 ## Why GPU is the next frontier
 

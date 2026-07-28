@@ -18,34 +18,35 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
 
 - **compiles fast** — the metric that dominates real ML edit-run iteration. Apples-to-apples
   *compiler-to-object* (`wukongc --emit=obj -O2` vs `gcc/g++/rustc -O2 -c`, same artifact, same
-  machine): **~7–12× faster** (`wukong_bench compile-vs`; ~7–9× measured this run). The larger **~100–680× (geomean ~305×)**
+  machine): **~7–12× faster** (`wukong_bench compile-vs`; ~7–9× measured this run). The larger **~100–680× (geomean ~306×)**
   figure is *time-to-running-code*: Wukong JIT-compiles in-process while C/Rust must spawn a full
-  toolchain **and link a shared object** — a real advantage for the JIT/embedding workflow, but not a
-  compiler-vs-compiler number, so it is disclosed as such, never as the headline;
+  toolchain **and link a shared object** (`-O3 -march=native`) — a real advantage for the JIT/embedding
+  workflow, but not a compiler-vs-compiler number, so it is disclosed as such, never as the headline;
 - **wins matmul/GEMM**, the flagship ML kernel: the compiler recognizes a matmul nest (incl. the
   `nn.Linear` `A·Bᵀ` form) and dispatches it to a tuned register-blocked, cache-tiled, packed
   **AVX2/FMA** microkernel — **~3–3.6× faster single-thread** at **~110–120 GFLOP/s ≈ 90% of one
   P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
-  **oneMKL parity**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
+  **~80–104% of oneMKL single-core**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
   (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*. Against
   the honest SOTA bar — **multi-threaded oneMKL** — Wukong's `@parallel` GEMM runs a
   **size-keyed BLIS/MKL-style 2D block-parallel decomposition** (per-thread L2-resident C blocks;
-  per-worker packing at mid/large — measured the right locality trade in both ABBA orderings —
-  and a cooperative shared-pack small band just above the parallel gate) and stands at
-  **70–83% at 512–1024³** (from 66–69%), **88–93% at 2048³ against a healthy peer** (and
-  176–186% against MKL's own degraded rounds), and **102–123% at 256³** (engaged at 1.7–2× over
-  serial; was deliberately-serial at ~39–52%). Single-core, the 2026-07-10 C-tile microkernel
-  prefetch closed the large-matrix tail: **96–99% of MKL-1c at 2048³** (was 83–88%).
-  (Disclosure: threaded MKL itself swings ~1.4–2× with this laptop's power state, so ratios are
-  same-run only and reported as ranges; the residual mid-size gap is parallel-grain scaling,
-  honestly open);
+  per-worker packing — measured the right locality trade in both ABBA orderings — with dynamic
+  block-claiming the 2026-07-11 default) and stands, same-run MKL-anchored, at **~98–99% at 512³,
+  ~104% at 1024³, 91% at 2048³, 93% at 4096³, and ~94–110% at 256³** (the dynamic-claiming default
+  closed the old mid-size gap; against MKL's own power-degraded rounds the ratios read far higher,
+  which is why only same-run figures are quoted). On the skinny transformer shapes it holds
+  **75–112% of MKL-all**, four of six at or above parity — the sole laggard the 151-MFLOP
+  128×768·768ᵀ, overhead-bound where MKL itself scales only ~2.1×. Single-core it is **~80–104% of
+  MKL-1c across sizes, at or above parity at 2048³/4096³**. (Disclosure: threaded MKL itself swings
+  ~1.4–2× with this laptop's power state, so ratios are same-run only and reported as ranges; the
+  residual mid-size gap is parallel-grain scaling, honestly open);
 - **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
   over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
   column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
   **RoPE** rotary embedding **~29–54×** (up to **~156× parallel**), **strided column reductions**
   (bias-grad / per-channel quant stats) **~29–50×**, and the training-backward kernels
   (activation/softmax/LayerNorm-RMSNorm backward, cross-entropy) **~3–13×**;
-- **wins the transcendental/activation family ~4.7–12× vs C** (**~28× under `@parallel`**) — the
+- **wins the transcendental/activation family ~4.7–11.5× vs C** (**~28× under `@parallel`**) — the
   cleanest compute-bound win — and stands near Intel oneMKL VML, the hand-tuned
   vector-math SOTA: same-run across thermal states, **tanh 2.7–2.9× FASTER than VML**, with
   **exp 1.23–1.45× and log ~1.25× slower** after 8-bucket in-register-LUT rewrites of both cores
@@ -63,15 +64,17 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   **~1.9–6.6×** and **convolution** (im2col + GEMM) **~6–7×**;
 - **runs a full 12-layer GPT-2-class transformer end-to-end** (d=768, 12 heads, causal attention,
   GELU MLP — ordinary Wukong source through the real pipeline, gated bit-exact against the
-  interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~19–21× idiomatic C,
-  3.6–4.9× `-ffast-math` C, and at parity-to-faster vs PyTorch CPU eager single-thread**
-  (1.03–1.09× behind @S=128, **1.12–1.22× faster @S=512**); multicore, since the `@parallel`
-  head-loop region shipped (2026-07-10 — independent-iteration loops with body-local scratch
-  outline to a parallel region, bit-exact by construction), Wukong **beats all-threads eager
-  torch at S=512 (1.10–1.24× faster, two valid rounds)** and holds parity at S=128
-  (1.19×-faster-to-1.02×-behind at the round-noise floor; was 1.5–1.9× behind), with model
-  `@parallel` scaling at **3.1–3.6×** (was ~1.5–2.1×) and the multicore stack **~61–69× idiomatic
-  single-thread C** end-to-end;
+  interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~19–21× idiomatic C** and
+  **3.6–4.9× `-ffast-math` C single-core**. Against the honest PyTorch bar — **`torch.compile`
+  (TorchInductor max-autotune, fullgraph, warmed; beating eager does *not* count)** — Wukong is
+  **faster at both batch sizes**: single-thread it beats compiled-torch-1T at S=128 and S=512, and
+  multicore (since the `@parallel` head-loop region shipped, 2026-07-10 — independent-iteration
+  loops with body-local scratch outline to a parallel region, bit-exact by construction) it runs
+  **1.39–1.81× faster than all-threads compiled torch at S=512 and 1.07–1.43× faster at S=128**
+  (three independent same-day rounds, isolated per-side probes with torch measured at its best; it
+  also beats torch's strongest *eager* config, 1.07–1.37× at S=512). Model `@parallel` scaling
+  reaches **4.7× on 16 cores** (default 4.44×, best 5.22×) — tracking this hybrid part's ~5–5.4×
+  same-run MKL ceiling, with T=1 at serial parity;
 - **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~4.6–14.7× parallel**, and runs a full
   **bf16 *and* f16 mixed-precision CPU suite** — `dot` (**~3×**) / `sum` (**~6–8×**), `max`/`min`/`absmax`
   (the symmetric-quant scale), streaming `axpby`, the `nn.Linear` GEMM (**~24–25×**), and the 36-op

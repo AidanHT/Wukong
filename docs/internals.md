@@ -239,8 +239,9 @@ express), runtime-detected with a scalar fallback. The parallel variant packs A 
 block — the packing itself **fanned across cores** (each `MR`-row / `NR`-col panel is independent),
 since with the C compute spread over ~14 cores a serial pack would be the Amdahl bottleneck — then
 runs the C tile grid across cores. It also **falls back to the serial kernel below a work threshold**
-(`m·n·k < 2²⁶`): on this P+E hybrid, cross-core wake/sync costs more than it saves for small matrices
-(256³ measured *faster* on one core). This is the same shape XLA/TVM/oneDNN lower a matmul op to, and
+(`m·n·k < 2²³`): on this P+E hybrid, cross-core wake/sync costs more than it saves only for the very
+smallest matrices (the 2026-07-11 dynamic-claiming default lowered this gate from 2²⁶, so 256³ now
+runs parallel at ~94–110% of MKL-all rather than deliberately serial). This is the same shape XLA/TVM/oneDNN lower a matmul op to, and
 it is why the win over gcc/rustc's naive nest *grows* with size (their version falls out of cache; the
 packed kernel does not).
 
