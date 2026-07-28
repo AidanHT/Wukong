@@ -1566,6 +1566,93 @@ fn parallel_region_declines_loudly() {
     );
 }
 
+/// A scalar element write into a buffer that a downstream recognized kernel then REDUCES is on the
+/// gradient path, but the reverse walk has no VJP rule for read-after-write through memory. It used
+/// to be skipped as "the loss sink", which made the whole reverse pass contribute nothing: observed
+/// with the shipped release compiler on
+///
+/// ```wukong
+/// @parallel fn loss(x:[f32;8], mut out:[f32;1]) -> f32 {
+///   let mut h: [f32; 8] = [0.0; 8];
+///   h[0] = x[0] * x[0];
+///   let mut l: f32 = 0.0; for i in 0..8 { l = l + h[i]; }
+///   out[0] = l; return l; }
+/// ```
+///
+/// `--emit=grad` exited 0 with no diagnostic and never stored to the appended gradient parameter at
+/// all — an all-zero gradient for every x, where the truth is `[2*x[0], 0, ...]`. It must refuse.
+#[test]
+fn store_into_live_gradient_buffer_declines_loudly() {
+    let n = 8;
+    let mut it = Interner::default();
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "storefwd"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let h = b.alloca(arr(n));
+    // h[0] = x[0] * x[0]   (a scalar write into the buffer the reduction below reads)
+    let x0 = b.build(MirType::F32, Op::Load(x, MirType::F32));
+    let sq = b.build(MirType::F32, Op::Bin(BinOp::FMul, x0, x0));
+    b.build_void(Op::Store { ptr: h, value: sq });
+    // loss = Σ h
+    let (nv, sumop) = (ci(&mut b, n as i64), ci(&mut b, RED_SUM));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![h, h, nv, sumop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    let fwd = b.finish();
+
+    let err = grad(&fwd, &[0], &mut it)
+        .expect_err("a store feeding a reduced buffer must not silently zero the gradient");
+    assert!(
+        err.contains("store into buffer") && err.contains("no VJP rule"),
+        "the decline must be the loud store error, got: {err}"
+    );
+}
+
+/// The autovectorizer's `Op::VecKernelCall` is void and writes through buffer pointers, exactly like
+/// an unrecognized `Op::Call` — but the loud guard only matched `Op::Call`, so it fell through to
+/// the `result.is_none() -> Ok(())` skip and contributed no adjoint at all. (Not reachable from
+/// `.wk` source at HEAD: `emit_veckernel_for` always leaves a scalar tail loop, so such a function
+/// has >1 block and `grad` rejects it earlier. This pins the crate's own contract so a future
+/// CFG-simplification that folds an empty tail cannot turn it into a silent zero gradient.)
+#[test]
+fn veckernel_declines_loudly() {
+    let mut it = Interner::default();
+    let mut b = Builder::new(sym(&mut it, "veckernel_fwd"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let ptrs = b.alloca(MirType::Array(Box::new(PTR), 2));
+    let i0 = ci(&mut b, 0);
+    let s0 = b.build(PTR, Op::Gep { ptr: ptrs, index: i0, elem: PTR });
+    b.build_void(Op::Store { ptr: s0, value: x });
+    let i1 = ci(&mut b, 1);
+    let s1 = b.build(PTR, Op::Gep { ptr: ptrs, index: i1, elem: PTR });
+    b.build_void(Op::Store { ptr: s1, value: out });
+    let scalars = b.alloca(MirType::Array(Box::new(MirType::F32), 1));
+    let n = ci(&mut b, 8);
+    b.build_void(Op::VecKernelCall {
+        kernel: 0,
+        ptrs,
+        scalars,
+        n,
+    });
+    let loss = b.build(F64, Op::Load(out, F64));
+    b.ret(Some(loss));
+    let fwd = b.finish();
+
+    let err = grad(&fwd, &[0], &mut it).expect_err("a veckernel must not tape");
+    assert!(
+        err.contains("no VJP rule") && err.contains("vector kernel"),
+        "the decline must name the vector kernel, got: {err}"
+    );
+}
+
 /// Build `t = velem(x, y, n, op); loss = Σ t` — the tape mir_build's `match_velem_binary` emits for
 /// `t[i] = x[i] * y[i]` (op = `VE_HADAMARD|VE_USE_Y`) or `x[i] / y[i]` (op = `VE_DIV|VE_USE_Y`).
 /// Params: X, Y, out; intermediate: t (alloca).
