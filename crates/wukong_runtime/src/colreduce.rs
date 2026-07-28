@@ -328,6 +328,12 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
         return;
     }
     use rayon::prelude::*;
+    // This entry can be the process's FIRST rayon touch, so it must configure the global pool before
+    // forking (crate::ensure_global_pool's stated contract): otherwise rayon lazily builds its default
+    // 2 MiB-stack registry here and the runtime's 16 MiB build_global silently loses the race for the
+    // whole process, leaving later outlined @parallel region bodies (~1.5 MiB of privatized scratch at
+    // S=512) on 2 MiB stacks. Configuration only -- the stripe split is unchanged, so the bits are too.
+    crate::ensure_global_pool();
     // One stripe per core, each a multiple of 8 columns (keep the AVX2 main loop aligned to the
     // stripe boundary); the last stripe absorbs the remainder.
     let nthreads = rayon::current_num_threads().max(1);
