@@ -4683,12 +4683,24 @@ impl FnLowerer<'_> {
         if out == weight || out == ids {
             return None;
         }
+        // `weight`'s declared extent, when it has one — the read bound the parallel selection's
+        // non-overlap test needs (`match_scatter` recovers the same quantity for `grad_w`). Recovered
+        // from sema, which keeps the declared `[f32; V*H]` even for an array PARAMETER (MIR lowers it
+        // to a bare pointer).
+        let w_total = match &value.kind {
+            ExprKind::Index { base: w_base, .. } => match self.expr_ty(w_base) {
+                Ty::Array { len, .. } => Some(len),
+                _ => None,
+            },
+            _ => None,
+        };
         Some(EmbeddingNest {
             out,
             weight,
             ids,
             t_rows,
             h,
+            w_total,
         })
     }
 
@@ -4788,16 +4800,100 @@ impl FnLowerer<'_> {
         let v = self
             .builder
             .build(MirType::I64, Op::ConstInt(1i128 << 48, MirType::I64));
-        let func = if parallel {
-            self.gemm.embedding_par
-        } else {
-            self.gemm.embedding
-        };
-        self.builder.build_void(Op::Call {
-            func,
-            args: vec![out, weight, ids, t_rows, h, v],
-        });
+        let args = vec![out, weight, ids, t_rows, h, v];
+        // The parallel gather writes `out` rows from several cores while every core reads `weight`, so
+        // it is only equivalent to this nest when the two buffers do not overlap — see
+        // `emit_nonoverlapping_call`, which picks the serial kernel when they may.
+        match (parallel, nest.w_total) {
+            (true, Some(w_total)) => {
+                let out_elems = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, t_rows, h));
+                let w_elems = self
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(w_total as i128, MirType::I64));
+                self.emit_nonoverlapping_call(
+                    self.gemm.embedding,
+                    self.gemm.embedding_par,
+                    args,
+                    (out, out_elems),
+                    (weight, w_elems),
+                );
+            }
+            // A weight with no compile-time extent: nothing to bound the read range with, so the
+            // overlap question cannot be settled and the serial kernel stands.
+            _ => {
+                self.builder.build_void(Op::Call {
+                    func: self.gemm.embedding,
+                    args,
+                });
+            }
+        }
         true
+    }
+
+    /// Emit `par(args)` when the two f32 buffers `a[0..a_elems)` and `b[0..b_elems)` do not overlap at
+    /// run time, and `ser(args)` when they may — the guard the `_parallel` gather/scatter kernels'
+    /// documented `non-overlapping` precondition needs (`wukong_embedding_f32_parallel`,
+    /// `wukong_scatter_add_f32_parallel`; the serial kernels touch the same rows in the same order as
+    /// the nest, so they hold for any aliasing).
+    ///
+    /// The recognizer's symbol comparison (`out == weight`) cannot decide this: two distinct array
+    /// PARAMETERS can be bound to the same array at the call site. `@parallel fn embed(ids, weight, mut
+    /// out)` called as `embed(ids, buf, buf)` printed 2432 / 2456 / 2400 / 1120 / 1280 over five
+    /// consecutive native runs where the serial kernel and the scalar nest both print 2400.
+    ///
+    /// The test is on the byte ranges through `PtrToInt` — the one pointer cast the interpreter
+    /// (`Value::Ptr(p) -> p as i128`) and Cranelift (an integer resize) both implement. Under the
+    /// interpreter's *slot* memory the `*4` byte scaling makes both ranges wider than the real ones, so
+    /// it can only over-report overlap and pick the serial kernel; the interpreter runs one arm for both
+    /// symbols, so the choice is unobservable there. Aliasing is caught on either backend regardless:
+    /// equal bases can never satisfy `a_end <= b || b_end <= a` for non-empty ranges.
+    fn emit_nonoverlapping_call(
+        &mut self,
+        ser: Symbol,
+        par: Symbol,
+        args: Vec<ValueId>,
+        (a, a_elems): (ValueId, ValueId),
+        (b, b_elems): (ValueId, ValueId),
+    ) {
+        let esize = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(4, MirType::I64));
+        let range = |me: &mut Self, p: ValueId, elems: ValueId| {
+            let lo = me
+                .builder
+                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, p, MirType::I64));
+            let bytes = me
+                .builder
+                .build(MirType::I64, Op::Bin(BinOp::Mul, elems, esize));
+            let hi = me.builder.build(MirType::I64, Op::Bin(BinOp::Add, lo, bytes));
+            (lo, hi)
+        };
+        let (a_lo, a_hi) = range(self, a, a_elems);
+        let (b_lo, b_hi) = range(self, b, b_elems);
+        let a_below = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Ule, a_hi, b_lo));
+        let b_below = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Ule, b_hi, a_lo));
+        let disjoint = self
+            .builder
+            .build(MirType::I1, Op::Bin(BinOp::Or, a_below, b_below));
+        let par_blk = self.builder.new_block();
+        let ser_blk = self.builder.new_block();
+        let join = self.builder.new_block();
+        self.builder
+            .cond_br(disjoint, par_blk, vec![], ser_blk, vec![]);
+        self.builder.switch_to(par_blk);
+        self.builder.build_void(Op::Call {
+            func: par,
+            args: args.clone(),
+        });
+        self.builder.br(join, vec![]);
+        self.builder.switch_to(ser_blk);
+        self.builder.build_void(Op::Call { func: ser, args });
+        self.builder.br(join, vec![]);
+        self.builder.switch_to(join);
     }
 
     /// Recognize the **scatter-add / embedding-gradient backward** — the dual of the embedding gather:
@@ -4903,15 +4999,30 @@ impl FnLowerer<'_> {
             .builder
             .build(MirType::I64, Op::ConstInt(nest.total as i128, MirType::I64));
         let v = self.builder.build(MirType::I64, Op::Bin(BinOp::UDiv, total, h));
-        let func = if parallel {
-            self.gemm.scatter_add_par
+        let args = vec![grad_w, grad_out, ids, t_rows, h, v];
+        if parallel {
+            // The parallel scatter accumulates into `grad_w` from several cores while every core reads
+            // `grad_out`; two distinct array parameters can be the same array at the call site, so the
+            // kernel's non-overlap precondition is a run-time question (see `emit_nonoverlapping_call`).
+            let go_elems = self
+                .builder
+                .build(MirType::I64, Op::Bin(BinOp::Mul, t_rows, h));
+            let gw_elems = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(nest.total as i128, MirType::I64));
+            self.emit_nonoverlapping_call(
+                self.gemm.scatter_add,
+                self.gemm.scatter_add_par,
+                args,
+                (grad_w, gw_elems),
+                (grad_out, go_elems),
+            );
         } else {
-            self.gemm.scatter_add
-        };
-        self.builder.build_void(Op::Call {
-            func,
-            args: vec![grad_w, grad_out, ids, t_rows, h, v],
-        });
+            self.builder.build_void(Op::Call {
+                func: self.gemm.scatter_add,
+                args,
+            });
+        }
         true
     }
 
@@ -24032,6 +24143,12 @@ struct EmbeddingNest {
     ids: Symbol,
     t_rows: Dim,
     h: Dim,
+    /// `weight`'s full declared element count `V*H`, when it is a statically-sized array — the upper
+    /// bound on the bytes the kernel may read, which is what the parallel selection's run-time
+    /// non-overlap test needs (`ScatterNest::total` is the same quantity for `grad_w`). `None` for a
+    /// slice/tensor weight, whose extent is not a compile-time constant; the emitter then cannot prove
+    /// non-overlap and keeps the serial kernel.
+    w_total: Option<u64>,
 }
 
 /// A recognized scatter-add / embedding-gradient-backward nest (see [`FnLowerer::match_scatter`]):
