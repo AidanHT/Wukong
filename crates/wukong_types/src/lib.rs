@@ -452,6 +452,46 @@ mod tests {
     }
 
     #[test]
+    fn tuple_offsets_are_alignment_correct() {
+        // `tuple_offsets` is `pub` and documented as the aggregate-layout authority, but it has no
+        // callers in the workspace and had no test; pin it against `size_of`/`align_of` so it
+        // cannot drift from the accumulation `wukong_mir_build`'s `aggregate_layout` performs.
+        let t = Ty::Tuple(vec![
+            Ty::Scalar(Scalar::I8),
+            Ty::Scalar(Scalar::I32),
+            Ty::Vector {
+                elem: Scalar::F32,
+                lanes: 4,
+            },
+        ]);
+        let offs: Vec<u64> = t.tuple_offsets().unwrap().iter().map(|(o, _)| *o).collect();
+        assert_eq!(offs, vec![0, 4, 16]);
+        assert_eq!(t.align_of(), Some(16));
+        assert_eq!(t.size_of(), Some(32));
+
+        // The non-power-of-two lane count that motivated the `align_of` correction.
+        let odd = Ty::Tuple(vec![
+            Ty::Scalar(Scalar::I32),
+            Ty::Vector {
+                elem: Scalar::F32,
+                lanes: 3,
+            },
+        ]);
+        assert_eq!(odd.tuple_offsets().unwrap()[1].0, 16);
+        assert_eq!(odd.size_of(), Some(32));
+
+        // Every field sits at a multiple of its own alignment and fits inside the aggregate.
+        for ty in [&t, &odd] {
+            let size = ty.size_of().unwrap();
+            for (off, f) in ty.tuple_offsets().unwrap() {
+                assert_eq!(off % f.align_of().unwrap(), 0, "field at {off}");
+                assert!(off + f.size_of().unwrap() <= size, "field at {off} overruns");
+            }
+        }
+        assert!(Ty::Scalar(Scalar::I32).tuple_offsets().is_none());
+    }
+
+    #[test]
     fn nested_array_size_and_pointer_layout() {
         // [[i32; 4]; 3] -> 3 * (4 * 4) = 48 bytes.
         let inner = Ty::Array {
