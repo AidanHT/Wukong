@@ -492,6 +492,23 @@ mod tests {
         assert!(out.contains("type i32"), "{out}");
     }
 
+    /// Struct functional update `P { x: 9, ..b }` is unsupported syntax. It must cost ONE accurate
+    /// diagnostic and leave the parser in sync: before, it produced five (E0201, E0200, E0202,
+    /// E0200, E0208), the last proving the parser had fallen out of the body into module scope.
+    #[test]
+    fn struct_functional_update_reports_once_and_stays_in_sync() {
+        let mut i = Interner::new();
+        let src = "struct P { x: i32, y: i32 }\nfn main() -> i32 {\n    let b: P = P { x: 1, y: 2 };\n    let c: P = P { x: 9, ..b };\n    return c.x;\n}\n";
+        let (module, diags) = parse_module(src, SourceId(0), &mut i);
+        assert_eq!(
+            diags.iter().filter(|d| d.is_error()).count(),
+            1,
+            "one construct, one diagnostic, got {diags:?}"
+        );
+        // Still in sync: both items survived, so the parser never fell back to module scope.
+        assert_eq!(module.items.len(), 2, "lost an item: {diags:?}");
+    }
+
     /// An attribute argument with a missing value must not swallow the `)` that closes the argument
     /// list. Before, the `)` became the value (the printer showed `@parallel(grain = ))`) and the
     /// sole diagnostic was "expected `)`" pointing at the `for` on the next line.

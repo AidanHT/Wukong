@@ -1013,6 +1013,28 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         self.allowing_struct_lit(|p| {
             while !p.at(T::RBrace) && !p.at(T::Eof) {
+                // Functional update (`P { x: 9, ..base }`) has an AST slot (`StructLit.rest`) and a
+                // printer, but no lowering: `mir_build`'s `StructLit` arm ignores `rest` and
+                // `lower_struct_init` writes only the listed fields into an uninitialized `alloca`,
+                // while sema's `check_struct_literal` suppresses its missing-field error when a
+                // `rest` is present. Filling `rest` in here would therefore leave the un-listed
+                // fields uninitialized with no diagnostic. Report once, consume the `..base` so the
+                // closing `}` is still found, and keep `rest: None`. Before this arm the syntax cost
+                // five errors (E0201, E0200, E0202, E0200, E0208), the last of them proving the
+                // parser had fallen out of the function body into module scope.
+                if p.at(T::DotDot) {
+                    let sp = p.span();
+                    p.error(
+                        sp,
+                        "E0201",
+                        "expected a field name; struct functional update (`..base`) is not \
+                         supported — list every field explicitly",
+                    );
+                    p.bump();
+                    let _ = p.parse_expr();
+                    p.eat(T::Comma);
+                    break;
+                }
                 let name = p.ident();
                 p.expect(T::Colon);
                 let value = p.parse_expr();
