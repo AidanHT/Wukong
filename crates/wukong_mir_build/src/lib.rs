@@ -3630,6 +3630,16 @@ impl FnLowerer<'_> {
             },
             _ => return None,
         };
+        // The kernel this feeds (`wukong_norm_f32`, via LayerNorm's leading mean pass) reads and
+        // writes the row as f32. Without this gate an `[f64; N]` window was folded into it and the
+        // native backend reinterpreted the f64 bytes — `--emit=mir -O2` showed `call wukong_norm_f32`
+        // for an f64 LayerNorm and native printed `-28 0 0 7000` where interp (which marshals
+        // slot-per-scalar, so it silently degrades to f32 and stays numerically right) printed
+        // `-1626 -108 108 1626`. The softmax matchers already gate this way (`match_exp_sub_body`,
+        // `match_sumexp_sub_body`); declining costs only the dispatch, the scalar nest is correct.
+        if self.expr_mir(addend) != MirType::F32 {
+            return None;
+        }
         self.index_off(addend, v, batch)
     }
 
@@ -3666,6 +3676,13 @@ impl FnLowerer<'_> {
             },
             _ => return None,
         };
+        // Same f32 element gate as [`Self::sum_body_array`]: RMSNorm and L2-norm feed the f32-only
+        // `wukong_norm_f32`, and an `[f64; N]` mean-square window was folded into it (native printed
+        // `22 16000` for a 16-element f64 RMSNorm where the correct answer, which interp printed, is
+        // `103 1654` — the kernel writes 16 f32 = only the first 8 f64 slots).
+        if self.expr_mir(addend) != MirType::F32 {
+            return None;
+        }
         // addend must be `x[v] * x[v]` — same array, same index, both factors.
         let ExprKind::Binary {
             op: ast::BinOp::Mul,
@@ -5758,6 +5775,14 @@ impl FnLowerer<'_> {
         }
         let (iv, n_expr, b1) = self.as_range0_for(&body.stmts[1])?;
         let term = match_add_accum(b1, s)?;
+        // Both consumers (`wukong_kldiv_f32`, `wukong_entropy_f32`) read every buffer as f32, and
+        // nothing further down this head or in `match_log_index` looks at the element type — so an
+        // all-f64 KL/entropy nest dispatched and native printed `0 0` / `-2029 0` where interp printed
+        // the correct `1064 4564` / `13862 12798`. The neighbouring loss matchers already gate their
+        // addend this way (`match_sumexp_sub_body`), which is why f64 xent/logsumexp/kd_loss decline.
+        if self.expr_mir(term) != MirType::F32 {
+            return None;
+        }
         // [2] out[r] = s   OR   out[r] = -s  (caller checks the sign and binds out)
         let StmtKind::Assign {
             target,
@@ -23979,7 +24004,15 @@ fn match_layernorm_bwd(
     }
     let (iv1, ce, b1) = stmt_range0_for(&body.stmts[1], interner)?;
     let cols = as_dim(ce, interner)?;
-    let x = index_rowmaj(match_add_accum(b1, sm)?, rvar, iv1, &cols, interner)?;
+    let xe = match_add_accum(b1, sm)?;
+    let x = index_rowmaj(xe, rvar, iv1, &cols, interner)?;
+    // The kernel is `wukong_layernorm_bwd_f32` — f32 in every buffer. Both siblings gate on the
+    // element type here (`match_softmax_bwd` at the dot product, `match_rmsnorm_bwd` at the squared
+    // term); this one did not, so an f64 LayerNorm backward dispatched anyway and native printed
+    // `1419 -727 0 0 0 0 0 0` where interp printed the correct `268 -357 -89 178 -178 1252 -357 -715`.
+    if scalar_of(xe, sema) != Some(wukong_types::Scalar::F32) {
+        return None;
+    }
     // [2] let mean = sm / C
     let (mean, mean0) = stmt_let_init(&body.stmts[2])?;
     let ExprKind::Binary {
@@ -24326,6 +24359,15 @@ fn match_rope(
     let (a, a0) = stmt_let_init(&inner.stmts[3])?;
     let (x, stride, off_a) = index_strided(a0, rvar, jvar, interner)?;
     if !off_a.is_empty() {
+        return None;
+    }
+    // `wukong_rope_f32` reads and writes x/out as f32; this matcher had no element-type check at all
+    // (unlike `match_transpose`, `match_pool2d`, `match_embedding`), so an f64 rotary nest dispatched
+    // and native printed `1000 2000 -18124 57 0 0 0 0` for tests/run/rope.wk-made-f64 against interp's
+    // correct `1000 2000 3000 4000 -1984 -162 2462 4469`. Checking the `x[r*D+j]` read covers the whole
+    // nest: [4] is verified to read the same array and sema rejects a mixed-width store (E0401). One
+    // guard, both directions — the backward goes through this same matcher.
+    if scalar_of(a0, sema) != Some(wukong_types::Scalar::F32) {
         return None;
     }
     let (bb, b0) = stmt_let_init(&inner.stmts[4])?;
