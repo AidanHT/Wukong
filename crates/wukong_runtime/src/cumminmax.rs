@@ -14,13 +14,18 @@
 //! work is SIMD-width instead of one-compare-at-a-time.
 //!
 //! **Bit-exactness contract — exact, not tolerance.** Unlike the prefix sum, `max`/`min` are
-//! **idempotent and associative** on the values here (no rounding — the result is always one of the
+//! **idempotent and associative** on non-NaN values (no rounding — the result is always one of the
 //! inputs), so the in-lane balanced-tree fold gives *exactly* the same value as a strict left-to-right
 //! scan. This kernel is therefore **bit-identical to its scalar twin** (`assert_eq!`, not a tolerance):
 //! there is no reassociated-reduction exception. The fold uses `(a > b) ? a : b` for max and `(a < b) ?
 //! a : b` for min — the exact lane semantics of `_mm256_max_ps`/`_mm256_min_ps` (which on a tie / NaN /
 //! ±0 return the second operand) — so the AVX2 lanes, the scalar twin, and the cross-lane shift all
-//! agree on every bit. Standard finite data has no ambiguity. And **serial == parallel bit-for-bit** —
+//! agree on every bit, ±0 and ties included (the tree's second operand is always the earlier index,
+//! exactly as `acc` is in the recurrence, so "leftmost among equals" is the same rule on both paths).
+//! NaN is the *one* value class that breaks the associativity — that fold discards a NaN in the first
+//! operand but is absorbed by one in the second — and it is handled by an explicit guard rather than
+//! assumed away: [`cummm_row_avx2`] folds any 8-block containing a NaN with the scalar recurrence, so
+//! the contract holds on every input. And **serial == parallel bit-for-bit** —
 //! rows are independent, the parallel path just maps the identical per-row routine across cores, so there
 //! is no cross-row combine and the result does not depend on thread count.
 
@@ -115,7 +120,9 @@ unsafe fn inclusive_scan8(v: std::arch::x86_64::__m256, ext: Ext) -> std::arch::
     let m4 = _mm256_castsi256_ps(_mm256_setr_epi32(-1, -1, -1, -1, 0, 0, 0, 0));
 
     // Pick the lane fold to match the scalar twin exactly. `_mm256_max_ps(a, b)` / `_mm256_min_ps(a, b)`
-    // return `b` on a tie/NaN — the same as `(a>b)?a:b` / `(a<b)?a:b` — so AVX2 == twin bit-for-bit.
+    // return `b` on a tie — the same as `(a>b)?a:b` / `(a<b)?a:b` — so AVX2 == twin bit-for-bit. (They
+    // also return `b` on a NaN, which is the *lane* semantics of `Ext::fold` but does not compose into
+    // a tree; the caller keeps NaN blocks out of here entirely — see [`cummm_row_avx2`].)
     #[inline(always)]
     unsafe fn foldv(ext: Ext, a: __m256, b: __m256) -> __m256 {
         match ext {
@@ -137,9 +144,11 @@ unsafe fn inclusive_scan8(v: std::arch::x86_64::__m256, ext: Ext) -> std::arch::
 
 /// AVX2 inclusive running extremum of one row. Processes the row in 8-element blocks: in-lane scan
 /// ([`inclusive_scan8`]), fold the running `carry` into all lanes, store, then update `carry` from lane 7
-/// (the block's full inclusive extremum). A scalar tail folds `cols % 8` left-to-right (`carry =
-/// fold(x, carry); out = carry`) — matching `cummm_row_scalar`'s recurrence exactly for the tail, and
-/// continuing the same `carry` so the row stays a single running extremum.
+/// (the block's full inclusive extremum). A block holding any NaN skips the tree and takes the scalar
+/// recurrence instead (the fold is not associative across NaN — see the module header), keeping the
+/// output bit-identical to [`cummm_row_scalar`] on every input. A scalar tail folds `cols % 8`
+/// left-to-right (`carry = fold(x, carry); out = carry`) — matching `cummm_row_scalar`'s recurrence
+/// exactly for the tail, and continuing the same `carry` so the row stays a single running extremum.
 ///
 /// # Safety
 /// `x`/`out` valid for `cols` f32 from `base` (distinct or aliasing); AVX2 available.
@@ -153,6 +162,23 @@ unsafe fn cummm_row_avx2(x: *const f32, out: *mut f32, base: usize, cols: usize,
     let mut i = 0usize;
     while i + 8 <= cols {
         let v = _mm256_loadu_ps(xb.add(i));
+        // NaN guard — the one input class for which the tree fold is NOT the left-to-right fold.
+        // `fold(a, b)` = `(a > b) ? a : b` is *asymmetric* in NaN: the scalar recurrence only ever
+        // presents a NaN as `a` (`fold(x[i], acc)`), where the false compare discards it, but the
+        // Hillis-Steele tree also presents it as `b` (the shifted earlier-index operand), where the
+        // same false compare makes it *absorbing*. The block's real extremum is then lost and the NaN
+        // is itself dropped one step later, so the tree can emit a running extremum that moves
+        // backwards. Fold any block containing a NaN with the scalar recurrence instead — same
+        // `carry`, so the row stays one running extremum. One vcmpps + vmovmskps + not-taken branch
+        // per 8 elements on the finite fast path.
+        if _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_UNORD_Q>(v, v)) != 0 {
+            for j in i..i + 8 {
+                carry = ext.fold(*xb.add(j), carry);
+                *ob.add(j) = carry;
+            }
+            i += 8;
+            continue;
+        }
         let scan = inclusive_scan8(v, ext);
         // fold(scan, carry) lane-wise — carry broadcast. max/min(a, set1(carry)).
         let cv = _mm256_set1_ps(carry);
