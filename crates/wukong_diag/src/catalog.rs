@@ -12,6 +12,10 @@
 //!   * `E04xx` — type checking
 //!   * `E05xx` — shape checking (Wukong's headline analysis)
 //!   * `C0xxx` — codegen / lowering limitations
+//!
+//! Codes are stable: never renumber one, and never reuse a retired number for a new rule. Retired:
+//! `E0001` (was "malformed type syntax"; no stage ever emitted it — the parser reports malformed
+//! types as `E0203`/`E0204`).
 
 /// One catalog entry: a stable code, a one-line title, and a longer explanation (Markdown-ish).
 pub struct Explanation {
@@ -42,13 +46,6 @@ macro_rules! entry {
 }
 
 static CATALOG: &[Explanation] = &[
-    entry!(
-        "E0001",
-        "malformed type syntax",
-        "A type expression was not well-formed. Tensor and SIMD-vector element types must be \
-         scalars, dimensions must be integers, names, or `?`, and layouts must be one of the \
-         known kinds (`contiguous`, `col_major`, `strided`, `tiled`)."
-    ),
     entry!(
         "E0101",
         "unexpected character",
