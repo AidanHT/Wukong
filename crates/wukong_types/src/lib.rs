@@ -370,6 +370,62 @@ mod tests {
     }
 
     #[test]
+    fn vector_align_is_a_power_of_two() {
+        // `f32x3` parses today (wukong_parser's `split_vector_ident` accepts any digit run) and
+        // nothing rejects a non-power-of-two lane count, so `align_of` must not hand one out:
+        // every consumer of an alignment assumes a power of two.
+        for lanes in 1u32..=17 {
+            for elem in [Scalar::I8, Scalar::F16, Scalar::F32, Scalar::F64] {
+                let a = Ty::Vector { elem, lanes }.align_of().unwrap();
+                assert!(
+                    a.is_power_of_two(),
+                    "{}x{lanes} reported align {a}",
+                    elem.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn align_of_satisfies_the_mir_build_round_up_mirror() {
+        // `wukong_mir_build::round_up` is documented as a mirror of the `round_up` here, but it is
+        // the bitmask form `(x + align - 1) & !(align - 1)`, which agrees with `div_ceil` only when
+        // `align` is a power of two. This pins the precondition from our side: every alignment
+        // `align_of` can produce must make the two forms identical, so the two layout authorities
+        // (`Ty::size_of`/`tuple_offsets` here, `FnLowerer::aggregate_layout` there) cannot diverge.
+        fn bitmask_round_up(x: u64, align: u64) -> u64 {
+            if align <= 1 {
+                x
+            } else {
+                (x + align - 1) & !(align - 1)
+            }
+        }
+        let tys = [
+            Ty::Scalar(Scalar::I8),
+            Ty::Scalar(Scalar::F64),
+            Ty::Slice(Box::new(Ty::Scalar(Scalar::F32))),
+            Ty::Vector {
+                elem: Scalar::F32,
+                lanes: 3,
+            },
+            Ty::Vector {
+                elem: Scalar::F32,
+                lanes: 8,
+            },
+            Ty::Vector {
+                elem: Scalar::Bf16,
+                lanes: 6,
+            },
+        ];
+        for t in &tys {
+            let a = t.align_of().unwrap();
+            for x in 0u64..64 {
+                assert_eq!(round_up(x, a), bitmask_round_up(x, a), "round_up({x}, {a})");
+            }
+        }
+    }
+
+    #[test]
     fn scalar_from_name_round_trips() {
         for s in [
             Scalar::Bool,
