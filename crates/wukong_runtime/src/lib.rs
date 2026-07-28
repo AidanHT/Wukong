@@ -2,8 +2,13 @@
 //!
 //! Kept deliberately tiny and allocation-explicit, matching the language's philosophy. The
 //! interpreter calls these implementations directly; native (LLVM) builds link the same logic
-//! compiled as a static library. Today it provides a bump [`Arena`], a CPU [`parallel_for`], and a
-//! tuned [`wukong_sgemm`] (the matmul microkernel the compiler lowers a matmul nest to).
+//! compiled as a static library. The surface is overwhelmingly the dispatched kernel family
+//! re-exported below (GEMM/GEMV, vmath, reductions, norms, …), fronted by [`wukong_sgemm`] (the
+//! matmul microkernel the compiler lowers a matmul nest to). The bump [`Arena`] and the sequential
+//! [`parallel_for`] are *reference* implementations with no caller anywhere in the workspace: no
+//! kernel allocates through `Arena` (they use thread-local `Vec` scratch), and `parallel_for` is
+//! the deterministic loop reference, not the native lowering target — that is
+//! [`wukong_parallel_for`].
 
 mod attention;
 mod gemm;
@@ -241,8 +246,9 @@ pub unsafe extern "C" fn wukong_f16_bits_to_f32(b: i32) -> f32 {
 }
 
 /// A bump (arena) allocator over an owned byte buffer. Allocation is a pointer bump; freeing is
-/// all-at-once via [`Arena::reset`]. This is the idiomatic allocator for kernel scratch space:
-/// no per-object bookkeeping, no fragmentation.
+/// all-at-once via [`Arena::reset`]: no per-object bookkeeping, no fragmentation. Reference
+/// surface only — the kernels in this crate do NOT allocate here; they use thread-local `Vec`
+/// scratch (`PACK_SCRATCH_2D` in `gemm.rs` is the pattern to copy).
 pub struct Arena {
     buf: Vec<u8>,
     offset: usize,
@@ -266,10 +272,18 @@ impl Arena {
         self.buf.len()
     }
 
-    /// Allocate `size` bytes aligned to `align` (a power of two). Returns the byte offset of the
-    /// allocation, or `None` if the arena is exhausted.
+    /// Allocate `size` bytes aligned to `align`. Returns the byte offset of the allocation, or
+    /// `None` if the arena is exhausted or `align` is not a power of two.
+    ///
+    /// The power-of-two requirement is *enforced*, not assumed: the round-up below is the
+    /// `& !(align - 1)` mask trick, and a non-power-of-two `align` silently produces a bogus mask
+    /// — `align == 0` wraps `align - 1` to `usize::MAX`, whose complement is `0`, so `start` is
+    /// `0` and the allocation aliases every live region handed out before it. A `debug_assert!`
+    /// left that intact in release builds, which is where it matters.
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<usize> {
-        debug_assert!(align.is_power_of_two());
+        if !align.is_power_of_two() {
+            return None;
+        }
         let start = (self.offset + align - 1) & !(align - 1);
         let end = start.checked_add(size)?;
         if end > self.buf.len() {
@@ -321,12 +335,15 @@ unsafe impl Sync for EnvAddr {}
 /// emits inline stack probes, so a big frame is safe exactly when the reserve is big enough) and
 /// `RAYON_NUM_THREADS` honored explicitly (the core-count sweep instrument).
 ///
-/// EVERY parallel path in this crate that can be the process's FIRST rayon touch must call this
-/// before forking: the pre-2026-07-10 code initialized only inside `wukong_parallel_for`, but in
+/// Calling this before the process's FIRST rayon touch is what makes the *global* pool carry that
+/// configuration: the pre-2026-07-10 code initialized only inside `wukong_parallel_for`, but in
 /// a real transformer forward the first parallel op is a `_parallel` norm — rayon then built the
 /// default registry (2 MiB stacks) first and the 16 MiB `build_global` silently lost the race, so
-/// region bodies ran on 2 MiB stacks. Best-effort as ever: if another rayon user in the host
-/// process won the race anyway, `build_global` errors and behavior is as before.
+/// region bodies ran on 2 MiB stacks. Most `_parallel` kernels still fork with a bare
+/// `into_par_iter()` and so can lose that race for us; rather than make correctness depend on an
+/// unstated call ordering, the outcome is *recorded* here and [`region_pool`] backstops it, so a
+/// lost race costs a second pool rather than a stack fault. Best-effort as ever: a host process
+/// that owns the global pool keeps it.
 pub(crate) fn ensure_global_pool() {
     use std::sync::Once;
     static POOL_INIT: Once = Once::new();
@@ -339,8 +356,41 @@ pub(crate) fn ensure_global_pool() {
         {
             b = b.num_threads(t);
         }
-        let _ = b.build_global();
+        // `Once` publishes this store to every later `call_once` caller, so `Relaxed` suffices.
+        GLOBAL_POOL_IS_OURS.store(
+            b.build_global().is_ok(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     });
+}
+
+/// Set by [`ensure_global_pool`]: `true` iff its `build_global` actually installed the global
+/// pool. `false` means some earlier rayon touch — including a bare `into_par_iter()` in one of
+/// this crate's own `_parallel` kernels — already built the default registry, whose worker stacks
+/// are rayon's ~2 MiB default, NOT the 16 MiB a region body needs.
+static GLOBAL_POOL_IS_OURS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The private 16 MiB-stack pool [`run_on_wuk_pool`] forks on when the global registry is not the
+/// one [`ensure_global_pool`] built and the GEMM pool is unavailable (no HyperThreads to shed, or
+/// `WUKONG_POOL_UNIFY=0`). Without it that path forks a region body onto rayon's ~2 MiB default
+/// stacks and Cranelift's inline stack probes fault — reproduced as STATUS_STACK_OVERFLOW from a
+/// 4 MiB body run after a bare `into_par_iter()`, and not reproducible when the race is won.
+/// Built lazily, so a process that wins the race never pays for it. Width is left to rayon's
+/// builder default, which reads `RAYON_NUM_THREADS` the same way [`ensure_global_pool`] does, so
+/// the worker count — and hence `wukong_parallel_for`'s chunking — matches the global pool it
+/// stands in for.
+fn region_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .stack_size(16 * 1024 * 1024)
+            .thread_name(|i| format!("wukong-region-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// Pool-unification opt-out (`WUKONG_POOL_UNIFY=0`, read once, **default ON**): when ON, the
@@ -359,15 +409,26 @@ pub(crate) fn pool_unify() -> bool {
 }
 
 /// Run `f` on the unified kernel pool: the private physical-core GEMM pool when unification is ON
-/// and the pool exists (see [`pool_unify`] / `gemm::gemm_pool`), the global pool otherwise. The
-/// global pool is configured first in every case ([`ensure_global_pool`]), so a fallback fork
-/// lands on properly-sized stacks. Nested calls from a worker of the same pool run inline
+/// and the pool exists (see [`pool_unify`] / `gemm::gemm_pool`), the global pool otherwise. Every
+/// fork here lands on 16 MiB worker stacks: the global pool when [`ensure_global_pool`] built it,
+/// [`region_pool`] when it did not. Nested calls from a worker of the same pool run inline
 /// (rayon's `install` semantics) — safe for kernels invoked inside an outlined region body.
+///
+/// The stack size is the load-bearing property (region bodies privatize ~1.5 MiB frames); which of
+/// the two pools serves the fallback is throughput-only, because every kernel routed here chunks
+/// independently of the worker count. `WUKONG_POOL_UNIFY=0` therefore still selects "not the GEMM
+/// pool", but on a process whose global registry was built by someone else it now measures
+/// `region_pool` rather than a configuration that faulted.
 pub(crate) fn run_on_wuk_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     ensure_global_pool();
     #[cfg(target_arch = "x86_64")]
     if pool_unify() {
         if let Some(p) = crate::gemm::gemm_pool() {
+            return p.install(f);
+        }
+    }
+    if !GLOBAL_POOL_IS_OURS.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(p) = region_pool() {
             return p.install(f);
         }
     }
@@ -564,8 +625,14 @@ macro_rules! rt_file_io {
         /// Opens `path` read-only (returns `-1` if that fails, leaving `data` untouched), then
         /// reads `n = min(len, file_size / sizeof)` elements — the file's trailing partial element,
         /// if any, is ignored. `data[0..n]` receives the decoded values; `data[n..]` is left as the
-        /// caller allocated it (`alloc_*` pre-zeroes). Returns `n` on success, `-2` on a mid-read
-        /// I/O error, and `0` (without touching `data`) when `len <= 0`.
+        /// caller allocated it (`alloc_*` pre-zeroes). Returns `n` on success and `-2` on a
+        /// mid-read I/O error.
+        ///
+        /// **Ordering is part of the contract**: the open is attempted FIRST, so a missing or
+        /// unopenable path is `-1` even when `len <= 0`. The interpreter — the semantic oracle for
+        /// this frozen family — has no early return, and a native short-circuit here answered `0`
+        /// where it answered `-1` for the same program. A `len <= 0` on an openable path still
+        /// reads nothing and returns `0`, which is `min(len, avail)` clamped at zero.
         ///
         /// # Safety
         /// `data` must address at least `len` writable `
@@ -575,9 +642,6 @@ macro_rules! rt_file_io {
         pub extern "C" fn $read(path: *const u8, data: *mut $T, len: i64) -> i64 {
             use std::io::Read;
             const SZ: usize = std::mem::size_of::<$T>();
-            if len <= 0 {
-                return 0;
-            }
             // SAFETY: forwarded from this function's own safety contract.
             let Some(path) = (unsafe { rt_path(path) }) else {
                 return -1;
@@ -590,7 +654,9 @@ macro_rules! rt_file_io {
                 Ok(m) => (m.len() / SZ as u64) as usize,
                 Err(_) => return -2,
             };
-            let n = (len as usize).min(avail);
+            // `min(len, avail)` clamped at zero — the interpreter's exact expression, so a
+            // non-positive `len` reads nothing on an openable path instead of casting negative.
+            let n = if len <= 0 { 0 } else { (len as usize).min(avail) };
             if n == 0 {
                 return 0;
             }
@@ -669,6 +735,108 @@ pub extern "C" fn wukong_now_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region body with a 4 MiB stack frame — the shape an outlined `@parallel` head-attention
+    /// region privatizes (~1.5 MiB of qh/kh/vt/scores at S=512), scaled up so the fault is
+    /// unambiguous. Writes the same value to every index so the result is chunking-independent.
+    extern "C" fn big_frame_region_body(start: i64, end: i64, env: *const u8) {
+        let mut buf = [0u8; 4 * 1024 * 1024];
+        let mut acc = 0u64;
+        let mut i = 0usize;
+        while i < buf.len() {
+            buf[i] = (i % 251) as u8;
+            acc += buf[i] as u64;
+            i += 4096;
+        }
+        std::hint::black_box(&buf);
+        let out = env as *mut u64;
+        for k in start..end {
+            // SAFETY: `env` is the base of the caller's `[u64; 32]`, and `wukong_parallel_for`
+            // hands each index to exactly one chunk, so `k < 32` and no two writes alias.
+            unsafe { *out.add(k as usize) = acc };
+        }
+    }
+
+    #[test]
+    fn region_body_survives_a_bare_rayon_fork_first() {
+        use rayon::prelude::*;
+        // Most `_parallel` kernels fork with a bare `into_par_iter()` and so can build rayon's
+        // default registry (~2 MiB worker stacks) before `ensure_global_pool` runs. Simulate that
+        // first touch, then run a region body through `wukong_parallel_for`.
+        let w: Vec<i32> = (0..64i32).into_par_iter().map(|x| x * 2).collect();
+        assert_eq!(w.len(), 64);
+        ensure_global_pool();
+
+        // Invariant: when the global registry is not the one we configured, `run_on_wuk_pool` must
+        // fork on a pool this crate built (`wukong-gemm-*` or `wukong-region-*`), never on rayon's
+        // defaults. NOTE this assertion is satisfied by `wukong-gemm-*` whenever unification is on
+        // and `gemm_pool()` exists, so it only catches a missing backstop under
+        // `WUKONG_POOL_UNIFY=0` — `the_region_pool_backstop_carries_a_region_frame` below is the
+        // gate that fires in the default configuration.
+        if !GLOBAL_POOL_IS_OURS.load(std::sync::atomic::Ordering::Relaxed) {
+            let named: Vec<bool> = run_on_wuk_pool(|| {
+                (0..256usize)
+                    .into_par_iter()
+                    .map(|_| {
+                        std::thread::current()
+                            .name()
+                            .is_some_and(|n| n.starts_with("wukong-"))
+                    })
+                    .collect()
+            });
+            assert!(
+                named.iter().all(|&b| b),
+                "a fork landed on a pool wukong_runtime did not configure"
+            );
+        }
+
+        // End-to-end: before the `region_pool` backstop this died with STATUS_STACK_OVERFLOW
+        // (exit 0xc00000fd) under `WUKONG_POOL_UNIFY=0`, where `gemm_pool()` is bypassed and the
+        // fallback fork went to the 2 MiB default registry the bare fork above had installed.
+        let mut v = vec![0u64; 32];
+        // SAFETY: `big_frame_region_body` has the required `extern "C" fn(i64, i64, *const u8)`
+        // shape and `v` outlives this blocking call, which is `wukong_parallel_for`'s contract.
+        unsafe { wukong_parallel_for(32, big_frame_region_body, v.as_mut_ptr() as *const u8) };
+        assert_eq!(v, vec![127_899u64; 32], "every index must be visited once");
+    }
+
+    #[test]
+    fn the_region_pool_backstop_carries_a_region_frame() {
+        use rayon::prelude::*;
+        // The end-to-end test above reaches `region_pool` only when `gemm_pool()` is unavailable,
+        // and on this SMT host under the default `WUKONG_POOL_UNIFY=1` it is available. MEASURED:
+        // with `run_on_wuk_pool`'s backstop branch deleted, that test stays GREEN under a plain
+        // `cargo test -p wukong_runtime` and only turns red under `WUKONG_POOL_UNIFY=0` — which
+        // the suite does not set, and which a test cannot set for itself because `pool_unify()`
+        // latches its `OnceLock` on whichever kernel reads it first. So drive the backstop
+        // directly: this is the assertion that gates the fallback in the default configuration.
+        let p = region_pool().expect("the fallback pool must be buildable");
+        let mut v = vec![0u64; 32];
+        // The `env` contract `wukong_parallel_for` gives its body, reproduced here: a raw base
+        // address whose pointee (`v`) outlives the blocking `install` below, and one job per index
+        // so no two writes alias. `EnvAddr`'s `Send`/`Sync` hold for exactly that reason.
+        let env = EnvAddr(v.as_mut_ptr() as usize);
+        let ours: Vec<bool> = p.install(|| {
+            (0..32usize)
+                .into_par_iter()
+                .map(|k| {
+                    big_frame_region_body(k as i64, k as i64 + 1, env.0 as *const u8);
+                    std::thread::current()
+                        .name()
+                        .is_some_and(|n| n.starts_with("wukong-region-"))
+                })
+                .collect()
+        });
+        assert!(
+            ours.iter().all(|&b| b),
+            "the backstop must be a pool this crate built, not rayon's default registry"
+        );
+        assert_eq!(
+            v,
+            vec![127_899u64; 32],
+            "a 4 MiB region frame must survive on every backstop worker"
+        );
+    }
 
     #[test]
     fn now_ns_is_monotonic() {
@@ -753,6 +921,21 @@ mod tests {
             .iter()
             .enumerate()
             .all(|(i, &v)| v == (i as i64) * (i as i64)));
+    }
+
+    #[test]
+    fn arena_rejects_a_non_power_of_two_align() {
+        // In a release build (no overflow checks, `debug_assert!` compiled out) `align == 0` made
+        // `align - 1` wrap to usize::MAX and `!(align - 1)` to 0, so the round-up handed back
+        // offset 0 — observed as `alloc(16, 0) == Some(0)` aliasing the live 16-byte region at 0.
+        let mut a = Arena::with_capacity(64);
+        let live = a.alloc(16, 8).unwrap();
+        assert_eq!(live, 0);
+        assert!(a.alloc(16, 0).is_none(), "align 0 must not alias the live region");
+        assert!(a.alloc(16, 3).is_none(), "a non-power-of-two align has no valid mask");
+        assert_eq!(a.used(), 16, "a rejected request must not move the bump pointer");
+        // The valid alignments still behave.
+        assert_eq!(a.alloc(8, 16).unwrap(), 16);
     }
 
     #[test]
@@ -968,6 +1151,8 @@ mod tests {
 
     #[test]
     fn read_nonpositive_len_returns_zero_without_touching_buf() {
+        // The path is written first on purpose: `0` is the *openable*-path answer for `len <= 0`.
+        // The missing-path answer is `-1`, pinned by the sibling test below.
         let path = io_tmp("zerolen");
         let cp = cpath(&path);
         let ptr = cp.as_ptr() as *const u8;
@@ -978,6 +1163,26 @@ mod tests {
         assert_eq!(wukong_rt_read_u8(ptr, buf.as_mut_ptr(), -5), 0);
         assert_eq!(buf, [0xAA; 3], "buf must be untouched on negative len");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_reports_open_failure_even_for_a_nonpositive_len() {
+        // The `-1` open-failure code is decided BEFORE the `len <= 0` short-circuit, because the
+        // interpreter (the semantic oracle) opens unconditionally: it has no early return, so a
+        // missing path is `-1` there for every `len`. The native read used to answer `0` first,
+        // which made `read_f32("missing", alloc_f32(0))` print `0` under `--backend=native` and
+        // `-1` under the interpreter for the same program.
+        let path = io_tmp("zerolen_missing"); // never created
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let mut bf = [0xAAu8; 3];
+        assert_eq!(wukong_rt_read_u8(ptr, bf.as_mut_ptr(), 0), -1);
+        assert_eq!(wukong_rt_read_u8(ptr, bf.as_mut_ptr(), -5), -1);
+        assert_eq!(bf, [0xAA; 3], "buf must be untouched on open failure");
+        let mut bs = [0f32; 1];
+        assert_eq!(wukong_rt_read_f32(ptr, bs.as_mut_ptr(), 0), -1);
+        let mut bl = [0i64; 1];
+        assert_eq!(wukong_rt_read_i64(ptr, bl.as_mut_ptr(), 0), -1);
     }
 
     #[test]
