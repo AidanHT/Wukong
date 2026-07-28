@@ -2,8 +2,13 @@
 //!
 //! Kept deliberately tiny and allocation-explicit, matching the language's philosophy. The
 //! interpreter calls these implementations directly; native (LLVM) builds link the same logic
-//! compiled as a static library. Today it provides a bump [`Arena`], a CPU [`parallel_for`], and a
-//! tuned [`wukong_sgemm`] (the matmul microkernel the compiler lowers a matmul nest to).
+//! compiled as a static library. The surface is overwhelmingly the dispatched kernel family
+//! re-exported below (GEMM/GEMV, vmath, reductions, norms, …), fronted by [`wukong_sgemm`] (the
+//! matmul microkernel the compiler lowers a matmul nest to). The bump [`Arena`] and the sequential
+//! [`parallel_for`] are *reference* implementations with no caller anywhere in the workspace: no
+//! kernel allocates through `Arena` (they use thread-local `Vec` scratch), and `parallel_for` is
+//! the deterministic loop reference, not the native lowering target — that is
+//! [`wukong_parallel_for`].
 
 mod attention;
 mod gemm;
@@ -241,8 +246,9 @@ pub unsafe extern "C" fn wukong_f16_bits_to_f32(b: i32) -> f32 {
 }
 
 /// A bump (arena) allocator over an owned byte buffer. Allocation is a pointer bump; freeing is
-/// all-at-once via [`Arena::reset`]. This is the idiomatic allocator for kernel scratch space:
-/// no per-object bookkeeping, no fragmentation.
+/// all-at-once via [`Arena::reset`]: no per-object bookkeeping, no fragmentation. Reference
+/// surface only — the kernels in this crate do NOT allocate here; they use thread-local `Vec`
+/// scratch (`PACK_SCRATCH_2D` in `gemm.rs` is the pattern to copy).
 pub struct Arena {
     buf: Vec<u8>,
     offset: usize,
@@ -266,10 +272,18 @@ impl Arena {
         self.buf.len()
     }
 
-    /// Allocate `size` bytes aligned to `align` (a power of two). Returns the byte offset of the
-    /// allocation, or `None` if the arena is exhausted.
+    /// Allocate `size` bytes aligned to `align`. Returns the byte offset of the allocation, or
+    /// `None` if the arena is exhausted or `align` is not a power of two.
+    ///
+    /// The power-of-two requirement is *enforced*, not assumed: the round-up below is the
+    /// `& !(align - 1)` mask trick, and a non-power-of-two `align` silently produces a bogus mask
+    /// — `align == 0` wraps `align - 1` to `usize::MAX`, whose complement is `0`, so `start` is
+    /// `0` and the allocation aliases every live region handed out before it. A `debug_assert!`
+    /// left that intact in release builds, which is where it matters.
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<usize> {
-        debug_assert!(align.is_power_of_two());
+        if !align.is_power_of_two() {
+            return None;
+        }
         let start = (self.offset + align - 1) & !(align - 1);
         let end = start.checked_add(size)?;
         if end > self.buf.len() {
@@ -866,6 +880,21 @@ mod tests {
             .iter()
             .enumerate()
             .all(|(i, &v)| v == (i as i64) * (i as i64)));
+    }
+
+    #[test]
+    fn arena_rejects_a_non_power_of_two_align() {
+        // In a release build (no overflow checks, `debug_assert!` compiled out) `align == 0` made
+        // `align - 1` wrap to usize::MAX and `!(align - 1)` to 0, so the round-up handed back
+        // offset 0 — observed as `alloc(16, 0) == Some(0)` aliasing the live 16-byte region at 0.
+        let mut a = Arena::with_capacity(64);
+        let live = a.alloc(16, 8).unwrap();
+        assert_eq!(live, 0);
+        assert!(a.alloc(16, 0).is_none(), "align 0 must not alias the live region");
+        assert!(a.alloc(16, 3).is_none(), "a non-power-of-two align has no valid mask");
+        assert_eq!(a.used(), 16, "a rejected request must not move the bump pointer");
+        // The valid alignments still behave.
+        assert_eq!(a.alloc(8, 16).unwrap(), 16);
     }
 
     #[test]
