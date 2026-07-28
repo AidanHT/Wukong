@@ -3273,6 +3273,20 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Whether `e` forces an ordered comparison performed in `common` to use an **unsigned**
+    /// predicate: it is an unsigned integer operand exactly as wide as `common`.
+    ///
+    /// This is C's usual-arithmetic-conversion rule. Taking the signedness from one operand alone
+    /// made `5 < x` with `x: u32 = 3_000_000_000` a *signed* compare against a value whose sign bit
+    /// is set (`cmp.slt`), so it answered false; the same one-sided rule made `for i in 0..n` with
+    /// an unsigned `n` run zero iterations. The width test is what keeps the rule faithful: a
+    /// *narrower* unsigned operand (`u32` against `i64`) widens losslessly into the signed type, and
+    /// C keeps the comparison signed there — so only an equal-rank mixed-sign pair goes unsigned.
+    fn forces_unsigned_cmp(&self, e: &Expr, common: &MirType) -> bool {
+        matches!(self.expr_ty(e), Ty::Scalar(s) if s.is_int() && !s.is_signed())
+            && self.expr_mir(e) == *common
+    }
+
     fn const_zero(&mut self, ty: MirType) -> ValueId {
         if ty.is_float() {
             self.builder.build(ty.clone(), Op::ConstFloat(0.0, ty))
@@ -7205,6 +7219,20 @@ impl FnLowerer<'_> {
         if expr_mentions(rhs, i) {
             return false;
         }
+        // The bound is evaluated exactly ONCE, before the loop, in place of the `while`'s own
+        // per-iteration re-evaluation, so it must also be side-effect-free. `expr_mentions` only
+        // proves it does not move with the counter: a *call* bound was still hoisted, so
+        // `while i < bound() { … }` (with `bound()` printing) printed once where the while prints
+        // five times — the loop's data result stayed right and only the observable side effect was
+        // dropped. Both backends run the identical rewritten MIR, so `native_matches_interpreter`
+        // and the -O0/-O2 gate are blind to it. Restrict the bound to the pure arithmetic form; on
+        // a decline the caller lowers the `while` scalar, which re-evaluates the condition each
+        // iteration and is already correct. (A variable named in the bound cannot be *reassigned*
+        // by the body: `vectorizable` below admits only a store to an inner `let` temp or to an
+        // array element, so a body assigning an outer scalar already declines.)
+        if !is_pure_loop_bound(rhs) {
+            return false;
+        }
         // `i` must be a mutable int local already in scope (its slot is the loop counter).
         let Some((islot, ity)) = self.lookup(i) else {
             return false;
@@ -10026,7 +10054,11 @@ impl FnLowerer<'_> {
         {
             (ety.clone(), self.signed(end))
         } else {
-            (sty.clone(), self.signed(start))
+            // The counter's signedness must consider BOTH bounds (see `forces_unsigned_cmp`).
+            // Reading it off the START alone drove `for i in 0..n` with `n: u32 = 3_000_000_000`
+            // as `cmp.slt i, -1294967296`, so the loop ran zero iterations; the `u64` form was
+            // right only because its end is strictly wider and takes the branch above.
+            (sty.clone(), self.signed(start) && !self.forces_unsigned_cmp(end, &sty))
         };
 
         // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
@@ -16330,7 +16362,15 @@ impl FnLowerer<'_> {
                 let common = numeric_join(&lty, &rty);
                 let l = self.coerce_to(l, &lty, &common, self.signed(lhs));
                 let r = self.coerce_to(r, &rty, &common, self.signed(rhs));
-                let pred = cmp_pred(op, common.is_float(), self.signed(lhs));
+                // The predicate's signedness must consider BOTH operands (see
+                // `forces_unsigned_cmp`); reading it off the LHS alone compared `5 < x` (x: u32 =
+                // 3_000_000_000) with `cmp.slt` and answered false. The two `coerce_to`s above
+                // keep each operand's *own* signedness, which is what the widening needs.
+                let pred = cmp_pred(
+                    op,
+                    common.is_float(),
+                    self.signed(lhs) && !self.forces_unsigned_cmp(rhs, &common),
+                );
                 self.builder.build(MirType::I1, Op::Cmp(pred, l, r))
             }
             And => self.lower_short_circuit(lhs, rhs, true),
@@ -18831,6 +18871,24 @@ fn expr_uses_sym(e: &Expr, sym: Symbol) -> bool {
             expr_uses_sym(base, sym) || indices.iter().any(|i| expr_uses_sym(i, sym))
         }
         ExprKind::Cast { expr, .. } => expr_uses_sym(expr, sym),
+        _ => false,
+    }
+}
+
+/// Whether `e` may be evaluated **once**, before a loop, in place of a `while` condition's
+/// per-iteration re-evaluation: a whitelist of literals, plain variable reads, and arithmetic /
+/// cast / unary over them. Anything outside it is rejected — a call may have side effects (or a
+/// different value each iteration), and an index / field / dereference reads storage the loop body
+/// might write. Conservative by construction: an unmodeled expression kind returns false.
+fn is_pure_loop_bound(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_) | ExprKind::Bool(_) => true,
+        ExprKind::Path(p) => p.is_single(),
+        ExprKind::Unary { op, expr } => {
+            matches!(op, ast::UnOp::Neg | ast::UnOp::Not) && is_pure_loop_bound(expr)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => is_pure_loop_bound(lhs) && is_pure_loop_bound(rhs),
+        ExprKind::Cast { expr, .. } => is_pure_loop_bound(expr),
         _ => false,
     }
 }
