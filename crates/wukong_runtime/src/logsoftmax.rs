@@ -52,6 +52,21 @@ fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))
 }
 
+/// `_mm256_max_ps(a, b)` semantics spelled out: `a > b ? a : b`. **Not** `f32::max` (= `maxNum`),
+/// which returns the non-NaN operand — MAXPS returns its *second* source whenever the compare is
+/// unordered, so a NaN in the freshly loaded operand poisons the accumulator lane while a NaN already
+/// in the accumulator is dropped. The scalar row-max twin folds with this so it mirrors the AVX2 body
+/// bit-for-bit on NaN rows too (pinned by `scalar_matches_avx2_on_nan_rows`). Same shape as
+/// `norm::maxps` — keep the two identical.
+#[inline(always)]
+fn maxps(a: f32, b: f32) -> f32 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback) ------------------------------------------
 
 /// `off = m + log(Σ exp(x_i − m))` for one row — the shared core of both kernels, scalar reference.
@@ -70,7 +85,7 @@ unsafe fn lse_off_scalar(x: *const f32, n: usize) -> f32 {
     for s in 0..nb {
         let b = s * 8;
         for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = mxj.max(*x.add(b + j));
+            *mxj = maxps(*mxj, *x.add(b + j));
         }
     }
     for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
@@ -233,6 +248,12 @@ const LOGSOFTMAX_PAR_MIN: usize = 8;
 /// `out[r,i] = x[r,i] − m_r − log(Σ_i exp(x[r,i] − m_r))`. `x`/`out` may alias (in-place); each row's
 /// reductions read `x` before that row's `out` is written.
 ///
+/// **Not reachable from the recognizer.** Every recognized log-softmax is emitted as
+/// `wukong_norm_f32(.., NORM_LOGSOFTMAX)`; no `RT_*` constant, `GemmSyms` field or interpreter
+/// marshal arm names this symbol. It is exported for external C callers, and
+/// `matches_norm_logsoftmax_bit_for_bit` pins it bit-for-bit against the live `norm.rs` copy so the
+/// two cannot drift apart.
+///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` `f32` elements.
 #[no_mangle]
@@ -275,6 +296,11 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
         wukong_logsoftmax_f32(x, out, rows, cols);
         return;
     }
+    // Configure the global pool BEFORE the first fork: this entry can be a program's first rayon
+    // touch, and `ensure_global_pool`'s contract is that whoever forks first must have built the
+    // 16 MiB-stack registry — otherwise rayon builds its default 2 MiB one and a later outlined
+    // `@parallel` region (which carries ~1.5 MiB of per-iteration scratch) overflows its stack.
+    crate::ensure_global_pool();
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel norm/reduce);
     // each row is a disjoint sub-slice.
     let (xa, oa) = (x as usize, out as usize);
@@ -328,6 +354,9 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
         wukong_logsumexp_f32(x, out, rows, cols);
         return;
     }
+    // Same first-touch obligation as `wukong_logsoftmax_f32_parallel`: build the 16 MiB-stack global
+    // registry before forking, or rayon's default 2 MiB one wins the race for the whole process.
+    crate::ensure_global_pool();
     // Pointers cross the rayon boundary as integers; each row reads a disjoint x-slice and writes one
     // disjoint out slot.
     let (xa, oa) = (x as usize, out as usize);
@@ -391,6 +420,35 @@ mod tests {
                 sa[0],
                 sb[0]
             );
+        }
+    }
+
+    /// (a2) the same agreement on a row whose maximum shares an 8-lane slot with a later NaN. The
+    /// AVX2 body folds with `_mm256_max_ps` (= `a > b ? a : b`, so the freshly loaded NaN wins and
+    /// poisons the lane); the scalar twin folds with `f32::max` (= `maxNum`, which drops the NaN and
+    /// keeps the peak) — so the two pick a different `m`. `exp1`/`exp8` saturate NaN to `exp(EXP_HI)`
+    /// instead of propagating it, so the divergent `m` survives into `off` rather than washing the
+    /// answer out to NaN. `peak = nan_at - 8` is the only arrangement that exposes it: a NaN in any
+    /// other lane poisons a lane that does not hold the row maximum and `hmax8` then drops it.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn scalar_matches_avx2_on_nan_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &n in &[16usize, 17, 24, 33, 100] {
+            for nan_at in 8..n {
+                let mut x = vec![0.0f32; n];
+                x[nan_at - 8] = 1.0; // the row maximum, same lane as the NaN, earlier chunk
+                x[nan_at] = f32::NAN;
+                let (sa, sb) =
+                    unsafe { (lse_off_scalar(x.as_ptr(), n), lse_off_avx2(x.as_ptr(), n)) };
+                assert_eq!(
+                    sa.to_bits(),
+                    sb.to_bits(),
+                    "lse_off scalar != avx2 on NaN row n={n} nan_at={nan_at}: {sa} vs {sb}"
+                );
+            }
         }
     }
 
@@ -507,6 +565,81 @@ mod tests {
                 ip[i].to_bits(),
                 "logsoftmax in-place != out-of-place i={i}"
             );
+        }
+    }
+
+    /// The cross-file gate. Stable log-softmax exists TWICE: here, and in `norm.rs` as the
+    /// `NORM_LOGSOFTMAX` arm of `wukong_norm_f32` — which is the copy every recognized log-softmax
+    /// actually runs (`mir_build` emits `wukong_norm_f32(.., NORM_LOGSOFTMAX)`; the entries in this
+    /// file are not reachable from the recognizer). Both files' doc comments assert the copies are
+    /// byte-identical, and nothing pinned it: each module's own tests only compare that module's
+    /// scalar/AVX2 pair against each other and against a loose f64 reference, so a change to one core
+    /// alone leaves every test green.
+    ///
+    /// Two asserts, both bit-for-bit:
+    ///  * `wukong_norm_f32(.., NORM_LOGSOFTMAX)` == `wukong_logsoftmax_f32` — the duplicated cores;
+    ///  * `logsoftmax[r,i]` == `x[r,i] − logsumexp[r]` — the identity a .wk program can observe by
+    ///    computing both over the same row, which go through *different* kernels
+    ///    (`wukong_norm_f32` vs `wukong_logsumexp_f32`). Exact, not approximate: both derive the same
+    ///    `off = m + log(s)` and both finish with one IEEE subtract.
+    #[test]
+    fn matches_norm_logsoftmax_bit_for_bit() {
+        use crate::norm::{wukong_norm_f32, NORM_LOGSOFTMAX};
+        for &(rows, cols) in &[
+            (1usize, 1usize),
+            (1, 3),
+            (1, 7),
+            (1, 8),
+            (1, 9),
+            (1, 16),
+            (1, 17),
+            (1, 31),
+            (1, 64),
+            (1, 100),
+            (1, 257),
+            (3, 33),
+            (9, 512),
+        ] {
+            let x = fill(rows * cols);
+            let mut via_norm = vec![0.0f32; rows * cols];
+            let mut via_logsoftmax = vec![0.0f32; rows * cols];
+            let mut lse = vec![0.0f32; rows];
+            unsafe {
+                wukong_norm_f32(
+                    x.as_ptr(),
+                    via_norm.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                    0,
+                    NORM_LOGSOFTMAX,
+                );
+                wukong_logsoftmax_f32(
+                    x.as_ptr(),
+                    via_logsoftmax.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
+                wukong_logsumexp_f32(x.as_ptr(), lse.as_mut_ptr(), rows as i64, cols as i64);
+            }
+            for r in 0..rows {
+                for i in 0..cols {
+                    let k = r * cols + i;
+                    assert_eq!(
+                        via_norm[k].to_bits(),
+                        via_logsoftmax[k].to_bits(),
+                        "norm::NORM_LOGSOFTMAX != logsoftmax.rs rows={rows} cols={cols} k={k}: {} vs {}",
+                        via_norm[k],
+                        via_logsoftmax[k]
+                    );
+                    assert_eq!(
+                        via_norm[k].to_bits(),
+                        (x[k] - lse[r]).to_bits(),
+                        "logsoftmax != x − logsumexp rows={rows} cols={cols} k={k}: {} vs {}",
+                        via_norm[k],
+                        x[k] - lse[r]
+                    );
+                }
+            }
         }
     }
 

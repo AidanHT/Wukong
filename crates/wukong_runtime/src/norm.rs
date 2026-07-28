@@ -46,6 +46,22 @@ fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))
 }
 
+/// `_mm256_max_ps(a, b)` semantics spelled out: `a > b ? a : b`. **Not** `f32::max` (= `maxNum`),
+/// which returns the non-NaN operand — MAXPS returns its *second* source whenever the compare is
+/// unordered, so a NaN in the freshly loaded operand poisons the accumulator lane while a NaN already
+/// in the accumulator is dropped. The scalar row-max twin folds with this, not with `f32::max`, so it
+/// mirrors the AVX2 body bit-for-bit on NaN rows too and not only on finite data (pinned by
+/// `scalar_matches_avx2_on_nan_rows`; `exp1`/`exp8` saturate NaN rather than propagating it, so a
+/// divergent row max would survive into the output).
+#[inline(always)]
+fn maxps(a: f32, b: f32) -> f32 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback) ------------------------------------------
 
 /// Numerically-stable softmax of one row, scalar reference. `x` and `out` may alias (in-place).
@@ -60,7 +76,7 @@ unsafe fn softmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
     for s in 0..nb {
         let b = s * 8;
         for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = mxj.max(*x.add(b + j));
+            *mxj = maxps(*mxj, *x.add(b + j));
         }
     }
     for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
@@ -107,7 +123,7 @@ unsafe fn logsoftmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
     for s in 0..nb {
         let b = s * 8;
         for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = mxj.max(*x.add(b + j));
+            *mxj = maxps(*mxj, *x.add(b + j));
         }
     }
     for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
@@ -953,6 +969,54 @@ mod tests {
         }
     }
 
+    /// A row whose maximum shares an 8-lane slot with a later NaN. The AVX2 body folds the max with
+    /// `_mm256_max_ps` (= `a > b ? a : b`, so a NaN in the freshly *loaded* operand wins and poisons
+    /// the lane), the scalar twin folds with `f32::max` (= `maxNum`, which always drops the NaN and
+    /// keeps the peak) — so the two paths pick a different row max `m`. `exp1`/`exp8` saturate NaN to
+    /// `exp(EXP_HI)` instead of propagating it, so the divergent `m` survives into the output rather
+    /// than washing the row out to all-NaN. The module contract at the top of this file claims the two
+    /// paths agree bit-for-bit with no finiteness caveat, so this must hold.
+    ///
+    /// `peak = nan_at - 8` puts the peak in the same lane and an earlier chunk, which is the only
+    /// arrangement that exposes it: a NaN elsewhere merely poisons a lane that does not hold the row
+    /// maximum, and `hmax8` then drops it.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn scalar_matches_avx2_on_nan_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &n in &[16usize, 17, 24, 33, 100] {
+            for nan_at in 8..n {
+                let mut x = vec![0.0f32; n];
+                x[nan_at - 8] = 1.0; // the row maximum, same lane as the NaN, earlier chunk
+                x[nan_at] = f32::NAN;
+                for &op in &[NORM_SOFTMAX, NORM_LOGSOFTMAX] {
+                    let mut a = vec![0.0f32; n];
+                    let mut b = vec![0.0f32; n];
+                    unsafe {
+                        if op == NORM_SOFTMAX {
+                            softmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                            softmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
+                        } else {
+                            logsoftmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                            logsoftmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
+                        }
+                    }
+                    for i in 0..n {
+                        assert_eq!(
+                            a[i].to_bits(),
+                            b[i].to_bits(),
+                            "scalar != avx2 on NaN row n={n} nan_at={nan_at} op={op} i={i}: {} vs {}",
+                            a[i],
+                            b[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn serial_matches_parallel_bit_for_bit() {
         let (rows, cols) = (37usize, 100usize);
@@ -1131,6 +1195,66 @@ mod tests {
                 "l2norm i={i}: {} vs {want}",
                 l2[i]
             );
+        }
+    }
+
+    /// Edge: zero or negative `rows`/`cols` are a no-op (don't write, don't panic) — for all four
+    /// C-ABI entries and every op code. The guard is load-bearing for memory safety, not tidiness:
+    /// `rows = -1` past it would reach `rows as usize` = 2^64-1 and walk `x.add(r * cols)` off the end
+    /// of the buffer. A negative shape is reachable from a .wk program with a runtime loop bound, so
+    /// the guard must not be silently deletable. (logsoftmax.rs pins the same property for its four
+    /// entries; norm.rs had no such test.)
+    #[test]
+    fn degenerate_shapes_are_noops() {
+        let x = fill(8);
+        let gamma = fill_off(8, 0.5);
+        let beta = fill_off(8, 1.3);
+        let mut buf = vec![42.0f32; 8];
+        for &(rows, cols) in &[(0i64, 4i64), (2, 0), (-1, 4), (3, -2), (0, 0), (-1, -1)] {
+            for &op in &OPS {
+                unsafe {
+                    wukong_norm_f32(
+                        x.as_ptr(),
+                        buf.as_mut_ptr(),
+                        rows,
+                        cols,
+                        EPS.to_bits() as i64,
+                        op,
+                    );
+                    wukong_norm_f32_parallel(
+                        x.as_ptr(),
+                        buf.as_mut_ptr(),
+                        rows,
+                        cols,
+                        EPS.to_bits() as i64,
+                        op,
+                    );
+                    wukong_norm_affine_f32(
+                        x.as_ptr(),
+                        buf.as_mut_ptr(),
+                        gamma.as_ptr(),
+                        beta.as_ptr(),
+                        rows,
+                        cols,
+                        EPS.to_bits() as i64,
+                        op,
+                    );
+                    wukong_norm_affine_f32_parallel(
+                        x.as_ptr(),
+                        buf.as_mut_ptr(),
+                        gamma.as_ptr(),
+                        beta.as_ptr(),
+                        rows,
+                        cols,
+                        EPS.to_bits() as i64,
+                        op,
+                    );
+                }
+                assert!(
+                    buf.iter().all(|&v| v == 42.0),
+                    "no-op must not write: rows={rows} cols={cols} op={op}"
+                );
+            }
         }
     }
 
