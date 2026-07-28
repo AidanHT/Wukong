@@ -448,6 +448,39 @@ struct Interp<'a, 'k> {
     data_addrs: HashMap<Symbol, usize>,
 }
 
+/// Marshal a recognized-kernel **extent** argument (`rows`, `cols`, `m`, `k`, `n`, `t`, `h`, `s`,
+/// `d`, `half`, `ncoeff`, ...) into a slot count, bailing out of the arm with the kernel's
+/// documented no-op when the extent is non-positive.
+///
+/// A non-positive extent is reachable from ordinary source: these shapes are loop bounds, and
+/// `for i in 0..n` with `n <= 0` runs zero iterations — a well-defined no-op in the language — so
+/// the *recognized* form of the same nest must be a no-op too. Every `wukong_runtime` kernel
+/// implements exactly that, opening with `if rows <= 0 || cols <= 0 { return; }` (`norm.rs:739`,
+/// `gemm.rs:596`, `attention.rs:37`, `rowarg.rs:142`, `velem.rs:185`, ...), so `--backend=native`
+/// completes and leaves the output buffer untouched.
+///
+/// Reading the argument with a bare `as usize` instead wrapped a negative extent to ~`usize::MAX`,
+/// and the `Vec::with_capacity(rows * cols)` marshalling that follows aborted the whole process
+/// with a raw Rust `capacity overflow` panic — an uncatchable abort out of the backend that is
+/// supposed to be the semantic oracle, on input the native backend runs cleanly.
+///
+/// Bailing on a **zero** extent as well is deliberate, and is likewise what the kernels do: e.g.
+/// `wukong_colargmax_i32` with `rows == 0` writes nothing, whereas marshalling it here would have
+/// written `cols` zero indices into the output.
+///
+/// Reductions that *return* a value (`wukong_sreduce_f32`, `wukong_argreduce_f32`, the bf16/f16
+/// dot/sum/reduce family) deliberately do **not** use this: they clamp the count with `.max(0)` and
+/// let the kernel supply its own empty-input identity (`reduce.rs:234` returns 0 / -inf / -1 for
+/// `n <= 0`), which is exactly the value native computes for a negative `n`.
+macro_rules! dim {
+    ($v:expr) => {
+        match $v.as_int() {
+            e if e <= 0 => return Ok(Value::Unit),
+            e => e as usize,
+        }
+    };
+}
+
 impl<'a, 'k> Interp<'a, 'k> {
     fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, String> {
         // Take a recycled register file (or a fresh one) and size it for this function. Values
@@ -1246,9 +1279,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
@@ -1337,8 +1370,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let x = ptr(args[1])?;
                 let y = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let n = args[4].as_int() as usize;
+                let m = dim!(args[3]);
+                let n = dim!(args[4]);
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
                     for t in 0..len {
@@ -1379,8 +1412,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let x = ptr(args[1])?;
                 let y = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let n = args[4].as_int() as usize;
+                let m = dim!(args[3]);
+                let n = dim!(args[4]);
                 let alpha = args[5].as_float() as f32;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
@@ -1423,8 +1456,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let w = ptr(args[0])?;
                 let a = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let alpha = args[5].as_float() as f32;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
@@ -1469,9 +1502,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let mut abuf: Vec<u8> = Vec::with_capacity(m * k);
                 for t in 0..m * k {
                     abuf.push(
@@ -1524,9 +1557,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let scale_a = args[6].as_float() as f32;
                 let scale_b_idx = ptr(args[7])?;
                 let bias_idx = match args[8] {
@@ -1613,7 +1646,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_dequant_f32" | "wukong_dequant_f32_parallel" => {
                 let q = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let scale = args[3].as_float() as f32;
                 let op = args[4].as_int() as i64;
                 let width = op & (0xff << 8);
@@ -1655,8 +1688,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_dequant_perchan_f32" | "wukong_dequant_perchan_f32_parallel" => {
                 let q = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let scale_idx = ptr(args[4])?;
                 let op = args[5].as_int() as i64;
                 let width = op & (0xff << 8);
@@ -1711,9 +1744,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 // An absent bias arrives as a `Value::Int(0)` (the null built as an integer 0) vs a
                 // real array's `Value::Ptr` — distinguished by variant, like the affine-norm params.
@@ -1788,9 +1821,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 let alpha = args[7].as_float() as f32;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
@@ -1838,7 +1871,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -1884,8 +1917,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_transpose_f32" | "wukong_transpose_f32_parallel" => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut sbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2011,8 +2044,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_transpose_u16" | "wukong_transpose_u16_parallel" => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let mut buf = Vec::with_capacity(rows * cols);
                 for t in 0..rows * cols {
                     buf.push(
@@ -2055,8 +2088,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_colrms_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2107,7 +2140,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let n = args[3].as_int() as usize;
+                let n = dim!(args[3]);
                 let op = args[4].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 let mut ybuf = Vec::with_capacity(n);
@@ -2152,8 +2185,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let y = ptr(args[0])?;
                 let dy = ptr(args[1])?;
                 let dx = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut ybuf = Vec::with_capacity(n);
                 let mut dybuf = Vec::with_capacity(n);
@@ -2198,8 +2231,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut abuf = Vec::with_capacity(n);
                 let mut bbuf = Vec::with_capacity(n);
@@ -2257,8 +2290,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let dx = ptr(args[3])?;
-                let rows = args[4].as_int() as usize;
-                let cols = args[5].as_int() as usize;
+                let rows = dim!(args[4]);
+                let cols = dim!(args[5]);
                 let eps_bits = args[6].as_int() as i64;
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
@@ -2329,8 +2362,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let target = ptr(args[1])?;
                 let loss = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2376,8 +2409,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let target = ptr(args[1])?;
                 let dx = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2424,8 +2457,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let inv_freq = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let half = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let half = dim!(args[4]);
                 let n = rows * 2 * half;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2470,8 +2503,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let g = ptr(args[0])?;
                 let inv_freq = ptr(args[1])?;
                 let dx = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let half = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let half = dim!(args[4]);
                 let n = rows * 2 * half;
                 let mut gbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2522,8 +2555,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_entropy_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2568,8 +2601,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_colargmin_i32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2620,8 +2653,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_cumprod_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2663,8 +2696,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut abuf = Vec::with_capacity(n);
                 let mut bbuf = Vec::with_capacity(n);
@@ -2714,7 +2747,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_vmath_bf16" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2748,7 +2781,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_vmath_f16" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2786,7 +2819,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let is_f16 = name == "wukong_vmath_f16_out";
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2846,7 +2879,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let n = args[3].as_int() as usize;
+                let n = dim!(args[3]);
                 let a = args[4].as_float() as f32;
                 let b = args[5].as_float() as f32;
                 let c = args[6].as_float() as f32;
@@ -2900,8 +2933,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let op = args[5].as_int() as i64;
                 let n = rows.saturating_mul(cols);
                 let mut xbuf = Vec::with_capacity(n);
@@ -2949,9 +2982,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_vhorner_f32" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let coeffs = ptr(args[3])?;
-                let ncoeff = args[4].as_int() as usize;
+                let ncoeff = dim!(args[4]);
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
                     xbuf.push(
@@ -2997,7 +3030,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_sreduce_f32" | "wukong_sreduce_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = args[2].as_int().max(0) as usize;
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 let mut ybuf = Vec::with_capacity(n);
@@ -3043,7 +3076,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // accelerator seam), so the differential oracle is unaffected.
             "wukong_argreduce_f32" | "wukong_argreduce_f32_parallel" => {
                 let x = ptr(args[0])?;
-                let n = args[1].as_int() as usize;
+                let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -3076,9 +3109,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let (y, n) = if is_dot {
-                    (ptr(args[1])?, args[2].as_int() as usize)
+                    (ptr(args[1])?, args[2].as_int().max(0) as usize)
                 } else {
-                    (x, args[1].as_int() as usize)
+                    (x, args[1].as_int().max(0) as usize)
                 };
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
                     Ok(wukong_runtime::f32_to_bf16_bits(
@@ -3122,7 +3155,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
-                let n = args[1].as_int() as usize;
+                let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -3153,9 +3186,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let (y, n) = if is_dot {
-                    (ptr(args[1])?, args[2].as_int() as usize)
+                    (ptr(args[1])?, args[2].as_int().max(0) as usize)
                 } else {
-                    (x, args[1].as_int() as usize)
+                    (x, args[1].as_int().max(0) as usize)
                 };
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
                     Ok(wukong_runtime::f32_to_f16_bits(
@@ -3196,7 +3229,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
-                let n = args[1].as_int() as usize;
+                let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -3226,7 +3259,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let n = args[3].as_int() as usize;
+                let n = dim!(args[3]);
                 let a = args[4].as_float() as f32;
                 let b = args[5].as_float() as f32;
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
@@ -3290,7 +3323,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let n = args[3].as_int() as usize;
+                let n = dim!(args[3]);
                 let a = args[4].as_float() as f32;
                 let b = args[5].as_float() as f32;
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
@@ -3374,9 +3407,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 // Read a `[bf16]`/`[f16]` element (stored as the rounded f32 value) back to its exact
                 // 16 stored bits — the same technique the bf16/f16 reductions and axpby use. The bf16
@@ -3439,9 +3472,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 // An absent bias arrives as a `Value::Int(0)` (the null built as an integer 0) vs a real
                 // array's `Value::Ptr` — distinguished by variant, like the f32 `nt_epi` epilogue.
@@ -3539,8 +3572,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_norm_f32" | "wukong_norm_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let eps_bits = args[4].as_int() as i64;
                 let op = args[5].as_int() as i64;
                 let n = rows * cols;
@@ -3606,8 +3639,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Ptr(p) => Some(p),
                     _ => None,
                 };
-                let rows = args[4].as_int() as usize;
-                let cols = args[5].as_int() as usize;
+                let rows = dim!(args[4]);
+                let cols = dim!(args[5]);
                 let eps_bits = args[6].as_int() as i64;
                 let op = args[7].as_int() as i64;
                 let n = rows * cols;
@@ -3686,8 +3719,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let out = ptr(args[0])?;
                 let weight = ptr(args[1])?;
                 let ids = ptr(args[2])?;
-                let t = args[3].as_int() as usize;
-                let h = args[4].as_int() as usize;
+                let t = dim!(args[3]);
+                let h = dim!(args[4]);
                 // Read the `t` token ids (each a `Value::Int`).
                 let mut idbuf = Vec::with_capacity(t);
                 for r in 0..t {
@@ -3747,9 +3780,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let grad_w = ptr(args[0])?;
                 let grad_out = ptr(args[1])?;
                 let ids = ptr(args[2])?;
-                let t = args[3].as_int() as usize;
-                let h = args[4].as_int() as usize;
-                let v = args[5].as_int() as usize;
+                let t = dim!(args[3]);
+                let h = dim!(args[4]);
+                let v = dim!(args[5]);
                 let mut idbuf = Vec::with_capacity(t);
                 for r in 0..t {
                     idbuf.push(
@@ -3808,8 +3841,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let k = ptr(args[1])?;
                 let v = ptr(args[2])?;
                 let out = ptr(args[3])?;
-                let s = args[4].as_int() as usize;
-                let d = args[5].as_int() as usize;
+                let s = dim!(args[4]);
+                let d = dim!(args[5]);
                 let scale = args[6].as_float() as f32;
                 let causal = args[7].as_int() as i64;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
