@@ -3810,65 +3810,51 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             // `wukong_embedding_f32[_parallel](out, weight, ids, t, h, v)` — embedding lookup (the first
             // layer of every LLM): `out[r,:] = weight[ids[r],:]`. NOTE the output pointer is the FIRST
-            // arg. Marshal the `t` i32 token ids and the f32 weight table out of abstract memory, call the
-            // *serial* kernel (bit-identical to the parallel one — output rows independent), write the
-            // `t*h` f32 result. The recognizer passes a huge `v` sentinel (so its clamp never fires); the
-            // interpreter can't marshal a 2^48-row table, so it derives the *real* table extent from the
-            // ids — `v_eff = max(ids)+1` — and passes that, which marshals exactly the live weight memory
-            // and still leaves every valid id in range (no clamp), matching the native call's gather.
+            // arg.
+            //
+            // The gather runs **row at a time straight against `self.memory`**, in ascending `t`, which
+            // is exactly the source nest `for t { for d { out[t*h+d] = weight[ids[t]*h+d] } }`. It must
+            // not marshal the weight table into a scratch buffer first: that snapshots `weight` before
+            // the first row is written, so when `out` and `weight` are the *same* buffer (an in-place
+            // gather — a legal Wukong program, and the case a shared token/position table produces) the
+            // interpreter computed a different program than the source and than the serial native
+            // kernel, which reads live memory. It also removes the old `v_eff = max(ids) + 1` extent
+            // heuristic the snapshot needed to size that buffer.
+            //
+            // Element-wise this is the identical gather (pure data movement — every output element is a
+            // verbatim copy, so there is no reassociation to keep in sync with the runtime kernel), with
+            // the runtime's own out-of-range rule preserved: an id outside `[0, v)` zeroes its row.
             "wukong_embedding_f32" | "wukong_embedding_f32_parallel" => {
                 let out = ptr(args[0])?;
                 let weight = ptr(args[1])?;
                 let ids = ptr(args[2])?;
                 let t = dim!(args[3]);
                 let h = dim!(args[4]);
-                // Read the `t` token ids (each a `Value::Int`).
-                let mut idbuf = Vec::with_capacity(t);
+                let v = args[5].as_int().max(0) as usize;
                 for r in 0..t {
-                    idbuf.push(
-                        self.memory
-                            .get(ids + r)
-                            .ok_or("embedding ids out of bounds")?
-                            .as_int() as i32,
-                    );
-                }
-                // Effective table height = the largest in-range id + 1 (out-of-range ids zero their row
-                // regardless of `v`, so they don't extend the live extent). This bounds the weight
-                // marshalling to memory that actually exists and keeps every valid id in `[0, v_eff)`.
-                let v_eff = idbuf
-                    .iter()
-                    .filter(|&&id| id >= 0)
-                    .map(|&id| id as usize + 1)
-                    .max()
-                    .unwrap_or(0);
-                let wn = v_eff * h;
-                let mut wbuf = Vec::with_capacity(wn);
-                for i in 0..wn {
-                    wbuf.push(
-                        self.memory
-                            .get(weight + i)
-                            .ok_or("embedding weight out of bounds")?
-                            .as_float() as f32,
-                    );
-                }
-                let mut obuf = vec![0.0f32; t * h];
-                // SAFETY: obuf is t*h f32, wbuf is v_eff*h f32, idbuf is t i32 — the kernel's contract,
-                // with every id < v_eff so no out-of-range path reads past wbuf.
-                unsafe {
-                    wukong_runtime::wukong_embedding_f32(
-                        obuf.as_mut_ptr(),
-                        wbuf.as_ptr(),
-                        idbuf.as_ptr(),
-                        t,
-                        h,
-                        v_eff,
-                    );
-                }
-                for (i, &val) in obuf.iter().enumerate() {
-                    *self
+                    let id = self
                         .memory
-                        .get_mut(out + i)
-                        .ok_or("embedding output out of bounds")? = Value::Float(val as f64);
+                        .get(ids + r)
+                        .ok_or("embedding ids out of bounds")?
+                        .as_int();
+                    for d in 0..h {
+                        let val = if id >= 0 && (id as usize) < v {
+                            let src = weight + id as usize * h + d;
+                            *self
+                                .memory
+                                .get(src)
+                                .ok_or("embedding weight out of bounds")?
+                        } else {
+                            Value::Float(0.0)
+                        };
+                        // Re-marshal through f32 so an `[f32]` table that happens to hold an
+                        // integer-typed slot lands as the f32 the native gather would copy.
+                        *self
+                            .memory
+                            .get_mut(out + r * h + d)
+                            .ok_or("embedding output out of bounds")? =
+                            Value::Float(val.as_float() as f32 as f64);
+                    }
                 }
                 Ok(Value::Unit)
             }
@@ -4587,6 +4573,20 @@ mod tests {
                      let mut s: f32 = 0.0; for i in 0..320 { s = s + buf[i]; } \
                      return (s / 100.0) as i32; }";
         assert_eq!(run_main(src), 766);
+
+        // The ordinary disjoint gather must be unchanged: reversing 80 rows of a table whose row `r`
+        // holds `4r..4r+3` sums to the same 0..319 total, and row 0 of the output is the last table
+        // row (316+317+318+319 = 1270).
+        let disjoint = "fn embed(ids: [i32;80], weight: [f32;320], mut out: [f32;320]) { \
+                          for t in 0..80 { for d in 0..4 { out[t*4+d] = weight[ids[t]*4+d]; } } } \
+                        fn main() -> i32 { let mut ids: [i32; 80] = [0; 80]; \
+                          let mut w: [f32; 320] = [0.0; 320]; let mut o: [f32; 320] = [0.0; 320]; \
+                          for i in 0..80 { ids[i] = 79 - i; } \
+                          for i in 0..320 { w[i] = (i as f32); } \
+                          embed(ids, w, o); \
+                          let mut s: f32 = 0.0; for i in 0..320 { s = s + o[i]; } \
+                          return (s as i32) * 10000 + ((o[0] + o[1] + o[2] + o[3]) as i32); }";
+        assert_eq!(run_main(disjoint), 51040 * 10000 + 1270);
     }
 
     /// An `alloc_<T>(n)` the interpreter's arena cannot satisfy must report a diagnostic. It used
