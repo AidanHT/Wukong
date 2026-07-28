@@ -3218,15 +3218,66 @@ mod tests {
         }
     }
 
-    /// Throughput probe (run: `cargo test -p wukong_runtime --release -- --ignored --nocapture`).
-    /// Sweeps square sizes so the parallel scaling (which improves with size, as the packs amortize
-    /// and each core gets more compute per K-block) is visible, not just the small-matrix corner.
+    /// Every piece of scheduling state [`pin_pcore`] overwrites, so [`restore_sched`] can put ALL
+    /// of it back. `pin_pcore` narrows the calling thread's affinity *and* raises the priority of
+    /// the whole PROCESS and of the calling thread; restoring only the mask left both elevations
+    /// in force for the rest of the test process, so the parallel rows of [`sgemm_throughput`] —
+    /// and every other `#[ignore]` probe sharing the process — were measured with the submitting
+    /// thread at TIME_CRITICAL and the process at HIGH while the rayon workers doing the actual
+    /// work stayed at NORMAL. On this hybrid P/E laptop that changes core placement, so the
+    /// printed parallel GFLOP/s were not reproducible by a run that did not include this probe.
+    #[derive(Clone, Copy)]
+    struct PrevSched {
+        /// Thread affinity mask; 0 means "nothing to restore" (the non-Windows no-op).
+        affinity: usize,
+        /// Process priority class. `GetPriorityClass` returns 0 on failure — never pushed back.
+        priority_class: u32,
+        /// Thread priority. `GetThreadPriority` returns `THREAD_PRIORITY_ERROR_RETURN` on failure.
+        thread_priority: i32,
+    }
+    /// `GetThreadPriority`'s documented failure return.
+    const THREAD_PRIORITY_ERROR_RETURN: i32 = 0x7FFF_FFFF;
+
+    /// Throughput probe (run: `cargo test -p wukong_runtime --release sgemm_throughput --
+    /// --ignored --nocapture --test-threads=1`). The filter and `--test-threads=1` are part of the
+    /// instrument: libtest's default `--test-threads` is the logical CPU count, so an unfiltered
+    /// `--ignored` run starts all nine ignored probes in this crate at once and the `sgemm
+    /// (1 core)` row below would be measured against an all-core 4096³ GEMM and two 64 MiB
+    /// bandwidth streams. Sweeps square sizes so the parallel scaling (which improves with size, as
+    /// the packs amortize and each core gets more compute per K-block) is visible, not just the
+    /// small-matrix corner.
     /// Pin the current thread to one P-core (logical CPU 0) and raise priority for a repeatable
-    /// single-core measurement; returns the previous affinity mask to restore before the parallel
-    /// benches. On this hybrid laptop the single-core GFLOP/s otherwise swings ±30% with P/E
-    /// scheduling and turbo, swamping microkernel changes. No-op (returns 0) off Windows.
+    /// single-core measurement; returns the previous scheduling state to restore before the
+    /// parallel benches. On this hybrid laptop the single-core GFLOP/s otherwise swings ±30% with
+    /// P/E scheduling and turbo, swamping microkernel changes. No-op off Windows.
     #[cfg(windows)]
-    fn pin_pcore() -> usize {
+    fn pin_pcore() -> PrevSched {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn GetCurrentProcess() -> isize;
+            fn SetThreadAffinityMask(h: isize, mask: usize) -> usize;
+            fn SetThreadPriority(h: isize, prio: i32) -> i32;
+            fn GetThreadPriority(h: isize) -> i32;
+            fn SetPriorityClass(h: isize, class: u32) -> i32;
+            fn GetPriorityClass(h: isize) -> u32;
+        }
+        // SAFETY: plain scheduling syscalls on the current thread/process pseudo-handles, which
+        // are always valid and need no close; every argument is a by-value integer.
+        unsafe {
+            // Read the state back BEFORE overwriting it: the elevation is meant to last only as
+            // long as the pinned single-core rows.
+            let priority_class = GetPriorityClass(GetCurrentProcess());
+            let thread_priority = GetThreadPriority(GetCurrentThread());
+            SetPriorityClass(GetCurrentProcess(), 0x0000_0080); // HIGH_PRIORITY_CLASS
+            SetThreadPriority(GetCurrentThread(), 15); // THREAD_PRIORITY_TIME_CRITICAL
+            let affinity = SetThreadAffinityMask(GetCurrentThread(), 0x1); // logical CPU 0 (a P-core)
+            PrevSched { affinity, priority_class, thread_priority }
+        }
+    }
+    /// Undo [`pin_pcore`] — all three pieces, not just the affinity mask.
+    #[cfg(windows)]
+    fn restore_sched(prev: PrevSched) {
         #[link(name = "kernel32")]
         extern "system" {
             fn GetCurrentThread() -> isize;
@@ -3235,32 +3286,78 @@ mod tests {
             fn SetThreadPriority(h: isize, prio: i32) -> i32;
             fn SetPriorityClass(h: isize, class: u32) -> i32;
         }
+        // SAFETY: the same current-thread/current-process pseudo-handle syscalls [`pin_pcore`]
+        // used, with the values it read back from them.
         unsafe {
-            SetPriorityClass(GetCurrentProcess(), 0x0000_0080); // HIGH_PRIORITY_CLASS
-            SetThreadPriority(GetCurrentThread(), 15); // THREAD_PRIORITY_TIME_CRITICAL
-            SetThreadAffinityMask(GetCurrentThread(), 0x1) // logical CPU 0 (a P-core)
+            // Each getter has a documented failure return that is not a valid setting; pushing it
+            // back would leave the process in a state it was never in.
+            if prev.affinity != 0 {
+                SetThreadAffinityMask(GetCurrentThread(), prev.affinity);
+            }
+            if prev.priority_class != 0 {
+                SetPriorityClass(GetCurrentProcess(), prev.priority_class);
+            }
+            if prev.thread_priority != THREAD_PRIORITY_ERROR_RETURN {
+                SetThreadPriority(GetCurrentThread(), prev.thread_priority);
+            }
         }
     }
+    #[cfg(not(windows))]
+    fn pin_pcore() -> PrevSched {
+        PrevSched { affinity: 0, priority_class: 0, thread_priority: THREAD_PRIORITY_ERROR_RETURN }
+    }
+    #[cfg(not(windows))]
+    fn restore_sched(_: PrevSched) {}
+
+    /// `pin_pcore` must hand back everything it took. It sets three pieces of state — the process
+    /// priority class, the calling thread's priority, and the thread affinity mask — and the old
+    /// `restore_affinity` put back only the mask. Observed before, in this exact sequence:
+    /// `BEFORE class=0x20 thread_prio=0` → `PINNED class=0x80 thread_prio=15` →
+    /// `RESTORED class=0x80 thread_prio=15`, i.e. HIGH_PRIORITY_CLASS and TIME_CRITICAL leaked for
+    /// the remainder of the process and every later measurement in it. Gated here rather than in
+    /// [`sgemm_throughput`] itself because that probe is `#[ignore]`d, so it never runs in CI.
+    #[test]
     #[cfg(windows)]
-    fn restore_affinity(mask: usize) {
-        if mask == 0 {
-            return;
-        }
+    fn pin_pcore_restores_every_piece_of_scheduling_state() {
         #[link(name = "kernel32")]
         extern "system" {
             fn GetCurrentThread() -> isize;
+            fn GetCurrentProcess() -> isize;
+            fn GetThreadPriority(h: isize) -> i32;
+            fn GetPriorityClass(h: isize) -> u32;
             fn SetThreadAffinityMask(h: isize, mask: usize) -> usize;
         }
+        // SAFETY: read-only scheduling queries on the current thread/process pseudo-handles, plus
+        // one `SetThreadAffinityMask` that re-applies the mask already in force (see below).
         unsafe {
-            SetThreadAffinityMask(GetCurrentThread(), mask);
+            let class0 = GetPriorityClass(GetCurrentProcess());
+            let prio0 = GetThreadPriority(GetCurrentThread());
+            let prev = pin_pcore();
+            assert_eq!(
+                GetPriorityClass(GetCurrentProcess()),
+                0x0000_0080,
+                "pin_pcore is supposed to raise the process to HIGH_PRIORITY_CLASS"
+            );
+            restore_sched(prev);
+            assert_eq!(
+                GetPriorityClass(GetCurrentProcess()),
+                class0,
+                "process priority class leaked past restore_sched"
+            );
+            assert_eq!(
+                GetThreadPriority(GetCurrentThread()),
+                prio0,
+                "thread priority leaked past restore_sched"
+            );
+            // No `GetThreadAffinityMask` exists: setting the mask returns the one that was in
+            // force, so re-setting the restored value both checks it and leaves it unchanged.
+            assert_eq!(
+                SetThreadAffinityMask(GetCurrentThread(), prev.affinity),
+                prev.affinity,
+                "thread affinity mask not restored"
+            );
         }
     }
-    #[cfg(not(windows))]
-    fn pin_pcore() -> usize {
-        0
-    }
-    #[cfg(not(windows))]
-    fn restore_affinity(_: usize) {}
 
     #[test]
     #[ignore]
@@ -3297,7 +3394,7 @@ mod tests {
             bench("sgemm_nt (1 core)", &|| unsafe {
                 wukong_sgemm_nt(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
-            restore_affinity(prev); // parallel benches want all cores
+            restore_sched(prev); // parallel benches want all cores, at the process's own priority
             bench("sgemm (parallel)", &|| unsafe {
                 wukong_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
