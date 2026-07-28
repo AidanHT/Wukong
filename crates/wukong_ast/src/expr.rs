@@ -150,6 +150,13 @@ pub enum BinOp {
     Or,
 }
 
+/// The largest const array length the compiler can carry end to end: `mir_build` stores a slot
+/// length in a `u32`, so any longer length is truncated on the way to MIR while sema's bounds
+/// check still believes the full value — the exact slot-size vs bounds-check desync
+/// [`BinOp::fold_const_len`] exists to prevent. Lengths above this fold to the invalid-length
+/// sentinel `0`, which sema already rejects (`E0501`) at the first index.
+pub const MAX_CONST_ARRAY_LEN: u64 = u32::MAX as u64;
+
 impl BinOp {
     pub fn glyph(self) -> &'static str {
         use BinOp::*;
@@ -180,44 +187,45 @@ impl BinOp {
     /// bounds-check desync reads out of bounds (native segfault / interp != native). Division/shift by
     /// zero, an over-wide shift, and a non-arithmetic op fold to 0 (an invalid length rejected
     /// downstream) rather than panicking.
+    ///
+    /// The same 0 sentinel covers everything the two consumers cannot represent identically: an
+    /// operand or a result above [`MAX_CONST_ARRAY_LEN`], and arithmetic that wraps in u64. Without
+    /// this, `[i32; 2 - 5]` folded to 2^64-3 (sema believes every index is in bounds; mir_build
+    /// allocas the low 32 bits) and `[i32; 4294967296 + 4]` folded above the u32 slot width, so a
+    /// well-formed program wrote out of bounds on native and trapped in the interpreter.
     pub fn fold_const_len(self, l: u64, r: u64) -> u64 {
         use BinOp::*;
-        match self {
-            Add => l.wrapping_add(r),
-            Sub => l.wrapping_sub(r),
-            Mul => l.wrapping_mul(r),
-            Div => {
-                if r != 0 {
-                    l / r
-                } else {
-                    0
-                }
-            }
-            Rem => {
-                if r != 0 {
-                    l % r
-                } else {
-                    0
-                }
-            }
+        if l > MAX_CONST_ARRAY_LEN || r > MAX_CONST_ARRAY_LEN {
+            return 0;
+        }
+        let folded = match self {
+            Add => l.checked_add(r),
+            Sub => l.checked_sub(r),
+            Mul => l.checked_mul(r),
+            Div => l.checked_div(r),
+            Rem => l.checked_rem(r),
             Shl => {
                 if r < 64 {
-                    l.wrapping_shl(r as u32)
+                    Some(l.wrapping_shl(r as u32))
                 } else {
-                    0
+                    None
                 }
             }
             Shr => {
                 if r < 64 {
-                    l.wrapping_shr(r as u32)
+                    Some(l.wrapping_shr(r as u32))
                 } else {
-                    0
+                    None
                 }
             }
-            BitAnd => l & r,
-            BitOr => l | r,
-            BitXor => l ^ r,
-            Eq | Ne | Lt | Le | Gt | Ge | And | Or => 0,
+            BitAnd => Some(l & r),
+            BitOr => Some(l | r),
+            BitXor => Some(l ^ r),
+            Eq | Ne | Lt | Le | Gt | Ge | And | Or => None,
+        };
+        match folded {
+            Some(n) if n <= MAX_CONST_ARRAY_LEN => n,
+            _ => 0,
         }
     }
 }
@@ -253,5 +261,66 @@ impl AssignOp {
             Shl => "<<=",
             Shr => ">>=",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-range lengths are unchanged — the folder is only tightened at the representable edge.
+    #[test]
+    fn fold_const_len_in_range_is_unchanged() {
+        assert_eq!(BinOp::Add.fold_const_len(2, 2), 4);
+        assert_eq!(BinOp::Sub.fold_const_len(8, 3), 5);
+        assert_eq!(BinOp::Mul.fold_const_len(4, 16), 64);
+        assert_eq!(BinOp::Div.fold_const_len(64, 8), 8);
+        assert_eq!(BinOp::Rem.fold_const_len(65, 8), 1);
+        assert_eq!(BinOp::Shl.fold_const_len(1, 10), 1024);
+        assert_eq!(BinOp::Shr.fold_const_len(1024, 2), 256);
+        assert_eq!(BinOp::BitOr.fold_const_len(8, 1), 9);
+        assert_eq!(
+            BinOp::Add.fold_const_len(MAX_CONST_ARRAY_LEN - 1, 1),
+            MAX_CONST_ARRAY_LEN
+        );
+    }
+
+    /// A length that wraps in u64 (`[i32; 2 - 5]`) must not be handed on as a colossal positive
+    /// length: sema then believes every index is in bounds while mir_build allocas the low 32 bits.
+    #[test]
+    fn fold_const_len_declines_wrapping() {
+        assert_eq!(BinOp::Sub.fold_const_len(2, 5), 0);
+        assert_eq!(BinOp::Add.fold_const_len(u64::MAX, 2), 0);
+        assert_eq!(BinOp::Mul.fold_const_len(u64::MAX, 2), 0);
+    }
+
+    /// A length above the MIR slot width (`[i32; 4294967296 + 4]`) is unrepresentable downstream,
+    /// so it must fold to the invalid-length sentinel rather than to a value mir_build truncates.
+    #[test]
+    fn fold_const_len_declines_above_slot_width() {
+        assert_eq!(BinOp::Add.fold_const_len(MAX_CONST_ARRAY_LEN, 1), 0);
+        assert_eq!(BinOp::Add.fold_const_len(4294967296, 4), 0);
+        assert_eq!(BinOp::Mul.fold_const_len(65536, 65536), 0);
+        assert_eq!(BinOp::Shl.fold_const_len(1, 40), 0);
+    }
+
+    /// An operand that is itself unrepresentable cannot be mirrored: mir_build's leaf decoder
+    /// narrows it to u32 before folding, so sema must not fold it to a length it would then trust.
+    #[test]
+    fn fold_const_len_declines_out_of_range_operand() {
+        assert_eq!(BinOp::Shr.fold_const_len(4294967296, 1), 0);
+        assert_eq!(BinOp::Div.fold_const_len(4294967296, 2), 0);
+        assert_eq!(BinOp::Mul.fold_const_len(4294967296, 0), 0);
+    }
+
+    /// Pre-existing sentinels stay: division/shift by zero and a non-arithmetic op fold to 0.
+    #[test]
+    fn fold_const_len_keeps_zero_sentinels() {
+        assert_eq!(BinOp::Div.fold_const_len(4, 0), 0);
+        assert_eq!(BinOp::Rem.fold_const_len(4, 0), 0);
+        assert_eq!(BinOp::Shl.fold_const_len(1, 64), 0);
+        assert_eq!(BinOp::Shr.fold_const_len(1, 64), 0);
+        assert_eq!(BinOp::Lt.fold_const_len(1, 2), 0);
+        assert_eq!(BinOp::And.fold_const_len(1, 1), 0);
     }
 }

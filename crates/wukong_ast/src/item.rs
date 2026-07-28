@@ -150,7 +150,11 @@ pub enum AttrVal {
 }
 
 impl Attr {
-    /// Find a `key = value` argument by key name (resolved via the interner by the caller).
+    /// All arguments in source order, in whatever form each was written. This is NOT a lookup:
+    /// it does not select a `key = value` pair, so `@parallel(grain = 1, restrict)` yields the
+    /// `restrict` word alongside the `grain` pair and a caller that reads position 1 as "the
+    /// value of grain" configures the grain from the wrong argument. Match on
+    /// [`AttrArg::KeyValue`] to read a keyed argument.
     pub fn args(&self) -> &[AttrArg] {
         &self.args
     }
