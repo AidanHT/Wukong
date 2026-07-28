@@ -479,6 +479,45 @@ mod tests {
         }
     }
 
+    /// The remaining non-finite classes, also bit-against-the-twin. `±∞` are ordinary operands for the
+    /// fold but collide with the tree's *identity fill* (`-∞` for max, `+∞` for min), so a real infinity
+    /// in the data and a vacated lane are indistinguishable inside `inclusive_scan8` — worth pinning
+    /// separately from the NaN sweep. `±0` pins that ties resolve to the earlier index on both paths
+    /// (`fold` returns its second operand on a tie, and the tree's second operand is always the earlier
+    /// index). An all-NaN row is the degenerate case where the twin's `acc` never leaves the identity.
+    #[test]
+    fn cummax_cummin_infinities_and_all_nan() {
+        let inf = f32::INFINITY;
+        let nan = f32::NAN;
+        let cases: [Vec<f32>; 6] = [
+            vec![nan; 8],
+            vec![nan; 20],
+            vec![-inf; 12],
+            vec![inf; 12],
+            vec![inf, -inf, 0.0, -0.0, inf, -inf, 3.0, -3.0, inf, 1.0, -0.0, 0.0],
+            vec![-inf, nan, inf, nan, 2.0, -inf, inf, 5.0, nan, -0.0, 0.0, 7.0, nan, 1.0],
+        ];
+        for x in &cases {
+            let cols = x.len();
+            let mut got_max = vec![0.0f32; cols];
+            let mut got_min = vec![0.0f32; cols];
+            unsafe {
+                wukong_cummax_f32(x.as_ptr(), got_max.as_mut_ptr(), 1, cols as i64);
+                wukong_cummin_f32(x.as_ptr(), got_min.as_mut_ptr(), 1, cols as i64);
+            }
+            assert_eq!(
+                bits(&got_max),
+                bits(&scalar_ref(x, 1, cols, Ext::Max)),
+                "cummax vs twin, non-finite row of {cols}"
+            );
+            assert_eq!(
+                bits(&got_min),
+                bits(&scalar_ref(x, 1, cols, Ext::Min)),
+                "cummin vs twin, non-finite row of {cols}"
+            );
+        }
+    }
+
     /// Focused check on the cross-128-lane in-lane scan with known data (exact, no rounding) on a single
     /// 8-block. An ascending ramp → cummax is the ramp itself and cummin is the first element repeated; a
     /// descending ramp → the opposite. This pins the `_mm256_permutevar8x32_ps` shift + identity-fill

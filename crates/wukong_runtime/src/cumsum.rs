@@ -269,6 +269,44 @@ mod tests {
         }
     }
 
+    /// NaN must reach the output at exactly the positions the strict left-to-right twin puts it. The
+    /// additive tree gives lane `j` the sum of `v[0..=j]` with every element counted exactly once — only
+    /// the *order* differs — so a NaN at index `p` poisons `out[p..]` on both paths and nothing before
+    /// it. This is precisely what makes the reassociated scan safe where the sibling running-max/min
+    /// scan needed an explicit guard: `+` propagates NaN under any association, `(a > b) ? a : b` does
+    /// not. Positions before `p` are an ordinary reassociated prefix sum and are held to `REL_TOL`.
+    #[test]
+    fn cumsum_nan_propagates_like_the_scalar_twin() {
+        for &cols in &[8usize, 9, 17, 33, 64] {
+            for p in 0..cols {
+                let mut x = fill(cols);
+                x[p] = f32::NAN;
+                let mut got = vec![0.0f32; cols];
+                unsafe {
+                    wukong_cumsum_f32(x.as_ptr(), got.as_mut_ptr(), 1, cols as i64);
+                }
+                let want = cumsum_scalar_ref(&x, 1, cols);
+                for t in 0..cols {
+                    assert_eq!(
+                        got[t].is_nan(),
+                        want[t].is_nan(),
+                        "NaN reach {cols} p={p} t={t}: {} vs {}",
+                        got[t],
+                        want[t]
+                    );
+                    if t < p {
+                        assert!(
+                            close(got[t], want[t]),
+                            "prefix {cols} p={p} t={t}: {} vs {}",
+                            got[t],
+                            want[t]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Serial and parallel must be **bit-for-bit identical** (rows independent, no new reassociation —
     /// the parallel path just maps the same per-row routine across cores). Exercised above the parallel
     /// threshold so the rayon path actually runs.
