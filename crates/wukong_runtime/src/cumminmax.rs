@@ -248,6 +248,14 @@ unsafe fn cummm_parallel(x: *const f32, out: *mut f32, rows: usize, cols: usize,
         cummm_serial(x, out, rows, cols, ext);
         return;
     }
+    // This fork can be the process's FIRST rayon touch, and rayon builds its global registry lazily
+    // there: without this, the DEFAULT registry (std-sized worker stacks) is what gets built, and the
+    // runtime's own 16 MiB `build_global` then loses the race for the rest of the process — its `Err`
+    // is discarded, so outlined `@parallel` region bodies end up on undersized stacks. See
+    // [`crate::ensure_global_pool`], whose doc states this as a precondition on every parallel path.
+    // Idempotent (`Once`) and scheduling-only: the row remains the unit of work, so the bits are
+    // unchanged and serial == parallel still holds bit-for-bit.
+    crate::ensure_global_pool();
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/norm/cumsum);
     // each row is a disjoint sub-slice of out.
     let (xa, oa) = (x as usize, out as usize);
