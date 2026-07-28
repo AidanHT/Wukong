@@ -470,15 +470,21 @@ fn mlp_sgd_decreases_loss() {
 use wukong_interp::run_kernel_f32;
 
 // Runtime op codes (mirrored from wukong_runtime).
+const VM_EXP: i64 = 0;
 const VM_TANH: i64 = 2;
 const VM_SIGMOID: i64 = 3;
 const VM_RELU: i64 = 4;
 const VM_SILU: i64 = 5;
 const VM_GELU: i64 = 6;
+const VM_ELU: i64 = 7;
+const VM_SOFTPLUS: i64 = 9;
 const RED_SUM: i64 = 2;
 const RED_SSD: i64 = 1;
 const VE_ID: i64 = 0;
 const VE_USE_Y: i64 = 256;
+// velem *compute modes* — they live above the low activation byte, so `op & 0xff` does not see them.
+const VE_HADAMARD: i64 = 512;
+const VE_DIV: i64 = 1024;
 
 fn ci(b: &mut Builder, x: i64) -> ValueId {
     b.build(MirType::I64, Op::ConstInt(x as i128, MirType::I64))
@@ -940,6 +946,51 @@ fn linear_gelu_sum_vjp() {
     tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
 }
 
+#[test]
+fn linear_exp_sum_vjp() {
+    // loss = sum(exp(X . W^T)); exp takes the SYNTHESIZED-loop route (`activation_backward`), whose
+    // `exp' = y` arm reuses the forward output buffer. It was the one algebraic-derivative arm with
+    // no test at all, so a wrong reuse there would have been silent.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_EXP), false);
+    let mut seed = 0xE770u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
+#[test]
+fn linear_elu_sum_vjp() {
+    // loss = sum(elu(X . W^T)); the elu backward rides wukong_vmath2_f32 with VM2_ELU_BWD. Nothing
+    // proved the tape picked the RIGHT vmath2 code for a given forward activation — the runtime's
+    // own f64 gate proves each kernel computes its derivative, not that `vm2_bwd_code` routes to it
+    // — so a typo in that map was invisible.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_ELU), false);
+    let mut seed = 0xE7Au64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
+#[test]
+fn linear_softplus_sum_vjp() {
+    // loss = sum(softplus(X . W^T)); rides wukong_vmath2_f32 with VM2_SOFTPLUS_BWD — the other
+    // previously ungated forward-to-backward routing.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_SOFTPLUS), false);
+    let mut seed = 0x50F7u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Softmax VJP: loss = sum_ij C[i,j] * softmax(X)[i,j] (a coefficient-weighted softmax). Backward
 // per row is dx = y (.) (dy - sum_j dy_j y_j) with dy = C — emitted as nested loops with a per-row
@@ -954,7 +1005,20 @@ const RED_DOT: i64 = 0;
 /// Build `y = norm(x); loss = sum_i C[i]*y[i]` — a coefficient-weighted norm (so dy = C is
 /// non-trivial). Params: X, C, out; intermediate: y (alloca).
 fn build_norm_dot(it: &mut Interner, rows: usize, cols: usize, op: i64, eps_bits: i64) -> Fwd {
-    let norm = it.intern("wukong_norm_f32");
+    build_norm_dot_sym(it, rows, cols, op, eps_bits, "wukong_norm_f32")
+}
+
+/// As [`build_norm_dot`], but with the norm kernel symbol chosen by the caller — so the same tape
+/// can be built against the serial `wukong_norm_f32` and its `@parallel` twin.
+fn build_norm_dot_sym(
+    it: &mut Interner,
+    rows: usize,
+    cols: usize,
+    op: i64,
+    eps_bits: i64,
+    norm_sym: &str,
+) -> Fwd {
+    let norm = it.intern(norm_sym);
     let sreduce = it.intern("wukong_sreduce_f32");
     let mut b = Builder::new(it.intern("normdot"), MirType::Void);
     let x = b.add_param(PTR);
@@ -1067,6 +1131,46 @@ fn rmsnorm_dot_vjp() {
     let xb = rand_vec(&mut seed, rows * cols);
     let cb = rand_vec(&mut seed, rows * cols);
     // y = x/r, r = sqrt(mean(x^2)+eps); dy = C; dx = (1/r)(dy - y*mean(dy*y)).
+    let mut dx = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let row = &xb[r * cols..(r + 1) * cols];
+        let nf = cols as f64;
+        let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / nf;
+        let rr = (ms + eps as f64).sqrt();
+        let y: Vec<f64> = row.iter().map(|&v| v as f64 / rr).collect();
+        let mean_dyy = (0..cols).map(|j| cb[r * cols + j] as f64 * y[j]).sum::<f64>() / nf;
+        for j in 0..cols {
+            dx[r * cols + j] = (1.0 / rr) * (cb[r * cols + j] as f64 - y[j] * mean_dyy);
+        }
+    }
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+/// The section-5 coupling contract: every `_parallel` recognizer arm in mir_build must have a
+/// counterpart in `Syms`/`is_kernel`/`diff_kernel_call`. `wukong_norm_f32_parallel` — which
+/// `emit_norm` selects for every batched norm inside a `@parallel fn`, i.e. the shipped transformer
+/// shape — had none, so a `@parallel` RMSNorm loss declined with
+/// "unrecognized buffer-writing call has no VJP rule" while the byte-identical serial spelling
+/// differentiated fine (observed with the shipped release compiler). Each row is independent, so the
+/// parallel kernel is bit-identical to the serial one and takes the very same rule; this gates that
+/// it now produces the same closed-form gradient as `rmsnorm_dot_vjp`.
+#[test]
+fn parallel_norm_dot_vjp() {
+    let (rows, cols) = (3, 5);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_dot_sym(
+        &mut it,
+        rows,
+        cols,
+        NORM_RMSNORM,
+        eps.to_bits() as i64,
+        "wukong_norm_f32_parallel",
+    );
+    let mut seed = 0x71A3u64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let cb = rand_vec(&mut seed, rows * cols);
     let mut dx = vec![0.0; rows * cols];
     for r in 0..rows {
         let row = &xb[r * cols..(r + 1) * cols];
@@ -1561,4 +1665,287 @@ fn parallel_region_declines_loudly() {
         err.contains("no VJP rule"),
         "the decline must be the loud unrecognized-call error, got: {err}"
     );
+}
+
+/// `loss = Σ x[i]^2` — the sum-of-squares loss / L2 regularizer, the most common scalar loss in the
+/// language — lowers to `sreduce(x, x, n, RED_DOT)` with both operands the SAME buffer. That is one
+/// op with a repeated operand, but the RED_DOT arm treated it as two contributions and called
+/// `single(x)` twice, so it always failed: observed with the shipped release compiler on
+/// `for i in 0..8 { l = l + x[i]*x[i]; }` — `--emit=mir -O2` shows
+/// `call wukong_sreduce_f32_parallel(v0, v0, 8, 0)` and `--emit=grad` failed with
+/// "buffer v0 receives multiple gradient contributions", a message that does not describe the actual
+/// problem. The rule is one velem scale, `dx = 2g·x`.
+#[test]
+fn self_dot_sumsq_vjp() {
+    let n = 8;
+    let mut it = Interner::default();
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "sumsq"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let (nv, dotop) = (ci(&mut b, n as i64), ci(&mut b, RED_DOT));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![x, x, nv, dotop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![n, 1],
+        loss_out: 1,
+    };
+
+    let mut seed = 0x5052u64;
+    let xb = rand_vec(&mut seed, n);
+    let dx: Vec<f64> = xb.iter().map(|&v| 2.0 * v as f64).collect();
+    let inputs = vec![xb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+/// The scalar path (`diff_load`) ACCUMULATES into the gradient buffer (read-add-write) while the
+/// kernel path (`fill_buf` / `velem_scale` / `velem_affine`) OVERWRITES it. A loss that both reduces
+/// a `wrt` buffer with a recognized kernel AND reads one of its elements as a scalar therefore lost
+/// the scalar contribution: observed with the shipped release compiler on
+///
+/// ```wukong
+/// @parallel fn loss(x:[f32;8], mut out:[f32;1]) -> f32 {
+///   let mut l: f32 = 0.0; for i in 0..8 { l = l + x[i]; }
+///   let e: f32 = x[0]; let r: f32 = l + e; out[0] = r; return r; }
+/// ```
+///
+/// which exited 0 emitting `grad[0] += 1` and then a broadcast `velem` fill of 1.0 over all 8
+/// elements that clobbered it — gradient [1,1,...] where the truth is [2,1,1,...]. `diff_load` now
+/// records the contribution, so `single()` sees the mix and declines instead of answering wrongly.
+#[test]
+fn scalar_load_plus_kernel_reduction_declines_loudly() {
+    let n = 8;
+    let mut it = Interner::default();
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "mixfwd"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    // l = Σ x   (kernel path: an overwriting broadcast fill in the backward)
+    let (nv, sumop) = (ci(&mut b, n as i64), ci(&mut b, RED_SUM));
+    let l = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![x, x, nv, sumop],
+        },
+    );
+    // e = x[0]  (scalar path: an accumulating read-add-write in the backward)
+    let e = b.build(MirType::F32, Op::Load(x, MirType::F32));
+    let r = b.build(MirType::F32, Op::Bin(BinOp::FAdd, l, e));
+    b.build_void(Op::Store { ptr: out, value: r });
+    b.ret(Some(r));
+    let fwd = b.finish();
+
+    let err = grad(&fwd, &[0], &mut it)
+        .expect_err("a mixed scalar+kernel contribution must not be silently clobbered");
+    assert!(
+        err.contains("multiple gradient contributions"),
+        "the decline must be the accumulation error, got: {err}"
+    );
+}
+
+/// `is_kernel` recognizes a call by SYMBOL NAME alone, but every VJP rule indexes the forward
+/// argument vector raw (`args[0]`..`args[7]`). A `.wk` program may declare a runtime kernel name in
+/// an `extern "C"` block with any signature, so a one-argument `wukong_norm_f32` used to reach
+/// `diff_norm` and panic the compiler:
+/// `index out of bounds: the len is 1 but the index is 1` at tape.rs (exit 127, observed with the
+/// shipped release compiler on an `extern "C" { fn wukong_norm_f32(p: *mut f32); }` program).
+/// The ABI arity is now checked up front, so the same input gets a diagnostic.
+#[test]
+fn kernel_call_with_wrong_arity_declines_loudly() {
+    for (name, nargs, want) in [
+        ("wukong_norm_f32", 1usize, 6usize),
+        ("wukong_velem_f32", 3, 8),
+        ("wukong_sgemm_nt", 2, 7),
+        ("wukong_vmath_f32", 9, 4),
+    ] {
+        let mut it = Interner::default();
+        let kern = sym(&mut it, name);
+        let mut b = Builder::new(sym(&mut it, "extfwd"), MirType::Void);
+        let x = b.add_param(PTR);
+        let out = b.add_param(PTR);
+        b.build_void(Op::Call {
+            func: kern,
+            args: vec![out; nargs],
+        });
+        let x0 = b.build(MirType::F32, Op::Load(x, MirType::F32));
+        let sq = b.build(MirType::F32, Op::Bin(BinOp::FMul, x0, x0));
+        b.build_void(Op::Store { ptr: out, value: sq });
+        b.ret(Some(sq));
+        let fwd = b.finish();
+
+        let err = grad(&fwd, &[0], &mut it)
+            .expect_err("a non-ABI arity must be a diagnostic, not an index panic");
+        assert!(
+            err.contains(name) && err.contains(&format!("expected {want}")),
+            "{name}/{nargs} must name the callee and the expected arity, got: {err}"
+        );
+    }
+}
+
+/// A scalar element write into a buffer that a downstream recognized kernel then REDUCES is on the
+/// gradient path, but the reverse walk has no VJP rule for read-after-write through memory. It used
+/// to be skipped as "the loss sink", which made the whole reverse pass contribute nothing: observed
+/// with the shipped release compiler on
+///
+/// ```wukong
+/// @parallel fn loss(x:[f32;8], mut out:[f32;1]) -> f32 {
+///   let mut h: [f32; 8] = [0.0; 8];
+///   h[0] = x[0] * x[0];
+///   let mut l: f32 = 0.0; for i in 0..8 { l = l + h[i]; }
+///   out[0] = l; return l; }
+/// ```
+///
+/// `--emit=grad` exited 0 with no diagnostic and never stored to the appended gradient parameter at
+/// all — an all-zero gradient for every x, where the truth is `[2*x[0], 0, ...]`. It must refuse.
+#[test]
+fn store_into_live_gradient_buffer_declines_loudly() {
+    let n = 8;
+    let mut it = Interner::default();
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "storefwd"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let h = b.alloca(arr(n));
+    // h[0] = x[0] * x[0]   (a scalar write into the buffer the reduction below reads)
+    let x0 = b.build(MirType::F32, Op::Load(x, MirType::F32));
+    let sq = b.build(MirType::F32, Op::Bin(BinOp::FMul, x0, x0));
+    b.build_void(Op::Store { ptr: h, value: sq });
+    // loss = Σ h
+    let (nv, sumop) = (ci(&mut b, n as i64), ci(&mut b, RED_SUM));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![h, h, nv, sumop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    let fwd = b.finish();
+
+    let err = grad(&fwd, &[0], &mut it)
+        .expect_err("a store feeding a reduced buffer must not silently zero the gradient");
+    assert!(
+        err.contains("store into buffer") && err.contains("no VJP rule"),
+        "the decline must be the loud store error, got: {err}"
+    );
+}
+
+/// The autovectorizer's `Op::VecKernelCall` is void and writes through buffer pointers, exactly like
+/// an unrecognized `Op::Call` — but the loud guard only matched `Op::Call`, so it fell through to
+/// the `result.is_none() -> Ok(())` skip and contributed no adjoint at all. (Not reachable from
+/// `.wk` source at HEAD: `emit_veckernel_for` always leaves a scalar tail loop, so such a function
+/// has >1 block and `grad` rejects it earlier. This pins the crate's own contract so a future
+/// CFG-simplification that folds an empty tail cannot turn it into a silent zero gradient.)
+#[test]
+fn veckernel_declines_loudly() {
+    let mut it = Interner::default();
+    let mut b = Builder::new(sym(&mut it, "veckernel_fwd"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let ptrs = b.alloca(MirType::Array(Box::new(PTR), 2));
+    let i0 = ci(&mut b, 0);
+    let s0 = b.build(PTR, Op::Gep { ptr: ptrs, index: i0, elem: PTR });
+    b.build_void(Op::Store { ptr: s0, value: x });
+    let i1 = ci(&mut b, 1);
+    let s1 = b.build(PTR, Op::Gep { ptr: ptrs, index: i1, elem: PTR });
+    b.build_void(Op::Store { ptr: s1, value: out });
+    let scalars = b.alloca(MirType::Array(Box::new(MirType::F32), 1));
+    let n = ci(&mut b, 8);
+    b.build_void(Op::VecKernelCall {
+        kernel: 0,
+        ptrs,
+        scalars,
+        n,
+    });
+    let loss = b.build(F64, Op::Load(out, F64));
+    b.ret(Some(loss));
+    let fwd = b.finish();
+
+    let err = grad(&fwd, &[0], &mut it).expect_err("a veckernel must not tape");
+    assert!(
+        err.contains("no VJP rule") && err.contains("vector kernel"),
+        "the decline must name the vector kernel, got: {err}"
+    );
+}
+
+/// Build `t = velem(x, y, n, op); loss = Σ t` — the tape mir_build's `match_velem_binary` emits for
+/// `t[i] = x[i] * y[i]` (op = `VE_HADAMARD|VE_USE_Y`) or `x[i] / y[i]` (op = `VE_DIV|VE_USE_Y`).
+/// Params: X, Y, out; intermediate: t (alloca).
+fn build_velem_sum(it: &mut Interner, n: usize, op: i64) -> Fwd {
+    let velem = it.intern("wukong_velem_f32");
+    let sreduce = it.intern("wukong_sreduce_f32");
+    let mut b = Builder::new(it.intern("velem_sum"), MirType::Void);
+    let x = b.add_param(PTR);
+    let y = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let t = b.alloca(arr(n));
+    let nv = ci(&mut b, n as i64);
+    let (a_c, b_c, c_c) = (cf(&mut b, 1.0), cf(&mut b, 1.0), cf(&mut b, 0.0));
+    let opv = ci(&mut b, op);
+    b.build_void(Op::Call {
+        func: velem,
+        args: vec![x, y, t, nv, a_c, b_c, c_c, opv],
+    });
+    let sumop = ci(&mut b, RED_SUM);
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![t, t, nv, sumop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![n, n, 1],
+        loss_out: 2,
+    }
+}
+
+/// A velem *compute mode* (`VE_HADAMARD` = 512, `VE_DIV` = 1024) lives ABOVE the activation byte, so
+/// the old `op & 0xff != VE_ID` gate let it through and applied the AFFINE VJP `dx = a·dout` to a
+/// nonlinear kernel: for `loss = Σ x[i]·y[i]` the emitted gradient was 1.0 everywhere instead of
+/// `y[i]`, with no diagnostic. The gate is now a whitelist of the two affine spellings, so both
+/// modes decline loudly. (The real Hadamard/quotient VJP can be added later; the refusal is what
+/// stops the wrong answer.)
+#[test]
+fn velem_compute_modes_decline_loudly() {
+    for (op, needle) in [
+        (VE_HADAMARD | VE_USE_Y, "Hadamard"),
+        (VE_DIV | VE_USE_Y, "division"),
+    ] {
+        let mut it = Interner::default();
+        let fwd = build_velem_sum(&mut it, 8, op);
+        let err = grad(&fwd.func, &[0, 1], &mut it)
+            .expect_err("a non-affine velem compute mode must not take the affine VJP");
+        assert!(
+            err.contains("velem VJP") && err.contains(needle),
+            "op {op} must decline naming the compute mode, got: {err}"
+        );
+    }
+}
+
+/// The two spellings the affine rule IS valid for must keep differentiating: the whitelist gate must
+/// not have narrowed the accepted set. `loss = Σ (a·x + b·y)` -> `dx = a`, `dy = b` per element.
+#[test]
+fn velem_affine_still_differentiates() {
+    let n = 8;
+    let mut it = Interner::default();
+    let fwd = build_velem_sum(&mut it, n, VE_ID | VE_USE_Y);
+    let mut seed = 0xBE1Eu64;
+    let xb = rand_vec(&mut seed, n);
+    let yb = rand_vec(&mut seed, n);
+    let inputs = vec![xb, yb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[vec![1.0; n], vec![1.0; n]], &mut it);
 }
