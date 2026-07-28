@@ -639,6 +639,34 @@ impl Sema<'_> {
     }
 
     fn register(&mut self, name: Ident, kind: DefKind, span: Span) {
+        // `wukong_` is the compiler's own runtime-kernel namespace (~150 symbols emitted by the GEMM
+        // / vmath / norm / reduction / transpose / quant recognizers). A user function with one of
+        // those names silently HIJACKED the dispatch: `fn wukong_norm_f32(…)` made a hand-written
+        // softmax lower to a call to the user's body instead — the normalization never ran, both
+        // backends agreed on the wrong answer, and no diagnostic was emitted. With a mismatched
+        // arity it instead diverged (interp dropped the kernel and ran on; native aborted with a raw
+        // Cranelift signature-incompatibility string, an uncatalogued error leaking backend
+        // internals), and with a body that dereferences its arguments it is arbitrary memory
+        // corruption — the recognizer passes raw pointers the user declared as `i64`. Reserving the
+        // whole prefix closes all of that for every kernel at once; mangling the emitted symbols
+        // instead would mean editing every backend's name constants.
+        if matches!(kind, DefKind::Fn(_)) {
+            let nm = self.sym_str(name.sym);
+            if nm.starts_with("wukong_") {
+                let nm = nm.to_string();
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "the name `{nm}` is reserved for a compiler runtime kernel"
+                    ))
+                    .with_code("E0300")
+                    .primary(name.span, "reserved name")
+                    .help("rename this function; the `wukong_` prefix is reserved for the symbols \
+                           the kernel recognizers emit"),
+                );
+                // Fall through and register it anyway: the compile is already failing, and leaving
+                // the def map complete keeps every call site from cascading into E0301.
+            }
+        }
         if let Some(&idx) = self.defs.by_name.get(&name.sym) {
             // Point at BOTH definitions. In a multi-file program (the driver's import loader
             // splices every imported file's items into one flat namespace) the two can live in
@@ -2416,6 +2444,22 @@ impl Sema<'_> {
         }
     }
 
+    /// Reject a `\u{…}` escape that is not a Unicode scalar value, keeping the established split
+    /// (sema validates literals, mir_build decodes them) alongside `int_literal_well_formed` /
+    /// `float_literal_well_formed`.
+    fn check_unicode_escapes(&mut self, sym: Symbol, span: Span) {
+        if let Some(cp) = bad_unicode_escape(self.sym_str(sym)) {
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "`\\u{{{cp:X}}}` is not a Unicode scalar value (the maximum is \\u{{10FFFF}}, \
+                     and \\u{{D800}}..=\\u{{DFFF}} are surrogates)"
+                ),
+            );
+        }
+    }
+
     fn type_expr(&mut self, e: &Expr) -> Ty {
         let ty = self.type_expr_inner(e);
         self.types.insert(e.id, ty.clone());
@@ -2449,11 +2493,17 @@ impl Sema<'_> {
                 }
             }
             ExprKind::Bool(_) => Ty::Scalar(Scalar::Bool),
-            ExprKind::Str(_) => Ty::Ptr {
-                mutable: false,
-                pointee: Box::new(Ty::Scalar(Scalar::U8)),
-            },
-            ExprKind::Char(_) => Ty::Scalar(Scalar::Char),
+            ExprKind::Str(s) => {
+                self.check_unicode_escapes(*s, e.span);
+                Ty::Ptr {
+                    mutable: false,
+                    pointee: Box::new(Ty::Scalar(Scalar::U8)),
+                }
+            }
+            ExprKind::Char(s) => {
+                self.check_unicode_escapes(*s, e.span);
+                Ty::Scalar(Scalar::Char)
+            }
             ExprKind::Path(p) => {
                 if p.is_single() {
                     match self.resolve_value(p.first().sym) {
@@ -3621,6 +3671,41 @@ fn float_literal_well_formed(text: &str) -> bool {
     !body.is_empty() && body.parse::<f64>().is_ok()
 }
 
+/// The first `\u{…}` escape in a char/string literal's raw source text that is NOT a Unicode scalar
+/// value (above `0x10FFFF`, or a surrogate `0xD800..=0xDFFF`), or `None` if every escape is fine.
+///
+/// mir_build's `decode_escape` saturates the accumulator, `char::from_u32` then returns `None`, and
+/// `decode_string_literal`'s fallback pushes `cp as u8`: `"a\u{110000}b"` pushed a NUL, so a
+/// `println` of it stopped before the `b` and the rest of the string was silently lost, while the
+/// char form printed 1114112 — a value the language guide says a `char` cannot hold. This mirrors
+/// `decode_escape`'s scan exactly, so it accepts precisely the set the decoder can represent.
+fn bad_unicode_escape(text: &str) -> Option<u32> {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            continue;
+        }
+        // Every other escape's body is plain text to this scan; consuming the escaped character is
+        // what matters, so a literal `\\` is not mistaken for the start of a new escape.
+        if chars.next() != Some('u') {
+            continue;
+        }
+        let cp = chars
+            .by_ref()
+            .skip_while(|&c| c != '{')
+            .skip(1)
+            .take_while(|&c| c != '}')
+            .fold(0u32, |v, c| {
+                c.to_digit(16)
+                    .map_or(v, |d| v.saturating_mul(16).saturating_add(d))
+            });
+        if char::from_u32(cp).is_none() {
+            return Some(cp);
+        }
+    }
+    None
+}
+
 fn parse_int_text(text: &str) -> Option<i64> {
     let mut s = text.trim();
     let neg = s.starts_with('-');
@@ -4224,6 +4309,48 @@ mod tests {
             "`::<0x4>` must bind N := 4: {:?}",
             errors(ok)
         );
+    }
+
+    #[test]
+    fn out_of_range_unicode_escape_is_rejected() {
+        // mir_build's decoder saturates and then falls back to `cp as u8`, so `\u{110000}` became a
+        // NUL inside the string (the `println` stopped there) and printed 1114112 as a `char`.
+        for src in [
+            r#"fn f() { println("a\u{110000}b"); }"#,
+            r#"fn f() { let c = '\u{110000}'; }"#,
+            r#"fn f() { let c = '\u{D800}'; }"#,
+        ] {
+            assert!(
+                errors(src).contains(&"E0401"),
+                "expected an invalid Unicode escape: {:?}",
+                errors(src)
+            );
+        }
+        // Valid escapes — including the largest scalar value and an escaped backslash followed by a
+        // literal `u{...}` — stay accepted.
+        for src in [
+            r#"fn f() { let c = '\u{1F600}'; }"#,
+            r#"fn f() { let c = '\u{10FFFF}'; }"#,
+            r#"fn f() { println("a\\u{110000}b"); }"#,
+            r#"fn f() { println("tab\there\n"); }"#,
+        ] {
+            assert!(errors(src).is_empty(), "unexpected: {:?}", errors(src));
+        }
+    }
+
+    #[test]
+    fn wukong_prefixed_function_name_is_reserved() {
+        // A user function named after a recognizer-emitted runtime kernel HIJACKED the dispatch: the
+        // recognized softmax window was replaced by a call to the user's body, silently.
+        let bad = "fn wukong_norm_f32(a: i64, b: i64) { } fn main() -> i32 { return 0; }";
+        assert!(
+            errors(bad).contains(&"E0300"),
+            "expected a reserved-name error: {:?}",
+            errors(bad)
+        );
+        // Only the prefix is reserved, and only for functions.
+        let ok = "fn wukongish(a: i64) {} fn my_wukong_norm(a: i64) {}";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
     }
 
     #[test]
