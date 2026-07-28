@@ -409,7 +409,13 @@ const ACT_GELU: u32 = 2;
 const ACT_SILU: u32 = 3;
 
 /// A fused GEMM epilogue, applied to each `C` element **on the final K-block writeback only**:
-/// `c = act(alpha·(A·Bᵀ) + bias[col])`. `bias` is null for no bias; `act` is one of [`ACT_IDENTITY`],
+/// `c = act(alpha·(A·Bᵀ) + bias[col])` — for `beta == 0`, which is the only rule the compiler emits
+/// (see the `debug_assert` in [`gemm_dispatch`]). With `beta != 0` the epilogue necessarily sees the
+/// beta-accumulated value, i.e. `act(alpha·(C_old + A·Bᵀ) + bias[col])`: the final-K-block writeback
+/// reads C once and cannot tell the caller's `C_old` apart from the partial sums the earlier
+/// K-blocks left there (both arrive as the same `beta_eff == 1` read), so `C_old + alpha·(A·Bᵀ)`
+/// is not expressible here without a second pass over C.
+/// `bias` is null for no bias; `act` is one of [`ACT_IDENTITY`],
 /// [`ACT_RELU`], [`ACT_GELU`], [`ACT_SILU`] (the transformer FFN activations); `alpha` is a
 /// loop-invariant scalar applied to the matmul result before the bias-add (the attention score scale
 /// `QKᵀ/√d` and every scaled projection). `alpha == 1.0` is the identity — the multiply is skipped so
@@ -532,7 +538,12 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi(
 /// scaled projection), where a loop-invariant scalar `alpha` multiplies the dot. The compiler lowers a
 /// matmul nest whose store is `c[i,j] = alpha·s` to this. `alpha` is folded into the C-tile writeback on
 /// the final K-block (no second pass over C), reusing the fused-epilogue machinery with a null bias and
-/// identity activation — so `C` is written once as `alpha·(A·Bᵀ)`. `beta` rule as usual. Single-threaded.
+/// identity activation — so `C` is written once as `alpha·(A·Bᵀ)`. Single-threaded.
+///
+/// **`beta` is NOT the usual rule here.** `alpha` is folded into the same final-K-block writeback
+/// that performs the accumulate, so `beta != 0` yields `alpha·(C_old + A·Bᵀ)`, not the BLAS
+/// `C_old + alpha·(A·Bᵀ)` — see [`Epilogue`] for why the writeback cannot separate the two. The
+/// only supported combination is `beta == 0`; [`gemm_dispatch`] `debug_assert`s it.
 ///
 /// The α multiply is one exact f32 op applied to the fully-reduced dot, so the result equals the naive
 /// nest's `alpha·s` under the documented matmul reassociation (both backends call this identical kernel,
@@ -562,7 +573,8 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha(
 /// Multi-threaded `C = alpha·(A·Bᵀ)` — the α-scaled `nn.Linear` across cores (the `@parallel` attention
 /// score / scaled projection). The scale folds into each tile's final-K-block writeback, and each C tile
 /// is owned by exactly one task with the same per-(i,j) accumulation order as the serial kernel — so it
-/// is bit-identical to the serial `wukong_sgemm_nt_alpha` the interpreter oracle calls.
+/// is bit-identical to the serial `wukong_sgemm_nt_alpha` the interpreter oracle calls. Same `beta`
+/// caveat as the serial entry point: only `beta == 0` is supported.
 ///
 /// # Safety
 /// `a` valid for `m*k`, `b` for `n*k`, `c` for `m*n` `f32`.
@@ -602,6 +614,16 @@ unsafe fn gemm_dispatch(
     par: bool,
     epi: Option<Epilogue>,
 ) {
+    // `alpha` scales the beta-ACCUMULATED value, not the matmul result alone — see [`Epilogue`].
+    // A non-unit `alpha` is therefore only meaningful with `beta == 0`. Every recognizer arm
+    // honours that today (`wukong_mir_build` pins `beta: 0` on the α-peeling arm and
+    // `alpha: None` on the β=1 residual arm), so this cannot fire in the current compiler; it is
+    // here to fail loudly on the day a new arm peels α off a residual store instead of silently
+    // gaining a spurious `alpha·` on the residual term.
+    debug_assert!(
+        beta == 0 || epi.is_none_or(|e| e.alpha == 1.0),
+        "gemm: alpha is applied AFTER the beta accumulate — alpha != 1 requires beta == 0"
+    );
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
