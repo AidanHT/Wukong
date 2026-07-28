@@ -151,10 +151,12 @@ pub fn run_with_output(
 ) -> Result<(i64, Vec<u8>), String> {
     // The tree-walker recurses on the *host* call stack — one host frame per Wukong call — so a
     // deeply recursive Wukong program would overflow the default main-thread stack and **abort**
-    // the process (a stack overflow is uncatchable) before the interpreter's own 100M-step guard
-    // could fire. The interpreter is the correctness oracle; an abort here would take down the
-    // whole differential gate, so run it on a worker thread with a large stack. `thread::scope`
-    // lets that worker borrow the non-`'static` program/interner.
+    // the process (a stack overflow is uncatchable). The interpreter is the correctness oracle; an
+    // abort here would take down the whole differential gate, so run it on a worker thread with a
+    // large stack. `thread::scope` lets that worker borrow the non-`'static` program/interner.
+    // `MAX_CALL_DEPTH` then bounds the recursion *within* that stack, so an unbounded recursion
+    // reports a diagnostic instead of overflowing even 512 MiB. Every other public entry point
+    // does the same — they are all the same tree-walker.
     with_big_stack(|| {
         let func = program
             .function(entry)
@@ -169,6 +171,7 @@ pub fn run_with_output(
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
             accel: None,
+            depth: 0,
         };
         let result = interp.run_function(func, Vec::new())?;
         Ok((result.as_int() as i64, interp.stdout))
@@ -195,6 +198,37 @@ fn with_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
+/// Carries a `&mut dyn Accelerator` into [`with_big_stack`]'s scoped worker.
+///
+/// The accelerator-taking entry points must run the tree-walker on the big stack for the same
+/// reason [`run_with_output`] does, but `Accelerator` deliberately carries no `Send` bound (adding
+/// one is a public-API change every backend implementing it would have to satisfy), so a closure
+/// borrowing one cannot be spawned. `with_big_stack` **joins** its worker before returning, so the
+/// accelerator is reachable from exactly one thread at a time and never outlives the borrow it came
+/// from — precisely the guarantee `thread::scope` already gives the `&Program`/`&Interner` borrows.
+struct AccelPtr<'k>(Option<*mut (dyn Accelerator + 'k)>);
+
+// SAFETY: as documented on `AccelPtr` — the pointer is handed to a scoped worker that is joined
+// before `with_big_stack` returns and is never dereferenced on the spawning thread in between, so
+// there is no concurrent access, and the scope keeps the original `&'k mut` borrow alive
+// throughout.
+unsafe impl Send for AccelPtr<'_> {}
+
+impl<'k> AccelPtr<'k> {
+    fn new(accel: Option<&'k mut (dyn Accelerator + 'k)>) -> Self {
+        Self(accel.map(|a| a as *mut (dyn Accelerator + 'k)))
+    }
+
+    /// Re-borrow the accelerator on the worker thread.
+    ///
+    /// # Safety
+    /// Must be called at most once, from inside the [`with_big_stack`] worker the value was moved
+    /// into, while the borrow it was built from is still live.
+    unsafe fn reborrow(self) -> Option<&'k mut (dyn Accelerator + 'k)> {
+        self.0.map(|p| unsafe { &mut *p })
+    }
+}
+
 /// Like [`run_with_output`] but offloads recognized kernel calls to `accel` (the GPU backend). This
 /// is the `--backend=gpu` execution path: the whole program is still tree-walked here, but every
 /// recognized GEMM / norm / activation / reduction call runs on the device instead of the CPU
@@ -205,22 +239,29 @@ pub fn run_with_output_accel(
     interner: &Interner,
     accel: &mut dyn Accelerator,
 ) -> Result<(i64, Vec<u8>), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        data_addrs: HashMap::new(),
-        accel: Some(accel),
-    };
-    let result = interp.run_function(func, Vec::new())?;
-    Ok((result.as_int() as i64, interp.stdout))
+    // Same big stack as `run_with_output`: this is the same tree-walker, so it needs the same
+    // recursion headroom. See `AccelPtr` for why the accelerator crosses the hand-off by pointer.
+    let accel = AccelPtr::new(Some(accel));
+    with_big_stack(move || {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            // SAFETY: first and only re-borrow, on the worker `AccelPtr` was moved into.
+            accel: unsafe { accel.reborrow() },
+            depth: 0,
+        };
+        let result = interp.run_function(func, Vec::new())?;
+        Ok((result.as_int() as i64, interp.stdout))
+    })
 }
 
 /// Run an f32-buffer kernel (`entry`) over caller-provided buffers — the interpreter's typed
@@ -264,50 +305,58 @@ fn run_kernel_f32_inner(
     interner: &Interner,
     accel: Option<&mut dyn Accelerator>,
 ) -> Result<(), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    if func.params.len() != bufs.len() {
-        return Err(format!(
-            "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
-            interner.resolve(entry),
-            func.params.len(),
-            bufs.len()
-        ));
-    }
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        data_addrs: HashMap::new(),
-        accel,
-    };
-    // Lay each buffer out contiguously in flat memory and remember its base slot. Any `alloca`
-    // the kernel performs internally grows memory *past* these regions, so it never clobbers them.
-    let mut bases = Vec::with_capacity(bufs.len());
-    for buf in bufs.iter() {
-        bases.push(interp.memory.len());
-        interp
-            .memory
-            .extend(buf.iter().map(|&v| Value::Float(v as f64)));
-    }
-    let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
-    interp.run_function(func, args)?;
-    // Copy the final contents back out (captures both outputs and in-place mutation).
-    for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
-        for (i, slot) in buf.iter_mut().enumerate() {
-            *slot = match interp.memory[base + i] {
-                Value::Float(f) => f as f32,
-                Value::Int(n) => n as f32,
-                _ => 0.0,
-            };
+    // Same big stack as `run_with_output`: a recursive kernel tree-walks exactly as deep here, and
+    // on the caller's default ~8 MiB stack it aborts the process at ~1/64 the depth `run` survives.
+    let accel = AccelPtr::new(accel);
+    with_big_stack(move || {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        if func.params.len() != bufs.len() {
+            return Err(format!(
+                "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
+                interner.resolve(entry),
+                func.params.len(),
+                bufs.len()
+            ));
         }
-    }
-    Ok(())
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            // SAFETY: first and only re-borrow, on the worker `AccelPtr` was moved into.
+            accel: unsafe { accel.reborrow() },
+            depth: 0,
+        };
+        // Lay each buffer out contiguously in flat memory and remember its base slot. Any `alloca`
+        // the kernel performs internally grows memory *past* these regions, so it never clobbers
+        // them.
+        let mut bases = Vec::with_capacity(bufs.len());
+        for buf in bufs.iter() {
+            bases.push(interp.memory.len());
+            interp
+                .memory
+                .extend(buf.iter().map(|&v| Value::Float(v as f64)));
+        }
+        let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
+        interp.run_function(func, args)?;
+        // Copy the final contents back out (captures both outputs and in-place mutation).
+        for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = match interp.memory[base + i] {
+                    Value::Float(f) => f as f32,
+                    Value::Int(n) => n as f32,
+                    _ => 0.0,
+                };
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Run an f64-buffer kernel over caller-provided buffers — the double-precision twin of
@@ -322,45 +371,49 @@ pub fn run_kernel_f64(
     bufs: &mut [&mut [f64]],
     interner: &Interner,
 ) -> Result<(), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    if func.params.len() != bufs.len() {
-        return Err(format!(
-            "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
-            interner.resolve(entry),
-            func.params.len(),
-            bufs.len()
-        ));
-    }
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        data_addrs: HashMap::new(),
-        accel: None,
-    };
-    let mut bases = Vec::with_capacity(bufs.len());
-    for buf in bufs.iter() {
-        bases.push(interp.memory.len());
-        interp.memory.extend(buf.iter().map(|&v| Value::Float(v)));
-    }
-    let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
-    interp.run_function(func, args)?;
-    for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
-        for (i, slot) in buf.iter_mut().enumerate() {
-            *slot = match interp.memory[base + i] {
-                Value::Float(f) => f,
-                Value::Int(n) => n as f64,
-                _ => 0.0,
-            };
+    // Same big stack as `run_with_output` — see `run_kernel_f32_inner`.
+    with_big_stack(move || {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        if func.params.len() != bufs.len() {
+            return Err(format!(
+                "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
+                interner.resolve(entry),
+                func.params.len(),
+                bufs.len()
+            ));
         }
-    }
-    Ok(())
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            accel: None,
+            depth: 0,
+        };
+        let mut bases = Vec::with_capacity(bufs.len());
+        for buf in bufs.iter() {
+            bases.push(interp.memory.len());
+            interp.memory.extend(buf.iter().map(|&v| Value::Float(v)));
+        }
+        let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
+        interp.run_function(func, args)?;
+        for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = match interp.memory[base + i] {
+                    Value::Float(f) => f,
+                    Value::Int(n) => n as f64,
+                    _ => 0.0,
+                };
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Run an int8 quantized GEMM kernel `fn k(a: [u8; _], b: [i8; _], c: [i32; _])` over caller
@@ -378,50 +431,55 @@ pub fn run_kernel_i8(
     c: &mut [i32],
     interner: &Interner,
 ) -> Result<(), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    if func.params.len() != 3 {
-        return Err(format!(
-            "int8 kernel `{}` takes {} parameter(s), expected 3 (a, b, c)",
-            interner.resolve(entry),
-            func.params.len()
-        ));
-    }
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        data_addrs: HashMap::new(),
-        accel: None,
-    };
-    // u8 zero-extends, i8 sign-extends — the `as i128` casts do exactly that, matching the kernel.
-    let a_base = interp.memory.len();
-    interp
-        .memory
-        .extend(a.iter().map(|&v| Value::Int(v as i128)));
-    let b_base = interp.memory.len();
-    interp
-        .memory
-        .extend(b.iter().map(|&v| Value::Int(v as i128)));
-    let c_base = interp.memory.len();
-    interp
-        .memory
-        .extend(c.iter().map(|&v| Value::Int(v as i128)));
-    let args = vec![Value::Ptr(a_base), Value::Ptr(b_base), Value::Ptr(c_base)];
-    interp.run_function(func, args)?;
-    for (i, slot) in c.iter_mut().enumerate() {
-        *slot = match interp.memory[c_base + i] {
-            Value::Int(n) => n as i32,
-            Value::Float(f) => f as i32,
-            _ => 0,
+    // Same big stack as `run_with_output` — see `run_kernel_f32_inner`.
+    with_big_stack(move || {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        if func.params.len() != 3 {
+            return Err(format!(
+                "int8 kernel `{}` takes {} parameter(s), expected 3 (a, b, c)",
+                interner.resolve(entry),
+                func.params.len()
+            ));
+        }
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            accel: None,
+            depth: 0,
         };
-    }
-    Ok(())
+        // u8 zero-extends, i8 sign-extends — the `as i128` casts do exactly that, matching the
+        // kernel.
+        let a_base = interp.memory.len();
+        interp
+            .memory
+            .extend(a.iter().map(|&v| Value::Int(v as i128)));
+        let b_base = interp.memory.len();
+        interp
+            .memory
+            .extend(b.iter().map(|&v| Value::Int(v as i128)));
+        let c_base = interp.memory.len();
+        interp
+            .memory
+            .extend(c.iter().map(|&v| Value::Int(v as i128)));
+        let args = vec![Value::Ptr(a_base), Value::Ptr(b_base), Value::Ptr(c_base)];
+        interp.run_function(func, args)?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = match interp.memory[c_base + i] {
+                Value::Int(n) => n as i32,
+                Value::Float(f) => f as i32,
+                _ => 0,
+            };
+        }
+        Ok(())
+    })
 }
 
 struct Interp<'a, 'k> {
@@ -446,7 +504,28 @@ struct Interp<'a, 'k> {
     /// native `.rodata` (a returned/threaded `*u8` stays valid, and `*u8` pointer equality agrees
     /// across backends). Persistent memory is never freed, so the address outlives its defining frame.
     data_addrs: HashMap<Symbol, usize>,
+    /// Active Wukong call depth, bounded by [`MAX_CALL_DEPTH`]. The 100M-step guard in `exec` is a
+    /// local of one `exec` invocation, so it counts only the blocks of a *single* frame and can
+    /// never fire on recursion; this is the counter that does.
+    depth: usize,
 }
+
+/// Wukong call depth at which the interpreter gives up.
+///
+/// The tree-walker recurses on the host stack (one `run_function`/`exec`/`eval` frame group per
+/// Wukong call), so unbounded recursion overflows even the 512 MiB [`with_big_stack`] reservation
+/// and **aborts** the process — uncatchable, no diagnostic, and it takes the differential oracle
+/// down with it.
+///
+/// The ceiling is a property of the *host* frame size, so it tracks the build profile. Measured
+/// against that reservation by bisection: the release build completes at depth 300000 and overflows
+/// at 350000 (unchanged for a fatter Wukong frame — five parameters plus three nested-arithmetic
+/// locals — at both -O0 and -O2, because the register file lives on the heap); the debug build,
+/// with no inlining and much larger frames, completes at 50000 and overflows at 55000. Each limit
+/// sits well inside its own measured ceiling, so no recursion depth that works today starts
+/// failing in either profile — the depths this now rejects are exactly the ones that used to abort
+/// the process.
+const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) { 30_000 } else { 200_000 };
 
 /// Marshal a recognized-kernel **extent** argument (`rows`, `cols`, `m`, `k`, `n`, `t`, `h`, `s`,
 /// `d`, `half`, `ncoeff`, ...) into a slot count, bailing out of the arm with the kernel's
@@ -483,6 +562,13 @@ macro_rules! dim {
 
 impl<'a, 'k> Interp<'a, 'k> {
     fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, String> {
+        // Bound the *host* stack recursion this call is about to perform. `exec`'s step guard is a
+        // local of a single `exec` invocation, so a recursion that runs a handful of blocks per
+        // frame increments no shared counter and would run to a process-killing stack overflow.
+        if self.depth >= MAX_CALL_DEPTH {
+            return Err("interpreter call-depth limit exceeded (likely unbounded recursion)".into());
+        }
+        self.depth += 1;
         // Take a recycled register file (or a fresh one) and size it for this function. Values
         // start as `Unit`, the interpreter's "undefined"; well-formed MIR writes before it reads.
         let mut regs = self.frames.pop().unwrap_or_default();
@@ -493,6 +579,7 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
         let result = self.exec(func, &mut regs);
         self.frames.push(regs);
+        self.depth -= 1;
         result
     }
 
@@ -1019,6 +1106,17 @@ impl<'a, 'k> Interp<'a, 'k> {
             // is `Float(0.0)` for float elements / `Int(0)` otherwise — the same typed value
             // native's calloc'd zero bits decode to, so a read-before-write observes an identical
             // zero on both backends (the determinism contract).
+            //
+            // **Exhaustion.** The native `wukong_rt_alloc` returns null when the allocator cannot
+            // satisfy the request (crates/wukong_runtime/src/lib.rs). The interpreter cannot return
+            // null: its pointers are slot indices and index 0 is a perfectly ordinary live slot (the
+            // first allocation of a run), so `Value::Ptr(0)` would alias real memory and turn an
+            // out-of-memory condition into silent corruption. It reports a diagnostic instead —
+            // `try_reserve` rather than `resize`, so the request never reaches Rust's allocation-
+            // error handler, which `abort()`s the process with a raw `memory allocation of N bytes
+            // failed` message no caller can catch. One element costs one 32-byte `Value` slot here
+            // against 4 bytes natively, so the interpreter reaches exhaustion ~8x earlier; that
+            // difference is why this path is reachable at all.
             "wukong_rt_alloc" => {
                 let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
                 let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
@@ -1028,6 +1126,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Int(0)
                 };
                 let idx = self.memory.len();
+                self.memory.try_reserve(count).map_err(|_| {
+                    format!("interpreter heap exhausted allocating {count} element(s)")
+                })?;
                 self.memory.resize(idx + count, zero);
                 Ok(Value::Ptr(idx))
             }
@@ -4351,6 +4452,46 @@ mod tests {
         );
     }
 
+    /// Unbounded recursion must produce a diagnostic, not a stack overflow. A stack overflow is an
+    /// uncatchable process abort: it takes the whole differential-oracle run (or test binary) down
+    /// and prints an internal Rust message in place of a catalogued error. `exec`'s 100M-step guard
+    /// cannot cover this — it is a local of one `exec` invocation, so a recursion that runs a few
+    /// blocks per frame never increments a shared counter.
+    #[test]
+    fn unbounded_recursion_is_a_diagnostic_not_a_process_abort() {
+        let mut interner = Interner::new();
+        let src = "fn f(n: i32) -> i32 { return f(n + 1); } fn main() -> i32 { return f(0); }";
+        let (module, _) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, _) = wukong_sema::check(&module, &interner);
+        let (program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let main = interner.intern("main");
+        let err = run(&program, main, &interner).unwrap_err();
+        assert!(err.contains("call-depth limit exceeded"), "got: {err}");
+    }
+
+    /// The typed kernel-entry ABI must give the tree-walker the same recursion headroom `run` gets
+    /// (`deep_recursion_does_not_overflow_oracle` above). It used to run on the caller's default
+    /// ~8 MiB stack, so this depth — an eighth of what `run` survives — aborted the whole test
+    /// binary with STATUS_STACK_OVERFLOW.
+    #[test]
+    fn kernel_entry_deep_recursion_does_not_overflow_oracle() {
+        let mut interner = Interner::new();
+        let src = "module m\n\
+            fn rec(v: f32, n: i32) -> f32 { if n == 0 { return v; } return rec(v, n - 1) + 1.0; }\n\
+            fn k(x: [f32; 1], mut out: [f32; 1]) { out[0] = rec(x[0], 20000); }\n";
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+        let mut x = vec![0.0f32; 1];
+        let mut out = vec![0.0f32; 1];
+        run_kernel_f32(&program, interner.intern("k"), &mut [&mut x, &mut out], &interner).unwrap();
+        assert_eq!(out[0], 20000.0);
+    }
+
+
     #[test]
     fn runs_loop_sum() {
         let src = "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
@@ -4446,6 +4587,23 @@ mod tests {
                      let mut s: f32 = 0.0; for i in 0..320 { s = s + buf[i]; } \
                      return (s / 100.0) as i32; }";
         assert_eq!(run_main(src), 766);
+    }
+
+    /// An `alloc_<T>(n)` the interpreter's arena cannot satisfy must report a diagnostic. It used
+    /// to reach Rust's allocation-error handler through `Vec::resize` and `abort()` the process
+    /// with `memory allocation of N bytes failed` — an internal runtime message, and an abort no
+    /// caller (fuzzer, differential harness, test binary) can catch.
+    #[test]
+    fn heap_exhaustion_is_a_diagnostic_not_an_allocator_abort() {
+        let mut interner = Interner::new();
+        let src = "fn main() -> i32 { let mut d: []f32 = alloc_f32(100000000000); \
+                   d[0] = 1.0; free(d); return 0; }";
+        let (module, _) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, _) = wukong_sema::check(&module, &interner);
+        let (program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let main = interner.intern("main");
+        let err = run(&program, main, &interner).unwrap_err();
+        assert!(err.contains("interpreter heap exhausted"), "got: {err}");
     }
 
     #[test]
