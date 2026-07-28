@@ -1,6 +1,5 @@
-// RUN: --run
-// EXPECT-EXIT: 1
-module tests.run.sdpa_operand_type
+// EXPECT-CODE: C0001
+module tests.fail.sdpa_operand_type
 
 // `sdpa` has no signature in wukong_sema, so `lower_attention` is the only place its operand contract
 // — four `f32` buffers — is checked. Both calls below hand the f32 kernel buffers of another element
