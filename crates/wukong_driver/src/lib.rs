@@ -1501,7 +1501,7 @@ mod gpu_e2e_tests {
     /// The `ijk` `C = A·Bᵀ` (nn.Linear) nest that the recognizer lowers to `wukong_sgemm_nt`.
     fn linear_src(m: usize, k: usize, n: usize) -> String {
         format!(
-            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],c:[f32;{mn}]) {{ \
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],mut c:[f32;{mn}]) {{ \
              for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
              for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} }}",
             mk = m * k,
@@ -1522,7 +1522,7 @@ mod gpu_e2e_tests {
             other => panic!("unknown activation {other}"),
         };
         format!(
-            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],c:[f32;{mn}]) {{ \
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],mut c:[f32;{mn}]) {{ \
              for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
              for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} \
              for i in 0..{m} {{ for j in 0..{n} {{ c[i*{n}+j] = {act}; }} }} }}",
@@ -1546,7 +1546,7 @@ mod gpu_e2e_tests {
             other => panic!("unknown activation {other}"),
         };
         format!(
-            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],bias:[f32;{n}],c:[f32;{mn}]) {{ \
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],bias:[f32;{n}],mut c:[f32;{mn}]) {{ \
              for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
              for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} \
              for i in 0..{m} {{ for j in 0..{n} {{ c[i*{n}+j] = {act}; }} }} }}",
@@ -1811,7 +1811,7 @@ mod gpu_e2e_tests {
             let (r, c) = (4usize, 16usize);
             let n = r * c;
             let src = format!(
-                "module m\nfn sm(x:[f32;{n}]) {{ for row in 0..{r} {{ \
+                "module m\nfn sm(mut x:[f32;{n}]) {{ for row in 0..{r} {{ \
                  let mut m: f32 = x[row*{c}]; for i in 0..{c} {{ m = fmax(m, x[row*{c}+i]); }} \
                  for i in 0..{c} {{ x[row*{c}+i] = exp(x[row*{c}+i] - m); }} \
                  let mut s: f32 = 0.0; for i in 0..{c} {{ s = s + x[row*{c}+i]; }} \
@@ -1829,6 +1829,73 @@ mod gpu_e2e_tests {
             eprintln!(
                 "gpu --backend softmax[{r}x{c}]: {calls} call(s), max_abs={:.2e} max_rel={:.2e}",
                 s.max_abs, s.max_rel
+            );
+        }
+    }
+
+    /// The two `NORM_*` op codes the recognizer emits but the GPU `norm` kernel has no PTX entry for
+    /// (LOGSOFTMAX=3, L2NORM=4). Before the `norm_supported` gate these forwarded to `gpu::norm` and
+    /// hit its `_ => panic!("norm op {op} not implemented on GPU yet")`, aborting the process on
+    /// ordinary user input. They must now decline to the CPU kernel: zero device calls, and — since
+    /// nothing ran on the device — output bit-identical to the interpreter oracle.
+    #[test]
+    fn gpu_backend_declines_unimplemented_norm_ops_to_cpu() {
+        let mut guard = wukong_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                eprintln!("skip gpu_backend_declines_unimplemented_norm_ops_to_cpu: no CUDA device");
+                return;
+            }
+        };
+        let mut rng = Rng::new(0x1EAF_0011);
+        let n = 64usize;
+
+        // NORM_LOGSOFTMAX (op 3): the stable max / log-sum-exp / subtract row window, in place.
+        let logsoftmax = format!(
+            "module m\nfn lsm(mut x:[f32;{n}]) {{ let mut m: f32 = x[0]; \
+             for i in 0..{n} {{ m = fmax(m, x[i]); }} let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + exp(x[i] - m); }} let ls: f32 = log(s); \
+             for i in 0..{n} {{ x[i] = (x[i] - m) - ls; }} }}"
+        );
+        // NORM_L2NORM (op 4): sum of squares / rsqrt / scale, x -> out.
+        let l2norm = format!(
+            "module m\nfn l2n(x:[f32;{n}], mut out:[f32;{n}]) {{ let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + x[i]*x[i]; }} let inv: f32 = rsqrt(s + 0.00001); \
+             for i in 0..{n} {{ out[i] = x[i]*inv; }} }}"
+        );
+
+        for (label, src, entry_name, init) in [
+            (
+                "log_softmax",
+                logsoftmax,
+                "lsm",
+                vec![rng.vec(n, -3.0, 3.0)],
+            ),
+            (
+                "l2norm",
+                l2norm,
+                "l2n",
+                vec![rng.vec(n, -3.0, 3.0), vec![0.0; n]],
+            ),
+        ] {
+            let (program, mut interner) = build(&src);
+            let entry = interner.intern(entry_name);
+            // The window must actually lower to `wukong_norm_f32`, else this tests nothing.
+            let mir = wukong_mir::print::print_program(&program, &interner);
+            assert!(
+                mir.contains("wukong_norm_f32"),
+                "{label}: did not lower to a fused norm — the gate would never be consulted"
+            );
+            let (cpu, gpu, calls) = run_both(g, &program, entry, &interner, &init);
+            assert_eq!(
+                calls, 0,
+                "{label}: an unimplemented norm op must not reach the device"
+            );
+            let last = cpu.len() - 1;
+            assert_eq!(
+                gpu[last], cpu[last],
+                "{label}: the CPU fallback must be bit-identical to the oracle"
             );
         }
     }
