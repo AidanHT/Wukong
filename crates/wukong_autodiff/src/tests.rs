@@ -470,11 +470,14 @@ fn mlp_sgd_decreases_loss() {
 use wukong_interp::run_kernel_f32;
 
 // Runtime op codes (mirrored from wukong_runtime).
+const VM_EXP: i64 = 0;
 const VM_TANH: i64 = 2;
 const VM_SIGMOID: i64 = 3;
 const VM_RELU: i64 = 4;
 const VM_SILU: i64 = 5;
 const VM_GELU: i64 = 6;
+const VM_ELU: i64 = 7;
+const VM_SOFTPLUS: i64 = 9;
 const RED_SUM: i64 = 2;
 const RED_SSD: i64 = 1;
 const VE_ID: i64 = 0;
@@ -937,6 +940,51 @@ fn linear_gelu_sum_vjp() {
     let mut it = Interner::default();
     let fwd = build_linear(&mut it, m, k, n, Some(VM_GELU), false);
     let mut seed = 0x6E10u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
+#[test]
+fn linear_exp_sum_vjp() {
+    // loss = sum(exp(X . W^T)); exp takes the SYNTHESIZED-loop route (`activation_backward`), whose
+    // `exp' = y` arm reuses the forward output buffer. It was the one algebraic-derivative arm with
+    // no test at all, so a wrong reuse there would have been silent.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_EXP), false);
+    let mut seed = 0xE770u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
+#[test]
+fn linear_elu_sum_vjp() {
+    // loss = sum(elu(X . W^T)); the elu backward rides wukong_vmath2_f32 with VM2_ELU_BWD. Nothing
+    // proved the tape picked the RIGHT vmath2 code for a given forward activation — the runtime's
+    // own f64 gate proves each kernel computes its derivative, not that `vm2_bwd_code` routes to it
+    // — so a typo in that map was invisible.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_ELU), false);
+    let mut seed = 0xE7Au64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
+#[test]
+fn linear_softplus_sum_vjp() {
+    // loss = sum(softplus(X . W^T)); rides wukong_vmath2_f32 with VM2_SOFTPLUS_BWD — the other
+    // previously ungated forward-to-backward routing.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_SOFTPLUS), false);
+    let mut seed = 0x50F7u64;
     let xb = rand_vec(&mut seed, m * k);
     let wb = rand_vec(&mut seed, n * k);
     let inputs = vec![xb, wb, vec![0.0]];
