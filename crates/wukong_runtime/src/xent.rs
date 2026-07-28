@@ -354,6 +354,30 @@ mod tests {
         }
     }
 
+    /// (e) A label past the end of the row must not gather past the end of the row. The logits sit at
+    /// the front of a padded buffer whose padding holds a recognizable sentinel, so a past-the-end
+    /// gather shows up as `lse − sentinel` here instead of touching unmapped memory in the field.
+    #[test]
+    fn past_the_end_target_does_not_gather_past_the_row() {
+        const PAD: usize = 8;
+        for &cols in &[1usize, 7, 8, 9, 17, 64] {
+            let mut buf = vec![777.0f32; cols + PAD];
+            buf[..cols].copy_from_slice(&fill(cols));
+            for t in [cols, cols + 3] {
+                let tg = [t as i32];
+                let mut got = [0.0f32; 1];
+                unsafe {
+                    wukong_xent_fwd_f32(buf.as_ptr(), tg.as_ptr(), got.as_mut_ptr(), 1, cols as i64);
+                }
+                assert!(
+                    got[0].is_nan(),
+                    "target {t} past cols={cols} must not gather the row's neighbour: {}",
+                    got[0]
+                );
+            }
+        }
+    }
+
     /// Edge: zero/negative rows or cols are a no-op (don't write, don't panic).
     #[test]
     fn degenerate_shapes_are_noops() {
