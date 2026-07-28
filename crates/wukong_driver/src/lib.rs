@@ -757,8 +757,13 @@ fn emit_grad(program: &wukong_mir::Program, interner: &mut Interner, opts: &Opti
         level: program.level,
         statics: program.statics.clone(),
     };
-    emit_mir(&out, interner);
-    exit::OK
+    // A verifier failure means we just printed an internal-compiler-error; never report success —
+    // the same mapping the `--emit=mir` / `--emit=mir-high` callers already apply.
+    if emit_mir(&out, interner) {
+        exit::COMPILE_ERROR
+    } else {
+        exit::OK
+    }
 }
 
 /// Shared core of `--emit=grad` and `--train`: resolve the target loss function and its `wrt` list
@@ -773,24 +778,44 @@ fn build_grad(
     let func = program.function(sym).ok_or_else(|| {
         format!("no function `{name}` in the module (choose the target with --grad-of=<fn>)")
     })?;
-    let wrt = grad_wrt(func, &opts.grad.wrt)?;
+    let wrt = grad_wrt(func, &opts.grad.wrt, opts.grad.train)?;
     let gradfn = wukong_autodiff::grad(func, &wrt, interner)?;
     Ok((func.clone(), gradfn))
 }
 
 /// The parameter indices to differentiate w.r.t.: the explicit `--grad-wrt` list (validated to be
-/// in-range pointer parameters), or — when empty — *every* pointer (buffer) parameter of the loss.
-/// Differentiating an unread or output buffer is harmless (its gradient is simply zero), so the
-/// "all buffers" default never produces a wrong answer, only occasionally an unused zero buffer.
-fn grad_wrt(func: &wukong_mir::Function, requested: &[usize]) -> Result<Vec<usize>, String> {
+/// distinct, in-range pointer parameters), or — when empty — *every* pointer (buffer) parameter of
+/// the loss. Differentiating an unread or output buffer is harmless (its gradient is simply zero),
+/// so the "all buffers" default never produces a wrong answer, only occasionally an unused zero
+/// buffer.
+///
+/// `training` selects the `--train` flavour of the default: the trainable weights, i.e. every buffer
+/// parameter *except* the last one, which by the `--train` convention is the scalar loss output.
+/// Without that exclusion the documented default expanded to a list containing the loss-output index
+/// and `train_loop` then rejected it, so `--train` could never run without an explicit `--grad-wrt`.
+fn grad_wrt(
+    func: &wukong_mir::Function,
+    requested: &[usize],
+    training: bool,
+) -> Result<Vec<usize>, String> {
     let is_ptr = |i: usize| *func.value_type(func.params[i]) == wukong_mir::MirType::Ptr;
     if requested.is_empty() {
-        let all: Vec<usize> = (0..func.params.len()).filter(|&i| is_ptr(i)).collect();
+        let loss_out = func.params.len().wrapping_sub(1);
+        let all: Vec<usize> = (0..func.params.len())
+            .filter(|&i| is_ptr(i) && !(training && i == loss_out))
+            .collect();
         if all.is_empty() {
-            return Err("the loss function has no buffer (pointer) parameters to differentiate".into());
+            return Err(if training {
+                "the loss function has no trainable buffer parameters (--train differentiates every \
+                 buffer parameter except the last, which is the scalar loss output)"
+                    .into()
+            } else {
+                "the loss function has no buffer (pointer) parameters to differentiate".to_string()
+            });
         }
         return Ok(all);
     }
+    let mut seen = std::collections::HashSet::new();
     for &wi in requested {
         if wi >= func.params.len() {
             return Err(format!(
@@ -801,6 +826,14 @@ fn grad_wrt(func: &wukong_mir::Function, requested: &[usize]) -> Result<Vec<usiz
         if !is_ptr(wi) {
             return Err(format!(
                 "--grad-wrt index {wi} is not a buffer (pointer) parameter"
+            ));
+        }
+        // A repeated index appends a second gradient buffer to the backward's parameter list, but
+        // `Vjp`'s param -> gradient-buffer map keeps only the last insert, so the earlier buffer is
+        // never written and its caller reads back all zeros.
+        if !seen.insert(wi) {
+            return Err(format!(
+                "--grad-wrt index {wi} is repeated; each parameter may be differentiated at most once"
             ));
         }
     }
@@ -932,7 +965,10 @@ fn train_loop(
         let loss_fn = program
             .function(fsym)
             .ok_or_else(|| format!("no function `{name}` in the module"))?;
-        (loss_fn.params.len(), grad_wrt(loss_fn, &opts.grad.wrt)?)
+        (
+            loss_fn.params.len(),
+            grad_wrt(loss_fn, &opts.grad.wrt, true)?,
+        )
     };
     if lens.len() != nparams {
         return Err(format!(
@@ -982,7 +1018,11 @@ fn train_loop(
 
     let lr = opts.grad.train_lr;
     let (beta1, beta2, eps) = (0.9f64, 0.999f64, 1e-8f64);
-    let mut traj = Vec::with_capacity(opts.grad.train_steps + 1);
+    // Grown amortized rather than pre-reserved: `--train-steps` is an unvalidated CLI integer, and
+    // reserving from it let `--train-steps=999999999999` abort inside the allocator ("memory
+    // allocation of 4000000000000 bytes failed", exit 127) before a single step ran — raw runtime
+    // text with no diagnostic. `usize::MAX` additionally wrapped `+ 1` to a zero reservation.
+    let mut traj = Vec::new();
 
     let run = |prog: &Program, entry, bufs: &mut [Vec<f32>], it: &Interner| -> Result<(), String> {
         let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
@@ -1113,7 +1153,8 @@ mod grad_cli_tests {
             ..Options::default()
         };
         let fsym = interner.intern(of);
-        let resolved = grad_wrt(program.function(fsym).expect("loss fn"), wrt).expect("wrt");
+        let resolved =
+            grad_wrt(program.function(fsym).expect("loss fn"), wrt, opts.grad.train).expect("wrt");
         let (fwd, g) = build_grad(&program, &mut interner, &opts).expect("build_grad failed");
         let (fname, gname) = (fwd.name, g.name);
         let prog = Program {
@@ -1468,6 +1509,38 @@ mod grad_cli_tests {
         let (l0, lf) = (traj[0], *traj.last().unwrap());
         assert!(l0 > 0.05, "test setup: initial loss should be substantial, got {l0}");
         assert!(lf < 0.3 * l0, "SGD did not reduce the loss enough: {l0} -> {lf}");
+    }
+
+    /// The documented `--grad-wrt` default ("all buffer parameters of the loss function ... for
+    /// `--train`, these are the trainable weights") must actually run. It used to expand to a list
+    /// that necessarily contained the loss-output parameter, which `train_loop` then rejected, so
+    /// `wukongc --train --grad-of=loss` always died with "--grad-wrt must not include the
+    /// loss-output parameter (the last one)" unless an explicit list was supplied.
+    #[test]
+    fn train_default_wrt_excludes_the_loss_output() {
+        let traj = train_traj(REGRESSION_SRC, &[], &[12, 8, 6, 1], 40, 0.02, TrainOpt::Sgd, 0xA5A5);
+        assert_eq!(traj.len(), 41, "traj[i] = loss after i updates, plus a final");
+        let (l0, lf) = (traj[0], *traj.last().unwrap());
+        assert!(lf < l0, "the default --grad-wrt did not train: {l0} -> {lf}");
+    }
+
+    /// A repeated `--grad-wrt` index appends a second gradient buffer to the backward's parameter
+    /// list while `Vjp`'s param -> buffer map keeps only the last insert, so the first appended
+    /// buffer is never written and the caller reads back zeros with exit 0. Reject it up front.
+    #[test]
+    fn duplicate_grad_wrt_index_is_rejected() {
+        let (program, mut interner) = compile_o1(REGRESSION_SRC);
+        let opts = Options {
+            grad: GradOptions {
+                of: Some("loss".to_string()),
+                wrt: vec![1, 1],
+                ..GradOptions::default()
+            },
+            ..Options::default()
+        };
+        let err = build_grad(&program, &mut interner, &opts)
+            .expect_err("a repeated --grad-wrt index must be rejected");
+        assert!(err.contains("repeated"), "unexpected error: {err}");
     }
 
     #[test]
