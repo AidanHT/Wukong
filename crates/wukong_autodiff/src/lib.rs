@@ -395,6 +395,14 @@ impl<'a> Vjp<'a> {
             ptr: gptr,
             value: sum,
         });
+        // This buffer has now received a gradient contribution. The scalar path above ACCUMULATES
+        // (read-add-write) while the kernel path (`fill_buf`/`velem_scale`/`velem_affine`) OVERWRITES,
+        // so recording it is what stops a later kernel rule from clobbering this element: `single()`
+        // turns the mix into a loud error, and `beta_for` switches a matmul adjoint to accumulate
+        // (correct, since the ABI has the caller pass a zeroed gradient buffer). Repeated scalar
+        // loads of the same buffer are unaffected — this ignores the "already present" result, and
+        // they accumulate correctly by construction.
+        self.contributed.insert(param);
         Ok(())
     }
 

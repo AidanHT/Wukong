@@ -1619,6 +1619,52 @@ fn parallel_region_declines_loudly() {
     );
 }
 
+/// The scalar path (`diff_load`) ACCUMULATES into the gradient buffer (read-add-write) while the
+/// kernel path (`fill_buf` / `velem_scale` / `velem_affine`) OVERWRITES it. A loss that both reduces
+/// a `wrt` buffer with a recognized kernel AND reads one of its elements as a scalar therefore lost
+/// the scalar contribution: observed with the shipped release compiler on
+///
+/// ```wukong
+/// @parallel fn loss(x:[f32;8], mut out:[f32;1]) -> f32 {
+///   let mut l: f32 = 0.0; for i in 0..8 { l = l + x[i]; }
+///   let e: f32 = x[0]; let r: f32 = l + e; out[0] = r; return r; }
+/// ```
+///
+/// which exited 0 emitting `grad[0] += 1` and then a broadcast `velem` fill of 1.0 over all 8
+/// elements that clobbered it — gradient [1,1,...] where the truth is [2,1,1,...]. `diff_load` now
+/// records the contribution, so `single()` sees the mix and declines instead of answering wrongly.
+#[test]
+fn scalar_load_plus_kernel_reduction_declines_loudly() {
+    let n = 8;
+    let mut it = Interner::default();
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "mixfwd"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    // l = Σ x   (kernel path: an overwriting broadcast fill in the backward)
+    let (nv, sumop) = (ci(&mut b, n as i64), ci(&mut b, RED_SUM));
+    let l = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![x, x, nv, sumop],
+        },
+    );
+    // e = x[0]  (scalar path: an accumulating read-add-write in the backward)
+    let e = b.build(MirType::F32, Op::Load(x, MirType::F32));
+    let r = b.build(MirType::F32, Op::Bin(BinOp::FAdd, l, e));
+    b.build_void(Op::Store { ptr: out, value: r });
+    b.ret(Some(r));
+    let fwd = b.finish();
+
+    let err = grad(&fwd, &[0], &mut it)
+        .expect_err("a mixed scalar+kernel contribution must not be silently clobbered");
+    assert!(
+        err.contains("multiple gradient contributions"),
+        "the decline must be the accumulation error, got: {err}"
+    );
+}
+
 /// `is_kernel` recognizes a call by SYMBOL NAME alone, but every VJP rule indexes the forward
 /// argument vector raw (`args[0]`..`args[7]`). A `.wk` program may declare a runtime kernel name in
 /// an `extern "C"` block with any signature, so a one-argument `wukong_norm_f32` used to reach
