@@ -206,11 +206,11 @@ mod tests {
     fn builder_sets_fields() {
         let sp = Span::new(SourceId(0), 0, 3);
         let d = Diagnostic::error("boom")
-            .with_code("E0001")
+            .with_code("E0501")
             .primary(sp, "here")
             .note("a note")
             .help("a help");
-        assert_eq!(d.code, Some("E0001"));
+        assert_eq!(d.code, Some("E0501"));
         assert!(d.is_error());
         assert_eq!(d.labels.len(), 1);
         assert_eq!(d.notes.len(), 2);
