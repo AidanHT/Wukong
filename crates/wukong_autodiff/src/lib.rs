@@ -18,8 +18,9 @@
 //! Contract for the forward function `f`:
 //! - exactly one basic block, terminated by `ret <loss>` (the scalar being differentiated);
 //! - every parameter is a `Ptr` (a buffer); inputs are read with `load`/`gep`, the loss is *also*
-//!   stored to an output buffer so a caller can observe it (the transform ignores stores — they are
-//!   either the loss sink or, in richer cases, handled by a dedicated rule);
+//!   stored to an output buffer so a caller can observe it (the transform skips a store whose
+//!   destination buffer has no live gradient — the loss sink, and constant array zero-init — and
+//!   *refuses* a store into a buffer a downstream recognized kernel reads, which has no VJP rule);
 //! - `wrt` lists the parameter indices to differentiate. For each, the emitted gradient function
 //!   appends one `Ptr` parameter that receives `d loss / d input` (accumulated, so the caller must
 //!   pass a zeroed buffer).
@@ -80,7 +81,7 @@ pub fn grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<F
     let syms = Syms::new(interner);
     let gname = interner.intern(&format!("{base}_grad"));
 
-    let mut vjp = Vjp::new(func, gname, wrt, syms);
+    let mut vjp = Vjp::new(func, gname, wrt, syms, interner);
     vjp.replay();
     vjp.seed()?;
     vjp.reverse()?;
@@ -111,10 +112,19 @@ struct Vjp<'a> {
     /// Buffers that have already received a gradient contribution — a second one would need
     /// accumulation (handled per-op for matmul via `beta`; a loud error elsewhere until supported).
     contributed: HashSet<ValueId>,
+    /// Read-only interner, so a decline can *name* the construct that blocked the gradient (a bare
+    /// "unrecognized call" leaves the user with no way to find the offending source line).
+    it: &'a Interner,
 }
 
 impl<'a> Vjp<'a> {
-    fn new(fwd: &'a Function, gname: Symbol, wrt: &[usize], syms: Syms) -> Vjp<'a> {
+    fn new(
+        fwd: &'a Function,
+        gname: Symbol,
+        wrt: &[usize],
+        syms: Syms,
+        it: &'a Interner,
+    ) -> Vjp<'a> {
         // The gradient function returns nothing — it writes gradients into its appended buffers.
         let mut b = wukong_mir::Builder::new(gname, MirType::Void);
         let mut fwd_to_new = HashMap::new();
@@ -154,6 +164,7 @@ impl<'a> Vjp<'a> {
             buf_adj: HashMap::new(),
             buf_count,
             contributed: HashSet::new(),
+            it,
         }
     }
 
@@ -226,16 +237,45 @@ impl<'a> Vjp<'a> {
             // gradient; we cannot prove its contribution is zero, so refuse rather than silently
             // emit a wrong (zero) gradient. (Value-returning unknown calls fall through to the
             // scalar path, which errors only if the value actually has a non-zero adjoint.)
+            // Name the callee: it is the only handle the user has on which source construct
+            // blocked the gradient (e.g. `wukong_norm_affine_f32` = a norm with a learned gamma).
             if inst.result.is_none() {
-                return Err(
-                    "autodiff: unrecognized buffer-writing call has no VJP rule".to_string()
-                );
+                return Err(format!(
+                    "autodiff: no VJP rule for buffer-writing call `{}`",
+                    self.it.resolve(*func)
+                ));
             }
         }
-        // Stores are the loss sink (or an output write); they propagate no adjoint in the
-        // SSA-temporaries model. (Read-after-write through intermediate memory is out of scope for
-        // this iteration — the input is expected to be mem2reg'd.)
-        if matches!(inst.op, Op::Store { .. }) {
+        // A synthesized vector kernel (the autovectorizer's output) writes through buffer pointers
+        // with a void result, so it would fall through to the `result.is_none() -> Ok(())` skip
+        // below and contribute nothing — a silently-zero gradient for every buffer it writes.
+        // There is no VJP rule for it; refuse loudly.
+        if matches!(inst.op, Op::VecKernelCall { .. }) {
+            return Err("autodiff: no VJP rule for a synthesized vector kernel \
+                        (veckernel); the vectorizer's output is not differentiable"
+                .to_string());
+        }
+        // Stores are normally the loss sink (or an output write) and propagate no adjoint in the
+        // SSA-temporaries model. But a store whose destination buffer already has a *live* gradient
+        // — i.e. the reverse walk has already seen a recognized kernel READ that buffer — is on the
+        // gradient path, and skipping it silently drops the contribution (an all-zero gradient, the
+        // one thing this crate promises never to emit). Read-after-write through intermediate memory
+        // has no VJP rule, so refuse. Constant stores stay skippable: `[0.0; N]` array zero-init
+        // carries no gradient, and the loss sink writes into a buffer no kernel reads.
+        if let Op::Store { ptr, value } = &inst.op {
+            let is_const = matches!(
+                self.def_op.get(value),
+                Some(Op::ConstFloat(..)) | Some(Op::ConstInt(..))
+            );
+            let base = self.store_base(*ptr);
+            if !is_const && self.buf_adj.contains_key(&base) {
+                return Err(format!(
+                    "autodiff: store into buffer v{} has no VJP rule, but that buffer's gradient \
+                     is live (a recognized kernel reads it downstream) — read-after-write through \
+                     intermediate memory is not supported",
+                    base.0
+                ));
+            }
             return Ok(());
         }
         let old_r = match inst.result {
@@ -355,7 +395,26 @@ impl<'a> Vjp<'a> {
             ptr: gptr,
             value: sum,
         });
+        // This buffer has now received a gradient contribution. The scalar path above ACCUMULATES
+        // (read-add-write) while the kernel path (`fill_buf`/`velem_scale`/`velem_affine`) OVERWRITES,
+        // so recording it is what stops a later kernel rule from clobbering this element: `single()`
+        // turns the mix into a loud error, and `beta_for` switches a matmul adjoint to accumulate
+        // (correct, since the ABI has the caller pass a zeroed gradient buffer). Repeated scalar
+        // loads of the same buffer are unaffected — this ignores the "already present" result, and
+        // they accumulate correctly by construction.
+        self.contributed.insert(param);
         Ok(())
+    }
+
+    /// The base buffer a store pointer addresses: peel a whole chain of `gep`s back to the
+    /// underlying alloca / parameter, whatever the index. (Unlike `tape::canon`, which peels only a
+    /// whole-buffer `gep ..., 0` because a non-zero offset there is a genuine sub-slice operand,
+    /// this must see through an element index: `h[3] = v` still writes into `h`.)
+    fn store_base(&self, ptr: ValueId) -> ValueId {
+        match self.def_op.get(&ptr) {
+            Some(Op::Gep { ptr: base, .. }) => self.store_base(*base),
+            _ => ptr,
+        }
     }
 
     /// Trace a load pointer to `(input parameter, optional element index in the new value space)`.
