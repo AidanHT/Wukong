@@ -957,7 +957,20 @@ const RED_DOT: i64 = 0;
 /// Build `y = norm(x); loss = sum_i C[i]*y[i]` — a coefficient-weighted norm (so dy = C is
 /// non-trivial). Params: X, C, out; intermediate: y (alloca).
 fn build_norm_dot(it: &mut Interner, rows: usize, cols: usize, op: i64, eps_bits: i64) -> Fwd {
-    let norm = it.intern("wukong_norm_f32");
+    build_norm_dot_sym(it, rows, cols, op, eps_bits, "wukong_norm_f32")
+}
+
+/// As [`build_norm_dot`], but with the norm kernel symbol chosen by the caller — so the same tape
+/// can be built against the serial `wukong_norm_f32` and its `@parallel` twin.
+fn build_norm_dot_sym(
+    it: &mut Interner,
+    rows: usize,
+    cols: usize,
+    op: i64,
+    eps_bits: i64,
+    norm_sym: &str,
+) -> Fwd {
+    let norm = it.intern(norm_sym);
     let sreduce = it.intern("wukong_sreduce_f32");
     let mut b = Builder::new(it.intern("normdot"), MirType::Void);
     let x = b.add_param(PTR);
@@ -1070,6 +1083,46 @@ fn rmsnorm_dot_vjp() {
     let xb = rand_vec(&mut seed, rows * cols);
     let cb = rand_vec(&mut seed, rows * cols);
     // y = x/r, r = sqrt(mean(x^2)+eps); dy = C; dx = (1/r)(dy - y*mean(dy*y)).
+    let mut dx = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let row = &xb[r * cols..(r + 1) * cols];
+        let nf = cols as f64;
+        let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / nf;
+        let rr = (ms + eps as f64).sqrt();
+        let y: Vec<f64> = row.iter().map(|&v| v as f64 / rr).collect();
+        let mean_dyy = (0..cols).map(|j| cb[r * cols + j] as f64 * y[j]).sum::<f64>() / nf;
+        for j in 0..cols {
+            dx[r * cols + j] = (1.0 / rr) * (cb[r * cols + j] as f64 - y[j] * mean_dyy);
+        }
+    }
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+/// The section-5 coupling contract: every `_parallel` recognizer arm in mir_build must have a
+/// counterpart in `Syms`/`is_kernel`/`diff_kernel_call`. `wukong_norm_f32_parallel` — which
+/// `emit_norm` selects for every batched norm inside a `@parallel fn`, i.e. the shipped transformer
+/// shape — had none, so a `@parallel` RMSNorm loss declined with
+/// "unrecognized buffer-writing call has no VJP rule" while the byte-identical serial spelling
+/// differentiated fine (observed with the shipped release compiler). Each row is independent, so the
+/// parallel kernel is bit-identical to the serial one and takes the very same rule; this gates that
+/// it now produces the same closed-form gradient as `rmsnorm_dot_vjp`.
+#[test]
+fn parallel_norm_dot_vjp() {
+    let (rows, cols) = (3, 5);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_dot_sym(
+        &mut it,
+        rows,
+        cols,
+        NORM_RMSNORM,
+        eps.to_bits() as i64,
+        "wukong_norm_f32_parallel",
+    );
+    let mut seed = 0x71A3u64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let cb = rand_vec(&mut seed, rows * cols);
     let mut dx = vec![0.0; rows * cols];
     for r in 0..rows {
         let row = &xb[r * cols..(r + 1) * cols];
