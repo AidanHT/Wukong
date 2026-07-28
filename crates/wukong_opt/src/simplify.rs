@@ -123,10 +123,17 @@ impl Pass for Simplify {
                             // >= 2^(w-1) (or an `as iW` reinterpret) folds against the raw i128 and
                             // -O2 disagrees with -O0.
                             let oty = f.value_types[l.0 as usize].clone();
-                            let val = fold_cmp(c, a, bv, &oty);
-                            set_const(f, bi, ii, CV::Int(val), &MirType::I1);
-                            consts.insert(res.0, CV::Int(val));
-                            changed = true;
+                            // Do not fold a bf16/f16 comparison, for the same reason `fold_bin`
+                            // refuses bf16/f16 arithmetic: `round_float_to_ty` rounds these to the
+                            // f32 grid, not the narrow grid the backends round to at runtime. Two
+                            // distinct f32 literals sharing one bf16 grid point compare EQUAL when
+                            // the op runs and "not equal" when folded here — an -O0/-O2 branch flip.
+                            if !matches!(oty, MirType::BF16 | MirType::F16) {
+                                let val = fold_cmp(c, a, bv, &oty);
+                                set_const(f, bi, ii, CV::Int(val), &MirType::I1);
+                                consts.insert(res.0, CV::Int(val));
+                                changed = true;
+                            }
                         } else if l == r && !f.value_types[res.0 as usize].is_vector() {
                             // Integer self-comparison is constant. Float self-comparison is NOT
                             // (NaN != NaN), so only fold the integer predicates. A lane-wise
