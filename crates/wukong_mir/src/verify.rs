@@ -6,23 +6,52 @@
 //! line up across edges; per-operation operand/result types are consistent; and terminators are
 //! type-correct (including the function return type).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{BinOp, Function, MirType, Op, Program, Terminator, ValueId};
+use wukong_span::Symbol;
+
+/// Declared signatures (parameter types, return type) of the functions defined in a program, so a
+/// call can be checked against the function it names. Only callees with a MIR body are in here:
+/// `print` and the `wukong_*` runtime kernels are external symbols whose signatures live outside
+/// the IR, and a call to one is left unchecked.
+type FnSigs = HashMap<Symbol, (Vec<MirType>, MirType)>;
 
 /// Verify every function in a program. Returns a list of human-readable problems (empty = ok).
+/// Unlike [`verify_function`] this also cross-checks each call against its callee's signature,
+/// which needs the whole program in hand.
 pub fn verify_program(p: &Program) -> Vec<String> {
+    let mut sigs: FnSigs = HashMap::new();
+    for f in &p.funcs {
+        // A parameter outside the value arena is reported separately; skip registering such a
+        // function rather than indexing past the end here.
+        let params: Option<Vec<MirType>> = f
+            .params
+            .iter()
+            .map(|v| f.value_types.get(v.0 as usize).cloned())
+            .collect();
+        if let Some(params) = params {
+            // `Program::function` resolves a name to the FIRST function carrying it; mirror that.
+            sigs.entry(f.name).or_insert((params, f.ret.clone()));
+        }
+    }
     let mut errors = Vec::new();
     for f in &p.funcs {
-        errors.extend(verify_function(f));
+        errors.extend(verify(f, Some(&sigs)));
     }
     errors
 }
 
-/// Verify a single function.
+/// Verify a single function. Calls are checked for operand definition only — cross-checking a call
+/// against its callee needs [`verify_program`].
 pub fn verify_function(f: &Function) -> Vec<String> {
+    verify(f, None)
+}
+
+fn verify(f: &Function, sigs: Option<&FnSigs>) -> Vec<String> {
     let mut v = Verifier {
         f,
+        sigs,
         errors: Vec::new(),
         defined: HashSet::new(),
     };
@@ -32,6 +61,8 @@ pub fn verify_function(f: &Function) -> Vec<String> {
 
 struct Verifier<'a> {
     f: &'a Function,
+    /// Callee signatures, when the verifier was entered with a whole program.
+    sigs: Option<&'a FnSigs>,
     errors: Vec<String>,
     defined: HashSet<u32>,
 }
@@ -246,9 +277,39 @@ impl Verifier<'_> {
                 }
                 self.check_result_is(result, &MirType::Ptr);
             }
-            Op::Call { args, .. } => {
+            Op::Call { func, args } => {
                 for a in args {
                     self.use_val(*a);
+                }
+                // Both backends consume a call's arity and types as fact, and both truncate
+                // silently on mismatch: the interpreter zips the callee's params with the args, so
+                // surplus parameters keep reading as 0, while Cranelift builds the call against the
+                // callee's signature and rejects or panics inside its own IR. An ABI desync is
+                // therefore an interp-vs-native divergence with a silent zero on the oracle side.
+                let sig = self.sigs.and_then(|s| s.get(func)).cloned();
+                if let Some((params, ret)) = sig {
+                    if params.len() != args.len() {
+                        self.err(format!(
+                            "call to {func:?} passes {} args but the function has {} parameters",
+                            args.len(),
+                            params.len()
+                        ));
+                    } else {
+                        for (i, (a, pt)) in args.iter().zip(&params).enumerate() {
+                            self.expect_ty(*a, pt, &format!("call argument {i} to {func:?}"));
+                        }
+                    }
+                    // Discarding a returned value is legal (`result` absent), but taking one from a
+                    // `void` callee is not, and a taken result must have the callee's return type.
+                    if ret == MirType::Void {
+                        if result.is_some() {
+                            self.err(format!(
+                                "call to {func:?} takes a result but the function returns void"
+                            ));
+                        }
+                    } else {
+                        self.check_result_is(result, &ret);
+                    }
                 }
             }
             Op::VecKernelCall {
@@ -526,5 +587,105 @@ mod tests {
             errs.iter().any(|e| e.contains("out of range")),
             "{errs:?}"
         );
+    }
+
+    // ---- cross-function call checks (`verify_program`) ----
+
+    fn two_ptr_void_callee(i: &mut Interner) -> Function {
+        let mut b = Builder::new(i.intern("callee"), MirType::Void);
+        let _a = b.add_param(MirType::Ptr);
+        let _c = b.add_param(MirType::Ptr);
+        b.ret(None);
+        b.finish()
+    }
+
+    fn program_of(funcs: Vec<Function>) -> Program {
+        Program {
+            funcs,
+            statics: Vec::new(),
+            level: crate::MirLevel::Low,
+        }
+    }
+
+    /// The exact shape a monomorphization-key collision produces: one argument passed to a
+    /// two-parameter function, and a result taken from a `void` callee. Per-function verification
+    /// accepted it; the interpreter then reported `expected a pointer` and the native backend
+    /// aborted with `MIR value used before definition`.
+    #[test]
+    fn program_detects_call_arity_and_void_result_mismatch() {
+        let mut i = Interner::new();
+        let callee = two_ptr_void_callee(&mut i);
+        let mut b = Builder::new(i.intern("main"), MirType::I32);
+        let slot = b.alloca(MirType::I32);
+        let bad = b.build(
+            MirType::I32,
+            Op::Call {
+                func: i.intern("callee"),
+                args: vec![slot],
+            },
+        );
+        b.ret(Some(bad));
+        let errs = verify_program(&program_of(vec![callee, b.finish()]));
+        assert!(
+            errs.iter().any(|e| e.contains("passes 1 args")),
+            "arity: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("returns void")),
+            "void result: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn program_detects_call_argument_type_mismatch() {
+        let mut i = Interner::new();
+        let callee = two_ptr_void_callee(&mut i);
+        let mut b = Builder::new(i.intern("main"), MirType::I32);
+        let slot = b.alloca(MirType::I32);
+        let wrong = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        b.build_void(Op::Call {
+            func: i.intern("callee"),
+            args: vec![slot, wrong],
+        });
+        let z = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(z));
+        let errs = verify_program(&program_of(vec![callee, b.finish()]));
+        assert!(
+            errs.iter().any(|e| e.contains("call argument 1")),
+            "{errs:?}"
+        );
+    }
+
+    /// A call to a symbol with no MIR body (the `print` intrinsic, a `wukong_*` runtime kernel) is
+    /// external and must be skipped, a well-formed internal call must stay clean, and discarding a
+    /// non-void callee's result is legal.
+    #[test]
+    fn program_accepts_external_well_formed_and_discarded_calls() {
+        let mut i = Interner::new();
+        let callee = two_ptr_void_callee(&mut i);
+        let mut vb = Builder::new(i.intern("answer"), MirType::I32);
+        let a = vb.build(MirType::I32, Op::ConstInt(42, MirType::I32));
+        vb.ret(Some(a));
+        let answer = vb.finish();
+
+        let mut b = Builder::new(i.intern("main"), MirType::I32);
+        let p1 = b.alloca(MirType::I32);
+        let p2 = b.alloca(MirType::I32);
+        b.build_void(Op::Call {
+            func: i.intern("callee"),
+            args: vec![p1, p2],
+        });
+        b.build_void(Op::Call {
+            func: i.intern("answer"),
+            args: vec![],
+        });
+        let z = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.build_void(Op::Call {
+            func: i.intern("print"),
+            args: vec![z],
+        });
+        b.ret(Some(z));
+        let p = program_of(vec![callee, answer, b.finish()]);
+        assert!(verify_program(&p).is_empty(), "{:?}", verify_program(&p));
     }
 }
