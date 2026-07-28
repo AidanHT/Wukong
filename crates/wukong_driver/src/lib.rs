@@ -314,19 +314,12 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Run via the selected backend (interpreter by default, Cranelift JIT with --backend=native) ---
     if opts.run {
-        // Gate every backend on a clean MIR verify. The optimizer verifies the forms its passes
+        // Gate the backend on a clean MIR verify. The optimizer verifies the forms its passes
         // produce, but at -O0 it runs no passes, so an invalid-MIR lowering bug would otherwise reach
         // the backend unchecked — and the native -O0 JIT codegens it into a SIGSEGV rather than the
-        // clean ICE that `--emit=mir` and the optimizer already report. Verifying here makes a lowering
-        // bug a diagnosable internal-compiler-error on every backend instead of a crash or miscompile.
-        let mut verify_failed = false;
-        for f in &program.funcs {
-            for ice in wukong_mir::verify::verify_function(f) {
-                eprint_line(&format!("internal compiler error (MIR verify): {ice}"));
-                verify_failed = true;
-            }
-        }
-        if verify_failed {
+        // clean ICE that `--emit=mir` and the optimizer already report. Verifying here makes a
+        // lowering bug a diagnosable internal-compiler-error instead of a crash or miscompile.
+        if verify_or_ice(&program) {
             return exit::COMPILE_ERROR;
         }
         let main = interner.intern("main");
@@ -356,6 +349,21 @@ pub fn compile(opts: &Options) -> i32 {
         } else {
             exit::OK
         };
+    }
+
+    // The AOT exits get the same gate as `--run` above. They used to have none: the verify loop was
+    // lexically inside the `if opts.run` block, and `wukong_opt`'s per-pass `verify-each` is
+    // `#[cfg(debug_assertions)]`, so a release `wukongc` handed unverified MIR to `emit_llvm_ir` and
+    // to Cranelift — the one path where an invalid lowering became a raw backend assertion or a
+    // silently miscompiled artifact instead of a diagnosable ICE. (`--emit=mir`/`mir-high` are
+    // deliberately *not* gated here: they verify inside `emit_mir` after dumping, so a broken program
+    // still prints the MIR that shows why.)
+    if matches!(
+        opts.emit,
+        EmitStage::LlvmIr | EmitStage::Obj | EmitStage::Exe
+    ) && verify_or_ice(&program)
+    {
+        return exit::COMPILE_ERROR;
     }
 
     // --- LLVM backend ---
@@ -1082,6 +1090,16 @@ fn train_loop(
 /// at least one failure, so callers can map an internal-compiler-error to a nonzero process exit
 /// status instead of reporting success on invalid MIR.
 fn emit_mir(program: &wukong_mir::Program, interner: &Interner) -> bool {
+    let verify_failed = verify_or_ice(program);
+    print_artifact(&wukong_mir::print::print_program(program, interner));
+    verify_failed
+}
+
+/// Run the MIR verifier over every function, reporting each violation as an
+/// `internal compiler error (MIR verify)` line. Returns `true` if anything failed. A failure is a
+/// bug in a compiler pass, not in the user's program, so it is reported and the process stops —
+/// never handed on to a backend.
+fn verify_or_ice(program: &wukong_mir::Program) -> bool {
     let mut verify_failed = false;
     for f in &program.funcs {
         for ice in wukong_mir::verify::verify_function(f) {
@@ -1089,7 +1107,6 @@ fn emit_mir(program: &wukong_mir::Program, interner: &Interner) -> bool {
             verify_failed = true;
         }
     }
-    print_artifact(&wukong_mir::print::print_program(program, interner));
     verify_failed
 }
 
@@ -1608,6 +1625,68 @@ mod grad_cli_tests {
         gate(src, "loss", &[1], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dW1
         gate(src, "loss", &[2], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dW2
         gate(src, "loss", &[0], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dX
+    }
+}
+
+/// The MIR-verifier gate that stands in front of every backend entry.
+#[cfg(test)]
+mod verify_gate_tests {
+    use super::*;
+    use wukong_mir::{BasicBlock, BlockId, Function, MirType, Program, Terminator, ValueId};
+
+    /// A function that returns a value no block parameter and no instruction ever defines — the
+    /// "use of undefined value" class the verifier exists to catch.
+    fn invalid_program(interner: &mut Interner) -> Program {
+        let f = Function {
+            name: interner.intern("bad"),
+            params: Vec::new(),
+            ret: MirType::I32,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                insts: Vec::new(),
+                term: Terminator::Ret(Some(ValueId(0))),
+            }],
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            vec_kernels: Vec::new(),
+        };
+        Program {
+            funcs: vec![f],
+            statics: Vec::new(),
+            level: wukong_mir::MirLevel::Low,
+        }
+    }
+
+    /// `verify_or_ice` is what `--run`, `--emit=llvm-ir`, `--emit=obj` and `--emit=exe` now all call
+    /// before entering a backend; before this it was inlined in the `--run` arm only, so the three
+    /// AOT exits reached their backend unverified.
+    #[test]
+    fn verify_or_ice_reports_an_undefined_value_use() {
+        let mut interner = Interner::new();
+        assert!(
+            verify_or_ice(&invalid_program(&mut interner)),
+            "a `ret` of an undefined value must be reported"
+        );
+    }
+
+    /// And it must stay quiet on well-formed MIR, or every AOT compile would start failing.
+    #[test]
+    fn verify_or_ice_accepts_a_real_compiled_program() {
+        let src = "module m\nfn main() -> i32 { let x: f32 = 0.5; print(x); return 0; }";
+        let mut sm = SourceMap::new();
+        let id = sm.add("v.wk".to_string(), src.to_string());
+        let (tokens, _) = wukong_lexer::tokenize(sm.source(id), id);
+        let mut interner = Interner::new();
+        let (module, _) = wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(!sd.iter().any(|d| d.is_error()), "sema errors");
+        for level in [0u8, 1, 2] {
+            let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+            assert!(!md.iter().any(|d| d.is_error()), "mir_build errors");
+            wukong_opt::optimize(&mut program, level);
+            assert!(!verify_or_ice(&program), "clean program failed verify at -O{level}");
+        }
     }
 }
 
