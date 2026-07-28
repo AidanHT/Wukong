@@ -9561,7 +9561,16 @@ impl FnLowerer<'_> {
     /// `-O0`==`-O3`; both backends marshal the identical kernel, so the differential gate stays
     /// bit-exact. In a `@parallel` function `emit_norm` selects the multicore `_parallel` variant.
     fn try_emit_batched_norm(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
-        let ForIter::Range { end: Some(end), .. } = iter else {
+        // Unit-step half-open only: the kernel's `rows` is `end`, so a `..=` or `step k` outer loop
+        // would normalize a different number of rows (the `range_bounds` contract, spelled out here
+        // because this recognizer reads the bound directly).
+        let ForIter::Range {
+            end: Some(end),
+            inclusive: false,
+            step: None,
+            ..
+        } = iter
+        else {
             return false;
         };
         if let Some((x, dst, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body)
@@ -24623,13 +24632,22 @@ fn fusable_for(s: &Stmt) -> Option<(&Pattern, &ForIter, &Block)> {
     None
 }
 
-/// The `(start, end)` expressions of a half-open range iterator.
+/// The `(start, end)` expressions of a half-open, **unit-step** range iterator.
+///
+/// The `inclusive`/`step` fields are part of the contract, not decoration: every kernel recognizer
+/// reads its trip count as `end - start` and hands it to a kernel that walks each index once. A
+/// `..=` bound is one iteration longer and a `step k` bound visits a fraction of the indices, so
+/// accepting either made the recognizers silently answer a *different* loop — `for i in 0..4 step 2
+/// { <ikj gemm> }` dispatched `wukong_sgemm` and printed `3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3` where
+/// `3 3 3 3 7 7 7 7 3 3 3 3 7 7 7 7` is correct, identically on both backends. Declining here is
+/// free: `lower_for`'s scalar path handles inclusive and stepped ranges correctly.
 fn range_bounds(iter: &ForIter) -> Option<(&Expr, &Expr)> {
     match iter {
         ForIter::Range {
             start,
             end: Some(end),
-            ..
+            inclusive: false,
+            step: None,
         } => Some((start, end)),
         _ => None,
     }
