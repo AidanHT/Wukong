@@ -238,12 +238,18 @@ impl Ty {
         }
     }
 
+    /// Alignment in bytes for sized types; `None` for the same cases as [`size_of`](Ty::size_of).
+    /// Every value returned is a power of two — `wukong_mir_build`'s mirrored `round_up` is the
+    /// bitmask form and is only correct under that precondition.
     pub fn align_of(&self) -> Option<u64> {
         match self {
             Ty::Scalar(s) => Some(s.align()),
             Ty::Unit => Some(1),
             Ty::Ptr { .. } | Ty::Ref { .. } => Some(8),
-            Ty::Vector { elem, lanes } => Some(elem.size() * *lanes as u64),
+            // An *alignment*, not the vector's size: `lanes` is documented as a power of two but
+            // nothing rejects `f32x3`, and a 12-byte "alignment" makes the two aggregate-layout
+            // authorities disagree. Identity for every power-of-two lane count.
+            Ty::Vector { elem, lanes } => Some((elem.size() * *lanes as u64).next_power_of_two()),
             // A slice's fat pointer is 8-byte aligned (its data pointer and length are both 8 bytes).
             Ty::Slice(_) => Some(8),
             Ty::Array { elem, .. } => elem.align_of(),
@@ -370,6 +376,62 @@ mod tests {
     }
 
     #[test]
+    fn vector_align_is_a_power_of_two() {
+        // `f32x3` parses today (wukong_parser's `split_vector_ident` accepts any digit run) and
+        // nothing rejects a non-power-of-two lane count, so `align_of` must not hand one out:
+        // every consumer of an alignment assumes a power of two.
+        for lanes in 1u32..=17 {
+            for elem in [Scalar::I8, Scalar::F16, Scalar::F32, Scalar::F64] {
+                let a = Ty::Vector { elem, lanes }.align_of().unwrap();
+                assert!(
+                    a.is_power_of_two(),
+                    "{}x{lanes} reported align {a}",
+                    elem.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn align_of_satisfies_the_mir_build_round_up_mirror() {
+        // `wukong_mir_build::round_up` is documented as a mirror of the `round_up` here, but it is
+        // the bitmask form `(x + align - 1) & !(align - 1)`, which agrees with `div_ceil` only when
+        // `align` is a power of two. This pins the precondition from our side: every alignment
+        // `align_of` can produce must make the two forms identical, so the two layout authorities
+        // (`Ty::size_of`/`tuple_offsets` here, `FnLowerer::aggregate_layout` there) cannot diverge.
+        fn bitmask_round_up(x: u64, align: u64) -> u64 {
+            if align <= 1 {
+                x
+            } else {
+                (x + align - 1) & !(align - 1)
+            }
+        }
+        let tys = [
+            Ty::Scalar(Scalar::I8),
+            Ty::Scalar(Scalar::F64),
+            Ty::Slice(Box::new(Ty::Scalar(Scalar::F32))),
+            Ty::Vector {
+                elem: Scalar::F32,
+                lanes: 3,
+            },
+            Ty::Vector {
+                elem: Scalar::F32,
+                lanes: 8,
+            },
+            Ty::Vector {
+                elem: Scalar::Bf16,
+                lanes: 6,
+            },
+        ];
+        for t in &tys {
+            let a = t.align_of().unwrap();
+            for x in 0u64..64 {
+                assert_eq!(round_up(x, a), bitmask_round_up(x, a), "round_up({x}, {a})");
+            }
+        }
+    }
+
+    #[test]
     fn scalar_from_name_round_trips() {
         for s in [
             Scalar::Bool,
@@ -387,6 +449,46 @@ mod tests {
             assert_eq!(Scalar::from_name(name), Some(s), "round-trip {name}");
         }
         assert_eq!(Scalar::from_name("not_a_type"), None);
+    }
+
+    #[test]
+    fn tuple_offsets_are_alignment_correct() {
+        // `tuple_offsets` is `pub` and documented as the aggregate-layout authority, but it has no
+        // callers in the workspace and had no test; pin it against `size_of`/`align_of` so it
+        // cannot drift from the accumulation `wukong_mir_build`'s `aggregate_layout` performs.
+        let t = Ty::Tuple(vec![
+            Ty::Scalar(Scalar::I8),
+            Ty::Scalar(Scalar::I32),
+            Ty::Vector {
+                elem: Scalar::F32,
+                lanes: 4,
+            },
+        ]);
+        let offs: Vec<u64> = t.tuple_offsets().unwrap().iter().map(|(o, _)| *o).collect();
+        assert_eq!(offs, vec![0, 4, 16]);
+        assert_eq!(t.align_of(), Some(16));
+        assert_eq!(t.size_of(), Some(32));
+
+        // The non-power-of-two lane count that motivated the `align_of` correction.
+        let odd = Ty::Tuple(vec![
+            Ty::Scalar(Scalar::I32),
+            Ty::Vector {
+                elem: Scalar::F32,
+                lanes: 3,
+            },
+        ]);
+        assert_eq!(odd.tuple_offsets().unwrap()[1].0, 16);
+        assert_eq!(odd.size_of(), Some(32));
+
+        // Every field sits at a multiple of its own alignment and fits inside the aggregate.
+        for ty in [&t, &odd] {
+            let size = ty.size_of().unwrap();
+            for (off, f) in ty.tuple_offsets().unwrap() {
+                assert_eq!(off % f.align_of().unwrap(), 0, "field at {off}");
+                assert!(off + f.size_of().unwrap() <= size, "field at {off} overruns");
+            }
+        }
+        assert!(Ty::Scalar(Scalar::I32).tuple_offsets().is_none());
     }
 
     #[test]
