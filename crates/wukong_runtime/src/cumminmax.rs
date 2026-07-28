@@ -403,6 +403,48 @@ mod tests {
         }
     }
 
+    /// Raw bit patterns — a row that opens with a NaN leaves the twin's `acc` at its identity, so the
+    /// expected output can contain `±∞`, and a float `assert_eq!` cannot compare NaN at all. Comparing
+    /// bits makes "bit-identical to the scalar twin" mean exactly that on every input.
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    /// A row containing NaN must still leave the AVX2 path **bit-identical to the scalar twin** — the
+    /// contract this module's header states unconditionally. In the strict left-to-right recurrence a
+    /// NaN only ever reaches `Ext::fold` as the `a` operand, where `(a > b) ? a : b` discards it; the
+    /// Hillis-Steele tree also feeds it in as `b` (the earlier-index operand), where it is *absorbing*,
+    /// so an unguarded tree both drops a real extremum and re-emits a stale one — e.g. `[1, NaN, 2, 3,
+    /// 4, 5, 6, 7]` scanned for the running max yielded `1 1 1 3 1 5 6 7`, a running maximum that
+    /// *decreases* from 3 to 1. NaN is swept across every lane of the first block, the block boundary,
+    /// and the scalar tail, for both extrema.
+    #[test]
+    fn cummax_cummin_nan_matches_scalar_twin() {
+        for &cols in &[1usize, 7, 8, 9, 16, 17, 33, 64] {
+            for p in 0..cols {
+                let mut x = fill(cols);
+                x[p] = f32::NAN;
+
+                let mut got_max = vec![0.0f32; cols];
+                let mut got_min = vec![0.0f32; cols];
+                unsafe {
+                    wukong_cummax_f32(x.as_ptr(), got_max.as_mut_ptr(), 1, cols as i64);
+                    wukong_cummin_f32(x.as_ptr(), got_min.as_mut_ptr(), 1, cols as i64);
+                }
+                assert_eq!(
+                    bits(&got_max),
+                    bits(&scalar_ref(&x, 1, cols, Ext::Max)),
+                    "cummax vs twin, NaN at {p} of {cols}"
+                );
+                assert_eq!(
+                    bits(&got_min),
+                    bits(&scalar_ref(&x, 1, cols, Ext::Min)),
+                    "cummin vs twin, NaN at {p} of {cols}"
+                );
+            }
+        }
+    }
+
     /// Focused check on the cross-128-lane in-lane scan with known data (exact, no rounding) on a single
     /// 8-block. An ascending ramp → cummax is the ramp itself and cummin is the first element repeated; a
     /// descending ramp → the opposite. This pins the `_mm256_permutevar8x32_ps` shift + identity-fill
