@@ -722,6 +722,19 @@ pub(crate) fn apply1(op: i64, x: f32) -> f32 {
     }
 }
 
+/// Scalar twin / no-AVX2 fallback for [`wukong_vmath_f32`]: `out[i] = apply1(op, x[i])`. The single
+/// source of truth for "this op, one element at a time" — the AVX2 dispatcher calls it too when `op`
+/// has no 8-lane kernel, so both hosts honour `apply1`'s identity-for-an-unknown-op contract.
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+unsafe fn vmath_scalar(x: *const f32, out: *mut f32, n: usize, op: i64) {
+    for i in 0..n {
+        // SAFETY: i < n; buffers valid for n by this function's contract.
+        unsafe { *out.add(i) = apply1(op, *x.add(i)) };
+    }
+}
+
 /// `out[i] = f(x[i])` for `i in 0..n`, where `f` is selected by `op` (see the `VM_*` codes). Uses the
 /// 256-bit AVX2 kernels when available (8 lanes/step + a scalar tail), else the scalar fallback. `x`
 /// and `out` may alias (the recognizer allows in-place activations).
@@ -742,10 +755,8 @@ pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, 
             return;
         }
     }
-    for i in 0..n {
-        // SAFETY: i < n; buffers valid for n.
-        unsafe { *out.add(i) = apply1(op, *x.add(i)) };
-    }
+    // SAFETY: buffers valid for n by the caller contract.
+    unsafe { vmath_scalar(x, out, n, op) };
 }
 
 /// Fixed chunk (elements) for the multicore [`wukong_vmath_f32_parallel`] — a constant span so the
@@ -885,7 +896,13 @@ fn vmath_unroll6() -> bool {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath8_for(op) else { return };
+    // No 8-lane kernel for this op (a sentinel like `bias::BIAS_ACT_NONE`, or a future `VM_*` added to
+    // `apply1` without its `vmath8_for` arm): run the scalar twin over the whole buffer, exactly as the
+    // no-AVX2 fallback and `lowp`'s half-output twins do. Returning here instead would leave `out` at
+    // its prior contents while a non-AVX2 host wrote `apply1`'s identity — the same call, different bytes.
+    let Some(f) = vmath8_for(op) else {
+        return vmath_scalar(x, out, n, op);
+    };
     // Non-temporal store regime — two streams (`x` in, `out` out), so the pair spills L3 at the same
     // total-bytes threshold `velem`/`vhorner` use. Above it the streaming store skips the
     // read-for-ownership a cacheable store pays for a write-once tensor (the >L3 activation sizes the
@@ -1358,6 +1375,19 @@ fn vmath2_8_for(
     })
 }
 
+/// Scalar twin / no-AVX2 fallback for [`wukong_vmath2_f32`]: `out[i] = apply2_1(op, x[i], y[i])`. The
+/// AVX2 dispatcher calls it too for an op with no 8-lane kernel, so both hosts honour `apply2_1`'s
+/// identity-for-an-unknown-op contract.
+///
+/// # Safety
+/// `x`, `y`, and `out` must each be valid for `n` `f32` elements.
+unsafe fn vmath2_scalar(x: *const f32, y: *const f32, out: *mut f32, n: usize, op: i64) {
+    for i in 0..n {
+        // SAFETY: i < n; buffers valid for n by this function's contract.
+        unsafe { *out.add(i) = apply2_1(op, *x.add(i), *y.add(i)) };
+    }
+}
+
 /// `out[i] = f(x[i], y[i])` for the two-input transcendentals (`VM2_*`). The 256-bit AVX2 twin of the
 /// inlined two-arg poly an `out[i] = pow/atan2/hypot(x[i], y[i])` loop lowers to; mirrors the inlined
 /// MIR op-for-op, so the interpreter marshalling through this kernel keeps native == interp exact.
@@ -1384,17 +1414,20 @@ pub unsafe extern "C" fn wukong_vmath2_f32(
             return;
         }
     }
-    for i in 0..n {
-        // SAFETY: i < n; buffers valid for n.
-        unsafe { *out.add(i) = apply2_1(op, *x.add(i), *y.add(i)) };
-    }
+    // SAFETY: buffers valid for n by the caller contract.
+    unsafe { vmath2_scalar(x, y, out, n, op) };
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath2_avx2(x: *const f32, y: *const f32, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath2_8_for(op) else { return };
+    // No 8-lane kernel for this op: run the scalar twin over the whole buffer rather than returning
+    // with `out` untouched, so an AVX2 host and a non-AVX2 host write the identical bytes (see the
+    // matching arm in `vmath_avx2`).
+    let Some(f) = vmath2_8_for(op) else {
+        return vmath2_scalar(x, y, out, n, op);
+    };
     // Same ×4-ILP + non-temporal-store treatment as `vmath_avx2` (this loop had the identical
     // single-vector, store-immediately structure). Three streams (`x`, `y` in, `out` out), so the
     // working set spills L3 — and wants `vmovntps` — at a *smaller* length than the one-input kernel.
@@ -1476,8 +1509,19 @@ pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64,
             return;
         }
     }
+    // SAFETY: buffers valid for n by the caller contract.
+    unsafe { vmath_bf16_scalar(x, out, n, op) };
+}
+
+/// Scalar twin / no-AVX2 fallback for [`wukong_vmath_bf16`]: `out[i] = apply1(op, widen(x[i]))`. The
+/// AVX2 dispatcher calls it too for an op with no 8-lane kernel (the shape `lowp`'s half-output twins
+/// already use), so both hosts honour `apply1`'s identity-for-an-unknown-op contract.
+///
+/// # Safety
+/// `x` must be valid for `n` `u16` (bf16 bits); `out` for `n` `f32`.
+unsafe fn vmath_bf16_scalar(x: *const u16, out: *mut f32, n: usize, op: i64) {
     for i in 0..n {
-        // SAFETY: i < n; buffers valid for n.
+        // SAFETY: i < n; buffers valid for n by this function's contract.
         unsafe { *out.add(i) = apply1(op, crate::bf16_bits_to_f32(*x.add(i))) };
     }
 }
@@ -1486,7 +1530,9 @@ pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64,
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath_bf16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath8_for(op) else { return };
+    let Some(f) = vmath8_for(op) else {
+        return vmath_bf16_scalar(x, out, n, op);
+    };
     let mut i = 0;
     while i + 8 <= n {
         // lossless bf16→f32 widen (the same `<<16` the bf16 reductions use), then the shared kernel.
@@ -1524,8 +1570,19 @@ pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, 
             return;
         }
     }
+    // SAFETY: buffers valid for n by the caller contract.
+    unsafe { vmath_f16_scalar(x, out, n, op) };
+}
+
+/// Scalar twin / no-F16C fallback for [`wukong_vmath_f16`]: `out[i] = apply1(op, widen(x[i]))`. The
+/// AVX2 dispatcher calls it too for an op with no 8-lane kernel, so both hosts honour `apply1`'s
+/// identity-for-an-unknown-op contract.
+///
+/// # Safety
+/// `x` must be valid for `n` `u16` (f16 bits); `out` for `n` `f32`.
+unsafe fn vmath_f16_scalar(x: *const u16, out: *mut f32, n: usize, op: i64) {
     for i in 0..n {
-        // SAFETY: i < n; buffers valid for n.
+        // SAFETY: i < n; buffers valid for n by this function's contract.
         unsafe { *out.add(i) = apply1(op, crate::f16_bits_to_f32(*x.add(i))) };
     }
 }
@@ -1534,7 +1591,9 @@ pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, 
 #[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn vmath_f16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath8_for(op) else { return };
+    let Some(f) = vmath8_for(op) else {
+        return vmath_f16_scalar(x, out, n, op);
+    };
     let mut i = 0;
     while i + 8 <= n {
         // lossless f16→f32 widen (F16C `vcvtph2ps`), then the shared activation kernel.
@@ -2786,6 +2845,53 @@ mod tests {
             for i in 0..n {
                 assert_eq!(gb[i].to_bits(), rb[i].to_bits(), "bf16 op {op} i {i}");
                 assert_eq!(gh[i].to_bits(), rh[i].to_bits(), "f16 op {op} i {i}");
+            }
+        }
+    }
+
+    /// The unknown-op contract is **identity**, and it must hold on every dispatch path. `apply1`
+    /// documents it (vmath.rs's `_ => x`), `bias.rs`'s `BIAS_ACT_NONE = -1` is a live in-production
+    /// user of it, and the no-AVX2 fallbacks implement it — so the AVX2 dispatchers must too, or the
+    /// same call returns different bytes depending on which host runs it (and on an AVX2 host leaves
+    /// `out` at whatever it already held, which for a fresh `wukong_rt_alloc` buffer is all-zeros).
+    /// A non-multiple-of-8 length covers both the lane body and the scalar tail; `out` is pre-filled
+    /// with a sentinel so "wrote nothing" is distinguishable from "wrote the identity".
+    #[test]
+    fn vmath_unknown_op_writes_identity_on_every_path() {
+        const STALE: f32 = -777.25; // outside every identity value produced below
+        let n = 1003usize; // not a multiple of 8
+        let xf: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.004).collect();
+        let yf: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+        let bbits: Vec<u16> = xf.iter().map(|&v| crate::f32_to_bf16_bits(v)).collect();
+        let hbits: Vec<u16> = xf.iter().map(|&v| crate::f32_to_f16_bits(v)).collect();
+        // -1 is `bias::BIAS_ACT_NONE`, the sentinel already in production use; 9999 stands in for a
+        // future `VM_*` code added to `apply1` without the matching `vmath8_for` arm.
+        for op in [-1i64, 9999] {
+            let mut o = vec![STALE; n];
+            // SAFETY: xf/o are exactly n f32 long — the kernel's operand contract.
+            unsafe { wukong_vmath_f32(xf.as_ptr(), o.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                assert_eq!(o[i].to_bits(), xf[i].to_bits(), "vmath_f32 op {op} i {i}");
+            }
+            let mut o = vec![STALE; n];
+            // SAFETY: xf/yf/o are exactly n f32 long.
+            unsafe { wukong_vmath2_f32(xf.as_ptr(), yf.as_ptr(), o.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                assert_eq!(o[i].to_bits(), xf[i].to_bits(), "vmath2_f32 op {op} i {i}");
+            }
+            let mut o = vec![STALE; n];
+            // SAFETY: bbits is n u16 (bf16 bits), o is n f32.
+            unsafe { wukong_vmath_bf16(bbits.as_ptr(), o.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                let want = crate::bf16_bits_to_f32(bbits[i]);
+                assert_eq!(o[i].to_bits(), want.to_bits(), "vmath_bf16 op {op} i {i}");
+            }
+            let mut o = vec![STALE; n];
+            // SAFETY: hbits is n u16 (f16 bits), o is n f32.
+            unsafe { wukong_vmath_f16(hbits.as_ptr(), o.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                let want = crate::f16_bits_to_f32(hbits[i]);
+                assert_eq!(o[i].to_bits(), want.to_bits(), "vmath_f16 op {op} i {i}");
             }
         }
     }
