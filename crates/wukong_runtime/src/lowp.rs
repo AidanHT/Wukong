@@ -1647,6 +1647,43 @@ mod tests {
     }
 
     #[test]
+    fn parallel_reductions_fork_on_the_unified_pool() {
+        // `par_chunk_reduce` can be a process's FIRST rayon touch (a bf16 model whose first parallel
+        // op is a reduction). Forking `into_par_iter()` straight from there builds rayon's DEFAULT
+        // global registry — 2 MiB worker stacks — and the runtime's later `ensure_global_pool()` then
+        // loses the race silently (`build_global` → GlobalPoolAlreadyInitialized, discarded at
+        // lib.rs), so every subsequent outlined `@parallel` region body runs on a stack an eighth of
+        // the required 16 MiB. That first-touch ordering is process-global, so a shared-process test
+        // harness cannot pin it directly; what it CAN pin, order-independently, is the cause: the
+        // chunks must execute on the unified kernel pool, i.e. this fork must go through
+        // `run_on_wuk_pool`, which is what configures the global pool before anything else can.
+        //
+        // On a part with no HyperThreads to shed, `gemm_pool()` is None and the two pools coincide,
+        // so the comparison is vacuous there (and under `WUKONG_POOL_UNIFY=0`, and at
+        // `RAYON_NUM_THREADS=1`) — it still cannot regress. On this 6P+8E+2LPE machine the widths are
+        // 16 vs 22 and it is a real discriminator.
+        let want = crate::wuk_pool_width();
+        let n = 4 * crate::reduce::RCHUNK + 7;
+        let seen = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let got = par_chunk_reduce(
+            n,
+            0.0,
+            |lo, hi| {
+                seen.lock().unwrap().insert(rayon::current_num_threads());
+                (hi - lo) as f32
+            },
+            |a, b| a + b,
+        );
+        // Every chunk ran exactly once (so the widths below are the whole story, not a sample).
+        assert_eq!(got, n as f32, "chunk coverage");
+        assert_eq!(
+            seen.into_inner().unwrap(),
+            std::collections::BTreeSet::from([want]),
+            "par_chunk_reduce forked off the unified kernel pool (width {want})"
+        );
+    }
+
+    #[test]
     fn parallel_reductions_within_f64_tolerance() {
         use crate::reduce::{RED_MAX, RED_MAXABS, RED_MIN};
         // A size that exercises several real chunks (RCHUNK = 8192), so rayon actually runs.
