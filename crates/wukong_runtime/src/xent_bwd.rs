@@ -131,7 +131,16 @@ unsafe fn xent_bwd_row_avx2(x: *const f32, target: usize, dx: *mut f32, n: usize
     let mut mxv = _mm256_set1_ps(f32::NEG_INFINITY);
     let mut i = 0;
     while i + 8 <= n {
-        mxv = _mm256_max_ps(mxv, _mm256_loadu_ps(x.add(i)));
+        let v = _mm256_loadu_ps(x.add(i));
+        // `_mm256_max_ps(a, b)` yields `b` for an unordered pair, so a NaN logit would ERASE the
+        // lane's running maximum; the scalar twin's `f32::max` ignores NaN and keeps it. Blend the
+        // accumulator back over the NaN lanes so both twins fold the same values. On a row with no
+        // NaN the mask is all-zero and the max — and its bits — are exactly as before.
+        mxv = _mm256_blendv_ps(
+            _mm256_max_ps(mxv, v),
+            mxv,
+            _mm256_cmp_ps::<_CMP_UNORD_Q>(v, v),
+        );
         i += 8;
     }
     let mut mx = [0.0f32; 8];
