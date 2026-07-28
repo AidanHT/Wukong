@@ -496,14 +496,23 @@ fn par_chunk_reduce(
     combine: impl Fn(f32, f32) -> f32,
 ) -> f32 {
     let nchunks = n.div_ceil(crate::reduce::RCHUNK);
-    let partials: Vec<f32> = (0..nchunks)
-        .into_par_iter()
-        .map(|c| {
-            let lo = c * crate::reduce::RCHUNK;
-            let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
-            per_chunk(lo, hi)
-        })
-        .collect();
+    // Fork on the unified kernel pool, never on rayon's implicit global registry: this is a path that
+    // can be a process's FIRST rayon touch (a bf16 model whose first parallel op is a reduction), and
+    // `run_on_wuk_pool` is what installs the runtime's 16 MiB worker stacks before anything can build
+    // rayon's 2 MiB default (`crate::ensure_global_pool`, lib.rs:324-329). Scheduling-only: the fixed
+    // `RCHUNK` decomposition and the ordered fold below are what fix the bits, so which pool runs the
+    // map cannot change them. `per_chunk` is borrowed, not moved — `&P` is `Send` because `P: Sync`.
+    let per_chunk = &per_chunk;
+    let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
+        (0..nchunks)
+            .into_par_iter()
+            .map(|c| {
+                let lo = c * crate::reduce::RCHUNK;
+                let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
+                per_chunk(lo, hi)
+            })
+            .collect()
+    });
     let mut acc = ident;
     for p in partials {
         acc = combine(acc, p);
