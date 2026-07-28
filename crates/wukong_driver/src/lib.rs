@@ -188,7 +188,7 @@ pub fn compile(opts: &Options) -> i32 {
 
     if opts.emit == EmitStage::Tokens {
         render_all(opts.error_format, &renderer, &sink, &sm);
-        print!("{}", wukong_lexer::dump(&tokens, sm.source(id)));
+        print_artifact(&wukong_lexer::dump(&tokens, sm.source(id)));
         return if sink.has_errors() {
             exit::COMPILE_ERROR
         } else {
@@ -210,7 +210,7 @@ pub fn compile(opts: &Options) -> i32 {
     // (`--emit=mir-high` onward, `--run`) sees.
     if opts.emit == EmitStage::Ast {
         render_all(opts.error_format, &renderer, &sink, &sm);
-        print!("{}", wukong_ast::print::print_module(&module, &interner));
+        print_artifact(&wukong_ast::print::print_module(&module, &interner));
         return if sink.has_errors() {
             exit::COMPILE_ERROR
         } else {
@@ -322,7 +322,7 @@ pub fn compile(opts: &Options) -> i32 {
         let mut verify_failed = false;
         for f in &program.funcs {
             for ice in wukong_mir::verify::verify_function(f) {
-                eprintln!("internal compiler error (MIR verify): {ice}");
+                eprint_line(&format!("internal compiler error (MIR verify): {ice}"));
                 verify_failed = true;
             }
         }
@@ -360,10 +360,7 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- LLVM backend ---
     if opts.emit == EmitStage::LlvmIr {
-        print!(
-            "{}",
-            wukong_codegen_llvm::emit_llvm_ir(&program, &interner)
-        );
+        print_artifact(&wukong_codegen_llvm::emit_llvm_ir(&program, &interner));
         return exit::OK;
     }
     if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
@@ -1088,19 +1085,39 @@ fn emit_mir(program: &wukong_mir::Program, interner: &Interner) -> bool {
     let mut verify_failed = false;
     for f in &program.funcs {
         for ice in wukong_mir::verify::verify_function(f) {
-            eprintln!("internal compiler error (MIR verify): {ice}");
+            eprint_line(&format!("internal compiler error (MIR verify): {ice}"));
             verify_failed = true;
         }
     }
-    print!("{}", wukong_mir::print::print_program(program, interner));
+    print_artifact(&wukong_mir::print::print_program(program, interner));
     verify_failed
+}
+
+/// Write a compiler artifact to stdout.
+///
+/// Deliberately a *fallible* write rather than `print!`: `print!` panics when the consumer closes
+/// the pipe, and with the workspace's `panic = "abort"` release profile that panic aborts the whole
+/// process. `wukongc --emit=mir big.wk | head -1` therefore printed Rust's internal
+/// "failed printing to stdout: The pipe has been ended. (os error 109)" and exited 127 instead of
+/// reporting the compile result. A closed consumer is not a compiler error — drop the rest of the
+/// artifact and let the normal exit code stand.
+fn print_artifact(s: &str) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(s.as_bytes());
+}
+
+/// One line of compiler output on stderr, fallible for the same reason as [`print_artifact`]: a
+/// many-diagnostic file piped into `head` aborted the process partway through the diagnostic stream.
+fn eprint_line(s: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{s}");
 }
 
 /// Emit a single diagnostic to stderr in the requested format.
 fn emit_diag(d: &Diagnostic, fmt: ErrorFormat, renderer: &Renderer, sm: &SourceMap) {
     match fmt {
-        ErrorFormat::Human => eprintln!("{}", renderer.render(d, sm)),
-        ErrorFormat::Json => eprintln!("{}", wukong_diag::to_json(d, sm)),
+        ErrorFormat::Human => eprint_line(&renderer.render(d, sm)),
+        ErrorFormat::Json => eprint_line(&wukong_diag::to_json(d, sm)),
     }
 }
 
