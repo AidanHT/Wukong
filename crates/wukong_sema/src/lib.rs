@@ -315,6 +315,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     // per function, so an unknown dim name can be told from a declared generic / a `const` with no
     // forward-reference false positive (and a function signature, re-lowered here, is reported once).
     s.checking_bodies = true;
+    s.recheck_item_signatures(module);
     s.check_bodies(module);
     let result = SemaResult {
         types: s.types,
@@ -494,6 +495,80 @@ impl Sema<'_> {
         }
     }
 
+    /// Re-lower struct field, enum payload and `extern` signature types once the body pass has begun,
+    /// purely for the diagnostics gated on `checking_bodies` (the unknown-tensor-dimension E0504 and
+    /// the unknown-array-length check).
+    ///
+    /// Those types are lowered exactly ONCE — during `collect`, with the flag still false — while the
+    /// only types re-lowered in the body pass are the parameters and return type of functions WITH a
+    /// body. So an undeclared dimension name in a struct field or an `extern` signature was silently
+    /// turned into a fresh unconstrained `Dim::Var`, precisely the hole E0504 exists to close:
+    /// `extern { fn dot(a: Tensor[f32, K], b: Tensor[f32, KK]) -> f32; }` — a one-character typo —
+    /// gave the two parameters independent dims, so a length-4 and a length-8 buffer unified without
+    /// complaint and the extern callee read a mismatched buffer.
+    ///
+    /// The lowered results are discarded (the def map is already populated, and `lower_type` has no
+    /// other side effect), and any diagnostic identical to one `collect` already reported is dropped,
+    /// so this cannot double-report.
+    fn recheck_item_signatures(&mut self, module: &Module) {
+        let before = self.diags.len();
+        for item in &module.items {
+            match &item.kind {
+                ItemKind::Struct(s) => {
+                    self.generics = generic_names(&s.generics);
+                    for fl in &s.fields {
+                        self.lower_type(&fl.ty);
+                    }
+                    self.generics.clear();
+                }
+                ItemKind::Enum(e) => {
+                    self.generics = generic_names(&e.generics);
+                    for v in &e.variants {
+                        match &v.data {
+                            VariantData::Unit => {}
+                            VariantData::Tuple(tys) => {
+                                for t in tys {
+                                    self.lower_type(t);
+                                }
+                            }
+                            VariantData::Struct(fields) => {
+                                for f in fields {
+                                    self.lower_type(&f.ty);
+                                }
+                            }
+                        }
+                    }
+                    self.generics.clear();
+                }
+                // An extern fn declares its own generics, exactly as `collect_fn` establishes them.
+                ItemKind::Extern(blk) => {
+                    for f in &blk.items {
+                        self.generics = generic_names(&f.generics);
+                        for p in &f.params {
+                            self.lower_type(&p.ty);
+                        }
+                        if let Some(t) = &f.ret {
+                            self.lower_type(t);
+                        }
+                        self.generics.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+        let key = |d: &Diagnostic| (d.code, d.message.clone(), d.labels.first().map(|l| l.span));
+        let seen: HashSet<(Option<&'static str>, String, Option<Span>)> =
+            self.diags[..before].iter().map(key).collect();
+        let mut i = before;
+        while i < self.diags.len() {
+            if seen.contains(&key(&self.diags[i])) {
+                self.diags.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// Reject a struct that contains itself by value — directly (`struct S { x: S }`) or transitively
     /// (`A` holds `B` holds `A`). Such a type has infinite size; sizing or instantiating it
     /// stack-overflows mir_build's layout pass (a compiler crash on a plausible mistake — forgetting
@@ -660,8 +735,10 @@ impl Sema<'_> {
                     ))
                     .with_code("E0300")
                     .primary(name.span, "reserved name")
-                    .help("rename this function; the `wukong_` prefix is reserved for the symbols \
-                           the kernel recognizers emit"),
+                    .help(
+                        "rename this function; the `wukong_` prefix is reserved for the symbols \
+                         the kernel recognizers emit",
+                    ),
                 );
                 // Fall through and register it anyway: the compile is already failing, and leaving
                 // the def map complete keeps every call site from cascading into E0301.
@@ -846,14 +923,41 @@ impl Sema<'_> {
         self.eval_usize_depth(e, 0)
     }
 
-    /// A fixed-size array's compile-time length, bounded to what lowering can represent. mir_build's
-    /// mirrored `const_usize_expr` is `u32` end to end and narrows the folded value with an unchecked
-    /// `as u32`, so a length above `u32::MAX` silently wrapped: `[i32; 0x1_0000_0001]` was bounds
-    /// checked here against 4294967297 while the emitted slot held 1 element. Reject the length
-    /// instead — with the length expression as the primary span — so the truncating path is
-    /// unreachable. Gated on `checking_bodies` exactly like the E0504 dim check, so a signature
-    /// re-lowered by `check_fn` is reported once (see the flag's doc-comment).
+    /// A fixed-size array's compile-time length, with the two diagnostics `eval_usize` cannot report
+    /// (it is `&self`, and every caller wants a number): an unresolvable length NAME, and a length
+    /// beyond what lowering can represent — mir_build's mirrored `const_usize_expr` is `u32` end to
+    /// end and narrows the folded value with an unchecked `as u32`, so `[i32; 0x1_0000_0001]` was
+    /// bounds checked here against 4294967297 while the emitted slot held 1 element. Both point at
+    /// the length expression and are gated on `checking_bodies` exactly like the E0504 dim check, so
+    /// a signature re-lowered by `check_fn` is reported once (see the flag's doc-comment).
     fn array_len(&mut self, len: &Expr) -> u64 {
+        // An array length naming an identifier that is neither a declared generic nor a top-level
+        // `const` is a typo, not a length. `fn sum(a: [i32; NOPE])` typed the parameter `[i32; 0]`
+        // and compiled clean — mir_build's `const_usize_expr` returned `None` and lowered a bare
+        // pointer — so every compile-time bounds check on that array was vacuous or nonsensical
+        // (`a[0]` reported "index 0 is out of bounds for an array of length 0", naming neither
+        // `NOPE` nor the real cause). Tensor dimensions already get exactly this check (E0504);
+        // array lengths had no equivalent. Generics are consulted first, like `lower_dim` does, and
+        // the same `checking_bodies` gate applies for the same reason: `collect` registers consts as
+        // it walks, so a const declared after this item is only guaranteed visible in the body pass.
+        if self.checking_bodies {
+            if let ExprKind::Path(p) = &len.kind {
+                if p.is_single() {
+                    let sym = p.first().sym;
+                    if !self.generics.contains(&sym) && !self.consts.contains_key(&sym) {
+                        let nm = self.sym_str(sym).to_string();
+                        self.error(
+                            len.span,
+                            "E0301",
+                            format!(
+                                "cannot find `{nm}` in this scope (an array length must be an \
+                                 integer literal, a `const`, or a declared generic parameter)"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         let n = self.eval_usize(len);
         if n > u32::MAX as u64 && self.checking_bodies {
             self.error(
@@ -4308,6 +4412,59 @@ mod tests {
             errors(ok).is_empty(),
             "`::<0x4>` must bind N := 4: {:?}",
             errors(ok)
+        );
+    }
+
+    #[test]
+    fn unknown_array_length_name_is_reported() {
+        // `[i32; NOPE]` typed the parameter `[i32; 0]` and compiled clean, so every compile-time
+        // bounds check on it was vacuous. Tensor dims already had this check (E0504).
+        let bad = "fn sum(a: [i32; NOPE]) -> i32 { return a[0]; }";
+        assert!(
+            errors(bad).contains(&"E0301"),
+            "expected an unknown array length: {:?}",
+            errors(bad)
+        );
+        // A `const` (declared BEFORE or AFTER the use) and a declared generic both resolve.
+        let after = "fn sum(a: [i32; N]) -> i32 { return a[0]; } const N: usize = 4;";
+        assert!(errors(after).is_empty(), "unexpected: {:?}", errors(after));
+        // A declared generic is consulted first, exactly as `lower_dim` does, so it is not reported
+        // as an unknown name. (Such a length still evaluates to 0 — pre-existing behaviour, which is
+        // why the E0501 below fires — but that is not this check's business.)
+        let gen = "fn sum<N>(a: [i32; N]) -> i32 { return a[0]; }";
+        assert!(
+            !errors(gen).contains(&"E0301"),
+            "a declared generic is not an unknown length: {:?}",
+            errors(gen)
+        );
+    }
+
+    #[test]
+    fn struct_and_extern_signature_dims_are_checked() {
+        // Struct fields, enum payloads and `extern` signatures are lowered once, in `collect`, with
+        // `checking_bodies` still false — so an undeclared dim name in one of them silently became a
+        // fresh unconstrained `Dim::Var`, the exact hole E0504 exists to close.
+        for src in [
+            "fn main() -> i32 { return 0; } struct S { t: Tensor[f32, KK] }",
+            "fn main() -> i32 { return 0; } enum E { V(Tensor[f32, KK]) }",
+            "fn main() -> i32 { return 0; } extern { fn ext(a: Tensor[f32, KK]) -> f32; }",
+            "fn main() -> i32 { return 0; } struct S { a: [i32; NOPE] }",
+        ] {
+            assert!(
+                errors(src).iter().any(|c| *c == "E0504" || *c == "E0301"),
+                "expected an unknown dimension/length in `{src}`: {:?}",
+                errors(src)
+            );
+        }
+        // An extern fn's own generics still bind, and a re-lowered signature must not double-report
+        // a diagnostic `collect` already emitted.
+        let ok = "extern { fn dot<K>(a: Tensor[f32, K], b: Tensor[f32, K]) -> f32; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        let dup = "struct P { a: i32 } struct Q { t: Tensor[P, 4] }";
+        assert_eq!(
+            errors(dup),
+            vec!["E0302"],
+            "the diagnostic re-pass must not double-report"
         );
     }
 
