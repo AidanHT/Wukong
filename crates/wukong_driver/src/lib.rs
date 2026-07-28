@@ -462,6 +462,40 @@ void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_fl
 }\n\
 void wukong_rt_free(void* p) { free(p); }\n";
 
+/// A per-invocation scratch directory for the generated `--emit=exe` link inputs (the Rust link
+/// shim and the C fallback runtime). They used to be written into the process's *current* directory
+/// as `{stem}_shim.rs` / `{stem}_rt.c`, where the shim overwrote — and then unconditionally deleted
+/// — any user file of that name, and two concurrent links on the same stem raced on it. Keyed by
+/// pid so concurrent invocations cannot collide; removed when the link finishes either way.
+struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    /// `None` when the directory cannot be created — the caller then falls back to the old
+    /// working-directory paths rather than failing the link outright.
+    fn new(stem: &str) -> Option<ScratchDir> {
+        let path = std::env::temp_dir().join(format!("wukongc-{}-{stem}", std::process::id()));
+        std::fs::create_dir_all(&path).ok()?;
+        Some(ScratchDir { path })
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Where a generated link input goes: inside the scratch directory when one could be created, else
+/// the working directory (the historical behaviour).
+fn scratch_path(scratch: Option<&ScratchDir>, name: String) -> PathBuf {
+    match scratch {
+        Some(s) => s.path.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 /// Emit a native object via Cranelift (no LLVM) and, for `--emit=exe`, link it with a small C
 /// runtime using the system C compiler. `CC` overrides the compiler (default `cc`).
 fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
@@ -503,13 +537,17 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{stem}.exe")));
 
+    // The generated link inputs are compiler intermediates, not user artifacts — keep them out of
+    // the directory the user invoked us in (see [`ScratchDir`]).
+    let scratch = ScratchDir::new(&stem);
+
     // Prefer the **rustc-driven link**: `rustc` invokes the object's *native* platform linker and
     // links `wukong_runtime` (the AVX2 kernels) as a real dependency, so a recognized-kernel program
     // resolves its `wukong_*` symbols AND the read-only string `.rodata` relocations link. The MinGW
     // `cc` path below can neither (it crashes on the MSVC object's data relocations and can't consume
     // the Rust runtime staticlib). Output is bit-identical to `--run`. Falls back to `cc` only when
     // rustc or the runtime rlib is unavailable (a scalar, no-data, no-kernel program still links).
-    match rustc_link(&stem, &obj_path, &out) {
+    match rustc_link(scratch.as_ref(), &stem, &obj_path, &out) {
         LinkOutcome::Linked => {
             eprintln!("wrote {}", out.display());
             return exit::OK;
@@ -521,8 +559,8 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
     }
 
-    // exe (fallback): emit the C runtime next to the object and link them with the system C compiler.
-    let rt_path = PathBuf::from(format!("{stem}_rt.c"));
+    // exe (fallback): emit the C runtime into the scratch dir and link it with the system C compiler.
+    let rt_path = scratch_path(scratch.as_ref(), format!("{stem}_rt.c"));
     if let Err(e) = std::fs::write(&rt_path, WUKONG_RT_C) {
         eprintln!("error: could not write `{}`: {e}", rt_path.display());
         return exit::IO_ERROR;
@@ -636,7 +674,12 @@ pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// `cc` path can do here. The runtime rlib + its dependency dir are located next to this compiler
 /// binary (the cargo `target/<profile>/` layout). Returns [`LinkOutcome::Unavailable`] when rustc or
 /// the rlib is absent so the caller can try the `cc` fallback.
-fn rustc_link(stem: &str, obj_path: &Path, out: &Path) -> LinkOutcome {
+fn rustc_link(
+    scratch: Option<&ScratchDir>,
+    stem: &str,
+    obj_path: &Path,
+    out: &Path,
+) -> LinkOutcome {
     use std::process::Command;
 
     let exe = match std::env::current_exe() {
@@ -654,7 +697,7 @@ fn rustc_link(stem: &str, obj_path: &Path, out: &Path) -> LinkOutcome {
         return LinkOutcome::Unavailable;
     }
 
-    let shim_path = PathBuf::from(format!("{stem}_shim.rs"));
+    let shim_path = scratch_path(scratch, format!("{stem}_shim.rs"));
     if let Err(e) = std::fs::write(&shim_path, WUKONG_RT_SHIM) {
         return LinkOutcome::Failed(format!("could not write `{}`: {e}", shim_path.display()));
     }
@@ -663,6 +706,14 @@ fn rustc_link(stem: &str, obj_path: &Path, out: &Path) -> LinkOutcome {
         .arg(&shim_path)
         .arg("--edition")
         .arg("2021")
+        // The rlib we link against is built by this workspace, whose `[profile.release]` sets
+        // `panic = "abort"`. rustc defaults the shim to `unwind`, and a strategy mismatch is a hard
+        // metadata error ("the crate `wukong_runtime` requires panic strategy `abort` which is
+        // incompatible with this crate's strategy of `unwind`") that rejected every release-profile
+        // link before it ever reached the linker. An abort-strategy crate may link unwind-built
+        // dependencies, so this is equally correct against a debug-profile rlib.
+        .arg("-C")
+        .arg("panic=abort")
         .arg("--extern")
         .arg(format!("wukong_runtime={}", rlib.display()))
         .arg("-L")
@@ -1467,6 +1518,37 @@ mod grad_cli_tests {
         gate(src, "loss", &[1], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dW1
         gate(src, "loss", &[2], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dW2
         gate(src, "loss", &[0], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dX
+    }
+}
+
+/// The `--emit=exe` link path's generated inputs (the Rust shim, the C fallback runtime).
+#[cfg(test)]
+mod native_link_tests {
+    use super::*;
+
+    /// They must never be generated in the directory the user invoked the compiler from:
+    /// `{stem}_shim.rs` was written there and then unconditionally deleted, so an `--emit=exe` run
+    /// in a source directory holding a file of that name destroyed it.
+    #[test]
+    fn exe_link_inputs_are_generated_outside_the_working_directory() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let scratch = ScratchDir::new("scratch_probe").expect("scratch dir");
+        let shim = scratch_path(Some(&scratch), "scratch_probe_shim.rs".to_string());
+        let rt = scratch_path(Some(&scratch), "scratch_probe_rt.c".to_string());
+        for p in [&shim, &rt] {
+            assert!(
+                !p.starts_with(&cwd),
+                "`{}` lands in the working directory",
+                p.display()
+            );
+        }
+        std::fs::write(&shim, "// probe").expect("write shim");
+        let dir = scratch.path.clone();
+        drop(scratch);
+        assert!(
+            !dir.exists(),
+            "the scratch directory must be removed when the link finishes"
+        );
     }
 }
 
