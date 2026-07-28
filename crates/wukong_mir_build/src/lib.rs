@@ -17143,9 +17143,36 @@ impl FnLowerer<'_> {
     /// `d`, `causal` coerce to `i64` and `scale` to `f32`. Returns `None` for any other name/arity so
     /// `lower_call` falls through. Both backends call the identical kernel, so the fused online
     /// softmax stays bit-for-bit exact — the same contract as the GEMM dispatch.
+    ///
+    /// `sdpa` has no signature in wukong_sema, so **nothing upstream checks its operands** and this is
+    /// the only place the kernel's contract — four `f32` buffers, each valid for `s*d` elements — can
+    /// be enforced. Without the check the call reaches the kernel with whatever the caller wrote: an
+    /// f32 immediate in a pointer slot (native SIGSEGV, interp `expected a pointer`), an f64/i32 array
+    /// reinterpreted as f32 (a silent wrong answer that also *diverges* between the backends), or a
+    /// buffer shorter than `s*d` (native writes past its end). Any of those declines, which routes the
+    /// call to `lower_call`'s catalogued C0001 at the call site — the same way `lower_heap_builtin`
+    /// declines a malformed `free` rather than miscompiling it.
     fn lower_attention(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
         if self.interner.resolve(name) != "sdpa" || args.len() != 8 {
             return None;
+        }
+        let extents = [
+            attn_buffer_extent(&self.expr_ty(&args[0]))?,
+            attn_buffer_extent(&self.expr_ty(&args[1]))?,
+            attn_buffer_extent(&self.expr_ty(&args[2]))?,
+            attn_buffer_extent(&self.expr_ty(&args[3]))?,
+        ];
+        // When the dims are compile-time constants, every buffer whose extent the type pins must hold
+        // the `s*d` elements the kernel reads/writes. A dynamic dim or an unsized view stays the
+        // caller's responsibility, as documented on `wukong_attention_f32`.
+        if let (Some(s), Some(d)) = (
+            const_usize_expr(&args[4], self.interner, self.sema),
+            const_usize_expr(&args[5], self.interner, self.sema),
+        ) {
+            let need = u64::from(s) * u64::from(d);
+            if extents.iter().any(|e| e.is_some_and(|len| len < need)) {
+                return None;
+            }
         }
         let q = self.kernel_operand_ptr(&args[0]);
         let k = self.kernel_operand_ptr(&args[1]);
@@ -18771,6 +18798,25 @@ fn mir_ty(ty: &Ty) -> MirType {
 /// const initializer (also rejected by sema's `check_recursive_consts`).
 fn const_usize_expr(e: &Expr, interner: &Interner, sema: &SemaResult) -> Option<u32> {
     const_usize_depth(e, interner, sema, 0)
+}
+
+/// Is `t` an `f32` buffer — the only operand kind `wukong_attention_f32` can be handed? Returns the
+/// element count when the type pins one (a fixed-size array), `Some(None)` when the extent is known
+/// only at run time (a `[]f32` slice or a tensor view), and `None` when `t` is not an f32 buffer at
+/// all (a scalar, or an array of some other element type). Used by [`FnLowerer::lower_attention`],
+/// which is the sole validation point for the `sdpa` builtin.
+fn attn_buffer_extent(t: &Ty) -> Option<Option<u64>> {
+    let f32_elem = |e: &Ty| matches!(e, Ty::Scalar(wukong_types::Scalar::F32));
+    match t {
+        Ty::Array { elem, len } if f32_elem(elem) => Some(Some(*len)),
+        Ty::Slice(elem) if f32_elem(elem) => Some(None),
+        Ty::Tensor {
+            elem: wukong_types::Scalar::F32,
+            ..
+        } => Some(None),
+        Ty::Ref { pointee, .. } | Ty::Ptr { pointee, .. } => attn_buffer_extent(pointee),
+        _ => None,
+    }
 }
 
 fn const_usize_depth(

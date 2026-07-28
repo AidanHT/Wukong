@@ -1,0 +1,33 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+module tests.run.sdpa_operand_type
+
+// `sdpa` has no signature in wukong_sema, so `lower_attention` is the only place its operand contract
+// — four `f32` buffers — is checked. Both calls below hand the f32 kernel buffers of another element
+// type, and both must be REFUSED at compile time (catalogued C0001 at the call site, exit 1, no
+// stdout) rather than dispatched.
+//
+// Before the guard this program compiled and ran to exit 0 printing garbage, and the two backends did
+// not even agree on the garbage: the f64 call printed 65 75 85 95 on the interpreter and 1 25 60 70 on
+// native — the kernel reads the f64 bytes as f32 pairs and writes f32 results into the first half of
+// the buffer. The i32 call printed a float (0.7310585975646973) out of an i32 array on the interpreter
+// and 0 on native. tests/run/sdpa.wk is the positive control: the well-typed f32 call still dispatches
+// `wukong_attention_f32`.
+
+fn main() -> i32 {
+    let mut qd: [f64; 16] = [0.0; 16];
+    let mut od: [f64; 16] = [0.0; 16];
+    for i in 0..16 {
+        qd[i] = (i as f64) * 0.1;
+    }
+    sdpa(qd, qd, qd, od, 4, 4, 0.5, 0);
+    for i in 0..4 {
+        print((od[i] * 100.0) as i32);
+    }
+
+    let qi: [i32; 4] = [1, 0, 0, 1];
+    let mut oi: [i32; 4] = [0; 4];
+    sdpa(qi, qi, qi, oi, 2, 2, 1.0, 0);
+    print(oi[0]);
+    return 0;
+}
