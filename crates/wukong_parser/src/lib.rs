@@ -344,7 +344,23 @@ impl<'a> Parser<'a> {
             self.bump(); // [
             let elem = Box::new(self.parse_type());
             self.expect(T::Comma);
-            let lanes = self.parse_int_value().unwrap_or(0) as u32;
+            // A lane count that does not decode, or does not fit `u32`, is reported — never wrapped.
+            // `vec[f32, 4294967304]` used to become `f32x8` and `vec[f32, 0x8]` a zero-lane `f32x0`.
+            let lanes_span = self.span();
+            let had_int = self.at(T::Int);
+            let lanes = match self.parse_int_value().and_then(|n| u32::try_from(n).ok()) {
+                Some(n) => n,
+                None => {
+                    if had_int {
+                        self.error(
+                            lanes_span,
+                            "E0203",
+                            "SIMD lane count must be an integer literal that fits in 32 bits",
+                        );
+                    }
+                    0
+                }
+            };
             self.expect(T::RBracket);
             return TypeKind::Vector { elem, lanes };
         }
@@ -397,10 +413,19 @@ impl<'a> Parser<'a> {
     fn parse_dim(&mut self) -> Dim {
         let span = self.span();
         let kind = match self.kind() {
-            T::Int => {
-                let v = self.parse_int_value().unwrap_or(0);
-                DimKind::Int(v)
-            }
+            // A dimension the decoder cannot represent is reported, not folded to 0: a 26-digit
+            // extent used to become `Tensor[f32, 0]` with no diagnostic anywhere.
+            T::Int => match self.parse_int_value() {
+                Some(v) => DimKind::Int(v),
+                None => {
+                    self.error(
+                        span,
+                        "E0203",
+                        "tensor dimension is not a valid integer literal (it must fit in 64 bits)",
+                    );
+                    DimKind::Dynamic
+                }
+            },
             T::Question => {
                 self.bump();
                 DimKind::Dynamic
@@ -439,8 +464,20 @@ impl<'a> Parser<'a> {
                 let mut sizes = Vec::new();
                 if self.eat(T::LParen) {
                     while !self.at(T::RParen) && !self.at(T::Eof) {
-                        if let Some(v) = self.parse_int_value() {
-                            sizes.push(v);
+                        // An integer literal is consumed by `parse_int_value` whether or not it
+                        // decodes, so the failure must be reported here rather than bumped again —
+                        // the extra bump ate the `,`/`)` and moved the report onto a later token.
+                        if self.at(T::Int) {
+                            let sp = self.span();
+                            match self.parse_int_value() {
+                                Some(v) => sizes.push(v),
+                                None => self.error(
+                                    sp,
+                                    "E0203",
+                                    "tile extent is not a valid integer literal (it must fit in 64 \
+                                     bits)",
+                                ),
+                            }
                         } else {
                             self.bump();
                         }
@@ -463,17 +500,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Read a (decimal) integer literal value at the cursor and consume it.
+    /// Read an integer literal value at the cursor and consume it. Returns `None` when the cursor is
+    /// not on an integer literal (nothing is consumed) or when the literal does not decode to a
+    /// `u64` (the literal *is* consumed) — every caller must report that, never substitute a value.
+    ///
+    /// It used to keep only the leading run of decimal digits, so `0x10` decoded to `0` and each
+    /// caller's `unwrap_or(0)` turned a written extent into a silent zero.
     fn parse_int_value(&mut self) -> Option<u64> {
         if !self.at(T::Int) {
             return None;
         }
-        let text = &self.src[self.span().lo as usize..self.span().hi as usize];
-        let digits: String = text
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '_')
-            .collect();
-        let v = digits.replace('_', "").parse().ok();
+        let span = self.span();
+        let v = parse_u64_literal(&self.src[span.lo as usize..span.hi as usize]);
         self.bump();
         v
     }
@@ -646,7 +684,22 @@ impl<'a> Parser<'a> {
                 T::Dot => {
                     self.bump();
                     if self.at(T::Int) {
-                        let index = self.parse_int_value().unwrap_or(0) as u32;
+                        // A tuple index that does not decode, or does not fit `u32`, is reported —
+                        // never narrowed. `t.0x1` used to read field 0 instead of field 1.
+                        let isp = self.span();
+                        let index = match self.parse_int_value().and_then(|n| u32::try_from(n).ok())
+                        {
+                            Some(n) => n,
+                            None => {
+                                self.error(
+                                    isp,
+                                    "E0202",
+                                    "tuple field index is not a valid integer literal (it must fit \
+                                     in 32 bits)",
+                                );
+                                0
+                            }
+                        };
                         lhs = self.finish_expr(
                             start,
                             ExprKind::TupleField {
@@ -1656,6 +1709,43 @@ impl<'a> Parser<'a> {
 /// the two indices the lexer glues together in a nested tuple-field access like `t.0.0` (it lexes
 /// the trailing `0.0` as one float literal). Returns `None` for any genuine float (one with an
 /// exponent, a suffix, or a missing side), which is not a valid tuple-index pair.
+/// Decode an integer literal's source text as an unsigned value. Handles the radix prefixes
+/// `0x`/`0o`/`0b` (case-insensitive), digit separators `_`, and an explicit integer type suffix
+/// (`16usize`). Returns `None` for a negative, malformed, or out-of-`u64`-range literal.
+///
+/// MIRROR: must accept exactly the literal grammar `wukong_sema::parse_u64_text` and
+/// `wukong_mir_build::parse_int` accept. A decoder that silently drops a prefix here turns the
+/// extent the user wrote into a different one with no diagnostic at all.
+fn parse_u64_literal(text: &str) -> Option<u64> {
+    let mut s = text.trim();
+    if s.starts_with('-') {
+        return None;
+    }
+    if s.starts_with('+') {
+        s = &s[1..];
+    }
+    // Longest-first so `usize`/`isize` win over a shorter prefix. Every suffix letter is a
+    // non-hex-digit, so this cannot truncate a hex literal's digits.
+    for suf in [
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ] {
+        if let Some(x) = s.strip_suffix(suf) {
+            s = x;
+            break;
+        }
+    }
+    let body = s.replace('_', "");
+    if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        u64::from_str_radix(h, 16).ok()
+    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        u64::from_str_radix(o, 8).ok()
+    } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        u64::from_str_radix(b, 2).ok()
+    } else {
+        body.parse::<u64>().ok()
+    }
+}
+
 fn split_tuple_float(text: &str) -> Option<(u32, u32)> {
     let (a, b) = text.split_once('.')?;
     if a.is_empty() || b.is_empty() {
@@ -1831,6 +1921,40 @@ mod tests {
             "Tensor[f32, 512, 512, .col_major]"
         );
         assert_eq!(ty("[]f32"), "[]f32");
+    }
+
+    /// Extents written in a type annotation are decoded with the full integer-literal grammar, and a
+    /// literal the decoder cannot represent is a diagnostic — never a silent 0. `Tensor[f32, 0x10]`
+    /// used to parse as a 0-element tensor and `vec[f32, 4294967304]` as `f32x8`.
+    #[test]
+    fn radix_and_out_of_range_extents() {
+        assert_eq!(ty("Tensor[f32, 0x10, 0b101, 0o17]"), "Tensor[f32, 16, 5, 15]");
+        assert_eq!(ty("Tensor[f32, 1_000, 16usize]"), "Tensor[f32, 1000, 16]");
+        assert_eq!(ty("vec[f32, 0x8]"), "f32x8");
+
+        let bad = |src: &str| -> Vec<Diagnostic> {
+            let mut i = Interner::new();
+            parse_type_str(src, SourceId(0), &mut i).1
+        };
+        // A 26-digit dimension and a lane count past `u32` are rejected, not truncated.
+        for src in [
+            "Tensor[f32, 99999999999999999999999999]",
+            "vec[f32, 4294967304]",
+            "Tensor[f32, 8, .tiled(99999999999999999999999999)]",
+        ] {
+            let d = bad(src);
+            assert!(
+                d.iter().any(|x| x.code == Some("E0203")),
+                "`{src}` should report E0203, got {d:?}"
+            );
+        }
+    }
+
+    /// A radix-prefixed tuple index selects the field the user wrote: `t.0x1` is field 1, not the
+    /// field 0 the leading-decimal-digits decoder used to produce.
+    #[test]
+    fn radix_tuple_field_index() {
+        assert_eq!(expr("t.0x1").lines().next().unwrap(), "tuple-field 1");
     }
 
     #[test]
