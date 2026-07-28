@@ -56,9 +56,10 @@ fn par_min_macs() -> u64 {
 /// Per-task MAC budget for the shared-pack 2D path's **work-scaled** load-balance target: the
 /// effective worker count is `clamp(macs / min_task_macs(), 1, nworkers)`, so a problem near the
 /// parallel gate gets a few large blocks (each still worth its scheduling) instead of `3×nworkers`
-/// slivers. 1 Mi MACs measured best in the small band this budget governs (256³ swept 1M/4M/16M →
-/// 209/146/90 GF/s, 2026-07-09; the shared path no longer runs by DEFAULT at any size — see
-/// [`gemm_2d_shared`] — so this budget only governs the `=1`/`=band` instrument settings).
+/// slivers. The coded default is 4 Mi. (The 2026-07-09 sweep at 256³ read 1M/4M/16M → 209/146/90
+/// GF/s, i.e. 1 Mi measured best; the default was never moved to it and the shared path no longer
+/// runs by DEFAULT at any size — see [`gemm_2d_shared`] — so this budget only governs the
+/// `=1`/`=band` instrument settings and the 1 Mi point stays an un-landed measurement.)
 /// Env-overridable
 /// (`WUKONG_GEMM_MIN_TASK_MACS`, read once) so the small-problem crossover can be swept together
 /// with `WUKONG_GEMM_PAR_MIN_MACS`. Throughput-only: the grid shape never changes the bits.
@@ -67,11 +68,19 @@ fn min_task_macs() -> u64 {
     use std::sync::OnceLock;
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("WUKONG_GEMM_MIN_TASK_MACS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(4 << 20)
+        positive_or_unset(std::env::var("WUKONG_GEMM_MIN_TASK_MACS").ok()).unwrap_or(4 << 20)
     })
+}
+
+/// Sanitize a knob value that is used as a **divisor**: zero — like an unparsable string — is
+/// ignored (= unset). `WUKONG_GEMM_MIN_TASK_MACS=0` otherwise reached the `macs / min_task_macs()`
+/// in [`sgemm_2d_shared`] and aborted the compiled program with `attempt to divide by zero` raised
+/// inside an `extern "C"` runtime kernel; a sweep script that walks a budget range down through 0
+/// must fall back to the default instead. Pure (takes the already-read variable) so the policy is
+/// unit-testable without process-global env state; [`gemm_task_macs`] enforces the same rule inline.
+#[cfg(target_arch = "x86_64")]
+fn positive_or_unset(raw: Option<String>) -> Option<u64> {
+    raw.and_then(|s| s.parse::<u64>().ok()).filter(|&v| v > 0)
 }
 
 #[inline]
@@ -2184,9 +2193,10 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
     // Work-scaled load-balance target: a problem near the parallel gate can't feed 3×nworkers
     // blocks each worth a task dispatch, so the effective worker count is capped by the per-task
-    // MAC budget ([`min_task_macs`]). At the default gate (2^26 MACs) w_eff == nworkers for every
-    // parallel shape on the 16-worker pool; it engages when `WUKONG_GEMM_PAR_MIN_MACS` lowers
-    // the gate (the 256³ crossover sweep), giving small problems a few large blocks.
+    // MAC budget ([`min_task_macs`]). The cap binds from the parallel gate up: at [`PAR_MIN_MACS`]
+    // (2^23 MACs) and the 4 Mi default budget it yields w_eff == 2, and only a shape ≳ 2^26 MACs
+    // reaches w_eff == nworkers on the 16-worker pool — so small problems near the gate (including
+    // the 256³ crossover sweep under a lowered `WUKONG_GEMM_PAR_MIN_MACS`) get a few large blocks.
     let macs = m as u64 * n as u64 * k as u64;
     let w_eff = (macs / min_task_macs()).clamp(1, nworkers.max(1) as u64) as usize;
     let (bm, bn) = select_2d_block_shape(m, n, 3 * w_eff);
@@ -2565,13 +2575,19 @@ unsafe fn pack_a(a: *const f32, lda: usize, mc: usize, kc: usize, ap: *mut f32) 
 fn pack_par_min_bytes() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("WUKONG_PACK_PAR_MIN_KB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(256)
-            * 1024
-    })
+    *V.get_or_init(|| pack_min_bytes_from_kb(std::env::var("WUKONG_PACK_PAR_MIN_KB").ok()))
+}
+
+/// The `WUKONG_PACK_PAR_MIN_KB` policy: KiB → bytes with a **saturating** scale. A plain `* 1024`
+/// overflowed usize for a knob value near `usize::MAX` — wrapping silently in release and aborting
+/// a debug build with `attempt to multiply with overflow` raised inside the packer of an
+/// `extern "C"` GEMM. Zero is a legitimate setting here (it means "always pack in parallel"), so
+/// unlike the divisor knobs it is NOT filtered out. Pure (takes the already-read variable) so the
+/// policy is unit-testable without process-global env state.
+fn pack_min_bytes_from_kb(raw: Option<String>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(256)
+        .saturating_mul(1024)
 }
 
 /// Pack one K-block's A column-panel and B row-panel in a **single** parallel region: one task per
@@ -3031,6 +3047,40 @@ unsafe fn micro_6x16_avx512(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two GEMM env knobs whose raw value reaches arithmetic that can trap. Both crashed a
+    /// compiled program before this gate, from inside an `extern "C"` runtime kernel:
+    /// `WUKONG_GEMM_2D_SHARED=1 WUKONG_GEMM_MIN_TASK_MACS=0 wukongc --run --backend=native -O2
+    /// tests/run/scaled_gemm_parallel.wk` → `attempt to divide by zero` at the `macs /
+    /// min_task_macs()` in `sgemm_2d_shared`, and `WUKONG_GEMM_2D=0
+    /// WUKONG_PACK_PAR_MIN_KB=18446744073709551615` (debug build) → `attempt to multiply with
+    /// overflow` in the KiB→byte scale. The policies are pure functions so this gate needs no
+    /// process-global env state.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn gemm_env_knobs_survive_hostile_values() {
+        // Divisor knob: 0 and unparsable are both "unset", so the caller's default stands.
+        assert_eq!(positive_or_unset(Some("0".to_string())), None);
+        assert_eq!(positive_or_unset(Some(String::new())), None);
+        assert_eq!(positive_or_unset(Some("-1".to_string())), None);
+        assert_eq!(positive_or_unset(Some("not-a-number".to_string())), None);
+        assert_eq!(positive_or_unset(None), None);
+        assert_eq!(positive_or_unset(Some("1".to_string())), Some(1));
+        assert_eq!(positive_or_unset(Some("4194304".to_string())), Some(4 << 20));
+        // The invariant the `macs / min_task_macs()` use site depends on, under this process's env.
+        assert!(min_task_macs() > 0, "min_task_macs is used as a divisor");
+
+        // Byte-threshold knob: 0 is a legitimate setting ("always pack in parallel") and must be
+        // preserved, but the KiB→byte scale must saturate rather than wrap or trap.
+        assert_eq!(pack_min_bytes_from_kb(Some("0".to_string())), 0);
+        assert_eq!(pack_min_bytes_from_kb(None), 256 * 1024);
+        assert_eq!(pack_min_bytes_from_kb(Some("junk".to_string())), 256 * 1024);
+        assert_eq!(pack_min_bytes_from_kb(Some("1".to_string())), 1024);
+        assert_eq!(
+            pack_min_bytes_from_kb(Some(usize::MAX.to_string())),
+            usize::MAX
+        );
+    }
 
     /// Naive reference, distinct from both production paths, for validation.
     fn naive(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
