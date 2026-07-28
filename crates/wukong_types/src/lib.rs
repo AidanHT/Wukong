@@ -238,12 +238,18 @@ impl Ty {
         }
     }
 
+    /// Alignment in bytes for sized types; `None` for the same cases as [`size_of`](Ty::size_of).
+    /// Every value returned is a power of two — `wukong_mir_build`'s mirrored `round_up` is the
+    /// bitmask form and is only correct under that precondition.
     pub fn align_of(&self) -> Option<u64> {
         match self {
             Ty::Scalar(s) => Some(s.align()),
             Ty::Unit => Some(1),
             Ty::Ptr { .. } | Ty::Ref { .. } => Some(8),
-            Ty::Vector { elem, lanes } => Some(elem.size() * *lanes as u64),
+            // An *alignment*, not the vector's size: `lanes` is documented as a power of two but
+            // nothing rejects `f32x3`, and a 12-byte "alignment" makes the two aggregate-layout
+            // authorities disagree. Identity for every power-of-two lane count.
+            Ty::Vector { elem, lanes } => Some((elem.size() * *lanes as u64).next_power_of_two()),
             // A slice's fat pointer is 8-byte aligned (its data pointer and length are both 8 bytes).
             Ty::Slice(_) => Some(8),
             Ty::Array { elem, .. } => elem.align_of(),
