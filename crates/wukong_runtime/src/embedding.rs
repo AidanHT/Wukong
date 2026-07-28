@@ -200,6 +200,13 @@ pub unsafe extern "C" fn wukong_embedding_f32_parallel(
     use rayon::prelude::*;
     // One chunk of rows per core; the last chunk absorbs the remainder. Raw pointers cross the rayon
     // boundary as integers (the pointees outlive this blocking call; chunks touch disjoint `out` rows).
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the `current_num_threads()` read below resolves `RAYON_NUM_THREADS` the same
+    // way either way, so the chunk count — and with it every chunk boundary — is unchanged.
+    crate::ensure_global_pool();
     let nthreads = rayon::current_num_threads().max(1);
     let per = t.div_ceil(nthreads).max(1);
     let nchunks = t.div_ceil(per);
