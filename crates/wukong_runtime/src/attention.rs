@@ -329,6 +329,56 @@ mod tests {
         }
     }
 
+    /// The scalar twin is the only path on a machine without AVX2/FMA and on every non-x86_64 build,
+    /// but `wukong_attention_f32`'s runtime dispatch (:44) sends every CI and developer machine down
+    /// the AVX2 path — so `attention_matches_naive` above never executes `attention_scalar` and a
+    /// regression in it (a dropped `corr` rescale, a lost `l == 0` guard) would ship green. Drive it
+    /// directly over the same shapes.
+    #[test]
+    fn attention_scalar_matches_naive() {
+        for &(s, d) in &[
+            (1usize, 1usize),
+            (2, 2),
+            (4, 8),
+            (5, 7),
+            (8, 16),
+            (16, 8),
+            (33, 17),
+            (64, 64),
+        ] {
+            for &causal in &[false, true] {
+                let q = fill(1, s * d);
+                let k = fill(2, s * d);
+                let v = fill(3, s * d);
+                let scale = 1.0 / (d as f32).sqrt();
+                let want = naive(&q, &k, &v, s, d, scale, causal);
+                let mut got = vec![0.0f32; s * d];
+                // SAFETY: q/k/v are s*d long and readable, got is s*d long and writable — the
+                // operand contract of `wukong_attention_f32` restated on `attention_scalar`.
+                unsafe {
+                    attention_scalar(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        got.as_mut_ptr(),
+                        s,
+                        d,
+                        scale,
+                        causal,
+                    );
+                }
+                for i in 0..s * d {
+                    assert!(
+                        (got[i] - want[i]).abs() <= 1e-4 + 1e-4 * want[i].abs(),
+                        "scalar ({s}x{d}, causal={causal}) idx {i}: got {} want {}",
+                        got[i],
+                        want[i]
+                    );
+                }
+            }
+        }
+    }
+
     /// Throughput probe (run: `cargo test -p wukong_runtime --release -- --ignored --nocapture`).
     /// Compares the fused kernel against Wukong's *own* strongest non-fused path: materialize
     /// `scores = Q·Kᵀ` with the tuned AVX2 GEMM, softmax the rows, then `O = P·V` with the GEMM —
