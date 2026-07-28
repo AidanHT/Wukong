@@ -107,11 +107,13 @@ impl Renderer {
         let line_text = sm.line_text(span.source, lo.line);
         let line_chars = line_text.chars().count() as u32;
 
-        // Number of caret characters: span length on the first line, at least 1.
+        // Number of caret characters: the *rendered* width of the span on the first line, at least
+        // 1. Rendered width, not the column difference, so a tab inside the span is underlined
+        // across the same number of columns it occupies in the line printed above.
         let caret_len = if hi.line == lo.line {
-            hi.col.saturating_sub(lo.col).max(1)
+            rendered_width(line_text, (lo.col - 1) as usize, (hi.col - 1) as usize).max(1)
         } else {
-            (line_chars + 1).saturating_sub(lo.col).max(1)
+            rendered_width(line_text, (lo.col - 1) as usize, line_chars as usize + 1).max(1)
         };
 
         let (mark, mark_color) = if l.primary {
@@ -119,12 +121,16 @@ impl Renderer {
         } else {
             ("-", span_color(false))
         };
-        let underline = mark.repeat(caret_len as usize);
-        let spaces = " ".repeat((lo.col - 1) as usize);
+        let underline = mark.repeat(caret_len);
+        let spaces = " ".repeat(rendered_width(line_text, 0, (lo.col - 1) as usize));
 
         let num = format!("{:>width$}", lo.line, width = width);
         out.push('\n');
-        out.push_str(&format!("{} {bar} {}", self.paint(BLUE, &num), line_text));
+        out.push_str(&format!(
+            "{} {bar} {}",
+            self.paint(BLUE, &num),
+            expand_tabs(line_text)
+        ));
         out.push('\n');
 
         let msg = if l.message.is_empty() {
@@ -138,6 +144,51 @@ impl Renderer {
             " ".repeat(width)
         ));
     }
+}
+
+/// How many columns a tab occupies when a source line is rendered.
+///
+/// The line and the caret padding beneath it must agree on this. Emitting a raw `\t` would let the
+/// reader's terminal pick the width instead, which the padding cannot know — so both sides expand
+/// tabs here, as rustc does.
+const TAB_WIDTH: usize = 4;
+
+/// Rendered width of the chars of `s` in the 0-based char range `[start, end)`, counting a tab as
+/// [`TAB_WIDTH`] columns.
+///
+/// Columns past the end of `s` count one each, so a span that reaches the stripped line terminator
+/// pads exactly as it did before tabs were expanded.
+fn rendered_width(s: &str, start: usize, end: usize) -> usize {
+    let mut width = 0usize;
+    let mut i = 0usize;
+    for c in s.chars() {
+        if i >= end {
+            break;
+        }
+        if i >= start {
+            width += if c == '\t' { TAB_WIDTH } else { 1 };
+        }
+        i += 1;
+    }
+    width + end.saturating_sub(i.max(start))
+}
+
+/// `s` with each tab replaced by [`TAB_WIDTH`] spaces, so it lines up with [`rendered_width`].
+fn expand_tabs(s: &str) -> String {
+    if !s.contains('\t') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + TAB_WIDTH);
+    for c in s.chars() {
+        if c == '\t' {
+            for _ in 0..TAB_WIDTH {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn span_color(primary: bool) -> &'static str {
