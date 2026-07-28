@@ -479,6 +479,9 @@ const RED_SUM: i64 = 2;
 const RED_SSD: i64 = 1;
 const VE_ID: i64 = 0;
 const VE_USE_Y: i64 = 256;
+// velem *compute modes* — they live above the low activation byte, so `op & 0xff` does not see them.
+const VE_HADAMARD: i64 = 512;
+const VE_DIV: i64 = 1024;
 
 fn ci(b: &mut Builder, x: i64) -> ValueId {
     b.build(MirType::I64, Op::ConstInt(x as i128, MirType::I64))
@@ -1561,4 +1564,76 @@ fn parallel_region_declines_loudly() {
         err.contains("no VJP rule"),
         "the decline must be the loud unrecognized-call error, got: {err}"
     );
+}
+
+/// Build `t = velem(x, y, n, op); loss = Σ t` — the tape mir_build's `match_velem_binary` emits for
+/// `t[i] = x[i] * y[i]` (op = `VE_HADAMARD|VE_USE_Y`) or `x[i] / y[i]` (op = `VE_DIV|VE_USE_Y`).
+/// Params: X, Y, out; intermediate: t (alloca).
+fn build_velem_sum(it: &mut Interner, n: usize, op: i64) -> Fwd {
+    let velem = it.intern("wukong_velem_f32");
+    let sreduce = it.intern("wukong_sreduce_f32");
+    let mut b = Builder::new(it.intern("velem_sum"), MirType::Void);
+    let x = b.add_param(PTR);
+    let y = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let t = b.alloca(arr(n));
+    let nv = ci(&mut b, n as i64);
+    let (a_c, b_c, c_c) = (cf(&mut b, 1.0), cf(&mut b, 1.0), cf(&mut b, 0.0));
+    let opv = ci(&mut b, op);
+    b.build_void(Op::Call {
+        func: velem,
+        args: vec![x, y, t, nv, a_c, b_c, c_c, opv],
+    });
+    let sumop = ci(&mut b, RED_SUM);
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![t, t, nv, sumop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![n, n, 1],
+        loss_out: 2,
+    }
+}
+
+/// A velem *compute mode* (`VE_HADAMARD` = 512, `VE_DIV` = 1024) lives ABOVE the activation byte, so
+/// the old `op & 0xff != VE_ID` gate let it through and applied the AFFINE VJP `dx = a·dout` to a
+/// nonlinear kernel: for `loss = Σ x[i]·y[i]` the emitted gradient was 1.0 everywhere instead of
+/// `y[i]`, with no diagnostic. The gate is now a whitelist of the two affine spellings, so both
+/// modes decline loudly. (The real Hadamard/quotient VJP can be added later; the refusal is what
+/// stops the wrong answer.)
+#[test]
+fn velem_compute_modes_decline_loudly() {
+    for (op, needle) in [
+        (VE_HADAMARD | VE_USE_Y, "Hadamard"),
+        (VE_DIV | VE_USE_Y, "division"),
+    ] {
+        let mut it = Interner::default();
+        let fwd = build_velem_sum(&mut it, 8, op);
+        let err = grad(&fwd.func, &[0, 1], &mut it)
+            .expect_err("a non-affine velem compute mode must not take the affine VJP");
+        assert!(
+            err.contains("velem VJP") && err.contains(needle),
+            "op {op} must decline naming the compute mode, got: {err}"
+        );
+    }
+}
+
+/// The two spellings the affine rule IS valid for must keep differentiating: the whitelist gate must
+/// not have narrowed the accepted set. `loss = Σ (a·x + b·y)` -> `dx = a`, `dy = b` per element.
+#[test]
+fn velem_affine_still_differentiates() {
+    let n = 8;
+    let mut it = Interner::default();
+    let fwd = build_velem_sum(&mut it, n, VE_ID | VE_USE_Y);
+    let mut seed = 0xBE1Eu64;
+    let xb = rand_vec(&mut seed, n);
+    let yb = rand_vec(&mut seed, n);
+    let inputs = vec![xb, yb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[vec![1.0; n], vec![1.0; n]], &mut it);
 }
