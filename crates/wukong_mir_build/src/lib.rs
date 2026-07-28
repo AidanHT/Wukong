@@ -15623,15 +15623,16 @@ impl FnLowerer<'_> {
     ) {
         match &pat.kind {
             ast::PatKind::Ident(name) => {
+                let is_slice = matches!(scrut_ty, Ty::Slice(_));
                 if matches!(scrut_mir, MirType::Array(..)) {
-                    self.bind(*name, scrut, scrut_mir.clone());
+                    self.bind_slice(*name, scrut, scrut_mir.clone(), is_slice);
                 } else {
                     let slot = self.builder.alloca(scrut_mir.clone());
                     self.builder.build_void(Op::Store {
                         ptr: slot,
                         value: scrut,
                     });
-                    self.bind(*name, slot, scrut_mir.clone());
+                    self.bind_slice(*name, slot, scrut_mir.clone(), is_slice);
                 }
             }
             ast::PatKind::Tuple(subs) => self.bind_tuple_match(subs, scrut, scrut_ty),
@@ -15664,13 +15665,14 @@ impl FnLowerer<'_> {
             let fptr = self.field_ptr(base, off);
             match &sub.kind {
                 ast::PatKind::Ident(name) => {
+                    let is_slice = matches!(fty, Ty::Slice(_));
                     if matches!(fmty, MirType::Array(..)) {
-                        self.bind(*name, fptr, fmty);
+                        self.bind_slice(*name, fptr, fmty, is_slice);
                     } else {
                         let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
                         let slot = self.builder.alloca(fmty.clone());
                         self.builder.build_void(Op::Store { ptr: slot, value: val });
-                        self.bind(*name, slot, fmty);
+                        self.bind_slice(*name, slot, fmty, is_slice);
                     }
                 }
                 ast::PatKind::Tuple(inner) => self.bind_tuple_match(inner, fptr, fty),
@@ -15994,13 +15996,14 @@ impl FnLowerer<'_> {
             let fptr = self.field_ptr(base, off);
             match &sub.kind {
                 ast::PatKind::Ident(name) => {
+                    let is_slice = matches!(fty, Ty::Slice(_));
                     if matches!(fmty, MirType::Array(..)) {
-                        self.bind(*name, fptr, fmty);
+                        self.bind_slice(*name, fptr, fmty, is_slice);
                     } else {
                         let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
                         let slot = self.builder.alloca(fmty.clone());
                         self.builder.build_void(Op::Store { ptr: slot, value: val });
-                        self.bind(*name, slot, fmty);
+                        self.bind_slice(*name, slot, fmty, is_slice);
                     }
                 }
                 ast::PatKind::Tuple(inner) => self.bind_tuple_match(inner, fptr, &fty),
