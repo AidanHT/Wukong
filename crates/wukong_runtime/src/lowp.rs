@@ -810,8 +810,14 @@ fn use_nt_halfout(n: usize) -> bool {
 
 /// Elements ahead to software-prefetch the `x`/`y` reads in the streaming path. The output is
 /// non-temporal (not prefetched — we never read it back here); the two half-width input streams are the
-/// DRAM-read-bound side, so pulling them in a few lines early hides the miss latency. A prefetch past
-/// the buffer end is a hint the hardware drops, so no end guard is needed.
+/// DRAM-read-bound side, so pulling them in a few lines early hides the miss latency. The last few
+/// iterations of every bulk loop deliberately address past the end of `x`/`y` — a prefetch past the
+/// buffer end is a hint the hardware drops, so no end guard is needed. That is a statement about the
+/// *hardware*; the Rust-level obligation is separate, so the prefetch sites form the address with
+/// `wrapping_add`, NOT `add`: `<*const T>::add` requires its result to stay inside (or one past) the
+/// same allocated object, which this by construction does not. `wrapping_add` carries no such
+/// precondition and lowers to the identical address arithmetic; the pointer is only ever handed to
+/// `_mm_prefetch`, which never dereferences it.
 const HALFOUT_PF_AHEAD: usize = 256;
 
 /// The streaming-narrow skeleton shared by the half-output kernels (axpby, activations): write
@@ -878,8 +884,8 @@ unsafe fn axpby_narrow_bf16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b
         |i: usize| _mm256_fmadd_ps(bv, widen_bf16(yp.add(i)), _mm256_mul_ps(av, widen_bf16(xp.add(i)))),
         |i: usize| crate::f32_to_bf16_bits(b.mul_add(bf16_bits_to_f32(y[i]), a * bf16_bits_to_f32(x[i]))),
         |i: usize| {
-            _mm_prefetch(xp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(yp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(yp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
         },
         narrow_bf16_pack,
         narrow_bf16
@@ -897,8 +903,8 @@ unsafe fn axpby_narrow_f16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b:
         |i: usize| _mm256_fmadd_ps(bv, widen_f16(yp.add(i)), _mm256_mul_ps(av, widen_f16(xp.add(i)))),
         |i: usize| crate::f32_to_f16_bits(b.mul_add(f16_to_f32(y[i]), a * f16_to_f32(x[i]))),
         |i: usize| {
-            _mm_prefetch(xp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(yp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(yp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
         },
         narrow_f16_pack,
         narrow_f16
@@ -926,7 +932,7 @@ unsafe fn vmath_narrow_bf16_avx(x: &[u16], out: &mut [u16], op: i64) {
         out.len(),
         |i: usize| f(widen_bf16(xp.add(i))),
         |i: usize| crate::f32_to_bf16_bits(crate::vmath::apply1(op, bf16_bits_to_f32(x[i]))),
-        |i: usize| _mm_prefetch(xp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
+        |i: usize| _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
         narrow_bf16_pack,
         narrow_bf16
     );
@@ -944,7 +950,7 @@ unsafe fn vmath_narrow_f16_avx(x: &[u16], out: &mut [u16], op: i64) {
         out.len(),
         |i: usize| f(widen_f16(xp.add(i))),
         |i: usize| crate::f32_to_f16_bits(crate::vmath::apply1(op, f16_to_f32(x[i]))),
-        |i: usize| _mm_prefetch(xp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
+        |i: usize| _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
         narrow_f16_pack,
         narrow_f16
     );
