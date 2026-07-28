@@ -1693,6 +1693,21 @@ mod tests {
     }
 
     #[test]
+    fn parallel_reductions_nest_inside_a_pool_worker() {
+        // A bf16 `_parallel` reduction is emitted inside `@parallel` functions, so it can be reached
+        // from an already-outlined region body — i.e. from a worker of the very pool the fix above
+        // now installs onto. rayon runs a nested `install` on the same pool inline, so this must
+        // complete and return the same bits as the un-nested call; if it ever deadlocked, the gate
+        // would hang rather than fail, so pin it explicitly.
+        let n = 4 * crate::reduce::RCHUNK + 7;
+        let flat = |lo: usize, hi: usize| (hi - lo) as f32;
+        let outer = par_chunk_reduce(n, 0.0, flat, |a, b| a + b);
+        let inner = crate::run_on_wuk_pool(|| par_chunk_reduce(n, 0.0, flat, |a, b| a + b));
+        assert_eq!(outer.to_bits(), inner.to_bits(), "nested != top-level");
+        assert_eq!(outer, n as f32, "chunk coverage");
+    }
+
+    #[test]
     fn parallel_reductions_within_f64_tolerance() {
         use crate::reduce::{RED_MAX, RED_MAXABS, RED_MIN};
         // A size that exercises several real chunks (RCHUNK = 8192), so rayon actually runs.
