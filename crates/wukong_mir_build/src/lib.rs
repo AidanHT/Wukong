@@ -197,17 +197,26 @@ fn symbolic_dim_params(param_tys: &[Ty]) -> Vec<Symbol> {
 }
 
 /// A stable ASCII name for a concrete type, for a monomorphization key and instance-name suffix.
+///
+/// Every *structural* form is separated by `$`, which no user identifier can contain (the lexer
+/// admits only `[A-Za-z_][A-Za-z0-9_]*`) and which this file already reserves for exactly this
+/// purpose (`wukong$rodata$N`, the `fn$args` instance separator). With `_` separators the encoding
+/// was **not injective**: `mono_type_name(*mut i32)` was `p_i32`, which is also a legal struct name,
+/// so a program declaring `struct p_i32` and calling `id(s)` then `id(q)` produced ONE instance and
+/// gave the second call the first one's ABI — `error: expected a pointer` on interp and a Cranelift
+/// "MIR value used before definition" ICE on native. `Ty::Named` stays bare (a user name is already
+/// unique among user names, and keeping it bare keeps `id$Point` readable).
 fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
     match ty {
         Ty::Scalar(s) => s.name().to_string(),
         Ty::Named(n) => interner.resolve(*n).to_string(),
-        Ty::Ptr { pointee, .. } => format!("p_{}", mono_type_name(pointee, interner)),
-        Ty::Ref { pointee, .. } => format!("r_{}", mono_type_name(pointee, interner)),
-        Ty::Slice(inner) => format!("s_{}", mono_type_name(inner, interner)),
-        Ty::Array { elem, len } => format!("a{len}_{}", mono_type_name(elem, interner)),
+        Ty::Ptr { pointee, .. } => format!("p${}", mono_type_name(pointee, interner)),
+        Ty::Ref { pointee, .. } => format!("r${}", mono_type_name(pointee, interner)),
+        Ty::Slice(inner) => format!("s${}", mono_type_name(inner, interner)),
+        Ty::Array { elem, len } => format!("a{len}${}", mono_type_name(elem, interner)),
         Ty::Tuple(fields) => {
             let parts: Vec<String> = fields.iter().map(|t| mono_type_name(t, interner)).collect();
-            format!("t{}_{}", fields.len(), parts.join("_"))
+            format!("t{}${}", fields.len(), parts.join("$"))
         }
         Ty::Unit => "unit".to_string(),
         _ => "x".to_string(),
