@@ -446,4 +446,69 @@ mod tests {
         assert!(out.contains("for"));
         assert!(out.contains("range"));
     }
+
+    /// `@extern("C")` (examples/vadd.wk) still parses — its name is a keyword token.
+    #[test]
+    fn extern_attribute_still_parses() {
+        let out = parse("@export(\"vadd_f32\")\n@extern(\"C\")\nfn vadd(a: *f32) {}\n");
+        assert!(out.contains("@extern"), "{out}");
+        assert!(out.contains("@export"), "{out}");
+    }
+
+    /// A stray `@` must cost one diagnostic at the `@` rather than eat the `fn` that follows it.
+    /// Before, this file produced a single E0208 pointing at `main` and the module contained only
+    /// `helper` — `fn main` had been silently deleted.
+    #[test]
+    fn stray_at_does_not_consume_the_following_item() {
+        let mut i = Interner::new();
+        let src =
+            "module t\nfn helper() -> i32 { return 1; }\n@\nfn main() -> i32 { return helper(); }\n";
+        let (module, diags) = parse_module(src, SourceId(0), &mut i);
+        assert!(!diags.is_empty(), "a stray `@` must be diagnosed");
+        let names: Vec<String> = module
+            .items
+            .iter()
+            .filter_map(|it| match &it.kind {
+                ItemKind::Fn(f) => Some(i.resolve(f.name.sym).to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"main".to_string()), "lost `main`: {names:?}");
+        assert!(
+            names.contains(&"helper".to_string()),
+            "lost `helper`: {names:?}"
+        );
+    }
+
+    /// A stray `@` inside a block must not eat the `let` that follows it.
+    #[test]
+    fn stray_at_does_not_consume_the_following_statement() {
+        let mut i = Interner::new();
+        let src = "fn main() -> i32 {\n    @\n    let x: i32 = 5;\n    return x;\n}\n";
+        let (module, diags) = parse_module(src, SourceId(0), &mut i);
+        assert!(!diags.is_empty(), "a stray `@` must be diagnosed");
+        let out = print::print_module(&module, &i);
+        assert!(out.contains("let"), "the `let` binding was shredded: {out}");
+        assert!(out.contains("type i32"), "{out}");
+    }
+
+    /// An attribute argument with a missing value must not swallow the `)` that closes the argument
+    /// list. Before, the `)` became the value (the printer showed `@parallel(grain = ))`) and the
+    /// sole diagnostic was "expected `)`" pointing at the `for` on the next line.
+    #[test]
+    fn attribute_missing_value_keeps_the_closing_paren() {
+        let mut i = Interner::new();
+        let src = "fn main() -> i32 {\n    let mut s: i32 = 0;\n    @parallel(grain = )\n    for i in 0..4 { s += i; }\n    return s;\n}\n";
+        let (module, diags) = parse_module(src, SourceId(0), &mut i);
+        assert!(
+            diags.iter().any(|d| d.code == Some("E0207")),
+            "expected E0207 at the missing value, got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == Some("E0200")),
+            "the `)` must not have been consumed, got {diags:?}"
+        );
+        let out = print::print_module(&module, &i);
+        assert!(out.contains("for"), "the loop was lost: {out}");
+    }
 }

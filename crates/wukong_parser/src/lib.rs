@@ -223,10 +223,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Like [`ident`], but also accepts keyword tokens by their text. Used for attribute names
-    /// such as `@extern` where the name collides with a keyword.
+    /// Like [`ident`], but also accepts the keyword `extern` by its text, so `@extern("C")` parses.
+    ///
+    /// Only `extern` is accepted. A blanket "any keyword" test let a stray or dangling `@` consume
+    /// the `fn` / `let` that followed it as the attribute's name: the whole item or statement was
+    /// then destroyed and the single diagnostic pointed at innocent code after it. `extern` is the
+    /// only keyword any attribute in the corpus is spelled with (`@parallel`, `@simd`, `@export`,
+    /// `@extern`), so every other keyword falls through to [`ident`]'s E0201 — which does not bump,
+    /// leaving the keyword for the item/statement parser to resync on.
     fn ident_like(&mut self) -> Ident {
-        if self.at(T::Ident) || self.kind().is_keyword() {
+        if self.at(T::Ident) || self.at(T::Extern) {
             let span = self.span();
             self.bump();
             let sym = self.intern_span(span);
@@ -1694,6 +1700,18 @@ impl<'a> Parser<'a> {
             T::False => {
                 self.bump();
                 AttrVal::Bool(false)
+            }
+            // A missing value (`@parallel(grain = )`) must not consume the delimiter that ends the
+            // argument list: bumping the `)` stored it as the attribute's value and pushed the
+            // "expected `)`" report onto the next line's token, so the user saw an error about the
+            // following statement. Report here and leave the delimiter for `parse_attr`.
+            T::RParen | T::Comma | T::Eof => {
+                self.error(
+                    span,
+                    "E0207",
+                    "expected a value after `=` in this attribute argument",
+                );
+                AttrVal::Word(self.interner.intern("«error»"))
             }
             _ => {
                 let s = self.intern_span(span);
