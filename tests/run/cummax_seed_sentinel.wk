@@ -1,0 +1,77 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+module tests.run.cummax_seed_sentinel
+
+// `wukong_cummax_f32` takes no seed argument — it always produces `out[0] = x[0]` — so the cumulative
+// max/min recognizer may only fold a nest whose seed is a true identity of the fold. A merely LARGE
+// sentinel is not one: it is kept whenever the data goes past it, and the kernel would silently
+// discard it. The three seeds below are the whole rule.
+//
+// The row `[-1e33, -1e33, -1e33, 5]` seeded `-1.0e30` printed -10000 (the kernel's `x[0]`) on both
+// backends where the scalar scan prints -10 (`fmax(-1e30, -1e33) = -1e30`). The tests are written as
+// magnitude comparisons rather than divisions so no float rounding enters the expected values.
+
+fn main() -> i32 {
+    let mut big: [f32; 4] = [0.0; 4];
+    big[0] = -1.0e33;
+    big[1] = -1.0e33;
+    big[2] = -1.0e33;
+    big[3] = 5.0;
+
+    // (1) A finite sentinel: `fmax(-1e30, -1e33)` is -1e30, so the seed survives the whole prefix and
+    // the nest is NOT this kernel's scan. Must fall to the scalar loop.
+    let mut a: [f32; 4] = [0.0; 4];
+    for r in 0..1 {
+        let mut m: f32 = -1.0e30;
+        for i in 0..4 {
+            m = fmax(m, big[r * 4 + i]);
+            a[r * 4 + i] = m;
+        }
+    }
+    if a[0] < -1.0e31 {
+        print(1);
+    } else {
+        print(0); // 0 — the seed is kept, as the source says
+    }
+    print(a[3] as i32); // 5
+
+    // (2) An infinite sentinel IS the identity: `fmax(-inf, v) == v` for every finite or infinite v, so
+    // this is exactly what the kernel computes and it still dispatches.
+    let mut b: [f32; 4] = [0.0; 4];
+    for r in 0..1 {
+        let mut m: f32 = -1.0e39;
+        for i in 0..4 {
+            m = fmax(m, big[r * 4 + i]);
+            b[r * 4 + i] = m;
+        }
+    }
+    if b[0] < -1.0e31 {
+        print(1); // 1 — -1e33 beats -inf
+    } else {
+        print(0);
+    }
+    print(b[3] as i32); // 5
+
+    // (3) The row's own first element — the exact arm `tests/run/cummax.wk` uses — is unchanged.
+    let x: [f32; 4] = [3.0, 1.0, 4.0, 1.0];
+    let mut c: [f32; 4] = [0.0; 4];
+    for r in 0..1 {
+        let mut m: f32 = x[r * 4];
+        for i in 0..4 {
+            m = fmax(m, x[r * 4 + i]);
+            c[r * 4 + i] = m;
+        }
+    }
+    for k in 0..4 {
+        print(c[k] as i32); // 3 3 4 4
+    }
+    return 0;
+}
