@@ -532,6 +532,23 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_block_comment_reports() {
+        // Block comments nest, so the outer `/*` here is still open at EOF.
+        let d = diags("/* a /* b */");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0103"));
+    }
+
+    #[test]
+    fn unterminated_char_reports() {
+        // `'5` cannot be a loop label (labels start with an identifier char), so it reaches
+        // lex_char and hits EOF with no closing quote.
+        let d = diags("'5");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0104"));
+    }
+
+    #[test]
     fn dump_snapshot() {
         let (toks, _) = tokenize("fn f()", SourceId(0));
         let expected = "Fn \"fn\"\nIdent \"f\"\nLParen \"(\"\nRParen \")\"\nEof \"\"\n";
