@@ -106,7 +106,9 @@ fn velem_par_min() -> usize {
 }
 
 /// Software-prefetch distance (elements ahead). A prefetch of an address past the buffer end is a
-/// hint the hardware silently drops — never a fault — so the last iterations need no guard.
+/// hint the hardware silently drops — never a fault — so the last iterations need no guard. Because
+/// that address IS routinely past the end, form it with `wrapping_add`: `add` would demand it stay
+/// inside the allocation and hand back poison when it does not.
 const PF_AHEAD: usize = 128;
 
 /// Scalar activation, mirroring the AVX2 `maxps`/`minps` semantics exactly: `maxps(v,0)` is
@@ -327,9 +329,15 @@ unsafe fn velem_avx2(
         // L3-resident map the hardware prefetcher already has the lines, so an explicit `prefetcht0`
         // just burns an issue slot — which is part of why a cache-resident `relu` trailed gcc.
         if nt {
-            _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+            // `wrapping_add`, not `add`: on the final iterations the `PF_AHEAD` lookahead deliberately
+            // targets an address past the end of `x`/`y` (that is the constant's whole point — see its
+            // doc). `<*const T>::add` requires the result to stay inside the same allocated object, so
+            // it lowers to `getelementptr inbounds` and yields poison there. `wrapping_add` carries no
+            // such precondition and lowers to the same `lea`, so the emitted address is unchanged — and
+            // a prefetch is architecturally a hint: it issues no load and faults on nothing.
+            _mm_prefetch(x.wrapping_add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
             if use_y {
-                _mm_prefetch(y.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(y.wrapping_add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
             }
         }
         let r0 = compute!(0);
@@ -526,7 +534,10 @@ unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
     while i + 48 <= n {
         // Prefetch only when streaming from DRAM; an L3-resident poly is served by the HW prefetcher.
         if nt {
-            _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+            // `wrapping_add`, not `add` — same reason as the `velem` loop above: the lookahead runs
+            // past the end of `x` on the final iterations, which `add`'s in-bounds precondition
+            // forbids, and a prefetch of that address is a hint that issues no load.
+            _mm_prefetch(x.wrapping_add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
         }
         let x0 = _mm256_loadu_ps(x.add(i));
         let x1 = _mm256_loadu_ps(x.add(i + 8));
