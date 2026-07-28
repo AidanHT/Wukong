@@ -549,6 +549,25 @@ mod tests {
     }
 
     #[test]
+    fn empty_char_literal_reports() {
+        // `''` has no body: without a diagnostic it decodes to 0, indistinguishable from `'\0'`.
+        let d = diags("''");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0104"));
+    }
+
+    #[test]
+    fn multi_codepoint_char_literal_reports_once_and_resyncs() {
+        use TokenKind::*;
+        // One stray literal costs one diagnostic, and its own closing quote must not be re-lexed
+        // as the opening quote of a new literal — the statement-terminating `;` stays a `;`.
+        assert_eq!(kinds("let c = 'ab';"), vec![Let, Ident, Eq, Char, Semi]);
+        let d = diags("let c = 'ab';");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0104"));
+    }
+
+    #[test]
     fn dump_snapshot() {
         let (toks, _) = tokenize("fn f()", SourceId(0));
         let expected = "Fn \"fn\"\nIdent \"f\"\nLParen \"(\"\nRParen \")\"\nEof \"\"\n";
