@@ -315,6 +315,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     // per function, so an unknown dim name can be told from a declared generic / a `const` with no
     // forward-reference false positive (and a function signature, re-lowered here, is reported once).
     s.checking_bodies = true;
+    s.recheck_item_signatures(module);
     s.check_bodies(module);
     let result = SemaResult {
         types: s.types,
@@ -419,11 +420,29 @@ impl Sema<'_> {
                     let mut next = 0i64;
                     let mut variants = Vec::with_capacity(e.variants.len());
                     for v in &e.variants {
-                        let disc = v
-                            .discriminant
-                            .as_ref()
-                            .and_then(|d| eval_const_int(d, self.interner))
-                            .unwrap_or(next);
+                        // A written discriminant the folder cannot read — most often a reference to a
+                        // top-level `const` — used to be DISCARDED for the auto-increment value with
+                        // no diagnostic: `enum Op { Add = 1, Mul = OP_MUL, Div }` numbered Mul 2 and
+                        // Div 3 on both backends, silently renumbering an opcode table. Say so
+                        // instead. (Resolving the name through `self.consts` here would make the
+                        // value depend on source order — `collect` inserts consts as it walks — so
+                        // const-valued discriminants need a const pre-pass, not a lookup here.)
+                        let disc = match &v.discriminant {
+                            None => next,
+                            Some(d) => match eval_const_int(d, self.interner) {
+                                Some(x) => x,
+                                None => {
+                                    self.error(
+                                        d.span,
+                                        "E0401",
+                                        "an enum discriminant must be a compile-time integer \
+                                         constant (an integer literal, or arithmetic on integer \
+                                         literals)",
+                                    );
+                                    next
+                                }
+                            },
+                        };
                         // An enum value lowers to a 32-bit discriminant (the C-style repr —
                         // mir_build emits `ConstInt(_, I32)`), so a discriminant outside the i32
                         // range would be silently truncated (a max-`i64` sentinel printed as its low
@@ -472,6 +491,80 @@ impl Sema<'_> {
                     }
                 }
                 ItemKind::Import(_) => {}
+            }
+        }
+    }
+
+    /// Re-lower struct field, enum payload and `extern` signature types once the body pass has begun,
+    /// purely for the diagnostics gated on `checking_bodies` (the unknown-tensor-dimension E0504 and
+    /// the unknown-array-length check).
+    ///
+    /// Those types are lowered exactly ONCE — during `collect`, with the flag still false — while the
+    /// only types re-lowered in the body pass are the parameters and return type of functions WITH a
+    /// body. So an undeclared dimension name in a struct field or an `extern` signature was silently
+    /// turned into a fresh unconstrained `Dim::Var`, precisely the hole E0504 exists to close:
+    /// `extern { fn dot(a: Tensor[f32, K], b: Tensor[f32, KK]) -> f32; }` — a one-character typo —
+    /// gave the two parameters independent dims, so a length-4 and a length-8 buffer unified without
+    /// complaint and the extern callee read a mismatched buffer.
+    ///
+    /// The lowered results are discarded (the def map is already populated, and `lower_type` has no
+    /// other side effect), and any diagnostic identical to one `collect` already reported is dropped,
+    /// so this cannot double-report.
+    fn recheck_item_signatures(&mut self, module: &Module) {
+        let before = self.diags.len();
+        for item in &module.items {
+            match &item.kind {
+                ItemKind::Struct(s) => {
+                    self.generics = generic_names(&s.generics);
+                    for fl in &s.fields {
+                        self.lower_type(&fl.ty);
+                    }
+                    self.generics.clear();
+                }
+                ItemKind::Enum(e) => {
+                    self.generics = generic_names(&e.generics);
+                    for v in &e.variants {
+                        match &v.data {
+                            VariantData::Unit => {}
+                            VariantData::Tuple(tys) => {
+                                for t in tys {
+                                    self.lower_type(t);
+                                }
+                            }
+                            VariantData::Struct(fields) => {
+                                for f in fields {
+                                    self.lower_type(&f.ty);
+                                }
+                            }
+                        }
+                    }
+                    self.generics.clear();
+                }
+                // An extern fn declares its own generics, exactly as `collect_fn` establishes them.
+                ItemKind::Extern(blk) => {
+                    for f in &blk.items {
+                        self.generics = generic_names(&f.generics);
+                        for p in &f.params {
+                            self.lower_type(&p.ty);
+                        }
+                        if let Some(t) = &f.ret {
+                            self.lower_type(t);
+                        }
+                        self.generics.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+        let key = |d: &Diagnostic| (d.code, d.message.clone(), d.labels.first().map(|l| l.span));
+        let seen: HashSet<(Option<&'static str>, String, Option<Span>)> =
+            self.diags[..before].iter().map(key).collect();
+        let mut i = before;
+        while i < self.diags.len() {
+            if seen.contains(&key(&self.diags[i])) {
+                self.diags.remove(i);
+            } else {
+                i += 1;
             }
         }
     }
@@ -621,6 +714,36 @@ impl Sema<'_> {
     }
 
     fn register(&mut self, name: Ident, kind: DefKind, span: Span) {
+        // `wukong_` is the compiler's own runtime-kernel namespace (~150 symbols emitted by the GEMM
+        // / vmath / norm / reduction / transpose / quant recognizers). A user function with one of
+        // those names silently HIJACKED the dispatch: `fn wukong_norm_f32(…)` made a hand-written
+        // softmax lower to a call to the user's body instead — the normalization never ran, both
+        // backends agreed on the wrong answer, and no diagnostic was emitted. With a mismatched
+        // arity it instead diverged (interp dropped the kernel and ran on; native aborted with a raw
+        // Cranelift signature-incompatibility string, an uncatalogued error leaking backend
+        // internals), and with a body that dereferences its arguments it is arbitrary memory
+        // corruption — the recognizer passes raw pointers the user declared as `i64`. Reserving the
+        // whole prefix closes all of that for every kernel at once; mangling the emitted symbols
+        // instead would mean editing every backend's name constants.
+        if matches!(kind, DefKind::Fn(_)) {
+            let nm = self.sym_str(name.sym);
+            if nm.starts_with("wukong_") {
+                let nm = nm.to_string();
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "the name `{nm}` is reserved for a compiler runtime kernel"
+                    ))
+                    .with_code("E0300")
+                    .primary(name.span, "reserved name")
+                    .help(
+                        "rename this function; the `wukong_` prefix is reserved for the symbols \
+                         the kernel recognizers emit",
+                    ),
+                );
+                // Fall through and register it anyway: the compile is already failing, and leaving
+                // the def map complete keeps every call site from cascading into E0301.
+            }
+        }
         if let Some(&idx) = self.defs.by_name.get(&name.sym) {
             // Point at BOTH definitions. In a multi-file program (the driver's import loader
             // splices every imported file's items into one flat namespace) the two can live in
@@ -673,10 +796,13 @@ impl Sema<'_> {
                 pointee: Box::new(self.lower_type(pointee)),
             },
             TypeKind::Slice(e) => Ty::Slice(Box::new(self.lower_type(e))),
-            TypeKind::Array { elem, len } => Ty::Array {
-                elem: Box::new(self.lower_type(elem)),
-                len: self.eval_usize(len),
-            },
+            TypeKind::Array { elem, len } => {
+                let elem = Box::new(self.lower_type(elem));
+                Ty::Array {
+                    elem,
+                    len: self.array_len(len),
+                }
+            }
             TypeKind::Tuple(items) => Ty::Tuple(items.iter().map(|i| self.lower_type(i)).collect()),
             TypeKind::Vector { elem, lanes } => match self.lower_type(elem) {
                 Ty::Scalar(s) => Ty::Vector {
@@ -797,6 +923,56 @@ impl Sema<'_> {
         self.eval_usize_depth(e, 0)
     }
 
+    /// A fixed-size array's compile-time length, with the two diagnostics `eval_usize` cannot report
+    /// (it is `&self`, and every caller wants a number): an unresolvable length NAME, and a length
+    /// beyond what lowering can represent — mir_build's mirrored `const_usize_expr` is `u32` end to
+    /// end and narrows the folded value with an unchecked `as u32`, so `[i32; 0x1_0000_0001]` was
+    /// bounds checked here against 4294967297 while the emitted slot held 1 element. Both point at
+    /// the length expression and are gated on `checking_bodies` exactly like the E0504 dim check, so
+    /// a signature re-lowered by `check_fn` is reported once (see the flag's doc-comment).
+    fn array_len(&mut self, len: &Expr) -> u64 {
+        // An array length naming an identifier that is neither a declared generic nor a top-level
+        // `const` is a typo, not a length. `fn sum(a: [i32; NOPE])` typed the parameter `[i32; 0]`
+        // and compiled clean — mir_build's `const_usize_expr` returned `None` and lowered a bare
+        // pointer — so every compile-time bounds check on that array was vacuous or nonsensical
+        // (`a[0]` reported "index 0 is out of bounds for an array of length 0", naming neither
+        // `NOPE` nor the real cause). Tensor dimensions already get exactly this check (E0504);
+        // array lengths had no equivalent. Generics are consulted first, like `lower_dim` does, and
+        // the same `checking_bodies` gate applies for the same reason: `collect` registers consts as
+        // it walks, so a const declared after this item is only guaranteed visible in the body pass.
+        if self.checking_bodies {
+            if let ExprKind::Path(p) = &len.kind {
+                if p.is_single() {
+                    let sym = p.first().sym;
+                    if !self.generics.contains(&sym) && !self.consts.contains_key(&sym) {
+                        let nm = self.sym_str(sym).to_string();
+                        self.error(
+                            len.span,
+                            "E0301",
+                            format!(
+                                "cannot find `{nm}` in this scope (an array length must be an \
+                                 integer literal, a `const`, or a declared generic parameter)"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        let n = self.eval_usize(len);
+        if n > u32::MAX as u64 && self.checking_bodies {
+            self.error(
+                len.span,
+                "E0401",
+                format!(
+                    "array length {n} is out of range: a fixed-size array may hold at most {} \
+                     elements",
+                    u32::MAX
+                ),
+            );
+        }
+        n
+    }
+
     /// If `e` is a C-style enum-variant access `E::V` (a `Field` whose base is a single-segment
     /// path naming a declared enum), its integer discriminant — the value the variant lowers to.
     /// Mirrors `mir_build`'s `enum_variant_value` exactly, so compile-time evaluation (array
@@ -828,14 +1004,14 @@ impl Sema<'_> {
             return 0;
         }
         match &e.kind {
-            ExprKind::Int(s) => {
-                let text = self.sym_str(*s);
-                text.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0)
-            }
+            // Decode the literal with the SAME rules mir_build's mirrored `const_usize_depth` uses
+            // (`parse_int`): radix prefixes `0x`/`0o`/`0b`, `_` digit separators, an integer type
+            // suffix. Keeping only the leading run of decimal digits desynced the mirror at the
+            // literal leaf — `[i32; 0x10]` was length 0 here and 16 there, `[i32; 1_6]` was 1 here
+            // and 16 there — so the alloca'd slot and these bounds checks disagreed: either a valid
+            // program rejected as "length 0", or (when sema's short length reached a struct layout)
+            // silent stack corruption both backends agreed on.
+            ExprKind::Int(s) => parse_u64_text(self.sym_str(*s)).unwrap_or(0),
             ExprKind::Path(p) if p.is_single() => match self.consts.get(&p.first().sym) {
                 Some(init) => self.eval_usize_depth(init, depth + 1),
                 None => 0,
@@ -1909,11 +2085,42 @@ impl Sema<'_> {
             // inner fields to their declared types (so an arm body sees `x`/`y` typed).
             PatKind::Variant { path, fields } => self.check_variant_pattern(path, fields, pat.span),
             // Literal / enum-variant / range patterns bind nothing — they test the scrutinee's value.
-            PatKind::Int { .. }
-            | PatKind::Char(_)
-            | PatKind::Bool(_)
-            | PatKind::Path(_)
-            | PatKind::Range { .. } => {}
+            // An integer literal pattern is materialized by mir_build as `ConstInt(v, <scrutinee
+            // width>)` with no range check, so an out-of-range literal was TRUNCATED to that width and
+            // matched a different value, shadowing the arm that legitimately covers it: on an `i32`
+            // scrutinee `match x { 4294967296 => 1, 0 => 2, _ => 0 }` returned 1 for `x == 0`, and on
+            // an `i8` scrutinee `200 => 1` matched `-56`. The same literal in `let`/`const`/`return`/
+            // argument position is already rejected — apply that rule here too.
+            PatKind::Int { .. } => self.range_check_int_pattern(pat, ty),
+            PatKind::Range { lo, hi, .. } => {
+                self.range_check_int_pattern(lo, ty);
+                self.range_check_int_pattern(hi, ty);
+            }
+            PatKind::Char(_) | PatKind::Bool(_) | PatKind::Path(_) => {}
+        }
+    }
+
+    /// The pattern counterpart of [`Sema::range_check_int_literal`]: an integer literal *pattern* that
+    /// does not fit the scrutinee's narrow type. Same rule, same code, same wording — only types whose
+    /// whole range fits in `i64` are checked (i8..u32), so an `i64`/`u64`/`usize` scrutinee is never
+    /// flagged.
+    fn range_check_int_pattern(&mut self, pat: &Pattern, ty: &Ty) {
+        let Ty::Scalar(sc) = ty else { return };
+        let Some((lo, hi)) = int_lit_range(*sc) else {
+            return;
+        };
+        let Some(v) = pat_int_value(pat, self.interner) else {
+            return;
+        };
+        if v < lo || v > hi {
+            self.error(
+                pat.span,
+                "E0401",
+                format!(
+                    "literal `{v}` is out of range for `{}` ({lo}..={hi})",
+                    sc.name()
+                ),
+            );
         }
     }
 
@@ -2226,8 +2433,13 @@ impl Sema<'_> {
             (ExprKind::ArrayLit(items), Ty::Array { elem, len }) => {
                 items.len() as u64 == *len && items.iter().all(|it| self.literal_adapts(elem, it))
             }
-            (ExprKind::ArrayRepeat { value, .. }, Ty::Array { elem, .. }) => {
-                self.literal_adapts(elem, value)
+            // …and so does a repeat initializer — but its COUNT must match the annotation's length,
+            // exactly like the `ArrayLit` arm above and `check_struct_literal`'s array-field check.
+            // Without it `let a: [i32; 4] = [7; 2];` compiled clean and mir_build filled the slot to
+            // the annotation's 4, silently discarding the count the programmer wrote (the identical
+            // mismatch is a hard error as a struct field and as an array literal).
+            (ExprKind::ArrayRepeat { value, count }, Ty::Array { elem, len }) => {
+                self.eval_usize(count) == *len && self.literal_adapts(elem, value)
             }
             (ExprKind::TupleLit(items), Ty::Tuple(tys)) => {
                 items.len() == tys.len()
@@ -2336,6 +2548,22 @@ impl Sema<'_> {
         }
     }
 
+    /// Reject a `\u{…}` escape that is not a Unicode scalar value, keeping the established split
+    /// (sema validates literals, mir_build decodes them) alongside `int_literal_well_formed` /
+    /// `float_literal_well_formed`.
+    fn check_unicode_escapes(&mut self, sym: Symbol, span: Span) {
+        if let Some(cp) = bad_unicode_escape(self.sym_str(sym)) {
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "`\\u{{{cp:X}}}` is not a Unicode scalar value (the maximum is \\u{{10FFFF}}, \
+                     and \\u{{D800}}..=\\u{{DFFF}} are surrogates)"
+                ),
+            );
+        }
+    }
+
     fn type_expr(&mut self, e: &Expr) -> Ty {
         let ty = self.type_expr_inner(e);
         self.types.insert(e.id, ty.clone());
@@ -2369,11 +2597,17 @@ impl Sema<'_> {
                 }
             }
             ExprKind::Bool(_) => Ty::Scalar(Scalar::Bool),
-            ExprKind::Str(_) => Ty::Ptr {
-                mutable: false,
-                pointee: Box::new(Ty::Scalar(Scalar::U8)),
-            },
-            ExprKind::Char(_) => Ty::Scalar(Scalar::Char),
+            ExprKind::Str(s) => {
+                self.check_unicode_escapes(*s, e.span);
+                Ty::Ptr {
+                    mutable: false,
+                    pointee: Box::new(Ty::Scalar(Scalar::U8)),
+                }
+            }
+            ExprKind::Char(s) => {
+                self.check_unicode_escapes(*s, e.span);
+                Ty::Scalar(Scalar::Char)
+            }
             ExprKind::Path(p) => {
                 if p.is_single() {
                     match self.resolve_value(p.first().sym) {
@@ -3541,6 +3775,41 @@ fn float_literal_well_formed(text: &str) -> bool {
     !body.is_empty() && body.parse::<f64>().is_ok()
 }
 
+/// The first `\u{…}` escape in a char/string literal's raw source text that is NOT a Unicode scalar
+/// value (above `0x10FFFF`, or a surrogate `0xD800..=0xDFFF`), or `None` if every escape is fine.
+///
+/// mir_build's `decode_escape` saturates the accumulator, `char::from_u32` then returns `None`, and
+/// `decode_string_literal`'s fallback pushes `cp as u8`: `"a\u{110000}b"` pushed a NUL, so a
+/// `println` of it stopped before the `b` and the rest of the string was silently lost, while the
+/// char form printed 1114112 — a value the language guide says a `char` cannot hold. This mirrors
+/// `decode_escape`'s scan exactly, so it accepts precisely the set the decoder can represent.
+fn bad_unicode_escape(text: &str) -> Option<u32> {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            continue;
+        }
+        // Every other escape's body is plain text to this scan; consuming the escaped character is
+        // what matters, so a literal `\\` is not mistaken for the start of a new escape.
+        if chars.next() != Some('u') {
+            continue;
+        }
+        let cp = chars
+            .by_ref()
+            .skip_while(|&c| c != '{')
+            .skip(1)
+            .take_while(|&c| c != '}')
+            .fold(0u32, |v, c| {
+                c.to_digit(16)
+                    .map_or(v, |d| v.saturating_mul(16).saturating_add(d))
+            });
+        if char::from_u32(cp).is_none() {
+            return Some(cp);
+        }
+    }
+    None
+}
+
 fn parse_int_text(text: &str) -> Option<i64> {
     let mut s = text.trim();
     let neg = s.starts_with('-');
@@ -3572,7 +3841,7 @@ fn parse_int_text(text: &str) -> Option<i64> {
 /// Parse an integer literal's MAGNITUDE as a `u64` (no sign — a negative value fits `i64` and is
 /// handled by `parse_int_text`). Used to recognize a literal in `(i64::MAX, u64::MAX]` so it defaults
 /// to `u64` instead of silently truncating to i32. Mirrors `parse_int_text`'s radix/suffix handling.
-fn parse_u64_text(text: &str) -> Option<u64> {
+pub(crate) fn parse_u64_text(text: &str) -> Option<u64> {
     let mut s = text.trim();
     if s.starts_with('-') {
         return None;
@@ -4095,5 +4364,313 @@ mod tests {
     fn tensor_index_correct_rank_ok() {
         let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0, 0]; }";
         assert!(errors(src).is_empty(), "unexpected: {:?}", errors(src));
+    }
+
+    #[test]
+    fn const_length_decodes_radix_and_separators() {
+        // §5: const-array-length folding is mirrored with mir_build's `const_usize_depth`, which
+        // decodes the literal with the full radix/`_`/suffix-aware `parse_int`. Decoding only the
+        // leading run of decimal digits here made `[i32; 0x10]` length 0 and `[i32; 1_6]` length 1,
+        // desyncing the bounds check from the emitted slot size.
+        for len in ["0x10", "0o20", "0b10000", "1_6", "16usize"] {
+            let ok = format!("fn f() {{ let mut a: [i32; {len}] = [0; {len}]; a[15] = 7; }}");
+            assert!(
+                errors(&ok).is_empty(),
+                "`[i32; {len}]` must be 16 elements: {:?}",
+                errors(&ok)
+            );
+            // …and still exactly 16, not "anything goes".
+            let bad = format!("fn f() {{ let mut a: [i32; {len}] = [0; {len}]; a[16] = 7; }}");
+            assert!(
+                errors(&bad).contains(&"E0501"),
+                "`[i32; {len}]` must still reject index 16: {:?}",
+                errors(&bad)
+            );
+        }
+        // Via a `const`, and as a tensor dimension (both route through `eval_usize_depth`).
+        let via_const = "const N: usize = 1_6; fn f() { let mut a: [i32; N] = [0; N]; a[15] = 7; }";
+        assert!(errors(via_const).is_empty(), "{:?}", errors(via_const));
+        let dim = "const N: usize = 0x10; fn f(a: Tensor[f32, N]) { let x = a[15]; }";
+        assert!(errors(dim).is_empty(), "{:?}", errors(dim));
+    }
+
+    #[test]
+    fn turbofish_dim_decodes_radix_and_separators() {
+        // The turbofish dim must decode like mir_build's `turbofish_dim_value` (the hidden
+        // symbolic-dim ABI): `::<3_0>` bound 3 in sema while codegen passed 30, so sema shape-checked
+        // one dimension and the callee addressed with another.
+        let bad = "fn get2<M, N>(x: Tensor[f32, M, N], i: i32) -> f32 { return x[i, 0]; } \
+                   fn f(a: Tensor[f32, 6]) { let v = get2::<2, 3_0>(a, 1); }";
+        assert!(
+            errors(bad).contains(&"E0501") || errors(bad).contains(&"E0502"),
+            "a 6-element argument cannot satisfy `::<2, 3_0>` (= 2x30): {:?}",
+            errors(bad)
+        );
+        let ok = "fn get1<N>(x: Tensor[f32, N], i: i32) -> f32 { return x[i]; } \
+                  fn f() { let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; let v = get1::<0x4>(a, 0); }";
+        assert!(
+            errors(ok).is_empty(),
+            "`::<0x4>` must bind N := 4: {:?}",
+            errors(ok)
+        );
+    }
+
+    #[test]
+    fn unknown_array_length_name_is_reported() {
+        // `[i32; NOPE]` typed the parameter `[i32; 0]` and compiled clean, so every compile-time
+        // bounds check on it was vacuous. Tensor dims already had this check (E0504).
+        let bad = "fn sum(a: [i32; NOPE]) -> i32 { return a[0]; }";
+        assert!(
+            errors(bad).contains(&"E0301"),
+            "expected an unknown array length: {:?}",
+            errors(bad)
+        );
+        // A `const` (declared BEFORE or AFTER the use) and a declared generic both resolve.
+        let after = "fn sum(a: [i32; N]) -> i32 { return a[0]; } const N: usize = 4;";
+        assert!(errors(after).is_empty(), "unexpected: {:?}", errors(after));
+        // A declared generic is consulted first, exactly as `lower_dim` does, so it is not reported
+        // as an unknown name. (Such a length still evaluates to 0 — pre-existing behaviour, which is
+        // why the E0501 below fires — but that is not this check's business.)
+        let gen = "fn sum<N>(a: [i32; N]) -> i32 { return a[0]; }";
+        assert!(
+            !errors(gen).contains(&"E0301"),
+            "a declared generic is not an unknown length: {:?}",
+            errors(gen)
+        );
+    }
+
+    #[test]
+    fn struct_and_extern_signature_dims_are_checked() {
+        // Struct fields, enum payloads and `extern` signatures are lowered once, in `collect`, with
+        // `checking_bodies` still false — so an undeclared dim name in one of them silently became a
+        // fresh unconstrained `Dim::Var`, the exact hole E0504 exists to close.
+        for src in [
+            "fn main() -> i32 { return 0; } struct S { t: Tensor[f32, KK] }",
+            "fn main() -> i32 { return 0; } enum E { V(Tensor[f32, KK]) }",
+            "fn main() -> i32 { return 0; } extern { fn ext(a: Tensor[f32, KK]) -> f32; }",
+            "fn main() -> i32 { return 0; } struct S { a: [i32; NOPE] }",
+        ] {
+            assert!(
+                errors(src).iter().any(|c| *c == "E0504" || *c == "E0301"),
+                "expected an unknown dimension/length in `{src}`: {:?}",
+                errors(src)
+            );
+        }
+        // An extern fn's own generics still bind, and a re-lowered signature must not double-report
+        // a diagnostic `collect` already emitted.
+        let ok = "extern { fn dot<K>(a: Tensor[f32, K], b: Tensor[f32, K]) -> f32; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        let dup = "struct P { a: i32 } struct Q { t: Tensor[P, 4] }";
+        assert_eq!(
+            errors(dup),
+            vec!["E0302"],
+            "the diagnostic re-pass must not double-report"
+        );
+    }
+
+    #[test]
+    fn out_of_range_unicode_escape_is_rejected() {
+        // mir_build's decoder saturates and then falls back to `cp as u8`, so `\u{110000}` became a
+        // NUL inside the string (the `println` stopped there) and printed 1114112 as a `char`.
+        for src in [
+            r#"fn f() { println("a\u{110000}b"); }"#,
+            r#"fn f() { let c = '\u{110000}'; }"#,
+            r#"fn f() { let c = '\u{D800}'; }"#,
+        ] {
+            assert!(
+                errors(src).contains(&"E0401"),
+                "expected an invalid Unicode escape: {:?}",
+                errors(src)
+            );
+        }
+        // Valid escapes — including the largest scalar value and an escaped backslash followed by a
+        // literal `u{...}` — stay accepted.
+        for src in [
+            r#"fn f() { let c = '\u{1F600}'; }"#,
+            r#"fn f() { let c = '\u{10FFFF}'; }"#,
+            r#"fn f() { println("a\\u{110000}b"); }"#,
+            r#"fn f() { println("tab\there\n"); }"#,
+        ] {
+            assert!(errors(src).is_empty(), "unexpected: {:?}", errors(src));
+        }
+    }
+
+    #[test]
+    fn wukong_prefixed_function_name_is_reserved() {
+        // A user function named after a recognizer-emitted runtime kernel HIJACKED the dispatch: the
+        // recognized softmax window was replaced by a call to the user's body, silently.
+        let bad = "fn wukong_norm_f32(a: i64, b: i64) { } fn main() -> i32 { return 0; }";
+        assert!(
+            errors(bad).contains(&"E0300"),
+            "expected a reserved-name error: {:?}",
+            errors(bad)
+        );
+        // Only the prefix is reserved, and only for functions.
+        let ok = "fn wukongish(a: i64) {} fn my_wukong_norm(a: i64) {}";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+    }
+
+    #[test]
+    fn out_of_range_match_pattern_literal_is_rejected() {
+        // `pattern_cond` materializes the literal as `ConstInt(v, <scrutinee width>)` with no range
+        // check, so it truncated and matched a DIFFERENT value — stealing the arm that covers it.
+        let wide = "fn f(x: i32) -> i32 { return match x { 4294967296 => 1, 0 => 2, _ => 0 }; }";
+        assert!(
+            errors(wide).contains(&"E0401"),
+            "expected an out-of-range pattern literal: {:?}",
+            errors(wide)
+        );
+        let narrow = "fn g(x: i8) -> i32 { return match x { 200 => 1, _ => 0 }; }";
+        assert!(
+            errors(narrow).contains(&"E0401"),
+            "expected an out-of-range pattern literal: {:?}",
+            errors(narrow)
+        );
+        // Range-pattern bounds are checked the same way …
+        let rng = "fn h(x: i8) -> i32 { return match x { 0..=200 => 1, _ => 0 }; }";
+        assert!(
+            errors(rng).contains(&"E0401"),
+            "expected an out-of-range range bound: {:?}",
+            errors(rng)
+        );
+        // … and every in-range pattern is unaffected, including a negative one.
+        let ok = "fn k(x: i8) -> i32 { return match x { -128 => 1, 0..=127 => 2, _ => 0 }; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+    }
+
+    #[test]
+    fn unfoldable_enum_discriminant_is_reported() {
+        // A discriminant the folder cannot read was silently replaced by the auto-increment value,
+        // renumbering the rest of the enum with no diagnostic at all.
+        let bad = "const OP_MUL: i32 = 10; enum Op { Add = 1, Mul = OP_MUL, Div }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected a non-constant discriminant error: {:?}",
+            errors(bad)
+        );
+        // Literal discriminants — including negative, hex and folded arithmetic — still work.
+        let ok = "enum E { Neg = -5, Pos = 7, Hex = 0x10, Sum = 2 + 3, Auto }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+    }
+
+    #[test]
+    fn array_repeat_count_must_match_the_annotation() {
+        // The `ArrayLit` arm and `check_struct_literal` both length-check; only the `let`/`const`
+        // repeat form swallowed the mismatch and let mir_build fill the slot to the annotation.
+        let short = "fn f() { let a: [i32; 4] = [7; 2]; }";
+        assert!(
+            errors(short).contains(&"E0401"),
+            "expected a length mismatch: {:?}",
+            errors(short)
+        );
+        let long = "fn f() { let a: [i32; 2] = [7; 8]; }";
+        assert!(
+            errors(long).contains(&"E0401"),
+            "expected a length mismatch: {:?}",
+            errors(long)
+        );
+        // Matching counts still adapt — including through a `const` and an enum-variant length.
+        let ok = "const N: usize = 4; fn f() { let a: [f32; N] = [0.0; 4]; let b: [i8; 2] = [7; 2]; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+    }
+
+    #[test]
+    fn slice_and_aggregate_do_not_satisfy_a_tensor_param() {
+        // A `[]T` slice is a `(ptr, len)` fat pointer, not a tensor base pointer; the clash had no
+        // arm in `unify` and fell to the lenient `_`, so the callee indexed the slice HEADER.
+        let sl = "fn get1(a: Tensor[f32, 4], i: i32) -> f32 { return a[i]; } \
+                  fn f(s: []f32) -> f32 { return get1(s, 2); }";
+        assert!(
+            errors(sl).contains(&"E0501"),
+            "a slice must not satisfy a tensor parameter: {:?}",
+            errors(sl)
+        );
+        let st = "struct S { a: f32 } \
+                  fn get1(a: Tensor[f32, 4], i: i32) -> f32 { return a[i]; } \
+                  fn f(s: S) -> f32 { return get1(s, 2); }";
+        assert!(
+            errors(st).contains(&"E0501"),
+            "a struct must not satisfy a tensor parameter: {:?}",
+            errors(st)
+        );
+        // A bare generic TYPE variable is also spelled `Ty::Named` and must stay lenient.
+        let gen = "fn take<T>(x: T) {} fn f(a: Tensor[f32, 4]) { take(a); }";
+        assert!(errors(gen).is_empty(), "unexpected: {:?}", errors(gen));
+        // Array → tensor decay is the documented, intentionally lenient path.
+        let arr = "fn get1(a: Tensor[f32, 4], i: i32) -> f32 { return a[i]; } \
+                   fn f() -> f32 { let b: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; return get1(b, 2); }";
+        assert!(errors(arr).is_empty(), "unexpected: {:?}", errors(arr));
+    }
+
+    #[test]
+    fn generic_dim_does_not_satisfy_a_const_dim_param() {
+        // A caller's universally-quantified `N` is not a proof that the buffer is 64 long. Rigid mode
+        // already rejected this; the call-site (inference) path silently accepted it.
+        let bad = "fn takes64(a: Tensor[f32, 64]) -> f32 { return a[63]; } \
+                   fn fwd<N>(a: Tensor[f32, N]) -> f32 { return takes64(a); }";
+        assert!(
+            errors(bad).contains(&"E0502"),
+            "expected a dimension mismatch: {:?}",
+            errors(bad)
+        );
+        // `?` stays the documented escape hatch, and Var→Var forwarding is unaffected.
+        let dyn_ok = "fn takes_any(a: Tensor[f32, ?]) -> f32 { return a[0]; } \
+                      fn fwd<N>(a: Tensor[f32, N]) -> f32 { return takes_any(a); }";
+        assert!(errors(dyn_ok).is_empty(), "unexpected: {:?}", errors(dyn_ok));
+        let var_ok = "fn inner<P>(a: Tensor[f32, P]) -> f32 { return a[0]; } \
+                      fn fwd<N>(a: Tensor[f32, N]) -> f32 { return inner(a); }";
+        assert!(errors(var_ok).is_empty(), "unexpected: {:?}", errors(var_ok));
+    }
+
+    #[test]
+    fn tensor_layout_must_match_at_a_call() {
+        // Lowering DECLINES a non-contiguous tensor (C0001), but `unify` dropped `layout` with `..`,
+        // so routing a `.col_major` value through a contiguous-typed callee silently reinterpreted it
+        // row-major.
+        let bad = "fn getrm(a: Tensor[f32, 2, 3], i: i32, j: i32) -> f32 { return a[i, j]; } \
+                   fn pass(a: Tensor[f32, 2, 3, .col_major], i: i32, j: i32) -> f32 { \
+                   return getrm(a, i, j); }";
+        assert!(
+            errors(bad).contains(&"E0502"),
+            "expected a layout mismatch: {:?}",
+            errors(bad)
+        );
+        // A fixed-size array is row-major, so it cannot decay to a column-major tensor.
+        let decay = "fn getcm(a: Tensor[f32, 2, 3, .col_major]) -> f32 { return a[0, 0]; } \
+                     fn f() -> f32 { let b: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]; \
+                     return getcm(b); }";
+        assert!(
+            errors(decay).contains(&"E0502"),
+            "expected a layout mismatch on array decay: {:?}",
+            errors(decay)
+        );
+        // Matching layouts (including the default contiguous one) still unify.
+        let ok = "fn getcm(a: Tensor[f32, 2, 3, .col_major], i: i32) -> f32 { return a[i, 0]; } \
+                  fn pass(a: Tensor[f32, 2, 3, .col_major], i: i32) -> f32 { return getcm(a, i); }";
+        assert!(
+            !errors(ok).contains(&"E0502"),
+            "identical layouts must unify: {:?}",
+            errors(ok)
+        );
+    }
+
+    #[test]
+    fn array_length_above_u32_max_is_rejected() {
+        // mir_build's mirrored `const_usize_expr` is u32 end to end and narrows with an unchecked
+        // `as u32`, so a longer length wrapped to a small slot while sema bounds-checked the full
+        // value. Reject it here so the truncating path is unreachable.
+        let bad = "fn f() { let mut a: [i32; 0x1_0000_0001] = [0; 0x1_0000_0001]; a[0] = 1; }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected an out-of-range array length: {:?}",
+            errors(bad)
+        );
+        // The largest representable length is still accepted (no off-by-one at the boundary).
+        let ok = "fn f(a: [i32; 4294967295]) -> i32 { return a[0]; }";
+        assert!(
+            !errors(ok).contains(&"E0401"),
+            "u32::MAX must remain a legal length: {:?}",
+            errors(ok)
+        );
     }
 }

@@ -11,7 +11,7 @@ use wukong_span::FxHashMap as HashMap;
 
 use wukong_ast::{Expr, ExprKind, TypeExpr, TypeKind};
 use wukong_span::{Span, Symbol};
-use wukong_types::{Dim, Scalar, Shape, Ty};
+use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 
 use crate::{DefKind, FnSig, Sema};
 
@@ -59,7 +59,18 @@ fn kind_name(t: &Ty) -> &'static str {
         Ty::Ref { .. } => "a reference",
         Ty::Tuple(_) => "a tuple",
         Ty::Slice(_) => "a slice",
+        Ty::Named(_) => "a named type",
         _ => "a different type",
+    }
+}
+
+/// A short human name for a tensor's declared layout, for the layout-mismatch diagnostic.
+fn layout_name(l: &Layout) -> String {
+    match l {
+        Layout::Contiguous => "contiguous (row-major)".to_string(),
+        Layout::ColMajor => "col_major".to_string(),
+        Layout::Strided => "strided".to_string(),
+        Layout::Tiled(v) => format!("tiled{v:?}"),
     }
 }
 
@@ -406,8 +417,15 @@ impl Sema<'_> {
             }
             for (g, ga) in sig.generics.iter().zip(generic_args) {
                 match &ga.kind {
+                    // Decode with the same radix/`_`/suffix-aware parser mir_build's
+                    // `turbofish_dim_value` uses (`parse_int`). The old digits-only scan bound
+                    // `::<3_0>` to 3 here while codegen passed the hidden dim 30 — sema shape-checked
+                    // one dimension and the callee addressed with another (accepted program, native
+                    // read past the buffer while the interpreter trapped) — and bound `::<0x4>` to 0,
+                    // rejecting valid code with a dimension the source never wrote.
                     TypeKind::Int(s) => {
-                        dims.insert(*g, Dim::Const(parse_dim_text(self.sym_str(*s))));
+                        let n = crate::parse_u64_text(self.sym_str(*s)).unwrap_or(0);
+                        dims.insert(*g, Dim::Const(n));
                     }
                     TypeKind::Path(p) if p.is_single() => {
                         let nm = p.first().sym;
@@ -461,14 +479,31 @@ impl Sema<'_> {
                 Ty::Tensor {
                     elem: pe,
                     shape: ps,
-                    ..
+                    layout: pl,
                 },
                 Ty::Tensor {
                     elem: ae,
                     shape: as_,
-                    ..
+                    layout: al,
                 },
             ) => {
+                // The declared layout is part of the type: `tensor_strides` and
+                // `lower_multi_index_dyn` both DECLINE a non-`Contiguous` tensor (C0001), so a
+                // `.col_major` value routed through a `Contiguous`-typed callee was silently
+                // reinterpreted row-major — the same access is a hard error in place and a wrong
+                // answer one call away (observed: prints 3, the row-major reading, where the
+                // column-major reading is 1).
+                if pl != al {
+                    self.error(
+                        span,
+                        "E0502",
+                        format!(
+                            "tensor layout mismatch: expected {}, found {}",
+                            layout_name(pl),
+                            layout_name(al)
+                        ),
+                    );
+                }
                 if pe != ae {
                     self.error(
                         span,
@@ -504,7 +539,25 @@ impl Sema<'_> {
             // in-tensor-bounds index becomes an out-of-bounds read (the interpreter traps, native
             // codegen does not: a backend divergence). A symbolic / dynamic dim stays lenient
             // (there is no concrete element count to check against).
-            (Ty::Tensor { elem: pe, shape, .. }, Ty::Array { elem: ae, len }) => {
+            (
+                Ty::Tensor {
+                    elem: pe,
+                    shape,
+                    layout: pl,
+                },
+                Ty::Array { elem: ae, len },
+            ) => {
+                // A fixed-size array is row-major, so it can only decay to a `Contiguous` tensor.
+                if *pl != Layout::Contiguous {
+                    self.error(
+                        span,
+                        "E0502",
+                        format!(
+                            "tensor layout mismatch: expected {}, found a row-major array",
+                            layout_name(pl)
+                        ),
+                    );
+                }
                 if let Ty::Scalar(ae) = ae.as_ref() {
                     if pe != ae {
                         self.error(
@@ -636,6 +689,40 @@ impl Sema<'_> {
                     ),
                 );
             }
+            // A `[]T` slice is a 16-byte `(ptr, len)` fat pointer and a tuple is an aggregate —
+            // neither is a tensor base pointer, and neither had an arm here, so both fell to the
+            // lenient `_` below and were silently accepted. mir_build then passed the address of the
+            // slice HEADER where the callee expects the data base: `get1(alloc_f32(4), 2)` printed 0
+            // on every backend and `a[0]` read the low half of the heap POINTER as an `f32` — an
+            // address leaked as data, with both backends agreeing so the differential gate is blind.
+            (Ty::Tensor { .. }, Ty::Slice(_) | Ty::Tuple(_))
+            | (Ty::Slice(_) | Ty::Tuple(_), Ty::Tensor { .. }) => {
+                self.error(
+                    span,
+                    "E0501",
+                    format!(
+                        "type mismatch: expected {}, found {}",
+                        kind_name(param),
+                        kind_name(arg)
+                    ),
+                );
+            }
+            // Same hole for a struct/enum value. `Ty::Named` also spells a bare generic TYPE variable
+            // (`fn f<T>(x: T)`), which must stay lenient, so only a name that resolves to a declared
+            // struct/enum is reported.
+            (Ty::Tensor { .. }, Ty::Named(n)) | (Ty::Named(n), Ty::Tensor { .. })
+                if self.is_declared_named_ty(*n) =>
+            {
+                self.error(
+                    span,
+                    "E0501",
+                    format!(
+                        "type mismatch: expected {}, found {}",
+                        kind_name(param),
+                        kind_name(arg)
+                    ),
+                );
+            }
             (Ty::Vector { .. }, Ty::Scalar(_)) | (Ty::Scalar(_), Ty::Vector { .. }) => {
                 self.error(
                     span,
@@ -737,17 +824,32 @@ impl Sema<'_> {
                     }
                 }
             },
-            Dim::Const(pc) => {
-                if let Dim::Const(ac) = ad {
-                    if pc != ac {
-                        self.error(
-                            span,
-                            "E0502",
-                            format!("dimension mismatch: expected {pc}, found {ac}"),
-                        );
-                    }
+            Dim::Const(pc) => match ad {
+                Dim::Const(ac) if pc != ac => self.error(
+                    span,
+                    "E0502",
+                    format!("dimension mismatch: expected {pc}, found {ac}"),
+                ),
+                // A caller's own universally-quantified dim cannot be ASSUMED equal to the callee's
+                // fixed size — that is a claim the checker cannot prove, and the very hole `rigid`
+                // mode closes on the return path was left open here on the call path: `fn fwd<N>(a:
+                // Tensor[f32, N]) { takes64(a) }` compiled clean and `fwd([1.0, 2.0])` read 248 bytes
+                // past an 8-byte stack array (interp trapped, native returned 0). `Dim::Dynamic`
+                // stays the documented `?` escape hatch.
+                Dim::Var(v) => {
+                    let name = self.sym_str(v).to_string();
+                    self.error(
+                        span,
+                        "E0502",
+                        format!(
+                            "dimension mismatch: expected {pc}, found the generic dimension `{name}` \
+                             (a universally-quantified dimension cannot be assumed equal to {pc}; \
+                             declare the parameter `?` if the size is a runtime value)"
+                        ),
+                    );
                 }
-            }
+                _ => {}
+            },
             Dim::Dynamic => {}
         }
     }
@@ -880,6 +982,15 @@ impl Sema<'_> {
         }
     }
 
+    /// Whether a `Ty::Named` refers to a DECLARED struct/enum rather than a generic type variable —
+    /// both are spelled `Named`, and only the former can be reported as a kind clash.
+    fn is_declared_named_ty(&self, n: Symbol) -> bool {
+        matches!(
+            self.defs.lookup(n).map(|d| &d.kind),
+            Some(DefKind::Struct(_) | DefKind::Enum(_))
+        )
+    }
+
     fn dim_str(&self, d: Dim) -> String {
         match d {
             Dim::Const(n) => n.to_string(),
@@ -896,14 +1007,6 @@ fn dims_equal(a: Dim, b: Dim) -> bool {
         (Dim::Var(x), Dim::Var(y)) => x == y,
         _ => false,
     }
-}
-
-fn parse_dim_text(text: &str) -> u64 {
-    text.chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .unwrap_or(0)
 }
 
 /// Infer value-type generics from a concrete argument: bind each `Ty::Named(g)` parameter position
