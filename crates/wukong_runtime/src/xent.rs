@@ -229,6 +229,13 @@ pub unsafe extern "C" fn wukong_xent_fwd_f32_parallel(
         wukong_xent_fwd_f32(x, target, loss, rows, cols);
         return;
     }
+    // This fork can be the process's FIRST rayon touch (a training step's first parallel kernel is
+    // often the loss), and `ensure_global_pool`'s contract is that such a path configures the global
+    // pool before forking — otherwise rayon builds its default 2 MiB-stack registry here and the
+    // later 16 MiB `build_global()` silently loses the race, leaving every outlined `@parallel`
+    // region body on a stack too small for its privatized scratch. Scheduling only: rows are mapped
+    // one per index regardless of worker count, so the bits cannot change.
+    crate::ensure_global_pool();
     // Raw pointers cross the rayon boundary as integers (the `target` i32 pointer and the `loss`
     // pointer cross as `usize` too); each row is a disjoint sub-slice, `target`/`loss` indexed by row.
     let (x_addr, t_addr, l_addr) = (x as usize, target as usize, loss as usize);
