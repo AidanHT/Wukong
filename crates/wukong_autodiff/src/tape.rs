@@ -46,6 +46,12 @@ const NORM_RMSNORM: i64 = 2;
 const VE_ID: i64 = 0;
 /// OR'd into a velem op when `y` is read (`b` may be non-zero).
 const VE_USE_Y: i64 = 256;
+/// velem *compute mode*: the elementwise Hadamard product (`out = act(x · y)`). Mirrored from
+/// `wukong_runtime::velem`. It lives ABOVE the low activation byte, so a `op & 0xff` test does not
+/// see it — and it is **non-affine**, so the affine VJP below is not a rule for it.
+const VE_HADAMARD: i64 = 512;
+/// velem *compute mode*: the elementwise quotient (`out = act(x / y)`) — likewise non-affine.
+const VE_DIV: i64 = 1024;
 
 const F32: MirType = MirType::F32;
 const I64T: MirType = MirType::I64;
@@ -343,13 +349,26 @@ impl<'a> Vjp<'a> {
     /// `velem(x, y, out, n, a, b, c, op)` computes `out = act(a*x + b*y + c)`. With the identity
     /// activation it is linear, so the VJP is exact: `dx = a*dout`, `dy = b*dout` (each a velem
     /// scale). This covers residual add (`a=b=1` -> `dx=dy=dout`) and scaling. Non-identity
-    /// activations (relu/relu6) are rejected for now (they need a masked loop like vmath).
+    /// activations (relu/relu6) are rejected for now (they need a masked loop like vmath), and so is
+    /// every *compute mode* above the activation byte ([`VE_HADAMARD`], [`VE_DIV`]) — those are not
+    /// the affine form this rule differentiates. The gate is a WHITELIST of the two op spellings the
+    /// affine rule is valid for, so a future high-bit mode fails closed rather than silently taking
+    /// the linear VJP.
     fn diff_velem(&mut self, args: &[ValueId]) -> Result<(), String> {
         let (x, y, out) = (args[0], args[1], args[2]);
         let op = self.const_i64(args[7])?;
-        if op & 0xff != VE_ID {
+        if op != VE_ID && op != (VE_ID | VE_USE_Y) {
+            let what = if op & VE_HADAMARD != 0 {
+                "the Hadamard-product compute mode (out = x . y)"
+            } else if op & VE_DIV != 0 {
+                "the elementwise-division compute mode (out = x / y)"
+            } else {
+                "a non-identity activation (relu/relu6)"
+            };
             return Err(format!(
-                "autodiff: velem VJP only supports the identity activation (op {op})"
+                "autodiff: velem VJP only supports the identity affine form (op {VE_ID} or \
+                 {}); op {op} selects {what}",
+                VE_ID | VE_USE_Y
             ));
         }
         let dout = match self.buf_adj.get(&out).copied() {
