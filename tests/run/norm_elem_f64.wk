@@ -1,0 +1,67 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 103
+// EXPECT-OUT: 827
+// EXPECT-OUT: 1654
+// EXPECT-OUT: -1626
+// EXPECT-OUT: -108
+// EXPECT-OUT: 108
+// EXPECT-OUT: 1626
+module tests.run.norm_elem_f64
+
+// tests/run/rmsnorm.wk and tests/run/layernorm.wk, verbatim except every `f32` is an `f64`.
+//
+// `wukong_norm_f32` reads and writes the row as f32, so an f64 window must NOT be folded into it —
+// the two reduction matchers (`match_sumsq_body` for RMSNorm/L2-norm, `sum_body_array` for
+// LayerNorm's mean pass) have to decline on the element type and let the scalar loops lower. Without
+// that gate `--emit=mir -O2` showed `call wukong_norm_f32` here and the kernel wrote 16 f32 = only
+// the first 8 f64 slots: native printed `22 16000` / `-28 0 0 7000` while the interpreter, which
+// marshals slot-per-scalar and so silently degrades to f32, printed the correct values below.
+//
+// This file is deliberately run on the NATIVE backend: the interpreter was right even when the
+// recognizer misfired, so `run_suite` only gates the defect from this side. `native_matches_
+// interpreter` covers the other direction. Every value below is computed from the f64 semantics of
+// the source (independently, in double precision), never read back from the compiler.
+fn main() -> i32 {
+    // --- RMSNorm: y = x · rsqrt(mean(x²)+eps) over x[i] = i+1, N = 16 ---------------------------
+    let mut x: [f64; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i as f64) + 1.0; // 1 .. 16
+    }
+    let mut ss: f64 = 0.0;
+    for i in 0..16 {
+        ss = ss + x[i] * x[i];
+    }
+    // Σx² = 1496, mean-square = 93.5, inv = 1/sqrt(93.5 + 1e-5) ≈ 0.1034165
+    let inv: f64 = 1.0 / sqrt(ss / 16.0 + 0.00001);
+    for i in 0..16 {
+        x[i] = x[i] * inv;
+    }
+    print((x[0] * 1000.0) as i32); //  1 · 0.1034165 → 103
+    print((x[7] * 1000.0) as i32); //  8 · 0.1034165 → 827
+    print((x[15] * 1000.0) as i32); // 16 · 0.1034165 → 1654
+
+    // --- LayerNorm: y = (x−mean)·rsqrt(var+eps) over x[i] = i−8, N = 16 -------------------------
+    let mut z: [f64; 16] = [0.0; 16];
+    for i in 0..16 {
+        z[i] = (i as f64) - 8.0; // -8 .. 7, mean = -0.5, variance = 21.25
+    }
+    let mut s: f64 = 0.0;
+    for i in 0..16 {
+        s = s + z[i];
+    }
+    let mean: f64 = s * 0.0625; // / 16
+    let mut v: f64 = 0.0;
+    for i in 0..16 {
+        v = v + (z[i] - mean) * (z[i] - mean);
+    }
+    let ninv: f64 = 1.0 / sqrt(v * 0.0625 + 0.00001);
+    for i in 0..16 {
+        z[i] = (z[i] - mean) * ninv;
+    }
+    print((z[0] * 1000.0) as i32); // (-8 + 0.5) / sqrt(21.25) → -1626
+    print((z[7] * 1000.0) as i32); // (-1 + 0.5) / sqrt(21.25) →  -108
+    print((z[8] * 1000.0) as i32); // ( 0 + 0.5) / sqrt(21.25) →   108
+    print((z[15] * 1000.0) as i32); // ( 7 + 0.5) / sqrt(21.25) →  1626
+    return 0;
+}

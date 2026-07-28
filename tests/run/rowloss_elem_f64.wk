@@ -1,0 +1,41 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1064
+// EXPECT-OUT: 4564
+// EXPECT-OUT: 13862
+// EXPECT-OUT: 12798
+module tests.run.rowloss_elem_f64
+
+// tests/run/kldiv.wk and tests/run/entropy.wk, verbatim except every `f32` is an `f64`.
+//
+// Both losses are built on the shared 3-statement head `match_row_reduce_head`, which checked the
+// loop shape and the `0.0` seed but never the element type — so an all-f64 nest dispatched
+// `wukong_kldiv_f32` / `wukong_entropy_f32`, which read the f64 buffers as f32: native printed
+// `0 0` and `-2029 0` where the interpreter printed the correct values below. The sibling loss
+// matchers (`match_sumexp_sub_body`, used by xent / logsumexp / kd_loss) already gate their addend,
+// which is why only these two leaked. Run on the native backend for the reason given in
+// tests/run/norm_elem_f64.wk; the expected values are computed from the f64 source semantics.
+fn main() -> i32 {
+    // --- KL divergence: out[r] = Σ_i p·(log p − log q) -----------------------------------------
+    let p: [f64; 8] = [0.1, 0.2, 0.3, 0.4, 0.4, 0.3, 0.2, 0.1];
+    let q: [f64; 8] = [0.25, 0.25, 0.25, 0.25, 0.1, 0.2, 0.3, 0.4];
+    let mut kl: [f64; 2] = [0.0; 2];
+    for r in 0..2 {
+        let mut s: f64 = 0.0;
+        for i in 0..4 { s = s + p[r * 4 + i] * (log(p[r * 4 + i]) - log(q[r * 4 + i])); }
+        kl[r] = s;
+    }
+    for k in 0..2 { print((kl[k] * 10000.0) as i32); }
+
+    // --- Shannon entropy: out[r] = − Σ_i p·log p -----------------------------------------------
+    let e: [f64; 8] = [0.25, 0.25, 0.25, 0.25, 0.1, 0.2, 0.3, 0.4];
+    let mut ent: [f64; 2] = [0.0; 2];
+    for r in 0..2 {
+        let mut s: f64 = 0.0;
+        for i in 0..4 { s = s + e[r * 4 + i] * log(e[r * 4 + i]); }
+        ent[r] = -s;
+    }
+    // Row 0 is uniform (1/4 each) → entropy = log(4) ≈ 1.38629
+    for k in 0..2 { print((ent[k] * 10000.0) as i32); }
+    return 0;
+}
