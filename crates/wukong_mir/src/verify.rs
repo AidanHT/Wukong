@@ -54,6 +54,8 @@ fn verify(f: &Function, sigs: Option<&FnSigs>) -> Vec<String> {
         sigs,
         errors: Vec::new(),
         defined: HashSet::new(),
+        live: HashSet::new(),
+        dom_check: false,
     };
     v.run();
     v.errors
@@ -65,6 +67,38 @@ struct Verifier<'a> {
     sigs: Option<&'a FnSigs>,
     errors: Vec<String>,
     defined: HashSet<u32>,
+    /// Values whose definition dominates the point currently being checked. Maintained only while
+    /// walking the reachable blocks in dominator-tree preorder; see [`Verifier::walk_dominated`].
+    live: HashSet<u32>,
+    /// Whether `live` is meaningful right now (false while checking unreachable blocks).
+    dom_check: bool,
+}
+
+/// The at-most-two blocks a terminator can transfer control to.
+fn successors(t: &Terminator) -> [Option<u32>; 2] {
+    match t {
+        Terminator::Br { target, .. } => [Some(target.0), None],
+        Terminator::CondBr {
+            then_blk, else_blk, ..
+        } => [Some(then_blk.0), Some(else_blk.0)],
+        Terminator::Ret(_) | Terminator::Unreachable => [None, None],
+    }
+}
+
+/// Sentinel for "no immediate dominator yet" in the Cooper–Harvey–Kennedy fixpoint below.
+const NO_IDOM: u32 = u32::MAX;
+
+/// Walk up the partially built dominator tree from two nodes until they meet.
+fn intersect(mut a: u32, mut b: u32, idom: &[u32], rpo_num: &[usize]) -> u32 {
+    while a != b {
+        while rpo_num[a as usize] > rpo_num[b as usize] {
+            a = idom[a as usize];
+        }
+        while rpo_num[b as usize] > rpo_num[a as usize] {
+            b = idom[b as usize];
+        }
+    }
+    a
 }
 
 impl Verifier<'_> {
@@ -73,22 +107,49 @@ impl Verifier<'_> {
     }
 
     fn run(&mut self) {
-        // Collect all defined values (block params + instruction results).
-        for b in &self.f.blocks {
+        let f = self.f;
+        let nblocks = f.blocks.len() as u32;
+
+        // Collect all defined values (block params + instruction results), checking as we go that
+        // each is defined exactly once and lies inside the value arena. Both are load-bearing:
+        // Cranelift's `vmap` keeps whichever definition RPO lowered last, and `Function::value_type`
+        // and the printer index `value_types` directly.
+        for b in &f.blocks {
             for p in &b.params {
-                self.defined.insert(p.0);
+                self.define(*p);
             }
             for inst in &b.insts {
                 if let Some(r) = inst.result {
-                    self.defined.insert(r.0);
+                    self.define(r);
                 }
             }
         }
 
-        let nblocks = self.f.blocks.len() as u32;
-        for (bi, b) in self.f.blocks.iter().enumerate() {
+        // Both backends bind the entry block's parameters by zipping them against `Function::params`
+        // and both zips truncate silently (Cranelift then aborts on the first unbound value, the
+        // interpreter reads it as 0), so the two lists must agree.
+        match f.blocks.get(f.entry.0 as usize) {
+            None => self.err(format!("entry block bb{} does not exist", f.entry.0)),
+            Some(entry) if entry.params != f.params => self.err(
+                "the entry block's parameters do not match the function's parameters".to_string(),
+            ),
+            Some(_) => {}
+        }
+
+        for (bi, b) in f.blocks.iter().enumerate() {
             if b.id.0 != bi as u32 {
                 self.err(format!("block {} has inconsistent id {}", bi, b.id.0));
+            }
+        }
+
+        // Check the reachable blocks in dominator-tree preorder so a use can be required to be
+        // dominated by its definition, then the rest with that rule off: nothing lowers a block the
+        // entry cannot reach (Cranelift's RPO skips it, the interpreter never enters it), so
+        // dominance is vacuous there — but its operand and result types are still checked.
+        let reachable = self.walk_dominated(nblocks);
+        for (bi, b) in f.blocks.iter().enumerate() {
+            if reachable[bi] {
+                continue;
             }
             for inst in &b.insts {
                 self.check_op(&inst.op, inst.result);
@@ -97,17 +158,177 @@ impl Verifier<'_> {
         }
     }
 
+    /// Walk the blocks reachable from the entry in dominator-tree preorder, checking each and
+    /// carrying `live` = the definitions that dominate the current point. Returns reachability.
+    fn walk_dominated(&mut self, nblocks: u32) -> Vec<bool> {
+        let f = self.f;
+        let n = f.blocks.len();
+        let entry = f.entry.0 as usize;
+        if entry >= n {
+            return vec![false; n];
+        }
+
+        // Depth-first search from the entry: postorder (reversed below) and the predecessor map,
+        // both restricted to the reachable subgraph.
+        let mut visited = vec![false; n];
+        let mut post: Vec<u32> = Vec::with_capacity(n);
+        let mut stack: Vec<(u32, usize)> = vec![(entry as u32, 0)];
+        visited[entry] = true;
+        while let Some(&mut (b, i)) = stack.last_mut() {
+            if i >= 2 {
+                post.push(b);
+                stack.pop();
+                continue;
+            }
+            stack.last_mut().expect("stack is non-empty here").1 += 1;
+            if let Some(s) = successors(&f.blocks[b as usize].term)[i] {
+                if (s as usize) < n && !visited[s as usize] {
+                    visited[s as usize] = true;
+                    stack.push((s, 0));
+                }
+            }
+        }
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (b, blk) in f.blocks.iter().enumerate() {
+            if !visited[b] {
+                continue;
+            }
+            for s in successors(&blk.term).into_iter().flatten() {
+                if (s as usize) < n {
+                    preds[s as usize].push(b as u32);
+                }
+            }
+        }
+        // `Builder::alloca` parks stack slots in the entry block because it runs exactly once, and
+        // mem2reg never places a merge parameter there only because nothing branches back to it.
+        if !preds[entry].is_empty() {
+            self.err(format!(
+                "the entry block bb{entry} has {} predecessor(s); it must have none",
+                preds[entry].len()
+            ));
+        }
+
+        // Immediate dominators over the reachable subgraph (Cooper–Harvey–Kennedy), then the
+        // dominator tree's children in ascending block order so the walk is deterministic.
+        let mut rpo_num = vec![usize::MAX; n];
+        for (i, &b) in post.iter().rev().enumerate() {
+            rpo_num[b as usize] = i;
+        }
+        let mut idom = vec![NO_IDOM; n];
+        idom[entry] = entry as u32;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in post.iter().rev() {
+                if b as usize == entry {
+                    continue;
+                }
+                let mut new_idom = NO_IDOM;
+                for &p in &preds[b as usize] {
+                    if rpo_num[p as usize] == usize::MAX || idom[p as usize] == NO_IDOM {
+                        continue;
+                    }
+                    new_idom = if new_idom == NO_IDOM {
+                        p
+                    } else {
+                        intersect(p, new_idom, &idom, &rpo_num)
+                    };
+                }
+                if new_idom != NO_IDOM && idom[b as usize] != new_idom {
+                    idom[b as usize] = new_idom;
+                    changed = true;
+                }
+            }
+        }
+        let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for b in 0..n as u32 {
+            let id = idom[b as usize];
+            if id != NO_IDOM && id != b {
+                children[id as usize].push(b);
+            }
+        }
+
+        // Preorder walk with an explicit stack (a recursive one would be as deep as the block chain
+        // of a long function). `undo` records what this subtree added to `live` so exiting a node
+        // restores exactly the state its siblings must see.
+        enum Step {
+            Enter(u32),
+            Exit(usize),
+        }
+        let mut undo: Vec<u32> = Vec::new();
+        let mut work = vec![Step::Enter(entry as u32)];
+        self.dom_check = true;
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Exit(mark) => {
+                    while undo.len() > mark {
+                        let v = undo.pop().expect("undo mark is a prefix");
+                        self.live.remove(&v);
+                    }
+                }
+                Step::Enter(b) => {
+                    let blk = &f.blocks[b as usize];
+                    work.push(Step::Exit(undo.len()));
+                    for p in &blk.params {
+                        if self.live.insert(p.0) {
+                            undo.push(p.0);
+                        }
+                    }
+                    for inst in &blk.insts {
+                        // Check before defining, so a use of the instruction's own result — or of
+                        // anything later in this block — is reported.
+                        self.check_op(&inst.op, inst.result);
+                        if let Some(r) = inst.result {
+                            if self.live.insert(r.0) {
+                                undo.push(r.0);
+                            }
+                        }
+                    }
+                    self.check_term(&blk.term, nblocks);
+                    for &c in children[b as usize].iter().rev() {
+                        work.push(Step::Enter(c));
+                    }
+                }
+            }
+        }
+        self.dom_check = false;
+        visited
+    }
+
+    /// Record a definition, rejecting a second definition of the same value and one that lies past
+    /// the end of the value arena.
+    fn define(&mut self, v: ValueId) {
+        if self.ty(v).is_none() {
+            self.err(format!(
+                "{v:?} is defined but lies outside the function's value arena"
+            ));
+        }
+        if !self.defined.insert(v.0) {
+            self.err(format!("value {v:?} is defined more than once"));
+        }
+    }
+
     fn ty(&self, v: ValueId) -> Option<&MirType> {
         self.f.value_types.get(v.0 as usize)
     }
 
     fn use_val(&mut self, v: ValueId) -> bool {
+        if self.ty(v).is_none() {
+            self.err(format!(
+                "use of {v:?}, which lies outside the function's value arena"
+            ));
+            return false;
+        }
         if !self.defined.contains(&v.0) {
             self.err(format!("use of undefined value {v:?}"));
-            false
-        } else {
-            true
+            return false;
         }
+        // The value exists and is typed, so the remaining checks are still worth running; only its
+        // position is wrong.
+        if self.dom_check && !self.live.contains(&v.0) {
+            self.err(format!("use of {v:?} is not dominated by its definition"));
+        }
+        true
     }
 
     fn expect_ty(&mut self, v: ValueId, want: &MirType, ctx: &str) {
@@ -587,6 +808,145 @@ mod tests {
             errs.iter().any(|e| e.contains("out of range")),
             "{errs:?}"
         );
+    }
+
+    // ---- SSA structure: single definition, dominance, entry-block invariants ----
+
+    /// A use whose definition lives in a sibling block is *defined somewhere*, so the flat-set check
+    /// accepted it. The two backends then disagree: the interpreter reads its pre-initialized
+    /// `Value::Unit` slot as 0, Cranelift aborts with "MIR value used before definition".
+    #[test]
+    fn detects_use_not_dominated_by_its_definition() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::I32);
+        let c = b.add_param(MirType::I1);
+        let t = b.new_block();
+        let e = b.new_block();
+        b.cond_br(c, t, vec![], e, vec![]);
+        b.switch_to(t);
+        let x = b.build(MirType::I32, Op::ConstInt(7, MirType::I32));
+        b.ret(Some(x));
+        b.switch_to(e);
+        // `x` is defined in `t`, which does not dominate `e`.
+        let y = b.build(MirType::I32, Op::Bin(BinOp::Add, x, x));
+        b.ret(Some(y));
+        let errs = verify_function(&b.finish());
+        assert!(errs.iter().any(|e| e.contains("not dominated")), "{errs:?}");
+    }
+
+    /// Within a block the definition must precede the use, not merely appear in the same block.
+    #[test]
+    fn detects_use_before_definition_in_the_same_block() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::I32);
+        let x = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        let y = b.build(MirType::I32, Op::Bin(BinOp::Add, x, x));
+        b.ret(Some(y));
+        let mut f = b.finish();
+        f.blocks[0].insts.swap(0, 1); // the add now reads `x` before the const defines it
+        let errs = verify_function(&f);
+        assert!(errs.iter().any(|e| e.contains("not dominated")), "{errs:?}");
+    }
+
+    /// A natural loop (a back edge into a block with a parameter) must still verify — the dominance
+    /// rule must not reject legitimate loop-carried values.
+    #[test]
+    fn loop_with_back_edge_still_verifies() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::I32);
+        let n = b.add_param(MirType::I32);
+        let head = b.new_block();
+        let body = b.new_block();
+        let done = b.new_block();
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        b.br(head, vec![zero]);
+        let iv = b.block_param(head, MirType::I32);
+        b.switch_to(head);
+        let cmp = b.build(MirType::I1, Op::Cmp(crate::CmpOp::Slt, iv, n));
+        b.cond_br(cmp, body, vec![], done, vec![]);
+        b.switch_to(body);
+        let next = b.build(MirType::I32, Op::Bin(BinOp::Add, iv, one));
+        b.br(head, vec![next]);
+        b.switch_to(done);
+        b.ret(Some(iv));
+        let errs = verify_function(&b.finish());
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    /// Dominance is vacuous for a block the entry cannot reach: nothing lowers it (Cranelift's RPO
+    /// skips it, the interpreter never enters it), so it must not be reported.
+    #[test]
+    fn unreachable_block_is_not_dominance_checked() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::I32);
+        let dead = b.new_block();
+        let x = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        b.ret(Some(x));
+        b.switch_to(dead);
+        let y = b.build(MirType::I32, Op::Bin(BinOp::Add, x, x));
+        b.ret(Some(y));
+        let errs = verify_function(&b.finish());
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn detects_value_defined_more_than_once() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::I32);
+        let a = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        let _c = b.build(MirType::I32, Op::ConstInt(2, MirType::I32));
+        b.ret(Some(a));
+        let mut f = b.finish();
+        f.blocks[0].insts[1].result = Some(a); // two instructions now define `a`
+        let errs = verify_function(&f);
+        assert!(
+            errs.iter().any(|e| e.contains("defined more than once")),
+            "{errs:?}"
+        );
+    }
+
+    /// `Function::value_type` and the printer index `value_types` directly, so a value id past the
+    /// end of the arena is a latent panic; `ty()` returned `None` and every type check passed.
+    #[test]
+    fn detects_definition_past_the_end_of_the_value_arena() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::I32);
+        let _dead = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        let y = b.build(MirType::I32, Op::ConstInt(2, MirType::I32));
+        b.ret(Some(y));
+        let mut f = b.finish();
+        f.blocks[0].insts[0].result = Some(ValueId(999));
+        let errs = verify_function(&f);
+        assert!(errs.iter().any(|e| e.contains("arena")), "{errs:?}");
+    }
+
+    /// Both backends bind the entry block's parameters by zipping against `Function::params` and
+    /// both zips truncate silently, so the two lists must agree.
+    #[test]
+    fn detects_entry_block_params_out_of_sync_with_function_params() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::I32);
+        let x = b.add_param(MirType::I32);
+        let _y = b.add_param(MirType::I32);
+        b.ret(Some(x));
+        let mut f = b.finish();
+        f.params.pop(); // the entry block still has two parameters
+        let errs = verify_function(&f);
+        assert!(errs.iter().any(|e| e.contains("entry block")), "{errs:?}");
+    }
+
+    #[test]
+    fn detects_branch_back_to_the_entry_block() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::Void);
+        let entry = b.entry();
+        let body = b.new_block();
+        b.br(body, vec![]);
+        b.switch_to(body);
+        b.br(entry, vec![]);
+        let errs = verify_function(&b.finish());
+        assert!(errs.iter().any(|e| e.contains("entry block")), "{errs:?}");
     }
 
     // ---- cross-function call checks (`verify_program`) ----
