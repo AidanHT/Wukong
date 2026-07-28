@@ -504,6 +504,40 @@ mod tests {
         }
     }
 
+    /// (g) A NaN logit must not split the twins. `_mm256_max_ps(a, b)` yields `b` for an unordered
+    /// pair, so a NaN lane ERASES that lane's running maximum, while the scalar twin's `f32::max`
+    /// ignores NaN and keeps it — the two then stabilize with different `m`, and since `m` scales the
+    /// whole row through `exp(x − m)/Z` the entire gradient row diverges on AVX2 hosts. The row here
+    /// puts the maximum in lane 0 and sweeps the NaN across every column.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn nan_logit_keeps_scalar_and_avx2_in_agreement() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &cols in &[9usize, 16, 17, 33, 64] {
+            for nan_at in 0..cols {
+                let mut x = fill(cols);
+                x[0] = 100.0; // the row max, in lane 0 — a NaN must not erase it
+                x[nan_at] = f32::NAN;
+                let mut a = vec![0.0f32; cols];
+                let mut b = vec![0.0f32; cols];
+                unsafe {
+                    xent_bwd_row_scalar(x.as_ptr(), 0, a.as_mut_ptr(), cols);
+                    xent_bwd_row_avx2(x.as_ptr(), 0, b.as_mut_ptr(), cols);
+                }
+                for i in 0..cols {
+                    assert!(
+                        (a[i].is_nan() && b[i].is_nan()) || a[i].to_bits() == b[i].to_bits(),
+                        "scalar != avx2 cols={cols} nan_at={nan_at} i={i}: {} vs {}",
+                        a[i],
+                        b[i]
+                    );
+                }
+            }
+        }
+    }
+
     /// Edge: zero/negative rows or cols are a no-op (don't write, don't panic).
     #[test]
     fn degenerate_shapes_are_noops() {
