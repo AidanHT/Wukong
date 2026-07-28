@@ -129,4 +129,13 @@ mod tests {
         esc("a\"b\\c\n", &mut s);
         assert_eq!(s, "\"a\\\"b\\\\c\\n\"");
     }
+
+    #[test]
+    fn escapes_other_control_characters_as_u_escapes() {
+        // A control char with no short escape must still come out as `\u00xx`; emitted raw it
+        // would make the line unparseable JSON for the editors/CI that consume this format.
+        let mut s = String::new();
+        esc("a\u{1}b\u{1f}", &mut s);
+        assert_eq!(s, "\"a\\u0001b\\u001f\"");
+    }
 }
