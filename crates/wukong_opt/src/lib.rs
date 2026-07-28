@@ -771,6 +771,27 @@ mod tests {
     }
 
     #[test]
+    fn inlining_rebases_repeated_and_multiple_kernel_owning_callees() {
+        // The kernel-table rebase has to accumulate: `negv` is spliced twice and `scalev` once, on
+        // top of a caller that already owns a recipe, so the three splices must land at successive
+        // offsets. Pinning it separately from the single-splice case because getting the base right
+        // once (and then re-using it, or resetting it) would still pass that test.
+        let src = "fn negv(mut d: [f32; 96]) { for i in 0..96 { d[i] = -d[i]; } } \
+             fn scalev(mut d: [f32; 96]) { for i in 0..96 { d[i] = d[i] * 3.0; } } \
+             fn main() -> i32 { let mut a: [f32; 96] = [0.0; 96]; \
+               let mut b: [f32; 96] = [0.0; 96]; let mut c: [f32; 96] = [0.0; 96]; \
+               for i in 0..96 { a[i] = (i as f32) - 50.0; } \
+               for i in 0..96 { b[i] = (i as f32) - 50.0; } \
+               for i in 0..96 { c[i] = (i as f32) - 50.0; } \
+               for i in 0..96 { c[i] = sqrt(c[i] * c[i]); } \
+               negv(a); negv(b); scalev(b); \
+               return (a[60] as i32) * 10000 + (b[60] as i32) * 100 + (c[47] as i32); }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), -102997, "level {lvl}");
+        }
+    }
+
+    #[test]
     fn inlining_handles_callee_control_flow() {
         // A leaf with branches (max) inlines correctly; results are preserved at every level.
         let src = "fn max(a: i32, b: i32) -> i32 { if a > b { return a; } return b; } \
