@@ -1,0 +1,23 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+module tests.run.mixed_sign_compare_highbit
+
+// The mixed-sign compare guard with the SIGN BIT SET, which is the only place the predicate's
+// signedness is observable. `mixed_sign_compare_ok.wk` uses `u = 5`, where `cmp.slt` and `cmp.ult`
+// give the same answer, so it passed over a live miscompile: the predicate was read off the LEFT
+// operand alone, so `5 < u` with `u: u32 = 3_000_000_000` emitted `cmp.slt 5, -1294967296` and
+// answered FALSE. Both backends ran the same wrong MIR, so only an explicit expected value catches
+// it. (A *suffixed* mixed-sign compare is rejected by sema; an unsuffixed literal adapts and is the
+// form that reaches lowering.)
+fn main() -> i32 {
+    let u: u32 = 3000000000;
+    if u > 5 { print(1); } else { print(0); }          // unsigned lhs: 3000000000 > 5  -> 1
+    if 5 < u { print(1); } else { print(0); }          // unsigned rhs: 5 < 3000000000  -> 1
+    if u > 2999999999 { print(1); } else { print(0); } // 3000000000 > 2999999999       -> 1
+    if 5 > u { print(1); } else { print(0); }          // 5 > 3000000000                -> 0
+    return 0;
+}

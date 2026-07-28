@@ -1,0 +1,42 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+module tests.run.for_range_unsigned_bound
+
+// A range `for` whose END bound is unsigned with the high bit set. The counter's signedness was
+// taken from the START bound whenever both bounds had the same MIR width, so the literal-`0` start
+// (i32) made `for i in 0..big` with `big: u32 = 3_000_000_000` compare `cmp.slt i, -1294967296`
+// and the loop ran ZERO iterations — a silent wrong answer both backends agreed on. The `u64` case
+// was accidentally correct (its end is strictly wider, so the counter already took the end's
+// signedness) and is pinned here so the fix does not regress it.
+fn main() -> i32 {
+    let small: u32 = 5;
+    let mut a = 0;
+    for i in 0..small {
+        a = a + 1;
+    }
+    print(a); // 5 iterations
+
+    let big: u32 = 3000000000;
+    let mut b = 0;
+    for i in 0..big {
+        b = b + 1;
+        if b > 2 {
+            break;
+        }
+    }
+    print(b); // the loop must run: 3 iterations before the break
+
+    let big64: u64 = 18000000000000000000;
+    let mut d = 0;
+    for i in 0..big64 {
+        d = d + 1;
+        if d > 2 {
+            break;
+        }
+    }
+    print(d); // 3
+    return 0;
+}
