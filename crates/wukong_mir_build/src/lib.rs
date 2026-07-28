@@ -15040,7 +15040,28 @@ impl FnLowerer<'_> {
         let aggregate = matches!(elem, MirType::Array(..));
         match &init.kind {
             ExprKind::ArrayLit(elems) => {
-                for (i, el) in elems.iter().enumerate() {
+                // `n` is the destination's extent and is the contract of this function, but the
+                // literal's own length was never compared against it. An over-long literal stored
+                // PAST the end of the buffer it was handed — `s.a = [7, 8, 9, 10, 11, 12]` into an
+                // `[i32; 2]` field emitted six stores into an 8-byte alloca (`error: store out of
+                // bounds` on interp, **segfault** on native) — and an under-long one left the tail
+                // unwritten, which reads back as 0 under the interpreter's slot memory and as stack
+                // garbage that differs at -O0 and -O2 on native. sema's `let`-annotation and
+                // struct-literal-field length checks do not cover an assignment RHS or an enum
+                // tuple payload, both of which reach here. Clamp the stores to `n` so no store can
+                // leave the buffer, and report the mismatch with the wording the struct-field check
+                // already uses.
+                if elems.len() as u32 != n {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "array has length {n} but its initializer has {} element(s)",
+                            elems.len()
+                        ))
+                        .with_code("E0401")
+                        .primary(init.span, "initializer length does not match the destination"),
+                    );
+                }
+                for (i, el) in elems.iter().take(n as usize).enumerate() {
                     if aggregate {
                         let ep = self.gep_elem(base, elem, i as i128);
                         let ety = self.expr_ty(el);
