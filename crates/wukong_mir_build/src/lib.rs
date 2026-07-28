@@ -4434,11 +4434,24 @@ impl FnLowerer<'_> {
                 _ => e,
             }
         }
+        // The label array must be `i32` — `wukong_xent_{fwd,bwd}_f32` reads `target` as `*const i32`,
+        // so an `[i64; R]` label array (the PyTorch convention, and what `read_i64` produces) was read
+        // with a halved stride: native printed `3440 626` for tests/run/xent.wk with i64 labels where
+        // interp printed the correct `3440 2626`. `match_id_gather` (the embedding's label read) has
+        // carried this exact guard all along; this is its missing twin.
+        let labels = |e: &Expr| -> Option<Symbol> {
+            let inner = peel(e);
+            let ids = index_by_var(inner, r)?;
+            if scalar_of(inner, self.sema) != Some(wukong_types::Scalar::I32) {
+                return None;
+            }
+            Some(ids)
+        };
         if self.is_mul_of(lhs, r, cols) {
-            return index_by_var(peel(rhs), r);
+            return labels(rhs);
         }
         if self.is_mul_of(rhs, r, cols) {
-            return index_by_var(peel(lhs), r);
+            return labels(lhs);
         }
         None
     }
@@ -5093,6 +5106,14 @@ impl FnLowerer<'_> {
             _ => return None,
         };
         let x = self.index_off(lhs, j, batch)?;
+        // Same f32 data gate the free twin [`match_colarg_inner`] already carries: only the *output*
+        // index type was checked, so `wukong_rowarg{max,min}_i32` — which reads the data as f32 — was
+        // dispatched over `[i32]`/`[f64]`/`[bf16]` rows. An i32 per-row argmax printed native `0 2`
+        // against interp's correct `1 2`, and a `[bf16]` row additionally made the kernel read
+        // `rows*cols*4` bytes out of a `rows*cols*2`-byte buffer.
+        if scalar_of(lhs, self.sema) != Some(wukong_types::Scalar::F32) {
+            return None;
+        }
         if single_path(rhs) != Some(bv) {
             return None;
         }
@@ -5353,9 +5374,9 @@ impl FnLowerer<'_> {
         if single_path(target) != Some(acc) {
             return None;
         }
-        match op {
+        let data: &Expr = match op {
             // `p *= x[r*C+i]`
-            ast::AssignOp::Mul => self.index_off(value, i, batch),
+            ast::AssignOp::Mul => value,
             // `p = p * x[r*C+i]` (either operand order)
             ast::AssignOp::Assign => {
                 let ExprKind::Binary {
@@ -5367,15 +5388,21 @@ impl FnLowerer<'_> {
                     return None;
                 };
                 if single_path(lhs) == Some(acc) {
-                    self.index_off(rhs, i, batch)
+                    rhs
                 } else if single_path(rhs) == Some(acc) {
-                    self.index_off(lhs, i, batch)
+                    lhs
                 } else {
-                    None
+                    return None;
                 }
             }
-            _ => None,
+            _ => return None,
+        };
+        // See [`Self::match_acc_add`]: only the *store* was type-checked, so a half/integer data array
+        // widened into an f32 accumulator still dispatched the f32 kernel.
+        if self.expr_mir(data) != MirType::F32 {
+            return None;
         }
+        self.index_off(data, i, batch)
     }
 
     /// The prefix-sum accumulate `acc = acc + x[r*C+i]` (or the compound `acc += x[r*C+i]`), target
@@ -5393,9 +5420,9 @@ impl FnLowerer<'_> {
         if single_path(target) != Some(acc) {
             return None;
         }
-        match op {
+        let data: &Expr = match op {
             // `acc += x[r*C+i]`
-            ast::AssignOp::Add => self.index_off(value, i, batch),
+            ast::AssignOp::Add => value,
             // `acc = acc + x[r*C+i]` (either operand order)
             ast::AssignOp::Assign => {
                 let ExprKind::Binary {
@@ -5407,15 +5434,24 @@ impl FnLowerer<'_> {
                     return None;
                 };
                 if single_path(lhs) == Some(acc) {
-                    self.index_off(rhs, i, batch)
+                    rhs
                 } else if single_path(rhs) == Some(acc) {
-                    self.index_off(lhs, i, batch)
+                    lhs
                 } else {
-                    None
+                    return None;
                 }
             }
-            _ => None,
+            _ => return None,
+        };
+        // `wukong_cumsum_f32` reads the data array as f32. Its caller only checked the *store* element
+        // type, and sema implicitly widens `bf16`/`f16`/`i32` into an f32 accumulator, so a bf16 scan
+        // dispatched anyway: native printed `1 2 3 4 4 4 4 4` against interp's correct `1 2 3 4 5 6 7 8`
+        // while reading 32 bytes out of a 16-byte buffer. The cast spelling `acc + (x[i] as f32)` still
+        // routes to the half kernel via `try_emit_lowp_reduction`, which is where it belongs.
+        if self.expr_mir(data) != MirType::F32 {
+            return None;
         }
+        self.index_off(data, i, batch)
     }
 
     /// Recognize a batched per-row **first-order linear recurrence / selective scan** (SSM/Mamba/EMA):
@@ -5551,10 +5587,18 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
+        // The per-step input read is f32 for the same reason the gate array is — see
+        // [`Self::match_gated_carry`].
         if let Some(a) = self.match_gated_carry(lhs, h, t, batch) {
+            if self.expr_mir(rhs) != MirType::F32 {
+                return None;
+            }
             let b = self.index_off(rhs, t, batch)?;
             Some((a, b))
         } else if let Some(a) = self.match_gated_carry(rhs, h, t, batch) {
+            if self.expr_mir(lhs) != MirType::F32 {
+                return None;
+            }
             let b = self.index_off(lhs, t, batch)?;
             Some((a, b))
         } else {
@@ -5579,13 +5623,20 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if single_path(rhs) == Some(h) {
-            self.index_off(lhs, t, batch)
+        let data: &Expr = if single_path(rhs) == Some(h) {
+            lhs
         } else if single_path(lhs) == Some(h) {
-            self.index_off(rhs, t, batch)
+            rhs
         } else {
-            None
+            return None;
+        };
+        // The gate array is read as f32 by `wukong_lrscan_f32`; only the *store* was type-checked, so
+        // a half/integer gate array widened into the f32 carry still dispatched (see
+        // [`Self::match_acc_add`] for the measured cumsum form of the same defect).
+        if self.expr_mir(data) != MirType::F32 {
+            return None;
         }
+        self.index_off(data, t, batch)
     }
 
     /// Recognize a batched per-row **cumulative max / min** (running max/min scan):
@@ -8431,12 +8482,20 @@ impl FnLowerer<'_> {
         if s == k {
             return None;
         }
-        // `base[k]` with the index exactly the loop variable → the base array symbol.
+        // `base[k]` with the index exactly the loop variable → the base array symbol. The element must
+        // be f32: the only consumer is `wukong_sreduce_f32_parallel`, which reads both operands as f32,
+        // and sema implicitly widens a `bf16`/`f16`/`i32` element into the f32 accumulator — so the
+        // uncast `acc = acc + x[k]` over `[bf16; 64]` dispatched and native printed `-2147483648`
+        // (256 bytes read from a 128-byte array) against interp's correct `64`. The explicitly cast
+        // spelling `(x[k] as f32)` is routed to the half kernel by `try_emit_lowp_reduction` instead.
         let idx_base = |e: &Expr| -> Option<Symbol> {
             let ExprKind::Index { base, indices } = &e.kind else {
                 return None;
             };
             if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+                return None;
+            }
+            if self.expr_mir(e) != MirType::F32 {
                 return None;
             }
             single_path(base)
