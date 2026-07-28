@@ -272,6 +272,21 @@ impl<'a> Vjp<'a> {
                 let (x, y) = (args[0], args[1]);
                 let xn = self.remap_v(x);
                 let yn = self.remap_v(y);
+                // The **self**-dot `loss = sum(x[i]^2)` — the sum-of-squares loss / L2 regularizer,
+                // which lowers to `sreduce(x, x, n, RED_DOT)` with both operands the SAME buffer —
+                // is one op with a repeated operand, not two separate contributions: `dx = 2g*x`, a
+                // single velem scale. (`x`/`y` are canon-normalized above, so pointer identity is
+                // the right test.) Without this case the two-buffer path below calls `single(x)`
+                // twice and the second call always errors.
+                if x == y {
+                    if let Some(gx) = self.grad_target(x)? {
+                        self.single(x)?;
+                        let two = self.cf32(2.0);
+                        let g2 = self.fmul(g, two, &F32); // 2g
+                        self.velem_scale(gx, xn, g2, n);
+                    }
+                    return Ok(());
+                }
                 if let Some(gx) = self.grad_target(x)? {
                     self.single(x)?;
                     self.velem_scale(gx, yn, g, n);
@@ -301,7 +316,7 @@ impl<'a> Vjp<'a> {
             }
             other => {
                 return Err(format!(
-                    "autodiff: no VJP for sreduce op {other} (only SUM and SSD so far)"
+                    "autodiff: no VJP for sreduce op {other} (supported: SUM, DOT, SSD)"
                 ))
             }
         }
