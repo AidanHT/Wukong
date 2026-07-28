@@ -4173,6 +4173,86 @@ mod tests {
     }
 
     #[test]
+    fn slice_and_aggregate_do_not_satisfy_a_tensor_param() {
+        // A `[]T` slice is a `(ptr, len)` fat pointer, not a tensor base pointer; the clash had no
+        // arm in `unify` and fell to the lenient `_`, so the callee indexed the slice HEADER.
+        let sl = "fn get1(a: Tensor[f32, 4], i: i32) -> f32 { return a[i]; } \
+                  fn f(s: []f32) -> f32 { return get1(s, 2); }";
+        assert!(
+            errors(sl).contains(&"E0501"),
+            "a slice must not satisfy a tensor parameter: {:?}",
+            errors(sl)
+        );
+        let st = "struct S { a: f32 } \
+                  fn get1(a: Tensor[f32, 4], i: i32) -> f32 { return a[i]; } \
+                  fn f(s: S) -> f32 { return get1(s, 2); }";
+        assert!(
+            errors(st).contains(&"E0501"),
+            "a struct must not satisfy a tensor parameter: {:?}",
+            errors(st)
+        );
+        // A bare generic TYPE variable is also spelled `Ty::Named` and must stay lenient.
+        let gen = "fn take<T>(x: T) {} fn f(a: Tensor[f32, 4]) { take(a); }";
+        assert!(errors(gen).is_empty(), "unexpected: {:?}", errors(gen));
+        // Array → tensor decay is the documented, intentionally lenient path.
+        let arr = "fn get1(a: Tensor[f32, 4], i: i32) -> f32 { return a[i]; } \
+                   fn f() -> f32 { let b: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; return get1(b, 2); }";
+        assert!(errors(arr).is_empty(), "unexpected: {:?}", errors(arr));
+    }
+
+    #[test]
+    fn generic_dim_does_not_satisfy_a_const_dim_param() {
+        // A caller's universally-quantified `N` is not a proof that the buffer is 64 long. Rigid mode
+        // already rejected this; the call-site (inference) path silently accepted it.
+        let bad = "fn takes64(a: Tensor[f32, 64]) -> f32 { return a[63]; } \
+                   fn fwd<N>(a: Tensor[f32, N]) -> f32 { return takes64(a); }";
+        assert!(
+            errors(bad).contains(&"E0502"),
+            "expected a dimension mismatch: {:?}",
+            errors(bad)
+        );
+        // `?` stays the documented escape hatch, and Var→Var forwarding is unaffected.
+        let dyn_ok = "fn takes_any(a: Tensor[f32, ?]) -> f32 { return a[0]; } \
+                      fn fwd<N>(a: Tensor[f32, N]) -> f32 { return takes_any(a); }";
+        assert!(errors(dyn_ok).is_empty(), "unexpected: {:?}", errors(dyn_ok));
+        let var_ok = "fn inner<P>(a: Tensor[f32, P]) -> f32 { return a[0]; } \
+                      fn fwd<N>(a: Tensor[f32, N]) -> f32 { return inner(a); }";
+        assert!(errors(var_ok).is_empty(), "unexpected: {:?}", errors(var_ok));
+    }
+
+    #[test]
+    fn tensor_layout_must_match_at_a_call() {
+        // Lowering DECLINES a non-contiguous tensor (C0001), but `unify` dropped `layout` with `..`,
+        // so routing a `.col_major` value through a contiguous-typed callee silently reinterpreted it
+        // row-major.
+        let bad = "fn getrm(a: Tensor[f32, 2, 3], i: i32, j: i32) -> f32 { return a[i, j]; } \
+                   fn pass(a: Tensor[f32, 2, 3, .col_major], i: i32, j: i32) -> f32 { \
+                   return getrm(a, i, j); }";
+        assert!(
+            errors(bad).contains(&"E0502"),
+            "expected a layout mismatch: {:?}",
+            errors(bad)
+        );
+        // A fixed-size array is row-major, so it cannot decay to a column-major tensor.
+        let decay = "fn getcm(a: Tensor[f32, 2, 3, .col_major]) -> f32 { return a[0, 0]; } \
+                     fn f() -> f32 { let b: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]; \
+                     return getcm(b); }";
+        assert!(
+            errors(decay).contains(&"E0502"),
+            "expected a layout mismatch on array decay: {:?}",
+            errors(decay)
+        );
+        // Matching layouts (including the default contiguous one) still unify.
+        let ok = "fn getcm(a: Tensor[f32, 2, 3, .col_major], i: i32) -> f32 { return a[i, 0]; } \
+                  fn pass(a: Tensor[f32, 2, 3, .col_major], i: i32) -> f32 { return getcm(a, i); }";
+        assert!(
+            !errors(ok).contains(&"E0502"),
+            "identical layouts must unify: {:?}",
+            errors(ok)
+        );
+    }
+
+    #[test]
     fn array_length_above_u32_max_is_rejected() {
         // mir_build's mirrored `const_usize_expr` is u32 end to end and narrows with an unchecked
         // `as u32`, so a longer length wrapped to a small slot while sema bounds-checked the full
