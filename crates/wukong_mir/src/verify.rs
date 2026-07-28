@@ -810,6 +810,72 @@ mod tests {
         );
     }
 
+    // ---- rules the verifier already enforced but that nothing pinned ----
+
+    #[test]
+    fn detects_use_of_undefined_value() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::I32);
+        let x = b.add_param(MirType::I32);
+        // A value that lives in the arena but that no block ever defines.
+        let ghost = b.new_value(MirType::I32);
+        b.ret(Some(x));
+        let mut f = b.finish();
+        f.blocks[0].term = Terminator::Ret(Some(ghost));
+        let errs = verify_function(&f);
+        assert!(
+            errs.iter().any(|e| e.contains("undefined value")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn detects_branch_to_nonexistent_block() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::Void);
+        b.br(crate::BlockId(99), vec![]);
+        let errs = verify_function(&b.finish());
+        assert!(errs.iter().any(|e| e.contains("nonexistent")), "{errs:?}");
+    }
+
+    #[test]
+    fn detects_block_with_inconsistent_id() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::Void);
+        let t = b.new_block();
+        b.br(t, vec![]);
+        b.switch_to(t);
+        b.ret(None);
+        let mut f = b.finish();
+        f.blocks[1].id = crate::BlockId(7);
+        let errs = verify_function(&f);
+        assert!(
+            errs.iter().any(|e| e.contains("inconsistent id")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn detects_store_with_a_result() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::Void);
+        let slot = b.alloca(MirType::I32);
+        let v = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        b.push(
+            Some(MirType::I32),
+            Op::Store {
+                ptr: slot,
+                value: v,
+            },
+        );
+        b.ret(None);
+        let errs = verify_function(&b.finish());
+        assert!(
+            errs.iter().any(|e| e.contains("Store must not produce")),
+            "{errs:?}"
+        );
+    }
+
     // ---- SSA structure: single definition, dominance, entry-block invariants ----
 
     /// A use whose definition lives in a sibling block is *defined somewhere*, so the flat-set check
