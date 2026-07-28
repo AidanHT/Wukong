@@ -2942,21 +2942,103 @@ mod tests {
         }
     }
 
+    /// One throughput row: `(op, name, scalar libm twin, twin needs a strictly positive domain)`. The
+    /// transcendentals the dispatch was written for, plus a few references — all true libm calls C must
+    /// keep scalar (softsign omitted: it's abs+div, which C *can* autovectorize).
+    ///
+    /// The domain flag picks the buffer **both** arms read (see [`throughput_inputs`]). It exists
+    /// because the log10 row used to feed the kernel the raw, half-negative `xs` while its twin read
+    /// `x + 1.1`; the flag makes a log-family row declare its domain instead of shifting one arm only.
+    /// Shared with the gate below so the table cannot drift back apart.
+    const THROUGHPUT_CASES: &[(i64, &str, fn(f32) -> f32, bool)] = &[
+        (VM_EXP, "exp", |x| x.exp(), false),
+        (
+            VM_GELU,
+            "gelu",
+            |x| 0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh()),
+            false,
+        ),
+        (VM_TAN, "tan", |x| x.tan(), false),
+        (VM_ASIN, "asin", |x| x.asin(), false),
+        (VM_ACOS, "acos", |x| x.acos(), false),
+        (VM_EXP10, "exp10", |x| 10.0f32.powf(x), false),
+        (VM_LOG10, "log10", |x| x.log10(), true),
+        (
+            VM_LOGSIGMOID,
+            "logsigmoid",
+            |x| (1.0 / (1.0 + (-x).exp())).ln(),
+            false,
+        ),
+    ];
+
+    /// The two input buffers [`THROUGHPUT_CASES`] selects between: `xs` spans [-0.9, 0.9] for the
+    /// all-real ops, `xs_pos` is the same values shifted into [0.2, 2.0] for the log-domain ones. A
+    /// case reads one or the other with **both** arms.
+    fn throughput_inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
+        let xs: Vec<f32> = (0..n).map(|i| ((i % 1801) as f32 / 1000.0) - 0.9).collect();
+        let xs_pos: Vec<f32> = xs.iter().map(|&x| x + 1.1).collect();
+        (xs, xs_pos)
+    }
+
+    /// The gate for the withdrawn log10 row: a throughput case's kernel arm and its scalar libm twin
+    /// must compute the **same function over the same inputs**, or the ratio it prints measures nothing.
+    ///
+    /// The kernel gives no signal when it is out of domain, which is why this has to be an *agreement*
+    /// check rather than a NaN/finite check: `log10_1`/`log10_8` are branch-free exponent/mantissa
+    /// polys, so a negative input returns a finite wrong number, not libm's NaN. Measured on the raw
+    /// `xs` the bench used to pass it: 33100 of 65536 values are negative, and log10(-0.9) = -77.109436,
+    /// log10(-0.5) = +76.76265, log10(-0.001) = +74.063675.
+    ///
+    /// The tolerance is deliberately loose — this pins "same function, same domain", not accuracy
+    /// (`vmath_matches_libm` is the accuracy gate). A domain mismatch misses by ~10^2, not ~10^-5.
+    #[test]
+    fn vmath_throughput_arms_compute_the_same_function() {
+        let n = 1801; // one full period of the input generator, and not a multiple of 8
+        let (xs, xs_pos) = throughput_inputs(n);
+        let mut out = vec![0.0f32; n];
+        for &(op, name, scalar, positive) in THROUGHPUT_CASES {
+            let src = if positive { &xs_pos } else { &xs };
+            // SAFETY: `src` and `out` are each exactly n f32 long — the kernel's operand contract.
+            unsafe { wukong_vmath_f32(src.as_ptr(), out.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                let (x, want) = (src[i], scalar(src[i]));
+                assert!(
+                    want.is_finite(),
+                    "{name}: the libm twin is out of domain at x = {x} — the case's domain flag is wrong"
+                );
+                assert!(
+                    (out[i] - want).abs() <= 1e-3 + 1e-3 * want.abs(),
+                    "{name} at x = {x}: kernel {} vs libm twin {want} — the two arms are not \
+                     computing the same function, so the throughput ratio is meaningless",
+                    out[i]
+                );
+            }
+        }
+    }
+
     /// In-process throughput: the 256-bit AVX2 kernel vs a scalar `libm`-call loop computing the
     /// *same* function — exactly the code gcc/rustc emit for a `for i { out[i] = f(x[i]) }` loop, which
     /// **cannot vectorize a call** (no `libmvec` on this toolchain). So `scalar/kernel` is the real
     /// per-function speedup over scalar `libm`, measured locally (no cross-language build needed). The
     /// working set fits L2 so the comparison is compute-bound, not bandwidth-bound.
     /// Observed on a Meteor Lake laptop (ratios are clock-invariant): exp ~5.9×, gelu ~5.5×, tan ~3.6×,
-    /// asin ~5.4×, acos ~5.0×, exp10 ~13× (Rust's `powf` is a heavy general path), log10 ~4.1×,
-    /// logsigmoid ~4.6×.
+    /// asin ~5.4×, acos ~5.0×, exp10 ~13× (Rust's `powf` is a heavy general path), logsigmoid ~4.6×.
+    /// The log10 row's previously published ~4.1× is **withdrawn**: it was measured with the kernel arm
+    /// reading the raw (half-negative) `xs` while its libm twin read `x + 1.1`, so the two arms were
+    /// timing different functions over different domains — and the twin paid a per-element add the
+    /// kernel arm did not. Re-measure it with the harness below.
     /// Run: `cargo test -p wukong_runtime --release vmath_throughput -- --ignored --nocapture`.
     #[test]
     #[ignore = "throughput bench; run explicitly in --release"]
     fn vmath_throughput() {
         use std::time::Instant;
+        assert!(
+            !cfg!(debug_assertions),
+            "this is a throughput measurement, not a test — rebuild with --release \
+             (cargo test -p wukong_runtime --release vmath_throughput -- --ignored --nocapture)"
+        );
         let n = 1 << 16; // 64K f32 = 256 KB, fits L2 → compute-bound
-        let xs: Vec<f32> = (0..n).map(|i| ((i % 1801) as f32 / 1000.0) - 0.9).collect(); // [-0.9, 0.9]
+        let (xs, xs_pos) = throughput_inputs(n);
         let mut out = vec![0.0f32; n];
         let best = |iters: usize, mut f: Box<dyn FnMut()>| -> f64 {
             f(); // warmup
@@ -2968,27 +3050,12 @@ mod tests {
             }
             t
         };
-        // (op, name, scalar libm twin) — the new transcendentals plus a few references. All are true
-        // libm calls C must keep scalar (softsign omitted: it's abs+div, which C *can* autovectorize).
-        let cases: &[(i64, &str, fn(f32) -> f32)] = &[
-            (VM_EXP, "exp", |x| x.exp()),
-            (VM_GELU, "gelu", |x| {
-                0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh())
-            }),
-            (VM_TAN, "tan", |x| x.tan()),
-            (VM_ASIN, "asin", |x| x.asin()),
-            (VM_ACOS, "acos", |x| x.acos()),
-            (VM_EXP10, "exp10", |x| 10.0f32.powf(x)),
-            (VM_LOG10, "log10", |x| (x + 1.1).log10()), // shift into the positive domain
-            (VM_LOGSIGMOID, "logsigmoid", |x| {
-                (1.0 / (1.0 + (-x).exp())).ln()
-            }),
-        ];
         let iters = 200;
         eprintln!("vmath throughput over {n} elements (best of {iters}), kernel vs scalar libm:");
-        for &(op, name, scalar) in cases {
-            let xp = xs.as_ptr() as usize;
-            let op2 = xs.clone();
+        for &(op, name, scalar, positive) in THROUGHPUT_CASES {
+            let src = if positive { &xs_pos } else { &xs };
+            let xp = src.as_ptr() as usize;
+            let op2 = src.to_vec();
             let outp = out.as_mut_ptr() as usize;
             let t_kernel = best(
                 iters,
@@ -3027,6 +3094,11 @@ mod tests {
     #[ignore = "throughput bench; run explicitly in --release"]
     fn vmath2_throughput() {
         use std::time::Instant;
+        assert!(
+            !cfg!(debug_assertions),
+            "this is a throughput measurement, not a test — rebuild with --release \
+             (cargo test -p wukong_runtime --release vmath2_throughput -- --ignored --nocapture)"
+        );
         let n = 1 << 16;
         let xs: Vec<f32> = (0..n).map(|i| 0.5 + (i % 397) as f32 * 0.01).collect();
         let ys: Vec<f32> = (0..n).map(|i| 0.5 + (i % 311) as f32 * 0.01).collect();
