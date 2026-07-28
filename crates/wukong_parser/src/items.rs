@@ -507,6 +507,21 @@ mod tests {
         );
         // Still in sync: both items survived, so the parser never fell back to module scope.
         assert_eq!(module.items.len(), 2, "lost an item: {diags:?}");
+
+        // A base-less `..` and a trailing `..` cost one diagnostic too — the recovery must not ask
+        // for an expression that is not there and eat the `}` closing the literal.
+        for body in ["P { .. }", "P { x: 1, .. }", "P { ..b }"] {
+            let src =
+                format!("struct P {{ x: i32, y: i32 }}\nfn main() -> i32 {{ let c: P = {body}; return c.x; }}\n");
+            let mut i = Interner::new();
+            let (m, d) = parse_module(&src, SourceId(0), &mut i);
+            assert_eq!(
+                d.iter().filter(|x| x.is_error()).count(),
+                1,
+                "`{body}` should cost one diagnostic, got {d:?}"
+            );
+            assert_eq!(m.items.len(), 2, "`{body}` lost an item");
+        }
     }
 
     /// An attribute argument with a missing value must not swallow the `)` that closes the argument

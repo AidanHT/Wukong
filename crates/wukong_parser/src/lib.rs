@@ -1031,7 +1031,11 @@ impl<'a> Parser<'a> {
                          supported — list every field explicitly",
                     );
                     p.bump();
-                    let _ = p.parse_expr();
+                    // `P { .. }` has no base to consume; asking for one would report a second
+                    // error and eat the `}` that closes the literal.
+                    if !p.at(T::RBrace) && !p.at(T::Eof) {
+                        let _ = p.parse_expr();
+                    }
                     p.eat(T::Comma);
                     break;
                 }
