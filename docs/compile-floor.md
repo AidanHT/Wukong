@@ -1,11 +1,11 @@
 # The compile-time floor — code → object at its principled minimum
 
-> **STATUS: DRAFT.** This document defines the *method* and the *floor model*. The measured tables
-> are placeholders to be filled by an authoritative central run — no absolute compile-time numbers
-> are claimed here (the recording machine was on battery when this was written, so its clock is not
-> reportable; only stage **shares/ratios**, which are clock-invariant, are noted, and only where
-> explicitly labeled *provisional*). Fill the bracketed cells from a release-binary run of the two
-> instrumentation modes below and promote to non-draft.
+> **STATUS: measured (2026-07-11 central run).** The method and floor model below are now populated
+> by an authoritative AC, release, warm best-of-N run over the 296-file corpus: §4–§6 carry real
+> numbers (168.1 ms front→object, the per-stage split, the compile-vs and spawn tables). Absolute
+> compile-time numbers are single-machine and clock-sensitive; the clock-invariant stage
+> **shares/ratios** are the portable figures. The earlier battery-state provisional shares are
+> retained (clearly labeled) only where they corroborate the central run.
 
 ## 1. The question
 
@@ -200,9 +200,12 @@ apples-to-apples with the other CLIs):
 **Composition disclosure (both directions).** Per §6, wukongc's CLI wall is ~90% spawn tax
 (process creation + driver init + I/O ≈ 7–8 ms); its in-process compile core is 0.5–1.0 ms on
 these kernels. So the CLI-to-CLI ratio (~7.4–11.7×, the honest user-visible number) UNDERSTATES
-the pipeline-work difference: in-process wukongc vs the gcc/rustc CLIs would read ~60–130×, but
-that comparison is asymmetric (their in-process cores are not separable) and is disclosed, not
-claimed. The historical "~9–12×" band (session X1) is refined to **7.4–11.7×** on this
+the pipeline-work difference: in-process wukongc vs the gcc/rustc CLIs would read ~60–130× on these
+object-compiles, but that comparison is asymmetric (their in-process cores are not separable) and is
+disclosed, not claimed. (The larger ~100–680× / geomean ~306× figure quoted in `BENCHMARKS.md` is a
+*different* basis — in-process JIT-to-running-code vs a spawned toolchain building a **shared library**
+at `-O3 -march=native`, link included — so it is legitimately larger than this object-core 60–130×;
+both are honest, they answer different questions.) The historical "~9–12×" band (session X1) is refined to **7.4–11.7×** on this
 measurement: gcc/g++ ratios came DOWN slightly — not because wukongc got slower (its in-process
 core got ~17% faster this campaign via the release-verifier flip) but because the CLI wall is
 spawn-tax-floored; the remaining C(2) lever is the driver's ~7 ms front-matter, not the compiler.
