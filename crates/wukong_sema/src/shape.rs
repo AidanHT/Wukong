@@ -406,8 +406,15 @@ impl Sema<'_> {
             }
             for (g, ga) in sig.generics.iter().zip(generic_args) {
                 match &ga.kind {
+                    // Decode with the same radix/`_`/suffix-aware parser mir_build's
+                    // `turbofish_dim_value` uses (`parse_int`). The old digits-only scan bound
+                    // `::<3_0>` to 3 here while codegen passed the hidden dim 30 — sema shape-checked
+                    // one dimension and the callee addressed with another (accepted program, native
+                    // read past the buffer while the interpreter trapped) — and bound `::<0x4>` to 0,
+                    // rejecting valid code with a dimension the source never wrote.
                     TypeKind::Int(s) => {
-                        dims.insert(*g, Dim::Const(parse_dim_text(self.sym_str(*s))));
+                        let n = crate::parse_u64_text(self.sym_str(*s)).unwrap_or(0);
+                        dims.insert(*g, Dim::Const(n));
                     }
                     TypeKind::Path(p) if p.is_single() => {
                         let nm = p.first().sym;
@@ -896,14 +903,6 @@ fn dims_equal(a: Dim, b: Dim) -> bool {
         (Dim::Var(x), Dim::Var(y)) => x == y,
         _ => false,
     }
-}
-
-fn parse_dim_text(text: &str) -> u64 {
-    text.chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .unwrap_or(0)
 }
 
 /// Infer value-type generics from a concrete argument: bind each `Ty::Named(g)` parameter position
