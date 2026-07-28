@@ -751,7 +751,7 @@ pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, 
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features detected; buffers valid for n by the caller contract.
-            unsafe { vmath_avx2(x, out, n, op) };
+            unsafe { vmath_avx2(x, out, n, op, vmath_unroll6()) };
             return;
         }
     }
@@ -885,6 +885,9 @@ fn use_nt(n: usize, streams: usize) -> bool {
 /// out-of-order window better on a throttled clock — or whether the wider live set spills past the 16
 /// ymm registers. Read once, process-wide (the same `OnceLock` discipline the GEMM env knobs use); the
 /// two bodies run the identical `f` per lane, so the output is bit-for-bit identical either way.
+///
+/// [`vmath_avx2`] takes the choice as a parameter rather than reading this directly: the `OnceLock` is
+/// process-lifetime, so a test could not otherwise reach the ×6 body at all and it shipped ungated.
 #[cfg(target_arch = "x86_64")]
 fn vmath_unroll6() -> bool {
     use std::sync::OnceLock;
@@ -892,9 +895,12 @@ fn vmath_unroll6() -> bool {
     *V.get_or_init(|| std::env::var("WUKONG_VMATH_UNROLL").is_ok_and(|v| v == "6"))
 }
 
+/// `unroll6` selects the ×6 (48-elem) body ahead of the shipped ×4 one; [`wukong_vmath_f32`] supplies
+/// [`vmath_unroll6`]. Both bodies must produce bit-identical output for every `n` — gated by
+/// `vmath_unroll6_body_matches_the_shipped_x4_body`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
+unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64, unroll6: bool) {
     use std::arch::x86_64::*;
     // No 8-lane kernel for this op (a sentinel like `bias::BIAS_ACT_NONE`, or a future `VM_*` added to
     // `apply1` without its `vmath8_for` arm): run the scalar twin over the whole buffer, exactly as the
@@ -942,7 +948,7 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
     // ×6 A/B variant (gated by `WUKONG_VMATH_UNROLL=6`, default off): six independent chains, 48
     // elems/step. Runs ahead of the ×4 body; whatever it leaves (`n % 48`, still ≥ 32 possible) the ×4
     // body mops up, then the ×8 remainder and scalar tail — so the result is identical for any `n`.
-    if vmath_unroll6() {
+    if unroll6 {
         while i + 48 <= n {
             let r0 = f(_mm256_loadu_ps(x.add(i)));
             let r1 = f(_mm256_loadu_ps(x.add(i + 8)));
@@ -3167,6 +3173,60 @@ mod tests {
             for (i, &x) in xs.iter().enumerate() {
                 assert_eq!(got[i].to_bits(), apply1(op, x).to_bits(), "op {op} i {i} x {x}");
             }
+        }
+    }
+
+    /// `WUKONG_VMATH_UNROLL=6` selects a second 48-element loop body with six hand-written load offsets
+    /// and six hand-written store offsets, and it shipped with **zero** coverage: no test sets the knob,
+    /// and it could not, because `vmath_unroll6` caches it in a process-lifetime `OnceLock`. Verified by
+    /// mutation — transposing the ×6 body's `r4`/`r5` store offsets (corrupting 8 of every 48 elements
+    /// for anyone who exports the knob during a measurement pass) left `cargo test -p wukong_runtime`
+    /// green at 199 passed. `vmath_avx2` now takes the choice as a parameter so a test can reach both
+    /// bodies; the public entry supplies `vmath_unroll6()` and the shipped default is unchanged.
+    ///
+    /// The claim being gated is the one the ×6 comment makes: "the result is identical for any `n`".
+    /// The lengths straddle the ×6 step (48), the ×4 body it falls through to (32), the 8-wide
+    /// remainder and the scalar tail; both bodies are also checked against the scalar twin, so this
+    /// cannot pass by two matching wrongs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vmath_unroll6_body_matches_the_shipped_x4_body() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return; // no AVX2: neither body is reachable, and the scalar twin is gated elsewhere
+        }
+        for n in [1usize, 7, 8, 31, 32, 47, 48, 49, 55, 95, 96, 143, 1001] {
+            let xs: Vec<f32> = (0..n).map(|i| (i as f32 - (n / 2) as f32) * 0.013).collect();
+            for op in [VM_EXP, VM_TANH, VM_GELU, VM_SIN, VM_ERF, VM_RELU, VM_SILU] {
+                let (mut x4, mut x6) = (vec![0.0f32; n], vec![0.0f32; n]);
+                // SAFETY: avx2+fma detected just above; xs/x4/x6 are each exactly n f32 long.
+                unsafe {
+                    vmath_avx2(xs.as_ptr(), x4.as_mut_ptr(), n, op, false);
+                    vmath_avx2(xs.as_ptr(), x6.as_mut_ptr(), n, op, true);
+                }
+                for i in 0..n {
+                    assert_eq!(x6[i].to_bits(), x4[i].to_bits(), "n {n} op {op} i {i}: ×6 vs ×4");
+                    assert_eq!(
+                        x6[i].to_bits(),
+                        apply1(op, xs[i]).to_bits(),
+                        "n {n} op {op} i {i}: ×6 vs scalar twin"
+                    );
+                }
+            }
+        }
+        // Non-temporal regime: the ×6 body then runs after the scalar alignment peel and issues six
+        // `vmovntps`, which is where a transposed store offset is most likely and least visible. One op
+        // is enough — the store offsets do not depend on `f`.
+        let n = 1_500_001usize;
+        assert!(use_nt(n, 2), "length no longer selects the NT store path");
+        let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
+        let (mut x4, mut x6) = (vec![0.0f32; n], vec![0.0f32; n]);
+        // SAFETY: avx2+fma detected above; xs/x4/x6 are each exactly n f32 long.
+        unsafe {
+            vmath_avx2(xs.as_ptr(), x4.as_mut_ptr(), n, VM_EXP, false);
+            vmath_avx2(xs.as_ptr(), x6.as_mut_ptr(), n, VM_EXP, true);
+        }
+        for i in 0..n {
+            assert_eq!(x6[i].to_bits(), x4[i].to_bits(), "NT i {i}: ×6 vs ×4");
         }
     }
 
