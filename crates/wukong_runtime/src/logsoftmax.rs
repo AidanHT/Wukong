@@ -290,6 +290,11 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
         wukong_logsoftmax_f32(x, out, rows, cols);
         return;
     }
+    // Configure the global pool BEFORE the first fork: this entry can be a program's first rayon
+    // touch, and `ensure_global_pool`'s contract is that whoever forks first must have built the
+    // 16 MiB-stack registry — otherwise rayon builds its default 2 MiB one and a later outlined
+    // `@parallel` region (which carries ~1.5 MiB of per-iteration scratch) overflows its stack.
+    crate::ensure_global_pool();
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel norm/reduce);
     // each row is a disjoint sub-slice.
     let (xa, oa) = (x as usize, out as usize);
@@ -343,6 +348,9 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
         wukong_logsumexp_f32(x, out, rows, cols);
         return;
     }
+    // Same first-touch obligation as `wukong_logsoftmax_f32_parallel`: build the 16 MiB-stack global
+    // registry before forking, or rayon's default 2 MiB one wins the race for the whole process.
+    crate::ensure_global_pool();
     // Pointers cross the rayon boundary as integers; each row reads a disjoint x-slice and writes one
     // disjoint out slot.
     let (xa, oa) = (x as usize, out as usize);
