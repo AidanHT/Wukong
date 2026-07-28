@@ -93,6 +93,13 @@ pub(crate) struct Syms {
     /// activation backwards (`dx = dy · act'(x)` in one fused pass).
     pub vmath2: Symbol,
     pub norm: Symbol,
+    /// The `@parallel` row-wise norm — same `(x, out, rows, cols, eps_bits, op)` ABI and
+    /// bit-identical (each row is independent, no cross-row combine) result as the serial `norm`, so
+    /// it differentiates through the very same rule. `emit_norm` selects *this* symbol for every
+    /// batched LayerNorm/RMSNorm/softmax inside a `@parallel fn` — the shipped transformer shape —
+    /// while single-row / non-parallel tapes use the serial one; accept both. Without it the same
+    /// model is differentiable serially and not in parallel.
+    pub norm_parallel: Symbol,
 }
 
 impl Syms {
@@ -109,6 +116,7 @@ impl Syms {
             velem_parallel: it.intern("wukong_velem_f32_parallel"),
             vmath2: it.intern("wukong_vmath2_f32"),
             norm: it.intern("wukong_norm_f32"),
+            norm_parallel: it.intern("wukong_norm_f32_parallel"),
         }
     }
 }
@@ -148,6 +156,7 @@ impl<'a> Vjp<'a> {
             || func == self.syms.velem
             || func == self.syms.velem_parallel
             || func == self.syms.norm
+            || func == self.syms.norm_parallel
     }
 
     /// Canonicalize a kernel buffer argument to the base buffer it addresses: peel a whole-buffer
@@ -191,7 +200,7 @@ impl<'a> Vjp<'a> {
             Some(4) // (x, out, n, op)
         } else if func == self.syms.velem || func == self.syms.velem_parallel {
             Some(8) // (x, y, out, n, a, b, c, op)
-        } else if func == self.syms.norm {
+        } else if func == self.syms.norm || func == self.syms.norm_parallel {
             Some(6) // (x, out, rows, cols, eps_bits, op)
         } else {
             None
@@ -230,7 +239,7 @@ impl<'a> Vjp<'a> {
             self.diff_vmath(args)
         } else if func == self.syms.velem || func == self.syms.velem_parallel {
             self.diff_velem(args)
-        } else if func == self.syms.norm {
+        } else if func == self.syms.norm || func == self.syms.norm_parallel {
             self.diff_norm(args)
         } else {
             Err("autodiff: kernel call has no VJP rule".to_string())
