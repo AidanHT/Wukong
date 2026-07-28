@@ -675,6 +675,89 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn argreduce_scalar_matches_avx2_bit_for_bit() {
+        // The twin gate for the ARG reduction (`scalar_matches_avx2_bit_for_bit` above pins only the
+        // VALUE reductions). `argreduce_chunk_avx2` is a separate 4-accumulator algorithm whose doc
+        // block claims bit-identity with `argreduce_chunk_scalar`; this is what checks it — including
+        // the DEGENERATE value sets the finite `fill()` data can never reach: a span made entirely of
+        // the fold identity (∓∞), of NaN, or of a mix. An all-(-∞) span is a real input class (a
+        // fully masked attention/logits row fed to a top-1).
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use std::arch::x86_64::{_CMP_GT_OQ, _CMP_LT_OQ};
+        let sets: [(&str, fn(usize) -> Vec<f32>); 6] = [
+            ("finite", |n| fill(n).0),
+            ("all -inf", |n| vec![f32::NEG_INFINITY; n]),
+            ("all +inf", |n| vec![f32::INFINITY; n]),
+            ("all NaN", |n| vec![f32::NAN; n]),
+            ("NaN/finite", |n| {
+                (0..n)
+                    .map(|i| if i % 3 == 0 { f32::NAN } else { i as f32 * 0.5 - 3.0 })
+                    .collect()
+            }),
+            ("-inf/finite", |n| {
+                (0..n)
+                    .map(|i| {
+                        if i % 5 == 0 {
+                            i as f32 * 0.25 - 1.0
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
+                    .collect()
+            }),
+        ];
+        for &n in &[1usize, 7, 8, 31, 32, 33, 63, 64, 8191, 8192] {
+            for (name, make) in sets {
+                let x = make(n);
+                for is_max in [true, false] {
+                    let s = unsafe { argreduce_chunk_scalar(x.as_ptr(), 0, n, is_max) };
+                    let v = unsafe {
+                        if is_max {
+                            argreduce_chunk_avx2::<_CMP_GT_OQ>(
+                                x.as_ptr(),
+                                0,
+                                n,
+                                f32::NEG_INFINITY,
+                                true,
+                            )
+                        } else {
+                            argreduce_chunk_avx2::<_CMP_LT_OQ>(x.as_ptr(), 0, n, f32::INFINITY, false)
+                        }
+                    };
+                    assert_eq!(
+                        (s.0.to_bits(), s.1),
+                        (v.0.to_bits(), v.1),
+                        "scalar != avx2 arg-reduce: set={name} n={n} is_max={is_max}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn argreduce_all_identity_span_returns_index_zero() {
+        // End-to-end contract for the degenerate span the twin gate above isolates: with every element
+        // equal to the fold identity, "lowest index wins on ties" makes the answer 0 — not the `-1`
+        // that `wukong_argreduce_f32` reserves for `n <= 0`. Sized to span several RCHUNK chunks so
+        // serial and parallel both exercise the multi-chunk fold.
+        for &n in &[32usize, 33, 8192, 3 * 8192 + 13] {
+            for &(op, ident_v) in &[
+                (RED_ARGMAX, f32::NEG_INFINITY),
+                (RED_ARGMIN, f32::INFINITY),
+            ] {
+                let x = vec![ident_v; n];
+                let s = unsafe { wukong_argreduce_f32(x.as_ptr(), n as i64, op) };
+                let p = unsafe { wukong_argreduce_f32_parallel(x.as_ptr(), n as i64, op) };
+                assert_eq!(s, 0, "all-identity argreduce n={n} op={op} (serial)");
+                assert_eq!(s, p, "serial != parallel n={n} op={op}");
+            }
+        }
+    }
+
+    #[test]
     fn argreduce_avx2_lane_ties_and_tails() {
         // Pin the AVX2 path's two tricky cases against the naive ascending scan: (a) duplicate maxima
         // in different SIMD lanes *within one 32-wide span* must collapse to the lower lane index, and
