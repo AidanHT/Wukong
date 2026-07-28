@@ -555,7 +555,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     let bv = self.vec_lanes(reg(regs, *r));
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| apply_bin(*b, av[i], bv[i], Some(&lane)))
+                        .map(|i| mask_lane(apply_bin(*b, av[i], bv[i], Some(&lane)), &lane))
                         .collect();
                     self.push_vec(lanes)
                 } else {
@@ -587,7 +587,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                             if is_float {
                                 Value::Float(-xs[i].as_float())
                             } else {
-                                Value::Int(-xs[i].as_int())
+                                // Wrap at the lane width: negating `i32::MIN` is `i32::MIN`.
+                                mask_lane(Value::Int(-xs[i].as_int()), lane)
                             }
                         })
                         .collect();
@@ -600,12 +601,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
             }
             Op::Not(v) => {
-                if let Some(MirType::Vec(_lane, n)) = rty {
-                    // Lane-wise bitwise complement. Latent today (the vectorizer does not yet emit a
-                    // vector `Not`), but mirror `Neg` so it can never silently zero lanes.
+                if let Some(MirType::Vec(lane, n)) = rty {
+                    // Lane-wise bitwise complement, truncated to the lane width. Latent today (the
+                    // vectorizer does not yet emit a vector `Not`), but mirror `Neg` so it can
+                    // never silently zero lanes or carry `i128` bits the backend does not have.
                     let xs = self.vec_lanes(reg(regs, *v));
-                    let lanes: Vec<Value> =
-                        (0..*n as usize).map(|i| Value::Int(!xs[i].as_int())).collect();
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| mask_lane(Value::Int(!xs[i].as_int()), lane))
+                        .collect();
                     self.push_vec(lanes)
                 } else {
                     match reg(regs, *v) {
@@ -3964,6 +3967,23 @@ fn mask(v: i128, ty: &MirType) -> i128 {
     }
     let shift = 128 - bits;
     (v << shift) >> shift // sign-extend from `bits`
+}
+
+/// Truncate one *lane* of a SIMD result to its lane width — the vector twin of the normalization
+/// `exec` applies to scalar results.
+///
+/// `exec` only masks a `Value::Int` whose declared result type `is_int()`, and a vector result is a
+/// `Value::VecRef` of a `MirType::Vec` (not an int type), so neither guard reaches a lane. The lane
+/// closures below compute in `i128` (`apply_bin` wraps with `i128::wrapping_*`, `Op::Neg`/`Op::Not`
+/// negate/complement an `i128`), so without this an `<4 x i32>` add of 2000000000 + 2000000000
+/// yields 4000000000 where the native backend wraps to -294967296: the oracle contradicting the
+/// backend it certifies. Float lanes are already rounded to the lane type by the callers and pass
+/// through unchanged.
+fn mask_lane(v: Value, lane: &MirType) -> Value {
+    match v {
+        Value::Int(i) if lane.is_int() => Value::Int(mask(i, lane)),
+        other => other,
+    }
 }
 
 /// `f16`/`bf16`/`f32` results are rounded to `f32` precision (the interpreter promotes sub-`f32`
