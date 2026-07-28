@@ -8269,7 +8269,7 @@ impl FnLowerer<'_> {
             return None;
         }
         let (bias, act) =
-            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner)?;
+            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner, self.sema)?;
         if self.emit_lowp_gemm_epi(&nest, bias, act) {
             Some(2)
         } else {
@@ -8317,7 +8317,7 @@ impl FnLowerer<'_> {
             return None;
         }
         let (bias, act) =
-            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner)?;
+            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner, self.sema)?;
         if self.emit_sgemm_epi(&nest, bias, act) {
             Some(2)
         } else {
@@ -20185,6 +20185,29 @@ fn match_c_plus_bias(
     None
 }
 
+/// The math intrinsic `callee` names — `None` unless it is a single-path call to one, and `None` when
+/// a user `fn` of that name shadows it. The free-standing mirror of
+/// [`FnLowerer::vectorizable_intrinsic`]: every peeler that folds an activation into a kernel must ask
+/// this question, not `interner.resolve(sym) == "gelu"`, or a program's own `fn gelu(..)` is fused
+/// away and silently replaced by the builtin — while every unfused path in the compiler honours it.
+fn unshadowed_intrinsic(
+    callee: &Expr,
+    interner: &Interner,
+    sema: &SemaResult,
+) -> Option<MathIntrinsic> {
+    let ExprKind::Path(p) = &callee.kind else {
+        return None;
+    };
+    if !p.is_single() {
+        return None;
+    }
+    let name = p.first().sym;
+    if matches!(sema.defs.lookup(name).map(|d| &d.kind), Some(DefKind::Fn(_))) {
+        return None;
+    }
+    math_intrinsic(interner.resolve(name))
+}
+
 /// Match the epilogue RHS over the matmul output `C[i*N+j]`: bare `C+bias` (identity), `fmax(_, 0)`
 /// (ReLU), or a `gelu(_)` / `silu(_)` activation call (the transformer FFN `act(x·Wᵀ [+ bias])`
 /// shape). Bias is **optional for the activation forms** — the bias-free `silu(x·Wᵀ)` is the
@@ -20197,6 +20220,7 @@ fn match_epi_value(
     jvar: Symbol,
     n: Dim,
     interner: &Interner,
+    sema: &SemaResult,
 ) -> Option<(Option<Symbol>, u32)> {
     // `C[i*N+j] + bias[j]` → `Some(bias)`; the bare output element `C[i*N+j]` → `None`; anything else
     // is not an epilogue over this matmul's output.
@@ -20212,20 +20236,23 @@ fn match_epi_value(
     if let ExprKind::Call { callee, args, .. } = &e.kind {
         // ReLU written as `fmax(inner, 0.0)`.
         if args.len() == 2
-            && single_path(callee).is_some_and(|s| interner.resolve(s) == "fmax")
+            && matches!(
+                unshadowed_intrinsic(callee, interner, sema),
+                Some(MathIntrinsic::Fmax)
+            )
             && is_float_zero(&args[1], interner)
         {
             return Some((c_with_opt_bias(&args[0])?, EPI_ACT_RELU));
         }
         // GELU / SiLU activation wrapping the (optional) bias-add (`gelu(C[i*N+j] + bias[j])` or the
-        // bias-free `silu(C[i*N+j])`). Both are first-class intrinsics, so a single-arg call by that
-        // name is unambiguous; the runtime epilogue applies the identical scalar form
-        // (`wukong_runtime::vmath::{gelu1,silu1}`), so the fused result equals the unfused
-        // `matmul → [bias →] activation` the recognizer replaces.
+        // bias-free `silu(C[i*N+j])`). Both are first-class intrinsics **unless the program defines a
+        // function of that name**, which `unshadowed_intrinsic` declines; the runtime epilogue applies
+        // the identical scalar form (`wukong_runtime::vmath::{gelu1,silu1}`), so the fused result
+        // equals the unfused `matmul → [bias →] activation` the recognizer replaces.
         if args.len() == 1 {
-            let act = match single_path(callee).map(|s| interner.resolve(s)) {
-                Some("gelu") => Some(EPI_ACT_GELU),
-                Some("silu") => Some(EPI_ACT_SILU),
+            let act = match unshadowed_intrinsic(callee, interner, sema) {
+                Some(MathIntrinsic::Gelu) => Some(EPI_ACT_GELU),
+                Some(MathIntrinsic::Silu) => Some(EPI_ACT_SILU),
                 _ => None,
             };
             if let Some(act) = act {
@@ -20250,6 +20277,7 @@ fn match_bias_act_epilogue(
     n: Dim,
     c: Symbol,
     interner: &Interner,
+    sema: &SemaResult,
 ) -> Option<(Option<Symbol>, u32)> {
     // for i in 0..M { <single nested loop> }
     let (ipat, iiter, ibody) = fusable_for(stmt)?;
@@ -20289,7 +20317,7 @@ fn match_bias_act_epilogue(
     if !is_c_elem(target, c, ivar, jvar, n, interner) {
         return None;
     }
-    match_epi_value(value, c, ivar, jvar, n, interner)
+    match_epi_value(value, c, ivar, jvar, n, interner, sema)
 }
 
 /// Flatten the multiplicative factors of `e`, recursing only through `*`. `(c as f32) * sa * sb[j]`
@@ -20323,20 +20351,28 @@ fn index_by_var(e: &Expr, var: Symbol) -> Option<Symbol> {
 
 /// Peel an optional activation wrapper off the int8 dequant value: `fmax(inner, 0.0)` → ReLU,
 /// `gelu(inner)` / `silu(inner)` → that activation, else the expression itself (identity). Mirrors
-/// [`match_epi_value`]'s activation detection; the runtime `dequant_row` applies the identical scalar
-/// form (`vmath::{gelu1,silu1}`), so fused == unfused.
-fn peel_dequant_act<'a>(e: &'a Expr, interner: &Interner) -> (&'a Expr, u32) {
+/// [`match_epi_value`]'s activation detection — including the shadow test, so a user `fn gelu` is
+/// never folded into the kernel; the runtime `dequant_row` applies the identical scalar form
+/// (`vmath::{gelu1,silu1}`), so fused == unfused.
+fn peel_dequant_act<'a>(
+    e: &'a Expr,
+    interner: &Interner,
+    sema: &SemaResult,
+) -> (&'a Expr, u32) {
     if let ExprKind::Call { callee, args, .. } = &e.kind {
         if args.len() == 2
-            && single_path(callee).is_some_and(|s| interner.resolve(s) == "fmax")
+            && matches!(
+                unshadowed_intrinsic(callee, interner, sema),
+                Some(MathIntrinsic::Fmax)
+            )
             && is_float_zero(&args[1], interner)
         {
             return (&args[0], EPI_ACT_RELU);
         }
         if args.len() == 1 {
-            match single_path(callee).map(|s| interner.resolve(s)) {
-                Some("gelu") => return (&args[0], EPI_ACT_GELU),
-                Some("silu") => return (&args[0], EPI_ACT_SILU),
+            match unshadowed_intrinsic(callee, interner, sema) {
+                Some(MathIntrinsic::Gelu) => return (&args[0], EPI_ACT_GELU),
+                Some(MathIntrinsic::Silu) => return (&args[0], EPI_ACT_SILU),
                 _ => {}
             }
         }
@@ -20441,7 +20477,7 @@ fn match_i8_dequant_epilogue(
         return None;
     }
     // Peel the optional activation, then the optional `+ bias[j]`.
-    let (core, act) = peel_dequant_act(value, interner);
+    let (core, act) = peel_dequant_act(value, interner, sema);
     let (prod, bias) = match peel_bias_add(core, jvar) {
         Some((p, b)) => (p, Some(b)),
         None => (core, None),
@@ -21267,8 +21303,9 @@ fn match_residual_store_value(
     n: Dim,
     s_sym: Symbol,
     interner: &Interner,
+    sema: &SemaResult,
 ) -> Option<(Option<Symbol>, u32)> {
-    let (inner, act) = peel_dequant_act(value, interner);
+    let (inner, act) = peel_dequant_act(value, interner, sema);
     let mut terms = Vec::new();
     flatten_add_terms(inner, &mut terms);
     let (mut saw_c, mut saw_s) = (false, false);
@@ -21427,7 +21464,7 @@ fn match_matmul_residual<'a>(
     if sa != kdim || sb != kdim || sc != n || !c_off.is_empty() {
         return None;
     }
-    let (bias, act) = match_residual_store_value(cv, cbase, row, jvar, n, s_sym, interner)?;
+    let (bias, act) = match_residual_store_value(cv, cbase, row, jvar, n, s_sym, interner, sema)?;
     // An input aliasing the output is a hazard (the blocked kernel writes C in a different order).
     if a_sym == cbase || b_sym == cbase {
         return None;
