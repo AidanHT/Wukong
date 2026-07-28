@@ -1,6 +1,5 @@
-// RUN: --run
-// EXPECT-EXIT: 1
-module tests.run.sdpa_operand_extent
+// EXPECT-CODE: C0001
+module tests.fail.sdpa_operand_extent
 
 // The attention kernel's documented contract is `q`, `k`, `v` valid for `s*d` f32 reads and `o` valid
 // for `s*d` f32 writes, and the only knob the programmer turns is the `s` argument — no index is ever
