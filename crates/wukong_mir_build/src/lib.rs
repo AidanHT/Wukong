@@ -7318,6 +7318,22 @@ impl FnLowerer<'_> {
         vals.try_into().ok()
     }
 
+    /// The base pointer of a kernel operand written as an *expression* — the `Expr` twin of
+    /// [`Self::kernel_base_ptr`], for the builtin calls whose operands are argument exprs rather
+    /// than recognized nest symbols. A `[]T` slice argument lowers to its 16-byte fat-pointer
+    /// buffer, so the data pointer is one `Load` at `SLICE_PTR_OFF` (= 0); every other buffer form
+    /// (a fixed array, a `Tensor[..]`/pointer) already lowers to a base pointer and passes through
+    /// unchanged, so fixed-array call sites lower byte-identically. Keys on the *sema* type, the
+    /// same authority `bind_slice` records from.
+    fn kernel_operand_ptr(&mut self, e: &Expr) -> ValueId {
+        let v = self.lower_expr(e);
+        if matches!(self.expr_ty(e), Ty::Slice(_)) {
+            self.builder.build(MirType::Ptr, Op::Load(v, MirType::Ptr))
+        } else {
+            v
+        }
+    }
+
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
         let (Some(a), Some(b), Some(c)) = (
             self.kernel_base_ptr(nest.a),
@@ -16772,7 +16788,10 @@ impl FnLowerer<'_> {
     /// Recognize `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention —
     /// and lower it to one `wukong_attention_f32` runtime call (computing
     /// `out = softmax(scale·Q·Kᵀ [+causal])·V` for one `[s,d]` head without materializing the S×S
-    /// scores). The array args lower to their base pointers (an array `Path` *is* its pointer); `s`,
+    /// scores). The four buffer args resolve through `kernel_operand_ptr` (an array `Path` *is* its
+    /// pointer; a `[]T` slice needs its fat pointer loaded — passing the buffer straight through
+    /// made the kernel read `{ data, len }` as f32 data: interp `error: expected a pointer`, native
+    /// SIGSEGV, on the only shape a runtime-sized model uses); `s`,
     /// `d`, `causal` coerce to `i64` and `scale` to `f32`. Returns `None` for any other name/arity so
     /// `lower_call` falls through. Both backends call the identical kernel, so the fused online
     /// softmax stays bit-for-bit exact — the same contract as the GEMM dispatch.
@@ -16780,10 +16799,10 @@ impl FnLowerer<'_> {
         if self.interner.resolve(name) != "sdpa" || args.len() != 8 {
             return None;
         }
-        let q = self.lower_expr(&args[0]);
-        let k = self.lower_expr(&args[1]);
-        let v = self.lower_expr(&args[2]);
-        let out = self.lower_expr(&args[3]);
+        let q = self.kernel_operand_ptr(&args[0]);
+        let k = self.kernel_operand_ptr(&args[1]);
+        let v = self.kernel_operand_ptr(&args[2]);
+        let out = self.kernel_operand_ptr(&args[3]);
         let s = self.lower_coerced(&args[4], &MirType::I64);
         let d = self.lower_coerced(&args[5], &MirType::I64);
         let scale = self.lower_coerced(&args[6], &MirType::F32);
