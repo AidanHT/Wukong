@@ -769,7 +769,10 @@ mod tests {
 
         // Invariant: when the global registry is not the one we configured, `run_on_wuk_pool` must
         // fork on a pool this crate built (`wukong-gemm-*` or `wukong-region-*`), never on rayon's
-        // defaults. This is the assertion that gates in the default configuration.
+        // defaults. NOTE this assertion is satisfied by `wukong-gemm-*` whenever unification is on
+        // and `gemm_pool()` exists, so it only catches a missing backstop under
+        // `WUKONG_POOL_UNIFY=0` — `the_region_pool_backstop_carries_a_region_frame` below is the
+        // gate that fires in the default configuration.
         if !GLOBAL_POOL_IS_OURS.load(std::sync::atomic::Ordering::Relaxed) {
             let named: Vec<bool> = run_on_wuk_pool(|| {
                 (0..256usize)
@@ -795,6 +798,44 @@ mod tests {
         // shape and `v` outlives this blocking call, which is `wukong_parallel_for`'s contract.
         unsafe { wukong_parallel_for(32, big_frame_region_body, v.as_mut_ptr() as *const u8) };
         assert_eq!(v, vec![127_899u64; 32], "every index must be visited once");
+    }
+
+    #[test]
+    fn the_region_pool_backstop_carries_a_region_frame() {
+        use rayon::prelude::*;
+        // The end-to-end test above reaches `region_pool` only when `gemm_pool()` is unavailable,
+        // and on this SMT host under the default `WUKONG_POOL_UNIFY=1` it is available. MEASURED:
+        // with `run_on_wuk_pool`'s backstop branch deleted, that test stays GREEN under a plain
+        // `cargo test -p wukong_runtime` and only turns red under `WUKONG_POOL_UNIFY=0` — which
+        // the suite does not set, and which a test cannot set for itself because `pool_unify()`
+        // latches its `OnceLock` on whichever kernel reads it first. So drive the backstop
+        // directly: this is the assertion that gates the fallback in the default configuration.
+        let p = region_pool().expect("the fallback pool must be buildable");
+        let mut v = vec![0u64; 32];
+        // The `env` contract `wukong_parallel_for` gives its body, reproduced here: a raw base
+        // address whose pointee (`v`) outlives the blocking `install` below, and one job per index
+        // so no two writes alias. `EnvAddr`'s `Send`/`Sync` hold for exactly that reason.
+        let env = EnvAddr(v.as_mut_ptr() as usize);
+        let ours: Vec<bool> = p.install(|| {
+            (0..32usize)
+                .into_par_iter()
+                .map(|k| {
+                    big_frame_region_body(k as i64, k as i64 + 1, env.0 as *const u8);
+                    std::thread::current()
+                        .name()
+                        .is_some_and(|n| n.starts_with("wukong-region-"))
+                })
+                .collect()
+        });
+        assert!(
+            ours.iter().all(|&b| b),
+            "the backstop must be a pool this crate built, not rayon's default registry"
+        );
+        assert_eq!(
+            v,
+            vec![127_899u64; 32],
+            "a 4 MiB region frame must survive on every backstop worker"
+        );
     }
 
     #[test]
