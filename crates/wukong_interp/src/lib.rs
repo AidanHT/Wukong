@@ -525,7 +525,13 @@ struct Interp<'a, 'k> {
 /// sits well inside its own measured ceiling, so no recursion depth that works today starts
 /// failing in either profile — the depths this now rejects are exactly the ones that used to abort
 /// the process.
-const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) { 30_000 } else { 200_000 };
+///
+/// The debug limit must also clear the depth the differential gate actually exercises:
+/// `wukong_codegen_cranelift`'s `differential_deep_recursion` runs `sum(30000)` (30001 frames with
+/// `main`) and asserts native == interp there, so a debug ceiling of 30000 made the *interpreter*
+/// — the semantic oracle — refuse a depth native completes, reintroducing the very divergence that
+/// test exists to catch. 40000 sits above that gate and below the measured 50000 debug ceiling.
+const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) { 40_000 } else { 200_000 };
 
 /// Marshal a recognized-kernel **extent** argument (`rows`, `cols`, `m`, `k`, `n`, `t`, `h`, `s`,
 /// `d`, `half`, `ncoeff`, ...) into a slot count, bailing out of the arm with the kernel's
