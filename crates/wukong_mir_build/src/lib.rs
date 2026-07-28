@@ -1240,6 +1240,126 @@ fn has_parallel_attr(item: &ast::Item, interner: &Interner) -> bool {
         .any(|a| interner.resolve(a.name.sym) == "parallel")
 }
 
+/// Does this `@parallel` loop body contain control flow that only makes sense under SERIAL
+/// iteration? The outliner runs the body over one CHUNK of `[0, hi)` per worker, so a `return` or a
+/// `break` out of the parallelized loop ends that chunk alone — every other chunk still runs to
+/// completion, and the answer becomes a function of the pool's chunking. `depth` counts the loops
+/// nested inside the body, so a `break`/`continue` at depth 0 targets the parallelized loop itself;
+/// one inside an inner loop is that loop's own control flow and stays legal. Any *labelled* form
+/// declines outright: the outliner drops the loop's label, so a labelled break finds no matching loop
+/// and the block is finished as `unreachable`. This is the rule the mid-function region scanner
+/// already applies (`scan_region_stmt`'s `Return`/`Break`/`Continue` arms).
+fn escapes_parallel_chunk_block(b: &Block, depth: u32) -> bool {
+    b.stmts.iter().any(|s| escapes_parallel_chunk_stmt(s, depth))
+        || b.tail
+            .as_ref()
+            .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
+}
+
+fn escapes_parallel_chunk_stmt(s: &Stmt, depth: u32) -> bool {
+    match &s.kind {
+        StmtKind::Return(_) | StmtKind::Defer(_) => true,
+        StmtKind::Break(label, val) => {
+            label.is_some()
+                || depth == 0
+                || val
+                    .as_ref()
+                    .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
+        }
+        StmtKind::Continue(label) => label.is_some() || depth == 0,
+        StmtKind::Let { init, .. } => init
+            .as_ref()
+            .is_some_and(|e| escapes_parallel_chunk_expr(e, depth)),
+        StmtKind::Assign { target, value, .. } => {
+            escapes_parallel_chunk_expr(target, depth) || escapes_parallel_chunk_expr(value, depth)
+        }
+        StmtKind::Expr(e) => escapes_parallel_chunk_expr(e, depth),
+        StmtKind::While { cond, body, .. } => {
+            escapes_parallel_chunk_expr(cond, depth) || escapes_parallel_chunk_block(body, depth + 1)
+        }
+        StmtKind::For { iter, body, .. } => {
+            let it = match iter {
+                ForIter::Range {
+                    start, end, step, ..
+                } => {
+                    escapes_parallel_chunk_expr(start, depth)
+                        || end
+                            .as_ref()
+                            .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
+                        || step
+                            .as_ref()
+                            .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
+                }
+                ForIter::Expr(e) => escapes_parallel_chunk_expr(e, depth),
+            };
+            it || escapes_parallel_chunk_block(body, depth + 1)
+        }
+    }
+}
+
+fn escapes_parallel_chunk_expr(e: &Expr, depth: u32) -> bool {
+    let any = |v: &[Expr]| v.iter().any(|x| escapes_parallel_chunk_expr(x, depth));
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => false,
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+            escapes_parallel_chunk_expr(expr, depth)
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+            escapes_parallel_chunk_expr(base, depth)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            escapes_parallel_chunk_expr(lhs, depth) || escapes_parallel_chunk_expr(rhs, depth)
+        }
+        ExprKind::Call { callee, args, .. } => {
+            escapes_parallel_chunk_expr(callee, depth) || any(args)
+        }
+        ExprKind::Index { base, indices } => {
+            escapes_parallel_chunk_expr(base, depth) || any(indices)
+        }
+        ExprKind::StructLit { fields, rest, .. } => {
+            fields
+                .iter()
+                .any(|f| escapes_parallel_chunk_expr(&f.value, depth))
+                || rest
+                    .as_ref()
+                    .is_some_and(|r| escapes_parallel_chunk_expr(r, depth))
+        }
+        ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => any(items),
+        ExprKind::ArrayRepeat { value, count } => {
+            escapes_parallel_chunk_expr(value, depth) || escapes_parallel_chunk_expr(count, depth)
+        }
+        ExprKind::Block(b) => escapes_parallel_chunk_block(b, depth),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            escapes_parallel_chunk_expr(cond, depth)
+                || escapes_parallel_chunk_block(then_branch, depth)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|b| escapes_parallel_chunk_expr(b, depth))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            escapes_parallel_chunk_expr(scrutinee, depth)
+                || arms.iter().any(|a| {
+                    a.guard
+                        .as_ref()
+                        .is_some_and(|g| escapes_parallel_chunk_expr(g, depth))
+                        || escapes_parallel_chunk_expr(&a.body, depth)
+                })
+        }
+        ExprKind::Loop { body, .. } => escapes_parallel_chunk_block(body, depth + 1),
+    }
+}
+
 /// Recognize a parallelizable function: its entire body is a single `for idx in 0..hi { … }` over
 /// pointer (array) parameters. Returns the index name, the upper-bound expression, and the loop
 /// body. Anything else falls back to ordinary sequential lowering.
@@ -1264,15 +1384,24 @@ fn parallel_spec<'a>(
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
     }
+    // The outliner drops the loop's label (`lower_ranged_loop` pushes `(None, latch, exit)`), so a
+    // `break 'l` / `continue 'l` in the body would find no matching loop and lower to `unreachable`:
+    // interp `error: execution reached \`unreachable\``, native SIGILL, on a program that runs fine
+    // without the attribute. Decline the labelled form and let it lower serially.
     let StmtKind::For {
+        label: None,
         pat,
         iter,
         body: lb,
-        ..
     } = &body.stmts[0].kind
     else {
         return None;
     };
+    // A `return`, a `defer`, or a `break`/`continue` out of the parallelized loop only makes sense
+    // under serial iteration — see `escapes_parallel_chunk_block`.
+    if escapes_parallel_chunk_block(lb, 0) {
+        return None;
+    }
     let ForIter::Range {
         start,
         end: Some(end),
@@ -10531,9 +10660,19 @@ impl FnLowerer<'_> {
                 // A body-local scalar/aggregate is private; writing the region var, a captured
                 // scalar (a loop-carried accumulator), or a captured whole array declines.
                 if sym != sc.hh && sc.is_local(sym) {
-                    // Assigning a digit-derived local invalidates its modeled value from here on;
-                    // accesses recorded earlier keep their (correct-at-the-time) snapshot.
-                    sc.derived.remove(&sym);
+                    // …but only if the scan is not MODELING that local. Both models this walk keeps
+                    // — a digit-derived value (`sc.derived`) and an inner loop variable's literal
+                    // range (`sc.env`) — are snapshotted into every access, and the walk is
+                    // source-ordered, not flow-sensitive: an access scanned BEFORE this assignment
+                    // keeps a snapshot that is wrong on every later trip of the enclosing loop, and
+                    // the disjointness proof is then carried out on a value the program never
+                    // computes. Both shapes were measured to produce a real data race (native
+                    // nondeterministic run to run, and never the interpreter's answer). Assigning a
+                    // modeled name declines the whole region; the loop then lowers serially.
+                    if sc.derived.contains_key(&sym) || sc.env.iter().any(|(v, _)| *v == sym) {
+                        sc.ok = false;
+                        return;
+                    }
                     return;
                 }
                 sc.ok = false;
