@@ -24,6 +24,11 @@
 //! is a single exact scalar subtraction (a write-after-read at one index). The AVX2 path and the
 //! scalar twin agree **bit-for-bit** (pinned by a unit test across non-multiple-of-8 `cols`).
 //!
+//! **Out-of-range labels.** `onehot(t)[i]` is `i == t`, so a `target[r]` outside `[0, C)` — negative
+//! (PyTorch's `ignore_index = -100` idiom) or `>= C` — matches no column and the row is the plain
+//! softmax, exactly as the formula above reads. The kernel does not write past the row for it.
+//! Identical in the AVX2, scalar and parallel paths.
+//!
 //! **Determinism.** Rows are independent, so the `_parallel` entry just maps the identical per-row
 //! routine across rows — `serial == parallel` bit-for-bit with no cross-row combine (thread count is
 //! irrelevant, so the interpreter's serial call agrees with the native `@parallel` path exactly). The
@@ -64,7 +69,8 @@ fn hmax8(a: [f32; 8]) -> f32 {
 ///
 /// # Safety
 /// `x` valid for `n` `f32`; `dx` valid for `n` `f32` (may alias `x` — each `x[i]` is read into `dx[i]`
-/// before being overwritten); `target ∈ [0, n)`.
+/// before being overwritten). `target` is unconstrained: a value outside `[0, n)` matches no column,
+/// so the onehot fixup is skipped.
 unsafe fn xent_bwd_row_scalar(x: *const f32, target: usize, dx: *mut f32, n: usize) {
     let nb = n / 8;
     let t = nb * 8;
@@ -100,8 +106,12 @@ unsafe fn xent_bwd_row_scalar(x: *const f32, target: usize, dx: *mut f32, n: usi
     for i in 0..n {
         *dx.add(i) *= inv;
     }
-    // 4) subtract the onehot at the target column — a single exact scalar fixup.
-    *dx.add(target) -= 1.0;
+    // 4) subtract the onehot at the target column — a single exact scalar fixup. `onehot(t)[i]` is
+    // `i == t`, so an out-of-range label matches no column: skip the fixup instead of writing past
+    // the row, leaving the plain softmax the formula prescribes.
+    if target < n {
+        *dx.add(target) -= 1.0;
+    }
 }
 
 // --- AVX2 kernel (mirrors the scalar twin lane-for-lane on finite inputs) --------------------------
@@ -111,8 +121,8 @@ unsafe fn xent_bwd_row_scalar(x: *const f32, target: usize, dx: *mut f32, n: usi
 /// the single scalar `dx[target] -= 1.0`.
 ///
 /// # Safety
-/// `x` valid for `n` `f32`; `dx` valid for `n` `f32` (may alias `x`); `target ∈ [0, n)`; AVX2+FMA
-/// available.
+/// `x` valid for `n` `f32`; `dx` valid for `n` `f32` (may alias `x`); AVX2+FMA available. `target` is
+/// unconstrained: a value outside `[0, n)` skips the onehot fixup, exactly as in the scalar twin.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn xent_bwd_row_avx2(x: *const f32, target: usize, dx: *mut f32, n: usize) {
@@ -121,7 +131,16 @@ unsafe fn xent_bwd_row_avx2(x: *const f32, target: usize, dx: *mut f32, n: usize
     let mut mxv = _mm256_set1_ps(f32::NEG_INFINITY);
     let mut i = 0;
     while i + 8 <= n {
-        mxv = _mm256_max_ps(mxv, _mm256_loadu_ps(x.add(i)));
+        let v = _mm256_loadu_ps(x.add(i));
+        // `_mm256_max_ps(a, b)` yields `b` for an unordered pair, so a NaN logit would ERASE the
+        // lane's running maximum; the scalar twin's `f32::max` ignores NaN and keeps it. Blend the
+        // accumulator back over the NaN lanes so both twins fold the same values. On a row with no
+        // NaN the mask is all-zero and the max — and its bits — are exactly as before.
+        mxv = _mm256_blendv_ps(
+            _mm256_max_ps(mxv, v),
+            mxv,
+            _mm256_cmp_ps::<_CMP_UNORD_Q>(v, v),
+        );
         i += 8;
     }
     let mut mx = [0.0f32; 8];
@@ -159,14 +178,18 @@ unsafe fn xent_bwd_row_avx2(x: *const f32, target: usize, dx: *mut f32, n: usize
         *dx.add(i) *= inv;
         i += 1;
     }
-    // 4) subtract the onehot at the target column — the same single scalar fixup as the scalar twin.
-    *dx.add(target) -= 1.0;
+    // 4) subtract the onehot at the target column — the same single scalar fixup, and the same
+    // out-of-range guard, as the scalar twin.
+    if target < n {
+        *dx.add(target) -= 1.0;
+    }
 }
 
 /// One row through cross-entropy backward, AVX2 when available, else the scalar twin.
 ///
 /// # Safety
-/// `x` valid for `n` `f32`; `dx` valid for `n` `f32` (may alias `x`); `target ∈ [0, n)`.
+/// `x` valid for `n` `f32`; `dx` valid for `n` `f32` (may alias `x`). `target` is unconstrained: a
+/// value outside `[0, n)` skips the onehot fixup.
 #[inline]
 unsafe fn xent_bwd_row(x: *const f32, target: usize, dx: *mut f32, n: usize) {
     #[cfg(target_arch = "x86_64")]
@@ -180,12 +203,13 @@ unsafe fn xent_bwd_row(x: *const f32, target: usize, dx: *mut f32, n: usize) {
 
 /// Fused softmax cross-entropy backward `dx[r,i] = softmax(x[r,·])[i] − onehot(target[r])[i]` over a
 /// `[rows, cols]` row-major logits matrix, single-threaded. `dx` is `[rows, cols]` and **may alias
-/// `x`** (each row's `x` is read into `dx` before the onehot fixup); each `target[r]` must be in
-/// `[0, cols)`. Unscaled — the caller multiplies by `1/rows` for the mean reduction.
+/// `x`** (each row's `x` is read into `dx` before the onehot fixup); a `target[r]` outside `[0, cols)`
+/// matches no column and leaves that row the plain softmax (see the module's out-of-range rule).
+/// Unscaled — the caller multiplies by `1/rows` for the mean reduction.
 ///
 /// # Safety
 /// `x` valid for `rows*cols` f32; `dx` valid for `rows*cols` f32 (may alias `x`); `target` valid for
-/// `rows`; every `target[r] ∈ [0, cols)`.
+/// `rows`. The label values are unconstrained — the kernel bounds them itself.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_xent_bwd_f32(
     x: *const f32,
@@ -199,7 +223,9 @@ pub unsafe extern "C" fn wukong_xent_bwd_f32(
     }
     let (r, c) = (rows as usize, cols as usize);
     for row in 0..r {
-        // SAFETY: row `row` occupies [row*c, row*c+c) ⊆ [0, rows*cols); target[row] ∈ [0, c) by contract.
+        // SAFETY: row `row` occupies [row*c, row*c+c) ⊆ [0, rows*cols); the label is bounded by
+        // `xent_bwd_row`'s own `target < c` check — a negative i32 sign-extends to a `usize` far
+        // above `c`, so both out-of-range directions fail it — and the fixup stays inside the row.
         let t = *target.add(row) as usize;
         xent_bwd_row(x.add(row * c), t, dx.add(row * c), c);
     }
@@ -231,12 +257,19 @@ pub unsafe extern "C" fn wukong_xent_bwd_f32_parallel(
         wukong_xent_bwd_f32(x, target, dx, rows, cols);
         return;
     }
+    // This fork can be the process's FIRST rayon touch, and `ensure_global_pool`'s contract is that
+    // such a path configures the global pool before forking — otherwise rayon builds its default
+    // 2 MiB-stack registry here and the later 16 MiB `build_global()` silently loses the race,
+    // leaving every outlined `@parallel` region body on a stack too small for its privatized
+    // scratch. Scheduling only: rows are mapped one per index regardless of worker count, so the
+    // bits cannot change.
+    crate::ensure_global_pool();
     // Raw pointers cross the rayon boundary as integers; each row is a disjoint sub-slice, `target`
     // indexed by row. (`dx` may alias `x`, but the per-row slices are disjoint across rows.)
     let (x_addr, t_addr, dx_addr) = (x as usize, target as usize, dx as usize);
     (0..r).into_par_iter().for_each(|row| {
-        // SAFETY: disjoint row slices; pointers re-derived from the captured addresses; target[row] ∈
-        // [0, c) by contract.
+        // SAFETY: disjoint row slices; pointers re-derived from the captured addresses; the label is
+        // bounded by `xent_bwd_row`'s own `target < c` check, exactly as in the serial entry.
         unsafe {
             let t = *(t_addr as *const i32).add(row) as usize;
             xent_bwd_row(
@@ -401,6 +434,122 @@ mod tests {
                     sum.abs() <= 1e-5,
                     "row sum != 0 cols={cols} row={row}: {sum}"
                 );
+            }
+        }
+    }
+
+    /// (e) A label past the end of the row must not write past the end of the row. `dx` sits at the
+    /// front of a padded buffer holding a recognizable sentinel, so the onehot fixup's stray `-= 1.0`
+    /// is observable here instead of corrupting unrelated memory in the field. No column matches an
+    /// out-of-range label, so the row is the plain softmax (`Σ dx = 1`, not 0).
+    #[test]
+    fn past_the_end_target_does_not_write_past_the_row() {
+        const PAD: usize = 8;
+        for &cols in &[1usize, 7, 8, 9, 17, 64] {
+            let x = fill(cols);
+            for t in [cols, cols + 3] {
+                let tg = [t as i32];
+                let mut dx = vec![777.0f32; cols + PAD];
+                unsafe {
+                    wukong_xent_bwd_f32(x.as_ptr(), tg.as_ptr(), dx.as_mut_ptr(), 1, cols as i64);
+                }
+                for (i, &v) in dx[cols..].iter().enumerate() {
+                    assert_eq!(
+                        v.to_bits(),
+                        777.0f32.to_bits(),
+                        "target {t} past cols={cols} wrote past the row at +{i}: {v}"
+                    );
+                }
+                let s: f64 = dx[..cols].iter().map(|&v| v as f64).sum();
+                assert!(
+                    (s - 1.0).abs() <= 1e-5,
+                    "cols={cols} target={t}: softmax row sum {s} != 1"
+                );
+            }
+        }
+    }
+
+    /// (f) Every out-of-range label is total and agrees between the serial and parallel entries:
+    /// negative (PyTorch's `ignore_index = -100`), `i32::MIN` and `i32::MAX` (whose `as usize` land
+    /// nowhere near the row) and `== cols` all leave the row the plain softmax (`Σ dx = 1`), while
+    /// the in-range rows still carry the onehot (`Σ dx = 0`). Only sound because the kernel now
+    /// bounds the label itself — each of these used to be an unchecked `-= 1.0` at that offset.
+    #[test]
+    fn out_of_range_labels_keep_the_plain_softmax_serial_and_parallel() {
+        for &cols in &[1usize, 7, 8, 9, 17, 64] {
+            let rows = 16usize; // ≥ XENT_BWD_PAR_MIN, so the parallel entry really forks
+            let x = fill(rows * cols);
+            let mut tg = fill_targets(rows, cols);
+            let bad = [-1, -100, i32::MIN, cols as i32, i32::MAX];
+            tg[..bad.len()].copy_from_slice(&bad);
+            let mut s = vec![0.0f32; rows * cols];
+            let mut p = vec![0.0f32; rows * cols];
+            unsafe {
+                wukong_xent_bwd_f32(
+                    x.as_ptr(),
+                    tg.as_ptr(),
+                    s.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
+                wukong_xent_bwd_f32_parallel(
+                    x.as_ptr(),
+                    tg.as_ptr(),
+                    p.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
+            }
+            for i in 0..rows * cols {
+                assert_eq!(
+                    s[i].to_bits(),
+                    p[i].to_bits(),
+                    "serial != parallel cols={cols} i={i}"
+                );
+            }
+            for row in 0..rows {
+                let off = row * cols;
+                let sum: f64 = s[off..off + cols].iter().map(|&v| v as f64).sum();
+                let want = if row < bad.len() { 1.0 } else { 0.0 };
+                assert!(
+                    (sum - want).abs() <= 1e-5,
+                    "cols={cols} row={row} target={}: row sum {sum} != {want}",
+                    tg[row]
+                );
+            }
+        }
+    }
+
+    /// (g) A NaN logit must not split the twins. `_mm256_max_ps(a, b)` yields `b` for an unordered
+    /// pair, so a NaN lane ERASES that lane's running maximum, while the scalar twin's `f32::max`
+    /// ignores NaN and keeps it — the two then stabilize with different `m`, and since `m` scales the
+    /// whole row through `exp(x − m)/Z` the entire gradient row diverges on AVX2 hosts. The row here
+    /// puts the maximum in lane 0 and sweeps the NaN across every column.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn nan_logit_keeps_scalar_and_avx2_in_agreement() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &cols in &[9usize, 16, 17, 33, 64] {
+            for nan_at in 0..cols {
+                let mut x = fill(cols);
+                x[0] = 100.0; // the row max, in lane 0 — a NaN must not erase it
+                x[nan_at] = f32::NAN;
+                let mut a = vec![0.0f32; cols];
+                let mut b = vec![0.0f32; cols];
+                unsafe {
+                    xent_bwd_row_scalar(x.as_ptr(), 0, a.as_mut_ptr(), cols);
+                    xent_bwd_row_avx2(x.as_ptr(), 0, b.as_mut_ptr(), cols);
+                }
+                for i in 0..cols {
+                    assert!(
+                        (a[i].is_nan() && b[i].is_nan()) || a[i].to_bits() == b[i].to_bits(),
+                        "scalar != avx2 cols={cols} nan_at={nan_at} i={i}: {} vs {}",
+                        a[i],
+                        b[i]
+                    );
+                }
             }
         }
     }
