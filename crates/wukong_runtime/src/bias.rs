@@ -30,7 +30,10 @@ use rayon::prelude::*;
 pub const BIAS_ACT_NONE: i64 = -1;
 
 /// Software-prefetch distance (elements ahead of the streamed `x` row). A prefetch past the buffer end
-/// is a hint the hardware silently drops, so the final rows need no guard.
+/// is a hint the hardware silently drops, so the final rows need no guard — but the *address* is still
+/// formed in Rust, and `<*const T>::add` requires the result to stay inside the allocation, so the
+/// prefetch site computes it with `wrapping_add` (no such requirement, and it lowers to the same
+/// `lea`+`prefetcht0` — verified byte-identical in the release asm of `bias_avx2`).
 const PF_AHEAD: usize = 64;
 
 /// One element `act(x + b)`, sharing the *identical* scalar activation the `vmath` kernel and the
@@ -93,7 +96,10 @@ unsafe fn bias_avx2(x: *const f32, b: *const f32, out: *mut f32, rows: usize, co
                 }
                 while j + 32 <= cols {
                     if nt {
-                        _mm_prefetch(xr.add(j + PF_AHEAD) as *const i8, _MM_HINT_T0);
+                        // `wrapping_add`, not `add`: the target is deliberately past the end of `x`
+                        // on the final rows (see `PF_AHEAD`), which `add`'s in-bounds precondition
+                        // forbids. A prefetch of an unmapped address is architecturally a no-op.
+                        _mm_prefetch(xr.wrapping_add(j + PF_AHEAD) as *const i8, _MM_HINT_T0);
                     }
                     let r0 = $mk(xr, j);
                     let r1 = $mk(xr, j + 8);
