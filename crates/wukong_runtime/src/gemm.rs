@@ -4492,6 +4492,107 @@ mod tests {
         }
     }
 
+    /// [`sgemm_scalar`] — the portable fallback, and the ONLY GEMM path on a target without
+    /// AVX2+FMA (every non-x86_64 build compiles the whole fast path out) — had no test at all:
+    /// its sole caller is the feature dispatch in [`gemm_dispatch`], which on any AVX2 host takes
+    /// the other branch, so `cargo test -p wukong_runtime` never executed a single line of it.
+    /// Verified by mutation: transposing the two arms of its `bt` select (`*b.add(j*k+p)` vs
+    /// `*b.add(p*n+j)`) left all 197 tests green while every `nn.Linear` off-AVX2 would return
+    /// garbage. This calls the private kernel directly, so it runs on every target.
+    ///
+    /// Covers the whole reachable argument space: `bt` × `beta ∈ {0, 1}` × the four activations ×
+    /// bias/no-bias × `alpha`, at shapes that exercise the 1-wide dims and the MR/NR remainders.
+    /// `alpha != 1` is paired only with `beta == 0`, the combination the ABI supports (see the
+    /// `debug_assert` in [`gemm_dispatch`]).
+    #[test]
+    fn sgemm_scalar_fallback_matches_reference() {
+        for &(m, k, n) in &[(1usize, 1usize, 1usize), (7, 17, 13), (64, 64, 64)] {
+            let a = fill(81, m * k);
+            let b = fill(82, k * n);
+            let bias = fill(83, n);
+            let c_init = fill(84, m * n);
+            for bt in [false, true] {
+                // `bt` reinterprets the same k*n elements as `[n, k]` rather than `[k, n]`.
+                let base = if bt {
+                    naive_nt(&a, &b, m, k, n)
+                } else {
+                    naive(&a, &b, m, k, n)
+                };
+                for &beta in &[0.0f32, 1.0] {
+                    let alphas: &[f32] = if beta == 0.0 { &[1.0, 0.125] } else { &[1.0] };
+                    for &alpha in alphas {
+                        for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
+                            for use_bias in [false, true] {
+                                let no_epi =
+                                    act == ACT_IDENTITY && !use_bias && alpha == 1.0;
+                                let bias_ptr = if use_bias {
+                                    bias.as_ptr()
+                                } else {
+                                    std::ptr::null()
+                                };
+                                let epi = if no_epi {
+                                    None
+                                } else {
+                                    Some(Epilogue { bias: bias_ptr, act, alpha })
+                                };
+                                // Reference: the beta rule, then the epilogue on the fully
+                                // reduced sum — `alpha` scales the accumulated value, then the
+                                // bias adds, then the activation (`Epilogue::apply`'s order).
+                                let mut want = vec![0.0f32; m * n];
+                                for i in 0..m {
+                                    for j in 0..n {
+                                        let mut v = base[i * n + j];
+                                        if beta != 0.0 {
+                                            v += c_init[i * n + j];
+                                        }
+                                        if epi.is_some() {
+                                            if alpha != 1.0 {
+                                                v *= alpha;
+                                            }
+                                            if use_bias {
+                                                v += bias[j];
+                                            }
+                                            v = match act {
+                                                ACT_RELU => v.max(0.0),
+                                                ACT_GELU => crate::vmath::gelu1(v),
+                                                ACT_SILU => crate::vmath::silu1(v),
+                                                _ => v,
+                                            };
+                                        }
+                                        want[i * n + j] = v;
+                                    }
+                                }
+                                let mut got = c_init.clone();
+                                sgemm_scalar(
+                                    a.as_ptr(),
+                                    b.as_ptr(),
+                                    got.as_mut_ptr(),
+                                    m,
+                                    k,
+                                    n,
+                                    beta,
+                                    bt,
+                                    epi,
+                                );
+                                let tol = 1e-3 * (k as f32).sqrt();
+                                for idx in 0..m * n {
+                                    assert!(
+                                        (got[idx] - want[idx]).abs()
+                                            <= tol + 1e-4 * want[idx].abs(),
+                                        "scalar (m{m} k{k} n{n} bt{bt} beta{beta} alpha{alpha} \
+                                         act{act} bias{use_bias}) idx {idx}: got {} want {}",
+                                        got[idx],
+                                        want[idx]
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// α-scaled `C = alpha·(A·Bᵀ)` must equal the plain `nt` GEMM followed by a scalar `alpha·c` pass
     /// (the α multiply is one exact f32 op on the fully-reduced dot — the *only* difference from the
     /// unscaled kernel), for both `alpha == 1.0` (must be **byte-identical** to `nt`) and a general
