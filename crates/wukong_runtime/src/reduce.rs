@@ -390,8 +390,10 @@ unsafe fn argreduce_chunk_scalar(x: *const f32, lo: usize, hi: usize, is_max: bo
 /// strict compare gives the lowest-index tie-break **for free** (a tie never fires the update, so each
 /// lane keeps its earlier index). The 32 lane candidates then collapse through the *same* scalar
 /// [`arg_fold`] (a total order on unique indices, so order-independent), and a `< 32` scalar tail folds
-/// in after — so the result is bit-identical to [`argreduce_chunk_scalar`]. Four accumulators hide the
-/// `cmp→blendv` latency while staying inside 16 ymm registers.
+/// in after — so the result is bit-identical to [`argreduce_chunk_scalar`], with the one span the
+/// strict compare cannot express (a lane that saw only NaN/identity values) delegated to the twin
+/// outright, see below. Four accumulators hide the `cmp→blendv` latency while staying inside 16 ymm
+/// registers.
 ///
 /// # Safety
 /// `x` valid for reads on `[lo, hi)`; AVX2 available; `hi ≤ i32::MAX` (indices ride i32 lanes).
@@ -432,18 +434,30 @@ unsafe fn argreduce_chunk_avx2<const PRED: i32>(
         }
     }
     // Collapse the 32 lane candidates through the scalar arg_fold (preserves the lowest-index tie-break
-    // exactly); only lanes that consumed an element (idx >= 0) participate.
+    // exactly).
     let mut vals = [0f32; 32];
     let mut idxs = [0i32; 32];
     for a in 0..4 {
         _mm256_storeu_ps(vals.as_mut_ptr().add(a * 8), vext[a]);
         _mm256_storeu_si256(idxs.as_mut_ptr().add(a * 8) as *mut __m256i, vidx[a]);
     }
+    // A lane still holding the `-1` sentinel never fired the strict compare, i.e. every element it saw
+    // was NaN or *exactly* the identity — and there the scalar twin does NOT agree: its `(ident,
+    // usize::MAX)` seed makes `arg_fold`'s `a.0 == b.0 && b.1 < a.1` arm fire on the first
+    // identity-valued element, so the twin reports that element's index while the lane reports
+    // "nothing". (Seeding the lanes from real data instead would fix that but change the NaN
+    // semantics, which are pinned to the identity seed.) Hand such a span to the twin outright: it is
+    // the reference, so bit-identity is exact by construction. Only a span that is entirely ±inf/NaN
+    // in some lane can take this branch (a fully masked logits row) — never real data, and `nsteps ==
+    // 0` (len < 32, every lane unconsumed) falls in here too, matching `rowarg_avx2`'s `cols < 8`
+    // delegation.
+    if idxs.iter().any(|&k| k < 0) {
+        // SAFETY: the same `[lo, hi)` read validity this function was called under.
+        return unsafe { argreduce_chunk_scalar(x, lo, hi, is_max) };
+    }
     let mut r = (ident_v, usize::MAX);
     for k in 0..32 {
-        if idxs[k] >= 0 {
-            r = arg_fold(r, (vals[k], idxs[k] as usize), is_max);
-        }
+        r = arg_fold(r, (vals[k], idxs[k] as usize), is_max);
     }
     // Scalar tail (< 32 elements), ascending — composes with the SIMD candidates under the same fold.
     let tail = lo + nsteps * 32;
