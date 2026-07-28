@@ -46,6 +46,22 @@ fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))
 }
 
+/// `_mm256_max_ps(a, b)` semantics spelled out: `a > b ? a : b`. **Not** `f32::max` (= `maxNum`),
+/// which returns the non-NaN operand — MAXPS returns its *second* source whenever the compare is
+/// unordered, so a NaN in the freshly loaded operand poisons the accumulator lane while a NaN already
+/// in the accumulator is dropped. The scalar row-max twin folds with this, not with `f32::max`, so it
+/// mirrors the AVX2 body bit-for-bit on NaN rows too and not only on finite data (pinned by
+/// `scalar_matches_avx2_on_nan_rows`; `exp1`/`exp8` saturate NaN rather than propagating it, so a
+/// divergent row max would survive into the output).
+#[inline(always)]
+fn maxps(a: f32, b: f32) -> f32 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback) ------------------------------------------
 
 /// Numerically-stable softmax of one row, scalar reference. `x` and `out` may alias (in-place).
@@ -60,7 +76,7 @@ unsafe fn softmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
     for s in 0..nb {
         let b = s * 8;
         for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = mxj.max(*x.add(b + j));
+            *mxj = maxps(*mxj, *x.add(b + j));
         }
     }
     for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
@@ -107,7 +123,7 @@ unsafe fn logsoftmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
     for s in 0..nb {
         let b = s * 8;
         for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = mxj.max(*x.add(b + j));
+            *mxj = maxps(*mxj, *x.add(b + j));
         }
     }
     for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
