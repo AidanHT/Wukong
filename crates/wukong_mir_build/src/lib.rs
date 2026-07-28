@@ -11793,13 +11793,55 @@ impl FnLowerer<'_> {
         true
     }
 
-    /// A loop-invariant f32 coefficient: an expr provably free of the loop var `j` and typed f32 (a
-    /// literal like `2.0`, or an outer scalar like saxpy's `a`). Lowered to a ValueId at emit time.
-    /// Uses the **conservative** [`expr_mentions`] (recurses through calls/casts/fields and assumes a
-    /// use for anything it cannot model), so a per-element factor like `sigmoid(x[j])` is correctly
-    /// rejected rather than mistaken for an invariant scale. Pure.
+    /// Is `e` safe to evaluate **once**, in the loop's enclosing scope, in place of once per iteration?
+    ///
+    /// [`expr_mentions`] answers "does this name the loop variable"; it does not answer this. It models
+    /// `ExprKind::Call` precisely (recursing into callee and args), so a zero-argument call to a
+    /// side-effecting user function reads as loop-invariant — and a recognizer that hoists it drops
+    /// every call but the first. Every form `expr_mentions` gives up on (its `_ => true` arm: blocks,
+    /// `if`/`match` values, method calls, …) is already rejected by the mention test, so the one hole
+    /// to close here is the call: only a pure math intrinsic — `vectorizable_intrinsic`, which itself
+    /// declines a name a user `fn` shadows — may appear. Pure.
+    fn coeff_is_hoistable(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Path(_)
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_) => true,
+            ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+                self.coeff_is_hoistable(expr)
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.coeff_is_hoistable(lhs) && self.coeff_is_hoistable(rhs)
+            }
+            ExprKind::Index { base, indices } => {
+                self.coeff_is_hoistable(base) && indices.iter().all(|i| self.coeff_is_hoistable(i))
+            }
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.coeff_is_hoistable(base)
+            }
+            ExprKind::ArrayLit(items) => items.iter().all(|i| self.coeff_is_hoistable(i)),
+            ExprKind::ArrayRepeat { value, count } => {
+                self.coeff_is_hoistable(value) && self.coeff_is_hoistable(count)
+            }
+            ExprKind::Call { callee, args, .. } => {
+                self.vectorizable_intrinsic(callee).is_some()
+                    && args.iter().all(|a| self.coeff_is_hoistable(a))
+            }
+            _ => false,
+        }
+    }
+
+    /// A loop-invariant f32 coefficient: an expr provably free of the loop var `j`, safe to evaluate
+    /// once outside the loop, and typed f32 (a literal like `2.0`, or an outer scalar like saxpy's
+    /// `a`). Lowered to a ValueId at emit time. Uses the **conservative** [`expr_mentions`] (recurses
+    /// through calls/casts/fields and assumes a use for anything it cannot model), so a per-element
+    /// factor like `sigmoid(x[j])` is correctly rejected rather than mistaken for an invariant scale;
+    /// [`Self::coeff_is_hoistable`] then rejects the invariant-but-effectful ones. Pure.
     fn velem_coeff<'b>(&self, e: &'b Expr, j: Symbol) -> Option<&'b Expr> {
-        if expr_mentions(e, j) || self.expr_mir(e) != MirType::F32 {
+        if expr_mentions(e, j) || !self.coeff_is_hoistable(e) || self.expr_mir(e) != MirType::F32 {
             return None;
         }
         Some(e)
@@ -12423,8 +12465,8 @@ impl FnLowerer<'_> {
     }
 
     /// Match `r = r·v + Ck` (the running Horner step) for accumulator `r` and per-element value `v`,
-    /// either factor order and either `Add` operand order. `Ck` must be a loop-invariant f32 (free of
-    /// the loop var `j`). Returns the coefficient expr. Pure.
+    /// either factor order and either `Add` operand order. `Ck` must be a coefficient
+    /// [`Self::horner_coeff`] accepts. Returns the coefficient expr. Pure.
     fn match_horner_step<'b>(
         &self,
         stmt: &'b Stmt,
@@ -12463,7 +12505,24 @@ impl FnLowerer<'_> {
         } else {
             return None;
         };
-        if expr_mentions(ck, j) || self.expr_mir(ck) != MirType::F32 {
+        self.horner_coeff(ck, r, v, j)
+    }
+
+    /// A Horner coefficient: loop-invariant, hoistable, f32 — and free of the body's OWN bindings.
+    ///
+    /// `emit_vhorner` materializes every coefficient into a stack array *before* the kernel call, i.e.
+    /// it lowers them in the loop's ENCLOSING scope, where the element temp `v` and the accumulator `r`
+    /// do not exist. `expr_mentions(ck, j)` alone does not see that: `acc = acc*v + v` reads as
+    /// invariant, and the hoisted `v` then either resolves to an outer binding of the same name — a
+    /// silent wrong polynomial — or to nothing, a bogus C0001 for a loop the generic vectorizer lowers
+    /// correctly. Reject both by rejecting any mention of `v` or `r`. Pure.
+    fn horner_coeff<'b>(&self, ck: &'b Expr, r: Symbol, v: Symbol, j: Symbol) -> Option<&'b Expr> {
+        if expr_mentions(ck, j)
+            || expr_mentions(ck, v)
+            || expr_mentions(ck, r)
+            || !self.coeff_is_hoistable(ck)
+            || self.expr_mir(ck) != MirType::F32
+        {
             return None;
         }
         Some(ck)
@@ -12498,11 +12557,11 @@ impl FnLowerer<'_> {
         if self.expr_mir(v_init) != MirType::F32 {
             return None;
         }
-        // `let mut r = C0` (leading coefficient, loop-invariant f32)
+        // `let mut r = C0` (leading coefficient, loop-invariant f32). `v` is already bound here, so
+        // `let mut r = v` reads as invariant to `expr_mentions` and would be hoisted; `horner_coeff`
+        // rejects it for the same reason it rejects a step's `v`.
         let (r, c0) = Self::let_init(&stmts[1])?;
-        if expr_mentions(c0, j) || self.expr_mir(c0) != MirType::F32 {
-            return None;
-        }
+        let c0 = self.horner_coeff(c0, r, v, j)?;
         let mut coeffs = vec![c0];
         for stmt in &stmts[2..n - 1] {
             coeffs.push(self.match_horner_step(stmt, r, v, j)?);
