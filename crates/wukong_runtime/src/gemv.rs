@@ -183,6 +183,14 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
     #[cfg(target_arch = "x86_64")]
     {
         use rayon::prelude::*;
+        // A `@parallel` GEMV can be the process's FIRST rayon touch (a decode-step LM head runs
+        // before any outlined region), so it must configure the global pool before forking — the
+        // invariant `ensure_global_pool` states: whoever forks first decides the registry, and a
+        // default 2 MiB-stack registry built here makes the runtime's later 16 MiB `build_global`
+        // lose the race, leaving `@parallel` region bodies (~1.5 MiB of privatized scratch) on
+        // 2 MiB stacks. Pool configuration only — the row split below is worker-count independent,
+        // so the bits are unchanged.
+        crate::ensure_global_pool();
         let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
         (0..mu).into_par_iter().for_each(|i| {
             // SAFETY: disjoint output element y[i]; shared read-only a-row / x; pointers re-derived.
@@ -227,6 +235,9 @@ pub unsafe extern "C" fn wukong_sgemv_parallel(
     #[cfg(target_arch = "x86_64")]
     {
         use rayon::prelude::*;
+        // Configure the global pool before forking, for the reason spelled out in
+        // [`wukong_sgemv_alpha_parallel`] (this entry can equally be the first rayon touch).
+        crate::ensure_global_pool();
         let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
         (0..mu).into_par_iter().for_each(|i| {
             // SAFETY: disjoint output element y[i]; shared read-only a-row / x; pointers re-derived.

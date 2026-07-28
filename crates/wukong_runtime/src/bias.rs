@@ -198,6 +198,14 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32_parallel(
     if rows_u <= RBAND {
         return wukong_bias_bcast_f32(x, b, out, rows, cols, op);
     }
+    // In a transformer forward the broadcast-bias is one of the first parallel ops, so this can be
+    // the process's FIRST rayon touch — configure the global pool before forking, the invariant
+    // `ensure_global_pool` states. Forking bare here builds rayon's default 2 MiB-stack registry and
+    // makes the runtime's later 16 MiB `build_global` silently lose the race, so outlined
+    // `@parallel` region bodies (~1.5 MiB of privatized scratch) end up on 2 MiB stacks. Pool
+    // configuration only — the row-band split below is worker-count independent, so bits are
+    // unchanged (`bias_parallel_matches_serial` stays exact).
+    crate::ensure_global_pool();
     let (xa, ba, oa) = (x as usize, b as usize, out as usize);
     let nbands = rows_u.div_ceil(RBAND);
     (0..nbands).into_par_iter().for_each(|band| {
