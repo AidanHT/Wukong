@@ -1619,6 +1619,45 @@ fn parallel_region_declines_loudly() {
     );
 }
 
+/// `loss = Σ x[i]^2` — the sum-of-squares loss / L2 regularizer, the most common scalar loss in the
+/// language — lowers to `sreduce(x, x, n, RED_DOT)` with both operands the SAME buffer. That is one
+/// op with a repeated operand, but the RED_DOT arm treated it as two contributions and called
+/// `single(x)` twice, so it always failed: observed with the shipped release compiler on
+/// `for i in 0..8 { l = l + x[i]*x[i]; }` — `--emit=mir -O2` shows
+/// `call wukong_sreduce_f32_parallel(v0, v0, 8, 0)` and `--emit=grad` failed with
+/// "buffer v0 receives multiple gradient contributions", a message that does not describe the actual
+/// problem. The rule is one velem scale, `dx = 2g·x`.
+#[test]
+fn self_dot_sumsq_vjp() {
+    let n = 8;
+    let mut it = Interner::default();
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "sumsq"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let (nv, dotop) = (ci(&mut b, n as i64), ci(&mut b, RED_DOT));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![x, x, nv, dotop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![n, 1],
+        loss_out: 1,
+    };
+
+    let mut seed = 0x5052u64;
+    let xb = rand_vec(&mut seed, n);
+    let dx: Vec<f64> = xb.iter().map(|&v| 2.0 * v as f64).collect();
+    let inputs = vec![xb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
 /// The scalar path (`diff_load`) ACCUMULATES into the gradient buffer (read-add-write) while the
 /// kernel path (`fill_buf` / `velem_scale` / `velem_affine`) OVERWRITES it. A loss that both reduces
 /// a `wrt` buffer with a recognized kernel AND reads one of its elements as a scalar therefore lost
