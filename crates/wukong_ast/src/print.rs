@@ -112,11 +112,18 @@ impl AstPrinter<'_> {
                     });
                 }
                 let lay = match layout {
-                    Some(Layout::Contiguous) => ", .contiguous",
-                    Some(Layout::ColMajor) => ", .col_major",
-                    Some(Layout::Strided) => ", .strided",
-                    Some(Layout::Tiled(_)) => ", .tiled(..)",
-                    None => "",
+                    Some(Layout::Contiguous) => ", .contiguous".to_string(),
+                    Some(Layout::ColMajor) => ", .col_major".to_string(),
+                    Some(Layout::Strided) => ", .strided".to_string(),
+                    Some(Layout::Tiled(extents)) => format!(
+                        ", .tiled({})",
+                        extents
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None => String::new(),
                 };
                 format!("Tensor[{}{}]", parts.join(", "), lay)
             }
@@ -171,6 +178,47 @@ impl AstPrinter<'_> {
         format!("@{}({})", self.sym(a.name.sym), args.join(", "))
     }
 
+    /// A one-line `fn name(a: T, b: U) -> R` signature, used where there is no body to hang a
+    /// tree off (extern declarations) — printing only the name there hides the whole ABI surface.
+    fn fn_sig_str(&self, f: &FnDecl) -> String {
+        let params: Vec<String> = f
+            .params
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}{}: {}",
+                    if p.mutable { "mut " } else { "" },
+                    self.sym(p.name.sym),
+                    self.type_str(&p.ty)
+                )
+            })
+            .collect();
+        let ret = match &f.ret {
+            Some(t) => format!(" -> {}", self.type_str(t)),
+            None => String::new(),
+        };
+        format!("fn {}({}){}", self.sym(f.name.sym), params.join(", "), ret)
+    }
+
+    /// An enum variant's payload in source form: `(i32, f32)`, `{ r: f32 }`, or empty for a unit
+    /// variant. Dropping it made every variant render identically as `variant A`.
+    fn variant_data_str(&self, d: &VariantData) -> String {
+        match d {
+            VariantData::Unit => String::new(),
+            VariantData::Tuple(tys) => {
+                let parts: Vec<String> = tys.iter().map(|t| self.type_str(t)).collect();
+                format!("({})", parts.join(", "))
+            }
+            VariantData::Struct(fields) => {
+                let parts: Vec<String> = fields
+                    .iter()
+                    .map(|f| format!("{}: {}", self.sym(f.name.sym), self.type_str(&f.ty)))
+                    .collect();
+                format!(" {{ {} }}", parts.join(", "))
+            }
+        }
+    }
+
     // --- Module & items ---
 
     fn module(&mut self, m: &Module) {
@@ -221,7 +269,16 @@ impl AstPrinter<'_> {
                 self.line(format!("enum {}", self.sym(e.name.sym)));
                 self.indented(|p| {
                     for v in &e.variants {
-                        p.line(format!("variant {}", p.sym(v.name.sym)));
+                        let disc = match &v.discriminant {
+                            Some(d) => format!(" = {}", p.expr_inline(d)),
+                            None => String::new(),
+                        };
+                        p.line(format!(
+                            "variant {}{}{}",
+                            p.sym(v.name.sym),
+                            p.variant_data_str(&v.data),
+                            disc
+                        ));
                     }
                 });
             }
@@ -234,13 +291,21 @@ impl AstPrinter<'_> {
                 self.indented(|p| p.expr(&c.value));
             }
             ItemKind::Import(i) => {
-                self.line(format!("import {}", self.path_str(&i.path, ".")));
+                let mut s = format!("import {}", self.path_str(&i.path, "."));
+                if let Some(items) = &i.items {
+                    let names: Vec<&str> = items.iter().map(|n| self.sym(n.sym)).collect();
+                    s.push_str(&format!(".{{{}}}", names.join(", ")));
+                }
+                if let Some(alias) = &i.alias {
+                    s.push_str(&format!(" as {}", self.sym(alias.sym)));
+                }
+                self.line(s);
             }
             ItemKind::Extern(e) => {
                 self.line(format!("extern {}", self.sym(e.abi)));
                 self.indented(|p| {
                     for f in &e.items {
-                        p.line(format!("fn {}", p.sym(f.name.sym)));
+                        p.line(p.fn_sig_str(f));
                     }
                 });
             }
@@ -625,5 +690,169 @@ mod tests {
             span: Span::dummy(),
         };
         assert_eq!(print_module(&m, &i), "module demo\n");
+    }
+
+    // --- helpers for the fidelity snapshot ---
+
+    fn id(i: &mut Interner, s: &str) -> Ident {
+        Ident {
+            sym: i.intern(s),
+            span: Span::dummy(),
+        }
+    }
+
+    fn path(i: &mut Interner, segs: &[&str]) -> Path {
+        Path {
+            segments: segs.iter().map(|s| id(i, s)).collect(),
+            span: Span::dummy(),
+        }
+    }
+
+    fn named_ty(i: &mut Interner, s: &str) -> TypeExpr {
+        TypeExpr {
+            id: NodeId::DUMMY,
+            kind: TypeKind::Path(path(i, &[s])),
+            span: Span::dummy(),
+        }
+    }
+
+    fn item(kind: ItemKind) -> Item {
+        Item {
+            id: NodeId::DUMMY,
+            attrs: vec![],
+            kind,
+            span: Span::dummy(),
+        }
+    }
+
+    /// `--emit=ast` is the parser's only user-facing observable, so the constructs a user would
+    /// reach for it to debug must survive the rendering. Before this was pinned the printer
+    /// dropped variant payloads, explicit discriminants, import aliases, selective import lists
+    /// and extern signatures — an engineer inspecting `E::A = 5` saw a bare `variant A` and
+    /// concluded the parser had lost the discriminant.
+    #[test]
+    fn payloads_aliases_and_signatures_survive_printing() {
+        let mut i = Interner::new();
+
+        let aliased = ItemKind::Import(Import {
+            path: path(&mut i, &["std", "math"]),
+            alias: Some(id(&mut i, "mm")),
+            items: None,
+        });
+        let selective = ItemKind::Import(Import {
+            path: path(&mut i, &["a", "b"]),
+            alias: None,
+            items: Some(vec![id(&mut i, "x"), id(&mut i, "y")]),
+        });
+
+        let five = i.intern("5");
+        let e = ItemKind::Enum(EnumDecl {
+            name: id(&mut i, "E"),
+            is_pub: false,
+            generics: vec![],
+            variants: vec![
+                Variant {
+                    name: id(&mut i, "A"),
+                    data: VariantData::Tuple(vec![
+                        named_ty(&mut i, "i32"),
+                        named_ty(&mut i, "f32"),
+                    ]),
+                    discriminant: Some(Expr {
+                        id: NodeId::DUMMY,
+                        kind: ExprKind::Int(five),
+                        span: Span::dummy(),
+                    }),
+                    span: Span::dummy(),
+                },
+                Variant {
+                    name: id(&mut i, "B"),
+                    data: VariantData::Struct(vec![Field {
+                        name: id(&mut i, "r"),
+                        is_pub: false,
+                        ty: named_ty(&mut i, "f32"),
+                        span: Span::dummy(),
+                    }]),
+                    discriminant: None,
+                    span: Span::dummy(),
+                },
+                Variant {
+                    name: id(&mut i, "C"),
+                    data: VariantData::Unit,
+                    discriminant: None,
+                    span: Span::dummy(),
+                },
+            ],
+        });
+
+        let u8_ty = named_ty(&mut i, "u8");
+        let ext = ItemKind::Extern(ExternBlock {
+            abi: i.intern("\"C\""),
+            items: vec![FnDecl {
+                name: id(&mut i, "puts"),
+                is_pub: false,
+                generics: vec![],
+                params: vec![Param {
+                    id: NodeId::DUMMY,
+                    attrs: vec![],
+                    mutable: false,
+                    name: id(&mut i, "s"),
+                    ty: TypeExpr {
+                        id: NodeId::DUMMY,
+                        kind: TypeKind::Pointer {
+                            mutable: false,
+                            pointee: Box::new(u8_ty),
+                        },
+                        span: Span::dummy(),
+                    },
+                    span: Span::dummy(),
+                }],
+                ret: Some(named_ty(&mut i, "i32")),
+                body: None,
+            }],
+        });
+
+        let m = Module {
+            name: None,
+            items: vec![item(aliased), item(selective), item(e), item(ext)],
+            span: Span::dummy(),
+        };
+
+        assert_eq!(
+            print_module(&m, &i),
+            "import std.math as mm\n\
+             import a.b.{x, y}\n\
+             enum E\n\
+             \x20 variant A(i32, f32) = 5\n\
+             \x20 variant B { r: f32 }\n\
+             \x20 variant C\n\
+             extern \"C\"\n\
+             \x20 fn puts(s: *u8) -> i32\n"
+        );
+    }
+
+    /// A tiled tensor layout carries its extents; rendering them as `.tiled(..)` hid exactly the
+    /// numbers a layout bug turns on.
+    #[test]
+    fn tiled_layout_prints_its_extents() {
+        let mut i = Interner::new();
+        let t = TypeExpr {
+            id: NodeId::DUMMY,
+            kind: TypeKind::Tensor {
+                elem: Box::new(named_ty(&mut i, "f32")),
+                dims: vec![
+                    Dim {
+                        kind: DimKind::Int(512),
+                        span: Span::dummy(),
+                    },
+                    Dim {
+                        kind: DimKind::Int(512),
+                        span: Span::dummy(),
+                    },
+                ],
+                layout: Some(Layout::Tiled(vec![64, 32])),
+            },
+            span: Span::dummy(),
+        };
+        assert_eq!(print_type(&t, &i), "Tensor[f32, 512, 512, .tiled(64, 32)]");
     }
 }
