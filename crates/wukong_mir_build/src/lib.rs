@@ -8769,12 +8769,22 @@ impl FnLowerer<'_> {
     }
 
     /// Lower a recognized argmax/argmin loop `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }`
-    /// to one `wukong_argreduce_f32(x, n, op)` call plus a branchless reconcile of the kernel's
-    /// (value, index) against the loop's running `(bv, bi)`: `(bv,bi) = arg_fold((bv,bi),(x[ki],ki))`.
-    /// Because `arg_fold` is associative (lowest-index tie-break, a total order) and the loop covers
-    /// `x[0..n]` (start 0), the loop result equals this reconcile for **any** seed — so the preceding
-    /// `let bv = …; let bi = …;` need not be inspected. Both backends marshal the identical kernel, so
-    /// the differential oracle stays exact. Returns false (fall back to the scalar loop) on any mismatch.
+    /// to one `wukong_argreduce_f32(x, n, op)` call plus a reconcile of the kernel's (value, index)
+    /// against the loop's running `(bv, bi)`.
+    ///
+    /// The loop's compare is STRICT, so a value merely equal to the running best can never displace
+    /// it: the final `(bv, bi)` is `(x[ki], ki)` when `x[ki]` strictly beats the seed and the seed
+    /// otherwise, where `ki` is the kernel's lowest-index extremum. The reconcile is therefore exactly
+    /// `Select(x[ki] CMP bv_seed, …)` — no tie-break term, which would make the emitted code disagree
+    /// with the source whenever the seed value ties the extremum at a *higher* index. Since `arg_fold`
+    /// breaks ties toward the lowest index and the loop covers `x[0..n]` (start 0), that identity holds
+    /// for **any** seed — so the preceding `let bv = …; let bi = …;` need not be inspected.
+    ///
+    /// The kernel returns `-1` when it found no index at all (`n <= 0`, and an all-NaN span; see
+    /// `wukong_argreduce_f32` in wukong_runtime), for which the source loop leaves the seed untouched.
+    /// The reconcile is guarded by `ki >= 0` so that case neither stores nor forms the address `x[-1]`.
+    /// Both backends marshal the identical kernel, so the differential oracle stays exact. Returns
+    /// false (fall back to the scalar loop) on any mismatch.
     fn try_emit_argreduce(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
         // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
         // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
@@ -8828,6 +8838,19 @@ impl FnLowerer<'_> {
                 args: vec![xv, n, opv],
             },
         );
+        // `ki == -1` ⇒ the kernel found no index (empty span / all-NaN); the source loop never ran its
+        // body, so the seed stands. Branch around the whole reconcile so `x[-1]` is never addressed.
+        let zero64 = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let valid = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Sge, ki, zero64));
+        let reconcile_blk = self.builder.new_block();
+        let join_blk = self.builder.new_block();
+        self.builder
+            .cond_br(valid, reconcile_blk, vec![], join_blk, vec![]);
+        self.builder.switch_to(reconcile_blk);
         let kptr = self.builder.build(
             MirType::Ptr,
             Op::Gep {
@@ -8837,7 +8860,7 @@ impl FnLowerer<'_> {
             },
         );
         let kv = self.builder.build(MirType::F32, Op::Load(kptr, MirType::F32));
-        // Reconcile with the running (bv, bi): better = (kv CMP bv) || (kv == bv && ki < bi).
+        // Reconcile with the running (bv, bi): better = (kv CMP bv), the loop's own strict compare.
         let bv_cur = self
             .builder
             .build(MirType::F32, Op::Load(bv_slot, MirType::F32));
@@ -8849,20 +8872,10 @@ impl FnLowerer<'_> {
         } else {
             CmpOp::Folt
         };
-        let strictly = self
-            .builder
-            .build(MirType::I1, Op::Cmp(pred, kv, bv_cur));
-        let eq = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Foeq, kv, bv_cur));
-        let ki_bi = self.coerce_to(ki, &MirType::I64, &bi_ty, true);
-        let idx_lt = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, ki_bi, bi_cur));
-        let tie = self.builder.build(MirType::I1, Op::Bin(BinOp::And, eq, idx_lt));
         let better = self
             .builder
-            .build(MirType::I1, Op::Bin(BinOp::Or, strictly, tie));
+            .build(MirType::I1, Op::Cmp(pred, kv, bv_cur));
+        let ki_bi = self.coerce_to(ki, &MirType::I64, &bi_ty, true);
         let new_bv = self
             .builder
             .build(MirType::F32, Op::Select(better, kv, bv_cur));
@@ -8877,6 +8890,8 @@ impl FnLowerer<'_> {
             ptr: bi_slot,
             value: new_bi,
         });
+        self.builder.br(join_blk, vec![]);
+        self.builder.switch_to(join_blk);
         true
     }
 
