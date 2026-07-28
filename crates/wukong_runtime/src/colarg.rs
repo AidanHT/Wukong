@@ -472,6 +472,11 @@ mod tests {
     /// Where AVX2 is available, the vector path must equal the scalar twin EXACTLY for every column,
     /// across widths spanning the 8-lane edge and tails (and a few row counts) — the column analogue of
     /// the rowarg scalar==avx2 pin. (i32 indices → exact equality, no tolerance.)
+    ///
+    /// Both output buffers are seeded with a SENTINEL rather than 0: row 0 is a legal answer, so a
+    /// zero-filled buffer cannot tell "wrote 0" from "never wrote this column" — verified by mutation
+    /// (suppressing the `out[j]` store whenever `best_row == 0` passed every col-arg test while the
+    /// buffers started at 0). With the sentinel, any column a path fails to write fails the compare.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
@@ -482,8 +487,8 @@ mod tests {
             for &rows in &[1usize, 2, 7, 33, 100] {
                 let x = fill(rows, cols);
                 for is_max in [true, false] {
-                    let mut s = vec![0i32; cols];
-                    let mut v = vec![0i32; cols];
+                    let mut s = vec![-7i32; cols]; // sentinel: never a legal row index
+                    let mut v = vec![-7i32; cols];
                     unsafe {
                         colarg_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, is_max);
                         colarg_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, is_max);
