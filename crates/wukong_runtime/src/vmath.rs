@@ -2419,10 +2419,18 @@ mod tests {
     }
 
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element, so a length that is
-    /// not a multiple of 8 produces a consistent result regardless of where the tail starts.
+    /// not a multiple of 8 produces a consistent result regardless of where the tail starts. The length
+    /// **must** stay a non-multiple of 8: at 1000 the ×4 body plus the 8-wide remainder consumed every
+    /// element and the scalar tail below them never ran, so despite its name this test only compared the
+    /// lanes. 1001 leaves one element for the tail.
+    ///
+    /// The op list is the all-real half of the `VM_*` set. The domain-restricted ops carry their own
+    /// bit-for-bit twin check inside their accuracy test (`vmath_inverse_hyperbolic` for acosh/atanh,
+    /// `vmath_inverse_trig` for tan/asin/acos, `vmath_expm1_log1p` for log1p, `vmath_log_dense_sweep`
+    /// for the log family — which is why log/log2/log10 are `continue`d below).
     #[test]
     fn vmath_tail_matches_lanes() {
-        let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
+        let xs: Vec<f32> = (0..1001).map(|i| (i as f32 - 500.0) * 0.013).collect();
         for op in [
             VM_EXP,
             VM_LOG,
@@ -2431,6 +2439,14 @@ mod tests {
             VM_RELU,
             VM_SILU,
             VM_GELU,
+            VM_ELU,
+            VM_LEAKYRELU,
+            VM_SOFTPLUS,
+            VM_MISH,
+            VM_SELU,
+            VM_TANHSHRINK,
+            VM_HARDSIGMOID,
+            VM_HARDSWISH,
             VM_SIN,
             VM_COS,
             VM_ERF,
