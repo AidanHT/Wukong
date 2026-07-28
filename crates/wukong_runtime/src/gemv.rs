@@ -369,6 +369,34 @@ mod tests {
         }
     }
 
+    /// The portable fallback [`gemv_row_scalar`] is the ONLY row dot on a target without AVX2+FMA
+    /// (and the whole kernel on a non-x86_64 build, where the `#[cfg(target_arch = "x86_64")]` fast
+    /// path is compiled out), but on an AVX2 host every public entry takes the AVX2 branch, so no
+    /// other test in this module ever executes it — deleting the `* x[j]` factor left the suite
+    /// green. Pin it directly against an independent f64 dot, across the sizes the AVX2 twin's
+    /// 32/8-element unroll edges are keyed to. Tolerance is the standard in-order f32 accumulation
+    /// bound `n·u·Σ|a·x|` with slack (this path does NOT reassociate, so it is the loosest of the
+    /// two paths only in chain length).
+    #[test]
+    fn gemv_row_scalar_matches_f64_reference() {
+        for &n in &[1usize, 7, 8, 31, 32, 33] {
+            let a = fill(11, n);
+            let x = fill(12, n);
+            let (mut want, mut mag) = (0.0f64, 0.0f64);
+            for j in 0..n {
+                want += a[j] as f64 * x[j] as f64;
+                mag += (a[j] as f64 * x[j] as f64).abs();
+            }
+            // SAFETY: `a` and `x` are each `n` `f32` long — the kernel's whole precondition.
+            let got = unsafe { gemv_row_scalar(a.as_ptr(), x.as_ptr(), n) };
+            let tol = 4.0 * n as f64 * f32::EPSILON as f64 * mag;
+            assert!(
+                (got as f64 - want).abs() <= tol,
+                "gemv_row_scalar n={n}: got {got} want {want} tol {tol}"
+            );
+        }
+    }
+
     /// Throughput probe (run: `cargo test -p wukong_runtime --release -- --ignored --nocapture
     /// sgemv_throughput`). GEMV is memory-bound, so the figure of merit is A-streaming GB/s, not GFLOP/s.
     #[test]
