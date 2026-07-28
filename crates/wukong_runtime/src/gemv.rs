@@ -183,6 +183,14 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
     #[cfg(target_arch = "x86_64")]
     {
         use rayon::prelude::*;
+        // A `@parallel` GEMV can be the process's FIRST rayon touch (a decode-step LM head runs
+        // before any outlined region), so it must configure the global pool before forking — the
+        // invariant `ensure_global_pool` states: whoever forks first decides the registry, and a
+        // default 2 MiB-stack registry built here makes the runtime's later 16 MiB `build_global`
+        // lose the race, leaving `@parallel` region bodies (~1.5 MiB of privatized scratch) on
+        // 2 MiB stacks. Pool configuration only — the row split below is worker-count independent,
+        // so the bits are unchanged.
+        crate::ensure_global_pool();
         let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
         (0..mu).into_par_iter().for_each(|i| {
             // SAFETY: disjoint output element y[i]; shared read-only a-row / x; pointers re-derived.
@@ -227,6 +235,9 @@ pub unsafe extern "C" fn wukong_sgemv_parallel(
     #[cfg(target_arch = "x86_64")]
     {
         use rayon::prelude::*;
+        // Configure the global pool before forking, for the reason spelled out in
+        // [`wukong_sgemv_alpha_parallel`] (this entry can equally be the first rayon touch).
+        crate::ensure_global_pool();
         let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
         (0..mu).into_par_iter().for_each(|i| {
             // SAFETY: disjoint output element y[i]; shared read-only a-row / x; pointers re-derived.
@@ -355,6 +366,34 @@ mod tests {
                 wukong_sgemv_alpha(a.as_ptr(), x.as_ptr(), a1.as_mut_ptr(), m as i64, n as i64, 1.0);
             }
             assert_eq!(plain, a1, "sgemv_alpha(1.0) must be byte-identical to sgemv ({m}x{n})");
+        }
+    }
+
+    /// The portable fallback [`gemv_row_scalar`] is the ONLY row dot on a target without AVX2+FMA
+    /// (and the whole kernel on a non-x86_64 build, where the `#[cfg(target_arch = "x86_64")]` fast
+    /// path is compiled out), but on an AVX2 host every public entry takes the AVX2 branch, so no
+    /// other test in this module ever executes it — deleting the `* x[j]` factor left the suite
+    /// green. Pin it directly against an independent f64 dot, across the sizes the AVX2 twin's
+    /// 32/8-element unroll edges are keyed to. Tolerance is the standard in-order f32 accumulation
+    /// bound `n·u·Σ|a·x|` with slack (this path does NOT reassociate, so it is the loosest of the
+    /// two paths only in chain length).
+    #[test]
+    fn gemv_row_scalar_matches_f64_reference() {
+        for &n in &[1usize, 7, 8, 31, 32, 33] {
+            let a = fill(11, n);
+            let x = fill(12, n);
+            let (mut want, mut mag) = (0.0f64, 0.0f64);
+            for j in 0..n {
+                want += a[j] as f64 * x[j] as f64;
+                mag += (a[j] as f64 * x[j] as f64).abs();
+            }
+            // SAFETY: `a` and `x` are each `n` `f32` long — the kernel's whole precondition.
+            let got = unsafe { gemv_row_scalar(a.as_ptr(), x.as_ptr(), n) };
+            let tol = 4.0 * n as f64 * f32::EPSILON as f64 * mag;
+            assert!(
+                (got as f64 - want).abs() <= tol,
+                "gemv_row_scalar n={n}: got {got} want {want} tol {tol}"
+            );
         }
     }
 
