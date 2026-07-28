@@ -598,6 +598,21 @@ impl<'a> Parser<'a> {
     fn parse_postfix(&mut self, mut lhs: Expr) -> Expr {
         loop {
             let start = lhs.span;
+            // Each postfix operator folds one more level onto the left-leaning tree. The chain is
+            // built *iteratively* (this loop, not recursion), so the parser's own descent stays
+            // shallow — but the resulting tree does not, and a later recursive consumer (sema,
+            // lowering, even the `Box` chain's `Drop`) overflows the stack on it. Charge every fold
+            // to the shared budget, exactly like the binop fold at :502 and the cast fold at :536;
+            // the `_ => break` arm below builds nothing, so it is not charged. No restore is needed
+            // here: the sole caller `parse_prefix` snapshots and restores `self.depth` around us.
+            if matches!(self.kind(), T::LParen | T::LBracket | T::Dot | T::ColonColon) {
+                self.depth += 1;
+                if self.depth > Self::MAX_DEPTH {
+                    let sp = self.span();
+                    self.too_deep(sp);
+                    break;
+                }
+            }
             match self.kind() {
                 T::LParen => {
                     let args = self.parse_args();
@@ -1887,6 +1902,42 @@ mod tests {
             .expect("spawn parser thread")
             .join()
             .expect("the parser must not overflow its stack on deeply nested input");
+    }
+
+    /// A long *postfix* chain (`a.b.b.b…`, `a[0][0]…`, `f()()…`, `a::b::b…`) builds the same kind of
+    /// deep left-leaning tree the binop fold does, and used to be the one fold that never charged
+    /// the depth budget: 400000 `.b` overflowed the compiler's stack (exit 127, zero diagnostics)
+    /// instead of reporting E0209.
+    #[test]
+    fn deep_postfix_chain_reports_e0209() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let has_e0209 =
+                    |diags: &[Diagnostic]| diags.iter().any(|d| d.code == Some("E0209"));
+                let n = 5000;
+                for chain in [
+                    format!("a{}", ".b".repeat(n)),
+                    format!("a{}", "[0]".repeat(n)),
+                    format!("f{}", "()".repeat(n)),
+                    format!("a{}", "::b".repeat(n)),
+                ] {
+                    let mut i = Interner::new();
+                    let (_e, d) = parse_expr_str(&chain, SourceId(0), &mut i);
+                    assert!(
+                        has_e0209(&d),
+                        "long postfix chain should report E0209, got {d:?}"
+                    );
+                }
+
+                // A realistic postfix chain stays far under the limit.
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str("a.b.c[0].d(1).e", SourceId(0), &mut i);
+                assert!(d.is_empty(), "short postfix chain must parse cleanly: {d:?}");
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("the parser must not overflow its stack on a long postfix chain");
     }
 
     /// Pathological *structural* nesting — deep `{ … }` blocks, `if`/`else if` chains, `match` arm
