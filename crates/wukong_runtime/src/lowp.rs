@@ -1374,6 +1374,11 @@ mod tests {
     #[ignore = "bandwidth bench; run explicitly in --release"]
     fn lowp_bandwidth() {
         use std::time::Instant;
+        assert!(
+            !cfg!(debug_assertions),
+            "this is a throughput measurement, not a test — rebuild with --release \
+             (cargo test -p wukong_runtime --release lowp_bandwidth -- --ignored --nocapture)"
+        );
         let n = 32 << 20; // 32M elements — 128 MB f32, 64 MB half, both ≫ L3
         let xs: Vec<f32> = (0..n).map(|i| ((i % 251) as f32) * 0.001).collect();
         let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
@@ -1460,6 +1465,11 @@ mod tests {
     #[ignore = "bandwidth bench; run explicitly in --release"]
     fn axpby_bf16_bandwidth() {
         use std::time::Instant;
+        assert!(
+            !cfg!(debug_assertions),
+            "this is a throughput measurement, not a test — rebuild with --release \
+             (cargo test -p wukong_runtime --release axpby_bf16_bandwidth -- --ignored --nocapture)"
+        );
         let n = 32 << 20; // 32M elems — bf16 in 128 MB, f32 in 256 MB, both ≫ L3
         let xs: Vec<f32> = (0..n).map(|i| ((i % 251) as f32) * 0.001).collect();
         let ys: Vec<f32> = (0..n).map(|i| ((i % 199) as f32) * 0.002).collect();
