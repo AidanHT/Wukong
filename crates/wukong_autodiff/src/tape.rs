@@ -175,6 +175,29 @@ impl<'a> Vjp<'a> {
         }
     }
 
+    /// The argument count of each recognized kernel's ABI, matching the operand lists the VJP rules
+    /// below index. `is_kernel` recognizes a call by SYMBOL NAME alone, and a `.wk` program may
+    /// declare that name in an `extern "C"` block with any signature it likes — so the arity must be
+    /// checked before those rules index `args[..]` raw, or a mismatched declaration panics the
+    /// compiler with an index-out-of-bounds ICE instead of producing a diagnostic.
+    /// The arms mirror [`Vjp::diff_kernel_call`]'s dispatch chain one-for-one, so a new kernel arm
+    /// there is a visible hole here.
+    fn kernel_arity(&self, func: Symbol) -> Option<usize> {
+        if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
+            Some(4) // (x, y, n, op)
+        } else if func == self.syms.sgemm_nt || func == self.syms.sgemm_nt_parallel {
+            Some(7) // (a, b, c, m, k, n, beta)
+        } else if func == self.syms.vmath || func == self.syms.vmath_parallel {
+            Some(4) // (x, out, n, op)
+        } else if func == self.syms.velem || func == self.syms.velem_parallel {
+            Some(8) // (x, y, out, n, a, b, c, op)
+        } else if func == self.syms.norm {
+            Some(6) // (x, out, rows, cols, eps_bits, op)
+        } else {
+            None
+        }
+    }
+
     /// Differentiate one recognized kernel call. `args`/`result` are the forward (old) value ids.
     pub(crate) fn diff_kernel_call(
         &mut self,
@@ -182,6 +205,18 @@ impl<'a> Vjp<'a> {
         raw_args: &[ValueId],
         result: Option<ValueId>,
     ) -> Result<(), String> {
+        let want = self
+            .kernel_arity(func)
+            .ok_or_else(|| "autodiff: kernel call has no VJP rule".to_string())?;
+        if raw_args.len() != want {
+            return Err(format!(
+                "autodiff: call to `{}` has {} argument(s), expected {} — not the recognized \
+                 kernel ABI",
+                self.it.resolve(func),
+                raw_args.len(),
+                want
+            ));
+        }
         // Normalize every buffer operand to its base alloca/param so the buffer-adjoint bookkeeping
         // is keyed consistently regardless of which whole-buffer pointer form lowering chose. (The
         // scalar `result` of a reduction is never a gep, so it needs no canonicalization.)

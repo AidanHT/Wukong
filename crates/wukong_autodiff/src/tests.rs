@@ -1566,6 +1566,45 @@ fn parallel_region_declines_loudly() {
     );
 }
 
+/// `is_kernel` recognizes a call by SYMBOL NAME alone, but every VJP rule indexes the forward
+/// argument vector raw (`args[0]`..`args[7]`). A `.wk` program may declare a runtime kernel name in
+/// an `extern "C"` block with any signature, so a one-argument `wukong_norm_f32` used to reach
+/// `diff_norm` and panic the compiler:
+/// `index out of bounds: the len is 1 but the index is 1` at tape.rs (exit 127, observed with the
+/// shipped release compiler on an `extern "C" { fn wukong_norm_f32(p: *mut f32); }` program).
+/// The ABI arity is now checked up front, so the same input gets a diagnostic.
+#[test]
+fn kernel_call_with_wrong_arity_declines_loudly() {
+    for (name, nargs, want) in [
+        ("wukong_norm_f32", 1usize, 6usize),
+        ("wukong_velem_f32", 3, 8),
+        ("wukong_sgemm_nt", 2, 7),
+        ("wukong_vmath_f32", 9, 4),
+    ] {
+        let mut it = Interner::default();
+        let kern = sym(&mut it, name);
+        let mut b = Builder::new(sym(&mut it, "extfwd"), MirType::Void);
+        let x = b.add_param(PTR);
+        let out = b.add_param(PTR);
+        b.build_void(Op::Call {
+            func: kern,
+            args: vec![out; nargs],
+        });
+        let x0 = b.build(MirType::F32, Op::Load(x, MirType::F32));
+        let sq = b.build(MirType::F32, Op::Bin(BinOp::FMul, x0, x0));
+        b.build_void(Op::Store { ptr: out, value: sq });
+        b.ret(Some(sq));
+        let fwd = b.finish();
+
+        let err = grad(&fwd, &[0], &mut it)
+            .expect_err("a non-ABI arity must be a diagnostic, not an index panic");
+        assert!(
+            err.contains(name) && err.contains(&format!("expected {want}")),
+            "{name}/{nargs} must name the callee and the expected arity, got: {err}"
+        );
+    }
+}
+
 /// A scalar element write into a buffer that a downstream recognized kernel then REDUCES is on the
 /// gradient path, but the reverse walk has no VJP rule for read-after-write through memory. It used
 /// to be skipped as "the loss sink", which made the whole reverse pass contribute nothing: observed
