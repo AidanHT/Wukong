@@ -340,6 +340,7 @@ impl<'a> Lexer<'a> {
 
     fn lex_char(&mut self, start: usize) -> TokenKind {
         self.bump(); // opening quote
+        let body = self.pos;
         match self.peek_at(0) {
             Some(b'\\') => self.consume_escape(),
             Some(c) if c != b'\'' => {
@@ -349,13 +350,45 @@ impl<'a> Lexer<'a> {
             }
             _ => {}
         }
+        let empty = self.pos == body;
         if self.peek_at(0) == Some(b'\'') {
             self.bump();
+            if empty {
+                // `''` has no body; without this it decodes to 0, i.e. it is silently `'\0'`.
+                let span = self.span(start);
+                self.error(span, "E0104", "empty character literal");
+            }
+        } else if let Some(close) = self.close_quote_on_line() {
+            // More than one codepoint. Consume through the literal's own closing quote so it is
+            // not re-lexed as the opening quote of the next one, which would cost a second
+            // diagnostic and swallow the token after it (`'ab';` losing its `;`).
+            self.pos = close + 1;
+            let span = self.span(start);
+            self.error(
+                span,
+                "E0104",
+                "character literal may only contain one codepoint",
+            );
         } else {
+            // No closing quote on this line: report and leave the cursor where it is, so the
+            // rest of the line still lexes as itself.
             let span = self.span(start);
             self.error(span, "E0104", "unterminated character literal");
         }
         TokenKind::Char
+    }
+
+    /// Byte offset of the next `'` at or after the cursor, if one occurs before the end of the
+    /// line. Used to resync after a malformed character literal.
+    fn close_quote_on_line(&self) -> Option<usize> {
+        let mut off = 0;
+        loop {
+            match self.peek_at(off) {
+                Some(b'\'') => return Some(self.pos + off),
+                Some(b'\n') | None => return None,
+                Some(_) => off += 1,
+            }
+        }
     }
 
     /// Match a punctuation/operator token at the cursor, consuming it. Returns `None` if the
