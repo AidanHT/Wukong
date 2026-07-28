@@ -2790,6 +2790,7 @@ mod tests {
         for (op, fref) in [
             (VM2_SILU_GATE, silu_f64 as fn(f64) -> f64),
             (VM2_GELU_GATE, gelu_f64 as fn(f64) -> f64),
+            (VM2_SIGMOID_GATE, sigmoid_f64 as fn(f64) -> f64),
         ] {
             let mut got = vec![0.0f32; n];
             // SAFETY: a/b/got are exactly n f32 long — the kernel's contract.
@@ -2909,6 +2910,35 @@ mod tests {
                 let want = crate::f16_bits_to_f32(hbits[i]);
                 assert_eq!(o[i].to_bits(), want.to_bits(), "vmath_f16 op {op} i {i}");
             }
+        }
+    }
+
+    /// `apply1`/`vmath8_for` and `apply2_1`/`vmath2_8_for` are mirrored op-code tables: the scalar one
+    /// is the twin the AVX2 tail and the no-AVX2 fallback run, the vector one is what the lanes run.
+    /// A code present in one and missing from the other used to be invisible (the AVX2 dispatcher just
+    /// returned, writing nothing) and is now merely slow — either way the desync is a bug, so pin both
+    /// tables total over their declared code space and `None` outside it. A future `VM_*` added to
+    /// `apply1` without its `vmath8_for` arm fails here instead of silently running at scalar speed.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vmath_op_tables_cover_the_declared_code_space() {
+        for op in 0..=VM_CBRT {
+            assert!(vmath8_for(op).is_some(), "vmath8_for missing VM_* code {op}");
+        }
+        for op in [-1i64, VM_CBRT + 1, 9999] {
+            assert!(vmath8_for(op).is_none(), "vmath8_for claims unknown code {op}");
+        }
+        for op in 0..=VM2_SIGMOID_GATE {
+            assert!(
+                vmath2_8_for(op).is_some(),
+                "vmath2_8_for missing VM2_* code {op}"
+            );
+        }
+        for op in [-1i64, VM2_SIGMOID_GATE + 1, 9999] {
+            assert!(
+                vmath2_8_for(op).is_none(),
+                "vmath2_8_for claims unknown code {op}"
+            );
         }
     }
 
