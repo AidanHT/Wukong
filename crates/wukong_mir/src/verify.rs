@@ -2,9 +2,12 @@
 //! error* (a bug in a pass), not a user error, so violations are returned as plain strings.
 //!
 //! It runs after MIR construction, between optimization passes (under `--verify-each`), and
-//! before backend entry. Checks: every value used is defined; block-parameter arities and types
-//! line up across edges; per-operation operand/result types are consistent; and terminators are
-//! type-correct (including the function return type).
+//! before backend entry. Checks: every value is defined exactly once, inside the value arena, and
+//! before — in the dominance order — every use of it; the entry block matches the function's
+//! parameters and has no predecessors; block-parameter arities and types line up across edges;
+//! per-operation operand/result types are consistent; a `veckernel` index is in range; and
+//! terminators are type-correct (including the function return type). Given a whole [`Program`],
+//! [`verify_program`] additionally checks each call against its callee's declared signature.
 
 use std::collections::{HashMap, HashSet};
 
