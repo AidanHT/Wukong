@@ -564,8 +564,14 @@ macro_rules! rt_file_io {
         /// Opens `path` read-only (returns `-1` if that fails, leaving `data` untouched), then
         /// reads `n = min(len, file_size / sizeof)` elements — the file's trailing partial element,
         /// if any, is ignored. `data[0..n]` receives the decoded values; `data[n..]` is left as the
-        /// caller allocated it (`alloc_*` pre-zeroes). Returns `n` on success, `-2` on a mid-read
-        /// I/O error, and `0` (without touching `data`) when `len <= 0`.
+        /// caller allocated it (`alloc_*` pre-zeroes). Returns `n` on success and `-2` on a
+        /// mid-read I/O error.
+        ///
+        /// **Ordering is part of the contract**: the open is attempted FIRST, so a missing or
+        /// unopenable path is `-1` even when `len <= 0`. The interpreter — the semantic oracle for
+        /// this frozen family — has no early return, and a native short-circuit here answered `0`
+        /// where it answered `-1` for the same program. A `len <= 0` on an openable path still
+        /// reads nothing and returns `0`, which is `min(len, avail)` clamped at zero.
         ///
         /// # Safety
         /// `data` must address at least `len` writable `
@@ -575,9 +581,6 @@ macro_rules! rt_file_io {
         pub extern "C" fn $read(path: *const u8, data: *mut $T, len: i64) -> i64 {
             use std::io::Read;
             const SZ: usize = std::mem::size_of::<$T>();
-            if len <= 0 {
-                return 0;
-            }
             // SAFETY: forwarded from this function's own safety contract.
             let Some(path) = (unsafe { rt_path(path) }) else {
                 return -1;
@@ -590,7 +593,9 @@ macro_rules! rt_file_io {
                 Ok(m) => (m.len() / SZ as u64) as usize,
                 Err(_) => return -2,
             };
-            let n = (len as usize).min(avail);
+            // `min(len, avail)` clamped at zero — the interpreter's exact expression, so a
+            // non-positive `len` reads nothing on an openable path instead of casting negative.
+            let n = if len <= 0 { 0 } else { (len as usize).min(avail) };
             if n == 0 {
                 return 0;
             }
@@ -968,6 +973,8 @@ mod tests {
 
     #[test]
     fn read_nonpositive_len_returns_zero_without_touching_buf() {
+        // The path is written first on purpose: `0` is the *openable*-path answer for `len <= 0`.
+        // The missing-path answer is `-1`, pinned by the sibling test below.
         let path = io_tmp("zerolen");
         let cp = cpath(&path);
         let ptr = cp.as_ptr() as *const u8;
@@ -978,6 +985,26 @@ mod tests {
         assert_eq!(wukong_rt_read_u8(ptr, buf.as_mut_ptr(), -5), 0);
         assert_eq!(buf, [0xAA; 3], "buf must be untouched on negative len");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_reports_open_failure_even_for_a_nonpositive_len() {
+        // The `-1` open-failure code is decided BEFORE the `len <= 0` short-circuit, because the
+        // interpreter (the semantic oracle) opens unconditionally: it has no early return, so a
+        // missing path is `-1` there for every `len`. The native read used to answer `0` first,
+        // which made `read_f32("missing", alloc_f32(0))` print `0` under `--backend=native` and
+        // `-1` under the interpreter for the same program.
+        let path = io_tmp("zerolen_missing"); // never created
+        let cp = cpath(&path);
+        let ptr = cp.as_ptr() as *const u8;
+        let mut bf = [0xAAu8; 3];
+        assert_eq!(wukong_rt_read_u8(ptr, bf.as_mut_ptr(), 0), -1);
+        assert_eq!(wukong_rt_read_u8(ptr, bf.as_mut_ptr(), -5), -1);
+        assert_eq!(bf, [0xAA; 3], "buf must be untouched on open failure");
+        let mut bs = [0f32; 1];
+        assert_eq!(wukong_rt_read_f32(ptr, bs.as_mut_ptr(), 0), -1);
+        let mut bl = [0i64; 1];
+        assert_eq!(wukong_rt_read_i64(ptr, bl.as_mut_ptr(), 0), -1);
     }
 
     #[test]
