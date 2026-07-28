@@ -182,6 +182,27 @@ error[E0501]: shape mismatch
     }
 
     #[test]
+    fn tab_indented_line_aligns_with_its_caret() {
+        // Two leading tabs. The rendered source line and the caret padding beneath it must agree
+        // on how wide a tab is; printing a raw `\t` and padding with one space per column puts the
+        // carets (tabstop - 1) columns left of the construct they are supposed to mark.
+        let (sm, id) = sm_with("fn main() {\n\t\tmatmul(a, b);\n}\n");
+        let span = Span::new(id, 14, 20); // "matmul" on line 2
+        let d = Diagnostic::error("shape mismatch")
+            .with_code("E0501")
+            .primary(span, "K must equal P");
+        let r = Renderer::new(false).render(&d, &sm);
+        let expected = "\
+error[E0501]: shape mismatch
+ --> test.wk:2:3
+  |
+2 |         matmul(a, b);
+  |         ^^^^^^ K must equal P
+  |";
+        assert_eq!(r, expected);
+    }
+
+    #[test]
     fn renders_without_labels() {
         let (sm, _id) = sm_with("x");
         let d = Diagnostic::error("could not find input file").note("check the path");
