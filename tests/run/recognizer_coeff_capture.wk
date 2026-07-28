@@ -1,0 +1,100 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 11
+// EXPECT-OUT: 21
+// EXPECT-OUT: 100
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 999
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 19
+// EXPECT-OUT: 32
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 9
+module tests.run.recognizer_coeff_capture
+
+// What the streaming recognizers may treat as a loop-invariant COEFFICIENT — the scalars they lower
+// once, outside the loop, and hand to the kernel. "Does not mention the loop variable" does not imply
+// either property the hoist needs:
+//   * it may name a binding the loop BODY introduces (the Horner element temp / accumulator), which
+//     outside the loop resolves to an outer variable of the same name, or to nothing at all;
+//   * it may have side effects, which then happen once instead of once per element.
+// Both loops below must therefore fall through to the generic vectorizer. The last two are positive
+// controls that the tightening did not disarm the recognizers — they still dispatch
+// (`wukong_vhorner_f32` / `wukong_velem_f32` in `--emit=mir -O2`) and must stay numerically right.
+// The kernel fires in BOTH backends, so interp==native and -O0==-O2 see nothing here: only these
+// golden values do.
+
+fn tick() -> f32 {
+    print(1);
+    return 2.0;
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        x[i] = (i as f32);
+    }
+
+    // The Horner "coefficient" is the body-local element temp, which shadows an outer `v`.
+    // Meaning: acc = 1*v + v = 2v, then acc = 2v*v + 3 = 2v^2 + 3.
+    let v: f32 = 100.0;
+    let mut out: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        let v: f32 = x[i];
+        let mut acc: f32 = 1.0;
+        acc = acc * v + v;
+        acc = acc * v + 3.0;
+        out[i] = acc;
+    }
+    for i in 0..4 {
+        print(round(out[i]) as i32); // 3 5 11 21 — never the outer v = 100
+    }
+    print(round(v) as i32); // 100 — the outer binding is untouched
+
+    // The elementwise scale factor is a call with an observable effect: four elements, four calls.
+    let mut o: [f32; 4] = [0.0; 4];
+    for j in 0..4 {
+        o[j] = x[j] * tick();
+    }
+    print(999);
+    for t in 0..4 {
+        print(o[t] as i32); // 0 2 4 6
+    }
+
+    // Positive control 1: a genuine Horner polynomial, coefficients an outer scalar and literals.
+    let a: f32 = 2.0;
+    let mut p: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        let e: f32 = x[i];
+        let mut r: f32 = a;
+        r = r * e + 3.0;
+        r = r * e + 5.0;
+        p[i] = r;
+    }
+    for i in 0..4 {
+        print(round(p[i]) as i32); // 2e^2 + 3e + 5 -> 5 10 19 32
+    }
+
+    // Positive control 2: a genuine invariant elementwise scale.
+    let b: f32 = 3.0;
+    let mut q: [f32; 4] = [0.0; 4];
+    for j in 0..4 {
+        q[j] = x[j] * b;
+    }
+    for t in 0..4 {
+        print(q[t] as i32); // 0 3 6 9
+    }
+    return 0;
+}
