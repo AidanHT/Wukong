@@ -138,6 +138,13 @@ const EMBEDDING_PAR_MIN: usize = 64;
 /// `out[t, :] = weight[ids[t], :]` over a `[T, H]` output, `[V, H]` weight table, and length-`T` `i32`
 /// `ids` — embedding lookup, single-threaded.
 ///
+/// The three extents are **signed**, matching the `i64` the compiler's import declares and every
+/// sibling kernel (`wukong_attention_f32`, `wukong_rope_f32`, `wukong_transpose_f32`). A non-positive
+/// `t` or `h` is a no-op, reproducing the source nest `for t in 0..n` with `n <= 0`, which iterates
+/// zero times; a non-positive `v` leaves no valid weight row, so every id is out of range and every
+/// output row is zeroed by the guard in [`embedding_rows`]. Taking these as `usize` instead read a
+/// negative extent as a near-`usize::MAX` magnitude and walked off the end of memory.
+///
 /// # Safety
 /// `out` valid for `t*h` f32, `weight` valid for `v*h` f32, `ids` valid for `t` `i32`, non-overlapping
 /// `out`/`weight`.
@@ -146,14 +153,22 @@ pub unsafe extern "C" fn wukong_embedding_f32(
     out: *mut f32,
     weight: *const f32,
     ids: *const i32,
-    t: usize,
-    h: usize,
-    v: usize,
+    t: i64,
+    h: i64,
+    v: i64,
 ) {
-    if t == 0 || h == 0 {
+    if t <= 0 || h <= 0 {
         return;
     }
-    embedding_rows(out, weight, ids, h, v, 0, t);
+    embedding_rows(
+        out,
+        weight,
+        ids,
+        h as usize,
+        v.max(0) as usize,
+        0,
+        t as usize,
+    );
 }
 
 /// Multi-threaded `out[t, :] = weight[ids[t], :]`: the independent `T` output rows are spread across
@@ -162,19 +177,22 @@ pub unsafe extern "C" fn wukong_embedding_f32(
 /// count and order are irrelevant). Below `EMBEDDING_PAR_MIN` rows it runs the serial path.
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_embedding_f32`].
+/// Operand-size contract of [`wukong_embedding_f32`], including its non-positive-extent rule.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_embedding_f32_parallel(
     out: *mut f32,
     weight: *const f32,
     ids: *const i32,
-    t: usize,
-    h: usize,
-    v: usize,
+    t: i64,
+    h: i64,
+    v: i64,
 ) {
-    if t == 0 || h == 0 {
+    if t <= 0 || h <= 0 {
         return;
     }
+    // Past the sign guard the extents are ordinary magnitudes; `per`/`nchunks` below are derived
+    // from `t`, so this conversion must come after it.
+    let (t, h, v) = (t as usize, h as usize, v.max(0) as usize);
     if t < EMBEDDING_PAR_MIN {
         embedding_rows(out, weight, ids, h, v, 0, t);
         return;
@@ -252,17 +270,17 @@ mod tests {
                     got.as_mut_ptr(),
                     weight.as_ptr(),
                     ids.as_ptr(),
-                    t,
-                    h,
-                    v,
+                    t as i64,
+                    h as i64,
+                    v as i64,
                 );
                 wukong_embedding_f32_parallel(
                     got_par.as_mut_ptr(),
                     weight.as_ptr(),
                     ids.as_ptr(),
-                    t,
-                    h,
-                    v,
+                    t as i64,
+                    h as i64,
+                    v as i64,
                 );
             }
             assert_eq!(got, want, "embedding {t}x{h} v={v} vs naive");
@@ -282,14 +300,21 @@ mod tests {
         let mut got = vec![9.0f32; t * h];
         let mut got_par = vec![9.0f32; t * h];
         unsafe {
-            wukong_embedding_f32(got.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), t, h, v);
+            wukong_embedding_f32(
+                got.as_mut_ptr(),
+                weight.as_ptr(),
+                ids.as_ptr(),
+                t as i64,
+                h as i64,
+                v as i64,
+            );
             wukong_embedding_f32_parallel(
                 got_par.as_mut_ptr(),
                 weight.as_ptr(),
                 ids.as_ptr(),
-                t,
-                h,
-                v,
+                t as i64,
+                h as i64,
+                v as i64,
             );
         }
         assert_eq!(got, want, "out-of-range gather vs naive");
@@ -315,5 +340,64 @@ mod tests {
             wukong_embedding_f32_parallel(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), 0, 4, 2);
         }
         assert!(out.iter().all(|&x| x == 42.0), "no-op must not write out");
+    }
+
+    /// A **negative** row or hidden count is a no-op too, not a near-`usize::MAX` extent. The dims
+    /// arrive as the compiler's `i64`s and a recognized gather nest can be handed a runtime-computed
+    /// negative bound (`for t in 0..n`, `n < 0` — zero iterations in the source), so this is a
+    /// reachable input, not a hypothetical: with `usize` parameters `t = -1` became 18446744073709551615
+    /// rows and the kernel walked off the end of `out`. A negative `v` likewise leaves no valid weight
+    /// row, so every id is out of range and every output row is zeroed rather than read from a table
+    /// of `usize::MAX` rows.
+    #[test]
+    fn negative_extents_are_noops() {
+        let weight = vec![1.0f32; 8];
+        let ids = [0i32; 2];
+        let mut out = vec![42.0f32; 8];
+        unsafe {
+            wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), -1, 4, 2);
+            wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), 2, -4, 2);
+            wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), i64::MIN, 4, 2);
+            wukong_embedding_f32_parallel(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), -1, 4, 2);
+            wukong_embedding_f32_parallel(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), 2, -4, 2);
+            wukong_embedding_f32_parallel(
+                out.as_mut_ptr(),
+                weight.as_ptr(),
+                ids.as_ptr(),
+                i64::MIN,
+                4,
+                2,
+            );
+        }
+        assert!(
+            out.iter().all(|&x| x == 42.0),
+            "a negative extent must not write out"
+        );
+
+        // Negative table height: no row is in range, so both paths zero every output row (the
+        // out-of-range rule) instead of indexing a `usize::MAX`-row table.
+        let (t, h) = (2usize, 4usize);
+        let mut got = vec![9.0f32; t * h];
+        let mut got_par = vec![9.0f32; t * h];
+        unsafe {
+            wukong_embedding_f32(
+                got.as_mut_ptr(),
+                weight.as_ptr(),
+                ids.as_ptr(),
+                t as i64,
+                h as i64,
+                -1,
+            );
+            wukong_embedding_f32_parallel(
+                got_par.as_mut_ptr(),
+                weight.as_ptr(),
+                ids.as_ptr(),
+                t as i64,
+                h as i64,
+                -1,
+            );
+        }
+        assert!(got.iter().all(|&x| x == 0.0), "v < 0 must zero every row");
+        assert_eq!(got, got_par, "v < 0 serial vs parallel");
     }
 }
