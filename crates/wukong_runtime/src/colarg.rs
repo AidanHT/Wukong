@@ -57,12 +57,10 @@ unsafe fn colarg_scalar(
     j1: usize,
     is_max: bool,
 ) {
-    // Seed from row 0: best value = x[0, j], best row = 0, for every column in the range.
-    for j in j0..j1 {
-        *out.add(j) = 0;
-    }
-    // (best value per column is recomputed from x on each comparison below; no separate value buffer
-    // is needed for the scalar path — clarity over a tiny re-load, and it mirrors the AVX2 seed.)
+    // One column at a time: the running best value and best row live in registers for the whole
+    // i-scan, so `out[j]` is written exactly once, at the end. Nothing reads `out` before that write
+    // — unlike the AVX2 twin, which needs a real seeded scratch buffer because its accumulators stay
+    // resident across all rows.
     for j in j0..j1 {
         let mut best_val = *x.add(j); // x[0*cols + j]
         let mut best_row = 0usize;
