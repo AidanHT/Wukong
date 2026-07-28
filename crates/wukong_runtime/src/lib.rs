@@ -321,12 +321,15 @@ unsafe impl Sync for EnvAddr {}
 /// emits inline stack probes, so a big frame is safe exactly when the reserve is big enough) and
 /// `RAYON_NUM_THREADS` honored explicitly (the core-count sweep instrument).
 ///
-/// EVERY parallel path in this crate that can be the process's FIRST rayon touch must call this
-/// before forking: the pre-2026-07-10 code initialized only inside `wukong_parallel_for`, but in
+/// Calling this before the process's FIRST rayon touch is what makes the *global* pool carry that
+/// configuration: the pre-2026-07-10 code initialized only inside `wukong_parallel_for`, but in
 /// a real transformer forward the first parallel op is a `_parallel` norm — rayon then built the
 /// default registry (2 MiB stacks) first and the 16 MiB `build_global` silently lost the race, so
-/// region bodies ran on 2 MiB stacks. Best-effort as ever: if another rayon user in the host
-/// process won the race anyway, `build_global` errors and behavior is as before.
+/// region bodies ran on 2 MiB stacks. Most `_parallel` kernels still fork with a bare
+/// `into_par_iter()` and so can lose that race for us; rather than make correctness depend on an
+/// unstated call ordering, the outcome is *recorded* here and [`region_pool`] backstops it, so a
+/// lost race costs a second pool rather than a stack fault. Best-effort as ever: a host process
+/// that owns the global pool keeps it.
 pub(crate) fn ensure_global_pool() {
     use std::sync::Once;
     static POOL_INIT: Once = Once::new();
@@ -339,8 +342,41 @@ pub(crate) fn ensure_global_pool() {
         {
             b = b.num_threads(t);
         }
-        let _ = b.build_global();
+        // `Once` publishes this store to every later `call_once` caller, so `Relaxed` suffices.
+        GLOBAL_POOL_IS_OURS.store(
+            b.build_global().is_ok(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     });
+}
+
+/// Set by [`ensure_global_pool`]: `true` iff its `build_global` actually installed the global
+/// pool. `false` means some earlier rayon touch — including a bare `into_par_iter()` in one of
+/// this crate's own `_parallel` kernels — already built the default registry, whose worker stacks
+/// are rayon's ~2 MiB default, NOT the 16 MiB a region body needs.
+static GLOBAL_POOL_IS_OURS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The private 16 MiB-stack pool [`run_on_wuk_pool`] forks on when the global registry is not the
+/// one [`ensure_global_pool`] built and the GEMM pool is unavailable (no HyperThreads to shed, or
+/// `WUKONG_POOL_UNIFY=0`). Without it that path forks a region body onto rayon's ~2 MiB default
+/// stacks and Cranelift's inline stack probes fault — reproduced as STATUS_STACK_OVERFLOW from a
+/// 4 MiB body run after a bare `into_par_iter()`, and not reproducible when the race is won.
+/// Built lazily, so a process that wins the race never pays for it. Width is left to rayon's
+/// builder default, which reads `RAYON_NUM_THREADS` the same way [`ensure_global_pool`] does, so
+/// the worker count — and hence `wukong_parallel_for`'s chunking — matches the global pool it
+/// stands in for.
+fn region_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .stack_size(16 * 1024 * 1024)
+            .thread_name(|i| format!("wukong-region-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// Pool-unification opt-out (`WUKONG_POOL_UNIFY=0`, read once, **default ON**): when ON, the
@@ -359,15 +395,26 @@ pub(crate) fn pool_unify() -> bool {
 }
 
 /// Run `f` on the unified kernel pool: the private physical-core GEMM pool when unification is ON
-/// and the pool exists (see [`pool_unify`] / `gemm::gemm_pool`), the global pool otherwise. The
-/// global pool is configured first in every case ([`ensure_global_pool`]), so a fallback fork
-/// lands on properly-sized stacks. Nested calls from a worker of the same pool run inline
+/// and the pool exists (see [`pool_unify`] / `gemm::gemm_pool`), the global pool otherwise. Every
+/// fork here lands on 16 MiB worker stacks: the global pool when [`ensure_global_pool`] built it,
+/// [`region_pool`] when it did not. Nested calls from a worker of the same pool run inline
 /// (rayon's `install` semantics) — safe for kernels invoked inside an outlined region body.
+///
+/// The stack size is the load-bearing property (region bodies privatize ~1.5 MiB frames); which of
+/// the two pools serves the fallback is throughput-only, because every kernel routed here chunks
+/// independently of the worker count. `WUKONG_POOL_UNIFY=0` therefore still selects "not the GEMM
+/// pool", but on a process whose global registry was built by someone else it now measures
+/// `region_pool` rather than a configuration that faulted.
 pub(crate) fn run_on_wuk_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     ensure_global_pool();
     #[cfg(target_arch = "x86_64")]
     if pool_unify() {
         if let Some(p) = crate::gemm::gemm_pool() {
+            return p.install(f);
+        }
+    }
+    if !GLOBAL_POOL_IS_OURS.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(p) = region_pool() {
             return p.install(f);
         }
     }
@@ -674,6 +721,67 @@ pub extern "C" fn wukong_now_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region body with a 4 MiB stack frame — the shape an outlined `@parallel` head-attention
+    /// region privatizes (~1.5 MiB of qh/kh/vt/scores at S=512), scaled up so the fault is
+    /// unambiguous. Writes the same value to every index so the result is chunking-independent.
+    extern "C" fn big_frame_region_body(start: i64, end: i64, env: *const u8) {
+        let mut buf = [0u8; 4 * 1024 * 1024];
+        let mut acc = 0u64;
+        let mut i = 0usize;
+        while i < buf.len() {
+            buf[i] = (i % 251) as u8;
+            acc += buf[i] as u64;
+            i += 4096;
+        }
+        std::hint::black_box(&buf);
+        let out = env as *mut u64;
+        for k in start..end {
+            // SAFETY: `env` is the base of the caller's `[u64; 32]`, and `wukong_parallel_for`
+            // hands each index to exactly one chunk, so `k < 32` and no two writes alias.
+            unsafe { *out.add(k as usize) = acc };
+        }
+    }
+
+    #[test]
+    fn region_body_survives_a_bare_rayon_fork_first() {
+        use rayon::prelude::*;
+        // Most `_parallel` kernels fork with a bare `into_par_iter()` and so can build rayon's
+        // default registry (~2 MiB worker stacks) before `ensure_global_pool` runs. Simulate that
+        // first touch, then run a region body through `wukong_parallel_for`.
+        let w: Vec<i32> = (0..64i32).into_par_iter().map(|x| x * 2).collect();
+        assert_eq!(w.len(), 64);
+        ensure_global_pool();
+
+        // Invariant: when the global registry is not the one we configured, `run_on_wuk_pool` must
+        // fork on a pool this crate built (`wukong-gemm-*` or `wukong-region-*`), never on rayon's
+        // defaults. This is the assertion that gates in the default configuration.
+        if !GLOBAL_POOL_IS_OURS.load(std::sync::atomic::Ordering::Relaxed) {
+            let named: Vec<bool> = run_on_wuk_pool(|| {
+                (0..256usize)
+                    .into_par_iter()
+                    .map(|_| {
+                        std::thread::current()
+                            .name()
+                            .is_some_and(|n| n.starts_with("wukong-"))
+                    })
+                    .collect()
+            });
+            assert!(
+                named.iter().all(|&b| b),
+                "a fork landed on a pool wukong_runtime did not configure"
+            );
+        }
+
+        // End-to-end: before the `region_pool` backstop this died with STATUS_STACK_OVERFLOW
+        // (exit 0xc00000fd) under `WUKONG_POOL_UNIFY=0`, where `gemm_pool()` is bypassed and the
+        // fallback fork went to the 2 MiB default registry the bare fork above had installed.
+        let mut v = vec![0u64; 32];
+        // SAFETY: `big_frame_region_body` has the required `extern "C" fn(i64, i64, *const u8)`
+        // shape and `v` outlives this blocking call, which is `wukong_parallel_for`'s contract.
+        unsafe { wukong_parallel_for(32, big_frame_region_body, v.as_mut_ptr() as *const u8) };
+        assert_eq!(v, vec![127_899u64; 32], "every index must be visited once");
+    }
 
     #[test]
     fn now_ns_is_monotonic() {
