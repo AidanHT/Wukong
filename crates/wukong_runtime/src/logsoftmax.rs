@@ -248,6 +248,12 @@ const LOGSOFTMAX_PAR_MIN: usize = 8;
 /// `out[r,i] = x[r,i] − m_r − log(Σ_i exp(x[r,i] − m_r))`. `x`/`out` may alias (in-place); each row's
 /// reductions read `x` before that row's `out` is written.
 ///
+/// **Not reachable from the recognizer.** Every recognized log-softmax is emitted as
+/// `wukong_norm_f32(.., NORM_LOGSOFTMAX)`; no `RT_*` constant, `GemmSyms` field or interpreter
+/// marshal arm names this symbol. It is exported for external C callers, and
+/// `matches_norm_logsoftmax_bit_for_bit` pins it bit-for-bit against the live `norm.rs` copy so the
+/// two cannot drift apart.
+///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` `f32` elements.
 #[no_mangle]
@@ -559,6 +565,81 @@ mod tests {
                 ip[i].to_bits(),
                 "logsoftmax in-place != out-of-place i={i}"
             );
+        }
+    }
+
+    /// The cross-file gate. Stable log-softmax exists TWICE: here, and in `norm.rs` as the
+    /// `NORM_LOGSOFTMAX` arm of `wukong_norm_f32` — which is the copy every recognized log-softmax
+    /// actually runs (`mir_build` emits `wukong_norm_f32(.., NORM_LOGSOFTMAX)`; the entries in this
+    /// file are not reachable from the recognizer). Both files' doc comments assert the copies are
+    /// byte-identical, and nothing pinned it: each module's own tests only compare that module's
+    /// scalar/AVX2 pair against each other and against a loose f64 reference, so a change to one core
+    /// alone leaves every test green.
+    ///
+    /// Two asserts, both bit-for-bit:
+    ///  * `wukong_norm_f32(.., NORM_LOGSOFTMAX)` == `wukong_logsoftmax_f32` — the duplicated cores;
+    ///  * `logsoftmax[r,i]` == `x[r,i] − logsumexp[r]` — the identity a .wk program can observe by
+    ///    computing both over the same row, which go through *different* kernels
+    ///    (`wukong_norm_f32` vs `wukong_logsumexp_f32`). Exact, not approximate: both derive the same
+    ///    `off = m + log(s)` and both finish with one IEEE subtract.
+    #[test]
+    fn matches_norm_logsoftmax_bit_for_bit() {
+        use crate::norm::{wukong_norm_f32, NORM_LOGSOFTMAX};
+        for &(rows, cols) in &[
+            (1usize, 1usize),
+            (1, 3),
+            (1, 7),
+            (1, 8),
+            (1, 9),
+            (1, 16),
+            (1, 17),
+            (1, 31),
+            (1, 64),
+            (1, 100),
+            (1, 257),
+            (3, 33),
+            (9, 512),
+        ] {
+            let x = fill(rows * cols);
+            let mut via_norm = vec![0.0f32; rows * cols];
+            let mut via_logsoftmax = vec![0.0f32; rows * cols];
+            let mut lse = vec![0.0f32; rows];
+            unsafe {
+                wukong_norm_f32(
+                    x.as_ptr(),
+                    via_norm.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                    0,
+                    NORM_LOGSOFTMAX,
+                );
+                wukong_logsoftmax_f32(
+                    x.as_ptr(),
+                    via_logsoftmax.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
+                wukong_logsumexp_f32(x.as_ptr(), lse.as_mut_ptr(), rows as i64, cols as i64);
+            }
+            for r in 0..rows {
+                for i in 0..cols {
+                    let k = r * cols + i;
+                    assert_eq!(
+                        via_norm[k].to_bits(),
+                        via_logsoftmax[k].to_bits(),
+                        "norm::NORM_LOGSOFTMAX != logsoftmax.rs rows={rows} cols={cols} k={k}: {} vs {}",
+                        via_norm[k],
+                        via_logsoftmax[k]
+                    );
+                    assert_eq!(
+                        via_norm[k].to_bits(),
+                        (x[k] - lse[r]).to_bits(),
+                        "logsoftmax != x − logsumexp rows={rows} cols={cols} k={k}: {} vs {}",
+                        via_norm[k],
+                        x[k] - lse[r]
+                    );
+                }
+            }
         }
     }
 

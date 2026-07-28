@@ -1198,6 +1198,66 @@ mod tests {
         }
     }
 
+    /// Edge: zero or negative `rows`/`cols` are a no-op (don't write, don't panic) — for all four
+    /// C-ABI entries and every op code. The guard is load-bearing for memory safety, not tidiness:
+    /// `rows = -1` past it would reach `rows as usize` = 2^64-1 and walk `x.add(r * cols)` off the end
+    /// of the buffer. A negative shape is reachable from a .wk program with a runtime loop bound, so
+    /// the guard must not be silently deletable. (logsoftmax.rs pins the same property for its four
+    /// entries; norm.rs had no such test.)
+    #[test]
+    fn degenerate_shapes_are_noops() {
+        let x = fill(8);
+        let gamma = fill_off(8, 0.5);
+        let beta = fill_off(8, 1.3);
+        let mut buf = vec![42.0f32; 8];
+        for &(rows, cols) in &[(0i64, 4i64), (2, 0), (-1, 4), (3, -2), (0, 0), (-1, -1)] {
+            for &op in &OPS {
+                unsafe {
+                    wukong_norm_f32(
+                        x.as_ptr(),
+                        buf.as_mut_ptr(),
+                        rows,
+                        cols,
+                        EPS.to_bits() as i64,
+                        op,
+                    );
+                    wukong_norm_f32_parallel(
+                        x.as_ptr(),
+                        buf.as_mut_ptr(),
+                        rows,
+                        cols,
+                        EPS.to_bits() as i64,
+                        op,
+                    );
+                    wukong_norm_affine_f32(
+                        x.as_ptr(),
+                        buf.as_mut_ptr(),
+                        gamma.as_ptr(),
+                        beta.as_ptr(),
+                        rows,
+                        cols,
+                        EPS.to_bits() as i64,
+                        op,
+                    );
+                    wukong_norm_affine_f32_parallel(
+                        x.as_ptr(),
+                        buf.as_mut_ptr(),
+                        gamma.as_ptr(),
+                        beta.as_ptr(),
+                        rows,
+                        cols,
+                        EPS.to_bits() as i64,
+                        op,
+                    );
+                }
+                assert!(
+                    buf.iter().all(|&v| v == 42.0),
+                    "no-op must not write: rows={rows} cols={cols} op={op}"
+                );
+            }
+        }
+    }
+
     // --- affine (gamma/beta) variants ----------------------------------------------------------
 
     // A second deterministic stream for gamma/beta (distinct from `fill` so the affine params are not
