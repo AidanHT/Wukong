@@ -1,0 +1,79 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 64
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 15
+module tests.run.scan_elem_lowp
+
+// The three loop-carried scan recognizers (cumsum / cumprod / lrscan) driven from a NON-f32 data
+// array. Each validated only the *store* element type, and sema implicitly widens `bf16`/`f16`/`i32`
+// into an f32 accumulator, so `acc = acc + x[i]` over `[bf16; 8]` still dispatched
+// `wukong_cumsum_f32` — which reads the data as f32, i.e. 32 bytes out of a 16-byte buffer. On the
+// campaign base `--emit=mir -O2` showed `2 call wukong_cumsum_f32; 1 call wukong_cumprod_f32;
+// 1 call wukong_lrscan_f32` for this file and native printed
+// `1 2 3 4 4 4 4 4 / 0 0 0 0 0 0 0 0 / 2 4 8 0 0 0 / 1 3 ? ?` — that tail varying run to run,
+// since it is whatever lies past the buffer — while the interpreter, which converts each element,
+// printed the correct sequences below.
+//
+// The explicitly cast spelling `acc + (x[i] as f32)` is a different nest and still routes to the
+// half kernels via `try_emit_lowp_reduction` — see tests/run/parallel_reduce_lowp.wk. Run on the
+// native backend: the interpreter was right even when the recognizer misfired, so `run_suite` only
+// gates this from the native side (`native_matches_interpreter` covers the other direction). Every
+// value is exact integer arithmetic, computed from the source, never read back from the compiler.
+fn main() -> i32 {
+    // --- bf16 data, f32 accumulator: inclusive prefix sum of eight 1.0s -------------------------
+    let mut xb: [bf16; 8] = [0.0; 8];
+    for i in 0..8 { xb[i] = 1.0; }
+    let mut o1: [f32; 8] = [0.0; 8];
+    let mut acc: f32 = 0.0;
+    for i in 0..8 { acc = acc + xb[i]; o1[i] = acc; }
+    for k in 0..8 { print((o1[k]) as i32); } // 1 2 3 4 5 6 7 8
+
+    // --- i32 data, f32 accumulator: same prefix sum over an integer buffer ----------------------
+    let xi: [i32; 8] = [1, 1, 1, 1, 1, 1, 1, 1];
+    let mut o2: [f32; 8] = [0.0; 8];
+    let mut acc2: f32 = 0.0;
+    for i in 0..8 { acc2 = acc2 + xi[i]; o2[i] = acc2; }
+    for k in 0..8 { print((o2[k]) as i32); } // 1 2 3 4 5 6 7 8
+
+    // --- bf16 data: inclusive prefix product of six 2.0s ----------------------------------------
+    let mut xp: [bf16; 6] = [0.0; 6];
+    for i in 0..6 { xp[i] = 2.0; }
+    let mut o3: [f32; 6] = [0.0; 6];
+    let mut pr: f32 = 1.0;
+    for i in 0..6 { pr = pr * xp[i]; o3[i] = pr; }
+    for k in 0..6 { print((o3[k]) as i32); } // 2 4 8 16 32 64
+
+    // --- bf16 data: first-order linear recurrence h = a[t]·h + b[t], a=2, b=1, h0=0 -------------
+    let mut ga: [bf16; 4] = [0.0; 4];
+    let mut gb: [bf16; 4] = [0.0; 4];
+    for i in 0..4 { ga[i] = 2.0; gb[i] = 1.0; }
+    let mut o4: [f32; 4] = [0.0; 4];
+    let mut h: f32 = 0.0;
+    for t in 0..4 { h = ga[t] * h + gb[t]; o4[t] = h; }
+    for k in 0..4 { print((o4[k]) as i32); } // 1 3 7 15
+    return 0;
+}

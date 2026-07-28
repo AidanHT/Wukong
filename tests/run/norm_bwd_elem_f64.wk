@@ -1,0 +1,46 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 268
+// EXPECT-OUT: -357
+// EXPECT-OUT: -89
+// EXPECT-OUT: 178
+// EXPECT-OUT: -178
+// EXPECT-OUT: 1252
+// EXPECT-OUT: -357
+// EXPECT-OUT: -715
+module tests.run.norm_bwd_elem_f64
+
+// tests/run/layernorm_bwd.wk, verbatim except every `f32` is an `f64`.
+//
+// `match_layernorm_bwd` is one of three mirrored batched-backward recognizers; the other two
+// (`match_softmax_bwd`, `match_rmsnorm_bwd`) pin the element type to f32 and this one did not, so an
+// f64 nest was folded into `wukong_layernorm_bwd_f32`. `--emit=mir -O2` showed
+// `call wukong_layernorm_bwd_f32` and native printed `1419 -727 0 0 0 0 0 0` (the kernel consumed
+// only the first half of each f64 buffer and left dx[2..7] at their initial 0) while the interpreter
+// printed the correct gradients below. Run on the native backend for the reason given in
+// tests/run/norm_elem_f64.wk. The f64 control values are computed from the source, not read back.
+fn main() -> i32 {
+    let x: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 1.0, 3.0, 2.0, 4.0];
+    let dy: [f64; 8] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let gamma: [f64; 4] = [1.0, 2.0, 1.0, 2.0];
+    let mut dx: [f64; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        let mut sm: f64 = 0.0;
+        for i in 0..4 { sm = sm + x[r * 4 + i]; }
+        let mean: f64 = sm / 4.0;
+        let mut vv: f64 = 0.0;
+        for i in 0..4 { vv = vv + (x[r * 4 + i] - mean) * (x[r * 4 + i] - mean); }
+        let rstd: f64 = 1.0 / sqrt(vv / 4.0 + 0.00001);
+        let mut s1: f64 = 0.0;
+        for i in 0..4 { s1 = s1 + dy[r * 4 + i] * gamma[i]; }
+        let mut s2: f64 = 0.0;
+        for i in 0..4 { s2 = s2 + dy[r * 4 + i] * gamma[i] * ((x[r * 4 + i] - mean) * rstd); }
+        let m1: f64 = s1 / 4.0;
+        let m2: f64 = s2 / 4.0;
+        for i in 0..4 { dx[r * 4 + i] = rstd * (dy[r * 4 + i] * gamma[i] - m1 - ((x[r * 4 + i] - mean) * rstd) * m2); }
+    }
+    // Each row's gradient sums to ~0 (LayerNorm projects out the mean + xhat directions).
+    for k in 0..8 { print((dx[k] * 1000.0) as i32); }
+    return 0;
+}
