@@ -6019,8 +6019,16 @@ impl FnLowerer<'_> {
     }
 
     /// The cumulative-max/min seed is valid iff `fXX(seed, x[r*C])` equals `x[r*C]` for any data: the
-    /// row's first element `x[r*C]`, or an extreme sentinel (`<= -1e30` for max, `>= 1e30` for min). The
+    /// row's first element `x[r*C]`, or an **infinite** sentinel (`-inf` for max, `+inf` for min). The
     /// max/`x[r*C]` cases match [`is_max_seed`]; this generalizes it to min. Pure.
+    ///
+    /// A merely large sentinel is not an identity, and `wukong_cummax_f32` takes no seed argument at all
+    /// (it always produces `out[0] = x[0]`), so the seed the source keeps is silently discarded: a row
+    /// `[-1e33, -1e33, -1e33, 5]` seeded `-1.0e30` printed `-10000 5` on both backends where the scalar
+    /// scan — the same nest with one statement appended so the recognizer declines — prints `-10 5`.
+    /// The bound is therefore the real one: a literal whose f32 value is infinite (`-1.0e39`), for which
+    /// `fmax(-inf, v) == v` holds for every finite or infinite `v`. `-1.0e38` is *not* one — it is finite
+    /// in f32, and a row holding `-inf` would keep it.
     fn is_cum_seed(
         &self,
         init: &Expr,
@@ -6050,10 +6058,11 @@ impl FnLowerer<'_> {
             },
             _ => return false,
         };
+        let s = v as f32;
         if is_max {
-            v <= -1e30
+            s == f32::NEG_INFINITY
         } else {
-            v >= 1e30
+            s == f32::INFINITY
         }
     }
 
@@ -9981,6 +9990,20 @@ impl FnLowerer<'_> {
         };
         if let Some((x, dst, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body)
         {
+            // `emit_norm` lowers the per-row width `cols` at the OUTER loop's statement position, where
+            // the row variable is not in scope. A width that depends on the row — a packed/triangular
+            // layout, `for i in 0..r { … x[r*r + i] … }` — is not this kernel's `[R, C]` shape anyway,
+            // and lowering it there reported `error[C0001]: 'value reference' is not yet supported by
+            // codegen` against `r` on a program that runs (999) as soon as the window declines.
+            if let Pattern {
+                kind: ast::PatKind::Ident(r),
+                ..
+            } = pat
+            {
+                if expr_mentions(&cols, *r) {
+                    return false;
+                }
+            }
             return self.emit_norm(x, dst, Some(end), &cols, eps, op, gamma, beta);
         }
         false
@@ -20397,9 +20420,19 @@ fn match_product_ab_off<'a>(
 
 /// Every term of `off` is invariant in all of `vars` (the matmul's bound `i`/`j`/`k`). A base offset
 /// that mentioned a loop variable would not be a constant per-call pointer shift, so it is rejected.
+///
+/// The test is the **conservative** [`expr_mentions`], not [`expr_uses_sym`]: the latter models only
+/// the index/arith subset and answers `false` for every other expression kind, so an unmodeled term
+/// read as invariant. `a[i*4 + k + (if j > 0 { 4 } else { 0 })]` — a legal nest — was accepted as a
+/// batched matmul, and `offset_base` then lowered the `if` at the GEMM call site where `j` no longer
+/// exists: `error[C0001]: 'value reference' is not yet supported by codegen` pointing at `j`, on a
+/// program that compiles and prints 30 174 70 278 the moment the nest declines. With an outer binding
+/// of the same name in scope the hoisted term would have resolved against *that* instead, with no
+/// diagnostic at all. Both predicates agree on every offset shape the recognized nests actually use
+/// (Path / Int / Binary / Index / Cast), so this only decides the unmodeled ones.
 fn offset_invariant(off: &[&Expr], vars: &[Symbol]) -> bool {
     off.iter()
-        .all(|t| vars.iter().all(|&v| !expr_uses_sym(t, v)))
+        .all(|t| vars.iter().all(|&v| !expr_mentions(t, v)))
 }
 
 /// Try both recognized matmul spellings: the `ikj` accumulate form and the `ijk` dot-product form.
