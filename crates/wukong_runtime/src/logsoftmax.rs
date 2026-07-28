@@ -52,6 +52,21 @@ fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))
 }
 
+/// `_mm256_max_ps(a, b)` semantics spelled out: `a > b ? a : b`. **Not** `f32::max` (= `maxNum`),
+/// which returns the non-NaN operand — MAXPS returns its *second* source whenever the compare is
+/// unordered, so a NaN in the freshly loaded operand poisons the accumulator lane while a NaN already
+/// in the accumulator is dropped. The scalar row-max twin folds with this so it mirrors the AVX2 body
+/// bit-for-bit on NaN rows too (pinned by `scalar_matches_avx2_on_nan_rows`). Same shape as
+/// `norm::maxps` — keep the two identical.
+#[inline(always)]
+fn maxps(a: f32, b: f32) -> f32 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback) ------------------------------------------
 
 /// `off = m + log(Σ exp(x_i − m))` for one row — the shared core of both kernels, scalar reference.
@@ -70,7 +85,7 @@ unsafe fn lse_off_scalar(x: *const f32, n: usize) -> f32 {
     for s in 0..nb {
         let b = s * 8;
         for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = mxj.max(*x.add(b + j));
+            *mxj = maxps(*mxj, *x.add(b + j));
         }
     }
     for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
