@@ -16726,6 +16726,20 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// The MIR type an already-lowered operand actually has. Sema's type for the *expression* is the
+    /// intent, but the value is what the verifier and both backends see, and the two can differ: a
+    /// scalar for-range counter is driven at the wider of its two bound types while sema types the
+    /// loop variable from the start literal. Falling back to sema's type when the value is a `Ptr`
+    /// (an aggregate flowing as its base pointer) keeps the aggregate paths reading exactly as before.
+    fn operand_mir(&mut self, v: ValueId, e: &Expr) -> MirType {
+        let vt = self.builder.value_type(v).clone();
+        if vt.is_int() || vt.is_float() {
+            vt
+        } else {
+            self.expr_mir(e)
+        }
+    }
+
     fn lower_binary(&mut self, op: ast::BinOp, lhs: &Expr, rhs: &Expr, e: &Expr) -> ValueId {
         use ast::BinOp::*;
         match op {
@@ -16733,9 +16747,10 @@ impl FnLowerer<'_> {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
                 // Compare in a common type: the front-end's loose literal typing can leave the two
-                // sides at different widths, but a `Cmp`'s operands must agree.
-                let lty = self.expr_mir(lhs);
-                let rty = self.expr_mir(rhs);
+                // sides at different widths, but a `Cmp`'s operands must agree. The widths come from
+                // the values themselves, not from sema — see the arithmetic arm below.
+                let lty = self.operand_mir(l, lhs);
+                let rty = self.operand_mir(r, rhs);
                 let common = numeric_join(&lty, &rty);
                 let l = self.coerce_to(l, &lty, &common, self.signed(lhs));
                 let r = self.coerce_to(r, &rty, &common, self.signed(rhs));
@@ -16763,8 +16778,21 @@ impl FnLowerer<'_> {
                 let r = self.lower_expr(rhs);
                 // Coerce both operands to the result type so the `Bin` is well-typed (e.g. an
                 // `f32` literal added to an `f64` is promoted), matching the verifier's contract.
-                let lty = self.expr_mir(lhs);
-                let rty = self.expr_mir(rhs);
+                let lty = self.operand_mir(l, lhs);
+                let rty = self.operand_mir(r, rhs);
+                // A value can be WIDER than the type sema gave its expression: the scalar for-range
+                // loop drives its counter at the wider of the two bound types, while sema types the
+                // loop variable from the start literal. `for i in 1..n` with `n: i64` therefore loads
+                // an i64 `i` that sema calls i32, and `i - 1` built `sub` on (i64, i32) — MIR the
+                // verifier rejects, so `src[i - 1]` was an internal compiler error at every -O level
+                // on both backends. Widening the op to hold both operands keeps the counter's real
+                // width instead of truncating it back. No-op whenever the value and sema agree, which
+                // is every other program.
+                let ty = if ty.is_int() && lty.is_int() && rty.is_int() {
+                    numeric_join(&ty, &numeric_join(&lty, &rty))
+                } else {
+                    ty
+                };
                 let l = self.coerce_to(l, &lty, &ty, self.signed(lhs));
                 let r = self.coerce_to(r, &rty, &ty, self.signed(rhs));
                 let bin = arith_binop(op, ty.is_float(), self.signed(lhs));
