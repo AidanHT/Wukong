@@ -601,6 +601,27 @@ mod tests {
     }
 
     #[test]
+    fn keyword_tables_agree() {
+        // `keyword()`, `is_keyword()` and `glyph()` are three separate spelling tables. Only
+        // `glyph()` and `name()` are compile-time enforced (exhaustive matches); `is_keyword()`
+        // is a `matches!` with an implicit `false`, so dropping a variant from it — or respelling
+        // one in `keyword()` — is silent. Pin the round trip.
+        const KEYWORDS: &[&str] = &[
+            "fn", "let", "mut", "if", "else", "while", "for", "in", "loop", "match", "return",
+            "break", "continue", "struct", "enum", "impl", "trait", "module", "import", "as",
+            "const", "defer", "pub", "extern", "step", "where", "true", "false",
+        ];
+        for text in KEYWORDS {
+            let kind = TokenKind::keyword(text).unwrap_or_else(|| panic!("`{text}` not a keyword"));
+            assert!(kind.is_keyword(), "`{text}` is not in is_keyword()");
+            assert_eq!(kind.glyph(), Some(*text), "glyph() disagrees for `{text}`");
+            assert_eq!(kinds(text), vec![kind], "`{text}` does not lex as its keyword");
+        }
+        assert!(TokenKind::keyword("fnx").is_none());
+        assert!(!TokenKind::Ident.is_keyword());
+    }
+
+    #[test]
     fn dump_snapshot() {
         let (toks, _) = tokenize("fn f()", SourceId(0));
         let expected = "Fn \"fn\"\nIdent \"f\"\nLParen \"(\"\nRParen \")\"\nEof \"\"\n";
