@@ -8258,8 +8258,21 @@ impl FnLowerer<'_> {
         };
         let nest = recognize_matmul(pat, iter, body, self.sema, self.interner)?;
         // Only the plain 2-D nn.Linear form `C = A·Bᵀ` — no batch/head offsets (the epilogue kernel
-        // is serial nt-only).
+        // is serial nt-only), and no transposed A: `wukong_sgemm_nt_epi` reads A row-major `[m,k]`,
+        // so an `Aᵀ·Bᵀ` nest (both flags set) computed the NT product instead — `1 2 5 6` where
+        // `1 3 2 4` is correct. `match_matmul_residual`, the emitter's other caller, already rejects
+        // `transposed_a`; this guard had only checked `transposed`.
+        //
+        // A peeled α or fused bias must decline too: `emit_sgemm_epi` reads NEITHER field (nt_epi has
+        // no alpha parameter at all and is handed the null bias literal), so the scale/bias was
+        // silently dropped — `c[i*2+j] = s * 0.5` followed by a relu loop printed `100 200 500 600`
+        // instead of `50 100 250 300`, and `c[i*2+j] = bq[j] + s` printed the same instead of
+        // `1100 2200 1500 2600`. Declining is free: `emit_sgemm` folds α into `wukong_sgemm_nt_alpha`
+        // and the bias into its own `nt_epi` call, and the epilogue loop then lowers as its own pass.
         if !nest.transposed
+            || nest.transposed_a
+            || nest.alpha.is_some()
+            || nest.bias.is_some()
             || !nest.a_off.is_empty()
             || !nest.b_off.is_empty()
             || !nest.c_off.is_empty()
@@ -8279,6 +8292,14 @@ impl FnLowerer<'_> {
     /// Linear+epilogue. Bails (false) if any operand/dim is somehow unbound at the call site, so the
     /// caller falls back to lowering the matmul and the epilogue loop separately.
     fn emit_sgemm_epi(&mut self, nest: &MatmulNest<'_>, bias: Option<Symbol>, act: u32) -> bool {
+        // This emitter reads neither `nest.alpha` nor `nest.bias` (the kernel has no α parameter, and
+        // the `bias` argument comes from the *epilogue* loop), and `wukong_sgemm_nt_epi` reads A
+        // row-major — so it cannot honour a peeled scale, a peeled store bias, or a transposed A, and
+        // must refuse them rather than emit a call that silently drops them. Its two callers are
+        // independent (`try_fuse_matmul_epilogue`, `match_matmul_residual`).
+        if nest.transposed_a || nest.alpha.is_some() || nest.bias.is_some() {
+            return false;
+        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
