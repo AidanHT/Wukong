@@ -175,6 +175,14 @@ pub unsafe extern "C" fn wukong_cumsum_f32_parallel(
         }
         return;
     }
+    // This fork can be the process's FIRST rayon touch, and rayon builds its global registry lazily
+    // there: without this, the DEFAULT registry (std-sized worker stacks) is what gets built, and the
+    // runtime's own 16 MiB `build_global` then loses the race for the rest of the process — its `Err`
+    // is discarded, so outlined `@parallel` region bodies end up on undersized stacks. See
+    // [`crate::ensure_global_pool`], whose doc states this as a precondition on every parallel path.
+    // Idempotent (`Once`) and scheduling-only: the row remains the unit of work, so the bits are
+    // unchanged and serial == parallel still holds bit-for-bit.
+    crate::ensure_global_pool();
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/norm); each
     // row is a disjoint sub-slice of out.
     let (xa, oa) = (x as usize, out as usize);
@@ -261,6 +269,44 @@ mod tests {
         }
     }
 
+    /// NaN must reach the output at exactly the positions the strict left-to-right twin puts it. The
+    /// additive tree gives lane `j` the sum of `v[0..=j]` with every element counted exactly once — only
+    /// the *order* differs — so a NaN at index `p` poisons `out[p..]` on both paths and nothing before
+    /// it. This is precisely what makes the reassociated scan safe where the sibling running-max/min
+    /// scan needed an explicit guard: `+` propagates NaN under any association, `(a > b) ? a : b` does
+    /// not. Positions before `p` are an ordinary reassociated prefix sum and are held to `REL_TOL`.
+    #[test]
+    fn cumsum_nan_propagates_like_the_scalar_twin() {
+        for &cols in &[8usize, 9, 17, 33, 64] {
+            for p in 0..cols {
+                let mut x = fill(cols);
+                x[p] = f32::NAN;
+                let mut got = vec![0.0f32; cols];
+                unsafe {
+                    wukong_cumsum_f32(x.as_ptr(), got.as_mut_ptr(), 1, cols as i64);
+                }
+                let want = cumsum_scalar_ref(&x, 1, cols);
+                for t in 0..cols {
+                    assert_eq!(
+                        got[t].is_nan(),
+                        want[t].is_nan(),
+                        "NaN reach {cols} p={p} t={t}: {} vs {}",
+                        got[t],
+                        want[t]
+                    );
+                    if t < p {
+                        assert!(
+                            close(got[t], want[t]),
+                            "prefix {cols} p={p} t={t}: {} vs {}",
+                            got[t],
+                            want[t]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Serial and parallel must be **bit-for-bit identical** (rows independent, no new reassociation —
     /// the parallel path just maps the same per-row routine across cores). Exercised above the parallel
     /// threshold so the rayon path actually runs.
@@ -276,6 +322,44 @@ mod tests {
                 wukong_cumsum_f32_parallel(x.as_ptr(), p.as_mut_ptr(), rows as i64, cols as i64);
             }
             assert_eq!(s, p, "serial != parallel {rows}x{cols}");
+        }
+    }
+
+    /// The same bit-for-bit serial/parallel contract on **non-finite** data. The check above feeds
+    /// finite input, and `assert_eq!` on `f32` silently cannot compare NaN at all — so a NaN-only
+    /// divergence between the two drivers would pass it. Bits make the claim mean what it says: both
+    /// drivers run the *identical* per-row instruction sequence, so even the NaN payload propagated by
+    /// `addps` has to land in the same place. The poison position is staggered per row (`r % cols`) so
+    /// rayon's workers see it at every block offset and in the tail.
+    #[test]
+    fn serial_equals_parallel_non_finite() {
+        let rows = CUMSUM_PAR_MIN + 137; // > threshold so the multicore path runs
+        for &cols in &[1usize, 8, 17, 64] {
+            let mut x = fill(rows * cols);
+            for r in 0..rows {
+                // Every 3rd row stays finite; the rest carry a NaN or an infinity.
+                let v = match r % 3 {
+                    0 => continue,
+                    1 => f32::NAN,
+                    _ => {
+                        if r % 6 == 2 {
+                            f32::INFINITY
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    }
+                };
+                x[r * cols + (r % cols)] = v;
+            }
+            let mut s = vec![0.0f32; rows * cols];
+            let mut p = vec![0.0f32; rows * cols];
+            unsafe {
+                wukong_cumsum_f32(x.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cumsum_f32_parallel(x.as_ptr(), p.as_mut_ptr(), rows as i64, cols as i64);
+            }
+            let sb: Vec<u32> = s.iter().map(|f| f.to_bits()).collect();
+            let pb: Vec<u32> = p.iter().map(|f| f.to_bits()).collect();
+            assert_eq!(sb, pb, "serial != parallel on non-finite {rows}x{cols}");
         }
     }
 

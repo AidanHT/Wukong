@@ -14,13 +14,18 @@
 //! work is SIMD-width instead of one-compare-at-a-time.
 //!
 //! **Bit-exactness contract — exact, not tolerance.** Unlike the prefix sum, `max`/`min` are
-//! **idempotent and associative** on the values here (no rounding — the result is always one of the
+//! **idempotent and associative** on non-NaN values (no rounding — the result is always one of the
 //! inputs), so the in-lane balanced-tree fold gives *exactly* the same value as a strict left-to-right
 //! scan. This kernel is therefore **bit-identical to its scalar twin** (`assert_eq!`, not a tolerance):
 //! there is no reassociated-reduction exception. The fold uses `(a > b) ? a : b` for max and `(a < b) ?
 //! a : b` for min — the exact lane semantics of `_mm256_max_ps`/`_mm256_min_ps` (which on a tie / NaN /
 //! ±0 return the second operand) — so the AVX2 lanes, the scalar twin, and the cross-lane shift all
-//! agree on every bit. Standard finite data has no ambiguity. And **serial == parallel bit-for-bit** —
+//! agree on every bit, ±0 and ties included (the tree's second operand is always the earlier index,
+//! exactly as `acc` is in the recurrence, so "leftmost among equals" is the same rule on both paths).
+//! NaN is the *one* value class that breaks the associativity — that fold discards a NaN in the first
+//! operand but is absorbed by one in the second — and it is handled by an explicit guard rather than
+//! assumed away: [`cummm_row_avx2`] folds any 8-block containing a NaN with the scalar recurrence, so
+//! the contract holds on every input. And **serial == parallel bit-for-bit** —
 //! rows are independent, the parallel path just maps the identical per-row routine across cores, so there
 //! is no cross-row combine and the result does not depend on thread count.
 
@@ -115,7 +120,9 @@ unsafe fn inclusive_scan8(v: std::arch::x86_64::__m256, ext: Ext) -> std::arch::
     let m4 = _mm256_castsi256_ps(_mm256_setr_epi32(-1, -1, -1, -1, 0, 0, 0, 0));
 
     // Pick the lane fold to match the scalar twin exactly. `_mm256_max_ps(a, b)` / `_mm256_min_ps(a, b)`
-    // return `b` on a tie/NaN — the same as `(a>b)?a:b` / `(a<b)?a:b` — so AVX2 == twin bit-for-bit.
+    // return `b` on a tie — the same as `(a>b)?a:b` / `(a<b)?a:b` — so AVX2 == twin bit-for-bit. (They
+    // also return `b` on a NaN, which is the *lane* semantics of `Ext::fold` but does not compose into
+    // a tree; the caller keeps NaN blocks out of here entirely — see [`cummm_row_avx2`].)
     #[inline(always)]
     unsafe fn foldv(ext: Ext, a: __m256, b: __m256) -> __m256 {
         match ext {
@@ -137,9 +144,11 @@ unsafe fn inclusive_scan8(v: std::arch::x86_64::__m256, ext: Ext) -> std::arch::
 
 /// AVX2 inclusive running extremum of one row. Processes the row in 8-element blocks: in-lane scan
 /// ([`inclusive_scan8`]), fold the running `carry` into all lanes, store, then update `carry` from lane 7
-/// (the block's full inclusive extremum). A scalar tail folds `cols % 8` left-to-right (`carry =
-/// fold(x, carry); out = carry`) — matching `cummm_row_scalar`'s recurrence exactly for the tail, and
-/// continuing the same `carry` so the row stays a single running extremum.
+/// (the block's full inclusive extremum). A block holding any NaN skips the tree and takes the scalar
+/// recurrence instead (the fold is not associative across NaN — see the module header), keeping the
+/// output bit-identical to [`cummm_row_scalar`] on every input. A scalar tail folds `cols % 8`
+/// left-to-right (`carry = fold(x, carry); out = carry`) — matching `cummm_row_scalar`'s recurrence
+/// exactly for the tail, and continuing the same `carry` so the row stays a single running extremum.
 ///
 /// # Safety
 /// `x`/`out` valid for `cols` f32 from `base` (distinct or aliasing); AVX2 available.
@@ -153,6 +162,23 @@ unsafe fn cummm_row_avx2(x: *const f32, out: *mut f32, base: usize, cols: usize,
     let mut i = 0usize;
     while i + 8 <= cols {
         let v = _mm256_loadu_ps(xb.add(i));
+        // NaN guard — the one input class for which the tree fold is NOT the left-to-right fold.
+        // `fold(a, b)` = `(a > b) ? a : b` is *asymmetric* in NaN: the scalar recurrence only ever
+        // presents a NaN as `a` (`fold(x[i], acc)`), where the false compare discards it, but the
+        // Hillis-Steele tree also presents it as `b` (the shifted earlier-index operand), where the
+        // same false compare makes it *absorbing*. The block's real extremum is then lost and the NaN
+        // is itself dropped one step later, so the tree can emit a running extremum that moves
+        // backwards. Fold any block containing a NaN with the scalar recurrence instead — same
+        // `carry`, so the row stays one running extremum. One vcmpps + vmovmskps + not-taken branch
+        // per 8 elements on the finite fast path.
+        if _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_UNORD_Q>(v, v)) != 0 {
+            for j in i..i + 8 {
+                carry = ext.fold(*xb.add(j), carry);
+                *ob.add(j) = carry;
+            }
+            i += 8;
+            continue;
+        }
         let scan = inclusive_scan8(v, ext);
         // fold(scan, carry) lane-wise — carry broadcast. max/min(a, set1(carry)).
         let cv = _mm256_set1_ps(carry);
@@ -222,6 +248,14 @@ unsafe fn cummm_parallel(x: *const f32, out: *mut f32, rows: usize, cols: usize,
         cummm_serial(x, out, rows, cols, ext);
         return;
     }
+    // This fork can be the process's FIRST rayon touch, and rayon builds its global registry lazily
+    // there: without this, the DEFAULT registry (std-sized worker stacks) is what gets built, and the
+    // runtime's own 16 MiB `build_global` then loses the race for the rest of the process — its `Err`
+    // is discarded, so outlined `@parallel` region bodies end up on undersized stacks. See
+    // [`crate::ensure_global_pool`], whose doc states this as a precondition on every parallel path.
+    // Idempotent (`Once`) and scheduling-only: the row remains the unit of work, so the bits are
+    // unchanged and serial == parallel still holds bit-for-bit.
+    crate::ensure_global_pool();
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/norm/cumsum);
     // each row is a disjoint sub-slice of out.
     let (xa, oa) = (x as usize, out as usize);
@@ -400,6 +434,138 @@ mod tests {
             }
             assert_eq!(s_max, p_max, "cummax serial != parallel {rows}x{cols}");
             assert_eq!(s_min, p_min, "cummin serial != parallel {rows}x{cols}");
+        }
+    }
+
+    /// A NaN-bearing row must give the SAME bits on the multicore path as on the serial one. Both
+    /// existing serial-vs-parallel checks feed finite data, which cannot reach the new NaN branch at
+    /// all — so the branch that decides between the tree and the scalar recurrence was only ever
+    /// exercised single-threaded. The NaN position is staggered per row (`r % cols`), so across the
+    /// `> CUMMINMAX_PAR_MIN` rows rayon hands to its workers the guard fires at every block offset and
+    /// in the tail, and rows with no NaN take the tree — both sides of the branch, on every core.
+    /// Bits, not `==`: NaN is never equal to itself.
+    #[test]
+    fn serial_equals_parallel_non_finite() {
+        let rows = CUMMINMAX_PAR_MIN + 137; // > threshold so the multicore path runs
+        for &cols in &[1usize, 8, 17, 64] {
+            let mut x = fill(rows * cols);
+            for r in 0..rows {
+                // Every 3rd row stays finite (the tree path); the rest carry a NaN or an infinity.
+                let v = match r % 3 {
+                    0 => continue,
+                    1 => f32::NAN,
+                    _ => {
+                        if r % 6 == 2 {
+                            f32::INFINITY
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    }
+                };
+                x[r * cols + (r % cols)] = v;
+            }
+
+            let mut s_max = vec![0.0f32; rows * cols];
+            let mut p_max = vec![0.0f32; rows * cols];
+            let mut s_min = vec![0.0f32; rows * cols];
+            let mut p_min = vec![0.0f32; rows * cols];
+            unsafe {
+                wukong_cummax_f32(x.as_ptr(), s_max.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummax_f32_parallel(x.as_ptr(), p_max.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummin_f32(x.as_ptr(), s_min.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummin_f32_parallel(x.as_ptr(), p_min.as_mut_ptr(), rows as i64, cols as i64);
+            }
+            assert_eq!(
+                bits(&s_max),
+                bits(&p_max),
+                "cummax serial != parallel on non-finite {rows}x{cols}"
+            );
+            assert_eq!(
+                bits(&s_min),
+                bits(&p_min),
+                "cummin serial != parallel on non-finite {rows}x{cols}"
+            );
+        }
+    }
+
+    /// Raw bit patterns — a row that opens with a NaN leaves the twin's `acc` at its identity, so the
+    /// expected output can contain `±∞`, and a float `assert_eq!` cannot compare NaN at all. Comparing
+    /// bits makes "bit-identical to the scalar twin" mean exactly that on every input.
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    /// A row containing NaN must still leave the AVX2 path **bit-identical to the scalar twin** — the
+    /// contract this module's header states unconditionally. In the strict left-to-right recurrence a
+    /// NaN only ever reaches `Ext::fold` as the `a` operand, where `(a > b) ? a : b` discards it; the
+    /// Hillis-Steele tree also feeds it in as `b` (the earlier-index operand), where it is *absorbing*,
+    /// so an unguarded tree both drops a real extremum and re-emits a stale one — e.g. `[1, NaN, 2, 3,
+    /// 4, 5, 6, 7]` scanned for the running max yielded `1 1 1 3 1 5 6 7`, a running maximum that
+    /// *decreases* from 3 to 1. NaN is swept across every lane of the first block, the block boundary,
+    /// and the scalar tail, for both extrema.
+    #[test]
+    fn cummax_cummin_nan_matches_scalar_twin() {
+        for &cols in &[1usize, 7, 8, 9, 16, 17, 33, 64] {
+            for p in 0..cols {
+                let mut x = fill(cols);
+                x[p] = f32::NAN;
+
+                let mut got_max = vec![0.0f32; cols];
+                let mut got_min = vec![0.0f32; cols];
+                unsafe {
+                    wukong_cummax_f32(x.as_ptr(), got_max.as_mut_ptr(), 1, cols as i64);
+                    wukong_cummin_f32(x.as_ptr(), got_min.as_mut_ptr(), 1, cols as i64);
+                }
+                assert_eq!(
+                    bits(&got_max),
+                    bits(&scalar_ref(&x, 1, cols, Ext::Max)),
+                    "cummax vs twin, NaN at {p} of {cols}"
+                );
+                assert_eq!(
+                    bits(&got_min),
+                    bits(&scalar_ref(&x, 1, cols, Ext::Min)),
+                    "cummin vs twin, NaN at {p} of {cols}"
+                );
+            }
+        }
+    }
+
+    /// The remaining non-finite classes, also bit-against-the-twin. `±∞` are ordinary operands for the
+    /// fold but collide with the tree's *identity fill* (`-∞` for max, `+∞` for min), so a real infinity
+    /// in the data and a vacated lane are indistinguishable inside `inclusive_scan8` — worth pinning
+    /// separately from the NaN sweep. `±0` pins that ties resolve to the earlier index on both paths
+    /// (`fold` returns its second operand on a tie, and the tree's second operand is always the earlier
+    /// index). An all-NaN row is the degenerate case where the twin's `acc` never leaves the identity.
+    #[test]
+    fn cummax_cummin_infinities_and_all_nan() {
+        let inf = f32::INFINITY;
+        let nan = f32::NAN;
+        let cases: [Vec<f32>; 6] = [
+            vec![nan; 8],
+            vec![nan; 20],
+            vec![-inf; 12],
+            vec![inf; 12],
+            vec![inf, -inf, 0.0, -0.0, inf, -inf, 3.0, -3.0, inf, 1.0, -0.0, 0.0],
+            vec![-inf, nan, inf, nan, 2.0, -inf, inf, 5.0, nan, -0.0, 0.0, 7.0, nan, 1.0],
+        ];
+        for x in &cases {
+            let cols = x.len();
+            let mut got_max = vec![0.0f32; cols];
+            let mut got_min = vec![0.0f32; cols];
+            unsafe {
+                wukong_cummax_f32(x.as_ptr(), got_max.as_mut_ptr(), 1, cols as i64);
+                wukong_cummin_f32(x.as_ptr(), got_min.as_mut_ptr(), 1, cols as i64);
+            }
+            assert_eq!(
+                bits(&got_max),
+                bits(&scalar_ref(x, 1, cols, Ext::Max)),
+                "cummax vs twin, non-finite row of {cols}"
+            );
+            assert_eq!(
+                bits(&got_min),
+                bits(&scalar_ref(x, 1, cols, Ext::Min)),
+                "cummin vs twin, non-finite row of {cols}"
+            );
         }
     }
 
