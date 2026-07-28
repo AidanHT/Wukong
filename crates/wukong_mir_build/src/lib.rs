@@ -12952,6 +12952,18 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Is every stream base of a built recipe a binding this lowerer can resolve? A module-level
+    /// `const` array is `Ty::Array` to sema — so `vectorizable`/`rec_value` happily accept it — but
+    /// it is never entered into `scopes`, and the two emitters' `lookup(..).expect("stream base in
+    /// scope")` turned that into a raw compiler panic (exit 127, internal file:line text, no span)
+    /// on plain user source such as `const W: [f32; 16] = [2.0; 16]; … o[i] = W[i]*W[i] + 1.0;`.
+    /// Checking here — where the recipe is still just data — makes the whole 256-bit path decline,
+    /// so lowering falls through to the 128-bit CLIF / scalar route and the user gets that route's
+    /// catalogued, spanned `C0001` diagnostic. The `expect`s downstream become true post-conditions.
+    fn recipe_bases_bound(&self, r: &VecRecipe) -> bool {
+        r.streams.iter().all(|(b, _)| self.lookup(*b).is_some())
+    }
+
     /// Capture a validated (`vectorizable`-passing) f32 loop body as a flat [`VecKernel`] recipe for
     /// the raw-AVX2 path, or `None` if it uses anything outside the assembler's coverage (a
     /// transcendental, `abs`/rounding, `fmax`/`fmin`, a compound assign) — in which case the caller
@@ -13010,8 +13022,12 @@ impl FnLowerer<'_> {
                 _ => return None,
             }
         }
-        // Need at least one stream and one store for a kernel to do anything.
-        if r.streams.is_empty() || !r.ops.iter().any(|o| matches!(o, VecOp::Store { .. })) {
+        // Need at least one stream and one store for a kernel to do anything, and every stream base
+        // must be resolvable at emit time (a module-level `const` array is not).
+        if r.streams.is_empty()
+            || !r.ops.iter().any(|o| matches!(o, VecOp::Store { .. }))
+            || !self.recipe_bases_bound(&r)
+        {
             return None;
         }
         Some(r)
@@ -13488,7 +13504,7 @@ impl FnLowerer<'_> {
                 let mut r = fresh();
                 if let Some(x) = self.rec_value(lhs, j, &HashMap::default(), &mut r) {
                     if let Some(y) = self.rec_value(rhs, j, &HashMap::default(), &mut r) {
-                        if !r.streams.is_empty() {
+                        if !r.streams.is_empty() && self.recipe_bases_bound(&r) {
                             return Some((r, x, Some((x, y))));
                         }
                     }
@@ -13506,6 +13522,7 @@ impl FnLowerer<'_> {
                 r.ops[value as usize],
                 VecOp::Splat { .. } | VecOp::Const { .. }
             )
+            || !self.recipe_bases_bound(&r)
         {
             return None;
         }
