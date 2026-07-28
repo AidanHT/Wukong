@@ -252,8 +252,41 @@ impl Verifier<'_> {
                 }
             }
             Op::VecKernelCall {
-                ptrs, scalars, n, ..
+                kernel,
+                ptrs,
+                scalars,
+                n,
             } => {
+                // `kernel` is a bare index into the *owning* function's `vec_kernels`; nothing else
+                // in the instruction can recover it, and both backends index their kernel table
+                // with it unchecked (Cranelift `kernel_refs[k]`, the interpreter `vec_kernels[k]`).
+                // A pass that re-parents the call into another function leaves it dangling, so
+                // range-check it here — this is the one operand the type rules below cannot see.
+                let kind = self
+                    .f
+                    .vec_kernels
+                    .get(*kernel as usize)
+                    .map(|k| k.reduce.is_some());
+                match kind {
+                    None => {
+                        let have = self.f.vec_kernels.len();
+                        self.err(format!(
+                            "veckernel kernel index {kernel} is out of range \
+                             (the function has {have} kernels)"
+                        ));
+                    }
+                    // A reduction kernel returns its horizontal fold as `f32`; an elementwise one
+                    // writes through its output streams and yields nothing. The two have different
+                    // backend signatures, so the call's result must agree with the recipe.
+                    Some(true) if result.is_none() => self.err(format!(
+                        "veckernel #{kernel} is a reduction but the call takes no result"
+                    )),
+                    Some(true) => self.check_result_is(result, &MirType::F32),
+                    Some(false) if result.is_some() => self.err(format!(
+                        "veckernel #{kernel} is elementwise but the call takes a result"
+                    )),
+                    Some(false) => {}
+                }
                 if self.use_val(*ptrs) {
                     self.expect_ty(*ptrs, &MirType::Ptr, "veckernel ptrs");
                 }
@@ -468,5 +501,30 @@ mod tests {
         b.ret(None);
         let errs = verify_function(&b.finish());
         assert!(errs.iter().any(|e| e.contains("parameters")), "{errs:?}");
+    }
+
+    /// `kernel` is a bare index into the *owning* function's `vec_kernels`; nothing else in the
+    /// instruction can recover it, and Cranelift indexes `kernel_refs` with it unchecked. A pass
+    /// that re-parents the call into a function that owns no kernels leaves it dangling.
+    #[test]
+    fn detects_veckernel_index_out_of_range() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::Void);
+        let ptrs = b.alloca(MirType::Ptr);
+        let scalars = b.alloca(MirType::F32);
+        let n = b.build(MirType::I64, Op::ConstInt(8, MirType::I64));
+        b.build_void(Op::VecKernelCall {
+            kernel: 0,
+            ptrs,
+            scalars,
+            n,
+        });
+        b.ret(None);
+        // The function registered no kernels, so `#0` refers to nothing.
+        let errs = verify_function(&b.finish());
+        assert!(
+            errs.iter().any(|e| e.contains("out of range")),
+            "{errs:?}"
+        );
     }
 }
