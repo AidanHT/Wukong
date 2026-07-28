@@ -405,6 +405,37 @@ mod tests {
         }
     }
 
+    /// (e) A label past the end of the row must not write past the end of the row. `dx` sits at the
+    /// front of a padded buffer holding a recognizable sentinel, so the onehot fixup's stray `-= 1.0`
+    /// is observable here instead of corrupting unrelated memory in the field. No column matches an
+    /// out-of-range label, so the row is the plain softmax (`Σ dx = 1`, not 0).
+    #[test]
+    fn past_the_end_target_does_not_write_past_the_row() {
+        const PAD: usize = 8;
+        for &cols in &[1usize, 7, 8, 9, 17, 64] {
+            let x = fill(cols);
+            for t in [cols, cols + 3] {
+                let tg = [t as i32];
+                let mut dx = vec![777.0f32; cols + PAD];
+                unsafe {
+                    wukong_xent_bwd_f32(x.as_ptr(), tg.as_ptr(), dx.as_mut_ptr(), 1, cols as i64);
+                }
+                for (i, &v) in dx[cols..].iter().enumerate() {
+                    assert_eq!(
+                        v.to_bits(),
+                        777.0f32.to_bits(),
+                        "target {t} past cols={cols} wrote past the row at +{i}: {v}"
+                    );
+                }
+                let s: f64 = dx[..cols].iter().map(|&v| v as f64).sum();
+                assert!(
+                    (s - 1.0).abs() <= 1e-5,
+                    "cols={cols} target={t}: softmax row sum {s} != 1"
+                );
+            }
+        }
+    }
+
     /// Edge: zero/negative rows or cols are a no-op (don't write, don't panic).
     #[test]
     fn degenerate_shapes_are_noops() {
