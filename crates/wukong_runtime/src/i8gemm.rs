@@ -497,6 +497,12 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_parallel(
     let vnni = is_x86_feature_detected!("avxvnni");
     #[cfg(target_arch = "x86_64")]
     let avx2 = is_x86_feature_detected!("avx2");
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
+    crate::ensure_global_pool();
     (0..m).into_par_iter().for_each(|i| {
         let (a, b, c) = (au as *const u8, bu as *const i8, cu as *mut i32);
         // SAFETY: disjoint output row i; pointers valid for the declared extents by contract.
@@ -659,6 +665,12 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(
     let vnni = is_x86_feature_detected!("avxvnni");
     #[cfg(target_arch = "x86_64")]
     let avx2 = is_x86_feature_detected!("avx2");
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
+    crate::ensure_global_pool();
     (0..m).into_par_iter().for_each(|i| {
         // SAFETY: disjoint output row i; per-row i32 scratch; pointers valid by contract.
         unsafe {

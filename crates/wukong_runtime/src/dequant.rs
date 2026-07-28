@@ -322,6 +322,13 @@ pub unsafe extern "C" fn wukong_dequant_f32_parallel(
     let n = n as usize;
     let in_bytes = if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 };
     let (qa, oa) = (Addr(q as usize), Addr(out as usize));
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the `current_num_threads()` read below resolves `RAYON_NUM_THREADS` the same
+    // way either way, so the chunk count — and with it every chunk boundary — is unchanged.
+    crate::ensure_global_pool();
     let workers = rayon::current_num_threads().max(1).min(n.div_ceil(8).max(1));
     // 8-aligned chunk bounds so each worker's output sub-slice starts 32-byte-aligned iff `out` is
     // (the NT prologue then peels ≤7 elements, disjointly from the previous chunk's tail).
@@ -516,6 +523,12 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32_parallel(
     let avx2 = is_x86_feature_detected!("avx2");
     #[cfg(target_arch = "x86_64")]
     let nt = use_nt(rows * cols, in_bytes);
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
+    crate::ensure_global_pool();
     (0..rows).into_par_iter().for_each(|i| {
         // SAFETY: disjoint output row i; pointers valid for the declared extents by contract.
         unsafe {
