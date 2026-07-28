@@ -953,6 +953,54 @@ mod tests {
         }
     }
 
+    /// A row whose maximum shares an 8-lane slot with a later NaN. The AVX2 body folds the max with
+    /// `_mm256_max_ps` (= `a > b ? a : b`, so a NaN in the freshly *loaded* operand wins and poisons
+    /// the lane), the scalar twin folds with `f32::max` (= `maxNum`, which always drops the NaN and
+    /// keeps the peak) — so the two paths pick a different row max `m`. `exp1`/`exp8` saturate NaN to
+    /// `exp(EXP_HI)` instead of propagating it, so the divergent `m` survives into the output rather
+    /// than washing the row out to all-NaN. The module contract at the top of this file claims the two
+    /// paths agree bit-for-bit with no finiteness caveat, so this must hold.
+    ///
+    /// `peak = nan_at - 8` puts the peak in the same lane and an earlier chunk, which is the only
+    /// arrangement that exposes it: a NaN elsewhere merely poisons a lane that does not hold the row
+    /// maximum, and `hmax8` then drops it.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn scalar_matches_avx2_on_nan_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &n in &[16usize, 17, 24, 33, 100] {
+            for nan_at in 8..n {
+                let mut x = vec![0.0f32; n];
+                x[nan_at - 8] = 1.0; // the row maximum, same lane as the NaN, earlier chunk
+                x[nan_at] = f32::NAN;
+                for &op in &[NORM_SOFTMAX, NORM_LOGSOFTMAX] {
+                    let mut a = vec![0.0f32; n];
+                    let mut b = vec![0.0f32; n];
+                    unsafe {
+                        if op == NORM_SOFTMAX {
+                            softmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                            softmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
+                        } else {
+                            logsoftmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                            logsoftmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
+                        }
+                    }
+                    for i in 0..n {
+                        assert_eq!(
+                            a[i].to_bits(),
+                            b[i].to_bits(),
+                            "scalar != avx2 on NaN row n={n} nan_at={nan_at} op={op} i={i}: {} vs {}",
+                            a[i],
+                            b[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn serial_matches_parallel_bit_for_bit() {
         let (rows, cols) = (37usize, 100usize);

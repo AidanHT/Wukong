@@ -394,6 +394,35 @@ mod tests {
         }
     }
 
+    /// (a2) the same agreement on a row whose maximum shares an 8-lane slot with a later NaN. The
+    /// AVX2 body folds with `_mm256_max_ps` (= `a > b ? a : b`, so the freshly loaded NaN wins and
+    /// poisons the lane); the scalar twin folds with `f32::max` (= `maxNum`, which drops the NaN and
+    /// keeps the peak) — so the two pick a different `m`. `exp1`/`exp8` saturate NaN to `exp(EXP_HI)`
+    /// instead of propagating it, so the divergent `m` survives into `off` rather than washing the
+    /// answer out to NaN. `peak = nan_at - 8` is the only arrangement that exposes it: a NaN in any
+    /// other lane poisons a lane that does not hold the row maximum and `hmax8` then drops it.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn scalar_matches_avx2_on_nan_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &n in &[16usize, 17, 24, 33, 100] {
+            for nan_at in 8..n {
+                let mut x = vec![0.0f32; n];
+                x[nan_at - 8] = 1.0; // the row maximum, same lane as the NaN, earlier chunk
+                x[nan_at] = f32::NAN;
+                let (sa, sb) =
+                    unsafe { (lse_off_scalar(x.as_ptr(), n), lse_off_avx2(x.as_ptr(), n)) };
+                assert_eq!(
+                    sa.to_bits(),
+                    sb.to_bits(),
+                    "lse_off scalar != avx2 on NaN row n={n} nan_at={nan_at}: {sa} vs {sb}"
+                );
+            }
+        }
+    }
+
     /// (b) both kernels ≈ an independent f64 reference within a tight tolerance — guards the *formula*
     /// (not just scalar==avx2). Also (d): the log-softmax row, re-exponentiated, sums to ≈1.
     #[test]
