@@ -419,11 +419,29 @@ impl Sema<'_> {
                     let mut next = 0i64;
                     let mut variants = Vec::with_capacity(e.variants.len());
                     for v in &e.variants {
-                        let disc = v
-                            .discriminant
-                            .as_ref()
-                            .and_then(|d| eval_const_int(d, self.interner))
-                            .unwrap_or(next);
+                        // A written discriminant the folder cannot read — most often a reference to a
+                        // top-level `const` — used to be DISCARDED for the auto-increment value with
+                        // no diagnostic: `enum Op { Add = 1, Mul = OP_MUL, Div }` numbered Mul 2 and
+                        // Div 3 on both backends, silently renumbering an opcode table. Say so
+                        // instead. (Resolving the name through `self.consts` here would make the
+                        // value depend on source order — `collect` inserts consts as it walks — so
+                        // const-valued discriminants need a const pre-pass, not a lookup here.)
+                        let disc = match &v.discriminant {
+                            None => next,
+                            Some(d) => match eval_const_int(d, self.interner) {
+                                Some(x) => x,
+                                None => {
+                                    self.error(
+                                        d.span,
+                                        "E0401",
+                                        "an enum discriminant must be a compile-time integer \
+                                         constant (an integer literal, or arithmetic on integer \
+                                         literals)",
+                                    );
+                                    next
+                                }
+                            },
+                        };
                         // An enum value lowers to a 32-bit discriminant (the C-style repr —
                         // mir_build emits `ConstInt(_, I32)`), so a discriminant outside the i32
                         // range would be silently truncated (a max-`i64` sentinel printed as its low
@@ -1935,11 +1953,42 @@ impl Sema<'_> {
             // inner fields to their declared types (so an arm body sees `x`/`y` typed).
             PatKind::Variant { path, fields } => self.check_variant_pattern(path, fields, pat.span),
             // Literal / enum-variant / range patterns bind nothing — they test the scrutinee's value.
-            PatKind::Int { .. }
-            | PatKind::Char(_)
-            | PatKind::Bool(_)
-            | PatKind::Path(_)
-            | PatKind::Range { .. } => {}
+            // An integer literal pattern is materialized by mir_build as `ConstInt(v, <scrutinee
+            // width>)` with no range check, so an out-of-range literal was TRUNCATED to that width and
+            // matched a different value, shadowing the arm that legitimately covers it: on an `i32`
+            // scrutinee `match x { 4294967296 => 1, 0 => 2, _ => 0 }` returned 1 for `x == 0`, and on
+            // an `i8` scrutinee `200 => 1` matched `-56`. The same literal in `let`/`const`/`return`/
+            // argument position is already rejected — apply that rule here too.
+            PatKind::Int { .. } => self.range_check_int_pattern(pat, ty),
+            PatKind::Range { lo, hi, .. } => {
+                self.range_check_int_pattern(lo, ty);
+                self.range_check_int_pattern(hi, ty);
+            }
+            PatKind::Char(_) | PatKind::Bool(_) | PatKind::Path(_) => {}
+        }
+    }
+
+    /// The pattern counterpart of [`Sema::range_check_int_literal`]: an integer literal *pattern* that
+    /// does not fit the scrutinee's narrow type. Same rule, same code, same wording — only types whose
+    /// whole range fits in `i64` are checked (i8..u32), so an `i64`/`u64`/`usize` scrutinee is never
+    /// flagged.
+    fn range_check_int_pattern(&mut self, pat: &Pattern, ty: &Ty) {
+        let Ty::Scalar(sc) = ty else { return };
+        let Some((lo, hi)) = int_lit_range(*sc) else {
+            return;
+        };
+        let Some(v) = pat_int_value(pat, self.interner) else {
+            return;
+        };
+        if v < lo || v > hi {
+            self.error(
+                pat.span,
+                "E0401",
+                format!(
+                    "literal `{v}` is out of range for `{}` ({lo}..={hi})",
+                    sc.name()
+                ),
+            );
         }
     }
 
@@ -2252,8 +2301,13 @@ impl Sema<'_> {
             (ExprKind::ArrayLit(items), Ty::Array { elem, len }) => {
                 items.len() as u64 == *len && items.iter().all(|it| self.literal_adapts(elem, it))
             }
-            (ExprKind::ArrayRepeat { value, .. }, Ty::Array { elem, .. }) => {
-                self.literal_adapts(elem, value)
+            // …and so does a repeat initializer — but its COUNT must match the annotation's length,
+            // exactly like the `ArrayLit` arm above and `check_struct_literal`'s array-field check.
+            // Without it `let a: [i32; 4] = [7; 2];` compiled clean and mir_build filled the slot to
+            // the annotation's 4, silently discarding the count the programmer wrote (the identical
+            // mismatch is a hard error as a struct field and as an array literal).
+            (ExprKind::ArrayRepeat { value, count }, Ty::Array { elem, len }) => {
+                self.eval_usize(count) == *len && self.literal_adapts(elem, value)
             }
             (ExprKind::TupleLit(items), Ty::Tuple(tys)) => {
                 items.len() == tys.len()
@@ -4170,6 +4224,70 @@ mod tests {
             "`::<0x4>` must bind N := 4: {:?}",
             errors(ok)
         );
+    }
+
+    #[test]
+    fn out_of_range_match_pattern_literal_is_rejected() {
+        // `pattern_cond` materializes the literal as `ConstInt(v, <scrutinee width>)` with no range
+        // check, so it truncated and matched a DIFFERENT value — stealing the arm that covers it.
+        let wide = "fn f(x: i32) -> i32 { return match x { 4294967296 => 1, 0 => 2, _ => 0 }; }";
+        assert!(
+            errors(wide).contains(&"E0401"),
+            "expected an out-of-range pattern literal: {:?}",
+            errors(wide)
+        );
+        let narrow = "fn g(x: i8) -> i32 { return match x { 200 => 1, _ => 0 }; }";
+        assert!(
+            errors(narrow).contains(&"E0401"),
+            "expected an out-of-range pattern literal: {:?}",
+            errors(narrow)
+        );
+        // Range-pattern bounds are checked the same way …
+        let rng = "fn h(x: i8) -> i32 { return match x { 0..=200 => 1, _ => 0 }; }";
+        assert!(
+            errors(rng).contains(&"E0401"),
+            "expected an out-of-range range bound: {:?}",
+            errors(rng)
+        );
+        // … and every in-range pattern is unaffected, including a negative one.
+        let ok = "fn k(x: i8) -> i32 { return match x { -128 => 1, 0..=127 => 2, _ => 0 }; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+    }
+
+    #[test]
+    fn unfoldable_enum_discriminant_is_reported() {
+        // A discriminant the folder cannot read was silently replaced by the auto-increment value,
+        // renumbering the rest of the enum with no diagnostic at all.
+        let bad = "const OP_MUL: i32 = 10; enum Op { Add = 1, Mul = OP_MUL, Div }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected a non-constant discriminant error: {:?}",
+            errors(bad)
+        );
+        // Literal discriminants — including negative, hex and folded arithmetic — still work.
+        let ok = "enum E { Neg = -5, Pos = 7, Hex = 0x10, Sum = 2 + 3, Auto }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+    }
+
+    #[test]
+    fn array_repeat_count_must_match_the_annotation() {
+        // The `ArrayLit` arm and `check_struct_literal` both length-check; only the `let`/`const`
+        // repeat form swallowed the mismatch and let mir_build fill the slot to the annotation.
+        let short = "fn f() { let a: [i32; 4] = [7; 2]; }";
+        assert!(
+            errors(short).contains(&"E0401"),
+            "expected a length mismatch: {:?}",
+            errors(short)
+        );
+        let long = "fn f() { let a: [i32; 2] = [7; 8]; }";
+        assert!(
+            errors(long).contains(&"E0401"),
+            "expected a length mismatch: {:?}",
+            errors(long)
+        );
+        // Matching counts still adapt — including through a `const` and an enum-variant length.
+        let ok = "const N: usize = 4; fn f() { let a: [f32; N] = [0.0; 4]; let b: [i8; 2] = [7; 2]; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
     }
 
     #[test]
