@@ -449,6 +449,60 @@ mod tests {
     }
 
     #[test]
+    fn vector_lane_self_ops_are_not_folded_to_scalar_consts() {
+        // The same `x - x` / `x <cmp> x` identities as above, but written so the front-end
+        // vectorizes the loop body: the Bin/Cmp results are then `<N x iW>`, which cannot hold the
+        // scalar `ConstInt` the fold would materialize. Declining the fold is the only legal answer.
+        let cases = [
+            (
+                "fn main() -> i32 { let mut n: [i32; 8] = [8; 8]; \
+                 for i in 0..8 { n[i] = n[i] - n[i]; } return n[0] + n[7] + 7; }",
+                7,
+            ),
+            (
+                "fn main() -> i32 { let mut n: [i64; 16] = [8; 16]; \
+                 for i in 0..16 { n[i] = n[i] - n[i]; } return (n[0] + n[15] + 7) as i32; }",
+                7,
+            ),
+            (
+                "fn main() -> i32 { let mut n: [i32; 16] = [8; 16]; let mut o: [i32; 16] = [0; 16]; \
+                 for i in 0..16 { o[i] = if n[i] < n[i] { 1 } else { 2 }; } \
+                 return o[0] + o[15]; }",
+                4,
+            ),
+        ];
+        for (src, expect) in cases {
+            for lvl in [0, 1, 2, 3] {
+                assert_eq!(run_main_opt(src, lvl), expect as i64, "O{lvl}: {src}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_float_constant_compares_are_not_folded() {
+        // Two distinct f32 literals that share one bf16 (resp. f16) grid point compare EQUAL at
+        // runtime, because both backends round the value to the narrow grid. The optimizer only
+        // rounds folded constants to f32, so folding these comparisons flips the branch at -O1+.
+        let cases = [
+            (
+                "fn main() -> i32 { let a: bf16 = 0.1; let b: bf16 = 0.1002; \
+                 if a == b { return 1; } return 0; }",
+                1,
+            ),
+            (
+                "fn main() -> i32 { let a: f16 = 0.1; let b: f16 = 0.100005; \
+                 if a == b { return 1; } return 0; }",
+                1,
+            ),
+        ];
+        for (src, expect) in cases {
+            for lvl in [0, 1, 2, 3] {
+                assert_eq!(run_main_opt(src, lvl), expect as i64, "O{lvl}: {src}");
+            }
+        }
+    }
+
+    #[test]
     fn folds_and_dces_constants() {
         // main computes (2*3 + 4) entirely from constants; after -O2 the body should be tiny.
         let src = "fn main() -> i32 { let x: i32 = 2 * 3 + 4; return x; }";
@@ -689,6 +743,52 @@ mod tests {
             .flat_map(|b| &b.insts)
             .any(|i| matches!(i.op, wukong_mir::Op::Call { .. }));
         assert!(!has_call, "sq should be inlined into main");
+    }
+
+    #[test]
+    fn inlining_rebases_a_callee_that_owns_vec_kernels() {
+        // `Op::VecKernelCall.kernel` indexes the *owning* function's `vec_kernels` table by
+        // position, so splicing a vectorized leaf into a caller must carry its recipes across and
+        // rebase the index. Case (a): the caller already owns a kernel, so a stale index silently
+        // resolves to the WRONG recipe (`|x|` instead of `-x`). Case (b): the caller owns none, so
+        // it dangles — a hard error in the interpreter and an out-of-bounds panic in codegen.
+        let with_caller_kernel = "fn negv(mut d: [f32; 96]) { for i in 0..96 { d[i] = -d[i]; } } \
+             fn main() -> i32 { let mut d: [f32; 96] = [0.0; 96]; \
+               let mut e: [f32; 96] = [0.0; 96]; \
+               for i in 0..96 { d[i] = (i as f32) - 50.0; } \
+               for i in 0..96 { e[i] = (i as f32) - 50.0; } \
+               for i in 0..96 { e[i] = sqrt(e[i] * e[i]); } \
+               negv(d); \
+               return (d[60] as i32) * 100 + (e[47] as i32); }";
+        let no_caller_kernel = "fn negv(mut d: [f32; 96]) { for i in 0..96 { d[i] = -d[i]; } } \
+             fn main() -> i32 { let mut d: [f32; 96] = [0.0; 96]; \
+               for i in 0..96 { d[i] = (i as f32) - 50.0; } \
+               negv(d); return d[47] as i32; }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(with_caller_kernel, lvl), -997, "level {lvl}");
+            assert_eq!(run_main_opt(no_caller_kernel, lvl), 3, "level {lvl}");
+        }
+    }
+
+    #[test]
+    fn inlining_rebases_repeated_and_multiple_kernel_owning_callees() {
+        // The kernel-table rebase has to accumulate: `negv` is spliced twice and `scalev` once, on
+        // top of a caller that already owns a recipe, so the three splices must land at successive
+        // offsets. Pinning it separately from the single-splice case because getting the base right
+        // once (and then re-using it, or resetting it) would still pass that test.
+        let src = "fn negv(mut d: [f32; 96]) { for i in 0..96 { d[i] = -d[i]; } } \
+             fn scalev(mut d: [f32; 96]) { for i in 0..96 { d[i] = d[i] * 3.0; } } \
+             fn main() -> i32 { let mut a: [f32; 96] = [0.0; 96]; \
+               let mut b: [f32; 96] = [0.0; 96]; let mut c: [f32; 96] = [0.0; 96]; \
+               for i in 0..96 { a[i] = (i as f32) - 50.0; } \
+               for i in 0..96 { b[i] = (i as f32) - 50.0; } \
+               for i in 0..96 { c[i] = (i as f32) - 50.0; } \
+               for i in 0..96 { c[i] = sqrt(c[i] * c[i]); } \
+               negv(a); negv(b); scalev(b); \
+               return (a[60] as i32) * 10000 + (b[60] as i32) * 100 + (c[47] as i32); }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), -102997, "level {lvl}");
+        }
     }
 
     #[test]

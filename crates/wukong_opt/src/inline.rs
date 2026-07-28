@@ -165,6 +165,17 @@ fn inline_call_site(caller: &mut Function, callee: &Function, bi: usize, ii: usi
         term: orig_term,
     };
 
+    // `Op::VecKernelCall.kernel` is an index into the *owning* function's `vec_kernels` table, not a
+    // `ValueId`, so `map_op_uses` does not (and must not) touch it. Re-parenting the callee's body
+    // therefore has to carry its recipes into the caller's table and shift every copied index by
+    // where they landed — otherwise the spliced call names one of the caller's own recipes (silent
+    // wrong kernel) or an index past the end (dangling). Empty for every non-vectorized callee, so
+    // this is a no-op on the common path.
+    let kbase = caller.vec_kernels.len() as u32;
+    caller
+        .vec_kernels
+        .extend(callee.vec_kernels.iter().cloned());
+
     // Copy the callee's blocks with everything remapped; `ret` becomes a branch to the continuation.
     for cb in &callee.blocks {
         let params = cb.params.iter().map(|p| mapv(*p)).collect();
@@ -174,6 +185,9 @@ fn inline_call_site(caller: &mut Function, callee: &Function, bi: usize, ii: usi
             .map(|inst| {
                 let mut op = inst.op.clone();
                 map_op_uses(&mut op, mapv);
+                if let Op::VecKernelCall { kernel, .. } = &mut op {
+                    *kernel += kbase;
+                }
                 Inst {
                     result: inst.result.map(mapv),
                     op,
