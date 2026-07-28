@@ -22169,6 +22169,37 @@ fn match_pool2d(
     if scalar_of(ot, sema) != Some(wukong_types::Scalar::F32) || obase == xbase {
         return None;
     }
+    // `Pool2dNest` carries no OH/OW: the kernel RECOMPUTES the output extent from H/W/KH/KW/SH/SW as
+    // the full no-padding `(H-KH)/SH + 1`. That is a second copy of this recognizer's shape model, and
+    // a source nest whose own OH/OW are smaller — pooling a sub-region — desynced the two: the kernel
+    // then writes the full extent, at the wrong row stride, into a smaller buffer. Measured on an 8x8
+    // plane pooled 2x2/stride 2 into a `[f32; 4]` (source loops `oy,ox in 0..2`, so OH=OW=2 where the
+    // kernel derives 4): `--emit=mir -O2` emitted `call wukong_maxpool2d_f32(v0, v23, 1, 8, 8, 2, 2,
+    // 2, 2)` with no OH/OW, the interpreter reported `pool2d output out of bounds` and native
+    // SEGFAULTED (exit 139) at -O0 and -O2. The correct answer is 9 11 25 27.
+    //
+    // Require the source's own extent to be exactly what the kernel will recompute, over literal dims
+    // (a symbolic dim cannot be compared here, and no .wk in the corpus pools at symbolic sizes).
+    // Anything else declines to the scalar nest, which is always correct.
+    let (
+        Dim::Lit(lh),
+        Dim::Lit(lw),
+        Dim::Lit(lkh),
+        Dim::Lit(lkw),
+        Dim::Lit(lsh),
+        Dim::Lit(lsw),
+        Dim::Lit(loh),
+        Dim::Lit(low),
+    ) = (h, w, kh, kw, sh, sw, oh, ow)
+    else {
+        return None;
+    };
+    if lsh <= 0 || lsw <= 0 || lkh > lh || lkw > lw {
+        return None;
+    }
+    if loh != (lh - lkh) / lsh + 1 || low != (lw - lkw) / lsw + 1 {
+        return None;
+    }
     Some(Pool2dNest {
         x: xbase,
         out: obase,
