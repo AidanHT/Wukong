@@ -4229,6 +4229,75 @@ mod tests {
         run(&program, main, &interner).unwrap()
     }
 
+    /// Like [`run_main`] but returns what the program printed (for results wider than the `i32`
+    /// exit code).
+    fn run_main_stdout(src: &str) -> String {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, _ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let main = interner.intern("main");
+        let (_, out) = run_with_output(&program, main, &interner).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// An integer SIMD lane must wrap at its **lane width**, exactly as the scalar path does — the
+    /// interpreter is the oracle the native backend is certified against, and Cranelift wraps at
+    /// 32/64 bits. The reference values here are hand-computed two's-complement truths, not native
+    /// readings: 2000000000+2000000000 = 4000000000 ≡ -294967296 (mod 2^32), 100000*100000 =
+    /// 10^10 ≡ 1410065408 (mod 2^32), -(-2^31) ≡ -2^31, and 9e18+9e18 = 1.8e19 ≡ -446744073709551616
+    /// (mod 2^64). `mir_build`'s AST vectorizer turns each `for k in 0..64` body into `<4 x i32>` /
+    /// `<2 x i64>` ops, so these exercise the vector arms of `eval`, not the scalar ones.
+    #[test]
+    fn integer_vector_lanes_wrap_at_lane_width() {
+        let fill = "let mut a: [i32; 64] = [0; 64]; let mut b: [i32; 64] = [0; 64]; \
+                    let mut i: i32 = 0; \
+                    while i < 64 { a[i] = 2000000000; b[i] = 2000000000; i = i + 1; }";
+        assert_eq!(
+            run_main(&format!(
+                "fn main() -> i32 {{ {fill} for k in 0..64 {{ a[k] = a[k] + b[k]; }} return a[0]; }}"
+            )),
+            -294967296,
+            "i32 vector add must wrap"
+        );
+
+        let fill_mul = "let mut a: [i32; 64] = [0; 64]; let mut b: [i32; 64] = [0; 64]; \
+                        let mut i: i32 = 0; \
+                        while i < 64 { a[i] = 100000; b[i] = 100000; i = i + 1; }";
+        assert_eq!(
+            run_main(&format!(
+                "fn main() -> i32 {{ {fill_mul} for k in 0..64 {{ a[k] = a[k] * b[k]; }} return a[0]; }}"
+            )),
+            1410065408,
+            "i32 vector multiply must wrap"
+        );
+
+        let fill_neg = "let mut a: [i32; 64] = [0; 64]; let mut i: i32 = 0; \
+                        while i < 64 { a[i] = -2147483647 - 1; i = i + 1; }";
+        assert_eq!(
+            run_main(&format!(
+                "fn main() -> i32 {{ {fill_neg} for k in 0..64 {{ a[k] = -a[k]; }} return a[0]; }}"
+            )),
+            -2147483648,
+            "negating i32::MIN in a lane must wrap back to i32::MIN"
+        );
+
+        let fill64 = "let mut a: [i64; 64] = [0; 64]; let mut b: [i64; 64] = [0; 64]; \
+                      let mut i: i64 = 0; \
+                      while i < 64 { a[i] = 9000000000000000000; \
+                      b[i] = 9000000000000000000; i = i + 1; }";
+        assert_eq!(
+            run_main_stdout(&format!(
+                "fn main() -> i32 {{ {fill64} for k in 0..64 {{ a[k] = a[k] + b[k]; }} \
+                 print(a[0]); return 0; }}"
+            )),
+            "-446744073709551616\n",
+            "i64 vector add must wrap"
+        );
+    }
+
     #[test]
     fn runs_loop_sum() {
         let src = "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
@@ -4253,6 +4322,77 @@ mod tests {
         let src = "fn sum(n: i32) -> i32 { if n == 0 { return 0; } return n + sum(n - 1); } \
                    fn main() -> i32 { return sum(1000); }";
         assert_eq!(run_main(src), 500500);
+    }
+
+    /// A recognized kernel called with a **non-positive extent** is a no-op: the shapes come from
+    /// loop bounds, and `for i in 0..n` with `n < 0` runs zero iterations, so the recognized form
+    /// must leave the output buffer alone — which is what every `wukong_runtime` kernel does
+    /// (`if rows <= 0 || cols <= 0 { return; }`) and therefore what `--backend=native` does. The
+    /// interpreter used to read the extent as a bare `as usize`, wrapping to ~`usize::MAX`, and the
+    /// `Vec::with_capacity(rows * cols)` that followed aborted the process with a raw Rust
+    /// `capacity overflow` panic. Each case below dispatches to a different kernel family.
+    #[test]
+    fn non_positive_kernel_extent_is_a_no_op() {
+        // Fused norm (`wukong_norm_f32`): negative row count.
+        assert_eq!(
+            run_main(
+                "fn norm_rows(mut x: [f32; 12], r: i64) { \
+                   for rr in 0..r { let mut ss: f32 = 0.0; \
+                     for i in 0..4 { ss = ss + x[rr*4+i] * x[rr*4+i]; } \
+                     let inv = 1.0 / sqrt(ss / 4.0 + 0.00001); \
+                     for i in 0..4 { x[rr*4+i] = x[rr*4+i] * inv; } } } \
+                 fn main() -> i32 { let mut x: [f32; 12] = [1.0; 12]; let n: i64 = 0 - 1; \
+                   norm_rows(x, n); return (x[0] * 10.0) as i32; }"
+            ),
+            10,
+            "negative rows must leave x untouched"
+        );
+
+        // GEMM (`wukong_sgemm_nt`): negative M.
+        assert_eq!(
+            run_main(
+                "fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16], m: i64) { \
+                   for i in 0..m { for j in 0..4 { let mut s: f32 = 0.0; \
+                     for k in 0..4 { s = s + a[i*4+k] * b[j*4+k]; } c[i*4+j] = s; } } } \
+                 fn main() -> i32 { let mut a: [f32;16] = [1.0;16]; let mut b: [f32;16] = [1.0;16]; \
+                   let mut c: [f32;16] = [2.0;16]; let m: i64 = 0 - 1; mm(a, b, c, m); \
+                   return (c[0] * 10.0) as i32; }"
+            ),
+            20,
+            "negative M must leave C untouched"
+        );
+
+        // Fused attention (`wukong_attention_f32`): negative sequence length.
+        assert_eq!(
+            run_main(
+                "fn main() -> i32 { let mut q: [f32; 16] = [0.0; 16]; let mut k: [f32; 16] = [0.0; 16]; \
+                   let mut v: [f32; 16] = [0.0; 16]; let mut o: [f32; 16] = [1.0; 16]; \
+                   for i in 0..16 { q[i] = (i as f32) * 0.1; k[i] = (i as f32) * 0.2; \
+                     v[i] = (i as f32) * 0.5; } \
+                   sdpa(q, k, v, o, -1, 4, 0.5, 0); return (o[0] * 100.0) as i32; }"
+            ),
+            100,
+            "negative S must leave the attention output untouched"
+        );
+    }
+
+    /// An in-place embedding gather (`out` and `weight` are the *same* buffer) must reproduce the
+    /// sequential source nest, which reads `weight[ids[t]]` **after** the earlier rows have already
+    /// overwritten it. The interpreter used to marshal the whole weight table into a scratch buffer
+    /// first and gather from that snapshot, which is a different program. 766 is the hand reference
+    /// (the nest run over the same inputs), not a reading taken from another backend.
+    #[test]
+    fn embedding_gather_reads_live_memory_when_out_aliases_weight() {
+        let src = "fn embed(ids: [i32;80], weight: [f32;320], mut out: [f32;320]) { \
+                     for t in 0..80 { for d in 0..4 { out[t*4+d] = weight[ids[t]*4+d]; } } } \
+                   fn main() -> i32 { let mut ids: [i32; 80] = [0; 80]; \
+                     let mut buf: [f32; 320] = [0.0; 320]; \
+                     for i in 0..80 { ids[i] = 79 - i; } \
+                     for i in 0..320 { buf[i] = (i as f32); } \
+                     embed(ids, buf, buf); \
+                     let mut s: f32 = 0.0; for i in 0..320 { s = s + buf[i]; } \
+                     return (s / 100.0) as i32; }";
+        assert_eq!(run_main(src), 766);
     }
 
     #[test]
