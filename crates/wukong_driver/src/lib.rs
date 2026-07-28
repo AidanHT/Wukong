@@ -188,7 +188,7 @@ pub fn compile(opts: &Options) -> i32 {
 
     if opts.emit == EmitStage::Tokens {
         render_all(opts.error_format, &renderer, &sink, &sm);
-        print!("{}", wukong_lexer::dump(&tokens, sm.source(id)));
+        print_artifact(&wukong_lexer::dump(&tokens, sm.source(id)));
         return if sink.has_errors() {
             exit::COMPILE_ERROR
         } else {
@@ -210,7 +210,7 @@ pub fn compile(opts: &Options) -> i32 {
     // (`--emit=mir-high` onward, `--run`) sees.
     if opts.emit == EmitStage::Ast {
         render_all(opts.error_format, &renderer, &sink, &sm);
-        print!("{}", wukong_ast::print::print_module(&module, &interner));
+        print_artifact(&wukong_ast::print::print_module(&module, &interner));
         return if sink.has_errors() {
             exit::COMPILE_ERROR
         } else {
@@ -314,19 +314,12 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Run via the selected backend (interpreter by default, Cranelift JIT with --backend=native) ---
     if opts.run {
-        // Gate every backend on a clean MIR verify. The optimizer verifies the forms its passes
+        // Gate the backend on a clean MIR verify. The optimizer verifies the forms its passes
         // produce, but at -O0 it runs no passes, so an invalid-MIR lowering bug would otherwise reach
         // the backend unchecked — and the native -O0 JIT codegens it into a SIGSEGV rather than the
-        // clean ICE that `--emit=mir` and the optimizer already report. Verifying here makes a lowering
-        // bug a diagnosable internal-compiler-error on every backend instead of a crash or miscompile.
-        let mut verify_failed = false;
-        for f in &program.funcs {
-            for ice in wukong_mir::verify::verify_function(f) {
-                eprintln!("internal compiler error (MIR verify): {ice}");
-                verify_failed = true;
-            }
-        }
-        if verify_failed {
+        // clean ICE that `--emit=mir` and the optimizer already report. Verifying here makes a
+        // lowering bug a diagnosable internal-compiler-error instead of a crash or miscompile.
+        if verify_or_ice(&program) {
             return exit::COMPILE_ERROR;
         }
         let main = interner.intern("main");
@@ -358,12 +351,24 @@ pub fn compile(opts: &Options) -> i32 {
         };
     }
 
+    // The AOT exits get the same gate as `--run` above. They used to have none: the verify loop was
+    // lexically inside the `if opts.run` block, and `wukong_opt`'s per-pass `verify-each` is
+    // `#[cfg(debug_assertions)]`, so a release `wukongc` handed unverified MIR to `emit_llvm_ir` and
+    // to Cranelift — the one path where an invalid lowering became a raw backend assertion or a
+    // silently miscompiled artifact instead of a diagnosable ICE. (`--emit=mir`/`mir-high` are
+    // deliberately *not* gated here: they verify inside `emit_mir` after dumping, so a broken program
+    // still prints the MIR that shows why.)
+    if matches!(
+        opts.emit,
+        EmitStage::LlvmIr | EmitStage::Obj | EmitStage::Exe
+    ) && verify_or_ice(&program)
+    {
+        return exit::COMPILE_ERROR;
+    }
+
     // --- LLVM backend ---
     if opts.emit == EmitStage::LlvmIr {
-        print!(
-            "{}",
-            wukong_codegen_llvm::emit_llvm_ir(&program, &interner)
-        );
+        print_artifact(&wukong_codegen_llvm::emit_llvm_ir(&program, &interner));
         return exit::OK;
     }
     if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
@@ -462,6 +467,40 @@ void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_fl
 }\n\
 void wukong_rt_free(void* p) { free(p); }\n";
 
+/// A per-invocation scratch directory for the generated `--emit=exe` link inputs (the Rust link
+/// shim and the C fallback runtime). They used to be written into the process's *current* directory
+/// as `{stem}_shim.rs` / `{stem}_rt.c`, where the shim overwrote — and then unconditionally deleted
+/// — any user file of that name, and two concurrent links on the same stem raced on it. Keyed by
+/// pid so concurrent invocations cannot collide; removed when the link finishes either way.
+struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    /// `None` when the directory cannot be created — the caller then falls back to the old
+    /// working-directory paths rather than failing the link outright.
+    fn new(stem: &str) -> Option<ScratchDir> {
+        let path = std::env::temp_dir().join(format!("wukongc-{}-{stem}", std::process::id()));
+        std::fs::create_dir_all(&path).ok()?;
+        Some(ScratchDir { path })
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Where a generated link input goes: inside the scratch directory when one could be created, else
+/// the working directory (the historical behaviour).
+fn scratch_path(scratch: Option<&ScratchDir>, name: String) -> PathBuf {
+    match scratch {
+        Some(s) => s.path.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 /// Emit a native object via Cranelift (no LLVM) and, for `--emit=exe`, link it with a small C
 /// runtime using the system C compiler. `CC` overrides the compiler (default `cc`).
 fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
@@ -503,13 +542,17 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{stem}.exe")));
 
+    // The generated link inputs are compiler intermediates, not user artifacts — keep them out of
+    // the directory the user invoked us in (see [`ScratchDir`]).
+    let scratch = ScratchDir::new(&stem);
+
     // Prefer the **rustc-driven link**: `rustc` invokes the object's *native* platform linker and
     // links `wukong_runtime` (the AVX2 kernels) as a real dependency, so a recognized-kernel program
     // resolves its `wukong_*` symbols AND the read-only string `.rodata` relocations link. The MinGW
     // `cc` path below can neither (it crashes on the MSVC object's data relocations and can't consume
     // the Rust runtime staticlib). Output is bit-identical to `--run`. Falls back to `cc` only when
     // rustc or the runtime rlib is unavailable (a scalar, no-data, no-kernel program still links).
-    match rustc_link(&stem, &obj_path, &out) {
+    match rustc_link(scratch.as_ref(), &stem, &obj_path, &out) {
         LinkOutcome::Linked => {
             eprintln!("wrote {}", out.display());
             return exit::OK;
@@ -521,8 +564,8 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
     }
 
-    // exe (fallback): emit the C runtime next to the object and link them with the system C compiler.
-    let rt_path = PathBuf::from(format!("{stem}_rt.c"));
+    // exe (fallback): emit the C runtime into the scratch dir and link it with the system C compiler.
+    let rt_path = scratch_path(scratch.as_ref(), format!("{stem}_rt.c"));
     if let Err(e) = std::fs::write(&rt_path, WUKONG_RT_C) {
         eprintln!("error: could not write `{}`: {e}", rt_path.display());
         return exit::IO_ERROR;
@@ -636,7 +679,12 @@ pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// `cc` path can do here. The runtime rlib + its dependency dir are located next to this compiler
 /// binary (the cargo `target/<profile>/` layout). Returns [`LinkOutcome::Unavailable`] when rustc or
 /// the rlib is absent so the caller can try the `cc` fallback.
-fn rustc_link(stem: &str, obj_path: &Path, out: &Path) -> LinkOutcome {
+fn rustc_link(
+    scratch: Option<&ScratchDir>,
+    stem: &str,
+    obj_path: &Path,
+    out: &Path,
+) -> LinkOutcome {
     use std::process::Command;
 
     let exe = match std::env::current_exe() {
@@ -654,7 +702,7 @@ fn rustc_link(stem: &str, obj_path: &Path, out: &Path) -> LinkOutcome {
         return LinkOutcome::Unavailable;
     }
 
-    let shim_path = PathBuf::from(format!("{stem}_shim.rs"));
+    let shim_path = scratch_path(scratch, format!("{stem}_shim.rs"));
     if let Err(e) = std::fs::write(&shim_path, WUKONG_RT_SHIM) {
         return LinkOutcome::Failed(format!("could not write `{}`: {e}", shim_path.display()));
     }
@@ -663,6 +711,14 @@ fn rustc_link(stem: &str, obj_path: &Path, out: &Path) -> LinkOutcome {
         .arg(&shim_path)
         .arg("--edition")
         .arg("2021")
+        // The rlib we link against is built by this workspace, whose `[profile.release]` sets
+        // `panic = "abort"`. rustc defaults the shim to `unwind`, and a strategy mismatch is a hard
+        // metadata error ("the crate `wukong_runtime` requires panic strategy `abort` which is
+        // incompatible with this crate's strategy of `unwind`") that rejected every release-profile
+        // link before it ever reached the linker. An abort-strategy crate may link unwind-built
+        // dependencies, so this is equally correct against a debug-profile rlib.
+        .arg("-C")
+        .arg("panic=abort")
         .arg("--extern")
         .arg(format!("wukong_runtime={}", rlib.display()))
         .arg("-L")
@@ -706,8 +762,13 @@ fn emit_grad(program: &wukong_mir::Program, interner: &mut Interner, opts: &Opti
         level: program.level,
         statics: program.statics.clone(),
     };
-    emit_mir(&out, interner);
-    exit::OK
+    // A verifier failure means we just printed an internal-compiler-error; never report success —
+    // the same mapping the `--emit=mir` / `--emit=mir-high` callers already apply.
+    if emit_mir(&out, interner) {
+        exit::COMPILE_ERROR
+    } else {
+        exit::OK
+    }
 }
 
 /// Shared core of `--emit=grad` and `--train`: resolve the target loss function and its `wrt` list
@@ -722,24 +783,44 @@ fn build_grad(
     let func = program.function(sym).ok_or_else(|| {
         format!("no function `{name}` in the module (choose the target with --grad-of=<fn>)")
     })?;
-    let wrt = grad_wrt(func, &opts.grad.wrt)?;
+    let wrt = grad_wrt(func, &opts.grad.wrt, opts.grad.train)?;
     let gradfn = wukong_autodiff::grad(func, &wrt, interner)?;
     Ok((func.clone(), gradfn))
 }
 
 /// The parameter indices to differentiate w.r.t.: the explicit `--grad-wrt` list (validated to be
-/// in-range pointer parameters), or — when empty — *every* pointer (buffer) parameter of the loss.
-/// Differentiating an unread or output buffer is harmless (its gradient is simply zero), so the
-/// "all buffers" default never produces a wrong answer, only occasionally an unused zero buffer.
-fn grad_wrt(func: &wukong_mir::Function, requested: &[usize]) -> Result<Vec<usize>, String> {
+/// distinct, in-range pointer parameters), or — when empty — *every* pointer (buffer) parameter of
+/// the loss. Differentiating an unread or output buffer is harmless (its gradient is simply zero),
+/// so the "all buffers" default never produces a wrong answer, only occasionally an unused zero
+/// buffer.
+///
+/// `training` selects the `--train` flavour of the default: the trainable weights, i.e. every buffer
+/// parameter *except* the last one, which by the `--train` convention is the scalar loss output.
+/// Without that exclusion the documented default expanded to a list containing the loss-output index
+/// and `train_loop` then rejected it, so `--train` could never run without an explicit `--grad-wrt`.
+fn grad_wrt(
+    func: &wukong_mir::Function,
+    requested: &[usize],
+    training: bool,
+) -> Result<Vec<usize>, String> {
     let is_ptr = |i: usize| *func.value_type(func.params[i]) == wukong_mir::MirType::Ptr;
     if requested.is_empty() {
-        let all: Vec<usize> = (0..func.params.len()).filter(|&i| is_ptr(i)).collect();
+        let loss_out = func.params.len().wrapping_sub(1);
+        let all: Vec<usize> = (0..func.params.len())
+            .filter(|&i| is_ptr(i) && !(training && i == loss_out))
+            .collect();
         if all.is_empty() {
-            return Err("the loss function has no buffer (pointer) parameters to differentiate".into());
+            return Err(if training {
+                "the loss function has no trainable buffer parameters (--train differentiates every \
+                 buffer parameter except the last, which is the scalar loss output)"
+                    .into()
+            } else {
+                "the loss function has no buffer (pointer) parameters to differentiate".to_string()
+            });
         }
         return Ok(all);
     }
+    let mut seen = std::collections::HashSet::new();
     for &wi in requested {
         if wi >= func.params.len() {
             return Err(format!(
@@ -750,6 +831,14 @@ fn grad_wrt(func: &wukong_mir::Function, requested: &[usize]) -> Result<Vec<usiz
         if !is_ptr(wi) {
             return Err(format!(
                 "--grad-wrt index {wi} is not a buffer (pointer) parameter"
+            ));
+        }
+        // A repeated index appends a second gradient buffer to the backward's parameter list, but
+        // `Vjp`'s param -> gradient-buffer map keeps only the last insert, so the earlier buffer is
+        // never written and its caller reads back all zeros.
+        if !seen.insert(wi) {
+            return Err(format!(
+                "--grad-wrt index {wi} is repeated; each parameter may be differentiated at most once"
             ));
         }
     }
@@ -881,7 +970,10 @@ fn train_loop(
         let loss_fn = program
             .function(fsym)
             .ok_or_else(|| format!("no function `{name}` in the module"))?;
-        (loss_fn.params.len(), grad_wrt(loss_fn, &opts.grad.wrt)?)
+        (
+            loss_fn.params.len(),
+            grad_wrt(loss_fn, &opts.grad.wrt, true)?,
+        )
     };
     if lens.len() != nparams {
         return Err(format!(
@@ -931,7 +1023,11 @@ fn train_loop(
 
     let lr = opts.grad.train_lr;
     let (beta1, beta2, eps) = (0.9f64, 0.999f64, 1e-8f64);
-    let mut traj = Vec::with_capacity(opts.grad.train_steps + 1);
+    // Grown amortized rather than pre-reserved: `--train-steps` is an unvalidated CLI integer, and
+    // reserving from it let `--train-steps=999999999999` abort inside the allocator ("memory
+    // allocation of 4000000000000 bytes failed", exit 127) before a single step ran — raw runtime
+    // text with no diagnostic. `usize::MAX` additionally wrapped `+ 1` to a zero reservation.
+    let mut traj = Vec::new();
 
     let run = |prog: &Program, entry, bufs: &mut [Vec<f32>], it: &Interner| -> Result<(), String> {
         let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
@@ -994,22 +1090,51 @@ fn train_loop(
 /// at least one failure, so callers can map an internal-compiler-error to a nonzero process exit
 /// status instead of reporting success on invalid MIR.
 fn emit_mir(program: &wukong_mir::Program, interner: &Interner) -> bool {
+    let verify_failed = verify_or_ice(program);
+    print_artifact(&wukong_mir::print::print_program(program, interner));
+    verify_failed
+}
+
+/// Run the MIR verifier over every function, reporting each violation as an
+/// `internal compiler error (MIR verify)` line. Returns `true` if anything failed. A failure is a
+/// bug in a compiler pass, not in the user's program, so it is reported and the process stops —
+/// never handed on to a backend.
+fn verify_or_ice(program: &wukong_mir::Program) -> bool {
     let mut verify_failed = false;
     for f in &program.funcs {
         for ice in wukong_mir::verify::verify_function(f) {
-            eprintln!("internal compiler error (MIR verify): {ice}");
+            eprint_line(&format!("internal compiler error (MIR verify): {ice}"));
             verify_failed = true;
         }
     }
-    print!("{}", wukong_mir::print::print_program(program, interner));
     verify_failed
+}
+
+/// Write a compiler artifact to stdout.
+///
+/// Deliberately a *fallible* write rather than `print!`: `print!` panics when the consumer closes
+/// the pipe, and with the workspace's `panic = "abort"` release profile that panic aborts the whole
+/// process. `wukongc --emit=mir big.wk | head -1` therefore printed Rust's internal
+/// "failed printing to stdout: The pipe has been ended. (os error 109)" and exited 127 instead of
+/// reporting the compile result. A closed consumer is not a compiler error — drop the rest of the
+/// artifact and let the normal exit code stand.
+fn print_artifact(s: &str) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(s.as_bytes());
+}
+
+/// One line of compiler output on stderr, fallible for the same reason as [`print_artifact`]: a
+/// many-diagnostic file piped into `head` aborted the process partway through the diagnostic stream.
+fn eprint_line(s: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{s}");
 }
 
 /// Emit a single diagnostic to stderr in the requested format.
 fn emit_diag(d: &Diagnostic, fmt: ErrorFormat, renderer: &Renderer, sm: &SourceMap) {
     match fmt {
-        ErrorFormat::Human => eprintln!("{}", renderer.render(d, sm)),
-        ErrorFormat::Json => eprintln!("{}", wukong_diag::to_json(d, sm)),
+        ErrorFormat::Human => eprint_line(&renderer.render(d, sm)),
+        ErrorFormat::Json => eprint_line(&wukong_diag::to_json(d, sm)),
     }
 }
 
@@ -1062,7 +1187,8 @@ mod grad_cli_tests {
             ..Options::default()
         };
         let fsym = interner.intern(of);
-        let resolved = grad_wrt(program.function(fsym).expect("loss fn"), wrt).expect("wrt");
+        let resolved =
+            grad_wrt(program.function(fsym).expect("loss fn"), wrt, opts.grad.train).expect("wrt");
         let (fwd, g) = build_grad(&program, &mut interner, &opts).expect("build_grad failed");
         let (fname, gname) = (fwd.name, g.name);
         let prog = Program {
@@ -1419,6 +1545,38 @@ mod grad_cli_tests {
         assert!(lf < 0.3 * l0, "SGD did not reduce the loss enough: {l0} -> {lf}");
     }
 
+    /// The documented `--grad-wrt` default ("all buffer parameters of the loss function ... for
+    /// `--train`, these are the trainable weights") must actually run. It used to expand to a list
+    /// that necessarily contained the loss-output parameter, which `train_loop` then rejected, so
+    /// `wukongc --train --grad-of=loss` always died with "--grad-wrt must not include the
+    /// loss-output parameter (the last one)" unless an explicit list was supplied.
+    #[test]
+    fn train_default_wrt_excludes_the_loss_output() {
+        let traj = train_traj(REGRESSION_SRC, &[], &[12, 8, 6, 1], 40, 0.02, TrainOpt::Sgd, 0xA5A5);
+        assert_eq!(traj.len(), 41, "traj[i] = loss after i updates, plus a final");
+        let (l0, lf) = (traj[0], *traj.last().unwrap());
+        assert!(lf < l0, "the default --grad-wrt did not train: {l0} -> {lf}");
+    }
+
+    /// A repeated `--grad-wrt` index appends a second gradient buffer to the backward's parameter
+    /// list while `Vjp`'s param -> buffer map keeps only the last insert, so the first appended
+    /// buffer is never written and the caller reads back zeros with exit 0. Reject it up front.
+    #[test]
+    fn duplicate_grad_wrt_index_is_rejected() {
+        let (program, mut interner) = compile_o1(REGRESSION_SRC);
+        let opts = Options {
+            grad: GradOptions {
+                of: Some("loss".to_string()),
+                wrt: vec![1, 1],
+                ..GradOptions::default()
+            },
+            ..Options::default()
+        };
+        let err = build_grad(&program, &mut interner, &opts)
+            .expect_err("a repeated --grad-wrt index must be rejected");
+        assert!(err.contains("repeated"), "unexpected error: {err}");
+    }
+
     #[test]
     fn train_adamw_reduces_loss() {
         // The fused AdamW kernel drives a much larger reduction than plain SGD in the same budget.
@@ -1470,6 +1628,99 @@ mod grad_cli_tests {
     }
 }
 
+/// The MIR-verifier gate that stands in front of every backend entry.
+#[cfg(test)]
+mod verify_gate_tests {
+    use super::*;
+    use wukong_mir::{BasicBlock, BlockId, Function, MirType, Program, Terminator, ValueId};
+
+    /// A function that returns a value no block parameter and no instruction ever defines — the
+    /// "use of undefined value" class the verifier exists to catch.
+    fn invalid_program(interner: &mut Interner) -> Program {
+        let f = Function {
+            name: interner.intern("bad"),
+            params: Vec::new(),
+            ret: MirType::I32,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                insts: Vec::new(),
+                term: Terminator::Ret(Some(ValueId(0))),
+            }],
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            vec_kernels: Vec::new(),
+        };
+        Program {
+            funcs: vec![f],
+            statics: Vec::new(),
+            level: wukong_mir::MirLevel::Low,
+        }
+    }
+
+    /// `verify_or_ice` is what `--run`, `--emit=llvm-ir`, `--emit=obj` and `--emit=exe` now all call
+    /// before entering a backend; before this it was inlined in the `--run` arm only, so the three
+    /// AOT exits reached their backend unverified.
+    #[test]
+    fn verify_or_ice_reports_an_undefined_value_use() {
+        let mut interner = Interner::new();
+        assert!(
+            verify_or_ice(&invalid_program(&mut interner)),
+            "a `ret` of an undefined value must be reported"
+        );
+    }
+
+    /// And it must stay quiet on well-formed MIR, or every AOT compile would start failing.
+    #[test]
+    fn verify_or_ice_accepts_a_real_compiled_program() {
+        let src = "module m\nfn main() -> i32 { let x: f32 = 0.5; print(x); return 0; }";
+        let mut sm = SourceMap::new();
+        let id = sm.add("v.wk".to_string(), src.to_string());
+        let (tokens, _) = wukong_lexer::tokenize(sm.source(id), id);
+        let mut interner = Interner::new();
+        let (module, _) = wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(!sd.iter().any(|d| d.is_error()), "sema errors");
+        for level in [0u8, 1, 2] {
+            let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+            assert!(!md.iter().any(|d| d.is_error()), "mir_build errors");
+            wukong_opt::optimize(&mut program, level);
+            assert!(!verify_or_ice(&program), "clean program failed verify at -O{level}");
+        }
+    }
+}
+
+/// The `--emit=exe` link path's generated inputs (the Rust shim, the C fallback runtime).
+#[cfg(test)]
+mod native_link_tests {
+    use super::*;
+
+    /// They must never be generated in the directory the user invoked the compiler from:
+    /// `{stem}_shim.rs` was written there and then unconditionally deleted, so an `--emit=exe` run
+    /// in a source directory holding a file of that name destroyed it.
+    #[test]
+    fn exe_link_inputs_are_generated_outside_the_working_directory() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let scratch = ScratchDir::new("scratch_probe").expect("scratch dir");
+        let shim = scratch_path(Some(&scratch), "scratch_probe_shim.rs".to_string());
+        let rt = scratch_path(Some(&scratch), "scratch_probe_rt.c".to_string());
+        for p in [&shim, &rt] {
+            assert!(
+                !p.starts_with(&cwd),
+                "`{}` lands in the working directory",
+                p.display()
+            );
+        }
+        std::fs::write(&shim, "// probe").expect("write shim");
+        let dir = scratch.path.clone();
+        drop(scratch);
+        assert!(
+            !dir.exists(),
+            "the scratch directory must be removed when the link finishes"
+        );
+    }
+}
+
 /// End-to-end GPU-backend gate: the `--backend=gpu` path (offloading interpreter + [`gpu_accel`])
 /// must match the pure-interpreter oracle within the CPU↔GPU tolerance over the **same** lowered MIR.
 /// Only built with `--features gpu`; skips (does not fail) when no CUDA device is present.
@@ -1501,7 +1752,7 @@ mod gpu_e2e_tests {
     /// The `ijk` `C = A·Bᵀ` (nn.Linear) nest that the recognizer lowers to `wukong_sgemm_nt`.
     fn linear_src(m: usize, k: usize, n: usize) -> String {
         format!(
-            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],c:[f32;{mn}]) {{ \
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],mut c:[f32;{mn}]) {{ \
              for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
              for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} }}",
             mk = m * k,
@@ -1522,7 +1773,7 @@ mod gpu_e2e_tests {
             other => panic!("unknown activation {other}"),
         };
         format!(
-            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],c:[f32;{mn}]) {{ \
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],mut c:[f32;{mn}]) {{ \
              for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
              for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} \
              for i in 0..{m} {{ for j in 0..{n} {{ c[i*{n}+j] = {act}; }} }} }}",
@@ -1546,7 +1797,7 @@ mod gpu_e2e_tests {
             other => panic!("unknown activation {other}"),
         };
         format!(
-            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],bias:[f32;{n}],c:[f32;{mn}]) {{ \
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],bias:[f32;{n}],mut c:[f32;{mn}]) {{ \
              for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
              for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} \
              for i in 0..{m} {{ for j in 0..{n} {{ c[i*{n}+j] = {act}; }} }} }}",
@@ -1811,7 +2062,7 @@ mod gpu_e2e_tests {
             let (r, c) = (4usize, 16usize);
             let n = r * c;
             let src = format!(
-                "module m\nfn sm(x:[f32;{n}]) {{ for row in 0..{r} {{ \
+                "module m\nfn sm(mut x:[f32;{n}]) {{ for row in 0..{r} {{ \
                  let mut m: f32 = x[row*{c}]; for i in 0..{c} {{ m = fmax(m, x[row*{c}+i]); }} \
                  for i in 0..{c} {{ x[row*{c}+i] = exp(x[row*{c}+i] - m); }} \
                  let mut s: f32 = 0.0; for i in 0..{c} {{ s = s + x[row*{c}+i]; }} \
@@ -1829,6 +2080,73 @@ mod gpu_e2e_tests {
             eprintln!(
                 "gpu --backend softmax[{r}x{c}]: {calls} call(s), max_abs={:.2e} max_rel={:.2e}",
                 s.max_abs, s.max_rel
+            );
+        }
+    }
+
+    /// The two `NORM_*` op codes the recognizer emits but the GPU `norm` kernel has no PTX entry for
+    /// (LOGSOFTMAX=3, L2NORM=4). Before the `norm_supported` gate these forwarded to `gpu::norm` and
+    /// hit its `_ => panic!("norm op {op} not implemented on GPU yet")`, aborting the process on
+    /// ordinary user input. They must now decline to the CPU kernel: zero device calls, and — since
+    /// nothing ran on the device — output bit-identical to the interpreter oracle.
+    #[test]
+    fn gpu_backend_declines_unimplemented_norm_ops_to_cpu() {
+        let mut guard = wukong_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                eprintln!("skip gpu_backend_declines_unimplemented_norm_ops_to_cpu: no CUDA device");
+                return;
+            }
+        };
+        let mut rng = Rng::new(0x1EAF_0011);
+        let n = 64usize;
+
+        // NORM_LOGSOFTMAX (op 3): the stable max / log-sum-exp / subtract row window, in place.
+        let logsoftmax = format!(
+            "module m\nfn lsm(mut x:[f32;{n}]) {{ let mut m: f32 = x[0]; \
+             for i in 0..{n} {{ m = fmax(m, x[i]); }} let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + exp(x[i] - m); }} let ls: f32 = log(s); \
+             for i in 0..{n} {{ x[i] = (x[i] - m) - ls; }} }}"
+        );
+        // NORM_L2NORM (op 4): sum of squares / rsqrt / scale, x -> out.
+        let l2norm = format!(
+            "module m\nfn l2n(x:[f32;{n}], mut out:[f32;{n}]) {{ let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + x[i]*x[i]; }} let inv: f32 = rsqrt(s + 0.00001); \
+             for i in 0..{n} {{ out[i] = x[i]*inv; }} }}"
+        );
+
+        for (label, src, entry_name, init) in [
+            (
+                "log_softmax",
+                logsoftmax,
+                "lsm",
+                vec![rng.vec(n, -3.0, 3.0)],
+            ),
+            (
+                "l2norm",
+                l2norm,
+                "l2n",
+                vec![rng.vec(n, -3.0, 3.0), vec![0.0; n]],
+            ),
+        ] {
+            let (program, mut interner) = build(&src);
+            let entry = interner.intern(entry_name);
+            // The window must actually lower to `wukong_norm_f32`, else this tests nothing.
+            let mir = wukong_mir::print::print_program(&program, &interner);
+            assert!(
+                mir.contains("wukong_norm_f32"),
+                "{label}: did not lower to a fused norm — the gate would never be consulted"
+            );
+            let (cpu, gpu, calls) = run_both(g, &program, entry, &interner, &init);
+            assert_eq!(
+                calls, 0,
+                "{label}: an unimplemented norm op must not reach the device"
+            );
+            let last = cpu.len() - 1;
+            assert_eq!(
+                gpu[last], cpu[last],
+                "{label}: the CPU fallback must be bit-identical to the oracle"
             );
         }
     }
