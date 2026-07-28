@@ -1315,6 +1315,7 @@ fn is_batched_norm_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -1361,6 +1362,7 @@ fn is_bias_bcast_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -1412,6 +1414,7 @@ fn lower_fn(
         gemm,
         parallel_fn,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: subst.clone(),
         mono: Some(mono),
@@ -1444,17 +1447,18 @@ fn lower_fn(
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         let mty = fl.mir_ty_of(pty);
+        let is_slice = matches!(pty, Ty::Slice(_));
         if matches!(mty, MirType::Array(..)) {
             // The parameter value *is* the aggregate's base pointer; bind it directly so field/index
             // access geps off it (no copy into a local slot).
-            fl.bind(p.name.sym, val, mty);
+            fl.bind_slice(p.name.sym, val, mty, is_slice);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {
                 ptr: slot,
                 value: val,
             });
-            fl.bind(p.name.sym, slot, mty);
+            fl.bind_slice(p.name.sym, slot, mty, is_slice);
         }
     }
 
@@ -1594,6 +1598,7 @@ fn lower_parallel(
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::default(),
+            slice_slots: HashSet::default(),
             sret: None,
             // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
             // generic functions, so no monomorphization context is needed.
@@ -1645,6 +1650,7 @@ fn lower_parallel(
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::default(),
+            slice_slots: HashSet::default(),
             sret: None,
             // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
             // generic functions, so no monomorphization context is needed.
@@ -2248,8 +2254,11 @@ struct VElemPlan<'b> {
 /// `[i32]`), the loop-invariant f32 `scale` expr (lowered at emit time), and the packed op (activation
 /// byte | input-width code from the source array's *signed* scalar type).
 struct DequantPlan<'b> {
-    out: ValueId,
-    q: ValueId,
+    // The operand *symbols*, resolved to base pointers at emit time via `kernel_base_ptr` — the
+    // rule `VElemPlan` documents above. Storing the slot value here handed the kernel a `[]T`
+    // slice's 16-byte fat-pointer buffer as its data pointer.
+    out: Symbol,
+    q: Symbol,
     q_elem: MirType,
     scale: &'b Expr,
     op: i64,
@@ -2331,6 +2340,14 @@ struct FnLowerer<'a> {
     /// lowerers and the outlined-body lowerers pass `None`, so a probe can never emit a region and
     /// an outlined body can never nest one.
     par: Option<&'a mut ParRegions>,
+    /// The bound slot values that hold a `[]T` **slice** fat pointer, recorded by `bind_slice` at
+    /// every binding site whose sema type is `Ty::Slice`. `kernel_base_ptr` needs this because the
+    /// slice's MIR slot type — `Array(I8, SLICE_SIZE)` — is *not* unique to slices: a tuple, a
+    /// 16-byte struct and a user's own `[i8; 16]`/`[u8; 16]` array all lower to the same shape, so
+    /// keying the fat-pointer load on the MIR shape would hand an int8 GEMM the first 8 bytes of its
+    /// data matrix as a base pointer. A slot value is unique within a function, so this needs no
+    /// scope discipline: a shadowing binding gets a fresh slot and is simply absent from the set.
+    slice_slots: HashSet<ValueId>,
 }
 
 impl FnLowerer<'_> {
@@ -2358,6 +2375,18 @@ impl FnLowerer<'_> {
 
     fn bind(&mut self, name: Symbol, slot: ValueId, ty: MirType) {
         self.scopes.last_mut().unwrap().insert(name, (slot, ty));
+    }
+
+    /// Bind a name whose sema type is `[]T` — a slice. Identical to [`Self::bind`] plus a record
+    /// that `slot` holds a fat pointer, which is the only way `kernel_base_ptr` can tell a slice
+    /// apart from the `[i8; 16]`/tuple/struct locals that share its `Array(I8, 16)` MIR slot shape.
+    /// A binding site that forgets to use this keeps the pre-existing (fat-pointer-as-data)
+    /// behaviour rather than corrupting an unrelated operand, so the record is fail-safe.
+    fn bind_slice(&mut self, name: Symbol, slot: ValueId, ty: MirType, is_slice: bool) {
+        self.bind(name, slot, ty);
+        if is_slice {
+            self.slice_slots.insert(slot);
+        }
     }
 
     fn lookup(&self, name: Symbol) -> Option<(ValueId, MirType)> {
@@ -2727,7 +2756,9 @@ impl FnLowerer<'_> {
             let fmir = self.mir_ty_of(fty);
             let fptr = self.field_ptr(base, *off);
             match &sub.kind {
-                ast::PatKind::Ident(name) => self.bind(*name, fptr, fmir),
+                ast::PatKind::Ident(name) => {
+                    self.bind_slice(*name, fptr, fmir, matches!(fty, Ty::Slice(_)))
+                }
                 ast::PatKind::Tuple(inner) => self.bind_tuple_pattern(fptr, fty, inner),
                 _ => {}
             }
@@ -4552,11 +4583,8 @@ impl FnLowerer<'_> {
     /// clamp from ever firing on the in-range ids a well-typed program produces (both backends call the
     /// identical kernel, so the differential gate holds regardless of the sentinel value).
     fn emit_embedding(&mut self, nest: &EmbeddingNest, parallel: bool) -> bool {
-        let (Some((out, _)), Some((weight, _)), Some((ids, _))) = (
-            self.lookup(nest.out),
-            self.lookup(nest.weight),
-            self.lookup(nest.ids),
-        ) else {
+        let Some([out, weight, ids]) = self.kernel_base_ptrs([nest.out, nest.weight, nest.ids])
+        else {
             return false;
         };
         let (Some(t_rows), Some(h)) = (self.dim_value(nest.t_rows), self.dim_value(nest.h)) else {
@@ -4671,11 +4699,9 @@ impl FnLowerer<'_> {
     /// derived from grad_w's array length, because the parallel kernel partitions the `V` output rows
     /// across cores. `parallel` selects the multicore kernel (output-row split → bit-identical to serial).
     fn emit_scatter(&mut self, nest: &ScatterNest, parallel: bool) -> bool {
-        let (Some((grad_w, _)), Some((grad_out, _)), Some((ids, _))) = (
-            self.lookup(nest.grad_w),
-            self.lookup(nest.grad_out),
-            self.lookup(nest.ids),
-        ) else {
+        let Some([grad_w, grad_out, ids]) =
+            self.kernel_base_ptrs([nest.grad_w, nest.grad_out, nest.ids])
+        else {
             return false;
         };
         let (Some(t_rows), Some(h)) = (self.dim_value(nest.t_rows), self.dim_value(nest.h)) else {
@@ -6841,8 +6867,16 @@ impl FnLowerer<'_> {
                     // invariants at once. Scalars, arrays, and struct/tuple byte buffers are covered.
                     self.zero_init(slot, &mty);
                 }
+                // A `[]T` local owns a fat-pointer buffer; record the slot so `kernel_base_ptr`
+                // loads the data pointer out of it (the `Array(I8, 16)` slot shape it would
+                // otherwise key on is shared with tuples, 16-byte structs and `[i8; 16]` arrays).
+                let is_slice = match (ty, init) {
+                    (_, Some(e)) => self.let_is_slice(ty, e),
+                    (Some(t), None) => matches!(&t.kind, ast::TypeKind::Slice(_)),
+                    (None, None) => false,
+                };
                 match &pat.kind {
-                    ast::PatKind::Ident(name) => self.bind(*name, slot, mty),
+                    ast::PatKind::Ident(name) => self.bind_slice(*name, slot, mty, is_slice),
                     // Destructuring `let (a, b) = …`: bind each sub-pattern to its tuple field's
                     // place within the slot (a scalar field reads via a `Load`, an aggregate field
                     // binds its pointer). Recurses for a nested tuple pattern.
@@ -7257,15 +7291,31 @@ impl FnLowerer<'_> {
         // `Ptr` from the slot. A fixed `[T; N]` array's slot *is* its storage, so its base is the slot
         // address itself. Without the slice arm a `[]f32` operand (the only way to hold a runtime-sized
         // weight blob — e.g. GPT-2's 124M params) passed the 16-byte fat-pointer buffer as the base and
-        // the kernel dereferenced garbage ("expected a pointer"); a fixed `[i8; 16]` never reaches a
-        // GEMM operand (sema types these f32), so keying on the slice MIR shape is safe here.
-        let is_slice = matches!(&ty, MirType::Array(elem, n)
-            if matches!(**elem, MirType::I8) && *n as u64 == SLICE_SIZE);
+        // the kernel dereferenced garbage ("expected a pointer").
+        //
+        // Slice-ness comes from `slice_slots` (recorded by `bind_slice` from the *sema* type), never
+        // from the slot's MIR shape: `Array(I8, SLICE_SIZE)` is also how a tuple, a 16-byte struct and
+        // a user's own `[i8; 16]`/`[u8; 16]` array are typed, so shape-keying would hand an int8 GEMM
+        // the first 8 bytes of its own data matrix as a base pointer.
+        let is_slice = self.slice_slots.contains(&val);
         Some(if matches!(ty, MirType::Ptr) || is_slice {
             self.builder.build(MirType::Ptr, Op::Load(val, MirType::Ptr))
         } else {
             val
         })
+    }
+
+    /// Resolve several kernel operands through [`Self::kernel_base_ptr`] in one step — the shared
+    /// resolution path every recognizer emitter uses for its buffer operands. `None` if any operand
+    /// is unbound, which every caller turns into "decline, lower the scalar nest". Buffer operands
+    /// must go through here; *scalar* operands (an α, an eps, a per-tensor scale) keep the plain
+    /// `lookup` + `Load` form, since their slot really does hold the value.
+    fn kernel_base_ptrs<const N: usize>(&mut self, syms: [Symbol; N]) -> Option<[ValueId; N]> {
+        let mut vals = Vec::with_capacity(N);
+        for s in syms {
+            vals.push(self.kernel_base_ptr(s)?);
+        }
+        vals.try_into().ok()
     }
 
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
@@ -7463,11 +7513,7 @@ impl FnLowerer<'_> {
     /// would reassociate per-thread partials). One symbol serves both store forms: the unscaled
     /// nest passes α = 1.0, which the kernel skips (byte-identical to a never-scaled fold).
     fn emit_gevm(&mut self, nest: &GevmNest, parallel: bool) -> bool {
-        let (Some((w, _)), Some((a, _)), Some((out, _))) = (
-            self.lookup(nest.w),
-            self.lookup(nest.a),
-            self.lookup(nest.out),
-        ) else {
+        let Some([w, a, out]) = self.kernel_base_ptrs([nest.w, nest.a, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7493,11 +7539,7 @@ impl FnLowerer<'_> {
     /// call site, so the caller lowers the scalar nest. `parallel` selects the multicore kernel (rows
     /// are independent, so it is bit-identical to the serial one the interpreter runs).
     fn emit_i8gemm(&mut self, nest: &I8MatmulNest, parallel: bool) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
-        ) else {
+        let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
         let (Some(m), Some(k), Some(n)) = (
@@ -7526,11 +7568,7 @@ impl FnLowerer<'_> {
     /// is bit-identical to the serial one the interpreter marshals). The widen is lossless, so the
     /// kernel equals the naive nest under the documented matmul reassociation.
     fn emit_lowp_gemm(&mut self, nest: &LowpMatmulNest, parallel: bool) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
-        ) else {
+        let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
         let (Some(m), Some(k), Some(n)) = (
@@ -7569,7 +7607,7 @@ impl FnLowerer<'_> {
     /// cross-channel combine). Max is idempotent and the avg sum order is fixed, so the kernel equals
     /// the scalar nest bit-for-bit (no reassociation exception).
     fn emit_pool2d(&mut self, nest: &Pool2dNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(channels), Some(h), Some(w)) = (
@@ -7605,7 +7643,7 @@ impl FnLowerer<'_> {
     /// the scalar nest). `parallel` selects the multicore kernel (the row blocks write disjoint `dst`
     /// columns → bit-identical to the serial one, which is a plain permutation the interpreter marshals).
     fn emit_transpose(&mut self, nest: &TransposeNest, parallel: bool) -> bool {
-        let (Some((src, _)), Some((dst, _))) = (self.lookup(nest.src), self.lookup(nest.dst)) else {
+        let Some([src, dst]) = self.kernel_base_ptrs([nest.src, nest.dst]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7629,7 +7667,7 @@ impl FnLowerer<'_> {
     /// `parallel` selects the multicore kernel (disjoint column stripes → bit-identical to the serial
     /// one, which sums each column in the same i-order the interpreter marshals).
     fn emit_colsum(&mut self, nest: &ColSumNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7665,9 +7703,7 @@ impl FnLowerer<'_> {
     /// `parallel` selects the multicore kernel (rows across cores → bit-identical to the serial one the
     /// interpreter marshals; rows are independent, no cross-row combine).
     fn emit_softmax_bwd(&mut self, nest: &SoftmaxBwdNest, parallel: bool) -> bool {
-        let (Some((y, _)), Some((dy, _)), Some((dx, _))) =
-            (self.lookup(nest.y), self.lookup(nest.dy), self.lookup(nest.dx))
-        else {
+        let Some([y, dy, dx]) = self.kernel_base_ptrs([nest.y, nest.dy, nest.dx]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7690,12 +7726,9 @@ impl FnLowerer<'_> {
     /// selects the multicore kernel (rows across cores → bit-identical to the serial one; rows
     /// independent, no cross-row combine).
     fn emit_rmsnorm_bwd(&mut self, nest: &RmsNormBwdNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((dy, _)), Some((gamma, _)), Some((dx, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.dy),
-            self.lookup(nest.gamma),
-            self.lookup(nest.dx),
-        ) else {
+        let Some([x, dy, gamma, dx]) =
+            self.kernel_base_ptrs([nest.x, nest.dy, nest.gamma, nest.dx])
+        else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7720,12 +7753,9 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_layernorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` call for
     /// a recognized batched LayerNorm backward. Same shape as `emit_rmsnorm_bwd`.
     fn emit_layernorm_bwd(&mut self, nest: &LayerNormBwdNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((dy, _)), Some((gamma, _)), Some((dx, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.dy),
-            self.lookup(nest.gamma),
-            self.lookup(nest.dx),
-        ) else {
+        let Some([x, dy, gamma, dx]) =
+            self.kernel_base_ptrs([nest.x, nest.dy, nest.gamma, nest.dx])
+        else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7751,11 +7781,8 @@ impl FnLowerer<'_> {
     /// batched cross-entropy loss. Bails (false) if an operand/dim is unbound. `parallel` selects the
     /// multicore kernel (rows independent → bit-identical to serial).
     fn emit_xent(&mut self, nest: &XentNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((target, _)), Some((loss, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.target),
-            self.lookup(nest.loss),
-        ) else {
+        let Some([x, target, loss]) = self.kernel_base_ptrs([nest.x, nest.target, nest.loss])
+        else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7776,11 +7803,7 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_xent_bwd_f32[_parallel](x, target, dx, rows, cols)` call for a recognized
     /// cross-entropy backward nest. Bails (false) if an operand/dim is unbound.
     fn emit_xent_bwd(&mut self, nest: &XentBwdNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((target, _)), Some((dx, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.target),
-            self.lookup(nest.dx),
-        ) else {
+        let Some([x, target, dx]) = self.kernel_base_ptrs([nest.x, nest.target, nest.dx]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7802,11 +7825,8 @@ impl FnLowerer<'_> {
     /// nest. Bails (false) if an operand/dim is unbound. `parallel` selects the multicore kernel (rows
     /// independent → bit-identical to serial).
     fn emit_rope(&mut self, nest: &RopeNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((inv_freq, _)), Some((out, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.inv_freq),
-            self.lookup(nest.out),
-        ) else {
+        let Some([x, inv_freq, out]) = self.kernel_base_ptrs([nest.x, nest.inv_freq, nest.out])
+        else {
             return false;
         };
         let (Some(rows), Some(half)) = (self.dim_value(nest.rows), self.dim_value(nest.half)) else {
@@ -7828,7 +7848,7 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_logsumexp_f32[_parallel](x, out, rows, cols)` call for a recognized log-sum-exp
     /// nest. Bails (false) if an operand/dim is unbound. `parallel` selects the multicore kernel.
     fn emit_logsumexp(&mut self, nest: &LogsumexpNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7849,7 +7869,7 @@ impl FnLowerer<'_> {
     /// Emit `wukong_colarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-column arg
     /// nest. Same `(ptr,ptr,i64,i64)` i32-output ABI as `emit_rowarg`; `out` is the per-column row-index.
     fn emit_colarg(&mut self, nest: &ColArgNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7871,7 +7891,7 @@ impl FnLowerer<'_> {
     /// Emit `wukong_rowarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-row arg nest.
     /// Same `(ptr,ptr,i64,i64)` shape as `wukong_logsumexp_f32`, but `out` is an i32 index buffer.
     fn emit_rowarg(&mut self, nest: &RowArgNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7893,7 +7913,7 @@ impl FnLowerer<'_> {
     /// Emit `wukong_cumsum_f32[_parallel](x, out, rows, cols)` for a recognized per-row prefix sum.
     /// Same `(ptr,ptr,i64,i64)` `sig_vmath` shape; the `_parallel` one maps rows across cores.
     fn emit_cumsum(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7914,7 +7934,7 @@ impl FnLowerer<'_> {
     /// Emit `wukong_cumprod_f32[_parallel](x, out, rows, cols)` for a recognized prefix product. Same
     /// 2-ptr + 2-i64 `sig_vmath` ABI as cumsum; the `_parallel` one maps independent rows across cores.
     fn emit_cumprod(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7936,9 +7956,7 @@ impl FnLowerer<'_> {
     /// 3 pointers + 2 i64 (the `softmax_bwd` ABI); the `_parallel` one maps the independent rows across
     /// cores (bit-identical to serial — no cross-row combine).
     fn emit_lrscan(&mut self, nest: &LrscanNest, parallel: bool) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((out, _))) =
-            (self.lookup(nest.a), self.lookup(nest.b), self.lookup(nest.out))
-        else {
+        let Some([a, b, out]) = self.kernel_base_ptrs([nest.a, nest.b, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7958,7 +7976,7 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_cum{max,min}_f32[_parallel](x, out, rows, cols)` for a recognized cumulative max/min.
     fn emit_cumminmax(&mut self, nest: &CumMinMaxNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7979,9 +7997,7 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_kldiv_f32[_parallel](p, q, out, rows, cols)` for a recognized KL-divergence nest.
     fn emit_kldiv(&mut self, nest: &KldivNest, parallel: bool) -> bool {
-        let (Some((p, _)), Some((q, _)), Some((out, _))) =
-            (self.lookup(nest.p), self.lookup(nest.q), self.lookup(nest.out))
-        else {
+        let Some([p, q, out]) = self.kernel_base_ptrs([nest.p, nest.q, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -8001,7 +8017,7 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_entropy_f32[_parallel](p, out, rows, cols)` for a recognized row-entropy nest.
     fn emit_entropy(&mut self, nest: &EntropyNest, parallel: bool) -> bool {
-        let (Some((p, _)), Some((out, _))) = (self.lookup(nest.p), self.lookup(nest.out)) else {
+        let Some([p, out]) = self.kernel_base_ptrs([nest.p, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -8021,9 +8037,7 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_kd_loss_f32[_parallel](x, q, out, rows, cols)` for a recognized soft-label xent nest.
     fn emit_kd_loss(&mut self, nest: &KdLossNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((q, _)), Some((out, _))) =
-            (self.lookup(nest.x), self.lookup(nest.q), self.lookup(nest.out))
-        else {
+        let Some([x, q, out]) = self.kernel_base_ptrs([nest.x, nest.q, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -8049,11 +8063,7 @@ impl FnLowerer<'_> {
     /// the widened operands; in a `@parallel` function the multicore kernel runs (each C tile owned by
     /// one task → bit-identical to the serial kernel the interpreter marshals).
     fn emit_lowp_gemm_epi(&mut self, nest: &LowpMatmulNest, bias: Option<Symbol>, act: u32) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
-        ) else {
+        let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
         let (Some(m), Some(k), Some(n)) = (
@@ -8067,8 +8077,8 @@ impl FnLowerer<'_> {
         // MIR): the kernel checks `bias.is_null()`, and the interpreter distinguishes the `Value::Int(0)`
         // from a real array's `Value::Ptr` by variant — same convention as the f32 `nt_epi` epilogue.
         let bias_ptr = match bias {
-            Some(s) => match self.lookup(s) {
-                Some((v, _)) => v,
+            Some(s) => match self.kernel_base_ptr(s) {
+                Some(v) => v,
                 None => return false,
             },
             None => self
@@ -8168,10 +8178,10 @@ impl FnLowerer<'_> {
     /// Linear+epilogue. Bails (false) if any operand/dim is somehow unbound at the call site, so the
     /// caller falls back to lowering the matmul and the epilogue loop separately.
     fn emit_sgemm_epi(&mut self, nest: &MatmulNest<'_>, bias: Option<Symbol>, act: u32) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _)), Some(m), Some(k), Some(n)) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
+        let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
             self.dim_value(nest.m),
             self.dim_value(nest.k),
             self.dim_value(nest.n),
@@ -8183,8 +8193,8 @@ impl FnLowerer<'_> {
         // `Value::Int(0)` from a real array's `Value::Ptr` by variant — same convention as the affine
         // norm null params.
         let bias_ptr = match bias {
-            Some(s) => match self.lookup(s) {
-                Some((v, _)) => v,
+            Some(s) => match self.kernel_base_ptr(s) {
+                Some(v) => v,
                 None => return false,
             },
             None => self
@@ -8268,12 +8278,7 @@ impl FnLowerer<'_> {
         bias: Option<Symbol>,
         act: u32,
     ) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((out_v, _)), Some((sb, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(out),
-            self.lookup(scale_b),
-        ) else {
+        let Some([a, b, out_v, sb]) = self.kernel_base_ptrs([nest.a, nest.b, out, scale_b]) else {
             return false;
         };
         let (Some(m), Some(k), Some(n)) = (
@@ -8295,8 +8300,8 @@ impl FnLowerer<'_> {
                 .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32)),
         };
         let bias_ptr = match bias {
-            Some(s) => match self.lookup(s) {
-                Some((v, _)) => v,
+            Some(s) => match self.kernel_base_ptr(s) {
+                Some(v) => v,
                 None => return false,
             },
             None => self
@@ -8632,7 +8637,7 @@ impl FnLowerer<'_> {
         ) {
             return false;
         }
-        let Some((xv, _)) = self.lookup(xb) else {
+        let Some(xv) = self.kernel_base_ptr(xb) else {
             return false;
         };
         let n_ty = self.expr_mir(end);
@@ -9132,9 +9137,7 @@ impl FnLowerer<'_> {
         let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, *k) else {
             return false;
         };
-        let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
-            (self.lookup(out), self.lookup(x), self.lookup(y))
-        else {
+        let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
             return false;
         };
         // Coefficients: lower the invariant expr (coerced to f32), or a literal 1.0 when implicit.
@@ -9196,9 +9199,7 @@ impl FnLowerer<'_> {
         let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby_narrow(body, *k) else {
             return false;
         };
-        let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
-            (self.lookup(out), self.lookup(x), self.lookup(y))
-        else {
+        let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
             return false;
         };
         let mut coef = |e: Option<&Expr>| -> ValueId {
@@ -9334,7 +9335,7 @@ impl FnLowerer<'_> {
         let Some((out, x, opcode, is_f16)) = self.match_vmath_narrow(body, *k) else {
             return false;
         };
-        let (Some((outv, _)), Some((xv, _))) = (self.lookup(out), self.lookup(x)) else {
+        let Some([outv, xv]) = self.kernel_base_ptrs([out, x]) else {
             return false;
         };
         let n_ty = self.expr_mir(end);
@@ -10567,11 +10568,15 @@ impl FnLowerer<'_> {
         // A captured array's bound ValueId IS its base pointer; a captured scalar's is its alloca
         // slot pointer. Both are pointer-shaped, so the env is a uniform pointer table. Scalars are
         // read-only inside the region (matcher-enforced), so sharing the slot is race-free.
-        let caps: Vec<(Symbol, ValueId, MirType)> = captures
+        // A captured `[]T` slice puts the address of *its fat-pointer buffer* in the env (the bound
+        // value of a slice is that buffer), so the re-bind inside the outlined body must carry the
+        // slice record forward or `kernel_base_ptr` would take the buffer for the data itself.
+        let caps: Vec<(Symbol, ValueId, MirType, bool)> = captures
             .iter()
             .map(|s| {
                 let (v, t) = self.lookup(*s).expect("region capture must be in scope");
-                (*s, v, t)
+                let is_slice = self.slice_slots.contains(&v);
+                (*s, v, t, is_slice)
             })
             .collect();
 
@@ -10580,7 +10585,7 @@ impl FnLowerer<'_> {
         let env = self
             .builder
             .alloca(MirType::Array(Box::new(MirType::Ptr), k));
-        for (i, (_, vid, _)) in caps.iter().enumerate() {
+        for (i, (_, vid, _, _)) in caps.iter().enumerate() {
             let kidx = self
                 .builder
                 .build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
@@ -10624,6 +10629,7 @@ impl FnLowerer<'_> {
                 // iterations never overlap writes).
                 parallel_fn: false,
                 vec_loads: HashMap::default(),
+                slice_slots: HashSet::default(),
                 sret: None,
                 subst: self.subst.clone(),
                 mono: self.mono,
@@ -10632,7 +10638,7 @@ impl FnLowerer<'_> {
             let start = fl.builder.add_param(MirType::I64);
             let end = fl.builder.add_param(MirType::I64);
             let envp = fl.builder.add_param(MirType::Ptr);
-            for (i, (sym, _, mty)) in caps.iter().enumerate() {
+            for (i, (sym, _, mty, is_slice)) in caps.iter().enumerate() {
                 let kidx = fl
                     .builder
                     .build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
@@ -10645,7 +10651,7 @@ impl FnLowerer<'_> {
                     },
                 );
                 let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
-                fl.bind(*sym, base, mty.clone());
+                fl.bind_slice(*sym, base, mty.clone(), *is_slice);
             }
             fl.lower_ranged_loop(hh, start, end, ity.clone(), body);
             if !fl.terminated {
@@ -11401,9 +11407,7 @@ impl FnLowerer<'_> {
         let Some((out, x, b, rows, cols, op)) = self.match_bias_bcast(pat, iter, body) else {
             return false;
         };
-        let (Some((outv, _)), Some((xv, _)), Some((bv, _))) =
-            (self.lookup(out), self.lookup(x), self.lookup(b))
-        else {
+        let Some([outv, xv, bv]) = self.kernel_base_ptrs([out, x, b]) else {
             return false;
         };
         let rty = self.expr_mir(rows);
@@ -12004,11 +12008,13 @@ impl FnLowerer<'_> {
         }
         let (inner, act) = self.peel_dequant_act(value);
         let (q_sym, q_elem, width, scale) = self.match_dequant_mul(inner, j)?;
-        let out = self.lookup(out_sym)?.0;
-        let q = self.lookup(q_sym)?.0;
+        // Validate both operands are bound (a pure matcher cannot emit the fat-pointer load); the
+        // base pointers are resolved at emit time.
+        self.lookup(out_sym)?;
+        self.lookup(q_sym)?;
         Some(DequantPlan {
-            out,
-            q,
+            out: out_sym,
+            q: q_sym,
             q_elem,
             scale,
             op: act | width,
@@ -12020,12 +12026,15 @@ impl FnLowerer<'_> {
     /// `out` GEP by `F32`; `scale` is lowered to an f32 ValueId. The serial kernel is used on both the
     /// sequential and the `@parallel`-chunk paths (the outliner supplies the threading, so each chunk is
     /// one serial call — bit-equal to the whole-range interpreter marshal, like velem).
-    fn emit_dequant_call(&mut self, s: ValueId, e: ValueId, plan: &DequantPlan) {
+    fn emit_dequant_call(&mut self, s: ValueId, e: ValueId, plan: &DequantPlan) -> bool {
+        let Some([q_base, out_base]) = self.kernel_base_ptrs([plan.q, plan.out]) else {
+            return false;
+        };
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
         let qp = self.builder.build(
             MirType::Ptr,
             Op::Gep {
-                ptr: plan.q,
+                ptr: q_base,
                 index: s,
                 elem: plan.q_elem.clone(),
             },
@@ -12033,7 +12042,7 @@ impl FnLowerer<'_> {
         let outp = self.builder.build(
             MirType::Ptr,
             Op::Gep {
-                ptr: plan.out,
+                ptr: out_base,
                 index: s,
                 elem: MirType::F32,
             },
@@ -12056,6 +12065,7 @@ impl FnLowerer<'_> {
             func,
             args: vec![qp, outp, n, scale, opv],
         });
+        true
     }
 
     /// Recognize a streaming int-input dequant `for j in lo..hi { out[j] = act((q[j] as f32)·scale) }`
@@ -12072,8 +12082,7 @@ impl FnLowerer<'_> {
         let ety = self.expr_mir(end);
         let e = self.lower_expr(end);
         let e = self.coerce_to(e, &ety, &MirType::I64, true);
-        self.emit_dequant_call(s, e, &plan);
-        true
+        self.emit_dequant_call(s, e, &plan)
     }
 
     /// Recognize a **batched** cast operand `(q[i*C+j] as f32)` (the integer factor of a per-channel
@@ -12194,11 +12203,7 @@ impl FnLowerer<'_> {
     /// maps independent rows across cores, bit-equal to serial). Returns false (fall through) if a base
     /// or dim cannot be resolved.
     fn emit_dequant_perchan(&mut self, nest: &DequantPerchanNest, parallel: bool) -> bool {
-        let (Some((q, _)), Some((out, _)), Some((scale, _))) = (
-            self.lookup(nest.q),
-            self.lookup(nest.out),
-            self.lookup(nest.scale),
-        ) else {
+        let Some([q, out, scale]) = self.kernel_base_ptrs([nest.q, nest.out, nest.scale]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -12286,7 +12291,7 @@ impl FnLowerer<'_> {
         &self,
         j: Symbol,
         body: &'b Block,
-    ) -> Option<(ValueId, ValueId, Vec<&'b Expr>)> {
+    ) -> Option<(Symbol, Symbol, Vec<&'b Expr>)> {
         if body.tail.is_some() || body.stmts.len() < 4 {
             return None;
         }
@@ -12320,7 +12325,12 @@ impl FnLowerer<'_> {
         if single_path(value) != Some(r) {
             return None;
         }
-        Some((self.lookup(out_sym)?.0, self.lookup(x_sym)?.0, coeffs))
+        // Validate both operands are bound and hand back their *symbols*: a pure matcher cannot emit
+        // the load that pulls a `[]T` slice's / a `Tensor[..]` param's data pointer out of its slot,
+        // so `emit_vhorner` resolves them through `kernel_base_ptr`.
+        self.lookup(out_sym)?;
+        self.lookup(x_sym)?;
+        Some((out_sym, x_sym, coeffs))
     }
 
     /// Emit one `wukong_vhorner_f32(x+s, out+s, e-s, coeffs, ncoeff)` call: materialize the
@@ -12331,10 +12341,13 @@ impl FnLowerer<'_> {
         &mut self,
         s: ValueId,
         e: ValueId,
-        out_base: ValueId,
-        x_base: ValueId,
+        out_sym: Symbol,
+        x_sym: Symbol,
         coeffs: &[&Expr],
-    ) {
+    ) -> bool {
+        let Some([out_base, x_base]) = self.kernel_base_ptrs([out_sym, x_sym]) else {
+            return false;
+        };
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
         let arr = self
             .builder
@@ -12374,6 +12387,7 @@ impl FnLowerer<'_> {
             func: self.gemm.vhorner,
             args: vec![xp, outp, n, arr, ncoeff],
         });
+        true
     }
 
     /// Recognize a per-element Horner polynomial loop `for j in lo..hi { let v=x[j]; let mut r=c0; r =
@@ -12390,8 +12404,7 @@ impl FnLowerer<'_> {
         let ety = self.expr_mir(end);
         let e = self.lower_expr(end);
         let e = self.coerce_to(e, &ety, &MirType::I64, true);
-        self.emit_vhorner(s, e, out_base, x_base, &coeffs);
-        true
+        self.emit_vhorner(s, e, out_base, x_base, &coeffs)
     }
 
     /// Attempt SIMD lowering of `for j in start..end { body }`. Returns true on success.
@@ -12582,17 +12595,16 @@ impl FnLowerer<'_> {
         if let Some(plan) = self.match_dequant_body(j, body) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            self.emit_dequant_call(s, e, &plan);
-            return true;
+            if self.emit_dequant_call(s, e, &plan) {
+                return true;
+            }
         }
         // A bf16/f16→f32 axpby per `@parallel` chunk → `wukong_axpby_{bf16,f16}` over `[s, e)`, so a
         // mixed-precision residual-add / saxpy runs multicore (the bandwidth payoff is largest here,
         // ≫ L3). Each chunk GEPs the half-width inputs and f32 output by `s`; elementwise, so the
         // per-chunk passes agree with the interpreter's whole-range marshal of the same kernel.
         if let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, j) {
-            if let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
-                (self.lookup(out), self.lookup(x), self.lookup(y))
-            {
+            if let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) {
                 let s = self.coerce_to(start_val, ity, &MirType::I64, true);
                 let e = self.coerce_to(end_val, ity, &MirType::I64, true);
                 let av = self.lower_coeff(a_expr, 1.0);
@@ -12638,8 +12650,9 @@ impl FnLowerer<'_> {
         if let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            self.emit_vhorner(s, e, out_base, x_base, &coeffs);
-            return true;
+            if self.emit_vhorner(s, e, out_base, x_base, &coeffs) {
+                return true;
+            }
         }
         let Some((lane, w)) = self.vectorizable(body, j) else {
             return false;
@@ -21560,6 +21573,7 @@ fn lower_matmul_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -23179,6 +23193,7 @@ fn xent_bwd_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -23220,6 +23235,7 @@ fn xent_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -23269,6 +23285,7 @@ fn logsumexp_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -23400,6 +23417,7 @@ fn probe_single_for(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -24403,6 +24421,7 @@ fn lower_i8matmul_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
