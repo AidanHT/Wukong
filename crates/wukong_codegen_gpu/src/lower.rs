@@ -726,7 +726,17 @@ impl<'a> FnEmit<'a> {
                 if matches!(ty, MirType::F64) {
                     self.emit(&format!("mov.f64 {d}, 0d{:016X};", v.to_bits()));
                 } else {
-                    self.emit(&format!("mov.f32 {d}, 0f{:08X};", (*v as f32).to_bits()));
+                    // A bf16/f16 const IS its grid-rounded value, so materialize it rounded — the
+                    // same host-side `wukong_runtime::round_*` the interpreter and Cranelift use at
+                    // this exact point. The per-store rounding in `store_into` alone is fragile:
+                    // mem2reg/CSE forward the value past its store, so `let b: bf16 = 0.1` reached
+                    // the multiply as the raw f32 0.1 at -O3 (and as the bf16 grid value at -O0).
+                    let f = match ty {
+                        MirType::BF16 => wukong_runtime::round_bf16(*v as f32),
+                        MirType::F16 => wukong_runtime::round_f16(*v as f32),
+                        _ => *v as f32,
+                    };
+                    self.emit(&format!("mov.f32 {d}, 0f{:08X};", f.to_bits()));
                 }
             }
             Op::Bin(op, l, r2) => self.lower_bin(*op, *l, *r2, &rty, r)?,
@@ -1113,20 +1123,38 @@ impl<'a> FnEmit<'a> {
             }
             FpToSi => self.fp_to_int_into(d, x, from, to, true),
             FpToUi => self.fp_to_int_into(d, x, from, to, false),
-            FpExt => match to {
-                // Widen to f64. Source is f64 already (mov) or f32/bf16/f16 held as f32 (cvt up).
-                MirType::F64 => {
-                    if rc_of(from) == RC::F64 {
-                        self.emit(&format!("mov.f64 {d}, {x};"));
-                    } else {
-                        self.emit(&format!("cvt.f64.f32 {d}, {x};"));
+            FpExt => {
+                // A bf16/f16 source must round to its grid before widening. bf16/f16 share f32's
+                // register, so the per-store rounding is fragile — an optimizer can forward a bf16 op
+                // result past its store, leaving an unrounded f32 that this widen would pass through
+                // unchanged. Round at the observation boundary too, exactly as
+                // `wukong_codegen_cranelift`'s FpExt arm and the interpreter's `apply_cast` do.
+                let xr = match from {
+                    MirType::BF16 | MirType::F16 => {
+                        let h = self.fresh_r16();
+                        let t = self.fresh(RC::F32);
+                        let c = if matches!(from, MirType::BF16) { "bf16" } else { "f16" };
+                        self.emit(&format!("cvt.rn.{c}.f32 {h}, {x};"));
+                        self.emit(&format!("cvt.f32.{c} {t}, {h};"));
+                        t
                     }
+                    _ => x.to_string(),
+                };
+                match to {
+                    // Widen to f64. Source is f64 already (mov) or f32/bf16/f16 held as f32 (cvt up).
+                    MirType::F64 => {
+                        if rc_of(from) == RC::F64 {
+                            self.emit(&format!("mov.f64 {d}, {xr};"));
+                        } else {
+                            self.emit(&format!("cvt.f64.f32 {d}, {xr};"));
+                        }
+                    }
+                    // bf16/f16 -> f32: loads/casts already widen low-precision floats into an f32
+                    // register, so after the grid rounding above the widening is just a move.
+                    MirType::F32 => self.emit(&format!("mov.f32 {d}, {xr};")),
+                    _ => return Err(format!("{UNSUPPORTED} FpExt to {:?}", to)),
                 }
-                // bf16/f16 -> f32: loads/casts already widen low-precision floats into an f32
-                // register, so the widening to f32 is just a move (the value is already f32).
-                MirType::F32 => self.emit(&format!("mov.f32 {d}, {x};")),
-                _ => return Err(format!("{UNSUPPORTED} FpExt to {:?}", to)),
-            },
+            }
             FpTrunc => {
                 // Demote an f64 source to f32 first; the result reg is always f32 (rc_of bf16/f16/f32).
                 let src = if rc_of(from) == RC::F64 {
