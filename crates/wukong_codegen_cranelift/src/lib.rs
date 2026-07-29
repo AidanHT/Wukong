@@ -3914,6 +3914,15 @@ impl JitProgram {
 
     /// Run once for timing: clears (but does not clone) the capture buffer so repeated prints don't
     /// grow memory, and returns just the exit code.
+    ///
+    /// **Stack contract — differs from [`JitProgram::run`].** This runs the JIT'd entry on the
+    /// *caller's* stack, deliberately: spawning a thread per iteration would land inside the
+    /// measured region and swamp a short kernel. The caller therefore owns the recursion headroom.
+    /// On the default ~8 MiB main-thread stack a deeply recursive program (the class
+    /// `run_on_big_stack` exists for) overflows and aborts the whole process, where the same source
+    /// under `wukongc --run --backend=native` completes. A timing harness must wrap its entire
+    /// warm-up + measurement loop in one `std::thread::Builder::new().stack_size(..)` worker so the
+    /// spawn is paid once, outside the timed region.
     pub fn call(&self) -> i64 {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
