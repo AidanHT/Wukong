@@ -2843,18 +2843,41 @@ pub fn conv2d_best(
     stride: usize,
     pad: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    // Winograd lane: valid 3×3, ≥64 channels, large enough spatial that the α² batched GEMM (N=tiles) is
-    // a real tensor-core problem. wino_ntiles gives the F(4,3) tile count T.
+    match conv2d_best_lane(c, h, width, r, s, stride, pad) {
+        "winograd" => winograd_conv2d(g, x, w, c, h, width, k, 4),
+        "affine-auto" => conv2d_wmma_padded_auto(g, x, w, c, h, width, k, r, s, stride, pad),
+        _ => conv2d_wmma_auto(g, x, w, c, h, width, k, r, s),
+    }
+}
+
+/// The routing predicate [`conv2d_best`] dispatches on, factored out so a gate can *assert* which
+/// lane a shape takes. `conv2d_best` returns only a `Vec<f32>`, so a test that merely prints an
+/// expected lane name proves nothing: if the Winograd guard stopped firing, every case would quietly
+/// fall to the GEMM lane, still satisfy the accuracy bound, and still print "winograd".
+///
+/// * `"winograd"` — valid 3×3, ≥64 channels, large enough spatial that the α² batched GEMM
+///   (N = tiles) is a real tensor-core problem (`wino_ntiles` gives the F(4,3) tile count T).
+/// * `"affine-auto"` — strided or padded.
+/// * `"valid-auto"` — everything else.
+pub fn conv2d_best_lane(
+    c: usize,
+    h: usize,
+    width: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> &'static str {
     if r == 3 && s == 3 && stride == 1 && pad == 0 && c >= 64 && h >= 28 && width >= 28 {
         let (_, _, nt) = crate::ptx_winograd::wino_ntiles(h, width, 4);
         if nt >= 16 {
-            return winograd_conv2d(g, x, w, c, h, width, k, 4);
+            return "winograd";
         }
     }
     if stride > 1 || pad > 0 {
-        conv2d_wmma_padded_auto(g, x, w, c, h, width, k, r, s, stride, pad)
+        "affine-auto"
     } else {
-        conv2d_wmma_auto(g, x, w, c, h, width, k, r, s)
+        "valid-auto"
     }
 }
 
@@ -5555,12 +5578,21 @@ mod tests {
                     v.name,
                     v.smem_bytes()
                 );
-                let shapes = [
+                let mut shapes = vec![
                     (v.bm, v.bk, v.bn),                          // 1 CTA, 1 K-tile (full prologue guard)
                     (v.bm, v.bk * 2, v.bn),                      // 1 CTA, 2 K-tiles
                     (2 * v.bm, v.bk * (v.stages + 3), 2 * v.bn), // 4 CTAs, ring wrap (K-tiles > stages)
                     (v.bm, v.bk * (v.stages + 1), 3 * v.bn),     // rectangular, multi-tile
                 ];
+                // **Multi-band raster.** Every shape above has `tiles_n <= 3` while `raster` is 16, so
+                // `grpr = lin/(tiles_m*raster)` is always 0 and `gw = min(tiles_n-col0, raster)` is
+                // always `tiles_n`: the `col0 = grpr*raster` multiply, the band carry, and a narrow
+                // trailing band AFTER a full one are all dead in test — yet production takes them
+                // (gemm_nt_f16 routes A+B>=16MB here, so any N >= 17*bn has tiles_n > raster).
+                // `17*bn` gives tiles_n = 17 > raster = 16: grpr in {0,1}, gw in {16,1}.
+                if v.raster > 0 {
+                    shapes.push((v.bm, v.bk, (v.raster + 1) * v.bn));
+                }
                 for (m, k, n) in shapes {
                     let a = rng.vec(m * k, -1.0, 1.0);
                     let b = rng.vec(n * k, -1.0, 1.0);
@@ -5599,6 +5631,9 @@ mod tests {
                 (128, 64, 128),
                 (256, 32 * (wh.stages + 3), 256),
                 (128, 32 * 3, 384),
+                // tiles_n = 17 > raster = 16 — the multi-band remap arm production always takes and
+                // the shapes above never do (see `wmma_pipe_matches_reference_within_tol`).
+                (128, 32, (wh.raster + 1) * 128),
             ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
@@ -8253,20 +8288,29 @@ mod tests {
         }
         with_gpu("conv2d_best", |g| {
             let mut rng = crate::diff::Rng::new(0xBE57FE);
-            // (C,H,W,K,R,S,stride,pad, expected lane): every lane exercised.
+            // (C,H,W,K,R,S,stride,pad, expected lane, why): every lane exercised. The lane is
+            // ASSERTED against `conv2d_best_lane` (the predicate `conv2d_best` dispatches on), not
+            // merely printed — `conv2d_best` returns only a Vec<f32>, so a routing regression that
+            // sent every case to the GEMM lane would still satisfy the accuracy bound below and
+            // still print "winograd", leaving the Winograd kernel with zero coverage.
             let cases = [
-                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 0usize, "winograd"),
-                (128, 28, 28, 128, 3, 3, 1, 0, "winograd"),
-                (32, 64, 64, 64, 3, 3, 1, 0, "valid-auto (C<64)"),
-                (64, 56, 56, 64, 1, 1, 1, 0, "valid-auto (1x1)"),
-                (64, 56, 56, 64, 3, 3, 2, 1, "affine-auto (s2p1)"),
-                (128, 28, 28, 128, 3, 3, 1, 1, "affine-auto (same)"),
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 0usize, "winograd", ""),
+                (128, 28, 28, 128, 3, 3, 1, 0, "winograd", ""),
+                (32, 64, 64, 64, 3, 3, 1, 0, "valid-auto", "C<64"),
+                (64, 56, 56, 64, 1, 1, 1, 0, "valid-auto", "1x1"),
+                (64, 56, 56, 64, 3, 3, 2, 1, "affine-auto", "s2p1"),
+                (128, 28, 28, 128, 3, 3, 1, 1, "affine-auto", "same"),
             ];
-            for (c, h, width, k, r, s, st, pad, lane) in cases {
+            for (c, h, width, k, r, s, st, pad, lane, why) in cases {
                 let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
                 if k < 16 || c * r * s < 16 || p * q < 16 {
                     continue;
                 }
+                assert_eq!(
+                    conv2d_best_lane(c, h, width, r, s, st, pad),
+                    lane,
+                    "conv2d_best routed C{c} {h}x{width} {r}x{s} s{st}p{pad} to the wrong lane"
+                );
                 let x = rng.vec(c * h * width, -1.0, 1.0);
                 let w = rng.vec(k * c * r * s, -1.0, 1.0);
                 let got = conv2d_best(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
@@ -8282,8 +8326,32 @@ mod tests {
                     .sqrt();
                 let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
                 let fro_rel = err_f / ref_f.max(1e-9);
-                eprintln!("conv2d_best C{c} {h}x{width} K{k} {r}x{s} s{st}p{pad} -> {lane}: fro_rel={fro_rel:.2e}");
+                // Per-element backstop, the same one `conv_winograd_matches_reference_within_tol`
+                // carries and for the same stated reason: a Frobenius ratio over 186k outputs whose
+                // ||ref||_F is ~1e4 lets a SINGLE element be wrong by 8e-3*1e4 = 80 — several times
+                // the typical element magnitude — and still pass. The aggregate norm cannot see one
+                // catastrophic lane (a Winograd output-transform edge clip, a partial-tile store
+                // guard); this can.
+                //
+                // Calibrated on this machine over these six shapes, not copied from the sibling's
+                // smaller ones: the F(4,3) inverse transform amplifies the fp16 error several-fold
+                // over the implicit-GEMM lanes, so the bound is per-lane. Measured worst is 4.3e-1
+                // (winograd C128) and 1.3e-2 (GEMM lanes). A *catastrophically* wrong element in a
+                // 9C-term reduction of unit-ish inputs is O(sqrt(9C/9)) = 8-11, so both bounds sit
+                // an order of magnitude under a real bug while keeping >=2x headroom over noise.
+                let max_abs = got
+                    .iter()
+                    .zip(&oracle)
+                    .map(|(a, b)| (*a as f64 - *b as f64).abs())
+                    .fold(0.0, f64::max);
+                let abs_backstop = if lane == "winograd" { 1.0 } else { 5e-2 };
+                eprintln!("conv2d_best C{c} {h}x{width} K{k} {r}x{s} s{st}p{pad} -> {lane}{}{why}{}: fro_rel={fro_rel:.2e} max_abs={max_abs:.2e}",
+                    if why.is_empty() { "" } else { " (" }, if why.is_empty() { "" } else { ")" });
                 assert!(fro_rel < 8e-3, "conv2d_best C{c} {r}x{s} s{st}p{pad} ({lane}): rel-Frobenius {fro_rel:.3e} >= 8e-3");
+                assert!(
+                    max_abs < abs_backstop,
+                    "conv2d_best C{c} {r}x{s} s{st}p{pad} ({lane}): max_abs {max_abs:.3e} >= {abs_backstop:.0e} — a lane blew up"
+                );
             }
         });
     }
@@ -11823,7 +11891,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("gemm_cliff_gate", |g| {
             let mut rng = crate::diff::Rng::new(0xC11F_6A7E);
-            for &(m, k, n) in &[(256usize, 256usize, 256usize), (256, 160, 512), (512, 128, 384)] {
+            // A variant whose macro-tile no test shape divides is silently `continue`d below, so it
+            // would ship completely ungated while this test still reported green — and
+            // `gemm_cliff_ab` would then time and possibly promote it. Count launches per variant and
+            // fail if any entry was never reached.
+            let mut launched: Vec<(&str, usize)> =
+                CLIFF_VARIANTS.iter().map(|v| (v.name, 0usize)).collect();
+            // The first three shapes all have tiles_n <= 4 while every variant rasterizes at 16, so the
+            // remap's `grpr = lin/(tiles_m*raster)` is always 0 and `gw` is always tiles_n — the
+            // `col0 = grpr*raster` multiply, the band carry and a narrow trailing band after a full
+            // one are dead in test. But `gemm_nt_f16` routes the whole A+B >= 48 MB regime here, where
+            // tiles_n is far past 16. (128, 32, 2176) gives tiles_n = 17 > raster = 16, so grpr takes
+            // {0,1} and gw takes {16,1}; ~1.1 MB of C, and no cuBLAS needed.
+            for &(m, k, n) in &[
+                (256usize, 256usize, 256usize),
+                (256, 160, 512),
+                (512, 128, 384),
+                (128, 32, 2176),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
@@ -11844,8 +11929,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let c = g.stream.memcpy_dtov(&c_d).unwrap();
                     let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
                     eprintln!("{:<20} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", v.name, s.max_abs, s.max_rel);
+                    launched.iter_mut().find(|(n, _)| *n == v.name).unwrap().1 += 1;
                 }
             }
+            for (name, hits) in &launched {
+                let v = CLIFF_VARIANTS.iter().find(|v| v.name == *name).unwrap();
+                assert!(
+                    *hits > 0,
+                    "CLIFF_VARIANTS entry `{name}` was never gated — no test shape tiles its \
+                     {}x{}x{} macro-tile; add one to this test's shape list",
+                    v.bm, v.bn, v.bk
+                );
+            }
+            eprintln!("[gate] all {} CLIFF_VARIANTS entries launched ✓", launched.len());
         });
     }
 
@@ -17926,6 +18022,51 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     );
                     eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
                 }
+            }
+            // **Multi-head.** Everything above runs at grid.y = 1, but `flash_d128_ws3_lm` is the
+            // PRODUCTION D=128 dispatch at S >= 4096 (`ws_flash_route_with`), always launched with
+            // grid.y = heads. Its `hoff = ctaid.y*S*d` prologue is a verbatim copy shared with eight
+            // other generators, so a slip there (the one line ws3 could diverge on) corrupts every
+            // head but head 0 while both the single-head ws3 gate and the multi-head *ws* gate stay
+            // green. Cross-check the full output against the `mp` twin, element by element — the
+            // abs-sum checksum the ws gate uses is invariant under exactly the head permutation this
+            // is looking for.
+            let heads = 4usize;
+            let s = 2048usize;
+            for &(d, ws3_e, mp_e) in &[
+                (64usize, "flash_d64_ws3", "flash_d64_mp"),
+                (128, "flash_d128_ws3_lm", "flash_d128_mp_lm"),
+            ] {
+                let (abs_tol, rel_tol) = if d == 64 { (2e-3, 2e-2) } else { (3e-3, 3e-2) };
+                let n = heads * s * d;
+                let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let mut outs: Vec<Vec<f32>> = Vec::new();
+                for (entry, mut cfg) in
+                    [(mp_e, wmma_flash_cfg(s)), (ws3_e, ws_flash_cfg(s))]
+                {
+                    cfg.grid_dim.1 = heads as u32;
+                    let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                    let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    outs.push(g.stream.memcpy_dtov(&o_d).unwrap());
+                }
+                let st = crate::diff::assert_close(
+                    &format!("{ws3_e} vs {mp_e} H={heads} S={s}"),
+                    &outs[1],
+                    &outs[0],
+                    abs_tol,
+                    rel_tol,
+                );
+                eprintln!(
+                    "ws3-vs-mp full-output d={d} S={s} H={heads}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
             }
         });
     }
