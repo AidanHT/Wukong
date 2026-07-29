@@ -2462,9 +2462,12 @@ pub fn conv2d_wmma_auto(
 /// **Winograd F(m×m,3×3) conv2d** (single batch, stride 1, no padding, `R=S=3`; `m∈{2,4}`) — cuDNN's
 /// `WINOGRAD_NONFUSED` strategy, the 2.25–4× multiply-reduction lever for 3×3. Four resident phases on
 /// device buffers (see [`crate::ptx_winograd`]): (1) filter transform `U[α²,K,C]`, (2) input transform
-/// `V[α²,C,T]`, (3) the α² batched channel-reduction GEMMs `M[ξν]=U[ξν]·V[ξν]` — each reusing the
-/// **proven `conv2d_wmma` tensor-core kernel** with `R=S=1` (`O[K,T]=W[K,C]·X[C,T]`) on a sub-slice — and
-/// (4) output transform → `O[K,P,Q]` (f32). fp16 storage, f32 transform arithmetic. Tolerance-gated
+/// `V[α²,C,T]`, (3) the α² batched channel-reduction GEMMs `M[ξν]=U[ξν]·V[ξν]` — a **dedicated**
+/// tensor-core NN GEMM (`ptx_winograd::wino_bgemm_ptx`), NOT `conv2d_wmma`: it stages a plain
+/// row-major `V[z][C,T]` with a baked z-plane offset, where `conv2d_wmma` stages B through an im2col
+/// address decode. The two share only the WMMA tile constants, and their MMA + SMEM-C drain blocks
+/// are copies of each other that must be kept in sync by hand — a fix to one does not reach the
+/// other. — and (4) output transform → `O[K,P,Q]` (f32). fp16 storage, f32 transform arithmetic. Tolerance-gated
 /// against the f64 oracle (fp16 quantization dominates; Winograd's amplification sits under it). Correct
 /// for any tile count `T`; perf only sensible once `T≥16` (a non-trivial batched-GEMM N) — large feature
 /// maps / early layers. `m=4` is F(4×4,3×3) (what cuDNN uses); `m=2` is the lower-amplification F(2,3).
@@ -3875,7 +3878,10 @@ pub fn gemm_nt_w4a16_splitk(
 /// [`gemm_nt_w4a16`] (gated against the same f64 reference), but ptxas strength-reduces the baked strides
 /// (`×K`, `×N`, `K/8`, `K/group`) to shifts/immediates — the runtime-multiply overhead a library, which
 /// never sees the shape at compile time, cannot remove. Loads a fresh module per call here (the per-shape
-/// compile is the static-shape tradeoff; the persistent cubin cache (M10) amortizes it across runs).
+/// compile is the static-shape tradeoff). Note this loads the PTX **directly**, not through
+/// `Gpu::load_module_cached`, so the persistent cubin cache (M10) does NOT amortize it: no cubin is
+/// written and every process pays the full PTX→SASS JIT. Routing it through the cache would write one
+/// cubin per (M, N, K, zero_point) tuple into an unbounded cache dir, which is why it does not.
 pub fn gemm_nt_w4a16_static(
     g: &mut Gpu,
     a: &[f32],
@@ -6529,11 +6535,86 @@ mod tests {
         });
     }
 
+    /// **The cubin cache's warm branch must compute the same numbers as the PTX JIT.**
+    ///
+    /// `cubin_cache_roundtrips_to_loadable_sass` only checks the ELF magic and that three entry names
+    /// resolve — it never launches. And in a clean run the warm branch is never taken at all: the
+    /// in-process `modules` map serves every repeat, so `load_module_cached`'s `path.exists()` arm
+    /// only fires on a box with leftover files in the temp cache dir. So nothing pinned that a kernel
+    /// loaded from a cached cubin agrees with the same kernel loaded from PTX — even though
+    /// `ptx_to_cubin` drives `cuLinkCreate(0, null, null)` while a plain load drives
+    /// `cuModuleLoadData`, two paths whose default JIT options could diverge (`-ftz`, opt level)
+    /// after a driver update. That divergence would silently change every kernel's numerics on the
+    /// *second and later* runs of a process while the first stayed correct.
+    ///
+    /// This launches the same fp16 WMMA GEMM from all three module sources — direct PTX JIT, a cubin
+    /// loaded from disk, and `load_module_cached`'s own warm branch (forced by pre-populating the
+    /// exact cache path it computes) — and requires all three outputs to be **bit-identical**, plus
+    /// one of them tolerance-checked against the f64 oracle so "all three equally wrong" cannot pass.
+    #[test]
+    fn cubin_cache_warm_branch_matches_the_ptx_jit() {
+        use half::f16;
+        with_gpu("cubin_warm_equivalence", |g| {
+            let _ = g.ctx.bind_to_thread();
+            let ptx = crate::ptx_wmma::wmma_f16_ptx();
+            let (m, k, n) = (128usize, 64usize, 128usize);
+            let mut rng = crate::diff::Rng::new(0xCB1E_CAFE);
+            let a = rng.vec(m * k, -1.0, 1.0);
+            let b = rng.vec(n * k, -1.0, 1.0);
+            let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+            let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+            let a_d = g.stream.memcpy_stod(&a16).unwrap();
+            let b_d = g.stream.memcpy_stod(&b16).unwrap();
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+
+            // The exact path `load_module_cached` consults. Clear it so the first call is the COLD
+            // branch (compile + persist), then confirm the file appeared so the second call is the
+            // WARM branch (`path.exists()` ⇒ `Ptx::from_file`, no JIT).
+            let path = crate::cubin::cache_path(ptx, crate::cubin::driver_version());
+            let _ = std::fs::remove_file(&path);
+            let m_cold = g.load_module_cached(ptx).expect("cold load_module_cached");
+            assert!(
+                path.exists(),
+                "cold load_module_cached must persist a cubin at {path:?} — without it the warm \
+                 branch is unreachable and this gate would be vacuous"
+            );
+            let m_warm = g.load_module_cached(ptx).expect("warm load_module_cached");
+            // An independent from-PTX JIT, bypassing the cache entirely.
+            let m_jit = g.ctx.load_module(ptx.into()).expect("direct PTX JIT");
+
+            let mut outs: Vec<Vec<f32>> = Vec::new();
+            for (tag, module) in [("cold", &m_cold), ("warm", &m_warm), ("ptx-jit", &m_jit)] {
+                let f = module
+                    .load_function("wmma_nt_f16_sm")
+                    .unwrap_or_else(|_| panic!("{tag}: entry missing"));
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                unsafe { bld.launch(wmma_sm_cfg(m, n)).unwrap() };
+                outs.push(g.stream.memcpy_dtov(&c_d).unwrap());
+            }
+            for (i, tag) in [(1usize, "warm cubin"), (2, "direct PTX JIT")] {
+                assert!(
+                    outs[i].iter().zip(&outs[0]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{tag} disagrees with the cold cubin load — the cubin cache is NOT numerically \
+                     transparent, so a second run of any process would compute different results"
+                );
+            }
+            // …and all three are actually right, not equally wrong.
+            let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+            let st = crate::diff::assert_close("cubin-warm gemm", &outs[1], &r, 1e-2, 2e-3);
+            let _ = std::fs::remove_file(&path);
+            eprintln!(
+                "[gate] cubin warm branch == cold cubin == PTX JIT, bit-identical (max_abs vs f64 oracle {:.2e}) ✓",
+                st.max_abs
+            );
+        });
+    }
+
     /// The cubin cache route (M10): `ptx_to_cubin` must emit a real SASS cubin (ELF), and loading it
     /// back via `Ptx::from_file` must yield a module whose entries resolve — i.e. a warm process skips
-    /// the PTX JIT entirely. (Execution equivalence of the cached path is covered by the whole suite,
-    /// which loads every kernel through `load_module_cached`; a second test-binary run exercises the
-    /// warm branch end-to-end.)
+    /// the PTX JIT entirely. Numeric equivalence of the warm branch is gated separately by
+    /// [`cubin_cache_warm_branch_matches_the_ptx_jit`].
     #[test]
     fn cubin_cache_roundtrips_to_loadable_sass() {
         with_gpu("cubin_roundtrip", |g| {
@@ -7842,6 +7923,121 @@ mod tests {
                 eprintln!(
                     "conv2d_wmma C{c} {h}x{width} K{k} {r}x{s}: max_abs={:.2e} max_rel={:.2e}",
                     st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
+    /// **The register double-buffered implicit-GEMM conv** (`conv_wmma_db_ptx` /
+    /// `conv_wmma_db_splitk_ptx` — 336 lines of hand-written pipelined PTX with an XOR SMEM buffer
+    /// toggle) had exactly one full-output check anywhere: an `assert_eq!` buried inside
+    /// `conv_vs_cudnn`, which is `#[ignore]`d *and* early-returns unless the NVRTC/cuDNN redist DLLs
+    /// are on PATH. So a race introduced by reordering an `a_store("%bufWA")` against its `bar.sync`
+    /// — a write-after-read on the buffer other warps are still loading fragments from — produced
+    /// wrong conv output on a GPU while a full `cargo test --features gpu` reported green.
+    ///
+    /// This gate needs a device but no peer toolchain, so it runs in the normal suite. The two
+    /// kernels issue the same `mma` in the same order (only the staging is pipelined), so the
+    /// contract is **bit-identity**, with the single-buffer side additionally pinned to the f64
+    /// oracle so "both equally wrong" cannot pass. Covers the split-K pair on the deep-channel shape.
+    #[test]
+    fn conv2d_wmma_db_matches_single_buffer() {
+        use half::f16;
+        with_gpu("conv2d_wmma_db", |g| {
+            let mut rng = crate::diff::Rng::new(0x0DB_C0A1);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            // (C,H,W,K,R,S,sk). Same corners as `conv2d_wmma_matches_reference_within_tol`
+            // (non-tile-multiple M/N/GK, a 1x1, a clean shape) at sk=1, plus the split-K shapes
+            // `conv2d_wmma_splitk_matches_reference_within_tol` uses so `conv_wmma_db_splitk_ptx` is
+            // covered too. sk is explicit rather than `conv_splitk_factor`: the auto factor returns 1
+            // for every shape on a 20-SM device, which would leave the split-K DB generator ungated.
+            let cases = [
+                (3usize, 32usize, 32usize, 16usize, 3usize, 3usize, 1usize),
+                (16, 28, 28, 32, 3, 3, 1),
+                (8, 16, 16, 48, 5, 5, 1),
+                (32, 14, 14, 64, 1, 1, 1),
+                (64, 56, 56, 64, 3, 3, 1),
+                (64, 28, 28, 64, 3, 3, 4),
+                (128, 14, 14, 128, 3, 3, 8),
+                (48, 18, 18, 16, 3, 3, 3),
+            ];
+            for (c, h, wd, k, r, s, sk) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, wd, k, r, s) {
+                    continue;
+                }
+                assert_eq!((c * r * s) % sk, 0, "sk must divide GK");
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let entry = if sk == 1 { "conv2d_wmma" } else { "conv2d_wmma_splitk" };
+                let sb_ptx = if sk == 1 {
+                    crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s)
+                } else {
+                    crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk)
+                };
+                let db_ptx = if sk == 1 {
+                    crate::ptx_conv::conv_wmma_db_ptx(c, h, wd, k, r, s)
+                } else {
+                    crate::ptx_conv::conv_wmma_db_splitk_ptx(c, h, wd, k, r, s, sk)
+                };
+                let cfg = if sk == 1 {
+                    conv_wmma_cfg(h, wd, k, r, s)
+                } else {
+                    conv_wmma_splitk_cfg(h, wd, k, r, s, sk)
+                };
+                let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let red = if sk > 1 {
+                    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(k * p * q, sk);
+                    let rmod = g.load_module_cached(&rptx).unwrap();
+                    let rf = rmod.load_function("conv_splitk_reduce").unwrap();
+                    Some((rmod, rf))
+                } else {
+                    None
+                };
+                let rcfg = LaunchConfig {
+                    grid_dim: (((k * p * q) as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut outs: Vec<Vec<f32>> = Vec::new();
+                for ptx in [&sb_ptx, &db_ptx] {
+                    let f = g.load_module_cached(ptx).unwrap().load_function(entry).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                    if sk == 1 {
+                        let mut b = g.stream.launch_builder(&f);
+                        b.arg(&x_d).arg(&w_d).arg(&mut o_d);
+                        unsafe { b.launch(cfg).unwrap() };
+                    } else {
+                        let mut part_d = g.stream.alloc_zeros::<f32>(sk * k * p * q).unwrap();
+                        let mut b = g.stream.launch_builder(&f);
+                        b.arg(&x_d).arg(&w_d).arg(&mut part_d);
+                        unsafe { b.launch(cfg).unwrap() };
+                        let (_, rf) = red.as_ref().unwrap();
+                        let mut rb = g.stream.launch_builder(rf);
+                        rb.arg(&part_d).arg(&mut o_d);
+                        unsafe { rb.launch(rcfg).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    outs.push(g.stream.memcpy_dtov(&o_d).unwrap());
+                }
+                assert!(
+                    outs[1].iter().zip(&outs[0]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "conv db vs single-buffer C{c} {h}x{wd} K{k} {r}x{s} sk{sk}: outputs differ — the \
+                     pipelined staging changed the result, so the buffer toggle or a barrier is wrong"
+                );
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let st = crate::diff::assert_close(
+                    &format!("conv db C{c} {h}x{wd} K{k} {r}x{s}"),
+                    &outs[0],
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv2d_wmma db==sb C{c} {h}x{wd} K{k} {r}x{s} sk{sk}: bit-identical, max_abs vs f64={:.2e}",
+                    st.max_abs
                 );
             }
         });
