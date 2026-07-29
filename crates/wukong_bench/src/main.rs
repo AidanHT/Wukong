@@ -2,7 +2,10 @@
 //!
 //! For each `.wk` program it can lower, it reports, comparing `-O0` against `-O3`:
 //!   * total MIR op count (instructions plus one terminator per block) and the reduction;
-//!   * interpreter wall-clock time per run (adaptively batched) and the resulting speedup.
+//!   * interpreter wall-clock time per run (adaptively batched) and the resulting speedup. Each such
+//!     run includes one 512 MiB worker-thread spawn+join, because that is what `wukong_interp::run`
+//!     costs a caller; the report measures that floor and prints both the raw and the floor-net
+//!     speedup so the two are never confused.
 //!
 //! Every program is also a correctness check: the `-O0` and `-O3` builds must verify and must
 //! produce the same result, otherwise it is reported and skipped. This quantifies the optimizer
@@ -87,6 +90,24 @@ fn main() {
         return;
     }
 
+    // Measure the interpreter's per-call floor BEFORE the table, so the disclosure sits above the
+    // numbers it qualifies (see `interp_call_floor`).
+    let floor = interp_call_floor();
+    match floor {
+        Some(fl) => println!(
+            "interp-call floor {}: `wukong_interp::run` wraps EVERY call in a 512 MiB-stack worker\n\
+             thread (`with_big_stack`), so one thread spawn+join is inside every `interp O3` cell\n\
+             below and inside every `nat:intp` ratio. Measured here by timing the smallest possible\n\
+             Wukong program with this same instrument. A cell at or near the floor is reporting\n\
+             Windows thread creation, not interpretation.\n",
+            fmt_dur(fl)
+        ),
+        None => println!(
+            "interp-call floor: NOT MEASURED — the probe program failed to lower. Every `interp O3`\n\
+             cell below still contains one 512 MiB worker-thread spawn+join, of unknown size here.\n"
+        ),
+    }
+
     println!(
         "{:<20} {:>7} {:>7} {:>9}  {:>11} {:>11} {:>9}",
         "program", "O0 ops", "O3 ops", "reduction", "interp O3", "native O3", "nat:intp"
@@ -96,6 +117,12 @@ fn main() {
     let (mut tot0, mut tot3) = (0usize, 0usize);
     let mut log_speedup_sum = 0.0f64;
     let mut speedup_n = 0u32;
+    // The same geomean with the interp-call floor taken out of the numerator, plus a count of the
+    // programs that interpret faster than the floor (for which no interpreter time can be separated
+    // from thread creation at all).
+    let mut log_net_sum = 0.0f64;
+    let mut net_n = 0u32;
+    let mut below_floor = 0u32;
     let mut failures: Vec<String> = Vec::new();
     for f in &files {
         match bench_one(f) {
@@ -106,6 +133,15 @@ fn main() {
                 let speedup = r.t_interp.as_secs_f64() / r.t_native.as_secs_f64().max(1e-12);
                 log_speedup_sum += speedup.ln();
                 speedup_n += 1;
+                match floor {
+                    Some(fl) if r.t_interp > fl => {
+                        let net = (r.t_interp - fl).as_secs_f64() / r.t_native.as_secs_f64().max(1e-12);
+                        log_net_sum += net.ln();
+                        net_n += 1;
+                    }
+                    Some(_) => below_floor += 1,
+                    None => {}
+                }
                 println!(
                     "{:<20} {:>7} {:>7} {:>8.1}%  {:>11} {:>11} {:>8.1}x",
                     short_name(f),
@@ -145,6 +181,28 @@ fn main() {
         "",
         geo,
     );
+
+    // The geomean above is RAW: its numerator still contains one interp-call floor per program.
+    // Print the floor-net figure next to it so nobody can quote the raw one as "native is Nx faster
+    // than interpreting" without seeing what that claim shrinks to.
+    if let Some(fl) = floor {
+        if net_n > 0 {
+            let net_geo = (log_net_sum / net_n as f64).exp();
+            println!(
+                "nat:intp above is RAW (one {} interp-call floor is inside every numerator).\n\
+                 Net of that floor: geomean {net_geo:.1}x over {net_n} program(s).",
+                fmt_dur(fl)
+            );
+        }
+        if below_floor > 0 {
+            println!(
+                "{below_floor} program(s) interpret faster than the {} floor, so no interpreter time \
+                 can be\nseparated from thread creation for them; they are excluded from the net \
+                 geomean but not\nfrom the raw one.",
+                fmt_dur(fl)
+            );
+        }
+    }
 
     // The harness doubles as a correctness gate: any program that lowers but misbehaves under
     // optimization fails the process so CI catches the regression.
@@ -300,8 +358,45 @@ fn time_native(
     }
 }
 
+/// The fixed cost `wukong_interp::run` pays per call, before it interprets anything.
+///
+/// `run` → `run_with_output` → `with_big_stack` (wukong_interp/src/lib.rs) spawns a 512 MiB-stack
+/// worker thread and joins it on **every** call, so the recursive tree-walker cannot overflow the
+/// host stack. [`time_run`] calls `run` inside its rep loop, so that spawn+join is charged to every
+/// rep — and for any program that interprets faster than one thread creation, the `interp O3` column
+/// and the `nat:intp` geomean are measuring Windows, not the interpreter.
+///
+/// This measures the floor instead of assuming it: lower the smallest Wukong program there is and
+/// time it with the *same* [`time_run`] instrument. Its interpretation is a handful of MIR ops, so
+/// what comes back is the per-call floor. It deliberately goes through the real `wukong_interp::run`
+/// rather than replicating `with_big_stack` here, so the number stays true if the interpreter ever
+/// changes how it obtains its stack. `None` if the probe program does not lower (never expected).
+fn interp_call_floor() -> Option<Duration> {
+    const SRC: &str = "module bench.floor\nfn main() -> i32 { return 0; }\n";
+    let mut interner = Interner::new();
+    let (module, pd) = wukong_parser::parse_module(SRC, SourceId(0), &mut interner);
+    if pd.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let (sema, sd) = wukong_sema::check(&module, &interner);
+    if sd.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    let (mut p, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    if ld.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    wukong_opt::optimize(&mut p, 3);
+    let main = interner.intern("main");
+    wukong_interp::run(&p, main, &interner).ok()?;
+    Some(time_run(&p, main, &interner))
+}
+
 /// Time one full execution, adaptively batching until at least 50 ms has elapsed so even fast
 /// programs are measured stably. Returns the per-run duration.
+///
+/// NOTE: every rep pays one 512 MiB worker-thread spawn+join inside `wukong_interp::run` — see
+/// [`interp_call_floor`], which measures it and which the report prints alongside this column.
 fn time_run(
     p: &wukong_mir::Program,
     entry: wukong_span::Symbol,
