@@ -1,0 +1,81 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+module tests.run.parallel_control_flow
+
+// `@parallel` must never change what a loop MEANS. Each loop below stops at the first `a[i] > 3.0`,
+// i.e. after writing o[0..4], so every answer is 4 — the same number the identical function without
+// the attribute produces (verified on both backends). The whole-function outliner runs the body over
+// one CHUNK of [0, hi) per worker, so none of these three shapes can be outlined:
+//   * `break 'outer` — the outliner drops the loop's label, so the break found no matching loop and
+//     the block was finished as `unreachable`: interp `error: execution reached `unreachable``,
+//     native SIGILL (exit 132), on a program that runs fine without `@parallel`;
+//   * a plain `break` out of the parallelized loop — it ends only the CURRENT chunk, so every chunk
+//     starting past index 7 ran to completion: interp printed 4, native printed 4068;
+//   * `return` — identical split, and the native number is a function of the pool's chunking.
+// All three must fall back to serial lowering (no `wukong_parallel_for` in `--emit=mir -O2`). The
+// other tests/run/parallel_*.wk fixtures are the positive controls that the outliner still fires.
+// Run on the native backend because the divergence is native-only: the interpreter runs the outlined
+// body once over the whole range and therefore always gives the serial answer.
+
+@parallel
+fn labeled(a: [f32; 4096], mut o: [f32; 4096]) {
+    'outer: for i in 0..4096 {
+        if a[i] > 3.0 {
+            break 'outer;
+        }
+        o[i] = 1.0;
+    }
+}
+
+@parallel
+fn plain_break(a: [f32; 4096], mut o: [f32; 4096]) {
+    for i in 0..4096 {
+        if a[i] > 3.0 {
+            break;
+        }
+        o[i] = 1.0;
+    }
+}
+
+@parallel
+fn early_return(a: [f32; 4096], mut o: [f32; 4096]) {
+    for i in 0..4096 {
+        if a[i] > 3.0 {
+            return;
+        }
+        o[i] = 1.0;
+    }
+}
+
+fn count(o: [f32; 4096]) -> i32 {
+    let mut s: i32 = 0;
+    for i in 0..4096 {
+        if o[i] != 0.0 {
+            s = s + 1;
+        }
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 4096] = [0.0; 4096];
+    for i in 0..8 {
+        a[i] = (i as f32);
+    }
+
+    let mut o1: [f32; 4096] = [0.0; 4096];
+    labeled(a, o1);
+    print(count(o1)); // 4
+
+    let mut o2: [f32; 4096] = [0.0; 4096];
+    plain_break(a, o2);
+    print(count(o2)); // 4
+
+    let mut o3: [f32; 4096] = [0.0; 4096];
+    early_return(a, o3);
+    print(count(o3)); // 4
+    return 0;
+}

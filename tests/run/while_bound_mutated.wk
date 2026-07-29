@@ -1,0 +1,72 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 127
+module tests.run.while_bound_mutated
+
+// A counting `while` whose bound is MEMORY THE BODY WRITES. The normalization that rewrites
+// `while i < N { …; i += 1 }` into the vectorizable for-range form evaluates `N` exactly once, before
+// the loop, and its only guard was "the bound does not mention the counter" — which `n[0]` passes
+// while being anything but invariant. The bound froze at its entry value and the loop ran the whole
+// trip count instead of stopping when the body invalidated it.
+//
+// This is the wrong-TRIP-COUNT half of that defect, and it is distinct from the side-effect half
+// already pinned by tests/run/while_bound_side_effect.wk: there a call bound ran once instead of
+// five times but the loop's data came out right; here the data itself is wrong. The rewrite happens
+// in mir_build, so both backends run the identical rewritten MIR and agree at every -O level — the
+// differential and optimization-invariance gates are all blind, and only these golden values catch it.
+//
+// The `loop`/`break` form below is the same algorithm written so that no normalization applies; it is
+// the oracle. Both must print the same three numbers, and those numbers are the source semantics:
+// iteration 0 sets element 0 to 0, so the re-evaluated `1 < 0` is false and the loop stops after ONE
+// iteration with every other element untouched.
+
+fn main() -> i32 {
+    let mut n: [i32; 8] = [8; 8];
+    let mut m: [i32; 8] = [8; 8];
+
+    let mut i: i32 = 0;
+    while i < n[0] {
+        n[i] = n[i] - 8;
+        i = i + 1;
+    }
+
+    let mut j: i32 = 0;
+    loop {
+        if j >= m[0] {
+            break;
+        }
+        m[j] = m[j] - 8;
+        j = j + 1;
+    }
+
+    print(i); // 1 — one iteration ran
+    print(n[0]); // 0 — that iteration zeroed the bound
+    print(n[7]); // 8 — no later iteration ran
+    print(j); // 1 — the un-normalizable spelling of the same loop
+    print(m[0]); // 0
+    print(m[7]); // 8
+
+    // Control: a bound that really is invariant must still normalize, or this fixture would also pass
+    // with the rewrite deleted outright. This loop reaches a recognized kernel — `--emit=mir -O2`
+    // shows `call wukong_velem_f32` — which it can only do via the for-range form.
+    let mut a: [f32; 64] = [0.0; 64];
+    let mut o: [f32; 64] = [0.0; 64];
+    let mut p: i32 = 0;
+    while p < 64 {
+        a[p] = (p as f32);
+        p = p + 1;
+    }
+    let mut q: i32 = 0;
+    while q < 64 {
+        o[q] = a[q] * 2.0 + 1.0;
+        q = q + 1;
+    }
+    print(o[63] as i32); // 63*2 + 1 = 127
+    return 0;
+}

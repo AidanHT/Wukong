@@ -1,0 +1,94 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2400
+// EXPECT-OUT: 1520
+// EXPECT-OUT: 24560
+module tests.run.embedding_alias_parallel
+
+// `@parallel` must not change what the gather and the scatter MEAN when their two f32 buffers are the
+// same array. Both `_parallel` kernels document a non-overlapping precondition (the gather's chunks
+// write `out` rows other chunks are concurrently reading as `weight` rows; the scatter's chunks read
+// `grad_out` while accumulating into `grad_w`), and the recognizer's `out == weight` symbol test cannot
+// see it: two distinct array PARAMETERS are bound to the same array at the call site.
+//
+// On the campaign base `embed(ids, buf, buf)` printed 2432, 2456, 2400, 1120, 1280 over five
+// consecutive native runs — a data race whose answer is only sometimes right. Both nests are
+// order-dependent in place (`ids[t] < 8`, so every source row is overwritten while the loop runs), so
+// the serial kernel — which touches the same rows in the same order as the nest — is the only correct
+// lowering, and the numbers below are what the scalar nests compute, verified independently.
+//
+// The distinct-buffer calls keep the non-overlapping path (the run-time range test's true arm, which
+// still dispatches `wukong_embedding_f32_parallel` / `wukong_scatter_add_f32_parallel`) covered.
+//
+// The *aliased* scatter is deliberately not asserted here: the interpreter marshals `grad_out` into a
+// scratch buffer before calling the kernel, so it gathers from a snapshot and answers 49120 where the
+// nest (and native, now that it takes the serial kernel) answers 49121 — the same defect the embedding
+// gather already had fixed. That one belongs to wukong_interp, not to this lowering.
+
+@parallel
+fn embed(ids: [i32; 80], weight: [f32; 320], mut out: [f32; 320]) {
+    for t in 0..80 {
+        for d in 0..4 {
+            out[t * 4 + d] = weight[ids[t] * 4 + d];
+        }
+    }
+}
+
+@parallel
+fn scatter(ids: [i32; 80], grad_out: [f32; 320], mut grad_w: [f32; 320]) {
+    for t in 0..80 {
+        for d in 0..4 {
+            grad_w[ids[t] * 4 + d] += grad_out[t * 4 + d];
+        }
+    }
+}
+
+fn fill(mut a: [f32; 320]) {
+    for i in 0..320 {
+        a[i] = (i as f32) * 0.5 - 3.0;
+    }
+}
+
+fn total(a: [f32; 320]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..320 {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let mut ids: [i32; 80] = [0; 80];
+    for i in 0..80 {
+        ids[i] = ((i * 3 + 1) % 8) as i32;
+    }
+
+    // Aliased gather: out and weight are the same array, so row t reads rows the loop has already
+    // rewritten. Scalar semantics: Σ = 2400.
+    let mut buf: [f32; 320] = [0.0; 320];
+    fill(buf);
+    embed(ids, buf, buf);
+    print(total(buf) as i32);
+
+    // Distinct gather: the ordinary lookup, Σ = 1520.
+    let mut w: [f32; 320] = [0.0; 320];
+    let mut o: [f32; 320] = [0.0; 320];
+    fill(w);
+    embed(ids, w, o);
+    print(total(o) as i32);
+
+    // Aliased scatter-add: grad_w and grad_out are the same array, so each accumulation reads a value
+    // an earlier token already updated. Scalar semantics: Σ = 49121 — run for the lowering's sake (the
+    // serial kernel must be selected) but not printed, see the note above.
+    let mut acc: [f32; 320] = [0.0; 320];
+    fill(acc);
+    scatter(ids, acc, acc);
+
+    // Distinct scatter-add: the ordinary embedding gradient, Σ = 24560 (every token's row lands once).
+    let mut g: [f32; 320] = [0.0; 320];
+    let mut gw: [f32; 320] = [0.0; 320];
+    fill(g);
+    scatter(ids, g, gw);
+    print(total(gw) as i32);
+    return 0;
+}

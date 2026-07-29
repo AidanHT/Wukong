@@ -1,0 +1,35 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3440
+// EXPECT-OUT: 2626
+module tests.run.xent_labels_i64
+
+// tests/run/xent.wk, verbatim except the label array is `[i64; 2]` instead of `[i32; 2]` — the
+// PyTorch convention, and exactly what the `read_i64` file intrinsic produces.
+//
+// `wukong_xent_fwd_f32` reads `target` as `*const i32`, so `match_xent_gather` must require an i32
+// label array the way `match_id_gather` (the embedding's label read) always has. Without that guard
+// `--emit=mir -O2` still emitted `call wukong_xent_fwd_f32` and the kernel read the little-endian
+// i64 `[0, 2]` as i32 `[0, 0]`: native printed `3440 626` (row 1 gathered logit x[4]=2.0 instead of
+// x[6]=0.0) where the interpreter, which marshals per memory slot, printed the correct `3440 2626`.
+// Run on the native backend for the reason given in tests/run/norm_elem_f64.wk.
+fn main() -> i32 {
+    // x is [2,4] row-major logits; target is the per-row true class index.
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 0.0, 1.0];
+    let target: [i64; 2] = [0, 2];
+    let mut loss: [f32; 2] = [0.0; 2];
+
+    for r in 0..2 {
+        let mut m: f32 = x[r * 4];
+        for i in 0..4 { m = fmax(m, x[r * 4 + i]); }
+        let mut s: f32 = 0.0;
+        for i in 0..4 { s = s + exp(x[r * 4 + i] - m); }
+        loss[r] = m + log(s) - x[r * 4 + target[r]];
+    }
+    // Row 0: lse ≈ 4.4402, target=0 (x=1) → loss ≈ 3.4402
+    // Row 1: lse ≈ 2.6266, target=2 (x=0) → loss ≈ 2.6266
+    for k in 0..2 {
+        print((loss[k] * 1000.0) as i32);
+    }
+    return 0;
+}

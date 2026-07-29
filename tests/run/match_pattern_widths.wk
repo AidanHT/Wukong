@@ -1,0 +1,87 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+module tests.run.match_pattern_widths
+
+// A match-pattern literal is materialized as a constant in the SCRUTINEE's type. That was done with
+// no check at all: a literal the scrutinee cannot hold was silently truncated and then matched a
+// DIFFERENT value (on an `i64` scrutinee `18446744073709551616 => 1` stole the `0 => 2` arm), and a
+// non-integer scrutinee produced a mistyped `Cmp` that surfaced as raw verifier text. Lowering now
+// range-checks the literal against the scrutinee's width. MIR integers are signless, so the band is
+// the union of the signed and unsigned ranges of that width — this fixture pins the extremes that
+// must STILL compile and match: an unsigned pattern above `i32::MAX`, `u64::MAX`, both `i64` ends,
+// `i8`'s two ends, plus the char-range, bool, or-pattern and literal-range forms.
+fn wide(x: u32) -> i32 {
+    return match x { 3000000000 => 1, 0 => 2, _ => 3 };
+}
+
+fn narrow(x: i8) -> i32 {
+    return match x { -128 => 1, 127 => 2, _ => 3 };
+}
+
+fn big(x: i64) -> i32 {
+    return match x { 9223372036854775807 => 1, _ => 3 };
+}
+
+fn ubig(x: u64) -> i32 {
+    return match x { 18446744073709551615 => 1, _ => 3 };
+}
+
+fn rng(x: i32) -> i32 {
+    return match x { 3..10 => 1, 10..=20 => 2, _ => 3 };
+}
+
+fn ch(c: char) -> i32 {
+    return match c { '0'..='9' => 1, 'a' => 2, _ => 3 };
+}
+
+fn flag(b: bool) -> i32 {
+    return match b { true => 1, false => 2 };
+}
+
+fn ors(x: i32) -> i32 {
+    return match x { 1 | 2 | 3 => 1, _ => 0 };
+}
+
+fn main() -> i32 {
+    print(wide(3000000000));
+    print(wide(0));
+    print(wide(7));
+    print(narrow(-128));
+    print(narrow(127));
+    print(narrow(0));
+    print(big(9223372036854775807));
+    print(big(0));
+    print(ubig(18446744073709551615));
+    print(ubig(0));
+    print(rng(5));
+    print(rng(15));
+    print(rng(1));
+    print(ch('5'));
+    print(ch('a'));
+    print(ch('z'));
+    print(flag(true));
+    print(flag(false));
+    print(ors(2));
+    print(ors(9));
+    return 0;
+}

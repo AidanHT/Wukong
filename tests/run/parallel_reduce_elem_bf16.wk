@@ -1,0 +1,30 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 64
+module tests.run.parallel_reduce_elem_bf16
+
+// A `@parallel` reduction whose data array is `[bf16; 64]` and whose accumulator is f32, written
+// WITHOUT the explicit `as f32` cast — sema widens the element implicitly, so the loop is a legal
+// program. `try_emit_parallel_reduction` checked only that the *accumulator* slot was f32 and never
+// the element type, so it dispatched `wukong_sreduce_f32_parallel`, which reads 64 f32 = 256 bytes
+// out of this 128-byte array: on the campaign base `--emit=mir -O2` showed
+// `call wukong_sreduce_f32_parallel` and native printed `-2147483648` where the correct sum of
+// sixty-four 1.0s is 64 (the interpreter, which calls the serial kernel through a converting
+// marshal, printed 64).
+//
+// The cast spelling `acc + (x[k] as f32)` is the one that belongs on the half kernel and is gated by
+// tests/run/parallel_reduce_lowp.wk; this file pins the uncast form to the scalar loop. Run on the
+// native backend for the reason given in tests/run/scan_elem_lowp.wk.
+@parallel
+fn total(x: [bf16; 64]) -> f32 {
+    let mut acc: f32 = 0.0;
+    for k in 0..64 { acc = acc + x[k]; }
+    return acc;
+}
+
+fn main() -> i32 {
+    let mut x: [bf16; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = 1.0; }
+    print(total(x) as i32); // 64 × 1.0
+    return 0;
+}

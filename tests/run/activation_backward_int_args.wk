@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2.1659281253814697
+// EXPECT-OUT: 2.1659281253814697
+// EXPECT-OUT: 1.8553410768508911
+// EXPECT-OUT: 0.3932238519191742
+// EXPECT-OUT: 0.8399486541748047
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1.4621171951293945
+// EXPECT-OUT: 0.8399486541748047
+module tests.run.activation_backward_int_args
+
+// The six activation-BACKWARD intrinsics with integer operands. Every *forward* intrinsic lowers
+// its arguments through `lower_math_arg` (so `sqrt(16)` promotes the `16`), but the backward family
+// used a bare `lower_expr`, feeding an `i32` straight into the float ops:
+// `gelu_backward(1, 2)` ICEd with raw verifier text ("fmul: v0 has type i32 but expected f32") on
+// both backends. The first two lines are the contract: the promoted integer call must equal the
+// float call exactly. The last line covers the MIXED form (float x, integer dy).
+fn main() -> i32 {
+    let xi: i32 = 1;
+    let di: i32 = 2;
+    print(gelu_backward(1, 2));
+    print(gelu_backward(1.0, 2.0)); // identical to the line above
+    print(silu_backward(xi, di));
+    print(sigmoid_backward(xi, di));
+    print(tanh_backward(xi, di));
+    print(elu_backward(xi, di)); // elu'(1) == 1, so dy passes through: 2
+    print(softplus_backward(xi, di));
+    print(tanh_backward(1.0, di));
+    return 0;
+}

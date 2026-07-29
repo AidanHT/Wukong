@@ -1,0 +1,91 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 51
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 11
+// EXPECT-OUT: 18
+// EXPECT-OUT: 27
+// EXPECT-OUT: 38
+// EXPECT-OUT: 51
+// EXPECT-OUT: 66
+// EXPECT-OUT: 83
+// EXPECT-OUT: 102
+// EXPECT-OUT: 123
+// EXPECT-OUT: 146
+// EXPECT-OUT: 171
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4098
+module tests.run.vhorner_vector_and_tail
+
+// The Horner-polynomial recognizer (`wukong_vhorner_f32`) across the boundary between the kernel's
+// 8-wide vector body and its scalar tail. Only two fixtures in the whole suite dispatch this kernel,
+// at n = 4 and n = 8 — tail-only and one-vector-no-tail — so no test anywhere ran a size at which
+// BOTH halves of the kernel execute over the same array. A tail that computed a different polynomial
+// from the lanes, or a vector body that ran the wrong number of groups, was invisible.
+//
+// That is not a hypothetical failure mode for this family: the sibling 256-bit elementwise recipe was
+// found doing exactly it, contracting `x + y*z` in the scalar tail but not in the vector part, so one
+// loop returned two different functions (tests/run/veckernel_fma_contract.wk).
+//
+// The kernel fires in both backends and bypasses the optimizer, so interp==native and -O0==-O2 agree
+// on whatever it computes; only these golden values, which are the polynomial's exact scalar meaning,
+// can catch it. All three loops dispatch — `--emit=mir -O2` shows three `wukong_vhorner_f32` calls.
+//
+//   p(v) = v*v + 2*v + 3, evaluated as Horner: acc = 1; acc = acc*v + 2; acc = acc*v + 3.
+//   Every value below is exact in f32 (integers well under 2^24), so the expectations are unambiguous.
+
+fn main() -> i32 {
+    // n = 7: fewer than 8 elements, so the whole array runs in the kernel's scalar tail.
+    let mut a: [f32; 7] = [0.0; 7];
+    let mut pa: [f32; 7] = [0.0; 7];
+    for j in 0..7 {
+        a[j] = (j as f32);
+    }
+    for j in 0..7 {
+        let v: f32 = a[j];
+        let mut acc: f32 = 1.0;
+        acc = acc * v + 2.0;
+        acc = acc * v + 3.0;
+        pa[j] = acc;
+    }
+    print(pa[0] as i32); // p(0) = 3
+    print(pa[6] as i32); // p(6) = 36 + 12 + 3 = 51
+
+    // n = 13: one full 8-lane group plus a 5-element tail. Printing every element puts the
+    // vector/tail boundary (between index 7 and index 8) inside the expectations.
+    let mut b: [f32; 13] = [0.0; 13];
+    let mut pb: [f32; 13] = [0.0; 13];
+    for j in 0..13 {
+        b[j] = (j as f32);
+    }
+    for j in 0..13 {
+        let v: f32 = b[j];
+        let mut acc: f32 = 1.0;
+        acc = acc * v + 2.0;
+        acc = acc * v + 3.0;
+        pb[j] = acc;
+    }
+    for j in 0..13 {
+        // 3 6 11 18 27 38 51 | 66 is index 7, the last vector lane; 83 .. 171 are the tail
+        print(pb[j] as i32);
+    }
+
+    // n = 64: eight full groups, no tail — the multi-group path.
+    let mut c: [f32; 64] = [0.0; 64];
+    let mut pc: [f32; 64] = [0.0; 64];
+    for j in 0..64 {
+        c[j] = (j as f32);
+    }
+    for j in 0..64 {
+        let v: f32 = c[j];
+        let mut acc: f32 = 1.0;
+        acc = acc * v + 2.0;
+        acc = acc * v + 3.0;
+        pc[j] = acc;
+    }
+    print(pc[0] as i32); // p(0) = 3
+    print(pc[63] as i32); // p(63) = 3969 + 126 + 3 = 4098
+    return 0;
+}

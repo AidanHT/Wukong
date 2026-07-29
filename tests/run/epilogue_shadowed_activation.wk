@@ -1,0 +1,116 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 974
+// EXPECT-OUT: 811
+// EXPECT-OUT: 906
+// EXPECT-OUT: 1197
+// EXPECT-OUT: 899
+// EXPECT-OUT: 807
+// EXPECT-OUT: 979
+// EXPECT-OUT: 1276
+// EXPECT-OUT: 849
+// EXPECT-OUT: 814
+// EXPECT-OUT: 1049
+// EXPECT-OUT: 1206
+// EXPECT-OUT: 810
+// EXPECT-OUT: 846
+// EXPECT-OUT: 1159
+// EXPECT-OUT: 1124
+module tests.run.epilogue_shadowed_activation
+
+// A user function that SHADOWS a math intrinsic must win everywhere, including inside the fused
+// matmul epilogues. `gelu` below returns `x + 1000.0`, so every expected value is the raw product
+// plus 1000 — nothing here is the builtin GELU curve (which would squash the small values toward 0).
+// Both epilogue peelers used to resolve the activation by raw name, so both folded this function away
+// and called the runtime's builtin instead; the GEMMs themselves still dispatch
+// (`wukong_sgemm_nt` / `wukong_i8gemm_nt` in `--emit=mir -O2`), only the activation fusion declines.
+// The unshadowed forms stay fused — `ffn_fused.wk` and `i8_linear_dequant.wk` gate that side.
+// The fusion happens in BOTH backends, so only these golden values catch it.
+
+fn gelu(x: f32) -> f32 {
+    return x + 1000.0;
+}
+
+// f32 `nn.Linear` + activation: matmul into `c`, then an epilogue loop over the same `c`.
+fn lin(a: [f32; 16], w: [f32; 16], mut c: [f32; 16]) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * w[j * 4 + k];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            c[i * 4 + j] = gelu(c[i * 4 + j]);
+        }
+    }
+}
+
+// int8 `nn.Linear` decode: u8 x i8 GEMM into an i32 accumulator, then the per-channel dequant.
+fn qlin(a: [u8; 160], b: [i8; 160], sb: [f32; 4], mut o: [f32; 16]) {
+    let mut c: [i32; 16] = [0; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: i32 = 0;
+            for k in 0..40 {
+                s = s + (a[i * 40 + k] as i32) * (b[j * 40 + k] as i32);
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            o[i * 4 + j] = gelu((c[i * 4 + j] as f32) * sb[j]);
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 16] = [0.0; 16];
+    let mut w: [f32; 16] = [0.0; 16];
+    let mut c: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        a[i] = ((i % 3) as f32);
+        w[i] = ((i % 2) as f32);
+    }
+    lin(a, w, c);
+    for i in 0..16 {
+        print(round(c[i]) as i32); // row dots are 1, 3, 2, 1 -> + 1000
+    }
+
+    let mut qa: [u8; 160] = [0 as u8; 160];
+    let mut qb: [i8; 160] = [0 as i8; 160];
+    let mut sb: [f32; 4] = [0.0; 4];
+    let mut o: [f32; 16] = [0.0; 16];
+    for i in 0..160 {
+        qa[i] = ((i * 7 + 3) % 256) as u8;
+        qb[i] = (((i * 5 + 1) % 256) - 128) as i8;
+    }
+    for j in 0..4 {
+        sb[j] = 0.001;
+    }
+    qlin(qa, qb, sb, o);
+    for i in 0..16 {
+        print(round(o[i]) as i32); // dot * 0.001 + 1000
+    }
+    return 0;
+}

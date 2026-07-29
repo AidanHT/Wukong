@@ -1,0 +1,93 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+module tests.run.argmax_seed_edges
+
+// Seed / no-index edges of the recognized global argmax (`wukong_argreduce_f32`). The kernel folds
+// the whole span and the lowering reconciles its (value, index) against the loop's running best, so
+// every expectation below is the SCALAR meaning of the source loop, not the kernel's own answer:
+//   * an empty span never runs the body, so the seed index stands (the kernel returns -1 there);
+//   * the loop's compare is STRICT, so a seed that TIES the maximum is never displaced, whatever
+//     index the kernel's lowest-index tie-break reports;
+//   * `NaN > -inf` and `-inf > -inf` are both false, so a fully-NaN / fully-masked row keeps the seed.
+// interp == native and -O0 == -O2 on all of these (the kernel fires in both backends), so only these
+// golden values catch a reconcile that disagrees with the loop it replaced.
+
+fn amax_from(x: [f32; 8], n: i64) -> i64 {
+    let mut bv: f32 = -1.0e30;
+    let mut bi: i64 = 6;
+    for k in 0..n {
+        if x[k] > bv {
+            bv = x[k];
+            bi = k as i64;
+        }
+    }
+    return bi;
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 8] = [0.0; 8];
+    for i in 0..8 {
+        x[i] = (i as f32);
+    }
+    print(amax_from(x, 0) as i32); // 6 — zero trip count, the seed index stands
+    print(amax_from(x, 8) as i32); // 7 — x[7] = 7.0 is the strict maximum
+
+    // The seed VALUE ties the maximum, at a HIGHER index than the kernel's lowest-index answer (1).
+    let mut y: [f32; 6] = [0.0; 6];
+    y[0] = 1.0;
+    y[1] = 9.0;
+    y[2] = 2.0;
+    y[3] = 3.0;
+    y[4] = 4.0;
+    y[5] = 9.0;
+    let mut bv: f32 = y[5];
+    let mut bi: i64 = 5;
+    for k in 0..6 {
+        if y[k] > bv {
+            bv = y[k];
+            bi = k as i64;
+        }
+    }
+    print(bi as i32); // 5 — a strict `>` can never displace an equal running best
+
+    let big: f32 = 1.0e30;
+    let inf: f32 = big * big;
+    let nan: f32 = inf - inf;
+
+    // All-NaN row (a diverged step): no compare is ever true.
+    let mut z: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        z[i] = nan;
+    }
+    let mut zv: f32 = 0.0 - inf;
+    let mut zi: i64 = 3;
+    for k in 0..16 {
+        if z[k] > zv {
+            zv = z[k];
+            zi = k as i64;
+        }
+    }
+    print(zi as i32); // 3 — the seed index stands
+
+    // Fully-masked logits: 64 elements of -inf, seeded from the row's own first element. n >= 32 so
+    // the runtime's wide span runs; every value ties the seed, so the lowest index (0) must stand.
+    let mut w: [f32; 64] = [0.0; 64];
+    for i in 0..64 {
+        w[i] = 0.0 - inf;
+    }
+    let mut wv: f32 = w[0];
+    let mut wi: i64 = 0;
+    for k in 0..64 {
+        if w[k] > wv {
+            wv = w[k];
+            wi = k as i64;
+        }
+    }
+    print(wi as i32); // 0
+    return 0;
+}
