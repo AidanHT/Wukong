@@ -3894,8 +3894,18 @@ unsafe fn invoke_code(code: usize, ret: &MirType) -> i64 {
             f();
             0
         }
-        t if t.is_float() => {
+        MirType::F64 => {
             let f: extern "C" fn() -> f64 = std::mem::transmute(code);
+            f() as i64
+        }
+        // The narrow floats must NOT share the `f64` arm. `signature_of` returns whatever
+        // `cl_type` says, and `cl_type` computes `f16`/`bf16` in `f32` registers, so all three
+        // return a *single-precision* XMM0: `movss` leaves the value in XMM0[31:0] and zeroes
+        // [127:32]. Reading those 64 bits as an `f64` reinterprets a live float as a denormal —
+        // `fn main() -> f32 { return 42.9; }` (XMM0[31:0] = 0x422b_999a) came out as 5.4e-315,
+        // which `as i64` saturates to 0, while the interpreter oracle exits 42.
+        MirType::F32 | MirType::F16 | MirType::BF16 => {
+            let f: extern "C" fn() -> f32 = std::mem::transmute(code);
             f() as i64
         }
         MirType::I64 => {

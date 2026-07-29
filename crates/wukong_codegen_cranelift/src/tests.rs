@@ -534,6 +534,34 @@ fn differential_against_interpreter() {
     }
 }
 
+/// An entry point that returns a float must be read out of XMM0 with *its own* width. The whole
+/// corpus had no float-returning `main` before this test, which is how `invoke_code` came to fold
+/// `f32`/`f16`/`bf16` into the `f64` ABI: the narrow floats return a single-precision XMM0, so
+/// reading 64 bits gave a denormal that `as i64` saturated to 0 while the interpreter exited 42.
+/// The three exits also pin the rounding each width applies to the same literal — 42.9 is 42 in
+/// f32 and f16, but 43 in bf16 (0x422b_999a rounds *up* to 0x422c) — so a fix that read the right
+/// register but dropped the narrowing would still fail.
+#[test]
+fn differential_float_return_type() {
+    let programs = [
+        ("fn main() -> f32 { print(1); return 42.9; }", 42),
+        ("fn main() -> f64 { print(1); return 42.9; }", 42),
+        ("fn main() -> f16 { print(1); return 42.9; }", 42),
+        ("fn main() -> bf16 { print(1); return 42.9; }", 43),
+        // Negative and fractional-magnitude values: `as i64` truncates toward zero on both sides.
+        ("fn main() -> f32 { return 0 as f32 - 7.75; }", -7),
+        ("fn main() -> f32 { return 0.5; }", 0),
+    ];
+    for (src, want) in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "exit code at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Heap allocation (`alloc_<T>(n)` / `free(s)`): an alloc'd slice must behave identically on
 /// native and the interpreter at every opt level — zero-initialized contents (read before any
 /// write), fill/reduce over a vectorizer-territory buffer, mutation across a fn boundary through
