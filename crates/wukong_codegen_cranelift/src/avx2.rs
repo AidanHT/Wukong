@@ -305,11 +305,18 @@ fn emit_group(
             _ => vreg[v as usize].expect("value has a register"),
         }
     };
-    // Free value `v`'s body register after op `i`, if this is its last use.
+    // Free value `v`'s body register after op `i`, if this is its last use. An op may name the same
+    // value twice (`a*a`, or an `Fma` sharing an operand), so this runs more than once for one value
+    // — `take()` makes the release idempotent. Without it the register is pushed twice and two later
+    // allocations receive the same physical register, the second silently clobbering the first.
+    // Taking is sound: `free_after` only fires when `last_use[v] == i`, so no later op reads
+    // `vreg[v]`; the reduction fold's addend / fused operands have `last_use == ops.len()` (set by
+    // `pressure()`), which equals no op index, so their registers survive to the post-loop fold.
     let free_after = |free: &mut Vec<u8>, vreg: &mut [Option<u8>], i: usize, v: u32| {
         if plan.last_use[v as usize] == i {
-            if let Some(r) = vreg[v as usize] {
-                if !matches!(k.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. }) {
+            if !matches!(k.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. }) {
+                if let Some(r) = vreg[v as usize].take() {
+                    debug_assert!(!free.contains(&r), "avx2: ymm{r} released twice at op {i}");
                     free.push(r);
                 }
             }
@@ -969,6 +976,98 @@ mod tests {
             &[],
             48,
         );
+    }
+
+    /// A value used TWICE by one op (`a*a`) must be released exactly once. The free list is a plain
+    /// `Vec`, so a double-push hands the same physical register to two later allocations and the
+    /// second silently clobbers the first — `o = a*a + b*c` then computes `a*a + c*c`. Three shapes,
+    /// each with the repeated operand followed by further allocating ops so the duplicate is actually
+    /// handed out: two loads, another repeated-operand op, and a fused `Fma` (whose three operands
+    /// give the widest double-free surface).
+    #[test]
+    fn avx2_kernel_repeated_operand_frees_once() {
+        // o = a*a + b*c   (dup-operand op, then two loads that pop the duplicate)
+        let dup_then_loads = VecKernel {
+            name: sym(),
+            streams: 4,
+            scalars: 0,
+            unroll: 4,
+            reduce: None,
+            ops: vec![
+                VecOp::Load { stream: 0 },                  // v0 = a
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
+                VecOp::Load { stream: 1 },                  // v2 = b
+                VecOp::Load { stream: 2 },                  // v3 = c
+                VecOp::Bin { op: VecBin::Mul, a: 2, b: 3 }, // v4 = b*c
+                VecOp::Bin { op: VecBin::Add, a: 1, b: 4 }, // v5 = a*a + b*c
+                VecOp::Store { stream: 3, val: 5 },
+            ],
+        };
+        // o = a*a + b*b + b   (dup-operand op, then a second dup-operand op)
+        let dup_then_dup = VecKernel {
+            name: sym(),
+            streams: 3,
+            scalars: 0,
+            unroll: 4,
+            reduce: None,
+            ops: vec![
+                VecOp::Load { stream: 0 },                  // v0 = a
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
+                VecOp::Load { stream: 1 },                  // v2 = b
+                VecOp::Bin { op: VecBin::Mul, a: 2, b: 2 }, // v3 = b*b
+                VecOp::Bin { op: VecBin::Add, a: 1, b: 3 }, // v4 = a*a + b*b
+                VecOp::Bin { op: VecBin::Add, a: 4, b: 2 }, // v5 = … + b
+                VecOp::Store { stream: 2, val: 5 },
+            ],
+        };
+        // o = (a*a)*c + b*c  — `c` feeds an Fma and a later Bin, so the Fma's three `free_after`
+        // calls run while `c` is still live; `a` is the repeated operand.
+        let dup_then_fma = VecKernel {
+            name: sym(),
+            streams: 4,
+            scalars: 0,
+            unroll: 2,
+            reduce: None,
+            ops: vec![
+                VecOp::Load { stream: 0 },                  // v0 = a
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
+                VecOp::Load { stream: 1 },                  // v2 = b
+                VecOp::Load { stream: 2 },                  // v3 = c
+                VecOp::Fma { a: 1, b: 3, c: 2 },            // v4 = (a*a)*c + b
+                VecOp::Bin { op: VecBin::Mul, a: 4, b: 3 }, // v5 = v4 * c
+                VecOp::Store { stream: 3, val: 5 },
+            ],
+        };
+        for n in [8usize, 16, 24, 64] {
+            let s = |seed| ramp(n, seed);
+            check(&dup_then_loads, &[s(0.0), s(1.0), s(2.0), vec![0.0; n]], &[], n);
+            check(&dup_then_dup, &[s(0.0), s(1.0), vec![0.0; n]], &[], n);
+            check(&dup_then_fma, &[s(0.0), s(1.0), s(2.0), vec![0.0; n]], &[], n);
+        }
+        // Same defect on the reduction path: the fold reads its addend after the body, so a register
+        // handed out twice corrupts the accumulator. `acc += (a*a) * (b*c)`.
+        let red = VecKernel {
+            name: sym(),
+            streams: 3,
+            scalars: 0,
+            unroll: 4,
+            reduce: Some(wukong_mir::VecReduce {
+                op: VecRedOp::Add,
+                value: 5,
+                fma: None,
+            }),
+            ops: vec![
+                VecOp::Load { stream: 0 },
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // a*a
+                VecOp::Load { stream: 1 },
+                VecOp::Load { stream: 2 },
+                VecOp::Bin { op: VecBin::Mul, a: 2, b: 3 }, // b*c
+                VecOp::Bin { op: VecBin::Mul, a: 1, b: 4 },
+            ],
+        };
+        for n in [8usize, 16, 64, 256] {
+            check_reduce(&red, &[ramp(n, 0.0), ramp(n, 1.0), ramp(n, 2.0)], &[], n);
+        }
     }
 
     #[test]
