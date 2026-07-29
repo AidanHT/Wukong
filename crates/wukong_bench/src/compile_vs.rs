@@ -129,6 +129,16 @@ pub fn report(wukongc: Option<PathBuf>) {
          (same run).\ncompile-only (no link); wukongc uses Cranelift (no LLVM), gcc/g++/rustc \
          their own -O2 backend."
     );
+    // The fairness decision the ratios rest on, printed with the ratios. This table is what gets
+    // pasted into BENCHMARKS.md and docs/metrics.md; from the numbers alone a reader cannot tell
+    // whether gcc was charged a libc header parse, so a regression that re-added an `#include` to
+    // the C kernel would restore previously-fixed rigging while the published output looked
+    // unchanged.
+    println!(
+        "peer sources are header-free bare translation units — no #include, no main — matching the \
+         bare\n#[no_mangle] .rs kernels; the .wk arm is a full program with main + print. rustc uses \
+         -O\n(= opt-level 2) to match gcc/g++ -O2."
+    );
 }
 
 fn default_wukongc() -> PathBuf {
