@@ -65,11 +65,16 @@ fn gen(rng: &mut Rng, regime: Regime) -> f32 {
     }
 }
 
-/// Two f32 results are "the same" if both are NaN (payloads may differ across an `f64`-rounding
-/// interpreter and a real-`f32` JIT), both are zero (±0 compare equal numerically), or their bits
-/// match exactly. Anything else is a divergence.
+/// Two f32 results are "the same" if their bits match exactly, or both are NaN — payloads may differ
+/// between an `f64`-rounding interpreter and a real-`f32` JIT, and no Wukong program can read one.
+///
+/// `+0.0` and `-0.0` are *not* interchangeable and used to be accepted here. The sign of zero is
+/// fully observable: `print(-0.0)` emits `-0` and `1.0 / (-1.0 * 0.0)` emits `-inf`, identically on
+/// both backends. A fold like `x * 0.0 -> 0.0` (wrong for `x < 0`, `-0.0`, `±Inf`, NaN) would make
+/// every multiplying kernel here produce `+0.0` natively against the interpreter's `-0.0`, and this
+/// fuzzer would pass every run.
 fn same(a: f32, b: f32) -> bool {
-    (a.is_nan() && b.is_nan()) || (a == 0.0 && b == 0.0) || a.to_bits() == b.to_bits()
+    (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
 }
 
 /// A kernel under test: a source template (parameterized by element count `n`), its element count,
@@ -809,6 +814,16 @@ fn vmath_kernels_match_f64_reference() {
             if !want.is_finite() {
                 continue;
             }
+            // A non-finite result where the f64 reference is finite must fail loudly. `max_rel.max(rel)`
+            // would otherwise *drop* it: `rel` is NaN, `f64::max` returns the other operand, and a
+            // kernel returning NaN on a whole regime (say `log` on (0,1), ~1/8 of these samples) leaves
+            // `max_rel` at whatever the finite samples produced and the test reports PASS. The
+            // full-buffer fuzzer cannot catch that either — the interpreter marshals the same kernel.
+            assert!(
+                got.is_finite(),
+                "{name}: kernel returned {got} where the f64 reference is finite ({want}) at x={}",
+                x[i]
+            );
             // Relative error with a small absolute floor so values near zero don't blow up the ratio.
             let rel = (got - want).abs() / want.abs().max(1e-6);
             max_rel = max_rel.max(rel);

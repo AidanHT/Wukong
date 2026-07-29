@@ -447,7 +447,9 @@ impl Gen {
             // array declaration
             5 => {
                 let t = Ty::pick_numeric(&mut self.rng);
-                let len = [4usize, 5, 8][self.rng.below(3) as usize];
+                // `index_for` only lets a loop var index an array whose length covers its bound, so
+                // these must reach the raised for-bounds above or a trip-17 loop can never index.
+                let len = [4usize, 5, 8, 17, 24][self.rng.below(5) as usize];
                 let init = self.literal(t);
                 let name = self.fresh("a");
                 self.line(format!("let mut {name}: [{}; {len}] = [{init}; {len}];", t.name()));
@@ -503,7 +505,15 @@ impl Gen {
                 if self.depth >= 3 {
                     return self.emit_print();
                 }
-                let bound = [3usize, 4, 5][self.rng.below(3) as usize];
+                // 3/4/5 alone kept every fuzzed loop below 8, the lane group, so no trip-dependent
+                // lowering (counting-while normalization, the vector strip's `trip & !7`, a
+                // non-empty tail) was ever reached. 8 is one whole group and 17 is two groups plus a
+                // one-element tail. NOT sufficient to reach the vectorizer itself: measured over 400
+                // generated programs, zero contain a `vec_kernels` entry or SIMD MIR, because the
+                // grammar's loop bodies are scalar `let`s and cast-heavy stores, not the f32
+                // elementwise nests a recipe claims. Reaching that needs a grammar that emits
+                // `arr[i] = f(arr2[i], …)` bodies.
+                let bound = [3usize, 4, 5, 8, 17][self.rng.below(5) as usize];
                 let iv = self.fresh("i");
                 self.line(format!("for {iv} in 0..{bound} {{"));
                 self.depth += 1;
@@ -861,10 +871,18 @@ fn fuzz_grammar_differential() {
     // 48 programs (~16 s) by default; WUKONG_FUZZ_PROGRAMS=N deepens a dedicated fuzz run
     // (120+ verified green). Seeds are fixed offsets from `base`, so N programs are always the
     // same N programs — a failure reproduces exactly from its printed seed.
+    // `WUKONG_FUZZ_PROGRAMS=0` used to report `ok` in 0.00 s having compiled and run nothing —
+    // verified — which is exactly what a "turn the slow fuzzer off" gesture in a CI job would do.
+    // A zero (or unparseable) override falls back to the default instead of silently disabling it.
     let programs: u64 = std::env::var("WUKONG_FUZZ_PROGRAMS")
         .ok()
         .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
         .unwrap_or(48);
+    // How many programs actually had two executions compared. Asserted against `programs` below: if
+    // every execution of a program errors, `first_ok` is `None`, the comparison arm is empty, and the
+    // fuzzer reports `ok` without having checked one exit code or one stdout byte.
+    let mut compared = 0u64;
     let base: u64 = 0x4D45_5243_5552_5931; // fixed tag so failures reproduce.
     for i in 0..programs {
         let seed = base ^ (i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -900,8 +918,9 @@ fn fuzz_grammar_differential() {
         let names = ["interp -O0", "interp -O2", "interp -O3", "native -O0", "native -O3"];
         let first_ok = outs.iter().position(|r| r.is_ok());
         match first_ok {
-            None => {} // all five failed — consistent (e.g. a runtime trap); acceptable.
+            None => {} // all five failed — counted as uncompared by the assert after the loop.
             Some(k) => {
+                compared += 1;
                 let golden = outs[k].as_ref().unwrap();
                 for (r, name) in outs.iter().zip(names) {
                     match r {
@@ -926,4 +945,9 @@ fn fuzz_grammar_differential() {
             }
         }
     }
+    assert_eq!(
+        compared, programs,
+        "grammar fuzzer compared {compared} of {programs} programs — every execution of the rest \
+         errored, so the corpus or the runner is broken, not the programs"
+    );
 }
