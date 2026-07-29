@@ -151,10 +151,12 @@ pub fn run_with_output(
 ) -> Result<(i64, Vec<u8>), String> {
     // The tree-walker recurses on the *host* call stack — one host frame per Wukong call — so a
     // deeply recursive Wukong program would overflow the default main-thread stack and **abort**
-    // the process (a stack overflow is uncatchable) before the interpreter's own 100M-step guard
-    // could fire. The interpreter is the correctness oracle; an abort here would take down the
-    // whole differential gate, so run it on a worker thread with a large stack. `thread::scope`
-    // lets that worker borrow the non-`'static` program/interner.
+    // the process (a stack overflow is uncatchable). The interpreter is the correctness oracle; an
+    // abort here would take down the whole differential gate, so run it on a worker thread with a
+    // large stack. `thread::scope` lets that worker borrow the non-`'static` program/interner.
+    // `MAX_CALL_DEPTH` then bounds the recursion *within* that stack, so an unbounded recursion
+    // reports a diagnostic instead of overflowing even 512 MiB. Every other public entry point
+    // does the same — they are all the same tree-walker.
     with_big_stack(|| {
         let func = program
             .function(entry)
@@ -169,6 +171,7 @@ pub fn run_with_output(
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
             accel: None,
+            depth: 0,
         };
         let result = interp.run_function(func, Vec::new())?;
         Ok((result.as_int() as i64, interp.stdout))
@@ -195,6 +198,37 @@ fn with_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
+/// Carries a `&mut dyn Accelerator` into [`with_big_stack`]'s scoped worker.
+///
+/// The accelerator-taking entry points must run the tree-walker on the big stack for the same
+/// reason [`run_with_output`] does, but `Accelerator` deliberately carries no `Send` bound (adding
+/// one is a public-API change every backend implementing it would have to satisfy), so a closure
+/// borrowing one cannot be spawned. `with_big_stack` **joins** its worker before returning, so the
+/// accelerator is reachable from exactly one thread at a time and never outlives the borrow it came
+/// from — precisely the guarantee `thread::scope` already gives the `&Program`/`&Interner` borrows.
+struct AccelPtr<'k>(Option<*mut (dyn Accelerator + 'k)>);
+
+// SAFETY: as documented on `AccelPtr` — the pointer is handed to a scoped worker that is joined
+// before `with_big_stack` returns and is never dereferenced on the spawning thread in between, so
+// there is no concurrent access, and the scope keeps the original `&'k mut` borrow alive
+// throughout.
+unsafe impl Send for AccelPtr<'_> {}
+
+impl<'k> AccelPtr<'k> {
+    fn new(accel: Option<&'k mut (dyn Accelerator + 'k)>) -> Self {
+        Self(accel.map(|a| a as *mut (dyn Accelerator + 'k)))
+    }
+
+    /// Re-borrow the accelerator on the worker thread.
+    ///
+    /// # Safety
+    /// Must be called at most once, from inside the [`with_big_stack`] worker the value was moved
+    /// into, while the borrow it was built from is still live.
+    unsafe fn reborrow(self) -> Option<&'k mut (dyn Accelerator + 'k)> {
+        self.0.map(|p| unsafe { &mut *p })
+    }
+}
+
 /// Like [`run_with_output`] but offloads recognized kernel calls to `accel` (the GPU backend). This
 /// is the `--backend=gpu` execution path: the whole program is still tree-walked here, but every
 /// recognized GEMM / norm / activation / reduction call runs on the device instead of the CPU
@@ -205,22 +239,29 @@ pub fn run_with_output_accel(
     interner: &Interner,
     accel: &mut dyn Accelerator,
 ) -> Result<(i64, Vec<u8>), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        data_addrs: HashMap::new(),
-        accel: Some(accel),
-    };
-    let result = interp.run_function(func, Vec::new())?;
-    Ok((result.as_int() as i64, interp.stdout))
+    // Same big stack as `run_with_output`: this is the same tree-walker, so it needs the same
+    // recursion headroom. See `AccelPtr` for why the accelerator crosses the hand-off by pointer.
+    let accel = AccelPtr::new(Some(accel));
+    with_big_stack(move || {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            // SAFETY: first and only re-borrow, on the worker `AccelPtr` was moved into.
+            accel: unsafe { accel.reborrow() },
+            depth: 0,
+        };
+        let result = interp.run_function(func, Vec::new())?;
+        Ok((result.as_int() as i64, interp.stdout))
+    })
 }
 
 /// Run an f32-buffer kernel (`entry`) over caller-provided buffers — the interpreter's typed
@@ -264,50 +305,58 @@ fn run_kernel_f32_inner(
     interner: &Interner,
     accel: Option<&mut dyn Accelerator>,
 ) -> Result<(), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    if func.params.len() != bufs.len() {
-        return Err(format!(
-            "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
-            interner.resolve(entry),
-            func.params.len(),
-            bufs.len()
-        ));
-    }
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        data_addrs: HashMap::new(),
-        accel,
-    };
-    // Lay each buffer out contiguously in flat memory and remember its base slot. Any `alloca`
-    // the kernel performs internally grows memory *past* these regions, so it never clobbers them.
-    let mut bases = Vec::with_capacity(bufs.len());
-    for buf in bufs.iter() {
-        bases.push(interp.memory.len());
-        interp
-            .memory
-            .extend(buf.iter().map(|&v| Value::Float(v as f64)));
-    }
-    let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
-    interp.run_function(func, args)?;
-    // Copy the final contents back out (captures both outputs and in-place mutation).
-    for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
-        for (i, slot) in buf.iter_mut().enumerate() {
-            *slot = match interp.memory[base + i] {
-                Value::Float(f) => f as f32,
-                Value::Int(n) => n as f32,
-                _ => 0.0,
-            };
+    // Same big stack as `run_with_output`: a recursive kernel tree-walks exactly as deep here, and
+    // on the caller's default ~8 MiB stack it aborts the process at ~1/64 the depth `run` survives.
+    let accel = AccelPtr::new(accel);
+    with_big_stack(move || {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        if func.params.len() != bufs.len() {
+            return Err(format!(
+                "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
+                interner.resolve(entry),
+                func.params.len(),
+                bufs.len()
+            ));
         }
-    }
-    Ok(())
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            // SAFETY: first and only re-borrow, on the worker `AccelPtr` was moved into.
+            accel: unsafe { accel.reborrow() },
+            depth: 0,
+        };
+        // Lay each buffer out contiguously in flat memory and remember its base slot. Any `alloca`
+        // the kernel performs internally grows memory *past* these regions, so it never clobbers
+        // them.
+        let mut bases = Vec::with_capacity(bufs.len());
+        for buf in bufs.iter() {
+            bases.push(interp.memory.len());
+            interp
+                .memory
+                .extend(buf.iter().map(|&v| Value::Float(v as f64)));
+        }
+        let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
+        interp.run_function(func, args)?;
+        // Copy the final contents back out (captures both outputs and in-place mutation).
+        for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = match interp.memory[base + i] {
+                    Value::Float(f) => f as f32,
+                    Value::Int(n) => n as f32,
+                    _ => 0.0,
+                };
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Run an f64-buffer kernel over caller-provided buffers — the double-precision twin of
@@ -322,45 +371,49 @@ pub fn run_kernel_f64(
     bufs: &mut [&mut [f64]],
     interner: &Interner,
 ) -> Result<(), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    if func.params.len() != bufs.len() {
-        return Err(format!(
-            "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
-            interner.resolve(entry),
-            func.params.len(),
-            bufs.len()
-        ));
-    }
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        data_addrs: HashMap::new(),
-        accel: None,
-    };
-    let mut bases = Vec::with_capacity(bufs.len());
-    for buf in bufs.iter() {
-        bases.push(interp.memory.len());
-        interp.memory.extend(buf.iter().map(|&v| Value::Float(v)));
-    }
-    let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
-    interp.run_function(func, args)?;
-    for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
-        for (i, slot) in buf.iter_mut().enumerate() {
-            *slot = match interp.memory[base + i] {
-                Value::Float(f) => f,
-                Value::Int(n) => n as f64,
-                _ => 0.0,
-            };
+    // Same big stack as `run_with_output` — see `run_kernel_f32_inner`.
+    with_big_stack(move || {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        if func.params.len() != bufs.len() {
+            return Err(format!(
+                "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
+                interner.resolve(entry),
+                func.params.len(),
+                bufs.len()
+            ));
         }
-    }
-    Ok(())
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            accel: None,
+            depth: 0,
+        };
+        let mut bases = Vec::with_capacity(bufs.len());
+        for buf in bufs.iter() {
+            bases.push(interp.memory.len());
+            interp.memory.extend(buf.iter().map(|&v| Value::Float(v)));
+        }
+        let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
+        interp.run_function(func, args)?;
+        for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = match interp.memory[base + i] {
+                    Value::Float(f) => f,
+                    Value::Int(n) => n as f64,
+                    _ => 0.0,
+                };
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Run an int8 quantized GEMM kernel `fn k(a: [u8; _], b: [i8; _], c: [i32; _])` over caller
@@ -378,50 +431,55 @@ pub fn run_kernel_i8(
     c: &mut [i32],
     interner: &Interner,
 ) -> Result<(), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    if func.params.len() != 3 {
-        return Err(format!(
-            "int8 kernel `{}` takes {} parameter(s), expected 3 (a, b, c)",
-            interner.resolve(entry),
-            func.params.len()
-        ));
-    }
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        data_addrs: HashMap::new(),
-        accel: None,
-    };
-    // u8 zero-extends, i8 sign-extends — the `as i128` casts do exactly that, matching the kernel.
-    let a_base = interp.memory.len();
-    interp
-        .memory
-        .extend(a.iter().map(|&v| Value::Int(v as i128)));
-    let b_base = interp.memory.len();
-    interp
-        .memory
-        .extend(b.iter().map(|&v| Value::Int(v as i128)));
-    let c_base = interp.memory.len();
-    interp
-        .memory
-        .extend(c.iter().map(|&v| Value::Int(v as i128)));
-    let args = vec![Value::Ptr(a_base), Value::Ptr(b_base), Value::Ptr(c_base)];
-    interp.run_function(func, args)?;
-    for (i, slot) in c.iter_mut().enumerate() {
-        *slot = match interp.memory[c_base + i] {
-            Value::Int(n) => n as i32,
-            Value::Float(f) => f as i32,
-            _ => 0,
+    // Same big stack as `run_with_output` — see `run_kernel_f32_inner`.
+    with_big_stack(move || {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        if func.params.len() != 3 {
+            return Err(format!(
+                "int8 kernel `{}` takes {} parameter(s), expected 3 (a, b, c)",
+                interner.resolve(entry),
+                func.params.len()
+            ));
+        }
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            accel: None,
+            depth: 0,
         };
-    }
-    Ok(())
+        // u8 zero-extends, i8 sign-extends — the `as i128` casts do exactly that, matching the
+        // kernel.
+        let a_base = interp.memory.len();
+        interp
+            .memory
+            .extend(a.iter().map(|&v| Value::Int(v as i128)));
+        let b_base = interp.memory.len();
+        interp
+            .memory
+            .extend(b.iter().map(|&v| Value::Int(v as i128)));
+        let c_base = interp.memory.len();
+        interp
+            .memory
+            .extend(c.iter().map(|&v| Value::Int(v as i128)));
+        let args = vec![Value::Ptr(a_base), Value::Ptr(b_base), Value::Ptr(c_base)];
+        interp.run_function(func, args)?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = match interp.memory[c_base + i] {
+                Value::Int(n) => n as i32,
+                Value::Float(f) => f as i32,
+                _ => 0,
+            };
+        }
+        Ok(())
+    })
 }
 
 struct Interp<'a, 'k> {
@@ -446,10 +504,83 @@ struct Interp<'a, 'k> {
     /// native `.rodata` (a returned/threaded `*u8` stays valid, and `*u8` pointer equality agrees
     /// across backends). Persistent memory is never freed, so the address outlives its defining frame.
     data_addrs: HashMap<Symbol, usize>,
+    /// Active Wukong call depth, bounded by [`MAX_CALL_DEPTH`]. The 100M-step guard in `exec` is a
+    /// local of one `exec` invocation, so it counts only the blocks of a *single* frame and can
+    /// never fire on recursion; this is the counter that does.
+    depth: usize,
+}
+
+/// Wukong call depth at which the interpreter gives up.
+///
+/// The tree-walker recurses on the host stack (one `run_function`/`exec`/`eval` frame group per
+/// Wukong call), so unbounded recursion overflows even the 512 MiB [`with_big_stack`] reservation
+/// and **aborts** the process — uncatchable, no diagnostic, and it takes the differential oracle
+/// down with it.
+///
+/// The ceiling is a property of the *host* frame size, so it tracks the build profile. Measured
+/// against that reservation by bisection: the release build completes at depth 300000 and overflows
+/// at 350000 (unchanged for a fatter Wukong frame — five parameters plus three nested-arithmetic
+/// locals — at both -O0 and -O2, because the register file lives on the heap); the debug build,
+/// with no inlining and much larger frames, completes at 50000 and overflows at 55000.
+///
+/// Each limit is the largest value that rejects **no depth measured to work**. The guard trips at
+/// `depth >= MAX_CALL_DEPTH`, so the deepest accepted call is one frame below the limit: 299999 in
+/// release, under the 300000 measured to complete. That matters because the pre-guard interpreter
+/// had no ceiling at all — it simply ran until the stack gave out — so every depth below the true
+/// overflow point used to succeed, and a limit set for "safety margin" is a *regression* over that
+/// band, not a precaution. An earlier 200_000 rejected 200001..300000, all of which complete. Keep
+/// these pinned to the bisection: raising one past its measured ceiling reintroduces the
+/// uncatchable abort, and lowering one silently breaks working programs.
+///
+/// The debug limit must also clear the depth the differential gate actually exercises:
+/// `wukong_codegen_cranelift`'s `differential_deep_recursion` runs `sum(30000)` (30001 frames with
+/// `main`) and asserts native == interp there, so a debug ceiling of 30000 made the *interpreter*
+/// — the semantic oracle — refuse a depth native completes, reintroducing the very divergence that
+/// test exists to catch. 40000 sits above that gate and below the measured 50000 debug ceiling.
+const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) { 40_000 } else { 300_000 };
+
+/// Marshal a recognized-kernel **extent** argument (`rows`, `cols`, `m`, `k`, `n`, `t`, `h`, `s`,
+/// `d`, `half`, `ncoeff`, ...) into a slot count, bailing out of the arm with the kernel's
+/// documented no-op when the extent is non-positive.
+///
+/// A non-positive extent is reachable from ordinary source: these shapes are loop bounds, and
+/// `for i in 0..n` with `n <= 0` runs zero iterations — a well-defined no-op in the language — so
+/// the *recognized* form of the same nest must be a no-op too. Every `wukong_runtime` kernel
+/// implements exactly that, opening with `if rows <= 0 || cols <= 0 { return; }` (`norm.rs:739`,
+/// `gemm.rs:596`, `attention.rs:37`, `rowarg.rs:142`, `velem.rs:185`, ...), so `--backend=native`
+/// completes and leaves the output buffer untouched.
+///
+/// Reading the argument with a bare `as usize` instead wrapped a negative extent to ~`usize::MAX`,
+/// and the `Vec::with_capacity(rows * cols)` marshalling that follows aborted the whole process
+/// with a raw Rust `capacity overflow` panic — an uncatchable abort out of the backend that is
+/// supposed to be the semantic oracle, on input the native backend runs cleanly.
+///
+/// Bailing on a **zero** extent as well is deliberate, and is likewise what the kernels do: e.g.
+/// `wukong_colargmax_i32` with `rows == 0` writes nothing, whereas marshalling it here would have
+/// written `cols` zero indices into the output.
+///
+/// Reductions that *return* a value (`wukong_sreduce_f32`, `wukong_argreduce_f32`, the bf16/f16
+/// dot/sum/reduce family) deliberately do **not** use this: they clamp the count with `.max(0)` and
+/// let the kernel supply its own empty-input identity (`reduce.rs:234` returns 0 / -inf / -1 for
+/// `n <= 0`), which is exactly the value native computes for a negative `n`.
+macro_rules! dim {
+    ($v:expr) => {
+        match $v.as_int() {
+            e if e <= 0 => return Ok(Value::Unit),
+            e => e as usize,
+        }
+    };
 }
 
 impl<'a, 'k> Interp<'a, 'k> {
     fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, String> {
+        // Bound the *host* stack recursion this call is about to perform. `exec`'s step guard is a
+        // local of a single `exec` invocation, so a recursion that runs a handful of blocks per
+        // frame increments no shared counter and would run to a process-killing stack overflow.
+        if self.depth >= MAX_CALL_DEPTH {
+            return Err("interpreter call-depth limit exceeded (likely unbounded recursion)".into());
+        }
+        self.depth += 1;
         // Take a recycled register file (or a fresh one) and size it for this function. Values
         // start as `Unit`, the interpreter's "undefined"; well-formed MIR writes before it reads.
         let mut regs = self.frames.pop().unwrap_or_default();
@@ -460,6 +591,7 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
         let result = self.exec(func, &mut regs);
         self.frames.push(regs);
+        self.depth -= 1;
         result
     }
 
@@ -551,11 +683,11 @@ impl<'a, 'k> Interp<'a, 'k> {
             // ops round at f32, matching the native backend). Scalar bins go the fast path.
             Op::Bin(b, l, r) => {
                 if let Some(MirType::Vec(lane, n)) = rty {
-                    let av = self.vec_lanes(reg(regs, *l));
-                    let bv = self.vec_lanes(reg(regs, *r));
+                    let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
+                    let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| apply_bin(*b, av[i], bv[i], Some(&lane)))
+                        .map(|i| mask_lane(apply_bin(*b, av[i], bv[i], Some(&lane)), &lane))
                         .collect();
                     self.push_vec(lanes)
                 } else {
@@ -565,8 +697,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Cmp(c, l, r) => {
                 if let Some(MirType::Vec(_, n)) = rty {
                     // Lane-wise compare → a mask vector of 1/0 lanes.
-                    let av = self.vec_lanes(reg(regs, *l));
-                    let bv = self.vec_lanes(reg(regs, *r));
+                    let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
+                    let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| Value::Int(apply_cmp(*c, av[i], bv[i]) as i128))
                         .collect();
@@ -580,14 +712,15 @@ impl<'a, 'k> Interp<'a, 'k> {
                     // Lane-wise negate (the autovectorized `-x[k]`). Without this arm a `VecRef`
                     // operand falls into the scalar path below, where `as_int()` yields 0, so every
                     // lane is silently zeroed — a miscompile the native backend does not share.
-                    let xs = self.vec_lanes(reg(regs, *v));
+                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let is_float = lane.is_float();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| {
                             if is_float {
                                 Value::Float(-xs[i].as_float())
                             } else {
-                                Value::Int(-xs[i].as_int())
+                                // Wrap at the lane width: negating `i32::MIN` is `i32::MIN`.
+                                mask_lane(Value::Int(-xs[i].as_int()), lane)
                             }
                         })
                         .collect();
@@ -600,12 +733,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
             }
             Op::Not(v) => {
-                if let Some(MirType::Vec(_lane, n)) = rty {
-                    // Lane-wise bitwise complement. Latent today (the vectorizer does not yet emit a
-                    // vector `Not`), but mirror `Neg` so it can never silently zero lanes.
-                    let xs = self.vec_lanes(reg(regs, *v));
-                    let lanes: Vec<Value> =
-                        (0..*n as usize).map(|i| Value::Int(!xs[i].as_int())).collect();
+                if let Some(MirType::Vec(lane, n)) = rty {
+                    // Lane-wise bitwise complement, truncated to the lane width. Latent today (the
+                    // vectorizer does not yet emit a vector `Not`), but mirror `Neg` so it can
+                    // never silently zero lanes or carry `i128` bits the backend does not have.
+                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| mask_lane(Value::Int(!xs[i].as_int()), lane))
+                        .collect();
                     self.push_vec(lanes)
                 } else {
                     match reg(regs, *v) {
@@ -617,7 +752,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Cast(kind, v, to) => {
                 if let Some(MirType::Vec(to_lane, n)) = rty {
                     // Lane-wise cast (e.g. the vectorized exp's f32->i32 and i32->f32 bitcast).
-                    let xs = self.vec_lanes(reg(regs, *v));
+                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let from_lane = match func.value_type(*v) {
                         MirType::Vec(l, _) => (**l).clone(),
                         other => other.clone(),
@@ -634,9 +769,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Select(c, a, b) => {
                 if let Some(MirType::Vec(_, n)) = rty {
                     // Lane-wise blend by a mask vector.
-                    let m = self.vec_lanes(reg(regs, *c));
-                    let av = self.vec_lanes(reg(regs, *a));
-                    let bv = self.vec_lanes(reg(regs, *b));
+                    let m = self.vec_lanes(reg(regs, *c), *n as usize)?;
+                    let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
+                    let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| if m[i].truthy() { av[i] } else { bv[i] })
                         .collect();
@@ -858,9 +993,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // to the native `fma`. Lane-wise for vectors, each lane rounded to its lane type.
             Op::Fma(a, b, c) => {
                 if let Some(MirType::Vec(lane, n)) = rty {
-                    let av = self.vec_lanes(reg(regs, *a));
-                    let bv = self.vec_lanes(reg(regs, *b));
-                    let cv = self.vec_lanes(reg(regs, *c));
+                    let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
+                    let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
+                    let cv = self.vec_lanes(reg(regs, *c), *n as usize)?;
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| apply_fma(av[i], bv[i], cv[i], Some(&lane)))
@@ -874,7 +1009,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // sqrt stays bit-identical to the native `fsqrt`.
             Op::Sqrt(v) => {
                 if let Some(MirType::Vec(lane, n)) = rty {
-                    let xv = self.vec_lanes(reg(regs, *v));
+                    let xv = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| apply_sqrt(xv[i], Some(&lane)))
@@ -886,7 +1021,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             Op::Round(mode, v) => {
                 if let Some(MirType::Vec(lane, n)) = rty {
-                    let xv = self.vec_lanes(reg(regs, *v));
+                    let xv = self.vec_lanes(reg(regs, *v), *n as usize)?;
                     let lane = (**lane).clone();
                     let lanes: Vec<Value> = (0..*n as usize)
                         .map(|i| apply_round(*mode, xv[i], Some(&lane)))
@@ -906,12 +1041,21 @@ impl<'a, 'k> Interp<'a, 'k> {
         Value::VecRef(i)
     }
 
-    /// The lanes behind a `VecRef` (cloned out so callers can borrow `self` mutably afterwards).
-    fn vec_lanes(&self, v: Value) -> Vec<Value> {
+    /// The `n` lanes behind a `VecRef` (cloned out so callers can borrow `self` mutably afterwards).
+    ///
+    /// An operand that is not an `n`-lane vector is a lowering bug, and every caller indexes
+    /// `0..n` — this used to hand back `vec![other]` for a scalar, so the next index panicked with
+    /// a raw `index out of bounds` instead of producing a diagnostic. The MIR verifier shields the
+    /// `Bin`/`Neg`/`Not`/`Select` arms (it forces operand type == vector result type) but **not**
+    /// `Op::Cast`, whose arm only checks the result: `%r: <4 x i32> = cast sext %s` with a scalar
+    /// `%s` verifies clean and then reached that panic. Report it instead of broadcasting, which
+    /// would hide the lowering bug; the durable fix is an operand check in `wukong_mir::verify`.
+    fn vec_lanes(&self, v: Value, n: usize) -> Result<Vec<Value>, String> {
         match v {
-            Value::VecRef(i) => self.vecs[i as usize].clone(),
-            // A non-vector reaching a vector op is a lowering bug; treat as a single lane.
-            other => vec![other],
+            Value::VecRef(i) if self.vecs[i as usize].len() == n => Ok(self.vecs[i as usize].clone()),
+            _ => Err(format!(
+                "vector op operand is not a {n}-lane vector (MIR invariant violation)"
+            )),
         }
     }
 
@@ -983,6 +1127,17 @@ impl<'a, 'k> Interp<'a, 'k> {
             // is `Float(0.0)` for float elements / `Int(0)` otherwise — the same typed value
             // native's calloc'd zero bits decode to, so a read-before-write observes an identical
             // zero on both backends (the determinism contract).
+            //
+            // **Exhaustion.** The native `wukong_rt_alloc` returns null when the allocator cannot
+            // satisfy the request (crates/wukong_runtime/src/lib.rs). The interpreter cannot return
+            // null: its pointers are slot indices and index 0 is a perfectly ordinary live slot (the
+            // first allocation of a run), so `Value::Ptr(0)` would alias real memory and turn an
+            // out-of-memory condition into silent corruption. It reports a diagnostic instead —
+            // `try_reserve` rather than `resize`, so the request never reaches Rust's allocation-
+            // error handler, which `abort()`s the process with a raw `memory allocation of N bytes
+            // failed` message no caller can catch. One element costs one 32-byte `Value` slot here
+            // against 4 bytes natively, so the interpreter reaches exhaustion ~8x earlier; that
+            // difference is why this path is reachable at all.
             "wukong_rt_alloc" => {
                 let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
                 let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
@@ -992,6 +1147,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Int(0)
                 };
                 let idx = self.memory.len();
+                self.memory.try_reserve(count).map_err(|_| {
+                    format!("interpreter heap exhausted allocating {count} element(s)")
+                })?;
                 self.memory.resize(idx + count, zero);
                 Ok(Value::Ptr(idx))
             }
@@ -1243,9 +1401,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
@@ -1334,8 +1492,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let x = ptr(args[1])?;
                 let y = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let n = args[4].as_int() as usize;
+                let m = dim!(args[3]);
+                let n = dim!(args[4]);
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
                     for t in 0..len {
@@ -1376,8 +1534,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let x = ptr(args[1])?;
                 let y = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let n = args[4].as_int() as usize;
+                let m = dim!(args[3]);
+                let n = dim!(args[4]);
                 let alpha = args[5].as_float() as f32;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
@@ -1420,8 +1578,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let w = ptr(args[0])?;
                 let a = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let alpha = args[5].as_float() as f32;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
@@ -1466,9 +1624,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let mut abuf: Vec<u8> = Vec::with_capacity(m * k);
                 for t in 0..m * k {
                     abuf.push(
@@ -1521,9 +1679,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let scale_a = args[6].as_float() as f32;
                 let scale_b_idx = ptr(args[7])?;
                 let bias_idx = match args[8] {
@@ -1610,7 +1768,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_dequant_f32" | "wukong_dequant_f32_parallel" => {
                 let q = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let scale = args[3].as_float() as f32;
                 let op = args[4].as_int() as i64;
                 let width = op & (0xff << 8);
@@ -1652,8 +1810,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_dequant_perchan_f32" | "wukong_dequant_perchan_f32_parallel" => {
                 let q = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let scale_idx = ptr(args[4])?;
                 let op = args[5].as_int() as i64;
                 let width = op & (0xff << 8);
@@ -1708,9 +1866,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 // An absent bias arrives as a `Value::Int(0)` (the null built as an integer 0) vs a
                 // real array's `Value::Ptr` — distinguished by variant, like the affine-norm params.
@@ -1785,9 +1943,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 let alpha = args[7].as_float() as f32;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
@@ -1835,7 +1993,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -1881,8 +2039,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_transpose_f32" | "wukong_transpose_f32_parallel" => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut sbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2008,8 +2166,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_transpose_u16" | "wukong_transpose_u16_parallel" => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let mut buf = Vec::with_capacity(rows * cols);
                 for t in 0..rows * cols {
                     buf.push(
@@ -2052,8 +2210,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_colrms_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2104,7 +2262,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let n = args[3].as_int() as usize;
+                let n = dim!(args[3]);
                 let op = args[4].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 let mut ybuf = Vec::with_capacity(n);
@@ -2149,8 +2307,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let y = ptr(args[0])?;
                 let dy = ptr(args[1])?;
                 let dx = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut ybuf = Vec::with_capacity(n);
                 let mut dybuf = Vec::with_capacity(n);
@@ -2195,8 +2353,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut abuf = Vec::with_capacity(n);
                 let mut bbuf = Vec::with_capacity(n);
@@ -2254,8 +2412,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let dx = ptr(args[3])?;
-                let rows = args[4].as_int() as usize;
-                let cols = args[5].as_int() as usize;
+                let rows = dim!(args[4]);
+                let cols = dim!(args[5]);
                 let eps_bits = args[6].as_int() as i64;
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
@@ -2326,8 +2484,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let target = ptr(args[1])?;
                 let loss = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2373,8 +2531,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let target = ptr(args[1])?;
                 let dx = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2421,8 +2579,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let inv_freq = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let half = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let half = dim!(args[4]);
                 let n = rows * 2 * half;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2467,8 +2625,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let g = ptr(args[0])?;
                 let inv_freq = ptr(args[1])?;
                 let dx = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let half = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let half = dim!(args[4]);
                 let n = rows * 2 * half;
                 let mut gbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2519,8 +2677,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_entropy_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2565,8 +2723,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_colargmin_i32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2617,8 +2775,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_cumprod_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let n = rows * cols;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2660,8 +2818,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let n = rows * cols;
                 let mut abuf = Vec::with_capacity(n);
                 let mut bbuf = Vec::with_capacity(n);
@@ -2711,7 +2869,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_vmath_bf16" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2745,7 +2903,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_vmath_f16" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2783,7 +2941,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let is_f16 = name == "wukong_vmath_f16_out";
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -2843,7 +3001,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let n = args[3].as_int() as usize;
+                let n = dim!(args[3]);
                 let a = args[4].as_float() as f32;
                 let b = args[5].as_float() as f32;
                 let c = args[6].as_float() as f32;
@@ -2897,8 +3055,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let rows = args[3].as_int() as usize;
-                let cols = args[4].as_int() as usize;
+                let rows = dim!(args[3]);
+                let cols = dim!(args[4]);
                 let op = args[5].as_int() as i64;
                 let n = rows.saturating_mul(cols);
                 let mut xbuf = Vec::with_capacity(n);
@@ -2946,9 +3104,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_vhorner_f32" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = dim!(args[2]);
                 let coeffs = ptr(args[3])?;
-                let ncoeff = args[4].as_int() as usize;
+                let ncoeff = dim!(args[4]);
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
                     xbuf.push(
@@ -2994,7 +3152,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_sreduce_f32" | "wukong_sreduce_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
-                let n = args[2].as_int() as usize;
+                let n = args[2].as_int().max(0) as usize;
                 let op = args[3].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 let mut ybuf = Vec::with_capacity(n);
@@ -3040,7 +3198,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // accelerator seam), so the differential oracle is unaffected.
             "wukong_argreduce_f32" | "wukong_argreduce_f32_parallel" => {
                 let x = ptr(args[0])?;
-                let n = args[1].as_int() as usize;
+                let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -3073,9 +3231,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let (y, n) = if is_dot {
-                    (ptr(args[1])?, args[2].as_int() as usize)
+                    (ptr(args[1])?, args[2].as_int().max(0) as usize)
                 } else {
-                    (x, args[1].as_int() as usize)
+                    (x, args[1].as_int().max(0) as usize)
                 };
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
                     Ok(wukong_runtime::f32_to_bf16_bits(
@@ -3119,7 +3277,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
-                let n = args[1].as_int() as usize;
+                let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -3150,9 +3308,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let (y, n) = if is_dot {
-                    (ptr(args[1])?, args[2].as_int() as usize)
+                    (ptr(args[1])?, args[2].as_int().max(0) as usize)
                 } else {
-                    (x, args[1].as_int() as usize)
+                    (x, args[1].as_int().max(0) as usize)
                 };
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
                     Ok(wukong_runtime::f32_to_f16_bits(
@@ -3193,7 +3351,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
-                let n = args[1].as_int() as usize;
+                let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
                 let mut xbuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -3223,7 +3381,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let n = args[3].as_int() as usize;
+                let n = dim!(args[3]);
                 let a = args[4].as_float() as f32;
                 let b = args[5].as_float() as f32;
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
@@ -3287,7 +3445,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
-                let n = args[3].as_int() as usize;
+                let n = dim!(args[3]);
                 let a = args[4].as_float() as f32;
                 let b = args[5].as_float() as f32;
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
@@ -3371,9 +3529,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 // Read a `[bf16]`/`[f16]` element (stored as the rounded f32 value) back to its exact
                 // 16 stored bits — the same technique the bf16/f16 reductions and axpby use. The bf16
@@ -3436,9 +3594,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
-                let m = args[3].as_int() as usize;
-                let k = args[4].as_int() as usize;
-                let n = args[5].as_int() as usize;
+                let m = dim!(args[3]);
+                let k = dim!(args[4]);
+                let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 // An absent bias arrives as a `Value::Int(0)` (the null built as an integer 0) vs a real
                 // array's `Value::Ptr` — distinguished by variant, like the f32 `nt_epi` epilogue.
@@ -3536,8 +3694,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             "wukong_norm_f32" | "wukong_norm_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let rows = args[2].as_int() as usize;
-                let cols = args[3].as_int() as usize;
+                let rows = dim!(args[2]);
+                let cols = dim!(args[3]);
                 let eps_bits = args[4].as_int() as i64;
                 let op = args[5].as_int() as i64;
                 let n = rows * cols;
@@ -3603,8 +3761,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Ptr(p) => Some(p),
                     _ => None,
                 };
-                let rows = args[4].as_int() as usize;
-                let cols = args[5].as_int() as usize;
+                let rows = dim!(args[4]);
+                let cols = dim!(args[5]);
                 let eps_bits = args[6].as_int() as i64;
                 let op = args[7].as_int() as i64;
                 let n = rows * cols;
@@ -3673,65 +3831,51 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             // `wukong_embedding_f32[_parallel](out, weight, ids, t, h, v)` — embedding lookup (the first
             // layer of every LLM): `out[r,:] = weight[ids[r],:]`. NOTE the output pointer is the FIRST
-            // arg. Marshal the `t` i32 token ids and the f32 weight table out of abstract memory, call the
-            // *serial* kernel (bit-identical to the parallel one — output rows independent), write the
-            // `t*h` f32 result. The recognizer passes a huge `v` sentinel (so its clamp never fires); the
-            // interpreter can't marshal a 2^48-row table, so it derives the *real* table extent from the
-            // ids — `v_eff = max(ids)+1` — and passes that, which marshals exactly the live weight memory
-            // and still leaves every valid id in range (no clamp), matching the native call's gather.
+            // arg.
+            //
+            // The gather runs **row at a time straight against `self.memory`**, in ascending `t`, which
+            // is exactly the source nest `for t { for d { out[t*h+d] = weight[ids[t]*h+d] } }`. It must
+            // not marshal the weight table into a scratch buffer first: that snapshots `weight` before
+            // the first row is written, so when `out` and `weight` are the *same* buffer (an in-place
+            // gather — a legal Wukong program, and the case a shared token/position table produces) the
+            // interpreter computed a different program than the source and than the serial native
+            // kernel, which reads live memory. It also removes the old `v_eff = max(ids) + 1` extent
+            // heuristic the snapshot needed to size that buffer.
+            //
+            // Element-wise this is the identical gather (pure data movement — every output element is a
+            // verbatim copy, so there is no reassociation to keep in sync with the runtime kernel), with
+            // the runtime's own out-of-range rule preserved: an id outside `[0, v)` zeroes its row.
             "wukong_embedding_f32" | "wukong_embedding_f32_parallel" => {
                 let out = ptr(args[0])?;
                 let weight = ptr(args[1])?;
                 let ids = ptr(args[2])?;
-                let t = args[3].as_int() as usize;
-                let h = args[4].as_int() as usize;
-                // Read the `t` token ids (each a `Value::Int`).
-                let mut idbuf = Vec::with_capacity(t);
+                let t = dim!(args[3]);
+                let h = dim!(args[4]);
+                let v = args[5].as_int().max(0) as usize;
                 for r in 0..t {
-                    idbuf.push(
-                        self.memory
-                            .get(ids + r)
-                            .ok_or("embedding ids out of bounds")?
-                            .as_int() as i32,
-                    );
-                }
-                // Effective table height = the largest in-range id + 1 (out-of-range ids zero their row
-                // regardless of `v`, so they don't extend the live extent). This bounds the weight
-                // marshalling to memory that actually exists and keeps every valid id in `[0, v_eff)`.
-                let v_eff = idbuf
-                    .iter()
-                    .filter(|&&id| id >= 0)
-                    .map(|&id| id as usize + 1)
-                    .max()
-                    .unwrap_or(0);
-                let wn = v_eff * h;
-                let mut wbuf = Vec::with_capacity(wn);
-                for i in 0..wn {
-                    wbuf.push(
-                        self.memory
-                            .get(weight + i)
-                            .ok_or("embedding weight out of bounds")?
-                            .as_float() as f32,
-                    );
-                }
-                let mut obuf = vec![0.0f32; t * h];
-                // SAFETY: obuf is t*h f32, wbuf is v_eff*h f32, idbuf is t i32 — the kernel's contract,
-                // with every id < v_eff so no out-of-range path reads past wbuf.
-                unsafe {
-                    wukong_runtime::wukong_embedding_f32(
-                        obuf.as_mut_ptr(),
-                        wbuf.as_ptr(),
-                        idbuf.as_ptr(),
-                        t,
-                        h,
-                        v_eff,
-                    );
-                }
-                for (i, &val) in obuf.iter().enumerate() {
-                    *self
+                    let id = self
                         .memory
-                        .get_mut(out + i)
-                        .ok_or("embedding output out of bounds")? = Value::Float(val as f64);
+                        .get(ids + r)
+                        .ok_or("embedding ids out of bounds")?
+                        .as_int();
+                    for d in 0..h {
+                        let val = if id >= 0 && (id as usize) < v {
+                            let src = weight + id as usize * h + d;
+                            *self
+                                .memory
+                                .get(src)
+                                .ok_or("embedding weight out of bounds")?
+                        } else {
+                            Value::Float(0.0)
+                        };
+                        // Re-marshal through f32 so an `[f32]` table that happens to hold an
+                        // integer-typed slot lands as the f32 the native gather would copy.
+                        *self
+                            .memory
+                            .get_mut(out + r * h + d)
+                            .ok_or("embedding output out of bounds")? =
+                            Value::Float(val.as_float() as f32 as f64);
+                    }
                 }
                 Ok(Value::Unit)
             }
@@ -3744,9 +3888,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let grad_w = ptr(args[0])?;
                 let grad_out = ptr(args[1])?;
                 let ids = ptr(args[2])?;
-                let t = args[3].as_int() as usize;
-                let h = args[4].as_int() as usize;
-                let v = args[5].as_int() as usize;
+                let t = dim!(args[3]);
+                let h = dim!(args[4]);
+                let v = dim!(args[5]);
                 let mut idbuf = Vec::with_capacity(t);
                 for r in 0..t {
                     idbuf.push(
@@ -3805,8 +3949,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let k = ptr(args[1])?;
                 let v = ptr(args[2])?;
                 let out = ptr(args[3])?;
-                let s = args[4].as_int() as usize;
-                let d = args[5].as_int() as usize;
+                let s = dim!(args[4]);
+                let d = dim!(args[5]);
                 let scale = args[6].as_float() as f32;
                 let causal = args[7].as_int() as i64;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
@@ -3964,6 +4108,23 @@ fn mask(v: i128, ty: &MirType) -> i128 {
     }
     let shift = 128 - bits;
     (v << shift) >> shift // sign-extend from `bits`
+}
+
+/// Truncate one *lane* of a SIMD result to its lane width — the vector twin of the normalization
+/// `exec` applies to scalar results.
+///
+/// `exec` only masks a `Value::Int` whose declared result type `is_int()`, and a vector result is a
+/// `Value::VecRef` of a `MirType::Vec` (not an int type), so neither guard reaches a lane. The lane
+/// closures below compute in `i128` (`apply_bin` wraps with `i128::wrapping_*`, `Op::Neg`/`Op::Not`
+/// negate/complement an `i128`), so without this an `<4 x i32>` add of 2000000000 + 2000000000
+/// yields 4000000000 where the native backend wraps to -294967296: the oracle contradicting the
+/// backend it certifies. Float lanes are already rounded to the lane type by the callers and pass
+/// through unchanged.
+fn mask_lane(v: Value, lane: &MirType) -> Value {
+    match v {
+        Value::Int(i) if lane.is_int() => Value::Int(mask(i, lane)),
+        other => other,
+    }
 }
 
 /// `f16`/`bf16`/`f32` results are rounded to `f32` precision (the interpreter promotes sub-`f32`
@@ -4229,6 +4390,159 @@ mod tests {
         run(&program, main, &interner).unwrap()
     }
 
+    /// Like [`run_main`] but returns what the program printed (for results wider than the `i32`
+    /// exit code).
+    fn run_main_stdout(src: &str) -> String {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, _ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let main = interner.intern("main");
+        let (_, out) = run_with_output(&program, main, &interner).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// An integer SIMD lane must wrap at its **lane width**, exactly as the scalar path does — the
+    /// interpreter is the oracle the native backend is certified against, and Cranelift wraps at
+    /// 32/64 bits. The reference values here are hand-computed two's-complement truths, not native
+    /// readings: 2000000000+2000000000 = 4000000000 ≡ -294967296 (mod 2^32), 100000*100000 =
+    /// 10^10 ≡ 1410065408 (mod 2^32), -(-2^31) ≡ -2^31, and 9e18+9e18 = 1.8e19 ≡ -446744073709551616
+    /// (mod 2^64). `mir_build`'s AST vectorizer turns each `for k in 0..64` body into `<4 x i32>` /
+    /// `<2 x i64>` ops, so these exercise the vector arms of `eval`, not the scalar ones.
+    #[test]
+    fn integer_vector_lanes_wrap_at_lane_width() {
+        let fill = "let mut a: [i32; 64] = [0; 64]; let mut b: [i32; 64] = [0; 64]; \
+                    let mut i: i32 = 0; \
+                    while i < 64 { a[i] = 2000000000; b[i] = 2000000000; i = i + 1; }";
+        assert_eq!(
+            run_main(&format!(
+                "fn main() -> i32 {{ {fill} for k in 0..64 {{ a[k] = a[k] + b[k]; }} return a[0]; }}"
+            )),
+            -294967296,
+            "i32 vector add must wrap"
+        );
+
+        let fill_mul = "let mut a: [i32; 64] = [0; 64]; let mut b: [i32; 64] = [0; 64]; \
+                        let mut i: i32 = 0; \
+                        while i < 64 { a[i] = 100000; b[i] = 100000; i = i + 1; }";
+        assert_eq!(
+            run_main(&format!(
+                "fn main() -> i32 {{ {fill_mul} for k in 0..64 {{ a[k] = a[k] * b[k]; }} return a[0]; }}"
+            )),
+            1410065408,
+            "i32 vector multiply must wrap"
+        );
+
+        let fill_neg = "let mut a: [i32; 64] = [0; 64]; let mut i: i32 = 0; \
+                        while i < 64 { a[i] = -2147483647 - 1; i = i + 1; }";
+        assert_eq!(
+            run_main(&format!(
+                "fn main() -> i32 {{ {fill_neg} for k in 0..64 {{ a[k] = -a[k]; }} return a[0]; }}"
+            )),
+            -2147483648,
+            "negating i32::MIN in a lane must wrap back to i32::MIN"
+        );
+
+        let fill64 = "let mut a: [i64; 64] = [0; 64]; let mut b: [i64; 64] = [0; 64]; \
+                      let mut i: i64 = 0; \
+                      while i < 64 { a[i] = 9000000000000000000; \
+                      b[i] = 9000000000000000000; i = i + 1; }";
+        assert_eq!(
+            run_main_stdout(&format!(
+                "fn main() -> i32 {{ {fill64} for k in 0..64 {{ a[k] = a[k] + b[k]; }} \
+                 print(a[0]); return 0; }}"
+            )),
+            "-446744073709551616\n",
+            "i64 vector add must wrap"
+        );
+    }
+
+    /// Unbounded recursion must produce a diagnostic, not a stack overflow. A stack overflow is an
+    /// uncatchable process abort: it takes the whole differential-oracle run (or test binary) down
+    /// and prints an internal Rust message in place of a catalogued error. `exec`'s 100M-step guard
+    /// cannot cover this — it is a local of one `exec` invocation, so a recursion that runs a few
+    /// blocks per frame never increments a shared counter.
+    #[test]
+    fn unbounded_recursion_is_a_diagnostic_not_a_process_abort() {
+        let mut interner = Interner::new();
+        let src = "fn f(n: i32) -> i32 { return f(n + 1); } fn main() -> i32 { return f(0); }";
+        let (module, _) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, _) = wukong_sema::check(&module, &interner);
+        let (program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let main = interner.intern("main");
+        let err = run(&program, main, &interner).unwrap_err();
+        assert!(err.contains("call-depth limit exceeded"), "got: {err}");
+    }
+
+    /// The typed kernel-entry ABI must give the tree-walker the same recursion headroom `run` gets
+    /// (`deep_recursion_does_not_overflow_oracle` above). It used to run on the caller's default
+    /// ~8 MiB stack, so this depth — an eighth of what `run` survives — aborted the whole test
+    /// binary with STATUS_STACK_OVERFLOW.
+    #[test]
+    fn kernel_entry_deep_recursion_does_not_overflow_oracle() {
+        let mut interner = Interner::new();
+        let src = "module m\n\
+            fn rec(v: f32, n: i32) -> f32 { if n == 0 { return v; } return rec(v, n - 1) + 1.0; }\n\
+            fn k(x: [f32; 1], mut out: [f32; 1]) { out[0] = rec(x[0], 20000); }\n";
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+        let mut x = vec![0.0f32; 1];
+        let mut out = vec![0.0f32; 1];
+        run_kernel_f32(&program, interner.intern("k"), &mut [&mut x, &mut out], &interner).unwrap();
+        assert_eq!(out[0], 20000.0);
+    }
+
+
+
+    /// MIR the verifier accepts must never panic the interpreter. `wukong_mir::verify`'s
+    /// `Op::Cast` arm checks only the *result* type, so `%r: <4 x i32> = cast sext %s` with a
+    /// scalar `%s` verifies clean; the vector cast arm then indexed a one-element lane list and
+    /// raised a raw `index out of bounds: the len is 1 but the index is 1`. It must be an
+    /// `Err(String)`, which the driver renders through its normal `error: {e}` path. (The durable
+    /// fix is an operand-lane-count check in the verifier — see the handoff.)
+    #[test]
+    fn vector_op_with_a_scalar_operand_is_an_error_not_a_panic() {
+        use wukong_mir::{BasicBlock, BlockId, CastKind, Function, Inst, MirLevel, Op, Terminator, ValueId};
+        let mut interner = Interner::new();
+        let name = interner.intern("main");
+        // %0: i32 = const 7 ; %1: <4 x i32> = cast sext %0 ; ret %0
+        let f = Function {
+            name,
+            params: Vec::new(),
+            ret: MirType::I32,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                insts: vec![
+                    Inst { result: Some(ValueId(0)), op: Op::ConstInt(7, MirType::I32) },
+                    Inst {
+                        result: Some(ValueId(1)),
+                        op: Op::Cast(CastKind::SExt, ValueId(0), MirType::Vec(Box::new(MirType::I32), 4)),
+                    },
+                ],
+                term: Terminator::Ret(Some(ValueId(0))),
+            }],
+            value_types: vec![MirType::I32, MirType::Vec(Box::new(MirType::I32), 4)],
+            entry: BlockId(0),
+            vec_kernels: Vec::new(),
+        };
+        let mut program = Program::new();
+        program.funcs.push(f);
+        program.level = MirLevel::Low;
+        assert!(
+            wukong_mir::verify::verify_program(&program).is_empty(),
+            "the verifier accepts this MIR today; that is the point of the test"
+        );
+        let err = run(&program, name, &interner).unwrap_err();
+        assert!(err.contains("not a 4-lane vector"), "got: {err}");
+    }
+
     #[test]
     fn runs_loop_sum() {
         let src = "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
@@ -4253,6 +4567,108 @@ mod tests {
         let src = "fn sum(n: i32) -> i32 { if n == 0 { return 0; } return n + sum(n - 1); } \
                    fn main() -> i32 { return sum(1000); }";
         assert_eq!(run_main(src), 500500);
+    }
+
+    /// A recognized kernel called with a **non-positive extent** is a no-op: the shapes come from
+    /// loop bounds, and `for i in 0..n` with `n < 0` runs zero iterations, so the recognized form
+    /// must leave the output buffer alone — which is what every `wukong_runtime` kernel does
+    /// (`if rows <= 0 || cols <= 0 { return; }`) and therefore what `--backend=native` does. The
+    /// interpreter used to read the extent as a bare `as usize`, wrapping to ~`usize::MAX`, and the
+    /// `Vec::with_capacity(rows * cols)` that followed aborted the process with a raw Rust
+    /// `capacity overflow` panic. Each case below dispatches to a different kernel family.
+    #[test]
+    fn non_positive_kernel_extent_is_a_no_op() {
+        // Fused norm (`wukong_norm_f32`): negative row count.
+        assert_eq!(
+            run_main(
+                "fn norm_rows(mut x: [f32; 12], r: i64) { \
+                   for rr in 0..r { let mut ss: f32 = 0.0; \
+                     for i in 0..4 { ss = ss + x[rr*4+i] * x[rr*4+i]; } \
+                     let inv = 1.0 / sqrt(ss / 4.0 + 0.00001); \
+                     for i in 0..4 { x[rr*4+i] = x[rr*4+i] * inv; } } } \
+                 fn main() -> i32 { let mut x: [f32; 12] = [1.0; 12]; let n: i64 = 0 - 1; \
+                   norm_rows(x, n); return (x[0] * 10.0) as i32; }"
+            ),
+            10,
+            "negative rows must leave x untouched"
+        );
+
+        // GEMM (`wukong_sgemm_nt`): negative M.
+        assert_eq!(
+            run_main(
+                "fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16], m: i64) { \
+                   for i in 0..m { for j in 0..4 { let mut s: f32 = 0.0; \
+                     for k in 0..4 { s = s + a[i*4+k] * b[j*4+k]; } c[i*4+j] = s; } } } \
+                 fn main() -> i32 { let mut a: [f32;16] = [1.0;16]; let mut b: [f32;16] = [1.0;16]; \
+                   let mut c: [f32;16] = [2.0;16]; let m: i64 = 0 - 1; mm(a, b, c, m); \
+                   return (c[0] * 10.0) as i32; }"
+            ),
+            20,
+            "negative M must leave C untouched"
+        );
+
+        // Fused attention (`wukong_attention_f32`): negative sequence length.
+        assert_eq!(
+            run_main(
+                "fn main() -> i32 { let mut q: [f32; 16] = [0.0; 16]; let mut k: [f32; 16] = [0.0; 16]; \
+                   let mut v: [f32; 16] = [0.0; 16]; let mut o: [f32; 16] = [1.0; 16]; \
+                   for i in 0..16 { q[i] = (i as f32) * 0.1; k[i] = (i as f32) * 0.2; \
+                     v[i] = (i as f32) * 0.5; } \
+                   sdpa(q, k, v, o, -1, 4, 0.5, 0); return (o[0] * 100.0) as i32; }"
+            ),
+            100,
+            "negative S must leave the attention output untouched"
+        );
+    }
+
+    /// An in-place embedding gather (`out` and `weight` are the *same* buffer) must reproduce the
+    /// sequential source nest, which reads `weight[ids[t]]` **after** the earlier rows have already
+    /// overwritten it. The interpreter used to marshal the whole weight table into a scratch buffer
+    /// first and gather from that snapshot, which is a different program. 766 is the hand reference
+    /// (the nest run over the same inputs), not a reading taken from another backend.
+    #[test]
+    fn embedding_gather_reads_live_memory_when_out_aliases_weight() {
+        let src = "fn embed(ids: [i32;80], weight: [f32;320], mut out: [f32;320]) { \
+                     for t in 0..80 { for d in 0..4 { out[t*4+d] = weight[ids[t]*4+d]; } } } \
+                   fn main() -> i32 { let mut ids: [i32; 80] = [0; 80]; \
+                     let mut buf: [f32; 320] = [0.0; 320]; \
+                     for i in 0..80 { ids[i] = 79 - i; } \
+                     for i in 0..320 { buf[i] = (i as f32); } \
+                     embed(ids, buf, buf); \
+                     let mut s: f32 = 0.0; for i in 0..320 { s = s + buf[i]; } \
+                     return (s / 100.0) as i32; }";
+        assert_eq!(run_main(src), 766);
+
+        // The ordinary disjoint gather must be unchanged: reversing 80 rows of a table whose row `r`
+        // holds `4r..4r+3` sums to the same 0..319 total, and row 0 of the output is the last table
+        // row (316+317+318+319 = 1270).
+        let disjoint = "fn embed(ids: [i32;80], weight: [f32;320], mut out: [f32;320]) { \
+                          for t in 0..80 { for d in 0..4 { out[t*4+d] = weight[ids[t]*4+d]; } } } \
+                        fn main() -> i32 { let mut ids: [i32; 80] = [0; 80]; \
+                          let mut w: [f32; 320] = [0.0; 320]; let mut o: [f32; 320] = [0.0; 320]; \
+                          for i in 0..80 { ids[i] = 79 - i; } \
+                          for i in 0..320 { w[i] = (i as f32); } \
+                          embed(ids, w, o); \
+                          let mut s: f32 = 0.0; for i in 0..320 { s = s + o[i]; } \
+                          return (s as i32) * 10000 + ((o[0] + o[1] + o[2] + o[3]) as i32); }";
+        assert_eq!(run_main(disjoint), 51040 * 10000 + 1270);
+    }
+
+    /// An `alloc_<T>(n)` the interpreter's arena cannot satisfy must report a diagnostic. It used
+    /// to reach Rust's allocation-error handler through `Vec::resize` and `abort()` the process
+    /// with `memory allocation of N bytes failed` — an internal runtime message, and an abort no
+    /// caller (fuzzer, differential harness, test binary) can catch.
+    #[test]
+    fn heap_exhaustion_is_a_diagnostic_not_an_allocator_abort() {
+        let mut interner = Interner::new();
+        let src = "fn main() -> i32 { let mut d: []f32 = alloc_f32(100000000000); \
+                   d[0] = 1.0; free(d); return 0; }";
+        let (module, _) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, _) = wukong_sema::check(&module, &interner);
+        let (program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let main = interner.intern("main");
+        let err = run(&program, main, &interner).unwrap_err();
+        assert!(err.contains("interpreter heap exhausted"), "got: {err}");
     }
 
     #[test]

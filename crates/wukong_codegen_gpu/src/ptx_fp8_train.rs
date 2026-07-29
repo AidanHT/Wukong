@@ -21,13 +21,22 @@ use crate::ptx_fp8::{FP8_TM, FP8_TN};
 
 /// OCP **E5M2** (1 sign, 5 exp bias 15, 2 mantissa; max normal 57344) round-to-nearest-even from `f32`,
 /// returning the 8 stored bits — the wider-range backward-gradient format. Saturates `|x|` to the max
-/// normal (training operands don't carry Inf into the GEMM); subnormals (|x| < 2⁻¹⁴) flush toward zero
-/// (the gates use normal-range data). The E5M2 twin of [`crate::ptx_fp8::f32_to_e4m3`].
+/// normal (training operands don't carry Inf into the GEMM). The E5M2 twin of
+/// [`crate::ptx_fp8::f32_to_e4m3`].
+///
+/// **Subnormals are encoded, not flushed** (values `m·2⁻¹⁶`, `m ∈ 1..=3`, covering `[2⁻¹⁶, 2⁻¹⁴)`),
+/// and `-0.0` keeps its sign bit — because this function is the *host half* of a codec whose device
+/// half is Ada's `cvt.rn.satfinite.e5m2x2.f32` ([`quantize_scaled_e5m2_ptx`]), which does both. The
+/// old flush-to-zero made the two halves disagree: `f32_to_e5m2(1.5e-5)` returned `0x00` while the
+/// device returned `0x01`, so a tile quantized on the host and a tile quantized on the device fed the
+/// tensor cores different bits. It also made the fp8 GEMM gates a *circular* oracle w.r.t. this
+/// encoder (both sides call it), so nothing could observe the disagreement — see
+/// `e5m2_host_matches_device_converter`.
 pub fn f32_to_e5m2(x: f32) -> u8 {
+    let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
     if x == 0.0 {
-        return 0;
+        return sign; // ±0 — the device converter preserves the sign of -0.0
     }
-    let sign = if x < 0.0 { 0x80u8 } else { 0 };
     let a = x.abs();
     if a.is_nan() {
         return sign | 0x7f; // exp=31, mant!=0 => NaN
@@ -38,7 +47,17 @@ pub fn f32_to_e5m2(x: f32) -> u8 {
     let mant = bits & 0x7f_ffff;
     let exp = e + 15; // e5m2 biased exponent
     if exp <= 0 {
-        return sign; // flush subnormals to zero (test data avoids this range)
+        // Subnormal range: the value is `m · 2⁻¹⁶` with `m = round_ties_even(|x| · 2¹⁶)`. Round the
+        // *explicit* 24-bit significand `1.mant` right by `sh = 22 - exp >= 22` bits, ties to even.
+        let sh = (22 - exp) as u32;
+        if sh >= 32 {
+            return sign; // |x| < 2⁻¹⁷ — rounds to ±0 (also catches f32 subnormal inputs)
+        }
+        let full = (1u32 << 23) | mant; // < 2^24, so `full + round_bias` cannot overflow u32
+        let round_bias = (1u32 << (sh - 1)) - 1 + ((full >> sh) & 1);
+        let m = (full + round_bias) >> sh;
+        // m == 4 carries out of the subnormal range into the smallest normal (exp field 1, mant 0).
+        return if m >= 4 { sign | 0x04 } else { sign | (m as u8) };
     }
     // round the 23-bit mantissa to 2 bits, ties-to-even
     let shift = 23 - 2;
@@ -345,6 +364,83 @@ mod tests {
         assert_eq!(e5m2_to_f32(f32_to_e5m2(1.375)), 1.5); // tie to even mantissa (10b)
         // Wider range than E4M3 (whose max is 448): 1024 is representable in E5M2.
         assert_eq!(e5m2_to_f32(f32_to_e5m2(1024.0)), 1024.0);
+    }
+
+    /// **Subnormals and signed zero round-trip** (no GPU). E5M2's subnormals are `m·2⁻¹⁶` for
+    /// `m ∈ 1..=3`, i.e. exactly `[2⁻¹⁶, 2⁻¹⁴)`; they used to be flushed to zero, which silently
+    /// dropped every gradient element below 2⁻¹⁴ *and* disagreed with the device converter.
+    #[test]
+    fn e5m2_subnormals_and_signed_zero() {
+        let d = 2f32.powi(-16); // the smallest positive E5M2 subnormal
+        for (v, bits) in [
+            (d, 0x01u8),
+            (2.0 * d, 0x02),
+            (3.0 * d, 0x03),
+            (-d, 0x81),
+            (-3.0 * d, 0x83),
+            (4.0 * d, 0x04),  // 2^-14: the smallest NORMAL (carry out of the subnormal range)
+            (-0.0, 0x80),     // the sign bit survives ±0
+            (0.0, 0x00),
+        ] {
+            assert_eq!(f32_to_e5m2(v), bits, "f32_to_e5m2({v:e}) should be {bits:#04x}");
+            // Exactly representable => the decode returns the same magnitude.
+            assert_eq!(e5m2_to_f32(bits).abs(), v.abs(), "e5m2_to_f32({bits:#04x})");
+        }
+        // Round-to-nearest-even inside the subnormal range, including the two ties.
+        assert_eq!(f32_to_e5m2(1.4 * d), 0x01, "1.4d rounds down to 1d");
+        assert_eq!(f32_to_e5m2(1.5 * d), 0x02, "tie 1.5d -> even (2d)");
+        assert_eq!(f32_to_e5m2(2.5 * d), 0x02, "tie 2.5d -> even (2d)");
+        assert_eq!(f32_to_e5m2(2.6 * d), 0x03, "2.6d rounds up to 3d");
+        // Below half the smallest subnormal everything still flushes (with its sign).
+        assert_eq!(f32_to_e5m2(0.4 * d), 0x00);
+        assert_eq!(f32_to_e5m2(-0.4 * d), 0x80);
+        assert_eq!(f32_to_e5m2(0.5 * d), 0x00, "tie 0.5d -> even (zero)");
+        assert_eq!(f32_to_e5m2(f32::MIN_POSITIVE / 4.0), 0x00, "an f32 subnormal input flushes");
+    }
+
+    /// **The host encoder and the device converter must produce the SAME BITS** — the two halves of
+    /// one codec. `quantize_scaled_e5m2` is Ada's hardware `cvt.rn.satfinite.e5m2x2.f32`; this host
+    /// encoder is the f64 oracle every fp8 gate decodes with. Because the GEMM gates call the host
+    /// encoder on *both* sides they are circular w.r.t. it, so this byte-for-byte comparison against an
+    /// independent implementation (the silicon) is the only thing that can catch an encoder bug — and
+    /// it did: the flush-to-zero path disagreed on the whole subnormal range and on `-0.0`.
+    #[test]
+    fn e5m2_host_matches_device_converter() {
+        let d = 2f32.powi(-16);
+        let mut xs: Vec<f32> = vec![
+            0.0, -0.0, d, -d, 1.4 * d, 1.5 * d, 2.5 * d, 3.0 * d, 4.0 * d, 0.5 * d, -0.4 * d,
+            1.0, -1.0, 1.3, 1.375, 0.5, -3.5, 256.0, -49152.0, 57344.0, -57344.0, 1e-5, -1e-5,
+            f32::MIN_POSITIVE, 6.1e-5, -6.1e-5,
+        ];
+        let mut rng = crate::diff::Rng::new(0xE5E5);
+        xs.extend(rng.vec(256, -2.0, 2.0));
+        xs.extend(rng.vec(256, -1e-4, 1e-4)); // straddles the subnormal boundary
+        if xs.len() % 2 == 1 {
+            xs.push(0.0); // the packed device converter needs an even count
+        }
+        let want: Vec<u8> = xs.iter().map(|&v| f32_to_e5m2(v)).collect();
+        let mut guard = crate::gpu::gpu();
+        let Some(g) = guard.as_mut() else {
+            crate::diff::skip_or_fail(
+                "e5m2_host_matches_device_converter",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        };
+        let got = crate::gpu::quantize_scaled_fp8(g, &xs, 1.0, true).unwrap();
+        let bad: Vec<String> = got
+            .iter()
+            .zip(&want)
+            .zip(&xs)
+            .filter(|((a, b), _)| a != b)
+            .map(|((a, b), x)| format!("x={x:e}: device {a:#04x} != host {b:#04x}"))
+            .collect();
+        assert!(bad.is_empty(), "host/device E5M2 encoders disagree:\n{}", bad.join("\n"));
+        eprintln!(
+            "[gate] E5M2 host encoder == device cvt.rn.satfinite.e5m2x2.f32 on {} values \
+             (subnormals and -0.0 included) ✓",
+            xs.len()
+        );
     }
 
     /// Delayed scaling maps a tensor whose max magnitude **exceeds E4M3's range** (1000 > 448) into the

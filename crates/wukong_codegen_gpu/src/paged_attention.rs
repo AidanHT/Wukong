@@ -8,25 +8,38 @@
 //! stable **online softmax** with **FP32 accumulators** (the precision vLLM/TRT-LLM use for the logits
 //! and the V-accumulation).
 //!
-//! ## Kernel shape (correctness-first v1)
-//! One **thread per `(slot, head)`** (grid = `ceil(num_slots*heads / BLOCK)` CTAs of `BLOCK` threads),
-//! each thread fully sequential over its context. This trades the warp-cooperative coalescing of
-//! vLLM's kernel for two decisive simplifications: it is **trivially bit-exact across physical block
-//! layouts** (one thread, one fixed accumulation order — the block table only changes *where* a value
-//! is read, never the value or the order), and it has **no shared-memory logits buffer**, so it handles
-//! arbitrary context length with no v2-style split-K (vLLM needs v2 past 8192 tokens precisely to dodge
-//! that SMEM shortage). The head dim is **unrolled into registers** and the query vector is **cached in
-//! registers** across the whole context loop (read once, reused every position); the block-table walk
-//! is **incremental** (track `logical`/`offset` as the position advances) so there is no per-position
-//! integer divide. A warp-cooperative rewrite is the documented next perf lever.
+//! ## Kernel shape (warp-cooperative)
+//! One **warp per `(slot, head)`**, [`PAGED_ATTN_WARPS`] pairs per CTA — grid =
+//! `ceil(num_slots*heads / PAGED_ATTN_WARPS)` CTAs of `32 * PAGED_ATTN_WARPS` threads. Each warp
+//! stages its query vector once into **shared memory** (`qsh`, one `head_dim` row per warp) and its 32
+//! lanes then split the context by position — lane `i` owns `{t : t % 32 == i}` — each carrying its own
+//! online-softmax state (`m`, `l`, and a `head_dim`-wide register accumulator `%acc0..`, unrolled). A
+//! fixed `shfl.sync.bfly` butterfly (offsets `16,8,4,2,1`) merges the lanes at the end: `max` for `m`,
+//! a rescale by `exp(m−M)`, then `add` for `l` and for every accumulator; lane 0 writes the normalized
+//! row. There is **no shared-memory logits buffer**, so arbitrary context length works with no v2-style
+//! split-K (vLLM needs v2 past 8192 tokens precisely to dodge that SMEM shortage). The block-table walk
+//! is *not* incremental — a `div.u32` per position recovers `logical`/`offset`; making it incremental
+//! is still an unclaimed perf lever.
 //!
 //! ## The first-law property the gates prove
 //! - **Absolute correctness**: tolerance-gated vs an f64 full-softmax CPU reference
 //!   ([`reference_decode_attn`]) — the only legitimate error is the GPU's `ex2.approx` exp + f32 order.
 //! - **Paging is numerically invisible**: the kernel output is **bit-for-bit identical** when the same
 //!   logical sequences are laid into two *different* physical block layouts (contiguous vs a fragmented
-//!   free-list order). True by construction; the `paged_attention_invariant_to_block_layout` gate proves
-//!   it to the bit (the decode analogue of int8 split-K / transpose bit-exactness).
+//!   free-list order); the `paged_attention_invariant_to_block_layout` gate proves it to the bit (the
+//!   decode analogue of int8 split-K / transpose bit-exactness).
+//!
+//! ### The invariant that property rests on (load-bearing — read before touching the loop)
+//! It is **not** "one thread, one fixed accumulation order". It is two separate facts:
+//! 1. the lane partition is a function of the **logical position index alone** (`t % 32`), so no
+//!    physical block id can influence *which* lane a value lands in; and
+//! 2. the cross-lane merge order is a **fixed** butterfly sequence.
+//!
+//! The block table therefore only changes *where* a value is read, never which partial accumulates it
+//! nor in what order. Re-partitioning the lanes for coalescing stays safe only while it remains
+//! position-keyed: partitioning by *physical block* — the obvious next optimization, and one that still
+//! satisfies "one fixed accumulation order per lane" — makes the accumulation order a function of the
+//! layout and breaks bit-exactness.
 
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
@@ -34,6 +47,9 @@ use std::sync::Arc;
 #[cfg(feature = "gpu")]
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg};
 
+// Only the (gpu-gated) launchers and device gates take a `KvConfig`; the generators, the quantizer
+// and the f64 reference are geometry-free, which is what lets this module compile un-gated.
+#[cfg(feature = "gpu")]
 use crate::paged_kv::KvConfig;
 
 /// `(slot, head)` pairs per CTA — one **warp** each (block_dim = `32 * PAGED_ATTN_WARPS`). The warp's
@@ -50,7 +66,7 @@ pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
 /// lanes split the context positions (`lane, lane+32, …`), each keeping a partial online-softmax state,
 /// then a fixed shfl-butterfly merge combines them (`m`→max, rescale, `l`/`acc`→sum). The query vector
 /// lives in shared memory (one copy per warp, read by every lane). `PAGED_ATTN_WARPS` `(slot,head)`
-/// pairs per CTA. Layout matches [`KvConfig::elem_offset`]: `[layers, num_blocks, block_size, heads,
+/// pairs per CTA. Layout matches [`crate::paged_kv::KvConfig::elem_offset`]: `[layers, num_blocks, block_size, heads,
 /// head_dim]`, f16 cache, f32 query/out. **Bit-exact across block layouts** (the lane partition + merge
 /// order are layout-independent; the block table only changes the load address).
 pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
@@ -199,6 +215,10 @@ pub fn launch_paged_attn_decode(
 ) -> Result<(), DriverError> {
     debug_assert_eq!(q_d.len(), bcap * cfg.heads * cfg.head_dim, "q must be [bcap, heads*head_dim]");
     debug_assert_eq!(out_d.len(), bcap * cfg.heads * cfg.head_dim, "out must be [bcap, heads*head_dim]");
+    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "k slab must be cfg.slab_elems()");
+    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "v slab must be cfg.slab_elems()");
+    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(cl_d.len(), bcap, "context lengths must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let cfg_launch = LaunchConfig {
         grid_dim: (nq.div_ceil(PAGED_ATTN_WARPS), 1, 1),
@@ -211,6 +231,13 @@ pub fn launch_paged_attn_decode(
     let mut b = stream.launch_builder(func);
     b.arg(q_d).arg(k_d).arg(v_d).arg(out_d).arg(bt_d).arg(cl_d).arg(&scale);
     b.arg(&bcap_u).arg(&heads).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    // SAFETY: the pushed arguments match `PAGED_ATTN_ENTRY`'s parameter list in order and width (six
+    // .u64 pointers, one .f32, six .u32 — see `paged_attn_decode_ptx`), and `func` was loaded from PTX
+    // generated for `cfg.head_dim` (the entry is head_dim-specialized). Every buffer is at least as long
+    // as the largest index this kernel's address arithmetic can produce for `bcap` slots at `layer`: the
+    // `%e` chain reproduces `KvConfig::elem_offset`, bounded by `slab_elems()`; `BT[slot*mbps+logical]`
+    // by `bcap * max_blocks_per_seq`; `CL[slot]` and the `Q`/`O` rows by the shapes asserted above —
+    // which the caller guarantees and the debug asserts check at the call site.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
@@ -359,6 +386,14 @@ pub fn launch_paged_attn_decode_int8(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    debug_assert_eq!(q_d.len(), bcap * cfg.heads * cfg.head_dim, "q must be [bcap, heads*head_dim]");
+    debug_assert_eq!(out_d.len(), bcap * cfg.heads * cfg.head_dim, "out must be [bcap, heads*head_dim]");
+    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "int8 k slab must be cfg.slab_elems()");
+    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "int8 v slab must be cfg.slab_elems()");
+    debug_assert_eq!(ksc_d.len(), cfg.scale_slab_elems(), "k scale slab must be cfg.scale_slab_elems()");
+    debug_assert_eq!(vsc_d.len(), cfg.scale_slab_elems(), "v scale slab must be cfg.scale_slab_elems()");
+    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(cl_d.len(), bcap, "context lengths must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let cfg_launch = LaunchConfig {
         grid_dim: (nq.div_ceil(PAGED_ATTN_WARPS), 1, 1),
@@ -371,6 +406,13 @@ pub fn launch_paged_attn_decode_int8(
     let mut b = stream.launch_builder(func);
     b.arg(q_d).arg(k_d).arg(v_d).arg(ksc_d).arg(vsc_d).arg(out_d).arg(bt_d).arg(cl_d).arg(&scale);
     b.arg(&bcap_u).arg(&heads).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    // SAFETY: the pushed arguments match `PAGED_ATTN_INT8_ENTRY`'s parameter list in order and width
+    // (eight .u64 pointers, one .f32, six .u32 — see `paged_attn_decode_int8_ptx`), and `func` was
+    // loaded from PTX generated for `cfg.head_dim`. Every buffer is at least as long as the largest
+    // index the kernel can produce for `bcap` slots at `layer`: `%e` reproduces `KvConfig::elem_offset`
+    // (bounded by `slab_elems()`) and `%es` reproduces `KvConfig::scale_offset` (bounded by
+    // `scale_slab_elems()`); the table/lengths/rows are bounded by the shapes asserted above, which the
+    // caller guarantees and the debug asserts check at the call site.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
@@ -489,6 +531,13 @@ pub fn launch_kv_append(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
+    debug_assert_eq!(knew_d.len(), bcap * cfg.heads * cfg.head_dim, "knew must be [bcap, heads*head_dim]");
+    debug_assert_eq!(vnew_d.len(), bcap * cfg.heads * cfg.head_dim, "vnew must be [bcap, heads*head_dim]");
+    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "k slab must be cfg.slab_elems()");
+    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "v slab must be cfg.slab_elems()");
+    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(wpos_d.len(), bcap, "write positions must be one u32 per slot");
+    debug_assert_eq!(active_d.len(), bcap, "active mask must be one u32 per slot");
     let total = (bcap * cfg.heads * cfg.head_dim) as u32;
     let launch = LaunchConfig {
         grid_dim: (total.div_ceil(KV_APPEND_BLOCK), 1, 1),
@@ -507,6 +556,14 @@ pub fn launch_kv_append(
     let mut b = stream.launch_builder(func);
     b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(bt_d).arg(wpos_d).arg(active_d);
     b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    // SAFETY: the pushed arguments match `KV_APPEND_ENTRY`'s parameter list in order and width (seven
+    // .u64 pointers, seven .u32 — see `kv_append_ptx`). Every buffer is at least as long as the largest
+    // index the kernel can produce for `bcap` slots at `layer`: the store index `%e` reproduces
+    // `KvConfig::elem_offset` (bounded by `slab_elems()`), the load index is the thread's own `gid <
+    // bcap*heads*hd`, and `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. That,
+    // plus each active slot's write position already having a reserved block (the caller's contract,
+    // established by `BlockManager::append`), is what keeps the scatter inside the slabs. The debug
+    // asserts above check the lengths at the call site.
     unsafe { b.launch(launch)? };
     Ok(())
 }
@@ -648,6 +705,15 @@ pub fn launch_kv_append_int8(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
+    debug_assert_eq!(knew_d.len(), bcap * cfg.heads * cfg.head_dim, "knew must be [bcap, heads*head_dim]");
+    debug_assert_eq!(vnew_d.len(), bcap * cfg.heads * cfg.head_dim, "vnew must be [bcap, heads*head_dim]");
+    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "int8 k slab must be cfg.slab_elems()");
+    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "int8 v slab must be cfg.slab_elems()");
+    debug_assert_eq!(ksc_d.len(), cfg.scale_slab_elems(), "k scale slab must be cfg.scale_slab_elems()");
+    debug_assert_eq!(vsc_d.len(), cfg.scale_slab_elems(), "v scale slab must be cfg.scale_slab_elems()");
+    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(wpos_d.len(), bcap, "write positions must be one u32 per slot");
+    debug_assert_eq!(active_d.len(), bcap, "active mask must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let launch = LaunchConfig {
         grid_dim: (nq.div_ceil(KV_APPEND_INT8_WARPS), 1, 1),
@@ -666,6 +732,14 @@ pub fn launch_kv_append_int8(
     let mut b = stream.launch_builder(func);
     b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(ksc_d).arg(vsc_d).arg(bt_d).arg(wpos_d).arg(active_d);
     b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    // SAFETY: the pushed arguments match `KV_APPEND_INT8_ENTRY`'s parameter list in order and width
+    // (nine .u64 pointers, seven .u32 — see `kv_append_int8_ptx`). Every buffer is at least as long as
+    // the largest index the kernel can produce for `bcap` slots at `layer`: `%e` reproduces
+    // `KvConfig::elem_offset` (bounded by `slab_elems()`), `%es` reproduces `KvConfig::scale_offset`
+    // (bounded by `scale_slab_elems()`), the source row base is `gid*hd < bcap*heads*hd`, and
+    // `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. As for the f16 append, the
+    // caller also guarantees every active slot's write position has a reserved block. The debug asserts
+    // above check the lengths at the call site.
     unsafe { b.launch(launch)? };
     Ok(())
 }
@@ -731,24 +805,70 @@ pub fn reference_decode_attn(
 mod tests {
     use super::*;
 
+    /// Both head dims `serving::DecodeLayer` will accept (it asserts `head_dim ∈ {64, 128}`). The
+    /// 128-wide lane had no gate at all until this loop: nothing generated it, so a shape or ASCII
+    /// regression there surfaced first as a `CUDA_ERROR_INVALID_PTX` at model construction.
+    const GATED_HEAD_DIMS: [usize; 2] = [64, 128];
+
     // PTX shape sanity (no device): the generator emits the entry, an unrolled query cache + accumulator
     // sized to head_dim, the exp recurrence, and a single bit-exact-friendly output normalize.
     #[test]
     fn ptx_generator_is_well_formed() {
-        let ptx = paged_attn_decode_ptx(64);
-        assert!(ptx.contains(".visible .entry paged_attn_decode("));
+        for hd in GATED_HEAD_DIMS {
+            let ptx = paged_attn_decode_ptx(hd);
+            assert!(ptx.contains(".visible .entry paged_attn_decode("));
+            assert!(ptx.contains(".target sm_89"));
+            assert!(ptx.contains(&format!("%acc{}", hd - 1)), "head dim {hd} must unroll the V accumulator");
+            assert!(!ptx.contains(&format!("%acc{hd}")), "must not over-unroll past head_dim {hd}");
+            assert!(
+                ptx.contains(&format!("qsh[{}]", PAGED_ATTN_WARPS as usize * hd)),
+                "per-warp query staging in shared (WARPS*head_dim)"
+            );
+            assert!(ptx.contains("ld.shared.f32"), "query read from shared in the dot");
+            assert!(ptx.contains("shfl.sync.bfly.b32"), "cross-lane online-softmax merge");
+            assert!(ptx.contains("bar.warp.sync"), "warp sync after staging q");
+            assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
+            assert!(ptx.contains("cvt.f32.f16"), "f16 cache widened to f32");
+            // The output uses rcp + select (the empty-sequence NaN guard).
+            assert!(ptx.contains("rcp.rn.f32") && ptx.contains("selp.f32"));
+            assert!(ptx.is_ascii(), "PTX must be pure ASCII (head_dim {hd})");
+            // Balanced braces.
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
+        }
+    }
+
+    // int8 decode-attention PTX shape sanity (no device), at both gated head dims: int8 cache loads
+    // (never an f16 widen), the accumulator unroll, the cross-lane merge, ASCII, balanced braces.
+    #[test]
+    fn int8_attn_ptx_is_well_formed() {
+        for hd in GATED_HEAD_DIMS {
+            let ptx = paged_attn_decode_int8_ptx(hd);
+            assert!(ptx.contains(".visible .entry paged_attn_decode_int8("));
+            assert!(ptx.contains(".target sm_89"));
+            assert!(ptx.contains("ld.global.s8"), "int8 cache read");
+            assert!(!ptx.contains("cvt.f32.f16"), "the int8 kernel stores no f16 — nothing to widen");
+            assert!(ptx.contains(&format!("%acc{}", hd - 1)), "head dim {hd} must unroll the V accumulator");
+            assert!(!ptx.contains(&format!("%acc{hd}")), "must not over-unroll past head_dim {hd}");
+            assert!(ptx.contains(&format!("qsh[{}]", PAGED_ATTN_WARPS as usize * hd)));
+            assert!(ptx.contains("shfl.sync.bfly.b32"), "cross-lane online-softmax merge");
+            assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
+            assert!(ptx.is_ascii(), "PTX must be pure ASCII (head_dim {hd})");
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
+        }
+    }
+
+    // f16 KV-append PTX shape sanity (no device): the entry, the narrowing store, and the
+    // inactive-slot early-out that keeps a padding row (block-table 0) off a live block.
+    #[test]
+    fn kv_append_ptx_is_well_formed() {
+        let ptx = kv_append_ptx();
+        assert!(ptx.contains(".visible .entry kv_append("));
         assert!(ptx.contains(".target sm_89"));
-        assert!(ptx.contains("%acc63"), "head dim must unroll the V accumulator to 64 regs");
-        assert!(!ptx.contains("%acc64"), "must not over-unroll past head_dim");
-        assert!(ptx.contains("qsh[256]"), "per-warp query staging in shared (WARPS*head_dim)");
-        assert!(ptx.contains("ld.shared.f32"), "query read from shared in the dot");
-        assert!(ptx.contains("shfl.sync.bfly.b32"), "cross-lane online-softmax merge");
-        assert!(ptx.contains("bar.warp.sync"), "warp sync after staging q");
-        assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
-        assert!(ptx.contains("cvt.f32.f16"), "f16 cache widened to f32");
-        // The output uses rcp + select (the empty-sequence NaN guard).
-        assert!(ptx.contains("rcp.rn.f32") && ptx.contains("selp.f32"));
-        // Balanced braces.
+        assert!(ptx.contains("cvt.rn.f16.f32"), "f32 input narrowed into the f16 cache");
+        assert!(ptx.contains("st.global.b16"), "f16 value store");
+        assert!(ptx.contains("setp.eq.u32 %p0,%tmp,0;"), "active-mask test");
+        assert!(ptx.contains("@%p0 bra DONE;"), "inactive rows exit before any store");
+        assert!(ptx.is_ascii(), "PTX must be pure ASCII");
         assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
     }
 
@@ -882,10 +1002,13 @@ mod tests {
         let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
         let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
         let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+        // `Gpu::function` caches on the key alone and never re-examines the PTX on a hit, so a key
+        // shared by two head dims silently hands the second one the first's compiled kernel. No
+        // catch-all: an unmapped head dim must fail loudly, as the production path does (serving.rs).
         let key: &'static str = match cfg.head_dim {
             64 => "paged_attn_d64",
             128 => "paged_attn_d128",
-            _ => "paged_attn_dX",
+            other => panic!("paged-attn test harness: no module-cache key for head_dim {other}; add an arm"),
         };
         let func = g.function(key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY).unwrap();
         launch_paged_attn_decode(&g.stream, &func, &q_d, &k_d, &v_d, &mut out_d, &bt_d, &cl_d, cfg, layer, bcap, scale)
@@ -930,27 +1053,31 @@ mod tests {
     /// f64 full-softmax reference within tolerance — the only legitimate error is the GPU's `ex2.approx`
     /// exp and f32 accumulation order (K/V are pre-rounded to f16 so storage precision cancels). Ragged
     /// context lengths (incl. an inactive 0, a single block, and non-block-multiple lengths) exercise the
-    /// block-table walk and the empty-sequence guard.
+    /// block-table walk and the empty-sequence guard. Run at **both** head dims the serving layer
+    /// advertises: `head_dim = 128` doubles the register accumulator (~190 virtual regs/thread) and had
+    /// never been JIT-loaded, let alone compared to the reference.
     #[cfg(feature = "gpu")]
     #[test]
     fn paged_attention_matches_reference() {
         with_gpu("paged_attention_matches_reference", |g| {
-            let (heads, hd, block_size) = (4usize, 64usize, 16usize);
-            let (cfg, ctx, q, k, v, scale) =
-                fixture(0x5E13, heads, hd, block_size, vec![37, 0, 16, 100, 5, 64]);
-            let mut mgr = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
-            for b in 0..cfg.num_slots {
-                if ctx[b] > 0 {
-                    mgr.reserve(b, ctx[b]).unwrap();
+            for hd in GATED_HEAD_DIMS {
+                let (heads, block_size) = (4usize, 16usize);
+                let (cfg, ctx, q, k, v, scale) =
+                    fixture(0x5E13, heads, hd, block_size, vec![37, 0, 16, 100, 5, 64]);
+                let mut mgr = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+                for b in 0..cfg.num_slots {
+                    if ctx[b] > 0 {
+                        mgr.reserve(b, ctx[b]).unwrap();
+                    }
                 }
+                let got = run_paged_attn(g, &mgr, &cfg, 0, &q, &k, &v, scale);
+                let refv = reference_decode_attn(&q, &k, &v, &ctx, heads, hd, scale);
+                let s = crate::diff::assert_close("paged_attn_decode", &got, &refv, 1e-2, 3e-3);
+                eprintln!(
+                    "paged decode-attn vs f64 ref: max_abs={:.2e} max_rel={:.2e} (bcap={}, heads={heads}, hd={hd}, ragged ctx {:?})",
+                    s.max_abs, s.max_rel, cfg.num_slots, ctx
+                );
             }
-            let got = run_paged_attn(g, &mgr, &cfg, 0, &q, &k, &v, scale);
-            let refv = reference_decode_attn(&q, &k, &v, &ctx, heads, hd, scale);
-            let s = crate::diff::assert_close("paged_attn_decode", &got, &refv, 1e-2, 3e-3);
-            eprintln!(
-                "paged decode-attn vs f64 ref: max_abs={:.2e} max_rel={:.2e} (bcap={}, heads={heads}, hd={hd}, ragged ctx {:?})",
-                s.max_abs, s.max_rel, cfg.num_slots, ctx
-            );
         });
     }
 
@@ -1055,10 +1182,11 @@ mod tests {
         let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
         let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
         let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+        // No catch-all — see the f16 twin in `run_paged_attn`: one cache key must mean one PTX.
         let key: &'static str = match cfg.head_dim {
             64 => "paged_attn_int8_d64",
             128 => "paged_attn_int8_d128",
-            _ => "paged_attn_int8_dX",
+            other => panic!("paged-attn int8 test harness: no module-cache key for head_dim {other}; add an arm"),
         };
         let func = g.function(key, &paged_attn_decode_int8_ptx(cfg.head_dim), PAGED_ATTN_INT8_ENTRY).unwrap();
         launch_paged_attn_decode_int8(
@@ -1076,24 +1204,26 @@ mod tests {
     #[test]
     fn paged_int8_attention_matches_reference() {
         with_gpu("paged_int8_attention_matches_reference", |g| {
-            let (heads, hd, block_size) = (4usize, 64usize, 16usize);
-            let (cfg, ctx, q, k, v, scale) =
-                fixture(0x171AB, heads, hd, block_size, vec![37, 0, 16, 100, 5, 64]);
-            let mut mgr = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
-            for b in 0..cfg.num_slots {
-                if ctx[b] > 0 {
-                    mgr.reserve(b, ctx[b]).unwrap();
+            for hd in GATED_HEAD_DIMS {
+                let (heads, block_size) = (4usize, 16usize);
+                let (cfg, ctx, q, k, v, scale) =
+                    fixture(0x171AB, heads, hd, block_size, vec![37, 0, 16, 100, 5, 64]);
+                let mut mgr = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+                for b in 0..cfg.num_slots {
+                    if ctx[b] > 0 {
+                        mgr.reserve(b, ctx[b]).unwrap();
+                    }
                 }
+                let got = run_paged_attn_int8(g, &mgr, &cfg, 0, &q, &k, &v, scale);
+                let refv = reference_decode_attn(&q, &k, &v, &ctx, heads, hd, scale);
+                // int8-KV achieves max_abs ~3e-3 here; gate at 1e-2 (3× headroom) to catch regressions.
+                let s = crate::diff::assert_close("paged_attn_int8", &got, &refv, 1e-2, 5e-2);
+                eprintln!(
+                    "int8-KV decode-attn vs f64 ref: max_abs={:.2e} max_rel={:.2e} (hd={hd}, per-(token,head) int8 \
+                     K/V, f32 Q; ragged ctx {:?})",
+                    s.max_abs, s.max_rel, ctx
+                );
             }
-            let got = run_paged_attn_int8(g, &mgr, &cfg, 0, &q, &k, &v, scale);
-            let refv = reference_decode_attn(&q, &k, &v, &ctx, heads, hd, scale);
-            // int8-KV achieves max_abs ~3e-3 here; gate at 1e-2 (3× headroom) to catch regressions.
-            let s = crate::diff::assert_close("paged_attn_int8", &got, &refv, 1e-2, 5e-2);
-            eprintln!(
-                "int8-KV decode-attn vs f64 ref: max_abs={:.2e} max_rel={:.2e} (per-(token,head) int8 K/V, f32 Q; \
-                 ragged ctx {:?})",
-                s.max_abs, s.max_rel, ctx
-            );
         });
     }
 

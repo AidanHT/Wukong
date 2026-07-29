@@ -722,6 +722,19 @@ pub(crate) fn apply1(op: i64, x: f32) -> f32 {
     }
 }
 
+/// Scalar twin / no-AVX2 fallback for [`wukong_vmath_f32`]: `out[i] = apply1(op, x[i])`. The single
+/// source of truth for "this op, one element at a time" — the AVX2 dispatcher calls it too when `op`
+/// has no 8-lane kernel, so both hosts honour `apply1`'s identity-for-an-unknown-op contract.
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+unsafe fn vmath_scalar(x: *const f32, out: *mut f32, n: usize, op: i64) {
+    for i in 0..n {
+        // SAFETY: i < n; buffers valid for n by this function's contract.
+        unsafe { *out.add(i) = apply1(op, *x.add(i)) };
+    }
+}
+
 /// `out[i] = f(x[i])` for `i in 0..n`, where `f` is selected by `op` (see the `VM_*` codes). Uses the
 /// 256-bit AVX2 kernels when available (8 lanes/step + a scalar tail), else the scalar fallback. `x`
 /// and `out` may alias (the recognizer allows in-place activations).
@@ -738,14 +751,12 @@ pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, 
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features detected; buffers valid for n by the caller contract.
-            unsafe { vmath_avx2(x, out, n, op) };
+            unsafe { vmath_avx2(x, out, n, op, vmath_unroll6()) };
             return;
         }
     }
-    for i in 0..n {
-        // SAFETY: i < n; buffers valid for n.
-        unsafe { *out.add(i) = apply1(op, *x.add(i)) };
-    }
+    // SAFETY: buffers valid for n by the caller contract.
+    unsafe { vmath_scalar(x, out, n, op) };
 }
 
 /// Fixed chunk (elements) for the multicore [`wukong_vmath_f32_parallel`] — a constant span so the
@@ -874,6 +885,9 @@ fn use_nt(n: usize, streams: usize) -> bool {
 /// out-of-order window better on a throttled clock — or whether the wider live set spills past the 16
 /// ymm registers. Read once, process-wide (the same `OnceLock` discipline the GEMM env knobs use); the
 /// two bodies run the identical `f` per lane, so the output is bit-for-bit identical either way.
+///
+/// [`vmath_avx2`] takes the choice as a parameter rather than reading this directly: the `OnceLock` is
+/// process-lifetime, so a test could not otherwise reach the ×6 body at all and it shipped ungated.
 #[cfg(target_arch = "x86_64")]
 fn vmath_unroll6() -> bool {
     use std::sync::OnceLock;
@@ -881,11 +895,20 @@ fn vmath_unroll6() -> bool {
     *V.get_or_init(|| std::env::var("WUKONG_VMATH_UNROLL").is_ok_and(|v| v == "6"))
 }
 
+/// `unroll6` selects the ×6 (48-elem) body ahead of the shipped ×4 one; [`wukong_vmath_f32`] supplies
+/// [`vmath_unroll6`]. Both bodies must produce bit-identical output for every `n` — gated by
+/// `vmath_unroll6_body_matches_the_shipped_x4_body`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
+unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64, unroll6: bool) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath8_for(op) else { return };
+    // No 8-lane kernel for this op (a sentinel like `bias::BIAS_ACT_NONE`, or a future `VM_*` added to
+    // `apply1` without its `vmath8_for` arm): run the scalar twin over the whole buffer, exactly as the
+    // no-AVX2 fallback and `lowp`'s half-output twins do. Returning here instead would leave `out` at
+    // its prior contents while a non-AVX2 host wrote `apply1`'s identity — the same call, different bytes.
+    let Some(f) = vmath8_for(op) else {
+        return vmath_scalar(x, out, n, op);
+    };
     // Non-temporal store regime — two streams (`x` in, `out` out), so the pair spills L3 at the same
     // total-bytes threshold `velem`/`vhorner` use. Above it the streaming store skips the
     // read-for-ownership a cacheable store pays for a write-once tensor (the >L3 activation sizes the
@@ -925,7 +948,7 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
     // ×6 A/B variant (gated by `WUKONG_VMATH_UNROLL=6`, default off): six independent chains, 48
     // elems/step. Runs ahead of the ×4 body; whatever it leaves (`n % 48`, still ≥ 32 possible) the ×4
     // body mops up, then the ×8 remainder and scalar tail — so the result is identical for any `n`.
-    if vmath_unroll6() {
+    if unroll6 {
         while i + 48 <= n {
             let r0 = f(_mm256_loadu_ps(x.add(i)));
             let r1 = f(_mm256_loadu_ps(x.add(i + 8)));
@@ -1358,6 +1381,19 @@ fn vmath2_8_for(
     })
 }
 
+/// Scalar twin / no-AVX2 fallback for [`wukong_vmath2_f32`]: `out[i] = apply2_1(op, x[i], y[i])`. The
+/// AVX2 dispatcher calls it too for an op with no 8-lane kernel, so both hosts honour `apply2_1`'s
+/// identity-for-an-unknown-op contract.
+///
+/// # Safety
+/// `x`, `y`, and `out` must each be valid for `n` `f32` elements.
+unsafe fn vmath2_scalar(x: *const f32, y: *const f32, out: *mut f32, n: usize, op: i64) {
+    for i in 0..n {
+        // SAFETY: i < n; buffers valid for n by this function's contract.
+        unsafe { *out.add(i) = apply2_1(op, *x.add(i), *y.add(i)) };
+    }
+}
+
 /// `out[i] = f(x[i], y[i])` for the two-input transcendentals (`VM2_*`). The 256-bit AVX2 twin of the
 /// inlined two-arg poly an `out[i] = pow/atan2/hypot(x[i], y[i])` loop lowers to; mirrors the inlined
 /// MIR op-for-op, so the interpreter marshalling through this kernel keeps native == interp exact.
@@ -1384,17 +1420,20 @@ pub unsafe extern "C" fn wukong_vmath2_f32(
             return;
         }
     }
-    for i in 0..n {
-        // SAFETY: i < n; buffers valid for n.
-        unsafe { *out.add(i) = apply2_1(op, *x.add(i), *y.add(i)) };
-    }
+    // SAFETY: buffers valid for n by the caller contract.
+    unsafe { vmath2_scalar(x, y, out, n, op) };
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath2_avx2(x: *const f32, y: *const f32, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath2_8_for(op) else { return };
+    // No 8-lane kernel for this op: run the scalar twin over the whole buffer rather than returning
+    // with `out` untouched, so an AVX2 host and a non-AVX2 host write the identical bytes (see the
+    // matching arm in `vmath_avx2`).
+    let Some(f) = vmath2_8_for(op) else {
+        return vmath2_scalar(x, y, out, n, op);
+    };
     // Same ×4-ILP + non-temporal-store treatment as `vmath_avx2` (this loop had the identical
     // single-vector, store-immediately structure). Three streams (`x`, `y` in, `out` out), so the
     // working set spills L3 — and wants `vmovntps` — at a *smaller* length than the one-input kernel.
@@ -1476,8 +1515,19 @@ pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64,
             return;
         }
     }
+    // SAFETY: buffers valid for n by the caller contract.
+    unsafe { vmath_bf16_scalar(x, out, n, op) };
+}
+
+/// Scalar twin / no-AVX2 fallback for [`wukong_vmath_bf16`]: `out[i] = apply1(op, widen(x[i]))`. The
+/// AVX2 dispatcher calls it too for an op with no 8-lane kernel (the shape `lowp`'s half-output twins
+/// already use), so both hosts honour `apply1`'s identity-for-an-unknown-op contract.
+///
+/// # Safety
+/// `x` must be valid for `n` `u16` (bf16 bits); `out` for `n` `f32`.
+unsafe fn vmath_bf16_scalar(x: *const u16, out: *mut f32, n: usize, op: i64) {
     for i in 0..n {
-        // SAFETY: i < n; buffers valid for n.
+        // SAFETY: i < n; buffers valid for n by this function's contract.
         unsafe { *out.add(i) = apply1(op, crate::bf16_bits_to_f32(*x.add(i))) };
     }
 }
@@ -1486,7 +1536,9 @@ pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64,
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath_bf16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath8_for(op) else { return };
+    let Some(f) = vmath8_for(op) else {
+        return vmath_bf16_scalar(x, out, n, op);
+    };
     let mut i = 0;
     while i + 8 <= n {
         // lossless bf16→f32 widen (the same `<<16` the bf16 reductions use), then the shared kernel.
@@ -1524,8 +1576,19 @@ pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, 
             return;
         }
     }
+    // SAFETY: buffers valid for n by the caller contract.
+    unsafe { vmath_f16_scalar(x, out, n, op) };
+}
+
+/// Scalar twin / no-F16C fallback for [`wukong_vmath_f16`]: `out[i] = apply1(op, widen(x[i]))`. The
+/// AVX2 dispatcher calls it too for an op with no 8-lane kernel, so both hosts honour `apply1`'s
+/// identity-for-an-unknown-op contract.
+///
+/// # Safety
+/// `x` must be valid for `n` `u16` (f16 bits); `out` for `n` `f32`.
+unsafe fn vmath_f16_scalar(x: *const u16, out: *mut f32, n: usize, op: i64) {
     for i in 0..n {
-        // SAFETY: i < n; buffers valid for n.
+        // SAFETY: i < n; buffers valid for n by this function's contract.
         unsafe { *out.add(i) = apply1(op, crate::f16_bits_to_f32(*x.add(i))) };
     }
 }
@@ -1534,7 +1597,9 @@ pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, 
 #[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn vmath_f16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath8_for(op) else { return };
+    let Some(f) = vmath8_for(op) else {
+        return vmath_f16_scalar(x, out, n, op);
+    };
     let mut i = 0;
     while i + 8 <= n {
         // lossless f16→f32 widen (F16C `vcvtph2ps`), then the shared activation kernel.
@@ -2360,10 +2425,18 @@ mod tests {
     }
 
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element, so a length that is
-    /// not a multiple of 8 produces a consistent result regardless of where the tail starts.
+    /// not a multiple of 8 produces a consistent result regardless of where the tail starts. The length
+    /// **must** stay a non-multiple of 8: at 1000 the ×4 body plus the 8-wide remainder consumed every
+    /// element and the scalar tail below them never ran, so despite its name this test only compared the
+    /// lanes. 1001 leaves one element for the tail.
+    ///
+    /// The op list is the all-real half of the `VM_*` set. The domain-restricted ops carry their own
+    /// bit-for-bit twin check inside their accuracy test (`vmath_inverse_hyperbolic` for acosh/atanh,
+    /// `vmath_inverse_trig` for tan/asin/acos, `vmath_expm1_log1p` for log1p, `vmath_log_dense_sweep`
+    /// for the log family — which is why log/log2/log10 are `continue`d below).
     #[test]
     fn vmath_tail_matches_lanes() {
-        let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
+        let xs: Vec<f32> = (0..1001).map(|i| (i as f32 - 500.0) * 0.013).collect();
         for op in [
             VM_EXP,
             VM_LOG,
@@ -2372,6 +2445,14 @@ mod tests {
             VM_RELU,
             VM_SILU,
             VM_GELU,
+            VM_ELU,
+            VM_LEAKYRELU,
+            VM_SOFTPLUS,
+            VM_MISH,
+            VM_SELU,
+            VM_TANHSHRINK,
+            VM_HARDSIGMOID,
+            VM_HARDSWISH,
             VM_SIN,
             VM_COS,
             VM_ERF,
@@ -2715,6 +2796,7 @@ mod tests {
         for (op, fref) in [
             (VM2_SILU_GATE, silu_f64 as fn(f64) -> f64),
             (VM2_GELU_GATE, gelu_f64 as fn(f64) -> f64),
+            (VM2_SIGMOID_GATE, sigmoid_f64 as fn(f64) -> f64),
         ] {
             let mut got = vec![0.0f32; n];
             // SAFETY: a/b/got are exactly n f32 long — the kernel's contract.
@@ -2790,21 +2872,179 @@ mod tests {
         }
     }
 
+    /// The unknown-op contract is **identity**, and it must hold on every dispatch path. `apply1`
+    /// documents it (vmath.rs's `_ => x`), `bias.rs`'s `BIAS_ACT_NONE = -1` is a live in-production
+    /// user of it, and the no-AVX2 fallbacks implement it — so the AVX2 dispatchers must too, or the
+    /// same call returns different bytes depending on which host runs it (and on an AVX2 host leaves
+    /// `out` at whatever it already held, which for a fresh `wukong_rt_alloc` buffer is all-zeros).
+    /// A non-multiple-of-8 length covers both the lane body and the scalar tail; `out` is pre-filled
+    /// with a sentinel so "wrote nothing" is distinguishable from "wrote the identity".
+    #[test]
+    fn vmath_unknown_op_writes_identity_on_every_path() {
+        const STALE: f32 = -777.25; // outside every identity value produced below
+        let n = 1003usize; // not a multiple of 8
+        let xf: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.004).collect();
+        let yf: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+        let bbits: Vec<u16> = xf.iter().map(|&v| crate::f32_to_bf16_bits(v)).collect();
+        let hbits: Vec<u16> = xf.iter().map(|&v| crate::f32_to_f16_bits(v)).collect();
+        // -1 is `bias::BIAS_ACT_NONE`, the sentinel already in production use; 9999 stands in for a
+        // future `VM_*` code added to `apply1` without the matching `vmath8_for` arm.
+        for op in [-1i64, 9999] {
+            let mut o = vec![STALE; n];
+            // SAFETY: xf/o are exactly n f32 long — the kernel's operand contract.
+            unsafe { wukong_vmath_f32(xf.as_ptr(), o.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                assert_eq!(o[i].to_bits(), xf[i].to_bits(), "vmath_f32 op {op} i {i}");
+            }
+            let mut o = vec![STALE; n];
+            // SAFETY: xf/yf/o are exactly n f32 long.
+            unsafe { wukong_vmath2_f32(xf.as_ptr(), yf.as_ptr(), o.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                assert_eq!(o[i].to_bits(), xf[i].to_bits(), "vmath2_f32 op {op} i {i}");
+            }
+            let mut o = vec![STALE; n];
+            // SAFETY: bbits is n u16 (bf16 bits), o is n f32.
+            unsafe { wukong_vmath_bf16(bbits.as_ptr(), o.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                let want = crate::bf16_bits_to_f32(bbits[i]);
+                assert_eq!(o[i].to_bits(), want.to_bits(), "vmath_bf16 op {op} i {i}");
+            }
+            let mut o = vec![STALE; n];
+            // SAFETY: hbits is n u16 (f16 bits), o is n f32.
+            unsafe { wukong_vmath_f16(hbits.as_ptr(), o.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                let want = crate::f16_bits_to_f32(hbits[i]);
+                assert_eq!(o[i].to_bits(), want.to_bits(), "vmath_f16 op {op} i {i}");
+            }
+        }
+    }
+
+    /// `apply1`/`vmath8_for` and `apply2_1`/`vmath2_8_for` are mirrored op-code tables: the scalar one
+    /// is the twin the AVX2 tail and the no-AVX2 fallback run, the vector one is what the lanes run.
+    /// A code present in one and missing from the other used to be invisible (the AVX2 dispatcher just
+    /// returned, writing nothing) and is now merely slow — either way the desync is a bug, so pin both
+    /// tables total over their declared code space and `None` outside it. A future `VM_*` added to
+    /// `apply1` without its `vmath8_for` arm fails here instead of silently running at scalar speed.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vmath_op_tables_cover_the_declared_code_space() {
+        for op in 0..=VM_CBRT {
+            assert!(vmath8_for(op).is_some(), "vmath8_for missing VM_* code {op}");
+        }
+        for op in [-1i64, VM_CBRT + 1, 9999] {
+            assert!(vmath8_for(op).is_none(), "vmath8_for claims unknown code {op}");
+        }
+        for op in 0..=VM2_SIGMOID_GATE {
+            assert!(
+                vmath2_8_for(op).is_some(),
+                "vmath2_8_for missing VM2_* code {op}"
+            );
+        }
+        for op in [-1i64, VM2_SIGMOID_GATE + 1, 9999] {
+            assert!(
+                vmath2_8_for(op).is_none(),
+                "vmath2_8_for claims unknown code {op}"
+            );
+        }
+    }
+
+    /// One throughput row: `(op, name, scalar libm twin, twin needs a strictly positive domain)`. The
+    /// transcendentals the dispatch was written for, plus a few references — all true libm calls C must
+    /// keep scalar (softsign omitted: it's abs+div, which C *can* autovectorize).
+    ///
+    /// The domain flag picks the buffer **both** arms read (see [`throughput_inputs`]). It exists
+    /// because the log10 row used to feed the kernel the raw, half-negative `xs` while its twin read
+    /// `x + 1.1`; the flag makes a log-family row declare its domain instead of shifting one arm only.
+    /// Shared with the gate below so the table cannot drift back apart.
+    const THROUGHPUT_CASES: &[(i64, &str, fn(f32) -> f32, bool)] = &[
+        (VM_EXP, "exp", |x| x.exp(), false),
+        (
+            VM_GELU,
+            "gelu",
+            |x| 0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh()),
+            false,
+        ),
+        (VM_TAN, "tan", |x| x.tan(), false),
+        (VM_ASIN, "asin", |x| x.asin(), false),
+        (VM_ACOS, "acos", |x| x.acos(), false),
+        (VM_EXP10, "exp10", |x| 10.0f32.powf(x), false),
+        (VM_LOG10, "log10", |x| x.log10(), true),
+        (
+            VM_LOGSIGMOID,
+            "logsigmoid",
+            |x| (1.0 / (1.0 + (-x).exp())).ln(),
+            false,
+        ),
+    ];
+
+    /// The two input buffers [`THROUGHPUT_CASES`] selects between: `xs` spans [-0.9, 0.9] for the
+    /// all-real ops, `xs_pos` is the same values shifted into [0.2, 2.0] for the log-domain ones. A
+    /// case reads one or the other with **both** arms.
+    fn throughput_inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
+        let xs: Vec<f32> = (0..n).map(|i| ((i % 1801) as f32 / 1000.0) - 0.9).collect();
+        let xs_pos: Vec<f32> = xs.iter().map(|&x| x + 1.1).collect();
+        (xs, xs_pos)
+    }
+
+    /// The gate for the withdrawn log10 row: a throughput case's kernel arm and its scalar libm twin
+    /// must compute the **same function over the same inputs**, or the ratio it prints measures nothing.
+    ///
+    /// The kernel gives no signal when it is out of domain, which is why this has to be an *agreement*
+    /// check rather than a NaN/finite check: `log10_1`/`log10_8` are branch-free exponent/mantissa
+    /// polys, so a negative input returns a finite wrong number, not libm's NaN. Measured on the raw
+    /// `xs` the bench used to pass it: 33100 of 65536 values are negative, and log10(-0.9) = -77.109436,
+    /// log10(-0.5) = +76.76265, log10(-0.001) = +74.063675.
+    ///
+    /// The tolerance is deliberately loose — this pins "same function, same domain", not accuracy
+    /// (`vmath_matches_libm` is the accuracy gate). A domain mismatch misses by ~10^2, not ~10^-5.
+    #[test]
+    fn vmath_throughput_arms_compute_the_same_function() {
+        let n = 1801; // one full period of the input generator, and not a multiple of 8
+        let (xs, xs_pos) = throughput_inputs(n);
+        let mut out = vec![0.0f32; n];
+        for &(op, name, scalar, positive) in THROUGHPUT_CASES {
+            let src = if positive { &xs_pos } else { &xs };
+            // SAFETY: `src` and `out` are each exactly n f32 long — the kernel's operand contract.
+            unsafe { wukong_vmath_f32(src.as_ptr(), out.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                let (x, want) = (src[i], scalar(src[i]));
+                assert!(
+                    want.is_finite(),
+                    "{name}: the libm twin is out of domain at x = {x} — the case's domain flag is wrong"
+                );
+                assert!(
+                    (out[i] - want).abs() <= 1e-3 + 1e-3 * want.abs(),
+                    "{name} at x = {x}: kernel {} vs libm twin {want} — the two arms are not \
+                     computing the same function, so the throughput ratio is meaningless",
+                    out[i]
+                );
+            }
+        }
+    }
+
     /// In-process throughput: the 256-bit AVX2 kernel vs a scalar `libm`-call loop computing the
     /// *same* function — exactly the code gcc/rustc emit for a `for i { out[i] = f(x[i]) }` loop, which
     /// **cannot vectorize a call** (no `libmvec` on this toolchain). So `scalar/kernel` is the real
     /// per-function speedup over scalar `libm`, measured locally (no cross-language build needed). The
     /// working set fits L2 so the comparison is compute-bound, not bandwidth-bound.
     /// Observed on a Meteor Lake laptop (ratios are clock-invariant): exp ~5.9×, gelu ~5.5×, tan ~3.6×,
-    /// asin ~5.4×, acos ~5.0×, exp10 ~13× (Rust's `powf` is a heavy general path), log10 ~4.1×,
-    /// logsigmoid ~4.6×.
+    /// asin ~5.4×, acos ~5.0×, exp10 ~13× (Rust's `powf` is a heavy general path), logsigmoid ~4.6×.
+    /// The log10 row's previously published ~4.1× is **withdrawn**: it was measured with the kernel arm
+    /// reading the raw (half-negative) `xs` while its libm twin read `x + 1.1`, so the two arms were
+    /// timing different functions over different domains — and the twin paid a per-element add the
+    /// kernel arm did not. Re-measure it with the harness below.
     /// Run: `cargo test -p wukong_runtime --release vmath_throughput -- --ignored --nocapture`.
     #[test]
     #[ignore = "throughput bench; run explicitly in --release"]
     fn vmath_throughput() {
         use std::time::Instant;
+        assert!(
+            !cfg!(debug_assertions),
+            "this is a throughput measurement, not a test — rebuild with --release \
+             (cargo test -p wukong_runtime --release vmath_throughput -- --ignored --nocapture)"
+        );
         let n = 1 << 16; // 64K f32 = 256 KB, fits L2 → compute-bound
-        let xs: Vec<f32> = (0..n).map(|i| ((i % 1801) as f32 / 1000.0) - 0.9).collect(); // [-0.9, 0.9]
+        let (xs, xs_pos) = throughput_inputs(n);
         let mut out = vec![0.0f32; n];
         let best = |iters: usize, mut f: Box<dyn FnMut()>| -> f64 {
             f(); // warmup
@@ -2816,27 +3056,12 @@ mod tests {
             }
             t
         };
-        // (op, name, scalar libm twin) — the new transcendentals plus a few references. All are true
-        // libm calls C must keep scalar (softsign omitted: it's abs+div, which C *can* autovectorize).
-        let cases: &[(i64, &str, fn(f32) -> f32)] = &[
-            (VM_EXP, "exp", |x| x.exp()),
-            (VM_GELU, "gelu", |x| {
-                0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh())
-            }),
-            (VM_TAN, "tan", |x| x.tan()),
-            (VM_ASIN, "asin", |x| x.asin()),
-            (VM_ACOS, "acos", |x| x.acos()),
-            (VM_EXP10, "exp10", |x| 10.0f32.powf(x)),
-            (VM_LOG10, "log10", |x| (x + 1.1).log10()), // shift into the positive domain
-            (VM_LOGSIGMOID, "logsigmoid", |x| {
-                (1.0 / (1.0 + (-x).exp())).ln()
-            }),
-        ];
         let iters = 200;
         eprintln!("vmath throughput over {n} elements (best of {iters}), kernel vs scalar libm:");
-        for &(op, name, scalar) in cases {
-            let xp = xs.as_ptr() as usize;
-            let op2 = xs.clone();
+        for &(op, name, scalar, positive) in THROUGHPUT_CASES {
+            let src = if positive { &xs_pos } else { &xs };
+            let xp = src.as_ptr() as usize;
+            let op2 = src.to_vec();
             let outp = out.as_mut_ptr() as usize;
             let t_kernel = best(
                 iters,
@@ -2875,6 +3100,11 @@ mod tests {
     #[ignore = "throughput bench; run explicitly in --release"]
     fn vmath2_throughput() {
         use std::time::Instant;
+        assert!(
+            !cfg!(debug_assertions),
+            "this is a throughput measurement, not a test — rebuild with --release \
+             (cargo test -p wukong_runtime --release vmath2_throughput -- --ignored --nocapture)"
+        );
         let n = 1 << 16;
         let xs: Vec<f32> = (0..n).map(|i| 0.5 + (i % 397) as f32 * 0.01).collect();
         let ys: Vec<f32> = (0..n).map(|i| 0.5 + (i % 311) as f32 * 0.01).collect();
@@ -2943,6 +3173,105 @@ mod tests {
             for (i, &x) in xs.iter().enumerate() {
                 assert_eq!(got[i].to_bits(), apply1(op, x).to_bits(), "op {op} i {i} x {x}");
             }
+        }
+    }
+
+    /// `wukong_vmath_f32_parallel` had no test at all, while every chunked sibling in this crate
+    /// (`velem`, `xent`, `xent_bwd`, `gemm`, `dequant`) carries a `serial_matches_parallel_bit_for_bit`.
+    /// Its whole contract is that fixed `VMATH_CHUNK` spans keep the output bit-identical to the serial
+    /// kernel "regardless of thread count" — the equality the interpreter oracle rests on, since the
+    /// oracle marshals the *serial* form for both symbols.
+    ///
+    /// The 1_500_001 row is the one that matters: 2 streams × 6 MB = 12 MiB is over `NT_MIN_BYTES`, so
+    /// the serial call takes the non-temporal path — scalar alignment peel, `vmovntps`, `sfence` —
+    /// while every 16 Ki parallel chunk re-evaluates `use_nt` on 64 KiB and takes the ordinary
+    /// cacheable path. The two arms therefore run *different store paths over the same data*, and this
+    /// pins that the bits do not move.
+    ///
+    /// Caveat: on a width-1 pool the parallel entry delegates to the serial kernel, and the comparison
+    /// is serial-vs-serial. That is the sibling tests' behaviour too; it under-tests rather than
+    /// false-passes.
+    #[test]
+    fn vmath_serial_matches_parallel_bit_for_bit() {
+        let all: &[i64] = &[VM_EXP, VM_LOG, VM_TANH, VM_GELU, VM_SELU, VM_ERF, VM_RELU];
+        for &(n, ops) in &[
+            (1_000usize, all),                   // < VMATH_PAR_MIN: the entry runs the serial kernel
+            (16_384, all),                       // == VMATH_PAR_MIN: exactly one chunk
+            (16_385, all),                       // one full chunk plus a 1-element chunk
+            (40_961, all),                       // two full chunks plus a ragged final one
+            (1_500_001, &[VM_EXP, VM_GELU][..]), // serial goes non-temporal, the chunks do not
+        ] {
+            // Kept > 0 so the log family stays in domain; a short period spans the poly's regions.
+            let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
+            for &op in ops {
+                let (mut s, mut p) = (vec![0.0f32; n], vec![0.0f32; n]);
+                // SAFETY: xs/s/p are each exactly n f32 long — both kernels' operand contract.
+                unsafe {
+                    wukong_vmath_f32(xs.as_ptr(), s.as_mut_ptr(), n as i64, op);
+                    wukong_vmath_f32_parallel(xs.as_ptr(), p.as_mut_ptr(), n as i64, op);
+                }
+                for i in 0..n {
+                    assert_eq!(
+                        p[i].to_bits(),
+                        s[i].to_bits(),
+                        "serial != parallel n {n} op {op} i {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `WUKONG_VMATH_UNROLL=6` selects a second 48-element loop body with six hand-written load offsets
+    /// and six hand-written store offsets, and it shipped with **zero** coverage: no test sets the knob,
+    /// and it could not, because `vmath_unroll6` caches it in a process-lifetime `OnceLock`. Verified by
+    /// mutation — transposing the ×6 body's `r4`/`r5` store offsets (corrupting 8 of every 48 elements
+    /// for anyone who exports the knob during a measurement pass) left `cargo test -p wukong_runtime`
+    /// green at 199 passed. `vmath_avx2` now takes the choice as a parameter so a test can reach both
+    /// bodies; the public entry supplies `vmath_unroll6()` and the shipped default is unchanged.
+    ///
+    /// The claim being gated is the one the ×6 comment makes: "the result is identical for any `n`".
+    /// The lengths straddle the ×6 step (48), the ×4 body it falls through to (32), the 8-wide
+    /// remainder and the scalar tail; both bodies are also checked against the scalar twin, so this
+    /// cannot pass by two matching wrongs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vmath_unroll6_body_matches_the_shipped_x4_body() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return; // no AVX2: neither body is reachable, and the scalar twin is gated elsewhere
+        }
+        for n in [1usize, 7, 8, 31, 32, 47, 48, 49, 55, 95, 96, 143, 1001] {
+            let xs: Vec<f32> = (0..n).map(|i| (i as f32 - (n / 2) as f32) * 0.013).collect();
+            for op in [VM_EXP, VM_TANH, VM_GELU, VM_SIN, VM_ERF, VM_RELU, VM_SILU] {
+                let (mut x4, mut x6) = (vec![0.0f32; n], vec![0.0f32; n]);
+                // SAFETY: avx2+fma detected just above; xs/x4/x6 are each exactly n f32 long.
+                unsafe {
+                    vmath_avx2(xs.as_ptr(), x4.as_mut_ptr(), n, op, false);
+                    vmath_avx2(xs.as_ptr(), x6.as_mut_ptr(), n, op, true);
+                }
+                for i in 0..n {
+                    assert_eq!(x6[i].to_bits(), x4[i].to_bits(), "n {n} op {op} i {i}: ×6 vs ×4");
+                    assert_eq!(
+                        x6[i].to_bits(),
+                        apply1(op, xs[i]).to_bits(),
+                        "n {n} op {op} i {i}: ×6 vs scalar twin"
+                    );
+                }
+            }
+        }
+        // Non-temporal regime: the ×6 body then runs after the scalar alignment peel and issues six
+        // `vmovntps`, which is where a transposed store offset is most likely and least visible. One op
+        // is enough — the store offsets do not depend on `f`.
+        let n = 1_500_001usize;
+        assert!(use_nt(n, 2), "length no longer selects the NT store path");
+        let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
+        let (mut x4, mut x6) = (vec![0.0f32; n], vec![0.0f32; n]);
+        // SAFETY: avx2+fma detected above; xs/x4/x6 are each exactly n f32 long.
+        unsafe {
+            vmath_avx2(xs.as_ptr(), x4.as_mut_ptr(), n, VM_EXP, false);
+            vmath_avx2(xs.as_ptr(), x6.as_mut_ptr(), n, VM_EXP, true);
+        }
+        for i in 0..n {
+            assert_eq!(x6[i].to_bits(), x4[i].to_bits(), "NT i {i}: ×6 vs ×4");
         }
     }
 

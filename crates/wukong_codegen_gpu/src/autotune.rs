@@ -90,6 +90,18 @@ fn applicable(c: &Int8Cand, m: usize, n: usize, k: usize) -> bool {
 }
 
 fn launch_cfg(c: &Int8Cand, m: usize, n: usize) -> LaunchConfig {
+    // The grid is `m/bm × n/bn` tiles — integer division, so a shape the candidate does not tile
+    // exactly would silently launch a SHORT grid and leave the trailing rows/columns of C untouched
+    // (whatever the caller pre-filled, typically zeros). Reject it here rather than return a partial
+    // answer: `applicable` is the contract, and every caller must have checked it.
+    assert!(
+        m % c.bm == 0 && n % c.bn == 0,
+        "autotune: candidate `{}` tiles {}x{} and cannot cover M={m}, N={n} — a truncated grid \
+         would leave part of C unwritten",
+        c.name,
+        c.bm,
+        c.bn
+    );
     // Rasterized kernels take a 1-D CTA grid (gridDim.x = tiles_m·tiles_n); all others a 2-D grid with
     // the K-split factor in gridDim.z (sk==1 for the non-split kernels).
     let grid_dim = if c.raster > 0 {
@@ -291,7 +303,20 @@ impl AutotuneCache {
     }
 }
 
+/// Is `token` a candidate this build knows *and* one that tiles `m×n×k` exactly? The cache is a
+/// hand-editable text file that survives across builds (the module header documents its format and
+/// `from_text` is deliberately corruption-tolerant), so a hit can name a token from an older candidate
+/// set, or a candidate that does not fit the shape it is keyed by. Neither may reach a launch: an
+/// unknown token used to `panic!` and a mis-tiled one used to launch a truncated grid, returning `Ok`
+/// with part of C left at its pre-fill. Both are treated as a cache miss and re-tuned.
+fn int8_token_usable(token: &str, m: usize, n: usize, k: usize) -> bool {
+    int8_candidates().iter().any(|c| c.name == token && applicable(c, m, n, k))
+}
+
 /// Look up the tuned config for `m×n×k`, tuning + caching it on a miss. Returns the config token.
+/// A cached token that this build cannot honour at this shape (see [`int8_token_usable`]) is treated
+/// as a miss and replaced, so a stale or hand-edited cache degrades to "re-tune", never to a wrong
+/// launch.
 pub fn tune_int8_cached(
     g: &mut Gpu,
     cache: &mut AutotuneCache,
@@ -300,7 +325,9 @@ pub fn tune_int8_cached(
     k: usize,
 ) -> Result<String, DriverError> {
     if let Some(e) = cache.get_int8(m, n, k) {
-        return Ok(e.config.clone());
+        if int8_token_usable(&e.config, m, n, k) {
+            return Ok(e.config.clone());
+        }
     }
     let r = tune_int8_gemm(g, m, n, k)?;
     cache.insert_int8(m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
@@ -371,10 +398,13 @@ pub fn launch_int8_tuned(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     let name = tune_int8_cached(g, cache, m, n, k)?;
+    // `tune_int8_cached` only ever returns a token that `int8_token_usable` accepted (a fresh search
+    // winner, or a cache hit it re-validated against this shape), so this cannot fail — but state the
+    // precondition where the launch geometry is built rather than trust it silently.
     let cand = int8_candidates()
         .into_iter()
-        .find(|c| c.name == name)
-        .expect("cached int8 config token must name a known candidate");
+        .find(|c| c.name == name && applicable(c, m, n, k))
+        .expect("tuned int8 config token must name a candidate applicable to this shape");
     let f = g.function(cand.entry, (cand.ptx)(), cand.entry)?;
     let cfg = launch_cfg(&cand, m, n);
     let a_d = g.stream.memcpy_stod(a)?;
@@ -407,6 +437,17 @@ fn w4a16_token(sk: usize) -> String {
 /// Parse a W4A16 config token to its split count (`"w4a16"` → 1, `"w4a16_skN"` → N).
 fn w4a16_sk_of(token: &str) -> usize {
     token.strip_prefix("w4a16_sk").and_then(|s| s.parse().ok()).unwrap_or(1)
+}
+
+/// Is `token` a split count this build searches *and* one the shape's `k` divides? Same reasoning as
+/// [`int8_token_usable`]: the on-disk cache outlives the candidate set, and the search itself only
+/// ever considers `sk` with `k % (sk·GROUP_SIZE) == 0`, so a cached token from another shape must not
+/// reach the split-K launcher.
+fn w4a16_token_usable(token: &str, k: usize) -> bool {
+    let sk = w4a16_sk_of(token);
+    (token == "w4a16" || token == w4a16_token(sk))
+        && W4A16_SK_CANDS.contains(&sk)
+        && k % (sk * crate::ptx_int4::GROUP_SIZE) == 0
 }
 
 /// **Search the W4A16 split counts for `m×n×k` and rank them.** sk=1 (un-split) vs split-K (sk∈{2,4,8}:
@@ -514,7 +555,9 @@ pub fn tune_w4a16_gemm(
     Ok(TuneResult { best: ranked[0].name.clone(), ranked })
 }
 
-/// Look up the tuned W4A16 split count for `m×n×k`, tuning + caching on a miss. Returns the config token.
+/// Look up the tuned W4A16 split count for `m×n×k`, tuning + caching on a miss. Returns the config
+/// token. A cached token this build cannot honour at this `k` (see [`w4a16_token_usable`]) counts as
+/// a miss and is re-tuned.
 pub fn tune_w4a16_cached(
     g: &mut Gpu,
     cache: &mut AutotuneCache,
@@ -524,7 +567,9 @@ pub fn tune_w4a16_cached(
     n: usize,
 ) -> Result<String, DriverError> {
     if let Some(e) = cache.get_w4a16(m, n, k) {
-        return Ok(e.config.clone());
+        if w4a16_token_usable(&e.config, k) {
+            return Ok(e.config.clone());
+        }
     }
     let r = tune_w4a16_gemm(g, qw, m, k, n)?;
     cache.insert_w4a16(m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
@@ -593,6 +638,68 @@ mod tests {
         assert_eq!(parsed.get_int8(256, 256, 256).unwrap().config, "swz64");
     }
 
+    /// **A cache hit must be re-validated against the shape it is used at (no GPU).** The cache is a
+    /// hand-editable text file that outlives the candidate set, and `from_text` is deliberately
+    /// corruption-tolerant, so a stale hit is an *expected* input. Two ways it used to escape:
+    ///   * `int8 192 256 256 = smdb128 999.9` — `smdb128` is a real token, but its 128×128 tile does not
+    ///     divide M=192, so `launch_cfg`'s `m/bm` truncated the grid to 1 row-tile and rows 128..192 of C
+    ///     came back as the zeros `launch_int8_tuned` pre-filled. `Ok`, 25% of the output silently zero.
+    ///   * `int8 256 256 256 = swz64_sk16 1.0` — a token from a hypothetical older candidate set;
+    ///     `launch_int8_tuned`'s `.expect(..)` panicked.
+    /// Both are now "not usable at this shape" → a miss → re-tune.
+    #[test]
+    fn stale_cache_tokens_are_not_usable() {
+        // A known token that fits its shape is usable.
+        assert!(int8_token_usable("smdb128", 256, 256, 256));
+        assert!(int8_token_usable("smdb64", 192, 256, 256), "64x64 tiles do divide M=192");
+        // The two escapes above.
+        assert!(!int8_token_usable("smdb128", 192, 256, 256), "128 does not divide M=192");
+        assert!(!int8_token_usable("swz64_sk16", 256, 256, 256), "unknown candidate token");
+        assert!(!int8_token_usable("", 256, 256, 256));
+        // K-divisibility is part of the contract too: the BK=64 swz kernels need K%64==0, split-K sk*64.
+        assert!(!int8_token_usable("swz64", 256, 256, 96), "BK=64 kernel needs K%64==0");
+        assert!(int8_token_usable("smdb64", 256, 256, 96), "BK=32 kernel accepts K=96");
+        assert!(!int8_token_usable("swz64_sk8", 256, 256, 256), "sk=8 needs K%512==0");
+        // A parsed cache entry is only trusted through the same predicate.
+        let c = AutotuneCache::from_text("int8 192 256 256 = smdb128 999.9\n");
+        let e = c.get_int8(192, 256, 256).expect("entry parses");
+        assert_eq!(e.config, "smdb128");
+        assert!(!int8_token_usable(&e.config, 192, 256, 256), "a parsed hit is still re-validated");
+        // W4A16: the split count must divide K by GROUP_SIZE·sk, and be one this build searches.
+        use crate::ptx_int4::GROUP_SIZE;
+        assert!(w4a16_token_usable("w4a16", 4 * GROUP_SIZE));
+        assert!(w4a16_token_usable("w4a16_sk4", 4 * GROUP_SIZE));
+        assert!(!w4a16_token_usable("w4a16_sk4", 2 * GROUP_SIZE), "sk=4 needs K%(4*group)==0");
+        assert!(!w4a16_token_usable("w4a16_sk3", 24 * GROUP_SIZE), "sk=3 is not a searched candidate");
+        assert!(!w4a16_token_usable("smdb64", 8 * GROUP_SIZE), "an int8 token is not a w4a16 token");
+    }
+
+    /// **The on-disk cache survives a real file round-trip (no GPU).** `cache_text_roundtrip` only
+    /// exercised `to_text`/`from_text` in memory, so `save`/`load` — the pair the module header's
+    /// "the tuning happens once and is reused" claim rests on — had no coverage at all: an unwritable
+    /// directory, or `load` mishandling the platform's line endings (this repo has been bitten by
+    /// CRLF before), would never have been caught.
+    #[test]
+    fn cache_save_load_roundtrip_through_a_file() {
+        let mut c = AutotuneCache::new();
+        c.insert_int8(1024, 1024, 1024, CacheEntry { config: "swz64".into(), gflops: 12345.6 });
+        c.insert_w4a16(64, 256, 1024, CacheEntry { config: "w4a16_sk4".into(), gflops: 900.0 });
+        let path = std::env::temp_dir().join(format!("wukong_autotune_{}.txt", std::process::id()));
+        c.save(&path).expect("save");
+        let back = AutotuneCache::load(&path).expect("load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.len(), c.len());
+        assert_eq!(back.get_int8(1024, 1024, 1024).unwrap().config, "swz64");
+        assert_eq!(back.get_w4a16(64, 256, 1024).unwrap().config, "w4a16_sk4");
+        // CRLF (what a Windows editor writes) must parse identically to LF.
+        let crlf = c.to_text().replace('\n', "\r\n");
+        let from_crlf = AutotuneCache::from_text(&crlf);
+        assert_eq!(from_crlf.len(), c.len(), "CRLF cache must parse");
+        assert_eq!(from_crlf.get_int8(1024, 1024, 1024).unwrap().config, "swz64");
+        // A path that cannot be written must surface an error, not be silently dropped.
+        assert!(c.save(std::env::temp_dir().join("wukong_no_such_dir_xyz").join("c.txt")).is_err());
+    }
+
     /// **Regression decision logic (no GPU).** Both directions, deterministic: a clearly-faster different
     /// config flags; the cached config still being best (or a within-threshold reshuffle) does not.
     #[test]
@@ -616,7 +723,11 @@ mod tests {
     fn tune_and_launch_int8_on_device() {
         let mut guard = crate::gpu::gpu();
         let Some(g) = guard.as_mut() else {
-            eprintln!("[skip] tune_and_launch_int8_on_device: no CUDA device reachable");
+            // §3A P3: never a silent green. `WUKONG_GPU_REQUIRED=1` makes this a failure.
+            crate::diff::skip_or_fail(
+                "tune_and_launch_int8_on_device",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
             return;
         };
         let n_cands = int8_candidates().len();
@@ -668,7 +779,11 @@ mod tests {
         use crate::ptx_int4::{quantize_weight_symmetric, reference_w4a16, GROUP_SIZE};
         let mut guard = crate::gpu::gpu();
         let Some(g) = guard.as_mut() else {
-            eprintln!("[skip] tune_and_launch_w4a16_on_device: no CUDA device reachable");
+            // §3A P3: never a silent green. `WUKONG_GPU_REQUIRED=1` makes this a failure.
+            crate::diff::skip_or_fail(
+                "tune_and_launch_w4a16_on_device",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
             return;
         };
         let mut rng = crate::diff::Rng::new(0x4A07);

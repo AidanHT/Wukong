@@ -195,6 +195,13 @@ pub unsafe extern "C" fn wukong_sgevm_f32_parallel(
     // One stripe per core, each a multiple of 8 columns (keep the AVX2 main loop aligned to the
     // stripe boundary); the last stripe absorbs the remainder. The split does not affect the bits
     // (per-column chains are self-contained), only the work distribution.
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the `current_num_threads()` read below resolves `RAYON_NUM_THREADS` the same
+    // way either way, so the chunk count — and with it every chunk boundary — is unchanged.
+    crate::ensure_global_pool();
     let nthreads = rayon::current_num_threads().max(1);
     let per = (c.div_ceil(nthreads)).next_multiple_of(8).max(8);
     let nstripes = c.div_ceil(per);
@@ -233,6 +240,62 @@ mod tests {
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
             })
             .collect()
+    }
+
+    /// The portable fallback [`gevm_scalar`] is the ONLY column fold on a target without AVX2+FMA
+    /// (and the whole kernel on a non-x86_64 build, where the `#[cfg(target_arch = "x86_64")]` fast
+    /// path is compiled out), but on an AVX2 host every public entry takes the AVX2 branch, so no
+    /// other test in this module ever reaches it — verified by mutation: scaling its accumulation
+    /// step by 0.5 left all 232 tests green. Pin it directly against the literal i-ascending
+    /// `mul_add` fold, EXACTLY (`assert_eq!`, no tolerance) — it performs that identical per-element
+    /// chain, so it is its own bit-exact oracle. Column SUB-ranges are covered too, because that is
+    /// how the parallel stripes call it, and a partial `[j0, j1)` is the one shape where a
+    /// zero-seed or finalize that ran over the whole row would go unnoticed.
+    /// Sibling of `gemv.rs`'s `gemv_row_scalar_matches_f64_reference`.
+    #[test]
+    fn gevm_scalar_matches_the_fma_reference() {
+        for &(rows, cols) in &[(1usize, 1usize), (3, 8), (5, 31), (7, 32), (9, 100)] {
+            let w = fill(3, rows);
+            let a = fill(4, rows * cols);
+            for &(j0, j1) in &[(0usize, cols), (0, cols / 2), (cols / 2, cols)] {
+                if j0 >= j1 {
+                    continue;
+                }
+                for &alpha in &[1.0f32, 0.125, -2.5] {
+                    let mut want = vec![0.0f32; cols];
+                    for i in 0..rows {
+                        for j in j0..j1 {
+                            want[j] = w[i].mul_add(a[i * cols + j], want[j]);
+                        }
+                    }
+                    if alpha != 1.0 {
+                        for v in &mut want[j0..j1] {
+                            *v *= alpha;
+                        }
+                    }
+                    let mut got = vec![0.0f32; cols];
+                    // SAFETY: `w` is `rows` long, `a` is `rows*cols`, `got` is `cols`, and
+                    // `j0 <= j1 <= cols` — the kernel's whole precondition.
+                    unsafe {
+                        gevm_scalar(
+                            w.as_ptr(),
+                            a.as_ptr(),
+                            got.as_mut_ptr(),
+                            rows,
+                            cols,
+                            j0,
+                            j1,
+                            alpha,
+                        );
+                    }
+                    assert_eq!(
+                        got[j0..j1],
+                        want[j0..j1],
+                        "gevm_scalar {rows}x{cols} cols [{j0},{j1}) alpha={alpha}"
+                    );
+                }
+            }
+        }
     }
 
     /// The kernel must equal the literal scalar reference — `out[j] = fold_{i ascending}

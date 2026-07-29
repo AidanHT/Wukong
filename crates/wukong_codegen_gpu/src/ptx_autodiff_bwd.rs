@@ -309,22 +309,49 @@ EXP_E:
 }
 "#;
 
-/// The PTX entry name for the activation-backward of op `op` (a `VM_*` code).
-fn act_bwd_entry(op: i64) -> &'static str {
+/// The PTX entry name for the activation-backward of op `op` (a `VM_*` code), or
+/// `CUDA_ERROR_NOT_SUPPORTED` for an op this module has no kernel for.
+///
+/// **A decline, not a panic.** The tape hands the GPU dispatcher whatever `VM_*` code the program
+/// used, and `tape.rs::activation_backward` covers ops the CPU vmath kernels have but this module
+/// does not (gelu/silu are the obvious next arms). The CPU path returns a recoverable `Err` for
+/// those; panicking here would abort the compiler process with internal text instead of falling back
+/// to the CPU form. [`act_bwd_supported`] is the same predicate, kept `pub` for a caller that wants
+/// to route *before* it builds the buffers — it used to be the guard that was compiled in and never
+/// called by anything, which is exactly how the panic stayed reachable.
+fn act_bwd_entry(op: i64) -> Result<&'static str, DriverError> {
     use wukong_runtime::{VM_EXP, VM_RELU, VM_SIGMOID, VM_TANH};
     match op {
-        x if x == VM_RELU => "relu_bwd",
-        x if x == VM_SIGMOID => "sigmoid_bwd",
-        x if x == VM_TANH => "tanh_bwd",
-        x if x == VM_EXP => "exp_bwd",
-        _ => panic!("act_bwd op {op} not implemented on GPU"),
+        x if x == VM_RELU => Ok("relu_bwd"),
+        x if x == VM_SIGMOID => Ok("sigmoid_bwd"),
+        x if x == VM_TANH => Ok("tanh_bwd"),
+        x if x == VM_EXP => Ok("exp_bwd"),
+        _ => Err(DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        )),
     }
 }
 
-/// Whether [`act_bwd_f32`] has a GPU kernel for activation-backward op `op`.
+/// Whether [`act_bwd_f32`] has a GPU kernel for activation-backward op `op`. Agrees with
+/// [`act_bwd_entry`] by construction (`act_bwd_guard_agrees_with_dispatch` pins it).
 pub fn act_bwd_supported(op: i64) -> bool {
     use wukong_runtime::{VM_EXP, VM_RELU, VM_SIGMOID, VM_TANH};
     op == VM_RELU || op == VM_SIGMOID || op == VM_TANH || op == VM_EXP
+}
+
+/// The PTX entry name for the row-norm backward of op `op` (a `NORM_*` code), or
+/// `CUDA_ERROR_NOT_SUPPORTED`. Same reasoning as [`act_bwd_entry`]: [`norm_bwd_supported`] already
+/// existed as the routing predicate, so an unsupported code must be a recoverable decline the caller
+/// can fall back from, not a process-killing panic.
+fn norm_bwd_entry(op: i64) -> Result<&'static str, DriverError> {
+    match op {
+        NORM_SOFTMAX => Ok("softmax_bwd"),
+        NORM_LAYERNORM => Ok("layernorm_bwd"),
+        NORM_RMSNORM => Ok("rmsnorm_bwd"),
+        _ => Err(DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        )),
+    }
 }
 
 /// Elementwise activation-backward on the GPU: `dx[i] = dout[i] * f'(·)`. `x` is the forward input
@@ -339,7 +366,7 @@ pub fn act_bwd_f32(
     let n = dout.len();
     assert_eq!(x.len(), n);
     assert_eq!(y.len(), n);
-    let entry = act_bwd_entry(op);
+    let entry = act_bwd_entry(op)?;
     let f = g.function("act_bwd", ACT_BWD_PTX, entry)?;
     let dout_d = g.stream.memcpy_stod(dout)?;
     let x_d = g.stream.memcpy_stod(x)?;
@@ -531,12 +558,7 @@ pub fn norm_bwd_f32(
     assert_eq!(dy.len(), n, "norm_bwd: dy must be rows*cols");
     assert_eq!(x.len(), n, "norm_bwd: x must be rows*cols");
     assert_eq!(y.len(), n, "norm_bwd: y must be rows*cols");
-    let entry = match op {
-        NORM_SOFTMAX => "softmax_bwd",
-        NORM_LAYERNORM => "layernorm_bwd",
-        NORM_RMSNORM => "rmsnorm_bwd",
-        _ => panic!("norm_bwd op {op} not implemented"),
-    };
+    let entry = norm_bwd_entry(op)?;
     let f = g.function("norm_bwd", norm_bwd_ptx(), entry)?;
     let dy_d = g.stream.memcpy_stod(dy)?;
     let x_d = g.stream.memcpy_stod(x)?;
@@ -782,6 +804,27 @@ CM_E:
 // device buffers it keeps alive across forward + backward + optimizer.
 // ----------------------------------------------------------------------------------------------
 
+/// **The precondition every `unsafe { launch }` below assumes** (U5): the buffer holds at least as
+/// many elements as the kernel, sized from the *separately passed* dimensions, will touch.
+///
+/// These launchers take the buffers and the dims as independent arguments, so nothing relates them.
+/// A caller that sizes a workspace wrong — e.g. an attention scratch allocated `s*d` where the
+/// kernel grid-strides `s*s` — makes the kernel store past the end of the allocation. That is not a
+/// wrong number: it is `CUDA_ERROR_ILLEGAL_ADDRESS`, which this crate documents (see `gpu.rs`'s
+/// `device_lost`) as **sticky** — every later driver call in the process returns it too, even for
+/// unrelated correct programs, and on this WDDM box `reset_gpu`'s re-retain does not recover. So one
+/// mis-sized buffer becomes a whole-test-binary wipeout with nothing naming the launcher at fault.
+/// A host-side comparison costs nothing and names it exactly. `>=` (not `==`) so an over-sized
+/// pooled workspace stays legal.
+#[track_caller]
+fn need_len<T>(what: &str, buf: &CudaSlice<T>, need: usize) {
+    assert!(
+        buf.len() >= need,
+        "{what}: device buffer holds {} elements but the launch touches {need}",
+        buf.len()
+    );
+}
+
 /// Transpose `src(m×n)` -> `dst(n×m)` over device buffers (the device twin of [`transpose_f32`]) —
 /// used to turn a TN GEMM (`Aᵀ·B`) into a transpose + NN, so all matmuls ride the reg-blocked kernel.
 pub fn transpose_device(
@@ -791,6 +834,8 @@ pub fn transpose_device(
     m: usize,
     n: usize,
 ) -> Result<(), DriverError> {
+    need_len("transpose_device src", src, m * n);
+    need_len("transpose_device dst", dst, m * n);
     let f = g.function("transpose_f32", TRANSPOSE_F32_PTX, "transpose_f32")?;
     let (mu, nu) = (m as u32, n as u32);
     let cfg = grid_stride_cfg(g, (m * n) as u32);
@@ -812,6 +857,9 @@ fn gemm_rb(
     n: usize,
     k: usize,
 ) -> Result<(), DriverError> {
+    need_len("gemm_rb A", a, m * k);
+    need_len("gemm_rb B", b, k * n);
+    need_len("gemm_rb C", c, m * n);
     let f = g.function("gemm_rb", gemm_rb_ptx(), entry)?;
     let (mu, nu, ku) = (m as u32, n as u32, k as u32);
     let cfg = LaunchConfig {
@@ -875,6 +923,8 @@ pub fn cast_f32_to_f16_device(
     dst: &mut CudaSlice<f16>,
     n: usize,
 ) -> Result<(), DriverError> {
+    need_len("cast_f32_to_f16_device src", src, n);
+    need_len("cast_f32_to_f16_device dst", dst, n);
     let f = g.function("cast_f32_f16", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
     let n_u = n as u32;
     let mut b = g.stream.launch_builder(&f);
@@ -892,6 +942,8 @@ pub fn transpose_cast_device(
     m: usize,
     n: usize,
 ) -> Result<(), DriverError> {
+    need_len("transpose_cast_device src", src, m * n);
+    need_len("transpose_cast_device dst", dst, m * n);
     let f = g.function(
         "transpose_cast_f32_f16",
         TRANSPOSE_CAST_F32_F16_PTX,
@@ -924,6 +976,9 @@ fn wmma_nt_device(
         m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
         "wmma_nt_device needs 16-multiple dims"
     );
+    need_len("wmma_nt_device A", a16, m * k);
+    need_len("wmma_nt_device B", b16, n * k);
+    need_len("wmma_nt_device C", c, m * n);
     let (entry, cfg) = if m % SM_BM == 0 && n % SM_BN == 0 {
         (
             "wmma_nt_f16_sm_db",
@@ -1038,7 +1093,11 @@ pub fn act_bwd_device(
     dx: &mut CudaSlice<f32>,
     n: usize,
 ) -> Result<(), DriverError> {
-    let f = g.function("act_bwd", ACT_BWD_PTX, act_bwd_entry(op))?;
+    for (tag, buf) in [("dout", dout), ("x", x), ("y", y)] {
+        need_len(&format!("act_bwd_device {tag}"), buf, n);
+    }
+    need_len("act_bwd_device dx", dx, n);
+    let f = g.function("act_bwd", ACT_BWD_PTX, act_bwd_entry(op)?)?;
     let n_u = n as u32;
     let cfg = grid_stride_cfg(g, n_u);
     let mut b = g.stream.launch_builder(&f);
@@ -1054,6 +1113,8 @@ pub fn relu_fwd_device(
     out: &mut CudaSlice<f32>,
     n: usize,
 ) -> Result<(), DriverError> {
+    need_len("relu_fwd_device x", x, n);
+    need_len("relu_fwd_device out", out, n);
     let f = g.function("train_elem", TRAIN_ELEM_PTX, "relu_fwd")?;
     let n_u = n as u32;
     let cfg = grid_stride_cfg(g, n_u);
@@ -1072,6 +1133,9 @@ pub fn mse_grad_device(
     n: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    need_len("mse_grad_device y", y, n);
+    need_len("mse_grad_device t", t, n);
+    need_len("mse_grad_device dy", dy, n);
     let f = g.function("train_elem", TRAIN_ELEM_PTX, "mse_grad")?;
     let n_u = n as u32;
     let cfg = grid_stride_cfg(g, n_u);
@@ -1088,6 +1152,7 @@ pub fn scale_inplace_device(
     n: usize,
     s: f32,
 ) -> Result<(), DriverError> {
+    need_len("scale_inplace_device x", x, n);
     let f = g.function("train_elem", TRAIN_ELEM_PTX, "scale_inplace")?;
     let n_u = n as u32;
     let cfg = grid_stride_cfg(g, n_u);
@@ -1100,6 +1165,7 @@ pub fn scale_inplace_device(
 /// Apply a causal mask to a square `s×s` score matrix in place: `S[i,j] = -inf` for `j > i` (each
 /// query attends only to keys at or before its position — the decoder mask).
 pub fn causal_mask_device(g: &mut Gpu, x: &mut CudaSlice<f32>, s: usize) -> Result<(), DriverError> {
+    need_len("causal_mask_device x", x, s * s);
     let f = g.function("train_elem", TRAIN_ELEM_PTX, "causal_mask")?;
     let s_u = s as u32;
     let cfg = grid_stride_cfg(g, (s * s) as u32);
@@ -1118,6 +1184,8 @@ pub fn softmax_fwd_device(
     rows: usize,
     cols: usize,
 ) -> Result<(), DriverError> {
+    need_len("softmax_fwd_device x", x, rows * cols);
+    need_len("softmax_fwd_device out", out, rows * cols);
     let f = g.function("norm_fwd", crate::ptx_norm::norm_ptx(), "softmax")?;
     let (r, c, eps) = (rows as u32, cols as u32, 0f32);
     let cfg = LaunchConfig {
@@ -1144,12 +1212,11 @@ pub fn norm_bwd_device(
     cols: usize,
     eps: f32,
 ) -> Result<(), DriverError> {
-    let entry = match op {
-        NORM_SOFTMAX => "softmax_bwd",
-        NORM_LAYERNORM => "layernorm_bwd",
-        NORM_RMSNORM => "rmsnorm_bwd",
-        _ => panic!("norm_bwd op {op} not implemented"),
-    };
+    let entry = norm_bwd_entry(op)?;
+    for (tag, buf) in [("dy", dy), ("x", x), ("y", y)] {
+        need_len(&format!("norm_bwd_device {tag}"), buf, rows * cols);
+    }
+    need_len("norm_bwd_device dx", dx, rows * cols);
     let f = g.function("norm_bwd", norm_bwd_ptx(), entry)?;
     let (r, c) = (rows as u32, cols as u32);
     let cfg = LaunchConfig {
@@ -1241,12 +1308,110 @@ mod tests {
     use crate::gpu::gpu;
     use wukong_runtime::{VM_EXP, VM_RELU, VM_SIGMOID, VM_TANH};
 
+    /// Run `body` with the shared GPU, or skip **loudly** (§3A P3 — see [`crate::diff::skip_or_fail`])
+    /// if none is present. The skip names the driver's actual error, and `WUKONG_GPU_REQUIRED=1` turns
+    /// it into a failure so a box that is supposed to have a device cannot report a green backward-kernel
+    /// gate having run nothing.
     fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
         let mut guard = gpu();
         match guard.as_mut() {
             Some(g) => body(g),
-            None => eprintln!("[skip] {name}: no CUDA device reachable"),
+            None => crate::diff::skip_or_fail(
+                name,
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            ),
         }
+    }
+
+    /// **The routing predicate and the dispatch must agree, and an unsupported op must DECLINE.**
+    /// `act_bwd_supported` / `norm_bwd_supported` existed as the guards a caller routes on, but nothing
+    /// consulted them: the dispatch `panic!`ed instead, so the first op the tape grows that this module
+    /// lacks (gelu/silu — the CPU vmath kernels already have them) would abort the compiler process with
+    /// internal text where the CPU path returns a recoverable `Err`. No GPU needed (pure lookup).
+    #[test]
+    fn act_bwd_guard_agrees_with_dispatch() {
+        for op in -3i64..40 {
+            assert_eq!(
+                act_bwd_supported(op),
+                act_bwd_entry(op).is_ok(),
+                "act_bwd_supported({op}) disagrees with the dispatch"
+            );
+            assert_eq!(
+                norm_bwd_supported(op),
+                norm_bwd_entry(op).is_ok(),
+                "norm_bwd_supported({op}) disagrees with the dispatch"
+            );
+        }
+        for op in [VM_RELU, VM_SIGMOID, VM_TANH, VM_EXP] {
+            assert!(act_bwd_entry(op).is_ok(), "op {op} must dispatch");
+        }
+        // An op the module has no kernel for is a recoverable decline, not a panic.
+        let unsupported = (0i64..64).find(|&o| !act_bwd_supported(o)).expect("some op is unsupported");
+        assert_eq!(
+            act_bwd_entry(unsupported).unwrap_err().0,
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED
+        );
+        assert_eq!(
+            norm_bwd_entry(99).unwrap_err().0,
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED
+        );
+    }
+
+    /// **An under-sized device buffer is caught on the host, before the launch.** These launchers take
+    /// the buffers and the dimensions as independent arguments, so a workspace sized `s*d` where the
+    /// kernel strides `s*s` used to reach the driver and raise `CUDA_ERROR_ILLEGAL_ADDRESS` — a
+    /// **sticky** fault that fails every later driver call in the process, so the real culprit is
+    /// unidentifiable and the rest of the run is a cascade of false failures. Each case here is the
+    /// exact mis-size from that scenario; the panic must name the launcher.
+    #[test]
+    fn undersized_device_buffers_are_rejected_before_launch() {
+        with_gpu("undersized_device_buffers", |g| {
+            let bad = |f: &mut dyn FnMut()| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+            };
+            let (s, d) = (64usize, 16usize);
+            // The cited scenario: an attention workspace sized s*d handed to the s*s causal mask.
+            let mut small = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+            assert!(
+                bad(&mut || {
+                    let _ = causal_mask_device(g, &mut small, s);
+                }),
+                "causal_mask_device must reject an s*d buffer for an s*s mask"
+            );
+            // A correctly sized buffer still runs (the check is `>=`, not a blanket refusal).
+            let mut ok = g.stream.alloc_zeros::<f32>(s * s).unwrap();
+            causal_mask_device(g, &mut ok, s).unwrap();
+            let masked = g.stream.memcpy_dtov(&ok).unwrap();
+            assert!(masked[1].is_infinite() && masked[1] < 0.0, "j>i must be -inf");
+            assert_eq!(masked[0], 0.0, "j<=i untouched");
+            // An over-sized (pooled) workspace is legal.
+            let mut big = g.stream.alloc_zeros::<f32>(s * s + 4096).unwrap();
+            causal_mask_device(g, &mut big, s).unwrap();
+            // Same for the GEMM and the row-norm backward.
+            let (m, n, k) = (32usize, 32usize, 32usize);
+            let a = g.stream.alloc_zeros::<f32>(m * k).unwrap();
+            let b = g.stream.alloc_zeros::<f32>(k * n).unwrap();
+            let mut c_small = g.stream.alloc_zeros::<f32>(m * n / 2).unwrap();
+            assert!(
+                bad(&mut || {
+                    let _ = gemm_device(g, false, true, &a, &b, &mut c_small, m, n, k);
+                }),
+                "gemm_device must reject a half-sized C"
+            );
+            let dy = g.stream.alloc_zeros::<f32>(8 * 16).unwrap();
+            let x = g.stream.alloc_zeros::<f32>(8 * 16).unwrap();
+            let y = g.stream.alloc_zeros::<f32>(8 * 16).unwrap();
+            let mut dx = g.stream.alloc_zeros::<f32>(8).unwrap();
+            assert!(
+                bad(&mut || {
+                    let _ = norm_bwd_device(g, NORM_SOFTMAX, &dy, &x, &y, &mut dx, 8, 16, 0.0);
+                }),
+                "norm_bwd_device must reject a rows-sized dx for a rows*cols write"
+            );
+            // The device is still healthy: nothing reached the driver, so no sticky fault.
+            assert!(!crate::gpu::device_lost(), "a rejected launch must not touch the device");
+            eprintln!("[gate] under-sized device buffers rejected on the host (no sticky fault) ✓");
+        });
     }
 
     #[test]

@@ -15,7 +15,10 @@
 //! the new value **strictly** beats its running max (so on a tie the lane keeps its earlier, lower
 //! index), then the eight lane candidates collapse left-to-right with the same lowest-index
 //! [`arg_fold`] — so lane 0 (the lowest indices) is preferred through the horizontal combine, exactly
-//! like the scalar ascending scan. A scalar tail finishes the `cols % 8` remainder.
+//! like the scalar ascending scan. A scalar tail finishes the `cols % 8` remainder. Those lane indices
+//! ride an f32 lane, exact only below the f32 mantissa limit `2^24`, so [`rowarg_one`] dispatches to
+//! the AVX2 path only when `cols < 2^24` and hands wider rows to the exact-integer scalar twin (the
+//! column-axis sibling of the bound `colarg_range` applies to its rows).
 //!
 //! Rows are independent, so `_parallel` just maps the per-row routine across rows (each writes a
 //! disjoint `out[r]`): serial == parallel bit-for-bit, no cross-row combine, the same play as the
@@ -56,7 +59,10 @@ unsafe fn rowarg_scalar(row: *const f32, cols: usize, is_max: bool) -> i32 {
 /// final `cols % 8` in ascending order.
 ///
 /// # Safety
-/// `row` valid for `cols` `f32` reads; `cols >= 1`; AVX2 must be available.
+/// `row` valid for `cols` `f32` reads; `cols >= 1`; AVX2 must be available. `cols < 2^24` — the
+/// running column index lives in an f32 lane, so above the f32 mantissa limit it would round and
+/// stop matching [`rowarg_scalar`]; [`rowarg_one`] is the only caller and is what guarantees the
+/// bound.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn rowarg_avx2(row: *const f32, cols: usize, is_max: bool) -> i32 {
@@ -74,8 +80,9 @@ unsafe fn rowarg_avx2(row: *const f32, cols: usize, is_max: bool) -> i32 {
     // ±∞) means every lane already holds a valid candidate, so the strict-compare updates below need
     // no "is this lane still empty?" special-casing — exactly the ascending-scan seed of the scalar.
     let mut best_val = _mm256_loadu_ps(row);
-    // Lane indices as f32: 0,1,..,7. cols fits in i32 for any realistic logits row, and these indices
-    // are small integers (< cols) exactly representable in f32, so the index bookkeeping is exact.
+    // Lane indices as f32: 0,1,..,7, advanced by +8.0 per step. Integers are exact in f32 only below
+    // `2^24`, which `rowarg_one` guarantees by routing wider rows to the scalar twin — so within this
+    // function the index bookkeeping is exact.
     let mut best_idx = _mm256_set_ps(7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0);
     let step8 = _mm256_set1_ps(8.0);
     let mut cur_idx = best_idx; // running per-lane index for the current step
@@ -126,7 +133,12 @@ unsafe fn rowarg_avx2(row: *const f32, cols: usize, is_max: bool) -> i32 {
 unsafe fn rowarg_one(row: *const f32, cols: usize, is_max: bool) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        // The AVX2 twin carries each lane's running column index in an f32 lane, exact only below the
+        // f32 mantissa limit; past it `cur_idx += 8.0` rounds (16777217 → 16777216) and the recovered
+        // index is off by one, so the exact-integer scalar twin takes over. Same guard shape
+        // `colarg_range` uses for its row-axis index and `argreduce_chunk` (reduce.rs) for its i32
+        // index lanes; one comparison per row.
+        if is_x86_feature_detected!("avx2") && cols < (1usize << 24) {
             return rowarg_avx2(row, cols, is_max);
         }
     }
@@ -170,6 +182,12 @@ unsafe fn rowarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
     // Raw pointers cross the rayon closure boundary as integers (the same pattern as the parallel
     // GEMM / reductions); every task reads a disjoint row of `x` and writes a disjoint `out[i]`.
     let (x_addr, out_addr) = (x as usize, out as usize);
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
+    crate::ensure_global_pool();
     (0..r).into_par_iter().for_each(|i| {
         // SAFETY: disjoint row read + disjoint out[i] write; pointers re-derived from the addresses.
         unsafe {
@@ -263,6 +281,31 @@ mod tests {
             // naturally and the lowest-index rule is exercised everywhere, not just in the planted rows.
             .map(|t| (((t * 31 + 7) % 101) as i32 - 50) as f32)
             .collect()
+    }
+
+    /// The AVX2 twin carries each lane's running COLUMN index in an f32 lane (`cur_idx += 8.0`), so
+    /// it is exact only while the index stays under the f32 mantissa limit `2^24` — the column-axis
+    /// sibling of `colarg`'s row-axis bound. Pin the dispatch guard that keeps that precondition true.
+    ///
+    /// The winner must land in the **8-lane body**, not the `cols % 8` tail: the tail folds with exact
+    /// `usize` indices and would mask the bug (an earlier cut of this test planted the max at
+    /// `cols - 1` with `cols = 2^24 + 2` and passed for exactly that reason). Column 16777217 is odd
+    /// and above `2^24`, where the f32 ulp is 2 — unrepresentable, so lane 1's running index rounds
+    /// ties-to-even from 16777217 down to 16777216 and the vector path reported an index one short of
+    /// the true answer while `rowarg_scalar` (exact integers) returned 16777217 — a CPU-dependent
+    /// wrong answer. One row keeps the buffer at ~67 MB.
+    #[test]
+    fn cols_past_the_f32_mantissa_limit_keep_the_exact_column_index() {
+        let rows = 1usize;
+        let cols = (1usize << 24) + 16; // multiple of 8: no scalar tail, the body owns every index
+        let mut x = vec![0.0f32; rows * cols];
+        let planted = (1usize << 24) + 1; // odd and > 2^24 ⇒ not representable in f32
+        x[planted] = 1.0;
+        let mut got = vec![0i32; rows];
+        let want = unsafe { rowarg_scalar(x.as_ptr(), cols, true) };
+        unsafe { wukong_rowargmax_i32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64) };
+        assert_eq!(want, planted as i32, "scalar twin lost the exact column index");
+        assert_eq!(got, vec![want], "rowargmax dispatch != scalar twin past 2^24 cols");
     }
 
     #[test]

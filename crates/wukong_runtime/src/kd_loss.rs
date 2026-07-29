@@ -248,6 +248,12 @@ pub unsafe extern "C" fn wukong_kd_loss_f32_parallel(
     // Raw pointers cross the rayon boundary as integers; each row is a disjoint sub-slice of x/q, and
     // `out` is indexed by row.
     let (x_addr, q_addr, o_addr) = (x as usize, q as usize, out as usize);
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
+    crate::ensure_global_pool();
     (0..r).into_par_iter().for_each(|row| {
         let off = row * c;
         // SAFETY: disjoint row slices; pointers re-derived from the captured addresses.

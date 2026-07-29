@@ -28,6 +28,37 @@ fn compile_native(src: &str, opt: u8) -> crate::JitProgram {
     crate::jit_compile(&program, main, &interner).expect("jit compile")
 }
 
+/// Orders every test that sets, clears, or *depends on* `WUKONG_P4_NO_256`.
+///
+/// The switch is read from the process environment in the middle of MIR lowering
+/// (`wukong_mir_build`), so a test that mutates it steers any lowering running concurrently on
+/// another test thread. That is observable both ways. A writer running while a reader lowers turns
+/// the reader's 256-bit program into a 128-bit one: `p4_vec256_coverage_sweep` still passes (both
+/// widths are correct) but the coverage it exists to lock goes dark, and `p4_vec256_general_matches_interp`
+/// fails outright on its "expected a synthesized vector kernel" assertion — which is exactly what
+/// happened when `p4_kill_switch_is_result_identical` was added without this. Symmetrically, one
+/// bench clearing the variable while the other compiles its `p128` turns a reported "128 vs 256"
+/// ratio into a 256-vs-256 comparison reading ~1.00x.
+///
+/// Readers ([`p4_read_lock`]) take it shared and still run concurrently with each other; only the
+/// mutators ([`p4_write_lock`]) exclude, across their whole set/compile/clear window. Poison is
+/// ignored: one failing test must not cascade into the rest.
+///
+/// This orders the *tests*; it cannot order a `getenv` in some other crate's test. The complete fix
+/// is to stop reading the environment inside lowering and thread the choice down as a compile option
+/// — that lives in `wukong_mir_build`.
+static P4_ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// For a test that requires the default (256-bit) lowering and does not touch the variable.
+fn p4_read_lock() -> std::sync::RwLockReadGuard<'static, ()> {
+    P4_ENV_LOCK.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// For a test that sets or clears `WUKONG_P4_NO_256`; held across the entire window.
+fn p4_write_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+    P4_ENV_LOCK.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A same-run A/B of the 256-bit AVX2 recipe vs the 128-bit CLIF vectorizer on one compute-heavy
 /// elementwise kernel. Reports the best-of-N wall-clock ratio (best-of controls for this laptop's
 /// clock/thermal drift; alternating A/B/A/B keeps the two measurements adjacent). Ignored by default
@@ -36,6 +67,7 @@ fn compile_native(src: &str, opt: u8) -> crate::JitProgram {
 #[test]
 #[ignore]
 fn p4_bench_256_vs_128() {
+    let _env = p4_write_lock();
     // Compute-bound, L1-resident body: a high arithmetic-intensity FMA chain (no sqrt, no memory
     // spill) over a 512-element array (3×2KB ≪ L1), repeated so wall-clock dominates setup. This
     // isolates the SIMD-width win; memory-bound bodies (large arrays, few flops/elem) see less
@@ -89,6 +121,7 @@ fn p4_bench_256_vs_128() {
 #[test]
 #[ignore]
 fn p4_bench_reduction_256_vs_128() {
+    let _env = p4_write_lock();
     // One `+ addend` off `s` (so `reduction_of` claims it); the addend's top `*` fuses via FMA. N is
     // ≥ `VEC256_REDUCTION_MIN_TRIP` so the gated 256-bit path actually fires (below it, both compile to
     // the inlined 128-bit reduction and this would compare 128 against 128).
@@ -136,6 +169,7 @@ fn p4_bench_reduction_256_vs_128() {
 /// drifts, one of these fails.
 #[test]
 fn p4_vec256_coverage_sweep() {
+    let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this sweep
     // Each body computes `o[i]` (or updates a stream in place) from streams a,b,c and scalar `k`.
     let bodies: &[&str] = &[
         "o[i] = a[i] + b[i] - c[i]",
@@ -150,6 +184,16 @@ fn p4_vec256_coverage_sweep() {
         "o[i] = a[i] * b[i] + a[i] * c[i] - b[i] * c[i] + a[i]",     // load reuse (CSE)
         "a[i] = a[i] * a[i] + 1.0",                                  // in-place, output=input
         "o[i] = sqrt(a[i]) * k - b[i] / c[i] + a[i] * b[i]",         // mixed, 3 streams + scalar
+        // Repeated-operand class: one op names the same value twice, then further allocating ops
+        // follow with no operand death between. That is the precondition for the emitter to release
+        // one register twice and hand it to two later allocations; no body above had it, so
+        // `o[i] = a[i]*a[i] + b[i]*c[i]` compiled to `a*a + c*c` while this sweep stayed green.
+        "o[i] = a[i] * a[i] + b[i] * c[i]",                          // dup, then two loads
+        "o[i] = a[i] * a[i] + b[i] * b[i] + b[i]",                   // dup, then dup
+        "o[i] = sqrt(a[i] * a[i]) + (-b[i])",                        // dup under sqrt, then neg
+        "o[i] = a[i] * a[i] + b[i] + c[i]",
+        "o[i] = a[i] + a[i] + b[i] * c[i]",
+        "o[i] = a[i] * a[i] * b[i] * c[i]",
     ];
     // Trip counts around the 8-lane group boundary, its multiples, and non-multiples (tail).
     let sizes: &[usize] = &[1, 2, 7, 8, 9, 15, 16, 17, 24, 63, 64, 65, 100, 255, 256, 257];
@@ -182,6 +226,97 @@ fn p4_vec256_coverage_sweep() {
                     .unwrap_or_else(|e| panic!("jit -O0 [{form} n={n}] `{body}`: {e}"));
                 assert_eq!(o0, native, "-O0 vs -O3 [{form} n={n}] `{body}`");
             }
+        }
+    }
+}
+
+/// `WUKONG_P4_NO_256=1` is documented as two things at once (wukong_mir_build/src/lib.rs:13864): a
+/// same-run A/B knob for measuring the 256-bit win, and a kill-switch should a body ever be found
+/// miscompiled. Both readings require the same property — flipping it must not change what a program
+/// computes — and nothing demonstrated that. This test does: for each body it compiles the SAME source
+/// twice under one lock, once with the switch clear and once set, and requires byte-identical stdout
+/// and exit code.
+///
+/// It is non-vacuous by construction: the switch-clear compile must synthesize at least one
+/// `vec_kernels` entry (else the two sides are the same 128-bit code and the comparison proves
+/// nothing) and the switch-set compile must synthesize none. Bodies a runtime recognizer claims
+/// first — `a[i]*k + b[i]` (velem saxpy), relu — never reach the recipe and so are not listed here;
+/// `p4_vec256_coverage_sweep` covers those.
+///
+/// The A/B is also a real miscompile detector, since the 128-bit CLIF path is the control: the
+/// repeated-operand bodies below disagreed across the switch before the emitter released a repeated
+/// operand's register only once, and the `x + y*z` body disagreed before the recipe learned to
+/// contract its multiply-add like the scalar tail it shares a loop with.
+#[test]
+fn p4_kill_switch_is_result_identical() {
+    let _env = p4_write_lock();
+    let bodies: &[&str] = &[
+        "o[i] = a[i] + b[i] - c[i]",
+        "o[i] = a[i] * b[i] * c[i]",
+        "o[i] = a[i] / (b[i] + 1.0)",
+        "o[i] = -a[i] + b[i] * c[i]",
+        "o[i] = sqrt(a[i] * a[i] + b[i] * b[i])",
+        "o[i] = if a[i] > b[i] { a[i] } else { b[i] }",
+        "o[i] = a[i] * b[i] + a[i] * c[i] - b[i] * c[i] + a[i]",
+        "a[i] = a[i] * a[i] + 1.0",
+        "o[i] = sqrt(a[i]) * k - b[i] / c[i] + a[i] * b[i]",
+        // add-of-product: the vector part must round exactly like the scalar tail beside it.
+        "o[i] = a[i] + b[i] * c[i]",
+        "o[i] = a[i] * b[i] + c[i]",
+        // repeated-operand class (one op naming the same value twice).
+        "o[i] = a[i] * a[i] + b[i] * c[i]",
+        "o[i] = a[i] * a[i] + b[i] * b[i] + b[i]",
+        "o[i] = sqrt(a[i] * a[i]) + (-b[i])",
+        "o[i] = a[i] * a[i] + b[i] + c[i]",
+        "o[i] = a[i] + a[i] + b[i] * c[i]",
+        "o[i] = a[i] * a[i] * b[i] * c[i]",
+    ];
+    // Around and across the 8-lane group boundary: whole groups, unroll multiples, and every tail
+    // width — the vector part and the scalar remainder of one loop must agree with each other AND
+    // with the 128-bit compile of the same source.
+    let sizes: &[usize] = &[8, 9, 16, 17, 63, 100, 257];
+    // Inputs chosen so the add-of-product bodies land on a value that fma and mul-then-add round
+    // differently: a = -(1+2^-11), b = c = 1+2^-12, all exact in f32. `x + y*y` is 0 with two
+    // roundings and 2^-24 with one, and the `* 16777216.0` in the program makes that visible.
+    let src_of = |body: &str, n: usize| {
+        format!(
+            "fn main() -> i32 {{ \
+               let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+               let mut c: [f32; {n}] = [0.0; {n}]; let mut o: [f32; {n}] = [0.0; {n}]; \
+               let k: f32 = 1.5; \
+               for j in 0..{n} {{ a[j] = -1.00048828125; b[j] = 1.000244140625; c[j] = 1.000244140625; }} \
+               for i in 0..{n} {{ {body}; }} \
+               let mut s: f32 = 0.0; for j in 0..{n} {{ s = s + (a[j] + o[j]) * 16777216.0; }} \
+               print(s); print(o[0] * 16777216.0); print(o[{last}] * 16777216.0); \
+               return ((s as i32) & 255); }}",
+            last = n - 1,
+        )
+    };
+
+    let kernels = |src: &str| -> usize {
+        let (p, _) = lowered(src, 3);
+        p.funcs.iter().map(|f| f.vec_kernels.len()).sum()
+    };
+    for body in bodies {
+        for &n in sizes {
+            let src = src_of(body, n);
+            std::env::remove_var("WUKONG_P4_NO_256");
+            let k256 = kernels(&src);
+            let wide = jit(&src, 3).unwrap_or_else(|e| panic!("256-bit [n={n}] `{body}`: {e}"));
+            std::env::set_var("WUKONG_P4_NO_256", "1");
+            let k128 = kernels(&src);
+            let narrow = jit(&src, 3).unwrap_or_else(|e| panic!("128-bit [n={n}] `{body}`: {e}"));
+            std::env::remove_var("WUKONG_P4_NO_256");
+
+            assert!(k256 > 0, "vacuous: no 256-bit kernel for [n={n}] `{body}`");
+            assert_eq!(k128, 0, "WUKONG_P4_NO_256=1 still built a kernel [n={n}] `{body}`");
+            assert_eq!(
+                wide, narrow,
+                "WUKONG_P4_NO_256 changed the result [n={n}] `{body}`"
+            );
+            // …and the interpreter, which marshals the same recipe, agrees with both.
+            let oracle = interp(&src, 3).unwrap_or_else(|e| panic!("interp [n={n}] `{body}`: {e}"));
+            assert_eq!(wide, oracle, "256-bit vs interp [n={n}] `{body}`");
         }
     }
 }
@@ -530,6 +665,34 @@ fn differential_against_interpreter() {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
             assert_eq!(n, i, "native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// An entry point that returns a float must be read out of XMM0 with *its own* width. The whole
+/// corpus had no float-returning `main` before this test, which is how `invoke_code` came to fold
+/// `f32`/`f16`/`bf16` into the `f64` ABI: the narrow floats return a single-precision XMM0, so
+/// reading 64 bits gave a denormal that `as i64` saturated to 0 while the interpreter exited 42.
+/// The three exits also pin the rounding each width applies to the same literal — 42.9 is 42 in
+/// f32 and f16, but 43 in bf16 (0x422b_999a rounds *up* to 0x422c) — so a fix that read the right
+/// register but dropped the narrowing would still fail.
+#[test]
+fn differential_float_return_type() {
+    let programs = [
+        ("fn main() -> f32 { print(1); return 42.9; }", 42),
+        ("fn main() -> f64 { print(1); return 42.9; }", 42),
+        ("fn main() -> f16 { print(1); return 42.9; }", 42),
+        ("fn main() -> bf16 { print(1); return 42.9; }", 43),
+        // Negative and fractional-magnitude values: `as i64` truncates toward zero on both sides.
+        ("fn main() -> f32 { return 0 as f32 - 7.75; }", -7),
+        ("fn main() -> f32 { return 0.5; }", 0),
+    ];
+    for (src, want) in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "exit code at -O{opt} for:\n{src}");
         }
     }
 }
@@ -3283,12 +3446,14 @@ fn p4_reduction_f64_reference() {
 /// `fmax`/`fmin`.
 #[test]
 fn p4_reduction256_gate_and_differential() {
+    let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this gate
     // Full program: init streams a,b (deterministic, both signs), then the reduction `red`, print s.
     let mk = |n: usize, red: &str| {
         format!(
             "fn main() -> i32 {{ let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+             let mut c: [f32; {n}] = [0.0; {n}]; \
              let mut i: i32 = 0; while i < {n} {{ a[i] = ((i % 23) as f32) * 0.5 - 3.0; \
-             b[i] = ((i % 19) as f32) * 0.25 + 0.5; i += 1; }} \
+             b[i] = ((i % 19) as f32) * 0.25 + 0.5; c[i] = ((i % 17) as f32) * 0.125 - 1.0; i += 1; }} \
              {red} print(s); return ((s as i32) & 1023); }}"
         )
     };
@@ -3301,6 +3466,18 @@ fn p4_reduction256_gate_and_differential() {
             ("plain", format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + (a[k] - b[k]); }}")),
             ("fmax", format!("let mut s: f32 = -1000.0; for k in 0..{n} {{ s = fmax(s, a[k]*b[k]); }}")),
             ("fmin", format!("let mut s: f32 = 1000.0; for k in 0..{n} {{ s = fmin(s, a[k]*b[k]); }}")),
+            // The addend names `a[k]` twice and then loads two more streams, so the emitter released
+            // one register twice and handed it to both loads. The reduction path takes the same
+            // `emit_group` code as the elementwise one and was equally miscompiled — it folded
+            // `(a*a)*(c*c)` for `(a*a)*(b*c)` — and no fold shape above reaches that state.
+            (
+                "dup operand fused",
+                format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + (a[k]*a[k]) * (b[k]*c[k]); }}"),
+            ),
+            (
+                "dup operand plain",
+                format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + (a[k]*a[k] + b[k]*c[k]); }}"),
+            ),
         ]
     };
 
@@ -3572,6 +3749,7 @@ fn fusion_collapses_adjacent_loops() {
 /// pins native -O0 == -O3 (the recipe is opaque to the optimizer, so both must match).
 #[test]
 fn p4_vec256_general_matches_interp() {
+    let _env = p4_read_lock(); // asserts a kernel was synthesized, so the knob must stay clear
     let prog = |n: usize| {
         format!(
             "fn main() -> i32 {{ \
@@ -3607,6 +3785,7 @@ fn p4_vec256_general_matches_interp() {
 /// start (the `start >= N` empty-run case), and (c) leave `i` reachable for code after the loop.
 #[test]
 fn p4_counting_while_normalizes_and_matches_interp() {
+    let _env = p4_read_lock(); // asserts a kernel was synthesized, so the knob must stay clear
     // `lo` lets us cover both the ran case (lo < N) and the empty case (lo == N ⇒ never runs). The
     // counting-while body is a stream×stream product plus a third stream (`a*b + e`) — velem can't
     // claim that shape, so it reaches the general recipe (a real `vec_kernels` entry).
@@ -3880,6 +4059,80 @@ fn lowered_calls(src: &str, callee: &str) -> bool {
     })
 }
 
+/// The row-loss and gather/scatter recognizers each have a serial arm and an `@parallel` arm, and
+/// nothing in the tree exercised the eight parallel ones: grepping the whole test corpus for
+/// `wukong_xent`, `wukong_kldiv`, `wukong_entropy`, `wukong_kd_loss`, `wukong_logsumexp` and
+/// `scatter` returned zero hits, and no `@parallel` fixture under `tests/run` names them. So
+/// reordering one of these arms after the elementwise outliner would silently drop a whole family
+/// back to a scalar loop with every existing test still green. Each nest is asserted to reach its
+/// serial symbol plain and its `_parallel` symbol under the attribute — both directions, so a
+/// recognizer that stops firing and one that fires unconditionally are each caught.
+#[test]
+fn parallel_row_loss_and_gather_nests_reach_their_kernels() {
+    // Two rows of four so the row loop is the parallel axis and the inner reductions are per row.
+    let xent = |a: &str| format!(
+        "module p\n{a}fn f(x:[f32;8], target:[i32;2], mut loss:[f32;2]) {{ for r in 0..2 {{ \
+         let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
+         let mut s: f32 = 0.0; for i in 0..4 {{ s = s + exp(x[r*4+i] - m); }} \
+         loss[r] = m + log(s) - x[r*4+target[r]]; }} }}");
+    let lse = |a: &str| format!(
+        "module p\n{a}fn f(x:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
+         let mut s: f32 = 0.0; for i in 0..4 {{ s = s + exp(x[r*4+i] - m); }} \
+         out[r] = m + log(s); }} }}");
+    let kldiv = |a: &str| format!(
+        "module p\n{a}fn f(p:[f32;8], q:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         let mut s: f32 = 0.0; \
+         for i in 0..4 {{ s = s + p[r*4+i] * (log(p[r*4+i]) - log(q[r*4+i])); }} \
+         out[r] = s; }} }}");
+    let entropy = |a: &str| format!(
+        "module p\n{a}fn f(p:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         let mut s: f32 = 0.0; for i in 0..4 {{ s = s + p[r*4+i] * log(p[r*4+i]); }} \
+         out[r] = -s; }} }}");
+    let kd = |a: &str| format!(
+        "module p\n{a}fn f(x:[f32;8], q:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
+         let mut z: f32 = 0.0; for i in 0..4 {{ z = z + exp(x[r*4+i] - m); }} \
+         let l: f32 = m + log(z); let mut s: f32 = 0.0; \
+         for i in 0..4 {{ s = s + q[r*4+i] * (l - x[r*4+i]); }} out[r] = s; }} }}");
+    let xbwd = |a: &str| format!(
+        "module p\n{a}fn f(x:[f32;8], target:[i32;2], mut dx:[f32;8]) {{ for r in 0..2 {{ \
+         let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
+         let mut z: f32 = 0.0; for i in 0..4 {{ z = z + exp(x[r*4+i] - m); }} \
+         let invz: f32 = 1.0 / z; \
+         for i in 0..4 {{ dx[r*4+i] = exp(x[r*4+i] - m) * invz; }} \
+         dx[r*4+target[r]] = dx[r*4+target[r]] - 1.0; }} }}");
+    let scatter = |a: &str| format!(
+        "module p\n{a}fn f(ids:[i32;4], grad_out:[f32;12], mut grad_w:[f32;6]) {{ \
+         for t in 0..4 {{ for d in 0..3 {{ grad_w[ids[t]*3+d] += grad_out[t*3+d]; }} }} }}");
+    let embed = |a: &str| format!(
+        "module p\n{a}fn f(ids:[i32;4], weight:[f32;12], mut out:[f32;12]) {{ \
+         for t in 0..4 {{ for d in 0..3 {{ out[t*3+d] = weight[ids[t]*3+d]; }} }} }}");
+
+    let cases: &[(&str, &dyn Fn(&str) -> String)] = &[
+        ("wukong_xent_fwd_f32", &xent),
+        ("wukong_logsumexp_f32", &lse),
+        ("wukong_kldiv_f32", &kldiv),
+        ("wukong_entropy_f32", &entropy),
+        ("wukong_kd_loss_f32", &kd),
+        ("wukong_xent_bwd_f32", &xbwd),
+        ("wukong_scatter_add_f32", &scatter),
+        ("wukong_embedding_f32", &embed),
+    ];
+    for (sym, mk) in cases {
+        let par = format!("{sym}_parallel");
+        assert!(lowered_calls(&mk(""), sym), "plain nest must reach {sym}");
+        assert!(
+            !lowered_calls(&mk(""), &par),
+            "plain nest must not reach {par}"
+        );
+        assert!(
+            lowered_calls(&mk("@parallel\n"), &par),
+            "@parallel nest must reach {par}"
+        );
+    }
+}
+
 /// The canonical f32 matmul nest must lower to the tuned `wukong_sgemm` microkernel (and the
 /// `@parallel` form to the parallel variant), in both the accumulate and zero-init shapes.
 #[test]
@@ -3920,6 +4173,60 @@ fn matmul_nest_lowers_to_sgemm() {
     assert!(
         !lowered_calls(not_mm, "wukong_sgemm"),
         "transposed-B is not a row-major matmul"
+    );
+}
+
+/// A runtime kernel whose MIR arity matches none of `lower_call`'s dispatch arms must FAIL the
+/// compile, not vanish from it. Every arm is guarded by `&& args.len() == N`; when none fires,
+/// `lower_call` used to return `None` and `Op::Call` lowered to nothing, so a void kernel like
+/// `wukong_sgemm` silently left `c` holding its previous contents — a wrong answer only on the
+/// native side, since the interpreter dispatches on the symbol name alone with no arity check.
+/// The mutation below is exactly the drift the guard exists for: a recognizer in `mir_build`
+/// changing a kernel's operand list without updating the matching arm here.
+#[test]
+fn runtime_kernel_with_unhandled_arity_fails_the_compile() {
+    let src = "module m\nfn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) { \
+               for i in 0..8 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
+               for j in 0..8 { c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; } } } }";
+    let lower = || {
+        let mut interner = Interner::new();
+        let (module, _) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, _) = wukong_sema::check(&module, &interner);
+        let (program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        (program, interner)
+    };
+
+    // Control: the untouched 7-argument call compiles.
+    let (program, interner) = lower();
+    assert!(
+        crate::emit_object(&program, &interner).is_ok(),
+        "the unmutated matmul must still compile"
+    );
+
+    // Drop one operand from the recognized call, leaving the symbol and the MIR well-formed.
+    let (mut program, mut interner) = lower();
+    let sgemm = interner.intern("wukong_sgemm");
+    let mut mutated = false;
+    for f in &mut program.funcs {
+        for b in &mut f.blocks {
+            for ins in &mut b.insts {
+                if let wukong_mir::Op::Call { func, args } = &mut ins.op {
+                    if *func == sgemm && args.len() == 7 {
+                        args.pop();
+                        mutated = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(mutated, "the matmul nest no longer lowers to wukong_sgemm");
+
+    let err = crate::emit_object(&program, &interner)
+        .map(|_| ())
+        .expect_err("a wukong_sgemm call with 6 arguments must not compile silently");
+    assert!(
+        err.contains("wukong_sgemm") && err.contains("6"),
+        "the diagnostic must name the symbol and the arity it got, got: {err}"
     );
 }
 
@@ -4906,6 +5213,66 @@ fn parallel_object_bytes_deterministic() {
     }
 }
 
+/// Determinism of the FAILURE path, not just the success path: when two functions both fail to
+/// lower, the reported diagnostic must be the lowest-source-order one every time, and must match
+/// what the serial path reports. Collecting the rayon results straight into `Result<Vec<_>, _>`
+/// short-circuits on whichever worker lost the race, so this program alternated between the
+/// `[... x i32]` and `[... x i64]` messages across identical invocations of the same binary.
+#[test]
+fn parallel_codegen_error_is_source_ordered() {
+    // Enough functions to give rayon a real split tree, each with a stack slot over the 4 GiB
+    // layout limit and a distinct extent so the message identifies which one was reported. `f0`
+    // reaches its oversized slot only after a long body, so in wall-clock order it is the LAST of
+    // the batch to fail — exactly the case where "first worker to report" and "first in source
+    // order" disagree.
+    const N: u64 = 32;
+    let mut src = String::new();
+    for k in 0..N {
+        let n = 2_000_000_000u64 + k;
+        let mut body = String::new();
+        if k == 0 {
+            // Seeded from a parameter so `-O2` cannot constant-fold the chain away.
+            for j in 0..3000 {
+                body.push_str(&format!("acc = acc * 3 + {j};"));
+            }
+        }
+        src.push_str(&format!(
+            "fn f{k}(mut acc: i32) -> i32 {{ {body} let x: [i32; {n}] = [0; {n}]; \
+             return x[0] + acc; }}\n"
+        ));
+    }
+    src.push_str("fn main() -> i32 {");
+    for k in 0..N {
+        src.push_str(&format!(" print(f{k}({k}));"));
+    }
+    src.push_str(" return 0; }");
+    let (program, interner) = program_o2(&src);
+    let serial = crate::emit_object_ex(
+        &program,
+        &interner,
+        crate::EmitOptions { verify: false, parallel: false },
+    )
+    .map(|_| ())
+    .expect_err("an oversized stack slot must not compile");
+    assert!(
+        serial.contains("2000000000"),
+        "serial reported a later function than the first: {serial}"
+    );
+    for _ in 0..24 {
+        let parallel = crate::emit_object_ex(
+            &program,
+            &interner,
+            crate::EmitOptions { verify: false, parallel: true },
+        )
+        .map(|_| ())
+        .expect_err("an oversized stack slot must not compile");
+        assert_eq!(
+            serial, parallel,
+            "parallel codegen reported a different failing function than serial"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Backend compile-time A/B harness (ignored; run in RELEASE with --nocapture).
 //
@@ -4971,12 +5338,21 @@ fn backend_compile_ab() {
     // only the backend.
     let mut progs: Vec<(String, wukong_mir::Program, Interner)> = Vec::new();
     let mut multi = 0usize;
+    // A file that legitimately declines (diagnostics) and a file that ICEs both used to arrive here
+    // as `None` — `.ok().flatten()` maps `Err(_)` and `Ok(None)` to the same value. The corpus count
+    // then quietly dropped by one, the byte-identity assertions below never ran for it, and the
+    // operator had no way to tell an unsupported program from a crash. Keep the two apart, and fail
+    // on the crash: this header claims to double as a corpus-wide gate. (Cargo ignores the
+    // workspace's `panic = "abort"` for test targets, so the unwind is catchable.)
+    let mut skipped: Vec<String> = Vec::new();
+    let mut panicked: Vec<String> = Vec::new();
     for path in &files {
+        let short = path.file_name().unwrap().to_string_lossy().into_owned();
         let Ok(src) = std::fs::read_to_string(path) else {
             continue;
         };
         // Skip files that don't cleanly reach an object (mirrors compile-profile).
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut interner = Interner::new();
             let (m, pd) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
             if pd.iter().any(|d| d.is_error()) {
@@ -4994,20 +5370,29 @@ fn backend_compile_ab() {
             crate::emit_object_ex(&p, &interner, crate::EmitOptions { verify: false, parallel: false })
                 .ok()?;
             Some((p, interner))
-        }))
-        .ok()
-        .flatten();
-        if let Some((p, interner)) = ok {
-            if p.funcs.len() > 1 {
-                multi += 1;
+        }));
+        match outcome {
+            Err(_) => panicked.push(short),
+            Ok(None) => skipped.push(short),
+            Ok(Some((p, interner))) => {
+                if p.funcs.len() > 1 {
+                    multi += 1;
+                }
+                progs.push((short, p, interner));
             }
-            progs.push((
-                path.file_name().unwrap().to_string_lossy().into_owned(),
-                p,
-                interner,
-            ));
         }
     }
+    eprintln!(
+        "corpus: {} compiled, {} skipped (diagnostics)",
+        progs.len(),
+        skipped.len()
+    );
+    assert!(
+        panicked.is_empty(),
+        "{} corpus file(s) ICEd during the front end: {:?}",
+        panicked.len(),
+        panicked
+    );
 
     let ser = crate::EmitOptions { verify: false, parallel: false };
     let ver = crate::EmitOptions { verify: true, parallel: false };

@@ -1,0 +1,178 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 12
+// EXPECT-OUT: 24
+// EXPECT-OUT: 36
+// EXPECT-OUT: 48
+// EXPECT-OUT: 60
+// EXPECT-OUT: 72
+// EXPECT-OUT: 84
+// EXPECT-OUT: 96
+// EXPECT-OUT: 1
+// EXPECT-OUT: 12
+// EXPECT-OUT: 23
+// EXPECT-OUT: 34
+// EXPECT-OUT: 5
+// EXPECT-OUT: 16
+// EXPECT-OUT: 27
+// EXPECT-OUT: 38
+// EXPECT-OUT: -16
+// EXPECT-OUT: -12
+// EXPECT-OUT: -8
+// EXPECT-OUT: -4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 32
+// EXPECT-OUT: 20
+// EXPECT-OUT: 12
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 11
+// EXPECT-OUT: 18
+// EXPECT-OUT: 27
+// EXPECT-OUT: 38
+// EXPECT-OUT: 51
+// EXPECT-OUT: 66
+// EXPECT-OUT: 12
+// EXPECT-OUT: 24
+// EXPECT-OUT: 36
+// EXPECT-OUT: 48
+// EXPECT-OUT: 60
+// EXPECT-OUT: 72
+// EXPECT-OUT: 84
+// EXPECT-OUT: 96
+// EXPECT-OUT: 12
+// EXPECT-OUT: 24
+// EXPECT-OUT: 36
+// EXPECT-OUT: 48
+// EXPECT-OUT: 60
+// EXPECT-OUT: 72
+// EXPECT-OUT: 84
+// EXPECT-OUT: 96
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+module tests.run.elementwise_slice
+
+// The streaming-elementwise recognizer family over runtime-sized []T SLICES rather than fixed [T; N]
+// arrays: velem saxpy, broadcast bias, streaming dequant, per-channel dequant, Horner, the bf16->f32
+// axpby, the all-bf16 narrowing axpby and the all-bf16 narrowing activation.
+//
+// A slice value is a 16-byte fat pointer `{ data, len }`, so each emitter must resolve its buffer
+// operands through the kernel base-pointer path. Passing the fat-pointer buffer straight through made
+// the kernel WRITE n*4 (or n*2) bytes starting at a 16-byte stack alloca — caller-frame stack
+// corruption, observed as a native SIGSEGV or hang and an interp `error: expected a pointer`.
+// The same defect was found and fixed for GEMV and the norms long ago (gemv_slice.wk, norm_slice.wk);
+// nothing pinned it for this family, which is why it survived.
+//
+// Every expected value below is computed from the SCALAR semantics of the loop, never read back from
+// the compiler: a recognizer fires in BOTH backends and runs pre-opt, so the interp==native and
+// -O0==-O2 gates agree on the same wrong answer. These EXPECT-OUT lines are the only gate that
+// catches it. All values are exact in f32 and bf16 (small integers / powers of two).
+
+fn main() -> i32 {
+    let n: i64 = 8;
+    let r: i64 = 2;
+    let c: i64 = 4;
+
+    // ---- streaming affine map (saxpy) -> wukong_velem_f32 ----
+    // x = 1..8, y = 10..80  =>  o = 2x + y = 12*(j+1)
+    let mut x: []f32 = alloc_f32(n);
+    let mut y: []f32 = alloc_f32(n);
+    let mut o: []f32 = alloc_f32(n);
+    for j in 0..n { x[j] = ((j + 1i64) as f32); y[j] = (((j + 1i64) * 10i64) as f32); }
+    for j in 0..n { o[j] = 2.0 * x[j] + y[j]; }
+    for j in 0..n { print(o[j] as i32); }
+
+    // ---- broadcast bias -> wukong_bias_bcast_f32 ----
+    // xm = 1..8 row-major [2,4], b = [0,10,20,30]  =>  row0 1,12,23,34   row1 5,16,27,38
+    let mut xm: []f32 = alloc_f32(r * c);
+    let mut b: []f32 = alloc_f32(c);
+    let mut ob: []f32 = alloc_f32(r * c);
+    for k in 0..(r * c) { xm[k] = ((k + 1i64) as f32); }
+    for j in 0..c { b[j] = ((j * 10i64) as f32); }
+    for i in 0..r { for j in 0..c { ob[i * c + j] = xm[i * c + j] + b[j]; } }
+    for k in 0..(r * c) { print(ob[k] as i32); }
+
+    // ---- streaming int8 dequant -> wukong_dequant_f32 ----
+    // q = -4..3, scale 4  =>  -16,-12,-8,-4,0,4,8,12
+    let mut q: []i8 = alloc_i8(n);
+    let mut dq: []f32 = alloc_f32(n);
+    for j in 0..n { q[j] = ((j - 4i64) as i8); }
+    for j in 0..n { dq[j] = (q[j] as f32) * 4.0; }
+    for j in 0..n { print(dq[j] as i32); }
+
+    // ---- per-channel dequant -> wukong_dequant_perchan_f32 ----
+    // qm = 0,8,16,…,56 over [2,4]; scale = [1, 0.5, 0.25, 0.125]
+    //   row0: 0, 4, 4, 3      row1: 32, 20, 12, 7
+    let mut qm: []i32 = alloc_i32(r * c);
+    let mut ps: []f32 = alloc_f32(c);
+    let mut pd: []f32 = alloc_f32(r * c);
+    for k in 0..(r * c) { qm[k] = ((k * 8i64) as i32); }
+    ps[0] = 1.0; ps[1] = 0.5; ps[2] = 0.25; ps[3] = 0.125;
+    for i in 0..r { for j in 0..c { pd[i * c + j] = (qm[i * c + j] as f32) * ps[j]; } }
+    for k in 0..(r * c) { print(pd[k] as i32); }
+
+    // ---- Horner polynomial -> wukong_vhorner_f32 ----
+    // r = v*v + 2v + 3 over v = 0..7  =>  3, 6, 11, 18, 27, 38, 51, 66
+    let mut hx: []f32 = alloc_f32(n);
+    let mut ho: []f32 = alloc_f32(n);
+    for j in 0..n { hx[j] = (j as f32); }
+    for j in 0..n {
+        let v: f32 = hx[j];
+        let mut acc: f32 = 1.0;
+        acc = acc * v + 2.0;
+        acc = acc * v + 3.0;
+        ho[j] = acc;
+    }
+    for j in 0..n { print(ho[j] as i32); }
+
+    // ---- bf16 -> f32 streaming axpby -> wukong_axpby_bf16 ----
+    // bx = 1..8, by = 10..80 (bf16-exact)  =>  2*bx + by = 12*(k+1)
+    let mut bx: []bf16 = alloc_bf16(n);
+    let mut by: []bf16 = alloc_bf16(n);
+    let mut af: []f32 = alloc_f32(n);
+    for k in 0..n {
+        bx[k] = (((k + 1i64) as f32) as bf16);
+        by[k] = ((((k + 1i64) * 10i64) as f32) as bf16);
+    }
+    for k in 0..n { af[k] = 2.0 * (bx[k] as f32) + 1.0 * (by[k] as f32); }
+    for k in 0..n { print(af[k] as i32); }
+
+    // ---- bf16 -> bf16 narrowing axpby -> wukong_axpby_bf16_out ----
+    // same 12*(k+1); every value has <= 8 mantissa bits, so the bf16 store is exact
+    let mut ab: []bf16 = alloc_bf16(n);
+    for k in 0..n { ab[k] = ((2.0 * (bx[k] as f32) + 1.0 * (by[k] as f32)) as bf16); }
+    for k in 0..n { print((ab[k] as f32) as i32); }
+
+    // ---- bf16 -> bf16 narrowing activation -> wukong_vmath_bf16_out ----
+    // leaky_relu is the identity on x > 0 in every implementation, so 1..8 maps to 1..8 with no
+    // dependence on the kernel's negative-slope arithmetic — the operand *resolution* is what this
+    // arm gates, and a fat-pointer base shows up as garbage/crash whatever the activation is.
+    let mut sq: []bf16 = alloc_bf16(n);
+    let mut sr: []bf16 = alloc_bf16(n);
+    for k in 0..n { sq[k] = (((k + 1i64) as f32) as bf16); }
+    for k in 0..n { sr[k] = (leaky_relu(sq[k] as f32) as bf16); }
+    for k in 0..n { print((sr[k] as f32) as i32); }
+
+    free(x); free(y); free(o);
+    free(xm); free(b); free(ob);
+    free(q); free(dq);
+    free(qm); free(ps); free(pd);
+    free(hx); free(ho);
+    free(bx); free(by); free(af); free(ab);
+    free(sq); free(sr);
+    return 0;
+}

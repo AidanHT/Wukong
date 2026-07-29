@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 999
+// EXPECT-OUT: 999
+// EXPECT-OUT: 999
+// EXPECT-OUT: 999
+// EXPECT-OUT: 999
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+module tests.run.while_bound_side_effect
+
+// A counting `while` whose bound is a CALL. The normalization that rewrites
+// `while i < N { …; i += 1 }` into the vectorizable for-range form evaluates `N` exactly once,
+// before the loop — legal only for a pure, loop-invariant bound. Its only guard was "the bound does
+// not mention the counter", so a call bound was hoisted too and `bound()`'s `print` ran ONCE
+// instead of five times (four passing tests plus the final failing one). The loop's data result
+// stayed correct, so nothing but the printed side effect exposes it — and both backends run the
+// identical rewritten MIR, so the differential and opt-invariance gates are blind. The bound is now
+// restricted to a pure arithmetic form; this loop falls back to the scalar `while`, which
+// re-evaluates the condition every iteration.
+fn bound() -> i32 {
+    print(999);
+    return 4;
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut i = 0;
+    while i < bound() {
+        a[i] = a[i] + 1.0;
+        i = i + 1;
+    }
+    print(a[0] as i32); // 1.0 + 1.0 = 2.0
+    print(i); // the loop exits with i == 4
+    return 0;
+}

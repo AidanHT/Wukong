@@ -1,0 +1,83 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 69616
+// EXPECT-OUT: 0
+// EXPECT-OUT: 35164
+module tests.run.parallel_region_reassigned_local
+
+// The mid-function `@parallel` region prover keeps two models of a body-local while it walks: a
+// digit-derived value (`let r = t % 64`) and an inner `for` variable's literal range. Both are
+// snapshotted into every recorded access, and the walk is source-ordered rather than flow-sensitive —
+// so a local that is REASSIGNED inside an inner loop kept a snapshot that is wrong on every later trip
+// of that loop, and the disjointness proof ran on a value the program never computes.
+//
+// `digit_reassigned` writes out[q*1024 + r*8] with `r` advanced by 8 each trip, so the k=1 store lands
+// exactly where iteration t+8's k=0 store lands. `loopvar_reassigned` writes out[t*8 + k] after
+// `k = k * 64`, so its second store lands where iteration t+8's first store lands. Both are real data
+// races once the region is outlined: on the campaign base native printed 69616, 72592, 71600, 69616
+// for the first and 35164, 35276, 35276, 35220 for the second — different answers run to run, and
+// only sometimes the right one. Both regions must now decline (no `wukong_parallel_for` in
+// `--emit=mir -O2`) and lower serially.
+//
+// The expected sums are the serial meaning of the two nests, computed independently: 69616 and 35164.
+// tests/run/parallel_divmod_tiling.wk and parallel_head_loop.wk are the positive controls that the
+// region prover still fires — neither reassigns a modeled local.
+
+@parallel
+fn digit_reassigned(mut out: [f32; 4096], src: [f32; 256]) {
+    let dummy: i32 = 0;
+    for t in 0..256 {
+        let q = t / 64;
+        let mut r = t % 64;
+        let mut acc: f32 = 0.0;
+        for z in 0..200 {
+            acc = acc + src[t] * 0.5;
+        }
+        for k in 0..2 {
+            out[q * 1024 + r * 8] = src[t] + (k as f32) * 1000.0 + acc * 0.0;
+            r = r + 8;
+        }
+    }
+    println(dummy as i64);
+}
+
+@parallel
+fn loopvar_reassigned(mut out: [f32; 4096], src: [f32; 256]) {
+    let dummy: i32 = 0;
+    for t in 0..256 {
+        let mut acc: f32 = 0.0;
+        for z in 0..200 {
+            acc = acc + src[t] * 0.5;
+        }
+        for k in 0..2 {
+            k = k * 64;
+            out[t * 8 + k] = src[t] + (k as f32) + acc * 0.0;
+        }
+    }
+    println(dummy as i64);
+}
+
+fn total(a: [f32; 4096]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..4096 {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let mut src: [f32; 256] = [0.0; 256];
+    for i in 0..256 {
+        src[i] = (i as f32);
+    }
+
+    let mut a: [f32; 4096] = [0.0; 4096];
+    digit_reassigned(a, src);
+    print(total(a) as i32); // 69616
+
+    let mut b: [f32; 4096] = [0.0; 4096];
+    loopvar_reassigned(b, src);
+    print(total(b) as i32); // 35164
+    return 0;
+}

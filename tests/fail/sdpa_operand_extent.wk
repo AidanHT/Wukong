@@ -1,0 +1,22 @@
+// EXPECT-CODE: C0001
+module tests.fail.sdpa_operand_extent
+
+// The attention kernel's documented contract is `q`, `k`, `v` valid for `s*d` f32 reads and `o` valid
+// for `s*d` f32 writes, and the only knob the programmer turns is the `s` argument — no index is ever
+// written, so nothing else in the language can catch a mistyped sequence length. With `s*d = 8` and a
+// 2-element `out`, six f32 land past the end of the buffer. When the dims are compile-time constants
+// and the buffer's type pins its extent, the call must be REFUSED (catalogued C0001, exit 1).
+//
+// Before the guard: the interpreter caught it at run time (`error: attention output out of bounds`,
+// exit 1) but native SEGFAULTED, exit 139 — a hard interpreter-vs-native divergence, which is what
+// `native_matches_interpreter` sees here. tests/run/sdpa.wk (len == s*d) is the positive control.
+
+fn main() -> i32 {
+    let q: [f32; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    let k: [f32; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    let v: [f32; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    let mut out: [f32; 2] = [0.0, 0.0];
+    sdpa(q, k, v, out, 4, 2, 1.0, 0);
+    print(out[0] as i32);
+    return 0;
+}

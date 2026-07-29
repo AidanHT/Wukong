@@ -21,7 +21,9 @@
 //! `_CMP_GT_OQ` for max, `_CMP_LT_OQ` for min), exactly the lane-update idiom of [`crate::wukong_rowargmax_i32`].
 //! Each lane is an **independent column**, so — unlike the per-row kernel — there is *no* horizontal
 //! lane collapse (the eight results are eight separate columns), which makes this simpler. Row indices
-//! are small integers (`< rows`) exactly representable in f32, so the index bookkeeping is exact. The
+//! ride an f32 lane, which is exact only below the f32 mantissa limit `2^24`, so [`colarg_range`]
+//! dispatches to the AVX2 path only when `rows < 2^24` and hands taller matrices to the exact-integer
+//! scalar twin (the same guard shape `argreduce_chunk` uses for its i32 index lanes). The
 //! best-value vector is seeded from **row 0** and the best-index vector from 0, then rows `1..rows` are
 //! scanned. The `cols % 8` remainder columns are a scalar tail (the same strict-compare scan).
 //!
@@ -55,12 +57,10 @@ unsafe fn colarg_scalar(
     j1: usize,
     is_max: bool,
 ) {
-    // Seed from row 0: best value = x[0, j], best row = 0, for every column in the range.
-    for j in j0..j1 {
-        *out.add(j) = 0;
-    }
-    // (best value per column is recomputed from x on each comparison below; no separate value buffer
-    // is needed for the scalar path — clarity over a tiny re-load, and it mirrors the AVX2 seed.)
+    // One column at a time: the running best value and best row live in registers for the whole
+    // i-scan, so `out[j]` is written exactly once, at the end. Nothing reads `out` before that write
+    // — unlike the AVX2 twin, which needs a real seeded scratch buffer because its accumulators stay
+    // resident across all rows.
     for j in j0..j1 {
         let mut best_val = *x.add(j); // x[0*cols + j]
         let mut best_row = 0usize;
@@ -93,7 +93,9 @@ unsafe fn colarg_scalar(
 ///
 /// # Safety
 /// `x` valid for `rows*cols` `f32`; `out` valid for `cols` `i32`; `j0 <= j1 <= cols`; `rows >= 1`;
-/// AVX2 must be available.
+/// AVX2 must be available. `rows < 2^24` — the running row index lives in an f32 lane, so above the
+/// f32 mantissa limit it would round and stop matching [`colarg_scalar`]; [`colarg_range`] is the
+/// only caller and is what guarantees the bound.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn colarg_avx2(
@@ -183,7 +185,11 @@ unsafe fn colarg_range(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        // The AVX2 twin carries the running row index in an f32 lane, exact only below the f32
+        // mantissa limit; past it `i as f32` rounds and the recovered index is off by one, so the
+        // exact-integer scalar twin takes over. Same guard shape `argreduce_chunk` (reduce.rs) uses
+        // for its i32 index lanes; one comparison per call.
+        if is_x86_feature_detected!("avx2") && rows < (1usize << 24) {
             colarg_avx2(x, out, rows, cols, j0, j1, is_max);
             return;
         }
@@ -225,6 +231,12 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
         return;
     }
     use rayon::prelude::*;
+    // This entry can be the process's FIRST rayon touch, so it must configure the global pool before
+    // forking (crate::ensure_global_pool's stated contract): otherwise rayon lazily builds its default
+    // 2 MiB-stack registry here and the runtime's 16 MiB build_global silently loses the race for the
+    // whole process, leaving later outlined @parallel region bodies (~1.5 MiB of privatized scratch at
+    // S=512) on 2 MiB stacks. Configuration only -- the stripe split is unchanged, so the bits are too.
+    crate::ensure_global_pool();
     // One stripe per core, each a multiple of 8 columns (keep the AVX2 8-wide main loop aligned to the
     // stripe boundary so every stripe's tail is only its own `cols % 8`); the last stripe absorbs the
     // remainder. Raw pointers cross the rayon closure boundary as integers (the same pattern as the
@@ -435,9 +447,36 @@ mod tests {
         assert_eq!(amin_p, amin, "argmin lowest-row-index (parallel == serial)");
     }
 
+    /// The AVX2 twin holds the winning row index in an f32 lane, so it is exact only while
+    /// `rows < 2^24`. Pin the dispatch guard that keeps that precondition true: with `rows = 2^24 + 2`
+    /// the unguarded vector path rounded row 16777217 down to 16777216 and returned an index one short
+    /// of the true answer, while `colarg_scalar` (exact integers) returned 16777217 — a CPU-dependent
+    /// wrong answer. One column keeps the buffer at ~67 MB and still crosses the bound, because the
+    /// f32 index is used by the AVX2 per-row tail as well as by its 8-lane body.
+    #[test]
+    fn rows_past_the_f32_mantissa_limit_keep_the_exact_row_index() {
+        let rows = (1usize << 24) + 2;
+        let cols = 1usize;
+        let mut x = vec![0.0f32; rows * cols];
+        x[(rows - 1) * cols] = 1.0; // unique max at row 16777217 (> 2^24)
+        let mut got = vec![0i32; cols];
+        let mut want = vec![0i32; cols];
+        unsafe {
+            wukong_colargmax_i32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
+            colarg_scalar(x.as_ptr(), want.as_mut_ptr(), rows, cols, 0, cols, true);
+        }
+        assert_eq!(want, vec![(rows - 1) as i32], "scalar twin lost the exact row index");
+        assert_eq!(got, want, "colargmax dispatch != scalar twin past 2^24 rows");
+    }
+
     /// Where AVX2 is available, the vector path must equal the scalar twin EXACTLY for every column,
     /// across widths spanning the 8-lane edge and tails (and a few row counts) — the column analogue of
     /// the rowarg scalar==avx2 pin. (i32 indices → exact equality, no tolerance.)
+    ///
+    /// Both output buffers are seeded with a SENTINEL rather than 0: row 0 is a legal answer, so a
+    /// zero-filled buffer cannot tell "wrote 0" from "never wrote this column" — verified by mutation
+    /// (suppressing the `out[j]` store whenever `best_row == 0` passed every col-arg test while the
+    /// buffers started at 0). With the sentinel, any column a path fails to write fails the compare.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
@@ -448,8 +487,8 @@ mod tests {
             for &rows in &[1usize, 2, 7, 33, 100] {
                 let x = fill(rows, cols);
                 for is_max in [true, false] {
-                    let mut s = vec![0i32; cols];
-                    let mut v = vec![0i32; cols];
+                    let mut s = vec![-7i32; cols]; // sentinel: never a legal row index
+                    let mut v = vec![-7i32; cols];
                     unsafe {
                         colarg_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, is_max);
                         colarg_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, is_max);

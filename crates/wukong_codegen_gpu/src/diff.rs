@@ -7,6 +7,28 @@
 //! interpreter marshals) within a bound that scales with the reduction length, plus an independent
 //! f64 accuracy check. Grids are fixed so a GPU result is deterministic run-to-run.
 
+/// **§3A P3 — a gate that cannot run must never report green silently.**
+///
+/// Every device-gated test in this crate early-`return`s when the GPU (or the thing under test) is
+/// unreachable. libtest captures stderr on a *pass*, so that early return is invisible: the suite
+/// prints `test result: ok` having executed zero device instructions — the exact "green without the
+/// hardware" failure this campaign already tripped over on the peer DLLs. Call this immediately
+/// before every such early return.
+///
+/// By default it only prints the `[skip]` marker, so a genuinely GPU-less box (CI) still passes.
+/// With `WUKONG_GPU_REQUIRED=1` — the campaign's own invocation, and any box that is *supposed* to
+/// have a device — it fails the test instead. Mirrors `gpu::tests::with_gpu`'s escape hatch so one
+/// env var governs every skip in the crate.
+#[track_caller]
+pub fn skip_or_fail(what: &str, why: &str) {
+    assert!(
+        !crate::gpu::gpu_required(),
+        "{what}: WUKONG_GPU_REQUIRED is set but this gate cannot run ({why}) — it would have \
+         reported a green pass having tested NOTHING"
+    );
+    eprintln!("[skip] {what}: {why}");
+}
+
 /// Deterministic, dependency-free PRNG (SplitMix64) for reproducible random test buffers — avoids a
 /// `rand` dep and `Math.random`, and gives identical inputs every run so a tolerance is stable.
 pub struct Rng(u64);

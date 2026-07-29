@@ -46,6 +46,12 @@ const NORM_RMSNORM: i64 = 2;
 const VE_ID: i64 = 0;
 /// OR'd into a velem op when `y` is read (`b` may be non-zero).
 const VE_USE_Y: i64 = 256;
+/// velem *compute mode*: the elementwise Hadamard product (`out = act(x · y)`). Mirrored from
+/// `wukong_runtime::velem`. It lives ABOVE the low activation byte, so a `op & 0xff` test does not
+/// see it — and it is **non-affine**, so the affine VJP below is not a rule for it.
+const VE_HADAMARD: i64 = 512;
+/// velem *compute mode*: the elementwise quotient (`out = act(x / y)`) — likewise non-affine.
+const VE_DIV: i64 = 1024;
 
 const F32: MirType = MirType::F32;
 const I64T: MirType = MirType::I64;
@@ -87,6 +93,13 @@ pub(crate) struct Syms {
     /// activation backwards (`dx = dy · act'(x)` in one fused pass).
     pub vmath2: Symbol,
     pub norm: Symbol,
+    /// The `@parallel` row-wise norm — same `(x, out, rows, cols, eps_bits, op)` ABI and
+    /// bit-identical (each row is independent, no cross-row combine) result as the serial `norm`, so
+    /// it differentiates through the very same rule. `emit_norm` selects *this* symbol for every
+    /// batched LayerNorm/RMSNorm/softmax inside a `@parallel fn` — the shipped transformer shape —
+    /// while single-row / non-parallel tapes use the serial one; accept both. Without it the same
+    /// model is differentiable serially and not in parallel.
+    pub norm_parallel: Symbol,
 }
 
 impl Syms {
@@ -103,6 +116,7 @@ impl Syms {
             velem_parallel: it.intern("wukong_velem_f32_parallel"),
             vmath2: it.intern("wukong_vmath2_f32"),
             norm: it.intern("wukong_norm_f32"),
+            norm_parallel: it.intern("wukong_norm_f32_parallel"),
         }
     }
 }
@@ -142,6 +156,7 @@ impl<'a> Vjp<'a> {
             || func == self.syms.velem
             || func == self.syms.velem_parallel
             || func == self.syms.norm
+            || func == self.syms.norm_parallel
     }
 
     /// Canonicalize a kernel buffer argument to the base buffer it addresses: peel a whole-buffer
@@ -169,6 +184,29 @@ impl<'a> Vjp<'a> {
         }
     }
 
+    /// The argument count of each recognized kernel's ABI, matching the operand lists the VJP rules
+    /// below index. `is_kernel` recognizes a call by SYMBOL NAME alone, and a `.wk` program may
+    /// declare that name in an `extern "C"` block with any signature it likes — so the arity must be
+    /// checked before those rules index `args[..]` raw, or a mismatched declaration panics the
+    /// compiler with an index-out-of-bounds ICE instead of producing a diagnostic.
+    /// The arms mirror [`Vjp::diff_kernel_call`]'s dispatch chain one-for-one, so a new kernel arm
+    /// there is a visible hole here.
+    fn kernel_arity(&self, func: Symbol) -> Option<usize> {
+        if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
+            Some(4) // (x, y, n, op)
+        } else if func == self.syms.sgemm_nt || func == self.syms.sgemm_nt_parallel {
+            Some(7) // (a, b, c, m, k, n, beta)
+        } else if func == self.syms.vmath || func == self.syms.vmath_parallel {
+            Some(4) // (x, out, n, op)
+        } else if func == self.syms.velem || func == self.syms.velem_parallel {
+            Some(8) // (x, y, out, n, a, b, c, op)
+        } else if func == self.syms.norm || func == self.syms.norm_parallel {
+            Some(6) // (x, out, rows, cols, eps_bits, op)
+        } else {
+            None
+        }
+    }
+
     /// Differentiate one recognized kernel call. `args`/`result` are the forward (old) value ids.
     pub(crate) fn diff_kernel_call(
         &mut self,
@@ -176,6 +214,18 @@ impl<'a> Vjp<'a> {
         raw_args: &[ValueId],
         result: Option<ValueId>,
     ) -> Result<(), String> {
+        let want = self
+            .kernel_arity(func)
+            .ok_or_else(|| "autodiff: kernel call has no VJP rule".to_string())?;
+        if raw_args.len() != want {
+            return Err(format!(
+                "autodiff: call to `{}` has {} argument(s), expected {} — not the recognized \
+                 kernel ABI",
+                self.it.resolve(func),
+                raw_args.len(),
+                want
+            ));
+        }
         // Normalize every buffer operand to its base alloca/param so the buffer-adjoint bookkeeping
         // is keyed consistently regardless of which whole-buffer pointer form lowering chose. (The
         // scalar `result` of a reduction is never a gep, so it needs no canonicalization.)
@@ -189,7 +239,7 @@ impl<'a> Vjp<'a> {
             self.diff_vmath(args)
         } else if func == self.syms.velem || func == self.syms.velem_parallel {
             self.diff_velem(args)
-        } else if func == self.syms.norm {
+        } else if func == self.syms.norm || func == self.syms.norm_parallel {
             self.diff_norm(args)
         } else {
             Err("autodiff: kernel call has no VJP rule".to_string())
@@ -222,6 +272,21 @@ impl<'a> Vjp<'a> {
                 let (x, y) = (args[0], args[1]);
                 let xn = self.remap_v(x);
                 let yn = self.remap_v(y);
+                // The **self**-dot `loss = sum(x[i]^2)` — the sum-of-squares loss / L2 regularizer,
+                // which lowers to `sreduce(x, x, n, RED_DOT)` with both operands the SAME buffer —
+                // is one op with a repeated operand, not two separate contributions: `dx = 2g*x`, a
+                // single velem scale. (`x`/`y` are canon-normalized above, so pointer identity is
+                // the right test.) Without this case the two-buffer path below calls `single(x)`
+                // twice and the second call always errors.
+                if x == y {
+                    if let Some(gx) = self.grad_target(x)? {
+                        self.single(x)?;
+                        let two = self.cf32(2.0);
+                        let g2 = self.fmul(g, two, &F32); // 2g
+                        self.velem_scale(gx, xn, g2, n);
+                    }
+                    return Ok(());
+                }
                 if let Some(gx) = self.grad_target(x)? {
                     self.single(x)?;
                     self.velem_scale(gx, yn, g, n);
@@ -251,7 +316,7 @@ impl<'a> Vjp<'a> {
             }
             other => {
                 return Err(format!(
-                    "autodiff: no VJP for sreduce op {other} (only SUM and SSD so far)"
+                    "autodiff: no VJP for sreduce op {other} (supported: SUM, DOT, SSD)"
                 ))
             }
         }
@@ -343,13 +408,26 @@ impl<'a> Vjp<'a> {
     /// `velem(x, y, out, n, a, b, c, op)` computes `out = act(a*x + b*y + c)`. With the identity
     /// activation it is linear, so the VJP is exact: `dx = a*dout`, `dy = b*dout` (each a velem
     /// scale). This covers residual add (`a=b=1` -> `dx=dy=dout`) and scaling. Non-identity
-    /// activations (relu/relu6) are rejected for now (they need a masked loop like vmath).
+    /// activations (relu/relu6) are rejected for now (they need a masked loop like vmath), and so is
+    /// every *compute mode* above the activation byte ([`VE_HADAMARD`], [`VE_DIV`]) — those are not
+    /// the affine form this rule differentiates. The gate is a WHITELIST of the two op spellings the
+    /// affine rule is valid for, so a future high-bit mode fails closed rather than silently taking
+    /// the linear VJP.
     fn diff_velem(&mut self, args: &[ValueId]) -> Result<(), String> {
         let (x, y, out) = (args[0], args[1], args[2]);
         let op = self.const_i64(args[7])?;
-        if op & 0xff != VE_ID {
+        if op != VE_ID && op != (VE_ID | VE_USE_Y) {
+            let what = if op & VE_HADAMARD != 0 {
+                "the Hadamard-product compute mode (out = x . y)"
+            } else if op & VE_DIV != 0 {
+                "the elementwise-division compute mode (out = x / y)"
+            } else {
+                "a non-identity activation (relu/relu6)"
+            };
             return Err(format!(
-                "autodiff: velem VJP only supports the identity activation (op {op})"
+                "autodiff: velem VJP only supports the identity affine form (op {VE_ID} or \
+                 {}); op {op} selects {what}",
+                VE_ID | VE_USE_Y
             ));
         }
         let dout = match self.buf_adj.get(&out).copied() {

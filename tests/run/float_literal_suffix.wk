@@ -1,0 +1,51 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 1000.5
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -0.25
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1.5
+module tests.run.float_literal_suffix
+
+// `f` alone is the C-style float suffix (`5f` is 5.0 typed f32). sema's literal check accepts it —
+// `float_literal_well_formed` lists it explicitly — but mir_build's `parse_float` stripped only
+// bf16/f16/f32/f64, so `"5f".parse::<f64>()` failed into an `unwrap_or(0.0)` and every `f`-suffixed
+// literal lowered to the constant 0.0. No diagnostic, and both backends emitted the same `const.f32 0`
+// at every -O level, so `native_matches_interpreter` and both optimization-invariance gates were
+// blind to it; only these golden values catch it. The language guide promises a malformed literal is
+// "a compile error (E0401), never silently zeroed", and this literal is not even malformed.
+//
+// Two decoders read one syntax: sema decides whether a literal is LEGAL and mir_build decides what it
+// is WORTH. A suffix on only one of the two lists is a literal that compiles to the wrong number, so
+// the point of this fixture is that the lists agree — the first six values below are the ones that
+// only sema used to accept, the last three are the spellings that always worked and pin that the
+// shared suffix stripping did not regress.
+
+fn main() -> i32 {
+    let a: f32 = 5f; // 5
+    let b: f32 = 1.5f; // 1.5
+    let c: f64 = 2.5f; // 2.5 — the suffix does not pin the type; the annotation does
+    let d: f32 = 1_000.5f; // 1000.5 — digit separators and the suffix strip together
+    let e: f32 = 1e3f; // 1000 — an exponent body still ends in the suffix
+    let g: f32 = 0f - 0.25f; // -0.25 — an `f` literal is a normal operand, not just an initializer
+
+    // Controls: the longer suffixes and the bare literal never went through the failing path.
+    let h: f32 = 5f32; // 5
+    let i: f64 = 5f64; // 5
+    let j: f32 = 1.5; // 1.5
+
+    print(a);
+    print(b);
+    print(c);
+    print(d);
+    print(e);
+    print(g);
+    print(h);
+    print(i);
+    print(j);
+    return 0;
+}

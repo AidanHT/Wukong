@@ -1,0 +1,55 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 15
+// EXPECT-OUT: 25
+// EXPECT-OUT: 25
+// EXPECT-OUT: 35
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -3
+module tests.run.loop_counter_wider_bound
+
+// The scalar for-range loop drives its counter at the WIDER of the two bound types, so `for i in 1..n`
+// with `n: i64` loads an i64 `i` — while sema types the loop variable from the start literal and calls
+// it i32. Arithmetic that mixed the counter with an unsuffixed literal therefore built `sub`/`add`/
+// `mul`/`cmp` on (i64, i32), which the MIR verifier rejects: `src[i - 1]` was
+//
+//     internal compiler error (MIR verify): sub: v12 has type i64 but expected i32
+//
+// at -O0 and -O2 on both backends — on a program whose every control (`src[i]`, `src[i - 1i64]`,
+// `n: i32`) compiles and runs. `if i > 1`, `i * 1`, `i + 1 - 2` and `0 - i` all reported the same ICE.
+// A binary operator now reads each operand's width off the VALUE rather than off sema's type for the
+// expression, and widens the operation to hold both — a no-op whenever the two agree, which is every
+// program that already compiled.
+
+fn scan(src: []f32, n: i64) {
+    for i in 1..n {
+        print((src[i - 1] * 10.0) as i32); // 5 15 25
+    }
+}
+
+fn gated(src: []f32, n: i64) {
+    for i in 0..n {
+        if i > 1 {
+            print((src[i] * 10.0) as i32); // 25 35
+        }
+    }
+}
+
+fn negated(n: i64) {
+    for i in 1..n {
+        print(0 - i); // -1 -2 -3
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 4] = [0.0; 4];
+    for k in 0..4 {
+        a[k] = (k as f32) + 0.5; // 0.5 1.5 2.5 3.5
+    }
+    scan(a, 4);
+    gated(a, 4);
+    negated(4);
+    return 0;
+}

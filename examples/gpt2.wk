@@ -9,13 +9,23 @@ module examples.gpt2
 //     a   = x + Wo · MHCausalAttn( LayerNorm1(x) )      // attention sublayer + residual
 //     out = a + W2 · GELU( W1 · LayerNorm2(a) )         // MLP sublayer       + residual
 //
-// Every sub-op is spelled in the form the compiler RECOGNIZES and dispatches to a tuned
-// kernel (the same lowering XLA/TVM use for a matmul/softmax/norm op, not the naive nest
-// gcc/rustc emit):
-//   * the LayerNorms are the batched `for r { mean; var; rsqrt; affine }` form  -> wukong_norm_affine_f32
-//   * the Q/K/V/O/FFN projections are the `nn.Linear` C = A·Bᵀ dot-product nest -> the tuned GEMM
-//   * the causal attention is Q·Kᵀ -> masked row-softmax -> P·V                 -> GEMM + fused norm
-//   * the GELU is the tanh-approximation elementwise loop                       -> the 256-bit vmath kernel
+// What this file actually dispatches — MEASURED, `wukongc --emit=mir -O2 examples/gpt2.wk`, not
+// inferred from the source (that inference is what made the two stale claims this list replaces):
+//   * the two LayerNorms, the batched `for r { mean; var; rsqrt; affine }` form -> wukong_norm_affine_f32 (2)
+//   * the six non-attention projections, the `nn.Linear` C = A·Bᵀ nest          -> wukong_sgemm_nt (6)
+//   * the two residual adds                                                     -> wukong_velem_f32 (2)
+// and NOTHING else — 10 kernel calls in total.
+//
+// Two things here deliberately do NOT dispatch, and the reason is instructive:
+//   * the per-head Q·Kᵀ and P·V nests index the INTERLEAVED [S, H*hd] layout (`q[i*64 + h*16 + p]`),
+//     whose row stride 64 != the contraction 16, so the GEMM recognizer declines them and they stay
+//     scalar. examples/gpt2_forward_bench.wk:131-139 shows the explicit per-head repack into contiguous
+//     [S,hd] panels (plus V transposed) that DOES make both attention GEMMs and the batched row-softmax
+//     dispatch — that is the spelling to copy for a new model, not this one.
+//   * the masked row-softmax and the inline tanh-GELU below likewise stay scalar here. The bench file's
+//     mask-as-its-own-pass + multi-pass softmax and its `gelu()` intrinsic are the recognized forms.
+// This file is the readable SHAPE spec for a GPT-2 block and the interp/native differential fixture;
+// it is not the dispatch-surface spec. gpt2_forward_bench.wk is.
 //
 // Under `--run` the interpreter executes those same kernels (the differential oracle), and the
 // native / `--backend=gpu-native` backends must agree with it bit-for-bit / within tolerance.
@@ -86,6 +96,10 @@ fn gpt2_block(
     // ---- 3. Multi-head causal attention.  H=4 heads, hd=16, scale 1/sqrt(16) = 0.25 ----
     // Each head h works over the column slice [h*16 .. h*16+16) of Q/K/V; the masked
     // row-softmax makes token i attend only to tokens j <= i (autoregressive).
+    // NOTE (measured): none of this section dispatches. The interleaved index `q[i*64 + h*16 + p]`
+    // has row stride 64 against a contraction of 16, so Q·Kᵀ and P·V stay scalar nests, and the
+    // mask-inside-the-row-loop softmax is not the recognized multi-pass form either. See
+    // examples/gpt2_forward_bench.wk:131-163 for the repacked spellings that do dispatch.
     for h in 0..4 {
         // scores = Qh · Khᵀ   (scaled)
         for i in 0..8 { for j in 0..8 {
@@ -139,7 +153,8 @@ fn gpt2_block(
         for p in 0..64 { s = s + nrm[i*64+p] * w1[j*64+p]; }
         ff1[i*256+j] = s;
     } }
-    // GELU (tanh approximation), the bit-exact elementwise form -> 256-bit vmath kernel.
+    // GELU (tanh approximation), written out elementwise. Measured: this spelling does NOT dispatch to
+    // wukong_vmath_f32 — the `gelu()` intrinsic (examples/gpt2_forward_bench.wk:201) is what does.
     for i in 0..2048 {
         let u: f32 = 0.7978845608 * (ff1[i] + 0.044715 * ff1[i] * ff1[i] * ff1[i]);
         let t: f32 = 1.0 - 2.0 / (exp(2.0 * u) + 1.0);

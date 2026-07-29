@@ -1,0 +1,73 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 99
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 2
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+module tests.run.array_assign_extent
+
+// Every place an array literal initializes a destination whose extent lowering already knows:
+// a struct field, an array-repeat into the same field, a tuple field, a data-carrying enum payload,
+// and an element of an array-of-arrays. `lower_array_init` never compared the literal's length
+// against that extent, so an over-long literal stored PAST the end of the buffer it was handed
+// (`s.a = [7, 8, 9, 10, 11, 12]` into an `[i32; 2]` field wrote 24 bytes into an 8-byte alloca:
+// `error: store out of bounds` on interp, a **segfault** on native) and an under-long one left the
+// tail uninitialized (interp read 0, native read stack garbage that differed at -O0 and -O2). The
+// stores are now clamped to the destination's extent and a mismatch is an E0401. This fixture pins
+// the matching-length forms, which must keep working unchanged.
+struct S {
+    a: [i32; 3],
+    b: i32,
+}
+
+enum E {
+    A([i32; 2]),
+    B(i32),
+}
+
+fn main() -> i32 {
+    let mut s = S { a: [1, 2, 3], b: 99 };
+    s.a = [7, 8, 9];
+    print(s.a[0]);
+    print(s.a[1]);
+    print(s.a[2]);
+    print(s.b); // the neighbouring field must be untouched
+
+    s.a = [5; 3];
+    print(s.a[0]);
+    print(s.a[2]);
+
+    let mut t: ([i32; 2], i32) = ([1, 2], 3);
+    t.0 = [4, 6];
+    print(t.0[0]);
+    print(t.0[1]);
+    print(t.1);
+
+    let e = E::A([11, 12]);
+    match e {
+        E::A(v) => {
+            print(v[0]);
+            print(v[1]);
+        }
+        E::B(n) => {
+            print(n);
+        }
+    }
+
+    let mut grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+    grid[1] = [8, 9];
+    print(grid[0][1]);
+    print(grid[1][0]);
+    print(grid[1][1]);
+    return 0;
+}

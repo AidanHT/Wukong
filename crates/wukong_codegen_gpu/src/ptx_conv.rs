@@ -1400,6 +1400,70 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
 mod tests {
     use super::*;
 
+    /// Assert a generated module is pure ASCII, naming the offending line if not. A single non-ASCII
+    /// byte anywhere in a PTX string is a `ptxas fatal`, and on the device path it surfaces only as an
+    /// opaque `DriverError` out of `cuModuleLoadData` with no hint that one byte is at fault (§3A P1).
+    pub(super) fn assert_ptx_ascii(what: &str, ptx: &str) {
+        if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+            panic!("{what}: PTX line {} is not ASCII (ptxas fatal): {line:?}", i + 1);
+        }
+        assert!(!ptx.is_empty(), "{what}: generated an empty module");
+    }
+
+    /// **§3A P1 gate, device-free.** Every generator in this file interleaves `writeln!` PTX text with
+    /// surrounding Rust doc comments full of non-ASCII (`×`, `→`, `≥`, `α`, `ᵀ`), so copying an
+    /// adjacent comment into an emitted line is a one-keystroke way to break every conv on the device.
+    /// Runs without a CUDA device, so it holds in every configuration. Each generator is exercised on
+    /// every shape in the sweep — no `continue`, so no variant can silently go unchecked.
+    #[test]
+    fn every_conv_generator_emits_ascii_ptx() {
+        for (c, h, w, k, r, s) in [
+            (3usize, 32usize, 32usize, 16usize, 3usize, 3usize),
+            (64, 56, 56, 64, 1, 1),
+            (8, 16, 16, 48, 5, 5),
+            (128, 28, 28, 128, 3, 3),
+        ] {
+            let pq = (h - r + 1) * (w - s + 1);
+            assert_ptx_ascii("conv2d_ptx", &conv2d_ptx(c, h, w, k, r, s));
+            assert_ptx_ascii("conv_wmma_ptx", &conv_wmma_ptx(c, h, w, k, r, s));
+            assert_ptx_ascii("conv_wmma_strided_ptx", &conv_wmma_strided_ptx(c, h, w, k, r, s, 2));
+            assert_ptx_ascii("conv_wmma_pad_ptx", &conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1));
+            assert_ptx_ascii("conv_wmma_db_ptx", &conv_wmma_db_ptx(c, h, w, k, r, s));
+            for act in [
+                crate::ptx_wmma::Act::None,
+                crate::ptx_wmma::Act::Relu,
+                crate::ptx_wmma::Act::Silu,
+                crate::ptx_wmma::Act::Gelu,
+            ] {
+                assert_ptx_ascii(
+                    "conv_wmma_epi_ptx",
+                    &conv_wmma_epi_ptx(c, h, w, k, r, s, act, true),
+                );
+            }
+            assert_ptx_ascii("bias_relu_ptx", &bias_relu_ptx(k, pq));
+            assert_ptx_ascii("pad_nchw_copy_ptx", &pad_nchw_copy_ptx(c, h, w, 1));
+        }
+        // Split-K variants need `sk | GK` with `GK/sk` a multiple of 16, so they carry their own
+        // shape list rather than being `continue`d out of the sweep above.
+        for (c, h, w, k, r, s, sk) in
+            [(256usize, 14usize, 14usize, 256usize, 3usize, 3usize, 4usize), (128, 28, 28, 128, 1, 1, 2)]
+        {
+            let gk = c * r * s;
+            assert_eq!(gk % sk, 0);
+            assert_eq!((gk / sk) % 16, 0);
+            assert_ptx_ascii("conv_wmma_splitk_ptx", &conv_wmma_splitk_ptx(c, h, w, k, r, s, sk));
+            assert_ptx_ascii(
+                "conv_wmma_pad_splitk_ptx",
+                &conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, sk),
+            );
+            assert_ptx_ascii(
+                "conv_wmma_db_splitk_ptx",
+                &conv_wmma_db_splitk_ptx(c, h, w, k, r, s, sk),
+            );
+            assert_ptx_ascii("conv_splitk_reduce_ptx", &conv_splitk_reduce_ptx(k * 196, sk));
+        }
+    }
+
     #[test]
     fn splitk_factor_picks_reasonable() {
         // ~20-SM device (RTX 4050). Heavily-starved deep-channel shapes split; full grids don't.

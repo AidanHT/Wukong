@@ -12,6 +12,9 @@
     * AC + charging (<~99%)    -> all-core CAPPED ~25% (charging draws the power budget); 1c is fine.
     * AC + full (~100%, ~0 W)  -> REPORTABLE. This is the only state whose all-core number is a real claim.
   The banner tells you which you got. Only publish REPORTABLE all-core numbers.
+  The law binds BOTH sides of a comparison: the power class is sampled around the torch peer too, and
+  a vs-torch verdict is REPORTABLE only if the Wukong regimes AND the peer were clean. A peer timed on
+  battery is 2-4x slow, which shows up as a Wukong "win" that the instrument, not the compiler, made.
 
   Usage:  pwsh tools/measure_gpt2.ps1            # full sweep
           pwsh tools/measure_gpt2.ps1 -SkipTorch # Wukong only (no python env needed)
@@ -145,24 +148,44 @@ if (-not $SingleCoreOnly) {
 }
 Write-Host ("  single-core self-consistency (serial-1c vs par-1c): {0:P1} skew  [{1}]" -f $sc1cSkew, $(if ($sc1cSkew -le 0.05) { 'STABLE' } else { 'THROTTLED — 1c numbers suspect' }))
 
+# The PEER is measured under the same instrument law as the Wukong regimes. bench_gpt2_torch.py has
+# no power gate of its own (min-of-5 + 2 warmups, nothing else), so if AC drops between the Wukong
+# sweep and the peer run — battery-care disengaging, a bumped adapter — the peer eats the documented
+# 2-4x battery DVFS penalty and a fabricated Wukong win gets published under this script's own
+# REPORTABLE stamp. Sample around the peer too, keep the worse class, and fold it into the verdict.
+$tPower = $null
 if (-not $SkipTorch) {
     $py = if (Test-Path $TorchPython) { $TorchPython } else { "python" }
     Write-Host "`n[torch] HF GPT2Model peer (eager 1t / all-t / compiled) via $py ..."
+    $tBefore = Get-PowerClass
     Push-Location $repo
     try { & $py tools/bench_gpt2_torch.py 512 } catch { Write-Host "  torch peer failed: $_" }
     Pop-Location
+    $tAfter = Get-PowerClass
+    $tPower = if ((Power-Rank $tBefore.Class) -le (Power-Rank $tAfter.Class)) { $tBefore } else { $tAfter }
+    Write-Host ("  torch peer power: {0} — {1}" -f $tPower.Class, $tPower.Detail)
 }
 
 Write-Host ""
 if ($argmaxOk) { Write-Host "correctness: all Wukong regimes argmax=338  OK" }
 else { Write-Host "correctness: ARGMAX MISMATCH ($($argmaxes -join ',')) — TIMING INVALID until fixed" }
 
-$scReportable = $argmaxOk -and $sc1cSkew -le 0.05 -and (Tag-1c $s1.Power) -eq 'reportable' -and (Tag-1c $p1.Power) -eq 'reportable'
-$allReportable = $argmaxOk -and (Tag-all $pAll.Power) -eq 'reportable'
+# A vs-torch claim needs BOTH sides clean. An unmeasured peer (-SkipTorch) is not a clean peer:
+# with no peer number at all there is no comparison to stamp, so it cannot be reportable either.
+$peerOk1c  = ($null -ne $tPower) -and (Tag-1c  $tPower) -eq 'reportable'
+$peerOkAll = ($null -ne $tPower) -and (Tag-all $tPower) -eq 'reportable'
+$wukOk1c  = $argmaxOk -and $sc1cSkew -le 0.05 -and (Tag-1c $s1.Power) -eq 'reportable' -and (Tag-1c $p1.Power) -eq 'reportable'
+$wukOkAll = $argmaxOk -and (Tag-all $pAll.Power) -eq 'reportable'
+$scReportable = $wukOk1c -and $peerOk1c
+$allReportable = $wukOkAll -and $peerOkAll
 Write-Host ""
-if ($scReportable) { Write-Host "-> SINGLE-CORE: REPORTABLE (stable AC, 1c self-consistent) — serial-1c vs torch eager-1t is a real claim." }
+if ($scReportable) { Write-Host "-> SINGLE-CORE: REPORTABLE (stable AC across the Wukong regimes AND the peer, 1c self-consistent) — serial-1c vs torch eager-1t is a real claim." }
+elseif ($SkipTorch) { Write-Host "-> SINGLE-CORE: no peer measured (-SkipTorch) — Wukong 1c timings only. NOT a vs-torch claim." }
+elseif ($wukOk1c) { Write-Host "-> SINGLE-CORE: NOT reportable — the Wukong side was clean but the torch peer ran under $($tPower.Class). A peer timed under DVFS manufactures a Wukong win; re-run the peer on stable AC." }
 else { Write-Host "-> SINGLE-CORE: NOT reportable (battery or >5% 1c skew). Re-run on stable AC." }
 if ($SingleCoreOnly) { Write-Host "-> ALL-CORE: skipped (-SingleCoreOnly). Run the full sweep on AC+full for the all-core claim." }
-elseif ($allReportable) { Write-Host "-> ALL-CORE: REPORTABLE (AC+full trickle held through the heavy run) — vs torch eager all-thread is a real claim." }
+elseif ($allReportable) { Write-Host "-> ALL-CORE: REPORTABLE (AC+full trickle held through the heavy run AND the peer) — vs torch eager all-thread is a real claim." }
+elseif ($SkipTorch) { Write-Host "-> ALL-CORE: no peer measured (-SkipTorch) — Wukong all-core timing only. NOT a vs-torch claim." }
+elseif ($wukOkAll) { Write-Host "-> ALL-CORE: NOT reportable — the Wukong all-core run held AC+full but the torch peer ran under $($tPower.Class). DIRECTIONAL ONLY until the peer is re-timed on AC+full." }
 else { Write-Host "-> ALL-CORE: NOT reportable (needs AC+full that survives the all-core draw — disable battery-care, ensure the adapter covers peak). DIRECTIONAL ONLY." }
 Write-Host ""

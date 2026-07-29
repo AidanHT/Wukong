@@ -1,0 +1,45 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4000
+// EXPECT-OUT: -1984
+// EXPECT-OUT: -162
+// EXPECT-OUT: 2462
+// EXPECT-OUT: 4469
+module tests.run.rope_elem_f64
+
+// tests/run/rope.wk, verbatim except every `f32` is an `f64`.
+//
+// `match_rope` carried no element-type check at all (unlike `match_transpose`, `match_pool2d` and
+// `match_embedding`), so an f64 rotary nest was folded into `wukong_rope_f32`: `--emit=mir -O2`
+// showed `call wukong_rope_f32(v0, v25, v32, 2, 2)` and native printed
+// `1000 2000 -18124 57 0 0 0 0` where the interpreter printed the correct rotation below. One guard
+// on the `x[r*D+j]` read covers the backward too (both directions go through this matcher). Run on
+// the native backend for the reason given in tests/run/norm_elem_f64.wk.
+//
+// Row 0 has theta = 0 (identity); row 1 rotates pair 0 by 1.0 rad and pair 1 by 0.5 rad:
+//   out[4] = 1·cos(1)   − 3·sin(1)   = -1.98442  out[6] = 3·cos(1)   + 1·sin(1)   = 2.46264
+//   out[5] = 2·cos(0.5) − 4·sin(0.5) = -0.16266  out[7] = 4·cos(0.5) + 2·sin(0.5) = 4.46901
+fn main() -> i32 {
+    let x: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0];
+    let inv_freq: [f64; 2] = [1.0, 0.5];
+    let mut out: [f64; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        for j in 0..2 {
+            let theta: f64 = (r as f64) * inv_freq[j];
+            let c: f64 = cos(theta);
+            let s: f64 = sin(theta);
+            let a: f64 = x[r * 4 + j];
+            let b: f64 = x[r * 4 + j + 2];
+            out[r * 4 + j] = a * c - b * s;
+            out[r * 4 + j + 2] = b * c + a * s;
+        }
+    }
+    for k in 0..8 {
+        print((out[k] * 1000.0) as i32);
+    }
+    return 0;
+}

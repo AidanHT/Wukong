@@ -167,6 +167,11 @@ impl KvConfig {
     /// Largest per-sequence context (tokens, rounded down to whole blocks) for which
     /// `for_serving(..)`'s cache still fits `budget_bytes` at `elem_size` bytes/element — the
     /// Bcap↔context trade-off table in one call. Returns 0 if even one block per slot is over budget.
+    ///
+    /// **Precondition:** every geometry parameter (`layers`, `heads`, `head_dim`, `block_size`,
+    /// `num_slots`, `elem_size`) must be non-zero — a zero anywhere makes the divisor zero. Asserted
+    /// with a message naming the offending values, rather than surfacing a bare `attempt to divide by
+    /// zero` from inside this function.
     pub fn max_ctx_within_budget(
         layers: usize,
         heads: usize,
@@ -178,6 +183,12 @@ impl KvConfig {
     ) -> usize {
         // Bytes per cached token position (K and V, all layers).
         let per_tok = 2 * layers * heads * head_dim * elem_size;
+        assert!(
+            per_tok > 0 && block_size > 0 && num_slots > 0,
+            "max_ctx_within_budget: layers/heads/head_dim/elem_size/block_size/num_slots must all be non-zero \
+             (got layers={layers} heads={heads} head_dim={head_dim} elem_size={elem_size} block_size={block_size} \
+             num_slots={num_slots})"
+        );
         let per_slot_blocks = budget_bytes / (per_tok * block_size * num_slots);
         per_slot_blocks * block_size
     }
@@ -636,6 +647,16 @@ mod tests {
         let max_ctx = KvConfig::max_ctx_within_budget(layers, heads, hd, bsz, 256, 2, budget);
         let cfg = KvConfig::for_serving(layers, heads, hd, bsz, 256, max_ctx + bsz);
         cfg.assert_kv_budget(2, budget);
+    }
+
+    /// A zero anywhere in the geometry makes `max_ctx_within_budget`'s divisor zero. The public API
+    /// must name the offending parameters instead of surfacing a bare `attempt to divide by zero`
+    /// from inside the function. (`num_slots = 0` here; `block_size` and every factor of `per_tok`
+    /// reach the same guard.)
+    #[test]
+    #[should_panic(expected = "must all be non-zero")]
+    fn zero_geometry_in_max_ctx_within_budget_is_named() {
+        KvConfig::max_ctx_within_budget(12, 8, 64, 16, 0, 2, 4usize << 30);
     }
 
     // ---- pure host allocator: runs on a GPU-less box (the policy is device-independent) ----

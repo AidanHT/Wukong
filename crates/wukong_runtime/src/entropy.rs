@@ -172,6 +172,12 @@ pub unsafe extern "C" fn wukong_entropy_f32_parallel(
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel norm/reduce);
     // each row reads a disjoint p-slice and writes one disjoint out slot.
     let (pa, oa) = (p as usize, out as usize);
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
+    crate::ensure_global_pool();
     (0..r).into_par_iter().for_each(|row| {
         // SAFETY: disjoint row data / out slot; pointers re-derived from the captured addresses, valid
         // for rows*cols / rows.

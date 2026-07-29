@@ -12,6 +12,10 @@
 //!   * `E04xx` — type checking
 //!   * `E05xx` — shape checking (Wukong's headline analysis)
 //!   * `C0xxx` — codegen / lowering limitations
+//!
+//! Codes are stable: never renumber one, and never reuse a retired number for a new rule. Retired:
+//! `E0001` (was "malformed type syntax"; no stage ever emitted it — the parser reports malformed
+//! types as `E0203`/`E0204`).
 
 /// One catalog entry: a stable code, a one-line title, and a longer explanation (Markdown-ish).
 pub struct Explanation {
@@ -42,13 +46,6 @@ macro_rules! entry {
 }
 
 static CATALOG: &[Explanation] = &[
-    entry!(
-        "E0001",
-        "malformed type syntax",
-        "A type expression was not well-formed. Tensor and SIMD-vector element types must be \
-         scalars, dimensions must be integers, names, or `?`, and layouts must be one of the \
-         known kinds (`contiguous`, `col_major`, `strided`, `tiled`)."
-    ),
     entry!(
         "E0101",
         "unexpected character",
@@ -160,9 +157,13 @@ static CATALOG: &[Explanation] = &[
         "E0304",
         "assignment to immutable binding",
         "A binding introduced with `let` (without `mut`) cannot be reassigned. Declare it `let mut` \
-         to allow reassignment, or introduce a new binding with another `let`. Mutating *through* \
-         the binding — an array element `a[i] = …`, a struct field `s.f = …`, or a pointee \
-         `*p = …` — is still allowed; only rebinding the name itself is rejected."
+         to allow reassignment, or introduce a new binding with another `let`. Mutating *through* a \
+         `let` binding — an array element `a[i] = …` or a struct field `s.f = …` — is still \
+         allowed; only rebinding the name itself is rejected. Mutating through a non-`mut` \
+         *aggregate parameter* is NOT: an aggregate parameter is passed by reference, so \
+         `fn f(p: S) { p.a = 9; }` would write into the caller's value — add `mut` to the parameter \
+         (`fn f(mut p: S)`). Writing through a pointer parameter (`*p = …`) needs no `mut`, because \
+         the pointer itself is not being reassigned."
     ),
     entry!(
         "E0305",
@@ -183,9 +184,10 @@ static CATALOG: &[Explanation] = &[
     ),
     entry!(
         "E0402",
-        "recursive struct has infinite size",
-        "A struct contains itself by value — directly (`struct S { x: S }`) or through a chain of \
-         structs — so its size would be infinite and the compiler cannot lay it out. Store the \
+        "recursive struct or enum has infinite size",
+        "A struct, or a data-carrying enum, contains itself by value — directly \
+         (`struct S { x: S }`, `enum List { Cons(i32, List), Nil }`) or through a chain of such \
+         types — so its size would be infinite and the compiler cannot lay it out. Store the \
          recursive field behind a pointer (e.g. `*S`), which has a fixed size and breaks the cycle, \
          as in C or Rust."
     ),
@@ -200,12 +202,14 @@ static CATALOG: &[Explanation] = &[
     entry!(
         "E0405",
         "non-exhaustive match",
-        "A `match` used in value position does not cover every possible value of the scrutinee, and \
-         no arm is an unconditional catch-all. The value it would produce when no arm matches is an \
-         injected zero default — a silent wrong answer (or, for a tuple/struct result, invalid \
-         code). Add a `_ => …` arm (or, for an `enum`, an arm for every remaining variant; for a \
-         `bool`, both `true` and `false`) so the match is total, as in Rust. Guarded arms (`if …`) \
-         do not count toward coverage because their guard may be false."
+        "A `match` does not cover every possible value of the scrutinee, and no arm is an \
+         unconditional catch-all. This is rejected in every position, not just value position: a \
+         value match would produce an injected zero default when no arm matches — a silent wrong \
+         answer (or, for a tuple/struct result, invalid code) — while a statement or empty match \
+         falls through to `Unreachable`, which the interpreter traps but the native backend hits as \
+         an illegal instruction. Add a `_ => …` arm (or, for an `enum`, an arm for every remaining \
+         variant; for a `bool`, both `true` and `false`) so the match is total, as in Rust. Guarded \
+         arms (`if …`) do not count toward coverage because their guard may be false."
     ),
     entry!(
         "E0501",
