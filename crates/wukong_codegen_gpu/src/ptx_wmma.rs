@@ -306,10 +306,6 @@ impl CliffCfg {
     pub const fn threads(&self) -> usize {
         self.wm * self.wn * 32
     }
-    /// `mma` sub-tiles per warp (the warp-tile ILP knob: `mma`/iteration = `tm·tn·(bk/16)`).
-    pub const fn mma_per_warp(&self) -> usize {
-        (self.bm / (16 * self.wm)) * (self.bn / (8 * self.wn))
-    }
 }
 
 /// The cliff sweep. `cliff_swz_s2` is byte-identical to the dispatched swizzle workhorse (the A/B base).
