@@ -26,6 +26,19 @@ impl<'g> GpuAccel<'g> {
     }
 }
 
+/// Whether `wukong_codegen_gpu::gpu::norm` has a PTX entry for this `NORM_*` op code — the sibling
+/// of `gpu::vmath_supported` / `gpu::reduce_supported`, which `norm` does not provide.
+///
+/// MIRROR: the op codes are defined in `wukong_runtime/src/norm.rs` — SOFTMAX=0, LAYERNORM=1,
+/// RMSNORM=2, LOGSOFTMAX=3, L2NORM=4 — and `gpu::norm` maps only the first three, ending its match
+/// in `panic!("norm op {op} not implemented on GPU yet")`. The recognizer in `wukong_mir_build`
+/// emits all five (`tests/run/log_softmax_fused.wk` lowers to op 3, `tests/run/l2norm.wk` to op 4),
+/// so without this gate those two programs abort the process under `--backend=gpu` instead of
+/// falling back to the CPU kernel. Extending `gpu::norm` must extend this list.
+fn norm_supported(op: i64) -> bool {
+    (0..=2).contains(&op)
+}
+
 impl Accelerator for GpuAccel<'_> {
     fn sgemm_nt(
         &mut self,
@@ -67,6 +80,11 @@ impl Accelerator for GpuAccel<'_> {
         cols: usize,
         eps: f32,
     ) -> Option<Result<(), String>> {
+        // Same guard as `vmath`/`sreduce`: `gpu::norm` panics on an op code it has no PTX entry for,
+        // and the recognizer really does emit the two it lacks, so decline them to the CPU kernel.
+        if !norm_supported(op) {
+            return None;
+        }
         self.calls += 1;
         Some(
             wukong_codegen_gpu::gpu::norm(self.gpu, op, x, rows, cols, eps)
@@ -134,5 +152,23 @@ impl Accelerator for GpuAccel<'_> {
             wukong_codegen_gpu::gpu::reduce(self.gpu, op, x, yopt)
                 .map_err(|e| format!("GPU reduce failed: {e:?}")),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::norm_supported;
+
+    /// The gate must cover exactly the three op codes `gpu::norm` has PTX entries for. The two the
+    /// recognizer also emits (LOGSOFTMAX=3, L2NORM=4) reach `panic!` inside `gpu::norm`, so they
+    /// must decline here; needs no CUDA device, unlike the end-to-end fallback test.
+    #[test]
+    fn norm_gate_covers_only_the_implemented_ptx_entries() {
+        for op in [0i64, 1, 2] {
+            assert!(norm_supported(op), "norm op {op} has a PTX entry");
+        }
+        for op in [3i64, 4, 5, -1] {
+            assert!(!norm_supported(op), "norm op {op} would panic in gpu::norm");
+        }
     }
 }

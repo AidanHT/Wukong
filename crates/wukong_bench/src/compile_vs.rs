@@ -53,6 +53,16 @@ pub fn report(wukongc: Option<PathBuf>) {
         );
         std::process::exit(2);
     }
+    // `compile-vs [path]` takes an arbitrary wukongc, and the whole table is a ratio against it, so
+    // a debug wukongc silently turns every published speedup into fiction. gcc/g++/rustc are always
+    // the shipped release binaries, so the comparison would not even be like-for-like.
+    if mc.components().any(|c| c.as_os_str() == "debug") {
+        eprintln!(
+            "*** wukongc at {} looks like a DEBUG build — the ratios below are against an\n\
+             *** unoptimized compiler while gcc/g++/rustc are release binaries. Not reportable.",
+            mc.display()
+        );
+    }
     let have_gcc = tool_exists("gcc");
     let have_gpp = tool_exists("g++");
     let have_rustc = tool_exists("rustc");
@@ -128,6 +138,16 @@ pub fn report(wukongc: Option<PathBuf>) {
         "ratios > 1.0 mean wukongc compiled the equivalent kernel that many times faster \
          (same run).\ncompile-only (no link); wukongc uses Cranelift (no LLVM), gcc/g++/rustc \
          their own -O2 backend."
+    );
+    // The fairness decision the ratios rest on, printed with the ratios. This table is what gets
+    // pasted into BENCHMARKS.md and docs/metrics.md; from the numbers alone a reader cannot tell
+    // whether gcc was charged a libc header parse, so a regression that re-added an `#include` to
+    // the C kernel would restore previously-fixed rigging while the published output looked
+    // unchanged.
+    println!(
+        "peer sources are header-free bare translation units — no #include, no main — matching the \
+         bare\n#[no_mangle] .rs kernels; the .wk arm is a full program with main + print. rustc uses \
+         -O\n(= opt-level 2) to match gcc/g++ -O2."
     );
 }
 

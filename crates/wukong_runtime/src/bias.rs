@@ -30,7 +30,10 @@ use rayon::prelude::*;
 pub const BIAS_ACT_NONE: i64 = -1;
 
 /// Software-prefetch distance (elements ahead of the streamed `x` row). A prefetch past the buffer end
-/// is a hint the hardware silently drops, so the final rows need no guard.
+/// is a hint the hardware silently drops, so the final rows need no guard — but the *address* is still
+/// formed in Rust, and `<*const T>::add` requires the result to stay inside the allocation, so the
+/// prefetch site computes it with `wrapping_add` (no such requirement, and it lowers to the same
+/// `lea`+`prefetcht0` — verified byte-identical in the release asm of `bias_avx2`).
 const PF_AHEAD: usize = 64;
 
 /// One element `act(x + b)`, sharing the *identical* scalar activation the `vmath` kernel and the
@@ -93,7 +96,10 @@ unsafe fn bias_avx2(x: *const f32, b: *const f32, out: *mut f32, rows: usize, co
                 }
                 while j + 32 <= cols {
                     if nt {
-                        _mm_prefetch(xr.add(j + PF_AHEAD) as *const i8, _MM_HINT_T0);
+                        // `wrapping_add`, not `add`: the target is deliberately past the end of `x`
+                        // on the final rows (see `PF_AHEAD`), which `add`'s in-bounds precondition
+                        // forbids. A prefetch of an unmapped address is architecturally a no-op.
+                        _mm_prefetch(xr.wrapping_add(j + PF_AHEAD) as *const i8, _MM_HINT_T0);
                     }
                     let r0 = $mk(xr, j);
                     let r1 = $mk(xr, j + 8);
@@ -198,6 +204,14 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32_parallel(
     if rows_u <= RBAND {
         return wukong_bias_bcast_f32(x, b, out, rows, cols, op);
     }
+    // In a transformer forward the broadcast-bias is one of the first parallel ops, so this can be
+    // the process's FIRST rayon touch — configure the global pool before forking, the invariant
+    // `ensure_global_pool` states. Forking bare here builds rayon's default 2 MiB-stack registry and
+    // makes the runtime's later 16 MiB `build_global` silently lose the race, so outlined
+    // `@parallel` region bodies (~1.5 MiB of privatized scratch) end up on 2 MiB stacks. Pool
+    // configuration only — the row-band split below is worker-count independent, so bits are
+    // unchanged (`bias_parallel_matches_serial` stays exact).
+    crate::ensure_global_pool();
     let (xa, ba, oa) = (x as usize, b as usize, out as usize);
     let nbands = rows_u.div_ceil(RBAND);
     (0..nbands).into_par_iter().for_each(|band| {
@@ -226,11 +240,25 @@ mod tests {
 
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element — across several
     /// activations, a `cols` that is not a multiple of 8 (forcing a tail), and a size large enough to
-    /// cross the non-temporal-store threshold (so the NT prologue + fence path is exercised).
+    /// cross the non-temporal-store threshold (so the `vmovntps` alignment prologue, the streaming
+    /// stores and the trailing `sfence` are really executed — narrowing the 32-byte peel to 16 makes
+    /// this test fault, which it did not before the last shape was added).
     #[test]
     fn bias_scalar_matches_avx() {
-        // rows*cols*2*4 = 8 MiB (< NT) for the small case and a big case (> NT) below.
-        for &(rows, cols) in &[(3usize, 5usize), (7, 8), (4, 13), (2, 64), (700, 1500)] {
+        // The last shape is the only one that crosses `NT_MIN_BYTES`: `use_nt` needs
+        // rows*cols >= 1_310_720 elements, so (700, 1500) = 1_050_000 (8.0 MiB of traffic) still
+        // takes the cacheable-store path and (1400, 1501) = 2_101_400 (16.0 MiB) takes the NT one.
+        // 1501 is not a multiple of 8 (forcing the scalar tail) and the row stride 1501*4 = 6004
+        // bytes is not a multiple of 32, so successive rows start at different mod-32 offsets and
+        // the `vmovntps` alignment prologue peels a different amount on each row.
+        for &(rows, cols) in &[
+            (3usize, 5usize),
+            (7, 8),
+            (4, 13),
+            (2, 64),
+            (700, 1500),
+            (1400, 1501),
+        ] {
             let n = rows * cols;
             let x: Vec<f32> = (0..n).map(|i| (i as f32 % 37.0) * 0.1 - 1.8).collect();
             let b: Vec<f32> = (0..cols).map(|j| (j as f32 % 11.0) * 0.25 - 1.3).collect();

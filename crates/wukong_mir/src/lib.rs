@@ -3,8 +3,9 @@
 //! A typed, block-structured SSA representation. Each [`Function`] is a list of
 //! [`BasicBlock`]s; every block ends in exactly one [`Terminator`]. SSA value merges use
 //! **block parameters** (à la Cranelift/MLIR) rather than explicit phi nodes, which keeps
-//! construction and verification simple. The IR carries a [`MirLevel`] invariant so lowering
-//! passes can advance it from `High` (structured tensor/loop ops) to `Low` (scalar SSA only).
+//! construction and verification simple. There is only one lowering stage today: `mir_build`
+//! produces scalar SSA directly, so every [`Program`] is [`MirLevel::Low`] from birth (see that
+//! type's note before building on the two-level design).
 
 mod builder;
 mod inst;
@@ -163,7 +164,12 @@ impl Function {
     }
 }
 
-/// How far MIR has been lowered. The backend only ever sees `Low`.
+/// How far MIR has been lowered.
+///
+/// NOT YET USED: no pass constructs `High`, `Program::new` starts at `Low`, and nothing anywhere
+/// reads `Program::level` — every mention is either a copy of an existing level or the literal
+/// `Low`. Do not write `if program.level == MirLevel::High { … }`: it can never fire. Note also
+/// that `wukongc --emit=mir-high` means *pre-optimization* MIR, not this `High`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MirLevel {
     High,

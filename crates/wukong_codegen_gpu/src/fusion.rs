@@ -81,19 +81,30 @@ pub enum CallClass {
 
 /// Classify a resolved call-target name into its [`CallClass`]. The `_parallel` suffix selects the
 /// multicore recognizer arm but the same cooperative kernel, so both map to the same [`CoopKind`].
+///
+/// **Every spelling `lower::rt_helper` maps must appear here**, or a program whose recognized op came
+/// out of an `@parallel fn` is declared ineligible and silently falls back to the one-thread path —
+/// the megakernel never accelerating the very shape the user asked to parallelize. (The converse
+/// direction is safe: a name classified here that `rt_helper` does not know now returns an
+/// `UNSUPPORTED:` decline rather than panicking.)
 pub fn classify_call(name: &str) -> CallClass {
     use CoopKind::*;
     let kind = match name {
         "wukong_sreduce_f32" | "wukong_sreduce_f32_parallel" => Reduce,
-        "wukong_dot_bf16" | "wukong_dot_f16" | "wukong_sum_bf16" | "wukong_sum_f16"
-        | "wukong_reduce_bf16" | "wukong_reduce_f16" => ReduceLowp,
+        "wukong_dot_bf16" | "wukong_dot_bf16_parallel" | "wukong_dot_f16"
+        | "wukong_dot_f16_parallel" | "wukong_sum_bf16" | "wukong_sum_bf16_parallel"
+        | "wukong_sum_f16" | "wukong_sum_f16_parallel" | "wukong_reduce_bf16"
+        | "wukong_reduce_bf16_parallel" | "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => {
+            ReduceLowp
+        }
         "wukong_sgemm" | "wukong_sgemm_parallel" => Gemm,
         "wukong_sgemm_nt" | "wukong_sgemm_nt_parallel" => GemmNt,
         "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => GemmNtEpi,
         "wukong_i8gemm_nt" | "wukong_i8gemm_nt_parallel" => I8GemmNt,
         "wukong_norm_f32" | "wukong_norm_f32_parallel" => Norm,
         "wukong_norm_affine_f32" | "wukong_norm_affine_f32_parallel" => NormAffine,
-        "wukong_vmath_f32" | "wukong_vmath_bf16" | "wukong_vmath_f16" => Vmath,
+        "wukong_vmath_f32" | "wukong_vmath_f32_parallel" | "wukong_vmath_bf16"
+        | "wukong_vmath_f16" => Vmath,
         "wukong_vmath2_f32" => Vmath2,
         "wukong_velem_f32" | "wukong_velem_f32_parallel" => Velem,
         "wukong_axpby_bf16" | "wukong_axpby_f16" => Axpby,
@@ -360,6 +371,65 @@ mod tests {
         assert_eq!(classify_call("print"), CallClass::SideEffect);
         assert_eq!(classify_call("println"), CallClass::SideEffect);
         assert_eq!(classify_call("some_user_fn"), CallClass::Other);
+    }
+
+    /// **Every `_parallel` spelling `lower::rt_helper` maps must classify as its serial twin's kind.**
+    /// These seven were missing, so a program whose activation or low-precision reduction came out of an
+    /// `@parallel fn` was reported ineligible ("entry calls unrecognized `wukong_vmath_f32_parallel`")
+    /// and silently fell back to the one-thread path — the megakernel declining exactly the shape the
+    /// user asked to parallelize. The serial twins are asserted alongside so the pairing stays visible.
+    #[test]
+    fn parallel_twins_classify_like_their_serial_form() {
+        for (serial, parallel) in [
+            ("wukong_vmath_f32", "wukong_vmath_f32_parallel"),
+            ("wukong_dot_bf16", "wukong_dot_bf16_parallel"),
+            ("wukong_dot_f16", "wukong_dot_f16_parallel"),
+            ("wukong_sum_bf16", "wukong_sum_bf16_parallel"),
+            ("wukong_sum_f16", "wukong_sum_f16_parallel"),
+            ("wukong_reduce_bf16", "wukong_reduce_bf16_parallel"),
+            ("wukong_reduce_f16", "wukong_reduce_f16_parallel"),
+        ] {
+            let (a, b) = (classify_call(serial), classify_call(parallel));
+            assert!(matches!(a, CallClass::Coop(_)), "{serial} must be a cooperative op");
+            assert_eq!(a, b, "`{parallel}` must classify exactly like `{serial}`");
+        }
+    }
+
+    /// The **`@parallel` activation shape** is megakernel-eligible. In a *multi-statement* `@parallel`
+    /// function the region runs with `parallel_fn = true`, so at -O2 mir_build interns
+    /// `wukong_vmath_f32_parallel` and inlines it into `main` (verified with `wukongc --emit=mir -O2`;
+    /// the same twin `tests/run/vmath_parallel.wk` gates on the CPU). Before the classification fix
+    /// that name reached `CallClass::Other`, so `analyze` refused the whole program with "entry calls
+    /// unrecognized `wukong_vmath_f32_parallel`" and the megakernel silently declined.
+    #[test]
+    fn parallel_activation_is_eligible() {
+        const N: usize = 1024;
+        let src = format!(
+            r#"module t
+@parallel
+fn act(x: [f32; {N}], mut o: [f32; {N}], mut tail: [f32; 1]) {{
+    for i in 0..{N} {{ o[i] = silu(x[i]); }}
+    tail[0] = o[{last}];
+}}
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [0.0; {N}];
+    let mut o: [f32; {N}] = [0.0; {N}];
+    let mut tail: [f32; 1] = [0.0; 1];
+    for i in 0..{N} {{ x[i] = ((i as f32) - 512.0) / 128.0; }}
+    act(x, o, tail);
+    print((o[3] * 10000.0) as i32);
+    return 0;
+}}
+"#,
+            last = N - 1
+        );
+        let (p, _prog, _i) = plan(&src, 2);
+        assert!(p.eligible, "expected eligible, got: {}", p.reason);
+        assert!(
+            p.coop_ops.iter().any(|c| c.name == "wukong_vmath_f32_parallel"),
+            "expected the @parallel vmath twin, got {:?}",
+            p.coop_ops.iter().map(|c| (c.kind, c.name.clone())).collect::<Vec<_>>()
+        );
     }
 
     /// A recognized-reduction program over statically-sized buffers: data-independent control flow,

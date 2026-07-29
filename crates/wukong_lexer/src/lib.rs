@@ -340,6 +340,7 @@ impl<'a> Lexer<'a> {
 
     fn lex_char(&mut self, start: usize) -> TokenKind {
         self.bump(); // opening quote
+        let body = self.pos;
         match self.peek_at(0) {
             Some(b'\\') => self.consume_escape(),
             Some(c) if c != b'\'' => {
@@ -349,13 +350,45 @@ impl<'a> Lexer<'a> {
             }
             _ => {}
         }
+        let empty = self.pos == body;
         if self.peek_at(0) == Some(b'\'') {
             self.bump();
+            if empty {
+                // `''` has no body; without this it decodes to 0, i.e. it is silently `'\0'`.
+                let span = self.span(start);
+                self.error(span, "E0104", "empty character literal");
+            }
+        } else if let Some(close) = self.close_quote_on_line() {
+            // More than one codepoint. Consume through the literal's own closing quote so it is
+            // not re-lexed as the opening quote of the next one, which would cost a second
+            // diagnostic and swallow the token after it (`'ab';` losing its `;`).
+            self.pos = close + 1;
+            let span = self.span(start);
+            self.error(
+                span,
+                "E0104",
+                "character literal may only contain one codepoint",
+            );
         } else {
+            // No closing quote on this line: report and leave the cursor where it is, so the
+            // rest of the line still lexes as itself.
             let span = self.span(start);
             self.error(span, "E0104", "unterminated character literal");
         }
         TokenKind::Char
+    }
+
+    /// Byte offset of the next `'` at or after the cursor, if one occurs before the end of the
+    /// line. Used to resync after a malformed character literal.
+    fn close_quote_on_line(&self) -> Option<usize> {
+        let mut off = 0;
+        loop {
+            match self.peek_at(off) {
+                Some(b'\'') => return Some(self.pos + off),
+                Some(b'\n') | None => return None,
+                Some(_) => off += 1,
+            }
+        }
     }
 
     /// Match a punctuation/operator token at the cursor, consuming it. Returns `None` if the
@@ -529,6 +562,63 @@ mod tests {
         let d = diags("\"abc");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].code, Some("E0102"));
+    }
+
+    #[test]
+    fn unterminated_block_comment_reports() {
+        // Block comments nest, so the outer `/*` here is still open at EOF.
+        let d = diags("/* a /* b */");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0103"));
+    }
+
+    #[test]
+    fn unterminated_char_reports() {
+        // `'5` cannot be a loop label (labels start with an identifier char), so it reaches
+        // lex_char and hits EOF with no closing quote.
+        let d = diags("'5");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0104"));
+    }
+
+    #[test]
+    fn empty_char_literal_reports() {
+        // `''` has no body: without a diagnostic it decodes to 0, indistinguishable from `'\0'`.
+        let d = diags("''");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0104"));
+    }
+
+    #[test]
+    fn multi_codepoint_char_literal_reports_once_and_resyncs() {
+        use TokenKind::*;
+        // One stray literal costs one diagnostic, and its own closing quote must not be re-lexed
+        // as the opening quote of a new literal — the statement-terminating `;` stays a `;`.
+        assert_eq!(kinds("let c = 'ab';"), vec![Let, Ident, Eq, Char, Semi]);
+        let d = diags("let c = 'ab';");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0104"));
+    }
+
+    #[test]
+    fn keyword_tables_agree() {
+        // `keyword()`, `is_keyword()` and `glyph()` are three separate spelling tables. Only
+        // `glyph()` and `name()` are compile-time enforced (exhaustive matches); `is_keyword()`
+        // is a `matches!` with an implicit `false`, so dropping a variant from it — or respelling
+        // one in `keyword()` — is silent. Pin the round trip.
+        const KEYWORDS: &[&str] = &[
+            "fn", "let", "mut", "if", "else", "while", "for", "in", "loop", "match", "return",
+            "break", "continue", "struct", "enum", "impl", "trait", "module", "import", "as",
+            "const", "defer", "pub", "extern", "step", "where", "true", "false",
+        ];
+        for text in KEYWORDS {
+            let kind = TokenKind::keyword(text).unwrap_or_else(|| panic!("`{text}` not a keyword"));
+            assert!(kind.is_keyword(), "`{text}` is not in is_keyword()");
+            assert_eq!(kind.glyph(), Some(*text), "glyph() disagrees for `{text}`");
+            assert_eq!(kinds(text), vec![kind], "`{text}` does not lex as its keyword");
+        }
+        assert!(TokenKind::keyword("fnx").is_none());
+        assert!(!TokenKind::Ident.is_keyword());
     }
 
     #[test]

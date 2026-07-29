@@ -1,0 +1,210 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 12
+// EXPECT-OUT: 15
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 28
+// EXPECT-OUT: 84
+// EXPECT-OUT: 6
+// EXPECT-OUT: 12
+// EXPECT-OUT: 60
+// EXPECT-OUT: 60
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 12
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 13
+// EXPECT-OUT: 8
+// EXPECT-OUT: 17
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1500
+// EXPECT-OUT: 1750
+// EXPECT-OUT: 1875
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 5000
+module tests.run.scan_slice
+
+// The scan / column-reduction / arg-reduction recognizer family over runtime-sized []T SLICES rather
+// than fixed [T; N] arrays. A slice value is a 16-byte fat pointer `{ data, len }` whose data pointer
+// is the first word, so every one of these emitters must resolve its buffer operands through the
+// kernel base-pointer path; passing the fat-pointer buffer straight through made the kernel read the
+// struct as element data (native SIGSEGV or a wild loop, interp `error: expected a pointer`, and for
+// rowargmax/colargmax a SILENT wrong answer that agrees on both backends).
+//
+// Slices are the only way to hold a runtime-sized buffer, so this is the shape a real model uses.
+// The corpus previously pinned slice operands for exactly two emitters (gemv_slice.wk,
+// gemm_fused_bias_slice.wk); this file covers cumsum, cumprod, cummax, cummin, colsum, rowargmax,
+// colargmax, the global argreduce, transpose, gevm and lrscan.
+//
+// EVERY expected value below is computed from the SCALAR semantics of the loop, never read back from
+// the compiler: three of the four suite gates are blind to a recognizer bug (the kernel fires in both
+// backends, so interp == native agrees on the same wrong answer, and recognizers run pre-opt so
+// -O0 == -O2 agrees too). These explicit EXPECT-OUT lines are the only gate that catches it.
+//
+//   x = [2, 4] = [1, 4, 7, 3]
+//                [6, 2, 5, 1]
+
+fn main() -> i32 {
+    let r: i64 = 2;
+    let c: i64 = 4;
+
+    let mut x: []f32 = alloc_f32(r * c);
+    x[0] = 1.0; x[1] = 4.0; x[2] = 7.0; x[3] = 3.0;
+    x[4] = 6.0; x[5] = 2.0; x[6] = 5.0; x[7] = 1.0;
+
+    // ---- per-row cumulative sum -> wukong_cumsum_f32 ----
+    // row 0: 1, 5, 12, 15    row 1: 6, 8, 13, 14
+    let mut csum: []f32 = alloc_f32(r * c);
+    for i in 0..r {
+        let mut acc: f32 = 0.0;
+        for j in 0..c { acc = acc + x[i * c + j]; csum[i * c + j] = acc; }
+    }
+    for k in 0..(r * c) { print(csum[k] as i32); }
+
+    // ---- per-row cumulative product -> wukong_cumprod_f32 ----
+    // row 0: 1, 4, 28, 84    row 1: 6, 12, 60, 60
+    let mut cprod: []f32 = alloc_f32(r * c);
+    for i in 0..r {
+        let mut acc: f32 = 1.0;
+        for j in 0..c { acc = acc * x[i * c + j]; cprod[i * c + j] = acc; }
+    }
+    for k in 0..(r * c) { print(cprod[k] as i32); }
+
+    // ---- per-row running max / min -> wukong_cummax_f32 / wukong_cummin_f32 ----
+    // max row 0: 1, 4, 7, 7   row 1: 6, 6, 6, 6
+    // min row 0: 1, 1, 1, 1   row 1: 6, 2, 2, 1
+    let mut cmax: []f32 = alloc_f32(r * c);
+    let mut cmin: []f32 = alloc_f32(r * c);
+    for i in 0..r {
+        let mut m: f32 = x[i * c];
+        for j in 0..c { m = fmax(m, x[i * c + j]); cmax[i * c + j] = m; }
+    }
+    for i in 0..r {
+        let mut m: f32 = x[i * c];
+        for j in 0..c { m = fmin(m, x[i * c + j]); cmin[i * c + j] = m; }
+    }
+    for k in 0..(r * c) { print(cmax[k] as i32); }
+    for k in 0..(r * c) { print(cmin[k] as i32); }
+
+    // ---- column sum -> wukong_colsum_f32 ----
+    // col j = x[0,j] + x[1,j] = 7, 6, 12, 4
+    let mut colsum: []f32 = alloc_f32(c);
+    for j in 0..c {
+        let mut s: f32 = 0.0;
+        for i in 0..r { s = s + x[i * c + j]; }
+        colsum[j] = s;
+    }
+    for j in 0..c { print(colsum[j] as i32); }
+
+    // ---- per-row argmax (index) -> wukong_rowargmax_i32 ----
+    // row 0 max 7 @ 2; row 1 max 6 @ 0
+    let mut ramax: []i32 = alloc_i32(r);
+    for i in 0..r {
+        let mut bv: f32 = x[i * c];
+        let mut bi: i32 = 0;
+        for j in 1..c { if x[i * c + j] > bv { bv = x[i * c + j]; bi = j as i32; } }
+        ramax[i] = bi;
+    }
+    for i in 0..r { print(ramax[i]); }
+
+    // ---- per-column argmax (row index) -> wukong_colargmax_i32 ----
+    // col 0 [1,6] -> 1; col 1 [4,2] -> 0; col 2 [7,5] -> 0; col 3 [3,1] -> 0
+    let mut camax: []i32 = alloc_i32(c);
+    for j in 0..c {
+        let mut bv: f32 = x[j];
+        let mut bi: i32 = 0;
+        for i in 1..r { if x[i * c + j] > bv { bv = x[i * c + j]; bi = i as i32; } }
+        camax[j] = bi;
+    }
+    for j in 0..c { print(camax[j]); }
+
+    // ---- flat argmax over the whole slice -> wukong_argreduce_f32 ----
+    // values 1,4,7,3,6,2,5,1 -> max 7 at index 2
+    let mut bv: f32 = x[0];
+    let mut bi: i64 = 0;
+    for k in 0..(r * c) { if x[k] > bv { bv = x[k]; bi = k as i64; } }
+    print(bi as i32);
+    print(bv as i32);
+
+    // ---- transpose [2,4] -> [4,2] -> wukong_transpose_f32 ----
+    // t = [1,6, 4,2, 7,5, 3,1]
+    let mut t: []f32 = alloc_f32(r * c);
+    for i in 0..r { for j in 0..c { t[j * r + i] = x[i * c + j]; } }
+    for k in 0..(r * c) { print(t[k] as i32); }
+
+    // ---- vector-matrix product -> wukong_sgevm_f32 ----
+    // w = [1, 2] => out[j] = x[0,j] + 2*x[1,j] = 13, 8, 17, 5
+    let mut w: []f32 = alloc_f32(r);
+    w[0] = 1.0; w[1] = 2.0;
+    let mut gv: []f32 = alloc_f32(c);
+    for j in 0..c {
+        let mut s: f32 = 0.0;
+        for i in 0..r { s = s + w[i] * x[i * c + j]; }
+        gv[j] = s;
+    }
+    for j in 0..c { print(gv[j] as i32); }
+
+    // ---- first-order linear recurrence -> wukong_lrscan_f32 ----
+    // row 0: gate 0.5, input 1 => 1, 1.5, 1.75, 1.875 (exact binary fractions)
+    // row 1: gate 0,   input 2,3,4,5 => 2, 3, 4, 5
+    let mut la: []f32 = alloc_f32(r * c);
+    let mut lb: []f32 = alloc_f32(r * c);
+    for j in 0..c { la[j] = 0.5; lb[j] = 1.0; }
+    for j in 0..c { la[c + j] = 0.0; lb[c + j] = (j as f32) + 2.0; }
+    let mut lo: []f32 = alloc_f32(r * c);
+    for i in 0..r {
+        let mut h: f32 = 0.0;
+        for j in 0..c {
+            h = la[i * c + j] * h + lb[i * c + j];
+            lo[i * c + j] = h;
+        }
+    }
+    for k in 0..(r * c) { print(round(lo[k] * 1000.0) as i32); }
+
+    free(x); free(csum); free(cprod); free(cmax); free(cmin); free(colsum);
+    free(ramax); free(camax); free(t); free(w); free(gv);
+    free(la); free(lb); free(lo);
+    return 0;
+}

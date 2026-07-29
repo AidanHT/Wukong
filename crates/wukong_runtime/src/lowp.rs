@@ -496,14 +496,23 @@ fn par_chunk_reduce(
     combine: impl Fn(f32, f32) -> f32,
 ) -> f32 {
     let nchunks = n.div_ceil(crate::reduce::RCHUNK);
-    let partials: Vec<f32> = (0..nchunks)
-        .into_par_iter()
-        .map(|c| {
-            let lo = c * crate::reduce::RCHUNK;
-            let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
-            per_chunk(lo, hi)
-        })
-        .collect();
+    // Fork on the unified kernel pool, never on rayon's implicit global registry: this is a path that
+    // can be a process's FIRST rayon touch (a bf16 model whose first parallel op is a reduction), and
+    // `run_on_wuk_pool` is what installs the runtime's 16 MiB worker stacks before anything can build
+    // rayon's 2 MiB default (`crate::ensure_global_pool`, lib.rs:324-329). Scheduling-only: the fixed
+    // `RCHUNK` decomposition and the ordered fold below are what fix the bits, so which pool runs the
+    // map cannot change them. `per_chunk` is borrowed, not moved — `&P` is `Send` because `P: Sync`.
+    let per_chunk = &per_chunk;
+    let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
+        (0..nchunks)
+            .into_par_iter()
+            .map(|c| {
+                let lo = c * crate::reduce::RCHUNK;
+                let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
+                per_chunk(lo, hi)
+            })
+            .collect()
+    });
     let mut acc = ident;
     for p in partials {
         acc = combine(acc, p);
@@ -810,8 +819,14 @@ fn use_nt_halfout(n: usize) -> bool {
 
 /// Elements ahead to software-prefetch the `x`/`y` reads in the streaming path. The output is
 /// non-temporal (not prefetched — we never read it back here); the two half-width input streams are the
-/// DRAM-read-bound side, so pulling them in a few lines early hides the miss latency. A prefetch past
-/// the buffer end is a hint the hardware drops, so no end guard is needed.
+/// DRAM-read-bound side, so pulling them in a few lines early hides the miss latency. The last few
+/// iterations of every bulk loop deliberately address past the end of `x`/`y` — a prefetch past the
+/// buffer end is a hint the hardware drops, so no end guard is needed. That is a statement about the
+/// *hardware*; the Rust-level obligation is separate, so the prefetch sites form the address with
+/// `wrapping_add`, NOT `add`: `<*const T>::add` requires its result to stay inside (or one past) the
+/// same allocated object, which this by construction does not. `wrapping_add` carries no such
+/// precondition and lowers to the identical address arithmetic; the pointer is only ever handed to
+/// `_mm_prefetch`, which never dereferences it.
 const HALFOUT_PF_AHEAD: usize = 256;
 
 /// The streaming-narrow skeleton shared by the half-output kernels (axpby, activations): write
@@ -878,8 +893,8 @@ unsafe fn axpby_narrow_bf16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b
         |i: usize| _mm256_fmadd_ps(bv, widen_bf16(yp.add(i)), _mm256_mul_ps(av, widen_bf16(xp.add(i)))),
         |i: usize| crate::f32_to_bf16_bits(b.mul_add(bf16_bits_to_f32(y[i]), a * bf16_bits_to_f32(x[i]))),
         |i: usize| {
-            _mm_prefetch(xp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(yp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(yp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
         },
         narrow_bf16_pack,
         narrow_bf16
@@ -897,8 +912,8 @@ unsafe fn axpby_narrow_f16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b:
         |i: usize| _mm256_fmadd_ps(bv, widen_f16(yp.add(i)), _mm256_mul_ps(av, widen_f16(xp.add(i)))),
         |i: usize| crate::f32_to_f16_bits(b.mul_add(f16_to_f32(y[i]), a * f16_to_f32(x[i]))),
         |i: usize| {
-            _mm_prefetch(xp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(yp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(yp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
         },
         narrow_f16_pack,
         narrow_f16
@@ -926,7 +941,7 @@ unsafe fn vmath_narrow_bf16_avx(x: &[u16], out: &mut [u16], op: i64) {
         out.len(),
         |i: usize| f(widen_bf16(xp.add(i))),
         |i: usize| crate::f32_to_bf16_bits(crate::vmath::apply1(op, bf16_bits_to_f32(x[i]))),
-        |i: usize| _mm_prefetch(xp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
+        |i: usize| _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
         narrow_bf16_pack,
         narrow_bf16
     );
@@ -944,7 +959,7 @@ unsafe fn vmath_narrow_f16_avx(x: &[u16], out: &mut [u16], op: i64) {
         out.len(),
         |i: usize| f(widen_f16(xp.add(i))),
         |i: usize| crate::f32_to_f16_bits(crate::vmath::apply1(op, f16_to_f32(x[i]))),
-        |i: usize| _mm_prefetch(xp.add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
+        |i: usize| _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
         narrow_f16_pack,
         narrow_f16
     );
@@ -1368,6 +1383,11 @@ mod tests {
     #[ignore = "bandwidth bench; run explicitly in --release"]
     fn lowp_bandwidth() {
         use std::time::Instant;
+        assert!(
+            !cfg!(debug_assertions),
+            "this is a throughput measurement, not a test — rebuild with --release \
+             (cargo test -p wukong_runtime --release lowp_bandwidth -- --ignored --nocapture)"
+        );
         let n = 32 << 20; // 32M elements — 128 MB f32, 64 MB half, both ≫ L3
         let xs: Vec<f32> = (0..n).map(|i| ((i % 251) as f32) * 0.001).collect();
         let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
@@ -1454,6 +1474,11 @@ mod tests {
     #[ignore = "bandwidth bench; run explicitly in --release"]
     fn axpby_bf16_bandwidth() {
         use std::time::Instant;
+        assert!(
+            !cfg!(debug_assertions),
+            "this is a throughput measurement, not a test — rebuild with --release \
+             (cargo test -p wukong_runtime --release axpby_bf16_bandwidth -- --ignored --nocapture)"
+        );
         let n = 32 << 20; // 32M elems — bf16 in 128 MB, f32 in 256 MB, both ≫ L3
         let xs: Vec<f32> = (0..n).map(|i| ((i % 251) as f32) * 0.001).collect();
         let ys: Vec<f32> = (0..n).map(|i| ((i % 199) as f32) * 0.002).collect();
@@ -1628,6 +1653,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parallel_reductions_fork_on_the_unified_pool() {
+        // `par_chunk_reduce` can be a process's FIRST rayon touch (a bf16 model whose first parallel
+        // op is a reduction). Forking `into_par_iter()` straight from there builds rayon's DEFAULT
+        // global registry — 2 MiB worker stacks — and the runtime's later `ensure_global_pool()` then
+        // loses the race silently (`build_global` → GlobalPoolAlreadyInitialized, discarded at
+        // lib.rs), so every subsequent outlined `@parallel` region body runs on a stack an eighth of
+        // the required 16 MiB. That first-touch ordering is process-global, so a shared-process test
+        // harness cannot pin it directly; what it CAN pin, order-independently, is the cause: the
+        // chunks must execute on the unified kernel pool, i.e. this fork must go through
+        // `run_on_wuk_pool`, which is what configures the global pool before anything else can.
+        //
+        // On a part with no HyperThreads to shed, `gemm_pool()` is None and the two pools coincide,
+        // so the comparison is vacuous there (and under `WUKONG_POOL_UNIFY=0`, and at
+        // `RAYON_NUM_THREADS=1`) — it still cannot regress. On this 6P+8E+2LPE machine the widths are
+        // 16 vs 22 and it is a real discriminator.
+        let want = crate::wuk_pool_width();
+        let n = 4 * crate::reduce::RCHUNK + 7;
+        let seen = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let got = par_chunk_reduce(
+            n,
+            0.0,
+            |lo, hi| {
+                seen.lock().unwrap().insert(rayon::current_num_threads());
+                (hi - lo) as f32
+            },
+            |a, b| a + b,
+        );
+        // Every chunk ran exactly once (so the widths below are the whole story, not a sample).
+        assert_eq!(got, n as f32, "chunk coverage");
+        assert_eq!(
+            seen.into_inner().unwrap(),
+            std::collections::BTreeSet::from([want]),
+            "par_chunk_reduce forked off the unified kernel pool (width {want})"
+        );
+    }
+
+    #[test]
+    fn parallel_reductions_nest_inside_a_pool_worker() {
+        // A bf16 `_parallel` reduction is emitted inside `@parallel` functions, so it can be reached
+        // from an already-outlined region body — i.e. from a worker of the very pool the fix above
+        // now installs onto. rayon runs a nested `install` on the same pool inline, so this must
+        // complete and return the same bits as the un-nested call; if it ever deadlocked, the gate
+        // would hang rather than fail, so pin it explicitly.
+        let n = 4 * crate::reduce::RCHUNK + 7;
+        let flat = |lo: usize, hi: usize| (hi - lo) as f32;
+        let outer = par_chunk_reduce(n, 0.0, flat, |a, b| a + b);
+        let inner = crate::run_on_wuk_pool(|| par_chunk_reduce(n, 0.0, flat, |a, b| a + b));
+        assert_eq!(outer.to_bits(), inner.to_bits(), "nested != top-level");
+        assert_eq!(outer, n as f32, "chunk coverage");
     }
 
     #[test]

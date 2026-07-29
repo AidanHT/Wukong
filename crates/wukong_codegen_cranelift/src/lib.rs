@@ -278,6 +278,24 @@ const RT_AXPBY_F16_OUT: &str = "wukong_axpby_f16_out";
 const RT_FMOD_F64: &str = "wukong_rt_fmod_f64";
 const RT_FMOD_F32: &str = "wukong_rt_fmod_f32";
 
+/// Flags for every load/store this backend emits: `notrap` (the address is in-bounds by
+/// construction — bounds checks happen upstream) but deliberately **not** `aligned`.
+///
+/// Cranelift's `trusted()` is `notrap | aligned`, and it documents `aligned` as a promise the
+/// caller makes: "the instruction is permitted to trap or return a wrong result if the effective
+/// address is misaligned" (`ir/memflags.rs`). This backend cannot make that promise. The 128-bit
+/// CLIF vectorizer emits `load.f32x4`/`store.f32x4` at addresses it *knows* are not 16-byte
+/// aligned — `for i in 1..4095 { c[i] = ... }` over `[f32; 4096]` locals lowers to a vector load at
+/// `alloca_base + 4`. On this AVX2 host nothing faults because the x64 ISLE rules pick VEX forms,
+/// which tolerate misalignment; on an x86-64 host without AVX, `xmm_mem_to_xmm_mem_aligned`
+/// (`isa/x64/lower/isle.rs`) sees the `aligned` bit, embeds the misaligned operand straight into a
+/// legacy SSE instruction instead of loading it through `movups`, and the program takes a #GP on
+/// the first vectorized iteration. Dropping the flag is strictly weaker: it can only make Cranelift
+/// materialize an unaligned load it would otherwise have folded, never introduce a fault.
+fn mem_flags() -> MemFlags {
+    MemFlags::new().with_notrap()
+}
+
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
 enum Intrinsic {
@@ -422,9 +440,11 @@ struct FnTranslator<'a> {
     /// FuncRefs for this function's synthesized AVX2 vector kernels, indexed by `Op::VecKernelCall`'s
     /// `kernel` field (the position in the owning `Function::vec_kernels`).
     kernel_refs: &'a [FuncRef],
-    /// First "type too large to lay out" overflow seen while lowering this function, if any.
-    /// Recorded (instead of panicking) so `populate_module` can abort with a clean error before
-    /// the half-built function is finalized/defined. See [`FnTranslator::size_of_or_err`].
+    /// First unrecoverable lowering failure seen while lowering this function, if any: a "type too
+    /// large to lay out" overflow ([`FnTranslator::size_of_or_err`]), or a runtime kernel that
+    /// reached [`FnTranslator::lower_call`] with an arity no dispatch arm accepts. Recorded
+    /// (instead of panicking, or silently dropping the instruction) so `populate_module` can abort
+    /// with a clean error before the half-built function is finalized/defined.
     layout_err: Option<String>,
 }
 
@@ -642,7 +662,7 @@ impl<'a> FnTranslator<'a> {
                     let half = self
                         .builder
                         .ins()
-                        .load(types::I16, MemFlags::trusted(), addr, 0);
+                        .load(types::I16, mem_flags(), addr, 0);
                     let ext = self.builder.ins().uextend(types::I32, half);
                     let shifted = self.builder.ins().ishl_imm(ext, 16);
                     self.builder
@@ -654,14 +674,14 @@ impl<'a> FnTranslator<'a> {
                     let half = self
                         .builder
                         .ins()
-                        .load(types::I16, MemFlags::trusted(), addr, 0);
+                        .load(types::I16, mem_flags(), addr, 0);
                     let ext = self.builder.ins().uextend(types::I32, half);
                     let fref = self.rt_refs[RT_F16_TO_F32];
                     let call = self.builder.ins().call(fref, &[ext]);
                     self.builder.inst_results(call)[0]
                 } else {
                     let t = cl_type(ty, self.ptr_ty).unwrap_or(self.ptr_ty);
-                    self.builder.ins().load(t, MemFlags::trusted(), addr, 0)
+                    self.builder.ins().load(t, mem_flags(), addr, 0)
                 }
             }
             Op::Store { ptr, value } => {
@@ -676,7 +696,7 @@ impl<'a> FnTranslator<'a> {
                         .bitcast(types::I32, MemFlags::new(), rounded);
                     let hi = self.builder.ins().ushr_imm(bits, 16);
                     let half = self.builder.ins().ireduce(types::I16, hi);
-                    self.builder.ins().store(MemFlags::trusted(), half, addr, 0);
+                    self.builder.ins().store(mem_flags(), half, addr, 0);
                 } else if matches!(self.ty_of(*value), MirType::F16) {
                     // Round the f32 register to f16 via the runtime shim, store the 16 bits (2 bytes).
                     let v = self.val(*value);
@@ -684,10 +704,10 @@ impl<'a> FnTranslator<'a> {
                     let call = self.builder.ins().call(fref, &[v]);
                     let bits = self.builder.inst_results(call)[0]; // i32, low 16 = f16 bits
                     let half = self.builder.ins().ireduce(types::I16, bits);
-                    self.builder.ins().store(MemFlags::trusted(), half, addr, 0);
+                    self.builder.ins().store(mem_flags(), half, addr, 0);
                 } else {
                     let v = self.val(*value);
-                    self.builder.ins().store(MemFlags::trusted(), v, addr, 0);
+                    self.builder.ins().store(mem_flags(), v, addr, 0);
                 }
                 return;
             }
@@ -1716,6 +1736,25 @@ impl<'a> FnTranslator<'a> {
             let op = self.coerce_to_i64(args[5]);
             let fref = self.rt_refs[name];
             self.builder.ins().call(fref, &[q, out, rows, cols, scale, op]);
+            return None;
+        }
+        // Everything above dispatches a runtime kernel on (name, arity). `rt_refs` holds exactly
+        // the runtime symbols this function is responsible for, so reaching here with one of them
+        // means a recognizer emitted an arity no arm accepts. Without this guard `?` below returns
+        // `None`, `Op::Call` lowers to *nothing*, and the call is silently deleted: a void kernel
+        // (`wukong_sgemm`, `wukong_norm_f32`) leaves the destination buffer holding whatever it
+        // held before — a silent wrong answer that the interpreter, which dispatches on the symbol
+        // name alone with no arity check, does not reproduce — and a value-returning kernel never
+        // enters `vmap`, so the first use panics with `MIR value used before definition`. Record it
+        // as a lowering error instead; `build_function_clif` aborts before the function is defined.
+        if self.rt_refs.contains_key(name) {
+            if self.layout_err.is_none() {
+                self.layout_err = Some(format!(
+                    "internal compiler error: runtime kernel `{name}` reached codegen with {} \
+                     argument(s), which matches no declared ABI",
+                    args.len()
+                ));
+            }
             return None;
         }
         let arg_is_float = args
@@ -2802,13 +2841,13 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         axpby_bf16: module
             .declare_function(RT_AXPBY_BF16, Linkage::Import, &sig_axpby_bf16)
-            .unwrap(),
+            .map_err(|e| e.to_string())?,
         axpby_bf16_out: module
             .declare_function(RT_AXPBY_BF16_OUT, Linkage::Import, &sig_axpby_bf16)
-            .unwrap(),
+            .map_err(|e| e.to_string())?,
         axpby_f16_out: module
             .declare_function(RT_AXPBY_F16_OUT, Linkage::Import, &sig_axpby_bf16)
-            .unwrap(),
+            .map_err(|e| e.to_string())?,
         dot_bf16: module
             .declare_function(RT_DOT_BF16, Linkage::Import, &sig_dot_bf16)
             .map_err(|e| e.to_string())?,
@@ -3812,6 +3851,16 @@ fn define_functions_parallel<M: Module>(
                     Ok((fid, alignment, bytes, relocs))
                 },
             )
+            // Collect the per-function `Result`s **positionally**, then take the first `Err` in
+            // source order. Collecting straight into `Result<Vec<_>, _>` reports whichever worker
+            // failed first in wall-clock time, so a program with two bad functions produced a
+            // different diagnostic run to run — `two_huge.wk` (an oversized array in `a()` and
+            // another in `b()`) alternated between the `[... x i32]` and `[... x i64]` messages
+            // across identical invocations, while the serial path always reported `a()`. Indexing
+            // the errors makes the parallel path report the same function the serial path does, so
+            // the compiler is a pure function of its input (U3).
+            .collect::<Vec<Result<_, String>>>()
+            .into_iter()
             .collect::<Result<Vec<_>, String>>()?
     };
 
@@ -3865,6 +3914,15 @@ impl JitProgram {
 
     /// Run once for timing: clears (but does not clone) the capture buffer so repeated prints don't
     /// grow memory, and returns just the exit code.
+    ///
+    /// **Stack contract — differs from [`JitProgram::run`].** This runs the JIT'd entry on the
+    /// *caller's* stack, deliberately: spawning a thread per iteration would land inside the
+    /// measured region and swamp a short kernel. The caller therefore owns the recursion headroom.
+    /// On the default ~8 MiB main-thread stack a deeply recursive program (the class
+    /// `run_on_big_stack` exists for) overflows and aborts the whole process, where the same source
+    /// under `wukongc --run --backend=native` completes. A timing harness must wrap its entire
+    /// warm-up + measurement loop in one `std::thread::Builder::new().stack_size(..)` worker so the
+    /// spawn is paid once, outside the timed region.
     pub fn call(&self) -> i64 {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3894,8 +3952,18 @@ unsafe fn invoke_code(code: usize, ret: &MirType) -> i64 {
             f();
             0
         }
-        t if t.is_float() => {
+        MirType::F64 => {
             let f: extern "C" fn() -> f64 = std::mem::transmute(code);
+            f() as i64
+        }
+        // The narrow floats must NOT share the `f64` arm. `signature_of` returns whatever
+        // `cl_type` says, and `cl_type` computes `f16`/`bf16` in `f32` registers, so all three
+        // return a *single-precision* XMM0: `movss` leaves the value in XMM0[31:0] and zeroes
+        // [127:32]. Reading those 64 bits as an `f64` reinterprets a live float as a denormal —
+        // `fn main() -> f32 { return 42.9; }` (XMM0[31:0] = 0x422b_999a) came out as 5.4e-315,
+        // which `as i64` saturates to 0, while the interpreter oracle exits 42.
+        MirType::F32 | MirType::F16 | MirType::BF16 => {
+            let f: extern "C" fn() -> f32 = std::mem::transmute(code);
             f() as i64
         }
         MirType::I64 => {

@@ -131,14 +131,46 @@ impl Gpu {
 }
 
 static GPU: OnceLock<Mutex<Option<Gpu>>> = OnceLock::new();
+/// Why `Gpu::new` failed, recorded the first time [`gpu`] is consulted. `Gpu::new().ok()` used to
+/// discard the `DriverError` outright, so every skip line reported "no CUDA device reachable" even
+/// when the real cause was an OOM, an exclusive-mode device, a driver/runtime mismatch, or an empty
+/// `CUDA_VISIBLE_DEVICES` — misattributing a broken box as a machine that simply has no GPU.
+static GPU_INIT_ERR: OnceLock<String> = OnceLock::new();
+
+/// Build the process-wide GPU, recording the driver's error if it fails.
+fn init_gpu() -> Option<Gpu> {
+    match Gpu::new() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            let _ = GPU_INIT_ERR.set(format!("{e:?}"));
+            None
+        }
+    }
+}
 
 /// Acquire the process-wide GPU. The inner `Option` is `None` when no CUDA device is reachable
 /// (no driver / no GPU): callers should treat that as "skip" rather than fail, so the suite still
-/// passes on machines without a GPU even with `--features gpu` compiled in.
+/// passes on machines without a GPU even with `--features gpu` compiled in. A skip must still be
+/// *loud* — see [`init_error`] for the reason to print with it.
 pub fn gpu() -> MutexGuard<'static, Option<Gpu>> {
-    GPU.get_or_init(|| Mutex::new(Gpu::new().ok()))
+    GPU.get_or_init(|| Mutex::new(init_gpu()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The driver error that made the process-wide GPU unavailable, if [`gpu`] has been consulted and
+/// `Gpu::new` failed. `None` means either the device is fine or nothing has asked for it yet.
+pub fn init_error() -> Option<&'static str> {
+    GPU_INIT_ERR.get().map(String::as_str)
+}
+
+/// Whether a run is *required* to have a GPU — set `WUKONG_GPU_REQUIRED=1` on a machine that is
+/// supposed to have one (CI, the campaign's own sweeps). With it set, a gate that would otherwise
+/// print `[skip]` and report a green "ok" having executed zero device instructions fails instead.
+/// Read once so every call site in a process agrees.
+pub fn gpu_required() -> bool {
+    static REQ: OnceLock<bool> = OnceLock::new();
+    *REQ.get_or_init(|| std::env::var_os("WUKONG_GPU_REQUIRED").is_some())
 }
 
 /// True iff a CUDA device is reachable in this process.
@@ -174,7 +206,7 @@ pub fn device_lost() -> bool {
 /// Returns `true` iff a live GPU is in place afterward.
 pub fn reset_gpu() -> bool {
     let mut guard = GPU
-        .get_or_init(|| Mutex::new(Gpu::new().ok()))
+        .get_or_init(|| Mutex::new(init_gpu()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     // Drop the (possibly poisoned) context first: releases our primary-ctx reference, streams, modules.
@@ -330,6 +362,23 @@ pub const RED_BLOCK: u32 = 256;
 /// `max(x[i])` reduction op-code (mirrors `wukong_runtime::reduce::RED_MAX`, which isn't re-exported).
 pub const RED_MAX: i64 = 4;
 
+// The hand copy above is pinned to the runtime's numbering at COMPILE TIME. `wukong_runtime`'s
+// `reduce` module is private, so `RED_MAX` cannot be imported directly; but its neighbours in the
+// same contiguous op-code block (`reduce.rs`: …SUMSQ=3, MAX=4, MIN=5, MAXABS=6, ARGMAX=7…) *are*
+// re-exported. If that block is ever renumbered, at least one neighbour moves and the build breaks
+// here — instead of `reduce()` silently dispatching the "reduce_max" entry for whatever op 4 became,
+// which would be a wrong answer under `--backend=gpu` only.
+const _: () = assert!(
+    wukong_runtime::RED_SUMSQ == RED_MAX - 1 && wukong_runtime::RED_ARGMAX == RED_MAX + 3,
+    "wukong_runtime's reduce op codes were renumbered: gpu::RED_MAX no longer names max(x[i])"
+);
+// The REDUCE PTX bakes `.shared .align 4 .b8 sdata[1024]` (= 256 f32) into every entry and unrolls
+// the tree for exactly 256 lanes (`ptx::REDUCE`), so a larger block would store past that array.
+const _: () = assert!(
+    RED_BLOCK == 256,
+    "ptx::REDUCE declares sdata[1024] (256 f32) and unrolls its tree for 256 lanes"
+);
+
 /// Deterministic GPU reduction — the GPU twin of `wukong_sreduce_f32`. `op` is `RED_SUM` /
 /// `RED_DOT` (needs `y`) / [`RED_MAX`]. Blocks tree-reduce in shared memory; the `RED_GRID` partials
 /// are combined on the host in ascending block order.
@@ -341,6 +390,21 @@ pub fn reduce(g: &mut Gpu, op: i64, x: &[f32], y: Option<&[f32]>) -> Result<f32,
         v if v == RED_MAX => "reduce_max",
         _ => panic!("reduce op {op} not implemented on GPU yet"),
     };
+    // The kernel's `.param` block is a function of `op` — only `reduce_dot` declares `y` — so the
+    // pushed argument list is derived from `op` too, never from whether the caller happened to pass a
+    // `y`. Launching `reduce_dot` with 3 args would make the driver read `partials` one slot past the
+    // end of the argument vector and have every block store through that garbage pointer, latching a
+    // process-sticky CUDA_ERROR_ILLEGAL_ADDRESS (see [`reset_gpu`]).
+    let needs_y = reduce_needs_y(op);
+    assert_eq!(
+        needs_y,
+        y.is_some(),
+        "reduce: op {op} {}",
+        if needs_y { "requires a second operand y" } else { "takes no second operand" }
+    );
+    if let Some(y) = y {
+        assert_eq!(x.len(), y.len(), "reduce: x and y must be equal length");
+    }
     let n = x.len() as u32;
     let f = g.function("reduce", crate::ptx::REDUCE, entry)?;
     let x_d = g.stream.memcpy_stod(x)?;
@@ -356,10 +420,14 @@ pub fn reduce(g: &mut Gpu, op: i64, x: &[f32], y: Option<&[f32]>) -> Result<f32,
     };
     let mut b = g.stream.launch_builder(&f);
     b.arg(&n).arg(&x_d);
-    if let Some(ref yd) = y_d {
-        b.arg(yd);
+    if needs_y {
+        b.arg(y_d.as_ref().expect("reduce_needs_y ⇒ y was uploaded"));
     }
     b.arg(&mut partials_d);
+    // SAFETY: `entry` and the pushed argument list are both derived from `op` immediately above, so
+    // the arity and types match the selected kernel's declared `.param` block; `x_d` (and `y_d` when
+    // pushed) hold exactly the `n` f32 the kernel indexes, and `partials_d` holds `RED_GRID` f32 —
+    // one per block of the fixed `RED_GRID` grid, which is the only slot a block writes.
     unsafe { b.launch(cfg)? };
     let partials = g.stream.memcpy_dtov(&partials_d)?;
     let is_max = op == RED_MAX;
@@ -1097,6 +1165,12 @@ pub(crate) fn gemm_nt_f16_cliff(
         .iter()
         .find(|v| v.name == name)
         .unwrap_or_else(|| panic!("unknown cliff variant {name}"));
+    // The same input contract every sibling GEMM wrapper states (gemm_nt, gemm_nt_f16,
+    // gemm_nt_f16_pipe, …): the kernel indexes A up to m*k and B up to n*k, so a short slice is an
+    // out-of-bounds *device* read folded into C — a wrong GEMM with no diagnostic — rather than a
+    // panic naming the violated contract.
+    assert_eq!(a.len(), m * k, "A must be m×k");
+    assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{} requires M%{}==0, N%{}==0, K%{}==0",
@@ -1168,6 +1242,13 @@ fn gemm_nt_f16_pipe_fused_bias_v(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
+    // Launch-arity seam: this wrapper always pushes 7 args (…, pC, pBias), so `entry` must name a
+    // `_bias` variant and must NOT name a `_residual` one (which declares a further `pResidual`
+    // param the driver would then read off the end of the argument vector).
+    assert!(
+        entry.contains("_bias") && !entry.contains("_residual"),
+        "{entry}: pushed launch args must match the kernel's declared .param count"
+    );
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{entry} requires M%{}==0, N%{}==0, K%{}==0",
@@ -1408,6 +1489,16 @@ fn gemm_nt_f16_gate(
     assert_eq!(x.len(), m * k);
     assert_eq!(wg.len(), n * k);
     assert_eq!(wu.len(), n * k);
+    // Launch-arity seam: `entry_mma_gate` emits 7 `.param` slots for a biasless gate and 9 for a
+    // `*_bias` one, and this wrapper pushes 7 or 9 depending on `bias`. The two are independent
+    // parameters, so pair them explicitly — a mismatch hands `cuLaunchKernel` a short argument
+    // vector, the driver reads two words of adjacent host stack as `pBiasG`/`pBiasU`, and the kernel
+    // loads through them (illegal address, or silently wrong gate output).
+    assert_eq!(
+        entry.contains("_bias"),
+        bias.is_some(),
+        "{entry}: pushed launch args must match the kernel's declared .param count"
+    );
     assert!(m % 128 == 0 && n % 64 == 0 && k % 32 == 0, "{entry} requires M%128==0, N%64==0, K%32==0");
     let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
     let wg16: Vec<f16> = wg.iter().map(|&v| f16::from_f32(v)).collect();
@@ -1452,6 +1543,12 @@ fn gemm_nt_bf16_gate(
     assert_eq!(x.len(), m * k);
     assert_eq!(wg.len(), n * k);
     assert_eq!(wu.len(), n * k);
+    // Same launch-arity seam as [`gemm_nt_f16_gate`] — 7 params biasless, 9 for a `*_bias` entry.
+    assert_eq!(
+        entry.contains("_bias"),
+        bias.is_some(),
+        "{entry}: pushed launch args must match the kernel's declared .param count"
+    );
     assert!(m % 128 == 0 && n % 64 == 0 && k % 32 == 0, "{entry} requires M%128==0, N%64==0, K%32==0");
     let xb: Vec<bf16> = x.iter().map(|&v| bf16::from_f32(v)).collect();
     let wgb: Vec<bf16> = wg.iter().map(|&v| bf16::from_f32(v)).collect();
@@ -1858,6 +1955,10 @@ pub fn wmma_roofline_f16(
 /// Fused row-wise normalization on the GPU — the GPU twin of `wukong_norm_f32`. `op` is a `NORM_*`
 /// code (softmax / layernorm / rmsnorm); `x` is `rows×cols` row-major. One warp per row; the row
 /// reductions are warp-butterfly all-reduces (deterministic order). Tolerance-gated.
+///
+/// Panics on a `NORM_*` code with no PTX entry (log-softmax, l2norm) — the right assertion for a
+/// direct library caller, but the `--backend=gpu` offload must consult [`norm_supported`] first and
+/// fall back to the CPU kernel, exactly as it does for [`vmath_supported`] / [`reduce_supported`].
 pub fn norm(
     g: &mut Gpu,
     op: i64,
@@ -1866,14 +1967,8 @@ pub fn norm(
     cols: usize,
     eps: f32,
 ) -> Result<Vec<f32>, DriverError> {
-    use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
     assert_eq!(x.len(), rows * cols);
-    let entry = match op {
-        v if v == NORM_SOFTMAX => "softmax",
-        v if v == NORM_LAYERNORM => "layernorm",
-        v if v == NORM_RMSNORM => "rmsnorm",
-        _ => panic!("norm op {op} not implemented on GPU yet"),
-    };
+    let entry = norm_entry(op);
     let f = g.function("norm", crate::ptx_norm::norm_ptx(), entry)?;
     let x_d = g.stream.memcpy_stod(x)?;
     let mut out_d = g.stream.memcpy_stod(&vec![0f32; x.len()])?;
@@ -1887,6 +1982,27 @@ pub fn norm(
     bld.arg(&r).arg(&c).arg(&eps).arg(&x_d).arg(&mut out_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&out_d)
+}
+
+fn norm_entry(op: i64) -> &'static str {
+    use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
+    match op {
+        v if v == NORM_SOFTMAX => "softmax",
+        v if v == NORM_LAYERNORM => "layernorm",
+        v if v == NORM_RMSNORM => "rmsnorm",
+        _ => panic!("norm op {op} not implemented on GPU yet"),
+    }
+}
+
+/// Whether [`norm`] has a GPU kernel for normalization op `op` — the sibling of
+/// [`vmath_supported`] / [`reduce_supported`], which `norm` was missing. The `--backend=gpu` offload
+/// must check this and fall back to the CPU kernel for the rest: the recognizer in
+/// `wukong_mir_build` emits all five `NORM_*` codes, but [`norm_entry`] has PTX entries only for
+/// softmax/layernorm/rmsnorm and `panic!`s on log-softmax (3) and l2norm (4). Without the gate those
+/// two lower a plain user program to an internal panic instead of a CPU fallback.
+pub fn norm_supported(op: i64) -> bool {
+    use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
+    op == NORM_SOFTMAX || op == NORM_LAYERNORM || op == NORM_RMSNORM
 }
 
 /// Pick the flash kernel **entry name and matched launch config** for sequence length `seq`, head dim
@@ -1954,16 +2070,32 @@ pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
 /// combine it with [`wmma_flash_cfg`], and the warp-specialized kernels need a different launch shape.
 /// The warp-specialized S≥4096 override (default ON, `WUKONG_FLASH_WS=0` kill-switch) lives in
 /// [`wmma_flash_plan`] (entry + config together).
+///
+/// **Total on its contract, not on all of `usize`.** `d == 32` is in `ptx_flash::SUPPORTED_D` and
+/// reaches `ResidentLayerF16::new_mha`'s first assert, but has no tensor-core flash kernel; a silent
+/// `else` fallback would hand it `flash_d64_mp`, which strides Q/O by 64 over 32-wide rows — one
+/// head reading and overwriting the next, and the last head running off the end of the allocation.
+/// So an unsupported `d` panics here rather than at the far end of a wrong-answer.
 pub(crate) fn wmma_flash_entry(d: usize, _s: usize) -> &'static str {
-    if d == 128 {
-        "flash_d128_mp_lm"
-    } else {
-        "flash_d64_mp"
+    match d {
+        64 => "flash_d64_mp",
+        128 => "flash_d128_mp_lm",
+        other => panic!(
+            "wmma_flash_entry: no tensor-core flash kernel for head dim {other} \
+             (wmma_flash_applies must gate this call)"
+        ),
     }
 }
 
 /// Launch config for the tensor-core flash kernels (`flash_d64_w`/`_w4`): one warp per 16-query-row block.
+/// `S % 16 != 0` would truncate the grid and silently drop the tail query rows, so it is rejected here
+/// rather than only in the separate [`wmma_flash_applies`] predicate every caller must remember to run.
 pub(crate) fn wmma_flash_cfg(s: usize) -> LaunchConfig {
+    assert_eq!(
+        s % 16,
+        0,
+        "wmma_flash_cfg: S={s} must be a multiple of 16 (the kernel's 16-query-row block)"
+    );
     LaunchConfig {
         grid_dim: ((s / 16) as u32, 1, 1),
         block_dim: (32, 1, 1),
@@ -2027,6 +2159,13 @@ pub(crate) fn ws_flash_cfg(s: usize) -> LaunchConfig {
 /// grid `ceil((S/16)/2)`): callers that pair them independently would deadlock a 64-thread named-barrier
 /// kernel on a 32-thread launch. `heads` lands in `grid_dim.1` (1 for single-head).
 pub(crate) fn wmma_flash_plan(d: usize, s: usize, heads: usize) -> (&'static str, LaunchConfig) {
+    // Fold the precondition into the seam itself, so an (entry, cfg) pair can never be built for a
+    // shape no tensor-core flash kernel covers — rather than leaving it to the separate
+    // `wmma_flash_applies` predicate every caller must remember to run first.
+    assert!(
+        wmma_flash_applies(d, s),
+        "wmma_flash_plan: no tensor-core flash kernel for (d={d}, S={s}) — needs D ∈ {{64, 128}}, S % 16 == 0, S >= 512"
+    );
     let (entry, mut cfg) = match ws_flash_route(d, s) {
         Some(e) => (e, ws_flash_cfg(s)),
         None => (wmma_flash_entry(d, s), wmma_flash_cfg(s)),
@@ -2323,9 +2462,12 @@ pub fn conv2d_wmma_auto(
 /// **Winograd F(m×m,3×3) conv2d** (single batch, stride 1, no padding, `R=S=3`; `m∈{2,4}`) — cuDNN's
 /// `WINOGRAD_NONFUSED` strategy, the 2.25–4× multiply-reduction lever for 3×3. Four resident phases on
 /// device buffers (see [`crate::ptx_winograd`]): (1) filter transform `U[α²,K,C]`, (2) input transform
-/// `V[α²,C,T]`, (3) the α² batched channel-reduction GEMMs `M[ξν]=U[ξν]·V[ξν]` — each reusing the
-/// **proven `conv2d_wmma` tensor-core kernel** with `R=S=1` (`O[K,T]=W[K,C]·X[C,T]`) on a sub-slice — and
-/// (4) output transform → `O[K,P,Q]` (f32). fp16 storage, f32 transform arithmetic. Tolerance-gated
+/// `V[α²,C,T]`, (3) the α² batched channel-reduction GEMMs `M[ξν]=U[ξν]·V[ξν]` — a **dedicated**
+/// tensor-core NN GEMM (`ptx_winograd::wino_bgemm_ptx`), NOT `conv2d_wmma`: it stages a plain
+/// row-major `V[z][C,T]` with a baked z-plane offset, where `conv2d_wmma` stages B through an im2col
+/// address decode. The two share only the WMMA tile constants, and their MMA + SMEM-C drain blocks
+/// are copies of each other that must be kept in sync by hand — a fix to one does not reach the
+/// other. — and (4) output transform → `O[K,P,Q]` (f32). fp16 storage, f32 transform arithmetic. Tolerance-gated
 /// against the f64 oracle (fp16 quantization dominates; Winograd's amplification sits under it). Correct
 /// for any tile count `T`; perf only sensible once `T≥16` (a non-trivial batched-GEMM N) — large feature
 /// maps / early layers. `m=4` is F(4×4,3×3) (what cuDNN uses); `m=2` is the lower-amplification F(2,3).
@@ -2704,18 +2846,41 @@ pub fn conv2d_best(
     stride: usize,
     pad: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    // Winograd lane: valid 3×3, ≥64 channels, large enough spatial that the α² batched GEMM (N=tiles) is
-    // a real tensor-core problem. wino_ntiles gives the F(4,3) tile count T.
+    match conv2d_best_lane(c, h, width, r, s, stride, pad) {
+        "winograd" => winograd_conv2d(g, x, w, c, h, width, k, 4),
+        "affine-auto" => conv2d_wmma_padded_auto(g, x, w, c, h, width, k, r, s, stride, pad),
+        _ => conv2d_wmma_auto(g, x, w, c, h, width, k, r, s),
+    }
+}
+
+/// The routing predicate [`conv2d_best`] dispatches on, factored out so a gate can *assert* which
+/// lane a shape takes. `conv2d_best` returns only a `Vec<f32>`, so a test that merely prints an
+/// expected lane name proves nothing: if the Winograd guard stopped firing, every case would quietly
+/// fall to the GEMM lane, still satisfy the accuracy bound, and still print "winograd".
+///
+/// * `"winograd"` — valid 3×3, ≥64 channels, large enough spatial that the α² batched GEMM
+///   (N = tiles) is a real tensor-core problem (`wino_ntiles` gives the F(4,3) tile count T).
+/// * `"affine-auto"` — strided or padded.
+/// * `"valid-auto"` — everything else.
+pub fn conv2d_best_lane(
+    c: usize,
+    h: usize,
+    width: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> &'static str {
     if r == 3 && s == 3 && stride == 1 && pad == 0 && c >= 64 && h >= 28 && width >= 28 {
         let (_, _, nt) = crate::ptx_winograd::wino_ntiles(h, width, 4);
         if nt >= 16 {
-            return winograd_conv2d(g, x, w, c, h, width, k, 4);
+            return "winograd";
         }
     }
     if stride > 1 || pad > 0 {
-        conv2d_wmma_padded_auto(g, x, w, c, h, width, k, r, s, stride, pad)
+        "affine-auto"
     } else {
-        conv2d_wmma_auto(g, x, w, c, h, width, k, r, s)
+        "valid-auto"
     }
 }
 
@@ -3193,6 +3358,12 @@ impl ResidentLayerF16 {
     /// Q/K/V to head-major f16 `[H,S,dh]`, run the tensor-core flash with `grid.y = heads` (each head an
     /// independent CTA column via the kernel's `hoff = ctaid.y·S·dh`), then transpose the `[H,S,dh]`
     /// output back to `[S,D]`. The seam both forward paths share.
+    ///
+    /// `s` must be `self.s`: the flash *entry* in `f_flash_w` was resolved at construction from
+    /// `self.s`, and only its launch *config* is rebuilt here. A different `s` would pair one plan's
+    /// entry with another plan's geometry — e.g. a layer built at S=4096 (whose entry is the 2-warp
+    /// named-barrier `flash_d64_ws`) called at S=512 would rebuild a 32-thread config and deadlock
+    /// the kernel on a barrier that never sees 64 threads.
     fn run_attn(
         &self,
         q: &cudarc::driver::CudaSlice<f32>,
@@ -3201,6 +3372,7 @@ impl ResidentLayerF16 {
         s: usize,
         _d: usize,
     ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
+        assert_eq!(s, self.s, "run_attn: the flash entry was resolved for S={}", self.s);
         let scale = 1.0f32 / (self.dh as f32).sqrt();
         let ss = s as u32;
         if self.heads == 1 {
@@ -3706,7 +3878,10 @@ pub fn gemm_nt_w4a16_splitk(
 /// [`gemm_nt_w4a16`] (gated against the same f64 reference), but ptxas strength-reduces the baked strides
 /// (`×K`, `×N`, `K/8`, `K/group`) to shifts/immediates — the runtime-multiply overhead a library, which
 /// never sees the shape at compile time, cannot remove. Loads a fresh module per call here (the per-shape
-/// compile is the static-shape tradeoff; the persistent cubin cache (M10) amortizes it across runs).
+/// compile is the static-shape tradeoff). Note this loads the PTX **directly**, not through
+/// `Gpu::load_module_cached`, so the persistent cubin cache (M10) does NOT amortize it: no cubin is
+/// written and every process pays the full PTX→SASS JIT. Routing it through the cache would write one
+/// cubin per (M, N, K, zero_point) tuple into an unbounded cache dir, which is why it does not.
 pub fn gemm_nt_w4a16_static(
     g: &mut Gpu,
     a: &[f32],
@@ -4678,12 +4853,41 @@ mod tests {
     }
 
     /// Run `body` with the shared GPU, or skip (printing why) if none is present.
+    ///
+    /// A skip is a *passing* libtest test whose `eprintln!` libtest captures, so without this the
+    /// whole GPU suite reports `test result: ok` — with no visible output at all — whenever the
+    /// device is unreachable for any reason (empty `CUDA_VISIBLE_DEVICES`, another process holding
+    /// it, a driver/runtime mismatch). `WUKONG_GPU_REQUIRED=1` turns that into a failure, and the
+    /// skip line now carries the driver's actual error instead of asserting "no CUDA device".
     fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
         let mut guard = gpu();
         match guard.as_mut() {
             Some(g) => body(g),
-            None => eprintln!("[skip] {name}: no CUDA device reachable"),
+            None => {
+                let why = crate::gpu::init_error().unwrap_or("no CUDA device reachable");
+                assert!(
+                    !crate::gpu::gpu_required(),
+                    "{name}: WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}"
+                );
+                eprintln!("[skip] {name}: GPU unavailable: {why}");
+            }
         }
+    }
+
+    /// **§3A P3 — a sweep that cannot find its peer must fail LOUDLY, never skip silently and report
+    /// green.** Every `[skip]` early-return in this module calls this first. By default it is a
+    /// no-op, so the suite still passes on a box without the peer toolchain; with
+    /// `WUKONG_PEER_REQUIRED=1` — the campaign's own sweep invocation — a missing peer fails the test
+    /// instead of reporting a green run that measured nothing. The `[skip]` line is still printed so
+    /// an operator grepping for it sees the same marker.
+    #[track_caller]
+    fn peer_gate(what: &str) {
+        assert!(
+            std::env::var_os("WUKONG_PEER_REQUIRED").is_none(),
+            "{what}: WUKONG_PEER_REQUIRED is set but the peer/toolchain is unreachable — this sweep \
+             would have reported green having measured NOTHING. {}",
+            crate::baselines::peer_env_hint()
+        );
     }
 
     /// **W4A16 correctness gate (the first law).** The int4-decode kernel must reproduce — within the
@@ -5069,6 +5273,64 @@ mod tests {
         });
     }
 
+    /// **Launch-arity seam.** `ptx::REDUCE` declares `reduce_dot(n, x, y, partials)` (4 params) but
+    /// `reduce_sum`/`reduce_max(n, x, partials)` (3), so the number of pushed kernel arguments is a
+    /// function of the *op*, not of whether the caller supplied a `y`. A mismatched pair makes
+    /// `cuLaunchKernel` read one slot past the end of the argument vector and use it as a device
+    /// pointer — a process-sticky `CUDA_ERROR_ILLEGAL_ADDRESS`, the failure `reset_gpu` documents as
+    /// unrecoverable. This asserts the seam rejects both mismatch directions *before* the launch, so
+    /// no device work is done; it needs no GPU (the panic precedes `g.function`).
+    #[test]
+    fn reduce_rejects_an_operand_list_that_would_not_match_the_kernel() {
+        use wukong_runtime::{RED_DOT, RED_SUM};
+        // `reduce_needs_y` is the single source of truth both the entry and the arg list derive from.
+        assert!(reduce_needs_y(RED_DOT), "dot reads y");
+        for op in [RED_SUM, RED_MAX] {
+            assert!(!reduce_needs_y(op), "op {op} declares no y param");
+        }
+        with_gpu("reduce_launch_arity", |g| {
+            let x = vec![1.0f32, 2.0, 3.0, 4.0];
+            let short = vec![1.0f32, 2.0];
+            // Each of these would build an argument list the selected kernel's `.param` block does not
+            // match; all three are rejected *before* `g.function`, so no device work is attempted.
+            for (op, y, why) in [
+                (RED_DOT, None, "3 args at the 4-param reduce_dot"),
+                (RED_SUM, Some(&x), "4 args at the 3-param reduce_sum"),
+                (RED_DOT, Some(&short), "|y| != |x| reads past the end of y_d"),
+            ] {
+                let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = reduce(g, op, &x, y.map(|v| v.as_slice()));
+                }));
+                assert!(e.is_err(), "reduce must reject: {why}");
+            }
+            // The legal pairing still runs and still agrees with the CPU.
+            let got = reduce(g, RED_DOT, &x, Some(&x)).unwrap();
+            assert_eq!(got, 30.0, "1+4+9+16");
+            eprintln!("[gate] reduce launch-arity seam rejects every mismatched (op, y) pair ✓");
+        });
+    }
+
+    /// **Offload support mirror.** `norm_supported` must be true for exactly the op codes
+    /// `norm_entry` has a PTX entry for — every other code reaches its `panic!`, and the
+    /// `--backend=gpu` offload consults the predicate to decline (CPU fallback) instead of aborting
+    /// the user's program. Runs without a GPU: both are pure functions of the op code.
+    #[test]
+    fn norm_supported_covers_exactly_the_entries_norm_can_launch() {
+        for op in -1i64..=6 {
+            let launchable =
+                std::panic::catch_unwind(|| norm_entry(op)).is_ok();
+            assert_eq!(
+                norm_supported(op),
+                launchable,
+                "norm_supported({op}) disagrees with norm_entry({op}): the offload would either \
+                 panic on an unsupported op or needlessly fall back on a supported one"
+            );
+        }
+        // The two the recognizer emits that the GPU does not implement (log-softmax, l2norm).
+        assert!(!norm_supported(3) && !norm_supported(4));
+        assert!(vmath_supported(wukong_runtime::VM_RELU)); // sibling predicate, same contract
+    }
+
     /// f64 reference for `C = A·Bᵀ` (`A` m×k, `B` n×k).
     fn ref_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
@@ -5322,12 +5584,21 @@ mod tests {
                     v.name,
                     v.smem_bytes()
                 );
-                let shapes = [
+                let mut shapes = vec![
                     (v.bm, v.bk, v.bn),                          // 1 CTA, 1 K-tile (full prologue guard)
                     (v.bm, v.bk * 2, v.bn),                      // 1 CTA, 2 K-tiles
                     (2 * v.bm, v.bk * (v.stages + 3), 2 * v.bn), // 4 CTAs, ring wrap (K-tiles > stages)
                     (v.bm, v.bk * (v.stages + 1), 3 * v.bn),     // rectangular, multi-tile
                 ];
+                // **Multi-band raster.** Every shape above has `tiles_n <= 3` while `raster` is 16, so
+                // `grpr = lin/(tiles_m*raster)` is always 0 and `gw = min(tiles_n-col0, raster)` is
+                // always `tiles_n`: the `col0 = grpr*raster` multiply, the band carry, and a narrow
+                // trailing band AFTER a full one are all dead in test — yet production takes them
+                // (gemm_nt_f16 routes A+B>=16MB here, so any N >= 17*bn has tiles_n > raster).
+                // `17*bn` gives tiles_n = 17 > raster = 16: grpr in {0,1}, gw in {16,1}.
+                if v.raster > 0 {
+                    shapes.push((v.bm, v.bk, (v.raster + 1) * v.bn));
+                }
                 for (m, k, n) in shapes {
                     let a = rng.vec(m * k, -1.0, 1.0);
                     let b = rng.vec(n * k, -1.0, 1.0);
@@ -5366,6 +5637,9 @@ mod tests {
                 (128, 64, 128),
                 (256, 32 * (wh.stages + 3), 256),
                 (128, 32 * 3, 384),
+                // tiles_n = 17 > raster = 16 — the multi-band remap arm production always takes and
+                // the shapes above never do (see `wmma_pipe_matches_reference_within_tol`).
+                (128, 32, (wh.raster + 1) * 128),
             ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
@@ -6261,11 +6535,86 @@ mod tests {
         });
     }
 
+    /// **The cubin cache's warm branch must compute the same numbers as the PTX JIT.**
+    ///
+    /// `cubin_cache_roundtrips_to_loadable_sass` only checks the ELF magic and that three entry names
+    /// resolve — it never launches. And in a clean run the warm branch is never taken at all: the
+    /// in-process `modules` map serves every repeat, so `load_module_cached`'s `path.exists()` arm
+    /// only fires on a box with leftover files in the temp cache dir. So nothing pinned that a kernel
+    /// loaded from a cached cubin agrees with the same kernel loaded from PTX — even though
+    /// `ptx_to_cubin` drives `cuLinkCreate(0, null, null)` while a plain load drives
+    /// `cuModuleLoadData`, two paths whose default JIT options could diverge (`-ftz`, opt level)
+    /// after a driver update. That divergence would silently change every kernel's numerics on the
+    /// *second and later* runs of a process while the first stayed correct.
+    ///
+    /// This launches the same fp16 WMMA GEMM from all three module sources — direct PTX JIT, a cubin
+    /// loaded from disk, and `load_module_cached`'s own warm branch (forced by pre-populating the
+    /// exact cache path it computes) — and requires all three outputs to be **bit-identical**, plus
+    /// one of them tolerance-checked against the f64 oracle so "all three equally wrong" cannot pass.
+    #[test]
+    fn cubin_cache_warm_branch_matches_the_ptx_jit() {
+        use half::f16;
+        with_gpu("cubin_warm_equivalence", |g| {
+            let _ = g.ctx.bind_to_thread();
+            let ptx = crate::ptx_wmma::wmma_f16_ptx();
+            let (m, k, n) = (128usize, 64usize, 128usize);
+            let mut rng = crate::diff::Rng::new(0xCB1E_CAFE);
+            let a = rng.vec(m * k, -1.0, 1.0);
+            let b = rng.vec(n * k, -1.0, 1.0);
+            let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+            let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+            let a_d = g.stream.memcpy_stod(&a16).unwrap();
+            let b_d = g.stream.memcpy_stod(&b16).unwrap();
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+
+            // The exact path `load_module_cached` consults. Clear it so the first call is the COLD
+            // branch (compile + persist), then confirm the file appeared so the second call is the
+            // WARM branch (`path.exists()` ⇒ `Ptx::from_file`, no JIT).
+            let path = crate::cubin::cache_path(ptx, crate::cubin::driver_version());
+            let _ = std::fs::remove_file(&path);
+            let m_cold = g.load_module_cached(ptx).expect("cold load_module_cached");
+            assert!(
+                path.exists(),
+                "cold load_module_cached must persist a cubin at {path:?} — without it the warm \
+                 branch is unreachable and this gate would be vacuous"
+            );
+            let m_warm = g.load_module_cached(ptx).expect("warm load_module_cached");
+            // An independent from-PTX JIT, bypassing the cache entirely.
+            let m_jit = g.ctx.load_module(ptx.into()).expect("direct PTX JIT");
+
+            let mut outs: Vec<Vec<f32>> = Vec::new();
+            for (tag, module) in [("cold", &m_cold), ("warm", &m_warm), ("ptx-jit", &m_jit)] {
+                let f = module
+                    .load_function("wmma_nt_f16_sm")
+                    .unwrap_or_else(|_| panic!("{tag}: entry missing"));
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                unsafe { bld.launch(wmma_sm_cfg(m, n)).unwrap() };
+                outs.push(g.stream.memcpy_dtov(&c_d).unwrap());
+            }
+            for (i, tag) in [(1usize, "warm cubin"), (2, "direct PTX JIT")] {
+                assert!(
+                    outs[i].iter().zip(&outs[0]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{tag} disagrees with the cold cubin load — the cubin cache is NOT numerically \
+                     transparent, so a second run of any process would compute different results"
+                );
+            }
+            // …and all three are actually right, not equally wrong.
+            let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+            let st = crate::diff::assert_close("cubin-warm gemm", &outs[1], &r, 1e-2, 2e-3);
+            let _ = std::fs::remove_file(&path);
+            eprintln!(
+                "[gate] cubin warm branch == cold cubin == PTX JIT, bit-identical (max_abs vs f64 oracle {:.2e}) ✓",
+                st.max_abs
+            );
+        });
+    }
+
     /// The cubin cache route (M10): `ptx_to_cubin` must emit a real SASS cubin (ELF), and loading it
     /// back via `Ptx::from_file` must yield a module whose entries resolve — i.e. a warm process skips
-    /// the PTX JIT entirely. (Execution equivalence of the cached path is covered by the whole suite,
-    /// which loads every kernel through `load_module_cached`; a second test-binary run exercises the
-    /// warm branch end-to-end.)
+    /// the PTX JIT entirely. Numeric equivalence of the warm branch is gated separately by
+    /// [`cubin_cache_warm_branch_matches_the_ptx_jit`].
     #[test]
     fn cubin_cache_roundtrips_to_loadable_sass() {
         with_gpu("cubin_roundtrip", |g| {
@@ -7579,6 +7928,121 @@ mod tests {
         });
     }
 
+    /// **The register double-buffered implicit-GEMM conv** (`conv_wmma_db_ptx` /
+    /// `conv_wmma_db_splitk_ptx` — 336 lines of hand-written pipelined PTX with an XOR SMEM buffer
+    /// toggle) had exactly one full-output check anywhere: an `assert_eq!` buried inside
+    /// `conv_vs_cudnn`, which is `#[ignore]`d *and* early-returns unless the NVRTC/cuDNN redist DLLs
+    /// are on PATH. So a race introduced by reordering an `a_store("%bufWA")` against its `bar.sync`
+    /// — a write-after-read on the buffer other warps are still loading fragments from — produced
+    /// wrong conv output on a GPU while a full `cargo test --features gpu` reported green.
+    ///
+    /// This gate needs a device but no peer toolchain, so it runs in the normal suite. The two
+    /// kernels issue the same `mma` in the same order (only the staging is pipelined), so the
+    /// contract is **bit-identity**, with the single-buffer side additionally pinned to the f64
+    /// oracle so "both equally wrong" cannot pass. Covers the split-K pair on the deep-channel shape.
+    #[test]
+    fn conv2d_wmma_db_matches_single_buffer() {
+        use half::f16;
+        with_gpu("conv2d_wmma_db", |g| {
+            let mut rng = crate::diff::Rng::new(0x0DB_C0A1);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            // (C,H,W,K,R,S,sk). Same corners as `conv2d_wmma_matches_reference_within_tol`
+            // (non-tile-multiple M/N/GK, a 1x1, a clean shape) at sk=1, plus the split-K shapes
+            // `conv2d_wmma_splitk_matches_reference_within_tol` uses so `conv_wmma_db_splitk_ptx` is
+            // covered too. sk is explicit rather than `conv_splitk_factor`: the auto factor returns 1
+            // for every shape on a 20-SM device, which would leave the split-K DB generator ungated.
+            let cases = [
+                (3usize, 32usize, 32usize, 16usize, 3usize, 3usize, 1usize),
+                (16, 28, 28, 32, 3, 3, 1),
+                (8, 16, 16, 48, 5, 5, 1),
+                (32, 14, 14, 64, 1, 1, 1),
+                (64, 56, 56, 64, 3, 3, 1),
+                (64, 28, 28, 64, 3, 3, 4),
+                (128, 14, 14, 128, 3, 3, 8),
+                (48, 18, 18, 16, 3, 3, 3),
+            ];
+            for (c, h, wd, k, r, s, sk) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, wd, k, r, s) {
+                    continue;
+                }
+                assert_eq!((c * r * s) % sk, 0, "sk must divide GK");
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let entry = if sk == 1 { "conv2d_wmma" } else { "conv2d_wmma_splitk" };
+                let sb_ptx = if sk == 1 {
+                    crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s)
+                } else {
+                    crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk)
+                };
+                let db_ptx = if sk == 1 {
+                    crate::ptx_conv::conv_wmma_db_ptx(c, h, wd, k, r, s)
+                } else {
+                    crate::ptx_conv::conv_wmma_db_splitk_ptx(c, h, wd, k, r, s, sk)
+                };
+                let cfg = if sk == 1 {
+                    conv_wmma_cfg(h, wd, k, r, s)
+                } else {
+                    conv_wmma_splitk_cfg(h, wd, k, r, s, sk)
+                };
+                let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let red = if sk > 1 {
+                    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(k * p * q, sk);
+                    let rmod = g.load_module_cached(&rptx).unwrap();
+                    let rf = rmod.load_function("conv_splitk_reduce").unwrap();
+                    Some((rmod, rf))
+                } else {
+                    None
+                };
+                let rcfg = LaunchConfig {
+                    grid_dim: (((k * p * q) as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut outs: Vec<Vec<f32>> = Vec::new();
+                for ptx in [&sb_ptx, &db_ptx] {
+                    let f = g.load_module_cached(ptx).unwrap().load_function(entry).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                    if sk == 1 {
+                        let mut b = g.stream.launch_builder(&f);
+                        b.arg(&x_d).arg(&w_d).arg(&mut o_d);
+                        unsafe { b.launch(cfg).unwrap() };
+                    } else {
+                        let mut part_d = g.stream.alloc_zeros::<f32>(sk * k * p * q).unwrap();
+                        let mut b = g.stream.launch_builder(&f);
+                        b.arg(&x_d).arg(&w_d).arg(&mut part_d);
+                        unsafe { b.launch(cfg).unwrap() };
+                        let (_, rf) = red.as_ref().unwrap();
+                        let mut rb = g.stream.launch_builder(rf);
+                        rb.arg(&part_d).arg(&mut o_d);
+                        unsafe { rb.launch(rcfg).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    outs.push(g.stream.memcpy_dtov(&o_d).unwrap());
+                }
+                assert!(
+                    outs[1].iter().zip(&outs[0]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "conv db vs single-buffer C{c} {h}x{wd} K{k} {r}x{s} sk{sk}: outputs differ — the \
+                     pipelined staging changed the result, so the buffer toggle or a barrier is wrong"
+                );
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let st = crate::diff::assert_close(
+                    &format!("conv db C{c} {h}x{wd} K{k} {r}x{s}"),
+                    &outs[0],
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv2d_wmma db==sb C{c} {h}x{wd} K{k} {r}x{s} sk{sk}: bit-identical, max_abs vs f64={:.2e}",
+                    st.max_abs
+                );
+            }
+        });
+    }
+
     #[test]
     fn conv_winograd_matches_reference_within_tol() {
         with_gpu("winograd", |g| {
@@ -8020,20 +8484,29 @@ mod tests {
         }
         with_gpu("conv2d_best", |g| {
             let mut rng = crate::diff::Rng::new(0xBE57FE);
-            // (C,H,W,K,R,S,stride,pad, expected lane): every lane exercised.
+            // (C,H,W,K,R,S,stride,pad, expected lane, why): every lane exercised. The lane is
+            // ASSERTED against `conv2d_best_lane` (the predicate `conv2d_best` dispatches on), not
+            // merely printed — `conv2d_best` returns only a Vec<f32>, so a routing regression that
+            // sent every case to the GEMM lane would still satisfy the accuracy bound below and
+            // still print "winograd", leaving the Winograd kernel with zero coverage.
             let cases = [
-                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 0usize, "winograd"),
-                (128, 28, 28, 128, 3, 3, 1, 0, "winograd"),
-                (32, 64, 64, 64, 3, 3, 1, 0, "valid-auto (C<64)"),
-                (64, 56, 56, 64, 1, 1, 1, 0, "valid-auto (1x1)"),
-                (64, 56, 56, 64, 3, 3, 2, 1, "affine-auto (s2p1)"),
-                (128, 28, 28, 128, 3, 3, 1, 1, "affine-auto (same)"),
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 0usize, "winograd", ""),
+                (128, 28, 28, 128, 3, 3, 1, 0, "winograd", ""),
+                (32, 64, 64, 64, 3, 3, 1, 0, "valid-auto", "C<64"),
+                (64, 56, 56, 64, 1, 1, 1, 0, "valid-auto", "1x1"),
+                (64, 56, 56, 64, 3, 3, 2, 1, "affine-auto", "s2p1"),
+                (128, 28, 28, 128, 3, 3, 1, 1, "affine-auto", "same"),
             ];
-            for (c, h, width, k, r, s, st, pad, lane) in cases {
+            for (c, h, width, k, r, s, st, pad, lane, why) in cases {
                 let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
                 if k < 16 || c * r * s < 16 || p * q < 16 {
                     continue;
                 }
+                assert_eq!(
+                    conv2d_best_lane(c, h, width, r, s, st, pad),
+                    lane,
+                    "conv2d_best routed C{c} {h}x{width} {r}x{s} s{st}p{pad} to the wrong lane"
+                );
                 let x = rng.vec(c * h * width, -1.0, 1.0);
                 let w = rng.vec(k * c * r * s, -1.0, 1.0);
                 let got = conv2d_best(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
@@ -8049,8 +8522,32 @@ mod tests {
                     .sqrt();
                 let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
                 let fro_rel = err_f / ref_f.max(1e-9);
-                eprintln!("conv2d_best C{c} {h}x{width} K{k} {r}x{s} s{st}p{pad} -> {lane}: fro_rel={fro_rel:.2e}");
+                // Per-element backstop, the same one `conv_winograd_matches_reference_within_tol`
+                // carries and for the same stated reason: a Frobenius ratio over 186k outputs whose
+                // ||ref||_F is ~1e4 lets a SINGLE element be wrong by 8e-3*1e4 = 80 — several times
+                // the typical element magnitude — and still pass. The aggregate norm cannot see one
+                // catastrophic lane (a Winograd output-transform edge clip, a partial-tile store
+                // guard); this can.
+                //
+                // Calibrated on this machine over these six shapes, not copied from the sibling's
+                // smaller ones: the F(4,3) inverse transform amplifies the fp16 error several-fold
+                // over the implicit-GEMM lanes, so the bound is per-lane. Measured worst is 4.3e-1
+                // (winograd C128) and 1.3e-2 (GEMM lanes). A *catastrophically* wrong element in a
+                // 9C-term reduction of unit-ish inputs is O(sqrt(9C/9)) = 8-11, so both bounds sit
+                // an order of magnitude under a real bug while keeping >=2x headroom over noise.
+                let max_abs = got
+                    .iter()
+                    .zip(&oracle)
+                    .map(|(a, b)| (*a as f64 - *b as f64).abs())
+                    .fold(0.0, f64::max);
+                let abs_backstop = if lane == "winograd" { 1.0 } else { 5e-2 };
+                eprintln!("conv2d_best C{c} {h}x{width} K{k} {r}x{s} s{st}p{pad} -> {lane}{}{why}{}: fro_rel={fro_rel:.2e} max_abs={max_abs:.2e}",
+                    if why.is_empty() { "" } else { " (" }, if why.is_empty() { "" } else { ")" });
                 assert!(fro_rel < 8e-3, "conv2d_best C{c} {r}x{s} s{st}p{pad} ({lane}): rel-Frobenius {fro_rel:.3e} >= 8e-3");
+                assert!(
+                    max_abs < abs_backstop,
+                    "conv2d_best C{c} {r}x{s} s{st}p{pad} ({lane}): max_abs {max_abs:.3e} >= {abs_backstop:.0e} — a lane blew up"
+                );
             }
         });
     }
@@ -8168,6 +8665,7 @@ mod tests {
         use half::f16;
         with_gpu("conv_winograd_vs_cudnn", |g| {
             if !peers_available(g) {
+                peer_gate("conv_winograd_vs_cudnn");
                 eprintln!("[skip] NVRTC not loadable.");
                 return;
             }
@@ -8379,6 +8877,7 @@ mod tests {
         };
         with_gpu("conv_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("conv_vs_peers");
                 eprintln!("[skip] conv_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -8511,6 +9010,7 @@ mod tests {
         use half::f16;
         with_gpu("conv_vs_cudnn", |g| {
             if !peers_available(g) {
+                peer_gate("conv_vs_cudnn");
                 eprintln!("[skip] conv_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -8762,6 +9262,7 @@ mod tests {
         }
         with_gpu("conv_affine_vs_cudnn", |g| {
             if !peers_available(g) {
+                peer_gate("conv_affine_vs_cudnn");
                 eprintln!("[skip] conv_affine_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -8969,6 +9470,7 @@ mod tests {
         use half::f16;
         with_gpu("conv_splitk_vs_cudnn", |g| {
             if !peers_available(g) {
+                peer_gate("conv_splitk_vs_cudnn");
                 eprintln!("[skip] conv_splitk_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -9511,6 +10013,7 @@ mod tests {
         use crate::baselines::{cublas_gemm_nt_f16, peer_env_hint, peers_available};
         with_gpu("repro_vs_cublas", |g| {
             if !peers_available(g) {
+                peer_gate("reproducibility_vs_cublas");
                 eprintln!("[skip] reproducibility_vs_cublas: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -9760,6 +10263,7 @@ mod tests {
         use crate::baselines::{peer_env_hint, peers_available, CublasChainModel};
         with_gpu("resident_model_vs_cublas", |g| {
             if !peers_available(g) {
+                peer_gate("resident_model_vs_cublas_chain_throughput");
                 eprintln!(
                     "[skip] resident_model_vs_cublas_chain_throughput: cuBLAS not loadable.\n{}",
                     peer_env_hint()
@@ -10046,6 +10550,7 @@ mod tests {
         };
         with_gpu("cublas_chain_layer", |g| {
             if !peers_available(g) {
+                peer_gate("cublas_chain_layer_matches_reference_within_tol");
                 eprintln!(
                     "[skip] cublas_chain_layer_matches_reference: cuBLAS not loadable.\n{}",
                     peer_env_hint()
@@ -10114,6 +10619,7 @@ mod tests {
         use crate::baselines::{peer_env_hint, peers_available, CublasChainLayer};
         with_gpu("cublas_chain_vs_wukong", |g| {
             if !peers_available(g) {
+                peer_gate("cublas_chain_vs_wukong_layer_throughput");
                 eprintln!(
                     "[skip] cublas_chain_vs_wukong_layer_throughput: cuBLAS not loadable.\n{}",
                     peer_env_hint()
@@ -10228,6 +10734,7 @@ mod tests {
         use crate::baselines::{peer_env_hint, peers_available, CublasChainLayer};
         with_gpu("cublas_chain_vs_wukong_mha", |g| {
             if !peers_available(g) {
+                peer_gate("cublas_chain_vs_wukong_mha_layer_throughput");
                 eprintln!(
                     "[skip] cublas_chain_vs_wukong_mha_layer_throughput: cuBLAS not loadable.\n{}",
                     peer_env_hint()
@@ -10807,6 +11314,7 @@ mod tests {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
         with_gpu("cublaslt_fp8_gate", |g| {
             if !peers_available(g) || !cublaslt_available() {
+                peer_gate("cublaslt_fp8_matches_reference_within_tol");
                 eprintln!("[skip] cublaslt_fp8_gate: cuBLASLt not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -10818,6 +11326,7 @@ mod tests {
                 let c = match cublaslt_gemm_nt_fp8_e4m3(g, &a, &b, m, k, n) {
                     Ok(c) => c,
                     Err(e) => {
+                        peer_gate("cublaslt_fp8_matches_reference_within_tol");
                         eprintln!("[skip] cuBLASLt fp8 unsupported for {m}x{k}x{n} on this device: {e}");
                         return;
                     }
@@ -10854,6 +11363,7 @@ mod tests {
         };
         with_gpu("fp8_vs_cublaslt", |g| {
             if !peers_available(g) || !cublaslt_available() {
+                peer_gate("fp8_vs_cublaslt_pct");
                 eprintln!("[skip] fp8_vs_cublaslt: cuBLASLt not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -10936,6 +11446,7 @@ mod tests {
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
         with_gpu("fp8_pipe_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
+                peer_gate("fp8_pipe_config_sweep_vs_cublaslt");
                 eprintln!("[skip] fp8_pipe_config_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11134,6 +11645,7 @@ mod tests {
         use half::f16;
         with_gpu("gemm_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("gemm_vs_peers");
                 eprintln!("[skip] gemm_vs_peers: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11337,6 +11849,7 @@ mod tests {
         use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
         with_gpu("nvrtc_wmma_probe", |g| {
             if !crate::baselines::peers_available(g) {
+                peer_gate("nvrtc_wmma_probe");
                 eprintln!("[skip] nvrtc_wmma_probe: NVRTC not loadable.");
                 return;
             }
@@ -11397,6 +11910,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("gemm_pipe_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("gemm_pipe_sweep");
                 eprintln!("[skip] gemm_pipe_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11495,6 +12009,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("mma_swizzle_bench", |g| {
             if !peers_available(g) {
+                peer_gate("mma_swizzle_vs_handplaced");
                 eprintln!("[skip] mma_swizzle_vs_handplaced: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11572,7 +12087,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("gemm_cliff_gate", |g| {
             let mut rng = crate::diff::Rng::new(0xC11F_6A7E);
-            for &(m, k, n) in &[(256usize, 256usize, 256usize), (256, 160, 512), (512, 128, 384)] {
+            // A variant whose macro-tile no test shape divides is silently `continue`d below, so it
+            // would ship completely ungated while this test still reported green — and
+            // `gemm_cliff_ab` would then time and possibly promote it. Count launches per variant and
+            // fail if any entry was never reached.
+            let mut launched: Vec<(&str, usize)> =
+                CLIFF_VARIANTS.iter().map(|v| (v.name, 0usize)).collect();
+            // The first three shapes all have tiles_n <= 4 while every variant rasterizes at 16, so the
+            // remap's `grpr = lin/(tiles_m*raster)` is always 0 and `gw` is always tiles_n — the
+            // `col0 = grpr*raster` multiply, the band carry and a narrow trailing band after a full
+            // one are dead in test. But `gemm_nt_f16` routes the whole A+B >= 48 MB regime here, where
+            // tiles_n is far past 16. (128, 32, 2176) gives tiles_n = 17 > raster = 16, so grpr takes
+            // {0,1} and gw takes {16,1}; ~1.1 MB of C, and no cuBLAS needed.
+            for &(m, k, n) in &[
+                (256usize, 256usize, 256usize),
+                (256, 160, 512),
+                (512, 128, 384),
+                (128, 32, 2176),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
@@ -11593,8 +12125,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let c = g.stream.memcpy_dtov(&c_d).unwrap();
                     let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
                     eprintln!("{:<20} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", v.name, s.max_abs, s.max_rel);
+                    launched.iter_mut().find(|(n, _)| *n == v.name).unwrap().1 += 1;
                 }
             }
+            for (name, hits) in &launched {
+                let v = CLIFF_VARIANTS.iter().find(|v| v.name == *name).unwrap();
+                assert!(
+                    *hits > 0,
+                    "CLIFF_VARIANTS entry `{name}` was never gated — no test shape tiles its \
+                     {}x{}x{} macro-tile; add one to this test's shape list",
+                    v.bm, v.bn, v.bk
+                );
+            }
+            eprintln!("[gate] all {} CLIFF_VARIANTS entries launched ✓", launched.len());
         });
     }
 
@@ -11670,6 +12213,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("gemm_cliff_ab", |g| {
             if !peers_available(g) {
+                peer_gate("gemm_cliff_ab");
                 eprintln!("[skip] gemm_cliff_ab: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11791,12 +12335,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let ptxas = match std::env::var("WUKONG_PTXAS") {
             Ok(p) if std::path::Path::new(&p).exists() => p,
             _ => {
+                peer_gate("gemm_cliff_ptxas_ab");
                 eprintln!("[skip] set WUKONG_PTXAS to a standalone ptxas (`pip install nvidia-cuda-nvcc-cu12` → nvidia/cuda_nvcc/bin/ptxas.exe).");
                 return;
             }
         };
         with_gpu("gemm_cliff_ptxas", |g| {
             if !peers_available(g) {
+                peer_gate("gemm_cliff_ptxas_ab");
                 eprintln!("[skip] cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11836,6 +12382,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
             }
             if cands.is_empty() {
+                peer_gate("gemm_cliff_ptxas_ab");
                 eprintln!("[skip] no offline cubin loaded — lever blocked (likely driver older than the ptxas toolkit).");
                 return;
             }
@@ -11934,6 +12481,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("flash_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("flash_vs_peers");
                 eprintln!("[skip] flash_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -12115,6 +12663,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("fused_act", |g| {
             if !peers_available(g) {
+                peer_gate("fused_gemm_activation_vs_chain");
                 eprintln!("[skip] fused_gemm_activation_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -12241,6 +12790,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("fused_bias_act", |g| {
             if !peers_available(g) {
+                peer_gate("fused_gemm_bias_act_vs_chain");
                 eprintln!("[skip] fused_gemm_bias_act_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -12863,6 +13413,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("swiglu_gate_bench", |g| {
             if !peers_available(g) {
+                peer_gate("fused_swiglu_gate_vs_chain");
                 eprintln!("[skip] fused_swiglu_gate_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -13050,6 +13601,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("int4_gemm_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("int4_gemm_vs_peers");
                 eprintln!("[skip] int4_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14220,6 +14772,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use crate::ptx_int8::{INT8_TM, INT8_TN};
         with_gpu("int8_gemm_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("int8_gemm_vs_peers");
                 eprintln!("[skip] int8_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14539,6 +15092,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("int8_smdb_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("int8_smdb_sweep");
                 eprintln!("[skip] int8_smdb_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14681,6 +15235,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("quant_int8_raster_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_raster_sweep");
                 eprintln!("[skip] quant_int8_raster_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14804,6 +15359,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use crate::ptx_int8::int8_gemm_swz_tile_ptx;
         with_gpu("quant_int8_bigtile_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_bigtile_sweep");
                 eprintln!("[skip] quant_int8_bigtile_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14891,6 +15447,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("quant_int8_w64_confirm", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_w64_confirm");
                 eprintln!("[skip] quant_int8_w64_confirm: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15021,6 +15578,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("quant_int8_w64_s3_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_w64_s3_sweep");
                 eprintln!("[skip] quant_int8_w64_s3_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15145,6 +15703,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("quant_int8_fused_dequant_vs_chain", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_fused_dequant_vs_chain");
                 eprintln!("[skip] quant_int8_fused_dequant_vs_chain: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15261,6 +15820,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
         with_gpu("quant_fp8_warp_tile_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
+                peer_gate("quant_fp8_warp_tile_sweep");
                 eprintln!("[skip] quant_fp8_warp_tile_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15729,6 +16289,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_vs_fused_peer");
                 eprintln!(
                     "[skip] attn_vs_fused_peer: torch-CUDA peer not runnable. Set WUKONG_FA2_PYTHON \
                      to a python.exe with CUDA `torch` + numpy (see tools/fa2_sdpa_peer.py)."
@@ -15886,6 +16447,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_variants_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_variants_vs_fused_peer");
                 eprintln!("[skip] attn_variants_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
                 return;
             }
@@ -16606,6 +17168,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_lm_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_lm_vs_fused_peer");
                 eprintln!("[skip] attn_lm_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
                 return;
             }
@@ -16959,6 +17522,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_rope_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_rope_vs_fused_peer");
                 eprintln!(
                     "[skip] attn_rope_vs_fused_peer: torch-CUDA peer not runnable. Set WUKONG_FA2_PYTHON \
                      to a python.exe with CUDA `torch` + numpy (see tools/fa2_sdpa_peer.py)."
@@ -17156,6 +17720,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_causal_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_causal_vs_fused_peer");
                 eprintln!(
                     "[skip] attn_causal_vs_fused_peer: torch-CUDA peer not runnable. Set WUKONG_FA2_PYTHON \
                      to a python.exe with CUDA `torch` + numpy (see tools/fa2_sdpa_peer.py)."
@@ -17469,6 +18034,42 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// cross-checks ws vs the production `mp`/`mp_lm` output at S=2048 (like `flash_lm_vs_mp`), and pins
     /// the dispatch wiring: default routing (env unset) unchanged, ws routing shape-correct and
     /// structurally unable to reach the S<=512 win regimes.
+    /// **The tensor-core flash dispatch seam is total on its contract.** `wmma_flash_entry` /
+    /// `wmma_flash_cfg` / `wmma_flash_plan` used to accept any `(d, s)` and answer with a *plausible
+    /// but wrong* plan: `d == 32` (which is in `ptx_flash::SUPPORTED_D` and passes `new_mha`'s first
+    /// assert) fell through to the D=64 kernel, which strides Q/O by 64 over 32-wide rows — head `h`
+    /// reading and overwriting head `h+1`, and the last head running `S*32` elements off the end of
+    /// the allocation; and `s % 16 != 0` truncated the grid, silently dropping the tail query rows.
+    /// Neither is reachable from today's call sites, all of which are guarded by
+    /// `wmma_flash_applies` — this pins that the seam now rejects them itself, so a future caller
+    /// that forgets the predicate gets a panic instead of a silent wrong answer plus an OOB read.
+    /// Pure functions of the shape; needs no device.
+    #[test]
+    fn wmma_flash_seam_rejects_shapes_it_has_no_kernel_for() {
+        let bad = |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+        // Supported head dims still answer exactly as before.
+        assert_eq!(wmma_flash_entry(64, 512), "flash_d64_mp");
+        assert_eq!(wmma_flash_entry(128, 512), "flash_d128_mp_lm");
+        // dh=32 is in SUPPORTED_D for the f32 flash but has no tensor-core kernel.
+        assert!(bad(&|| { wmma_flash_entry(32, 512); }), "d=32 must not silently take the D=64 kernel");
+        assert!(bad(&|| { wmma_flash_entry(96, 512); }), "d=96 must not silently take the D=64 kernel");
+        // The 16-query-row block: a ragged S would truncate the grid and drop the tail rows.
+        assert_eq!(wmma_flash_cfg(512).grid_dim.0, 32);
+        assert!(bad(&|| { wmma_flash_cfg(520); }), "S%16!=0 must not silently truncate the grid");
+        // The whole plan carries the precondition, so an (entry, cfg) pair cannot be built at all
+        // for a shape outside `wmma_flash_applies`.
+        for (d, s) in [(32usize, 512usize), (64, 520), (64, 256), (96, 1024)] {
+            assert!(!wmma_flash_applies(d, s), "test shape (d={d}, S={s}) must be out of contract");
+            assert!(bad(&|| { wmma_flash_plan(d, s, 1); }), "wmma_flash_plan(d={d}, S={s}) must reject");
+        }
+        for (d, s) in [(64usize, 512usize), (64, 4096), (128, 512), (128, 4096)] {
+            assert!(wmma_flash_applies(d, s));
+            let (_, cfg) = wmma_flash_plan(d, s, 4);
+            assert_eq!(cfg.grid_dim.1, 4, "heads land in grid.y");
+        }
+        eprintln!("[gate] tensor-core flash seam is total on wmma_flash_applies ✓");
+    }
+
     #[test]
     fn ws_flash_matches_reference_within_tol() {
         use half::f16;
@@ -17618,6 +18219,51 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
                 }
             }
+            // **Multi-head.** Everything above runs at grid.y = 1, but `flash_d128_ws3_lm` is the
+            // PRODUCTION D=128 dispatch at S >= 4096 (`ws_flash_route_with`), always launched with
+            // grid.y = heads. Its `hoff = ctaid.y*S*d` prologue is a verbatim copy shared with eight
+            // other generators, so a slip there (the one line ws3 could diverge on) corrupts every
+            // head but head 0 while both the single-head ws3 gate and the multi-head *ws* gate stay
+            // green. Cross-check the full output against the `mp` twin, element by element — the
+            // abs-sum checksum the ws gate uses is invariant under exactly the head permutation this
+            // is looking for.
+            let heads = 4usize;
+            let s = 2048usize;
+            for &(d, ws3_e, mp_e) in &[
+                (64usize, "flash_d64_ws3", "flash_d64_mp"),
+                (128, "flash_d128_ws3_lm", "flash_d128_mp_lm"),
+            ] {
+                let (abs_tol, rel_tol) = if d == 64 { (2e-3, 2e-2) } else { (3e-3, 3e-2) };
+                let n = heads * s * d;
+                let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let mut outs: Vec<Vec<f32>> = Vec::new();
+                for (entry, mut cfg) in
+                    [(mp_e, wmma_flash_cfg(s)), (ws3_e, ws_flash_cfg(s))]
+                {
+                    cfg.grid_dim.1 = heads as u32;
+                    let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                    let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    outs.push(g.stream.memcpy_dtov(&o_d).unwrap());
+                }
+                let st = crate::diff::assert_close(
+                    &format!("{ws3_e} vs {mp_e} H={heads} S={s}"),
+                    &outs[1],
+                    &outs[0],
+                    abs_tol,
+                    rel_tol,
+                );
+                eprintln!(
+                    "ws3-vs-mp full-output d={d} S={s} H={heads}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
         });
     }
 
@@ -17755,6 +18401,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_d128_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_d128_vs_fused_peer");
                 eprintln!("[skip] attn_d128_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
                 return;
             }

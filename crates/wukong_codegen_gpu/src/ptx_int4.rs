@@ -52,9 +52,14 @@ pub struct QuantWeight {
     /// Per-group fp16 scale, `[N, K/G]` row-major.
     pub scales: Vec<f16>,
     /// Per-group integer zero-point, `[N, K/G]` — `Some` for the asymmetric path (`Z = zero[group]`).
+    /// **This is the discriminator**: every launcher (`crate::gpu::gemm_nt_w4a16` and friends) and the
+    /// host oracle [`dequant_weight`] pick symmetric vs asymmetric by matching on this field alone.
     pub zeros: Option<Vec<u8>>,
     /// `true` ⇒ symmetric, offset-binary nibbles (`u = q+8`, dequant `Z = 8`); `false` ⇒ asymmetric,
-    /// unsigned nibbles with per-group `zeros` (`Z = zero[group]`).
+    /// unsigned nibbles with per-group `zeros` (`Z = zero[group]`). Both quantizers keep this equal to
+    /// `zeros.is_none()`; it is a **label, not a discriminator** — neither the kernel selection nor the
+    /// host oracle reads it (both match on `zeros`, see [`dequant_weight`]), so an inconsistent pair
+    /// cannot make the two compute different shapes.
     pub signed: bool,
 }
 
@@ -180,18 +185,25 @@ pub fn quantize_weight_asymmetric(w: &[f32], n: usize, k: usize, group: usize) -
 /// f32)` is exact for the small integer `v = u-Z`, and the half-crate `f16*f16` is the correctly-rounded
 /// product (matching PTX `mul.rn.f16x2`), so the gate's reference weight equals the kernel's bit-for-bit
 /// and the only kernel error is the f32 accumulation order.
+///
+/// **Which path is taken is decided by [`QuantWeight::zeros`], never by `signed`** — that is the field
+/// every launcher dispatches on (`crate::gpu::gemm_nt_w4a16` matches on `qw.zeros` to pick
+/// `gemm_nt_w4a16` vs `gemm_nt_w4a16_z`; the split-K and autotune paths assert `zeros.is_none()`).
+/// Since this function *is* the oracle the W4A16 first-law gate compares the kernel against, reading a
+/// second, independent discriminator here would let the oracle and the kernel compute different shapes
+/// for any `QuantWeight` built by hand rather than by the two quantizers.
 pub fn dequant_weight(qw: &QuantWeight) -> Vec<f16> {
     let (n, k, group) = (qw.n, qw.k, qw.group);
     let (kg, kw) = (qw.groups(), qw.words());
+    let zeros = qw.zeros.as_deref();
     let mut w = vec![f16::ZERO; n * k];
     for r in 0..n {
         let row = &qw.packed[r * kw..r * kw + kw];
         for kk in 0..k {
             let u = unpack_nibble(row, kk) as i32;
-            let z = if qw.signed {
-                8
-            } else {
-                qw.zeros.as_ref().unwrap()[r * kg + kk / group] as i32
+            let z = match zeros {
+                None => 8, // symmetric / offset-binary: u = q+8
+                Some(z) => z[r * kg + kk / group] as i32,
             };
             let scale = qw.scales[r * kg + kk / group];
             w[r * k + kk] = f16::from_f32((u - z) as f32) * scale;
@@ -643,6 +655,33 @@ mod tests {
                 assert!(err <= scale + 1e-3, "asym deq err {err} > step {scale}");
             }
         }
+    }
+
+    /// **The oracle and the launchers must dispatch symmetric-vs-asymmetric off the SAME field.**
+    /// `QuantWeight` is `pub` with `pub` fields, so an external caller loading GPTQ/AWQ weights builds
+    /// one by hand; `gpu::gemm_nt_w4a16` (and every other W4A16 launcher, plus `autotune`) selects the
+    /// kernel by matching on `zeros`, so `dequant_weight` — the exact reference the W4A16 first-law
+    /// gate compares against — must read `zeros` too. Reading `signed` instead silently redefined the
+    /// oracle for an inconsistent pair, and `zeros.unwrap()` panicked outright on the other one.
+    #[test]
+    fn dequant_follows_zeros_not_the_signed_flag() {
+        let (n, k, group) = (2usize, 256usize, GROUP_SIZE);
+        let mut rng = crate::diff::Rng::new(0x4E12);
+        let w = rng.vec(n * k, -2.0, 2.0);
+
+        // A hand-built asymmetric weight that mislabels itself `signed: true`. The launcher takes the
+        // `Some(zeros)` arm and dequants (u - z)*scale, so the reference must do the same.
+        let asym = quantize_weight_asymmetric(&w, n, k, group);
+        let want = dequant_weight(&asym);
+        let mislabelled = QuantWeight { signed: true, ..asym.clone() };
+        assert_eq!(dequant_weight(&mislabelled), want, "oracle must follow `zeros`, not `signed`");
+
+        // The mirror case: a symmetric weight mislabelled `signed: false`. The launcher takes the
+        // `None` arm (Z = 8); the reference must not panic on `zeros.unwrap()`.
+        let sym = quantize_weight_symmetric(&w, n, k, group);
+        let want = dequant_weight(&sym);
+        let mislabelled = QuantWeight { signed: false, ..sym.clone() };
+        assert_eq!(dequant_weight(&mislabelled), want, "oracle must not read `signed` for Z");
     }
 
     /// The generated PTX must be **pure ASCII** (a single non-ASCII byte is a `ptxas fatal` on this

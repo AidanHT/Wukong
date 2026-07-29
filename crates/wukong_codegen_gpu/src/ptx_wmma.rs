@@ -306,10 +306,6 @@ impl CliffCfg {
     pub const fn threads(&self) -> usize {
         self.wm * self.wn * 32
     }
-    /// `mma` sub-tiles per warp (the warp-tile ILP knob: `mma`/iteration = `tm·tn·(bk/16)`).
-    pub const fn mma_per_warp(&self) -> usize {
-        (self.bm / (16 * self.wm)) * (self.bn / (8 * self.wn))
-    }
 }
 
 /// The cliff sweep. `cliff_swz_s2` is byte-identical to the dispatched swizzle workhorse (the A/B base).
@@ -399,6 +395,21 @@ fn entry_smem(
     // global index is K(·16)-aligned + kt(·16) + {0,8} ⇒ a multiple of 8 ⇒ 16-byte aligned.
     let a_chunks = bm * SM_BK / (threads * 8);
     let b_chunks = bn * SM_BK / (threads * 8);
+    // The whole-multiple staging constraint stated above must be CHECKED, not assumed: the division
+    // truncates, so a tile that does not tile the CTA emits a kernel that stages only part of A/B (or,
+    // at `*_chunks == 0`, nothing at all) while every `bar.sync`/`wmma.load`/`wmma.mma` stays
+    // well-formed — it JITs cleanly and computes C from stale shared memory. Same guard the sibling
+    // generators (`entry_smem_pipe`, `entry_mma_pipe`, `entry_mma_gate`) already carry.
+    assert!(
+        a_chunks >= 1 && a_chunks * threads * 8 == bm * SM_BK,
+        "{name}: A tile {bm}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
+    assert!(
+        b_chunks >= 1 && b_chunks * threads * 8 == bn * SM_BK,
+        "{name}: B tile {bn}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
     let wn_shift = warps_n.trailing_zeros(); // warpId / warps_n  (warps_n a power of two)
     let wm = (16 * tm) as i64; // per-warp rows owned
     let wn = (16 * tn) as i64; // per-warp cols owned
@@ -635,6 +646,18 @@ fn entry_smem_db(
     }
     let a_chunks = bm * SM_BK / (threads * 8);
     let b_chunks = bn * SM_BK / (threads * 8);
+    // Same unchecked truncating division as [`entry_smem`] — a tile that does not tile the CTA emits a
+    // kernel whose double-buffered staging is partial (or empty), which JITs and reads stale SMEM.
+    assert!(
+        a_chunks >= 1 && a_chunks * threads * 8 == bm * SM_BK,
+        "{name}: A tile {bm}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
+    assert!(
+        b_chunks >= 1 && b_chunks * threads * 8 == bn * SM_BK,
+        "{name}: B tile {bn}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
     let wn_shift = warps_n.trailing_zeros();
     let wm = (16 * tm) as i64;
     let wn = (16 * tn) as i64;
@@ -2385,3 +2408,254 @@ pub const TN_TILES: usize = 4;
 /// Per-warp output tile dims (the multi-tile kernel requires M%WARP_M==0 and N%WARP_N==0).
 pub const WARP_M: usize = 16 * TM_TILES;
 pub const WARP_N: usize = 16 * TN_TILES;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Split a straight-line PTX instruction into `(opcode, operands)`, dropping the `;` and all
+    /// whitespace the two spellings happen to differ in.
+    fn split_insn(line: &str) -> (String, Vec<String>) {
+        let l = line.trim().trim_end_matches(';');
+        let (op, rest) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
+        (op.to_string(), rest.split(',').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect())
+    }
+
+    /// Canonicalize an activation body so two spellings of the *same dataflow* compare equal:
+    /// registers are renamed by role -- `%in` is the live-in value, `%t0..` the scratch registers in
+    /// first-definition order, and the destination of the last instruction is `%out` (the standalone
+    /// vmath entry leaves its result wherever it lands and stores it, while the fused epilogue writes
+    /// back into the accumulator). Immediates (`0f...`) are compared verbatim, so a changed constant
+    /// still fails.
+    fn canon_act_body(lines: &[&str], live_in: &str) -> Vec<String> {
+        let mut map: Vec<(String, String)> = vec![(live_in.to_string(), "%in".to_string())];
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let (op, ops) = split_insn(line);
+            let last = i + 1 == lines.len();
+            let mut canon_ops = Vec::new();
+            for (j, o) in ops.iter().enumerate() {
+                if !o.starts_with('%') {
+                    canon_ops.push(o.clone());
+                } else if last && j == 0 {
+                    canon_ops.push("%out".to_string());
+                } else if let Some((_, v)) = map.iter().find(|(k, _)| k == o) {
+                    canon_ops.push(v.clone());
+                } else {
+                    let v = format!("%t{}", map.len() - 1);
+                    map.push((o.clone(), v.clone()));
+                    canon_ops.push(v);
+                }
+            }
+            out.push(format!("{op} {}", canon_ops.join(",")));
+        }
+        out
+    }
+
+    /// The instruction lines of `ptx::vmath_ptx`'s `name` entry between the input load and the output
+    /// store, plus the register the store reads (which must be what the last instruction wrote).
+    fn vmath_body(name: &str) -> Vec<String> {
+        let ptx = crate::ptx::vmath_ptx();
+        let at = ptx.find(&format!(".visible .entry {name}(")).expect("entry exists");
+        let body = &ptx[at..];
+        let body = &body[..body.find("\nDONE:").expect("entry has a DONE label")];
+        let start = body.find("ld.global.f32").expect("entry loads x[i]");
+        let tail = &body[start..];
+        let lines: Vec<&str> = tail.lines().skip(1).map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let (store, act) = lines.split_last().expect("at least the store");
+        let (op, ops) = split_insn(store);
+        assert_eq!(op, "st.global.f32", "{name}: the entry must end in the output store");
+        let result = ops[1].clone();
+        let (last_op, last_ops) = split_insn(act.last().expect("at least one activation instruction"));
+        assert_eq!(last_ops[0], result, "{name}: `{last_op}` must write the register the store reads");
+        act.iter().map(|l| l.to_string()).collect()
+    }
+
+    /// U4 mirror gate. `Act::epilogue` (the fused GEMM/fp8 epilogue) and `ptx::vmath_ptx`'s standalone
+    /// relu/silu/gelu entries are two copies of one semantic rule: the same .wk source reaches EITHER,
+    /// depending only on whether the `sgemm_nt_epi` epilogue recognizer fired. The doc comment on
+    /// `Act::epilogue` claims they use "the exact same formulas + constants", but nothing enforced it,
+    /// so improving one copy in isolation (e.g. moving vmath's gelu to the erf form) would make the
+    /// same program produce different numbers depending on the recognizer -- and the fused kernel's
+    /// own 5e-2-tolerance gate compares it to a Rust tanh-form reference, so it would still pass.
+    /// Compared as canonical dataflow, so a swapped operand, a changed constant or a different opcode
+    /// sequence all fail here.
+    #[test]
+    fn fused_activation_epilogue_matches_the_standalone_vmath_kernel() {
+        for (name, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
+            let standalone = vmath_body(name);
+            let standalone: Vec<&str> = standalone.iter().map(|s| s.as_str()).collect();
+            let fused = act.epilogue("%acc");
+            let fused: Vec<&str> = fused.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            assert_eq!(
+                canon_act_body(&standalone, "%f1"),
+                canon_act_body(&fused, "%acc"),
+                "{name}: the fused epilogue and the standalone vmath kernel have drifted -- a program \
+                 would compute a different answer depending on whether the epilogue recognizer fired"
+            );
+        }
+        assert_eq!(Act::None.epilogue("%acc"), "", "the plain GEMM must emit no epilogue");
+    }
+
+    /// Every `.visible .entry <name>(` defined in `ptx`, in order.
+    fn entry_names(ptx: &str) -> Vec<&str> {
+        ptx.match_indices(".visible .entry ")
+            .map(|(i, m)| {
+                let rest = &ptx[i + m.len()..];
+                &rest[..rest.find('(').expect("an entry declaration opens its param list")]
+            })
+            .collect()
+    }
+
+    /// B1: one non-ASCII byte anywhere in an emitted module is a `ptxas fatal` on this box. `Act`'s
+    /// doc comments, the assert messages and the CLIFF_VARIANTS prose in this file are full of
+    /// `.`/`x`-style math characters sitting right next to the `format!`s that build the kernels, and
+    /// a GPU-less `cargo test` never loads a module -- so nothing but this test keeps the emitted
+    /// text loadable.
+    #[test]
+    fn every_tensor_core_module_is_pure_ascii() {
+        let modules: [(&str, &str); 5] = [
+            ("wmma_f16_ptx", wmma_f16_ptx()),
+            ("wmma_bf16_ptx", wmma_bf16_ptx()),
+            ("gemm_cliff_ptx", gemm_cliff_ptx()),
+            ("roofline_f16_ptx", roofline_f16_ptx()),
+            ("wmma_f16_sm_static_ptx", &wmma_f16_sm_static_ptx(128, 128, 128, false)),
+        ];
+        for (what, ptx) in modules {
+            if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+                panic!("{what}: PTX must be pure ASCII (ptxas fatal otherwise) -- line {}: {line}", i + 1);
+            }
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "{what}: unbalanced braces");
+            let names = entry_names(ptx);
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), names.len(), "{what}: duplicate .visible .entry name");
+        }
+    }
+
+    /// The dispatch seam must close: every entry name a host launcher can hand `Gpu::function` has to
+    /// be defined in the module it is loaded from. The two sides are separate literals -- e.g.
+    /// `gpu::gemm_nt_f16_mma_bias_gelu` asks for "mma_nt_f16_128_bk32_s2_r16_swz_bias_gelu" while the
+    /// builder synthesises it as `format!("{}_swz_{suffix}", wh.name)` -- so reordering the builder's
+    /// format string compiles clean, passes every GPU-less test, and then fails at runtime with
+    /// `DriverError(CUDA_ERROR_NOT_FOUND)` on four dispatched public entry points.
+    #[test]
+    fn every_dispatched_tensor_core_entry_is_defined() {
+        let f16 = wmma_f16_ptx();
+        let bf16 = wmma_bf16_ptx();
+        let cliff = gemm_cliff_ptx();
+        let has = |ptx: &str, n: &str| ptx.contains(&format!(".visible .entry {n}("));
+
+        // Sweep tables shared by the builder and the host (`gemm_nt_f16_pipe` / `gemm_nt_f16_cliff`
+        // launch `v.name` straight from these), so a table edit must reach the module.
+        for v in PIPE_VARIANTS {
+            assert!(has(f16, v.name), "PIPE_VARIANTS entry `{}` missing from wmma_f16_ptx", v.name);
+        }
+        for v in CLIFF_VARIANTS {
+            assert!(has(cliff, v.name), "CLIFF_VARIANTS entry `{}` missing from gemm_cliff_ptx", v.name);
+        }
+        assert!(has(bf16, PIPE_BF16.name), "PIPE_BF16 entry `{}` missing", PIPE_BF16.name);
+        for use_128 in [false, true] {
+            let n = wmma_f16_sm_static_entry(use_128);
+            let ptx = wmma_f16_sm_static_ptx(256, 256, 256, use_128);
+            assert!(has(&ptx, n), "static-shape entry `{n}` missing from its own module");
+        }
+
+        // The names gpu.rs spells as literals at its dispatch sites.
+        let wh = "mma_nt_f16_128_bk32_s2_r16";
+        let p64 = "wmma_nt_f16_pipe_64_s6";
+        let bwh = PIPE_BF16.name;
+        for n in ["wmma_nt_f16", "wmma_nt_f16_mt", "wmma_nt_f16_sm", "wmma_nt_f16_sm128",
+                  "wmma_nt_f16_sm_db", "wmma_nt_f16_sm128_db", "wmma_nt_f16_sm_db_residual",
+                  "wmma_nt_f16_sm_db_relu", "wmma_nt_f16_sm_db_silu", "wmma_nt_f16_sm_db_gelu",
+                  "wmma_nt_f16_sm_db_bias", "wmma_nt_f16_sm_db_bias_relu",
+                  "wmma_nt_f16_sm_db_bias_silu", "wmma_nt_f16_sm_db_bias_gelu"] {
+            assert!(has(f16, n), "dispatched entry `{n}` missing from wmma_f16_ptx");
+        }
+        for n in ["wmma_nt_bf16", "wmma_nt_bf16_mt", "wmma_nt_bf16_sm_db", "wmma_nt_bf16_sm_db_relu",
+                  "wmma_nt_bf16_sm_db_silu", "wmma_nt_bf16_sm_db_gelu", "wmma_nt_bf16_sm_db_bias",
+                  "wmma_nt_bf16_sm_db_bias_relu", "wmma_nt_bf16_sm_db_bias_silu",
+                  "wmma_nt_bf16_sm_db_bias_gelu"] {
+            assert!(has(bf16, n), "dispatched entry `{n}` missing from wmma_bf16_ptx");
+        }
+        // The fused-epilogue families: `{base}[_swz]_bias[_act]` and `..._bias_residual`.
+        for base in [wh, p64] {
+            for suffix in ["bias", "bias_relu", "bias_silu", "bias_gelu", "bias_residual"] {
+                assert!(has(f16, &format!("{base}_{suffix}")), "`{base}_{suffix}` missing");
+            }
+        }
+        for suffix in ["bias", "bias_relu", "bias_silu", "bias_gelu", "bias_residual"] {
+            assert!(has(f16, &format!("{wh}_swz_{suffix}")), "`{wh}_swz_{suffix}` missing");
+            assert!(has(bf16, &format!("{bwh}_{suffix}")), "`{bwh}_{suffix}` missing");
+            assert!(has(bf16, &format!("{bwh}_swz_{suffix}")), "`{bwh}_swz_{suffix}` missing");
+        }
+        for base in [wh, bwh] {
+            let ptx = if base == wh { f16 } else { bf16 };
+            for twin in ["_swz", "_w22swz"] {
+                assert!(has(ptx, &format!("{base}{twin}")), "`{base}{twin}` missing");
+            }
+        }
+        // The gated-FFN (GLU-family) dual-B tiles, padded base + swizzle twin.
+        for ty in ["f16", "bf16"] {
+            let ptx = if ty == "f16" { f16 } else { bf16 };
+            for g in ["gate_silu", "gate_gelu", "gate_glu", "gate_silu_bias", "gate_gelu_bias"] {
+                assert!(has(ptx, &format!("mma_nt_{ty}_128x64_{g}")), "`mma_nt_{ty}_128x64_{g}` missing");
+                assert!(has(ptx, &format!("mma_nt_{ty}_128x64_{g}_swz")), "`mma_nt_{ty}_128x64_{g}_swz` missing");
+            }
+        }
+        assert!(has(roofline_f16_ptx(), "wmma_roofline_f16"));
+    }
+
+    /// The staging precondition [`entry_smem`]/[`entry_smem_db`] document is now checked, so the four
+    /// production instantiations must satisfy it (each is one 128-bit chunk per thread) and a tile that
+    /// does not tile the CTA must be rejected at generation time instead of emitting a kernel with a
+    /// partial (or empty) global->shared stage that JITs and reads stale shared memory.
+    #[test]
+    fn smem_staging_tiles_the_cta_for_every_generated_shape() {
+        // Production shapes: 64x64 / 4 warps and 128x128 / 8 warps, both precisions. `a_chunks == 1`
+        // each, so the guard changes no emitted byte.
+        for (bm, bn, wm, wn) in [
+            (SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N),
+            (SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N),
+        ] {
+            let threads = wm * wn * 32;
+            assert_eq!(bm * SM_BK % (threads * 8), 0, "A tile {bm}x{SM_BK} must tile {threads} threads");
+            assert_eq!(bn * SM_BK % (threads * 8), 0, "B tile {bn}x{SM_BK} must tile {threads} threads");
+            for ty in ["f16", "bf16"] {
+                let p = entry_smem("t_sm", ty, bm, bn, wm, wn, None);
+                assert_eq!(p.matches("ld.global.v4.u32").count(), 2, "one A + one B stage per K step");
+                // The double-buffered twin stages with `cp.async` (global->shared, no register hop):
+                // one 16-byte copy per chunk, prologue + steady state.
+                let d = entry_smem_db("t_db", ty, bm, bn, wm, wn, Act::None, false, false);
+                assert!(
+                    d.matches("cp.async.cg.shared.global").count() >= 4,
+                    "the double-buffered kernel must stage A/B in both the prologue and the K loop"
+                );
+            }
+        }
+    }
+
+    /// `bm*SM_BK = 32*16 = 512 < threads*8 = 1024` truncates to ZERO staging chunks: before the guard
+    /// this generated a fully well-formed kernel with no global->shared copy at all.
+    #[test]
+    #[should_panic(expected = "is not a whole multiple of threads*8")]
+    fn smem_tile_smaller_than_one_chunk_per_thread_is_rejected() {
+        entry_smem("t_bad_sm", "f16", 32, 32, 2, 2, None);
+    }
+
+    /// The partial-multiple case (`96*16 = 1536`, `threads*8 = 1024` => one chunk staged, a third of the
+    /// tile left stale) is the more dangerous one — it reads as a tolerance failure, not a codegen bug.
+    #[test]
+    #[should_panic(expected = "is not a whole multiple of threads*8")]
+    fn smem_tile_that_only_partly_tiles_the_cta_is_rejected() {
+        entry_smem("t_partial_sm", "f16", 96, 96, 2, 2, None);
+    }
+
+    /// The double-buffered generator carries the same guard.
+    #[test]
+    #[should_panic(expected = "is not a whole multiple of threads*8")]
+    fn smem_db_tile_smaller_than_one_chunk_per_thread_is_rejected() {
+        entry_smem_db("t_bad_db", "f16", 32, 32, 2, 2, Act::None, false, false);
+    }
+}

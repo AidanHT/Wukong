@@ -432,6 +432,11 @@ impl DecodeModel {
     /// table without corrupting block 0). This is the host half of one continuous-batching step — the
     /// [`Scheduler`] calls it, then [`run_layers_on`](Self::run_layers_on) (the graph-capturable launch
     /// half). Returns the per-slot pre-append write positions.
+    ///
+    /// **Atomic**: on `Err` (the cache cannot grow every active slot by one token) *nothing* has been
+    /// mutated — no context length advanced, no block popped, no upload issued — so the caller may
+    /// preempt and retry with a different mask without the host allocator and the device metadata
+    /// having drifted apart.
     pub fn advance_and_upload_masked(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -439,6 +444,23 @@ impl DecodeModel {
     ) -> Result<Vec<u32>, DriverError> {
         let bcap = self.cfg.num_slots;
         assert_eq!(active.len(), bcap, "active mask must be one bool per slot");
+        // **Feasibility pre-pass — the advance must be all-or-nothing.** The loop below mutates the
+        // host allocator slot by slot, but the four device metadata uploads happen only after it
+        // completes; a mid-loop failure would leave the earlier slots' context lengths advanced with
+        // *nothing* uploaded, and the caller's documented recovery (preempt, retry) would then take
+        // those inflated lengths as the next write positions — writing each survivor's next token one
+        // position past a hole the attention kernel still covers (stale bytes from whichever sequence
+        // last owned that block). `can_grow` tests exactly the two conditions `push_block` can fail on
+        // (free-list exhaustion and the per-sequence table-width cap), so once it passes for every
+        // active slot no `append` below can fail.
+        {
+            let mgr = self.cache.manager_ref();
+            for b in 0..bcap {
+                if active[b] && !mgr.can_grow(b, 1) {
+                    return Err(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY));
+                }
+            }
+        }
         let mut wpos = vec![0u32; bcap];
         let mut mask = vec![0u32; bcap];
         for b in 0..bcap {
@@ -501,6 +523,11 @@ impl DecodeModel {
 }
 
 /// A serving request: a `prompt_len`-token prefill followed by `gen_len` decode tokens.
+///
+/// **Both lengths are floored at 1 on admission.** A slot must own at least one cache block (a
+/// zero-length prefill would leave the block table padded with 0 — the live block the append kernel's
+/// `active` mask exists to protect), and a sequence must emit at least one token (`gen_len == 0` would
+/// underflow the in-flight `remaining` counter on its very first retire).
 #[derive(Clone, Copy, Debug)]
 pub struct Request {
     pub prompt_len: usize,
@@ -664,7 +691,10 @@ impl Scheduler {
                 .manager()
                 .reserve(slot, req.prompt_len.max(1))
                 .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
-            self.slots[slot] = Some(Inflight { remaining: req.gen_len });
+            // `gen_len.max(1)`: the same normalization `prompt_len` gets just above. A `remaining` of 0
+            // would go negative on this sequence's first `retire_finished` — panicking in a debug build
+            // and wrapping to `usize::MAX` in a release one, pinning the slot and its blocks forever.
+            self.slots[slot] = Some(Inflight { remaining: req.gen_len.max(1) });
             self.admitted += 1;
             n += 1;
         }
@@ -1746,6 +1776,125 @@ mod tests {
                     trace_e.len()
                 );
             });
+        });
+    }
+
+    /// **A legal `gen_len == 0` request must not wedge the scheduler.** [`Request`] is a public struct
+    /// of two plain `usize`s, so `gen_len == 0` is a legal-typed input that [`Scheduler::admit`]
+    /// accepts (it only floors `prompt_len`). Un-floored, the first `retire_finished` decrements
+    /// `remaining` from 0: a debug build panics with `attempt to subtract with overflow`, and a
+    /// *release* build wraps to `usize::MAX`, so the slot never retires, its KV blocks never return to
+    /// the pool, and `is_idle()` never becomes true — the standard drain loop spins until its liveness
+    /// guard fires (or forever, in a server loop that has none). Admission floors `gen_len` at one
+    /// token exactly as it already floors `prompt_len`.
+    #[test]
+    fn serving_scheduler_retires_zero_gen_len_request() {
+        with_gpu("serving_scheduler_retires_zero_gen_len_request", |g| {
+            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 128usize, 16usize, 64usize, 1usize);
+            let d = heads * hd;
+            let cfg = KvConfig {
+                layers: depth,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks: 160,
+                num_slots: bcap,
+                max_blocks_per_seq: 4,
+            };
+            let mut rng = crate::diff::Rng::new(0x0E20);
+            let wdata = layer_weights(&mut rng, depth, d, dff);
+            let weights = weights_view(&wdata);
+            let x = rng.vec(bcap * d, -1.0, 1.0);
+            let model = DecodeModel::new(g, &weights, cfg, dff, 32 * 1024 * 1024).unwrap();
+            let init_free = model.cache().manager_ref().free_blocks();
+            let mut sched = Scheduler::new(model);
+            sched.enqueue(Request { prompt_len: 8, gen_len: 0 });
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let mut out = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+            let mut steps = 0usize;
+            while !sched.is_idle() {
+                sched.step(&g.stream.clone(), &x_d, &mut out).unwrap();
+                steps += 1;
+                assert!(steps <= 4, "gen_len==0 never retired: `remaining` underflowed and pinned the slot");
+            }
+            g.stream.synchronize().unwrap();
+            assert_eq!(steps, 1, "a gen_len==0 request emits its one floored token and retires the same step");
+            assert_eq!(sched.completed(), 1, "the request completes");
+            assert_eq!(sched.emitted(), 1, "gen_len is floored at one token");
+            assert_eq!(sched.free_blocks(), init_free, "the retired slot's KV blocks return to the pool");
+            eprintln!(
+                "gen_len==0 request retired in 1 step, blocks conserved {init_free}->{} (no `remaining` underflow)",
+                sched.free_blocks()
+            );
+        });
+    }
+
+    /// **A failed decode advance must leave the host allocator untouched.**
+    /// [`DecodeModel::advance_and_upload_masked`] mutates the [`BlockManager`] slot by slot but uploads
+    /// the four device metadata buffers only *after* the whole loop, so a mid-loop `OutOfBlocks` used to
+    /// leave the earlier slots' context lengths already advanced with nothing uploaded. The caller's
+    /// documented recovery (preempt, retry) would then re-read those inflated lengths as the next write
+    /// positions, writing each survivor's next token one slot past a hole the attention kernel still
+    /// covers — stale f16 bytes from whichever sequence last owned that block, silently wrong logits.
+    /// The advance is now all-or-nothing: a `can_grow` feasibility pass runs before any mutation.
+    #[test]
+    fn serving_failed_advance_leaves_allocator_unchanged() {
+        with_gpu("serving_failed_advance_leaves_allocator_unchanged", |g| {
+            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 128usize, 16usize, 64usize, 1usize);
+            let d = heads * hd;
+            // max_blocks_per_seq = 2 ⇒ a sequence tops out at 32 cached tokens; the pool itself is
+            // roomy, so the only way to fail is the per-sequence table-width cap.
+            let cfg = KvConfig {
+                layers: depth,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks: 160,
+                num_slots: bcap,
+                max_blocks_per_seq: 2,
+            };
+            let mut rng = crate::diff::Rng::new(0x0A70);
+            let wdata = layer_weights(&mut rng, depth, d, dff);
+            let weights = weights_view(&wdata);
+            let mut model = DecodeModel::new(g, &weights, cfg, dff, 32 * 1024 * 1024).unwrap();
+            // Slots 0 and 1 have room; slot 3 sits exactly at its per-sequence cap (2 blocks, 32 tokens).
+            model.cache_mut().manager().reserve(0, 5).unwrap();
+            model.cache_mut().manager().reserve(1, 5).unwrap();
+            model.cache_mut().manager().reserve(3, 32).unwrap();
+            let before: Vec<usize> = (0..bcap).map(|b| model.cache().manager_ref().context_len(b)).collect();
+            let free_before = model.cache().manager_ref().free_blocks();
+            let epoch_before = model.cache().manager_ref().layout_epoch();
+
+            let stream = g.stream.clone();
+            assert!(
+                model.advance_and_upload_masked(&stream, &vec![true; bcap]).is_err(),
+                "slot 3 is at its max_blocks_per_seq cap ⇒ the advance must fail"
+            );
+            let after: Vec<usize> = (0..bcap).map(|b| model.cache().manager_ref().context_len(b)).collect();
+            assert_eq!(before, after, "a failed advance must not advance any slot's context length");
+            assert_eq!(
+                free_before,
+                model.cache().manager_ref().free_blocks(),
+                "a failed advance must not consume physical blocks"
+            );
+            assert_eq!(
+                epoch_before,
+                model.cache().manager_ref().layout_epoch(),
+                "a failed advance must not move the block-table layout epoch"
+            );
+            // With the capped slot masked off, the same call succeeds and advances exactly the active slots.
+            let mut mask = vec![true; bcap];
+            mask[3] = false;
+            model.advance_and_upload_masked(&stream, &mask).unwrap();
+            stream.synchronize().unwrap();
+            for b in 0..bcap {
+                let want = before[b] + usize::from(b != 3);
+                assert_eq!(model.cache().manager_ref().context_len(b), want, "slot {b} advance");
+            }
+            eprintln!(
+                "failed decode advance is atomic: ctx lengths, free blocks ({free_before}) and layout epoch \
+                 ({epoch_before}) all unchanged; masking the capped slot then advances the rest"
+            );
         });
     }
 

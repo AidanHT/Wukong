@@ -49,13 +49,23 @@ pub unsafe extern "C" fn wukong_attention_f32(
             return;
         }
     }
-    attention_scalar(q, k, v, o, s, d, scale, causal);
+    // SAFETY: dims validated above; the operand-size contract is this entry point's caller's.
+    unsafe {
+        attention_scalar(q, k, v, o, s, d, scale, causal);
+    }
 }
 
 /// Portable reference: the same online-softmax recurrence, scalar. Used where AVX2 is unavailable;
-/// also the algorithm the AVX2 path vectorizes (over `D`) without changing the reduction order.
+/// also the algorithm the AVX2 path vectorizes (over `D`). The vectorization *does* reassociate the
+/// `q_i·k_j` dot — the AVX2 path accumulates 8 partial sums and horizontally reduces them (:161-175)
+/// where this one sums sequentially — so the two agree to tolerance, not bit-for-bit. Both are gated
+/// against the naive materialized reference, which is the actual oracle.
+///
+/// # Safety
+/// Operand-size contract of [`wukong_attention_f32`]: `q`, `k`, `v` must each be valid for `s*d`
+/// `f32` reads and `o` valid for `s*d` `f32` writes, with `o` not overlapping `q`/`k`/`v`.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn attention_scalar(
+unsafe fn attention_scalar(
     q: *const f32,
     k: *const f32,
     v: *const f32,
@@ -65,6 +75,8 @@ fn attention_scalar(
     scale: f32,
     causal: bool,
 ) {
+    // SAFETY: every pointer read/write below stays inside `s*d` elements of the respective operand,
+    // which the caller guarantees above.
     unsafe {
         let mut acc = vec![0.0f32; d];
         for i in 0..s {
@@ -317,7 +329,60 @@ mod tests {
         }
     }
 
-    /// Throughput probe (run: `cargo test -p wukong_runtime --release -- --ignored --nocapture`).
+    /// The scalar twin is the only path on a machine without AVX2/FMA and on every non-x86_64 build,
+    /// but `wukong_attention_f32`'s runtime dispatch (:44) sends every CI and developer machine down
+    /// the AVX2 path — so `attention_matches_naive` above never executes `attention_scalar` and a
+    /// regression in it (a dropped `corr` rescale, a lost `l == 0` guard) would ship green. Drive it
+    /// directly over the same shapes.
+    #[test]
+    fn attention_scalar_matches_naive() {
+        for &(s, d) in &[
+            (1usize, 1usize),
+            (2, 2),
+            (4, 8),
+            (5, 7),
+            (8, 16),
+            (16, 8),
+            (33, 17),
+            (64, 64),
+        ] {
+            for &causal in &[false, true] {
+                let q = fill(1, s * d);
+                let k = fill(2, s * d);
+                let v = fill(3, s * d);
+                let scale = 1.0 / (d as f32).sqrt();
+                let want = naive(&q, &k, &v, s, d, scale, causal);
+                let mut got = vec![0.0f32; s * d];
+                // SAFETY: q/k/v are s*d long and readable, got is s*d long and writable — the
+                // operand contract of `wukong_attention_f32` restated on `attention_scalar`.
+                unsafe {
+                    attention_scalar(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        got.as_mut_ptr(),
+                        s,
+                        d,
+                        scale,
+                        causal,
+                    );
+                }
+                for i in 0..s * d {
+                    assert!(
+                        (got[i] - want[i]).abs() <= 1e-4 + 1e-4 * want[i].abs(),
+                        "scalar ({s}x{d}, causal={causal}) idx {i}: got {} want {}",
+                        got[i],
+                        want[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Throughput probe (run: `cargo test -p wukong_runtime --release attention_throughput --
+    /// --ignored --nocapture --test-threads=1`). The filter and `--test-threads=1` are load-bearing:
+    /// an unfiltered `--ignored` run starts all nine of the crate's throughput probes at once on
+    /// libtest's default thread pool, so each one measures a machine saturated by the other eight.
     /// Compares the fused kernel against Wukong's *own* strongest non-fused path: materialize
     /// `scores = Q·Kᵀ` with the tuned AVX2 GEMM, softmax the rows, then `O = P·V` with the GEMM —
     /// the two-matmul + S×S-intermediate shape. Both paths use the same AVX2 primitives and the same

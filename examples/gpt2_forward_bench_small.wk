@@ -1,0 +1,296 @@
+module examples.gpt2_forward_bench_small
+
+// ===================================================================================================
+// GPT-2 forward at a reduced, INTERPRETER-RUNNABLE config, spelled in the recognized dispatch forms —
+// the differential gate for examples/gpt2_forward_bench.wk's kernel surface.
+//
+// WHY THIS FILE EXISTS. The two programs that carry the GPT-2 dispatch surface (gpt2_forward_bench.wk
+// and its _par twin) are native-only and 500 MB-of-weights-only, so under `cargo test` they take the
+// data-absent early return and gate nothing. The reduced twins that DO run under the examples gate —
+// gpt2_infer.wk / gpt2_infer_small.wk — dispatch no recognized kernel at all (bare imported-const dims;
+// measured: only rt_alloc/rt_free). So every kernel the GPT-2 headline runs on had zero automated
+// coverage: a regression in the sgemv's bare `w[vt*d+dd]` form, or in norm_affine_f32's gathered
+// gamma/beta form, or in the []f32-slice pointer/stride each kernel call is lowered with, would change
+// the 124M argmax with nothing in the test suite firing. That is the documented "recognized kernels are
+// gate-blind" landmine.
+//
+// This file closes that: it uses the SAME spellings as gpt2_forward_bench.wk — local `let` dim bindings
+// (d/dff/hd/hh/voc), the per-head qh/kh/vt repack, the mask-as-its-own-pass multi-pass row softmax, the
+// gelu() intrinsic, gathered [i]-indexed gtmp/btmp, and the `xlast` + bare `w[vt*d+dd]` LM head — at
+// D=64, H=4, DFF=256, SEQ=8, VOCAB=32, LAYERS=2 with synthetic in-loop weights and no file I/O. The
+// examples gate then runs it interp-vs-native at -O0/-O2 and -O0-vs-O3, which pins the kernel-call
+// lowering seam (buffer pointer, stride, length, epilogue) against the interpreter oracle.
+//
+// MEASURED dispatch (`wukongc --emit=mir -O2 examples/gpt2_forward_bench_small.wk`) — this must stay
+// equal to gpt2_forward_bench.wk's set or this file has stopped being that program's gate:
+//   6 wukong_sgemm_nt_epi, 3 wukong_norm_affine_f32, 2 wukong_velem_f32, 1 wukong_sgemm_nt_alpha,
+//   1 wukong_sgemm_nt, 1 wukong_norm_f32, 1 wukong_vmath_f32, 1 wukong_sgemv.
+//
+// Unlike the full bench this prints NO wall-clock time: it is a correctness fixture, and a raw now_ns
+// stamp on stdout would make the differential gate compare two different microsecond counts.
+//
+// CROSS-CHECKED AGAINST AN INDEPENDENT SCALAR IMPLEMENTATION. examples/gpt2_infer_small.wk computes the
+// same forward at the same config (same dims, same weight-fill pattern, same id formula) with ZERO
+// dispatched kernels. It prints argmax(last) 15, logits[last,0]*1e4 -14352 and logits[last,31]*1e4 9521;
+// this file prints 15, -14352 and 9521 for the same three quantities. So the 15-kernel path and the
+// all-scalar path agree to 4 decimals — the values frozen here are validated, not merely "whatever the
+// compiler printed today".
+//
+// SCOPE, stated honestly so this file is not over-claimed the way the headers it was written to backstop
+// were: the interpreter dispatches these kernels through the SAME wukong_runtime entry points as the
+// native backend, so interp-vs-native cannot detect a bug inside a kernel. What it does pin is the
+// native kernel-CALL lowering seam — the buffer pointer, stride, length, bias and epilogue each call is
+// lowered with — against the interpreter oracle. That is exactly where the historical faults lived
+// (the emit_gemv and emit_norm []f32-slice pointer bugs), and it had no fixture until now.
+//
+// Run:  wukongc --run examples/gpt2_forward_bench_small.wk
+// Prints:  <argmax(last)>  <4 rounded logit signatures>
+
+// ---- reduced config (GPT-2 shapes, scaled; same dims as gpt2_infer_small.wk) ----
+const D:      i64 = 64;      // model dim
+const H:      i64 = 4;       // heads
+const HD:     i64 = 16;      // head dim = D / H
+const DFF:    i64 = 256;     // FFN hidden = 4*D
+const VOCAB:  i64 = 32;      // token embedding rows (also the tied LM head)
+const POS:    i64 = 8;       // positional embedding rows (>= SEQ)
+const SEQ:    i64 = 8;       // sequence length
+const LAYERS: i64 = 2;
+
+// ---- within-layer relative offsets (running sums, same tensor order as the full model) ----
+const REL_LN1G: i64 = 0;
+const REL_LN1B: i64 = REL_LN1G + D;
+const REL_WQ:   i64 = REL_LN1B + D;
+const REL_BQ:   i64 = REL_WQ + D * D;
+const REL_WK:   i64 = REL_BQ + D;
+const REL_BK:   i64 = REL_WK + D * D;
+const REL_WV:   i64 = REL_BK + D;
+const REL_BV:   i64 = REL_WV + D * D;
+const REL_WO:   i64 = REL_BV + D;
+const REL_BO:   i64 = REL_WO + D * D;
+const REL_LN2G: i64 = REL_BO + D;
+const REL_LN2B: i64 = REL_LN2G + D;
+const REL_W1:   i64 = REL_LN2B + D;
+const REL_B1:   i64 = REL_W1 + DFF * D;
+const REL_W2:   i64 = REL_B1 + DFF;
+const REL_B2:   i64 = REL_W2 + D * DFF;
+const LAYER_STRIDE: i64 = REL_B2 + D;
+
+// ---- top-level blob offsets. wte MUST stay at 0: the LM-head GEMV recognizer requires the matrix
+//      index to be exactly `vt * d + dd` with no base offset. ----
+const OFF_WTE:    i64 = 0;
+const OFF_WPE:    i64 = OFF_WTE + VOCAB * D;
+const OFF_LAYER0: i64 = OFF_WPE + POS * D;
+const OFF_LNFG:   i64 = OFF_LAYER0 + LAYERS * LAYER_STRIDE;
+const OFF_LNFB:   i64 = OFF_LNFG + D;
+const TOTAL:      i64 = OFF_LNFB + D;
+
+fn main() -> i32 {
+    // Dims bound to locals: the recognizers key stride/bound/divisor equality on the BINDING, and a
+    // bare const used directly as a dim does not resolve. This is the whole difference between this
+    // file and gpt2_infer_small.wk.
+    let s_len: i64 = SEQ;
+    let d:     i64 = D;
+    let dff:   i64 = DFF;
+    let hd:    i64 = HD;
+    let hh:    i64 = H;
+    let voc:   i64 = VOCAB;
+
+    let mut w:   []f32 = alloc_f32(TOTAL);
+    let mut ids: []i32 = alloc_i32(s_len);
+
+    // ---- scratch (mirrors gpt2_forward_bench.wk one-for-one) ----
+    let mut x:      []f32 = alloc_f32(s_len * d);
+    let mut nrm:    []f32 = alloc_f32(s_len * d);
+    let mut q:      []f32 = alloc_f32(s_len * d);
+    let mut k:      []f32 = alloc_f32(s_len * d);
+    let mut v:      []f32 = alloc_f32(s_len * d);
+    let mut scores: []f32 = alloc_f32(s_len * s_len);
+    let mut attn:   []f32 = alloc_f32(s_len * d);
+    let mut qh:     []f32 = alloc_f32(s_len * hd);
+    let mut kh:     []f32 = alloc_f32(s_len * hd);
+    let mut vt:     []f32 = alloc_f32(hd * s_len);
+    let mut oh:     []f32 = alloc_f32(s_len * hd);
+    let mut a:      []f32 = alloc_f32(s_len * d);
+    let mut ff:     []f32 = alloc_f32(s_len * dff);
+    let mut lastrow: []f32 = alloc_f32(voc);
+    let mut xlast:   []f32 = alloc_f32(d);
+    let mut gtmp:    []f32 = alloc_f32(d);
+    let mut btmp:    []f32 = alloc_f32(d);
+
+    // ---- synthetic weights: the same bounded deterministic pattern gpt2_infer_small.wk uses ----
+    for i in 0..TOTAL { w[i] = (((i % 17i64) as f32) - 8.0) * 0.01; }
+    for l in 0..LAYERS {
+        let lb: i64 = OFF_LAYER0 + l * LAYER_STRIDE;
+        for i in 0..D {
+            w[lb + REL_LN1G + i] = 1.0 + ((i % 3i64) as f32) * 0.05;
+            w[lb + REL_LN1B + i] = ((i % 5i64) as f32) * 0.01 - 0.02;
+            w[lb + REL_LN2G + i] = 1.0 - ((i % 4i64) as f32) * 0.03;
+            w[lb + REL_LN2B + i] = ((i % 7i64) as f32) * 0.008 - 0.02;
+        }
+    }
+    for i in 0..D {
+        w[OFF_LNFG + i] = 1.0 + ((i % 3i64) as f32) * 0.02;
+        w[OFF_LNFB + i] = ((i % 5i64) as f32) * 0.005 - 0.01;
+    }
+    for s in 0..s_len { ids[s] = ((s * 3i64 + 1i64) % VOCAB) as i32; }
+
+    // ---- embed:  x[s,d] = wte[ids[s], d] + wpe[s, d]  (scalar gather, as in the full bench) ----
+    for s in 0..s_len {
+        let id: i64 = ids[s] as i64;
+        for dd in 0..d {
+            x[s * d + dd] = w[OFF_WTE + id * d + dd] + w[OFF_WPE + s * d + dd];
+        }
+    }
+
+    for l in 0..LAYERS {
+        let base: i64 = OFF_LAYER0 + l * LAYER_STRIDE;
+
+        // LN1 -> wukong_norm_affine_f32 (gamma/beta gathered into [i]-indexed locals first)
+        for i in 0..d { gtmp[i] = w[base + REL_LN1G + i]; btmp[i] = w[base + REL_LN1B + i]; }
+        for r in 0..s_len {
+            let mut sm: f32 = 0.0;
+            for i in 0..d { sm = sm + x[r * d + i]; }
+            let mean: f32 = sm / (d as f32);
+            let mut vv: f32 = 0.0;
+            for i in 0..d { vv = vv + (x[r * d + i] - mean) * (x[r * d + i] - mean); }
+            let inv: f32 = rsqrt(vv / (d as f32) + 0.00001);
+            for i in 0..d {
+                nrm[r * d + i] = (x[r * d + i] - mean) * inv * gtmp[i] + btmp[i];
+            }
+        }
+
+        // Q/K/V projections -> wukong_sgemm_nt_epi (fused bias epilogue)
+        for i in 0..s_len { for j in 0..d {
+            let mut s: f32 = 0.0;
+            for p in 0..d { s = s + nrm[i * d + p] * w[base + REL_WQ + j * d + p]; }
+            q[i * d + j] = w[base + REL_BQ + j] + s;
+        } }
+        for i in 0..s_len { for j in 0..d {
+            let mut s: f32 = 0.0;
+            for p in 0..d { s = s + nrm[i * d + p] * w[base + REL_WK + j * d + p]; }
+            k[i * d + j] = w[base + REL_BK + j] + s;
+        } }
+        for i in 0..s_len { for j in 0..d {
+            let mut s: f32 = 0.0;
+            for p in 0..d { s = s + nrm[i * d + p] * w[base + REL_WV + j * d + p]; }
+            v[i * d + j] = w[base + REL_BV + j] + s;
+        } }
+
+        for h in 0..hh {
+            // repack head h into contiguous [S,hd] panels (V transposed to [hd,S]) so both attention
+            // matmuls are packed NT dots the GEMM recognizer takes
+            for i in 0..s_len { for p in 0..hd {
+                qh[i * hd + p] = q[i * d + h * hd + p];
+                kh[i * hd + p] = k[i * d + h * hd + p];
+                vt[p * s_len + i] = v[i * d + h * hd + p];
+            } }
+            // scaled scores -> wukong_sgemm_nt_alpha (alpha = 1/sqrt(hd) = 0.25 folded into writeback)
+            for i in 0..s_len { for j in 0..s_len {
+                let mut s: f32 = 0.0;
+                for p in 0..hd { s = s + qh[i * hd + p] * kh[j * hd + p]; }
+                scores[i * s_len + j] = s * 0.25;
+            } }
+            // causal mask as its own pass, then the multi-pass row softmax -> wukong_norm_f32
+            for i in 0..s_len { for j in 0..s_len {
+                if j > i { scores[i * s_len + j] = -1.0e30; }
+            } }
+            for i in 0..s_len {
+                let mut m: f32 = scores[i * s_len];
+                for j in 0..s_len { m = fmax(m, scores[i * s_len + j]); }
+                let mut den: f32 = 0.0;
+                for j in 0..s_len {
+                    let e: f32 = exp(scores[i * s_len + j] - m);
+                    scores[i * s_len + j] = e;
+                    den = den + e;
+                }
+                let dinv: f32 = 1.0 / den;
+                for j in 0..s_len { scores[i * s_len + j] = scores[i * s_len + j] * dinv; }
+            }
+            // P.V -> wukong_sgemm_nt, then scatter the head band back into attn
+            for i in 0..s_len { for dd in 0..hd {
+                let mut s: f32 = 0.0;
+                for j in 0..s_len { s = s + scores[i * s_len + j] * vt[dd * s_len + j]; }
+                oh[i * hd + dd] = s;
+            } }
+            for i in 0..s_len { for dd in 0..hd { attn[i * d + h * hd + dd] = oh[i * hd + dd]; } }
+        }
+
+        // output projection -> wukong_sgemm_nt_epi, residual -> wukong_velem_f32
+        for i in 0..s_len { for j in 0..d {
+            let mut s: f32 = 0.0;
+            for p in 0..d { s = s + attn[i * d + p] * w[base + REL_WO + j * d + p]; }
+            a[i * d + j] = w[base + REL_BO + j] + s;
+        } }
+        for i in 0..s_len * d { a[i] = x[i] + a[i]; }
+
+        // LN2 -> wukong_norm_affine_f32
+        for i in 0..d { gtmp[i] = w[base + REL_LN2G + i]; btmp[i] = w[base + REL_LN2B + i]; }
+        for r in 0..s_len {
+            let mut sm: f32 = 0.0;
+            for i in 0..d { sm = sm + a[r * d + i]; }
+            let mean: f32 = sm / (d as f32);
+            let mut vv: f32 = 0.0;
+            for i in 0..d { vv = vv + (a[r * d + i] - mean) * (a[r * d + i] - mean); }
+            let inv: f32 = rsqrt(vv / (d as f32) + 0.00001);
+            for i in 0..d {
+                nrm[r * d + i] = (a[r * d + i] - mean) * inv * gtmp[i] + btmp[i];
+            }
+        }
+
+        // MLP up -> wukong_sgemm_nt_epi, GELU -> wukong_vmath_f32, down -> sgemm_nt_epi, residual -> velem
+        for i in 0..s_len { for j in 0..dff {
+            let mut s: f32 = 0.0;
+            for p in 0..d { s = s + nrm[i * d + p] * w[base + REL_W1 + j * d + p]; }
+            ff[i * dff + j] = w[base + REL_B1 + j] + s;
+        } }
+        for i in 0..s_len * dff { ff[i] = gelu(ff[i]); }
+        for i in 0..s_len { for j in 0..d {
+            let mut s: f32 = 0.0;
+            for p in 0..dff { s = s + ff[i * dff + p] * w[base + REL_W2 + j * dff + p]; }
+            x[i * d + j] = w[base + REL_B2 + j] + s;
+        } }
+        for i in 0..s_len * d { x[i] = a[i] + x[i]; }
+    }
+
+    // final LayerNorm in place -> wukong_norm_affine_f32
+    for i in 0..d { gtmp[i] = w[OFF_LNFG + i]; btmp[i] = w[OFF_LNFB + i]; }
+    for r in 0..s_len {
+        let mut sm: f32 = 0.0;
+        for i in 0..d { sm = sm + x[r * d + i]; }
+        let mean: f32 = sm / (d as f32);
+        let mut vv: f32 = 0.0;
+        for i in 0..d { vv = vv + (x[r * d + i] - mean) * (x[r * d + i] - mean); }
+        let inv: f32 = rsqrt(vv / (d as f32) + 0.00001);
+        for i in 0..d {
+            x[r * d + i] = (x[r * d + i] - mean) * inv * gtmp[i] + btmp[i];
+        }
+    }
+
+    // tied LM head, LAST POSITION ONLY -> wukong_sgemv. Both shape requirements of the recognizer are
+    // reproduced here: the vector is indexed by the inner var alone (xlast[dd]), and the matrix index
+    // is exactly `vt * d + dd` with no base offset (wte sits at element 0 of the blob).
+    let lastp: i64 = (s_len - 1) * d;
+    for dd in 0..d { xlast[dd] = x[lastp + dd]; }
+    for vt in 0..voc {
+        let mut acc: f32 = 0.0;
+        for dd in 0..d { acc = acc + w[vt * d + dd] * xlast[dd]; }
+        lastrow[vt] = acc;
+    }
+
+    let mut best_i: i64 = 0;
+    let mut best_v: f32 = lastrow[0];
+    for vt in 0i64..voc {
+        let val: f32 = lastrow[vt];
+        if val > best_v { best_v = val; best_i = vt; }
+    }
+    print(best_i as i32);                          // argmax(last)
+    print(round(lastrow[0] * 10000.0) as i32);     // rounded logit signatures — the differential
+    print(round(lastrow[1] * 10000.0) as i32);     // gate compares these across backends and opt
+    print(round(lastrow[voc / 2] * 10000.0) as i32);
+    print(round(lastrow[voc - 1] * 10000.0) as i32);
+
+    free(w); free(ids); free(x); free(nrm); free(q); free(k); free(v);
+    free(scores); free(attn); free(qh); free(kh); free(vt); free(oh);
+    free(a); free(ff); free(lastrow); free(xlast); free(gtmp); free(btmp);
+    return 0;
+}

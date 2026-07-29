@@ -122,9 +122,11 @@ pub use lower::{jit_run as lower_jit_run, GpuLowerBackend};
 pub mod paged_kv;
 
 /// Paged decode-attention kernel: single-query attention against the paged KV-cache, gathering K/V
-/// through the per-sequence block table (PagedAttention). PTX generator + reference are pure; the
-/// launcher is `#[cfg(feature = "gpu")]` within.
-#[cfg(feature = "gpu")]
+/// through the per-sequence block table (PagedAttention). The four PTX generators, the int8 quantizer
+/// and the f64 reference are pure host code with no device dependency, so — like its `paged_kv`
+/// sibling above — this module is declared **un-gated**: the PTX shape and **ASCII** gates run in a
+/// plain, toolchain-free `cargo test`. Only the launchers and the device gates are
+/// `#[cfg(feature = "gpu")]` within.
 pub mod paged_attention;
 
 /// Batched autoregressive decode layer/model over the paged KV-cache (`DecodeLayer`/`DecodeModel`) —

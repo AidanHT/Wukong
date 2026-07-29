@@ -1,0 +1,75 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 11
+// EXPECT-OUT: 25
+// EXPECT-OUT: 27
+// EXPECT-OUT: 45
+// EXPECT-OUT: 65
+// EXPECT-OUT: 205
+// EXPECT-OUT: 225
+module tests.run.pool2d_partial_window
+
+// Max- and average-pooling that cover only PART of the input plane: an 8x8 channel pooled 2x2 with
+// stride 2, but the source's own output loops run `oy, ox in 0..2` and the destination is a [f32; 4],
+// not the full 4x4 = [f32; 16].
+//
+// `Pool2dNest` carries no OH/OW — the kernel recomputes the output extent from H/W/KH/KW/SH/SW as the
+// full no-padding `(H-KH)/SH + 1`, i.e. 4x4 here. That second copy of the shape model desynced from
+// the source's, so the kernel wrote 16 f32 at row stride 4 into a 4-element buffer. On the campaign
+// base `--emit=mir -O2` emitted `call wukong_maxpool2d_f32(v0, v23, 1, 8, 8, 2, 2, 2, 2)` — no OH/OW
+// argument at all — the interpreter reported `pool2d output out of bounds` (exit 1) and the native
+// backend SEGFAULTED (exit 139) at -O0 and -O2. Even where the buffer happens to be large enough the
+// values are silently wrong: out[2] would be the kernel's (0,2) cell, 13, not the source's (1,0)
+// cell, 25.
+//
+// The recognizer now requires the source's OH/OW to equal what the kernel will recompute, so these
+// nests decline to the scalar loops. tests/run/maxpool.wk and avgpool.wk pool their full plane and
+// keep dispatching. Every value below is read off the 0..63 ramp by hand.
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = i as f32; }
+
+    // max over the top-left quarter of the plane: windows (0,0) (0,1) (1,0) (1,1)
+    let mut mx: [f32; 4] = [0.0; 4];
+    for c in 0..1 {
+        for oy in 0..2 {
+            for ox in 0..2 {
+                let mut m: f32 = x[c * 8 * 8 + (oy * 2) * 8 + (ox * 2)];
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let v: f32 = x[c * 8 * 8 + (oy * 2 + dy) * 8 + (ox * 2 + dx)];
+                        m = fmax(m, v);
+                    }
+                }
+                mx[c * 2 * 2 + oy * 2 + ox] = m;
+            }
+        }
+    }
+    print(mx[0] as i32); // max(0,1,8,9)     = 9
+    print(mx[1] as i32); // max(2,3,10,11)   = 11
+    print(mx[2] as i32); // max(16,17,24,25) = 25
+    print(mx[3] as i32); // max(18,19,26,27) = 27
+
+    // the same partial extent, average pooling
+    let mut av: [f32; 4] = [0.0; 4];
+    for c in 0..1 {
+        for oy in 0..2 {
+            for ox in 0..2 {
+                let mut s = 0.0;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let v = x[c * 8 * 8 + (oy * 2 + dy) * 8 + (ox * 2 + dx)];
+                        s = s + v;
+                    }
+                }
+                av[c * 2 * 2 + oy * 2 + ox] = s / 4.0;
+            }
+        }
+    }
+    print((av[0] * 10.0) as i32); // (0+1+8+9)/4     =  4.5 →  45
+    print((av[1] * 10.0) as i32); // (2+3+10+11)/4   =  6.5 →  65
+    print((av[2] * 10.0) as i32); // (16+17+24+25)/4 = 20.5 → 205
+    print((av[3] * 10.0) as i32); // (18+19+26+27)/4 = 22.5 → 225
+    return 0;
+}

@@ -251,6 +251,10 @@ pub fn adamw_step(
         .arg(&mut v_d)
         .arg(&hp_d)
         .arg(&n_u);
+    // SAFETY: the `adamw_step` kernel reads `grad[i]` and `hp[0..hp::LEN)` and writes `w[i]`, `m[i]`,
+    // `v[i]` for `i` in `[0, n)` only. Every device buffer here was just uploaded from a host slice
+    // the asserts above proved is `n` long (`hp` at least `hp::LEN`), so no access leaves its
+    // allocation.
     unsafe { b.launch(cfg)? };
     w.copy_from_slice(&g.stream.memcpy_dtov(&w_d)?);
     m.copy_from_slice(&g.stream.memcpy_dtov(&m_d)?);
@@ -261,6 +265,15 @@ pub fn adamw_step(
 /// Device-buffer **AdamW** step (no host round-trip) — the resident-training entry point. Updates
 /// `w`, `m`, `v` in place on the device from the device gradient `grad` and hyperparameters `hp`.
 /// One launch over a contiguous `(w,g,m,v)` updates every parameter it spans.
+///
+/// The element count `n` is a *separate* parameter from the buffers, and every caller computes it at
+/// the call site from the layer dims (`self.h * self.i`) rather than reading `w.len()` — so nothing
+/// in the type system ties the two together. The asserts below do: an `n` longer than any of the five
+/// buffers would otherwise launch a grid-stride kernel that reads and **writes** past the end of `w`,
+/// `m` and `v` on the device, silently clobbering whatever cudarc allocated next (three
+/// `st.global.f32` per element; no fault, just wrong weights on some later step). They are real
+/// asserts, not `debug_assert`s, because the GPU path is exercised in release builds — four integer
+/// comparisons are free next to a kernel launch.
 pub fn adamw_step_device(
     g: &mut Gpu,
     w: &mut CudaSlice<f32>,
@@ -270,11 +283,29 @@ pub fn adamw_step_device(
     hp: &CudaSlice<f32>,
     n: usize,
 ) -> Result<(), DriverError> {
+    assert!(
+        n <= w.len() && n <= grad.len() && n <= m.len() && n <= v.len(),
+        "adamw_step_device: n={n} exceeds a parameter buffer (w={}, grad={}, m={}, v={})",
+        w.len(),
+        grad.len(),
+        m.len(),
+        v.len()
+    );
+    assert!(
+        hp.len() >= hp::LEN,
+        "adamw_step_device: hp has {} entries, needs >= {}",
+        hp.len(),
+        hp::LEN
+    );
     let f = g.function("adamw_step", ADAMW_STEP_PTX, "adamw_step")?;
     let n_u = n as u32;
     let cfg = grid_stride_cfg(g, n_u);
     let mut b = g.stream.launch_builder(&f);
     b.arg(w).arg(grad).arg(m).arg(v).arg(hp).arg(&n_u);
+    // SAFETY: `adamw_step` is a grid-stride loop over `[0, n)` that reads `g[i]`/`hp[0..hp::LEN)` and
+    // writes `w[i]`, `m[i]`, `v[i]` — and nothing else. The asserts above establish that each of the
+    // five device buffers is at least that long, so no access leaves its allocation. The launch
+    // config only sizes occupancy: the grid-stride loop covers `[0, n)` for any grid.
     unsafe { b.launch(cfg)? };
     Ok(())
 }
@@ -294,6 +325,9 @@ pub fn sgd_step(g: &mut Gpu, w: &mut [f32], grad: &[f32], hp: &[f32]) -> Result<
     let cfg = grid_stride_cfg(g, n_u);
     let mut b = g.stream.launch_builder(&f);
     b.arg(&mut w_d).arg(&g_d).arg(&hp_d).arg(&n_u);
+    // SAFETY: `sgd_step` reads `g[i]`/`hp[LR]`/`hp[WD]` and writes `w[i]` for `i` in `[0, n)` only.
+    // `n` is `w.len()` and the asserts above proved `grad` is the same length and `hp` is at least
+    // `hp::LEN`, so every access stays inside the buffer it was uploaded from.
     unsafe { b.launch(cfg)? };
     w.copy_from_slice(&g.stream.memcpy_dtov(&w_d)?);
     Ok(())
@@ -306,12 +340,38 @@ mod tests {
     use crate::gpu::gpu;
 
     /// Run `body` with the process-wide GPU, or skip (no device) — mirrors the `gpu.rs` test guard.
+    ///
+    /// A skip is a *passing* libtest test whose `eprintln!` libtest captures, so without the
+    /// `WUKONG_GPU_REQUIRED` escalation this whole module reports `test result: ok` — having run no
+    /// kernel at all — whenever the device is unreachable for any reason (§3A P3).
     fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
         let mut guard = gpu();
         match guard.as_mut() {
             Some(g) => body(g),
-            None => eprintln!("[skip] {name}: no CUDA device reachable"),
+            None => {
+                let why = crate::gpu::init_error().unwrap_or("no CUDA device reachable");
+                assert!(
+                    !crate::gpu::gpu_required(),
+                    "{name}: WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}"
+                );
+                eprintln!("[skip] {name}: GPU unavailable: {why}");
+            }
         }
+    }
+
+    /// **§3A P1 gate, device-free.** Both optimizer modules are literals sitting beside doc comments
+    /// full of non-ASCII (`—`, `≤`, `·`, `⊙`); a single non-ASCII byte in the PTX is a `ptxas fatal`
+    /// that surfaces on the device only as an opaque `cuModuleLoadData` `DriverError`. Checked here so
+    /// it fails on any machine, with or without a GPU.
+    #[test]
+    fn optimizer_ptx_is_ascii() {
+        for (what, ptx) in [("ADAMW_STEP_PTX", ADAMW_STEP_PTX), ("SGD_STEP_PTX", SGD_STEP_PTX)] {
+            if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+                panic!("{what}: PTX line {} is not ASCII (ptxas fatal): {line:?}", i + 1);
+            }
+        }
+        assert!(ADAMW_STEP_PTX.contains(".visible .entry adamw_step("));
+        assert!(SGD_STEP_PTX.contains(".visible .entry sgd_step("));
     }
 
     /// Fill a hyperparameter vector for step `t`.
@@ -419,6 +479,56 @@ mod tests {
                 })
                 .collect();
             assert_close("sgd", &gw, &cref, 1e-7, 1e-6);
+        });
+    }
+
+    /// **The `adamw_step_device` precondition gate.** `n` is passed independently of the five device
+    /// buffers and every caller in `train_resident` computes it from the layer dims (`self.h *
+    /// self.i`) rather than from `w.len()`, so nothing but this check stands between a padded or
+    /// re-shaped weight allocation and a grid-stride kernel that *writes* `w`/`m`/`v` past their
+    /// allocations. Asserts both that the exactly-sized call still launches and that an over-long `n`
+    /// (or a short `hp`) is refused *before* the launch.
+    #[test]
+    fn adamw_step_device_refuses_n_past_the_buffers() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        fn panic_msg(e: Box<dyn std::any::Any + Send>) -> String {
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        }
+
+        with_gpu("adamw_step_device_refuses_n_past_the_buffers", |g| {
+            let n = 256usize;
+            let zeros = vec![0.0f32; n];
+            let hpv = make_hp(0.01, 0.9, 0.999, 1e-8, 0.0, 1);
+            let mut w = g.stream.memcpy_stod(&zeros).unwrap();
+            let grad = g.stream.memcpy_stod(&zeros).unwrap();
+            let mut m = g.stream.memcpy_stod(&zeros).unwrap();
+            let mut v = g.stream.memcpy_stod(&zeros).unwrap();
+            let hp_d = g.stream.memcpy_stod(&hpv).unwrap();
+
+            // Exactly-sized: launches normally.
+            adamw_step_device(g, &mut w, &grad, &mut m, &mut v, &hp_d, n).expect("exact n launches");
+
+            // One element past the end: refused before the launch.
+            let e = catch_unwind(AssertUnwindSafe(|| {
+                let _ = adamw_step_device(g, &mut w, &grad, &mut m, &mut v, &hp_d, n + 1);
+            }))
+            .expect_err("n past the buffer length must be refused, not launched");
+            let msg = panic_msg(e);
+            assert!(msg.contains("exceeds a parameter buffer"), "unexpected panic: {msg}");
+
+            // A short hyperparameter buffer is refused too (the kernel reads hp[0..hp::LEN)).
+            let short = g.stream.memcpy_stod(&hpv[..hp::LEN - 1]).unwrap();
+            let e = catch_unwind(AssertUnwindSafe(|| {
+                let _ = adamw_step_device(g, &mut w, &grad, &mut m, &mut v, &short, n);
+            }))
+            .expect_err("a short hp buffer must be refused");
+            let msg = panic_msg(e);
+            assert!(msg.contains("hp has"), "unexpected panic: {msg}");
+            eprintln!("[gate] adamw_step_device bounds n by its five device buffers");
         });
     }
 

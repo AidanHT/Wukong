@@ -83,6 +83,12 @@ unsafe fn transpose_parallel<T: Copy + Send + Sync>(
     use rayon::prelude::*;
     let nblocks = r.div_ceil(B);
     let (src_addr, dst_addr) = (src as usize, dst as usize);
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
+    crate::ensure_global_pool();
     (0..nblocks).into_par_iter().for_each(|blk| {
         let i0 = blk * B;
         let i1 = (i0 + B).min(r);

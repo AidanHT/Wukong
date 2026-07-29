@@ -1,0 +1,53 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+// EXPECT-OUT: 32
+// EXPECT-OUT: 34
+module tests.run.for_each_array_of_slices
+
+// `for w in ws` over an **array of slices**. The loop variable is a `[]f32`, whose MIR shape is the
+// fat pointer — an `Array` — so it binds by pointer through the aggregate arm of `lower_for_array`.
+// That arm bound with the plain `bind`, which never recorded the slot in `slice_slots`, so
+// `kernel_base_ptr` handed the recognized kernel the **fat pointer** instead of loading its data
+// pointer. The inner elementwise loop dispatches to `wukong_velem_f32`, so the wrong base was read
+// as data and every lane came back 0 — a silent wrong answer on both backends at both -O0 and -O2,
+// not a crash.
+//
+// The expected values are the scalar semantics of the loop, not a recording of compiler output:
+// `a[i] = i+1` and `c[i] = i+10`, doubled. Both are exact in f32. Printing every lane (rather than
+// a reduction) keeps the check from passing on a partially-correct buffer.
+fn main() -> i32 {
+    let a: []f32 = alloc_f32(8);
+    let c: []f32 = alloc_f32(8);
+    let b: []f32 = alloc_f32(8);
+    for i in 0..8 {
+        a[i] = (i as f32) + 1.0;
+    }
+    for i in 0..8 {
+        c[i] = (i as f32) + 10.0;
+    }
+
+    let ws: [[]f32; 2] = [a, c];
+    for w in ws {
+        for i in 0..8 {
+            b[i] = w[i] * 2.0;
+        }
+        for i in 0..8 {
+            print(b[i]);
+        }
+    }
+    return 0;
+}

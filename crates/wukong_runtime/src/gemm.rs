@@ -56,9 +56,10 @@ fn par_min_macs() -> u64 {
 /// Per-task MAC budget for the shared-pack 2D path's **work-scaled** load-balance target: the
 /// effective worker count is `clamp(macs / min_task_macs(), 1, nworkers)`, so a problem near the
 /// parallel gate gets a few large blocks (each still worth its scheduling) instead of `3×nworkers`
-/// slivers. 1 Mi MACs measured best in the small band this budget governs (256³ swept 1M/4M/16M →
-/// 209/146/90 GF/s, 2026-07-09; the shared path no longer runs by DEFAULT at any size — see
-/// [`gemm_2d_shared`] — so this budget only governs the `=1`/`=band` instrument settings).
+/// slivers. The coded default is 4 Mi. (The 2026-07-09 sweep at 256³ read 1M/4M/16M → 209/146/90
+/// GF/s, i.e. 1 Mi measured best; the default was never moved to it and the shared path no longer
+/// runs by DEFAULT at any size — see [`gemm_2d_shared`] — so this budget only governs the
+/// `=1`/`=band` instrument settings and the 1 Mi point stays an un-landed measurement.)
 /// Env-overridable
 /// (`WUKONG_GEMM_MIN_TASK_MACS`, read once) so the small-problem crossover can be swept together
 /// with `WUKONG_GEMM_PAR_MIN_MACS`. Throughput-only: the grid shape never changes the bits.
@@ -67,11 +68,19 @@ fn min_task_macs() -> u64 {
     use std::sync::OnceLock;
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("WUKONG_GEMM_MIN_TASK_MACS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(4 << 20)
+        positive_or_unset(std::env::var("WUKONG_GEMM_MIN_TASK_MACS").ok()).unwrap_or(4 << 20)
     })
+}
+
+/// Sanitize a knob value that is used as a **divisor**: zero — like an unparsable string — is
+/// ignored (= unset). `WUKONG_GEMM_MIN_TASK_MACS=0` otherwise reached the `macs / min_task_macs()`
+/// in [`sgemm_2d_shared`] and aborted the compiled program with `attempt to divide by zero` raised
+/// inside an `extern "C"` runtime kernel; a sweep script that walks a budget range down through 0
+/// must fall back to the default instead. Pure (takes the already-read variable) so the policy is
+/// unit-testable without process-global env state; [`gemm_task_macs`] enforces the same rule inline.
+#[cfg(target_arch = "x86_64")]
+fn positive_or_unset(raw: Option<String>) -> Option<u64> {
+    raw.and_then(|s| s.parse::<u64>().ok()).filter(|&v| v > 0)
 }
 
 #[inline]
@@ -400,7 +409,13 @@ const ACT_GELU: u32 = 2;
 const ACT_SILU: u32 = 3;
 
 /// A fused GEMM epilogue, applied to each `C` element **on the final K-block writeback only**:
-/// `c = act(alpha·(A·Bᵀ) + bias[col])`. `bias` is null for no bias; `act` is one of [`ACT_IDENTITY`],
+/// `c = act(alpha·(A·Bᵀ) + bias[col])` — for `beta == 0`, which is the only rule the compiler emits
+/// (see the `debug_assert` in [`gemm_dispatch`]). With `beta != 0` the epilogue necessarily sees the
+/// beta-accumulated value, i.e. `act(alpha·(C_old + A·Bᵀ) + bias[col])`: the final-K-block writeback
+/// reads C once and cannot tell the caller's `C_old` apart from the partial sums the earlier
+/// K-blocks left there (both arrive as the same `beta_eff == 1` read), so `C_old + alpha·(A·Bᵀ)`
+/// is not expressible here without a second pass over C.
+/// `bias` is null for no bias; `act` is one of [`ACT_IDENTITY`],
 /// [`ACT_RELU`], [`ACT_GELU`], [`ACT_SILU`] (the transformer FFN activations); `alpha` is a
 /// loop-invariant scalar applied to the matmul result before the bias-add (the attention score scale
 /// `QKᵀ/√d` and every scaled projection). `alpha == 1.0` is the identity — the multiply is skipped so
@@ -523,7 +538,12 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi(
 /// scaled projection), where a loop-invariant scalar `alpha` multiplies the dot. The compiler lowers a
 /// matmul nest whose store is `c[i,j] = alpha·s` to this. `alpha` is folded into the C-tile writeback on
 /// the final K-block (no second pass over C), reusing the fused-epilogue machinery with a null bias and
-/// identity activation — so `C` is written once as `alpha·(A·Bᵀ)`. `beta` rule as usual. Single-threaded.
+/// identity activation — so `C` is written once as `alpha·(A·Bᵀ)`. Single-threaded.
+///
+/// **`beta` is NOT the usual rule here.** `alpha` is folded into the same final-K-block writeback
+/// that performs the accumulate, so `beta != 0` yields `alpha·(C_old + A·Bᵀ)`, not the BLAS
+/// `C_old + alpha·(A·Bᵀ)` — see [`Epilogue`] for why the writeback cannot separate the two. The
+/// only supported combination is `beta == 0`; [`gemm_dispatch`] `debug_assert`s it.
 ///
 /// The α multiply is one exact f32 op applied to the fully-reduced dot, so the result equals the naive
 /// nest's `alpha·s` under the documented matmul reassociation (both backends call this identical kernel,
@@ -553,7 +573,8 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha(
 /// Multi-threaded `C = alpha·(A·Bᵀ)` — the α-scaled `nn.Linear` across cores (the `@parallel` attention
 /// score / scaled projection). The scale folds into each tile's final-K-block writeback, and each C tile
 /// is owned by exactly one task with the same per-(i,j) accumulation order as the serial kernel — so it
-/// is bit-identical to the serial `wukong_sgemm_nt_alpha` the interpreter oracle calls.
+/// is bit-identical to the serial `wukong_sgemm_nt_alpha` the interpreter oracle calls. Same `beta`
+/// caveat as the serial entry point: only `beta == 0` is supported.
 ///
 /// # Safety
 /// `a` valid for `m*k`, `b` for `n*k`, `c` for `m*n` `f32`.
@@ -593,6 +614,16 @@ unsafe fn gemm_dispatch(
     par: bool,
     epi: Option<Epilogue>,
 ) {
+    // `alpha` scales the beta-ACCUMULATED value, not the matmul result alone — see [`Epilogue`].
+    // A non-unit `alpha` is therefore only meaningful with `beta == 0`. Every recognizer arm
+    // honours that today (`wukong_mir_build` pins `beta: 0` on the α-peeling arm and
+    // `alpha: None` on the β=1 residual arm), so this cannot fire in the current compiler; it is
+    // here to fail loudly on the day a new arm peels α off a residual store instead of silently
+    // gaining a spurious `alpha·` on the residual term.
+    debug_assert!(
+        beta == 0 || epi.is_none_or(|e| e.alpha == 1.0),
+        "gemm: alpha is applied AFTER the beta accumulate — alpha != 1 requires beta == 0"
+    );
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
@@ -2184,9 +2215,10 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
     // Work-scaled load-balance target: a problem near the parallel gate can't feed 3×nworkers
     // blocks each worth a task dispatch, so the effective worker count is capped by the per-task
-    // MAC budget ([`min_task_macs`]). At the default gate (2^26 MACs) w_eff == nworkers for every
-    // parallel shape on the 16-worker pool; it engages when `WUKONG_GEMM_PAR_MIN_MACS` lowers
-    // the gate (the 256³ crossover sweep), giving small problems a few large blocks.
+    // MAC budget ([`min_task_macs`]). The cap binds from the parallel gate up: at [`PAR_MIN_MACS`]
+    // (2^23 MACs) and the 4 Mi default budget it yields w_eff == 2, and only a shape ≳ 2^26 MACs
+    // reaches w_eff == nworkers on the 16-worker pool — so small problems near the gate (including
+    // the 256³ crossover sweep under a lowered `WUKONG_GEMM_PAR_MIN_MACS`) get a few large blocks.
     let macs = m as u64 * n as u64 * k as u64;
     let w_eff = (macs / min_task_macs()).clamp(1, nworkers.max(1) as u64) as usize;
     let (bm, bn) = select_2d_block_shape(m, n, 3 * w_eff);
@@ -2565,13 +2597,19 @@ unsafe fn pack_a(a: *const f32, lda: usize, mc: usize, kc: usize, ap: *mut f32) 
 fn pack_par_min_bytes() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("WUKONG_PACK_PAR_MIN_KB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(256)
-            * 1024
-    })
+    *V.get_or_init(|| pack_min_bytes_from_kb(std::env::var("WUKONG_PACK_PAR_MIN_KB").ok()))
+}
+
+/// The `WUKONG_PACK_PAR_MIN_KB` policy: KiB → bytes with a **saturating** scale. A plain `* 1024`
+/// overflowed usize for a knob value near `usize::MAX` — wrapping silently in release and aborting
+/// a debug build with `attempt to multiply with overflow` raised inside the packer of an
+/// `extern "C"` GEMM. Zero is a legitimate setting here (it means "always pack in parallel"), so
+/// unlike the divisor knobs it is NOT filtered out. Pure (takes the already-read variable) so the
+/// policy is unit-testable without process-global env state.
+fn pack_min_bytes_from_kb(raw: Option<String>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(256)
+        .saturating_mul(1024)
 }
 
 /// Pack one K-block's A column-panel and B row-panel in a **single** parallel region: one task per
@@ -2805,9 +2843,18 @@ unsafe fn micro_6x16(
     // increment/compare otherwise contends with the FMAs for ports 0/1), and the scheduler gets a
     // wider window to overlap loads with the in-flight FMA chains. One prefetch per 4 steps keeps
     // the next B panel rows warm in L1 without flooding the load ports.
+    //
+    // `wrapping_add`, not `add`: the 8-K-step lookahead deliberately runs off the end of the
+    // packed-B buffer near the end of the last micropanel (instrumented against the packed-B
+    // length: exactly 256 bytes past, on every `sgemm_matches_naive_various_sizes` shape).
+    // `<*const T>::add`'s precondition is that the result stays inside the same allocated object,
+    // so it lowers to `getelementptr inbounds` on an address that is not — poison — even though
+    // the prefetch itself is architecturally a hint that issues no load and faults on nothing.
+    // `wrapping_add` carries no such precondition and lowers to the same `lea`, so the emitted
+    // address and every computed bit are unchanged.
     let mut p = 0;
     while p + 4 <= kc {
-        _mm_prefetch::<_MM_HINT_T0>(bp.add(NR * 8) as *const i8);
+        _mm_prefetch::<_MM_HINT_T0>(bp.wrapping_add(NR * 8) as *const i8);
         kstep!();
         kstep!();
         kstep!();
@@ -2994,10 +3041,12 @@ unsafe fn micro_6x16_avx512(
             bp = bp.add(NR);
         }};
     }
-    // Same ×4 K-unroll + one prefetch per 4 steps as the AVX2 kernel.
+    // Same ×4 K-unroll + one prefetch per 4 steps as the AVX2 kernel — including its
+    // `wrapping_add` (the lookahead leaves the packed-B allocation on the last micropanel; see
+    // [`micro_6x16`] for why `add` would be `inbounds` poison there).
     let mut p = 0;
     while p + 4 <= kc {
-        _mm_prefetch::<_MM_HINT_T0>(bp.add(NR * 8) as *const i8);
+        _mm_prefetch::<_MM_HINT_T0>(bp.wrapping_add(NR * 8) as *const i8);
         kstep!();
         kstep!();
         kstep!();
@@ -3031,6 +3080,40 @@ unsafe fn micro_6x16_avx512(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two GEMM env knobs whose raw value reaches arithmetic that can trap. Both crashed a
+    /// compiled program before this gate, from inside an `extern "C"` runtime kernel:
+    /// `WUKONG_GEMM_2D_SHARED=1 WUKONG_GEMM_MIN_TASK_MACS=0 wukongc --run --backend=native -O2
+    /// tests/run/scaled_gemm_parallel.wk` → `attempt to divide by zero` at the `macs /
+    /// min_task_macs()` in `sgemm_2d_shared`, and `WUKONG_GEMM_2D=0
+    /// WUKONG_PACK_PAR_MIN_KB=18446744073709551615` (debug build) → `attempt to multiply with
+    /// overflow` in the KiB→byte scale. The policies are pure functions so this gate needs no
+    /// process-global env state.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn gemm_env_knobs_survive_hostile_values() {
+        // Divisor knob: 0 and unparsable are both "unset", so the caller's default stands.
+        assert_eq!(positive_or_unset(Some("0".to_string())), None);
+        assert_eq!(positive_or_unset(Some(String::new())), None);
+        assert_eq!(positive_or_unset(Some("-1".to_string())), None);
+        assert_eq!(positive_or_unset(Some("not-a-number".to_string())), None);
+        assert_eq!(positive_or_unset(None), None);
+        assert_eq!(positive_or_unset(Some("1".to_string())), Some(1));
+        assert_eq!(positive_or_unset(Some("4194304".to_string())), Some(4 << 20));
+        // The invariant the `macs / min_task_macs()` use site depends on, under this process's env.
+        assert!(min_task_macs() > 0, "min_task_macs is used as a divisor");
+
+        // Byte-threshold knob: 0 is a legitimate setting ("always pack in parallel") and must be
+        // preserved, but the KiB→byte scale must saturate rather than wrap or trap.
+        assert_eq!(pack_min_bytes_from_kb(Some("0".to_string())), 0);
+        assert_eq!(pack_min_bytes_from_kb(None), 256 * 1024);
+        assert_eq!(pack_min_bytes_from_kb(Some("junk".to_string())), 256 * 1024);
+        assert_eq!(pack_min_bytes_from_kb(Some("1".to_string())), 1024);
+        assert_eq!(
+            pack_min_bytes_from_kb(Some(usize::MAX.to_string())),
+            usize::MAX
+        );
+    }
 
     /// Naive reference, distinct from both production paths, for validation.
     fn naive(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -3135,15 +3218,66 @@ mod tests {
         }
     }
 
-    /// Throughput probe (run: `cargo test -p wukong_runtime --release -- --ignored --nocapture`).
-    /// Sweeps square sizes so the parallel scaling (which improves with size, as the packs amortize
-    /// and each core gets more compute per K-block) is visible, not just the small-matrix corner.
+    /// Every piece of scheduling state [`pin_pcore`] overwrites, so [`restore_sched`] can put ALL
+    /// of it back. `pin_pcore` narrows the calling thread's affinity *and* raises the priority of
+    /// the whole PROCESS and of the calling thread; restoring only the mask left both elevations
+    /// in force for the rest of the test process, so the parallel rows of [`sgemm_throughput`] —
+    /// and every other `#[ignore]` probe sharing the process — were measured with the submitting
+    /// thread at TIME_CRITICAL and the process at HIGH while the rayon workers doing the actual
+    /// work stayed at NORMAL. On this hybrid P/E laptop that changes core placement, so the
+    /// printed parallel GFLOP/s were not reproducible by a run that did not include this probe.
+    #[derive(Clone, Copy)]
+    struct PrevSched {
+        /// Thread affinity mask; 0 means "nothing to restore" (the non-Windows no-op).
+        affinity: usize,
+        /// Process priority class. `GetPriorityClass` returns 0 on failure — never pushed back.
+        priority_class: u32,
+        /// Thread priority. `GetThreadPriority` returns `THREAD_PRIORITY_ERROR_RETURN` on failure.
+        thread_priority: i32,
+    }
+    /// `GetThreadPriority`'s documented failure return.
+    const THREAD_PRIORITY_ERROR_RETURN: i32 = 0x7FFF_FFFF;
+
+    /// Throughput probe (run: `cargo test -p wukong_runtime --release sgemm_throughput --
+    /// --ignored --nocapture --test-threads=1`). The filter and `--test-threads=1` are part of the
+    /// instrument: libtest's default `--test-threads` is the logical CPU count, so an unfiltered
+    /// `--ignored` run starts all nine ignored probes in this crate at once and the `sgemm
+    /// (1 core)` row below would be measured against an all-core 4096³ GEMM and two 64 MiB
+    /// bandwidth streams. Sweeps square sizes so the parallel scaling (which improves with size, as
+    /// the packs amortize and each core gets more compute per K-block) is visible, not just the
+    /// small-matrix corner.
     /// Pin the current thread to one P-core (logical CPU 0) and raise priority for a repeatable
-    /// single-core measurement; returns the previous affinity mask to restore before the parallel
-    /// benches. On this hybrid laptop the single-core GFLOP/s otherwise swings ±30% with P/E
-    /// scheduling and turbo, swamping microkernel changes. No-op (returns 0) off Windows.
+    /// single-core measurement; returns the previous scheduling state to restore before the
+    /// parallel benches. On this hybrid laptop the single-core GFLOP/s otherwise swings ±30% with
+    /// P/E scheduling and turbo, swamping microkernel changes. No-op off Windows.
     #[cfg(windows)]
-    fn pin_pcore() -> usize {
+    fn pin_pcore() -> PrevSched {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn GetCurrentProcess() -> isize;
+            fn SetThreadAffinityMask(h: isize, mask: usize) -> usize;
+            fn SetThreadPriority(h: isize, prio: i32) -> i32;
+            fn GetThreadPriority(h: isize) -> i32;
+            fn SetPriorityClass(h: isize, class: u32) -> i32;
+            fn GetPriorityClass(h: isize) -> u32;
+        }
+        // SAFETY: plain scheduling syscalls on the current thread/process pseudo-handles, which
+        // are always valid and need no close; every argument is a by-value integer.
+        unsafe {
+            // Read the state back BEFORE overwriting it: the elevation is meant to last only as
+            // long as the pinned single-core rows.
+            let priority_class = GetPriorityClass(GetCurrentProcess());
+            let thread_priority = GetThreadPriority(GetCurrentThread());
+            SetPriorityClass(GetCurrentProcess(), 0x0000_0080); // HIGH_PRIORITY_CLASS
+            SetThreadPriority(GetCurrentThread(), 15); // THREAD_PRIORITY_TIME_CRITICAL
+            let affinity = SetThreadAffinityMask(GetCurrentThread(), 0x1); // logical CPU 0 (a P-core)
+            PrevSched { affinity, priority_class, thread_priority }
+        }
+    }
+    /// Undo [`pin_pcore`] — all three pieces, not just the affinity mask.
+    #[cfg(windows)]
+    fn restore_sched(prev: PrevSched) {
         #[link(name = "kernel32")]
         extern "system" {
             fn GetCurrentThread() -> isize;
@@ -3152,32 +3286,78 @@ mod tests {
             fn SetThreadPriority(h: isize, prio: i32) -> i32;
             fn SetPriorityClass(h: isize, class: u32) -> i32;
         }
+        // SAFETY: the same current-thread/current-process pseudo-handle syscalls [`pin_pcore`]
+        // used, with the values it read back from them.
         unsafe {
-            SetPriorityClass(GetCurrentProcess(), 0x0000_0080); // HIGH_PRIORITY_CLASS
-            SetThreadPriority(GetCurrentThread(), 15); // THREAD_PRIORITY_TIME_CRITICAL
-            SetThreadAffinityMask(GetCurrentThread(), 0x1) // logical CPU 0 (a P-core)
+            // Each getter has a documented failure return that is not a valid setting; pushing it
+            // back would leave the process in a state it was never in.
+            if prev.affinity != 0 {
+                SetThreadAffinityMask(GetCurrentThread(), prev.affinity);
+            }
+            if prev.priority_class != 0 {
+                SetPriorityClass(GetCurrentProcess(), prev.priority_class);
+            }
+            if prev.thread_priority != THREAD_PRIORITY_ERROR_RETURN {
+                SetThreadPriority(GetCurrentThread(), prev.thread_priority);
+            }
         }
     }
+    #[cfg(not(windows))]
+    fn pin_pcore() -> PrevSched {
+        PrevSched { affinity: 0, priority_class: 0, thread_priority: THREAD_PRIORITY_ERROR_RETURN }
+    }
+    #[cfg(not(windows))]
+    fn restore_sched(_: PrevSched) {}
+
+    /// `pin_pcore` must hand back everything it took. It sets three pieces of state — the process
+    /// priority class, the calling thread's priority, and the thread affinity mask — and the old
+    /// `restore_affinity` put back only the mask. Observed before, in this exact sequence:
+    /// `BEFORE class=0x20 thread_prio=0` → `PINNED class=0x80 thread_prio=15` →
+    /// `RESTORED class=0x80 thread_prio=15`, i.e. HIGH_PRIORITY_CLASS and TIME_CRITICAL leaked for
+    /// the remainder of the process and every later measurement in it. Gated here rather than in
+    /// [`sgemm_throughput`] itself because that probe is `#[ignore]`d, so it never runs in CI.
+    #[test]
     #[cfg(windows)]
-    fn restore_affinity(mask: usize) {
-        if mask == 0 {
-            return;
-        }
+    fn pin_pcore_restores_every_piece_of_scheduling_state() {
         #[link(name = "kernel32")]
         extern "system" {
             fn GetCurrentThread() -> isize;
+            fn GetCurrentProcess() -> isize;
+            fn GetThreadPriority(h: isize) -> i32;
+            fn GetPriorityClass(h: isize) -> u32;
             fn SetThreadAffinityMask(h: isize, mask: usize) -> usize;
         }
+        // SAFETY: read-only scheduling queries on the current thread/process pseudo-handles, plus
+        // one `SetThreadAffinityMask` that re-applies the mask already in force (see below).
         unsafe {
-            SetThreadAffinityMask(GetCurrentThread(), mask);
+            let class0 = GetPriorityClass(GetCurrentProcess());
+            let prio0 = GetThreadPriority(GetCurrentThread());
+            let prev = pin_pcore();
+            assert_eq!(
+                GetPriorityClass(GetCurrentProcess()),
+                0x0000_0080,
+                "pin_pcore is supposed to raise the process to HIGH_PRIORITY_CLASS"
+            );
+            restore_sched(prev);
+            assert_eq!(
+                GetPriorityClass(GetCurrentProcess()),
+                class0,
+                "process priority class leaked past restore_sched"
+            );
+            assert_eq!(
+                GetThreadPriority(GetCurrentThread()),
+                prio0,
+                "thread priority leaked past restore_sched"
+            );
+            // No `GetThreadAffinityMask` exists: setting the mask returns the one that was in
+            // force, so re-setting the restored value both checks it and leaves it unchanged.
+            assert_eq!(
+                SetThreadAffinityMask(GetCurrentThread(), prev.affinity),
+                prev.affinity,
+                "thread affinity mask not restored"
+            );
         }
     }
-    #[cfg(not(windows))]
-    fn pin_pcore() -> usize {
-        0
-    }
-    #[cfg(not(windows))]
-    fn restore_affinity(_: usize) {}
 
     #[test]
     #[ignore]
@@ -3214,7 +3394,7 @@ mod tests {
             bench("sgemm_nt (1 core)", &|| unsafe {
                 wukong_sgemm_nt(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
-            restore_affinity(prev); // parallel benches want all cores
+            restore_sched(prev); // parallel benches want all cores, at the process's own priority
             bench("sgemm (parallel)", &|| unsafe {
                 wukong_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
@@ -4403,6 +4583,107 @@ mod tests {
                             got[idx],
                             want[idx]
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`sgemm_scalar`] — the portable fallback, and the ONLY GEMM path on a target without
+    /// AVX2+FMA (every non-x86_64 build compiles the whole fast path out) — had no test at all:
+    /// its sole caller is the feature dispatch in [`gemm_dispatch`], which on any AVX2 host takes
+    /// the other branch, so `cargo test -p wukong_runtime` never executed a single line of it.
+    /// Verified by mutation: transposing the two arms of its `bt` select (`*b.add(j*k+p)` vs
+    /// `*b.add(p*n+j)`) left all 197 tests green while every `nn.Linear` off-AVX2 would return
+    /// garbage. This calls the private kernel directly, so it runs on every target.
+    ///
+    /// Covers the whole reachable argument space: `bt` × `beta ∈ {0, 1}` × the four activations ×
+    /// bias/no-bias × `alpha`, at shapes that exercise the 1-wide dims and the MR/NR remainders.
+    /// `alpha != 1` is paired only with `beta == 0`, the combination the ABI supports (see the
+    /// `debug_assert` in [`gemm_dispatch`]).
+    #[test]
+    fn sgemm_scalar_fallback_matches_reference() {
+        for &(m, k, n) in &[(1usize, 1usize, 1usize), (7, 17, 13), (64, 64, 64)] {
+            let a = fill(81, m * k);
+            let b = fill(82, k * n);
+            let bias = fill(83, n);
+            let c_init = fill(84, m * n);
+            for bt in [false, true] {
+                // `bt` reinterprets the same k*n elements as `[n, k]` rather than `[k, n]`.
+                let base = if bt {
+                    naive_nt(&a, &b, m, k, n)
+                } else {
+                    naive(&a, &b, m, k, n)
+                };
+                for &beta in &[0.0f32, 1.0] {
+                    let alphas: &[f32] = if beta == 0.0 { &[1.0, 0.125] } else { &[1.0] };
+                    for &alpha in alphas {
+                        for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
+                            for use_bias in [false, true] {
+                                let no_epi =
+                                    act == ACT_IDENTITY && !use_bias && alpha == 1.0;
+                                let bias_ptr = if use_bias {
+                                    bias.as_ptr()
+                                } else {
+                                    std::ptr::null()
+                                };
+                                let epi = if no_epi {
+                                    None
+                                } else {
+                                    Some(Epilogue { bias: bias_ptr, act, alpha })
+                                };
+                                // Reference: the beta rule, then the epilogue on the fully
+                                // reduced sum — `alpha` scales the accumulated value, then the
+                                // bias adds, then the activation (`Epilogue::apply`'s order).
+                                let mut want = vec![0.0f32; m * n];
+                                for i in 0..m {
+                                    for j in 0..n {
+                                        let mut v = base[i * n + j];
+                                        if beta != 0.0 {
+                                            v += c_init[i * n + j];
+                                        }
+                                        if epi.is_some() {
+                                            if alpha != 1.0 {
+                                                v *= alpha;
+                                            }
+                                            if use_bias {
+                                                v += bias[j];
+                                            }
+                                            v = match act {
+                                                ACT_RELU => v.max(0.0),
+                                                ACT_GELU => crate::vmath::gelu1(v),
+                                                ACT_SILU => crate::vmath::silu1(v),
+                                                _ => v,
+                                            };
+                                        }
+                                        want[i * n + j] = v;
+                                    }
+                                }
+                                let mut got = c_init.clone();
+                                sgemm_scalar(
+                                    a.as_ptr(),
+                                    b.as_ptr(),
+                                    got.as_mut_ptr(),
+                                    m,
+                                    k,
+                                    n,
+                                    beta,
+                                    bt,
+                                    epi,
+                                );
+                                let tol = 1e-3 * (k as f32).sqrt();
+                                for idx in 0..m * n {
+                                    assert!(
+                                        (got[idx] - want[idx]).abs()
+                                            <= tol + 1e-4 * want[idx].abs(),
+                                        "scalar (m{m} k{k} n{n} bt{bt} beta{beta} alpha{alpha} \
+                                         act{act} bias{use_bias}) idx {idx}: got {} want {}",
+                                        got[idx],
+                                        want[idx]
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
