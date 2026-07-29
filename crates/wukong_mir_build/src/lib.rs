@@ -15261,23 +15261,18 @@ impl FnLowerer<'_> {
             // unaffected.
             let zero = self.builder.build(ty.clone(), Op::ConstInt(0, ty.clone()));
             self.builder.build(MirType::I1, Op::Cmp(CmpOp::Ne, v, zero))
-        } else if ty == MirType::Ptr {
-            // A **pointer** condition (`if s { .. }` for a string local — `if (p)` is the canonical
-            // C form) is the same C-like truthiness: `p != null`. It used to fall through here
-            // *unchanged* into `cond_br`, which both backends reject with raw internal text and no
-            // span ("cond_br condition: v2 has type ptr but expected i1") — an ICE on a program the
-            // front end accepts. Compare the address rather than the pointer: `PtrToInt` is the one
-            // pointer cast the interpreter (`Value::Ptr(p) -> p as i128`) and Cranelift (a plain
-            // integer resize) both already implement, so the two agree by construction.
-            let addr = self
-                .builder
-                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, v, MirType::I64));
-            let zero = self
-                .builder
-                .build(MirType::I64, Op::ConstInt(0, MirType::I64));
-            self.builder
-                .build(MirType::I1, Op::Cmp(CmpOp::Ne, addr, zero))
         } else {
+            // NOTE: a **pointer** condition (`if p`) still falls through here unchanged and both
+            // backends reject it with raw verifier text and no span ("cond_br condition: v2 has
+            // type ptr but expected i1"). A `PtrToInt(p) != 0` lowering was tried and reverted: it
+            // is *silently wrong in the interpreter*, whose addresses are slot indices starting at
+            // 0, so the first pointer taken in a function has address 0 and reads as null. `let mut
+            // v: i32 = 7; let p = &mut v; if p` printed 0 under the interpreter and 1 natively —
+            // trading a loud ICE for a silent interp/native divergence, the worse failure. A
+            // correct lowering needs a null test the two backends genuinely share (a dedicated
+            // `IsNull` op, or the interpreter reserving address 0 as never-allocated), not a
+            // comparison on `PtrToInt`.
+
             v
         }
     }
