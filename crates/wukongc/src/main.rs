@@ -28,7 +28,8 @@ OPTIONS:
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
                        recognizer offload, gpu-native lowers the whole program's MIR to PTX)
-    -o <path>          Write output to <path>
+    -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
+                       file; every other stage prints its artifact on stdout.
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
     --error-format=<f> Diagnostic output format: human, json  (default: human)
@@ -228,7 +229,40 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let input = input.ok_or("no input file given")?;
     opts.input = input;
 
-    // `--run` implies we don't need a final emit target.
-    let _ = emit_explicit;
+    // A requested `--emit=<stage>` and `--run` cannot both be honoured: the driver dispatches
+    // exactly ONE of them and silently drops the other, while still exiting 0. Which one wins
+    // depends on where the stage sits relative to the run block, so the discarded work is not even
+    // consistent: `--run --emit=obj|exe|mir|llvm-ir` runs the program and writes/prints no artifact,
+    // and `--run --emit=tokens|ast|mir-high|grad` prints the artifact and never runs. Reject the
+    // combination rather than report success for work that was not done. (`emit_explicit` exists
+    // precisely for this check; it used to be discarded at the end of `parse_args`.)
+    if opts.run && emit_explicit {
+        return Err(
+            "`--run` cannot be combined with `--emit=<stage>`: the compiler honours exactly one of \
+             them and would silently discard the other"
+                .to_string(),
+        );
+    }
+
+    // `-o` names an artifact FILE, and only the two artifact stages write one. For every textual
+    // stage the driver prints to stdout and the flag was silently ignored — no file appeared and
+    // the process still exited 0, so `wukongc --emit=llvm-ir -o out.ll p.wk && llc out.ll` failed
+    // at the *next* command with a missing-file error naming the wrong culprit.
+    if opts.output.is_some() {
+        if opts.run {
+            return Err(
+                "`-o` has no meaning with `--run`: running the program writes no artifact file"
+                    .to_string(),
+            );
+        }
+        if !matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
+            return Err(
+                "`-o` is only supported with `--emit=obj` and `--emit=exe`: every other stage \
+                 prints its artifact on stdout (redirect it instead)"
+                    .to_string(),
+            );
+        }
+    }
+
     Ok(Some(opts))
 }
