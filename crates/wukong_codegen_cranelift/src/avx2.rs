@@ -13,11 +13,18 @@
 //! `define_function_bytes`) and — for the differential oracle — the interpreter marshals lane-wise
 //! from the *same* recipe. Elementwise lanes are bit-identical across the two; the gate polices it.
 //!
-//! ABI of an assembled kernel (Windows/SysV both pass the first args in registers we normalize to):
-//! `fn(ptrs: *const *mut u8, scalars: *const f32, n: u64)`. `ptrs[k]` is the base of stream `k`,
-//! `scalars[k]` the k-th loop-invariant f32, `n` the (multiple-of-8) element count the caller assigns
-//! to the vector part; the caller runs the scalar remainder itself. The kernel touches only volatile
-//! registers, makes no calls, and ends with `vzeroupper` — so no prologue/epilogue is needed.
+//! ABI of an assembled kernel: `fn(ptrs: *const *mut u8, scalars: *const f32, n: u64)`. `ptrs[k]` is
+//! the base of stream `k`, `scalars[k]` the k-th loop-invariant f32, `n` the (multiple-of-8) element
+//! count the caller assigns to the vector part; the caller runs the scalar remainder itself. The
+//! kernel touches only volatile registers, makes no calls, and ends with `vzeroupper` — so no
+//! prologue/epilogue is needed beyond the callee-saved xmm halves Win64 requires.
+//!
+//! The body reads its three arguments out of **rcx/rdx/r8** — the Win64 integer argument registers —
+//! and executes VEX.256 AVX2 + FMA3 encodings. Neither is negotiable here: the register mapping is
+//! literal in the emitted bytes, and there is no runtime dispatch inside a kernel. So
+//! [`assemble_kernel`] refuses on any host that does not supply both (see [`host_supports_kernels`]),
+//! which is the only CPU-feature gate on this path — the Cranelift side declares the kernel with the
+//! module's `default_call_conv` and installs the bytes verbatim, so a mismatch is silent corruption.
 
 #![allow(dead_code)] // Phase A: assembler proven in isolation before the vectorizer wires it in.
 
@@ -25,10 +32,26 @@ use iced_x86::code_asm::*;
 use wukong_mir::{VecBin, VecCmp, VecKernel, VecOp, VecPressure, VecRedOp};
 
 /// f32 lanes per YMM register (256-bit / 32-bit).
-pub const LANES: u32 = 8;
+pub const LANES: u32 = wukong_mir::VEC_LANES;
 const GROUP_BYTES: i32 = (LANES * 4) as i32;
 /// Total architectural YMM registers.
-const NREG: u8 = 16;
+const NREG: u32 = wukong_mir::VEC_NREG;
+
+/// Whether this host can run the machine code this module emits: the AVX2 + FMA3 instructions the
+/// body encodes, delivered under the Win64 argument-register mapping (rcx/rdx/r8) the body hardcodes.
+/// Every other AVX2 consumer in the tree (`wukong_runtime`'s gemm/gemv/attention/… kernels) gates the
+/// same way and keeps a scalar twin; this path has no in-kernel fallback, so the gate is the refusal
+/// in [`assemble_kernel`]. `is_x86_feature_detected!` caches its CPUID probe, so this is cheap.
+pub fn host_supports_kernels() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    {
+        false
+    }
+}
 
 fn ymm(n: u8) -> AsmRegisterYmm {
     [
@@ -89,13 +112,16 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
         last_use,
         per_group,
     } = pressure;
-    let per_group = per_group as u8;
-    let hoist = hoist_scalars.len() as u8 + needs_signmask as u8;
-    if per_group as u32 + hoist as u32 > NREG as u32 {
+    // Prove the bound in u32 and narrow only after: a `per_group` of 256 truncates to 0 (integer
+    // divide by zero below), 257 truncates to 1 (`free.pop()` panics), so a body that overflows must
+    // become the promised `Err` and not a panic reaching the user through the driver.
+    let hoist = hoist_scalars.len() as u32 + needs_signmask as u32;
+    if per_group == 0 || per_group + hoist > NREG {
         return Err(format!(
             "avx2: body needs {per_group}+{hoist} > {NREG} registers"
         ));
     }
+    let (per_group, hoist) = (per_group as u8, hoist as u8);
     // A reduction additionally needs one accumulator register per unrolled copy; an elementwise
     // kernel needs none. The unroll comes from `wukong_mir` (single-sourced with the interpreter's
     // `eval_reduction`, which must pick the same number of accumulators to reassociate identically).
@@ -111,7 +137,7 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
         // Interleave as many groups as fit (dense from ymm0), capped by the requested unroll.
         k.unroll
             .max(1)
-            .min(((NREG - hoist) / per_group) as u32)
+            .min((NREG - hoist as u32) / per_group as u32)
             .max(1)
     };
 
@@ -154,9 +180,17 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
 }
 
 /// Assemble `k` into a self-contained AVX2 function `fn(ptrs, scalars, n)` (Win64 ABI: rcx, rdx,
-/// r8). Returns the raw machine code, or `Err` if the body is outside this emitter's coverage (the
-/// caller then keeps the differential-safe 128-bit vectorizer path).
+/// r8). Returns the raw machine code, or `Err` if the host cannot run these bytes at all, or if the
+/// body is outside this emitter's coverage.
 pub fn assemble_kernel(k: &VecKernel) -> Result<Vec<u8>, String> {
+    // The ISA/ABI gate comes first: the bytes below are AVX2+FMA3 under the Win64 argument
+    // registers, with no in-kernel dispatch. Emitting them for a host that lacks either is a #UD at
+    // the first `vmovups ymm` or a wild dereference of whatever rcx held — neither diagnosable.
+    if !host_supports_kernels() {
+        return Err(
+            "avx2: host lacks AVX2+FMA3 under the Win64 ABI these kernels encode".to_string(),
+        );
+    }
     let plan = plan_registers(k)?;
     emit(k, &plan).map_err(|e| format!("avx2 encode: {e}"))
 }
@@ -305,11 +339,18 @@ fn emit_group(
             _ => vreg[v as usize].expect("value has a register"),
         }
     };
-    // Free value `v`'s body register after op `i`, if this is its last use.
+    // Free value `v`'s body register after op `i`, if this is its last use. An op may name the same
+    // value twice (`a*a`, or an `Fma` sharing an operand), so this runs more than once for one value
+    // — `take()` makes the release idempotent. Without it the register is pushed twice and two later
+    // allocations receive the same physical register, the second silently clobbering the first.
+    // Taking is sound: `free_after` only fires when `last_use[v] == i`, so no later op reads
+    // `vreg[v]`; the reduction fold's addend / fused operands have `last_use == ops.len()` (set by
+    // `pressure()`), which equals no op index, so their registers survive to the post-loop fold.
     let free_after = |free: &mut Vec<u8>, vreg: &mut [Option<u8>], i: usize, v: u32| {
         if plan.last_use[v as usize] == i {
-            if let Some(r) = vreg[v as usize] {
-                if !matches!(k.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. }) {
+            if !matches!(k.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. }) {
+                if let Some(r) = vreg[v as usize].take() {
+                    debug_assert!(!free.contains(&r), "avx2: ymm{r} released twice at op {i}");
                     free.push(r);
                 }
             }
@@ -437,9 +478,9 @@ fn fold_ss(a: &mut CodeAssembler, op: VecRedOp, src: AsmMemoryOperand) -> Result
 pub fn assemble_saxpy_probe() -> Result<Vec<u8>, IcedError> {
     let mut a = CodeAssembler::new(64)?;
 
-    // Args (SysV: rdi,rsi,rdx / Win64: rcx,rdx,r8). This bring-up test drives it through the host
-    // C ABI directly, so we branch on target below when calling; the body uses the Win64 mapping
-    // because that is this box. rcx = ptrs, rdx = scalars, r8 = n.
+    // Win64 argument registers: rcx = ptrs, rdx = scalars, r8 = n — the same hardcoded mapping the
+    // recipe emitter uses, and the reason `host_supports_kernels` refuses non-Windows hosts. The
+    // caller drives this through the host C ABI directly, so it is only valid where that gate passes.
     a.mov(r9, qword_ptr(rcx))?; // x   = ptrs[0]
     a.mov(r10, qword_ptr(rcx + 8))?; // y   = ptrs[1]
     a.mov(r11, qword_ptr(rcx + 16))?; // out = ptrs[2]
@@ -476,6 +517,9 @@ mod tests {
     /// it, and check it computed `a*x + y` in true 256-bit strides. This is the whole raw-AVX2 seam.
     #[test]
     fn avx2_saxpy_kernel_runs() {
+        if !host_supports_kernels() {
+            return; // these bytes are not executable here — see `host_supports_kernels`
+        }
         let bytes = assemble_saxpy_probe().expect("assemble");
         assert!(!bytes.is_empty());
         if std::env::var("P4_DUMP").is_ok() {
@@ -528,6 +572,9 @@ mod tests {
     /// the `VecKernel::eval_lane` reference **bit-for-bit** on every full-vector lane `[0, n/8*8)`.
     /// Inputs may alias outputs (in-place); the reference mutates its own copy the same way.
     fn check(k: &VecKernel, init: &[Vec<f32>], scalars: &[f32], n: usize) {
+        if !host_supports_kernels() {
+            return; // these bytes are not executable here — see `host_supports_kernels`
+        }
         let bytes = assemble_kernel(k).expect("assemble");
 
         // Reference: run eval_lane over its own mutable copy of the streams.
@@ -582,6 +629,9 @@ mod tests {
     /// assert its f32 return matches [`VecKernel::eval_reduction`] **bit-for-bit** — the same
     /// reassociation on both. Reduction kernels only read their streams, so `*const` suffices.
     fn check_reduce(k: &VecKernel, streams: &[Vec<f32>], scalars: &[f32], n: usize) {
+        if !host_supports_kernels() {
+            return; // these bytes are not executable here — see `host_supports_kernels`
+        }
         let bytes = assemble_kernel(k).expect("assemble reduction");
         let vlen = n / LANES as usize * LANES as usize;
         let want =
@@ -971,6 +1021,98 @@ mod tests {
         );
     }
 
+    /// A value used TWICE by one op (`a*a`) must be released exactly once. The free list is a plain
+    /// `Vec`, so a double-push hands the same physical register to two later allocations and the
+    /// second silently clobbers the first — `o = a*a + b*c` then computes `a*a + c*c`. Three shapes,
+    /// each with the repeated operand followed by further allocating ops so the duplicate is actually
+    /// handed out: two loads, another repeated-operand op, and a fused `Fma` (whose three operands
+    /// give the widest double-free surface).
+    #[test]
+    fn avx2_kernel_repeated_operand_frees_once() {
+        // o = a*a + b*c   (dup-operand op, then two loads that pop the duplicate)
+        let dup_then_loads = VecKernel {
+            name: sym(),
+            streams: 4,
+            scalars: 0,
+            unroll: 4,
+            reduce: None,
+            ops: vec![
+                VecOp::Load { stream: 0 },                  // v0 = a
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
+                VecOp::Load { stream: 1 },                  // v2 = b
+                VecOp::Load { stream: 2 },                  // v3 = c
+                VecOp::Bin { op: VecBin::Mul, a: 2, b: 3 }, // v4 = b*c
+                VecOp::Bin { op: VecBin::Add, a: 1, b: 4 }, // v5 = a*a + b*c
+                VecOp::Store { stream: 3, val: 5 },
+            ],
+        };
+        // o = a*a + b*b + b   (dup-operand op, then a second dup-operand op)
+        let dup_then_dup = VecKernel {
+            name: sym(),
+            streams: 3,
+            scalars: 0,
+            unroll: 4,
+            reduce: None,
+            ops: vec![
+                VecOp::Load { stream: 0 },                  // v0 = a
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
+                VecOp::Load { stream: 1 },                  // v2 = b
+                VecOp::Bin { op: VecBin::Mul, a: 2, b: 2 }, // v3 = b*b
+                VecOp::Bin { op: VecBin::Add, a: 1, b: 3 }, // v4 = a*a + b*b
+                VecOp::Bin { op: VecBin::Add, a: 4, b: 2 }, // v5 = … + b
+                VecOp::Store { stream: 2, val: 5 },
+            ],
+        };
+        // o = (a*a)*c + b*c  — `c` feeds an Fma and a later Bin, so the Fma's three `free_after`
+        // calls run while `c` is still live; `a` is the repeated operand.
+        let dup_then_fma = VecKernel {
+            name: sym(),
+            streams: 4,
+            scalars: 0,
+            unroll: 2,
+            reduce: None,
+            ops: vec![
+                VecOp::Load { stream: 0 },                  // v0 = a
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
+                VecOp::Load { stream: 1 },                  // v2 = b
+                VecOp::Load { stream: 2 },                  // v3 = c
+                VecOp::Fma { a: 1, b: 3, c: 2 },            // v4 = (a*a)*c + b
+                VecOp::Bin { op: VecBin::Mul, a: 4, b: 3 }, // v5 = v4 * c
+                VecOp::Store { stream: 3, val: 5 },
+            ],
+        };
+        for n in [8usize, 16, 24, 64] {
+            let s = |seed| ramp(n, seed);
+            check(&dup_then_loads, &[s(0.0), s(1.0), s(2.0), vec![0.0; n]], &[], n);
+            check(&dup_then_dup, &[s(0.0), s(1.0), vec![0.0; n]], &[], n);
+            check(&dup_then_fma, &[s(0.0), s(1.0), s(2.0), vec![0.0; n]], &[], n);
+        }
+        // Same defect on the reduction path: the fold reads its addend after the body, so a register
+        // handed out twice corrupts the accumulator. `acc += (a*a) * (b*c)`.
+        let red = VecKernel {
+            name: sym(),
+            streams: 3,
+            scalars: 0,
+            unroll: 4,
+            reduce: Some(wukong_mir::VecReduce {
+                op: VecRedOp::Add,
+                value: 5,
+                fma: None,
+            }),
+            ops: vec![
+                VecOp::Load { stream: 0 },
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // a*a
+                VecOp::Load { stream: 1 },
+                VecOp::Load { stream: 2 },
+                VecOp::Bin { op: VecBin::Mul, a: 2, b: 3 }, // b*c
+                VecOp::Bin { op: VecBin::Mul, a: 1, b: 4 },
+            ],
+        };
+        for n in [8usize, 16, 64, 256] {
+            check_reduce(&red, &[ramp(n, 0.0), ramp(n, 1.0), ramp(n, 2.0)], &[], n);
+        }
+    }
+
     #[test]
     fn avx2_kernel_bails_on_five_streams() {
         let k = VecKernel {
@@ -985,5 +1127,27 @@ mod tests {
             ],
         };
         assert!(assemble_kernel(&k).is_err(), "5 streams must bail to fallback");
+    }
+
+    /// `assemble_kernel` promises `Err` for a body it cannot express, and callers rely on that (the
+    /// message reaches the user through the driver; a panic would not). A body with exactly 256 live
+    /// values used to narrow to `per_group == 0` *before* the bound was checked, so it slipped past
+    /// the register guard and divided by zero computing the unroll. The vectorizer's own u32 gate
+    /// rejects such a body first today, but this entry point must stand on its own.
+    #[test]
+    fn avx2_kernel_bails_on_register_overflow() {
+        let mut ops: Vec<VecOp> = (0..256).map(|_| VecOp::Load { stream: 0 }).collect();
+        ops.push(VecOp::Store { stream: 1, val: 0 });
+        let k = VecKernel {
+            name: sym(),
+            streams: 2,
+            scalars: 0,
+            unroll: 1,
+            reduce: None,
+            ops,
+        };
+        assert_eq!(k.pressure().map(|p| p.per_group), Some(256), "test premise");
+        let err = assemble_kernel(&k).expect_err("256 live values must bail, not panic");
+        assert!(err.contains("registers") || err.contains("Win64"), "unexpected: {err}");
     }
 }
