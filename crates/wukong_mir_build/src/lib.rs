@@ -13616,6 +13616,39 @@ impl FnLowerer<'_> {
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 use ast::BinOp::*;
+                // `x + y*z` contracts into ONE lane-wise `Fma`, exactly as the 128-bit CLIF path
+                // (`vec_try_fma`) and the scalar remainder that the SAME loop runs
+                // (`try_contract_fma`) already do. Emitting `Mul` + `Add` instead rounded the vector
+                // part twice where the tail rounded once: nine identical input triples
+                // (`o[i] = x[i] + y[i]*z[i]`, x = -(1+2^-11), y = z = 1+2^-12) printed 0 for lanes
+                // 0..7 and 1 for the tail lane — one loop, two answers, on both backends at every -O
+                // level. `WUKONG_P4_NO_256=1` printed 1 for both, so the knob was changing the
+                // program's numbers rather than only its instruction selection. The leaves lower in
+                // source order, matching the twins.
+                if matches!(op, Add) {
+                    if let ExprKind::Binary {
+                        op: Mul,
+                        lhs: y,
+                        rhs: z,
+                    } = &lhs.kind
+                    {
+                        let a = self.rec_value(y, j, locals, r)?;
+                        let b = self.rec_value(z, j, locals, r)?;
+                        let c = self.rec_value(rhs, j, locals, r)?;
+                        return Some(push(r, VecOp::Fma { a, b, c }));
+                    }
+                    if let ExprKind::Binary {
+                        op: Mul,
+                        lhs: y,
+                        rhs: z,
+                    } = &rhs.kind
+                    {
+                        let c = self.rec_value(lhs, j, locals, r)?;
+                        let a = self.rec_value(y, j, locals, r)?;
+                        let b = self.rec_value(z, j, locals, r)?;
+                        return Some(push(r, VecOp::Fma { a, b, c }));
+                    }
+                }
                 let vop = match op {
                     Add => VecBin::Add,
                     Sub => VecBin::Sub,

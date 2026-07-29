@@ -1,0 +1,63 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: -4097
+// EXPECT-OUT: -4097
+module tests.run.veckernel_fma_contract
+
+// One loop must not compute two different functions. The 256-bit AVX2 recipe runs the multiple-of-8
+// part of an elementwise loop and a scalar tail runs the rest, and the scalar tail contracts
+// `x + y*z` into a single-rounded `Fma` — so the recipe has to as well. It emitted a separate multiply
+// and add, i.e. two roundings, and nine IDENTICAL input triples printed 0 for lanes 0..7 and 1 for the
+// tail lane on both backends at every -O level. `WUKONG_P4_NO_256=1` printed 1 for both, so the
+// documented kill-switch was changing the program's numbers, not just its instruction selection.
+//
+// The inputs are exact in f32 and chosen so the two roundings are distinguishable:
+//   x = -(1 + 2^-11), y = z = 1 + 2^-12
+//   y*z            = 1 + 2^-11 + 2^-24 exactly, which rounds (ties-to-even) to 1 + 2^-11 in f32
+//   x + round(y*z) = 0            (two roundings)
+//   fma(y, z, x)   = 2^-24        (one rounding)
+// so `o[i] * 2^24` is 1 under the contract and 0 without it. `mixed` is the control the contraction
+// must NOT reach — the multiply is not an addend — and is exact either way:
+//   (x + y)*z = -2^-12 * (1 + 2^-12) = -(2^-12 + 2^-24), times 2^24 = -4097.
+
+fn main() -> i32 {
+    let mut x: [f32; 9] = [0.0; 9];
+    let mut y: [f32; 9] = [0.0; 9];
+    let mut z: [f32; 9] = [0.0; 9];
+    let mut o: [f32; 9] = [0.0; 9];
+    let mut mixed: [f32; 9] = [0.0; 9];
+    for c in 0..9 {
+        x[c] = -1.00048828125;
+        y[c] = 1.000244140625;
+        z[c] = 1.000244140625;
+    }
+
+    // The addend on the left, then on the right — both spellings contract.
+    for i in 0..9 {
+        o[i] = x[i] + y[i] * z[i];
+    }
+    print(o[0] * 16777216.0); // lane 0  — the 256-bit part
+    print(o[7] * 16777216.0); // lane 7  — the last vector lane
+    print(o[8] * 16777216.0); // lane 8  — the scalar tail
+    for i in 0..9 {
+        o[i] = y[i] * z[i] + x[i];
+    }
+    print(o[0] * 16777216.0);
+    print(o[7] * 16777216.0);
+    print(o[8] * 16777216.0);
+
+    // Control: the product is a factor, not an addend, so nothing contracts and the vector part and
+    // the tail have always agreed.
+    for i in 0..9 {
+        mixed[i] = (x[i] + y[i]) * z[i];
+    }
+    print(mixed[0] * 16777216.0);
+    print(mixed[8] * 16777216.0);
+    return 0;
+}
