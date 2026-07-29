@@ -35,6 +35,11 @@ type I8KernelFn = unsafe extern "C" fn(*const u8, *const i8, *mut i32);
 
 const N: usize = 1 << 20; // 1,048,576 elements (4 MiB per f32 array)
 
+/// One row of the elementwise table: the same computation in three languages behind the shared
+/// `(x, y, out)` ABI. `x` and `out` are read-only input / write-only output for every row; the
+/// MIDDLE buffer `y` is an input for most rows but is used as a WRITABLE scratch array by
+/// `fused_linear_relu` (whose peers stream the fused intermediate through it), so `main` derives
+/// `yp` with `as_mut_ptr` rather than `as_ptr`.
 struct Kernel {
     name: &'static str,
     /// bytes of memory traffic per call (for a GB/s figure)
@@ -359,11 +364,16 @@ fn main() {
         if !want(k.name) {
             continue;
         }
-        // Shared buffers, filled once; kernels read x,y and write out.
+        // Shared buffers, filled once; kernels read x,y and write out. `y` doubles as the scratch
+        // array for the `fused_linear_relu` row (see [`Kernel`]), whose C/Rust peers cast the const
+        // away and write it — so `yp` is derived with `as_mut_ptr`, giving it write provenance. A
+        // pointer from `as_ptr()` is read-only: writing through it is UB, and the `Vec` would be
+        // entitled to be treated as unmodified across the FFI call. Rebuilt per kernel, so no row
+        // can contaminate another.
         let x: Vec<f32> = (0..N).map(|i| (i as f32 % 17.0) * 0.5 + 1.0).collect();
-        let y: Vec<f32> = (0..N).map(|i| (i as f32 % 13.0) * 0.25 - 0.5).collect();
+        let mut y: Vec<f32> = (0..N).map(|i| (i as f32 % 13.0) * 0.25 - 0.5).collect();
         let mut out: Vec<f32> = vec![0.0; N];
-        let (xp, yp) = (x.as_ptr(), y.as_ptr());
+        let (xp, yp): (*const f32, *const f32) = (x.as_ptr(), y.as_mut_ptr());
 
         let wukong = bench_wukong(&k.wuk, &mut out, xp, yp);
         let c = bench_external(
@@ -5599,6 +5609,46 @@ fn report(
     }
 }
 
+/// Check that the just-lowered `kbench` really has the ABI the caller is about to `transmute` it
+/// to, at the exact point where that precondition is otherwise only *hoped* for.
+///
+/// The harnesses transmute a raw code pointer to a fixed `extern "C"` signature; the guarantee that
+/// the JIT'd function matches is a hand-maintained convention spread over ~60 independent source
+/// generators in this file. Nothing in the compiler enforces it. Give a generated kernel a fourth
+/// buffer while its caller still uses the 3-pointer harness and the code parses, type-checks,
+/// lowers and JITs cleanly — then the callee reads its missing pointer argument out of an
+/// uninitialized register inside the timed region and dereferences garbage. `Program` carries the
+/// signature, so it is checkable right here. Every generated kernel in this file lowers to N
+/// pointer parameters and no return value (verified across all five harness families).
+fn kbench_abi_ok(
+    program: &wukong_mir::Program,
+    sym: wukong_span::Symbol,
+    ptr_params: usize,
+) -> bool {
+    let Some(f) = program.function(sym) else {
+        eprintln!("wukong ABI error: the lowered module has no `kbench`");
+        return false;
+    };
+    let all_ptr = f
+        .params
+        .iter()
+        .all(|&p| matches!(f.value_type(p), wukong_mir::MirType::Ptr));
+    if f.params.len() != ptr_params || !all_ptr || !matches!(f.ret, wukong_mir::MirType::Void) {
+        eprintln!(
+            "wukong ABI error: kbench lowered to ({}) -> {}, harness expects {ptr_params} \
+             pointer(s) -> void",
+            f.params
+                .iter()
+                .map(|&p| f.value_type(p).display())
+                .collect::<Vec<_>>()
+                .join(", "),
+            f.ret.display(),
+        );
+        return false;
+    }
+    true
+}
+
 /// Compile a Wukong kernel to native code (timed) and benchmark it.
 ///
 /// ONE-LIVE-POINTER LAW (every harness in this file obeys it). The kernel's output pointer is
@@ -5637,8 +5687,13 @@ fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> O
         }
     };
     let sym = interner.intern("kbench");
+    if !kbench_abi_ok(&program, sym, 3) {
+        return None;
+    }
     let ptr = handle.func_ptr(sym)?;
     let compile = t.elapsed();
+    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr) -> void,
+    // which is exactly `KernelFn`; `handle` is kept alive across the call below.
     let f: KernelFn = unsafe { std::mem::transmute(ptr) };
 
     out.iter_mut().for_each(|v| *v = 0.0);
@@ -5771,8 +5826,13 @@ fn bench_wukong4(
         }
     };
     let sym = interner.intern("kbench");
+    if !kbench_abi_ok(&program, sym, 4) {
+        return None;
+    }
     let ptr = handle.func_ptr(sym)?;
     let compile = t.elapsed();
+    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr, ptr) -> void,
+    // which is exactly `KernelFn4`; `handle` is kept alive across the call below.
     let f: KernelFn4 = unsafe { std::mem::transmute(ptr) };
     out.iter_mut().for_each(|v| *v = 0.0);
     let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
@@ -5891,8 +5951,13 @@ fn bench_wukong_i8(src: &str, out: &mut [i32], ap: *const u8, bp: *const i8) -> 
         }
     };
     let sym = interner.intern("kbench");
+    if !kbench_abi_ok(&program, sym, 3) {
+        return None;
+    }
     let ptr = handle.func_ptr(sym)?;
     let compile = t.elapsed();
+    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr) -> void,
+    // which is exactly `I8KernelFn`; `handle` is kept alive across the call below.
     let f: I8KernelFn = unsafe { std::mem::transmute(ptr) };
 
     out.iter_mut().for_each(|v| *v = 0);
@@ -6017,8 +6082,13 @@ fn bench_wukong_bf16(
         }
     };
     let sym = interner.intern("kbench");
+    if !kbench_abi_ok(&program, sym, 3) {
+        return None;
+    }
     let ptr = handle.func_ptr(sym)?;
     let compile = t.elapsed();
+    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr) -> void,
+    // which is exactly `Bf16KernelFn`; `handle` is kept alive across the call below.
     let f: Bf16KernelFn = unsafe { std::mem::transmute(ptr) };
 
     out[0] = 0.0;
@@ -6143,8 +6213,13 @@ fn bench_wukong_halfout(
         }
     };
     let sym = interner.intern("kbench");
+    if !kbench_abi_ok(&program, sym, 3) {
+        return None;
+    }
     let ptr = handle.func_ptr(sym)?;
     let compile = t.elapsed();
+    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr) -> void,
+    // which is exactly `HalfOutKernelFn`; `handle` is kept alive across the call below.
     let f: HalfOutKernelFn = unsafe { std::mem::transmute(ptr) };
     let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
     let ns = time_ns(|| unsafe { f(xp, yp, op) });
