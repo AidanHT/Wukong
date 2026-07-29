@@ -31,7 +31,9 @@
 //!   printed note + skipped columns otherwise), the harness dumps the *exact* weight/input
 //!   buffers as little-endian f32 blobs and generates a self-contained PyTorch script that
 //!   rebuilds the identical forward: `F.linear` computes `x·Wᵀ` over the same `[out,in]`
-//!   row-major weights Wukong/C use (the layouts coincide — no transposition), `F.layer_norm`
+//!   row-major weights Wukong/C use (the layouts coincide — no transposition), with the Q/K/V
+//!   weights concatenated into HuggingFace's fused `c_attn` `[3D, D]` form (see Known
+//!   asymmetries — the peer is deliberately built the strong way), `F.layer_norm`
 //!   at the same eps=1e-5, the same tanh-approx GELU via `F.gelu(approximate="tanh")`, and
 //!   multi-head causal attention two ways — `F.scaled_dot_product_attention(is_causal=True)`
 //!   (the fused industry path) *and* a manual matmul+softmax variant — under
@@ -86,6 +88,14 @@
 //! * Wukong's GEMMs go to the tuned AVX2/FMA microkernel; C's stay whatever gcc makes of the
 //!   idiomatic nests. That *is* the product claim being measured (a shape-safe tensor language
 //!   whose compiler lowers to tuned kernels), the same basis as `bench_matmul`/`bench_linear`.
+//! * **The torch peer's Q/K/V projection is FUSED and Wukong's is not** — an asymmetry in the
+//!   PEER's favour, on purpose. HuggingFace's `GPT2Attention` issues one `Conv1D` `c_attn` of
+//!   shape `[D, 3D]` (a single `[S,D]x[D,3D]` GEMM), so the peer does too; the Wukong and C
+//!   columns issue three separate `[S,D]x[D,D]` projections. A benchmark must run against the
+//!   strongest honest peer, not the convenient weak one, and QKV fusion is a known open Wukong
+//!   lever — so this ratio charges Wukong for not having it yet. The fusion is bit-exact with the
+//!   three separate `F.linear` calls (same weights, same dot products), so the cross-check
+//!   tolerance is unaffected. The disclosure is printed beside the ratio lines, not only here.
 //! * The `@parallel` Wukong column is fully multicore, in two tiers: the whole-`[S,D]` ops
 //!   outside the head loop (LayerNorms, Q/K/V/WO/down-proj GEMMs, fused-GELU FFN, residual adds)
 //!   dispatch `_parallel` kernels (each bit-identical to its serial twin), and the per-head
@@ -191,6 +201,28 @@ type WukBlockFn = unsafe extern "C" fn(
 
 /// The final-LayerNorm ABI: `(x, gamma, beta, out)`.
 type LnFn = unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32);
+
+/// Argument counts of [`WukBlockFn`] and [`LnFn`]. These fn-pointer types and the Wukong source
+/// that `wk_block` / `wk_final_ln` generate are edited in two different places with nothing in the
+/// type system linking them, and the pair has already gone out of step once historically (the
+/// per-head scratch moved into the loop body and the block ABI went 24 -> 19). If a future edit
+/// adds a parameter to the generated source and forgets the type here, everything still compiles,
+/// `func_ptr("kbench")` still resolves, and the callee reads an uninitialized register as its
+/// output pointer and writes S*D f32 through it — a wild write inside the bench process. So the
+/// lowered function's arity is asserted against these before every transmute.
+const WUK_BLOCK_PARAMS: usize = 19;
+const LN_PARAMS: usize = 4;
+/// Argument count of [`BlockFn`] — the C variant, which keeps the five caller-provided per-head
+/// scratch pointers. Counted back out of the `c_model` prototype for the same reason.
+const C_BLOCK_PARAMS: usize = 24;
+
+/// Parameter count of `entry` in a lowered program (0 if the symbol is absent).
+fn entry_param_count(prog: &wukong_mir::Program, entry: wukong_span::Symbol) -> usize {
+    prog.funcs
+        .iter()
+        .find(|f| f.name == entry)
+        .map_or(0, |f| f.params.len())
+}
 
 struct LayerW {
     ln1g: Vec<f32>,
@@ -569,6 +601,9 @@ struct WukModule {
     compile: Duration,
     /// Optimized-MIR text, for the recognized-kernel dispatch scan.
     mir: String,
+    /// Parameter count of the lowered `kbench`, checked against [`WUK_BLOCK_PARAMS`] /
+    /// [`LN_PARAMS`] before the JIT'd pointer is transmuted to a typed fn pointer.
+    entry_params: usize,
 }
 
 impl WukModule {
@@ -598,6 +633,7 @@ fn compile_wukong(src: &str, interner: &mut Interner) -> Option<WukModule> {
     }
     wukong_opt::optimize(&mut program, 3);
     let mir = wukong_mir::print::print_program(&program, interner);
+    let entry_params = entry_param_count(&program, interner.intern("kbench"));
     let handle = match wukong_codegen_cranelift::jit_module(&program, interner) {
         Ok(h) => h,
         Err(e) => {
@@ -610,6 +646,7 @@ fn compile_wukong(src: &str, interner: &mut Interner) -> Option<WukModule> {
         handle,
         compile,
         mir,
+        entry_params,
     })
 }
 
@@ -649,6 +686,81 @@ fn kernel_calls(mir: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// Split optimized `@parallel` MIR into `(outlined region body, everything else)`. The head loop
+/// is outlined into a `fn wukong$par$…`; `None` means nothing was outlined at all.
+///
+/// The bench and `block_dispatch_sets_pinned` share this so they cannot drift: a
+/// `wukong_parallel_for` call *somewhere* in the MIR proves only that SOME loop was outlined, and
+/// the outliner is free to pick a trivial one (a mask-store loop, say) while the head chain stays
+/// serial. The question that matters — "is the region the HEAD loop?" — is answered by what the
+/// region BODY calls, which is what this split exposes.
+fn par_region_split(mir: &str) -> Option<(String, String)> {
+    let start = mir.find("fn wukong$par$")?;
+    let after = &mir[start..];
+    let end = after[3..].find("\nfn ").map(|i| i + 4).unwrap_or(after.len());
+    Some((
+        after[..end].to_string(),
+        format!("{}{}", &mir[..start], &after[end..]),
+    ))
+}
+
+/// The per-head kernel sequence the outlined `@parallel` region body must contain: the scaled QKᵀ
+/// GEMM, the plain PV GEMM and the batched softmax. If the region body is missing these, the
+/// region is not the head loop and the heads are running serially — a regression that is still
+/// *correct*, so only this scan can see it.
+const PAR_REGION_KERNELS: [&str; 3] = ["wukong_sgemm_nt", "wukong_sgemm_nt_alpha", "wukong_norm_f32"];
+
+/// The suite's magnitude-normalized full-buffer metric `max|Δ| / max|out|`, or `Err(reason)` when
+/// the two buffers **cannot be compared at all**.
+///
+/// The error arms are not pedantry — they are the difference between a cross-check and a rubber
+/// stamp. `zip` truncates to the shorter buffer, so folding a full Wukong output against an EMPTY
+/// peer output yields `max|Δ| = 0`, `max|out|` falls back to the `1e-6` floor, and the caller
+/// prints `PASS` having compared zero elements — next to a fully-reported ms/forward column.
+/// `f32::max` likewise *discards* NaN, so an all-NaN peer output also folds to 0 and passes. A
+/// comparison that inspected nothing must be reported as not-run, never as agreement.
+fn cross_check_rel(ours: &[f32], peer: &[f32]) -> Result<f64, String> {
+    if peer.is_empty() {
+        return Err(format!(
+            "peer produced no output (0 of {} elements) — nothing to compare",
+            ours.len()
+        ));
+    }
+    if ours.len() != peer.len() {
+        return Err(format!(
+            "buffer lengths differ ({} ours vs {} peer) — a peer produced partial output",
+            ours.len(),
+            peer.len()
+        ));
+    }
+    let nonfinite = ours.iter().chain(peer).filter(|v| !v.is_finite()).count();
+    if nonfinite != 0 {
+        return Err(format!(
+            "{nonfinite} non-finite element(s) across the two buffers — max() discards NaN, so a \
+             relative error would be meaningless"
+        ));
+    }
+    let maxabs = peer.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+    let maxerr = ours
+        .iter()
+        .zip(peer)
+        .fold(0.0f32, |m, (&p, &q)| m.max((p - q).abs()));
+    Ok((maxerr / maxabs) as f64)
+}
+
+/// Count the parameters of a generated C prototype. The lists `c_model` emits are flat `float*`
+/// declarations with no nested parentheses, so the commas before the first `)` are the separators.
+fn c_proto_params(src: &str, marker: &str) -> usize {
+    let Some(i) = src.find(marker) else {
+        return 0;
+    };
+    let rest = &src[i + marker.len()..];
+    let Some(close) = rest.find(')') else {
+        return 0;
+    };
+    rest[..close].matches(',').count() + 1
+}
+
 struct CModel {
     _lib: libloading::Library,
     block: BlockFn,
@@ -685,6 +797,21 @@ fn compile_c_model(
             return None;
         }
     }
+    // SAFETY (for the two `libloading::get` casts below): `kbench`/`kfinal` are generated by
+    // `c_model`, whose parameter lists and the `BlockFn`/`LnFn` types are edited in separate
+    // places with nothing linking them. Calling a 25-parameter callee through a 24-argument fn
+    // pointer would have it read an uninitialized register as `out` and write S*D f32 through it,
+    // so the generated prototype's arity is counted rather than trusted.
+    assert_eq!(
+        c_proto_params(src, "void kbench("),
+        C_BLOCK_PARAMS,
+        "c_model's kbench prototype changed but BlockFn was not updated"
+    );
+    assert_eq!(
+        c_proto_params(src, "void kfinal("),
+        LN_PARAMS,
+        "c_model's kfinal prototype changed but LnFn was not updated"
+    );
     unsafe {
         let lib = libloading::Library::new(&dll).ok()?;
         let block: BlockFn = *lib.get::<BlockFn>(b"kbench\0").ok()?;
@@ -1050,12 +1177,18 @@ fn peer_command(ctx: &TorchCtx, script: &Path) -> Command {
 }
 
 // -------------------------------------------------------------------------------------------
-// Power-state disclosure — sustained-load timings taken on battery are not comparable to AC runs
-// (aggressive DVFS / power caps). Queried via the Win32 `GetSystemPowerStatus`, same `extern
-// "system"` pattern as `pin_worker_to_cpu` in wukong_runtime/src/gemm.rs.
+// Power-state disclosure. This machine has THREE regimes, not two, and `tools/measure_gpt2.ps1`
+// (the first-party instrument for the same workload) encodes them:
+//   * BATTERY          — NON-REPORTABLE: single-core noisy, all-core meaningless (2-4x slow).
+//   * AC + CHARGING    — ALL-CORE CAPPED: single core fine, all-core throttled ~25%.
+//   * AC + full        — REPORTABLE: an all-core number is a real claim.
+// Collapsing the middle state into "power: AC" prints a reportable-looking banner over multicore
+// rows that are power-capped. Queried via the Win32 `GetSystemPowerStatus`, same `extern "system"`
+// pattern as `pin_worker_to_cpu` in wukong_runtime/src/gemm.rs — `BatteryFlag & 0x08` is the
+// charging bit, the Win32 equivalent of the `ChargeRate > 0` test measure_gpt2.ps1 uses.
 // -------------------------------------------------------------------------------------------
 
-/// `power: AC` / `power: BATTERY — ...` / `power: unknown`, for the bench headers.
+/// One of the three states above (or `power: unknown`), for the bench headers.
 #[cfg(windows)]
 pub(crate) fn power_status_line() -> String {
     #[repr(C)]
@@ -1083,9 +1216,25 @@ pub(crate) fn power_status_line() -> String {
     if ok == 0 {
         return "power: unknown".to_string();
     }
-    match st.ac_line_status {
-        1 => "power: AC".to_string(),
-        0 => "power: BATTERY — sustained-load results not comparable to AC runs".to_string(),
+    // BatteryFlag: 1 high, 2 low, 4 critical, 8 CHARGING, 128 no system battery, 255 unknown.
+    let charging = st.battery_flag != 255 && st.battery_flag & 0x08 != 0;
+    let no_battery = st.battery_flag != 255 && st.battery_flag & 0x80 != 0;
+    let pct = if st.battery_life_percent <= 100 {
+        format!("{}%", st.battery_life_percent)
+    } else {
+        "?%".to_string()
+    };
+    match (st.ac_line_status, charging, no_battery) {
+        (1, true, _) => format!(
+            "power: AC+CHARGING ({pct}) — ALL-CORE CAPPED (~25%): single-core numbers are fine, \
+             every multicore row below is DIRECTIONAL ONLY"
+        ),
+        (1, false, true) => "power: AC (desktop, no battery) — REPORTABLE".to_string(),
+        (1, false, _) => format!("power: AC+full ({pct}) — REPORTABLE"),
+        (0, _, _) => format!(
+            "power: BATTERY ({pct}) — NON-REPORTABLE: single-core noisy, all-core meaningless \
+             (2-4x slow); not comparable to AC runs"
+        ),
         _ => "power: unknown".to_string(),
     }
 }
@@ -1182,6 +1331,13 @@ for _ in range(LAYERS):
     for n, sh in zip(sizes, shapes):
         ws.append(wbuf[off:off + n].clone().view(sh))
         off += n
+    # HuggingFace GPT2Attention issues the Q/K/V projection as ONE fused `Conv1D` c_attn of shape
+    # [D, 3D] — a single [S,D]x[D,3D] GEMM, not three [S,D]x[D,D] ones. The peer must be the
+    # STRONGEST honest implementation of this forward, so it is built the reference way. It is the
+    # same arithmetic on the same bytes (each output column is the same dot product), verified
+    # bit-exact against the three separate F.linear calls, so the vs-Wukong cross-check tolerance
+    # is unchanged.
+    ws[2:5] = [torch.cat(ws[2:5], dim=0)]     # wq|wk|wv  ->  wqkv [3D, D]
     layers.append(ws)
 assert off == wbuf.numel(), "weight blob size mismatch"
 iobuf = load(IO_PATH)
@@ -1198,12 +1354,17 @@ MASK = torch.triu(torch.ones(S, S, dtype=torch.bool), diagonal=1)
 # One pre-LN block. Linear weights are [out, in] row-major — torch's own x @ W.T layout, byte-
 # identical to what Wukong/C dot against. GELU is the tanh approximation, matching Wukong's
 # gelu() and the C column exactly (same flavor, so the cross-check needs no loosening).
+# The Q/K/V projection is the FUSED HuggingFace `c_attn` form: one [S,D]x[D,3D] GEMM split into
+# three [S,D] views (bit-exact with three separate F.linear calls). Wukong and C issue three
+# separate [D,D] projections — a disclosed asymmetry in the PEER's favour, printed next to the
+# ratio lines, because the peer's job is to be the strongest honest baseline.
 def block(x, w, manual):
-    ln1g, ln1b, wq, wk, wv, wo, ln2g, ln2b, w1, w2 = w
+    ln1g, ln1b, wqkv, wo, ln2g, ln2b, w1, w2 = w
     nrm = F.layer_norm(x, LNSHAPE, ln1g, ln1b, 1e-5)
-    q = F.linear(nrm, wq).view(S, H, HD).transpose(0, 1)
-    k = F.linear(nrm, wk).view(S, H, HD).transpose(0, 1)
-    v = F.linear(nrm, wv).view(S, H, HD).transpose(0, 1)
+    q, k, v = F.linear(nrm, wqkv).split(D, dim=1)
+    q = q.view(S, H, HD).transpose(0, 1)
+    k = k.view(S, H, HD).transpose(0, 1)
+    v = v.view(S, H, HD).transpose(0, 1)
     if manual:
         sc = torch.matmul(q, k.transpose(-2, -1)) * SCALE
         sc = sc.masked_fill(MASK, NEGINF)
@@ -1314,8 +1475,13 @@ with torch.inference_mode():
                 print("TORCH_COMPILED_VS_EAGER_%s %.3e" % (tag, delta), flush=True)
                 if delta <= CTOL:
                     if tag == "1T":
-                        comp1 = fn
+                        # Dump BEFORE binding comp1: the compiled 1T variant is only timed once its
+                        # output has actually landed for the vs-Wukong cross-check. Binding first
+                        # left a dump failure (locked/full temp dir) with comp1 already set, so the
+                        # variant was still timed and the Rust side cross-checked it against an
+                        # empty buffer.
                         dump(out, COUT_PATH)   # the compiled output for the vs-Wukong cross-check
+                        comp1 = fn
                     else:
                         compN = fn
                 else:
@@ -1493,7 +1659,9 @@ fn bench_torch(
         return None;
     }
     // Only accept a compiled output of the right size (it exists only if the compiled path passed
-    // its own vs-eager check); otherwise leave it empty so no compiled column reports a time.
+    // its own vs-eager check and dumped before being bound for timing). Otherwise leave it empty —
+    // and `bench_model_size` then suppresses the compiled column's time, so a variant that produced
+    // no verifiable output never reports one.
     let comp_out = read_f32(&cout_path);
     let comp_out = if comp_out.len() == cfg.s * cfg.d {
         comp_out
@@ -1556,7 +1724,9 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
                  mode=\"max-autotune\", fullgraph=True) (T1c/Tnc). {compile_env}.\n  Same \
                  weights/inputs via little-endian f32 blobs; T1 = set_num_threads(1), Tn = default \
                  all threads;\n  sdpa = F.scaled_dot_product_attention (fused industry path), man = \
-                 manual matmul+softmax; comp = TorchInductor-compiled whole forward.\n",
+                 manual matmul+softmax; comp = TorchInductor-compiled whole forward.\n  Peer \
+                 strength: Q/K/V is ONE fused [D,3D] projection (HuggingFace GPT2 `c_attn`); \
+                 Wukong and C issue three [D,D] projections.\n",
                 t.version, t.py, t.threads
             );
         }
@@ -1700,6 +1870,21 @@ fn interp_gate() -> Option<f64> {
         println!("  ! interp gate: kbench symbol missing — skipping gate\n");
         return None;
     };
+    // SAFETY: `bp`/`lp` are the JIT'd entry points of `wk_block(cfg, false)` and `wk_final_ln`,
+    // whose generated parameter lists are asserted here to still be the 19 / 4 bare array-base
+    // pointers `WukBlockFn` / `LnFn` describe. Wukong lowers every array param to one base
+    // pointer, so an arity match is an ABI match; without the assert an added parameter would
+    // leave the callee writing S*D f32 through an uninitialized register.
+    assert_eq!(
+        entry_param_count(&block_prog, entry),
+        WUK_BLOCK_PARAMS,
+        "wk_block ABI changed but WukBlockFn was not updated"
+    );
+    assert_eq!(
+        entry_param_count(&ln_prog, entry),
+        LN_PARAMS,
+        "wk_final_ln ABI changed but LnFn was not updated"
+    );
     let block_fn: WukBlockFn = unsafe { std::mem::transmute(bp) };
     let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
     let mut sc2 = Scratch::new(cfg);
@@ -1736,6 +1921,13 @@ fn interp_gate() -> Option<f64> {
         println!("  ! interp gate: @parallel kbench symbol missing — skipping gate\n");
         return None;
     };
+    // SAFETY: as above — same generator (`wk_block`, `@parallel` variant), same 19-pointer ABI,
+    // asserted against the lowered signature before the transmute.
+    assert_eq!(
+        entry_param_count(&par_prog, entry),
+        WUK_BLOCK_PARAMS,
+        "wk_block(@parallel) ABI changed but WukBlockFn was not updated"
+    );
     let par_fn: WukBlockFn = unsafe { std::mem::transmute(pp) };
     let mut sc3 = Scratch::new(cfg);
     let (mut xa3, mut xb3) = (vec![0.0f32; sd], vec![0.0f32; sd]);
@@ -1772,6 +1964,12 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         cfg.s,
         flops / 1e9
     );
+    // Sample the power state BEFORE this size and again after it. A single sample at the top of
+    // the run is not enough: a size takes minutes, and an all-core burst on this box can knock the
+    // adapter off mid-sweep — after which every remaining column is battery-throttled with nothing
+    // in the output to say so. `tools/measure_gpt2.ps1` samples per regime for exactly this reason.
+    let power_before = power_status_line();
+    println!("  {power_before}");
 
     // Shared inputs: every column reads the same weight/input buffers.
     let mut seed = 0x0D15EA5E_u64;
@@ -1824,6 +2022,18 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                 println!("  ! wukong kbench symbol missing");
                 return;
             };
+            // SAFETY: `m`/`l` were lowered from `wk_block(cfg, false)` / `wk_final_ln(cfg)`, whose
+            // parameter lists are asserted here to still be the 19 / 4 bare array-base pointers
+            // `WukBlockFn` / `LnFn` declare. The generated source and these types live in separate
+            // places, so the arity is checked rather than trusted.
+            assert_eq!(
+                m.entry_params, WUK_BLOCK_PARAMS,
+                "wk_block ABI changed but WukBlockFn was not updated"
+            );
+            assert_eq!(
+                l.entry_params, LN_PARAMS,
+                "wk_final_ln ABI changed but LnFn was not updated"
+            );
             let block_fn: WukBlockFn = unsafe { std::mem::transmute(bp) };
             let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
             // Big stack: the per-head scratch is loop-body-local in the Wukong block, so the
@@ -1934,14 +2144,32 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                  embedded GEMMs are running serial"
             );
         }
-        // The head loop must have outlined into a parallel region (heads across cores). Without
-        // it the block is still correct — the heads just run as the old serial chain — so only
-        // this scan makes the regression visible.
-        if !calls.iter().any(|(k, _)| k == "wukong_parallel_for") {
-            println!(
+        // The head loop must have outlined into a parallel region (heads across cores) — and it
+        // must be THE HEAD LOOP. A `wukong_parallel_for` call anywhere in the MIR is not evidence
+        // of that: the outliner can pick a trivial loop (a mask-store nest, say) and leave the
+        // head chain serial, which the presence test reported as healthy while the `Wuk scaling`
+        // and `@parallel` ratio lines below described a serial vehicle. Check the region BODY at
+        // every reported S — the unit test only pins the reduced config.
+        match par_region_split(&m.mir) {
+            None => println!(
                 "  ! WARNING: @parallel block did NOT outline the head loop into a \
                  wukong_parallel_for region — heads are running serially"
-            );
+            ),
+            Some((region, _)) => {
+                let rcalls = kernel_calls(&region);
+                let missing: Vec<&str> = PAR_REGION_KERNELS
+                    .into_iter()
+                    .filter(|need| !rcalls.iter().any(|(k, _)| k == need))
+                    .collect();
+                if !missing.is_empty() {
+                    println!(
+                        "  ! WARNING: the outlined wukong_parallel_for region is NOT the head \
+                         loop — its body is missing {missing:?}, so a trivial loop took the \
+                         region and the per-head chain is running SERIALLY; the Wuk(par) column \
+                         below is not an all-core attention vehicle"
+                    );
+                }
+            }
         }
         let lnf = lnf_mod.as_ref()?;
         let (Some(bp), Some(lp)) = (
@@ -1950,6 +2178,17 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         ) else {
             return None;
         };
+        // SAFETY: as the serial column above — `wk_block(cfg, true)` generates the same 19-pointer
+        // `kbench` ABI (the `@parallel` attribute changes the body, never the signature), asserted
+        // against the lowered function before the transmute.
+        assert_eq!(
+            m.entry_params, WUK_BLOCK_PARAMS,
+            "wk_block(@parallel) ABI changed but WukBlockFn was not updated"
+        );
+        assert_eq!(
+            lnf.entry_params, LN_PARAMS,
+            "wk_final_ln ABI changed but LnFn was not updated"
+        );
         let block_fn: WukBlockFn = unsafe { std::mem::transmute(bp) };
         let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
         let ns = on_big_stack(|| {
@@ -2017,12 +2256,30 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             out: out.to_vec(),
         })
     };
+    // The compiled 1-thread variant is the one whose output is dumped for the vs-Wukong
+    // cross-check. If that output did not land, its timing is SUPPRESSED rather than printed
+    // beside an uncheckable column — the invariant `bench_torch` documents, now enforced on this
+    // side too instead of only assumed of the peer script. (`Tn(comp)`, `T1(man)` and `Tn(sdpa)`
+    // dump no output by design; they are timing-only columns and are never cross-checked.)
+    if let Some(t) = &torch_m {
+        if t.comp_1t.is_some() && t.comp_out.len() != sd {
+            println!(
+                "  ! T1(comp) SUPPRESSED — the compiled peer reported a time but dumped {} of {sd} \
+                 output elements, so its result cannot be cross-checked",
+                t.comp_out.len()
+            );
+        }
+    }
     let (torch1_m, torchman_m, torchn_m, torch1c_m, torchnc_m) = match &torch_m {
         Some(t) => (
             mk_torch(t.sdpa_1t, &t.out),
             mk_torch(t.manual_1t, &[]),
             mk_torch(t.sdpa_nt, &[]),
-            mk_comp(t.comp_1t, t.compile_ms_1t, &t.comp_out),
+            mk_comp(
+                t.comp_1t.filter(|_| t.comp_out.len() == sd),
+                t.compile_ms_1t,
+                &t.comp_out,
+            ),
             mk_comp(t.comp_nt, t.compile_ms_nt, &[]),
         ),
         None => (None, None, None, None, None),
@@ -2084,9 +2341,21 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         // any per-forward number).
         if t.comp_1t.is_some() || t.comp_nt.is_some() {
             let wall = |ms: &Option<f64>| ms.map(|m| format!("{m:.0} ms")).unwrap_or_else(|| "n/a".into());
+            // The raw peer telemetry is still echoed when the T1(comp) column was suppressed, so
+            // it has to carry the reason HERE too — this line is itself a point where a number is
+            // printed, and the whole defect being fixed is a peer time appearing without a
+            // verified output behind it.
+            let c1 = if t.comp_1t.is_some() && t.comp_out.len() != sd {
+                format!(
+                    "{} [UNVERIFIED — no output dumped, T1(comp) column suppressed]",
+                    fmt(&t.comp_1t)
+                )
+            } else {
+                fmt(&t.comp_1t)
+            };
             println!(
                 "  torch detail (compiled, max-autotune): comp-1t {} (compile {}); comp-all {} (compile {})",
-                fmt(&t.comp_1t),
+                c1,
                 wall(&t.compile_ms_1t),
                 fmt(&t.comp_nt),
                 wall(&t.compile_ms_nt),
@@ -2170,6 +2439,17 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         "@parallel",
         "PyTorch compiled max-autotune (all threads)",
     );
+    // Disclosed AT THE POINT THE NUMBER IS PRINTED, not only in the module header: every torch
+    // ratio above is measured against the FUSED-c_attn peer, which is the strongest honest form of
+    // this forward and stronger than what Wukong currently emits.
+    if torch1_m.is_some() || torchn_m.is_some() || torch1c_m.is_some() || torchnc_m.is_some() {
+        println!(
+            "     (peer-strength disclosure: the torch columns use HuggingFace GPT2's FUSED \
+             [D,3D] c_attn Q/K/V projection — ONE GEMM; Wukong and C issue THREE [D,D] \
+             projections. QKV fusion is an open Wukong lever, so these ratios charge Wukong for \
+             not having it.)"
+        );
+    }
     if wk_par_m.is_some() {
         println!(
             "     (thread disclosure: both C columns and the T1 torch columns are \
@@ -2184,19 +2464,27 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // 0, so a *per-element* relative error is meaningless on the near-zero elements (catastrophic-
     // cancellation zeros). Use the suite's **magnitude-normalized** metric `max|Δ| / max|out|`
     // (the softmax_bwd / cumsum convention) at the usual 1e-3.
+    // Every non-PASS outcome is also collected so the run ends with ONE loud line: a `!` in the
+    // middle of a long sweep scrolls past, and this bench's callers gate on the exit code, not on
+    // stdout. A comparison that could not be made (`cross_check_rel` -> Err) is reported as NOT RUN
+    // and counted here — it is never allowed to read as agreement.
+    let unpassed = std::cell::RefCell::new(Vec::<String>::new());
     let check = |a: &Option<MeasureModel>, b: &Option<MeasureModel>, who: &str, tol: f64| {
         if let (Some(x), Some(z)) = (a, b) {
-            let maxabs = z.out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
-            let maxerr = x
-                .out
-                .iter()
-                .zip(&z.out)
-                .fold(0.0f32, |m, (&p, &q)| m.max((p - q).abs()));
-            let rel = (maxerr / maxabs) as f64;
-            if rel > tol {
-                println!("  ! full-buffer mismatch {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e})");
-            } else {
-                println!("  cross-check {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e}) — PASS");
+            match cross_check_rel(&x.out, &z.out) {
+                Err(why) => {
+                    println!("  ! cross-check {who}: NOT RUN — {why}");
+                    unpassed.borrow_mut().push(format!("{who}: not run ({why})"));
+                }
+                Ok(rel) if rel > tol => {
+                    println!("  ! full-buffer mismatch {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e})");
+                    unpassed
+                        .borrow_mut()
+                        .push(format!("{who}: max|Δ|/max|out| = {rel:.2e} > tol {tol:.0e}"));
+                }
+                Ok(rel) => {
+                    println!("  cross-check {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e}) — PASS")
+                }
             }
         }
     };
@@ -2213,22 +2501,112 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // twin (fixed chunking / row-mapped) and the outlined glue loops are deterministic, so this one
     // stays the strict per-element check — it is expected EXACT.
     if let (Some(x), Some(z)) = (&wk_m, &wk_par_m) {
-        let (rel, at) = max_rel_err(&x.out, &z.out);
-        if rel > 0.0 {
+        if x.out.len() != z.out.len() || x.out.is_empty() {
             println!(
-                "  ! Wukong serial vs @parallel differ at [{at}]: {} vs {} (rel {rel:.2e}) — \
-                 expected bit-exact",
-                x.out[at], z.out[at]
+                "  ! cross-check Wukong serial vs @parallel: NOT RUN — buffer lengths {} vs {}",
+                x.out.len(),
+                z.out.len()
             );
+            unpassed
+                .borrow_mut()
+                .push("Wukong serial vs @parallel: not run (buffer length disagreement)".into());
         } else {
-            println!("  cross-check Wukong serial vs @parallel: BIT-EXACT");
+            let (rel, at) = max_rel_err(&x.out, &z.out);
+            if rel > 0.0 {
+                println!(
+                    "  ! Wukong serial vs @parallel differ at [{at}]: {} vs {} (rel {rel:.2e}) — \
+                     expected bit-exact",
+                    x.out[at], z.out[at]
+                );
+                unpassed
+                    .borrow_mut()
+                    .push(format!("Wukong serial vs @parallel: rel {rel:.2e} at [{at}], expected bit-exact"));
+            } else {
+                println!("  cross-check Wukong serial vs @parallel: BIT-EXACT");
+            }
         }
+    }
+
+    // The second power sample. A state change across the size means the columns above were taken
+    // under two different machines, so none of them is comparable to any other.
+    let power_after = power_status_line();
+    if power_after == power_before {
+        println!("  {power_after} (unchanged before -> after this size)");
+    } else {
+        println!(
+            "  !!! POWER STATE CHANGED DURING S={} — every timing above is NON-REPORTABLE\n      \
+             before: {power_before}\n      after:  {power_after}",
+            cfg.s
+        );
+    }
+
+    // One loud terminal line per size, so a failed or un-runnable cross-check cannot be mistaken
+    // for a clean sweep by anyone skimming the table.
+    let unpassed = unpassed.into_inner();
+    if !unpassed.is_empty() {
+        println!(
+            "  !!! {} CROSS-CHECK(S) DID NOT PASS at S={} — the timings above are NOT trustworthy: {}",
+            unpassed.len(),
+            cfg.s,
+            unpassed.join("; ")
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cross-check that inspected no elements must never report agreement. The old closure
+    /// `zip`ped the two buffers, so an EMPTY or truncated peer output folded to `max|Δ| = 0` and
+    /// printed `PASS` beside a fully-reported ms/forward column; `f32::max` discarding NaN gave
+    /// an all-NaN peer the same free pass. All three must come back as `Err`.
+    #[test]
+    fn cross_check_refuses_vacuous_comparisons() {
+        let ours: Vec<f32> = (0..1024).map(|i| (i % 97) as f32 * 0.031 - 1.5).collect();
+
+        // No peer output at all — the compiled-peer dump-failure path.
+        assert!(cross_check_rel(&ours, &[]).is_err(), "empty peer must not pass");
+        // Partial peer output: zip truncates, so this used to read as a perfect match.
+        assert!(
+            cross_check_rel(&ours, &ours[..4]).is_err(),
+            "truncated peer must not pass"
+        );
+        // All-NaN peer: max() discards NaN, so maxerr folded to 0.0.
+        let nans = vec![f32::NAN; ours.len()];
+        assert!(cross_check_rel(&ours, &nans).is_err(), "NaN peer must not pass");
+
+        // Real comparisons still produce the same magnitude-normalized number as before.
+        assert_eq!(cross_check_rel(&ours, &ours), Ok(0.0));
+        let off: Vec<f32> = ours.iter().map(|v| v + 1.0).collect();
+        let maxabs = off.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let rel = cross_check_rel(&ours, &off).expect("equal-length finite buffers compare");
+        assert!(
+            (rel - (1.0 / maxabs) as f64).abs() < 1e-9,
+            "magnitude-normalized metric changed: {rel}"
+        );
+    }
+
+    /// The JIT'd and `dlopen`ed entry points are reached through `transmute` / `libloading::get`,
+    /// whose safety rests entirely on the generated sources' parameter lists matching the
+    /// hand-written fn-pointer types. The bench asserts that on every run; this is the cheap
+    /// `cargo test` mirror, so the mismatch is caught before anyone calls through the pointer.
+    #[test]
+    fn generated_entry_arities_match_the_fn_pointer_types() {
+        let cfg = Cfg { s: 16, d: 64, h: 4, dff: 256 };
+        let mut interner = Interner::new();
+        let entry = interner.intern("kbench");
+        let block = build_program(&wk_block(cfg, false), &mut interner).expect("block lowers");
+        let par = build_program(&wk_block(cfg, true), &mut interner).expect("@parallel lowers");
+        let ln = build_program(&wk_final_ln(cfg), &mut interner).expect("final LN lowers");
+        assert_eq!(entry_param_count(&block, entry), WUK_BLOCK_PARAMS, "WukBlockFn arity");
+        assert_eq!(entry_param_count(&par, entry), WUK_BLOCK_PARAMS, "WukBlockFn arity (@parallel)");
+        assert_eq!(entry_param_count(&ln, entry), LN_PARAMS, "LnFn arity");
+
+        let c = c_model(cfg);
+        assert_eq!(c_proto_params(&c, "void kbench("), C_BLOCK_PARAMS, "BlockFn arity");
+        assert_eq!(c_proto_params(&c, "void kfinal("), LN_PARAMS, "LnFn arity (C)");
+    }
 
     /// Pin the model block's recognized-kernel dispatch sets for BOTH variants. The recognizers
     /// are gate-blind (interp and native call the same symbol), so a silent regression to scalar
@@ -2278,16 +2656,15 @@ mod tests {
         // SERIAL inside the region (the region supplies the threading — the identical op sequence
         // the serial spelling runs, which is the serial == @parallel bit-exactness argument), and
         // NO serial NT GEMM may appear outside it.
-        let start = par
-            .mir
-            .find("fn wukong$par$")
-            .expect("outlined head-region body missing from @parallel MIR");
-        let after = &par.mir[start..];
-        let end = after[3..].find("\nfn ").map(|i| i + 4).unwrap_or(after.len());
-        let region = &after[..end];
-        let rest = format!("{}{}", &par.mir[..start], &after[end..]);
-        let rcalls = kernel_calls(region);
-        for need in ["wukong_sgemm_nt", "wukong_sgemm_nt_alpha", "wukong_norm_f32"] {
+        //
+        // This uses the same `par_region_split` + `PAR_REGION_KERNELS` the bench applies at every
+        // reported S, so the runtime warning and this test cannot disagree about what "the head
+        // loop was outlined" means. The reduced config is kept here only for speed — the full
+        // 768-wide configs are covered by the identical check inside `bench_model_size`.
+        let (region, rest) =
+            par_region_split(&par.mir).expect("outlined head-region body missing from @parallel MIR");
+        let rcalls = kernel_calls(&region);
+        for need in PAR_REGION_KERNELS {
             assert!(
                 rcalls.iter().any(|(k, _)| k == need),
                 "region body lost per-head serial dispatch {need}; got {rcalls:?}"
@@ -2301,6 +2678,35 @@ mod tests {
         assert!(
             !restc.iter().any(|(k, _)| k == "wukong_sgemm_nt"),
             "@parallel block emits serial wukong_sgemm_nt outside the region; got {restc:?}"
+        );
+    }
+
+    /// The peer must stay the STRONGEST honest implementation of this forward. The model bench
+    /// previously compared against an unfused manual forward rather than the `Conv1D`-fused
+    /// HuggingFace path, and the strongest-peer measurement of the same workload came out the
+    /// other way round — so the fused `c_attn` form is pinned here, not left to review.
+    #[test]
+    fn torch_peer_uses_the_fused_hf_qkv_projection() {
+        let cfg = Cfg { s: 128, d: 768, h: 12, dff: 3072 };
+        let p = Path::new("unused.bin");
+        let src = torch_script(cfg, p, p, p, p, true);
+        assert!(
+            src.contains("ws[2:5] = [torch.cat(ws[2:5], dim=0)]"),
+            "peer no longer builds HuggingFace's fused [3D, D] c_attn weight"
+        );
+        assert!(
+            src.contains("q, k, v = F.linear(nrm, wqkv).split(D, dim=1)"),
+            "peer no longer issues the Q/K/V projection as ONE fused GEMM"
+        );
+        assert!(
+            !src.contains("F.linear(nrm, wq)"),
+            "peer regressed to three separate Q/K/V projections — that is the weaker peer the \
+             band standard forbids"
+        );
+        // The asymmetry must be disclosed where the ratio is read, not only in a doc elsewhere.
+        assert!(
+            src.contains("HuggingFace"),
+            "the fused-projection asymmetry lost its in-script disclosure"
         );
     }
 
