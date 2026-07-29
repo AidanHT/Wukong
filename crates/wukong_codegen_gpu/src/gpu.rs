@@ -1133,6 +1133,12 @@ pub(crate) fn gemm_nt_f16_cliff(
         .iter()
         .find(|v| v.name == name)
         .unwrap_or_else(|| panic!("unknown cliff variant {name}"));
+    // The same input contract every sibling GEMM wrapper states (gemm_nt, gemm_nt_f16,
+    // gemm_nt_f16_pipe, …): the kernel indexes A up to m*k and B up to n*k, so a short slice is an
+    // out-of-bounds *device* read folded into C — a wrong GEMM with no diagnostic — rather than a
+    // panic naming the violated contract.
+    assert_eq!(a.len(), m * k, "A must be m×k");
+    assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{} requires M%{}==0, N%{}==0, K%{}==0",
@@ -1204,6 +1210,13 @@ fn gemm_nt_f16_pipe_fused_bias_v(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
+    // Launch-arity seam: this wrapper always pushes 7 args (…, pC, pBias), so `entry` must name a
+    // `_bias` variant and must NOT name a `_residual` one (which declares a further `pResidual`
+    // param the driver would then read off the end of the argument vector).
+    assert!(
+        entry.contains("_bias") && !entry.contains("_residual"),
+        "{entry}: pushed launch args must match the kernel's declared .param count"
+    );
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{entry} requires M%{}==0, N%{}==0, K%{}==0",
@@ -1444,6 +1457,16 @@ fn gemm_nt_f16_gate(
     assert_eq!(x.len(), m * k);
     assert_eq!(wg.len(), n * k);
     assert_eq!(wu.len(), n * k);
+    // Launch-arity seam: `entry_mma_gate` emits 7 `.param` slots for a biasless gate and 9 for a
+    // `*_bias` one, and this wrapper pushes 7 or 9 depending on `bias`. The two are independent
+    // parameters, so pair them explicitly — a mismatch hands `cuLaunchKernel` a short argument
+    // vector, the driver reads two words of adjacent host stack as `pBiasG`/`pBiasU`, and the kernel
+    // loads through them (illegal address, or silently wrong gate output).
+    assert_eq!(
+        entry.contains("_bias"),
+        bias.is_some(),
+        "{entry}: pushed launch args must match the kernel's declared .param count"
+    );
     assert!(m % 128 == 0 && n % 64 == 0 && k % 32 == 0, "{entry} requires M%128==0, N%64==0, K%32==0");
     let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
     let wg16: Vec<f16> = wg.iter().map(|&v| f16::from_f32(v)).collect();
@@ -1488,6 +1511,12 @@ fn gemm_nt_bf16_gate(
     assert_eq!(x.len(), m * k);
     assert_eq!(wg.len(), n * k);
     assert_eq!(wu.len(), n * k);
+    // Same launch-arity seam as [`gemm_nt_f16_gate`] — 7 params biasless, 9 for a `*_bias` entry.
+    assert_eq!(
+        entry.contains("_bias"),
+        bias.is_some(),
+        "{entry}: pushed launch args must match the kernel's declared .param count"
+    );
     assert!(m % 128 == 0 && n % 64 == 0 && k % 32 == 0, "{entry} requires M%128==0, N%64==0, K%32==0");
     let xb: Vec<bf16> = x.iter().map(|&v| bf16::from_f32(v)).collect();
     let wgb: Vec<bf16> = wg.iter().map(|&v| bf16::from_f32(v)).collect();
@@ -2009,16 +2038,32 @@ pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
 /// combine it with [`wmma_flash_cfg`], and the warp-specialized kernels need a different launch shape.
 /// The warp-specialized S≥4096 override (default ON, `WUKONG_FLASH_WS=0` kill-switch) lives in
 /// [`wmma_flash_plan`] (entry + config together).
+///
+/// **Total on its contract, not on all of `usize`.** `d == 32` is in `ptx_flash::SUPPORTED_D` and
+/// reaches `ResidentLayerF16::new_mha`'s first assert, but has no tensor-core flash kernel; a silent
+/// `else` fallback would hand it `flash_d64_mp`, which strides Q/O by 64 over 32-wide rows — one
+/// head reading and overwriting the next, and the last head running off the end of the allocation.
+/// So an unsupported `d` panics here rather than at the far end of a wrong-answer.
 pub(crate) fn wmma_flash_entry(d: usize, _s: usize) -> &'static str {
-    if d == 128 {
-        "flash_d128_mp_lm"
-    } else {
-        "flash_d64_mp"
+    match d {
+        64 => "flash_d64_mp",
+        128 => "flash_d128_mp_lm",
+        other => panic!(
+            "wmma_flash_entry: no tensor-core flash kernel for head dim {other} \
+             (wmma_flash_applies must gate this call)"
+        ),
     }
 }
 
 /// Launch config for the tensor-core flash kernels (`flash_d64_w`/`_w4`): one warp per 16-query-row block.
+/// `S % 16 != 0` would truncate the grid and silently drop the tail query rows, so it is rejected here
+/// rather than only in the separate [`wmma_flash_applies`] predicate every caller must remember to run.
 pub(crate) fn wmma_flash_cfg(s: usize) -> LaunchConfig {
+    assert_eq!(
+        s % 16,
+        0,
+        "wmma_flash_cfg: S={s} must be a multiple of 16 (the kernel's 16-query-row block)"
+    );
     LaunchConfig {
         grid_dim: ((s / 16) as u32, 1, 1),
         block_dim: (32, 1, 1),
@@ -2082,6 +2127,13 @@ pub(crate) fn ws_flash_cfg(s: usize) -> LaunchConfig {
 /// grid `ceil((S/16)/2)`): callers that pair them independently would deadlock a 64-thread named-barrier
 /// kernel on a 32-thread launch. `heads` lands in `grid_dim.1` (1 for single-head).
 pub(crate) fn wmma_flash_plan(d: usize, s: usize, heads: usize) -> (&'static str, LaunchConfig) {
+    // Fold the precondition into the seam itself, so an (entry, cfg) pair can never be built for a
+    // shape no tensor-core flash kernel covers — rather than leaving it to the separate
+    // `wmma_flash_applies` predicate every caller must remember to run first.
+    assert!(
+        wmma_flash_applies(d, s),
+        "wmma_flash_plan: no tensor-core flash kernel for (d={d}, S={s}) — needs D ∈ {{64, 128}}, S % 16 == 0, S >= 512"
+    );
     let (entry, mut cfg) = match ws_flash_route(d, s) {
         Some(e) => (e, ws_flash_cfg(s)),
         None => (wmma_flash_entry(d, s), wmma_flash_cfg(s)),
@@ -3248,6 +3300,12 @@ impl ResidentLayerF16 {
     /// Q/K/V to head-major f16 `[H,S,dh]`, run the tensor-core flash with `grid.y = heads` (each head an
     /// independent CTA column via the kernel's `hoff = ctaid.y·S·dh`), then transpose the `[H,S,dh]`
     /// output back to `[S,D]`. The seam both forward paths share.
+    ///
+    /// `s` must be `self.s`: the flash *entry* in `f_flash_w` was resolved at construction from
+    /// `self.s`, and only its launch *config* is rebuilt here. A different `s` would pair one plan's
+    /// entry with another plan's geometry — e.g. a layer built at S=4096 (whose entry is the 2-warp
+    /// named-barrier `flash_d64_ws`) called at S=512 would rebuild a 32-thread config and deadlock
+    /// the kernel on a barrier that never sees 64 threads.
     fn run_attn(
         &self,
         q: &cudarc::driver::CudaSlice<f32>,
@@ -3256,6 +3314,7 @@ impl ResidentLayerF16 {
         s: usize,
         _d: usize,
     ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
+        assert_eq!(s, self.s, "run_attn: the flash entry was resolved for S={}", self.s);
         let scale = 1.0f32 / (self.dh as f32).sqrt();
         let ss = s as u32;
         if self.heads == 1 {
@@ -17582,6 +17641,42 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// cross-checks ws vs the production `mp`/`mp_lm` output at S=2048 (like `flash_lm_vs_mp`), and pins
     /// the dispatch wiring: default routing (env unset) unchanged, ws routing shape-correct and
     /// structurally unable to reach the S<=512 win regimes.
+    /// **The tensor-core flash dispatch seam is total on its contract.** `wmma_flash_entry` /
+    /// `wmma_flash_cfg` / `wmma_flash_plan` used to accept any `(d, s)` and answer with a *plausible
+    /// but wrong* plan: `d == 32` (which is in `ptx_flash::SUPPORTED_D` and passes `new_mha`'s first
+    /// assert) fell through to the D=64 kernel, which strides Q/O by 64 over 32-wide rows — head `h`
+    /// reading and overwriting head `h+1`, and the last head running `S*32` elements off the end of
+    /// the allocation; and `s % 16 != 0` truncated the grid, silently dropping the tail query rows.
+    /// Neither is reachable from today's call sites, all of which are guarded by
+    /// `wmma_flash_applies` — this pins that the seam now rejects them itself, so a future caller
+    /// that forgets the predicate gets a panic instead of a silent wrong answer plus an OOB read.
+    /// Pure functions of the shape; needs no device.
+    #[test]
+    fn wmma_flash_seam_rejects_shapes_it_has_no_kernel_for() {
+        let bad = |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+        // Supported head dims still answer exactly as before.
+        assert_eq!(wmma_flash_entry(64, 512), "flash_d64_mp");
+        assert_eq!(wmma_flash_entry(128, 512), "flash_d128_mp_lm");
+        // dh=32 is in SUPPORTED_D for the f32 flash but has no tensor-core kernel.
+        assert!(bad(&|| { wmma_flash_entry(32, 512); }), "d=32 must not silently take the D=64 kernel");
+        assert!(bad(&|| { wmma_flash_entry(96, 512); }), "d=96 must not silently take the D=64 kernel");
+        // The 16-query-row block: a ragged S would truncate the grid and drop the tail rows.
+        assert_eq!(wmma_flash_cfg(512).grid_dim.0, 32);
+        assert!(bad(&|| { wmma_flash_cfg(520); }), "S%16!=0 must not silently truncate the grid");
+        // The whole plan carries the precondition, so an (entry, cfg) pair cannot be built at all
+        // for a shape outside `wmma_flash_applies`.
+        for (d, s) in [(32usize, 512usize), (64, 520), (64, 256), (96, 1024)] {
+            assert!(!wmma_flash_applies(d, s), "test shape (d={d}, S={s}) must be out of contract");
+            assert!(bad(&|| { wmma_flash_plan(d, s, 1); }), "wmma_flash_plan(d={d}, S={s}) must reject");
+        }
+        for (d, s) in [(64usize, 512usize), (64, 4096), (128, 512), (128, 4096)] {
+            assert!(wmma_flash_applies(d, s));
+            let (_, cfg) = wmma_flash_plan(d, s, 4);
+            assert_eq!(cfg.grid_dim.1, 4, "heads land in grid.y");
+        }
+        eprintln!("[gate] tensor-core flash seam is total on wmma_flash_applies ✓");
+    }
+
     #[test]
     fn ws_flash_matches_reference_within_tol() {
         use half::f16;
