@@ -278,6 +278,24 @@ const RT_AXPBY_F16_OUT: &str = "wukong_axpby_f16_out";
 const RT_FMOD_F64: &str = "wukong_rt_fmod_f64";
 const RT_FMOD_F32: &str = "wukong_rt_fmod_f32";
 
+/// Flags for every load/store this backend emits: `notrap` (the address is in-bounds by
+/// construction — bounds checks happen upstream) but deliberately **not** `aligned`.
+///
+/// Cranelift's `trusted()` is `notrap | aligned`, and it documents `aligned` as a promise the
+/// caller makes: "the instruction is permitted to trap or return a wrong result if the effective
+/// address is misaligned" (`ir/memflags.rs`). This backend cannot make that promise. The 128-bit
+/// CLIF vectorizer emits `load.f32x4`/`store.f32x4` at addresses it *knows* are not 16-byte
+/// aligned — `for i in 1..4095 { c[i] = ... }` over `[f32; 4096]` locals lowers to a vector load at
+/// `alloca_base + 4`. On this AVX2 host nothing faults because the x64 ISLE rules pick VEX forms,
+/// which tolerate misalignment; on an x86-64 host without AVX, `xmm_mem_to_xmm_mem_aligned`
+/// (`isa/x64/lower/isle.rs`) sees the `aligned` bit, embeds the misaligned operand straight into a
+/// legacy SSE instruction instead of loading it through `movups`, and the program takes a #GP on
+/// the first vectorized iteration. Dropping the flag is strictly weaker: it can only make Cranelift
+/// materialize an unaligned load it would otherwise have folded, never introduce a fault.
+fn mem_flags() -> MemFlags {
+    MemFlags::new().with_notrap()
+}
+
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
 enum Intrinsic {
@@ -642,7 +660,7 @@ impl<'a> FnTranslator<'a> {
                     let half = self
                         .builder
                         .ins()
-                        .load(types::I16, MemFlags::trusted(), addr, 0);
+                        .load(types::I16, mem_flags(), addr, 0);
                     let ext = self.builder.ins().uextend(types::I32, half);
                     let shifted = self.builder.ins().ishl_imm(ext, 16);
                     self.builder
@@ -654,14 +672,14 @@ impl<'a> FnTranslator<'a> {
                     let half = self
                         .builder
                         .ins()
-                        .load(types::I16, MemFlags::trusted(), addr, 0);
+                        .load(types::I16, mem_flags(), addr, 0);
                     let ext = self.builder.ins().uextend(types::I32, half);
                     let fref = self.rt_refs[RT_F16_TO_F32];
                     let call = self.builder.ins().call(fref, &[ext]);
                     self.builder.inst_results(call)[0]
                 } else {
                     let t = cl_type(ty, self.ptr_ty).unwrap_or(self.ptr_ty);
-                    self.builder.ins().load(t, MemFlags::trusted(), addr, 0)
+                    self.builder.ins().load(t, mem_flags(), addr, 0)
                 }
             }
             Op::Store { ptr, value } => {
@@ -676,7 +694,7 @@ impl<'a> FnTranslator<'a> {
                         .bitcast(types::I32, MemFlags::new(), rounded);
                     let hi = self.builder.ins().ushr_imm(bits, 16);
                     let half = self.builder.ins().ireduce(types::I16, hi);
-                    self.builder.ins().store(MemFlags::trusted(), half, addr, 0);
+                    self.builder.ins().store(mem_flags(), half, addr, 0);
                 } else if matches!(self.ty_of(*value), MirType::F16) {
                     // Round the f32 register to f16 via the runtime shim, store the 16 bits (2 bytes).
                     let v = self.val(*value);
@@ -684,10 +702,10 @@ impl<'a> FnTranslator<'a> {
                     let call = self.builder.ins().call(fref, &[v]);
                     let bits = self.builder.inst_results(call)[0]; // i32, low 16 = f16 bits
                     let half = self.builder.ins().ireduce(types::I16, bits);
-                    self.builder.ins().store(MemFlags::trusted(), half, addr, 0);
+                    self.builder.ins().store(mem_flags(), half, addr, 0);
                 } else {
                     let v = self.val(*value);
-                    self.builder.ins().store(MemFlags::trusted(), v, addr, 0);
+                    self.builder.ins().store(mem_flags(), v, addr, 0);
                 }
                 return;
             }
