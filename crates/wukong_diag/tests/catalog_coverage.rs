@@ -48,9 +48,19 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Every `"Ennnn"` / `"Cnnnn"` string literal in `src`, paired with its 1-based line.
+///
+/// Comment lines are skipped. A code named in prose is *documentation*, not an emit site, and
+/// counting it makes this gate fire on a file that merely explains the numbering — which is what
+/// happened for `E0210`, quoted inside a doc comment in `wukongc/tests/fail.rs` that describes a
+/// hypothetical renumbering. Scanning only non-comment lines keeps the gate's meaning ("a code the
+/// compiler can actually emit") intact while letting docs cite codes freely.
 fn codes_in(src: &str) -> Vec<(String, usize)> {
     let mut found = Vec::new();
     for (i, line) in src.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
         let b = line.as_bytes();
         for j in 0..b.len().saturating_sub(6) {
             if b[j] == b'"'
