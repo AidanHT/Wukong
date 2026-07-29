@@ -649,6 +649,44 @@ fn kernel_calls(mir: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// The suite's magnitude-normalized full-buffer metric `max|Δ| / max|out|`, or `Err(reason)` when
+/// the two buffers **cannot be compared at all**.
+///
+/// The error arms are not pedantry — they are the difference between a cross-check and a rubber
+/// stamp. `zip` truncates to the shorter buffer, so folding a full Wukong output against an EMPTY
+/// peer output yields `max|Δ| = 0`, `max|out|` falls back to the `1e-6` floor, and the caller
+/// prints `PASS` having compared zero elements — next to a fully-reported ms/forward column.
+/// `f32::max` likewise *discards* NaN, so an all-NaN peer output also folds to 0 and passes. A
+/// comparison that inspected nothing must be reported as not-run, never as agreement.
+fn cross_check_rel(ours: &[f32], peer: &[f32]) -> Result<f64, String> {
+    if peer.is_empty() {
+        return Err(format!(
+            "peer produced no output (0 of {} elements) — nothing to compare",
+            ours.len()
+        ));
+    }
+    if ours.len() != peer.len() {
+        return Err(format!(
+            "buffer lengths differ ({} ours vs {} peer) — a peer produced partial output",
+            ours.len(),
+            peer.len()
+        ));
+    }
+    let nonfinite = ours.iter().chain(peer).filter(|v| !v.is_finite()).count();
+    if nonfinite != 0 {
+        return Err(format!(
+            "{nonfinite} non-finite element(s) across the two buffers — max() discards NaN, so a \
+             relative error would be meaningless"
+        ));
+    }
+    let maxabs = peer.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+    let maxerr = ours
+        .iter()
+        .zip(peer)
+        .fold(0.0f32, |m, (&p, &q)| m.max((p - q).abs()));
+    Ok((maxerr / maxabs) as f64)
+}
+
 struct CModel {
     _lib: libloading::Library,
     block: BlockFn,
@@ -1314,8 +1352,13 @@ with torch.inference_mode():
                 print("TORCH_COMPILED_VS_EAGER_%s %.3e" % (tag, delta), flush=True)
                 if delta <= CTOL:
                     if tag == "1T":
-                        comp1 = fn
+                        # Dump BEFORE binding comp1: the compiled 1T variant is only timed once its
+                        # output has actually landed for the vs-Wukong cross-check. Binding first
+                        # left a dump failure (locked/full temp dir) with comp1 already set, so the
+                        # variant was still timed and the Rust side cross-checked it against an
+                        # empty buffer.
                         dump(out, COUT_PATH)   # the compiled output for the vs-Wukong cross-check
+                        comp1 = fn
                     else:
                         compN = fn
                 else:
@@ -1493,7 +1536,9 @@ fn bench_torch(
         return None;
     }
     // Only accept a compiled output of the right size (it exists only if the compiled path passed
-    // its own vs-eager check); otherwise leave it empty so no compiled column reports a time.
+    // its own vs-eager check and dumped before being bound for timing). Otherwise leave it empty —
+    // and `bench_model_size` then suppresses the compiled column's time, so a variant that produced
+    // no verifiable output never reports one.
     let comp_out = read_f32(&cout_path);
     let comp_out = if comp_out.len() == cfg.s * cfg.d {
         comp_out
@@ -2017,12 +2062,30 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             out: out.to_vec(),
         })
     };
+    // The compiled 1-thread variant is the one whose output is dumped for the vs-Wukong
+    // cross-check. If that output did not land, its timing is SUPPRESSED rather than printed
+    // beside an uncheckable column — the invariant `bench_torch` documents, now enforced on this
+    // side too instead of only assumed of the peer script. (`Tn(comp)`, `T1(man)` and `Tn(sdpa)`
+    // dump no output by design; they are timing-only columns and are never cross-checked.)
+    if let Some(t) = &torch_m {
+        if t.comp_1t.is_some() && t.comp_out.len() != sd {
+            println!(
+                "  ! T1(comp) SUPPRESSED — the compiled peer reported a time but dumped {} of {sd} \
+                 output elements, so its result cannot be cross-checked",
+                t.comp_out.len()
+            );
+        }
+    }
     let (torch1_m, torchman_m, torchn_m, torch1c_m, torchnc_m) = match &torch_m {
         Some(t) => (
             mk_torch(t.sdpa_1t, &t.out),
             mk_torch(t.manual_1t, &[]),
             mk_torch(t.sdpa_nt, &[]),
-            mk_comp(t.comp_1t, t.compile_ms_1t, &t.comp_out),
+            mk_comp(
+                t.comp_1t.filter(|_| t.comp_out.len() == sd),
+                t.compile_ms_1t,
+                &t.comp_out,
+            ),
             mk_comp(t.comp_nt, t.compile_ms_nt, &[]),
         ),
         None => (None, None, None, None, None),
@@ -2184,19 +2247,27 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // 0, so a *per-element* relative error is meaningless on the near-zero elements (catastrophic-
     // cancellation zeros). Use the suite's **magnitude-normalized** metric `max|Δ| / max|out|`
     // (the softmax_bwd / cumsum convention) at the usual 1e-3.
+    // Every non-PASS outcome is also collected so the run ends with ONE loud line: a `!` in the
+    // middle of a long sweep scrolls past, and this bench's callers gate on the exit code, not on
+    // stdout. A comparison that could not be made (`cross_check_rel` -> Err) is reported as NOT RUN
+    // and counted here — it is never allowed to read as agreement.
+    let unpassed = std::cell::RefCell::new(Vec::<String>::new());
     let check = |a: &Option<MeasureModel>, b: &Option<MeasureModel>, who: &str, tol: f64| {
         if let (Some(x), Some(z)) = (a, b) {
-            let maxabs = z.out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
-            let maxerr = x
-                .out
-                .iter()
-                .zip(&z.out)
-                .fold(0.0f32, |m, (&p, &q)| m.max((p - q).abs()));
-            let rel = (maxerr / maxabs) as f64;
-            if rel > tol {
-                println!("  ! full-buffer mismatch {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e})");
-            } else {
-                println!("  cross-check {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e}) — PASS");
+            match cross_check_rel(&x.out, &z.out) {
+                Err(why) => {
+                    println!("  ! cross-check {who}: NOT RUN — {why}");
+                    unpassed.borrow_mut().push(format!("{who}: not run ({why})"));
+                }
+                Ok(rel) if rel > tol => {
+                    println!("  ! full-buffer mismatch {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e})");
+                    unpassed
+                        .borrow_mut()
+                        .push(format!("{who}: max|Δ|/max|out| = {rel:.2e} > tol {tol:.0e}"));
+                }
+                Ok(rel) => {
+                    println!("  cross-check {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e}) — PASS")
+                }
             }
         }
     };
@@ -2213,22 +2284,78 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // twin (fixed chunking / row-mapped) and the outlined glue loops are deterministic, so this one
     // stays the strict per-element check — it is expected EXACT.
     if let (Some(x), Some(z)) = (&wk_m, &wk_par_m) {
-        let (rel, at) = max_rel_err(&x.out, &z.out);
-        if rel > 0.0 {
+        if x.out.len() != z.out.len() || x.out.is_empty() {
             println!(
-                "  ! Wukong serial vs @parallel differ at [{at}]: {} vs {} (rel {rel:.2e}) — \
-                 expected bit-exact",
-                x.out[at], z.out[at]
+                "  ! cross-check Wukong serial vs @parallel: NOT RUN — buffer lengths {} vs {}",
+                x.out.len(),
+                z.out.len()
             );
+            unpassed
+                .borrow_mut()
+                .push("Wukong serial vs @parallel: not run (buffer length disagreement)".into());
         } else {
-            println!("  cross-check Wukong serial vs @parallel: BIT-EXACT");
+            let (rel, at) = max_rel_err(&x.out, &z.out);
+            if rel > 0.0 {
+                println!(
+                    "  ! Wukong serial vs @parallel differ at [{at}]: {} vs {} (rel {rel:.2e}) — \
+                     expected bit-exact",
+                    x.out[at], z.out[at]
+                );
+                unpassed
+                    .borrow_mut()
+                    .push(format!("Wukong serial vs @parallel: rel {rel:.2e} at [{at}], expected bit-exact"));
+            } else {
+                println!("  cross-check Wukong serial vs @parallel: BIT-EXACT");
+            }
         }
+    }
+
+    // One loud terminal line per size, so a failed or un-runnable cross-check cannot be mistaken
+    // for a clean sweep by anyone skimming the table.
+    let unpassed = unpassed.into_inner();
+    if !unpassed.is_empty() {
+        println!(
+            "  !!! {} CROSS-CHECK(S) DID NOT PASS at S={} — the timings above are NOT trustworthy: {}",
+            unpassed.len(),
+            cfg.s,
+            unpassed.join("; ")
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cross-check that inspected no elements must never report agreement. The old closure
+    /// `zip`ped the two buffers, so an EMPTY or truncated peer output folded to `max|Δ| = 0` and
+    /// printed `PASS` beside a fully-reported ms/forward column; `f32::max` discarding NaN gave
+    /// an all-NaN peer the same free pass. All three must come back as `Err`.
+    #[test]
+    fn cross_check_refuses_vacuous_comparisons() {
+        let ours: Vec<f32> = (0..1024).map(|i| (i % 97) as f32 * 0.031 - 1.5).collect();
+
+        // No peer output at all — the compiled-peer dump-failure path.
+        assert!(cross_check_rel(&ours, &[]).is_err(), "empty peer must not pass");
+        // Partial peer output: zip truncates, so this used to read as a perfect match.
+        assert!(
+            cross_check_rel(&ours, &ours[..4]).is_err(),
+            "truncated peer must not pass"
+        );
+        // All-NaN peer: max() discards NaN, so maxerr folded to 0.0.
+        let nans = vec![f32::NAN; ours.len()];
+        assert!(cross_check_rel(&ours, &nans).is_err(), "NaN peer must not pass");
+
+        // Real comparisons still produce the same magnitude-normalized number as before.
+        assert_eq!(cross_check_rel(&ours, &ours), Ok(0.0));
+        let off: Vec<f32> = ours.iter().map(|v| v + 1.0).collect();
+        let maxabs = off.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let rel = cross_check_rel(&ours, &off).expect("equal-length finite buffers compare");
+        assert!(
+            (rel - (1.0 / maxabs) as f64).abs() < 1e-9,
+            "magnitude-normalized metric changed: {rel}"
+        );
+    }
 
     /// Pin the model block's recognized-kernel dispatch sets for BOTH variants. The recognizers
     /// are gate-blind (interp and native call the same symbol), so a silent regression to scalar
