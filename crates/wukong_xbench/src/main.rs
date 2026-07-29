@@ -111,8 +111,20 @@ fn max_rel_err(a: &[f32], b: &[f32]) -> (f64, usize) {
         if x == y {
             continue; // exact (covers ±0 and equal Inf)
         }
+        // NaN vs finite is a DIVERGENCE, and the loudest one there is. Falling through would make
+        // `rel` NaN, and `NaN > worst` is false — so the pair would be silently skipped and the
+        // function would return its "bit-exact" sentinel 0.0 for buffers that do not match. That
+        // is exactly how a broken kernel (an unwritten row seeding a fused softmax's max with
+        // +Inf, giving `0 * Inf == NaN`) would still print BIT-EXACT. +Inf vs -Inf lands here too,
+        // via the NaN `rel`.
+        if x.is_nan() != y.is_nan() {
+            return (f64::INFINITY, i);
+        }
         let (x, y) = (x as f64, y as f64);
         let rel = (x - y).abs() / x.abs().max(y.abs()).max(1e-6);
+        if rel.is_nan() {
+            return (f64::INFINITY, i);
+        }
         if rel > worst {
             worst = rel;
             at = i;
@@ -208,11 +220,19 @@ fn report_relaxed_ratio(
 }
 
 /// The elementwise-table rows whose C baseline is an IEEE-serial float reduction — exactly the rows
-/// the "`-ffast-math` is withheld" disclosure applies to. These get the additional C(fast) column.
+/// the "`-ffast-math` is withheld" disclosure applies to. These get the additional C(fast) column
+/// (and, on the `@parallel` rows, [`C_OMP_FAST_FLAGS`] instead of [`C_OMP_FLAGS`]).
+///
+/// `argmax` and `argmax@parallel` share byte-identical C source, so both are listed: gcc can
+/// vectorize a float max-with-index reduction only under relaxed FP (the comparison must be
+/// reassociable), so withholding `-ffast-math` from the serial row alone would publish its
+/// un-normalized ratio while its parallel twin published a normalized one. Every name here must
+/// exist in [`kernels()`] — pinned by `reduction_rows_exist`.
 fn is_reduction_kernel(name: &str) -> bool {
     matches!(
         name,
         "dot" | "ssd"
+            | "argmax"
             | "dot@parallel"
             | "ssd@parallel"
             | "max@parallel"
@@ -346,7 +366,10 @@ fn main() {
     println!(
         "Cross-language kernel benchmark — Wukong (native) vs C (gcc -O3) vs Rust (rustc -Copt-level=3)"
     );
-    println!("N = {N} f32 elements, single-threaded, -march=native. Lower ns is better.");
+    println!(
+        "N = {N} f32 elements, single-threaded except the `@parallel` rows (labelled), \
+         -march=native. Lower ns is better."
+    );
     // Power state up front: sustained-load timings on battery are not comparable to AC runs.
     println!("{}\n", model::power_status_line());
 
@@ -356,9 +379,17 @@ fn main() {
     let want = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
 
     let kernels = kernels();
+    // Two separate accumulators, because the two groups of rows are not the same comparison. The
+    // plain rows are single-threaded Wukong vs single-threaded C; the `@parallel` rows are
+    // all-core Wukong vs the SAME single-threaded C. Pooling them into one geomean would let nine
+    // multicore-vs-1-thread ratios inflate a headline printed under a "single-threaded" header —
+    // the asymmetry is disclosed per row, so it must not be erased at the point the summary number
+    // is printed. (The apples-to-apples multicore number is the C(omp) column on those rows.)
     let mut runtime_ratios_c = Vec::new();
     let mut compile_ratios_c = Vec::new();
     let mut runtime_ratios_cpp = Vec::new();
+    let mut par_ratios_c = Vec::new();
+    let mut par_ratios_cpp = Vec::new();
 
     for k in &kernels {
         if !want(k.name) {
@@ -473,35 +504,74 @@ fn main() {
                 );
             }
         }
+        let is_par = k.name.contains("@parallel");
         if let (Some(m), Some(c)) = (&wukong, &c) {
-            runtime_ratios_c.push(c.ns_per_call / m.ns_per_call); // >1 => Wukong faster
+            let r = c.ns_per_call / m.ns_per_call; // >1 => Wukong faster
+            if is_par {
+                par_ratios_c.push(r);
+            } else {
+                runtime_ratios_c.push(r);
+                // Compile time is threading-independent, so it pools over every row.
+            }
             compile_ratios_c.push(c.compile.as_secs_f64() / m.compile.as_secs_f64());
         }
         if let (Some(m), Some(cpp)) = (&wukong, &cpp) {
-            runtime_ratios_cpp.push(cpp.ns_per_call / m.ns_per_call); // >1 => Wukong faster
+            let r = cpp.ns_per_call / m.ns_per_call; // >1 => Wukong faster
+            if is_par {
+                par_ratios_cpp.push(r);
+            } else {
+                runtime_ratios_cpp.push(r);
+            }
         }
         println!();
     }
 
-    if !runtime_ratios_c.is_empty() {
-        let g_rt = geomean(&runtime_ratios_c);
-        let g_ct = geomean(&compile_ratios_c);
+    // Direction-aware ratio + word: a geomean below 1.0 is a LOSS and must print as one.
+    let standing = |g: f64| {
+        (
+            if g >= 1.0 { g } else { 1.0 / g },
+            if g >= 1.0 { "faster" } else { "slower" },
+        )
+    };
+    if !runtime_ratios_c.is_empty() || !compile_ratios_c.is_empty() {
         println!("Summary vs C (geomean over kernels):");
-        println!(
-            "  runtime:  Wukong is {:.2}x {} than C",
-            if g_rt >= 1.0 { g_rt } else { 1.0 / g_rt },
-            if g_rt >= 1.0 { "faster" } else { "slower" }
-        );
-        println!("  compile:  Wukong is {g_ct:.1}x faster to compile than C");
+        if !runtime_ratios_c.is_empty() {
+            let (g, w) = standing(geomean(&runtime_ratios_c));
+            println!(
+                "  runtime:  Wukong is {g:.2}x {w} than C  [single-threaded rows: {}]",
+                runtime_ratios_c.len()
+            );
+        }
+        if !par_ratios_c.is_empty() {
+            let (g, w) = standing(geomean(&par_ratios_c));
+            println!(
+                "  runtime:  Wukong is {g:.2}x {w} than C  [@parallel rows: {} — all-core Wukong \
+                 vs 1-thread C; see each row's C(omp) column for multicore-vs-multicore]",
+                par_ratios_c.len()
+            );
+        }
+        if !compile_ratios_c.is_empty() {
+            let (g, w) = standing(geomean(&compile_ratios_c));
+            println!("  compile:  Wukong is {g:.1}x {w} to compile than C");
+        }
     }
-    if !runtime_ratios_cpp.is_empty() {
-        let g_rt = geomean(&runtime_ratios_cpp);
+    if !runtime_ratios_cpp.is_empty() || !par_ratios_cpp.is_empty() {
         println!("Summary vs C++ (g++, geomean over kernels):");
-        println!(
-            "  runtime:  Wukong is {:.2}x {} than C++",
-            if g_rt >= 1.0 { g_rt } else { 1.0 / g_rt },
-            if g_rt >= 1.0 { "faster" } else { "slower" }
-        );
+        if !runtime_ratios_cpp.is_empty() {
+            let (g, w) = standing(geomean(&runtime_ratios_cpp));
+            println!(
+                "  runtime:  Wukong is {g:.2}x {w} than C++  [single-threaded rows: {}]",
+                runtime_ratios_cpp.len()
+            );
+        }
+        if !par_ratios_cpp.is_empty() {
+            let (g, w) = standing(geomean(&par_ratios_cpp));
+            println!(
+                "  runtime:  Wukong is {g:.2}x {w} than C++  [@parallel rows: {} — all-core \
+                 Wukong vs 1-thread C++]",
+                par_ratios_cpp.len()
+            );
+        }
     }
 
     println!();
@@ -1410,8 +1480,9 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
         if let (Some(mp), Some(c)) = (&wk_par, &cm) {
             let r = (flops / mp.ns_per_call) / (flops / c.ns_per_call);
             println!(
-                "  -> Wukong @parallel is {:.2}x faster than idiomatic single-threaded C",
-                r
+                "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
@@ -1735,7 +1806,11 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x faster than idiomatic single-threaded bf16 C");
+            println!(
+                "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded bf16 C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
         }
         println!();
     }
@@ -4511,7 +4586,11 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = (ops / mp.ns_per_call) / (ops / c2.ns_per_call);
-            println!("  -> Wukong @parallel is {r:.2}x faster than idiomatic single-threaded C");
+            println!(
+                "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
         }
         println!();
     }
@@ -7454,4 +7533,147 @@ fn c_kernel_n(n: usize, body: &str) -> String {
 }
 fn rust_kernel_n(n: usize, body: &str) -> String {
     format!("const N: usize = {n};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
+}
+
+/// Regression guards for the pure decision functions this file's peer columns and correctness
+/// checks hang off. None of them were covered before: `crates/wukong_xbench` had no test over
+/// `main.rs` at all, so a rename that silently DROPPED a peer column — weakening the comparison
+/// rather than breaking the build — left `cargo test` green.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `@parallel` row must have an OpenMP twin in [`c_omp_source`]. Rename a row in
+    /// [`kernels()`] without renaming its arm and `c_omp_source` falls through to `None`: the
+    /// C(omp) column vanishes with no diagnostic, and the multicore-vs-multicore comparison is
+    /// silently replaced by multicore-Wukong-vs-1-thread-C.
+    #[test]
+    fn every_parallel_row_has_an_omp_peer() {
+        for k in kernels() {
+            if k.name.contains("@parallel") {
+                assert!(
+                    c_omp_source(k.name).is_some(),
+                    "`{}` is a @parallel row with no c_omp_source arm — its C(omp) column would \
+                     silently disappear",
+                    k.name
+                );
+            }
+        }
+    }
+
+    /// Rows built from byte-identical C source must get identical peer-column treatment. This is
+    /// the invariant `argmax` / `argmax@parallel` broke: the same C string, but only the parallel
+    /// row was listed in [`is_reduction_kernel`], so only it got the `-ffast-math` C(fast)
+    /// normalization while the serial row published an un-normalized ratio.
+    #[test]
+    fn identical_c_sources_get_identical_peer_columns() {
+        let ks = kernels();
+        for i in 0..ks.len() {
+            for j in (i + 1)..ks.len() {
+                if ks[i].c == ks[j].c {
+                    assert_eq!(
+                        is_reduction_kernel(ks[i].name),
+                        is_reduction_kernel(ks[j].name),
+                        "`{}` and `{}` have byte-identical C source but disagree on the C(fast) \
+                         column",
+                        ks[i].name,
+                        ks[j].name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Both peer selectors are keyed by hard-coded kernel names; a name that no longer exists in
+    /// [`kernels()`] is a dead arm and a sign the two lists have drifted.
+    #[test]
+    fn peer_selector_names_exist_in_the_catalogue() {
+        let names: Vec<&str> = kernels().iter().map(|k| k.name).collect();
+        for n in [
+            "dot",
+            "ssd",
+            "argmax",
+            "dot@parallel",
+            "ssd@parallel",
+            "max@parallel",
+            "absmax@parallel",
+            "argmax@parallel",
+        ] {
+            assert!(names.contains(&n), "`{n}` is no longer a kernel row");
+            assert!(is_reduction_kernel(n), "`{n}` dropped out of is_reduction_kernel");
+        }
+        for n in [
+            "saxpy@parallel",
+            "poly@parallel",
+            "relu6@parallel",
+            "gelu@parallel",
+            "dot@parallel",
+            "ssd@parallel",
+            "max@parallel",
+            "absmax@parallel",
+            "argmax@parallel",
+        ] {
+            assert!(names.contains(&n), "`{n}` is no longer a kernel row");
+            assert!(c_omp_source(n).is_some(), "`{n}` dropped out of c_omp_source");
+        }
+    }
+
+    /// `max_rel_err` is the suite's cross-language equality metric; 0.0 is its "bit-exact"
+    /// sentinel, so every way of reaching 0.0 on unequal buffers is a vacuous pass.
+    #[test]
+    fn max_rel_err_reports_divergence() {
+        assert_eq!(max_rel_err(&[1.0, 2.0], &[1.0, 2.0]), (0.0, 0));
+        // ±0 and equal Inf are exact; NaN agrees with NaN.
+        assert_eq!(max_rel_err(&[0.0, -0.0], &[-0.0, 0.0]).0, 0.0);
+        assert_eq!(
+            max_rel_err(&[f32::INFINITY, f32::NAN], &[f32::INFINITY, f32::NAN]).0,
+            0.0
+        );
+        // NaN vs finite is a divergence, not a skip (this used to return 0.0 = "bit-exact").
+        let (rel, at) = max_rel_err(&[1.0, f32::NAN, 3.0], &[1.0, 0.42, 3.0]);
+        assert!(rel.is_infinite(), "NaN vs finite must not read as bit-exact");
+        assert_eq!(at, 1);
+        assert!(max_rel_err(&[0.42], &[f32::NAN]).0.is_infinite());
+        // +Inf vs -Inf makes `rel` NaN, which must not be silently skipped either.
+        assert!(
+            max_rel_err(&[f32::INFINITY], &[f32::NEG_INFINITY])
+                .0
+                .is_infinite()
+        );
+        // A real relative difference, magnitude-normalized.
+        let (rel, at) = max_rel_err(&[100.0, 1.0], &[100.0, 1.5]);
+        assert_eq!(at, 1);
+        assert!((rel - 1.0 / 3.0).abs() < 1e-9, "rel = {rel}");
+    }
+
+    /// bf16 conversion is round-to-nearest-EVEN on the discarded low half — a truncating version
+    /// would bias every bf16 row's inputs low.
+    #[test]
+    fn to_bf16_bits_rounds_to_nearest_even() {
+        // Exactly representable: the low 16 bits are already zero.
+        assert_eq!(to_bf16_bits(1.0), (1.0f32.to_bits() >> 16) as u16);
+        assert_eq!(widen_bf16(to_bf16_bits(1.0)), 1.0);
+        // Halfway cases tie to even: 0x3f80_8000 sits between 0x3f80 and 0x3f81.
+        assert_eq!(to_bf16_bits(f32::from_bits(0x3f80_8000)), 0x3f80);
+        assert_eq!(to_bf16_bits(f32::from_bits(0x3f81_8000)), 0x3f82);
+        // Above halfway rounds up, below rounds down.
+        assert_eq!(to_bf16_bits(f32::from_bits(0x3f80_8001)), 0x3f81);
+        assert_eq!(to_bf16_bits(f32::from_bits(0x3f80_7fff)), 0x3f80);
+        // Round-trip through widen is idempotent.
+        for v in [0.5f32, -1.25, 3.0, -0.0, 256.0] {
+            assert_eq!(to_bf16_bits(widen_bf16(to_bf16_bits(v))), to_bf16_bits(v));
+        }
+    }
+
+    /// The headline summary numbers are geometric means of ratios; an arithmetic mean would not be
+    /// symmetric under inverting the comparison.
+    #[test]
+    fn geomean_is_the_geometric_mean() {
+        assert!((geomean(&[2.0, 8.0]) - 4.0).abs() < 1e-12);
+        assert!((geomean(&[3.0]) - 3.0).abs() < 1e-12);
+        // Symmetry: geomean(1/x) == 1/geomean(x), the property that makes it the honest summary.
+        let xs = [0.5, 2.0, 4.0, 0.25];
+        let inv: Vec<f64> = xs.iter().map(|x| 1.0 / x).collect();
+        assert!((geomean(&xs) * geomean(&inv) - 1.0).abs() < 1e-12);
+    }
 }
