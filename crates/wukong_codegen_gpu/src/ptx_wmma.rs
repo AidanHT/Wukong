@@ -2413,6 +2413,90 @@ pub const WARP_N: usize = 16 * TN_TILES;
 mod tests {
     use super::*;
 
+    /// Split a straight-line PTX instruction into `(opcode, operands)`, dropping the `;` and all
+    /// whitespace the two spellings happen to differ in.
+    fn split_insn(line: &str) -> (String, Vec<String>) {
+        let l = line.trim().trim_end_matches(';');
+        let (op, rest) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
+        (op.to_string(), rest.split(',').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect())
+    }
+
+    /// Canonicalize an activation body so two spellings of the *same dataflow* compare equal:
+    /// registers are renamed by role -- `%in` is the live-in value, `%t0..` the scratch registers in
+    /// first-definition order, and the destination of the last instruction is `%out` (the standalone
+    /// vmath entry leaves its result wherever it lands and stores it, while the fused epilogue writes
+    /// back into the accumulator). Immediates (`0f...`) are compared verbatim, so a changed constant
+    /// still fails.
+    fn canon_act_body(lines: &[&str], live_in: &str) -> Vec<String> {
+        let mut map: Vec<(String, String)> = vec![(live_in.to_string(), "%in".to_string())];
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let (op, ops) = split_insn(line);
+            let last = i + 1 == lines.len();
+            let mut canon_ops = Vec::new();
+            for (j, o) in ops.iter().enumerate() {
+                if !o.starts_with('%') {
+                    canon_ops.push(o.clone());
+                } else if last && j == 0 {
+                    canon_ops.push("%out".to_string());
+                } else if let Some((_, v)) = map.iter().find(|(k, _)| k == o) {
+                    canon_ops.push(v.clone());
+                } else {
+                    let v = format!("%t{}", map.len() - 1);
+                    map.push((o.clone(), v.clone()));
+                    canon_ops.push(v);
+                }
+            }
+            out.push(format!("{op} {}", canon_ops.join(",")));
+        }
+        out
+    }
+
+    /// The instruction lines of `ptx::vmath_ptx`'s `name` entry between the input load and the output
+    /// store, plus the register the store reads (which must be what the last instruction wrote).
+    fn vmath_body(name: &str) -> Vec<String> {
+        let ptx = crate::ptx::vmath_ptx();
+        let at = ptx.find(&format!(".visible .entry {name}(")).expect("entry exists");
+        let body = &ptx[at..];
+        let body = &body[..body.find("\nDONE:").expect("entry has a DONE label")];
+        let start = body.find("ld.global.f32").expect("entry loads x[i]");
+        let tail = &body[start..];
+        let lines: Vec<&str> = tail.lines().skip(1).map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let (store, act) = lines.split_last().expect("at least the store");
+        let (op, ops) = split_insn(store);
+        assert_eq!(op, "st.global.f32", "{name}: the entry must end in the output store");
+        let result = ops[1].clone();
+        let (last_op, last_ops) = split_insn(act.last().expect("at least one activation instruction"));
+        assert_eq!(last_ops[0], result, "{name}: `{last_op}` must write the register the store reads");
+        act.iter().map(|l| l.to_string()).collect()
+    }
+
+    /// U4 mirror gate. `Act::epilogue` (the fused GEMM/fp8 epilogue) and `ptx::vmath_ptx`'s standalone
+    /// relu/silu/gelu entries are two copies of one semantic rule: the same .wk source reaches EITHER,
+    /// depending only on whether the `sgemm_nt_epi` epilogue recognizer fired. The doc comment on
+    /// `Act::epilogue` claims they use "the exact same formulas + constants", but nothing enforced it,
+    /// so improving one copy in isolation (e.g. moving vmath's gelu to the erf form) would make the
+    /// same program produce different numbers depending on the recognizer -- and the fused kernel's
+    /// own 5e-2-tolerance gate compares it to a Rust tanh-form reference, so it would still pass.
+    /// Compared as canonical dataflow, so a swapped operand, a changed constant or a different opcode
+    /// sequence all fail here.
+    #[test]
+    fn fused_activation_epilogue_matches_the_standalone_vmath_kernel() {
+        for (name, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
+            let standalone = vmath_body(name);
+            let standalone: Vec<&str> = standalone.iter().map(|s| s.as_str()).collect();
+            let fused = act.epilogue("%acc");
+            let fused: Vec<&str> = fused.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            assert_eq!(
+                canon_act_body(&standalone, "%f1"),
+                canon_act_body(&fused, "%acc"),
+                "{name}: the fused epilogue and the standalone vmath kernel have drifted -- a program \
+                 would compute a different answer depending on whether the epilogue recognizer fired"
+            );
+        }
+        assert_eq!(Act::None.epilogue("%acc"), "", "the plain GEMM must emit no epilogue");
+    }
+
     /// Every `.visible .entry <name>(` defined in `ptx`, in order.
     fn entry_names(ptx: &str) -> Vec<&str> {
         ptx.match_indices(".visible .entry ")
