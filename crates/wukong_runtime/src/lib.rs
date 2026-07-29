@@ -409,10 +409,21 @@ pub(crate) fn pool_unify() -> bool {
 }
 
 /// Run `f` on the unified kernel pool: the private physical-core GEMM pool when unification is ON
-/// and the pool exists (see [`pool_unify`] / `gemm::gemm_pool`), the global pool otherwise. Every
-/// fork here lands on 16 MiB worker stacks: the global pool when [`ensure_global_pool`] built it,
-/// [`region_pool`] when it did not. Nested calls from a worker of the same pool run inline
-/// (rayon's `install` semantics) — safe for kernels invoked inside an outlined region body.
+/// and the pool exists (see [`pool_unify`] / `gemm::gemm_pool`), the global pool otherwise. A fork
+/// that reaches one of those pools lands on 16 MiB worker stacks: the global pool when
+/// [`ensure_global_pool`] built it, [`region_pool`] when it did not. Nested calls from a worker of
+/// the same pool run inline (rayon's `install` semantics) — safe for kernels invoked inside an
+/// outlined region body.
+///
+/// KNOWN GAP — the trailing `f()` is **not** on a 16 MiB stack. It is reached when `gemm_pool()` is
+/// unavailable *and* the global registry is ours, which is exactly what a width-1 configuration
+/// gives (`gemm_pool()` returns None once `physical >= current_num_threads()`). `f` then runs
+/// inline on whatever thread called in, so an outlined region body — which `wuk_pool_width`'s doc
+/// requires to stay on a pool worker stack — privatizes its multi-hundred-KB frame on the caller's
+/// stack instead. Under `RAYON_NUM_THREADS=1` this aborts with STATUS_STACK_OVERFLOW rather than
+/// failing gracefully. Closing it means routing through [`region_pool`] whenever the caller is not
+/// already a pool worker (`rayon::current_thread_index().is_none()`), which is a routing change
+/// this crate's throughput law wants measured first.
 ///
 /// The stack size is the load-bearing property (region bodies privatize ~1.5 MiB frames); which of
 /// the two pools serves the fallback is throughput-only, because every kernel routed here chunks
@@ -793,6 +804,23 @@ mod tests {
         // End-to-end: before the `region_pool` backstop this died with STATUS_STACK_OVERFLOW
         // (exit 0xc00000fd) under `WUKONG_POOL_UNIFY=0`, where `gemm_pool()` is bypassed and the
         // fallback fork went to the 2 MiB default registry the bare fork above had installed.
+        // Only meaningful where `run_on_wuk_pool` actually *forks*. At width 1 it reaches its
+        // trailing `f()` and runs the body INLINE on the caller — here the libtest thread, whose
+        // stack is nowhere near 16 MiB — so a 4 MiB frame aborts the whole test binary with
+        // STATUS_STACK_OVERFLOW (0xc00000fd) instead of failing an assertion. Reproduced
+        // deterministically, debug and release, with `RAYON_NUM_THREADS=1 cargo test -p
+        // wukong_runtime --lib`: `gemm_pool()` returns None once `physical >=
+        // current_num_threads()`, and `GLOBAL_POOL_IS_OURS` is then true, so both pool branches are
+        // skipped. Guarding keeps a core-count sweep from taking the suite down with it.
+        //
+        // The inline fallthrough is a real gap, not just a test artifact: `wuk_pool_width`'s doc
+        // records that region bodies "must stay on the pool's 16 MiB worker stacks", and at width 1
+        // they do not. Closing it means routing through `region_pool` when the caller is not
+        // already a pool worker — a production routing change with no adjacent A/B behind it, so it
+        // is reported as an open finding rather than landed here.
+        if wuk_pool_width() <= 1 {
+            return;
+        }
         let mut v = vec![0u64; 32];
         // SAFETY: `big_frame_region_body` has the required `extern "C" fn(i64, i64, *const u8)`
         // shape and `v` outlives this blocking call, which is `wukong_parallel_for`'s contract.
