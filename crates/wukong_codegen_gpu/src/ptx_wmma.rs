@@ -2413,6 +2413,116 @@ pub const WARP_N: usize = 16 * TN_TILES;
 mod tests {
     use super::*;
 
+    /// Every `.visible .entry <name>(` defined in `ptx`, in order.
+    fn entry_names(ptx: &str) -> Vec<&str> {
+        ptx.match_indices(".visible .entry ")
+            .map(|(i, m)| {
+                let rest = &ptx[i + m.len()..];
+                &rest[..rest.find('(').expect("an entry declaration opens its param list")]
+            })
+            .collect()
+    }
+
+    /// B1: one non-ASCII byte anywhere in an emitted module is a `ptxas fatal` on this box. `Act`'s
+    /// doc comments, the assert messages and the CLIFF_VARIANTS prose in this file are full of
+    /// `.`/`x`-style math characters sitting right next to the `format!`s that build the kernels, and
+    /// a GPU-less `cargo test` never loads a module -- so nothing but this test keeps the emitted
+    /// text loadable.
+    #[test]
+    fn every_tensor_core_module_is_pure_ascii() {
+        let modules: [(&str, &str); 5] = [
+            ("wmma_f16_ptx", wmma_f16_ptx()),
+            ("wmma_bf16_ptx", wmma_bf16_ptx()),
+            ("gemm_cliff_ptx", gemm_cliff_ptx()),
+            ("roofline_f16_ptx", roofline_f16_ptx()),
+            ("wmma_f16_sm_static_ptx", &wmma_f16_sm_static_ptx(128, 128, 128, false)),
+        ];
+        for (what, ptx) in modules {
+            if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+                panic!("{what}: PTX must be pure ASCII (ptxas fatal otherwise) -- line {}: {line}", i + 1);
+            }
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "{what}: unbalanced braces");
+            let names = entry_names(ptx);
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), names.len(), "{what}: duplicate .visible .entry name");
+        }
+    }
+
+    /// The dispatch seam must close: every entry name a host launcher can hand `Gpu::function` has to
+    /// be defined in the module it is loaded from. The two sides are separate literals -- e.g.
+    /// `gpu::gemm_nt_f16_mma_bias_gelu` asks for "mma_nt_f16_128_bk32_s2_r16_swz_bias_gelu" while the
+    /// builder synthesises it as `format!("{}_swz_{suffix}", wh.name)` -- so reordering the builder's
+    /// format string compiles clean, passes every GPU-less test, and then fails at runtime with
+    /// `DriverError(CUDA_ERROR_NOT_FOUND)` on four dispatched public entry points.
+    #[test]
+    fn every_dispatched_tensor_core_entry_is_defined() {
+        let f16 = wmma_f16_ptx();
+        let bf16 = wmma_bf16_ptx();
+        let cliff = gemm_cliff_ptx();
+        let has = |ptx: &str, n: &str| ptx.contains(&format!(".visible .entry {n}("));
+
+        // Sweep tables shared by the builder and the host (`gemm_nt_f16_pipe` / `gemm_nt_f16_cliff`
+        // launch `v.name` straight from these), so a table edit must reach the module.
+        for v in PIPE_VARIANTS {
+            assert!(has(f16, v.name), "PIPE_VARIANTS entry `{}` missing from wmma_f16_ptx", v.name);
+        }
+        for v in CLIFF_VARIANTS {
+            assert!(has(cliff, v.name), "CLIFF_VARIANTS entry `{}` missing from gemm_cliff_ptx", v.name);
+        }
+        assert!(has(bf16, PIPE_BF16.name), "PIPE_BF16 entry `{}` missing", PIPE_BF16.name);
+        for use_128 in [false, true] {
+            let n = wmma_f16_sm_static_entry(use_128);
+            let ptx = wmma_f16_sm_static_ptx(256, 256, 256, use_128);
+            assert!(has(&ptx, n), "static-shape entry `{n}` missing from its own module");
+        }
+
+        // The names gpu.rs spells as literals at its dispatch sites.
+        let wh = "mma_nt_f16_128_bk32_s2_r16";
+        let p64 = "wmma_nt_f16_pipe_64_s6";
+        let bwh = PIPE_BF16.name;
+        for n in ["wmma_nt_f16", "wmma_nt_f16_mt", "wmma_nt_f16_sm", "wmma_nt_f16_sm128",
+                  "wmma_nt_f16_sm_db", "wmma_nt_f16_sm128_db", "wmma_nt_f16_sm_db_residual",
+                  "wmma_nt_f16_sm_db_relu", "wmma_nt_f16_sm_db_silu", "wmma_nt_f16_sm_db_gelu",
+                  "wmma_nt_f16_sm_db_bias", "wmma_nt_f16_sm_db_bias_relu",
+                  "wmma_nt_f16_sm_db_bias_silu", "wmma_nt_f16_sm_db_bias_gelu"] {
+            assert!(has(f16, n), "dispatched entry `{n}` missing from wmma_f16_ptx");
+        }
+        for n in ["wmma_nt_bf16", "wmma_nt_bf16_mt", "wmma_nt_bf16_sm_db", "wmma_nt_bf16_sm_db_relu",
+                  "wmma_nt_bf16_sm_db_silu", "wmma_nt_bf16_sm_db_gelu", "wmma_nt_bf16_sm_db_bias",
+                  "wmma_nt_bf16_sm_db_bias_relu", "wmma_nt_bf16_sm_db_bias_silu",
+                  "wmma_nt_bf16_sm_db_bias_gelu"] {
+            assert!(has(bf16, n), "dispatched entry `{n}` missing from wmma_bf16_ptx");
+        }
+        // The fused-epilogue families: `{base}[_swz]_bias[_act]` and `..._bias_residual`.
+        for base in [wh, p64] {
+            for suffix in ["bias", "bias_relu", "bias_silu", "bias_gelu", "bias_residual"] {
+                assert!(has(f16, &format!("{base}_{suffix}")), "`{base}_{suffix}` missing");
+            }
+        }
+        for suffix in ["bias", "bias_relu", "bias_silu", "bias_gelu", "bias_residual"] {
+            assert!(has(f16, &format!("{wh}_swz_{suffix}")), "`{wh}_swz_{suffix}` missing");
+            assert!(has(bf16, &format!("{bwh}_{suffix}")), "`{bwh}_{suffix}` missing");
+            assert!(has(bf16, &format!("{bwh}_swz_{suffix}")), "`{bwh}_swz_{suffix}` missing");
+        }
+        for base in [wh, bwh] {
+            let ptx = if base == wh { f16 } else { bf16 };
+            for twin in ["_swz", "_w22swz"] {
+                assert!(has(ptx, &format!("{base}{twin}")), "`{base}{twin}` missing");
+            }
+        }
+        // The gated-FFN (GLU-family) dual-B tiles, padded base + swizzle twin.
+        for ty in ["f16", "bf16"] {
+            let ptx = if ty == "f16" { f16 } else { bf16 };
+            for g in ["gate_silu", "gate_gelu", "gate_glu", "gate_silu_bias", "gate_gelu_bias"] {
+                assert!(has(ptx, &format!("mma_nt_{ty}_128x64_{g}")), "`mma_nt_{ty}_128x64_{g}` missing");
+                assert!(has(ptx, &format!("mma_nt_{ty}_128x64_{g}_swz")), "`mma_nt_{ty}_128x64_{g}_swz` missing");
+            }
+        }
+        assert!(has(roofline_f16_ptx(), "wmma_roofline_f16"));
+    }
+
     /// The staging precondition [`entry_smem`]/[`entry_smem_db`] document is now checked, so the four
     /// production instantiations must satisfy it (each is one 128-bit chunk per thread) and a tile that
     /// does not tile the CTA must be rejected at generation time instead of emitting a kernel with a

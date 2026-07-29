@@ -154,3 +154,28 @@ pub fn gemm_rb_ptx() -> &'static str {
 /// Block tile dims, exported so the host can compute the grid.
 pub const TILE_M: u32 = BM;
 pub const TILE_N: u32 = BN;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B1 + dispatch-closure gate (no device): the module the `gemm_rb` launcher loads must be pure
+    /// ASCII -- the driver rejects a module with one non-ASCII byte -- and must define both entries
+    /// `gpu::gemm_nt_rb` / the megakernel path ask `Gpu::function` for by literal name.
+    #[test]
+    fn gemm_rb_ptx_is_ascii_and_defines_both_entries() {
+        let ptx = gemm_rb_ptx();
+        if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+            panic!("gemm_rb PTX must be pure ASCII -- line {}: {line}", i + 1);
+        }
+        assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "unbalanced braces");
+        for n in ["gemm_nt_rb", "gemm_nn_rb"] {
+            assert_eq!(
+                ptx.matches(&format!(".visible .entry {n}(")).count(),
+                1,
+                "dispatched entry `{n}` must be defined exactly once"
+            );
+        }
+        assert_eq!(ptx.matches(".visible .entry ").count(), 2);
+    }
+}

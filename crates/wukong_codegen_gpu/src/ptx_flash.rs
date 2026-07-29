@@ -2808,3 +2808,81 @@ pub const WMMA_FLASH_NKB: usize = 4;
 
 /// Head dims with a generated kernel (the common transformer values).
 pub const SUPPORTED_D: [usize; 3] = [32, 64, 128];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `.visible .entry <name>(` defined in `ptx`, in order.
+    fn entry_names(ptx: &str) -> Vec<&str> {
+        ptx.match_indices(".visible .entry ")
+            .map(|(i, m)| {
+                let rest = &ptx[i + m.len()..];
+                &rest[..rest.find('(').expect("an entry declaration opens its param list")]
+            })
+            .collect()
+    }
+
+    /// B1: a single non-ASCII byte anywhere in the module is a `ptxas fatal` at `cuModuleLoadData`,
+    /// and this file's prose is written with `.`/`x`-style math characters right next to the
+    /// `format!`s that build the kernels. Nothing but this test keeps the emitted text ASCII, and a
+    /// GPU-less `cargo test` never loads a module, so the failure would surface only on a machine
+    /// with a device -- as every flash launch dying at once.
+    #[test]
+    fn flash_ptx_is_pure_ascii() {
+        let ptx = flash_ptx();
+        if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+            panic!("flash PTX must be pure ASCII (ptxas fatal otherwise) -- line {}: {line}", i + 1);
+        }
+    }
+
+    /// Structural sanity the driver would otherwise be the first to check: balanced braces and one
+    /// uniquely named entry per generated kernel (a duplicate name silently shadows a kernel).
+    #[test]
+    fn flash_ptx_is_structurally_well_formed() {
+        let ptx = flash_ptx();
+        assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "unbalanced braces");
+        let names = entry_names(ptx);
+        assert!(!names.is_empty(), "the module must define kernels");
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate .visible .entry name in the flash module");
+        for n in &names {
+            assert_eq!(ptx.matches(&format!(".visible .entry {n}(")).count(), 1, "{n} declared twice");
+        }
+    }
+
+    /// The dispatch seam must close: every entry name a *host* dispatch decision can produce has to
+    /// be defined in `flash_ptx()`. Renaming a generator's output (or a routing literal) on one side
+    /// only builds clean and passes every non-GPU test; it surfaces as a `CUDA_ERROR_NOT_FOUND` from
+    /// `Gpu::function` at exactly the shape that reaches the renamed arm. The names are taken from
+    /// the routing functions themselves, not copied, so either side drifting fails here.
+    #[test]
+    fn every_dispatchable_flash_entry_is_defined() {
+        let ptx = flash_ptx();
+        let defined = |name: &str| ptx.contains(&format!(".visible .entry {name}("));
+
+        // The f32 flash plan: both the untiled and the SMEM-tiled kernel, for every supported head dim.
+        for &d in &SUPPORTED_D {
+            for tiled in [false, true] {
+                let (name, _) = crate::gpu::flash_plan_forced(d, 512, tiled);
+                assert!(defined(&name), "flash_plan_forced({d}, .., {tiled}) picks undefined entry `{name}`");
+            }
+        }
+        // The tensor-core dispatch (`wmma_flash_applies` gates d to 64/128).
+        for d in [64usize, 128] {
+            for s in [512usize, 1024, 4096] {
+                let name = crate::gpu::wmma_flash_entry(d, s);
+                assert!(defined(name), "wmma_flash_entry({d}, {s}) picks undefined entry `{name}`");
+            }
+        }
+        // The warp-specialized override (enabled + S >= 4096); the routing table itself is gated in
+        // gpu.rs, here only its *products* must exist.
+        for d in [64usize, 128] {
+            let name = crate::gpu::ws_flash_route_with(true, d, 4096)
+                .unwrap_or_else(|| panic!("ws_flash_route_with(true, {d}, 4096) must route somewhere"));
+            assert!(defined(name), "ws_flash_route_with(true, {d}, 4096) picks undefined entry `{name}`");
+        }
+    }
+}
