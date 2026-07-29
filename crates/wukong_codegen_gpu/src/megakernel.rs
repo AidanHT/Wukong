@@ -191,7 +191,10 @@ mod tests {
             );
         }
         if crate::gpu::gpu().is_none() {
-            eprintln!("skip mega_corpus_matches_oracle: no CUDA device");
+            crate::diff::skip_or_fail(
+                "mega_corpus_matches_oracle",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
             return;
         }
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/run");
@@ -295,6 +298,92 @@ mod tests {
         assert!(ran > 0, "no eligible program ran on the megakernel — pipeline broken");
     }
 
+    /// **The `@parallel` activation shape runs cooperatively and is correct** (full output, not a
+    /// checksum). At -O2 a multi-statement `@parallel` region is recognized as
+    /// `wukong_vmath_f32_parallel` and inlined into `main`; `fusion::classify_call` did not know that
+    /// spelling, so `analyze` reported
+    /// "entry calls unrecognized `wukong_vmath_f32_parallel`" and the megakernel silently declined the
+    /// very shape the user asked to parallelize. This asserts eligibility *and* that the cooperative
+    /// run reproduces every printed line — exactly against the single-thread GPU lowering (same kernel,
+    /// so bit-identical) and within tolerance against the interpreter oracle (an independent CPU
+    /// evaluator, not a GPU-vs-GPU self-check).
+    #[test]
+    fn mega_parallel_activation_matches_single_and_oracle() {
+        const N: usize = 1024;
+        // A *multi-statement* @parallel body is what makes mir_build run the region with
+        // `parallel_fn = true` and intern `wukong_vmath_f32_parallel`, inlined into `main` (the trailing
+        // `tail[0] = ..` is what makes the body multi-statement; a single-statement body is outlined to
+        // `wukong_parallel_for` instead, which is a different — and still ineligible — shape). x[i]
+        // spans negatives, zero and positives so silu's sign/saturation regions are all covered, and 13
+        // sampled outputs are printed so the comparison is over real per-element values, not a checksum.
+        let src = format!(
+            r#"module mega_par
+@parallel
+fn act(x: [f32; {N}], mut o: [f32; {N}], mut tail: [f32; 1]) {{
+    for i in 0..{N} {{ o[i] = silu(x[i]); }}
+    tail[0] = o[{last}];
+}}
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [0.0; {N}];
+    let mut o: [f32; {N}] = [0.0; {N}];
+    let mut tail: [f32; 1] = [0.0; 1];
+    for i in 0..{N} {{ x[i] = ((i as f32) - 512.0) / 128.0; }}
+    act(x, o, tail);
+    let mut j: i32 = 0;
+    while j < 12 {{
+        print((o[(j * 71) as usize] * 10000.0) as i32);
+        j = j + 1;
+    }}
+    print((tail[0] * 10000.0) as i32);
+    return 0;
+}}
+"#,
+            last = N - 1
+        );
+        let (program, mut interner) = build(&src, 2).expect("frontend ok");
+        let entry = interner.intern("main");
+        let plan = crate::fusion::analyze(&program, entry, &interner);
+        assert!(
+            plan.eligible,
+            "the @parallel activation shape must be megakernel-eligible, got: {}",
+            plan.reason
+        );
+        assert!(
+            plan.coop_ops.iter().any(|c| c.name == "wukong_vmath_f32_parallel"),
+            "expected the @parallel vmath twin, got {:?}",
+            plan.coop_ops.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        let oracle = wukong_interp::run_with_output(&program, entry, &interner).expect("interp");
+        if crate::gpu::gpu().is_none() {
+            crate::diff::skip_or_fail(
+                "mega_parallel_activation_matches_single_and_oracle",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        }
+        let mega = try_run(&program, entry, &interner)
+            .expect("mega run")
+            .expect("mega eligible");
+        let single = lower::jit_run_single(&program, entry, &interner).expect("single run");
+        assert_eq!(mega.0, single.0, "exit codes differ");
+        // Same PTX helper, same math: mega and single must agree byte-for-byte, no tolerance.
+        assert_eq!(
+            String::from_utf8_lossy(&mega.1),
+            String::from_utf8_lossy(&single.1),
+            "cooperative and single-thread output differ"
+        );
+        assert!(
+            outputs_match(&mega.1, &oracle.1),
+            "mega vs interpreter oracle differ:\nmega:   {}\noracle: {}",
+            String::from_utf8_lossy(&mega.1).trim(),
+            String::from_utf8_lossy(&oracle.1).trim()
+        );
+        eprintln!(
+            "[gate] @parallel activation cooperative == single == oracle: {}",
+            String::from_utf8_lossy(&mega.1).trim().replace('\n', " ")
+        );
+    }
+
     /// Same-run latency A/B: the cooperative megakernel vs the single-thread lowering on a
     /// reduction-heavy program (a `[N]` dot reduced `REPEAT` times). Both produce byte-identical
     /// output (checksum cross-check) before any timing counts; we then report the clock-invariant
@@ -306,7 +395,10 @@ mod tests {
     fn mega_vs_single_reduce() {
         use std::time::Instant;
         if crate::gpu::gpu().is_none() {
-            eprintln!("skip mega_vs_single_reduce: no CUDA device");
+            crate::diff::skip_or_fail(
+                "mega_vs_single_reduce",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
             return;
         }
         // N small enough for the single-thread .local frame, REPEAT large enough that compute
@@ -392,7 +484,10 @@ fn main() -> i32 {{
     fn mega_vs_single_vmath() {
         use std::time::Instant;
         if crate::gpu::gpu().is_none() {
-            eprintln!("skip mega_vs_single_vmath: no CUDA device");
+            crate::diff::skip_or_fail(
+                "mega_vs_single_vmath",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
             return;
         }
         const N: usize = 8192;
@@ -418,7 +513,7 @@ fn main() -> i32 {{
         let (program, mut interner) = build(&src, 2).expect("frontend ok");
         let entry = interner.intern("main");
         if !crate::fusion::analyze(&program, entry, &interner).eligible {
-            eprintln!("skip mega_vs_single_vmath: program not eligible (recognizer/opt shape)");
+            crate::diff::skip_or_fail("mega_vs_single_vmath", "the bench program is not megakernel-eligible");
             return;
         }
         let mega0 = try_run(&program, entry, &interner).expect("mega").expect("eligible");
@@ -464,7 +559,10 @@ fn main() -> i32 {{
     fn mega_vs_single_gemm() {
         use std::time::Instant;
         if crate::gpu::gpu().is_none() {
-            eprintln!("skip mega_vs_single_gemm: no CUDA device");
+            crate::diff::skip_or_fail(
+                "mega_vs_single_gemm",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
             return;
         }
         // M rows chunked across the 256-thread block; K/N kept modest so the single-thread .local
@@ -502,7 +600,7 @@ fn main() -> i32 {{
         let (program, mut interner) = build(&src, 2).expect("frontend ok");
         let entry = interner.intern("main");
         if !crate::fusion::analyze(&program, entry, &interner).eligible {
-            eprintln!("skip mega_vs_single_gemm: not eligible (recognizer/opt shape)");
+            crate::diff::skip_or_fail("mega_vs_single_gemm", "the bench program is not megakernel-eligible");
             return;
         }
         let mega0 = try_run(&program, entry, &interner).expect("mega").expect("eligible");
@@ -556,7 +654,10 @@ fn main() -> i32 {{
     fn mega_vs_chain_reduce() {
         use std::time::Instant;
         if crate::gpu::gpu().is_none() {
-            eprintln!("skip mega_vs_chain_reduce: no CUDA device");
+            crate::diff::skip_or_fail(
+                "mega_vs_chain_reduce",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
             return;
         }
         const N: usize = 4096;
