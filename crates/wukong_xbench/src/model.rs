@@ -2341,9 +2341,21 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         // any per-forward number).
         if t.comp_1t.is_some() || t.comp_nt.is_some() {
             let wall = |ms: &Option<f64>| ms.map(|m| format!("{m:.0} ms")).unwrap_or_else(|| "n/a".into());
+            // The raw peer telemetry is still echoed when the T1(comp) column was suppressed, so
+            // it has to carry the reason HERE too — this line is itself a point where a number is
+            // printed, and the whole defect being fixed is a peer time appearing without a
+            // verified output behind it.
+            let c1 = if t.comp_1t.is_some() && t.comp_out.len() != sd {
+                format!(
+                    "{} [UNVERIFIED — no output dumped, T1(comp) column suppressed]",
+                    fmt(&t.comp_1t)
+                )
+            } else {
+                fmt(&t.comp_1t)
+            };
             println!(
                 "  torch detail (compiled, max-autotune): comp-1t {} (compile {}); comp-all {} (compile {})",
-                fmt(&t.comp_1t),
+                c1,
                 wall(&t.compile_ms_1t),
                 fmt(&t.comp_nt),
                 wall(&t.compile_ms_nt),
