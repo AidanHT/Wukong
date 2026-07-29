@@ -440,9 +440,11 @@ struct FnTranslator<'a> {
     /// FuncRefs for this function's synthesized AVX2 vector kernels, indexed by `Op::VecKernelCall`'s
     /// `kernel` field (the position in the owning `Function::vec_kernels`).
     kernel_refs: &'a [FuncRef],
-    /// First "type too large to lay out" overflow seen while lowering this function, if any.
-    /// Recorded (instead of panicking) so `populate_module` can abort with a clean error before
-    /// the half-built function is finalized/defined. See [`FnTranslator::size_of_or_err`].
+    /// First unrecoverable lowering failure seen while lowering this function, if any: a "type too
+    /// large to lay out" overflow ([`FnTranslator::size_of_or_err`]), or a runtime kernel that
+    /// reached [`FnTranslator::lower_call`] with an arity no dispatch arm accepts. Recorded
+    /// (instead of panicking, or silently dropping the instruction) so `populate_module` can abort
+    /// with a clean error before the half-built function is finalized/defined.
     layout_err: Option<String>,
 }
 
@@ -1736,6 +1738,25 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[q, out, rows, cols, scale, op]);
             return None;
         }
+        // Everything above dispatches a runtime kernel on (name, arity). `rt_refs` holds exactly
+        // the runtime symbols this function is responsible for, so reaching here with one of them
+        // means a recognizer emitted an arity no arm accepts. Without this guard `?` below returns
+        // `None`, `Op::Call` lowers to *nothing*, and the call is silently deleted: a void kernel
+        // (`wukong_sgemm`, `wukong_norm_f32`) leaves the destination buffer holding whatever it
+        // held before — a silent wrong answer that the interpreter, which dispatches on the symbol
+        // name alone with no arity check, does not reproduce — and a value-returning kernel never
+        // enters `vmap`, so the first use panics with `MIR value used before definition`. Record it
+        // as a lowering error instead; `build_function_clif` aborts before the function is defined.
+        if self.rt_refs.contains_key(name) {
+            if self.layout_err.is_none() {
+                self.layout_err = Some(format!(
+                    "internal compiler error: runtime kernel `{name}` reached codegen with {} \
+                     argument(s), which matches no declared ABI",
+                    args.len()
+                ));
+            }
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -2820,13 +2841,13 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         axpby_bf16: module
             .declare_function(RT_AXPBY_BF16, Linkage::Import, &sig_axpby_bf16)
-            .unwrap(),
+            .map_err(|e| e.to_string())?,
         axpby_bf16_out: module
             .declare_function(RT_AXPBY_BF16_OUT, Linkage::Import, &sig_axpby_bf16)
-            .unwrap(),
+            .map_err(|e| e.to_string())?,
         axpby_f16_out: module
             .declare_function(RT_AXPBY_F16_OUT, Linkage::Import, &sig_axpby_bf16)
-            .unwrap(),
+            .map_err(|e| e.to_string())?,
         dot_bf16: module
             .declare_function(RT_DOT_BF16, Linkage::Import, &sig_dot_bf16)
             .map_err(|e| e.to_string())?,

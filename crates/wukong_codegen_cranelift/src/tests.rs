@@ -3951,6 +3951,60 @@ fn matmul_nest_lowers_to_sgemm() {
     );
 }
 
+/// A runtime kernel whose MIR arity matches none of `lower_call`'s dispatch arms must FAIL the
+/// compile, not vanish from it. Every arm is guarded by `&& args.len() == N`; when none fires,
+/// `lower_call` used to return `None` and `Op::Call` lowered to nothing, so a void kernel like
+/// `wukong_sgemm` silently left `c` holding its previous contents — a wrong answer only on the
+/// native side, since the interpreter dispatches on the symbol name alone with no arity check.
+/// The mutation below is exactly the drift the guard exists for: a recognizer in `mir_build`
+/// changing a kernel's operand list without updating the matching arm here.
+#[test]
+fn runtime_kernel_with_unhandled_arity_fails_the_compile() {
+    let src = "module m\nfn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) { \
+               for i in 0..8 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
+               for j in 0..8 { c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; } } } }";
+    let lower = || {
+        let mut interner = Interner::new();
+        let (module, _) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, _) = wukong_sema::check(&module, &interner);
+        let (program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        (program, interner)
+    };
+
+    // Control: the untouched 7-argument call compiles.
+    let (program, interner) = lower();
+    assert!(
+        crate::emit_object(&program, &interner).is_ok(),
+        "the unmutated matmul must still compile"
+    );
+
+    // Drop one operand from the recognized call, leaving the symbol and the MIR well-formed.
+    let (mut program, mut interner) = lower();
+    let sgemm = interner.intern("wukong_sgemm");
+    let mut mutated = false;
+    for f in &mut program.funcs {
+        for b in &mut f.blocks {
+            for ins in &mut b.insts {
+                if let wukong_mir::Op::Call { func, args } = &mut ins.op {
+                    if *func == sgemm && args.len() == 7 {
+                        args.pop();
+                        mutated = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(mutated, "the matmul nest no longer lowers to wukong_sgemm");
+
+    let err = crate::emit_object(&program, &interner)
+        .map(|_| ())
+        .expect_err("a wukong_sgemm call with 6 arguments must not compile silently");
+    assert!(
+        err.contains("wukong_sgemm") && err.contains("6"),
+        "the diagnostic must name the symbol and the arity it got, got: {err}"
+    );
+}
+
 /// An embedded matmul nest inside a MULTI-statement `@parallel` fn must pick the multicore
 /// kernel from the statement path (`lower_for` passes `self.parallel_fn`, like its i8/lowp/norm
 /// siblings) — it was hardcoded serial, so a `@parallel` transformer block ran its six plain
