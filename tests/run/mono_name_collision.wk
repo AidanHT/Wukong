@@ -1,0 +1,52 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: 22
+// EXPECT-OUT: 77
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+module tests.run.mono_name_collision
+
+// The monomorphization key must be INJECTIVE. It rendered a structural type with a bare
+// identifier-legal prefix (`p_`, `r_`, `s_`, `aN_`, `tN_`) into the same namespace as user type
+// names, so `*mut i32` mangled to `p_i32` — which is also a legal struct name. A program that
+// declares `struct p_i32` and instantiates one generic at BOTH types got a single instance, and the
+// second call was given the first one's ABI: `error: expected a pointer` on the interpreter and a
+// Cranelift "MIR value used before definition (non-SSA input?)" panic on native. The separator is
+// now `$`, which no user identifier can contain. `a2_i32` covers the array mangling against a
+// struct of the same name.
+struct p_i32 {
+    a: i32,
+    b: i32,
+}
+
+struct a2_i32 {
+    p: i32,
+    q: i32,
+}
+
+fn id<T>(x: T) -> T {
+    return x;
+}
+
+fn get(q: *mut i32) -> i32 {
+    return *q;
+}
+
+fn main() -> i32 {
+    let s = p_i32 { a: 11, b: 22 };
+    let r = id(s);
+    print(r.a);
+    print(r.b);
+
+    let mut v: i32 = 77;
+    let q: *mut i32 = &mut v;
+    let rq = id(q);
+    print(get(rq)); // the pointer instance must be its own specialization
+
+    let t = a2_i32 { p: 5, q: 6 };
+    let rt = id(t);
+    print(rt.p);
+    print(rt.q);
+    return 0;
+}

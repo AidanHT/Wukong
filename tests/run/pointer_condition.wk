@@ -1,0 +1,42 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+module tests.run.pointer_condition
+
+// A POINTER in condition position. `lower_bool_cond` normalized `i1`, integer and float conditions
+// but let a pointer through unchanged into `cond_br`, which both backends reject with raw internal
+// text and no span ("cond_br condition: v2 has type ptr but expected i1") — an ICE on a program the
+// front end accepts, and `if (p)` is the canonical C form. A pointer condition is now the same
+// C-like truthiness as every other non-bool scalar: `p != null`. Covers `if`, `while`, the
+// short-circuit path (which re-enters `lower_bool_cond`) and `assert`.
+fn main() -> i32 {
+    let s = "hi";
+    if s {
+        print(1);
+    } else {
+        print(0);
+    }
+
+    let mut v: i32 = 7;
+    let p: *mut i32 = &mut v;
+    if p {
+        print(2);
+    } else {
+        print(3);
+    }
+
+    if s && 1 > 0 {
+        print(4);
+    }
+
+    while p {
+        print(5);
+        break;
+    }
+
+    assert(p);
+    return 0;
+}

@@ -1,0 +1,76 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 999
+// EXPECT-OUT: 30
+// EXPECT-OUT: 174
+// EXPECT-OUT: 70
+// EXPECT-OUT: 278
+module tests.run.recognizer_operand_scope
+
+// Two recognizers hoisted an operand out of the loop that binds it, and lowered it at the kernel call
+// site where the loop variable no longer exists — so a legal program was rejected with
+// `error[C0001]: 'value reference' is not yet supported by codegen` pointing at the loop variable.
+// Both nests below compiled and ran the moment one extra statement made the window decline, which is
+// what pins them as valid: `norm_rows` printed 999 and `packed_matmul` printed 30 174 70 278 on both
+// backends. (With an outer binding of the same name in scope the hoisted term would have silently
+// resolved against *that* instead — a wrong constant, no diagnostic.)
+//
+//   * the batched-norm window read its per-row width from the OUTER loop position, so a packed
+//     (triangular) layout `for i in 0..r { … x[r*r + i] … }` — whose width IS the row — could not be
+//     lowered there. It is not the kernel's `[R, C]` shape anyway, so the window must decline.
+//   * the batched-matmul base offset was proved loop-invariant by a predicate that answers "not used"
+//     for every expression kind it does not model, so an `if`-as-value offset term read as invariant.
+
+fn norm_rows() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    for k in 0..64 {
+        x[k] = (k as f32) + 1.0;
+    }
+    // Row r occupies x[r*r .. r*r + r] — a packed layout whose width is the row index.
+    for r in 0..4 {
+        let mut s: f32 = 0.0;
+        for i in 0..r {
+            s = s + x[r * r + i] * x[r * r + i];
+        }
+        let inv: f32 = 1.0 / sqrt(s / (r as f32) + 0.00001);
+        for i in 0..r {
+            x[r * r + i] = x[r * r + i] * inv;
+        }
+    }
+    // Row 1 holds one element, x[1] = 2, so it normalizes to 2/sqrt(4 + 1e-5) = 0.99999875.
+    return (x[1] * 1000.0) as i32;
+}
+
+fn packed_matmul(a: [f32; 12], b: [f32; 8], mut c: [f32; 4]) {
+    // c[i,j] = Σ_k a[i*4 + k + (j > 0 ? 4 : 0)] * b[j*4 + k] — the A-side base offset is chosen by an
+    // `if` on the j loop variable, so it is not a per-call constant pointer shift.
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k + (if j > 0 { 4 } else { 0 })] * b[j * 4 + k];
+            }
+            c[i * 2 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    print(norm_rows()); // 999
+
+    let mut a: [f32; 12] = [0.0; 12];
+    let mut b: [f32; 8] = [0.0; 8];
+    let mut c: [f32; 4] = [0.0; 4];
+    for k in 0..12 {
+        a[k] = (k as f32) + 1.0;
+    }
+    for k in 0..8 {
+        b[k] = (k as f32) + 1.0;
+    }
+    packed_matmul(a, b, c);
+    // 1·1+2·2+3·3+4·4 = 30;  5·5+6·6+7·7+8·8 = 174;  5·1+6·2+7·3+8·4 = 70;  9·5+10·6+11·7+12·8 = 278
+    for k in 0..4 {
+        print(c[k] as i32);
+    }
+    return 0;
+}

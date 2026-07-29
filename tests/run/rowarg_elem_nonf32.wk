@@ -1,0 +1,57 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+module tests.run.rowarg_elem_nonf32
+
+// tests/run/rowargmax.wk's nest over data arrays that are NOT f32.
+//
+// `match_rowarg_inner` validated only the *output* index type (`i32`) and never the data array's,
+// while its documented free twin `match_colarg_inner` has always pinned the data to f32. So a
+// per-row argmax over `[i32]` or `[bf16]` dispatched `wukong_rowargmax_i32`, which reinterprets the
+// raw bytes as f32: on the campaign base `--emit=mir -O2` showed `call wukong_rowargmax_i32` and
+// native printed `0 2` for the i32 rows below (against the interpreter's correct `1 2`), while the
+// bf16 rows additionally made the kernel read rows·cols·4 bytes out of a rows·cols·2-byte buffer.
+// Run on the native backend for the reason given in tests/run/scan_elem_lowp.wk. Every index below
+// is read straight off the data, not from the compiler.
+fn main() -> i32 {
+    // i32 data. row 0: [-5,-1,-9,-3] → max @1 ; row 1: [2,-7,4,-2] → max @2
+    let xi: [i32; 8] = [-5, -1, -9, -3, 2, -7, 4, -2];
+    let mut ai: [i32; 2] = [0; 2];
+    for r in 0..2 {
+        let mut bv: i32 = xi[r * 4];
+        let mut bi: i32 = 0;
+        for j in 1..4 { if xi[r * 4 + j] > bv { bv = xi[r * 4 + j]; bi = j; } }
+        ai[r] = bi;
+    }
+    for k in 0..2 { print(ai[k]); } // 1 2
+
+    // bf16 data. row 0: [1,2,3,9] → max @3 ; row 1: [7,1,2,3] → max @0
+    let mut xb: [bf16; 8] = [0.0; 8];
+    xb[0] = 1.0; xb[1] = 2.0; xb[2] = 3.0; xb[3] = 9.0;
+    xb[4] = 7.0; xb[5] = 1.0; xb[6] = 2.0; xb[7] = 3.0;
+    let mut ab: [i32; 2] = [0; 2];
+    for r in 0..2 {
+        let mut bv: bf16 = xb[r * 4];
+        let mut bi: i32 = 0;
+        for j in 1..4 { if xb[r * 4 + j] > bv { bv = xb[r * 4 + j]; bi = j; } }
+        ab[r] = bi;
+    }
+    for k in 0..2 { print(ab[k]); } // 3 0
+
+    // f64 data. row 0: [1,5,2,3] → max @1 ; row 1: [4,1,9,2] → max @2
+    let xd: [f64; 8] = [1.0, 5.0, 2.0, 3.0, 4.0, 1.0, 9.0, 2.0];
+    let mut ad: [i32; 2] = [0; 2];
+    for r in 0..2 {
+        let mut bv: f64 = xd[r * 4];
+        let mut bi: i32 = 0;
+        for j in 1..4 { if xd[r * 4 + j] > bv { bv = xd[r * 4 + j]; bi = j; } }
+        ad[r] = bi;
+    }
+    for k in 0..2 { print(ad[k]); } // 1 2
+    return 0;
+}

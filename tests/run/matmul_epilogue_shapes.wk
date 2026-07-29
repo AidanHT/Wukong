@@ -1,0 +1,85 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 50
+// EXPECT-OUT: 100
+// EXPECT-OUT: 250
+// EXPECT-OUT: 300
+// EXPECT-OUT: 1100
+// EXPECT-OUT: 2200
+// EXPECT-OUT: 1500
+// EXPECT-OUT: 2600
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+module tests.run.matmul_epilogue_shapes
+
+// `C = A·Bᵀ` followed in the same block by a recognized activation loop — the fused-epilogue shape —
+// but with a store the epilogue kernel cannot represent. `wukong_sgemm_nt_epi` has no alpha
+// parameter at all, takes its bias from the *epilogue* loop (the fusion passed the null literal),
+// and reads A row-major; the fusion guard checked only `transposed` and the batch offsets, so all
+// three nests below were fused and the peeled scale / peeled bias / transposed A were silently
+// dropped. On the campaign base `--emit=mir -O2` showed one `call wukong_sgemm_nt_epi` per function
+// and the program printed `100 200 500 600 / 100 200 500 600 / 1 2 5 6`.
+//
+// Both backends agreed on those wrong answers at every opt level (recognition runs before the
+// optimizer), so only these EXPECT-OUT lines catch it. All twelve are hand-computed from the scalar
+// nests. Declining costs nothing: `emit_sgemm` still folds the alpha into `wukong_sgemm_nt_alpha`
+// and the bias into its own `nt_epi` call, and the relu loop lowers as its own pass.
+//
+// A = [[1,2,3,4],[5,6,7,8]], B stored [N=2,K=4] = [[1,0,0,0],[0,1,0,0]] → A·Bᵀ = [[1,2],[5,6]].
+
+// (a) alpha-scaled store, then relu. Expect relu(0.5·A·Bᵀ)·100 = 50 100 250 300.
+fn alpha_epi(a: [f32; 8], b: [f32; 8], mut c: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 { s = s + a[i * 4 + k] * b[j * 4 + k]; }
+            c[i * 2 + j] = s * 0.5;
+        }
+    }
+    for i in 0..2 { for j in 0..2 { c[i * 2 + j] = fmax(c[i * 2 + j], 0.0); } }
+}
+
+// (b) fused per-column bias store, then relu. Expect relu(A·Bᵀ + [10,20])·100 = 1100 2200 1500 2600.
+fn bias_epi(a: [f32; 8], b: [f32; 8], bq: [f32; 2], mut c: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 { s = s + a[i * 4 + k] * b[j * 4 + k]; }
+            c[i * 2 + j] = bq[j] + s;
+        }
+    }
+    for i in 0..2 { for j in 0..2 { c[i * 2 + j] = fmax(c[i * 2 + j], 0.0); } }
+}
+
+// (c) C = Aᵀ·Bᵀ, then relu. A stored [K=4,M=2] so Aᵀ = [[1,3,5,7],[2,4,6,8]]; Aᵀ·Bᵀ = [[1,3],[2,4]].
+fn tt_epi(a: [f32; 8], b: [f32; 8], mut c: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 { s = s + a[k * 2 + i] * b[j * 4 + k]; }
+            c[i * 2 + j] = s;
+        }
+    }
+    for i in 0..2 { for j in 0..2 { c[i * 2 + j] = fmax(c[i * 2 + j], 0.0); } }
+}
+
+fn main() -> i32 {
+    let a: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let b: [f32; 8] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let bq: [f32; 2] = [10.0, 20.0];
+
+    let mut c1: [f32; 4] = [0.0; 4];
+    alpha_epi(a, b, c1);
+    for i in 0..4 { print((c1[i] * 100.0) as i32); }
+
+    let mut c2: [f32; 4] = [0.0; 4];
+    bias_epi(a, b, bq, c2);
+    for i in 0..4 { print((c2[i] * 100.0) as i32); }
+
+    let mut c3: [f32; 4] = [0.0; 4];
+    tt_epi(a, b, c3);
+    for i in 0..4 { print(c3[i] as i32); }
+    return 0;
+}

@@ -197,17 +197,26 @@ fn symbolic_dim_params(param_tys: &[Ty]) -> Vec<Symbol> {
 }
 
 /// A stable ASCII name for a concrete type, for a monomorphization key and instance-name suffix.
+///
+/// Every *structural* form is separated by `$`, which no user identifier can contain (the lexer
+/// admits only `[A-Za-z_][A-Za-z0-9_]*`) and which this file already reserves for exactly this
+/// purpose (`wukong$rodata$N`, the `fn$args` instance separator). With `_` separators the encoding
+/// was **not injective**: `mono_type_name(*mut i32)` was `p_i32`, which is also a legal struct name,
+/// so a program declaring `struct p_i32` and calling `id(s)` then `id(q)` produced ONE instance and
+/// gave the second call the first one's ABI — `error: expected a pointer` on interp and a Cranelift
+/// "MIR value used before definition" ICE on native. `Ty::Named` stays bare (a user name is already
+/// unique among user names, and keeping it bare keeps `id$Point` readable).
 fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
     match ty {
         Ty::Scalar(s) => s.name().to_string(),
         Ty::Named(n) => interner.resolve(*n).to_string(),
-        Ty::Ptr { pointee, .. } => format!("p_{}", mono_type_name(pointee, interner)),
-        Ty::Ref { pointee, .. } => format!("r_{}", mono_type_name(pointee, interner)),
-        Ty::Slice(inner) => format!("s_{}", mono_type_name(inner, interner)),
-        Ty::Array { elem, len } => format!("a{len}_{}", mono_type_name(elem, interner)),
+        Ty::Ptr { pointee, .. } => format!("p${}", mono_type_name(pointee, interner)),
+        Ty::Ref { pointee, .. } => format!("r${}", mono_type_name(pointee, interner)),
+        Ty::Slice(inner) => format!("s${}", mono_type_name(inner, interner)),
+        Ty::Array { elem, len } => format!("a{len}${}", mono_type_name(elem, interner)),
         Ty::Tuple(fields) => {
             let parts: Vec<String> = fields.iter().map(|t| mono_type_name(t, interner)).collect();
-            format!("t{}_{}", fields.len(), parts.join("_"))
+            format!("t{}${}", fields.len(), parts.join("$"))
         }
         Ty::Unit => "unit".to_string(),
         _ => "x".to_string(),
@@ -878,13 +887,20 @@ pub fn lower_program(
                     continue;
                 }
                 // Whole-function matmul: lower the entire nest to a single (optionally parallel)
-                // `wukong_sgemm` call — the tuned 256-bit AVX2/FMA microkernel.
+                // `wukong_sgemm` call — the tuned 256-bit AVX2/FMA microkernel. `emit_sgemm` declines
+                // shapes it has no kernel for (a fused bias or an α on a non-NT store, `Aᵀ·Bᵀ`), so the
+                // wrapper reports that and we fall through to the ordinary `lower_fn` path, exactly as
+                // the sibling interceptions below do. Discarding the decline built a function body of
+                // dead constants and a bare `ret`: `fn lin(a,b,bias,c) { … c[i*2+j] = bias[j] + s; }`
+                // printed `0 0 0 0` on both backends at every opt level where `11 22 15 26` is correct.
                 if let Some(nest) = matmul_fn(body, sema, interner) {
                     let parallel = has_parallel_attr(item, interner);
-                    let func =
-                        lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
-                    program.funcs.push(func);
-                    continue;
+                    if let Some(func) =
+                        lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
+                    {
+                        program.funcs.push(func);
+                        continue;
+                    }
                 }
                 // Whole-function int8 quantized matmul (`u8×i8→i32` `C = A·Bᵀ`) → the int8 GEMM
                 // microkernel. Checked *before* the `@parallel` outliner below so a `@parallel` int8
@@ -893,10 +909,12 @@ pub fn lower_program(
                 // Integer math, so the kernel equals the scalar nest bit-for-bit (no reassoc).
                 if let Some(nest) = i8matmul_fn(body, sema, interner) {
                     let parallel = has_parallel_attr(item, interner);
-                    let func =
-                        lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
-                    program.funcs.push(func);
-                    continue;
+                    if let Some(func) =
+                        lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
+                    {
+                        program.funcs.push(func);
+                        continue;
+                    }
                 }
                 // A `@parallel` whole-function bf16/f16 matmul: intercept before the elementwise
                 // outliner below (which would outline the outer row loop into per-row scalar loops and
@@ -1222,6 +1240,126 @@ fn has_parallel_attr(item: &ast::Item, interner: &Interner) -> bool {
         .any(|a| interner.resolve(a.name.sym) == "parallel")
 }
 
+/// Does this `@parallel` loop body contain control flow that only makes sense under SERIAL
+/// iteration? The outliner runs the body over one CHUNK of `[0, hi)` per worker, so a `return` or a
+/// `break` out of the parallelized loop ends that chunk alone — every other chunk still runs to
+/// completion, and the answer becomes a function of the pool's chunking. `depth` counts the loops
+/// nested inside the body, so a `break`/`continue` at depth 0 targets the parallelized loop itself;
+/// one inside an inner loop is that loop's own control flow and stays legal. Any *labelled* form
+/// declines outright: the outliner drops the loop's label, so a labelled break finds no matching loop
+/// and the block is finished as `unreachable`. This is the rule the mid-function region scanner
+/// already applies (`scan_region_stmt`'s `Return`/`Break`/`Continue` arms).
+fn escapes_parallel_chunk_block(b: &Block, depth: u32) -> bool {
+    b.stmts.iter().any(|s| escapes_parallel_chunk_stmt(s, depth))
+        || b.tail
+            .as_ref()
+            .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
+}
+
+fn escapes_parallel_chunk_stmt(s: &Stmt, depth: u32) -> bool {
+    match &s.kind {
+        StmtKind::Return(_) | StmtKind::Defer(_) => true,
+        StmtKind::Break(label, val) => {
+            label.is_some()
+                || depth == 0
+                || val
+                    .as_ref()
+                    .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
+        }
+        StmtKind::Continue(label) => label.is_some() || depth == 0,
+        StmtKind::Let { init, .. } => init
+            .as_ref()
+            .is_some_and(|e| escapes_parallel_chunk_expr(e, depth)),
+        StmtKind::Assign { target, value, .. } => {
+            escapes_parallel_chunk_expr(target, depth) || escapes_parallel_chunk_expr(value, depth)
+        }
+        StmtKind::Expr(e) => escapes_parallel_chunk_expr(e, depth),
+        StmtKind::While { cond, body, .. } => {
+            escapes_parallel_chunk_expr(cond, depth) || escapes_parallel_chunk_block(body, depth + 1)
+        }
+        StmtKind::For { iter, body, .. } => {
+            let it = match iter {
+                ForIter::Range {
+                    start, end, step, ..
+                } => {
+                    escapes_parallel_chunk_expr(start, depth)
+                        || end
+                            .as_ref()
+                            .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
+                        || step
+                            .as_ref()
+                            .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
+                }
+                ForIter::Expr(e) => escapes_parallel_chunk_expr(e, depth),
+            };
+            it || escapes_parallel_chunk_block(body, depth + 1)
+        }
+    }
+}
+
+fn escapes_parallel_chunk_expr(e: &Expr, depth: u32) -> bool {
+    let any = |v: &[Expr]| v.iter().any(|x| escapes_parallel_chunk_expr(x, depth));
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => false,
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+            escapes_parallel_chunk_expr(expr, depth)
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+            escapes_parallel_chunk_expr(base, depth)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            escapes_parallel_chunk_expr(lhs, depth) || escapes_parallel_chunk_expr(rhs, depth)
+        }
+        ExprKind::Call { callee, args, .. } => {
+            escapes_parallel_chunk_expr(callee, depth) || any(args)
+        }
+        ExprKind::Index { base, indices } => {
+            escapes_parallel_chunk_expr(base, depth) || any(indices)
+        }
+        ExprKind::StructLit { fields, rest, .. } => {
+            fields
+                .iter()
+                .any(|f| escapes_parallel_chunk_expr(&f.value, depth))
+                || rest
+                    .as_ref()
+                    .is_some_and(|r| escapes_parallel_chunk_expr(r, depth))
+        }
+        ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => any(items),
+        ExprKind::ArrayRepeat { value, count } => {
+            escapes_parallel_chunk_expr(value, depth) || escapes_parallel_chunk_expr(count, depth)
+        }
+        ExprKind::Block(b) => escapes_parallel_chunk_block(b, depth),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            escapes_parallel_chunk_expr(cond, depth)
+                || escapes_parallel_chunk_block(then_branch, depth)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|b| escapes_parallel_chunk_expr(b, depth))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            escapes_parallel_chunk_expr(scrutinee, depth)
+                || arms.iter().any(|a| {
+                    a.guard
+                        .as_ref()
+                        .is_some_and(|g| escapes_parallel_chunk_expr(g, depth))
+                        || escapes_parallel_chunk_expr(&a.body, depth)
+                })
+        }
+        ExprKind::Loop { body, .. } => escapes_parallel_chunk_block(body, depth + 1),
+    }
+}
+
 /// Recognize a parallelizable function: its entire body is a single `for idx in 0..hi { … }` over
 /// pointer (array) parameters. Returns the index name, the upper-bound expression, and the loop
 /// body. Anything else falls back to ordinary sequential lowering.
@@ -1246,15 +1384,24 @@ fn parallel_spec<'a>(
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
     }
+    // The outliner drops the loop's label (`lower_ranged_loop` pushes `(None, latch, exit)`), so a
+    // `break 'l` / `continue 'l` in the body would find no matching loop and lower to `unreachable`:
+    // interp `error: execution reached \`unreachable\``, native SIGILL, on a program that runs fine
+    // without the attribute. Decline the labelled form and let it lower serially.
     let StmtKind::For {
+        label: None,
         pat,
         iter,
         body: lb,
-        ..
     } = &body.stmts[0].kind
     else {
         return None;
     };
+    // A `return`, a `defer`, or a `break`/`continue` out of the parallelized loop only makes sense
+    // under serial iteration — see `escapes_parallel_chunk_block`.
+    if escapes_parallel_chunk_block(lb, 0) {
+        return None;
+    }
     let ForIter::Range {
         start,
         end: Some(end),
@@ -1315,6 +1462,7 @@ fn is_batched_norm_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -1361,6 +1509,7 @@ fn is_bias_bcast_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -1412,6 +1561,7 @@ fn lower_fn(
         gemm,
         parallel_fn,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: subst.clone(),
         mono: Some(mono),
@@ -1444,17 +1594,18 @@ fn lower_fn(
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         let mty = fl.mir_ty_of(pty);
+        let is_slice = matches!(pty, Ty::Slice(_));
         if matches!(mty, MirType::Array(..)) {
             // The parameter value *is* the aggregate's base pointer; bind it directly so field/index
             // access geps off it (no copy into a local slot).
-            fl.bind(p.name.sym, val, mty);
+            fl.bind_slice(p.name.sym, val, mty, is_slice);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {
                 ptr: slot,
                 value: val,
             });
-            fl.bind(p.name.sym, slot, mty);
+            fl.bind_slice(p.name.sym, slot, mty, is_slice);
         }
     }
 
@@ -1594,6 +1745,7 @@ fn lower_parallel(
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::default(),
+            slice_slots: HashSet::default(),
             sret: None,
             // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
             // generic functions, so no monomorphization context is needed.
@@ -1645,6 +1797,7 @@ fn lower_parallel(
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::default(),
+            slice_slots: HashSet::default(),
             sret: None,
             // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
             // generic functions, so no monomorphization context is needed.
@@ -2248,8 +2401,11 @@ struct VElemPlan<'b> {
 /// `[i32]`), the loop-invariant f32 `scale` expr (lowered at emit time), and the packed op (activation
 /// byte | input-width code from the source array's *signed* scalar type).
 struct DequantPlan<'b> {
-    out: ValueId,
-    q: ValueId,
+    // The operand *symbols*, resolved to base pointers at emit time via `kernel_base_ptr` — the
+    // rule `VElemPlan` documents above. Storing the slot value here handed the kernel a `[]T`
+    // slice's 16-byte fat-pointer buffer as its data pointer.
+    out: Symbol,
+    q: Symbol,
     q_elem: MirType,
     scale: &'b Expr,
     op: i64,
@@ -2331,6 +2487,14 @@ struct FnLowerer<'a> {
     /// lowerers and the outlined-body lowerers pass `None`, so a probe can never emit a region and
     /// an outlined body can never nest one.
     par: Option<&'a mut ParRegions>,
+    /// The bound slot values that hold a `[]T` **slice** fat pointer, recorded by `bind_slice` at
+    /// every binding site whose sema type is `Ty::Slice`. `kernel_base_ptr` needs this because the
+    /// slice's MIR slot type — `Array(I8, SLICE_SIZE)` — is *not* unique to slices: a tuple, a
+    /// 16-byte struct and a user's own `[i8; 16]`/`[u8; 16]` array all lower to the same shape, so
+    /// keying the fat-pointer load on the MIR shape would hand an int8 GEMM the first 8 bytes of its
+    /// data matrix as a base pointer. A slot value is unique within a function, so this needs no
+    /// scope discipline: a shadowing binding gets a fresh slot and is simply absent from the set.
+    slice_slots: HashSet<ValueId>,
 }
 
 impl FnLowerer<'_> {
@@ -2358,6 +2522,18 @@ impl FnLowerer<'_> {
 
     fn bind(&mut self, name: Symbol, slot: ValueId, ty: MirType) {
         self.scopes.last_mut().unwrap().insert(name, (slot, ty));
+    }
+
+    /// Bind a name whose sema type is `[]T` — a slice. Identical to [`Self::bind`] plus a record
+    /// that `slot` holds a fat pointer, which is the only way `kernel_base_ptr` can tell a slice
+    /// apart from the `[i8; 16]`/tuple/struct locals that share its `Array(I8, 16)` MIR slot shape.
+    /// A binding site that forgets to use this keeps the pre-existing (fat-pointer-as-data)
+    /// behaviour rather than corrupting an unrelated operand, so the record is fail-safe.
+    fn bind_slice(&mut self, name: Symbol, slot: ValueId, ty: MirType, is_slice: bool) {
+        self.bind(name, slot, ty);
+        if is_slice {
+            self.slice_slots.insert(slot);
+        }
     }
 
     fn lookup(&self, name: Symbol) -> Option<(ValueId, MirType)> {
@@ -2727,7 +2903,9 @@ impl FnLowerer<'_> {
             let fmir = self.mir_ty_of(fty);
             let fptr = self.field_ptr(base, *off);
             match &sub.kind {
-                ast::PatKind::Ident(name) => self.bind(*name, fptr, fmir),
+                ast::PatKind::Ident(name) => {
+                    self.bind_slice(*name, fptr, fmir, matches!(fty, Ty::Slice(_)))
+                }
                 ast::PatKind::Tuple(inner) => self.bind_tuple_pattern(fptr, fty, inner),
                 _ => {}
             }
@@ -3233,6 +3411,20 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Whether `e` forces an ordered comparison performed in `common` to use an **unsigned**
+    /// predicate: it is an unsigned integer operand exactly as wide as `common`.
+    ///
+    /// This is C's usual-arithmetic-conversion rule. Taking the signedness from one operand alone
+    /// made `5 < x` with `x: u32 = 3_000_000_000` a *signed* compare against a value whose sign bit
+    /// is set (`cmp.slt`), so it answered false; the same one-sided rule made `for i in 0..n` with
+    /// an unsigned `n` run zero iterations. The width test is what keeps the rule faithful: a
+    /// *narrower* unsigned operand (`u32` against `i64`) widens losslessly into the signed type, and
+    /// C keeps the comparison signed there — so only an equal-rank mixed-sign pair goes unsigned.
+    fn forces_unsigned_cmp(&self, e: &Expr, common: &MirType) -> bool {
+        matches!(self.expr_ty(e), Ty::Scalar(s) if s.is_int() && !s.is_signed())
+            && self.expr_mir(e) == *common
+    }
+
     fn const_zero(&mut self, ty: MirType) -> ValueId {
         if ty.is_float() {
             self.builder.build(ty.clone(), Op::ConstFloat(0.0, ty))
@@ -3599,6 +3791,16 @@ impl FnLowerer<'_> {
             },
             _ => return None,
         };
+        // The kernel this feeds (`wukong_norm_f32`, via LayerNorm's leading mean pass) reads and
+        // writes the row as f32. Without this gate an `[f64; N]` window was folded into it and the
+        // native backend reinterpreted the f64 bytes — `--emit=mir -O2` showed `call wukong_norm_f32`
+        // for an f64 LayerNorm and native printed `-28 0 0 7000` where interp (which marshals
+        // slot-per-scalar, so it silently degrades to f32 and stays numerically right) printed
+        // `-1626 -108 108 1626`. The softmax matchers already gate this way (`match_exp_sub_body`,
+        // `match_sumexp_sub_body`); declining costs only the dispatch, the scalar nest is correct.
+        if self.expr_mir(addend) != MirType::F32 {
+            return None;
+        }
         self.index_off(addend, v, batch)
     }
 
@@ -3635,6 +3837,13 @@ impl FnLowerer<'_> {
             },
             _ => return None,
         };
+        // Same f32 element gate as [`Self::sum_body_array`]: RMSNorm and L2-norm feed the f32-only
+        // `wukong_norm_f32`, and an `[f64; N]` mean-square window was folded into it (native printed
+        // `22 16000` for a 16-element f64 RMSNorm where the correct answer, which interp printed, is
+        // `103 1654` — the kernel writes 16 f32 = only the first 8 f64 slots).
+        if self.expr_mir(addend) != MirType::F32 {
+            return None;
+        }
         // addend must be `x[v] * x[v]` — same array, same index, both factors.
         let ExprKind::Binary {
             op: ast::BinOp::Mul,
@@ -4386,11 +4595,24 @@ impl FnLowerer<'_> {
                 _ => e,
             }
         }
+        // The label array must be `i32` — `wukong_xent_{fwd,bwd}_f32` reads `target` as `*const i32`,
+        // so an `[i64; R]` label array (the PyTorch convention, and what `read_i64` produces) was read
+        // with a halved stride: native printed `3440 626` for tests/run/xent.wk with i64 labels where
+        // interp printed the correct `3440 2626`. `match_id_gather` (the embedding's label read) has
+        // carried this exact guard all along; this is its missing twin.
+        let labels = |e: &Expr| -> Option<Symbol> {
+            let inner = peel(e);
+            let ids = index_by_var(inner, r)?;
+            if scalar_of(inner, self.sema) != Some(wukong_types::Scalar::I32) {
+                return None;
+            }
+            Some(ids)
+        };
         if self.is_mul_of(lhs, r, cols) {
-            return index_by_var(peel(rhs), r);
+            return labels(rhs);
         }
         if self.is_mul_of(rhs, r, cols) {
-            return index_by_var(peel(lhs), r);
+            return labels(lhs);
         }
         None
     }
@@ -4461,12 +4683,24 @@ impl FnLowerer<'_> {
         if out == weight || out == ids {
             return None;
         }
+        // `weight`'s declared extent, when it has one — the read bound the parallel selection's
+        // non-overlap test needs (`match_scatter` recovers the same quantity for `grad_w`). Recovered
+        // from sema, which keeps the declared `[f32; V*H]` even for an array PARAMETER (MIR lowers it
+        // to a bare pointer).
+        let w_total = match &value.kind {
+            ExprKind::Index { base: w_base, .. } => match self.expr_ty(w_base) {
+                Ty::Array { len, .. } => Some(len),
+                _ => None,
+            },
+            _ => None,
+        };
         Some(EmbeddingNest {
             out,
             weight,
             ids,
             t_rows,
             h,
+            w_total,
         })
     }
 
@@ -4552,11 +4786,8 @@ impl FnLowerer<'_> {
     /// clamp from ever firing on the in-range ids a well-typed program produces (both backends call the
     /// identical kernel, so the differential gate holds regardless of the sentinel value).
     fn emit_embedding(&mut self, nest: &EmbeddingNest, parallel: bool) -> bool {
-        let (Some((out, _)), Some((weight, _)), Some((ids, _))) = (
-            self.lookup(nest.out),
-            self.lookup(nest.weight),
-            self.lookup(nest.ids),
-        ) else {
+        let Some([out, weight, ids]) = self.kernel_base_ptrs([nest.out, nest.weight, nest.ids])
+        else {
             return false;
         };
         let (Some(t_rows), Some(h)) = (self.dim_value(nest.t_rows), self.dim_value(nest.h)) else {
@@ -4569,16 +4800,100 @@ impl FnLowerer<'_> {
         let v = self
             .builder
             .build(MirType::I64, Op::ConstInt(1i128 << 48, MirType::I64));
-        let func = if parallel {
-            self.gemm.embedding_par
-        } else {
-            self.gemm.embedding
-        };
-        self.builder.build_void(Op::Call {
-            func,
-            args: vec![out, weight, ids, t_rows, h, v],
-        });
+        let args = vec![out, weight, ids, t_rows, h, v];
+        // The parallel gather writes `out` rows from several cores while every core reads `weight`, so
+        // it is only equivalent to this nest when the two buffers do not overlap — see
+        // `emit_nonoverlapping_call`, which picks the serial kernel when they may.
+        match (parallel, nest.w_total) {
+            (true, Some(w_total)) => {
+                let out_elems = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, t_rows, h));
+                let w_elems = self
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(w_total as i128, MirType::I64));
+                self.emit_nonoverlapping_call(
+                    self.gemm.embedding,
+                    self.gemm.embedding_par,
+                    args,
+                    (out, out_elems),
+                    (weight, w_elems),
+                );
+            }
+            // A weight with no compile-time extent: nothing to bound the read range with, so the
+            // overlap question cannot be settled and the serial kernel stands.
+            _ => {
+                self.builder.build_void(Op::Call {
+                    func: self.gemm.embedding,
+                    args,
+                });
+            }
+        }
         true
+    }
+
+    /// Emit `par(args)` when the two f32 buffers `a[0..a_elems)` and `b[0..b_elems)` do not overlap at
+    /// run time, and `ser(args)` when they may — the guard the `_parallel` gather/scatter kernels'
+    /// documented `non-overlapping` precondition needs (`wukong_embedding_f32_parallel`,
+    /// `wukong_scatter_add_f32_parallel`; the serial kernels touch the same rows in the same order as
+    /// the nest, so they hold for any aliasing).
+    ///
+    /// The recognizer's symbol comparison (`out == weight`) cannot decide this: two distinct array
+    /// PARAMETERS can be bound to the same array at the call site. `@parallel fn embed(ids, weight, mut
+    /// out)` called as `embed(ids, buf, buf)` printed 2432 / 2456 / 2400 / 1120 / 1280 over five
+    /// consecutive native runs where the serial kernel and the scalar nest both print 2400.
+    ///
+    /// The test is on the byte ranges through `PtrToInt` — the one pointer cast the interpreter
+    /// (`Value::Ptr(p) -> p as i128`) and Cranelift (an integer resize) both implement. Under the
+    /// interpreter's *slot* memory the `*4` byte scaling makes both ranges wider than the real ones, so
+    /// it can only over-report overlap and pick the serial kernel; the interpreter runs one arm for both
+    /// symbols, so the choice is unobservable there. Aliasing is caught on either backend regardless:
+    /// equal bases can never satisfy `a_end <= b || b_end <= a` for non-empty ranges.
+    fn emit_nonoverlapping_call(
+        &mut self,
+        ser: Symbol,
+        par: Symbol,
+        args: Vec<ValueId>,
+        (a, a_elems): (ValueId, ValueId),
+        (b, b_elems): (ValueId, ValueId),
+    ) {
+        let esize = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(4, MirType::I64));
+        let range = |me: &mut Self, p: ValueId, elems: ValueId| {
+            let lo = me
+                .builder
+                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, p, MirType::I64));
+            let bytes = me
+                .builder
+                .build(MirType::I64, Op::Bin(BinOp::Mul, elems, esize));
+            let hi = me.builder.build(MirType::I64, Op::Bin(BinOp::Add, lo, bytes));
+            (lo, hi)
+        };
+        let (a_lo, a_hi) = range(self, a, a_elems);
+        let (b_lo, b_hi) = range(self, b, b_elems);
+        let a_below = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Ule, a_hi, b_lo));
+        let b_below = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Ule, b_hi, a_lo));
+        let disjoint = self
+            .builder
+            .build(MirType::I1, Op::Bin(BinOp::Or, a_below, b_below));
+        let par_blk = self.builder.new_block();
+        let ser_blk = self.builder.new_block();
+        let join = self.builder.new_block();
+        self.builder
+            .cond_br(disjoint, par_blk, vec![], ser_blk, vec![]);
+        self.builder.switch_to(par_blk);
+        self.builder.build_void(Op::Call {
+            func: par,
+            args: args.clone(),
+        });
+        self.builder.br(join, vec![]);
+        self.builder.switch_to(ser_blk);
+        self.builder.build_void(Op::Call { func: ser, args });
+        self.builder.br(join, vec![]);
+        self.builder.switch_to(join);
     }
 
     /// Recognize the **scatter-add / embedding-gradient backward** — the dual of the embedding gather:
@@ -4671,11 +4986,9 @@ impl FnLowerer<'_> {
     /// derived from grad_w's array length, because the parallel kernel partitions the `V` output rows
     /// across cores. `parallel` selects the multicore kernel (output-row split → bit-identical to serial).
     fn emit_scatter(&mut self, nest: &ScatterNest, parallel: bool) -> bool {
-        let (Some((grad_w, _)), Some((grad_out, _)), Some((ids, _))) = (
-            self.lookup(nest.grad_w),
-            self.lookup(nest.grad_out),
-            self.lookup(nest.ids),
-        ) else {
+        let Some([grad_w, grad_out, ids]) =
+            self.kernel_base_ptrs([nest.grad_w, nest.grad_out, nest.ids])
+        else {
             return false;
         };
         let (Some(t_rows), Some(h)) = (self.dim_value(nest.t_rows), self.dim_value(nest.h)) else {
@@ -4686,15 +4999,30 @@ impl FnLowerer<'_> {
             .builder
             .build(MirType::I64, Op::ConstInt(nest.total as i128, MirType::I64));
         let v = self.builder.build(MirType::I64, Op::Bin(BinOp::UDiv, total, h));
-        let func = if parallel {
-            self.gemm.scatter_add_par
+        let args = vec![grad_w, grad_out, ids, t_rows, h, v];
+        if parallel {
+            // The parallel scatter accumulates into `grad_w` from several cores while every core reads
+            // `grad_out`; two distinct array parameters can be the same array at the call site, so the
+            // kernel's non-overlap precondition is a run-time question (see `emit_nonoverlapping_call`).
+            let go_elems = self
+                .builder
+                .build(MirType::I64, Op::Bin(BinOp::Mul, t_rows, h));
+            let gw_elems = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(nest.total as i128, MirType::I64));
+            self.emit_nonoverlapping_call(
+                self.gemm.scatter_add,
+                self.gemm.scatter_add_par,
+                args,
+                (grad_w, gw_elems),
+                (grad_out, go_elems),
+            );
         } else {
-            self.gemm.scatter_add
-        };
-        self.builder.build_void(Op::Call {
-            func,
-            args: vec![grad_w, grad_out, ids, t_rows, h, v],
-        });
+            self.builder.build_void(Op::Call {
+                func: self.gemm.scatter_add,
+                args,
+            });
+        }
         true
     }
 
@@ -5050,6 +5378,14 @@ impl FnLowerer<'_> {
             _ => return None,
         };
         let x = self.index_off(lhs, j, batch)?;
+        // Same f32 data gate the free twin [`match_colarg_inner`] already carries: only the *output*
+        // index type was checked, so `wukong_rowarg{max,min}_i32` — which reads the data as f32 — was
+        // dispatched over `[i32]`/`[f64]`/`[bf16]` rows. An i32 per-row argmax printed native `0 2`
+        // against interp's correct `1 2`, and a `[bf16]` row additionally made the kernel read
+        // `rows*cols*4` bytes out of a `rows*cols*2`-byte buffer.
+        if scalar_of(lhs, self.sema) != Some(wukong_types::Scalar::F32) {
+            return None;
+        }
         if single_path(rhs) != Some(bv) {
             return None;
         }
@@ -5310,9 +5646,9 @@ impl FnLowerer<'_> {
         if single_path(target) != Some(acc) {
             return None;
         }
-        match op {
+        let data: &Expr = match op {
             // `p *= x[r*C+i]`
-            ast::AssignOp::Mul => self.index_off(value, i, batch),
+            ast::AssignOp::Mul => value,
             // `p = p * x[r*C+i]` (either operand order)
             ast::AssignOp::Assign => {
                 let ExprKind::Binary {
@@ -5324,15 +5660,21 @@ impl FnLowerer<'_> {
                     return None;
                 };
                 if single_path(lhs) == Some(acc) {
-                    self.index_off(rhs, i, batch)
+                    rhs
                 } else if single_path(rhs) == Some(acc) {
-                    self.index_off(lhs, i, batch)
+                    lhs
                 } else {
-                    None
+                    return None;
                 }
             }
-            _ => None,
+            _ => return None,
+        };
+        // See [`Self::match_acc_add`]: only the *store* was type-checked, so a half/integer data array
+        // widened into an f32 accumulator still dispatched the f32 kernel.
+        if self.expr_mir(data) != MirType::F32 {
+            return None;
         }
+        self.index_off(data, i, batch)
     }
 
     /// The prefix-sum accumulate `acc = acc + x[r*C+i]` (or the compound `acc += x[r*C+i]`), target
@@ -5350,9 +5692,9 @@ impl FnLowerer<'_> {
         if single_path(target) != Some(acc) {
             return None;
         }
-        match op {
+        let data: &Expr = match op {
             // `acc += x[r*C+i]`
-            ast::AssignOp::Add => self.index_off(value, i, batch),
+            ast::AssignOp::Add => value,
             // `acc = acc + x[r*C+i]` (either operand order)
             ast::AssignOp::Assign => {
                 let ExprKind::Binary {
@@ -5364,15 +5706,24 @@ impl FnLowerer<'_> {
                     return None;
                 };
                 if single_path(lhs) == Some(acc) {
-                    self.index_off(rhs, i, batch)
+                    rhs
                 } else if single_path(rhs) == Some(acc) {
-                    self.index_off(lhs, i, batch)
+                    lhs
                 } else {
-                    None
+                    return None;
                 }
             }
-            _ => None,
+            _ => return None,
+        };
+        // `wukong_cumsum_f32` reads the data array as f32. Its caller only checked the *store* element
+        // type, and sema implicitly widens `bf16`/`f16`/`i32` into an f32 accumulator, so a bf16 scan
+        // dispatched anyway: native printed `1 2 3 4 4 4 4 4` against interp's correct `1 2 3 4 5 6 7 8`
+        // while reading 32 bytes out of a 16-byte buffer. The cast spelling `acc + (x[i] as f32)` still
+        // routes to the half kernel via `try_emit_lowp_reduction`, which is where it belongs.
+        if self.expr_mir(data) != MirType::F32 {
+            return None;
         }
+        self.index_off(data, i, batch)
     }
 
     /// Recognize a batched per-row **first-order linear recurrence / selective scan** (SSM/Mamba/EMA):
@@ -5508,10 +5859,18 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
+        // The per-step input read is f32 for the same reason the gate array is — see
+        // [`Self::match_gated_carry`].
         if let Some(a) = self.match_gated_carry(lhs, h, t, batch) {
+            if self.expr_mir(rhs) != MirType::F32 {
+                return None;
+            }
             let b = self.index_off(rhs, t, batch)?;
             Some((a, b))
         } else if let Some(a) = self.match_gated_carry(rhs, h, t, batch) {
+            if self.expr_mir(lhs) != MirType::F32 {
+                return None;
+            }
             let b = self.index_off(lhs, t, batch)?;
             Some((a, b))
         } else {
@@ -5536,13 +5895,20 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if single_path(rhs) == Some(h) {
-            self.index_off(lhs, t, batch)
+        let data: &Expr = if single_path(rhs) == Some(h) {
+            lhs
         } else if single_path(lhs) == Some(h) {
-            self.index_off(rhs, t, batch)
+            rhs
         } else {
-            None
+            return None;
+        };
+        // The gate array is read as f32 by `wukong_lrscan_f32`; only the *store* was type-checked, so
+        // a half/integer gate array widened into the f32 carry still dispatched (see
+        // [`Self::match_acc_add`] for the measured cumsum form of the same defect).
+        if self.expr_mir(data) != MirType::F32 {
+            return None;
         }
+        self.index_off(data, t, batch)
     }
 
     /// Recognize a batched per-row **cumulative max / min** (running max/min scan):
@@ -5653,8 +6019,16 @@ impl FnLowerer<'_> {
     }
 
     /// The cumulative-max/min seed is valid iff `fXX(seed, x[r*C])` equals `x[r*C]` for any data: the
-    /// row's first element `x[r*C]`, or an extreme sentinel (`<= -1e30` for max, `>= 1e30` for min). The
+    /// row's first element `x[r*C]`, or an **infinite** sentinel (`-inf` for max, `+inf` for min). The
     /// max/`x[r*C]` cases match [`is_max_seed`]; this generalizes it to min. Pure.
+    ///
+    /// A merely large sentinel is not an identity, and `wukong_cummax_f32` takes no seed argument at all
+    /// (it always produces `out[0] = x[0]`), so the seed the source keeps is silently discarded: a row
+    /// `[-1e33, -1e33, -1e33, 5]` seeded `-1.0e30` printed `-10000 5` on both backends where the scalar
+    /// scan — the same nest with one statement appended so the recognizer declines — prints `-10 5`.
+    /// The bound is therefore the real one: a literal whose f32 value is infinite (`-1.0e39`), for which
+    /// `fmax(-inf, v) == v` holds for every finite or infinite `v`. `-1.0e38` is *not* one — it is finite
+    /// in f32, and a row holding `-inf` would keep it.
     fn is_cum_seed(
         &self,
         init: &Expr,
@@ -5684,10 +6058,11 @@ impl FnLowerer<'_> {
             },
             _ => return false,
         };
+        let s = v as f32;
         if is_max {
-            v <= -1e30
+            s == f32::NEG_INFINITY
         } else {
-            v >= 1e30
+            s == f32::INFINITY
         }
     }
 
@@ -5732,6 +6107,14 @@ impl FnLowerer<'_> {
         }
         let (iv, n_expr, b1) = self.as_range0_for(&body.stmts[1])?;
         let term = match_add_accum(b1, s)?;
+        // Both consumers (`wukong_kldiv_f32`, `wukong_entropy_f32`) read every buffer as f32, and
+        // nothing further down this head or in `match_log_index` looks at the element type — so an
+        // all-f64 KL/entropy nest dispatched and native printed `0 0` / `-2029 0` where interp printed
+        // the correct `1064 4564` / `13862 12798`. The neighbouring loss matchers already gate their
+        // addend this way (`match_sumexp_sub_body`), which is why f64 xent/logsumexp/kd_loss decline.
+        if self.expr_mir(term) != MirType::F32 {
+            return None;
+        }
         // [2] out[r] = s   OR   out[r] = -s  (caller checks the sign and binds out)
         let StmtKind::Assign {
             target,
@@ -6841,8 +7224,16 @@ impl FnLowerer<'_> {
                     // invariants at once. Scalars, arrays, and struct/tuple byte buffers are covered.
                     self.zero_init(slot, &mty);
                 }
+                // A `[]T` local owns a fat-pointer buffer; record the slot so `kernel_base_ptr`
+                // loads the data pointer out of it (the `Array(I8, 16)` slot shape it would
+                // otherwise key on is shared with tuples, 16-byte structs and `[i8; 16]` arrays).
+                let is_slice = match (ty, init) {
+                    (_, Some(e)) => self.let_is_slice(ty, e),
+                    (Some(t), None) => matches!(&t.kind, ast::TypeKind::Slice(_)),
+                    (None, None) => false,
+                };
                 match &pat.kind {
-                    ast::PatKind::Ident(name) => self.bind(*name, slot, mty),
+                    ast::PatKind::Ident(name) => self.bind_slice(*name, slot, mty, is_slice),
                     // Destructuring `let (a, b) = …`: bind each sub-pattern to its tuple field's
                     // place within the slot (a scalar field reads via a `Load`, an aggregate field
                     // binds its pointer). Recurses for a nested tuple pattern.
@@ -7086,6 +7477,20 @@ impl FnLowerer<'_> {
         if expr_mentions(rhs, i) {
             return false;
         }
+        // The bound is evaluated exactly ONCE, before the loop, in place of the `while`'s own
+        // per-iteration re-evaluation, so it must also be side-effect-free. `expr_mentions` only
+        // proves it does not move with the counter: a *call* bound was still hoisted, so
+        // `while i < bound() { … }` (with `bound()` printing) printed once where the while prints
+        // five times — the loop's data result stayed right and only the observable side effect was
+        // dropped. Both backends run the identical rewritten MIR, so `native_matches_interpreter`
+        // and the -O0/-O2 gate are blind to it. Restrict the bound to the pure arithmetic form; on
+        // a decline the caller lowers the `while` scalar, which re-evaluates the condition each
+        // iteration and is already correct. (A variable named in the bound cannot be *reassigned*
+        // by the body: `vectorizable` below admits only a store to an inner `let` temp or to an
+        // array element, so a body assigning an outer scalar already declines.)
+        if !is_pure_loop_bound(rhs) {
+            return false;
+        }
         // `i` must be a mutable int local already in scope (its slot is the loop counter).
         let Some((islot, ity)) = self.lookup(i) else {
             return false;
@@ -7257,15 +7662,47 @@ impl FnLowerer<'_> {
         // `Ptr` from the slot. A fixed `[T; N]` array's slot *is* its storage, so its base is the slot
         // address itself. Without the slice arm a `[]f32` operand (the only way to hold a runtime-sized
         // weight blob — e.g. GPT-2's 124M params) passed the 16-byte fat-pointer buffer as the base and
-        // the kernel dereferenced garbage ("expected a pointer"); a fixed `[i8; 16]` never reaches a
-        // GEMM operand (sema types these f32), so keying on the slice MIR shape is safe here.
-        let is_slice = matches!(&ty, MirType::Array(elem, n)
-            if matches!(**elem, MirType::I8) && *n as u64 == SLICE_SIZE);
+        // the kernel dereferenced garbage ("expected a pointer").
+        //
+        // Slice-ness comes from `slice_slots` (recorded by `bind_slice` from the *sema* type), never
+        // from the slot's MIR shape: `Array(I8, SLICE_SIZE)` is also how a tuple, a 16-byte struct and
+        // a user's own `[i8; 16]`/`[u8; 16]` array are typed, so shape-keying would hand an int8 GEMM
+        // the first 8 bytes of its own data matrix as a base pointer.
+        let is_slice = self.slice_slots.contains(&val);
         Some(if matches!(ty, MirType::Ptr) || is_slice {
             self.builder.build(MirType::Ptr, Op::Load(val, MirType::Ptr))
         } else {
             val
         })
+    }
+
+    /// Resolve several kernel operands through [`Self::kernel_base_ptr`] in one step — the shared
+    /// resolution path every recognizer emitter uses for its buffer operands. `None` if any operand
+    /// is unbound, which every caller turns into "decline, lower the scalar nest". Buffer operands
+    /// must go through here; *scalar* operands (an α, an eps, a per-tensor scale) keep the plain
+    /// `lookup` + `Load` form, since their slot really does hold the value.
+    fn kernel_base_ptrs<const N: usize>(&mut self, syms: [Symbol; N]) -> Option<[ValueId; N]> {
+        let mut vals = Vec::with_capacity(N);
+        for s in syms {
+            vals.push(self.kernel_base_ptr(s)?);
+        }
+        vals.try_into().ok()
+    }
+
+    /// The base pointer of a kernel operand written as an *expression* — the `Expr` twin of
+    /// [`Self::kernel_base_ptr`], for the builtin calls whose operands are argument exprs rather
+    /// than recognized nest symbols. A `[]T` slice argument lowers to its 16-byte fat-pointer
+    /// buffer, so the data pointer is one `Load` at `SLICE_PTR_OFF` (= 0); every other buffer form
+    /// (a fixed array, a `Tensor[..]`/pointer) already lowers to a base pointer and passes through
+    /// unchanged, so fixed-array call sites lower byte-identically. Keys on the *sema* type, the
+    /// same authority `bind_slice` records from.
+    fn kernel_operand_ptr(&mut self, e: &Expr) -> ValueId {
+        let v = self.lower_expr(e);
+        if matches!(self.expr_ty(e), Ty::Slice(_)) {
+            self.builder.build(MirType::Ptr, Op::Load(v, MirType::Ptr))
+        } else {
+            v
+        }
     }
 
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
@@ -7463,11 +7900,7 @@ impl FnLowerer<'_> {
     /// would reassociate per-thread partials). One symbol serves both store forms: the unscaled
     /// nest passes α = 1.0, which the kernel skips (byte-identical to a never-scaled fold).
     fn emit_gevm(&mut self, nest: &GevmNest, parallel: bool) -> bool {
-        let (Some((w, _)), Some((a, _)), Some((out, _))) = (
-            self.lookup(nest.w),
-            self.lookup(nest.a),
-            self.lookup(nest.out),
-        ) else {
+        let Some([w, a, out]) = self.kernel_base_ptrs([nest.w, nest.a, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7493,11 +7926,7 @@ impl FnLowerer<'_> {
     /// call site, so the caller lowers the scalar nest. `parallel` selects the multicore kernel (rows
     /// are independent, so it is bit-identical to the serial one the interpreter runs).
     fn emit_i8gemm(&mut self, nest: &I8MatmulNest, parallel: bool) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
-        ) else {
+        let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
         let (Some(m), Some(k), Some(n)) = (
@@ -7526,11 +7955,7 @@ impl FnLowerer<'_> {
     /// is bit-identical to the serial one the interpreter marshals). The widen is lossless, so the
     /// kernel equals the naive nest under the documented matmul reassociation.
     fn emit_lowp_gemm(&mut self, nest: &LowpMatmulNest, parallel: bool) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
-        ) else {
+        let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
         let (Some(m), Some(k), Some(n)) = (
@@ -7569,7 +7994,7 @@ impl FnLowerer<'_> {
     /// cross-channel combine). Max is idempotent and the avg sum order is fixed, so the kernel equals
     /// the scalar nest bit-for-bit (no reassociation exception).
     fn emit_pool2d(&mut self, nest: &Pool2dNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(channels), Some(h), Some(w)) = (
@@ -7605,7 +8030,7 @@ impl FnLowerer<'_> {
     /// the scalar nest). `parallel` selects the multicore kernel (the row blocks write disjoint `dst`
     /// columns → bit-identical to the serial one, which is a plain permutation the interpreter marshals).
     fn emit_transpose(&mut self, nest: &TransposeNest, parallel: bool) -> bool {
-        let (Some((src, _)), Some((dst, _))) = (self.lookup(nest.src), self.lookup(nest.dst)) else {
+        let Some([src, dst]) = self.kernel_base_ptrs([nest.src, nest.dst]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7629,7 +8054,7 @@ impl FnLowerer<'_> {
     /// `parallel` selects the multicore kernel (disjoint column stripes → bit-identical to the serial
     /// one, which sums each column in the same i-order the interpreter marshals).
     fn emit_colsum(&mut self, nest: &ColSumNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7665,9 +8090,7 @@ impl FnLowerer<'_> {
     /// `parallel` selects the multicore kernel (rows across cores → bit-identical to the serial one the
     /// interpreter marshals; rows are independent, no cross-row combine).
     fn emit_softmax_bwd(&mut self, nest: &SoftmaxBwdNest, parallel: bool) -> bool {
-        let (Some((y, _)), Some((dy, _)), Some((dx, _))) =
-            (self.lookup(nest.y), self.lookup(nest.dy), self.lookup(nest.dx))
-        else {
+        let Some([y, dy, dx]) = self.kernel_base_ptrs([nest.y, nest.dy, nest.dx]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7690,12 +8113,9 @@ impl FnLowerer<'_> {
     /// selects the multicore kernel (rows across cores → bit-identical to the serial one; rows
     /// independent, no cross-row combine).
     fn emit_rmsnorm_bwd(&mut self, nest: &RmsNormBwdNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((dy, _)), Some((gamma, _)), Some((dx, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.dy),
-            self.lookup(nest.gamma),
-            self.lookup(nest.dx),
-        ) else {
+        let Some([x, dy, gamma, dx]) =
+            self.kernel_base_ptrs([nest.x, nest.dy, nest.gamma, nest.dx])
+        else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7720,12 +8140,9 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_layernorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` call for
     /// a recognized batched LayerNorm backward. Same shape as `emit_rmsnorm_bwd`.
     fn emit_layernorm_bwd(&mut self, nest: &LayerNormBwdNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((dy, _)), Some((gamma, _)), Some((dx, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.dy),
-            self.lookup(nest.gamma),
-            self.lookup(nest.dx),
-        ) else {
+        let Some([x, dy, gamma, dx]) =
+            self.kernel_base_ptrs([nest.x, nest.dy, nest.gamma, nest.dx])
+        else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7751,11 +8168,8 @@ impl FnLowerer<'_> {
     /// batched cross-entropy loss. Bails (false) if an operand/dim is unbound. `parallel` selects the
     /// multicore kernel (rows independent → bit-identical to serial).
     fn emit_xent(&mut self, nest: &XentNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((target, _)), Some((loss, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.target),
-            self.lookup(nest.loss),
-        ) else {
+        let Some([x, target, loss]) = self.kernel_base_ptrs([nest.x, nest.target, nest.loss])
+        else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7776,11 +8190,7 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_xent_bwd_f32[_parallel](x, target, dx, rows, cols)` call for a recognized
     /// cross-entropy backward nest. Bails (false) if an operand/dim is unbound.
     fn emit_xent_bwd(&mut self, nest: &XentBwdNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((target, _)), Some((dx, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.target),
-            self.lookup(nest.dx),
-        ) else {
+        let Some([x, target, dx]) = self.kernel_base_ptrs([nest.x, nest.target, nest.dx]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7802,11 +8212,8 @@ impl FnLowerer<'_> {
     /// nest. Bails (false) if an operand/dim is unbound. `parallel` selects the multicore kernel (rows
     /// independent → bit-identical to serial).
     fn emit_rope(&mut self, nest: &RopeNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((inv_freq, _)), Some((out, _))) = (
-            self.lookup(nest.x),
-            self.lookup(nest.inv_freq),
-            self.lookup(nest.out),
-        ) else {
+        let Some([x, inv_freq, out]) = self.kernel_base_ptrs([nest.x, nest.inv_freq, nest.out])
+        else {
             return false;
         };
         let (Some(rows), Some(half)) = (self.dim_value(nest.rows), self.dim_value(nest.half)) else {
@@ -7828,7 +8235,7 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_logsumexp_f32[_parallel](x, out, rows, cols)` call for a recognized log-sum-exp
     /// nest. Bails (false) if an operand/dim is unbound. `parallel` selects the multicore kernel.
     fn emit_logsumexp(&mut self, nest: &LogsumexpNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7849,7 +8256,7 @@ impl FnLowerer<'_> {
     /// Emit `wukong_colarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-column arg
     /// nest. Same `(ptr,ptr,i64,i64)` i32-output ABI as `emit_rowarg`; `out` is the per-column row-index.
     fn emit_colarg(&mut self, nest: &ColArgNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7871,7 +8278,7 @@ impl FnLowerer<'_> {
     /// Emit `wukong_rowarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-row arg nest.
     /// Same `(ptr,ptr,i64,i64)` shape as `wukong_logsumexp_f32`, but `out` is an i32 index buffer.
     fn emit_rowarg(&mut self, nest: &RowArgNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7893,7 +8300,7 @@ impl FnLowerer<'_> {
     /// Emit `wukong_cumsum_f32[_parallel](x, out, rows, cols)` for a recognized per-row prefix sum.
     /// Same `(ptr,ptr,i64,i64)` `sig_vmath` shape; the `_parallel` one maps rows across cores.
     fn emit_cumsum(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7914,7 +8321,7 @@ impl FnLowerer<'_> {
     /// Emit `wukong_cumprod_f32[_parallel](x, out, rows, cols)` for a recognized prefix product. Same
     /// 2-ptr + 2-i64 `sig_vmath` ABI as cumsum; the `_parallel` one maps independent rows across cores.
     fn emit_cumprod(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7936,9 +8343,7 @@ impl FnLowerer<'_> {
     /// 3 pointers + 2 i64 (the `softmax_bwd` ABI); the `_parallel` one maps the independent rows across
     /// cores (bit-identical to serial — no cross-row combine).
     fn emit_lrscan(&mut self, nest: &LrscanNest, parallel: bool) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((out, _))) =
-            (self.lookup(nest.a), self.lookup(nest.b), self.lookup(nest.out))
-        else {
+        let Some([a, b, out]) = self.kernel_base_ptrs([nest.a, nest.b, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7958,7 +8363,7 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_cum{max,min}_f32[_parallel](x, out, rows, cols)` for a recognized cumulative max/min.
     fn emit_cumminmax(&mut self, nest: &CumMinMaxNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -7979,9 +8384,7 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_kldiv_f32[_parallel](p, q, out, rows, cols)` for a recognized KL-divergence nest.
     fn emit_kldiv(&mut self, nest: &KldivNest, parallel: bool) -> bool {
-        let (Some((p, _)), Some((q, _)), Some((out, _))) =
-            (self.lookup(nest.p), self.lookup(nest.q), self.lookup(nest.out))
-        else {
+        let Some([p, q, out]) = self.kernel_base_ptrs([nest.p, nest.q, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -8001,7 +8404,7 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_entropy_f32[_parallel](p, out, rows, cols)` for a recognized row-entropy nest.
     fn emit_entropy(&mut self, nest: &EntropyNest, parallel: bool) -> bool {
-        let (Some((p, _)), Some((out, _))) = (self.lookup(nest.p), self.lookup(nest.out)) else {
+        let Some([p, out]) = self.kernel_base_ptrs([nest.p, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -8021,9 +8424,7 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_kd_loss_f32[_parallel](x, q, out, rows, cols)` for a recognized soft-label xent nest.
     fn emit_kd_loss(&mut self, nest: &KdLossNest, parallel: bool) -> bool {
-        let (Some((x, _)), Some((q, _)), Some((out, _))) =
-            (self.lookup(nest.x), self.lookup(nest.q), self.lookup(nest.out))
-        else {
+        let Some([x, q, out]) = self.kernel_base_ptrs([nest.x, nest.q, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -8049,11 +8450,7 @@ impl FnLowerer<'_> {
     /// the widened operands; in a `@parallel` function the multicore kernel runs (each C tile owned by
     /// one task → bit-identical to the serial kernel the interpreter marshals).
     fn emit_lowp_gemm_epi(&mut self, nest: &LowpMatmulNest, bias: Option<Symbol>, act: u32) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
-        ) else {
+        let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
         let (Some(m), Some(k), Some(n)) = (
@@ -8067,8 +8464,8 @@ impl FnLowerer<'_> {
         // MIR): the kernel checks `bias.is_null()`, and the interpreter distinguishes the `Value::Int(0)`
         // from a real array's `Value::Ptr` by variant — same convention as the f32 `nt_epi` epilogue.
         let bias_ptr = match bias {
-            Some(s) => match self.lookup(s) {
-                Some((v, _)) => v,
+            Some(s) => match self.kernel_base_ptr(s) {
+                Some(v) => v,
                 None => return false,
             },
             None => self
@@ -8121,7 +8518,7 @@ impl FnLowerer<'_> {
             return None;
         }
         let (bias, act) =
-            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner)?;
+            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner, self.sema)?;
         if self.emit_lowp_gemm_epi(&nest, bias, act) {
             Some(2)
         } else {
@@ -8147,8 +8544,21 @@ impl FnLowerer<'_> {
         };
         let nest = recognize_matmul(pat, iter, body, self.sema, self.interner)?;
         // Only the plain 2-D nn.Linear form `C = A·Bᵀ` — no batch/head offsets (the epilogue kernel
-        // is serial nt-only).
+        // is serial nt-only), and no transposed A: `wukong_sgemm_nt_epi` reads A row-major `[m,k]`,
+        // so an `Aᵀ·Bᵀ` nest (both flags set) computed the NT product instead — `1 2 5 6` where
+        // `1 3 2 4` is correct. `match_matmul_residual`, the emitter's other caller, already rejects
+        // `transposed_a`; this guard had only checked `transposed`.
+        //
+        // A peeled α or fused bias must decline too: `emit_sgemm_epi` reads NEITHER field (nt_epi has
+        // no alpha parameter at all and is handed the null bias literal), so the scale/bias was
+        // silently dropped — `c[i*2+j] = s * 0.5` followed by a relu loop printed `100 200 500 600`
+        // instead of `50 100 250 300`, and `c[i*2+j] = bq[j] + s` printed the same instead of
+        // `1100 2200 1500 2600`. Declining is free: `emit_sgemm` folds α into `wukong_sgemm_nt_alpha`
+        // and the bias into its own `nt_epi` call, and the epilogue loop then lowers as its own pass.
         if !nest.transposed
+            || nest.transposed_a
+            || nest.alpha.is_some()
+            || nest.bias.is_some()
             || !nest.a_off.is_empty()
             || !nest.b_off.is_empty()
             || !nest.c_off.is_empty()
@@ -8156,7 +8566,7 @@ impl FnLowerer<'_> {
             return None;
         }
         let (bias, act) =
-            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner)?;
+            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner, self.sema)?;
         if self.emit_sgemm_epi(&nest, bias, act) {
             Some(2)
         } else {
@@ -8168,10 +8578,18 @@ impl FnLowerer<'_> {
     /// Linear+epilogue. Bails (false) if any operand/dim is somehow unbound at the call site, so the
     /// caller falls back to lowering the matmul and the epilogue loop separately.
     fn emit_sgemm_epi(&mut self, nest: &MatmulNest<'_>, bias: Option<Symbol>, act: u32) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _)), Some(m), Some(k), Some(n)) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
+        // This emitter reads neither `nest.alpha` nor `nest.bias` (the kernel has no α parameter, and
+        // the `bias` argument comes from the *epilogue* loop), and `wukong_sgemm_nt_epi` reads A
+        // row-major — so it cannot honour a peeled scale, a peeled store bias, or a transposed A, and
+        // must refuse them rather than emit a call that silently drops them. Its two callers are
+        // independent (`try_fuse_matmul_epilogue`, `match_matmul_residual`).
+        if nest.transposed_a || nest.alpha.is_some() || nest.bias.is_some() {
+            return false;
+        }
+        let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
             self.dim_value(nest.m),
             self.dim_value(nest.k),
             self.dim_value(nest.n),
@@ -8183,8 +8601,8 @@ impl FnLowerer<'_> {
         // `Value::Int(0)` from a real array's `Value::Ptr` by variant — same convention as the affine
         // norm null params.
         let bias_ptr = match bias {
-            Some(s) => match self.lookup(s) {
-                Some((v, _)) => v,
+            Some(s) => match self.kernel_base_ptr(s) {
+                Some(v) => v,
                 None => return false,
             },
             None => self
@@ -8268,12 +8686,7 @@ impl FnLowerer<'_> {
         bias: Option<Symbol>,
         act: u32,
     ) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((out_v, _)), Some((sb, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(out),
-            self.lookup(scale_b),
-        ) else {
+        let Some([a, b, out_v, sb]) = self.kernel_base_ptrs([nest.a, nest.b, out, scale_b]) else {
             return false;
         };
         let (Some(m), Some(k), Some(n)) = (
@@ -8295,8 +8708,8 @@ impl FnLowerer<'_> {
                 .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32)),
         };
         let bias_ptr = match bias {
-            Some(s) => match self.lookup(s) {
-                Some((v, _)) => v,
+            Some(s) => match self.kernel_base_ptr(s) {
+                Some(v) => v,
                 None => return false,
             },
             None => self
@@ -8385,12 +8798,20 @@ impl FnLowerer<'_> {
         if s == k {
             return None;
         }
-        // `base[k]` with the index exactly the loop variable → the base array symbol.
+        // `base[k]` with the index exactly the loop variable → the base array symbol. The element must
+        // be f32: the only consumer is `wukong_sreduce_f32_parallel`, which reads both operands as f32,
+        // and sema implicitly widens a `bf16`/`f16`/`i32` element into the f32 accumulator — so the
+        // uncast `acc = acc + x[k]` over `[bf16; 64]` dispatched and native printed `-2147483648`
+        // (256 bytes read from a 128-byte array) against interp's correct `64`. The explicitly cast
+        // spelling `(x[k] as f32)` is routed to the half kernel by `try_emit_lowp_reduction` instead.
         let idx_base = |e: &Expr| -> Option<Symbol> {
             let ExprKind::Index { base, indices } = &e.kind else {
                 return None;
             };
             if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+                return None;
+            }
+            if self.expr_mir(e) != MirType::F32 {
                 return None;
             }
             single_path(base)
@@ -8597,12 +9018,22 @@ impl FnLowerer<'_> {
     }
 
     /// Lower a recognized argmax/argmin loop `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }`
-    /// to one `wukong_argreduce_f32(x, n, op)` call plus a branchless reconcile of the kernel's
-    /// (value, index) against the loop's running `(bv, bi)`: `(bv,bi) = arg_fold((bv,bi),(x[ki],ki))`.
-    /// Because `arg_fold` is associative (lowest-index tie-break, a total order) and the loop covers
-    /// `x[0..n]` (start 0), the loop result equals this reconcile for **any** seed — so the preceding
-    /// `let bv = …; let bi = …;` need not be inspected. Both backends marshal the identical kernel, so
-    /// the differential oracle stays exact. Returns false (fall back to the scalar loop) on any mismatch.
+    /// to one `wukong_argreduce_f32(x, n, op)` call plus a reconcile of the kernel's (value, index)
+    /// against the loop's running `(bv, bi)`.
+    ///
+    /// The loop's compare is STRICT, so a value merely equal to the running best can never displace
+    /// it: the final `(bv, bi)` is `(x[ki], ki)` when `x[ki]` strictly beats the seed and the seed
+    /// otherwise, where `ki` is the kernel's lowest-index extremum. The reconcile is therefore exactly
+    /// `Select(x[ki] CMP bv_seed, …)` — no tie-break term, which would make the emitted code disagree
+    /// with the source whenever the seed value ties the extremum at a *higher* index. Since `arg_fold`
+    /// breaks ties toward the lowest index and the loop covers `x[0..n]` (start 0), that identity holds
+    /// for **any** seed — so the preceding `let bv = …; let bi = …;` need not be inspected.
+    ///
+    /// The kernel returns `-1` when it found no index at all (`n <= 0`, and an all-NaN span; see
+    /// `wukong_argreduce_f32` in wukong_runtime), for which the source loop leaves the seed untouched.
+    /// The reconcile is guarded by `ki >= 0` so that case neither stores nor forms the address `x[-1]`.
+    /// Both backends marshal the identical kernel, so the differential oracle stays exact. Returns
+    /// false (fall back to the scalar loop) on any mismatch.
     fn try_emit_argreduce(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
         // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
         // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
@@ -8632,7 +9063,7 @@ impl FnLowerer<'_> {
         ) {
             return false;
         }
-        let Some((xv, _)) = self.lookup(xb) else {
+        let Some(xv) = self.kernel_base_ptr(xb) else {
             return false;
         };
         let n_ty = self.expr_mir(end);
@@ -8656,6 +9087,19 @@ impl FnLowerer<'_> {
                 args: vec![xv, n, opv],
             },
         );
+        // `ki == -1` ⇒ the kernel found no index (empty span / all-NaN); the source loop never ran its
+        // body, so the seed stands. Branch around the whole reconcile so `x[-1]` is never addressed.
+        let zero64 = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let valid = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Sge, ki, zero64));
+        let reconcile_blk = self.builder.new_block();
+        let join_blk = self.builder.new_block();
+        self.builder
+            .cond_br(valid, reconcile_blk, vec![], join_blk, vec![]);
+        self.builder.switch_to(reconcile_blk);
         let kptr = self.builder.build(
             MirType::Ptr,
             Op::Gep {
@@ -8665,7 +9109,7 @@ impl FnLowerer<'_> {
             },
         );
         let kv = self.builder.build(MirType::F32, Op::Load(kptr, MirType::F32));
-        // Reconcile with the running (bv, bi): better = (kv CMP bv) || (kv == bv && ki < bi).
+        // Reconcile with the running (bv, bi): better = (kv CMP bv), the loop's own strict compare.
         let bv_cur = self
             .builder
             .build(MirType::F32, Op::Load(bv_slot, MirType::F32));
@@ -8677,20 +9121,10 @@ impl FnLowerer<'_> {
         } else {
             CmpOp::Folt
         };
-        let strictly = self
-            .builder
-            .build(MirType::I1, Op::Cmp(pred, kv, bv_cur));
-        let eq = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Foeq, kv, bv_cur));
-        let ki_bi = self.coerce_to(ki, &MirType::I64, &bi_ty, true);
-        let idx_lt = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, ki_bi, bi_cur));
-        let tie = self.builder.build(MirType::I1, Op::Bin(BinOp::And, eq, idx_lt));
         let better = self
             .builder
-            .build(MirType::I1, Op::Bin(BinOp::Or, strictly, tie));
+            .build(MirType::I1, Op::Cmp(pred, kv, bv_cur));
+        let ki_bi = self.coerce_to(ki, &MirType::I64, &bi_ty, true);
         let new_bv = self
             .builder
             .build(MirType::F32, Op::Select(better, kv, bv_cur));
@@ -8705,6 +9139,8 @@ impl FnLowerer<'_> {
             ptr: bi_slot,
             value: new_bi,
         });
+        self.builder.br(join_blk, vec![]);
+        self.builder.switch_to(join_blk);
         true
     }
 
@@ -9132,9 +9568,7 @@ impl FnLowerer<'_> {
         let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, *k) else {
             return false;
         };
-        let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
-            (self.lookup(out), self.lookup(x), self.lookup(y))
-        else {
+        let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
             return false;
         };
         // Coefficients: lower the invariant expr (coerced to f32), or a literal 1.0 when implicit.
@@ -9196,9 +9630,7 @@ impl FnLowerer<'_> {
         let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby_narrow(body, *k) else {
             return false;
         };
-        let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
-            (self.lookup(out), self.lookup(x), self.lookup(y))
-        else {
+        let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
             return false;
         };
         let mut coef = |e: Option<&Expr>| -> ValueId {
@@ -9334,7 +9766,7 @@ impl FnLowerer<'_> {
         let Some((out, x, opcode, is_f16)) = self.match_vmath_narrow(body, *k) else {
             return false;
         };
-        let (Some((outv, _)), Some((xv, _))) = (self.lookup(out), self.lookup(x)) else {
+        let Some([outv, xv]) = self.kernel_base_ptrs([out, x]) else {
             return false;
         };
         let n_ty = self.expr_mir(end);
@@ -9544,11 +9976,34 @@ impl FnLowerer<'_> {
     /// `-O0`==`-O3`; both backends marshal the identical kernel, so the differential gate stays
     /// bit-exact. In a `@parallel` function `emit_norm` selects the multicore `_parallel` variant.
     fn try_emit_batched_norm(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
-        let ForIter::Range { end: Some(end), .. } = iter else {
+        // Unit-step half-open only: the kernel's `rows` is `end`, so a `..=` or `step k` outer loop
+        // would normalize a different number of rows (the `range_bounds` contract, spelled out here
+        // because this recognizer reads the bound directly).
+        let ForIter::Range {
+            end: Some(end),
+            inclusive: false,
+            step: None,
+            ..
+        } = iter
+        else {
             return false;
         };
         if let Some((x, dst, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body)
         {
+            // `emit_norm` lowers the per-row width `cols` at the OUTER loop's statement position, where
+            // the row variable is not in scope. A width that depends on the row — a packed/triangular
+            // layout, `for i in 0..r { … x[r*r + i] … }` — is not this kernel's `[R, C]` shape anyway,
+            // and lowering it there reported `error[C0001]: 'value reference' is not yet supported by
+            // codegen` against `r` on a program that runs (999) as soon as the window declines.
+            if let Pattern {
+                kind: ast::PatKind::Ident(r),
+                ..
+            } = pat
+            {
+                if expr_mentions(&cols, *r) {
+                    return false;
+                }
+            }
             return self.emit_norm(x, dst, Some(end), &cols, eps, op, gamma, beta);
         }
         false
@@ -9886,7 +10341,11 @@ impl FnLowerer<'_> {
         {
             (ety.clone(), self.signed(end))
         } else {
-            (sty.clone(), self.signed(start))
+            // The counter's signedness must consider BOTH bounds (see `forces_unsigned_cmp`).
+            // Reading it off the START alone drove `for i in 0..n` with `n: u32 = 3_000_000_000`
+            // as `cmp.slt i, -1294967296`, so the loop ran zero iterations; the `u64` form was
+            // right only because its end is strictly wider and takes the branch above.
+            (sty.clone(), self.signed(start) && !self.forces_unsigned_cmp(end, &sty))
         };
 
         // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
@@ -10335,9 +10794,19 @@ impl FnLowerer<'_> {
                 // A body-local scalar/aggregate is private; writing the region var, a captured
                 // scalar (a loop-carried accumulator), or a captured whole array declines.
                 if sym != sc.hh && sc.is_local(sym) {
-                    // Assigning a digit-derived local invalidates its modeled value from here on;
-                    // accesses recorded earlier keep their (correct-at-the-time) snapshot.
-                    sc.derived.remove(&sym);
+                    // …but only if the scan is not MODELING that local. Both models this walk keeps
+                    // — a digit-derived value (`sc.derived`) and an inner loop variable's literal
+                    // range (`sc.env`) — are snapshotted into every access, and the walk is
+                    // source-ordered, not flow-sensitive: an access scanned BEFORE this assignment
+                    // keeps a snapshot that is wrong on every later trip of the enclosing loop, and
+                    // the disjointness proof is then carried out on a value the program never
+                    // computes. Both shapes were measured to produce a real data race (native
+                    // nondeterministic run to run, and never the interpreter's answer). Assigning a
+                    // modeled name declines the whole region; the loop then lowers serially.
+                    if sc.derived.contains_key(&sym) || sc.env.iter().any(|(v, _)| *v == sym) {
+                        sc.ok = false;
+                        return;
+                    }
                     return;
                 }
                 sc.ok = false;
@@ -10567,11 +11036,15 @@ impl FnLowerer<'_> {
         // A captured array's bound ValueId IS its base pointer; a captured scalar's is its alloca
         // slot pointer. Both are pointer-shaped, so the env is a uniform pointer table. Scalars are
         // read-only inside the region (matcher-enforced), so sharing the slot is race-free.
-        let caps: Vec<(Symbol, ValueId, MirType)> = captures
+        // A captured `[]T` slice puts the address of *its fat-pointer buffer* in the env (the bound
+        // value of a slice is that buffer), so the re-bind inside the outlined body must carry the
+        // slice record forward or `kernel_base_ptr` would take the buffer for the data itself.
+        let caps: Vec<(Symbol, ValueId, MirType, bool)> = captures
             .iter()
             .map(|s| {
                 let (v, t) = self.lookup(*s).expect("region capture must be in scope");
-                (*s, v, t)
+                let is_slice = self.slice_slots.contains(&v);
+                (*s, v, t, is_slice)
             })
             .collect();
 
@@ -10580,7 +11053,7 @@ impl FnLowerer<'_> {
         let env = self
             .builder
             .alloca(MirType::Array(Box::new(MirType::Ptr), k));
-        for (i, (_, vid, _)) in caps.iter().enumerate() {
+        for (i, (_, vid, _, _)) in caps.iter().enumerate() {
             let kidx = self
                 .builder
                 .build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
@@ -10624,6 +11097,7 @@ impl FnLowerer<'_> {
                 // iterations never overlap writes).
                 parallel_fn: false,
                 vec_loads: HashMap::default(),
+                slice_slots: HashSet::default(),
                 sret: None,
                 subst: self.subst.clone(),
                 mono: self.mono,
@@ -10632,7 +11106,7 @@ impl FnLowerer<'_> {
             let start = fl.builder.add_param(MirType::I64);
             let end = fl.builder.add_param(MirType::I64);
             let envp = fl.builder.add_param(MirType::Ptr);
-            for (i, (sym, _, mty)) in caps.iter().enumerate() {
+            for (i, (sym, _, mty, is_slice)) in caps.iter().enumerate() {
                 let kidx = fl
                     .builder
                     .build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
@@ -10645,7 +11119,7 @@ impl FnLowerer<'_> {
                     },
                 );
                 let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
-                fl.bind(*sym, base, mty.clone());
+                fl.bind_slice(*sym, base, mty.clone(), *is_slice);
             }
             fl.lower_ranged_loop(hh, start, end, ity.clone(), body);
             if !fl.terminated {
@@ -11401,9 +11875,7 @@ impl FnLowerer<'_> {
         let Some((out, x, b, rows, cols, op)) = self.match_bias_bcast(pat, iter, body) else {
             return false;
         };
-        let (Some((outv, _)), Some((xv, _)), Some((bv, _))) =
-            (self.lookup(out), self.lookup(x), self.lookup(b))
-        else {
+        let Some([outv, xv, bv]) = self.kernel_base_ptrs([out, x, b]) else {
             return false;
         };
         let rty = self.expr_mir(rows);
@@ -11594,13 +12066,55 @@ impl FnLowerer<'_> {
         true
     }
 
-    /// A loop-invariant f32 coefficient: an expr provably free of the loop var `j` and typed f32 (a
-    /// literal like `2.0`, or an outer scalar like saxpy's `a`). Lowered to a ValueId at emit time.
-    /// Uses the **conservative** [`expr_mentions`] (recurses through calls/casts/fields and assumes a
-    /// use for anything it cannot model), so a per-element factor like `sigmoid(x[j])` is correctly
-    /// rejected rather than mistaken for an invariant scale. Pure.
+    /// Is `e` safe to evaluate **once**, in the loop's enclosing scope, in place of once per iteration?
+    ///
+    /// [`expr_mentions`] answers "does this name the loop variable"; it does not answer this. It models
+    /// `ExprKind::Call` precisely (recursing into callee and args), so a zero-argument call to a
+    /// side-effecting user function reads as loop-invariant — and a recognizer that hoists it drops
+    /// every call but the first. Every form `expr_mentions` gives up on (its `_ => true` arm: blocks,
+    /// `if`/`match` values, method calls, …) is already rejected by the mention test, so the one hole
+    /// to close here is the call: only a pure math intrinsic — `vectorizable_intrinsic`, which itself
+    /// declines a name a user `fn` shadows — may appear. Pure.
+    fn coeff_is_hoistable(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Path(_)
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_) => true,
+            ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+                self.coeff_is_hoistable(expr)
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.coeff_is_hoistable(lhs) && self.coeff_is_hoistable(rhs)
+            }
+            ExprKind::Index { base, indices } => {
+                self.coeff_is_hoistable(base) && indices.iter().all(|i| self.coeff_is_hoistable(i))
+            }
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.coeff_is_hoistable(base)
+            }
+            ExprKind::ArrayLit(items) => items.iter().all(|i| self.coeff_is_hoistable(i)),
+            ExprKind::ArrayRepeat { value, count } => {
+                self.coeff_is_hoistable(value) && self.coeff_is_hoistable(count)
+            }
+            ExprKind::Call { callee, args, .. } => {
+                self.vectorizable_intrinsic(callee).is_some()
+                    && args.iter().all(|a| self.coeff_is_hoistable(a))
+            }
+            _ => false,
+        }
+    }
+
+    /// A loop-invariant f32 coefficient: an expr provably free of the loop var `j`, safe to evaluate
+    /// once outside the loop, and typed f32 (a literal like `2.0`, or an outer scalar like saxpy's
+    /// `a`). Lowered to a ValueId at emit time. Uses the **conservative** [`expr_mentions`] (recurses
+    /// through calls/casts/fields and assumes a use for anything it cannot model), so a per-element
+    /// factor like `sigmoid(x[j])` is correctly rejected rather than mistaken for an invariant scale;
+    /// [`Self::coeff_is_hoistable`] then rejects the invariant-but-effectful ones. Pure.
     fn velem_coeff<'b>(&self, e: &'b Expr, j: Symbol) -> Option<&'b Expr> {
-        if expr_mentions(e, j) || self.expr_mir(e) != MirType::F32 {
+        if expr_mentions(e, j) || !self.coeff_is_hoistable(e) || self.expr_mir(e) != MirType::F32 {
             return None;
         }
         Some(e)
@@ -12004,11 +12518,13 @@ impl FnLowerer<'_> {
         }
         let (inner, act) = self.peel_dequant_act(value);
         let (q_sym, q_elem, width, scale) = self.match_dequant_mul(inner, j)?;
-        let out = self.lookup(out_sym)?.0;
-        let q = self.lookup(q_sym)?.0;
+        // Validate both operands are bound (a pure matcher cannot emit the fat-pointer load); the
+        // base pointers are resolved at emit time.
+        self.lookup(out_sym)?;
+        self.lookup(q_sym)?;
         Some(DequantPlan {
-            out,
-            q,
+            out: out_sym,
+            q: q_sym,
             q_elem,
             scale,
             op: act | width,
@@ -12020,12 +12536,15 @@ impl FnLowerer<'_> {
     /// `out` GEP by `F32`; `scale` is lowered to an f32 ValueId. The serial kernel is used on both the
     /// sequential and the `@parallel`-chunk paths (the outliner supplies the threading, so each chunk is
     /// one serial call — bit-equal to the whole-range interpreter marshal, like velem).
-    fn emit_dequant_call(&mut self, s: ValueId, e: ValueId, plan: &DequantPlan) {
+    fn emit_dequant_call(&mut self, s: ValueId, e: ValueId, plan: &DequantPlan) -> bool {
+        let Some([q_base, out_base]) = self.kernel_base_ptrs([plan.q, plan.out]) else {
+            return false;
+        };
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
         let qp = self.builder.build(
             MirType::Ptr,
             Op::Gep {
-                ptr: plan.q,
+                ptr: q_base,
                 index: s,
                 elem: plan.q_elem.clone(),
             },
@@ -12033,7 +12552,7 @@ impl FnLowerer<'_> {
         let outp = self.builder.build(
             MirType::Ptr,
             Op::Gep {
-                ptr: plan.out,
+                ptr: out_base,
                 index: s,
                 elem: MirType::F32,
             },
@@ -12056,6 +12575,7 @@ impl FnLowerer<'_> {
             func,
             args: vec![qp, outp, n, scale, opv],
         });
+        true
     }
 
     /// Recognize a streaming int-input dequant `for j in lo..hi { out[j] = act((q[j] as f32)·scale) }`
@@ -12072,8 +12592,7 @@ impl FnLowerer<'_> {
         let ety = self.expr_mir(end);
         let e = self.lower_expr(end);
         let e = self.coerce_to(e, &ety, &MirType::I64, true);
-        self.emit_dequant_call(s, e, &plan);
-        true
+        self.emit_dequant_call(s, e, &plan)
     }
 
     /// Recognize a **batched** cast operand `(q[i*C+j] as f32)` (the integer factor of a per-channel
@@ -12194,11 +12713,7 @@ impl FnLowerer<'_> {
     /// maps independent rows across cores, bit-equal to serial). Returns false (fall through) if a base
     /// or dim cannot be resolved.
     fn emit_dequant_perchan(&mut self, nest: &DequantPerchanNest, parallel: bool) -> bool {
-        let (Some((q, _)), Some((out, _)), Some((scale, _))) = (
-            self.lookup(nest.q),
-            self.lookup(nest.out),
-            self.lookup(nest.scale),
-        ) else {
+        let Some([q, out, scale]) = self.kernel_base_ptrs([nest.q, nest.out, nest.scale]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
@@ -12223,8 +12738,8 @@ impl FnLowerer<'_> {
     }
 
     /// Match `r = r·v + Ck` (the running Horner step) for accumulator `r` and per-element value `v`,
-    /// either factor order and either `Add` operand order. `Ck` must be a loop-invariant f32 (free of
-    /// the loop var `j`). Returns the coefficient expr. Pure.
+    /// either factor order and either `Add` operand order. `Ck` must be a coefficient
+    /// [`Self::horner_coeff`] accepts. Returns the coefficient expr. Pure.
     fn match_horner_step<'b>(
         &self,
         stmt: &'b Stmt,
@@ -12263,7 +12778,24 @@ impl FnLowerer<'_> {
         } else {
             return None;
         };
-        if expr_mentions(ck, j) || self.expr_mir(ck) != MirType::F32 {
+        self.horner_coeff(ck, r, v, j)
+    }
+
+    /// A Horner coefficient: loop-invariant, hoistable, f32 — and free of the body's OWN bindings.
+    ///
+    /// `emit_vhorner` materializes every coefficient into a stack array *before* the kernel call, i.e.
+    /// it lowers them in the loop's ENCLOSING scope, where the element temp `v` and the accumulator `r`
+    /// do not exist. `expr_mentions(ck, j)` alone does not see that: `acc = acc*v + v` reads as
+    /// invariant, and the hoisted `v` then either resolves to an outer binding of the same name — a
+    /// silent wrong polynomial — or to nothing, a bogus C0001 for a loop the generic vectorizer lowers
+    /// correctly. Reject both by rejecting any mention of `v` or `r`. Pure.
+    fn horner_coeff<'b>(&self, ck: &'b Expr, r: Symbol, v: Symbol, j: Symbol) -> Option<&'b Expr> {
+        if expr_mentions(ck, j)
+            || expr_mentions(ck, v)
+            || expr_mentions(ck, r)
+            || !self.coeff_is_hoistable(ck)
+            || self.expr_mir(ck) != MirType::F32
+        {
             return None;
         }
         Some(ck)
@@ -12286,7 +12818,7 @@ impl FnLowerer<'_> {
         &self,
         j: Symbol,
         body: &'b Block,
-    ) -> Option<(ValueId, ValueId, Vec<&'b Expr>)> {
+    ) -> Option<(Symbol, Symbol, Vec<&'b Expr>)> {
         if body.tail.is_some() || body.stmts.len() < 4 {
             return None;
         }
@@ -12298,11 +12830,11 @@ impl FnLowerer<'_> {
         if self.expr_mir(v_init) != MirType::F32 {
             return None;
         }
-        // `let mut r = C0` (leading coefficient, loop-invariant f32)
+        // `let mut r = C0` (leading coefficient, loop-invariant f32). `v` is already bound here, so
+        // `let mut r = v` reads as invariant to `expr_mentions` and would be hoisted; `horner_coeff`
+        // rejects it for the same reason it rejects a step's `v`.
         let (r, c0) = Self::let_init(&stmts[1])?;
-        if expr_mentions(c0, j) || self.expr_mir(c0) != MirType::F32 {
-            return None;
-        }
+        let c0 = self.horner_coeff(c0, r, v, j)?;
         let mut coeffs = vec![c0];
         for stmt in &stmts[2..n - 1] {
             coeffs.push(self.match_horner_step(stmt, r, v, j)?);
@@ -12320,7 +12852,12 @@ impl FnLowerer<'_> {
         if single_path(value) != Some(r) {
             return None;
         }
-        Some((self.lookup(out_sym)?.0, self.lookup(x_sym)?.0, coeffs))
+        // Validate both operands are bound and hand back their *symbols*: a pure matcher cannot emit
+        // the load that pulls a `[]T` slice's / a `Tensor[..]` param's data pointer out of its slot,
+        // so `emit_vhorner` resolves them through `kernel_base_ptr`.
+        self.lookup(out_sym)?;
+        self.lookup(x_sym)?;
+        Some((out_sym, x_sym, coeffs))
     }
 
     /// Emit one `wukong_vhorner_f32(x+s, out+s, e-s, coeffs, ncoeff)` call: materialize the
@@ -12331,10 +12868,13 @@ impl FnLowerer<'_> {
         &mut self,
         s: ValueId,
         e: ValueId,
-        out_base: ValueId,
-        x_base: ValueId,
+        out_sym: Symbol,
+        x_sym: Symbol,
         coeffs: &[&Expr],
-    ) {
+    ) -> bool {
+        let Some([out_base, x_base]) = self.kernel_base_ptrs([out_sym, x_sym]) else {
+            return false;
+        };
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
         let arr = self
             .builder
@@ -12374,6 +12914,7 @@ impl FnLowerer<'_> {
             func: self.gemm.vhorner,
             args: vec![xp, outp, n, arr, ncoeff],
         });
+        true
     }
 
     /// Recognize a per-element Horner polynomial loop `for j in lo..hi { let v=x[j]; let mut r=c0; r =
@@ -12390,8 +12931,7 @@ impl FnLowerer<'_> {
         let ety = self.expr_mir(end);
         let e = self.lower_expr(end);
         let e = self.coerce_to(e, &ety, &MirType::I64, true);
-        self.emit_vhorner(s, e, out_base, x_base, &coeffs);
-        true
+        self.emit_vhorner(s, e, out_base, x_base, &coeffs)
     }
 
     /// Attempt SIMD lowering of `for j in start..end { body }`. Returns true on success.
@@ -12582,17 +13122,16 @@ impl FnLowerer<'_> {
         if let Some(plan) = self.match_dequant_body(j, body) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            self.emit_dequant_call(s, e, &plan);
-            return true;
+            if self.emit_dequant_call(s, e, &plan) {
+                return true;
+            }
         }
         // A bf16/f16→f32 axpby per `@parallel` chunk → `wukong_axpby_{bf16,f16}` over `[s, e)`, so a
         // mixed-precision residual-add / saxpy runs multicore (the bandwidth payoff is largest here,
         // ≫ L3). Each chunk GEPs the half-width inputs and f32 output by `s`; elementwise, so the
         // per-chunk passes agree with the interpreter's whole-range marshal of the same kernel.
         if let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, j) {
-            if let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
-                (self.lookup(out), self.lookup(x), self.lookup(y))
-            {
+            if let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) {
                 let s = self.coerce_to(start_val, ity, &MirType::I64, true);
                 let e = self.coerce_to(end_val, ity, &MirType::I64, true);
                 let av = self.lower_coeff(a_expr, 1.0);
@@ -12638,8 +13177,9 @@ impl FnLowerer<'_> {
         if let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            self.emit_vhorner(s, e, out_base, x_base, &coeffs);
-            return true;
+            if self.emit_vhorner(s, e, out_base, x_base, &coeffs) {
+                return true;
+            }
         }
         let Some((lane, w)) = self.vectorizable(body, j) else {
             return false;
@@ -12939,6 +13479,18 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Is every stream base of a built recipe a binding this lowerer can resolve? A module-level
+    /// `const` array is `Ty::Array` to sema — so `vectorizable`/`rec_value` happily accept it — but
+    /// it is never entered into `scopes`, and the two emitters' `lookup(..).expect("stream base in
+    /// scope")` turned that into a raw compiler panic (exit 127, internal file:line text, no span)
+    /// on plain user source such as `const W: [f32; 16] = [2.0; 16]; … o[i] = W[i]*W[i] + 1.0;`.
+    /// Checking here — where the recipe is still just data — makes the whole 256-bit path decline,
+    /// so lowering falls through to the 128-bit CLIF / scalar route and the user gets that route's
+    /// catalogued, spanned `C0001` diagnostic. The `expect`s downstream become true post-conditions.
+    fn recipe_bases_bound(&self, r: &VecRecipe) -> bool {
+        r.streams.iter().all(|(b, _)| self.lookup(*b).is_some())
+    }
+
     /// Capture a validated (`vectorizable`-passing) f32 loop body as a flat [`VecKernel`] recipe for
     /// the raw-AVX2 path, or `None` if it uses anything outside the assembler's coverage (a
     /// transcendental, `abs`/rounding, `fmax`/`fmin`, a compound assign) — in which case the caller
@@ -12997,8 +13549,12 @@ impl FnLowerer<'_> {
                 _ => return None,
             }
         }
-        // Need at least one stream and one store for a kernel to do anything.
-        if r.streams.is_empty() || !r.ops.iter().any(|o| matches!(o, VecOp::Store { .. })) {
+        // Need at least one stream and one store for a kernel to do anything, and every stream base
+        // must be resolvable at emit time (a module-level `const` array is not).
+        if r.streams.is_empty()
+            || !r.ops.iter().any(|o| matches!(o, VecOp::Store { .. }))
+            || !self.recipe_bases_bound(&r)
+        {
             return None;
         }
         Some(r)
@@ -13060,6 +13616,39 @@ impl FnLowerer<'_> {
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 use ast::BinOp::*;
+                // `x + y*z` contracts into ONE lane-wise `Fma`, exactly as the 128-bit CLIF path
+                // (`vec_try_fma`) and the scalar remainder that the SAME loop runs
+                // (`try_contract_fma`) already do. Emitting `Mul` + `Add` instead rounded the vector
+                // part twice where the tail rounded once: nine identical input triples
+                // (`o[i] = x[i] + y[i]*z[i]`, x = -(1+2^-11), y = z = 1+2^-12) printed 0 for lanes
+                // 0..7 and 1 for the tail lane — one loop, two answers, on both backends at every -O
+                // level. `WUKONG_P4_NO_256=1` printed 1 for both, so the knob was changing the
+                // program's numbers rather than only its instruction selection. The leaves lower in
+                // source order, matching the twins.
+                if matches!(op, Add) {
+                    if let ExprKind::Binary {
+                        op: Mul,
+                        lhs: y,
+                        rhs: z,
+                    } = &lhs.kind
+                    {
+                        let a = self.rec_value(y, j, locals, r)?;
+                        let b = self.rec_value(z, j, locals, r)?;
+                        let c = self.rec_value(rhs, j, locals, r)?;
+                        return Some(push(r, VecOp::Fma { a, b, c }));
+                    }
+                    if let ExprKind::Binary {
+                        op: Mul,
+                        lhs: y,
+                        rhs: z,
+                    } = &rhs.kind
+                    {
+                        let c = self.rec_value(lhs, j, locals, r)?;
+                        let a = self.rec_value(y, j, locals, r)?;
+                        let b = self.rec_value(z, j, locals, r)?;
+                        return Some(push(r, VecOp::Fma { a, b, c }));
+                    }
+                }
                 let vop = match op {
                     Add => VecBin::Add,
                     Sub => VecBin::Sub,
@@ -13475,7 +14064,7 @@ impl FnLowerer<'_> {
                 let mut r = fresh();
                 if let Some(x) = self.rec_value(lhs, j, &HashMap::default(), &mut r) {
                     if let Some(y) = self.rec_value(rhs, j, &HashMap::default(), &mut r) {
-                        if !r.streams.is_empty() {
+                        if !r.streams.is_empty() && self.recipe_bases_bound(&r) {
                             return Some((r, x, Some((x, y))));
                         }
                     }
@@ -13493,6 +14082,7 @@ impl FnLowerer<'_> {
                 r.ops[value as usize],
                 VecOp::Splat { .. } | VecOp::Const { .. }
             )
+            || !self.recipe_bases_bound(&r)
         {
             return None;
         }
@@ -14671,6 +15261,22 @@ impl FnLowerer<'_> {
             // unaffected.
             let zero = self.builder.build(ty.clone(), Op::ConstInt(0, ty.clone()));
             self.builder.build(MirType::I1, Op::Cmp(CmpOp::Ne, v, zero))
+        } else if ty == MirType::Ptr {
+            // A **pointer** condition (`if s { .. }` for a string local — `if (p)` is the canonical
+            // C form) is the same C-like truthiness: `p != null`. It used to fall through here
+            // *unchanged* into `cond_br`, which both backends reject with raw internal text and no
+            // span ("cond_br condition: v2 has type ptr but expected i1") — an ICE on a program the
+            // front end accepts. Compare the address rather than the pointer: `PtrToInt` is the one
+            // pointer cast the interpreter (`Value::Ptr(p) -> p as i128`) and Cranelift (a plain
+            // integer resize) both already implement, so the two agree by construction.
+            let addr = self
+                .builder
+                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, v, MirType::I64));
+            let zero = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+            self.builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Ne, addr, zero))
         } else {
             v
         }
@@ -14823,7 +15429,28 @@ impl FnLowerer<'_> {
         let aggregate = matches!(elem, MirType::Array(..));
         match &init.kind {
             ExprKind::ArrayLit(elems) => {
-                for (i, el) in elems.iter().enumerate() {
+                // `n` is the destination's extent and is the contract of this function, but the
+                // literal's own length was never compared against it. An over-long literal stored
+                // PAST the end of the buffer it was handed — `s.a = [7, 8, 9, 10, 11, 12]` into an
+                // `[i32; 2]` field emitted six stores into an 8-byte alloca (`error: store out of
+                // bounds` on interp, **segfault** on native) — and an under-long one left the tail
+                // unwritten, which reads back as 0 under the interpreter's slot memory and as stack
+                // garbage that differs at -O0 and -O2 on native. sema's `let`-annotation and
+                // struct-literal-field length checks do not cover an assignment RHS or an enum
+                // tuple payload, both of which reach here. Clamp the stores to `n` so no store can
+                // leave the buffer, and report the mismatch with the wording the struct-field check
+                // already uses.
+                if elems.len() as u32 != n {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "array has length {n} but its initializer has {} element(s)",
+                            elems.len()
+                        ))
+                        .with_code("E0401")
+                        .primary(init.span, "initializer length does not match the destination"),
+                    );
+                }
+                for (i, el) in elems.iter().take(n as usize).enumerate() {
                     if aggregate {
                         let ep = self.gep_elem(base, elem, i as i128);
                         let ety = self.expr_ty(el);
@@ -15568,15 +16195,16 @@ impl FnLowerer<'_> {
     ) {
         match &pat.kind {
             ast::PatKind::Ident(name) => {
+                let is_slice = matches!(scrut_ty, Ty::Slice(_));
                 if matches!(scrut_mir, MirType::Array(..)) {
-                    self.bind(*name, scrut, scrut_mir.clone());
+                    self.bind_slice(*name, scrut, scrut_mir.clone(), is_slice);
                 } else {
                     let slot = self.builder.alloca(scrut_mir.clone());
                     self.builder.build_void(Op::Store {
                         ptr: slot,
                         value: scrut,
                     });
-                    self.bind(*name, slot, scrut_mir.clone());
+                    self.bind_slice(*name, slot, scrut_mir.clone(), is_slice);
                 }
             }
             ast::PatKind::Tuple(subs) => self.bind_tuple_match(subs, scrut, scrut_ty),
@@ -15609,13 +16237,14 @@ impl FnLowerer<'_> {
             let fptr = self.field_ptr(base, off);
             match &sub.kind {
                 ast::PatKind::Ident(name) => {
+                    let is_slice = matches!(fty, Ty::Slice(_));
                     if matches!(fmty, MirType::Array(..)) {
-                        self.bind(*name, fptr, fmty);
+                        self.bind_slice(*name, fptr, fmty, is_slice);
                     } else {
                         let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
                         let slot = self.builder.alloca(fmty.clone());
                         self.builder.build_void(Op::Store { ptr: slot, value: val });
-                        self.bind(*name, slot, fmty);
+                        self.bind_slice(*name, slot, fmty, is_slice);
                     }
                 }
                 ast::PatKind::Tuple(inner) => self.bind_tuple_match(inner, fptr, fty),
@@ -15670,21 +16299,29 @@ impl FnLowerer<'_> {
                 if *neg {
                     v = -v;
                 }
-                let c = self
-                    .builder
-                    .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
+                let Some(c) = self.pattern_const(v, scrut_mir, scrut_ty, pat.span) else {
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
                 Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
             }
             // A char-literal pattern compares the scrutinee (a `char` is its integer code point) to
             // the literal's decoded code point — the same equality test as an integer-literal pattern.
             ast::PatKind::Char(sym) => {
                 let v = decode_char_literal(self.interner.resolve(*sym)) as i128;
-                let c = self
-                    .builder
-                    .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
+                let Some(c) = self.pattern_const(v, scrut_mir, scrut_ty, pat.span) else {
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
                 Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
             }
+            // A bool pattern's constant is `i1`, so the scrutinee must be one too: `match x { true =>
+            // .. }` on an `i32` scrutinee emitted `cmp i32, i1`, which the verifier rejected with raw
+            // internal text (`cmp operands differ: i32 vs i1`). That is the match-position mirror of a
+            // rule sema already enforces for `==` (bool compared with a non-bool).
             ast::PatKind::Bool(b) => {
+                if *scrut_mir != MirType::I1 {
+                    self.unsupported(pat.span, "bool pattern on a non-bool scrutinee");
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                }
                 let c = self
                     .builder
                     .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
@@ -15723,14 +16360,22 @@ impl FnLowerer<'_> {
                 inclusive,
             } => {
                 let signed = !matches!(scrut_ty, Ty::Scalar(s) if !s.is_signed());
-                let lo_v = self.pattern_int_value(lo);
-                let hi_v = self.pattern_int_value(hi);
-                let lo_c = self
-                    .builder
-                    .build(scrut_mir.clone(), Op::ConstInt(lo_v, scrut_mir.clone()));
-                let hi_c = self
-                    .builder
-                    .build(scrut_mir.clone(), Op::ConstInt(hi_v, scrut_mir.clone()));
+                // A bound that is not an int/char literal (the parser accepts any pattern as `hi`,
+                // so `3..LIMIT` for a `const LIMIT` parses) used to fold to a silent `0`, compiling
+                // `3..LIMIT` into `3 <= x && x < 0` — an arm that can never fire, with no diagnostic
+                // anywhere. Decline the arm instead, like the unresolved `Path`/tuple arms already do.
+                let (Some(lo_v), Some(hi_v)) =
+                    (self.pattern_int_value(lo), self.pattern_int_value(hi))
+                else {
+                    self.unsupported(span, "non-literal range-pattern bound");
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
+                let (Some(lo_c), Some(hi_c)) = (
+                    self.pattern_const(lo_v, scrut_mir, scrut_ty, lo.span),
+                    self.pattern_const(hi_v, scrut_mir, scrut_ty, hi.span),
+                ) else {
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
                 let ge = self.builder.build(
                     MirType::I1,
                     Op::Cmp(if signed { CmpOp::Sge } else { CmpOp::Uge }, scrut, lo_c),
@@ -15769,20 +16414,66 @@ impl FnLowerer<'_> {
     }
 
     /// The integer value of an int- or char-literal range bound (`lo`/`hi`). A char decodes to its
-    /// code point, so `'a'..='z'` ranges work. A non-literal bound yields 0.
-    fn pattern_int_value(&self, pat: &Pattern) -> i128 {
+    /// code point, so `'a'..='z'` ranges work. A non-literal bound yields `None` — the caller must
+    /// decline the arm rather than substitute a value (it used to fold to `0`, silently turning
+    /// `3..LIMIT` into an arm that never matches).
+    fn pattern_int_value(&self, pat: &Pattern) -> Option<i128> {
         match &pat.kind {
             ast::PatKind::Int { sym, neg } => {
                 let v = parse_int(self.interner.resolve(*sym));
-                if *neg {
-                    -v
-                } else {
-                    v
-                }
+                Some(if *neg { -v } else { v })
             }
-            ast::PatKind::Char(sym) => decode_char_literal(self.interner.resolve(*sym)) as i128,
-            _ => 0,
+            ast::PatKind::Char(sym) => {
+                Some(decode_char_literal(self.interner.resolve(*sym)) as i128)
+            }
+            _ => None,
         }
+    }
+
+    /// The MIR constant a literal pattern compares against, in the scrutinee's own type — or `None`
+    /// (diagnostic already pushed) when the scrutinee cannot hold it.
+    ///
+    /// Building `Op::ConstInt(v, scrut_mir)` unchecked was wrong twice over. A **non-integer**
+    /// scrutinee produced a mistyped constant and a mistyped `Cmp`, which surfaced as raw MIR-verify
+    /// text with no code and no span (`match x { 1 => .. }` on an `f32` scrutinee: "const int has
+    /// non-integer type f32" + "cmp predicate eq mismatches operand type f32"). An **out-of-range**
+    /// literal was silently truncated to the scrutinee's width and then matched a *different* value,
+    /// shadowing the arm that legitimately covers it (on an `i64` scrutinee
+    /// `match x { 18446744073709551616 => 1, 0 => 2, _ => 0 }` answered 1 for `x == 0`). Sema's
+    /// `range_check_int_pattern` already rejects the narrow scrutinees whose whole range fits `i64`
+    /// (`i8`..`u32`); this is the width-general backstop that also covers `i64`/`u64`/`usize`. MIR
+    /// integers are signless, so the accepted band is the union of the signed and unsigned ranges of
+    /// that width — an `i32` pattern may be `-1` and a `u32` one may be `3000000000`.
+    fn pattern_const(
+        &mut self,
+        v: i128,
+        scrut_mir: &MirType,
+        scrut_ty: &Ty,
+        span: Span,
+    ) -> Option<ValueId> {
+        if !scrut_mir.is_int() {
+            self.unsupported(span, "literal pattern on a non-integer scrutinee");
+            return None;
+        }
+        let bits = mir_byte_size(scrut_mir) * 8;
+        let lo = -(1i128 << (bits - 1));
+        let hi = (1i128 << bits) - 1;
+        if v < lo || v > hi {
+            let name = match scrut_ty {
+                Ty::Scalar(s) => s.name().to_string(),
+                _ => scrut_mir.display(),
+            };
+            self.diags.push(
+                Diagnostic::error(format!("literal `{v}` is out of range for `{name}`"))
+                    .with_code("E0401")
+                    .primary(span, "this pattern can never match the scrutinee"),
+            );
+            return None;
+        }
+        Some(
+            self.builder
+                .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone())),
+        )
     }
 
     /// The integer discriminant of variant `vname` of enum `enum_sym`, or `None` if unresolved.
@@ -15939,13 +16630,14 @@ impl FnLowerer<'_> {
             let fptr = self.field_ptr(base, off);
             match &sub.kind {
                 ast::PatKind::Ident(name) => {
+                    let is_slice = matches!(fty, Ty::Slice(_));
                     if matches!(fmty, MirType::Array(..)) {
-                        self.bind(*name, fptr, fmty);
+                        self.bind_slice(*name, fptr, fmty, is_slice);
                     } else {
                         let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
                         let slot = self.builder.alloca(fmty.clone());
                         self.builder.build_void(Op::Store { ptr: slot, value: val });
-                        self.bind(*name, slot, fmty);
+                        self.bind_slice(*name, slot, fmty, is_slice);
                     }
                 }
                 ast::PatKind::Tuple(inner) => self.bind_tuple_match(inner, fptr, &fty),
@@ -16067,6 +16759,20 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// The MIR type an already-lowered operand actually has. Sema's type for the *expression* is the
+    /// intent, but the value is what the verifier and both backends see, and the two can differ: a
+    /// scalar for-range counter is driven at the wider of its two bound types while sema types the
+    /// loop variable from the start literal. Falling back to sema's type when the value is a `Ptr`
+    /// (an aggregate flowing as its base pointer) keeps the aggregate paths reading exactly as before.
+    fn operand_mir(&mut self, v: ValueId, e: &Expr) -> MirType {
+        let vt = self.builder.value_type(v).clone();
+        if vt.is_int() || vt.is_float() {
+            vt
+        } else {
+            self.expr_mir(e)
+        }
+    }
+
     fn lower_binary(&mut self, op: ast::BinOp, lhs: &Expr, rhs: &Expr, e: &Expr) -> ValueId {
         use ast::BinOp::*;
         match op {
@@ -16074,13 +16780,22 @@ impl FnLowerer<'_> {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
                 // Compare in a common type: the front-end's loose literal typing can leave the two
-                // sides at different widths, but a `Cmp`'s operands must agree.
-                let lty = self.expr_mir(lhs);
-                let rty = self.expr_mir(rhs);
+                // sides at different widths, but a `Cmp`'s operands must agree. The widths come from
+                // the values themselves, not from sema — see the arithmetic arm below.
+                let lty = self.operand_mir(l, lhs);
+                let rty = self.operand_mir(r, rhs);
                 let common = numeric_join(&lty, &rty);
                 let l = self.coerce_to(l, &lty, &common, self.signed(lhs));
                 let r = self.coerce_to(r, &rty, &common, self.signed(rhs));
-                let pred = cmp_pred(op, common.is_float(), self.signed(lhs));
+                // The predicate's signedness must consider BOTH operands (see
+                // `forces_unsigned_cmp`); reading it off the LHS alone compared `5 < x` (x: u32 =
+                // 3_000_000_000) with `cmp.slt` and answered false. The two `coerce_to`s above
+                // keep each operand's *own* signedness, which is what the widening needs.
+                let pred = cmp_pred(
+                    op,
+                    common.is_float(),
+                    self.signed(lhs) && !self.forces_unsigned_cmp(rhs, &common),
+                );
                 self.builder.build(MirType::I1, Op::Cmp(pred, l, r))
             }
             And => self.lower_short_circuit(lhs, rhs, true),
@@ -16096,8 +16811,21 @@ impl FnLowerer<'_> {
                 let r = self.lower_expr(rhs);
                 // Coerce both operands to the result type so the `Bin` is well-typed (e.g. an
                 // `f32` literal added to an `f64` is promoted), matching the verifier's contract.
-                let lty = self.expr_mir(lhs);
-                let rty = self.expr_mir(rhs);
+                let lty = self.operand_mir(l, lhs);
+                let rty = self.operand_mir(r, rhs);
+                // A value can be WIDER than the type sema gave its expression: the scalar for-range
+                // loop drives its counter at the wider of the two bound types, while sema types the
+                // loop variable from the start literal. `for i in 1..n` with `n: i64` therefore loads
+                // an i64 `i` that sema calls i32, and `i - 1` built `sub` on (i64, i32) — MIR the
+                // verifier rejects, so `src[i - 1]` was an internal compiler error at every -O level
+                // on both backends. Widening the op to hold both operands keeps the counter's real
+                // width instead of truncating it back. No-op whenever the value and sema agree, which
+                // is every other program.
+                let ty = if ty.is_int() && lty.is_int() && rty.is_int() {
+                    numeric_join(&ty, &numeric_join(&lty, &rty))
+                } else {
+                    ty
+                };
                 let l = self.coerce_to(l, &lty, &ty, self.signed(lhs));
                 let r = self.coerce_to(r, &rty, &ty, self.signed(rhs));
                 let bin = arith_binop(op, ty.is_float(), self.signed(lhs));
@@ -16742,18 +17470,48 @@ impl FnLowerer<'_> {
     /// Recognize `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention —
     /// and lower it to one `wukong_attention_f32` runtime call (computing
     /// `out = softmax(scale·Q·Kᵀ [+causal])·V` for one `[s,d]` head without materializing the S×S
-    /// scores). The array args lower to their base pointers (an array `Path` *is* its pointer); `s`,
+    /// scores). The four buffer args resolve through `kernel_operand_ptr` (an array `Path` *is* its
+    /// pointer; a `[]T` slice needs its fat pointer loaded — passing the buffer straight through
+    /// made the kernel read `{ data, len }` as f32 data: interp `error: expected a pointer`, native
+    /// SIGSEGV, on the only shape a runtime-sized model uses); `s`,
     /// `d`, `causal` coerce to `i64` and `scale` to `f32`. Returns `None` for any other name/arity so
     /// `lower_call` falls through. Both backends call the identical kernel, so the fused online
     /// softmax stays bit-for-bit exact — the same contract as the GEMM dispatch.
+    ///
+    /// `sdpa` has no signature in wukong_sema, so **nothing upstream checks its operands** and this is
+    /// the only place the kernel's contract — four `f32` buffers, each valid for `s*d` elements — can
+    /// be enforced. Without the check the call reaches the kernel with whatever the caller wrote: an
+    /// f32 immediate in a pointer slot (native SIGSEGV, interp `expected a pointer`), an f64/i32 array
+    /// reinterpreted as f32 (a silent wrong answer that also *diverges* between the backends), or a
+    /// buffer shorter than `s*d` (native writes past its end). Any of those declines, which routes the
+    /// call to `lower_call`'s catalogued C0001 at the call site — the same way `lower_heap_builtin`
+    /// declines a malformed `free` rather than miscompiling it.
     fn lower_attention(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
         if self.interner.resolve(name) != "sdpa" || args.len() != 8 {
             return None;
         }
-        let q = self.lower_expr(&args[0]);
-        let k = self.lower_expr(&args[1]);
-        let v = self.lower_expr(&args[2]);
-        let out = self.lower_expr(&args[3]);
+        let extents = [
+            attn_buffer_extent(&self.expr_ty(&args[0]))?,
+            attn_buffer_extent(&self.expr_ty(&args[1]))?,
+            attn_buffer_extent(&self.expr_ty(&args[2]))?,
+            attn_buffer_extent(&self.expr_ty(&args[3]))?,
+        ];
+        // When the dims are compile-time constants, every buffer whose extent the type pins must hold
+        // the `s*d` elements the kernel reads/writes. A dynamic dim or an unsized view stays the
+        // caller's responsibility, as documented on `wukong_attention_f32`.
+        if let (Some(s), Some(d)) = (
+            const_usize_expr(&args[4], self.interner, self.sema),
+            const_usize_expr(&args[5], self.interner, self.sema),
+        ) {
+            let need = u64::from(s) * u64::from(d);
+            if extents.iter().any(|e| e.is_some_and(|len| len < need)) {
+                return None;
+            }
+        }
+        let q = self.kernel_operand_ptr(&args[0]);
+        let k = self.kernel_operand_ptr(&args[1]);
+        let v = self.kernel_operand_ptr(&args[2]);
+        let out = self.kernel_operand_ptr(&args[3]);
         let s = self.lower_coerced(&args[4], &MirType::I64);
         let d = self.lower_coerced(&args[5], &MirType::I64);
         let scale = self.lower_coerced(&args[6], &MirType::F32);
@@ -16960,52 +17718,57 @@ impl FnLowerer<'_> {
             // Activation backward `act_backward(x, dy) = dy · act'(x)` — two args. The non-dispatched
             // path (a `while` loop / standalone call); the elementwise `for` form goes 256-bit via
             // `match_vmath2_stmt`. Inlined form is bit-identical to the kernel (mirrors `*_bwd8`).
+            // Both operands go through `lower_math_arg`, like every *forward* intrinsic: lowering
+            // them with a bare `lower_expr` fed an integer straight into the float ops, so
+            // `gelu_backward(1, 2)` ICEd with raw verifier text ("fmul: v0 has type i32 but expected
+            // f32"). `lower_math_arg` is the identity on an already-`rty` float operand, so every
+            // float call site lowers byte-identically and the `*_bwd8` mirror is untouched.
             MathIntrinsic::SiluBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_silu_backward(x, dy, &rty))
             }
             MathIntrinsic::GeluBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_gelu_backward(x, dy, &rty))
             }
             MathIntrinsic::SigmoidBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_sigmoid_backward(x, dy, &rty))
             }
             MathIntrinsic::TanhBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_tanh_backward(x, dy, &rty))
             }
             MathIntrinsic::EluBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_elu_backward(x, dy, &rty))
             }
             MathIntrinsic::SoftplusBackward => {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let dy = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let dy = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_softplus_backward(x, dy, &rty))
             }
             MathIntrinsic::Elu => {
@@ -18371,6 +19134,25 @@ fn const_usize_expr(e: &Expr, interner: &Interner, sema: &SemaResult) -> Option<
     const_usize_depth(e, interner, sema, 0)
 }
 
+/// Is `t` an `f32` buffer — the only operand kind `wukong_attention_f32` can be handed? Returns the
+/// element count when the type pins one (a fixed-size array), `Some(None)` when the extent is known
+/// only at run time (a `[]f32` slice or a tensor view), and `None` when `t` is not an f32 buffer at
+/// all (a scalar, or an array of some other element type). Used by [`FnLowerer::lower_attention`],
+/// which is the sole validation point for the `sdpa` builtin.
+fn attn_buffer_extent(t: &Ty) -> Option<Option<u64>> {
+    let f32_elem = |e: &Ty| matches!(e, Ty::Scalar(wukong_types::Scalar::F32));
+    match t {
+        Ty::Array { elem, len } if f32_elem(elem) => Some(Some(*len)),
+        Ty::Slice(elem) if f32_elem(elem) => Some(None),
+        Ty::Tensor {
+            elem: wukong_types::Scalar::F32,
+            ..
+        } => Some(None),
+        Ty::Ref { pointee, .. } | Ty::Ptr { pointee, .. } => attn_buffer_extent(pointee),
+        _ => None,
+    }
+}
+
 fn const_usize_depth(
     e: &Expr,
     interner: &Interner,
@@ -18573,6 +19355,24 @@ fn expr_uses_sym(e: &Expr, sym: Symbol) -> bool {
             expr_uses_sym(base, sym) || indices.iter().any(|i| expr_uses_sym(i, sym))
         }
         ExprKind::Cast { expr, .. } => expr_uses_sym(expr, sym),
+        _ => false,
+    }
+}
+
+/// Whether `e` may be evaluated **once**, before a loop, in place of a `while` condition's
+/// per-iteration re-evaluation: a whitelist of literals, plain variable reads, and arithmetic /
+/// cast / unary over them. Anything outside it is rejected — a call may have side effects (or a
+/// different value each iteration), and an index / field / dereference reads storage the loop body
+/// might write. Conservative by construction: an unmodeled expression kind returns false.
+fn is_pure_loop_bound(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_) | ExprKind::Bool(_) => true,
+        ExprKind::Path(p) => p.is_single(),
+        ExprKind::Unary { op, expr } => {
+            matches!(op, ast::UnOp::Neg | ast::UnOp::Not) && is_pure_loop_bound(expr)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => is_pure_loop_bound(lhs) && is_pure_loop_bound(rhs),
+        ExprKind::Cast { expr, .. } => is_pure_loop_bound(expr),
         _ => false,
     }
 }
@@ -19681,9 +20481,19 @@ fn match_product_ab_off<'a>(
 
 /// Every term of `off` is invariant in all of `vars` (the matmul's bound `i`/`j`/`k`). A base offset
 /// that mentioned a loop variable would not be a constant per-call pointer shift, so it is rejected.
+///
+/// The test is the **conservative** [`expr_mentions`], not [`expr_uses_sym`]: the latter models only
+/// the index/arith subset and answers `false` for every other expression kind, so an unmodeled term
+/// read as invariant. `a[i*4 + k + (if j > 0 { 4 } else { 0 })]` — a legal nest — was accepted as a
+/// batched matmul, and `offset_base` then lowered the `if` at the GEMM call site where `j` no longer
+/// exists: `error[C0001]: 'value reference' is not yet supported by codegen` pointing at `j`, on a
+/// program that compiles and prints 30 174 70 278 the moment the nest declines. With an outer binding
+/// of the same name in scope the hoisted term would have resolved against *that* instead, with no
+/// diagnostic at all. Both predicates agree on every offset shape the recognized nests actually use
+/// (Path / Int / Binary / Index / Cast), so this only decides the unmodeled ones.
 fn offset_invariant(off: &[&Expr], vars: &[Symbol]) -> bool {
     off.iter()
-        .all(|t| vars.iter().all(|&v| !expr_uses_sym(t, v)))
+        .all(|t| vars.iter().all(|&v| !expr_mentions(t, v)))
 }
 
 /// Try both recognized matmul spellings: the `ikj` accumulate form and the `ijk` dot-product form.
@@ -19765,6 +20575,29 @@ fn match_c_plus_bias(
     None
 }
 
+/// The math intrinsic `callee` names — `None` unless it is a single-path call to one, and `None` when
+/// a user `fn` of that name shadows it. The free-standing mirror of
+/// [`FnLowerer::vectorizable_intrinsic`]: every peeler that folds an activation into a kernel must ask
+/// this question, not `interner.resolve(sym) == "gelu"`, or a program's own `fn gelu(..)` is fused
+/// away and silently replaced by the builtin — while every unfused path in the compiler honours it.
+fn unshadowed_intrinsic(
+    callee: &Expr,
+    interner: &Interner,
+    sema: &SemaResult,
+) -> Option<MathIntrinsic> {
+    let ExprKind::Path(p) = &callee.kind else {
+        return None;
+    };
+    if !p.is_single() {
+        return None;
+    }
+    let name = p.first().sym;
+    if matches!(sema.defs.lookup(name).map(|d| &d.kind), Some(DefKind::Fn(_))) {
+        return None;
+    }
+    math_intrinsic(interner.resolve(name))
+}
+
 /// Match the epilogue RHS over the matmul output `C[i*N+j]`: bare `C+bias` (identity), `fmax(_, 0)`
 /// (ReLU), or a `gelu(_)` / `silu(_)` activation call (the transformer FFN `act(x·Wᵀ [+ bias])`
 /// shape). Bias is **optional for the activation forms** — the bias-free `silu(x·Wᵀ)` is the
@@ -19777,6 +20610,7 @@ fn match_epi_value(
     jvar: Symbol,
     n: Dim,
     interner: &Interner,
+    sema: &SemaResult,
 ) -> Option<(Option<Symbol>, u32)> {
     // `C[i*N+j] + bias[j]` → `Some(bias)`; the bare output element `C[i*N+j]` → `None`; anything else
     // is not an epilogue over this matmul's output.
@@ -19792,20 +20626,23 @@ fn match_epi_value(
     if let ExprKind::Call { callee, args, .. } = &e.kind {
         // ReLU written as `fmax(inner, 0.0)`.
         if args.len() == 2
-            && single_path(callee).is_some_and(|s| interner.resolve(s) == "fmax")
+            && matches!(
+                unshadowed_intrinsic(callee, interner, sema),
+                Some(MathIntrinsic::Fmax)
+            )
             && is_float_zero(&args[1], interner)
         {
             return Some((c_with_opt_bias(&args[0])?, EPI_ACT_RELU));
         }
         // GELU / SiLU activation wrapping the (optional) bias-add (`gelu(C[i*N+j] + bias[j])` or the
-        // bias-free `silu(C[i*N+j])`). Both are first-class intrinsics, so a single-arg call by that
-        // name is unambiguous; the runtime epilogue applies the identical scalar form
-        // (`wukong_runtime::vmath::{gelu1,silu1}`), so the fused result equals the unfused
-        // `matmul → [bias →] activation` the recognizer replaces.
+        // bias-free `silu(C[i*N+j])`). Both are first-class intrinsics **unless the program defines a
+        // function of that name**, which `unshadowed_intrinsic` declines; the runtime epilogue applies
+        // the identical scalar form (`wukong_runtime::vmath::{gelu1,silu1}`), so the fused result
+        // equals the unfused `matmul → [bias →] activation` the recognizer replaces.
         if args.len() == 1 {
-            let act = match single_path(callee).map(|s| interner.resolve(s)) {
-                Some("gelu") => Some(EPI_ACT_GELU),
-                Some("silu") => Some(EPI_ACT_SILU),
+            let act = match unshadowed_intrinsic(callee, interner, sema) {
+                Some(MathIntrinsic::Gelu) => Some(EPI_ACT_GELU),
+                Some(MathIntrinsic::Silu) => Some(EPI_ACT_SILU),
                 _ => None,
             };
             if let Some(act) = act {
@@ -19830,6 +20667,7 @@ fn match_bias_act_epilogue(
     n: Dim,
     c: Symbol,
     interner: &Interner,
+    sema: &SemaResult,
 ) -> Option<(Option<Symbol>, u32)> {
     // for i in 0..M { <single nested loop> }
     let (ipat, iiter, ibody) = fusable_for(stmt)?;
@@ -19869,7 +20707,7 @@ fn match_bias_act_epilogue(
     if !is_c_elem(target, c, ivar, jvar, n, interner) {
         return None;
     }
-    match_epi_value(value, c, ivar, jvar, n, interner)
+    match_epi_value(value, c, ivar, jvar, n, interner, sema)
 }
 
 /// Flatten the multiplicative factors of `e`, recursing only through `*`. `(c as f32) * sa * sb[j]`
@@ -19903,20 +20741,28 @@ fn index_by_var(e: &Expr, var: Symbol) -> Option<Symbol> {
 
 /// Peel an optional activation wrapper off the int8 dequant value: `fmax(inner, 0.0)` → ReLU,
 /// `gelu(inner)` / `silu(inner)` → that activation, else the expression itself (identity). Mirrors
-/// [`match_epi_value`]'s activation detection; the runtime `dequant_row` applies the identical scalar
-/// form (`vmath::{gelu1,silu1}`), so fused == unfused.
-fn peel_dequant_act<'a>(e: &'a Expr, interner: &Interner) -> (&'a Expr, u32) {
+/// [`match_epi_value`]'s activation detection — including the shadow test, so a user `fn gelu` is
+/// never folded into the kernel; the runtime `dequant_row` applies the identical scalar form
+/// (`vmath::{gelu1,silu1}`), so fused == unfused.
+fn peel_dequant_act<'a>(
+    e: &'a Expr,
+    interner: &Interner,
+    sema: &SemaResult,
+) -> (&'a Expr, u32) {
     if let ExprKind::Call { callee, args, .. } = &e.kind {
         if args.len() == 2
-            && single_path(callee).is_some_and(|s| interner.resolve(s) == "fmax")
+            && matches!(
+                unshadowed_intrinsic(callee, interner, sema),
+                Some(MathIntrinsic::Fmax)
+            )
             && is_float_zero(&args[1], interner)
         {
             return (&args[0], EPI_ACT_RELU);
         }
         if args.len() == 1 {
-            match single_path(callee).map(|s| interner.resolve(s)) {
-                Some("gelu") => return (&args[0], EPI_ACT_GELU),
-                Some("silu") => return (&args[0], EPI_ACT_SILU),
+            match unshadowed_intrinsic(callee, interner, sema) {
+                Some(MathIntrinsic::Gelu) => return (&args[0], EPI_ACT_GELU),
+                Some(MathIntrinsic::Silu) => return (&args[0], EPI_ACT_SILU),
                 _ => {}
             }
         }
@@ -20021,7 +20867,7 @@ fn match_i8_dequant_epilogue(
         return None;
     }
     // Peel the optional activation, then the optional `+ bias[j]`.
-    let (core, act) = peel_dequant_act(value, interner);
+    let (core, act) = peel_dequant_act(value, interner, sema);
     let (prod, bias) = match peel_bias_add(core, jvar) {
         Some((p, b)) => (p, Some(b)),
         None => (core, None),
@@ -20847,8 +21693,9 @@ fn match_residual_store_value(
     n: Dim,
     s_sym: Symbol,
     interner: &Interner,
+    sema: &SemaResult,
 ) -> Option<(Option<Symbol>, u32)> {
-    let (inner, act) = peel_dequant_act(value, interner);
+    let (inner, act) = peel_dequant_act(value, interner, sema);
     let mut terms = Vec::new();
     flatten_add_terms(inner, &mut terms);
     let (mut saw_c, mut saw_s) = (false, false);
@@ -21007,7 +21854,7 @@ fn match_matmul_residual<'a>(
     if sa != kdim || sb != kdim || sc != n || !c_off.is_empty() {
         return None;
     }
-    let (bias, act) = match_residual_store_value(cv, cbase, row, jvar, n, s_sym, interner)?;
+    let (bias, act) = match_residual_store_value(cv, cbase, row, jvar, n, s_sym, interner, sema)?;
     // An input aliasing the output is a hazard (the blocked kernel writes C in a different order).
     if a_sym == cbase || b_sym == cbase {
         return None;
@@ -21533,7 +22380,9 @@ fn matmul_fn<'a>(
 }
 
 /// Lower a recognized matmul function to a thin wrapper that binds its array params to base
-/// pointers and tail-calls `wukong_sgemm`/`wukong_sgemm_parallel`.
+/// pointers and tail-calls `wukong_sgemm`/`wukong_sgemm_parallel`. `None` when `emit_sgemm` declines
+/// the shape (it has no kernel for a fused bias or an α on a non-NT store, nor for `Aᵀ·Bᵀ`) — the
+/// caller must then lower the function normally, because the half-built wrapper computes nothing.
 #[allow(clippy::too_many_arguments)]
 fn lower_matmul_fn(
     f: &FnDecl,
@@ -21543,7 +22392,7 @@ fn lower_matmul_fn(
     interner: &Interner,
     gemm: GemmSyms,
     diags: &mut Vec<Diagnostic>,
-) -> Function {
+) -> Option<Function> {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
         Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
@@ -21560,6 +22409,7 @@ fn lower_matmul_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -21589,7 +22439,9 @@ fn lower_matmul_fn(
             fl.bind(p.name.sym, slot, mty);
         }
     }
-    fl.emit_sgemm(nest, parallel);
+    if !fl.emit_sgemm(nest, parallel) {
+        return None;
+    }
     if !fl.terminated {
         match ret_mir {
             MirType::Void => fl.builder.ret(None),
@@ -21599,7 +22451,7 @@ fn lower_matmul_fn(
             }
         }
     }
-    fl.builder.finish()
+    Some(fl.builder.finish())
 }
 
 /// Recognize a function whose entire body is an int8 matmul nest (`{ for i in 0..M { … } }`) — the
@@ -21987,6 +22839,37 @@ fn match_pool2d(
         return None;
     }
     if scalar_of(ot, sema) != Some(wukong_types::Scalar::F32) || obase == xbase {
+        return None;
+    }
+    // `Pool2dNest` carries no OH/OW: the kernel RECOMPUTES the output extent from H/W/KH/KW/SH/SW as
+    // the full no-padding `(H-KH)/SH + 1`. That is a second copy of this recognizer's shape model, and
+    // a source nest whose own OH/OW are smaller — pooling a sub-region — desynced the two: the kernel
+    // then writes the full extent, at the wrong row stride, into a smaller buffer. Measured on an 8x8
+    // plane pooled 2x2/stride 2 into a `[f32; 4]` (source loops `oy,ox in 0..2`, so OH=OW=2 where the
+    // kernel derives 4): `--emit=mir -O2` emitted `call wukong_maxpool2d_f32(v0, v23, 1, 8, 8, 2, 2,
+    // 2, 2)` with no OH/OW, the interpreter reported `pool2d output out of bounds` and native
+    // SEGFAULTED (exit 139) at -O0 and -O2. The correct answer is 9 11 25 27.
+    //
+    // Require the source's own extent to be exactly what the kernel will recompute, over literal dims
+    // (a symbolic dim cannot be compared here, and no .wk in the corpus pools at symbolic sizes).
+    // Anything else declines to the scalar nest, which is always correct.
+    let (
+        Dim::Lit(lh),
+        Dim::Lit(lw),
+        Dim::Lit(lkh),
+        Dim::Lit(lkw),
+        Dim::Lit(lsh),
+        Dim::Lit(lsw),
+        Dim::Lit(loh),
+        Dim::Lit(low),
+    ) = (h, w, kh, kw, sh, sw, oh, ow)
+    else {
+        return None;
+    };
+    if lsh <= 0 || lsw <= 0 || lkh > lh || lkw > lw {
+        return None;
+    }
+    if loh != (lh - lkh) / lsh + 1 || low != (lw - lkw) / lsw + 1 {
         return None;
     }
     Some(Pool2dNest {
@@ -23179,6 +24062,7 @@ fn xent_bwd_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -23220,6 +24104,7 @@ fn xent_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -23269,6 +24154,7 @@ fn logsumexp_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -23351,6 +24237,12 @@ struct EmbeddingNest {
     ids: Symbol,
     t_rows: Dim,
     h: Dim,
+    /// `weight`'s full declared element count `V*H`, when it is a statically-sized array — the upper
+    /// bound on the bytes the kernel may read, which is what the parallel selection's run-time
+    /// non-overlap test needs (`ScatterNest::total` is the same quantity for `grad_w`). `None` for a
+    /// slice/tensor weight, whose extent is not a compile-time constant; the emitter then cannot prove
+    /// non-overlap and keeps the serial kernel.
+    w_total: Option<u64>,
 }
 
 /// A recognized scatter-add / embedding-gradient-backward nest (see [`FnLowerer::match_scatter`]):
@@ -23400,6 +24292,7 @@ fn probe_single_for(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -23913,7 +24806,15 @@ fn match_layernorm_bwd(
     }
     let (iv1, ce, b1) = stmt_range0_for(&body.stmts[1], interner)?;
     let cols = as_dim(ce, interner)?;
-    let x = index_rowmaj(match_add_accum(b1, sm)?, rvar, iv1, &cols, interner)?;
+    let xe = match_add_accum(b1, sm)?;
+    let x = index_rowmaj(xe, rvar, iv1, &cols, interner)?;
+    // The kernel is `wukong_layernorm_bwd_f32` — f32 in every buffer. Both siblings gate on the
+    // element type here (`match_softmax_bwd` at the dot product, `match_rmsnorm_bwd` at the squared
+    // term); this one did not, so an f64 LayerNorm backward dispatched anyway and native printed
+    // `1419 -727 0 0 0 0 0 0` where interp printed the correct `268 -357 -89 178 -178 1252 -357 -715`.
+    if scalar_of(xe, sema) != Some(wukong_types::Scalar::F32) {
+        return None;
+    }
     // [2] let mean = sm / C
     let (mean, mean0) = stmt_let_init(&body.stmts[2])?;
     let ExprKind::Binary {
@@ -24262,6 +25163,15 @@ fn match_rope(
     if !off_a.is_empty() {
         return None;
     }
+    // `wukong_rope_f32` reads and writes x/out as f32; this matcher had no element-type check at all
+    // (unlike `match_transpose`, `match_pool2d`, `match_embedding`), so an f64 rotary nest dispatched
+    // and native printed `1000 2000 -18124 57 0 0 0 0` for tests/run/rope.wk-made-f64 against interp's
+    // correct `1000 2000 3000 4000 -1984 -162 2462 4469`. Checking the `x[r*D+j]` read covers the whole
+    // nest: [4] is verified to read the same array and sema rejects a mixed-width store (E0401). One
+    // guard, both directions — the backward goes through this same matcher.
+    if scalar_of(a0, sema) != Some(wukong_types::Scalar::F32) {
+        return None;
+    }
     let (bb, b0) = stmt_let_init(&inner.stmts[4])?;
     let (xb, stride_b, off_b) = index_strided(b0, rvar, jvar, interner)?;
     if xb != x || stride_b != stride || !offset_is_half(&off_b, he) {
@@ -24376,7 +25286,8 @@ fn matmul_residual_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> b
 
 /// Lower a recognized int8 matmul function to a thin wrapper that binds its array params to base
 /// pointers and tail-calls `wukong_i8gemm_nt`/`wukong_i8gemm_nt_parallel` — the int8 twin of
-/// `lower_matmul_fn`.
+/// `lower_matmul_fn`, including its `None`-on-decline contract (`emit_i8gemm` bails when an operand
+/// or dim is out of scope, and the half-built wrapper would compute nothing).
 #[allow(clippy::too_many_arguments)]
 fn lower_i8matmul_fn(
     f: &FnDecl,
@@ -24386,7 +25297,7 @@ fn lower_i8matmul_fn(
     interner: &Interner,
     gemm: GemmSyms,
     diags: &mut Vec<Diagnostic>,
-) -> Function {
+) -> Option<Function> {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
         Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
@@ -24403,6 +25314,7 @@ fn lower_i8matmul_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
         mono: None,
@@ -24425,7 +25337,9 @@ fn lower_i8matmul_fn(
             fl.bind(p.name.sym, slot, mty);
         }
     }
-    fl.emit_i8gemm(nest, parallel);
+    if !fl.emit_i8gemm(nest, parallel) {
+        return None;
+    }
     if !fl.terminated {
         match ret_mir {
             MirType::Void => fl.builder.ret(None),
@@ -24435,7 +25349,7 @@ fn lower_i8matmul_fn(
             }
         }
     }
-    fl.builder.finish()
+    Some(fl.builder.finish())
 }
 
 /// A captured recipe for the 256-bit AVX2 vectorizer (`build_vec_recipe`): the flat op body plus the
@@ -24568,13 +25482,22 @@ fn fusable_for(s: &Stmt) -> Option<(&Pattern, &ForIter, &Block)> {
     None
 }
 
-/// The `(start, end)` expressions of a half-open range iterator.
+/// The `(start, end)` expressions of a half-open, **unit-step** range iterator.
+///
+/// The `inclusive`/`step` fields are part of the contract, not decoration: every kernel recognizer
+/// reads its trip count as `end - start` and hands it to a kernel that walks each index once. A
+/// `..=` bound is one iteration longer and a `step k` bound visits a fraction of the indices, so
+/// accepting either made the recognizers silently answer a *different* loop — `for i in 0..4 step 2
+/// { <ikj gemm> }` dispatched `wukong_sgemm` and printed `3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3` where
+/// `3 3 3 3 7 7 7 7 3 3 3 3 7 7 7 7` is correct, identically on both backends. Declining here is
+/// free: `lower_for`'s scalar path handles inclusive and stepped ranges correctly.
 fn range_bounds(iter: &ForIter) -> Option<(&Expr, &Expr)> {
     match iter {
         ForIter::Range {
             start,
             end: Some(end),
-            ..
+            inclusive: false,
+            step: None,
         } => Some((start, end)),
         _ => None,
     }
@@ -25021,9 +25944,15 @@ fn parse_int(text: &str) -> i128 {
 }
 
 fn parse_float(text: &str) -> f64 {
-    // Strip a trailing type suffix (bf16/f16/f32/f64) before parsing.
+    // Strip a trailing type suffix before parsing. This list must be the one sema accepts in
+    // `float_literal_well_formed` — sema decides whether the literal is legal, this decides what it
+    // is worth, and a suffix on only one list is a literal that compiles to the wrong number. `f`
+    // alone is the C-style float suffix (`5f` → f32); it was missing here, so sema admitted `5f`
+    // and `1.5f` and then `"5f".parse::<f64>()` failed into the `unwrap_or(0.0)` below — both
+    // printed 0 on both backends with no diagnostic. Longer suffixes are tried first so `5f32`
+    // strips `f32` rather than nothing (no float body ends in `f`, so the order is belt-and-braces).
     let mut core = text;
-    for suf in ["bf16", "f16", "f32", "f64"] {
+    for suf in ["bf16", "f16", "f32", "f64", "f"] {
         if let Some(stripped) = core.strip_suffix(suf) {
             core = stripped;
             break;
