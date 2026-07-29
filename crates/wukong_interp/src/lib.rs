@@ -521,17 +521,23 @@ struct Interp<'a, 'k> {
 /// against that reservation by bisection: the release build completes at depth 300000 and overflows
 /// at 350000 (unchanged for a fatter Wukong frame — five parameters plus three nested-arithmetic
 /// locals — at both -O0 and -O2, because the register file lives on the heap); the debug build,
-/// with no inlining and much larger frames, completes at 50000 and overflows at 55000. Each limit
-/// sits well inside its own measured ceiling, so no recursion depth that works today starts
-/// failing in either profile — the depths this now rejects are exactly the ones that used to abort
-/// the process.
+/// with no inlining and much larger frames, completes at 50000 and overflows at 55000.
+///
+/// Each limit is the largest value that rejects **no depth measured to work**. The guard trips at
+/// `depth >= MAX_CALL_DEPTH`, so the deepest accepted call is one frame below the limit: 299999 in
+/// release, under the 300000 measured to complete. That matters because the pre-guard interpreter
+/// had no ceiling at all — it simply ran until the stack gave out — so every depth below the true
+/// overflow point used to succeed, and a limit set for "safety margin" is a *regression* over that
+/// band, not a precaution. An earlier 200_000 rejected 200001..300000, all of which complete. Keep
+/// these pinned to the bisection: raising one past its measured ceiling reintroduces the
+/// uncatchable abort, and lowering one silently breaks working programs.
 ///
 /// The debug limit must also clear the depth the differential gate actually exercises:
 /// `wukong_codegen_cranelift`'s `differential_deep_recursion` runs `sum(30000)` (30001 frames with
 /// `main`) and asserts native == interp there, so a debug ceiling of 30000 made the *interpreter*
 /// — the semantic oracle — refuse a depth native completes, reintroducing the very divergence that
 /// test exists to catch. 40000 sits above that gate and below the measured 50000 debug ceiling.
-const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) { 40_000 } else { 200_000 };
+const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) { 40_000 } else { 300_000 };
 
 /// Marshal a recognized-kernel **extent** argument (`rows`, `cols`, `m`, `k`, `n`, `t`, `h`, `s`,
 /// `d`, `half`, `ncoeff`, ...) into a slot count, bailing out of the arm with the kernel's
