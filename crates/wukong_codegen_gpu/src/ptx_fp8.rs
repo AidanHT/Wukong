@@ -169,7 +169,22 @@ fn fp8_pipe_entry(
     assert!(stages >= 2 && bk % 32 == 0 && (bk / 16).is_power_of_two() && pad % 16 == 0);
     assert!(bm % (16 * warps_m) == 0 && bn % (8 * warps_n) == 0);
     assert!(raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()));
+    // `warpRow = warpId >> wn_shift` / `warpCol = warpId & (warps_n-1)` only partition the warps when
+    // the warp grid is powers of two; with e.g. warps_n=3 the shift is 0, so warpRow is the raw warp id
+    // and warps 2.. address rows outside the CTA tile. (The int8 swz twin is immune only by accident —
+    // its `a_tile.is_power_of_two()` assert forces a power-of-two `bn`, which `8*3` cannot divide.)
+    assert!(
+        warps_m.is_power_of_two() && warps_n.is_power_of_two(),
+        "{name}: warp grid must be powers of two (warpRow/warpCol are a shift and a mask)"
+    );
     let threads = warps_m * warps_n * 32;
+    // The doc above states `bm*bk`/`bn*bk` must be multiples of `threads*16`, but `a_chunks`/`b_chunks`
+    // are TRUNCATING divisions: a tile that is not a whole multiple stages only part of itself and
+    // feeds uninitialised shared memory straight into `mma.sync` — silently wrong C, no diagnostic.
+    assert!(
+        (bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0,
+        "{name}: threads*16 must divide the A/B tile bytes (128-bit cp.async staging)"
+    );
     let tm = bm / (16 * warps_m);
     let tn = bn / (8 * warps_n);
     let nks = bk / 32; // m16n8k32 k-steps per staged tile
@@ -407,7 +422,17 @@ fn fp8_gate_entry(
     assert!(stages >= 2 && bk % 32 == 0 && (bk / 16).is_power_of_two() && pad % 16 == 0);
     assert!(bm % (16 * warps_m) == 0 && bn % (8 * warps_n) == 0);
     assert!(raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()));
+    // Same two preconditions as `fp8_pipe_entry` (this generator mirrors its staging/fragment layout
+    // verbatim): the warp grid is addressed by shift+mask, and the cp.async chunk counts truncate.
+    assert!(
+        warps_m.is_power_of_two() && warps_n.is_power_of_two(),
+        "{name}: warp grid must be powers of two (warpRow/warpCol are a shift and a mask)"
+    );
     let threads = warps_m * warps_n * 32;
+    assert!(
+        (bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0,
+        "{name}: threads*16 must divide the A/B tile bytes (128-bit cp.async staging)"
+    );
     let tm = bm / (16 * warps_m);
     let tn = bn / (8 * warps_n);
     let nks = bk / 32;
@@ -991,4 +1016,124 @@ KEND:
         )
     })
     .as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `.visible .entry` names `fp8_pipe_ptx()` must declare, in emission order.
+    const PIPE_ENTRIES: [&str; 12] = [
+        "fp8_gemm_pipe",
+        "fp8_gemm_pipe_m64",
+        "fp8_gemm_pipe_bias",
+        "fp8_gemm_pipe_bias_relu",
+        "fp8_gemm_pipe_bias_silu",
+        "fp8_gemm_pipe_bias_gelu",
+        "fp8_gemm_pipe_bias_residual",
+        "fp8_gemm_pipe_gate_silu",
+        "fp8_gemm_pipe_gate_gelu",
+        "fp8_gemm_pipe_gate_glu",
+        "fp8_gemm_pipe_gate_silu_bias",
+        "fp8_gemm_pipe_gate_gelu_bias",
+    ];
+
+    /// **§3A P1 — PTX stays ASCII**, plus the structural minimum, over every module this file emits.
+    /// A single non-ASCII byte turns all of `fp8_pipe_ptx()`'s entries into a `ptxas fatal` at
+    /// driver-JIT time; on a GPU-less box every fp8 test skips, so nothing else keeps this file ASCII.
+    /// Pure-CPU.
+    #[test]
+    fn fp8_ptx_is_ascii_and_structural() {
+        let modules: Vec<(&str, String)> = vec![
+            ("fp8_tile", FP8_TILE.to_string()),
+            ("fp8_gemm_nt", fp8_gemm_ptx().to_string()),
+            ("fp8_gemm_nt_mt", fp8_gemm_mt_ptx().to_string()),
+            ("fp8_gemm_pipe", fp8_pipe_ptx().to_string()),
+            ("fp8_gemm_pipe(w64)", fp8_pipe_w64_ptx().to_string()),
+            ("fp8_gemm_pipe(w64_s3)", fp8_pipe_w64_s3_ptx().to_string()),
+            ("fp8_gemm_pipe(cfg)", fp8_pipe_cfg_ptx(128, 128, 64, 2, 4, 2, 16)),
+        ];
+        for (label, ptx) in &modules {
+            assert!(ptx.is_ascii(), "{label}: PTX must be ASCII");
+            assert!(ptx.contains(".target sm_89"), "{label}: must target sm_89");
+            assert_eq!(
+                ptx.matches('{').count(),
+                ptx.matches('}').count(),
+                "{label}: unbalanced braces"
+            );
+            assert!(
+                ptx.contains("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"),
+                "{label}: must issue the E4M3 mma"
+            );
+        }
+        // Every entry of the multi-entry pipe module must actually be declared — the dispatch in
+        // `gpu::gemm_nt_fp8_pipe` and the fused-epilogue launchers look these names up by string.
+        let pipe = fp8_pipe_ptx();
+        for e in PIPE_ENTRIES {
+            assert!(pipe.contains(&format!(".visible .entry {e}(")), "fp8_pipe_ptx: missing entry {e}");
+        }
+        assert_eq!(
+            pipe.matches(".visible .entry ").count(),
+            PIPE_ENTRIES.len(),
+            "fp8_pipe_ptx entry count changed - update PIPE_ENTRIES"
+        );
+    }
+
+    /// **The E4M3 host codec is the fp8 oracle, so it must be pinned independently.** Every fp8 gate
+    /// quantizes the kernel's inputs with [`f32_to_e4m3`] *and* re-decodes the same bits for the
+    /// reference, so a regression in the encoder moves both sides together and no gate notices. These
+    /// are hand-derived bit patterns (bias 7, 3 mantissa bits, max normal 448, no Inf).
+    #[test]
+    fn e4m3_encoding_matches_hand_derived_bits() {
+        for (x, bits) in [
+            (0.0f32, 0x00u8),
+            (-0.0f32, 0x00),      // both zeros encode as +0 (the `x == 0.0` early return)
+            (1.0, 0x38),          // exp 7 << 3, m3 = 0
+            (-1.0, 0xb8),         // sign bit set
+            (2.0, 0x40),          // exp 8 << 3
+            (448.0, 0x7e),        // max normal: exp 15, m3 = 6
+            (1000.0, 0x7e),       // saturates to max normal (E4M3 has no Inf)
+            (f32::INFINITY, 0x7e),
+            (-f32::INFINITY, 0xfe),
+            (2f32.powi(-9), 0x00), // below the subnormal range -> flushed to zero
+            (1.0625, 0x38),        // exact tie between m3=0 and m3=1 -> ties-to-even picks 0
+            (1.1875, 0x3a),        // exact tie between m3=1 and m3=2 -> ties-to-even picks 2
+            (1.99, 0x40),          // rounds up through the mantissa carry into exp+1 (= 2.0)
+        ] {
+            assert_eq!(f32_to_e4m3(x), bits, "f32_to_e4m3({x}) != {bits:#04x}");
+        }
+        assert!(f32_to_e4m3(f32::NAN) & 0x7f == 0x7f, "NaN must encode as the OCP NaN pattern");
+        // Every *normal* encoding must survive decode->encode unchanged. Excluded by construction:
+        // exp==0 (zero + the subnormals this codec flushes) and 0x7f/0xff (the OCP NaN, which
+        // `e4m3_to_f32` decodes as the finite 480 and the encoder then saturates to 448 = 0x7e).
+        for b in 0u8..=255 {
+            let (exp, m) = ((b >> 3) & 0x0f, b & 0x07);
+            if exp == 0 || (exp == 15 && m == 7) {
+                continue;
+            }
+            assert_eq!(f32_to_e4m3(e4m3_to_f32(b)), b, "e4m3 round-trip failed for {b:#04x}");
+        }
+    }
+
+    /// **The fp8 generators must reject a config they cannot codegen.** `a_chunks`/`b_chunks` are
+    /// truncating integer divisions, so a tile whose bytes are not a whole multiple of `threads*16`
+    /// silently stages only part of itself and feeds uninitialised shared memory to `mma.sync`; and
+    /// `warpRow`/`warpCol` are derived by shift+mask, which is only a partition when the warp grid is
+    /// powers of two. Both are documented at the top of `fp8_pipe_entry` and both were unchecked; the
+    /// three sibling generators in `ptx_int8.rs` / `ptx_int4.rs` assert them.
+    #[test]
+    #[should_panic(expected = "must divide the A/B tile bytes")]
+    fn pipe_rejects_a_tile_that_threads16_does_not_divide() {
+        // bm=96, threads=256: bm*bk = 6144 but threads*16 = 4096, so a_chunks truncates 1.5 -> 1 and
+        // a third of every staged A tile would never be written.
+        let _ = fp8_pipe_cfg_ptx(96, 128, 64, 2, 4, 2, 0);
+    }
+
+    /// Sibling of the above for the warp grid: `warps_n = 3` makes `wn_shift = 0`, so `warpRow` is the
+    /// raw warp id and `warpCol` is masked with 2 - warps 2..5 address rows outside the CTA tile.
+    #[test]
+    #[should_panic(expected = "warp grid must be powers of two")]
+    fn pipe_rejects_a_non_power_of_two_warp_grid() {
+        let _ = fp8_pipe_cfg_ptx(128, 192, 64, 2, 3, 2, 0);
+    }
 }

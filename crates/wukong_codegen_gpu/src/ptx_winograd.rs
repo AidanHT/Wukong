@@ -819,6 +819,36 @@ mod tests {
         println!("WORST f23_err={worst_f23:.3e}  WORST f43_err={worst_f43:.3e}  (tol={tol:.0e})");
     }
 
+    /// **§3A P1 gate, device-free.** The four Winograd PTX generators bake f32 hex constants and
+    /// `//` header comments into their modules, and the Rust doc comments right beside those
+    /// `writeln!`s are full of non-ASCII (`α`, `ξν`, `Bᵀ`, `→`) — one copy-paste away from a `ptxas
+    /// fatal` that surfaces on the device only as an opaque `cuModuleLoadData` `DriverError`. Both
+    /// output-tile sizes (`m = 2` and `m = 4`, i.e. `α = 4` and `6`) are swept for every shape.
+    #[test]
+    fn every_winograd_generator_emits_ascii_ptx() {
+        for m in [2usize, 4] {
+            for (c, h, w, k) in [(3usize, 32usize, 32usize, 16usize), (64, 14, 14, 64), (8, 9, 9, 32)]
+            {
+                let (_, _, nt) = wino_ntiles(h, w, m);
+                for (what, ptx) in [
+                    ("wino_filter_xform_ptx", wino_filter_xform_ptx(c, k, m)),
+                    ("wino_input_xform_ptx", wino_input_xform_ptx(c, h, w, m)),
+                    ("wino_output_xform_ptx", wino_output_xform_ptx(k, h, w, m)),
+                    ("wino_bgemm_ptx", wino_bgemm_ptx(c, nt, k)),
+                ] {
+                    if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+                        panic!(
+                            "{what} (C{c} {h}x{w} K{k} m{m}): PTX line {} is not ASCII (ptxas \
+                             fatal): {line:?}",
+                            i + 1
+                        );
+                    }
+                    assert!(!ptx.is_empty(), "{what}: generated an empty module");
+                }
+            }
+        }
+    }
+
     /// Spot-check the helpers in isolation.
     #[test]
     fn matmul_and_transpose_sane() {

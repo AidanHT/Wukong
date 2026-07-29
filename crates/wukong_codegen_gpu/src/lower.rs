@@ -726,7 +726,17 @@ impl<'a> FnEmit<'a> {
                 if matches!(ty, MirType::F64) {
                     self.emit(&format!("mov.f64 {d}, 0d{:016X};", v.to_bits()));
                 } else {
-                    self.emit(&format!("mov.f32 {d}, 0f{:08X};", (*v as f32).to_bits()));
+                    // A bf16/f16 const IS its grid-rounded value, so materialize it rounded — the
+                    // same host-side `wukong_runtime::round_*` the interpreter and Cranelift use at
+                    // this exact point. The per-store rounding in `store_into` alone is fragile:
+                    // mem2reg/CSE forward the value past its store, so `let b: bf16 = 0.1` reached
+                    // the multiply as the raw f32 0.1 at -O3 (and as the bf16 grid value at -O0).
+                    let f = match ty {
+                        MirType::BF16 => wukong_runtime::round_bf16(*v as f32),
+                        MirType::F16 => wukong_runtime::round_f16(*v as f32),
+                        _ => *v as f32,
+                    };
+                    self.emit(&format!("mov.f32 {d}, 0f{:08X};", f.to_bits()));
                 }
             }
             Op::Bin(op, l, r2) => self.lower_bin(*op, *l, *r2, &rty, r)?,
@@ -753,7 +763,7 @@ impl<'a> FnEmit<'a> {
                     self.emit(&format!("add.s64 {d}, {base}, {off};"));
                 }
             }
-            Op::Load(p, ty) => self.lower_load(*p, ty, r),
+            Op::Load(p, ty) => self.lower_load(*p, ty, r)?,
             Op::Gep { ptr, index, elem } => {
                 let base = self.reg(*ptr);
                 let idx = self.reg(*index);
@@ -1113,20 +1123,38 @@ impl<'a> FnEmit<'a> {
             }
             FpToSi => self.fp_to_int_into(d, x, from, to, true),
             FpToUi => self.fp_to_int_into(d, x, from, to, false),
-            FpExt => match to {
-                // Widen to f64. Source is f64 already (mov) or f32/bf16/f16 held as f32 (cvt up).
-                MirType::F64 => {
-                    if rc_of(from) == RC::F64 {
-                        self.emit(&format!("mov.f64 {d}, {x};"));
-                    } else {
-                        self.emit(&format!("cvt.f64.f32 {d}, {x};"));
+            FpExt => {
+                // A bf16/f16 source must round to its grid before widening. bf16/f16 share f32's
+                // register, so the per-store rounding is fragile — an optimizer can forward a bf16 op
+                // result past its store, leaving an unrounded f32 that this widen would pass through
+                // unchanged. Round at the observation boundary too, exactly as
+                // `wukong_codegen_cranelift`'s FpExt arm and the interpreter's `apply_cast` do.
+                let xr = match from {
+                    MirType::BF16 | MirType::F16 => {
+                        let h = self.fresh_r16();
+                        let t = self.fresh(RC::F32);
+                        let c = if matches!(from, MirType::BF16) { "bf16" } else { "f16" };
+                        self.emit(&format!("cvt.rn.{c}.f32 {h}, {x};"));
+                        self.emit(&format!("cvt.f32.{c} {t}, {h};"));
+                        t
                     }
+                    _ => x.to_string(),
+                };
+                match to {
+                    // Widen to f64. Source is f64 already (mov) or f32/bf16/f16 held as f32 (cvt up).
+                    MirType::F64 => {
+                        if rc_of(from) == RC::F64 {
+                            self.emit(&format!("mov.f64 {d}, {xr};"));
+                        } else {
+                            self.emit(&format!("cvt.f64.f32 {d}, {xr};"));
+                        }
+                    }
+                    // bf16/f16 -> f32: loads/casts already widen low-precision floats into an f32
+                    // register, so after the grid rounding above the widening is just a move.
+                    MirType::F32 => self.emit(&format!("mov.f32 {d}, {xr};")),
+                    _ => return Err(format!("{UNSUPPORTED} FpExt to {:?}", to)),
                 }
-                // bf16/f16 -> f32: loads/casts already widen low-precision floats into an f32
-                // register, so the widening to f32 is just a move (the value is already f32).
-                MirType::F32 => self.emit(&format!("mov.f32 {d}, {x};")),
-                _ => return Err(format!("{UNSUPPORTED} FpExt to {:?}", to)),
-            },
+            }
             FpTrunc => {
                 // Demote an f64 source to f32 first; the result reg is always f32 (rc_of bf16/f16/f32).
                 let src = if rc_of(from) == RC::F64 {
@@ -1199,6 +1227,12 @@ impl<'a> FnEmit<'a> {
                 let hi = if w == 8 { 255 } else { 65535 };
                 self.emit(&format!("min.u32 {t}, {t}, {hi};"));
                 self.emit(&format!("cvt.u64.u32 {d}, {t};"));
+                // `cvt.u64.u32` leaves the clamped value ZERO-extended, but every integer register in
+                // this backend is kept SIGN-extended to its MIR width (the interpreter's `mask`). Skip
+                // this and `250.0 as u8` sits in the register as +250 while `const.i8 250` materializes
+                // as -6, so a following `setp.eq.s64` against it is false. The signed branch above is
+                // already canonical (`cvt.s64.s32` after the clamp sign-extends).
+                self.mask_int(d, to);
             }
         }
     }
@@ -1227,15 +1261,25 @@ impl<'a> FnEmit<'a> {
 
     // --- memory ---
 
-    fn lower_load(&mut self, p: ValueId, ty: &MirType, res: ValueId) {
+    fn lower_load(&mut self, p: ValueId, ty: &MirType, res: ValueId) -> Result<(), String> {
         let addr = self.reg(p);
         let d = self.reg(res);
-        self.load_into(&d, &addr, ty);
+        self.load_into(&d, &addr, ty)
     }
 
     /// Load one (scalar or lane) value of MIR type `ty` from generic address `addr` into `d`.
-    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType) {
+    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType) -> Result<(), String> {
         match ty {
+            // `i1` occupies ONE byte in memory (`size_of(I1) == 1`, and `Op::Gep` strides bools by 1),
+            // exactly like Cranelift's `types::I8` mapping — so it must be accessed with `ld.u8`. A
+            // 4-byte access would read three neighbouring bools (or run past the frame) and, on an
+            // odd address, faults the device outright with CUDA_ERROR_MISALIGNED_ADDRESS.
+            MirType::I1 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("ld.u8 {w}, [{addr}];"));
+                self.emit(&format!("cvt.u64.u32 {d}, {w};"));
+                self.mask_int(d, ty);
+            }
             MirType::F32 => self.emit(&format!("ld.f32 {d}, [{addr}];")),
             MirType::F64 => self.emit(&format!("ld.f64 {d}, [{addr}];")),
             MirType::I64 | MirType::Ptr => self.emit(&format!("ld.u64 {d}, [{addr}];")),
@@ -1260,13 +1304,20 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("ld.s16 {w}, [{addr}];"));
                 self.emit(&format!("cvt.s64.s32 {d}, {w};"));
             }
-            _ => {
-                // i32 / i1: load 32 bits, sign-extend to 64.
+            // i32: load 32 bits, sign-extend to 64.
+            MirType::I32 => {
                 let w = self.fresh_r32();
                 self.emit(&format!("ld.u32 {w}, [{addr}];"));
                 self.emit(&format!("cvt.s64.s32 {d}, {w};"));
             }
+            // An aggregate/void has no single-register load. Falling through to the 4-byte `ld.u32`
+            // would emit *plausible but wrong* PTX (a `load [2 x i32]` would read only its first
+            // element) — the contract is to decline so the gate reports it as not-yet-covered.
+            MirType::Vec(..) | MirType::Array(..) | MirType::Void => {
+                return Err(format!("{UNSUPPORTED} load of aggregate type {ty:?}"))
+            }
         }
+        Ok(())
     }
 
     fn lower_store(&mut self, ptr: ValueId, value: ValueId) -> Result<(), String> {
@@ -1333,6 +1384,14 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("cvt.rn.f16.f32 {h}, {v};"));
                 self.emit(&format!("{g}st.u16 [{addr}], {h};"));
             }
+            // `i1` is a ONE-byte object (see `load_into`): store the low byte, masked to 0/1 so the
+            // byte read back is canonical whatever produced the value.
+            MirType::I1 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("cvt.u32.u64 {w}, {v};"));
+                self.emit(&format!("and.b32 {w}, {w}, 1;"));
+                self.emit(&format!("{g}st.u8 [{addr}], {w};"));
+            }
             // Narrow stores take a 32-bit source register (low bits); narrow the 64-bit value first.
             MirType::I8 => {
                 let w = self.fresh_r32();
@@ -1344,11 +1403,15 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("cvt.u32.u64 {w}, {v};"));
                 self.emit(&format!("{g}st.u16 [{addr}], {w};"));
             }
-            _ => {
-                // i32 / i1
+            MirType::I32 => {
                 let w = self.fresh_r32();
                 self.emit(&format!("cvt.u32.u64 {w}, {v};"));
                 self.emit(&format!("{g}st.u32 [{addr}], {w};"));
+            }
+            // As in `load_into`: an aggregate/void has no single-register store, and a 4-byte
+            // `st.u32` would write only part of it. Decline instead of emitting a partial write.
+            MirType::Vec(..) | MirType::Array(..) | MirType::Void => {
+                return Err(format!("{UNSUPPORTED} store of aggregate type {ty:?}"))
             }
         }
         Ok(())
@@ -1406,7 +1469,7 @@ impl<'a> FnEmit<'a> {
                 for i in 0..n {
                     let la = self.lane_addr(&addr, i, esz);
                     let d = self.fresh(lane_rc);
-                    self.load_into(&d, &la, &lane);
+                    self.load_into(&d, &la, &lane)?;
                     ls.push(d);
                 }
                 ls
@@ -1543,7 +1606,12 @@ impl<'a> FnEmit<'a> {
             // The elementwise transcendental kernel dispatches on a compile-time op code; only lower
             // the ops `mrt_vmath` implements (a few inverse fns need an atan polynomial, not yet done).
             // The bf16/f16 variants share the op-switch (and the op gate) — only the input load differs.
-            "wukong_vmath_f32" | "wukong_vmath_bf16" | "wukong_vmath_f16"
+            // NOTE: every spelling `rt_helper` maps to `mrt_vmath*` must be listed here, or it falls
+            // through to the generic `other =>` arm below and reaches the helper with this op-code
+            // gate BYPASSED — an unimplemented op would then silently run `mrt_vmath`'s identity
+            // default instead of declining.
+            "wukong_vmath_f32" | "wukong_vmath_f32_parallel" | "wukong_vmath_bf16"
+            | "wukong_vmath_f16"
                 if args.len() == 4 =>
             {
                 let op = self
@@ -1667,8 +1735,12 @@ impl<'a> FnEmit<'a> {
             // *always* f32 (4 B) — the activation result is computed and stored in f32 — so the two
             // pointers can have different per-element strides (a 2/4 mismatch was a misaligned store).
             CoopKind::Vmath => {
-                let in_esz = if name == "wukong_vmath_f32" { 4 } else { 2 };
-                let h = rt_helper(name).expect("vmath helper");
+                // Keyed on the f32 family (`wukong_vmath_f32` and its `_parallel` twin), NOT on the
+                // one exact serial spelling: giving an f32 input buffer the bf16 2-byte stride would
+                // walk each thread's chunk over the wrong half of the array.
+                let in_esz = if name.starts_with("wukong_vmath_f32") { 4 } else { 2 };
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1679,7 +1751,8 @@ impl<'a> FnEmit<'a> {
                 );
             }
             CoopKind::Vmath2 => {
-                let h = rt_helper(name).expect("vmath2 helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1690,7 +1763,8 @@ impl<'a> FnEmit<'a> {
                 );
             }
             CoopKind::Velem => {
-                let h = rt_helper(name).expect("velem helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1704,7 +1778,8 @@ impl<'a> FnEmit<'a> {
             // each thread owns a contiguous A-row / C-row block; B / bias / beta / act are shared. A-row
             // = `k` elems, C-row = `n` elems. (a=0, b=1, c=2, m=3, k=4, n=5, ...)
             CoopKind::Gemm | CoopKind::GemmNt | CoopKind::GemmNtEpi => {
-                let h = rt_helper(name).expect("gemm helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1716,7 +1791,8 @@ impl<'a> FnEmit<'a> {
             }
             // int8 GEMM: A rows are u8 (`k`*1 B), C rows are i32 (`n`*4 B).
             CoopKind::I8GemmNt => {
-                let h = rt_helper(name).expect("i8gemm helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1729,7 +1805,8 @@ impl<'a> FnEmit<'a> {
             // Row-wise norm: each row's softmax/LayerNorm/RMSNorm is independent -> chunk `rows`.
             // (x=0, out=1, rows=2, cols=3, ...); each row is `cols` f32.
             CoopKind::Norm => {
-                let h = rt_helper(name).expect("norm helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1742,7 +1819,8 @@ impl<'a> FnEmit<'a> {
             // Affine norm: (x=0, out=1, gamma=2, beta=3, rows=4, cols=5, ...); gamma/beta are
             // per-column (shared across rows), so only x/out are row-offset by `cols`*4 B.
             CoopKind::NormAffine => {
-                let h = rt_helper(name).expect("norm_affine helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -2303,23 +2381,33 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
         "wukong_norm_affine_f32" | "wukong_norm_affine_f32_parallel" => {
             ("mrt_norm_affine", None, PTX_NORM_AFFINE.to_string())
         }
-        "wukong_vmath_f32" => ("mrt_vmath", None, PTX_VMATH.to_string()),
+        "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
+            ("mrt_vmath", None, PTX_VMATH.to_string())
+        }
         "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => {
             ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI.to_string())
         }
         // Mixed-precision (bf16/f16 storage, f32 compute) — generated per precision.
-        "wukong_vmath_bf16" => ("mrt_vmath_bf16", None, ptx_vmath_lowp("mrt_vmath_bf16", "bf16")),
-        "wukong_vmath_f16" => ("mrt_vmath_f16", None, ptx_vmath_lowp("mrt_vmath_f16", "f16")),
-        "wukong_dot_bf16" => ("mrt_dot_bf16", Some(RC::F32), ptx_dot_lowp("mrt_dot_bf16", "bf16")),
-        "wukong_dot_f16" => ("mrt_dot_f16", Some(RC::F32), ptx_dot_lowp("mrt_dot_f16", "f16")),
-        "wukong_sum_bf16" => ("mrt_sum_bf16", Some(RC::F32), ptx_sum_lowp("mrt_sum_bf16", "bf16")),
-        "wukong_sum_f16" => ("mrt_sum_f16", Some(RC::F32), ptx_sum_lowp("mrt_sum_f16", "f16")),
-        "wukong_reduce_bf16" => (
+        "wukong_vmath_bf16" => ("mrt_vmath_bf16", None, ptx_vmath_lowp("mrt_vmath_bf16", "bf16")?),
+        "wukong_vmath_f16" => ("mrt_vmath_f16", None, ptx_vmath_lowp("mrt_vmath_f16", "f16")?),
+        "wukong_dot_bf16" | "wukong_dot_bf16_parallel" => {
+            ("mrt_dot_bf16", Some(RC::F32), ptx_dot_lowp("mrt_dot_bf16", "bf16"))
+        }
+        "wukong_dot_f16" | "wukong_dot_f16_parallel" => {
+            ("mrt_dot_f16", Some(RC::F32), ptx_dot_lowp("mrt_dot_f16", "f16"))
+        }
+        "wukong_sum_bf16" | "wukong_sum_bf16_parallel" => {
+            ("mrt_sum_bf16", Some(RC::F32), ptx_sum_lowp("mrt_sum_bf16", "bf16"))
+        }
+        "wukong_sum_f16" | "wukong_sum_f16_parallel" => {
+            ("mrt_sum_f16", Some(RC::F32), ptx_sum_lowp("mrt_sum_f16", "f16"))
+        }
+        "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => (
             "mrt_reduce_bf16",
             Some(RC::F32),
             ptx_reduce_lowp("mrt_reduce_bf16", "bf16"),
         ),
-        "wukong_reduce_f16" => (
+        "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => (
             "mrt_reduce_f16",
             Some(RC::F32),
             ptx_reduce_lowp("mrt_reduce_f16", "f16"),
@@ -3394,16 +3482,18 @@ FMOD_RET:
 /// (2-byte stride) and writing f32 (4-byte stride). Reuses the f32 kernel's op-switch verbatim (the
 /// op codes and SFU formulas are identical; only the input load differs), so the result is bit-for-
 /// bit the f32 kernel run on the widened inputs.
-fn ptx_vmath_lowp(fn_name: &str, cvt: &str) -> String {
+fn ptx_vmath_lowp(fn_name: &str, cvt: &str) -> Option<String> {
     // Splice in the shared dispatch + op bodies (`setp …; VM0: …; VM_DEF: mov %f2,%f1`) from the
     // committed f32 kernel so there is one source of truth for the ~30 activation formulas.
+    // The two markers are an invariant of `PTX_VMATH` in this same file; if an edit ever renames or
+    // reflows them, DECLINE (the caller turns `None` into an `UNSUPPORTED:` diagnostic) instead of
+    // panicking with internal text on a path a user program reaches. `vmath_lowp_markers_present`
+    // below pins the invariant so a desync is caught at edit time, not at compile time of a program.
     let s = PTX_VMATH;
-    let start = s
-        .find("    setp.eq.s64 %p1, %rd3, 0;")
-        .expect("vmath op dispatch");
-    let end = s.find("VM_ST:").expect("vmath store label");
+    let start = s.find(VM_DISPATCH_MARKER)?;
+    let end = s.find(VM_STORE_MARKER)?;
     let ops = &s[start..end];
-    format!(
+    Some(format!(
         r#".func {fn_name} (.param .b64 px, .param .b64 pout, .param .b64 pn, .param .b64 pop)
 {{
     .reg .b64 %rd<9>;
@@ -3432,8 +3522,14 @@ VM_DONE:
     ret;
 }}
 "#
-    )
+    ))
 }
+
+/// The two `PTX_VMATH` anchors [`ptx_vmath_lowp`] splices between: the first line of the op-code
+/// dispatch, and the shared store label that ends the op bodies. Named constants so the test below
+/// pins exactly what the splice looks for.
+const VM_DISPATCH_MARKER: &str = "    setp.eq.s64 %p1, %rd3, 0;";
+const VM_STORE_MARKER: &str = "VM_ST:";
 
 /// `wukong_dot_{bf16,f16}(x, y, n) -> f32`: `Σ widen(x[k])·widen(y[k])`, f32 accumulate.
 fn ptx_dot_lowp(fn_name: &str, cvt: &str) -> String {
@@ -3793,6 +3889,53 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// `ptx_vmath_lowp` builds the bf16/f16 activation kernels by slicing `PTX_VMATH` between two
+    /// literal markers. That is a self-referential invariant of this file: renaming `VM_ST:` or
+    /// reflowing the first dispatch line silently turns every bf16/f16 activation program into an
+    /// `UNSUPPORTED:` decline. Pin it here — this test needs no CUDA device, so it fires on any
+    /// `--features gpu` build the moment the PTX literal and the splice desync.
+    #[test]
+    fn vmath_lowp_markers_present() {
+        assert!(
+            PTX_VMATH.contains(VM_DISPATCH_MARKER),
+            "PTX_VMATH no longer contains the op-dispatch marker {VM_DISPATCH_MARKER:?} that \
+             ptx_vmath_lowp splices from"
+        );
+        assert!(
+            PTX_VMATH.contains(VM_STORE_MARKER),
+            "PTX_VMATH no longer contains the store marker {VM_STORE_MARKER:?} that \
+             ptx_vmath_lowp splices to"
+        );
+        // And the splice really produces a kernel (markers in the right order, non-empty body).
+        let k = ptx_vmath_lowp("mrt_vmath_bf16", "bf16").expect("bf16 vmath kernel");
+        assert!(k.contains("cvt.f32.bf16"), "spliced kernel lost its bf16 input widen");
+        assert!(k.is_ascii(), "PTX must stay ASCII");
+    }
+
+    /// The comparator the corpus gate is built on, pinned against the real divergence it used to
+    /// wave through. The four "before" lines are the actual gpu-native -O3 output of
+    /// `tests/run/bf16_literal_grid.wk` when bf16/f16 constants were not grid-rounded; the oracle
+    /// column is the interpreter's. Every one of them passed the old 1e-2 relative tolerance.
+    /// Needs no CUDA device.
+    #[test]
+    fn integer_lines_compare_exactly() {
+        for (gpu, cpu) in [("10000", "10009"), ("10000", "9997"), ("32968", "33125"), ("3141", "3140")]
+        {
+            assert!(
+                !line_matches(gpu, cpu),
+                "integer line {gpu} must not match the oracle's {cpu}"
+            );
+        }
+        assert!(!outputs_match(b"10000\n10000\n32968\n3141\n", b"10009\n9997\n33125\n3140\n"));
+        // Equal integers still match, in any spelling that parses to the same value.
+        assert!(line_matches("12345678901", "12345678901"));
+        assert!(line_matches("-0", "0"));
+        // Floats keep the CPU<->GPU tolerance (reduction order / SFU differences).
+        assert!(line_matches("1.0000001", "1.0"));
+        assert!(line_matches("0.30000000000000004", "0.3"));
+        assert!(!line_matches("1.5", "2.5"));
+    }
+
     /// Build a program from `.wk` source at `opt` (lex -> parse -> sema -> mir_build -> opt).
     fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
         use wukong_span::SourceMap;
@@ -3819,12 +3962,25 @@ mod tests {
         Some((program, interner))
     }
 
-    /// Compare one output line numerically (float tolerance) or exactly (everything else).
+    /// Compare one output line. **Integer output is compared exactly**: `decode_ctx` replays an
+    /// integer print record with the identical `format!("{}\n", payload as i64)` the interpreter
+    /// uses, so any difference on such a line is a miscompile, never a rounding artifact. Only a
+    /// line carrying a float form gets the CPU<->GPU tolerance, which exists for reduction-order and
+    /// SFU differences.
+    ///
+    /// The tolerance used to apply to *every* numeric line, which made a large class of miscompiles
+    /// report green: on `bf16_literal_grid.wk` the GPU printed 10000 where the oracle printed 10009
+    /// and `9 <= 1e-2 * 10009` accepted it. bf16/f16 error is structurally bounded by 2^-9 relative,
+    /// so a 1e-2 relative slack could never catch that bug class.
     fn line_matches(g: &str, c: &str) -> bool {
         if g == c {
             return true;
         }
-        match (g.trim().parse::<f64>(), c.trim().parse::<f64>()) {
+        let (gt, ct) = (g.trim(), c.trim());
+        if let (Ok(a), Ok(b)) = (gt.parse::<i128>(), ct.parse::<i128>()) {
+            return a == b;
+        }
+        match (gt.parse::<f64>(), ct.parse::<f64>()) {
             (Ok(a), Ok(b)) => {
                 let diff = (a - b).abs();
                 diff <= 1e-3 || diff <= 1e-2 * b.abs().max(a.abs())
@@ -3898,7 +4054,35 @@ mod tests {
                 let cpu = wukong_interp::run_with_output(&program, entry, &interner);
                 let gpu = jit_run(&program, entry, &interner);
                 match (&cpu, &gpu) {
-                    (Err(_), Err(_)) => {} // both error (e.g. assertion failed) — agree.
+                    // Both errored. That is only *agreement* when the GPU's error is the one
+                    // deterministic program-level error both executors produce identically. An
+                    // unchecked "both Err" arm counted an `UNSUPPORTED:` decline as coverage and,
+                    // worse, let a genuine driver fault through without landing on `faults` or
+                    // resetting the context — so the next healthy program inherited the sticky
+                    // CUDA error and took the blame, breaking this gate's root-cause-only rule.
+                    (Err(ce), Err(ge)) => {
+                        if ge.starts_with(UNSUPPORTED)
+                            || ge.starts_with("gpu-native print buffer overflow")
+                        {
+                            // A decline or a device-capacity limit: no GPU output existed to compare.
+                            covered_here = false;
+                            skipped.push(format!("{name}@O{opt}: {ge}"));
+                            break;
+                        }
+                        if ge != "assertion failed" {
+                            covered_here = false;
+                            faults.push(format!("{name}@O{opt}: gpu errored: {ge}"));
+                            crate::gpu::reset_gpu();
+                            break;
+                        }
+                        if ce != ge {
+                            covered_here = false;
+                            mismatches
+                                .push(format!("{name}@O{opt}: cpu err `{ce}` gpu err `{ge}`"));
+                            break;
+                        }
+                        // Both `assertion failed` — agree.
+                    }
                     (Ok((ce, co)), Ok((ge, go))) => {
                         if ce != ge || !outputs_match(go, co) {
                             mismatches.push(format!(

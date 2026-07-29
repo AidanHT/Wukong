@@ -16,8 +16,10 @@
 //! no CUDA toolkit; only *running these benches* needs the DLLs reachable on the loader path. On this
 //! box they live in a git-ignored `tools/cuda-redist/` (see `peer_env_hint`), put on `PATH` by the
 //! bench invocation. If they are absent the loader would `panic!`, so [`peers_available`] probes for
-//! them under `catch_unwind` and the peer benches **skip** (never fail) when they are missing — the
-//! same "green without the hardware" discipline the GPU tests already follow.
+//! them under `catch_unwind` and the peer benches skip when they are missing — the same "green
+//! without the hardware" discipline the GPU tests already follow. **A skip is not silent**: a run
+//! that is *supposed* to have the peers sets `WUKONG_PEER_REQUIRED=1` and the skip becomes a
+//! failure, and [`peer_probe`] names which library was unreachable (§3A P3).
 //!
 //! Correctness first (the plan's first law): every peer is cross-checked against the **same f64 CPU
 //! reference** as Wukong's own kernels before any speed number counts, so a fast-but-wrong peer
@@ -61,21 +63,38 @@ pub fn peer_env_hint() -> &'static str {
 /// the first real call to each library under `catch_unwind` and treat a panic (or any error) as "not
 /// available → skip". The probe is cheap and its result is cached for the whole process.
 pub fn peers_available(g: &mut Gpu) -> bool {
+    peer_probe(g).is_none()
+}
+
+/// Why the peer probe failed, or `None` when both peers are loadable. **§3A P3 — a sweep that cannot
+/// find its peer must fail LOUDLY.** A caller that takes a `&mut Gpu` already *has* a live device, so
+/// a `Some` here is never "this box has no GPU" (a legitimate skip): it is always "the device is fine
+/// but the peer toolchain is unreachable", which is the case that must not report green having
+/// measured nothing. The string names *which* library failed so the operator does not have to guess
+/// between a missing NVRTC and a missing cuBLAS (they live in different redist wheels).
+pub fn peer_probe(g: &mut Gpu) -> Option<&'static str> {
     use std::sync::OnceLock;
-    static OK: OnceLock<bool> = OnceLock::new();
-    *OK.get_or_init(|| {
+    static WHY: OnceLock<Option<String>> = OnceLock::new();
+    WHY.get_or_init(|| {
         // NVRTC: compile a trivial program. cuBLAS: create a handle on the stream. Either touching a
-        // missing DLL panics inside cudarc's loader; catch it so we report false instead of crashing.
+        // missing DLL panics inside cudarc's loader; catch it so we report a reason instead of crashing.
         let stream = g.stream.clone();
-        let nvrtc_ok = std::panic::catch_unwind(|| {
+        let nvrtc = std::panic::catch_unwind(|| {
             compile_ptx_with_opts("extern \"C\" __global__ void p(){}", CompileOptions::default())
-                .is_ok()
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
         })
-        .unwrap_or(false);
-        let cublas_ok =
-            std::panic::catch_unwind(|| CudaBlas::new(stream).is_ok()).unwrap_or(false);
-        nvrtc_ok && cublas_ok
+        .unwrap_or_else(|_| Err("loader panicked (DLL not found)".to_string()));
+        let cublas = std::panic::catch_unwind(|| CudaBlas::new(stream).map(|_| ()).map_err(|e| format!("{e:?}")))
+            .unwrap_or_else(|_| Err("loader panicked (DLL not found)".to_string()));
+        match (nvrtc, cublas) {
+            (Ok(()), Ok(())) => None,
+            (Err(n), Err(c)) => Some(format!("NVRTC unavailable ({n}) and cuBLAS unavailable ({c})")),
+            (Err(n), Ok(())) => Some(format!("NVRTC unavailable ({n})")),
+            (Ok(()), Err(c)) => Some(format!("cuBLAS unavailable ({c})")),
+        }
     })
+    .as_deref()
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -704,7 +723,8 @@ pub struct CublasChainLayer {
     flash_cfg: LaunchConfig,
     /// Tensor-core flash (`flash_d64_w`) + cfg — `Some` when `gpu::wmma_flash_applies`. Kept identical
     /// to `ResidentLayerF16` so the flash stays *common* to both stacks and the measured gap is purely
-    /// cuBLAS-vs-WMMA GEMM + epilogue fusion, not a difference in the attention kernel.
+    /// cuBLAS-vs-WMMA GEMM + epilogue fusion, not a difference in the attention kernel. Resolved
+    /// through [`Self::flash_plan_w`] — the *same* `gpu::wmma_flash_plan` seam the Wukong layer uses.
     f_flash_w: Option<(CudaFunction, LaunchConfig)>,
     f_silu: CudaFunction,
     f_vadd: CudaFunction,
@@ -727,6 +747,22 @@ pub struct CublasChainLayer {
 }
 
 impl CublasChainLayer {
+    /// **The tensor-core flash the chain runs — resolved through the *same* seam as the Wukong layer.**
+    ///
+    /// The whole point of this peer is that attention is *common* to both stacks, so the measured gap is
+    /// purely cuBLAS-vs-WMMA GEMM + epilogue fusion. That only holds if the chain launches the kernel
+    /// `ResidentLayerF16` launches, and `ResidentLayerF16::new_mha` resolves it with
+    /// [`gpu::wmma_flash_plan`](crate::gpu) — which at `S >= 4096` routes to the warp-specialized
+    /// `flash_d64_ws` / `flash_d128_ws3_lm` (2 warps/CTA, grid `ceil((S/16)/2)`), not to
+    /// `wmma_flash_entry`'s `flash_d*_mp` (1 warp, grid `S/16`). Pairing `wmma_flash_entry` with
+    /// `wmma_flash_cfg` here — as this did — gave the *peer* the mp kernel while Wukong ran ws, so the
+    /// S=4096 GPT-2-layer headline carried an attention-kernel delta (`flash_ws_vs_mp` measured ws/mp
+    /// 0.944× at S=4096) inside a number documented as GEMM-only. Entry and config also *must* travel
+    /// together: the ws family is a 64-thread named-barrier kernel and would hang on a 32-thread launch.
+    fn flash_plan_w(dh: usize, s: usize, heads: usize) -> (&'static str, LaunchConfig) {
+        crate::gpu::wmma_flash_plan(dh, s, heads)
+    }
+
     /// Upload the weights (narrowed to f16) and preload the glue kernels — mirrors
     /// [`ResidentLayerF16::new`]'s shape constraints (S,D,Dff multiples of 64; `d` a supported flash head
     /// dim) and reuses the *same* kernel keys (`norm`/`cast`/`flash`/`vmath`/`vadd`) so those kernels are
@@ -789,8 +825,9 @@ impl CublasChainLayer {
         let (flash_name, flash_cfg) = crate::gpu::flash_plan(dh, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
         let f_flash_w = if crate::gpu::wmma_flash_applies(dh, s) {
-            let f = g.function("flash", crate::ptx_flash::flash_ptx(), crate::gpu::wmma_flash_entry(dh, s))?;
-            Some((f, crate::gpu::wmma_flash_cfg(s)))
+            let (entry, cfg) = Self::flash_plan_w(dh, s, heads);
+            let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry)?;
+            Some((f, cfg))
         } else {
             None
         };
@@ -895,16 +932,19 @@ impl CublasChainLayer {
             }
             Ok(attn)
         } else {
-            let (f_w, _) = self.f_flash_w.as_ref().expect("multi-head requires the tensor-core flash");
+            // Entry AND config both come from `flash_plan_w` (grid.y = heads is already folded in by
+            // `wmma_flash_plan`): a hand-built 1-warp/`S/16` config here would silently pair the
+            // warp-specialized S>=4096 entry with a 32-thread launch — a different kernel from the one
+            // `ResidentLayerF16` runs, and a hang for the 64-thread named-barrier ws family.
+            let (f_w, cfg) = self
+                .f_flash_w
+                .as_ref()
+                .expect("multi-head requires the tensor-core flash");
             let q_hsd = self.cast_transpose(q)?;
             let k_hsd = self.cast_transpose(k)?;
             let v_hsd = self.cast_transpose(v)?;
             let mut attn_hsd = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
-            let cfg = LaunchConfig {
-                grid_dim: ((self.s / 16) as u32, self.heads as u32, 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
-            };
+            let cfg = *cfg;
             let mut bld = self.stream.launch_builder(f_w);
             bld.arg(&ss).arg(&scale).arg(&q_hsd).arg(&k_hsd).arg(&v_hsd).arg(&mut attn_hsd);
             unsafe { bld.launch(cfg)? };
@@ -2516,4 +2556,53 @@ pub fn fa2_sdpa_peer_rope(
         device: map.get("device").cloned().unwrap_or_default(),
         torch: map.get("torch").cloned().unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// **The peer chain's attention must be the *same kernel* the Wukong layer runs** (device-free).
+    ///
+    /// `CublasChainLayer`'s whole claim is that attention is common to both stacks, so the printed
+    /// GPT-2-layer ratio is cuBLAS-vs-WMMA GEMM + epilogue fusion and nothing else. It used to pair
+    /// `gpu::wmma_flash_entry` with `gpu::wmma_flash_cfg` while `ResidentLayerF16` resolved the pair
+    /// through `gpu::wmma_flash_plan` — identical up to S=2048 and *different* at S>=4096, where the
+    /// plan routes to the warp-specialized kernels. This pins the seam at every shape the MHA bench
+    /// runs, single- and multi-head, and pins the two families' launch shapes so an entry can never be
+    /// paired with the other family's config (2-warp ws on a 32-thread launch is a hang, not a number).
+    #[test]
+    fn chain_flash_is_the_wukong_plan() {
+        use super::CublasChainLayer;
+        // (d, heads) pairs whose head dim `d/heads` the tensor-core flash covers: 64 and 128.
+        for &(d, heads) in &[(768usize, 12usize), (64, 1), (128, 1), (256, 2)] {
+            let dh = d / heads;
+            for &s in &[512usize, 1024, 2048, 4096] {
+                let (entry, cfg) = CublasChainLayer::flash_plan_w(dh, s, heads);
+                let (want_entry, want_cfg) = crate::gpu::wmma_flash_plan(dh, s, heads);
+                assert_eq!(entry, want_entry, "chain flash entry dh={dh} S={s} heads={heads}");
+                assert_eq!(cfg.grid_dim, want_cfg.grid_dim, "chain flash grid dh={dh} S={s}");
+                assert_eq!(cfg.block_dim, want_cfg.block_dim, "chain flash block dh={dh} S={s}");
+                assert_eq!(cfg.grid_dim.1, heads as u32, "grid.y must carry the head count");
+                // Entry and config must belong to the same family: the `_ws*` kernels are 2 warps per
+                // CTA with a halved grid; every other tensor-core flash entry is 1 warp, grid S/16.
+                if entry.contains("_ws") {
+                    assert_eq!(cfg.block_dim.0, 64, "{entry} is warp-specialized: 2 warps/CTA");
+                    assert_eq!(cfg.grid_dim.0, ((s / 16) as u32).div_ceil(2), "{entry} grid");
+                } else {
+                    assert_eq!(cfg.block_dim.0, 32, "{entry} is 1 warp/CTA");
+                    assert_eq!(cfg.grid_dim.0, (s / 16) as u32, "{entry} grid");
+                }
+            }
+        }
+        // The regression this closes, stated as a fact about the shape that carried it: with the ws
+        // route live (the default), at S=4096 the plan and the bare `wmma_flash_entry` name DIFFERENT
+        // kernels — so a peer built on the latter measures a different attention than Wukong runs.
+        // Skipped only under the `WUKONG_FLASH_WS=0` kill-switch, where the two legitimately coincide.
+        if crate::gpu::ws_flash_route(64, 4096).is_some() {
+            assert_ne!(
+                crate::gpu::wmma_flash_plan(64, 4096, 12).0,
+                crate::gpu::wmma_flash_entry(64, 4096),
+                "S=4096 D=64: plan and bare entry must differ (else this gate proves nothing)"
+            );
+        }
+    }
 }

@@ -279,6 +279,13 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
         let tn = bn / (8 * wn); //  8-col B subtiles per warp
         let tile_bytes = bm * bk; // one A (== one B) tile in bytes (u8); a power of two ⇒ XOR toggles
         debug_assert!(tile_bytes.is_power_of_two());
+        // Two preconditions this generator *derives from* rather than checks — its swizzled twin
+        // `gen_int8_smdb_swz_impl` asserts both (ptx_int8.rs `bk == 64` / distinct `a_tile`,`b_tile`).
+        // (1) The `stage` lambda below hardcodes the BK=32 chunk decomposition (`r = e>>1`,
+        // `c = (e&1)*16`), which decomposes a 32-byte row and nothing else. (2) `smemA`, `smemB` and
+        // the single `%bufc`/`%bufp` toggle are ALL sized from `bm*bk`, so `bn > bm` overruns `smemB`.
+        assert!(bk == 32, "{name}: the hand-placed staging decomposition is derived for BK=32");
+        assert!(bm == bn, "{name}: smemA/smemB and the buffer toggle are all sized from bm*bk");
         assert!(
             threads * 16 <= bm * bk && (bm * bk) % (threads * 16) == 0,
             "smdb staging needs threads*16 to divide the tile bytes"
@@ -689,12 +696,21 @@ fn gen_int8_smdb_swz_impl(
         s += "    cp.async.commit_group;\n";
     } else {
         // Multistage prologue: prefetch slabs 0..stages-2 into buffers 0..stages-2 (stages-1 committed
-        // groups). kstart is 0 here (multistage forbids split-K), so kcol = j·bk are absolute K columns.
+        // groups). kstart is 0 here (multistage forbids split-K), so kcol = j·bk are absolute K columns
+        // — past the end of A/B whenever K < (stages-1)·bk (e.g. the s3 128×128 entry at K=64), so each
+        // j>0 slab is guarded by `kcol < K` exactly as `ptx_fp8::fp8_pipe_entry` guards its prologue.
+        // The commit stays OUTSIDE the guard so the positional `wait_group stages-1` accounting holds.
         for j in 0..(stages - 1) {
             s += &format!("    mov.u32 %kcol,{};\n", j * bk);
             let (offa, offb) = (format!("{}", j * a_tile), format!("{}", j * b_tile));
+            if j > 0 {
+                s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{j};\n");
+            }
             stage("%baseRow", "%A", "smemA", &offa, a_chunks, &mut s);
             stage("%baseCol", "%B", "smemB", &offb, b_chunks, &mut s);
+            if j > 0 {
+                s += &format!("PRO_{name}_{j}:\n");
+            }
             s += "    cp.async.commit_group;\n";
         }
     }
@@ -1086,6 +1102,11 @@ fn gen_int8_smdb_ms(
     let tn = bn / (8 * wn);
     let tile_bytes = bm * bk;
     let ring = stages * tile_bytes;
+    // Same two derived-from-but-unchecked preconditions as `gen_int8_smdb` (see there): the staging
+    // lambda is the BK=32 decomposition, and `smemA`, `smemB` and both ring pointers are sized from
+    // `bm*bk` alone — with `bn > bm` the B staging writes `bn*bk` per buffer into a `bm*bk`-strided ring.
+    assert!(bk == 32, "{name}: the hand-placed staging decomposition is derived for BK=32");
+    assert!(bm == bn, "{name}: smemA/smemB and the ring pointers are all sized from bm*bk");
     assert!(
         threads * 16 <= bm * bk && (bm * bk) % (threads * 16) == 0,
         "smdb_ms staging needs threads*16 to divide the tile bytes"
@@ -1171,11 +1192,23 @@ fn gen_int8_smdb_ms(
     };
 
     // Prologue: prefetch slabs 0..stages-2 into buffers 0..stages-2 (stages-1 committed groups).
+    // Slab j starts at the ABSOLUTE K column j*bk, which is past the end of A and B whenever
+    // K < (stages-1)*bk — reachable from the shipped shapes (the s4 entry at K=64 stages its third
+    // slab at column 64 == K), so every j>0 slab is guarded by `kcol < K`. This mirrors the fp8 twin
+    // `ptx_fp8::fp8_pipe_entry`, whose prologue has always carried the guard. j==0 needs none (K>0).
+    // The `commit_group` stays OUTSIDE the guard: `cp.async.wait_group stages-1` is positional, so the
+    // committed-group count must track the slab counter whether or not a copy was actually issued.
     for j in 0..(stages - 1) {
         s += &format!("    mov.u32 %kcol,{};\n", j * bk);
         let off = format!("{}", j * tile_bytes);
+        if j > 0 {
+            s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{j};\n");
+        }
         stage("%baseRow", "%A", "smemA", &off, a_chunks, &mut s);
         stage("%baseCol", "%B", "smemB", &off, b_chunks, &mut s);
+        if j > 0 {
+            s += &format!("PRO_{name}_{j}:\n");
+        }
         s += "    cp.async.commit_group;\n";
     }
     s += "    mov.u32 %roff,0;\n";
@@ -1285,4 +1318,111 @@ pub fn int8_gemm_smdb128_s4_ptx() -> &'static str {
         gen_int8_smdb_ms("int8_gemm_nt_smdb128_s4", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128, 4, false)
     })
     .as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every module this file emits, paired with the entry it must declare. `int8_gemm_swz_tile_ptx`
+    /// returns its own entry name, so it is folded in separately below.
+    fn modules() -> Vec<(&'static str, String)> {
+        vec![
+            ("int8_tile", INT8_TILE.to_string()),
+            ("int8_gemm_nt", int8_gemm_ptx().to_string()),
+            ("int8_gemm_nt_mt", int8_gemm_mt_ptx().to_string()),
+            ("int8_gemm_nt_smdb", int8_gemm_smdb_ptx().to_string()),
+            ("int8_gemm_nt_smdb_deq", int8_gemm_smdb_deq_ptx().to_string()),
+            ("int8_gemm_nt_smdb128", int8_gemm_smdb128_ptx().to_string()),
+            ("int8_gemm_nt_smdb_swz", int8_gemm_smdb_swz_ptx().to_string()),
+            ("int8_gemm_nt_smdb_swz_sk", int8_gemm_smdb_swz_splitk_ptx().to_string()),
+            ("int8_gemm_nt_smdb_swz_deq", int8_gemm_smdb_swz_deq_ptx().to_string()),
+            ("int8_gemm_nt_smdb128_swz", int8_gemm_smdb128_swz_ptx().to_string()),
+            ("int8_gemm_nt_w64_swz", int8_gemm_w64_swz_ptx().to_string()),
+            ("int8_gemm_nt_w64_swz_s3", int8_gemm_w64_swz_s3_ptx().to_string()),
+            ("int8_gemm_nt_w64_swz_r8", int8_gemm_w64_swz_r8_ptx().to_string()),
+            ("int8_gemm_nt_w64_swz_deq", int8_gemm_w64_swz_deq_ptx().to_string()),
+            ("int8_gemm_nt_smdb_s3", int8_gemm_smdb_s3_ptx().to_string()),
+            ("int8_gemm_nt_smdb_s4", int8_gemm_smdb_s4_ptx().to_string()),
+            ("int8_gemm_nt_smdb128_s3", int8_gemm_smdb128_s3_ptx().to_string()),
+            ("int8_gemm_nt_smdb128_s4", int8_gemm_smdb128_s4_ptx().to_string()),
+            ("int8_gemm_nt_smdb_swz_static", int8_gemm_smdb_swz_static_ptx(256, 256, 256, false)),
+            ("int8_gemm_nt_smdb128_swz_static", int8_gemm_smdb_swz_static_ptx(256, 256, 256, true)),
+            ("int8_gemm_nt_smdb_swz_r", int8_gemm_smdb_swz_raster_ptx(false, 8)),
+            ("int8_gemm_nt_smdb128_swz_r", int8_gemm_smdb_swz_raster_ptx(true, 8)),
+        ]
+    }
+
+    /// **§3A P1 — PTX stays ASCII**, plus the structural minimum, over *every* module this file emits.
+    /// A single non-ASCII byte is a `ptxas fatal` at driver-JIT time, and on a GPU-less box every int8
+    /// test skips, so without this gate the breakage only surfaces as a bare `CUDA_ERROR_INVALID_PTX`
+    /// on a machine with a device. `ptx_int4.rs` has carried this gate since it shipped; int8 had none.
+    /// Pure-CPU — runs under plain `cargo test --features gpu`.
+    #[test]
+    fn int8_ptx_is_ascii_and_structural() {
+        let mut all = modules();
+        let (tile_name, tile_ptx) = int8_gemm_swz_tile_ptx(256, 128, 4, 2, 0);
+        assert_eq!(tile_name, "int8_swz_256x128_w4x2");
+        all.push(("int8_swz_256x128_w4x2", tile_ptx));
+        for (entry, ptx) in &all {
+            assert!(ptx.is_ascii(), "{entry}: PTX must be ASCII");
+            assert!(ptx.contains(".target sm_89"), "{entry}: must target sm_89");
+            assert!(ptx.contains(&format!(".visible .entry {entry}(")), "{entry}: entry missing");
+            assert_eq!(
+                ptx.matches('{').count(),
+                ptx.matches('}').count(),
+                "{entry}: unbalanced braces"
+            );
+            assert!(
+                ptx.contains("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32"),
+                "{entry}: must issue the 8-bit u8xi8->i32 mma"
+            );
+        }
+        // The static-shape module must bake its dims as immediates (that is its whole point).
+        let st = int8_gemm_smdb_swz_static_ptx(256, 256, 256, false);
+        assert!(st.contains("mov.u32 %K,256;"), "static kernel must bake K as a constant");
+    }
+
+    /// **The multistage `cp.async` prologue must be bounded by `K`.** Both int8 ring generators stage
+    /// K-slabs `0..stages-2` up front; slab `j` starts at absolute K column `j*BK`, which is *past the
+    /// end of A and B* whenever `K < (stages-1)*BK`. That is reachable from the shipped gate shapes
+    /// (`int8_gemm_nt_smdb_s4` at K=64 stages its third slab at column 64 == K), so every `j>0` slab
+    /// must be guarded by `kcol < K` exactly as the fp8 twin `ptx_fp8::fp8_pipe_entry` guards its own
+    /// prologue. The `cp.async.commit_group` must stay *outside* the guard: `wait_group stages-1` is
+    /// positional, so the committed-group count has to track the loop counter regardless.
+    #[test]
+    fn multistage_prologue_is_guarded_against_short_k() {
+        for (entry, ptx) in [
+            ("int8_gemm_nt_smdb_s3", int8_gemm_smdb_s3_ptx()),
+            ("int8_gemm_nt_smdb_s4", int8_gemm_smdb_s4_ptx()),
+            ("int8_gemm_nt_smdb128_s3", int8_gemm_smdb128_s3_ptx()),
+            ("int8_gemm_nt_smdb128_s4", int8_gemm_smdb128_s4_ptx()),
+            ("int8_gemm_nt_w64_swz_s3", int8_gemm_w64_swz_s3_ptx()),
+        ] {
+            // One guard + one landing label per j>0 prologue slab, and the commit stays unconditional.
+            let guards = ptx.matches("setp.lt.u32 %pmore,%kcol,%K;").count();
+            let labels = ptx.matches(&format!("PRO_{entry}_")).count();
+            assert!(guards >= 1, "{entry}: prologue stages past K unguarded (no kcol<K test)");
+            assert_eq!(labels, 2 * guards, "{entry}: each prologue guard needs its landing label");
+            assert!(
+                ptx.matches("cp.async.commit_group;").count() > guards,
+                "{entry}: commit_group must stay outside the prologue guard"
+            );
+        }
+        // The s4 prologue really does reach K column 64 — the column the shipped 64x64x64 gate shape
+        // would read out of bounds without the guard.
+        assert!(int8_gemm_smdb_s4_ptx().contains("mov.u32 %kcol,64;"));
+    }
+
+    /// **The two hand-placed generators state their tile preconditions.** `gen_int8_smdb` /
+    /// `gen_int8_smdb_ms` size `smemA`, `smemB` *and* the buffer toggle from `bm*bk` alone and hardcode
+    /// the BK=32 chunk decomposition (`r=e>>1`, `c=(e&1)*16`), so `bm != bn` overruns `smemB` and any
+    /// other BK scrambles every staged tile. Their swizzled twin asserts both; these must too.
+    #[test]
+    #[should_panic(expected = "sized from bm*bk")]
+    fn hand_placed_generator_rejects_non_square_tile() {
+        // bm=64,bn=128,wm=wn=2: threads*16 == bm*bk, so the *existing* staging assert passes and the
+        // generator happily emits smemB[stages*bm*bk] while the B staging writes bn*bk per buffer.
+        let _ = gen_int8_smdb_ms("int8_probe_nonsquare", 64, 128, 2, 2, 3, false);
+    }
 }
