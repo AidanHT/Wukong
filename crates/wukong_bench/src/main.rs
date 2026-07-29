@@ -24,8 +24,26 @@ mod compile_time;
 mod compile_vs;
 mod profile;
 
+/// Every mode of this harness prints a wall-clock number, and every one of those numbers is
+/// meaningless from a build with optimizations off — an unoptimized `wukong_opt`/`wukong_interp`
+/// does not have the same shape as the shipped one, and the project has already been burned by
+/// exactly this (a debug build makes runtime kernels read ~7x slower than JIT loops, inverting A/B
+/// conclusions). The harness still runs, because the -O0-vs-O3 equivalence check it also performs is
+/// a correctness gate that is valid in any build; but it says so first, unmissably, so no number
+/// taken from a debug build can be mistaken for a measurement.
+fn warn_if_debug_build() {
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "*** DEBUG BUILD — every timing below is NOT a measurement and must not be reported. \
+             Re-run\n*** with `cargo run -p wukong_bench --release`. (Correctness results are still \
+             valid.)"
+        );
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    warn_if_debug_build();
 
     // Mode selector: `compile-time` switches to the in-process optimizer-timing report; anything
     // else keeps the original optimizer-effectiveness + execution-timing report. Appended, not
