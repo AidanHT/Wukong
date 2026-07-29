@@ -25944,9 +25944,15 @@ fn parse_int(text: &str) -> i128 {
 }
 
 fn parse_float(text: &str) -> f64 {
-    // Strip a trailing type suffix (bf16/f16/f32/f64) before parsing.
+    // Strip a trailing type suffix before parsing. This list must be the one sema accepts in
+    // `float_literal_well_formed` — sema decides whether the literal is legal, this decides what it
+    // is worth, and a suffix on only one list is a literal that compiles to the wrong number. `f`
+    // alone is the C-style float suffix (`5f` → f32); it was missing here, so sema admitted `5f`
+    // and `1.5f` and then `"5f".parse::<f64>()` failed into the `unwrap_or(0.0)` below — both
+    // printed 0 on both backends with no diagnostic. Longer suffixes are tried first so `5f32`
+    // strips `f32` rather than nothing (no float body ends in `f`, so the order is belt-and-braces).
     let mut core = text;
-    for suf in ["bf16", "f16", "f32", "f64"] {
+    for suf in ["bf16", "f16", "f32", "f64", "f"] {
         if let Some(stripped) = core.strip_suffix(suf) {
             core = stripped;
             break;
