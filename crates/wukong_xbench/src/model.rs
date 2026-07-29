@@ -659,6 +659,30 @@ fn kernel_calls(mir: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// Split optimized `@parallel` MIR into `(outlined region body, everything else)`. The head loop
+/// is outlined into a `fn wukong$par$…`; `None` means nothing was outlined at all.
+///
+/// The bench and `block_dispatch_sets_pinned` share this so they cannot drift: a
+/// `wukong_parallel_for` call *somewhere* in the MIR proves only that SOME loop was outlined, and
+/// the outliner is free to pick a trivial one (a mask-store loop, say) while the head chain stays
+/// serial. The question that matters — "is the region the HEAD loop?" — is answered by what the
+/// region BODY calls, which is what this split exposes.
+fn par_region_split(mir: &str) -> Option<(String, String)> {
+    let start = mir.find("fn wukong$par$")?;
+    let after = &mir[start..];
+    let end = after[3..].find("\nfn ").map(|i| i + 4).unwrap_or(after.len());
+    Some((
+        after[..end].to_string(),
+        format!("{}{}", &mir[..start], &after[end..]),
+    ))
+}
+
+/// The per-head kernel sequence the outlined `@parallel` region body must contain: the scaled QKᵀ
+/// GEMM, the plain PV GEMM and the batched softmax. If the region body is missing these, the
+/// region is not the head loop and the heads are running serially — a regression that is still
+/// *correct*, so only this scan can see it.
+const PAR_REGION_KERNELS: [&str; 3] = ["wukong_sgemm_nt", "wukong_sgemm_nt_alpha", "wukong_norm_f32"];
+
 /// The suite's magnitude-normalized full-buffer metric `max|Δ| / max|out|`, or `Err(reason)` when
 /// the two buffers **cannot be compared at all**.
 ///
@@ -2031,14 +2055,32 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                  embedded GEMMs are running serial"
             );
         }
-        // The head loop must have outlined into a parallel region (heads across cores). Without
-        // it the block is still correct — the heads just run as the old serial chain — so only
-        // this scan makes the regression visible.
-        if !calls.iter().any(|(k, _)| k == "wukong_parallel_for") {
-            println!(
+        // The head loop must have outlined into a parallel region (heads across cores) — and it
+        // must be THE HEAD LOOP. A `wukong_parallel_for` call anywhere in the MIR is not evidence
+        // of that: the outliner can pick a trivial loop (a mask-store nest, say) and leave the
+        // head chain serial, which the presence test reported as healthy while the `Wuk scaling`
+        // and `@parallel` ratio lines below described a serial vehicle. Check the region BODY at
+        // every reported S — the unit test only pins the reduced config.
+        match par_region_split(&m.mir) {
+            None => println!(
                 "  ! WARNING: @parallel block did NOT outline the head loop into a \
                  wukong_parallel_for region — heads are running serially"
-            );
+            ),
+            Some((region, _)) => {
+                let rcalls = kernel_calls(&region);
+                let missing: Vec<&str> = PAR_REGION_KERNELS
+                    .into_iter()
+                    .filter(|need| !rcalls.iter().any(|(k, _)| k == need))
+                    .collect();
+                if !missing.is_empty() {
+                    println!(
+                        "  ! WARNING: the outlined wukong_parallel_for region is NOT the head \
+                         loop — its body is missing {missing:?}, so a trivial loop took the \
+                         region and the per-head chain is running SERIALLY; the Wuk(par) column \
+                         below is not an all-core attention vehicle"
+                    );
+                }
+            }
         }
         let lnf = lnf_mod.as_ref()?;
         let (Some(bp), Some(lp)) = (
@@ -2481,16 +2523,15 @@ mod tests {
         // SERIAL inside the region (the region supplies the threading — the identical op sequence
         // the serial spelling runs, which is the serial == @parallel bit-exactness argument), and
         // NO serial NT GEMM may appear outside it.
-        let start = par
-            .mir
-            .find("fn wukong$par$")
-            .expect("outlined head-region body missing from @parallel MIR");
-        let after = &par.mir[start..];
-        let end = after[3..].find("\nfn ").map(|i| i + 4).unwrap_or(after.len());
-        let region = &after[..end];
-        let rest = format!("{}{}", &par.mir[..start], &after[end..]);
-        let rcalls = kernel_calls(region);
-        for need in ["wukong_sgemm_nt", "wukong_sgemm_nt_alpha", "wukong_norm_f32"] {
+        //
+        // This uses the same `par_region_split` + `PAR_REGION_KERNELS` the bench applies at every
+        // reported S, so the runtime warning and this test cannot disagree about what "the head
+        // loop was outlined" means. The reduced config is kept here only for speed — the full
+        // 768-wide configs are covered by the identical check inside `bench_model_size`.
+        let (region, rest) =
+            par_region_split(&par.mir).expect("outlined head-region body missing from @parallel MIR");
+        let rcalls = kernel_calls(&region);
+        for need in PAR_REGION_KERNELS {
             assert!(
                 rcalls.iter().any(|(k, _)| k == need),
                 "region body lost per-head serial dispatch {need}; got {rcalls:?}"
