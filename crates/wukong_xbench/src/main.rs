@@ -628,7 +628,7 @@ fn main() {
         bench_i8gemm(&cc, &dir);
     }
     if want("dequant") {
-        bench_dequant(&cc, &dir);
+        bench_dequant(&cc, &cxx, &dir);
     }
     if want("bf16") {
         bench_bf16(&cc, &dir);
@@ -726,7 +726,17 @@ fn bench_matmul(cc: &str, dir: &Path, roof: f64) {
     if let Ok(f) = std::env::var("XBENCH_MATMUL_SIZES") {
         let want: Vec<usize> = f.split(',').filter_map(|s| s.trim().parse().ok()).collect();
         if !want.is_empty() {
+            let offered = sizes.clone();
             sizes.retain(|ns| want.contains(ns));
+            // A value matching nothing (a typo, or 4096 without XBENCH_HUGE) used to leave `sizes`
+            // empty and run zero benchmarks silently — indistinguishable from a filter miss. Say
+            // so and fall back to the full sweep, like the sibling XBENCH_MODEL_S knob.
+            if sizes.is_empty() {
+                println!(
+                    "  ! XBENCH_MATMUL_SIZES={f} selected none of {offered:?}; running the full sweep"
+                );
+                sizes = offered;
+            }
         }
     }
     for ns in sizes {
@@ -1034,7 +1044,6 @@ fn rust_matmul(ns: usize) -> String {
 /// column-strided A reads (one cache line per element) as a near-scalar k-loop gcc cannot vectorize —
 /// the regime the domain lowering should dominate hardest. Square M=K=N for the shared-buffer ABI.
 fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
-    let _ = roof;
     for ns in [256usize, 512, 1024] {
         let n2 = ns * ns;
         let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
@@ -1089,6 +1098,18 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             gflops(&cfast),
             gflops(&rm)
         );
+        // Absolute GFLOP/s on this laptop swings ~3x with the power state, so the number above is
+        // only comparable within a run. The clock-invariant denominator is the roofline measured by
+        // the SAME process (`measure_fma_roofline`) — print the percentage next to the table, as
+        // `bench_matmul_skinny`/`bench_linear` already do.
+        if roof > 0.0 {
+            if let Some(w) = &wuk {
+                println!(
+                    "  -> Wukong single-core = {:.0}% of measured roofline",
+                    (flops / w.ns_per_call) / roof * 100.0
+                );
+            }
+        }
         // Cross-language correctness: the transpose-once-then-NN result must match the naive nest.
         if let (Some(m), Some(c)) = (&wuk, &cm) {
             let (rel, at) = max_rel_err(&m.out, &c.out);
@@ -1580,7 +1601,6 @@ fn rust_linear(ns: usize) -> String {
 /// silu(GEMM): the GEMM reassociates and silu is poly-vs-libm ~1 ULP, so the full-buffer check is a tight
 /// tolerance (`max_rel_err`'s near-zero floor covers silu's zero crossing), exactly like `bench_matmul`.
 fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
-    let _ = roof;
     for ns in [512usize, 1024] {
         let n2 = ns * ns;
         let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
@@ -1636,6 +1656,18 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
             gflops(&cfast),
             gflops(&rm)
         );
+        // Absolute GFLOP/s on this laptop swings ~3x with the power state, so the number above is
+        // only comparable within a run. The clock-invariant denominator is the roofline measured by
+        // the SAME process (`measure_fma_roofline`) — print the percentage next to the table, as
+        // `bench_matmul_skinny`/`bench_linear` already do.
+        if roof > 0.0 {
+            if let Some(w) = &wuk {
+                println!(
+                    "  -> Wukong single-core = {:.0}% of measured roofline",
+                    (flops / w.ns_per_call) / roof * 100.0
+                );
+            }
+        }
         // Cross-language correctness over the whole buffer (silu(GEMM) — tight tolerance, see doc).
         if let (Some(m), Some(c)) = (&wk_par, &cm) {
             let (rel, at) = max_rel_err(&m.out, &c.out);
@@ -1711,14 +1743,6 @@ fn rust_ffn(ns: usize) -> String {
     )
 }
 
-/// int8 quantized `nn.Linear` (`C = A·Bᵀ`, `u8` activations × `i8` weights → `i32` accumulator) — the
-/// quantized-inference GEMM that QNNPACK/oneDNN exist for. Wukong recognizes the nest and dispatches
-/// it to the AVX2 widen+`vpmaddwd` int8 microkernel; C/Rust run the *idiomatic* naive int8 GEMM at
-/// `-O3 -march=native` / `-O -Ctarget-cpu=native` — whatever their auto-vectorizers produce is the
-/// honest baseline (no hand intrinsics, same as every other kernel here). **Integer arithmetic, so
-/// the cross-language check is bit-exact** — a stronger bar than the f32 kernels' tolerance. Reported
-/// as int8 GOP/s (2 ops per multiply-accumulate). The inputs stay within `i32` (no overflow at these
-/// sizes), so all three languages must agree exactly.
 /// bf16 mixed-precision `nn.Linear` (`C = A·Bᵀ`, bf16 inputs, f32 accumulate) — the standard
 /// transformer matmul. Wukong recognizes the half-precision dot-product nest and folds it to one
 /// `wukong_sgemm_bf16_nt[_parallel]` call (a lossless widen prepass + the tuned AVX2 f32 GEMM); the
@@ -2253,7 +2277,7 @@ fn rust_biasadd(r: usize, c: usize) -> String {
 /// the two levers Wukong's `wukong_dequant_f32` pulls (folded 256-bit widen+scale + `vmovntps` past
 /// L3). Reported as GB/s (`(in_bytes + 4)·N`, read once + written once); the dequant is exact so the
 /// cross-check is bit-exact. Sizes past L3 so the streaming-store advantage is exercised.
-fn bench_dequant(cc: &str, dir: &Path) {
+fn bench_dequant(cc: &str, cxx: &str, dir: &Path) {
     let ext_flags_c = ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
     let ext_flags_rs = ["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"];
 
@@ -2276,7 +2300,7 @@ fn bench_dequant(cc: &str, dir: &Path) {
         let wuk = bench_wukong(&wk_dequant_1d(n, is_i8, false), &mut out, qp, dummy);
         let wk_par = bench_wukong(&wk_dequant_1d(n, is_i8, true), &mut out, qp, dummy);
         let cm = bench_external("c", &c_dequant_1d(n, is_i8), dir, "dequant1d", cc, &ext_flags_c, &mut out, qp, dummy);
-        let cpp = bench_external("cpp", &cpp_from_c(&c_dequant_1d(n, is_i8)), dir, "dequant1d", "g++", &ext_flags_c, &mut out, qp, dummy);
+        let cpp = bench_external("cpp", &cpp_from_c(&c_dequant_1d(n, is_i8)), dir, "dequant1d", cxx, &ext_flags_c, &mut out, qp, dummy);
         let rm = bench_external("rs", &rust_dequant_1d(n, is_i8), dir, "dequant1d", "rustc", &ext_flags_rs, &mut out, qp, dummy);
         println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust");
         println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cpp), gbps(&rm));
@@ -2305,7 +2329,7 @@ fn bench_dequant(cc: &str, dir: &Path) {
         let wuk = bench_wukong(&wk_dequant_perchan(r, c, is_i8, false), &mut out, qp, sp);
         let wk_par = bench_wukong(&wk_dequant_perchan(r, c, is_i8, true), &mut out, qp, sp);
         let cm = bench_external("c", &c_dequant_perchan(r, c, is_i8), dir, "dequantpc", cc, &ext_flags_c, &mut out, qp, sp);
-        let cpp = bench_external("cpp", &cpp_from_c(&c_dequant_perchan(r, c, is_i8)), dir, "dequantpc", "g++", &ext_flags_c, &mut out, qp, sp);
+        let cpp = bench_external("cpp", &cpp_from_c(&c_dequant_perchan(r, c, is_i8)), dir, "dequantpc", cxx, &ext_flags_c, &mut out, qp, sp);
         let rm = bench_external("rs", &rust_dequant_perchan(r, c, is_i8), dir, "dequantpc", "rustc", &ext_flags_rs, &mut out, qp, sp);
         println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust");
         println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cpp), gbps(&rm));
@@ -4487,6 +4511,15 @@ fn rust_act_backward(n: usize, op: &str) -> String {
     )
 }
 
+/// int8 quantized `nn.Linear` (`C = A·Bᵀ`, `u8` activations × `i8` weights → `i32` accumulator) — the
+/// quantized-inference GEMM that QNNPACK/oneDNN exist for. Wukong recognizes the nest and dispatches
+/// it to the AVX2 widen+`vpmaddwd` int8 microkernel; C/Rust run the *idiomatic* naive int8 GEMM at
+/// `-O3 -march=native` / `-O -Ctarget-cpu=native` — whatever their auto-vectorizers produce is the
+/// honest baseline (no hand intrinsics, same as every other kernel here). **Integer arithmetic, so
+/// the cross-language check is bit-exact** — a stronger bar than the f32 kernels' tolerance. Reported
+/// as int8 GOP/s (2 ops per multiply-accumulate). The inputs stay within `i32` (no overflow at these
+/// sizes: max ≈ ns·250·125 ≪ 2³¹), so all three languages must agree exactly — widening the input
+/// ranges without re-checking that bound would invalidate the exact-equality gate below.
 fn bench_i8gemm(cc: &str, dir: &Path) {
     for ns in [512usize, 1024] {
         let n2 = ns * ns;
