@@ -8,25 +8,38 @@
 //! stable **online softmax** with **FP32 accumulators** (the precision vLLM/TRT-LLM use for the logits
 //! and the V-accumulation).
 //!
-//! ## Kernel shape (correctness-first v1)
-//! One **thread per `(slot, head)`** (grid = `ceil(num_slots*heads / BLOCK)` CTAs of `BLOCK` threads),
-//! each thread fully sequential over its context. This trades the warp-cooperative coalescing of
-//! vLLM's kernel for two decisive simplifications: it is **trivially bit-exact across physical block
-//! layouts** (one thread, one fixed accumulation order — the block table only changes *where* a value
-//! is read, never the value or the order), and it has **no shared-memory logits buffer**, so it handles
-//! arbitrary context length with no v2-style split-K (vLLM needs v2 past 8192 tokens precisely to dodge
-//! that SMEM shortage). The head dim is **unrolled into registers** and the query vector is **cached in
-//! registers** across the whole context loop (read once, reused every position); the block-table walk
-//! is **incremental** (track `logical`/`offset` as the position advances) so there is no per-position
-//! integer divide. A warp-cooperative rewrite is the documented next perf lever.
+//! ## Kernel shape (warp-cooperative)
+//! One **warp per `(slot, head)`**, [`PAGED_ATTN_WARPS`] pairs per CTA — grid =
+//! `ceil(num_slots*heads / PAGED_ATTN_WARPS)` CTAs of `32 * PAGED_ATTN_WARPS` threads. Each warp
+//! stages its query vector once into **shared memory** (`qsh`, one `head_dim` row per warp) and its 32
+//! lanes then split the context by position — lane `i` owns `{t : t % 32 == i}` — each carrying its own
+//! online-softmax state (`m`, `l`, and a `head_dim`-wide register accumulator `%acc0..`, unrolled). A
+//! fixed `shfl.sync.bfly` butterfly (offsets `16,8,4,2,1`) merges the lanes at the end: `max` for `m`,
+//! a rescale by `exp(m−M)`, then `add` for `l` and for every accumulator; lane 0 writes the normalized
+//! row. There is **no shared-memory logits buffer**, so arbitrary context length works with no v2-style
+//! split-K (vLLM needs v2 past 8192 tokens precisely to dodge that SMEM shortage). The block-table walk
+//! is *not* incremental — a `div.u32` per position recovers `logical`/`offset`; making it incremental
+//! is still an unclaimed perf lever.
 //!
 //! ## The first-law property the gates prove
 //! - **Absolute correctness**: tolerance-gated vs an f64 full-softmax CPU reference
 //!   ([`reference_decode_attn`]) — the only legitimate error is the GPU's `ex2.approx` exp + f32 order.
 //! - **Paging is numerically invisible**: the kernel output is **bit-for-bit identical** when the same
 //!   logical sequences are laid into two *different* physical block layouts (contiguous vs a fragmented
-//!   free-list order). True by construction; the `paged_attention_invariant_to_block_layout` gate proves
-//!   it to the bit (the decode analogue of int8 split-K / transpose bit-exactness).
+//!   free-list order); the `paged_attention_invariant_to_block_layout` gate proves it to the bit (the
+//!   decode analogue of int8 split-K / transpose bit-exactness).
+//!
+//! ### The invariant that property rests on (load-bearing — read before touching the loop)
+//! It is **not** "one thread, one fixed accumulation order". It is two separate facts:
+//! 1. the lane partition is a function of the **logical position index alone** (`t % 32`), so no
+//!    physical block id can influence *which* lane a value lands in; and
+//! 2. the cross-lane merge order is a **fixed** butterfly sequence.
+//!
+//! The block table therefore only changes *where* a value is read, never which partial accumulates it
+//! nor in what order. Re-partitioning the lanes for coalescing stays safe only while it remains
+//! position-keyed: partitioning by *physical block* — the obvious next optimization, and one that still
+//! satisfies "one fixed accumulation order per lane" — makes the accumulation order a function of the
+//! layout and breaks bit-exactness.
 
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
