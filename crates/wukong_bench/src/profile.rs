@@ -21,8 +21,11 @@
 //! * `spawn-overhead` — the same source compiled two ways: (a) the in-process API to an object in
 //!   memory, and (b) spawning the real `wukongc.exe --emit=obj`. The difference is the spawn tax
 //!   (process creation + runtime init + file I/O + the driver's own front-matter). Reported both
-//!   cold-start (first call — Windows image/page-cache cold) and warm steady-state (best-of-N min),
-//!   plus the `--emit=exe` path broken into compile vs the rustc-driven link.
+//!   first-call and warm steady-state (best-of-N min), plus the `--emit=exe` path broken into
+//!   compile vs the rustc-driven link. Only the FIRST row of the first-call table is a genuine cold
+//!   start — after it the compiler image and the OS page cache are warm — and every spawn's exit
+//!   status is checked, because a child that fails emits no object and its wall time is not a
+//!   compile measurement.
 //!
 //! ```text
 //! cargo run -p wukong_bench --release -- compile-profile tests/run examples bench/kernels
@@ -368,8 +371,11 @@ pub fn spawn_report(files: &[PathBuf]) {
         mc.display()
     );
 
-    // --- Cold-start table (first call; image/page cache cold) ---
-    println!("[regime: cold-start / first call]");
+    // --- First-call table ---
+    // Only the FIRST row is a true cold start: after it, wukongc.exe, its rlibs and the OS page
+    // cache are warm for every later row, so those rows are warm-image first-calls. Labelled as
+    // such rather than as "cold-start", which they are not.
+    println!("[regime: first call for this file — the wukongc image is cold only for row 1 (*)]");
     println!(
         "{:<24} {:>12} {:>12} {:>12}",
         "file", "in-proc obj", "spawn obj", "spawn exe"
@@ -384,6 +390,7 @@ pub fn spawn_report(files: &[PathBuf]) {
     }
     let mut warm_rows: Vec<Row> = Vec::new();
 
+    let mut printed = 0usize;
     for (name, wk, src) in &chosen {
         let out_o = workdir.join("out.o");
         let out_exe = workdir.join("out.exe");
@@ -393,31 +400,64 @@ pub fn spawn_report(files: &[PathBuf]) {
             let _ = compile_to_object(src);
             t.elapsed()
         });
-        // Does `--emit=exe` link cleanly here (needs rustc + the runtime rlib next to wukongc)?
-        let exe_ok = spawn_ok(&mc, wk, &workdir, "exe", &out_exe);
-
-        let (obj_cold, obj_warm) =
-            cold_warm(|| spawn_compile(&mc, wk, &workdir, "obj", &out_o));
-        let (exe_cold, exe_warm) = if exe_ok {
-            let (c, w) = cold_warm(|| spawn_compile(&mc, wk, &workdir, "exe", &out_exe));
-            (Some(c), Some(w))
-        } else {
-            (None, None)
+        // The obj spawn goes FIRST, so its cold sample is the genuine first `wukongc.exe` launch for
+        // this file. (It used to be preceded by an untimed `--emit=exe` probe spawn, which warmed the
+        // compiler image, its rlibs and the page cache before the "cold" number was taken.)
+        let mut obj_ok = true;
+        let (obj_cold, obj_warm) = cold_warm(|| {
+            let (d, ok) = spawn_compile(&mc, wk, &workdir, "obj", &out_o);
+            obj_ok &= ok;
+            d
+        });
+        // A child that exits nonzero produced no object: what was timed is an error-and-exit, not a
+        // compile. Files are admitted to `chosen` by the IN-PROCESS pipeline, which never runs the
+        // driver's own front matter (source maps, import resolution, `-o` handling), so the driver
+        // can legitimately reject one — e.g. a file whose `import` resolves in the repo but not in
+        // the isolated workdir the child runs in. Timing that would report a fast failure as a small
+        // spawn tax, and `saturating_sub` would then clamp it to `0ns` — "process spawn is free".
+        if !obj_ok {
+            eprintln!("{name}: spawn --emit=obj failed — excluded (nothing was compiled to time)");
+            continue;
+        }
+        // Does `--emit=exe` link here (needs rustc + the runtime rlib next to wukongc)? Answered by
+        // the status of the timed spawns themselves rather than by a separate untimed probe.
+        let mut exe_ok = true;
+        let (exe_cold, exe_warm) = {
+            let (c, w) = cold_warm(|| {
+                let (d, ok) = spawn_compile(&mc, wk, &workdir, "exe", &out_exe);
+                exe_ok &= ok;
+                d
+            });
+            if exe_ok {
+                (Some(c), Some(w))
+            } else {
+                (None, None)
+            }
         };
 
         println!(
-            "{:<24} {:>12} {:>12} {:>12}",
+            "{:<24} {:>12} {:>12} {:>12}{}",
             trunc(name, 24),
             fmt(ip_cold),
             fmt(obj_cold),
             exe_cold.map(fmt).unwrap_or_else(|| "n/a".into()),
+            if printed == 0 { "  *" } else { "" },
         );
+        printed += 1;
         warm_rows.push(Row {
             name: name.clone(),
             inproc: ip_warm,
             spawn_obj: obj_warm,
             spawn_exe: exe_warm,
         });
+    }
+    println!(
+        "* row 1 only: wukongc.exe, its rlibs and the OS page cache are cold for it. Every later \
+         row's\n  spawn columns are warm-image first-calls, so they are NOT cold-start numbers."
+    );
+    if warm_rows.is_empty() {
+        eprintln!("spawn-overhead: every chosen file failed to compile under the driver — no rows.");
+        return;
     }
 
     // --- Warm steady-state table ---
@@ -449,8 +489,9 @@ pub fn spawn_report(files: &[PathBuf]) {
          file I/O\n  + the driver's source-map/diagnostics/import front-matter that the in-process \
          path skips.\nlink(exe-obj) = the rustc-driven link the driver spawns for --emit=exe \
          (links wukong_runtime + the\n  platform linker); it is a whole second process, so it \
-         dominates the exe path. 'n/a' = rustc or the\n  runtime rlib was not next to wukongc, so \
-         --emit=exe fell back / did not link."
+         dominates the exe path. 'n/a' = the child\n  exited nonzero for this file (rustc or the \
+         runtime rlib not next to wukongc, or the link failed),\n  so there is no exe compile to \
+         time. Any file whose --emit=obj spawn failed is dropped entirely."
     );
 }
 
@@ -478,33 +519,24 @@ fn compile_to_object(src: &str) -> Option<Vec<u8>> {
 }
 
 /// Spawn `wukongc --emit=<emit> -O{LEVEL} <file> -o <out>` from `workdir` and return the child wall
-/// time. Output is discarded. The child writes its intermediates into `workdir`, isolated from the
-/// repo.
-fn spawn_compile(mc: &Path, wk: &Path, workdir: &Path, emit: &str, out: &Path) -> Duration {
+/// time **and whether it succeeded**. Output is discarded. The child writes its intermediates into
+/// `workdir`, isolated from the repo.
+///
+/// The status is load-bearing, not decoration: with both pipes at `Stdio::null()` a failed compile
+/// is invisible, and its wall time — an error-and-exit that emitted nothing — would otherwise be
+/// reported as a spawn measurement. Callers must drop any file whose spawn ever fails.
+fn spawn_compile(mc: &Path, wk: &Path, workdir: &Path, emit: &str, out: &Path) -> (Duration, bool) {
     let file = wk.file_name().unwrap().to_string_lossy().into_owned();
     let out = out.to_string_lossy().into_owned();
     let t = Instant::now();
-    let _ = Command::new(mc)
+    let st = Command::new(mc)
         .current_dir(workdir)
         .args([&format!("--emit={emit}"), "-O2", &file, "-o", &out])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    t.elapsed()
-}
-
-/// One spawn to check the child actually succeeded (used to decide whether `--emit=exe` links here).
-fn spawn_ok(mc: &Path, wk: &Path, workdir: &Path, emit: &str, out: &Path) -> bool {
-    let file = wk.file_name().unwrap().to_string_lossy().into_owned();
-    let out = out.to_string_lossy().into_owned();
-    Command::new(mc)
-        .current_dir(workdir)
-        .args([&format!("--emit={emit}"), "-O2", &file, "-o", &out])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let dt = t.elapsed();
+    (dt, st.map(|s| s.success()).unwrap_or(false))
 }
 
 fn default_wukongc() -> PathBuf {
