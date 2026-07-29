@@ -11237,7 +11237,21 @@ impl FnLowerer<'_> {
             if matches!(elem_mir, MirType::Array(..)) {
                 // An aggregate element (struct / tuple / array) binds **by pointer** — `x.field`
                 // / `x[k]` / `x.0` GEP off it — exactly as the `a[i]` aggregate read arm does.
-                self.bind(name, elem_ptr, elem_mir.clone());
+                //
+                // Bind through `bind_slice`, because a `[]T` element arrives here too: a slice's
+                // `elem_mir` is its fat pointer, whose MIR shape is an `Array`, so it takes this
+                // branch. `slice_slots` is what `kernel_base_ptr` consults to know a slot holds a
+                // fat pointer and must be dereferenced to its data pointer; leaving this site on
+                // the plain `self.bind` handed the fat pointer itself to the kernel. That is a
+                // silent wrong answer, not a crash — `let ws: [[]f32; 1] = [a]; for w in ws { for
+                // i in 0..8 { b[i] = w[i] * 2.0; } }` printed zeros where the scalar loop prints
+                // `2 4 … 16`. Gated by tests/run/for_each_array_of_slices.wk.
+                self.bind_slice(
+                    name,
+                    elem_ptr,
+                    elem_mir.clone(),
+                    matches!(elem, Ty::Slice(_)),
+                );
             } else {
                 // A scalar element loads into a fresh slot (hoisted to the entry block), so the
                 // loop variable is an ordinary mutable local — the faithful `let x = a[i]`.
