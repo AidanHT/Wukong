@@ -330,6 +330,23 @@ pub const RED_BLOCK: u32 = 256;
 /// `max(x[i])` reduction op-code (mirrors `wukong_runtime::reduce::RED_MAX`, which isn't re-exported).
 pub const RED_MAX: i64 = 4;
 
+// The hand copy above is pinned to the runtime's numbering at COMPILE TIME. `wukong_runtime`'s
+// `reduce` module is private, so `RED_MAX` cannot be imported directly; but its neighbours in the
+// same contiguous op-code block (`reduce.rs`: …SUMSQ=3, MAX=4, MIN=5, MAXABS=6, ARGMAX=7…) *are*
+// re-exported. If that block is ever renumbered, at least one neighbour moves and the build breaks
+// here — instead of `reduce()` silently dispatching the "reduce_max" entry for whatever op 4 became,
+// which would be a wrong answer under `--backend=gpu` only.
+const _: () = assert!(
+    wukong_runtime::RED_SUMSQ == RED_MAX - 1 && wukong_runtime::RED_ARGMAX == RED_MAX + 3,
+    "wukong_runtime's reduce op codes were renumbered: gpu::RED_MAX no longer names max(x[i])"
+);
+// The REDUCE PTX bakes `.shared .align 4 .b8 sdata[1024]` (= 256 f32) into every entry and unrolls
+// the tree for exactly 256 lanes (`ptx::REDUCE`), so a larger block would store past that array.
+const _: () = assert!(
+    RED_BLOCK == 256,
+    "ptx::REDUCE declares sdata[1024] (256 f32) and unrolls its tree for 256 lanes"
+);
+
 /// Deterministic GPU reduction — the GPU twin of `wukong_sreduce_f32`. `op` is `RED_SUM` /
 /// `RED_DOT` (needs `y`) / [`RED_MAX`]. Blocks tree-reduce in shared memory; the `RED_GRID` partials
 /// are combined on the host in ascending block order.
@@ -341,6 +358,21 @@ pub fn reduce(g: &mut Gpu, op: i64, x: &[f32], y: Option<&[f32]>) -> Result<f32,
         v if v == RED_MAX => "reduce_max",
         _ => panic!("reduce op {op} not implemented on GPU yet"),
     };
+    // The kernel's `.param` block is a function of `op` — only `reduce_dot` declares `y` — so the
+    // pushed argument list is derived from `op` too, never from whether the caller happened to pass a
+    // `y`. Launching `reduce_dot` with 3 args would make the driver read `partials` one slot past the
+    // end of the argument vector and have every block store through that garbage pointer, latching a
+    // process-sticky CUDA_ERROR_ILLEGAL_ADDRESS (see [`reset_gpu`]).
+    let needs_y = reduce_needs_y(op);
+    assert_eq!(
+        needs_y,
+        y.is_some(),
+        "reduce: op {op} {}",
+        if needs_y { "requires a second operand y" } else { "takes no second operand" }
+    );
+    if let Some(y) = y {
+        assert_eq!(x.len(), y.len(), "reduce: x and y must be equal length");
+    }
     let n = x.len() as u32;
     let f = g.function("reduce", crate::ptx::REDUCE, entry)?;
     let x_d = g.stream.memcpy_stod(x)?;
@@ -356,10 +388,14 @@ pub fn reduce(g: &mut Gpu, op: i64, x: &[f32], y: Option<&[f32]>) -> Result<f32,
     };
     let mut b = g.stream.launch_builder(&f);
     b.arg(&n).arg(&x_d);
-    if let Some(ref yd) = y_d {
-        b.arg(yd);
+    if needs_y {
+        b.arg(y_d.as_ref().expect("reduce_needs_y ⇒ y was uploaded"));
     }
     b.arg(&mut partials_d);
+    // SAFETY: `entry` and the pushed argument list are both derived from `op` immediately above, so
+    // the arity and types match the selected kernel's declared `.param` block; `x_d` (and `y_d` when
+    // pushed) hold exactly the `n` f32 the kernel indexes, and `partials_d` holds `RED_GRID` f32 —
+    // one per block of the fixed `RED_GRID` grid, which is the only slot a block writes.
     unsafe { b.launch(cfg)? };
     let partials = g.stream.memcpy_dtov(&partials_d)?;
     let is_max = op == RED_MAX;
@@ -1858,6 +1894,10 @@ pub fn wmma_roofline_f16(
 /// Fused row-wise normalization on the GPU — the GPU twin of `wukong_norm_f32`. `op` is a `NORM_*`
 /// code (softmax / layernorm / rmsnorm); `x` is `rows×cols` row-major. One warp per row; the row
 /// reductions are warp-butterfly all-reduces (deterministic order). Tolerance-gated.
+///
+/// Panics on a `NORM_*` code with no PTX entry (log-softmax, l2norm) — the right assertion for a
+/// direct library caller, but the `--backend=gpu` offload must consult [`norm_supported`] first and
+/// fall back to the CPU kernel, exactly as it does for [`vmath_supported`] / [`reduce_supported`].
 pub fn norm(
     g: &mut Gpu,
     op: i64,
@@ -1866,14 +1906,8 @@ pub fn norm(
     cols: usize,
     eps: f32,
 ) -> Result<Vec<f32>, DriverError> {
-    use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
     assert_eq!(x.len(), rows * cols);
-    let entry = match op {
-        v if v == NORM_SOFTMAX => "softmax",
-        v if v == NORM_LAYERNORM => "layernorm",
-        v if v == NORM_RMSNORM => "rmsnorm",
-        _ => panic!("norm op {op} not implemented on GPU yet"),
-    };
+    let entry = norm_entry(op);
     let f = g.function("norm", crate::ptx_norm::norm_ptx(), entry)?;
     let x_d = g.stream.memcpy_stod(x)?;
     let mut out_d = g.stream.memcpy_stod(&vec![0f32; x.len()])?;
@@ -1887,6 +1921,27 @@ pub fn norm(
     bld.arg(&r).arg(&c).arg(&eps).arg(&x_d).arg(&mut out_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&out_d)
+}
+
+fn norm_entry(op: i64) -> &'static str {
+    use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
+    match op {
+        v if v == NORM_SOFTMAX => "softmax",
+        v if v == NORM_LAYERNORM => "layernorm",
+        v if v == NORM_RMSNORM => "rmsnorm",
+        _ => panic!("norm op {op} not implemented on GPU yet"),
+    }
+}
+
+/// Whether [`norm`] has a GPU kernel for normalization op `op` — the sibling of
+/// [`vmath_supported`] / [`reduce_supported`], which `norm` was missing. The `--backend=gpu` offload
+/// must check this and fall back to the CPU kernel for the rest: the recognizer in
+/// `wukong_mir_build` emits all five `NORM_*` codes, but [`norm_entry`] has PTX entries only for
+/// softmax/layernorm/rmsnorm and `panic!`s on log-softmax (3) and l2norm (4). Without the gate those
+/// two lower a plain user program to an internal panic instead of a CPU fallback.
+pub fn norm_supported(op: i64) -> bool {
+    use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
+    op == NORM_SOFTMAX || op == NORM_LAYERNORM || op == NORM_RMSNORM
 }
 
 /// Pick the flash kernel **entry name and matched launch config** for sequence length `seq`, head dim
@@ -5067,6 +5122,64 @@ mod tests {
                 "reduction must be deterministic"
             );
         });
+    }
+
+    /// **Launch-arity seam.** `ptx::REDUCE` declares `reduce_dot(n, x, y, partials)` (4 params) but
+    /// `reduce_sum`/`reduce_max(n, x, partials)` (3), so the number of pushed kernel arguments is a
+    /// function of the *op*, not of whether the caller supplied a `y`. A mismatched pair makes
+    /// `cuLaunchKernel` read one slot past the end of the argument vector and use it as a device
+    /// pointer — a process-sticky `CUDA_ERROR_ILLEGAL_ADDRESS`, the failure `reset_gpu` documents as
+    /// unrecoverable. This asserts the seam rejects both mismatch directions *before* the launch, so
+    /// no device work is done; it needs no GPU (the panic precedes `g.function`).
+    #[test]
+    fn reduce_rejects_an_operand_list_that_would_not_match_the_kernel() {
+        use wukong_runtime::{RED_DOT, RED_SUM};
+        // `reduce_needs_y` is the single source of truth both the entry and the arg list derive from.
+        assert!(reduce_needs_y(RED_DOT), "dot reads y");
+        for op in [RED_SUM, RED_MAX] {
+            assert!(!reduce_needs_y(op), "op {op} declares no y param");
+        }
+        with_gpu("reduce_launch_arity", |g| {
+            let x = vec![1.0f32, 2.0, 3.0, 4.0];
+            let short = vec![1.0f32, 2.0];
+            // Each of these would build an argument list the selected kernel's `.param` block does not
+            // match; all three are rejected *before* `g.function`, so no device work is attempted.
+            for (op, y, why) in [
+                (RED_DOT, None, "3 args at the 4-param reduce_dot"),
+                (RED_SUM, Some(&x), "4 args at the 3-param reduce_sum"),
+                (RED_DOT, Some(&short), "|y| != |x| reads past the end of y_d"),
+            ] {
+                let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = reduce(g, op, &x, y.map(|v| v.as_slice()));
+                }));
+                assert!(e.is_err(), "reduce must reject: {why}");
+            }
+            // The legal pairing still runs and still agrees with the CPU.
+            let got = reduce(g, RED_DOT, &x, Some(&x)).unwrap();
+            assert_eq!(got, 30.0, "1+4+9+16");
+            eprintln!("[gate] reduce launch-arity seam rejects every mismatched (op, y) pair ✓");
+        });
+    }
+
+    /// **Offload support mirror.** `norm_supported` must be true for exactly the op codes
+    /// `norm_entry` has a PTX entry for — every other code reaches its `panic!`, and the
+    /// `--backend=gpu` offload consults the predicate to decline (CPU fallback) instead of aborting
+    /// the user's program. Runs without a GPU: both are pure functions of the op code.
+    #[test]
+    fn norm_supported_covers_exactly_the_entries_norm_can_launch() {
+        for op in -1i64..=6 {
+            let launchable =
+                std::panic::catch_unwind(|| norm_entry(op)).is_ok();
+            assert_eq!(
+                norm_supported(op),
+                launchable,
+                "norm_supported({op}) disagrees with norm_entry({op}): the offload would either \
+                 panic on an unsupported op or needlessly fall back on a supported one"
+            );
+        }
+        // The two the recognizer emits that the GPU does not implement (log-softmax, l2norm).
+        assert!(!norm_supported(3) && !norm_supported(4));
+        assert!(vmath_supported(wukong_runtime::VM_RELU)); // sibling predicate, same contract
     }
 
     /// f64 reference for `C = A·Bᵀ` (`A` m×k, `B` n×k).
