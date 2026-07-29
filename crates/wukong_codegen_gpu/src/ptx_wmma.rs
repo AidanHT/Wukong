@@ -399,6 +399,21 @@ fn entry_smem(
     // global index is K(·16)-aligned + kt(·16) + {0,8} ⇒ a multiple of 8 ⇒ 16-byte aligned.
     let a_chunks = bm * SM_BK / (threads * 8);
     let b_chunks = bn * SM_BK / (threads * 8);
+    // The whole-multiple staging constraint stated above must be CHECKED, not assumed: the division
+    // truncates, so a tile that does not tile the CTA emits a kernel that stages only part of A/B (or,
+    // at `*_chunks == 0`, nothing at all) while every `bar.sync`/`wmma.load`/`wmma.mma` stays
+    // well-formed — it JITs cleanly and computes C from stale shared memory. Same guard the sibling
+    // generators (`entry_smem_pipe`, `entry_mma_pipe`, `entry_mma_gate`) already carry.
+    assert!(
+        a_chunks >= 1 && a_chunks * threads * 8 == bm * SM_BK,
+        "{name}: A tile {bm}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
+    assert!(
+        b_chunks >= 1 && b_chunks * threads * 8 == bn * SM_BK,
+        "{name}: B tile {bn}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
     let wn_shift = warps_n.trailing_zeros(); // warpId / warps_n  (warps_n a power of two)
     let wm = (16 * tm) as i64; // per-warp rows owned
     let wn = (16 * tn) as i64; // per-warp cols owned
@@ -635,6 +650,18 @@ fn entry_smem_db(
     }
     let a_chunks = bm * SM_BK / (threads * 8);
     let b_chunks = bn * SM_BK / (threads * 8);
+    // Same unchecked truncating division as [`entry_smem`] — a tile that does not tile the CTA emits a
+    // kernel whose double-buffered staging is partial (or empty), which JITs and reads stale SMEM.
+    assert!(
+        a_chunks >= 1 && a_chunks * threads * 8 == bm * SM_BK,
+        "{name}: A tile {bm}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
+    assert!(
+        b_chunks >= 1 && b_chunks * threads * 8 == bn * SM_BK,
+        "{name}: B tile {bn}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
     let wn_shift = warps_n.trailing_zeros();
     let wm = (16 * tm) as i64;
     let wn = (16 * tn) as i64;
@@ -2385,3 +2412,60 @@ pub const TN_TILES: usize = 4;
 /// Per-warp output tile dims (the multi-tile kernel requires M%WARP_M==0 and N%WARP_N==0).
 pub const WARP_M: usize = 16 * TM_TILES;
 pub const WARP_N: usize = 16 * TN_TILES;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The staging precondition [`entry_smem`]/[`entry_smem_db`] document is now checked, so the four
+    /// production instantiations must satisfy it (each is one 128-bit chunk per thread) and a tile that
+    /// does not tile the CTA must be rejected at generation time instead of emitting a kernel with a
+    /// partial (or empty) global->shared stage that JITs and reads stale shared memory.
+    #[test]
+    fn smem_staging_tiles_the_cta_for_every_generated_shape() {
+        // Production shapes: 64x64 / 4 warps and 128x128 / 8 warps, both precisions. `a_chunks == 1`
+        // each, so the guard changes no emitted byte.
+        for (bm, bn, wm, wn) in [
+            (SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N),
+            (SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N),
+        ] {
+            let threads = wm * wn * 32;
+            assert_eq!(bm * SM_BK % (threads * 8), 0, "A tile {bm}x{SM_BK} must tile {threads} threads");
+            assert_eq!(bn * SM_BK % (threads * 8), 0, "B tile {bn}x{SM_BK} must tile {threads} threads");
+            for ty in ["f16", "bf16"] {
+                let p = entry_smem("t_sm", ty, bm, bn, wm, wn, None);
+                assert_eq!(p.matches("ld.global.v4.u32").count(), 2, "one A + one B stage per K step");
+                // The double-buffered twin stages with `cp.async` (global->shared, no register hop):
+                // one 16-byte copy per chunk, prologue + steady state.
+                let d = entry_smem_db("t_db", ty, bm, bn, wm, wn, Act::None, false, false);
+                assert!(
+                    d.matches("cp.async.cg.shared.global").count() >= 4,
+                    "the double-buffered kernel must stage A/B in both the prologue and the K loop"
+                );
+            }
+        }
+    }
+
+    /// `bm*SM_BK = 32*16 = 512 < threads*8 = 1024` truncates to ZERO staging chunks: before the guard
+    /// this generated a fully well-formed kernel with no global->shared copy at all.
+    #[test]
+    #[should_panic(expected = "is not a whole multiple of threads*8")]
+    fn smem_tile_smaller_than_one_chunk_per_thread_is_rejected() {
+        entry_smem("t_bad_sm", "f16", 32, 32, 2, 2, None);
+    }
+
+    /// The partial-multiple case (`96*16 = 1536`, `threads*8 = 1024` => one chunk staged, a third of the
+    /// tile left stale) is the more dangerous one — it reads as a tolerance failure, not a codegen bug.
+    #[test]
+    #[should_panic(expected = "is not a whole multiple of threads*8")]
+    fn smem_tile_that_only_partly_tiles_the_cta_is_rejected() {
+        entry_smem("t_partial_sm", "f16", 96, 96, 2, 2, None);
+    }
+
+    /// The double-buffered generator carries the same guard.
+    #[test]
+    #[should_panic(expected = "is not a whole multiple of threads*8")]
+    fn smem_db_tile_smaller_than_one_chunk_per_thread_is_rejected() {
+        entry_smem_db("t_bad_db", "f16", 32, 32, 2, 2, Act::None, false, false);
+    }
+}
