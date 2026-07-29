@@ -13,9 +13,18 @@ module examples.gpt2_infer_small
 //
 // The weights are stored exactly as the full model stores them: ONE flat []f32 buffer plus
 // integer element offsets (computed here by const arithmetic instead of the exporter), indexed
-// with i64 arithmetic — so this exercises the identical indexing/kernel code paths. The examples
-// gate (crates/wukongc/tests/examples.rs) runs this interp-vs-native at -O0/-O2 and asserts
-// identical stdout: proof the whole pipeline is bit-exact across backends and opt-invariant.
+// with i64 arithmetic — so this exercises the identical INDEXING code path. The examples gate
+// (crates/wukongc/tests/examples.rs) runs this interp-vs-native at -O0/-O2 and asserts identical
+// stdout: proof the pipeline's index arithmetic and scalar math are bit-exact across backends and
+// opt-invariant.
+//
+// SCOPE, measured (`wukongc --emit=mir -O2 examples/gpt2_infer_small.wk`): the only wukong_* calls
+// emitted are rt_alloc/rt_free. This file dispatches NO recognized kernel — it mirrors gpt2_infer.wk,
+// which does not either (bare const dims). It therefore gates the scalar pipeline, NOT the GEMM /
+// norm / softmax / vmath / GEMV kernels that examples/gpt2_forward_bench.wk's timed forward runs on.
+// The reduced twin that gates those is examples/gpt2_forward_bench_small.wk — same config as this file,
+// spelled in the recognized forms. The two agree on argmax(last) 15, logits[last,0]*1e4 -14352 and
+// logits[last,31]*1e4 9521, which makes this file the scalar oracle for that one.
 
 // ---- reduced config (GPT-2 shapes, scaled) ----
 const D: i64 = 64;          // model dim
