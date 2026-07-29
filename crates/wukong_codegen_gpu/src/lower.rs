@@ -1199,6 +1199,12 @@ impl<'a> FnEmit<'a> {
                 let hi = if w == 8 { 255 } else { 65535 };
                 self.emit(&format!("min.u32 {t}, {t}, {hi};"));
                 self.emit(&format!("cvt.u64.u32 {d}, {t};"));
+                // `cvt.u64.u32` leaves the clamped value ZERO-extended, but every integer register in
+                // this backend is kept SIGN-extended to its MIR width (the interpreter's `mask`). Skip
+                // this and `250.0 as u8` sits in the register as +250 while `const.i8 250` materializes
+                // as -6, so a following `setp.eq.s64` against it is false. The signed branch above is
+                // already canonical (`cvt.s64.s32` after the clamp sign-extends).
+                self.mask_int(d, to);
             }
         }
     }
