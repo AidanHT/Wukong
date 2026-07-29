@@ -940,3 +940,67 @@ DONE2:
     ret;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B1 gate for the core PTX families the `--backend=gpu` offload dispatches. A single non-ASCII
+    /// byte inside any of these strings is rejected by the driver at `cuModuleLoadData`
+    /// (`CUDA_ERROR_INVALID_PTX`), and these bodies already carry inline `//` comments while the
+    /// surrounding prose in this repo is written with `.`-style math characters -- so the only thing
+    /// keeping them ASCII was that nobody had pasted one in yet. A GPU-less `cargo test` never loads
+    /// a module, so without this the regression lands green and breaks only on a machine with a device.
+    #[test]
+    fn every_dispatched_ptx_family_is_pure_ascii() {
+        let modules: [(&str, &str); 9] = [
+            ("SAXPY", SAXPY),
+            ("VADD", VADD),
+            ("COPY_V4", COPY_V4),
+            ("CAST_F32_F16", CAST_F32_F16),
+            ("REDUCE", REDUCE),
+            ("GEMM", GEMM),
+            ("vmath_ptx", vmath_ptx()),
+            ("ptx_norm::norm_ptx", crate::ptx_norm::norm_ptx()),
+            ("ptx_gemm::gemm_rb_ptx", crate::ptx_gemm::gemm_rb_ptx()),
+        ];
+        for (what, ptx) in modules {
+            if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+                panic!("{what}: PTX must be pure ASCII (the driver rejects the module) -- line {}: {line}", i + 1);
+            }
+        }
+    }
+
+    /// Each family must actually define the entry its launcher asks `Gpu::function` for, and each
+    /// name exactly once. `gpu::vmath_entry` / `gpu::reduce` / `gpu::gemm_nt` name these by literal,
+    /// so a rename on the generator side alone fails only at runtime with `CUDA_ERROR_NOT_FOUND`.
+    #[test]
+    fn every_dispatched_entry_is_defined_exactly_once() {
+        let families: [(&str, &str, &[&str]); 7] = [
+            ("SAXPY", SAXPY, &["saxpy"]),
+            ("VADD", VADD, &["vadd"]),
+            ("COPY_V4", COPY_V4, &["copy_v4"]),
+            ("CAST_F32_F16", CAST_F32_F16, &["cast_f32_f16"]),
+            // gpu::reduce selects one of these three from the RED_* op code.
+            ("REDUCE", REDUCE, &["reduce_sum", "reduce_dot", "reduce_max"]),
+            ("GEMM", GEMM, &["gemm_nt", "gemm_nn"]),
+            // gpu::vmath_entry maps the six supported VM_* op codes onto these.
+            ("vmath_ptx", vmath_ptx(), &["relu", "exp", "sigmoid", "tanh", "silu", "gelu"]),
+        ];
+        for (what, ptx, names) in families {
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "{what}: unbalanced braces");
+            for n in names {
+                assert_eq!(
+                    ptx.matches(&format!(".visible .entry {n}(")).count(),
+                    1,
+                    "{what}: dispatched entry `{n}` must be defined exactly once"
+                );
+            }
+            assert_eq!(
+                ptx.matches(".visible .entry ").count(),
+                names.len(),
+                "{what}: the module defines entries this gate does not cover"
+            );
+        }
+    }
+}
