@@ -199,6 +199,10 @@ pub fn launch_paged_attn_decode(
 ) -> Result<(), DriverError> {
     debug_assert_eq!(q_d.len(), bcap * cfg.heads * cfg.head_dim, "q must be [bcap, heads*head_dim]");
     debug_assert_eq!(out_d.len(), bcap * cfg.heads * cfg.head_dim, "out must be [bcap, heads*head_dim]");
+    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "k slab must be cfg.slab_elems()");
+    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "v slab must be cfg.slab_elems()");
+    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(cl_d.len(), bcap, "context lengths must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let cfg_launch = LaunchConfig {
         grid_dim: (nq.div_ceil(PAGED_ATTN_WARPS), 1, 1),
@@ -211,6 +215,13 @@ pub fn launch_paged_attn_decode(
     let mut b = stream.launch_builder(func);
     b.arg(q_d).arg(k_d).arg(v_d).arg(out_d).arg(bt_d).arg(cl_d).arg(&scale);
     b.arg(&bcap_u).arg(&heads).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    // SAFETY: the pushed arguments match `PAGED_ATTN_ENTRY`'s parameter list in order and width (six
+    // .u64 pointers, one .f32, six .u32 — see `paged_attn_decode_ptx`), and `func` was loaded from PTX
+    // generated for `cfg.head_dim` (the entry is head_dim-specialized). Every buffer is at least as long
+    // as the largest index this kernel's address arithmetic can produce for `bcap` slots at `layer`: the
+    // `%e` chain reproduces `KvConfig::elem_offset`, bounded by `slab_elems()`; `BT[slot*mbps+logical]`
+    // by `bcap * max_blocks_per_seq`; `CL[slot]` and the `Q`/`O` rows by the shapes asserted above —
+    // which the caller guarantees and the debug asserts check at the call site.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
@@ -359,6 +370,14 @@ pub fn launch_paged_attn_decode_int8(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    debug_assert_eq!(q_d.len(), bcap * cfg.heads * cfg.head_dim, "q must be [bcap, heads*head_dim]");
+    debug_assert_eq!(out_d.len(), bcap * cfg.heads * cfg.head_dim, "out must be [bcap, heads*head_dim]");
+    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "int8 k slab must be cfg.slab_elems()");
+    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "int8 v slab must be cfg.slab_elems()");
+    debug_assert_eq!(ksc_d.len(), cfg.scale_slab_elems(), "k scale slab must be cfg.scale_slab_elems()");
+    debug_assert_eq!(vsc_d.len(), cfg.scale_slab_elems(), "v scale slab must be cfg.scale_slab_elems()");
+    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(cl_d.len(), bcap, "context lengths must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let cfg_launch = LaunchConfig {
         grid_dim: (nq.div_ceil(PAGED_ATTN_WARPS), 1, 1),
@@ -371,6 +390,13 @@ pub fn launch_paged_attn_decode_int8(
     let mut b = stream.launch_builder(func);
     b.arg(q_d).arg(k_d).arg(v_d).arg(ksc_d).arg(vsc_d).arg(out_d).arg(bt_d).arg(cl_d).arg(&scale);
     b.arg(&bcap_u).arg(&heads).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    // SAFETY: the pushed arguments match `PAGED_ATTN_INT8_ENTRY`'s parameter list in order and width
+    // (eight .u64 pointers, one .f32, six .u32 — see `paged_attn_decode_int8_ptx`), and `func` was
+    // loaded from PTX generated for `cfg.head_dim`. Every buffer is at least as long as the largest
+    // index the kernel can produce for `bcap` slots at `layer`: `%e` reproduces `KvConfig::elem_offset`
+    // (bounded by `slab_elems()`) and `%es` reproduces `KvConfig::scale_offset` (bounded by
+    // `scale_slab_elems()`); the table/lengths/rows are bounded by the shapes asserted above, which the
+    // caller guarantees and the debug asserts check at the call site.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
@@ -489,6 +515,13 @@ pub fn launch_kv_append(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
+    debug_assert_eq!(knew_d.len(), bcap * cfg.heads * cfg.head_dim, "knew must be [bcap, heads*head_dim]");
+    debug_assert_eq!(vnew_d.len(), bcap * cfg.heads * cfg.head_dim, "vnew must be [bcap, heads*head_dim]");
+    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "k slab must be cfg.slab_elems()");
+    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "v slab must be cfg.slab_elems()");
+    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(wpos_d.len(), bcap, "write positions must be one u32 per slot");
+    debug_assert_eq!(active_d.len(), bcap, "active mask must be one u32 per slot");
     let total = (bcap * cfg.heads * cfg.head_dim) as u32;
     let launch = LaunchConfig {
         grid_dim: (total.div_ceil(KV_APPEND_BLOCK), 1, 1),
@@ -507,6 +540,14 @@ pub fn launch_kv_append(
     let mut b = stream.launch_builder(func);
     b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(bt_d).arg(wpos_d).arg(active_d);
     b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    // SAFETY: the pushed arguments match `KV_APPEND_ENTRY`'s parameter list in order and width (seven
+    // .u64 pointers, seven .u32 — see `kv_append_ptx`). Every buffer is at least as long as the largest
+    // index the kernel can produce for `bcap` slots at `layer`: the store index `%e` reproduces
+    // `KvConfig::elem_offset` (bounded by `slab_elems()`), the load index is the thread's own `gid <
+    // bcap*heads*hd`, and `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. That,
+    // plus each active slot's write position already having a reserved block (the caller's contract,
+    // established by `BlockManager::append`), is what keeps the scatter inside the slabs. The debug
+    // asserts above check the lengths at the call site.
     unsafe { b.launch(launch)? };
     Ok(())
 }
@@ -648,6 +689,15 @@ pub fn launch_kv_append_int8(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
+    debug_assert_eq!(knew_d.len(), bcap * cfg.heads * cfg.head_dim, "knew must be [bcap, heads*head_dim]");
+    debug_assert_eq!(vnew_d.len(), bcap * cfg.heads * cfg.head_dim, "vnew must be [bcap, heads*head_dim]");
+    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "int8 k slab must be cfg.slab_elems()");
+    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "int8 v slab must be cfg.slab_elems()");
+    debug_assert_eq!(ksc_d.len(), cfg.scale_slab_elems(), "k scale slab must be cfg.scale_slab_elems()");
+    debug_assert_eq!(vsc_d.len(), cfg.scale_slab_elems(), "v scale slab must be cfg.scale_slab_elems()");
+    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(wpos_d.len(), bcap, "write positions must be one u32 per slot");
+    debug_assert_eq!(active_d.len(), bcap, "active mask must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let launch = LaunchConfig {
         grid_dim: (nq.div_ceil(KV_APPEND_INT8_WARPS), 1, 1),
@@ -666,6 +716,14 @@ pub fn launch_kv_append_int8(
     let mut b = stream.launch_builder(func);
     b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(ksc_d).arg(vsc_d).arg(bt_d).arg(wpos_d).arg(active_d);
     b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    // SAFETY: the pushed arguments match `KV_APPEND_INT8_ENTRY`'s parameter list in order and width
+    // (nine .u64 pointers, seven .u32 — see `kv_append_int8_ptx`). Every buffer is at least as long as
+    // the largest index the kernel can produce for `bcap` slots at `layer`: `%e` reproduces
+    // `KvConfig::elem_offset` (bounded by `slab_elems()`), `%es` reproduces `KvConfig::scale_offset`
+    // (bounded by `scale_slab_elems()`), the source row base is `gid*hd < bcap*heads*hd`, and
+    // `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. As for the f16 append, the
+    // caller also guarantees every active slot's write position has a reserved block. The debug asserts
+    // above check the lengths at the call site.
     unsafe { b.launch(launch)? };
     Ok(())
 }
@@ -882,10 +940,13 @@ mod tests {
         let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
         let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
         let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+        // `Gpu::function` caches on the key alone and never re-examines the PTX on a hit, so a key
+        // shared by two head dims silently hands the second one the first's compiled kernel. No
+        // catch-all: an unmapped head dim must fail loudly, as the production path does (serving.rs).
         let key: &'static str = match cfg.head_dim {
             64 => "paged_attn_d64",
             128 => "paged_attn_d128",
-            _ => "paged_attn_dX",
+            other => panic!("paged-attn test harness: no module-cache key for head_dim {other}; add an arm"),
         };
         let func = g.function(key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY).unwrap();
         launch_paged_attn_decode(&g.stream, &func, &q_d, &k_d, &v_d, &mut out_d, &bt_d, &cl_d, cfg, layer, bcap, scale)
@@ -1055,10 +1116,11 @@ mod tests {
         let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
         let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
         let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+        // No catch-all — see the f16 twin in `run_paged_attn`: one cache key must mean one PTX.
         let key: &'static str = match cfg.head_dim {
             64 => "paged_attn_int8_d64",
             128 => "paged_attn_int8_d128",
-            _ => "paged_attn_int8_dX",
+            other => panic!("paged-attn int8 test harness: no module-cache key for head_dim {other}; add an arm"),
         };
         let func = g.function(key, &paged_attn_decode_int8_ptx(cfg.head_dim), PAGED_ATTN_INT8_ENTRY).unwrap();
         launch_paged_attn_decode_int8(
