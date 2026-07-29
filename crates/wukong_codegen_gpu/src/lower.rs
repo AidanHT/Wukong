@@ -753,7 +753,7 @@ impl<'a> FnEmit<'a> {
                     self.emit(&format!("add.s64 {d}, {base}, {off};"));
                 }
             }
-            Op::Load(p, ty) => self.lower_load(*p, ty, r),
+            Op::Load(p, ty) => self.lower_load(*p, ty, r)?,
             Op::Gep { ptr, index, elem } => {
                 let base = self.reg(*ptr);
                 let idx = self.reg(*index);
@@ -1227,15 +1227,25 @@ impl<'a> FnEmit<'a> {
 
     // --- memory ---
 
-    fn lower_load(&mut self, p: ValueId, ty: &MirType, res: ValueId) {
+    fn lower_load(&mut self, p: ValueId, ty: &MirType, res: ValueId) -> Result<(), String> {
         let addr = self.reg(p);
         let d = self.reg(res);
-        self.load_into(&d, &addr, ty);
+        self.load_into(&d, &addr, ty)
     }
 
     /// Load one (scalar or lane) value of MIR type `ty` from generic address `addr` into `d`.
-    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType) {
+    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType) -> Result<(), String> {
         match ty {
+            // `i1` occupies ONE byte in memory (`size_of(I1) == 1`, and `Op::Gep` strides bools by 1),
+            // exactly like Cranelift's `types::I8` mapping — so it must be accessed with `ld.u8`. A
+            // 4-byte access would read three neighbouring bools (or run past the frame) and, on an
+            // odd address, faults the device outright with CUDA_ERROR_MISALIGNED_ADDRESS.
+            MirType::I1 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("ld.u8 {w}, [{addr}];"));
+                self.emit(&format!("cvt.u64.u32 {d}, {w};"));
+                self.mask_int(d, ty);
+            }
             MirType::F32 => self.emit(&format!("ld.f32 {d}, [{addr}];")),
             MirType::F64 => self.emit(&format!("ld.f64 {d}, [{addr}];")),
             MirType::I64 | MirType::Ptr => self.emit(&format!("ld.u64 {d}, [{addr}];")),
@@ -1260,13 +1270,20 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("ld.s16 {w}, [{addr}];"));
                 self.emit(&format!("cvt.s64.s32 {d}, {w};"));
             }
-            _ => {
-                // i32 / i1: load 32 bits, sign-extend to 64.
+            // i32: load 32 bits, sign-extend to 64.
+            MirType::I32 => {
                 let w = self.fresh_r32();
                 self.emit(&format!("ld.u32 {w}, [{addr}];"));
                 self.emit(&format!("cvt.s64.s32 {d}, {w};"));
             }
+            // An aggregate/void has no single-register load. Falling through to the 4-byte `ld.u32`
+            // would emit *plausible but wrong* PTX (a `load [2 x i32]` would read only its first
+            // element) — the contract is to decline so the gate reports it as not-yet-covered.
+            MirType::Vec(..) | MirType::Array(..) | MirType::Void => {
+                return Err(format!("{UNSUPPORTED} load of aggregate type {ty:?}"))
+            }
         }
+        Ok(())
     }
 
     fn lower_store(&mut self, ptr: ValueId, value: ValueId) -> Result<(), String> {
@@ -1333,6 +1350,14 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("cvt.rn.f16.f32 {h}, {v};"));
                 self.emit(&format!("{g}st.u16 [{addr}], {h};"));
             }
+            // `i1` is a ONE-byte object (see `load_into`): store the low byte, masked to 0/1 so the
+            // byte read back is canonical whatever produced the value.
+            MirType::I1 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("cvt.u32.u64 {w}, {v};"));
+                self.emit(&format!("and.b32 {w}, {w}, 1;"));
+                self.emit(&format!("{g}st.u8 [{addr}], {w};"));
+            }
             // Narrow stores take a 32-bit source register (low bits); narrow the 64-bit value first.
             MirType::I8 => {
                 let w = self.fresh_r32();
@@ -1344,11 +1369,15 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("cvt.u32.u64 {w}, {v};"));
                 self.emit(&format!("{g}st.u16 [{addr}], {w};"));
             }
-            _ => {
-                // i32 / i1
+            MirType::I32 => {
                 let w = self.fresh_r32();
                 self.emit(&format!("cvt.u32.u64 {w}, {v};"));
                 self.emit(&format!("{g}st.u32 [{addr}], {w};"));
+            }
+            // As in `load_into`: an aggregate/void has no single-register store, and a 4-byte
+            // `st.u32` would write only part of it. Decline instead of emitting a partial write.
+            MirType::Vec(..) | MirType::Array(..) | MirType::Void => {
+                return Err(format!("{UNSUPPORTED} store of aggregate type {ty:?}"))
             }
         }
         Ok(())
@@ -1406,7 +1435,7 @@ impl<'a> FnEmit<'a> {
                 for i in 0..n {
                     let la = self.lane_addr(&addr, i, esz);
                     let d = self.fresh(lane_rc);
-                    self.load_into(&d, &la, &lane);
+                    self.load_into(&d, &la, &lane)?;
                     ls.push(d);
                 }
                 ls
