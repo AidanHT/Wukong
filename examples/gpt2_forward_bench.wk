@@ -44,6 +44,20 @@ fn main() -> i32 {
     let nreps: i64 = 8;
 
     // ---- weights: the real flat blob (gate-guard: absent data => identical -1 on both backends) ----
+    // Probe with a ONE-element read BEFORE the 124M-element allocation, exactly as gpt2_infer.wk
+    // probes its token file first. The interpreter — the default backend, and the one the examples
+    // gate runs — materialises one Value slot per element in alloc_f32, so allocating the blob just
+    // to reach this early return costs ~7.4 GB working set / ~11.2 GB commit on a run whose entire
+    // observable behaviour is `print(-1)`. read_f32 answers -1 when the path cannot be opened and
+    // min(len, file_elems) otherwise, so a 1-element probe returns 1 iff the blob is readable.
+    let mut probe: []f32 = alloc_f32(1);
+    let pgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", probe);
+    free(probe);
+    if pgot != 1 {
+        print(-1);
+        return 1;
+    }
+
     let mut w: []f32 = alloc_f32(GPT2_TOTAL_WEIGHTS);
     let wgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", w);
     if wgot != GPT2_TOTAL_WEIGHTS {

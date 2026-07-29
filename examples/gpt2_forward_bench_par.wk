@@ -144,6 +144,17 @@ fn main() -> i32 {
     let nwarm: i64 = 3;
     let nreps: i64 = 8;
 
+    // Probe with a ONE-element read BEFORE the 124M-element allocation (see gpt2_forward_bench.wk):
+    // on the interpreter alloc_f32 costs one Value slot per element, so allocating the blob merely to
+    // reach this early return burns ~7.4 GB working set / ~11.2 GB commit to print -1.
+    let mut probe: []f32 = alloc_f32(1);
+    let pgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", probe);
+    free(probe);
+    if pgot != 1 {
+        print(-1);
+        return 1;
+    }
+
     let mut w: []f32 = alloc_f32(GPT2_TOTAL_WEIGHTS);
     let wgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", w);
     if wgot != GPT2_TOTAL_WEIGHTS {
