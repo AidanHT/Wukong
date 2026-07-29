@@ -131,14 +131,46 @@ impl Gpu {
 }
 
 static GPU: OnceLock<Mutex<Option<Gpu>>> = OnceLock::new();
+/// Why `Gpu::new` failed, recorded the first time [`gpu`] is consulted. `Gpu::new().ok()` used to
+/// discard the `DriverError` outright, so every skip line reported "no CUDA device reachable" even
+/// when the real cause was an OOM, an exclusive-mode device, a driver/runtime mismatch, or an empty
+/// `CUDA_VISIBLE_DEVICES` — misattributing a broken box as a machine that simply has no GPU.
+static GPU_INIT_ERR: OnceLock<String> = OnceLock::new();
+
+/// Build the process-wide GPU, recording the driver's error if it fails.
+fn init_gpu() -> Option<Gpu> {
+    match Gpu::new() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            let _ = GPU_INIT_ERR.set(format!("{e:?}"));
+            None
+        }
+    }
+}
 
 /// Acquire the process-wide GPU. The inner `Option` is `None` when no CUDA device is reachable
 /// (no driver / no GPU): callers should treat that as "skip" rather than fail, so the suite still
-/// passes on machines without a GPU even with `--features gpu` compiled in.
+/// passes on machines without a GPU even with `--features gpu` compiled in. A skip must still be
+/// *loud* — see [`init_error`] for the reason to print with it.
 pub fn gpu() -> MutexGuard<'static, Option<Gpu>> {
-    GPU.get_or_init(|| Mutex::new(Gpu::new().ok()))
+    GPU.get_or_init(|| Mutex::new(init_gpu()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The driver error that made the process-wide GPU unavailable, if [`gpu`] has been consulted and
+/// `Gpu::new` failed. `None` means either the device is fine or nothing has asked for it yet.
+pub fn init_error() -> Option<&'static str> {
+    GPU_INIT_ERR.get().map(String::as_str)
+}
+
+/// Whether a run is *required* to have a GPU — set `WUKONG_GPU_REQUIRED=1` on a machine that is
+/// supposed to have one (CI, the campaign's own sweeps). With it set, a gate that would otherwise
+/// print `[skip]` and report a green "ok" having executed zero device instructions fails instead.
+/// Read once so every call site in a process agrees.
+pub fn gpu_required() -> bool {
+    static REQ: OnceLock<bool> = OnceLock::new();
+    *REQ.get_or_init(|| std::env::var_os("WUKONG_GPU_REQUIRED").is_some())
 }
 
 /// True iff a CUDA device is reachable in this process.
@@ -174,7 +206,7 @@ pub fn device_lost() -> bool {
 /// Returns `true` iff a live GPU is in place afterward.
 pub fn reset_gpu() -> bool {
     let mut guard = GPU
-        .get_or_init(|| Mutex::new(Gpu::new().ok()))
+        .get_or_init(|| Mutex::new(init_gpu()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     // Drop the (possibly poisoned) context first: releases our primary-ctx reference, streams, modules.
@@ -4792,12 +4824,41 @@ mod tests {
     }
 
     /// Run `body` with the shared GPU, or skip (printing why) if none is present.
+    ///
+    /// A skip is a *passing* libtest test whose `eprintln!` libtest captures, so without this the
+    /// whole GPU suite reports `test result: ok` — with no visible output at all — whenever the
+    /// device is unreachable for any reason (empty `CUDA_VISIBLE_DEVICES`, another process holding
+    /// it, a driver/runtime mismatch). `WUKONG_GPU_REQUIRED=1` turns that into a failure, and the
+    /// skip line now carries the driver's actual error instead of asserting "no CUDA device".
     fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
         let mut guard = gpu();
         match guard.as_mut() {
             Some(g) => body(g),
-            None => eprintln!("[skip] {name}: no CUDA device reachable"),
+            None => {
+                let why = crate::gpu::init_error().unwrap_or("no CUDA device reachable");
+                assert!(
+                    !crate::gpu::gpu_required(),
+                    "{name}: WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}"
+                );
+                eprintln!("[skip] {name}: GPU unavailable: {why}");
+            }
         }
+    }
+
+    /// **§3A P3 — a sweep that cannot find its peer must fail LOUDLY, never skip silently and report
+    /// green.** Every `[skip]` early-return in this module calls this first. By default it is a
+    /// no-op, so the suite still passes on a box without the peer toolchain; with
+    /// `WUKONG_PEER_REQUIRED=1` — the campaign's own sweep invocation — a missing peer fails the test
+    /// instead of reporting a green run that measured nothing. The `[skip]` line is still printed so
+    /// an operator grepping for it sees the same marker.
+    #[track_caller]
+    fn peer_gate(what: &str) {
+        assert!(
+            std::env::var_os("WUKONG_PEER_REQUIRED").is_none(),
+            "{what}: WUKONG_PEER_REQUIRED is set but the peer/toolchain is unreachable — this sweep \
+             would have reported green having measured NOTHING. {}",
+            crate::baselines::peer_env_hint()
+        );
     }
 
     /// **W4A16 correctness gate (the first law).** The int4-decode kernel must reproduce — within the
@@ -8340,6 +8401,7 @@ mod tests {
         use half::f16;
         with_gpu("conv_winograd_vs_cudnn", |g| {
             if !peers_available(g) {
+                peer_gate("conv_winograd_vs_cudnn");
                 eprintln!("[skip] NVRTC not loadable.");
                 return;
             }
@@ -8551,6 +8613,7 @@ mod tests {
         };
         with_gpu("conv_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("conv_vs_peers");
                 eprintln!("[skip] conv_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -8683,6 +8746,7 @@ mod tests {
         use half::f16;
         with_gpu("conv_vs_cudnn", |g| {
             if !peers_available(g) {
+                peer_gate("conv_vs_cudnn");
                 eprintln!("[skip] conv_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -8934,6 +8998,7 @@ mod tests {
         }
         with_gpu("conv_affine_vs_cudnn", |g| {
             if !peers_available(g) {
+                peer_gate("conv_affine_vs_cudnn");
                 eprintln!("[skip] conv_affine_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -9141,6 +9206,7 @@ mod tests {
         use half::f16;
         with_gpu("conv_splitk_vs_cudnn", |g| {
             if !peers_available(g) {
+                peer_gate("conv_splitk_vs_cudnn");
                 eprintln!("[skip] conv_splitk_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -9683,6 +9749,7 @@ mod tests {
         use crate::baselines::{cublas_gemm_nt_f16, peer_env_hint, peers_available};
         with_gpu("repro_vs_cublas", |g| {
             if !peers_available(g) {
+                peer_gate("reproducibility_vs_cublas");
                 eprintln!("[skip] reproducibility_vs_cublas: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -9932,6 +9999,7 @@ mod tests {
         use crate::baselines::{peer_env_hint, peers_available, CublasChainModel};
         with_gpu("resident_model_vs_cublas", |g| {
             if !peers_available(g) {
+                peer_gate("resident_model_vs_cublas_chain_throughput");
                 eprintln!(
                     "[skip] resident_model_vs_cublas_chain_throughput: cuBLAS not loadable.\n{}",
                     peer_env_hint()
@@ -10218,6 +10286,7 @@ mod tests {
         };
         with_gpu("cublas_chain_layer", |g| {
             if !peers_available(g) {
+                peer_gate("cublas_chain_layer_matches_reference_within_tol");
                 eprintln!(
                     "[skip] cublas_chain_layer_matches_reference: cuBLAS not loadable.\n{}",
                     peer_env_hint()
@@ -10286,6 +10355,7 @@ mod tests {
         use crate::baselines::{peer_env_hint, peers_available, CublasChainLayer};
         with_gpu("cublas_chain_vs_wukong", |g| {
             if !peers_available(g) {
+                peer_gate("cublas_chain_vs_wukong_layer_throughput");
                 eprintln!(
                     "[skip] cublas_chain_vs_wukong_layer_throughput: cuBLAS not loadable.\n{}",
                     peer_env_hint()
@@ -10400,6 +10470,7 @@ mod tests {
         use crate::baselines::{peer_env_hint, peers_available, CublasChainLayer};
         with_gpu("cublas_chain_vs_wukong_mha", |g| {
             if !peers_available(g) {
+                peer_gate("cublas_chain_vs_wukong_mha_layer_throughput");
                 eprintln!(
                     "[skip] cublas_chain_vs_wukong_mha_layer_throughput: cuBLAS not loadable.\n{}",
                     peer_env_hint()
@@ -10979,6 +11050,7 @@ mod tests {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
         with_gpu("cublaslt_fp8_gate", |g| {
             if !peers_available(g) || !cublaslt_available() {
+                peer_gate("cublaslt_fp8_matches_reference_within_tol");
                 eprintln!("[skip] cublaslt_fp8_gate: cuBLASLt not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -10990,6 +11062,7 @@ mod tests {
                 let c = match cublaslt_gemm_nt_fp8_e4m3(g, &a, &b, m, k, n) {
                     Ok(c) => c,
                     Err(e) => {
+                        peer_gate("cublaslt_fp8_matches_reference_within_tol");
                         eprintln!("[skip] cuBLASLt fp8 unsupported for {m}x{k}x{n} on this device: {e}");
                         return;
                     }
@@ -11026,6 +11099,7 @@ mod tests {
         };
         with_gpu("fp8_vs_cublaslt", |g| {
             if !peers_available(g) || !cublaslt_available() {
+                peer_gate("fp8_vs_cublaslt_pct");
                 eprintln!("[skip] fp8_vs_cublaslt: cuBLASLt not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11108,6 +11182,7 @@ mod tests {
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
         with_gpu("fp8_pipe_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
+                peer_gate("fp8_pipe_config_sweep_vs_cublaslt");
                 eprintln!("[skip] fp8_pipe_config_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11306,6 +11381,7 @@ mod tests {
         use half::f16;
         with_gpu("gemm_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("gemm_vs_peers");
                 eprintln!("[skip] gemm_vs_peers: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11509,6 +11585,7 @@ mod tests {
         use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
         with_gpu("nvrtc_wmma_probe", |g| {
             if !crate::baselines::peers_available(g) {
+                peer_gate("nvrtc_wmma_probe");
                 eprintln!("[skip] nvrtc_wmma_probe: NVRTC not loadable.");
                 return;
             }
@@ -11569,6 +11646,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("gemm_pipe_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("gemm_pipe_sweep");
                 eprintln!("[skip] gemm_pipe_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11667,6 +11745,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("mma_swizzle_bench", |g| {
             if !peers_available(g) {
+                peer_gate("mma_swizzle_vs_handplaced");
                 eprintln!("[skip] mma_swizzle_vs_handplaced: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11842,6 +11921,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("gemm_cliff_ab", |g| {
             if !peers_available(g) {
+                peer_gate("gemm_cliff_ab");
                 eprintln!("[skip] gemm_cliff_ab: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -11963,12 +12043,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let ptxas = match std::env::var("WUKONG_PTXAS") {
             Ok(p) if std::path::Path::new(&p).exists() => p,
             _ => {
+                peer_gate("gemm_cliff_ptxas_ab");
                 eprintln!("[skip] set WUKONG_PTXAS to a standalone ptxas (`pip install nvidia-cuda-nvcc-cu12` → nvidia/cuda_nvcc/bin/ptxas.exe).");
                 return;
             }
         };
         with_gpu("gemm_cliff_ptxas", |g| {
             if !peers_available(g) {
+                peer_gate("gemm_cliff_ptxas_ab");
                 eprintln!("[skip] cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -12008,6 +12090,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
             }
             if cands.is_empty() {
+                peer_gate("gemm_cliff_ptxas_ab");
                 eprintln!("[skip] no offline cubin loaded — lever blocked (likely driver older than the ptxas toolkit).");
                 return;
             }
@@ -12106,6 +12189,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("flash_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("flash_vs_peers");
                 eprintln!("[skip] flash_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -12287,6 +12371,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("fused_act", |g| {
             if !peers_available(g) {
+                peer_gate("fused_gemm_activation_vs_chain");
                 eprintln!("[skip] fused_gemm_activation_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -12413,6 +12498,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("fused_bias_act", |g| {
             if !peers_available(g) {
+                peer_gate("fused_gemm_bias_act_vs_chain");
                 eprintln!("[skip] fused_gemm_bias_act_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -13035,6 +13121,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("swiglu_gate_bench", |g| {
             if !peers_available(g) {
+                peer_gate("fused_swiglu_gate_vs_chain");
                 eprintln!("[skip] fused_swiglu_gate_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -13222,6 +13309,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("int4_gemm_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("int4_gemm_vs_peers");
                 eprintln!("[skip] int4_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14392,6 +14480,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use crate::ptx_int8::{INT8_TM, INT8_TN};
         with_gpu("int8_gemm_vs_peers", |g| {
             if !peers_available(g) {
+                peer_gate("int8_gemm_vs_peers");
                 eprintln!("[skip] int8_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14711,6 +14800,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("int8_smdb_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("int8_smdb_sweep");
                 eprintln!("[skip] int8_smdb_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14853,6 +14943,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("quant_int8_raster_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_raster_sweep");
                 eprintln!("[skip] quant_int8_raster_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -14976,6 +15067,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use crate::ptx_int8::int8_gemm_swz_tile_ptx;
         with_gpu("quant_int8_bigtile_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_bigtile_sweep");
                 eprintln!("[skip] quant_int8_bigtile_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15063,6 +15155,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("quant_int8_w64_confirm", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_w64_confirm");
                 eprintln!("[skip] quant_int8_w64_confirm: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15193,6 +15286,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("quant_int8_w64_s3_sweep", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_w64_s3_sweep");
                 eprintln!("[skip] quant_int8_w64_s3_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15317,6 +15411,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         };
         with_gpu("quant_int8_fused_dequant_vs_chain", |g| {
             if !peers_available(g) {
+                peer_gate("quant_int8_fused_dequant_vs_chain");
                 eprintln!("[skip] quant_int8_fused_dequant_vs_chain: cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15433,6 +15528,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
         with_gpu("quant_fp8_warp_tile_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
+                peer_gate("quant_fp8_warp_tile_sweep");
                 eprintln!("[skip] quant_fp8_warp_tile_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
                 return;
             }
@@ -15901,6 +15997,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_vs_fused_peer");
                 eprintln!(
                     "[skip] attn_vs_fused_peer: torch-CUDA peer not runnable. Set WUKONG_FA2_PYTHON \
                      to a python.exe with CUDA `torch` + numpy (see tools/fa2_sdpa_peer.py)."
@@ -16058,6 +16155,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_variants_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_variants_vs_fused_peer");
                 eprintln!("[skip] attn_variants_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
                 return;
             }
@@ -16778,6 +16876,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_lm_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_lm_vs_fused_peer");
                 eprintln!("[skip] attn_lm_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
                 return;
             }
@@ -17131,6 +17230,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_rope_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_rope_vs_fused_peer");
                 eprintln!(
                     "[skip] attn_rope_vs_fused_peer: torch-CUDA peer not runnable. Set WUKONG_FA2_PYTHON \
                      to a python.exe with CUDA `torch` + numpy (see tools/fa2_sdpa_peer.py)."
@@ -17328,6 +17428,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_causal_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_causal_vs_fused_peer");
                 eprintln!(
                     "[skip] attn_causal_vs_fused_peer: torch-CUDA peer not runnable. Set WUKONG_FA2_PYTHON \
                      to a python.exe with CUDA `torch` + numpy (see tools/fa2_sdpa_peer.py)."
@@ -17963,6 +18064,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("attn_d128_vs_fused_peer", |g| {
             if !fa2_peer_available() {
+                peer_gate("attn_d128_vs_fused_peer");
                 eprintln!("[skip] attn_d128_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
                 return;
             }
