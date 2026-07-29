@@ -1606,7 +1606,12 @@ impl<'a> FnEmit<'a> {
             // The elementwise transcendental kernel dispatches on a compile-time op code; only lower
             // the ops `mrt_vmath` implements (a few inverse fns need an atan polynomial, not yet done).
             // The bf16/f16 variants share the op-switch (and the op gate) — only the input load differs.
-            "wukong_vmath_f32" | "wukong_vmath_bf16" | "wukong_vmath_f16"
+            // NOTE: every spelling `rt_helper` maps to `mrt_vmath*` must be listed here, or it falls
+            // through to the generic `other =>` arm below and reaches the helper with this op-code
+            // gate BYPASSED — an unimplemented op would then silently run `mrt_vmath`'s identity
+            // default instead of declining.
+            "wukong_vmath_f32" | "wukong_vmath_f32_parallel" | "wukong_vmath_bf16"
+            | "wukong_vmath_f16"
                 if args.len() == 4 =>
             {
                 let op = self
@@ -1730,8 +1735,12 @@ impl<'a> FnEmit<'a> {
             // *always* f32 (4 B) — the activation result is computed and stored in f32 — so the two
             // pointers can have different per-element strides (a 2/4 mismatch was a misaligned store).
             CoopKind::Vmath => {
-                let in_esz = if name == "wukong_vmath_f32" { 4 } else { 2 };
-                let h = rt_helper(name).expect("vmath helper");
+                // Keyed on the f32 family (`wukong_vmath_f32` and its `_parallel` twin), NOT on the
+                // one exact serial spelling: giving an f32 input buffer the bf16 2-byte stride would
+                // walk each thread's chunk over the wrong half of the array.
+                let in_esz = if name.starts_with("wukong_vmath_f32") { 4 } else { 2 };
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1742,7 +1751,8 @@ impl<'a> FnEmit<'a> {
                 );
             }
             CoopKind::Vmath2 => {
-                let h = rt_helper(name).expect("vmath2 helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1753,7 +1763,8 @@ impl<'a> FnEmit<'a> {
                 );
             }
             CoopKind::Velem => {
-                let h = rt_helper(name).expect("velem helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1767,7 +1778,8 @@ impl<'a> FnEmit<'a> {
             // each thread owns a contiguous A-row / C-row block; B / bias / beta / act are shared. A-row
             // = `k` elems, C-row = `n` elems. (a=0, b=1, c=2, m=3, k=4, n=5, ...)
             CoopKind::Gemm | CoopKind::GemmNt | CoopKind::GemmNtEpi => {
-                let h = rt_helper(name).expect("gemm helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1779,7 +1791,8 @@ impl<'a> FnEmit<'a> {
             }
             // int8 GEMM: A rows are u8 (`k`*1 B), C rows are i32 (`n`*4 B).
             CoopKind::I8GemmNt => {
-                let h = rt_helper(name).expect("i8gemm helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1792,7 +1805,8 @@ impl<'a> FnEmit<'a> {
             // Row-wise norm: each row's softmax/LayerNorm/RMSNorm is independent -> chunk `rows`.
             // (x=0, out=1, rows=2, cols=3, ...); each row is `cols` f32.
             CoopKind::Norm => {
-                let h = rt_helper(name).expect("norm helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1805,7 +1819,8 @@ impl<'a> FnEmit<'a> {
             // Affine norm: (x=0, out=1, gamma=2, beta=3, rows=4, cols=5, ...); gamma/beta are
             // per-column (shared across rows), so only x/out are row-offset by `cols`*4 B.
             CoopKind::NormAffine => {
-                let h = rt_helper(name).expect("norm_affine helper");
+                let h = rt_helper(name)
+                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -2366,23 +2381,33 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
         "wukong_norm_affine_f32" | "wukong_norm_affine_f32_parallel" => {
             ("mrt_norm_affine", None, PTX_NORM_AFFINE.to_string())
         }
-        "wukong_vmath_f32" => ("mrt_vmath", None, PTX_VMATH.to_string()),
+        "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
+            ("mrt_vmath", None, PTX_VMATH.to_string())
+        }
         "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => {
             ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI.to_string())
         }
         // Mixed-precision (bf16/f16 storage, f32 compute) — generated per precision.
-        "wukong_vmath_bf16" => ("mrt_vmath_bf16", None, ptx_vmath_lowp("mrt_vmath_bf16", "bf16")),
-        "wukong_vmath_f16" => ("mrt_vmath_f16", None, ptx_vmath_lowp("mrt_vmath_f16", "f16")),
-        "wukong_dot_bf16" => ("mrt_dot_bf16", Some(RC::F32), ptx_dot_lowp("mrt_dot_bf16", "bf16")),
-        "wukong_dot_f16" => ("mrt_dot_f16", Some(RC::F32), ptx_dot_lowp("mrt_dot_f16", "f16")),
-        "wukong_sum_bf16" => ("mrt_sum_bf16", Some(RC::F32), ptx_sum_lowp("mrt_sum_bf16", "bf16")),
-        "wukong_sum_f16" => ("mrt_sum_f16", Some(RC::F32), ptx_sum_lowp("mrt_sum_f16", "f16")),
-        "wukong_reduce_bf16" => (
+        "wukong_vmath_bf16" => ("mrt_vmath_bf16", None, ptx_vmath_lowp("mrt_vmath_bf16", "bf16")?),
+        "wukong_vmath_f16" => ("mrt_vmath_f16", None, ptx_vmath_lowp("mrt_vmath_f16", "f16")?),
+        "wukong_dot_bf16" | "wukong_dot_bf16_parallel" => {
+            ("mrt_dot_bf16", Some(RC::F32), ptx_dot_lowp("mrt_dot_bf16", "bf16"))
+        }
+        "wukong_dot_f16" | "wukong_dot_f16_parallel" => {
+            ("mrt_dot_f16", Some(RC::F32), ptx_dot_lowp("mrt_dot_f16", "f16"))
+        }
+        "wukong_sum_bf16" | "wukong_sum_bf16_parallel" => {
+            ("mrt_sum_bf16", Some(RC::F32), ptx_sum_lowp("mrt_sum_bf16", "bf16"))
+        }
+        "wukong_sum_f16" | "wukong_sum_f16_parallel" => {
+            ("mrt_sum_f16", Some(RC::F32), ptx_sum_lowp("mrt_sum_f16", "f16"))
+        }
+        "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => (
             "mrt_reduce_bf16",
             Some(RC::F32),
             ptx_reduce_lowp("mrt_reduce_bf16", "bf16"),
         ),
-        "wukong_reduce_f16" => (
+        "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => (
             "mrt_reduce_f16",
             Some(RC::F32),
             ptx_reduce_lowp("mrt_reduce_f16", "f16"),
@@ -3457,16 +3482,18 @@ FMOD_RET:
 /// (2-byte stride) and writing f32 (4-byte stride). Reuses the f32 kernel's op-switch verbatim (the
 /// op codes and SFU formulas are identical; only the input load differs), so the result is bit-for-
 /// bit the f32 kernel run on the widened inputs.
-fn ptx_vmath_lowp(fn_name: &str, cvt: &str) -> String {
+fn ptx_vmath_lowp(fn_name: &str, cvt: &str) -> Option<String> {
     // Splice in the shared dispatch + op bodies (`setp …; VM0: …; VM_DEF: mov %f2,%f1`) from the
     // committed f32 kernel so there is one source of truth for the ~30 activation formulas.
+    // The two markers are an invariant of `PTX_VMATH` in this same file; if an edit ever renames or
+    // reflows them, DECLINE (the caller turns `None` into an `UNSUPPORTED:` diagnostic) instead of
+    // panicking with internal text on a path a user program reaches. `vmath_lowp_markers_present`
+    // below pins the invariant so a desync is caught at edit time, not at compile time of a program.
     let s = PTX_VMATH;
-    let start = s
-        .find("    setp.eq.s64 %p1, %rd3, 0;")
-        .expect("vmath op dispatch");
-    let end = s.find("VM_ST:").expect("vmath store label");
+    let start = s.find(VM_DISPATCH_MARKER)?;
+    let end = s.find(VM_STORE_MARKER)?;
     let ops = &s[start..end];
-    format!(
+    Some(format!(
         r#".func {fn_name} (.param .b64 px, .param .b64 pout, .param .b64 pn, .param .b64 pop)
 {{
     .reg .b64 %rd<9>;
@@ -3495,8 +3522,14 @@ VM_DONE:
     ret;
 }}
 "#
-    )
+    ))
 }
+
+/// The two `PTX_VMATH` anchors [`ptx_vmath_lowp`] splices between: the first line of the op-code
+/// dispatch, and the shared store label that ends the op bodies. Named constants so the test below
+/// pins exactly what the splice looks for.
+const VM_DISPATCH_MARKER: &str = "    setp.eq.s64 %p1, %rd3, 0;";
+const VM_STORE_MARKER: &str = "VM_ST:";
 
 /// `wukong_dot_{bf16,f16}(x, y, n) -> f32`: `Σ widen(x[k])·widen(y[k])`, f32 accumulate.
 fn ptx_dot_lowp(fn_name: &str, cvt: &str) -> String {
@@ -3855,6 +3888,29 @@ pub fn mega_frame_bytes(func: &Function) -> u64 {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// `ptx_vmath_lowp` builds the bf16/f16 activation kernels by slicing `PTX_VMATH` between two
+    /// literal markers. That is a self-referential invariant of this file: renaming `VM_ST:` or
+    /// reflowing the first dispatch line silently turns every bf16/f16 activation program into an
+    /// `UNSUPPORTED:` decline. Pin it here — this test needs no CUDA device, so it fires on any
+    /// `--features gpu` build the moment the PTX literal and the splice desync.
+    #[test]
+    fn vmath_lowp_markers_present() {
+        assert!(
+            PTX_VMATH.contains(VM_DISPATCH_MARKER),
+            "PTX_VMATH no longer contains the op-dispatch marker {VM_DISPATCH_MARKER:?} that \
+             ptx_vmath_lowp splices from"
+        );
+        assert!(
+            PTX_VMATH.contains(VM_STORE_MARKER),
+            "PTX_VMATH no longer contains the store marker {VM_STORE_MARKER:?} that \
+             ptx_vmath_lowp splices to"
+        );
+        // And the splice really produces a kernel (markers in the right order, non-empty body).
+        let k = ptx_vmath_lowp("mrt_vmath_bf16", "bf16").expect("bf16 vmath kernel");
+        assert!(k.contains("cvt.f32.bf16"), "spliced kernel lost its bf16 input widen");
+        assert!(k.is_ascii(), "PTX must stay ASCII");
+    }
 
     /// Build a program from `.wk` source at `opt` (lex -> parse -> sema -> mir_build -> opt).
     fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
