@@ -3912,6 +3912,30 @@ mod tests {
         assert!(k.is_ascii(), "PTX must stay ASCII");
     }
 
+    /// The comparator the corpus gate is built on, pinned against the real divergence it used to
+    /// wave through. The four "before" lines are the actual gpu-native -O3 output of
+    /// `tests/run/bf16_literal_grid.wk` when bf16/f16 constants were not grid-rounded; the oracle
+    /// column is the interpreter's. Every one of them passed the old 1e-2 relative tolerance.
+    /// Needs no CUDA device.
+    #[test]
+    fn integer_lines_compare_exactly() {
+        for (gpu, cpu) in [("10000", "10009"), ("10000", "9997"), ("32968", "33125"), ("3141", "3140")]
+        {
+            assert!(
+                !line_matches(gpu, cpu),
+                "integer line {gpu} must not match the oracle's {cpu}"
+            );
+        }
+        assert!(!outputs_match(b"10000\n10000\n32968\n3141\n", b"10009\n9997\n33125\n3140\n"));
+        // Equal integers still match, in any spelling that parses to the same value.
+        assert!(line_matches("12345678901", "12345678901"));
+        assert!(line_matches("-0", "0"));
+        // Floats keep the CPU<->GPU tolerance (reduction order / SFU differences).
+        assert!(line_matches("1.0000001", "1.0"));
+        assert!(line_matches("0.30000000000000004", "0.3"));
+        assert!(!line_matches("1.5", "2.5"));
+    }
+
     /// Build a program from `.wk` source at `opt` (lex -> parse -> sema -> mir_build -> opt).
     fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
         use wukong_span::SourceMap;
@@ -3938,12 +3962,25 @@ mod tests {
         Some((program, interner))
     }
 
-    /// Compare one output line numerically (float tolerance) or exactly (everything else).
+    /// Compare one output line. **Integer output is compared exactly**: `decode_ctx` replays an
+    /// integer print record with the identical `format!("{}\n", payload as i64)` the interpreter
+    /// uses, so any difference on such a line is a miscompile, never a rounding artifact. Only a
+    /// line carrying a float form gets the CPU<->GPU tolerance, which exists for reduction-order and
+    /// SFU differences.
+    ///
+    /// The tolerance used to apply to *every* numeric line, which made a large class of miscompiles
+    /// report green: on `bf16_literal_grid.wk` the GPU printed 10000 where the oracle printed 10009
+    /// and `9 <= 1e-2 * 10009` accepted it. bf16/f16 error is structurally bounded by 2^-9 relative,
+    /// so a 1e-2 relative slack could never catch that bug class.
     fn line_matches(g: &str, c: &str) -> bool {
         if g == c {
             return true;
         }
-        match (g.trim().parse::<f64>(), c.trim().parse::<f64>()) {
+        let (gt, ct) = (g.trim(), c.trim());
+        if let (Ok(a), Ok(b)) = (gt.parse::<i128>(), ct.parse::<i128>()) {
+            return a == b;
+        }
+        match (gt.parse::<f64>(), ct.parse::<f64>()) {
             (Ok(a), Ok(b)) => {
                 let diff = (a - b).abs();
                 diff <= 1e-3 || diff <= 1e-2 * b.abs().max(a.abs())
@@ -4017,7 +4054,35 @@ mod tests {
                 let cpu = wukong_interp::run_with_output(&program, entry, &interner);
                 let gpu = jit_run(&program, entry, &interner);
                 match (&cpu, &gpu) {
-                    (Err(_), Err(_)) => {} // both error (e.g. assertion failed) — agree.
+                    // Both errored. That is only *agreement* when the GPU's error is the one
+                    // deterministic program-level error both executors produce identically. An
+                    // unchecked "both Err" arm counted an `UNSUPPORTED:` decline as coverage and,
+                    // worse, let a genuine driver fault through without landing on `faults` or
+                    // resetting the context — so the next healthy program inherited the sticky
+                    // CUDA error and took the blame, breaking this gate's root-cause-only rule.
+                    (Err(ce), Err(ge)) => {
+                        if ge.starts_with(UNSUPPORTED)
+                            || ge.starts_with("gpu-native print buffer overflow")
+                        {
+                            // A decline or a device-capacity limit: no GPU output existed to compare.
+                            covered_here = false;
+                            skipped.push(format!("{name}@O{opt}: {ge}"));
+                            break;
+                        }
+                        if ge != "assertion failed" {
+                            covered_here = false;
+                            faults.push(format!("{name}@O{opt}: gpu errored: {ge}"));
+                            crate::gpu::reset_gpu();
+                            break;
+                        }
+                        if ce != ge {
+                            covered_here = false;
+                            mismatches
+                                .push(format!("{name}@O{opt}: cpu err `{ce}` gpu err `{ge}`"));
+                            break;
+                        }
+                        // Both `assertion failed` — agree.
+                    }
                     (Ok((ce, co)), Ok((ge, go))) => {
                         if ce != ge || !outputs_match(go, co) {
                             mismatches.push(format!(
