@@ -3830,6 +3830,16 @@ fn define_functions_parallel<M: Module>(
                     Ok((fid, alignment, bytes, relocs))
                 },
             )
+            // Collect the per-function `Result`s **positionally**, then take the first `Err` in
+            // source order. Collecting straight into `Result<Vec<_>, _>` reports whichever worker
+            // failed first in wall-clock time, so a program with two bad functions produced a
+            // different diagnostic run to run — `two_huge.wk` (an oversized array in `a()` and
+            // another in `b()`) alternated between the `[... x i32]` and `[... x i64]` messages
+            // across identical invocations, while the serial path always reported `a()`. Indexing
+            // the errors makes the parallel path report the same function the serial path does, so
+            // the compiler is a pure function of its input (U3).
+            .collect::<Vec<Result<_, String>>>()
+            .into_iter()
             .collect::<Result<Vec<_>, String>>()?
     };
 

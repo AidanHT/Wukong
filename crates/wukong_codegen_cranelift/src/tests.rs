@@ -4934,6 +4934,66 @@ fn parallel_object_bytes_deterministic() {
     }
 }
 
+/// Determinism of the FAILURE path, not just the success path: when two functions both fail to
+/// lower, the reported diagnostic must be the lowest-source-order one every time, and must match
+/// what the serial path reports. Collecting the rayon results straight into `Result<Vec<_>, _>`
+/// short-circuits on whichever worker lost the race, so this program alternated between the
+/// `[... x i32]` and `[... x i64]` messages across identical invocations of the same binary.
+#[test]
+fn parallel_codegen_error_is_source_ordered() {
+    // Enough functions to give rayon a real split tree, each with a stack slot over the 4 GiB
+    // layout limit and a distinct extent so the message identifies which one was reported. `f0`
+    // reaches its oversized slot only after a long body, so in wall-clock order it is the LAST of
+    // the batch to fail — exactly the case where "first worker to report" and "first in source
+    // order" disagree.
+    const N: u64 = 32;
+    let mut src = String::new();
+    for k in 0..N {
+        let n = 2_000_000_000u64 + k;
+        let mut body = String::new();
+        if k == 0 {
+            // Seeded from a parameter so `-O2` cannot constant-fold the chain away.
+            for j in 0..3000 {
+                body.push_str(&format!("acc = acc * 3 + {j};"));
+            }
+        }
+        src.push_str(&format!(
+            "fn f{k}(mut acc: i32) -> i32 {{ {body} let x: [i32; {n}] = [0; {n}]; \
+             return x[0] + acc; }}\n"
+        ));
+    }
+    src.push_str("fn main() -> i32 {");
+    for k in 0..N {
+        src.push_str(&format!(" print(f{k}({k}));"));
+    }
+    src.push_str(" return 0; }");
+    let (program, interner) = program_o2(&src);
+    let serial = crate::emit_object_ex(
+        &program,
+        &interner,
+        crate::EmitOptions { verify: false, parallel: false },
+    )
+    .map(|_| ())
+    .expect_err("an oversized stack slot must not compile");
+    assert!(
+        serial.contains("2000000000"),
+        "serial reported a later function than the first: {serial}"
+    );
+    for _ in 0..24 {
+        let parallel = crate::emit_object_ex(
+            &program,
+            &interner,
+            crate::EmitOptions { verify: false, parallel: true },
+        )
+        .map(|_| ())
+        .expect_err("an oversized stack slot must not compile");
+        assert_eq!(
+            serial, parallel,
+            "parallel codegen reported a different failing function than serial"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Backend compile-time A/B harness (ignored; run in RELEASE with --nocapture).
 //
