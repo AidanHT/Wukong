@@ -1098,12 +1098,18 @@ fn peer_command(ctx: &TorchCtx, script: &Path) -> Command {
 }
 
 // -------------------------------------------------------------------------------------------
-// Power-state disclosure — sustained-load timings taken on battery are not comparable to AC runs
-// (aggressive DVFS / power caps). Queried via the Win32 `GetSystemPowerStatus`, same `extern
-// "system"` pattern as `pin_worker_to_cpu` in wukong_runtime/src/gemm.rs.
+// Power-state disclosure. This machine has THREE regimes, not two, and `tools/measure_gpt2.ps1`
+// (the first-party instrument for the same workload) encodes them:
+//   * BATTERY          — NON-REPORTABLE: single-core noisy, all-core meaningless (2-4x slow).
+//   * AC + CHARGING    — ALL-CORE CAPPED: single core fine, all-core throttled ~25%.
+//   * AC + full        — REPORTABLE: an all-core number is a real claim.
+// Collapsing the middle state into "power: AC" prints a reportable-looking banner over multicore
+// rows that are power-capped. Queried via the Win32 `GetSystemPowerStatus`, same `extern "system"`
+// pattern as `pin_worker_to_cpu` in wukong_runtime/src/gemm.rs — `BatteryFlag & 0x08` is the
+// charging bit, the Win32 equivalent of the `ChargeRate > 0` test measure_gpt2.ps1 uses.
 // -------------------------------------------------------------------------------------------
 
-/// `power: AC` / `power: BATTERY — ...` / `power: unknown`, for the bench headers.
+/// One of the three states above (or `power: unknown`), for the bench headers.
 #[cfg(windows)]
 pub(crate) fn power_status_line() -> String {
     #[repr(C)]
@@ -1131,9 +1137,25 @@ pub(crate) fn power_status_line() -> String {
     if ok == 0 {
         return "power: unknown".to_string();
     }
-    match st.ac_line_status {
-        1 => "power: AC".to_string(),
-        0 => "power: BATTERY — sustained-load results not comparable to AC runs".to_string(),
+    // BatteryFlag: 1 high, 2 low, 4 critical, 8 CHARGING, 128 no system battery, 255 unknown.
+    let charging = st.battery_flag != 255 && st.battery_flag & 0x08 != 0;
+    let no_battery = st.battery_flag != 255 && st.battery_flag & 0x80 != 0;
+    let pct = if st.battery_life_percent <= 100 {
+        format!("{}%", st.battery_life_percent)
+    } else {
+        "?%".to_string()
+    };
+    match (st.ac_line_status, charging, no_battery) {
+        (1, true, _) => format!(
+            "power: AC+CHARGING ({pct}) — ALL-CORE CAPPED (~25%): single-core numbers are fine, \
+             every multicore row below is DIRECTIONAL ONLY"
+        ),
+        (1, false, true) => "power: AC (desktop, no battery) — REPORTABLE".to_string(),
+        (1, false, _) => format!("power: AC+full ({pct}) — REPORTABLE"),
+        (0, _, _) => format!(
+            "power: BATTERY ({pct}) — NON-REPORTABLE: single-core noisy, all-core meaningless \
+             (2-4x slow); not comparable to AC runs"
+        ),
         _ => "power: unknown".to_string(),
     }
 }
@@ -1841,6 +1863,12 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         cfg.s,
         flops / 1e9
     );
+    // Sample the power state BEFORE this size and again after it. A single sample at the top of
+    // the run is not enough: a size takes minutes, and an all-core burst on this box can knock the
+    // adapter off mid-sweep — after which every remaining column is battery-throttled with nothing
+    // in the output to say so. `tools/measure_gpt2.ps1` samples per regime for exactly this reason.
+    let power_before = power_status_line();
+    println!("  {power_before}");
 
     // Shared inputs: every column reads the same weight/input buffers.
     let mut seed = 0x0D15EA5E_u64;
@@ -2343,6 +2371,19 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                 println!("  cross-check Wukong serial vs @parallel: BIT-EXACT");
             }
         }
+    }
+
+    // The second power sample. A state change across the size means the columns above were taken
+    // under two different machines, so none of them is comparable to any other.
+    let power_after = power_status_line();
+    if power_after == power_before {
+        println!("  {power_after} (unchanged before -> after this size)");
+    } else {
+        println!(
+            "  !!! POWER STATE CHANGED DURING S={} — every timing above is NON-REPORTABLE\n      \
+             before: {power_before}\n      after:  {power_after}",
+            cfg.s
+        );
     }
 
     // One loud terminal line per size, so a failed or un-runnable cross-check cannot be mistaken
