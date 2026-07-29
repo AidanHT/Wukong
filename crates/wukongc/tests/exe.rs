@@ -205,8 +205,10 @@ fn exe_matches_run() {
          LLVM bitcode rather than native objects (the workspace `[profile.release]` sets \
          `lto = \"thin\"`), so `rustc_link` has to be told to consume it accordingly — that is the \
          release-profile shape of this break, and every `wukong_*` symbol then reads as \
-         unresolved. (This gate previously reported exactly this state as \"no linker toolchain to \
-         produce an exe\" and passed green, which is why the break went unreported.)\n{}",
+         unresolved. If instead exactly one or two `wukong_*` symbols are unresolved, the rlib next \
+         to the compiler is simply STALE — rebuild the workspace so it is re-uplifted. (This gate \
+         previously reported every one of these states as \"no linker toolchain to produce an \
+         exe\" and passed green, which is why the break went unreported.)\n{}",
         failures.len(),
         failures.join("\n")
     );
