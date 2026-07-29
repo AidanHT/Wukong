@@ -21,9 +21,12 @@ module examples.gpt2_forward_bench
 //   * the row softmax             -> wukong_norm_f32
 //   * the tanh-approx GELU        -> wukong_vmath_f32       (the gelu() intrinsic)
 //   * the two residual adds       -> wukong_velem_f32
-// The embed gather, the causal-mask write, and the last-position LM head stay scalar/generic-vectorized
-// (the LM head's offset-based GEMV isn't a recognized dispatch yet); at S=512 they are together well
-// under 1% of the forward's arithmetic, so they do not gate the timing.
+//   * the last-position LM head   -> wukong_sgemv           (see the shape notes at the LM head below)
+// MEASURED counts at -O2 (this is the falsifiable form of the list above — if a respelling stops a
+// recognizer firing, these change): 6 sgemm_nt_epi, 3 norm_affine_f32, 2 velem_f32, 1 sgemm_nt_alpha,
+// 1 sgemm_nt, 1 norm_f32, 1 vmath_f32, 1 sgemv.
+// Only the embed gather and the causal-mask write stay scalar/generic-vectorized; at S=512 they are
+// together well under 1% of the forward's arithmetic, so they do not gate the timing.
 //
 // Native-only (the interpreter cannot hold 124M params); gate-safe: run from a CWD without data/gpt2/
 // (as the examples test does) and it early-returns -1 identically on both backends.
