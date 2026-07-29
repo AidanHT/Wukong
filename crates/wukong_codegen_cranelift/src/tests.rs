@@ -4059,6 +4059,80 @@ fn lowered_calls(src: &str, callee: &str) -> bool {
     })
 }
 
+/// The row-loss and gather/scatter recognizers each have a serial arm and an `@parallel` arm, and
+/// nothing in the tree exercised the eight parallel ones: grepping the whole test corpus for
+/// `wukong_xent`, `wukong_kldiv`, `wukong_entropy`, `wukong_kd_loss`, `wukong_logsumexp` and
+/// `scatter` returned zero hits, and no `@parallel` fixture under `tests/run` names them. So
+/// reordering one of these arms after the elementwise outliner would silently drop a whole family
+/// back to a scalar loop with every existing test still green. Each nest is asserted to reach its
+/// serial symbol plain and its `_parallel` symbol under the attribute — both directions, so a
+/// recognizer that stops firing and one that fires unconditionally are each caught.
+#[test]
+fn parallel_row_loss_and_gather_nests_reach_their_kernels() {
+    // Two rows of four so the row loop is the parallel axis and the inner reductions are per row.
+    let xent = |a: &str| format!(
+        "module p\n{a}fn f(x:[f32;8], target:[i32;2], mut loss:[f32;2]) {{ for r in 0..2 {{ \
+         let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
+         let mut s: f32 = 0.0; for i in 0..4 {{ s = s + exp(x[r*4+i] - m); }} \
+         loss[r] = m + log(s) - x[r*4+target[r]]; }} }}");
+    let lse = |a: &str| format!(
+        "module p\n{a}fn f(x:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
+         let mut s: f32 = 0.0; for i in 0..4 {{ s = s + exp(x[r*4+i] - m); }} \
+         out[r] = m + log(s); }} }}");
+    let kldiv = |a: &str| format!(
+        "module p\n{a}fn f(p:[f32;8], q:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         let mut s: f32 = 0.0; \
+         for i in 0..4 {{ s = s + p[r*4+i] * (log(p[r*4+i]) - log(q[r*4+i])); }} \
+         out[r] = s; }} }}");
+    let entropy = |a: &str| format!(
+        "module p\n{a}fn f(p:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         let mut s: f32 = 0.0; for i in 0..4 {{ s = s + p[r*4+i] * log(p[r*4+i]); }} \
+         out[r] = -s; }} }}");
+    let kd = |a: &str| format!(
+        "module p\n{a}fn f(x:[f32;8], q:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
+         let mut z: f32 = 0.0; for i in 0..4 {{ z = z + exp(x[r*4+i] - m); }} \
+         let l: f32 = m + log(z); let mut s: f32 = 0.0; \
+         for i in 0..4 {{ s = s + q[r*4+i] * (l - x[r*4+i]); }} out[r] = s; }} }}");
+    let xbwd = |a: &str| format!(
+        "module p\n{a}fn f(x:[f32;8], target:[i32;2], mut dx:[f32;8]) {{ for r in 0..2 {{ \
+         let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
+         let mut z: f32 = 0.0; for i in 0..4 {{ z = z + exp(x[r*4+i] - m); }} \
+         let invz: f32 = 1.0 / z; \
+         for i in 0..4 {{ dx[r*4+i] = exp(x[r*4+i] - m) * invz; }} \
+         dx[r*4+target[r]] = dx[r*4+target[r]] - 1.0; }} }}");
+    let scatter = |a: &str| format!(
+        "module p\n{a}fn f(ids:[i32;4], grad_out:[f32;12], mut grad_w:[f32;6]) {{ \
+         for t in 0..4 {{ for d in 0..3 {{ grad_w[ids[t]*3+d] += grad_out[t*3+d]; }} }} }}");
+    let embed = |a: &str| format!(
+        "module p\n{a}fn f(ids:[i32;4], weight:[f32;12], mut out:[f32;12]) {{ \
+         for t in 0..4 {{ for d in 0..3 {{ out[t*3+d] = weight[ids[t]*3+d]; }} }} }}");
+
+    let cases: &[(&str, &dyn Fn(&str) -> String)] = &[
+        ("wukong_xent_fwd_f32", &xent),
+        ("wukong_logsumexp_f32", &lse),
+        ("wukong_kldiv_f32", &kldiv),
+        ("wukong_entropy_f32", &entropy),
+        ("wukong_kd_loss_f32", &kd),
+        ("wukong_xent_bwd_f32", &xbwd),
+        ("wukong_scatter_add_f32", &scatter),
+        ("wukong_embedding_f32", &embed),
+    ];
+    for (sym, mk) in cases {
+        let par = format!("{sym}_parallel");
+        assert!(lowered_calls(&mk(""), sym), "plain nest must reach {sym}");
+        assert!(
+            !lowered_calls(&mk(""), &par),
+            "plain nest must not reach {par}"
+        );
+        assert!(
+            lowered_calls(&mk("@parallel\n"), &par),
+            "@parallel nest must reach {par}"
+        );
+    }
+}
+
 /// The canonical f32 matmul nest must lower to the tuned `wukong_sgemm` microkernel (and the
 /// `@parallel` form to the parallel variant), in both the accumulate and zero-init shapes.
 #[test]
@@ -5264,12 +5338,21 @@ fn backend_compile_ab() {
     // only the backend.
     let mut progs: Vec<(String, wukong_mir::Program, Interner)> = Vec::new();
     let mut multi = 0usize;
+    // A file that legitimately declines (diagnostics) and a file that ICEs both used to arrive here
+    // as `None` — `.ok().flatten()` maps `Err(_)` and `Ok(None)` to the same value. The corpus count
+    // then quietly dropped by one, the byte-identity assertions below never ran for it, and the
+    // operator had no way to tell an unsupported program from a crash. Keep the two apart, and fail
+    // on the crash: this header claims to double as a corpus-wide gate. (Cargo ignores the
+    // workspace's `panic = "abort"` for test targets, so the unwind is catchable.)
+    let mut skipped: Vec<String> = Vec::new();
+    let mut panicked: Vec<String> = Vec::new();
     for path in &files {
+        let short = path.file_name().unwrap().to_string_lossy().into_owned();
         let Ok(src) = std::fs::read_to_string(path) else {
             continue;
         };
         // Skip files that don't cleanly reach an object (mirrors compile-profile).
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut interner = Interner::new();
             let (m, pd) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
             if pd.iter().any(|d| d.is_error()) {
@@ -5287,20 +5370,29 @@ fn backend_compile_ab() {
             crate::emit_object_ex(&p, &interner, crate::EmitOptions { verify: false, parallel: false })
                 .ok()?;
             Some((p, interner))
-        }))
-        .ok()
-        .flatten();
-        if let Some((p, interner)) = ok {
-            if p.funcs.len() > 1 {
-                multi += 1;
+        }));
+        match outcome {
+            Err(_) => panicked.push(short),
+            Ok(None) => skipped.push(short),
+            Ok(Some((p, interner))) => {
+                if p.funcs.len() > 1 {
+                    multi += 1;
+                }
+                progs.push((short, p, interner));
             }
-            progs.push((
-                path.file_name().unwrap().to_string_lossy().into_owned(),
-                p,
-                interner,
-            ));
         }
     }
+    eprintln!(
+        "corpus: {} compiled, {} skipped (diagnostics)",
+        progs.len(),
+        skipped.len()
+    );
+    assert!(
+        panicked.is_empty(),
+        "{} corpus file(s) ICEd during the front end: {:?}",
+        panicked.len(),
+        panicked
+    );
 
     let ser = crate::EmitOptions { verify: false, parallel: false };
     let ver = crate::EmitOptions { verify: true, parallel: false };
