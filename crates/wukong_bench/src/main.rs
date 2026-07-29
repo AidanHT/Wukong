@@ -180,11 +180,20 @@ struct Res {
     t_native: Duration,
 }
 
+/// Percent change in op count from `a` (-O0) to `b` (-O3), **signed**.
+///
+/// The subtraction is done in `f64`, not `usize`, because nothing guarantees `a >= b`: inlining at
+/// -O2/-O3 can make the optimized program larger than the unoptimized one. A 150-call-site corpus
+/// program measured 962 ops at -O0 and 1416 at -O3, and the old `(a - b) as f64` wrapped that into a
+/// printed `1917540964003072000.0%` — corrupting the row *and* the TOTAL — while a debug build (where
+/// overflow checks are on) would instead panic and abort the whole optimizer-equivalence gate.
+/// A negative value, which the `{:>8.1}%` format already renders as `-47.2%`, is the honest report
+/// for a program the optimizer grows.
 fn reduction(a: usize, b: usize) -> f64 {
     if a == 0 {
         0.0
     } else {
-        100.0 * (a - b) as f64 / a as f64
+        100.0 * (a as f64 - b as f64) / a as f64
     }
 }
 
