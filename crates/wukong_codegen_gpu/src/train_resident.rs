@@ -269,11 +269,18 @@ mod tests {
     use crate::diff::{assert_close, Rng};
     use crate::gpu::gpu;
 
+    /// Run `body` with the shared GPU, or skip **loudly** (§3A P3 — see [`crate::diff::skip_or_fail`])
+    /// if none is present. The skip names the driver's actual error, and `WUKONG_GPU_REQUIRED=1` turns
+    /// it into a failure so a box that is supposed to have a device cannot report a green training gate
+    /// having run nothing.
     fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
         let mut guard = gpu();
         match guard.as_mut() {
             Some(g) => body(g),
-            None => eprintln!("[skip] {name}: no CUDA device reachable"),
+            None => crate::diff::skip_or_fail(
+                name,
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            ),
         }
     }
 
