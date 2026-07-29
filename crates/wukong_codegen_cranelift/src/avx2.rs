@@ -13,11 +13,18 @@
 //! `define_function_bytes`) and — for the differential oracle — the interpreter marshals lane-wise
 //! from the *same* recipe. Elementwise lanes are bit-identical across the two; the gate polices it.
 //!
-//! ABI of an assembled kernel (Windows/SysV both pass the first args in registers we normalize to):
-//! `fn(ptrs: *const *mut u8, scalars: *const f32, n: u64)`. `ptrs[k]` is the base of stream `k`,
-//! `scalars[k]` the k-th loop-invariant f32, `n` the (multiple-of-8) element count the caller assigns
-//! to the vector part; the caller runs the scalar remainder itself. The kernel touches only volatile
-//! registers, makes no calls, and ends with `vzeroupper` — so no prologue/epilogue is needed.
+//! ABI of an assembled kernel: `fn(ptrs: *const *mut u8, scalars: *const f32, n: u64)`. `ptrs[k]` is
+//! the base of stream `k`, `scalars[k]` the k-th loop-invariant f32, `n` the (multiple-of-8) element
+//! count the caller assigns to the vector part; the caller runs the scalar remainder itself. The
+//! kernel touches only volatile registers, makes no calls, and ends with `vzeroupper` — so no
+//! prologue/epilogue is needed beyond the callee-saved xmm halves Win64 requires.
+//!
+//! The body reads its three arguments out of **rcx/rdx/r8** — the Win64 integer argument registers —
+//! and executes VEX.256 AVX2 + FMA3 encodings. Neither is negotiable here: the register mapping is
+//! literal in the emitted bytes, and there is no runtime dispatch inside a kernel. So
+//! [`assemble_kernel`] refuses on any host that does not supply both (see [`host_supports_kernels`]),
+//! which is the only CPU-feature gate on this path — the Cranelift side declares the kernel with the
+//! module's `default_call_conv` and installs the bytes verbatim, so a mismatch is silent corruption.
 
 #![allow(dead_code)] // Phase A: assembler proven in isolation before the vectorizer wires it in.
 
@@ -25,10 +32,26 @@ use iced_x86::code_asm::*;
 use wukong_mir::{VecBin, VecCmp, VecKernel, VecOp, VecPressure, VecRedOp};
 
 /// f32 lanes per YMM register (256-bit / 32-bit).
-pub const LANES: u32 = 8;
+pub const LANES: u32 = wukong_mir::VEC_LANES;
 const GROUP_BYTES: i32 = (LANES * 4) as i32;
 /// Total architectural YMM registers.
-const NREG: u8 = 16;
+const NREG: u32 = wukong_mir::VEC_NREG;
+
+/// Whether this host can run the machine code this module emits: the AVX2 + FMA3 instructions the
+/// body encodes, delivered under the Win64 argument-register mapping (rcx/rdx/r8) the body hardcodes.
+/// Every other AVX2 consumer in the tree (`wukong_runtime`'s gemm/gemv/attention/… kernels) gates the
+/// same way and keeps a scalar twin; this path has no in-kernel fallback, so the gate is the refusal
+/// in [`assemble_kernel`]. `is_x86_feature_detected!` caches its CPUID probe, so this is cheap.
+pub fn host_supports_kernels() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    {
+        false
+    }
+}
 
 fn ymm(n: u8) -> AsmRegisterYmm {
     [
@@ -89,13 +112,16 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
         last_use,
         per_group,
     } = pressure;
-    let per_group = per_group as u8;
-    let hoist = hoist_scalars.len() as u8 + needs_signmask as u8;
-    if per_group as u32 + hoist as u32 > NREG as u32 {
+    // Prove the bound in u32 and narrow only after: a `per_group` of 256 truncates to 0 (integer
+    // divide by zero below), 257 truncates to 1 (`free.pop()` panics), so a body that overflows must
+    // become the promised `Err` and not a panic reaching the user through the driver.
+    let hoist = hoist_scalars.len() as u32 + needs_signmask as u32;
+    if per_group == 0 || per_group + hoist > NREG {
         return Err(format!(
             "avx2: body needs {per_group}+{hoist} > {NREG} registers"
         ));
     }
+    let (per_group, hoist) = (per_group as u8, hoist as u8);
     // A reduction additionally needs one accumulator register per unrolled copy; an elementwise
     // kernel needs none. The unroll comes from `wukong_mir` (single-sourced with the interpreter's
     // `eval_reduction`, which must pick the same number of accumulators to reassociate identically).
@@ -111,7 +137,7 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
         // Interleave as many groups as fit (dense from ymm0), capped by the requested unroll.
         k.unroll
             .max(1)
-            .min(((NREG - hoist) / per_group) as u32)
+            .min((NREG - hoist as u32) / per_group as u32)
             .max(1)
     };
 
@@ -154,9 +180,17 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
 }
 
 /// Assemble `k` into a self-contained AVX2 function `fn(ptrs, scalars, n)` (Win64 ABI: rcx, rdx,
-/// r8). Returns the raw machine code, or `Err` if the body is outside this emitter's coverage (the
-/// caller then keeps the differential-safe 128-bit vectorizer path).
+/// r8). Returns the raw machine code, or `Err` if the host cannot run these bytes at all, or if the
+/// body is outside this emitter's coverage.
 pub fn assemble_kernel(k: &VecKernel) -> Result<Vec<u8>, String> {
+    // The ISA/ABI gate comes first: the bytes below are AVX2+FMA3 under the Win64 argument
+    // registers, with no in-kernel dispatch. Emitting them for a host that lacks either is a #UD at
+    // the first `vmovups ymm` or a wild dereference of whatever rcx held — neither diagnosable.
+    if !host_supports_kernels() {
+        return Err(
+            "avx2: host lacks AVX2+FMA3 under the Win64 ABI these kernels encode".to_string(),
+        );
+    }
     let plan = plan_registers(k)?;
     emit(k, &plan).map_err(|e| format!("avx2 encode: {e}"))
 }
@@ -444,9 +478,9 @@ fn fold_ss(a: &mut CodeAssembler, op: VecRedOp, src: AsmMemoryOperand) -> Result
 pub fn assemble_saxpy_probe() -> Result<Vec<u8>, IcedError> {
     let mut a = CodeAssembler::new(64)?;
 
-    // Args (SysV: rdi,rsi,rdx / Win64: rcx,rdx,r8). This bring-up test drives it through the host
-    // C ABI directly, so we branch on target below when calling; the body uses the Win64 mapping
-    // because that is this box. rcx = ptrs, rdx = scalars, r8 = n.
+    // Win64 argument registers: rcx = ptrs, rdx = scalars, r8 = n — the same hardcoded mapping the
+    // recipe emitter uses, and the reason `host_supports_kernels` refuses non-Windows hosts. The
+    // caller drives this through the host C ABI directly, so it is only valid where that gate passes.
     a.mov(r9, qword_ptr(rcx))?; // x   = ptrs[0]
     a.mov(r10, qword_ptr(rcx + 8))?; // y   = ptrs[1]
     a.mov(r11, qword_ptr(rcx + 16))?; // out = ptrs[2]
@@ -483,6 +517,9 @@ mod tests {
     /// it, and check it computed `a*x + y` in true 256-bit strides. This is the whole raw-AVX2 seam.
     #[test]
     fn avx2_saxpy_kernel_runs() {
+        if !host_supports_kernels() {
+            return; // these bytes are not executable here — see `host_supports_kernels`
+        }
         let bytes = assemble_saxpy_probe().expect("assemble");
         assert!(!bytes.is_empty());
         if std::env::var("P4_DUMP").is_ok() {
@@ -535,6 +572,9 @@ mod tests {
     /// the `VecKernel::eval_lane` reference **bit-for-bit** on every full-vector lane `[0, n/8*8)`.
     /// Inputs may alias outputs (in-place); the reference mutates its own copy the same way.
     fn check(k: &VecKernel, init: &[Vec<f32>], scalars: &[f32], n: usize) {
+        if !host_supports_kernels() {
+            return; // these bytes are not executable here — see `host_supports_kernels`
+        }
         let bytes = assemble_kernel(k).expect("assemble");
 
         // Reference: run eval_lane over its own mutable copy of the streams.
@@ -589,6 +629,9 @@ mod tests {
     /// assert its f32 return matches [`VecKernel::eval_reduction`] **bit-for-bit** — the same
     /// reassociation on both. Reduction kernels only read their streams, so `*const` suffices.
     fn check_reduce(k: &VecKernel, streams: &[Vec<f32>], scalars: &[f32], n: usize) {
+        if !host_supports_kernels() {
+            return; // these bytes are not executable here — see `host_supports_kernels`
+        }
         let bytes = assemble_kernel(k).expect("assemble reduction");
         let vlen = n / LANES as usize * LANES as usize;
         let want =
@@ -1084,5 +1127,27 @@ mod tests {
             ],
         };
         assert!(assemble_kernel(&k).is_err(), "5 streams must bail to fallback");
+    }
+
+    /// `assemble_kernel` promises `Err` for a body it cannot express, and callers rely on that (the
+    /// message reaches the user through the driver; a panic would not). A body with exactly 256 live
+    /// values used to narrow to `per_group == 0` *before* the bound was checked, so it slipped past
+    /// the register guard and divided by zero computing the unroll. The vectorizer's own u32 gate
+    /// rejects such a body first today, but this entry point must stand on its own.
+    #[test]
+    fn avx2_kernel_bails_on_register_overflow() {
+        let mut ops: Vec<VecOp> = (0..256).map(|_| VecOp::Load { stream: 0 }).collect();
+        ops.push(VecOp::Store { stream: 1, val: 0 });
+        let k = VecKernel {
+            name: sym(),
+            streams: 2,
+            scalars: 0,
+            unroll: 1,
+            reduce: None,
+            ops,
+        };
+        assert_eq!(k.pressure().map(|p| p.per_group), Some(256), "test premise");
+        let err = assemble_kernel(&k).expect_err("256 live values must bail, not panic");
+        assert!(err.contains("registers") || err.contains("Win64"), "unexpected: {err}");
     }
 }
