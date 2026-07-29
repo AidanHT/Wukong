@@ -31,7 +31,9 @@
 //!   printed note + skipped columns otherwise), the harness dumps the *exact* weight/input
 //!   buffers as little-endian f32 blobs and generates a self-contained PyTorch script that
 //!   rebuilds the identical forward: `F.linear` computes `x·Wᵀ` over the same `[out,in]`
-//!   row-major weights Wukong/C use (the layouts coincide — no transposition), `F.layer_norm`
+//!   row-major weights Wukong/C use (the layouts coincide — no transposition), with the Q/K/V
+//!   weights concatenated into HuggingFace's fused `c_attn` `[3D, D]` form (see Known
+//!   asymmetries — the peer is deliberately built the strong way), `F.layer_norm`
 //!   at the same eps=1e-5, the same tanh-approx GELU via `F.gelu(approximate="tanh")`, and
 //!   multi-head causal attention two ways — `F.scaled_dot_product_attention(is_causal=True)`
 //!   (the fused industry path) *and* a manual matmul+softmax variant — under
@@ -86,6 +88,14 @@
 //! * Wukong's GEMMs go to the tuned AVX2/FMA microkernel; C's stay whatever gcc makes of the
 //!   idiomatic nests. That *is* the product claim being measured (a shape-safe tensor language
 //!   whose compiler lowers to tuned kernels), the same basis as `bench_matmul`/`bench_linear`.
+//! * **The torch peer's Q/K/V projection is FUSED and Wukong's is not** — an asymmetry in the
+//!   PEER's favour, on purpose. HuggingFace's `GPT2Attention` issues one `Conv1D` `c_attn` of
+//!   shape `[D, 3D]` (a single `[S,D]x[D,3D]` GEMM), so the peer does too; the Wukong and C
+//!   columns issue three separate `[S,D]x[D,D]` projections. A benchmark must run against the
+//!   strongest honest peer, not the convenient weak one, and QKV fusion is a known open Wukong
+//!   lever — so this ratio charges Wukong for not having it yet. The fusion is bit-exact with the
+//!   three separate `F.linear` calls (same weights, same dot products), so the cross-check
+//!   tolerance is unaffected. The disclosure is printed beside the ratio lines, not only here.
 //! * The `@parallel` Wukong column is fully multicore, in two tiers: the whole-`[S,D]` ops
 //!   outside the head loop (LayerNorms, Q/K/V/WO/down-proj GEMMs, fused-GELU FFN, residual adds)
 //!   dispatch `_parallel` kernels (each bit-identical to its serial twin), and the per-head
@@ -1220,6 +1230,13 @@ for _ in range(LAYERS):
     for n, sh in zip(sizes, shapes):
         ws.append(wbuf[off:off + n].clone().view(sh))
         off += n
+    # HuggingFace GPT2Attention issues the Q/K/V projection as ONE fused `Conv1D` c_attn of shape
+    # [D, 3D] — a single [S,D]x[D,3D] GEMM, not three [S,D]x[D,D] ones. The peer must be the
+    # STRONGEST honest implementation of this forward, so it is built the reference way. It is the
+    # same arithmetic on the same bytes (each output column is the same dot product), verified
+    # bit-exact against the three separate F.linear calls, so the vs-Wukong cross-check tolerance
+    # is unchanged.
+    ws[2:5] = [torch.cat(ws[2:5], dim=0)]     # wq|wk|wv  ->  wqkv [3D, D]
     layers.append(ws)
 assert off == wbuf.numel(), "weight blob size mismatch"
 iobuf = load(IO_PATH)
@@ -1236,12 +1253,17 @@ MASK = torch.triu(torch.ones(S, S, dtype=torch.bool), diagonal=1)
 # One pre-LN block. Linear weights are [out, in] row-major — torch's own x @ W.T layout, byte-
 # identical to what Wukong/C dot against. GELU is the tanh approximation, matching Wukong's
 # gelu() and the C column exactly (same flavor, so the cross-check needs no loosening).
+# The Q/K/V projection is the FUSED HuggingFace `c_attn` form: one [S,D]x[D,3D] GEMM split into
+# three [S,D] views (bit-exact with three separate F.linear calls). Wukong and C issue three
+# separate [D,D] projections — a disclosed asymmetry in the PEER's favour, printed next to the
+# ratio lines, because the peer's job is to be the strongest honest baseline.
 def block(x, w, manual):
-    ln1g, ln1b, wq, wk, wv, wo, ln2g, ln2b, w1, w2 = w
+    ln1g, ln1b, wqkv, wo, ln2g, ln2b, w1, w2 = w
     nrm = F.layer_norm(x, LNSHAPE, ln1g, ln1b, 1e-5)
-    q = F.linear(nrm, wq).view(S, H, HD).transpose(0, 1)
-    k = F.linear(nrm, wk).view(S, H, HD).transpose(0, 1)
-    v = F.linear(nrm, wv).view(S, H, HD).transpose(0, 1)
+    q, k, v = F.linear(nrm, wqkv).split(D, dim=1)
+    q = q.view(S, H, HD).transpose(0, 1)
+    k = k.view(S, H, HD).transpose(0, 1)
+    v = v.view(S, H, HD).transpose(0, 1)
     if manual:
         sc = torch.matmul(q, k.transpose(-2, -1)) * SCALE
         sc = sc.masked_fill(MASK, NEGINF)
@@ -1601,7 +1623,9 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
                  mode=\"max-autotune\", fullgraph=True) (T1c/Tnc). {compile_env}.\n  Same \
                  weights/inputs via little-endian f32 blobs; T1 = set_num_threads(1), Tn = default \
                  all threads;\n  sdpa = F.scaled_dot_product_attention (fused industry path), man = \
-                 manual matmul+softmax; comp = TorchInductor-compiled whole forward.\n",
+                 manual matmul+softmax; comp = TorchInductor-compiled whole forward.\n  Peer \
+                 strength: Q/K/V is ONE fused [D,3D] projection (HuggingFace GPT2 `c_attn`); \
+                 Wukong and C issue three [D,D] projections.\n",
                 t.version, t.py, t.threads
             );
         }
@@ -2233,6 +2257,17 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         "@parallel",
         "PyTorch compiled max-autotune (all threads)",
     );
+    // Disclosed AT THE POINT THE NUMBER IS PRINTED, not only in the module header: every torch
+    // ratio above is measured against the FUSED-c_attn peer, which is the strongest honest form of
+    // this forward and stronger than what Wukong currently emits.
+    if torch1_m.is_some() || torchn_m.is_some() || torch1c_m.is_some() || torchnc_m.is_some() {
+        println!(
+            "     (peer-strength disclosure: the torch columns use HuggingFace GPT2's FUSED \
+             [D,3D] c_attn Q/K/V projection — ONE GEMM; Wukong and C issue THREE [D,D] \
+             projections. QKV fusion is an open Wukong lever, so these ratios charge Wukong for \
+             not having it.)"
+        );
+    }
     if wk_par_m.is_some() {
         println!(
             "     (thread disclosure: both C columns and the T1 torch columns are \
@@ -2428,6 +2463,35 @@ mod tests {
         assert!(
             !restc.iter().any(|(k, _)| k == "wukong_sgemm_nt"),
             "@parallel block emits serial wukong_sgemm_nt outside the region; got {restc:?}"
+        );
+    }
+
+    /// The peer must stay the STRONGEST honest implementation of this forward. The model bench
+    /// previously compared against an unfused manual forward rather than the `Conv1D`-fused
+    /// HuggingFace path, and the strongest-peer measurement of the same workload came out the
+    /// other way round — so the fused `c_attn` form is pinned here, not left to review.
+    #[test]
+    fn torch_peer_uses_the_fused_hf_qkv_projection() {
+        let cfg = Cfg { s: 128, d: 768, h: 12, dff: 3072 };
+        let p = Path::new("unused.bin");
+        let src = torch_script(cfg, p, p, p, p, true);
+        assert!(
+            src.contains("ws[2:5] = [torch.cat(ws[2:5], dim=0)]"),
+            "peer no longer builds HuggingFace's fused [3D, D] c_attn weight"
+        );
+        assert!(
+            src.contains("q, k, v = F.linear(nrm, wqkv).split(D, dim=1)"),
+            "peer no longer issues the Q/K/V projection as ONE fused GEMM"
+        );
+        assert!(
+            !src.contains("F.linear(nrm, wq)"),
+            "peer regressed to three separate Q/K/V projections — that is the weaker peer the \
+             band standard forbids"
+        );
+        // The asymmetry must be disclosed where the ratio is read, not only in a doc elsewhere.
+        assert!(
+            src.contains("HuggingFace"),
+            "the fused-projection asymmetry lost its in-script disclosure"
         );
     }
 
