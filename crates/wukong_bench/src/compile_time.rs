@@ -158,10 +158,16 @@ fn measure_one(path: &Path) -> Meas {
     let ops3 = count_ops(&a);
 
     // Front-end: parse + sema + mir_build, re-run from source with a fresh interner each rep.
+    // Bind the result and stop the clock before dropping it: `let _ = lower(&src);` drops the
+    // returned Program+Interner *before* `elapsed()`, charging the front-end for tearing down its
+    // own output, while the `opt` measurement below never pays that (its scratch clone outlives the
+    // closure). That asymmetry inflates `front`, and the headline `opt%` is a ratio of the two.
     let front = best_of(|| {
         let t0 = Instant::now();
-        let _ = lower(&src);
-        t0.elapsed()
+        let out = lower(&src);
+        let e = t0.elapsed();
+        drop(out);
+        e
     });
 
     // Optimizer: clone the lowered program (untimed), then time `optimize` alone.

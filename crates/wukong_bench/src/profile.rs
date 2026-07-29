@@ -244,24 +244,39 @@ fn measure_one(path: &Path) -> Option<Prof> {
     let obj = wukong_codegen_cranelift::emit_object(&p_opt, &interner).ok()?;
     let obj_bytes = obj.len();
 
+    // CONVENTION: every stage times CONSTRUCTION of its output only. Each rep binds the result,
+    // stops the clock, and only then drops it — because `let _ = f();` drops the temporary *before*
+    // `t.elapsed()` runs, charging that stage for tearing its own artifact down. `optimize` never
+    // paid that (its scratch clone outlives the closure), so the table was comparing five
+    // build+destroy stages against one build-only stage. Measured on the 346-file corpus, the
+    // destruction inside the timed region was a median 16.7% of `parse` (p90 19.0%, max 21.4%),
+    // 3.9% of `sema` and 2.3% of `mir_build`, against ~0% for `lex` and `backend`, whose outputs are
+    // single flat allocations. Shares are per-stage attribution, so that bias was not cosmetic.
+
     // Lex: input is the source text (fixed).
     let lex = best_of(|| {
         let t = Instant::now();
-        let _ = wukong_lexer::tokenize(&src, SourceId(0));
-        t.elapsed()
+        let out = wukong_lexer::tokenize(&src, SourceId(0));
+        let e = t.elapsed();
+        drop(out);
+        e
     });
     // Parse: input is the fixed token stream; a fresh interner each rep (parse interns identifiers).
     let parse = best_of(|| {
         let mut it = Interner::new();
         let t = Instant::now();
-        let _ = wukong_parser::parse_module_tokens_from(&tokens, &src, &mut it, 0);
-        t.elapsed()
+        let out = wukong_parser::parse_module_tokens_from(&tokens, &src, &mut it, 0);
+        let e = t.elapsed();
+        drop(out);
+        e
     });
     // Sema: reads the fixed module + interner and mutates neither, so time it directly.
     let sema_t = best_of(|| {
         let t = Instant::now();
-        let _ = wukong_sema::check(&module, &interner);
-        t.elapsed()
+        let out = wukong_sema::check(&module, &interner);
+        let e = t.elapsed();
+        drop(out);
+        e
     });
     // MIR build: needs a pristine interner (it extends it with kernel symbols). Rebuild module+sema
     // from the fixed tokens each rep, untimed, then time only `lower_program`.
@@ -270,8 +285,10 @@ fn measure_one(path: &Path) -> Option<Prof> {
         let (m, _, _) = wukong_parser::parse_module_tokens_from(&tokens, &src, &mut it, 0);
         let (s, _) = wukong_sema::check(&m, &it);
         let t = Instant::now();
-        let _ = wukong_mir_build::lower_program(&m, &s, &mut it);
-        t.elapsed()
+        let out = wukong_mir_build::lower_program(&m, &s, &mut it);
+        let e = t.elapsed();
+        drop(out);
+        e
     });
     // Optimize: clone the unoptimized program each rep (untimed), then time `optimize`.
     let optimize = best_of(|| {
@@ -283,8 +300,10 @@ fn measure_one(path: &Path) -> Option<Prof> {
     // Backend: Cranelift codegen + object serialization on the fixed optimized program.
     let backend = best_of(|| {
         let t = Instant::now();
-        let _ = wukong_codegen_cranelift::emit_object(&p_opt, &interner);
-        t.elapsed()
+        let out = wukong_codegen_cranelift::emit_object(&p_opt, &interner);
+        let e = t.elapsed();
+        drop(out);
+        e
     });
     // Backend split (isel/regalloc/emit vs object-container write). `emit_object_timed` returns the
     // two halves from *inside* the backend; take a best-of-N min of each independently so the split
