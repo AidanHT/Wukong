@@ -28,6 +28,37 @@ fn compile_native(src: &str, opt: u8) -> crate::JitProgram {
     crate::jit_compile(&program, main, &interner).expect("jit compile")
 }
 
+/// Orders every test that sets, clears, or *depends on* `WUKONG_P4_NO_256`.
+///
+/// The switch is read from the process environment in the middle of MIR lowering
+/// (`wukong_mir_build`), so a test that mutates it steers any lowering running concurrently on
+/// another test thread. That is observable both ways. A writer running while a reader lowers turns
+/// the reader's 256-bit program into a 128-bit one: `p4_vec256_coverage_sweep` still passes (both
+/// widths are correct) but the coverage it exists to lock goes dark, and `p4_vec256_general_matches_interp`
+/// fails outright on its "expected a synthesized vector kernel" assertion — which is exactly what
+/// happened when `p4_kill_switch_is_result_identical` was added without this. Symmetrically, one
+/// bench clearing the variable while the other compiles its `p128` turns a reported "128 vs 256"
+/// ratio into a 256-vs-256 comparison reading ~1.00x.
+///
+/// Readers ([`p4_read_lock`]) take it shared and still run concurrently with each other; only the
+/// mutators ([`p4_write_lock`]) exclude, across their whole set/compile/clear window. Poison is
+/// ignored: one failing test must not cascade into the rest.
+///
+/// This orders the *tests*; it cannot order a `getenv` in some other crate's test. The complete fix
+/// is to stop reading the environment inside lowering and thread the choice down as a compile option
+/// — that lives in `wukong_mir_build`.
+static P4_ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// For a test that requires the default (256-bit) lowering and does not touch the variable.
+fn p4_read_lock() -> std::sync::RwLockReadGuard<'static, ()> {
+    P4_ENV_LOCK.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// For a test that sets or clears `WUKONG_P4_NO_256`; held across the entire window.
+fn p4_write_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+    P4_ENV_LOCK.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A same-run A/B of the 256-bit AVX2 recipe vs the 128-bit CLIF vectorizer on one compute-heavy
 /// elementwise kernel. Reports the best-of-N wall-clock ratio (best-of controls for this laptop's
 /// clock/thermal drift; alternating A/B/A/B keeps the two measurements adjacent). Ignored by default
@@ -36,6 +67,7 @@ fn compile_native(src: &str, opt: u8) -> crate::JitProgram {
 #[test]
 #[ignore]
 fn p4_bench_256_vs_128() {
+    let _env = p4_write_lock();
     // Compute-bound, L1-resident body: a high arithmetic-intensity FMA chain (no sqrt, no memory
     // spill) over a 512-element array (3×2KB ≪ L1), repeated so wall-clock dominates setup. This
     // isolates the SIMD-width win; memory-bound bodies (large arrays, few flops/elem) see less
@@ -89,6 +121,7 @@ fn p4_bench_256_vs_128() {
 #[test]
 #[ignore]
 fn p4_bench_reduction_256_vs_128() {
+    let _env = p4_write_lock();
     // One `+ addend` off `s` (so `reduction_of` claims it); the addend's top `*` fuses via FMA. N is
     // ≥ `VEC256_REDUCTION_MIN_TRIP` so the gated 256-bit path actually fires (below it, both compile to
     // the inlined 128-bit reduction and this would compare 128 against 128).
@@ -136,6 +169,7 @@ fn p4_bench_reduction_256_vs_128() {
 /// drifts, one of these fails.
 #[test]
 fn p4_vec256_coverage_sweep() {
+    let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this sweep
     // Each body computes `o[i]` (or updates a stream in place) from streams a,b,c and scalar `k`.
     let bodies: &[&str] = &[
         "o[i] = a[i] + b[i] - c[i]",
@@ -150,6 +184,16 @@ fn p4_vec256_coverage_sweep() {
         "o[i] = a[i] * b[i] + a[i] * c[i] - b[i] * c[i] + a[i]",     // load reuse (CSE)
         "a[i] = a[i] * a[i] + 1.0",                                  // in-place, output=input
         "o[i] = sqrt(a[i]) * k - b[i] / c[i] + a[i] * b[i]",         // mixed, 3 streams + scalar
+        // Repeated-operand class: one op names the same value twice, then further allocating ops
+        // follow with no operand death between. That is the precondition for the emitter to release
+        // one register twice and hand it to two later allocations; no body above had it, so
+        // `o[i] = a[i]*a[i] + b[i]*c[i]` compiled to `a*a + c*c` while this sweep stayed green.
+        "o[i] = a[i] * a[i] + b[i] * c[i]",                          // dup, then two loads
+        "o[i] = a[i] * a[i] + b[i] * b[i] + b[i]",                   // dup, then dup
+        "o[i] = sqrt(a[i] * a[i]) + (-b[i])",                        // dup under sqrt, then neg
+        "o[i] = a[i] * a[i] + b[i] + c[i]",
+        "o[i] = a[i] + a[i] + b[i] * c[i]",
+        "o[i] = a[i] * a[i] * b[i] * c[i]",
     ];
     // Trip counts around the 8-lane group boundary, its multiples, and non-multiples (tail).
     let sizes: &[usize] = &[1, 2, 7, 8, 9, 15, 16, 17, 24, 63, 64, 65, 100, 255, 256, 257];
@@ -182,6 +226,97 @@ fn p4_vec256_coverage_sweep() {
                     .unwrap_or_else(|e| panic!("jit -O0 [{form} n={n}] `{body}`: {e}"));
                 assert_eq!(o0, native, "-O0 vs -O3 [{form} n={n}] `{body}`");
             }
+        }
+    }
+}
+
+/// `WUKONG_P4_NO_256=1` is documented as two things at once (wukong_mir_build/src/lib.rs:13864): a
+/// same-run A/B knob for measuring the 256-bit win, and a kill-switch should a body ever be found
+/// miscompiled. Both readings require the same property — flipping it must not change what a program
+/// computes — and nothing demonstrated that. This test does: for each body it compiles the SAME source
+/// twice under one lock, once with the switch clear and once set, and requires byte-identical stdout
+/// and exit code.
+///
+/// It is non-vacuous by construction: the switch-clear compile must synthesize at least one
+/// `vec_kernels` entry (else the two sides are the same 128-bit code and the comparison proves
+/// nothing) and the switch-set compile must synthesize none. Bodies a runtime recognizer claims
+/// first — `a[i]*k + b[i]` (velem saxpy), relu — never reach the recipe and so are not listed here;
+/// `p4_vec256_coverage_sweep` covers those.
+///
+/// The A/B is also a real miscompile detector, since the 128-bit CLIF path is the control: the
+/// repeated-operand bodies below disagreed across the switch before the emitter released a repeated
+/// operand's register only once, and the `x + y*z` body disagreed before the recipe learned to
+/// contract its multiply-add like the scalar tail it shares a loop with.
+#[test]
+fn p4_kill_switch_is_result_identical() {
+    let _env = p4_write_lock();
+    let bodies: &[&str] = &[
+        "o[i] = a[i] + b[i] - c[i]",
+        "o[i] = a[i] * b[i] * c[i]",
+        "o[i] = a[i] / (b[i] + 1.0)",
+        "o[i] = -a[i] + b[i] * c[i]",
+        "o[i] = sqrt(a[i] * a[i] + b[i] * b[i])",
+        "o[i] = if a[i] > b[i] { a[i] } else { b[i] }",
+        "o[i] = a[i] * b[i] + a[i] * c[i] - b[i] * c[i] + a[i]",
+        "a[i] = a[i] * a[i] + 1.0",
+        "o[i] = sqrt(a[i]) * k - b[i] / c[i] + a[i] * b[i]",
+        // add-of-product: the vector part must round exactly like the scalar tail beside it.
+        "o[i] = a[i] + b[i] * c[i]",
+        "o[i] = a[i] * b[i] + c[i]",
+        // repeated-operand class (one op naming the same value twice).
+        "o[i] = a[i] * a[i] + b[i] * c[i]",
+        "o[i] = a[i] * a[i] + b[i] * b[i] + b[i]",
+        "o[i] = sqrt(a[i] * a[i]) + (-b[i])",
+        "o[i] = a[i] * a[i] + b[i] + c[i]",
+        "o[i] = a[i] + a[i] + b[i] * c[i]",
+        "o[i] = a[i] * a[i] * b[i] * c[i]",
+    ];
+    // Around and across the 8-lane group boundary: whole groups, unroll multiples, and every tail
+    // width — the vector part and the scalar remainder of one loop must agree with each other AND
+    // with the 128-bit compile of the same source.
+    let sizes: &[usize] = &[8, 9, 16, 17, 63, 100, 257];
+    // Inputs chosen so the add-of-product bodies land on a value that fma and mul-then-add round
+    // differently: a = -(1+2^-11), b = c = 1+2^-12, all exact in f32. `x + y*y` is 0 with two
+    // roundings and 2^-24 with one, and the `* 16777216.0` in the program makes that visible.
+    let src_of = |body: &str, n: usize| {
+        format!(
+            "fn main() -> i32 {{ \
+               let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+               let mut c: [f32; {n}] = [0.0; {n}]; let mut o: [f32; {n}] = [0.0; {n}]; \
+               let k: f32 = 1.5; \
+               for j in 0..{n} {{ a[j] = -1.00048828125; b[j] = 1.000244140625; c[j] = 1.000244140625; }} \
+               for i in 0..{n} {{ {body}; }} \
+               let mut s: f32 = 0.0; for j in 0..{n} {{ s = s + (a[j] + o[j]) * 16777216.0; }} \
+               print(s); print(o[0] * 16777216.0); print(o[{last}] * 16777216.0); \
+               return ((s as i32) & 255); }}",
+            last = n - 1,
+        )
+    };
+
+    let kernels = |src: &str| -> usize {
+        let (p, _) = lowered(src, 3);
+        p.funcs.iter().map(|f| f.vec_kernels.len()).sum()
+    };
+    for body in bodies {
+        for &n in sizes {
+            let src = src_of(body, n);
+            std::env::remove_var("WUKONG_P4_NO_256");
+            let k256 = kernels(&src);
+            let wide = jit(&src, 3).unwrap_or_else(|e| panic!("256-bit [n={n}] `{body}`: {e}"));
+            std::env::set_var("WUKONG_P4_NO_256", "1");
+            let k128 = kernels(&src);
+            let narrow = jit(&src, 3).unwrap_or_else(|e| panic!("128-bit [n={n}] `{body}`: {e}"));
+            std::env::remove_var("WUKONG_P4_NO_256");
+
+            assert!(k256 > 0, "vacuous: no 256-bit kernel for [n={n}] `{body}`");
+            assert_eq!(k128, 0, "WUKONG_P4_NO_256=1 still built a kernel [n={n}] `{body}`");
+            assert_eq!(
+                wide, narrow,
+                "WUKONG_P4_NO_256 changed the result [n={n}] `{body}`"
+            );
+            // …and the interpreter, which marshals the same recipe, agrees with both.
+            let oracle = interp(&src, 3).unwrap_or_else(|e| panic!("interp [n={n}] `{body}`: {e}"));
+            assert_eq!(wide, oracle, "256-bit vs interp [n={n}] `{body}`");
         }
     }
 }
@@ -3311,12 +3446,14 @@ fn p4_reduction_f64_reference() {
 /// `fmax`/`fmin`.
 #[test]
 fn p4_reduction256_gate_and_differential() {
+    let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this gate
     // Full program: init streams a,b (deterministic, both signs), then the reduction `red`, print s.
     let mk = |n: usize, red: &str| {
         format!(
             "fn main() -> i32 {{ let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+             let mut c: [f32; {n}] = [0.0; {n}]; \
              let mut i: i32 = 0; while i < {n} {{ a[i] = ((i % 23) as f32) * 0.5 - 3.0; \
-             b[i] = ((i % 19) as f32) * 0.25 + 0.5; i += 1; }} \
+             b[i] = ((i % 19) as f32) * 0.25 + 0.5; c[i] = ((i % 17) as f32) * 0.125 - 1.0; i += 1; }} \
              {red} print(s); return ((s as i32) & 1023); }}"
         )
     };
@@ -3329,6 +3466,18 @@ fn p4_reduction256_gate_and_differential() {
             ("plain", format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + (a[k] - b[k]); }}")),
             ("fmax", format!("let mut s: f32 = -1000.0; for k in 0..{n} {{ s = fmax(s, a[k]*b[k]); }}")),
             ("fmin", format!("let mut s: f32 = 1000.0; for k in 0..{n} {{ s = fmin(s, a[k]*b[k]); }}")),
+            // The addend names `a[k]` twice and then loads two more streams, so the emitter released
+            // one register twice and handed it to both loads. The reduction path takes the same
+            // `emit_group` code as the elementwise one and was equally miscompiled — it folded
+            // `(a*a)*(c*c)` for `(a*a)*(b*c)` — and no fold shape above reaches that state.
+            (
+                "dup operand fused",
+                format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + (a[k]*a[k]) * (b[k]*c[k]); }}"),
+            ),
+            (
+                "dup operand plain",
+                format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + (a[k]*a[k] + b[k]*c[k]); }}"),
+            ),
         ]
     };
 
@@ -3600,6 +3749,7 @@ fn fusion_collapses_adjacent_loops() {
 /// pins native -O0 == -O3 (the recipe is opaque to the optimizer, so both must match).
 #[test]
 fn p4_vec256_general_matches_interp() {
+    let _env = p4_read_lock(); // asserts a kernel was synthesized, so the knob must stay clear
     let prog = |n: usize| {
         format!(
             "fn main() -> i32 {{ \
@@ -3635,6 +3785,7 @@ fn p4_vec256_general_matches_interp() {
 /// start (the `start >= N` empty-run case), and (c) leave `i` reachable for code after the loop.
 #[test]
 fn p4_counting_while_normalizes_and_matches_interp() {
+    let _env = p4_read_lock(); // asserts a kernel was synthesized, so the knob must stay clear
     // `lo` lets us cover both the ran case (lo < N) and the empty case (lo == N ⇒ never runs). The
     // counting-while body is a stream×stream product plus a third stream (`a*b + e`) — velem can't
     // claim that shape, so it reaches the general recipe (a real `vec_kernels` entry).
