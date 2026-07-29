@@ -21,9 +21,12 @@ module examples.gpt2_forward_bench
 //   * the row softmax             -> wukong_norm_f32
 //   * the tanh-approx GELU        -> wukong_vmath_f32       (the gelu() intrinsic)
 //   * the two residual adds       -> wukong_velem_f32
-// The embed gather, the causal-mask write, and the last-position LM head stay scalar/generic-vectorized
-// (the LM head's offset-based GEMV isn't a recognized dispatch yet); at S=512 they are together well
-// under 1% of the forward's arithmetic, so they do not gate the timing.
+//   * the last-position LM head   -> wukong_sgemv           (see the shape notes at the LM head below)
+// MEASURED counts at -O2 (this is the falsifiable form of the list above — if a respelling stops a
+// recognizer firing, these change): 6 sgemm_nt_epi, 3 norm_affine_f32, 2 velem_f32, 1 sgemm_nt_alpha,
+// 1 sgemm_nt, 1 norm_f32, 1 vmath_f32, 1 sgemv.
+// Only the embed gather and the causal-mask write stay scalar/generic-vectorized; at S=512 they are
+// together well under 1% of the forward's arithmetic, so they do not gate the timing.
 //
 // Native-only (the interpreter cannot hold 124M params); gate-safe: run from a CWD without data/gpt2/
 // (as the examples test does) and it early-returns -1 identically on both backends.
@@ -44,6 +47,20 @@ fn main() -> i32 {
     let nreps: i64 = 8;
 
     // ---- weights: the real flat blob (gate-guard: absent data => identical -1 on both backends) ----
+    // Probe with a ONE-element read BEFORE the 124M-element allocation, exactly as gpt2_infer.wk
+    // probes its token file first. The interpreter — the default backend, and the one the examples
+    // gate runs — materialises one Value slot per element in alloc_f32, so allocating the blob just
+    // to reach this early return costs ~7.4 GB working set / ~11.2 GB commit on a run whose entire
+    // observable behaviour is `print(-1)`. read_f32 answers -1 when the path cannot be opened and
+    // min(len, file_elems) otherwise, so a 1-element probe returns 1 iff the blob is readable.
+    let mut probe: []f32 = alloc_f32(1);
+    let pgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", probe);
+    free(probe);
+    if pgot != 1 {
+        print(-1);
+        return 1;
+    }
+
     let mut w: []f32 = alloc_f32(GPT2_TOTAL_WEIGHTS);
     let wgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", w);
     if wgot != GPT2_TOTAL_WEIGHTS {

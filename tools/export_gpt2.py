@@ -13,7 +13,13 @@ little-endian f32 blob in the FROZEN layout order:
 
 Also writes the prompt token ids (int32) and the authoritative HF logits (f32), emits the
 `examples/gpt2_config.wk` const file (single source of truth for every offset) and
-`data/gpt2/MANIFEST.md`.
+`MANIFEST.md` alongside the blobs.
+
+Output dir resolution (same order as tools/verify_gpt2.py, so the two never disagree):
+`$GPT2_DATA_DIR`, then `argv[1]`, then `<repo>/data/gpt2` — where `<repo>` is the checkout this
+script lives in. The `.wk` programs read the RELATIVE path `data/gpt2/...`, so on the default
+the export lands exactly where `wukongc --run ... examples/gpt2_infer.wk` (run from the repo
+root) looks for it.
 
 MANDATORY SELF-CHECK: an INDEPENDENT numpy forward is run by slicing the *just-written* flat
 blob at the *computed* offsets (so it validates the transposes AND the offset table at once),
@@ -23,6 +29,7 @@ and asserted against the HF logits (small max|Δ|, and argmax of the last positi
 
 import math
 import os
+import sys
 
 import numpy as np
 import torch
@@ -45,15 +52,23 @@ PROMPT = "Hello, my name is"
 EXPECT_IDS = [15496, 11, 616, 1438, 318]   # frozen tokenization of PROMPT, S=5
 EXPECT_ARGMAX = 1757                        # " John"
 
-# Absolute main-repo output dir (blobs are large, NOT committed).
-OUT_DIR = r"C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\data\gpt2"
-# Committed config file lives in the worktree next to this script's repo.
+# The repo this script was checked out into (never a hard-coded machine path).
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+# Committed config file lives in the worktree next to this script's repo.
 CONFIG_WK = os.path.join(REPO, "examples", "gpt2_config.wk")
-# MANIFEST.md is a small COMMITTED artifact, so it is written into the repo tree (next to
-# where `data/gpt2/` is version-controlled) rather than into the large uncommitted blob dir.
-MANIFEST = os.path.join(REPO, "data", "gpt2", "MANIFEST.md")
+# Output dir for the large (uncommitted) blobs. Resolution mirrors tools/verify_gpt2.py so the
+# exporter and the verifier agree on one directory on ANY checkout: $GPT2_DATA_DIR, then argv[1],
+# then `<this repo>/data/gpt2`. It must stay a real path on the running machine — the .wk programs
+# read the RELATIVE path `data/gpt2/...`, so exporting anywhere else makes them print -1/-2.
+OUT_DIR = os.environ.get("GPT2_DATA_DIR") or (
+    sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "data", "gpt2")
+)
+# MANIFEST.md is a small COMMITTED artifact and belongs next to the blobs it describes, so it is
+# written into OUT_DIR. When OUT_DIR is the default `<repo>/data/gpt2` that is the version-
+# controlled location; when it is overridden the manifest follows the blobs instead of being
+# split from them.
+MANIFEST = os.path.join(OUT_DIR, "MANIFEST.md")
 
 WEIGHTS_BIN = os.path.join(OUT_DIR, "gpt2_124m_weights.bin")
 TOKENS_BIN = os.path.join(OUT_DIR, "gpt2_tokens.bin")
