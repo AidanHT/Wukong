@@ -2042,12 +2042,20 @@ fn rust_transpose(ns: usize) -> String {
 }
 
 /// Column reduction `out[j] = Σ_i x[i, j]` — the sum over the outer (batch/row) axis (the bias gradient
-/// `db = Σ_batch dY`, batch sum, reduce-along-axis-0). The naive `for j { for i { s += x[i*N+j] } }`
-/// reads `x` with stride `N` — a strided reduction gcc/rustc leave **scalar** (verified: no packed
-/// `vaddps` at `-O3 -march=native`). Wukong folds the nest to `wukong_colsum_f32`, which streams `x`
-/// row-major + 8 columns at a time. The kernels carry an unused middle pointer so they share the
-/// `(x, _, out)` 3-pointer harness. Reported as GB/s (`M·N·4` bytes — the matrix read once). Both
-/// languages sum each column i-ascending, so the cross-check is **bit-exact** (no reassociation).
+/// `db = Σ_batch dY`, batch sum, reduce-along-axis-0). Wukong folds the nest to `wukong_colsum_f32`,
+/// which streams `x` row-major + 8 columns at a time. The kernels carry an unused middle pointer so
+/// they share the `(x, _, out)` 3-pointer harness. Reported as GB/s (`M·N·4` bytes — the matrix read
+/// once). Every language sums each column i-ascending, so the cross-check is **bit-exact**.
+///
+/// PEER SPELLING (corrected 2026-08-04). The C/Rust peers used to be written **column-outer**,
+/// `for j { float s=0; for i { s += x[i*N+j]; } out[j]=s; }` — the single worst loop order for a
+/// row-major column reduction (stride-`N` reads, one cache line touched per element, and gcc/rustc
+/// leave it fully scalar). That was the *only* order measured, and the ~29–50× multiple this bench
+/// published was mostly the peer's loop order, not Wukong's kernel. The peers are now **row-outer**,
+/// `for i { for j { out[j] += x[i*N+j]; } }` — the natural, cache-friendly spelling, which folds each
+/// column in the identical i-ascending order (so the bit-exact cross-check still holds) and which
+/// gcc auto-vectorizes. Measured standalone at `-O3 -march=native`, 4096×1024: **3.739 ms
+/// column-outer vs 0.563 ms row-outer + `restrict`, a 6.6× handicap**, with byte-identical output.
 fn bench_colsum(cc: &str, dir: &Path) {
     for (m, n) in [(1024usize, 1024usize), (4096, 1024)] {
         let mn = m * n;
@@ -2163,26 +2171,34 @@ fn c_colsum(m: usize, n: usize) -> String {
         "#define M {m}\n#define N {n}\n\
          __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
-         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
+         \x20 for (long j=0;j<N;j++) out[j]=0.0f;\n\
+         \x20 for (long i=0;i<M;i++) for (long j=0;j<N;j++) out[j] += x[i*N+j];\n}}\n"
     )
 }
 
-/// The OpenMP twin of [`c_colsum`]: columns across cores (each `out[j]` owned by one thread, so no
-/// combine — the per-column fold order is unchanged). Compiled with [`C_OMP_FAST_FLAGS`].
+/// The OpenMP twin of [`c_colsum`]: **column blocks** across cores, each block folded row-outer
+/// inside. Every `out[j]` is owned by exactly one thread, so there is no cross-thread combine and
+/// the per-column fold order stays i-ascending — identical to the serial peer and to Wukong.
+/// Compiled with [`C_OMP_FAST_FLAGS`].
 fn c_colsum_omp(m: usize, n: usize) -> String {
     format!(
-        "#define M {m}\n#define N {n}\n\
+        "#define M {m}\n#define N {n}\n#define JB 64\n\
          __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          #pragma omp parallel for\n\
-         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
+         \x20 for (long jb=0;jb<N;jb+=JB){{ long je = jb+JB<N ? jb+JB : N;\n\
+         \x20   for (long j=jb;j<je;j++) out[j]=0.0f;\n\
+         \x20   for (long i=0;i<M;i++) for (long j=jb;j<je;j++) out[j] += x[i*N+j]; }}\n}}\n"
     )
 }
 
 fn rust_colsum(m: usize, n: usize) -> String {
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 for j in 0..N {{ let mut s=0.0f32; for i in 0..M {{ s += *x.add(i*N+j); }} *out.add(j)=s; }}\n}}\n"
+         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
+         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+         \x20 for o in os.iter_mut() {{ *o = 0.0; }}\n\
+         \x20 for i in 0..M {{ let row = &xs[i*N..i*N+N]; for (o, &v) in os.iter_mut().zip(row) {{ *o += v; }} }}\n}}\n"
     )
 }
 
@@ -2458,14 +2474,20 @@ fn rust_dequant_perchan(r: usize, c: usize, is_i8: bool) -> String {
 }
 
 /// Column max / min / **abs-max** `out[j] = max/min_i x[i,j]` (and `max_i |x[i,j]|`, the per-channel
-/// symmetric-quant scale) — per-channel statistics / axis-0 pooling, the siblings of `colsum`. The naive
-/// `for j { let s=x[j]; for i { s = max(s, x[i*N+j]) } }` strides `x` by `N` and — verified — gcc/rustc
-/// leave all three **scalar** (no packed `vmaxps`/`vminps` at `-O3 -march=native`: `fmax`/`fmin` are
-/// non-associative so they will not reassociate the strided fold). Wukong folds them to
-/// `wukong_col{max,min,maxabs}_f32`, streaming `x` row-major + 8 columns at a time. Reported as GB/s
-/// (`M·N·4`, the matrix read once); the kernels carry an unused middle pointer to share the `(x, _, out)`
-/// 3-pointer harness. Both fold each column i-ascending (`s ⊕ v` mirrors `_mm256_{max,min}_ps`, abs via
-/// sign-mask == `fabsf`), so the cross-check is **bit-exact** on finite data.
+/// symmetric-quant scale) — per-channel statistics / axis-0 pooling, the siblings of `colsum`. Wukong
+/// folds them to `wukong_col{max,min,maxabs}_f32`, streaming `x` row-major + 8 columns at a time.
+/// Reported as GB/s (`M·N·4`, the matrix read once); the kernels carry an unused middle pointer to
+/// share the `(x, _, out)` 3-pointer harness. Every language folds each column i-ascending (`s ⊕ v`
+/// mirrors `_mm256_{max,min}_ps`, abs via sign-mask == `fabsf`), so the cross-check is **bit-exact**
+/// on finite data.
+///
+/// PEER SPELLING (corrected 2026-08-04) — same defect as [`bench_colsum`]: the C/Rust peers were
+/// written column-outer, `for j { s=x[j]; for i { s = s>v?s:v } out[j]=s; }`, striding `x` by `N`.
+/// They are now row-outer (`out[]` seeded from row 0, then `for i { for j { … } }`), which keeps the
+/// identical i-ascending fold *and* the identical `s{cmp}v?s:v` expression (so NaN behaviour and
+/// bit-exactness are preserved) while streaming `x` sequentially. Measured standalone at `-O3
+/// -march=native`, 4096×1024 max: **5.730 ms column-outer vs 0.888 ms row-outer + `restrict`, a
+/// 6.5× handicap**, output identical.
 fn bench_colmax(cc: &str, dir: &Path) {
     // 0 = max, 1 = min, 2 = abs-max (the per-channel symmetric-quant scale).
     for (opc, label, sym) in [
@@ -2571,7 +2593,8 @@ fn c_colmax(m: usize, n: usize, op: u8) -> String {
         "#include <math.h>\n#define M {m}\n#define N {n}\n\
          __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
-         \x20 for (long j=0;j<N;j++){{ float s={lo}x[j]{hi}; for (long i=1;i<M;i++){{ float v={lo}x[i*N+j]{hi}; s = s{cmp}v?s:v; }} out[j]=s; }}\n}}\n"
+         \x20 for (long j=0;j<N;j++) out[j]={lo}x[j]{hi};\n\
+         \x20 for (long i=1;i<M;i++) for (long j=0;j<N;j++){{ float s=out[j], v={lo}x[i*N+j]{hi}; out[j] = s{cmp}v?s:v; }}\n}}\n"
     )
 }
 
@@ -2580,7 +2603,11 @@ fn rust_colmax(m: usize, n: usize, op: u8) -> String {
     let (lo, hi) = if op == 2 { ("(", ").abs()") } else { ("", "") };
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 for j in 0..N {{ let mut s={lo}*x.add(j){hi}; for i in 1..M {{ let v={lo}*x.add(i*N+j){hi}; s = if s{cmp}v {{s}} else {{v}}; }} *out.add(j)=s; }}\n}}\n"
+         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
+         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+         \x20 for (o, &v) in os.iter_mut().zip(&xs[0..N]) {{ *o = {lo}v{hi}; }}\n\
+         \x20 for i in 1..M {{ let row = &xs[i*N..i*N+N];\n\
+         \x20   for (o, &r) in os.iter_mut().zip(row) {{ let s=*o; let v={lo}r{hi}; *o = if s{cmp}v {{s}} else {{v}}; }} }}\n}}\n"
     )
 }
 
@@ -3301,12 +3328,17 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
 }
 
 /// Column **statistics** `out[j] = mean/sumsq/L2/RMS_i x[i,j]` — the per-channel BatchNorm mean, 2nd
-/// moment / energy, column L2 norm, and per-feature RMS. Same strided `Σ`/`Σx²` column-outer fold as
-/// `colsum` that gcc/rustc leave **scalar** (verified: no packed `vaddps` for the stride-N reduction);
-/// Wukong folds each nest to `wukong_col{mean,sumsq,l2,rms}_f32[_parallel]` (row-major streaming + a
-/// per-column finalize). Reported as GB/s (`M·N·4`, the matrix read once), reusing the `(x, _, out)`
-/// 3-pointer harness via the unused middle. Each folds its column i-ascending — exactly the naive C
-/// order — and `/M`/`sqrt` are correctly-rounded, so the full-buffer cross-check is **bit-exact**.
+/// moment / energy, column L2 norm, and per-feature RMS. Wukong folds each nest to
+/// `wukong_col{mean,sumsq,l2,rms}_f32[_parallel]` (row-major streaming + a per-column finalize).
+/// Reported as GB/s (`M·N·4`, the matrix read once), reusing the `(x, _, out)` 3-pointer harness via
+/// the unused middle. Each language folds its column i-ascending and `/M`/`sqrt` are correctly
+/// rounded, so the full-buffer cross-check is **bit-exact**.
+///
+/// PEER SPELLING (corrected 2026-08-04) — the third instance of the [`bench_colsum`] defect. The
+/// C/Rust peers were column-outer; they are now row-outer (accumulate into `out[]` row by row, then
+/// one finalize pass), same fold order, same result. Measured standalone at `-O3 -march=native`,
+/// 4096×1024 column mean: **5.990 ms column-outer vs 0.509 ms row-outer + `restrict`, an 11.8×
+/// handicap** — the largest single peer-spelling inflation found in this file.
 fn bench_colstat(cc: &str, dir: &Path) {
     // 0 = mean, 1 = sumsq (energy), 2 = L2, 3 = RMS.
     for (opc, label, sym) in [
@@ -3421,30 +3453,37 @@ fn wk_colstat(m: usize, n: usize, parallel: bool, op: u8) -> String {
 }
 
 fn c_colstat(m: usize, n: usize, op: u8) -> String {
+    // Row-outer: accumulate the column folds into `out[]` sweeping `x` sequentially, then finalize.
     let (fold, fin) = match op {
-        0 => ("s += x[i*N+j];", "s / (float)M"),
-        1 => ("s += x[i*N+j]*x[i*N+j];", "s"),
-        2 => ("s += x[i*N+j]*x[i*N+j];", "sqrtf(s)"),
-        _ => ("s += x[i*N+j]*x[i*N+j];", "sqrtf(s / (float)M)"),
+        0 => ("out[j] += x[i*N+j];", "s / (float)M"),
+        1 => ("{ float v=x[i*N+j]; out[j] += v*v; }", "s"),
+        2 => ("{ float v=x[i*N+j]; out[j] += v*v; }", "sqrtf(s)"),
+        _ => ("{ float v=x[i*N+j]; out[j] += v*v; }", "sqrtf(s / (float)M)"),
     };
     format!(
         "#include <math.h>\n#define M {m}\n#define N {n}\n\
          __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
-         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++){{ {fold} }} out[j]={fin}; }}\n}}\n"
+         \x20 for (long j=0;j<N;j++) out[j]=0.0f;\n\
+         \x20 for (long i=0;i<M;i++) for (long j=0;j<N;j++) {fold}\n\
+         \x20 for (long j=0;j<N;j++){{ float s=out[j]; out[j]={fin}; }}\n}}\n"
     )
 }
 
 fn rust_colstat(m: usize, n: usize, op: u8) -> String {
     let (fold, fin) = match op {
-        0 => ("s += *x.add(i*N+j);", "s / M as f32"),
-        1 => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "s"),
-        2 => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "s.sqrt()"),
-        _ => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "(s / M as f32).sqrt()"),
+        0 => ("*o += r;", "s / M as f32"),
+        1 => ("*o += r*r;", "s"),
+        2 => ("*o += r*r;", "s.sqrt()"),
+        _ => ("*o += r*r;", "(s / M as f32).sqrt()"),
     };
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 for j in 0..N {{ let mut s=0.0f32; for i in 0..M {{ {fold} }} *out.add(j)={fin}; }}\n}}\n"
+         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
+         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+         \x20 for o in os.iter_mut() {{ *o = 0.0; }}\n\
+         \x20 for i in 0..M {{ let row = &xs[i*N..i*N+N]; for (o, &r) in os.iter_mut().zip(row) {{ {fold} }} }}\n\
+         \x20 for o in os.iter_mut() {{ let s = *o; *o = {fin}; }}\n}}\n"
     )
 }
 
