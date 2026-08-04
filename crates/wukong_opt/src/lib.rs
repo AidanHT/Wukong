@@ -12,8 +12,8 @@
 //!  * **loop-canon** — one shape per loop: a preheader, a single latch, one exit-test polarity
 //!    (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
-//!  * **vectorize** — widen a canonical loop body to 128-bit SIMD, with the original loop kept as
-//!    its scalar epilogue (`-O2`).
+//!  * **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting a conditional
+//!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`).
 //!
 //! At `-O2` and above, whole-program inlining of small leaf functions ([`inline_program`]) runs once
 //! before the per-function pipeline. `-O3` adds nothing to either — see [`PassManager::standard`].

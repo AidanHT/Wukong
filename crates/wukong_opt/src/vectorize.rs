@@ -50,6 +50,17 @@
 //! group executes the identical operation sequence on the identical operands that scalar iteration
 //! `i + k` would have.
 //!
+//! # If-conversion
+//!
+//! A branch inside the body cannot be widened as control flow — lane 3 may take the `then` arm
+//! while lane 0 takes the `else`. [`linearize_region`] flattens a diamond or a triangle into one
+//! straight line and turns the branch condition into a lane mask, so `if c { o[i] = f } else { o[i]
+//! = g }` becomes one `select` and one store. Both arms then run for every lane, which is only
+//! sound when running the arm a lane did not take is harmless; the two ways it would not be — an
+//! unpaired store (it writes memory the scalar loop leaves alone) and an unpaired load (it reads an
+//! address the scalar loop never touches, and Wukong does not bounds-check slice indexing) — are
+//! refused there.
+//!
 //! # Width
 //!
 //! `W` is `128 / lane_bits`, i.e. `<4 x f32>`, `<2 x f64>`, `<8 x i16>`, `<16 x i8>`. That is not a
@@ -223,12 +234,54 @@ enum Plan {
     /// A reduction's combining instruction. Not emitted inline — every accumulate is folded
     /// serially at the end of the vector body by [`emit_reduction_fold`].
     Reduce,
+    /// An if-converted store: one `store` of a lane-wise `select` between the two arms' values.
+    MaskedStore,
+    /// An if-converted latch parameter: a lane-wise `select` between the two arms' arguments.
+    Merge,
+}
+
+/// One step of the loop body after **if-conversion**: the body's control flow is flattened into a
+/// single straight line, with the branch's condition becoming a lane mask.
+///
+/// A conditional body is the third of the four shapes this pass exists to fix, and it cannot be
+/// widened as a CFG — lane 3 might take the `then` arm while lane 0 takes the `else`. Flattening
+/// executes *both* arms and selects per lane, which is only sound if executing the arm a lane did
+/// not take is harmless. Two things could make it harmful, and both are checked in
+/// [`linearize_region`]: a store the other arm does not make (it would write memory the scalar loop
+/// leaves alone), and a load the other arm does not make (it would read an address the scalar loop
+/// never touches, which in a language with unchecked slice indexing can be off the end of a
+/// shorter buffer).
+#[derive(Clone, Debug)]
+enum LinInst {
+    /// Reproduce `blocks[block].insts[idx]` unchanged.
+    Real { block: BlockId, idx: usize },
+    /// Both arms store to this address: one `store(ptr, select(cond, then_val, else_val))`.
+    /// `ptr` is the `then` arm's pointer; the `else` arm's names the same address.
+    MaskedStore {
+        ptr: ValueId,
+        cond: ValueId,
+        then_val: ValueId,
+        else_val: ValueId,
+        /// The `then` arm's store, for its `AddrForm`.
+        at: (BlockId, usize),
+    },
+    /// A join block parameter: `param = select(cond, then_arg, else_arg)`.
+    Merge {
+        param: ValueId,
+        cond: ValueId,
+        then_arg: ValueId,
+        else_arg: ValueId,
+    },
 }
 
 /// Everything [`apply`] needs, decided before any mutation.
 struct VecPlan {
     header: BlockId,
+    /// The block whose terminator carries the back edge — the latch, and the join of an
+    /// if-converted region.
     body: BlockId,
+    /// The loop body, flattened to a straight line.
+    lin: Vec<LinInst>,
     preheader: BlockId,
     /// Header parameter index of the primary induction variable.
     iv_index: usize,
@@ -237,7 +290,7 @@ struct VecPlan {
     trip: TripPlan,
     /// Lane count.
     w: u32,
-    /// One entry per instruction of `body`, in order.
+    /// One entry per element of `lin`, in order.
     plans: Vec<Plan>,
     /// Values in `body` that become vectors, and their lane type.
     vector_ty: FxHashMap<u32, MirType>,
@@ -352,19 +405,10 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if exit_from != l.header {
         return Err("exit is not tested in the header");
     }
-    // Exactly two blocks: the header (which must hold nothing but the exit test) and one body
-    // block, which is therefore also the latch. If-conversion, which lifts this, is a later step.
-    if l.blocks.len() != 2 {
-        return Err("body is not a single block (needs if-conversion)");
-    }
-    let body = *l
-        .blocks
-        .iter()
-        .find(|&&b| b != l.header)
-        .ok_or("no body block")?;
-    if l.latches[0] != body {
-        return Err("the body block is not the latch");
-    }
+    // The body is either one straight-line block (which is then also the latch), or a diamond /
+    // triangle that if-conversion flattens into one. Either way the latch carries the back edge.
+    let body = l.latches[0];
+    let lin = linearize_region(f, l, body)?;
     if !header_is_test_only(f, l) {
         return Err("the header computes more than the exit test");
     }
@@ -388,7 +432,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if !carried_values_are_handled(l, iv.param_index) {
         return Err("a carried value is neither the primary IV, a reduction nor invariant");
     }
-    if !index_values_only_address(f, l, body, iv.value) {
+    if !index_values_only_address(f, &lin, iv.value) {
         return Err("the induction variable is used for something other than addressing");
     }
     if !invariant_loads_are_safe(l) {
@@ -420,7 +464,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
 
     // ---- per-instruction plan -----------------------------------------------------------------
     let (plans, vector_ty, reductions) =
-        plan_body(f, l, body, w).ok_or("an instruction in the body cannot be widened")?;
+        plan_body(f, l, &lin, w).ok_or("an instruction in the body cannot be widened")?;
 
     // ---- runtime alias guard ------------------------------------------------------------------
     let (guards, guard_elem, guard_allows_equal) =
@@ -429,6 +473,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     Ok(VecPlan {
         header: l.header,
         body,
+        lin,
         preheader,
         iv_index,
         iv_ty,
@@ -441,6 +486,228 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         guard_elem,
         guard_allows_equal,
     })
+}
+
+/// Flatten the loop body into one straight line, if-converting a conditional region.
+///
+/// Two shapes are accepted. A body of one block (which is then the latch) linearizes to itself. A
+/// **diamond or triangle** — `entry` branching on a condition to a `then` and an `else` side that
+/// both reach the latch — linearizes to `entry`, then both arms, then one `select` per latch
+/// parameter, then the latch's own instructions.
+///
+/// Executing an arm a lane did not take must be harmless, and the two ways it might not be are
+/// both refused here:
+///
+/// * **A store with no counterpart.** If only the `then` arm writes `o[i]`, the flattened body
+///   would write it for every lane. Turning that into a read-modify-write (`store(p, select(m, v,
+///   load(p)))`) is possible but introduces a load *and* a write to memory the scalar loop never
+///   touches, so it is left out. A pair of stores to the same address becomes one masked store.
+/// * **A load with no counterpart.** Wukong does not bounds-check slice indexing, so speculating
+///   `w[i]` when only one arm reads it can read off the end of a buffer that is genuinely shorter
+///   than the loop's trip count. A load is speculated only when the *same* base and index is also
+///   read or written by the other arm or by the unconditional part of the body, which makes the
+///   set of addresses the flattened body touches equal to the set one arm would have touched.
+///
+/// Integer division is refused for the same reason in a different register: `sdiv` traps on a zero
+/// divisor, and a lane that would not have executed it must not fault.
+fn linearize_region(
+    f: &Function,
+    l: &NaturalLoop,
+    latch: BlockId,
+) -> Result<Vec<LinInst>, &'static str> {
+    let straight = |b: BlockId| -> Vec<LinInst> {
+        (0..f.blocks[b.0 as usize].insts.len())
+            .map(|idx| LinInst::Real { block: b, idx })
+            .collect()
+    };
+    if l.blocks.len() == 2 {
+        return Ok(straight(latch));
+    }
+    if l.blocks.len() > 5 {
+        return Err("body has more blocks than one diamond");
+    }
+
+    // `entry` is the header's one successor inside the loop, and it must branch on a condition.
+    let entry = {
+        let inside: Vec<BlockId> = succs(&f.blocks[l.header.0 as usize].term)
+            .into_iter()
+            .filter(|b| l.blocks.contains(b))
+            .collect();
+        match inside.as_slice() {
+            [b] if *b != latch => *b,
+            _ => return Err("the header does not enter the body through one block"),
+        }
+    };
+    let Terminator::CondBr {
+        cond,
+        then_blk,
+        then_args,
+        else_blk,
+        else_args,
+    } = &f.blocks[entry.0 as usize].term
+    else {
+        return Err("the body's entry does not branch on a condition");
+    };
+    if then_blk == else_blk {
+        return Err("both arms of the body's branch go the same way");
+    }
+
+    // Each side is either an arm block that falls through to the latch, or the latch itself (a
+    // triangle). `arm_args` is what that side passes to the latch's parameters.
+    let side = |blk: BlockId, direct: &[ValueId]| -> Result<(Option<BlockId>, Vec<ValueId>), &'static str> {
+        if blk == latch {
+            return Ok((None, direct.to_vec()));
+        }
+        if !l.blocks.contains(&blk) {
+            return Err("an arm of the body leaves the loop");
+        }
+        match &f.blocks[blk.0 as usize].term {
+            Terminator::Br { target, args } if *target == latch => Ok((Some(blk), args.clone())),
+            _ => Err("an arm of the body does not fall through to the latch"),
+        }
+    };
+    let (t_blk, t_args) = side(*then_blk, then_args)?;
+    let (e_blk, e_args) = side(*else_blk, else_args)?;
+    if t_blk.is_none() && e_blk.is_none() {
+        return Err("neither arm has a block of its own");
+    }
+
+    // ---- speculation safety --------------------------------------------------------------------
+    let arm_accesses = |b: Option<BlockId>| -> Vec<&MemAccess> {
+        b.map(|b| l.accesses.iter().filter(|a| a.block == b).collect())
+            .unwrap_or_default()
+    };
+    let t_acc = arm_accesses(t_blk);
+    let e_acc = arm_accesses(e_blk);
+    let unconditional: Vec<&MemAccess> = l
+        .accesses
+        .iter()
+        .filter(|a| a.block == entry || a.block == latch)
+        .collect();
+    let same_place = |a: &MemAccess, b: &MemAccess| match (&a.addr, &b.addr) {
+        (
+            AddrForm::Affine {
+                base: ba,
+                index: ia,
+                elem: ea,
+            },
+            AddrForm::Affine {
+                base: bb,
+                index: ib,
+                elem: eb,
+            },
+        ) => ba.same_object(*bb) && ia == ib && ea == eb,
+        (AddrForm::Invariant(ba), AddrForm::Invariant(bb)) => ba.same_object(*bb),
+        _ => false,
+    };
+    for (mine, theirs) in [(&t_acc, &e_acc), (&e_acc, &t_acc)] {
+        for a in mine.iter().filter(|a| a.kind == AccessKind::Load) {
+            let covered = theirs.iter().chain(unconditional.iter()).any(|b| same_place(a, b));
+            if !covered {
+                return Err("an arm loads an address the other arm never touches");
+            }
+        }
+    }
+    for b in [t_blk, e_blk].into_iter().flatten() {
+        for inst in &f.blocks[b.0 as usize].insts {
+            match &inst.op {
+                Op::Bin(BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem, ..) => {
+                    return Err("an arm divides, which may fault on a lane that would not run it")
+                }
+                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca(..) => {
+                    return Err("an arm has an effect that cannot be predicated")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ---- store pairing -------------------------------------------------------------------------
+    let stores_of = |b: Option<BlockId>| -> Vec<(BlockId, usize, ValueId, ValueId)> {
+        let Some(b) = b else { return Vec::new() };
+        f.blocks[b.0 as usize]
+            .insts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, inst)| match &inst.op {
+                Op::Store { ptr, value } => Some((b, i, *ptr, *value)),
+                _ => None,
+            })
+            .collect()
+    };
+    let t_stores = stores_of(t_blk);
+    let e_stores = stores_of(e_blk);
+    if t_stores.len() != e_stores.len() {
+        return Err("the two arms do not store the same number of times");
+    }
+    let access_at = |b: BlockId, i: usize| l.accesses.iter().find(|a| a.block == b && a.inst == i);
+    let mut merged_stores: Vec<LinInst> = Vec::with_capacity(t_stores.len());
+    for (ts, es) in t_stores.iter().zip(&e_stores) {
+        let (Some(ta), Some(ea)) = (access_at(ts.0, ts.1), access_at(es.0, es.1)) else {
+            return Err("a store in an arm has no analyzed address");
+        };
+        if !same_place(ta, ea) {
+            return Err("the two arms store to different addresses");
+        }
+        merged_stores.push(LinInst::MaskedStore {
+            ptr: ts.2,
+            cond: *cond,
+            then_val: ts.3,
+            else_val: es.3,
+            at: (ts.0, ts.1),
+        });
+    }
+
+    // A merged store reads *both* arms' values, so it can only be emitted once both arms have run
+    // — which means every store sinks past every load. That is order-preserving only if no arm
+    // already read back through a store it made, so require loads-before-stores within each arm.
+    for b in [t_blk, e_blk].into_iter().flatten() {
+        let mut stored = false;
+        for inst in &f.blocks[b.0 as usize].insts {
+            match &inst.op {
+                Op::Store { .. } => stored = true,
+                Op::Load(..) if stored => {
+                    return Err("an arm reads memory after writing it")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ---- the flattened body --------------------------------------------------------------------
+    let mut lin = straight(entry);
+    for b in [t_blk, e_blk].into_iter().flatten() {
+        for (idx, inst) in f.blocks[b.0 as usize].insts.iter().enumerate() {
+            if matches!(inst.op, Op::Store { .. }) {
+                continue; // replaced by the merged store below
+            }
+            lin.push(LinInst::Real { block: b, idx });
+        }
+    }
+    lin.extend(merged_stores);
+    for (k, &p) in f.blocks[latch.0 as usize].params.iter().enumerate() {
+        let (Some(&ta), Some(&ea)) = (t_args.get(k), e_args.get(k)) else {
+            return Err("an arm passes the wrong number of arguments to the latch");
+        };
+        lin.push(LinInst::Merge {
+            param: p,
+            cond: *cond,
+            then_arg: ta,
+            else_arg: ea,
+        });
+    }
+    lin.extend(straight(latch));
+    Ok(lin)
+}
+
+fn succs(t: &Terminator) -> Vec<BlockId> {
+    match t {
+        Terminator::Br { target, .. } => vec![*target],
+        Terminator::CondBr {
+            then_blk, else_blk, ..
+        } => vec![*then_blk, *else_blk],
+        _ => Vec::new(),
+    }
 }
 
 /// The header may compute the exit test and nothing else: no memory, no side effects, and no value
@@ -524,13 +791,46 @@ fn carried_values_are_handled(l: &NaturalLoop, primary_param: usize) -> bool {
 /// terminates at a `gep` index, a load/store pointer, or the latch's branch arguments (where the
 /// only index value is the induction variable's own increment, which [`emit_body`] replaces with a
 /// step of `W`).
-fn index_values_only_address(f: &Function, l: &NaturalLoop, body: BlockId, iv: ValueId) -> bool {
+fn index_values_only_address(f: &Function, lin: &[LinInst], iv: ValueId) -> bool {
     let mut index: FxHashSet<u32> = FxHashSet::default();
     index.insert(iv.0);
     // The header parameters other than the IV are not index values: `carried_values_are_handled`
     // has already restricted them to reductions and pass-through invariants.
-    let _ = l;
-    for inst in &f.blocks[body.0 as usize].insts {
+    for step in lin {
+        // A synthesized `select` never takes an index value: `linearize_region` only ever merges a
+        // latch parameter or two stored *values*, and a lane-varying stored value is rejected
+        // separately. Check it rather than assume it.
+        let inst = match step {
+            LinInst::Real { block, idx } => &f.blocks[block.0 as usize].insts[*idx],
+            LinInst::MaskedStore {
+                cond,
+                then_val,
+                else_val,
+                ..
+            } => {
+                if index.contains(&cond.0)
+                    || index.contains(&then_val.0)
+                    || index.contains(&else_val.0)
+                {
+                    return false;
+                }
+                continue;
+            }
+            LinInst::Merge {
+                cond,
+                then_arg,
+                else_arg,
+                ..
+            } => {
+                if index.contains(&cond.0)
+                    || index.contains(&then_arg.0)
+                    || index.contains(&else_arg.0)
+                {
+                    return false;
+                }
+                continue;
+            }
+        };
         let mut touches_index = false;
         each_op_use(&inst.op, &mut |u| {
             if index.contains(&u.0) {
@@ -618,15 +918,13 @@ fn pick_width(l: &NaturalLoop) -> Option<u32> {
 fn plan_body(
     f: &Function,
     l: &NaturalLoop,
-    body: BlockId,
+    lin: &[LinInst],
     w: u32,
 ) -> Option<(Vec<Plan>, FxHashMap<u32, MirType>, Vec<RedPlan>)> {
-    let blk = &f.blocks[body.0 as usize];
-    let access_at: FxHashMap<usize, &MemAccess> = l
+    let access_at: FxHashMap<(u32, usize), &MemAccess> = l
         .accesses
         .iter()
-        .filter(|a| a.block == body)
-        .map(|a| (a.inst, a))
+        .map(|a| ((a.block.0, a.inst), a))
         .collect();
 
     // The reductions, keyed by their combining instruction's result.
@@ -680,13 +978,77 @@ fn plan_body(
         })
         .collect();
 
-    // Forward dataflow over the single body block: a value is a vector iff it is a widened load or
-    // has a vector operand. Loop-invariant values and the induction variable are uniform.
+    // Forward dataflow over the flattened body: a value is a vector iff it is a widened load or has
+    // a vector operand. Loop-invariant values and the induction variable are uniform.
     let mut vector_ty: FxHashMap<u32, MirType> = FxHashMap::default();
-    let mut plans: Vec<Plan> = Vec::with_capacity(blk.insts.len());
+    let mut plans: Vec<Plan> = Vec::with_capacity(lin.len());
     let is_vec = |m: &FxHashMap<u32, MirType>, v: ValueId| m.contains_key(&v.0);
 
-    for (i, inst) in blk.insts.iter().enumerate() {
+    for step in lin {
+        // A synthesized step (an if-converted store or merge) reads values the arms computed and,
+        // for a merge, defines the latch parameter the rest of the body reads.
+        let (block, i, inst) = match step {
+            LinInst::Real { block, idx } => (
+                block.0,
+                *idx,
+                f.blocks[block.0 as usize].insts[*idx].clone(),
+            ),
+            LinInst::MaskedStore {
+                ptr,
+                cond,
+                then_val,
+                else_val,
+                at,
+            } => {
+                for u in [*ptr, *cond, *then_val, *else_val] {
+                    if defined_in_loop.contains(&u.0) && !available.contains(&u.0) {
+                        return None;
+                    }
+                }
+                let addr = access_at.get(&(at.0 .0, at.1)).map(|a| &a.addr);
+                if !matches!(addr, Some(AddrForm::Affine { .. })) {
+                    return None;
+                }
+                let vt = f.value_type(*then_val).clone();
+                if vt != *f.value_type(*else_val) || lanes_of(&vt)? != w {
+                    return None;
+                }
+                // A predicated store must be a *lane* selection: with a uniform `i1` condition
+                // there is no per-lane mask, and blending two vectors with it is not expressible.
+                if !is_vec(&vector_ty, *cond)
+                    || (!is_vec(&vector_ty, *then_val) && !is_vec(&vector_ty, *else_val))
+                {
+                    return None;
+                }
+                plans.push(Plan::MaskedStore);
+                continue;
+            }
+            LinInst::Merge {
+                param,
+                cond,
+                then_arg,
+                else_arg,
+            } => {
+                for u in [*cond, *then_arg, *else_arg] {
+                    if defined_in_loop.contains(&u.0) && !available.contains(&u.0) {
+                        return None;
+                    }
+                }
+                let ty = f.value_type(*param).clone();
+                let any_vec = is_vec(&vector_ty, *then_arg) || is_vec(&vector_ty, *else_arg);
+                if any_vec {
+                    if !is_vec(&vector_ty, *cond) || lanes_of(&ty)? != w {
+                        return None;
+                    }
+                    vector_ty.insert(param.0, ty);
+                } else if is_vec(&vector_ty, *cond) {
+                    return None; // a lane mask selecting between two uniforms is not a value
+                }
+                available.insert(param.0);
+                plans.push(Plan::Merge);
+                continue;
+            }
+        };
         let mut readable = true;
         each_op_use(&inst.op, &mut |u| {
             if defined_in_loop.contains(&u.0) && !available.contains(&u.0) {
@@ -710,7 +1072,7 @@ fn plan_body(
             }
         });
         let plan = match &inst.op {
-            Op::Load(_, ty) => match access_at.get(&i).map(|a| &a.addr) {
+            Op::Load(_, ty) => match access_at.get(&(block, i)).map(|a| &a.addr) {
                 Some(AddrForm::Affine { .. }) => {
                     if lanes_of(ty)? != w {
                         return None;
@@ -723,7 +1085,7 @@ fn plan_body(
                 Some(AddrForm::Invariant(_)) => Plan::Scalar,
                 _ => return None,
             },
-            Op::Store { ptr: _, value } => match access_at.get(&i).map(|a| &a.addr) {
+            Op::Store { ptr: _, value } => match access_at.get(&(block, i)).map(|a| &a.addr) {
                 Some(AddrForm::Affine { .. }) => {
                     let vt = f.value_type(*value);
                     if lanes_of(vt)? != w {
@@ -1221,7 +1583,6 @@ fn emit_body(
     header_params: &[ValueId],
     vh_params: &[ValueId],
 ) -> Vec<ValueId> {
-    let body_insts = e.f.blocks[p.body.0 as usize].insts.clone();
     let latch_term = e.f.blocks[p.body.0 as usize].term.clone();
 
     // scalar value -> its counterpart in the vector body.
@@ -1230,8 +1591,76 @@ fn emit_body(
         map.insert(hp.0, Wide::Uniform(vh_params[i]));
     }
 
-    for (i, inst) in body_insts.iter().enumerate() {
+    for (i, step) in p.lin.iter().enumerate() {
+        // The two synthesized steps of if-conversion. Both are lane-wise `select`s: one feeds a
+        // single store that stands in for the two arms' stores, the other defines the latch
+        // parameter the arms were merging into.
+        match (&p.plans[i], step) {
+            (
+                Plan::MaskedStore,
+                LinInst::MaskedStore {
+                    ptr,
+                    cond,
+                    then_val,
+                    else_val,
+                    ..
+                },
+            ) => {
+                let lane = e.f.value_type(*then_val).clone();
+                let vty = vec_of(&lane, p.w);
+                let mask = resolve_vector(&map, *cond);
+                let a = to_vector(e, vb, &map, *then_val, &lane, p.w);
+                let b = to_vector(e, vb, &map, *else_val, &lane, p.w);
+                let blended = e.push(vb, vty, Op::Select(mask, a, b));
+                let ptr = resolve_uniform(&map, *ptr);
+                e.push_void(
+                    vb,
+                    Op::Store {
+                        ptr,
+                        value: blended,
+                    },
+                );
+                continue;
+            }
+            (
+                Plan::Merge,
+                LinInst::Merge {
+                    param,
+                    cond,
+                    then_arg,
+                    else_arg,
+                },
+            ) => {
+                match p.vector_ty.get(&param.0) {
+                    Some(lane) => {
+                        let lane = lane.clone();
+                        let vty = vec_of(&lane, p.w);
+                        let mask = resolve_vector(&map, *cond);
+                        let a = to_vector(e, vb, &map, *then_arg, &lane, p.w);
+                        let b = to_vector(e, vb, &map, *else_arg, &lane, p.w);
+                        let nv = e.push(vb, vty, Op::Select(mask, a, b));
+                        map.insert(param.0, Wide::Vector(nv));
+                    }
+                    None => {
+                        let ty = e.f.value_type(*param).clone();
+                        let c = resolve_uniform(&map, *cond);
+                        let a = resolve_uniform(&map, *then_arg);
+                        let b = resolve_uniform(&map, *else_arg);
+                        let nv = e.push(vb, ty, Op::Select(c, a, b));
+                        map.insert(param.0, Wide::Uniform(nv));
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let LinInst::Real { block, idx } = step else {
+            unreachable!("a synthesized step is handled above")
+        };
+        let inst = e.f.blocks[block.0 as usize].insts[*idx].clone();
+        let inst = &inst;
         match &p.plans[i] {
+            Plan::MaskedStore | Plan::Merge => unreachable!("handled above"),
             Plan::Reduce => continue, // folded after the body, see below
             Plan::Scalar => {
                 let mut op = inst.op.clone();
@@ -1713,6 +2142,68 @@ mod tests {
                    while i < n { o[i * 2] = x[i * 2]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         assert!(!is_widened(src, "k"), "stride 2 must stay scalar");
+    }
+
+    // ---- if-conversion -------------------------------------------------------------------------
+
+    /// A diamond whose two arms store to the same address becomes one masked store.
+    #[test]
+    fn a_diamond_body_is_if_converted() {
+        let src = "fn k(x: []f32, y: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { let xi: f32 = x[i]; \
+                   if xi > 0.0 { o[i] = xi * 2.0 + y[i]; } else { o[i] = y[i] - xi; } \
+                   i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(!vs.is_empty(), "a diamond body was not if-converted");
+    }
+
+    /// A triangle whose `then` arm is empty: the merge is a `select` on the join parameter.
+    #[test]
+    fn a_triangle_body_is_if_converted() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { let mut t: f32 = x[i]; if t < 0.0 { t = 0.0; } \
+                   o[i] = t; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!vector_values(src, "k").is_empty(), "a triangle was not if-converted");
+    }
+
+    /// Only one arm stores, so the flattened body would write `o[i]` for lanes the scalar loop
+    /// leaves untouched. A read-modify-write could express it; until then, decline.
+    #[test]
+    fn an_unpaired_conditional_store_is_declined() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { if x[i] > 0.0 { o[i] = 1.0; } i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "an unpaired store must stay scalar");
+    }
+
+    /// Only one arm reads `w[i]`. Wukong does not bounds-check slice indexing, so speculating that
+    /// load can read off the end of a buffer shorter than the loop's trip count.
+    #[test]
+    fn an_unpaired_conditional_load_is_declined() {
+        let src = "fn k(x: []f32, w: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { let xi: f32 = x[i]; \
+                   if xi > 0.0 { o[i] = w[i]; } else { o[i] = 1.0; } i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "an unpaired load must stay scalar");
+    }
+
+    #[test]
+    fn if_converted_output_matches_the_scalar_loop() {
+        let src = "fn k(x: []f32, y: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { let xi: f32 = x[i]; \
+                   if xi > 0.0 { o[i] = xi * 2.0 + y[i]; } else { o[i] = y[i] - xi; } \
+                   i = i + 1; } } \
+                   fn main() -> i32 { \
+                     let mut x: []f32 = alloc_f32(23); let mut y: []f32 = alloc_f32(23); \
+                     let mut o: []f32 = alloc_f32(23); let mut i: i64 = 0; \
+                     while i < 23 { x[i] = (i as f32) * 0.5 - 5.0; y[i] = (i as f32) * 0.25 + 1.0; \
+                       o[i] = 0.0; i = i + 1; } \
+                     k(x, y, o, 23); \
+                     i = 0; while i < 23 { print((o[i] * 100.0) as i32); i = i + 1; } \
+                     free(o); free(y); free(x); return 0; }";
+        scalar_and_vector_agree(src);
     }
 
     // ---- termination ---------------------------------------------------------------------------

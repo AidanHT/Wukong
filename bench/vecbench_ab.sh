@@ -28,10 +28,19 @@ run_into() {           # $1 = assoc array name, $2.. = command
   done <<< "$out"
 }
 
+# The arm order alternates by round. Running one arm always first gives it the cold cache and the
+# other the warm one, which showed up as a 1.14x "speedup" on the kernel that this pass does not
+# touch at all — i.e. as pure ordering bias, not as a result.
 for r in $(seq 1 "$ROUNDS"); do
-  WUKONG_NO_VECTORIZE=1 "$WK" --run --backend=native -O2 "$SRC" >/dev/null 2>&1   # warm
-  run_into best_off env WUKONG_NO_VECTORIZE=1 "$WK" --run --backend=native -O2 "$SRC"
-  run_into best_on  "$WK" --run --backend=native -O2 "$SRC"
+  "$WK" --run --backend=native -O2 "$SRC" >/dev/null 2>&1                          # warm
+  WUKONG_NO_VECTORIZE=1 "$WK" --run --backend=native -O2 "$SRC" >/dev/null 2>&1    # warm
+  if [ $((r % 2)) -eq 1 ]; then
+    run_into best_off env WUKONG_NO_VECTORIZE=1 "$WK" --run --backend=native -O2 "$SRC"
+    run_into best_on  "$WK" --run --backend=native -O2 "$SRC"
+  else
+    run_into best_on  "$WK" --run --backend=native -O2 "$SRC"
+    run_into best_off env WUKONG_NO_VECTORIZE=1 "$WK" --run --backend=native -O2 "$SRC"
+  fi
   run_into best_c   "$CPEER"
 done
 
