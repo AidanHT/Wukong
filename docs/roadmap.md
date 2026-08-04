@@ -520,6 +520,14 @@ buffer with a scalar load instead of through another recognized kernel, that ker
 never seeded. Both `--emit=grad` and `--train` force `-O1` or higher, since the transform needs
 single-block SSA (mem2reg + simplify-cfg).
 
+A loss whose buffers are **raw `*T` / `*mut T` parameters** now differentiates. It previously could
+not: the front end gives a pointer parameter an `alloca ptr` + `store`, so its base reached autodiff
+as `load ptr <slot>` and `Vjp::canon` refused to route through a load whose result is a pointer
+(*"cannot route gradient for load pointer … (not a parameter or a one-level gep of a parameter)"*).
+`mem2reg` now promotes that slot, so the base pointer *is* the parameter value and every access is a
+one-level gep off a parameter (`raw_pointer_parameter_grad`, finite-difference-gated). `--train` still
+declines on such a loss — a raw pointer carries no extent, so the trainer cannot size its buffers.
+
 ## Checked but not yet executed
 
 - **Explicit SIMD vector types** `f32x8` etc. in *source*: parse and type-check; user-written vector
@@ -650,8 +658,23 @@ single-block SSA (mem2reg + simplify-cfg).
   buffer, classic UB like C (and an optimization level can even change the garbage observed). An
   out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
   `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
-- `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
-  stay in memory (the interpreter and `cse`/`dse` handle those directly).
+- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot qualifies only when
+  it is provably written before it is read: the first access inside its own `alloca`'s block must be
+  a store, and that block must be the entry block or have an empty dominance frontier. That covers
+  every pointer-typed *parameter* (`*T`, `&T`, and every `Tensor[…]`, all of which lower to one MIR
+  `ptr`) — the case that matters, since the front end otherwise re-loads the base pointer from its
+  stack slot at every element access — including after `-O2` inlining has spliced a callee's entry
+  block into the middle of a caller block. A pointer local whose `alloca` and initializing store are
+  separated by a branch keeps its slot: promoting it would need a typed "undefined" pointer for the
+  read-before-write path, and there is no sound one (`inttoptr 0` is a genuine null natively but a
+  *valid, addressable* slot in the interpreter). Arrays, vectors, address-taken locals of any type,
+  and any slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse`
+  handle those directly).
+- A **`[]T` slice parameter still re-loads its data pointer at every element access.** A slice is a
+  16-byte `{ data, len }` fat pointer passed *by address*, so the base comes from
+  `load ptr (gep <param>, 0)` — a load out of caller-owned memory, not out of a local slot — and
+  `mem2reg` has nothing to promote. Removing it needs loop-invariant load motion (or a `noalias`
+  fact about the fat pointer), not slot promotion; `licm` does not hoist loads today.
 - **String literals live in a read-only static-data section** (`.rodata`), referenced by address via
   `Op::GlobalAddr` and deduped by content (one blob per unique literal). So **returning or threading a
   `*u8`** that points at a literal created inside a callee is valid — the pointer outlives the frame,
