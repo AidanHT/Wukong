@@ -225,6 +225,10 @@ enum Wide {
 enum Plan {
     /// Copy the instruction unchanged (address arithmetic, invariant loads, constants).
     Scalar,
+    /// A `Load` at a loop-invariant address whose result is a **pointer** — a `[]T` slice
+    /// re-reading its own data pointer out of the fat pointer. Emitted once, in the guard block,
+    /// instead of once per lane group. See [`emit_body`] for why that is the same program.
+    InvariantPtrLoad,
     /// Widen it: same opcode, vector-typed result, operands splatted as needed.
     Widen,
     /// A `Load` whose address is affine unit-stride: becomes a `Vec` load.
@@ -1098,8 +1102,15 @@ fn plan_body(
                     Plan::VecLoad
                 }
                 // An invariant address yields the same value every iteration: keep it scalar and
-                // let a consumer splat it. This is how a `[]T` slice's data pointer is read.
-                Some(AddrForm::Invariant(_)) => Plan::Scalar,
+                // let a consumer splat it. This is how a `[]T` slice's data pointer is read — and
+                // when that is what it is, it is hoisted out of the vector body entirely.
+                Some(AddrForm::Invariant(_)) => {
+                    if *ty == MirType::Ptr {
+                        Plan::InvariantPtrLoad
+                    } else {
+                        Plan::Scalar
+                    }
+                }
                 _ => return None,
             },
             Op::Store { ptr: _, value } => match access_at.get(&(block, i)).map(|a| &a.addr) {
@@ -1523,7 +1534,7 @@ fn apply(f: &mut Function, p: &VecPlan) {
     };
 
     // ---- vector body ---------------------------------------------------------------------------
-    let latch_args = emit_body(&mut e, p, vb, &header_params, &vh_params);
+    let latch_args = emit_body(&mut e, p, vb, guard, &header_params, &vh_params);
     e.f.blocks[vb.0 as usize].term = Terminator::Br {
         target: vh,
         args: latch_args,
@@ -1657,10 +1668,30 @@ fn range_of(
 
 /// Emit the widened body into `vb`, returning the arguments its back edge passes to the vector
 /// header.
+///
+/// `guard` is where work that belongs once per *call* goes rather than once per lane group. Only
+/// one thing uses it — [`Plan::InvariantPtrLoad`], the `[]T` slice base reload — and it is worth
+/// saying why that is sound rather than merely convenient, because LICM refuses to do it.
+///
+/// LICM's `safe_to_hoist` excludes `Op::Load`, and rightly so in general: the loop stores, and
+/// without alias analysis a store might be the thing the load re-reads. This pass does not need
+/// general alias analysis here, because it has already required the answer. A loop only reaches
+/// [`apply`] if its dependence verdict is [`crate::loop_info::MemDep::Independent`] or
+/// `IndependentIfBasesStable`, and the latter's entire content is "a `load ptr <invariant>`
+/// executed inside the loop yields the same pointer on every iteration". `invariant_loads_are_safe`
+/// already leans on exactly that to let such a load coexist with a store at all. Doing it once is
+/// that same statement, spent.
+///
+/// The restriction to `Ptr` results is not decoration. The guard runs even when the vector loop
+/// runs zero iterations, so hoisting speculates the load; for a slice's fat pointer that is free
+/// (the fat pointer is the parameter the loop indexes through, live for the whole call, and
+/// `emit_alias_checks` already reads it), but for an arbitrary invariant address it would be a
+/// read the scalar loop never performs when the trip count is zero.
 fn emit_body(
     e: &mut Emit<'_>,
     p: &VecPlan,
     vb: BlockId,
+    guard: BlockId,
     header_params: &[ValueId],
     vh_params: &[ValueId],
 ) -> Vec<ValueId> {
@@ -1754,6 +1785,19 @@ fn emit_body(
                     }
                     None => e.push_void(vb, op),
                 }
+            }
+            Plan::InvariantPtrLoad => {
+                let Op::Load(ptr, ty) = &inst.op else {
+                    unreachable!("InvariantPtrLoad plan on a non-load")
+                };
+                // Hoist only if the address itself is available where the guard runs. A value the
+                // map does not hold is defined outside the loop, so it dominates the preheader and
+                // therefore the guard; anything else (a pointer carried in a header parameter) has
+                // its counterpart in the vector *header*, which the guard does not dominate.
+                let at = if map.contains_key(&ptr.0) { vb } else { guard };
+                let ptr = resolve_uniform(&map, *ptr);
+                let nv = e.push(at, ty.clone(), Op::Load(ptr, ty.clone()));
+                map.insert(inst.result.expect("a load has a result").0, Wide::Uniform(nv));
             }
             Plan::VecLoad => {
                 let Op::Load(ptr, ty) = &inst.op else {
@@ -2175,6 +2219,45 @@ mod tests {
             vs.iter().all(|(l, n)| *l == MirType::I32 && *n == 4),
             "{vs:?}"
         );
+    }
+
+    /// A `[]T` slice re-reads its data pointer out of the fat pointer at every indexed access, so
+    /// a three-slice saxpy body holds three pointer loads on top of its two data loads and one
+    /// store — half its memory operations are the same three addresses. The widened body inherited
+    /// all three and did them once per *group*. They are loop-invariant by the same
+    /// `IndependentIfBasesStable` verdict the pass already requires, so they belong in the guard.
+    ///
+    /// Asserted structurally rather than by counting instructions: no block that holds a
+    /// vector-typed value may contain a `Ptr`-typed load. That fails if the hoist ever silently
+    /// stops firing, and does not care how many streams the kernel has.
+    #[test]
+    fn a_slice_base_is_read_once_not_once_per_group() {
+        let (program, mut interner) = optimized(SAXPY, 2);
+        let sym = interner.intern("k");
+        let f = program.function(sym).expect("no fn k");
+        let mut checked = 0;
+        for b in &f.blocks {
+            // The vector *body* is the block that transfers vectors to and from memory. The guard
+            // is deliberately not it: the guard is where the hoisted loads went, and it also holds
+            // the splat of the loop-invariant scalar, so "any vector-typed value" would match it.
+            let is_vector_body = b.insts.iter().any(|i| match &i.op {
+                Op::Load(_, t) => t.is_vector(),
+                Op::Store { value, .. } => f.value_type(*value).is_vector(),
+                _ => false,
+            });
+            if !is_vector_body {
+                continue;
+            }
+            checked += 1;
+            for inst in &b.insts {
+                assert!(
+                    !matches!(&inst.op, Op::Load(_, MirType::Ptr)),
+                    "bb{} is a vector body and still reloads a slice base",
+                    b.id.0
+                );
+            }
+        }
+        assert!(checked > 0, "saxpy was not widened at all");
     }
 
     /// `f32 -> i32` widens (Cranelift lowers `fcvt_to_sint_sat.i32x4`); `f64 -> i64` must not,
