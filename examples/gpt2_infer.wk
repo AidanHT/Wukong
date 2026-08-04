@@ -142,8 +142,9 @@ fn main() -> i32 {
 
         // output projection + bias, then the residual as a separate streaming add — the same split
         // gpt2.wk documents. Math: a = attn·Woᵀ + bo, then a = x + a.
-        // NOT fused to wukong_sgemm_nt_epi: see the module header — the bare imported-const dims in
-        // this file keep every GEMM here on the scalar/generic-vectorized path.
+        // This one IS fused to wukong_sgemm_nt_epi now: `canon` folds the imported-const dims into
+        // their uses before recognition, so the bare-const spelling in this file dispatches like the
+        // local-`let` spelling in gpt2_forward_bench.wk. (It did not before that pass existed.)
         for i in 0..GPT2_SEQ { for j in 0..GPT2_D {
             let mut s: f32 = 0.0;
             for p in 0..GPT2_D { s = s + attn[i * GPT2_D + p] * w[base + GPT2_REL_WO + j * GPT2_D + p]; }
