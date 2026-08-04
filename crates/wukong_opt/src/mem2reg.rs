@@ -121,11 +121,14 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
     for x in bad {
         cand.remove(&x);
     }
-    cand.retain(|slot, ty| !matches!(ty, MirType::Ptr) || entry_initialized(f, *slot));
+    if cand.values().any(|ty| matches!(ty, MirType::Ptr)) {
+        let init = entry_initialized(f, &cand);
+        cand.retain(|slot, ty| !matches!(ty, MirType::Ptr) || init.contains(slot));
+    }
     cand
 }
 
-/// Does the entry block store to `slot` before any load of it?
+/// The candidate slots the entry block stores to before any load of them.
 ///
 /// A read-before-write slot is promoted to a zero constant of the slot's type — what the
 /// interpreter's zero-initialized memory would have yielded. There is no such constant for a
@@ -143,15 +146,28 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
 /// (`*T`, `&T`, and every `Tensor[…]`) an `alloca ptr` immediately followed by `store <param>` in
 /// the entry block. It excludes a pointer local whose first assignment is inside an `if` or a loop;
 /// those keep their stack slot.
-fn entry_initialized(f: &Function, slot: u32) -> bool {
+///
+/// One pass over the entry block classifies every candidate at once — a per-slot scan would be
+/// `O(slots × entry length)`, and an entry block holds one `alloca` per local of the whole function.
+fn entry_initialized(f: &Function, cand: &BTreeMap<u32, MirType>) -> FxHashSet<u32> {
+    // slot -> was its first entry-block access a store?
+    let mut first_is_store: FxHashMap<u32, bool> = FxHashMap::default();
     for inst in &f.blocks[f.entry.0 as usize].insts {
         match &inst.op {
-            Op::Store { ptr, .. } if ptr.0 == slot => return true,
-            Op::Load(p, _) if p.0 == slot => return false,
+            Op::Store { ptr, .. } if cand.contains_key(&ptr.0) => {
+                first_is_store.entry(ptr.0).or_insert(true);
+            }
+            Op::Load(p, _) if cand.contains_key(&p.0) => {
+                first_is_store.entry(p.0).or_insert(false);
+            }
             _ => {}
         }
     }
-    false
+    first_is_store
+        .into_iter()
+        .filter(|&(_, stored)| stored)
+        .map(|(slot, _)| slot)
+        .collect()
 }
 
 fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut CfgAnalyses) {
