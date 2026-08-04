@@ -26775,6 +26775,75 @@ fn main() -> i32 { return 0; }
         );
     }
 
+    /// A module-level `const` used directly as a dimension left the nest matching symbolically
+    /// (`Dim::Var(N)` on every side) and then declining at `dim_value`, which looks the name up in
+    /// the *locals*. That is the sharp edge `examples/gpt2_forward_bench.wk` documents and works
+    /// around by re-binding every dimension to a local `let`. Folding the literal in beforehand —
+    /// which is exactly what `FnLowerer`'s const arm does at lowering time anyway — makes the bare
+    /// const spelling dispatch.
+    #[test]
+    fn a_const_dimension_dispatches_the_gemm() {
+        let src = "module m
+const N: i64 = 8;
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..N {
+        for j in 0..N {
+            let mut s: f32 = 0.0;
+            for p in 0..N { s = s + a[i * N + p] * b[j * N + p]; }
+            c[i * N + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a const dimension must not cost the GEMM kernel"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
+    /// The DECLINE for the const fold: a local (or parameter) of the same name shadows the const —
+    /// `lower_expr` resolves a `Path` in the locals first — so the const must be left alone in a
+    /// function that declares that name, or the loop would read the wrong stride.
+    #[test]
+    fn a_shadowed_const_is_not_folded() {
+        let src = "module m
+const N: i64 = 8;
+fn f() -> i64 {
+    let N: i64 = 3;
+    return N * 2;
+}
+fn main() -> i32 { return f() as i32; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        // The body must still compute 3*2, never 8*2.
+        let f = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == "f")
+            .expect("fn f");
+        let eights = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(&i.op, Op::ConstInt(8, _)))
+            .count();
+        let threes = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(&i.op, Op::ConstInt(3, _)))
+            .count();
+        assert!(threes >= 1, "the local N = 3 must survive");
+        assert_eq!(eights, 0, "the shadowed const must not be folded in");
+    }
+
     /// Substitution is scoped to the **region** a binding dominates — the rest of its own block — so
     /// two sibling loops may each spell `let ib = …` without either disqualifying the other. Under a
     /// whole-function "declared exactly once" rule they knocked each other out, and re-using an
