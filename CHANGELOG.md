@@ -5,6 +5,32 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Measurement — a benchmark for general code, outside the recognizer dialect (2026-08-04)
+`cargo run -p wukong_xbench --release -- general` — a new opt-in mode measuring Wukong written the way
+an ML engineer actually writes it, deliberately NOT in the shapes `wukong_mir_build`'s kernel
+recognizers match. Every other row in `wukong_xbench` is written in that dialect, so the suite could
+not see what missing it costs; and recognized kernels are **gate-blind** (a recognizer fires
+pre-optimization and in both backends, so the differential and opt-invariance gates agree on the same
+answer whether one fired or not), so no correctness gate could see it either. The new mode therefore
+**prints the dispatch census** for every program it times and writes the exact source it compiled to
+the xbench temp directory, so `wukongc --emit=mir -O2 <file> | grep -oE 'wukong_[a-z0-9_]+'`
+reproduces the census against the real binary.
+- **Recognizer fragility** (census only, nothing timed): ten probes in five pairs that compute
+  bit-identical results and differ by one edit. Hoisting a row base out of a loop (`let ib = i*256;`
+  then `a[ib+p]`), writing an activation into the store instead of a follow-up loop, writing a
+  residual into the store, or naming a dimension `let n: i64 = 256` — each **on its own** makes the
+  GEMM, epilogue or RMSNorm recognizer decline, and none of them changes a floating-point result.
+- **Structure tax**: one pre-norm transformer block (RMSNorm → RoPE → causal MHA → RMSNorm → SwiGLU
+  MLP) written five ways with the same arithmetic in the same order — recognizer dialect, natural
+  spelling, factored into `[]f32` helpers, weights in a `struct`, and shape-typed
+  `Tensor[f32, S, D]` — against one C peer written once. Measured spread **41–50×**; see
+  `BENCHMARKS.md` for the table and the disclosed asymmetries.
+- Two programs with no pattern to match: a fused focal loss with label smoothing, per-class weights
+  and a hand-written backward, and a Mamba/S6 selective scan with a vector state.
+- Each program is checked against an **f64 scalar reference on every lane** (never a reduction — a
+  partially-correct buffer passes a sum; and never the interpreter, which cannot hold these buffers),
+  and a `C(fast)` `-ffast-math` column runs wherever Wukong's dispatched kernels reassociate.
+
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
 write-sets → adversarial re-verification), plus a harness-hardening wave. Almost nothing here is a new
