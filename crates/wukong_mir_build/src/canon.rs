@@ -4,72 +4,84 @@
 //! `wukong_opt` has run mem2reg or CSE. That makes recognition brittle in a way that has nothing to
 //! do with the arithmetic: hoisting a row base into a local (`let ib = i*256;` then `a[ib + p]`) is
 //! plain common-subexpression elimination — it changes no floating-point result and every optimizer
-//! performs it anyway — yet it moved the index arithmetic out of the index expression, so
-//! `match_row_col` no longer saw `i*N + p` and the whole GEMM fell back to a scalar nest. Measured
-//! across the recognizer family, binding *any* index subexpression to a local had a 0/17 hit rate.
+//! performs it anyway — yet it moves the index arithmetic *out* of the index expression, so
+//! `match_row_col` no longer sees `i*N + p` and the whole GEMM falls back to a scalar nest. Measured
+//! across the recognizer family, binding an index subexpression to a local had a 0/17 hit rate.
 //!
 //! This pass runs once, on the whole module, at the very top of [`crate::lower_program`], and
 //! rewrites the AST into the canonical spelling the matchers already understand. It is a *pure*
-//! source-to-source rewrite: every rewrite below is value-identical at every node, so lowering the
-//! normalized tree produces the same results as lowering the original.
+//! source-to-source rewrite: every rewrite is value-identical at every node, so lowering the
+//! normalized tree computes exactly what lowering the original computed.
 //!
 //! # Why it needs no new sema entries
 //!
 //! Substitution moves an already-type-checked subtree to a new position and keeps its `NodeId`s, so
 //! `sema.types` answers for every node exactly as before. `SemaResult::defs` is keyed by *name*, not
 //! by `NodeId`, and local resolution in `FnLowerer` is by name as well, so a duplicated `NodeId` is
-//! read-only aliasing, never a collision. The soundness conditions that make this true are enforced
-//! in [`Subst::collect`]:
+//! read-only aliasing, never a collision.
 //!
-//! * the binding is declared **exactly once** in the function and is never a top-level `const`/`fn`
-//!   name, so every `Path` occurrence of that name in the body denotes it (no shadowing, no capture);
-//! * neither the binding nor any free variable of its initializer is ever **assigned**, so the
-//!   substituted expression evaluates to the same value at the use site as it did at the `let`;
-//! * the initializer is a **pure integer** expression (literals, those variables, and `+ - *`), so
-//!   duplicating it cannot duplicate a side effect, a trap (no `/`, no `%`, no call, no index) or a
-//!   float rounding, and re-evaluating it cannot observe a different value;
-//! * every use site's recorded type **equals** the initializer's recorded type, which is what rules
-//!   out a narrowing/widening `let` annotation (`let ib: i32 = i * 256;` with `i: i64`) silently
-//!   turning into full-width arithmetic.
+//! # The soundness conditions
 //!
-//! Once every use is substituted the `let` is dead and is deleted — that deletion is the actual
-//! enabler, because a leftover statement in a loop body is itself enough to make a whole-nest
-//! matcher (which requires the body to be exactly the inner `for`) decline.
+//! A binding is inlined only into the **region** it dominates — the statements after its `let` in the
+//! same block, plus that block's tail — and only when, over that whole region:
+//!
+//! * the binding is never re-declared, never assigned and never `&`-taken, so every `Path` naming it
+//!   in the region denotes this binding and holds this binding's value;
+//! * no free variable of the initializer is re-declared, assigned or `&`-taken either, so the
+//!   initializer evaluates to the same value at a use as it did at the `let` (this is what rejects
+//!   `let b = t*4;` in a loop that later does `t = t + 1`);
+//! * the initializer is a **pure integer** expression — literals, those variables, and `+ - *` — so
+//!   duplicating it cannot duplicate a side effect, cannot duplicate or *move* a trap (no `/`, no
+//!   `%`, no call, no index), and cannot move a float rounding;
+//! * every use site's recorded type **equals** the initializer's recorded type, which is what rejects
+//!   a narrowing/widening annotation (`let ib: i32 = i * 256;` with `i: i64`) silently becoming
+//!   full-width arithmetic;
+//! * every use is in **index position**. That is where the recognizers' affine analysis needs to see
+//!   the arithmetic, and restricting to it bounds the blast radius: a binding read anywhere else is
+//!   left completely alone.
+//!
+//! Once every use is substituted the `let` is dead and is deleted — the deletion is half the point,
+//! because a leftover statement in a loop body is itself enough to make a whole-nest matcher (which
+//! requires the body to be exactly the inner `for`) decline.
+//!
+//! Substituting into a nested `let` initializer is not allowed (that is not index position), so a
+//! *chain* of bases (`let d = 16; let ib = i*d; … a[ib + p]`) needs one round per link: the pass is
+//! a fixpoint, and each round strictly removes at least one `let`.
 
 use wukong_ast::{
-    Block, Expr, ExprKind, ForIter, Module, PatKind, Pattern, Stmt, StmtKind, UnOp, VariantPat,
+    Block, Expr, ExprKind, ForIter, ItemKind, Module, PatKind, Pattern, Stmt, StmtKind, UnOp,
+    VariantPat,
 };
 use wukong_sema::SemaResult;
-use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Symbol};
+use wukong_span::{FxHashSet as HashSet, Symbol};
 use wukong_types::Ty;
 
-/// Bound on the substitute-and-retry fixpoint. Each round deletes at least one `let` or stops, so
-/// this is a belt-and-braces cap, not the normal exit; chained bases (`let ib = i*N; let ic = ib+C;`)
-/// need one round per link.
+/// Bound on the substitute-and-retry fixpoint. Every round that reports a change has deleted at
+/// least one `let`, so the loop terminates on its own; this is only a belt-and-braces cap. Chained
+/// bases need one round per link.
 const MAX_ROUNDS: usize = 8;
 
-/// Canonicalize `module` for the recognizers. Returns `None` — having touched nothing and cloned
-/// nothing — when no function in the module admits a rewrite, which keeps the output byte-identical
-/// for the programs this cannot help.
+/// Canonicalize `module` for the recognizers. Returns `None` — having cloned nothing — when no
+/// function admits a rewrite, so the output stays byte-identical for the programs this cannot help.
 pub(crate) fn canonicalize_module(module: &Module, sema: &SemaResult) -> Option<Module> {
-    // Names that a single-segment `Path` could denote *without* being the local we are substituting
-    // (a top-level `const`, a `fn`, a struct/enum). A local of the same name shadows them inside the
-    // function, so a body-wide substitution keyed on the bare name would rewrite the wrong node.
-    let mut shadowed: HashSet<Symbol> = HashSet::default();
-    for d in &sema.defs.defs {
-        shadowed.insert(d.name);
-    }
-    for name in sema.consts.keys() {
-        shadowed.insert(*name);
-    }
-
     let mut out = module.clone();
     let mut changed = false;
     for item in &mut out.items {
-        if let wukong_ast::ItemKind::Fn(f) = &mut item.kind {
-            let Some(body) = f.body.as_mut() else { continue };
-            let params: Vec<Symbol> = f.params.iter().map(|p| p.name.sym).collect();
-            changed |= canonicalize_fn(body, &params, sema, &shadowed);
+        let ItemKind::Fn(f) = &mut item.kind else {
+            continue;
+        };
+        let Some(body) = f.body.as_mut() else { continue };
+        // A `defer` runs its expression at a *scope exit*, where a substituted loop variable no
+        // longer holds the value it had at the `let`. Decline the whole function rather than reason
+        // about it (lowering rejects `defer` anyway).
+        if block_has_defer(body) {
+            continue;
+        }
+        for _ in 0..MAX_ROUNDS {
+            if !canon_block(body, sema) {
+                break;
+            }
+            changed = true;
         }
     }
     if changed {
@@ -79,278 +91,222 @@ pub(crate) fn canonicalize_module(module: &Module, sema: &SemaResult) -> Option<
     }
 }
 
-/// Run the fixpoint over one function body. Returns whether anything was rewritten.
-fn canonicalize_fn(
-    body: &mut Block,
-    params: &[Symbol],
-    sema: &SemaResult,
-    shadowed: &HashSet<Symbol>,
-) -> bool {
-    let mut any = false;
-    for _ in 0..MAX_ROUNDS {
-        let subst = Subst::collect(body, params, sema, shadowed);
-        if subst.map.is_empty() {
-            break;
-        }
-        subst.apply_block(body);
-        any = true;
-    }
-    any
-}
-
-/// The substitutions chosen for one round: binding name -> the initializer to inline at every use.
-struct Subst {
-    map: HashMap<Symbol, Expr>,
-}
-
-/// Per-function facts gathered in one scan, used to prove a candidate binding safe.
-#[derive(Default)]
-struct FnFacts {
-    /// How many times each name is *declared* (parameter, `let`, `for` binding, pattern binding).
-    /// A name declared more than once may be shadowed, so a body-wide rewrite of it is unsound.
-    decls: HashMap<Symbol, u32>,
-    /// Names that are the root of an assignment target anywhere in the function (`x = …`, `x += …`).
-    /// Only the *root* counts: in `a[i] = v` the buffer `a` is assigned, `i` is merely read.
-    assigned: HashSet<Symbol>,
-    /// Names that appear under a `&` / `&mut`, whose address therefore escapes.
-    addressed: HashSet<Symbol>,
-    /// The function contains a `defer`, whose deferred expression runs at a scope exit where a
-    /// substituted loop variable no longer holds the value it had at the `let`. Decline wholesale.
-    has_defer: bool,
-}
-
-impl Subst {
-    /// Choose every binding in `body` that can be safely forward-substituted into its uses.
-    fn collect(
-        body: &Block,
-        params: &[Symbol],
-        sema: &SemaResult,
-        shadowed: &HashSet<Symbol>,
-    ) -> Subst {
-        let mut facts = FnFacts::default();
-        for p in params {
-            *facts.decls.entry(*p).or_insert(0) += 1;
-        }
-        scan_block(body, &mut facts);
-
-        let mut map: HashMap<Symbol, Expr> = HashMap::default();
-        if facts.has_defer {
-            return Subst { map };
-        }
-        let mut cands = Vec::new();
-        collect_candidates(body, &mut cands);
-        for (name, init) in cands {
-            if map.contains_key(&name) {
-                continue;
-            }
-            if !binding_is_substitutable(name, init, &facts, sema, shadowed) {
-                continue;
-            }
-            // Every use must be in index position, and must carry the initializer's exact type.
-            let init_ty = match sema.types.get(&init.id) {
-                Some(t) => t,
-                None => continue,
-            };
-            let mut uses = UseScan {
-                name,
-                init_ty,
-                sema,
-                count: 0,
-                ok: true,
-            };
-            uses.block(body, false);
-            if uses.ok && uses.count > 0 {
-                map.insert(name, init.clone());
-            }
-        }
-        Subst { map }
-    }
-
-    fn apply_block(&self, b: &mut Block) {
-        b.stmts.retain(|s| !self.is_dead_let(s));
-        for s in &mut b.stmts {
-            self.apply_stmt(s);
-        }
-        if let Some(t) = &mut b.tail {
-            self.apply_expr(t);
-        }
-    }
-
-    /// A `let` whose binding was fully substituted has no readers left, and its initializer is pure
-    /// by construction, so the statement is dead. Deleting it is the point: a leftover statement in
-    /// a loop body makes every whole-nest matcher decline.
-    fn is_dead_let(&self, s: &Stmt) -> bool {
-        match &s.kind {
+/// Rewrite one block: first every `let` it declares itself (each against the remainder of *this*
+/// block, which is exactly the region that binding dominates), then, recursively, the blocks nested
+/// inside the statements that survive. Returns whether anything was rewritten.
+fn canon_block(b: &mut Block, sema: &SemaResult) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < b.stmts.len() {
+        // A `let <ident> = <init>;` with no statement attributes (dropping the statement would drop
+        // them). Cloning the initializer up front releases the borrow on `b` for the rewrite below.
+        let cand = match &b.stmts[i].kind {
             StmtKind::Let {
-                pat: Pattern {
-                    kind: PatKind::Ident(sym),
-                    ..
-                },
-                init: Some(_),
+                pat:
+                    Pattern {
+                        kind: PatKind::Ident(x),
+                        ..
+                    },
+                init: Some(e),
                 ..
-            } => self.map.contains_key(sym),
-            _ => false,
+            } if b.stmts[i].attrs.is_empty() => Some((*x, e.clone())),
+            _ => None,
+        };
+        if let Some((x, init)) = cand {
+            if region_admits(&b.stmts[i + 1..], b.tail.as_deref(), x, &init, sema) {
+                let rest = &mut b.stmts[i + 1..];
+                for s in rest.iter_mut() {
+                    subst_stmt(s, x, &init);
+                }
+                if let Some(t) = b.tail.as_mut() {
+                    subst_expr(t, x, &init);
+                }
+                b.stmts.remove(i);
+                changed = true;
+                continue; // the statement that shifted into slot `i` has not been looked at yet
+            }
         }
+        i += 1;
     }
-
-    fn apply_stmt(&self, s: &mut Stmt) {
-        match &mut s.kind {
-            StmtKind::Let { init, .. } => {
-                if let Some(e) = init {
-                    self.apply_expr(e);
-                }
-            }
-            StmtKind::Assign { target, value, .. } => {
-                self.apply_expr(target);
-                self.apply_expr(value);
-            }
-            StmtKind::Expr(e) | StmtKind::Defer(e) => self.apply_expr(e),
-            StmtKind::Return(e) | StmtKind::Break(_, e) => {
-                if let Some(e) = e {
-                    self.apply_expr(e);
-                }
-            }
-            StmtKind::Continue(_) => {}
-            StmtKind::While { cond, body, .. } => {
-                self.apply_expr(cond);
-                self.apply_block(body);
-            }
-            StmtKind::For { iter, body, .. } => {
-                match iter {
-                    ForIter::Range {
-                        start, end, step, ..
-                    } => {
-                        self.apply_expr(start);
-                        if let Some(e) = end {
-                            self.apply_expr(e);
-                        }
-                        if let Some(e) = step {
-                            self.apply_expr(e);
-                        }
-                    }
-                    ForIter::Expr(e) => self.apply_expr(e),
-                }
-                self.apply_block(body);
-            }
-        }
+    for s in &mut b.stmts {
+        changed |= canon_stmt(s, sema);
     }
+    if let Some(t) = b.tail.as_mut() {
+        changed |= canon_expr(t, sema);
+    }
+    changed
+}
 
-    fn apply_expr(&self, e: &mut Expr) {
-        if let ExprKind::Path(p) = &e.kind {
-            if p.is_single() {
-                if let Some(rep) = self.map.get(&p.first().sym) {
-                    *e = rep.clone();
-                    return;
-                }
-            }
+fn canon_stmt(s: &mut Stmt, sema: &SemaResult) -> bool {
+    match &mut s.kind {
+        StmtKind::Let { init, .. } => init.as_mut().is_some_and(|e| canon_expr(e, sema)),
+        StmtKind::Assign { target, value, .. } => {
+            canon_expr(target, sema) | canon_expr(value, sema)
         }
-        match &mut e.kind {
-            ExprKind::Int(_)
-            | ExprKind::Float(_)
-            | ExprKind::Str(_)
-            | ExprKind::Char(_)
-            | ExprKind::Bool(_)
-            | ExprKind::Path(_)
-            | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
-            ExprKind::Unary { expr, .. }
-            | ExprKind::Cast { expr, .. }
-            | ExprKind::Field { base: expr, .. }
-            | ExprKind::TupleField { base: expr, .. } => self.apply_expr(expr),
-            ExprKind::Binary { lhs, rhs, .. } => {
-                self.apply_expr(lhs);
-                self.apply_expr(rhs);
-            }
-            ExprKind::Call { callee, args, .. } => {
-                self.apply_expr(callee);
-                for a in args {
-                    self.apply_expr(a);
+        StmtKind::Expr(e) | StmtKind::Defer(e) => canon_expr(e, sema),
+        StmtKind::Return(e) | StmtKind::Break(_, e) => {
+            e.as_mut().is_some_and(|e| canon_expr(e, sema))
+        }
+        StmtKind::Continue(_) => false,
+        StmtKind::While { cond, body, .. } => canon_expr(cond, sema) | canon_block(body, sema),
+        StmtKind::For { iter, body, .. } => {
+            let mut c = match iter {
+                ForIter::Range {
+                    start, end, step, ..
+                } => {
+                    canon_expr(start, sema)
+                        | end.as_mut().is_some_and(|e| canon_expr(e, sema))
+                        | step.as_mut().is_some_and(|e| canon_expr(e, sema))
                 }
-            }
-            ExprKind::Index { base, indices } => {
-                self.apply_expr(base);
-                for i in indices {
-                    self.apply_expr(i);
-                }
-            }
-            ExprKind::StructLit { fields, rest, .. } => {
-                for f in fields {
-                    self.apply_expr(&mut f.value);
-                }
-                if let Some(r) = rest {
-                    self.apply_expr(r);
-                }
-            }
-            ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
-                for x in xs {
-                    self.apply_expr(x);
-                }
-            }
-            ExprKind::ArrayRepeat { value, count } => {
-                self.apply_expr(value);
-                self.apply_expr(count);
-            }
-            ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => self.apply_block(b),
-            ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                self.apply_expr(cond);
-                self.apply_block(then_branch);
-                if let Some(e) = else_branch {
-                    self.apply_expr(e);
-                }
-            }
-            ExprKind::Match { scrutinee, arms } => {
-                self.apply_expr(scrutinee);
-                for a in arms {
-                    if let Some(g) = &mut a.guard {
-                        self.apply_expr(g);
-                    }
-                    self.apply_expr(&mut a.body);
-                }
-            }
+                ForIter::Expr(e) => canon_expr(e, sema),
+            };
+            c |= canon_block(body, sema);
+            c
         }
     }
 }
 
-/// Is this binding safe to inline at every one of its uses? Checks everything that does not depend
-/// on the use sites themselves (those are checked by [`UseScan`]).
-fn binding_is_substitutable(
-    name: Symbol,
+fn canon_expr(e: &mut Expr, sema: &SemaResult) -> bool {
+    match &mut e.kind {
+        ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => canon_block(b, sema),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            canon_expr(cond, sema)
+                | canon_block(then_branch, sema)
+                | else_branch.as_mut().is_some_and(|x| canon_expr(x, sema))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            let mut c = canon_expr(scrutinee, sema);
+            for a in arms {
+                if let Some(g) = &mut a.guard {
+                    c |= canon_expr(g, sema);
+                }
+                c |= canon_expr(&mut a.body, sema);
+            }
+            c
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Field { base: expr, .. }
+        | ExprKind::TupleField { base: expr, .. } => canon_expr(expr, sema),
+        ExprKind::Binary { lhs, rhs, .. } => canon_expr(lhs, sema) | canon_expr(rhs, sema),
+        ExprKind::Call { callee, args, .. } => {
+            let mut c = canon_expr(callee, sema);
+            for a in args {
+                c |= canon_expr(a, sema);
+            }
+            c
+        }
+        ExprKind::Index { base, indices } => {
+            let mut c = canon_expr(base, sema);
+            for i in indices {
+                c |= canon_expr(i, sema);
+            }
+            c
+        }
+        ExprKind::StructLit { fields, rest, .. } => {
+            let mut c = false;
+            for f in fields {
+                c |= canon_expr(&mut f.value, sema);
+            }
+            if let Some(r) = rest {
+                c |= canon_expr(r, sema);
+            }
+            c
+        }
+        ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
+            let mut c = false;
+            for x in xs {
+                c |= canon_expr(x, sema);
+            }
+            c
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            canon_expr(value, sema) | canon_expr(count, sema)
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => false,
+    }
+}
+
+// ---- legality ----------------------------------------------------------------------------------
+
+/// What the region does to the *names* a substitution depends on. One scan answers all of it.
+#[derive(Default)]
+struct RegionFacts {
+    /// Names the region re-declares (a `let`, a `for` binding, a `match` pattern binding). A name
+    /// re-declared in the region may denote a different binding at a use, so neither the substituted
+    /// binding nor any free variable of its initializer may appear here.
+    declared: HashSet<Symbol>,
+    /// Names that are the *root* of an assignment target in the region. Only the root counts: in
+    /// `a[i] = v` the buffer `a` is written and `i` is merely read.
+    assigned: HashSet<Symbol>,
+    /// Names whose address is taken (`&x` / `&mut x`) in the region.
+    addressed: HashSet<Symbol>,
+}
+
+/// May `x`, bound to `init`, be inlined at every one of its uses in this region?
+fn region_admits(
+    stmts: &[Stmt],
+    tail: Option<&Expr>,
+    x: Symbol,
     init: &Expr,
-    facts: &FnFacts,
     sema: &SemaResult,
-    shadowed: &HashSet<Symbol>,
 ) -> bool {
-    if shadowed.contains(&name) || facts.decls.get(&name) != Some(&1) {
+    // Integer only: a float binding would move a rounding step and an aggregate would move a copy.
+    let Some(init_ty) = sema.types.get(&init.id) else {
+        return false;
+    };
+    if !matches!(init_ty, Ty::Scalar(s) if s.is_int()) {
         return false;
     }
-    if facts.assigned.contains(&name) || facts.addressed.contains(&name) {
+    let mut facts = RegionFacts::default();
+    for s in stmts {
+        scan_stmt(s, &mut facts);
+    }
+    if let Some(t) = tail {
+        scan_expr(t, &mut facts);
+    }
+    if facts.declared.contains(&x) || facts.assigned.contains(&x) || facts.addressed.contains(&x) {
         return false;
     }
-    // Integer only: a float `let` would move a rounding step, and an aggregate would move a copy.
-    if !matches!(sema.types.get(&init.id), Some(Ty::Scalar(s)) if s.is_int()) {
+    if !pure_index_expr(init, &facts, sema) {
         return false;
     }
-    pure_index_expr(init, facts, sema, shadowed)
+    let mut uses = UseScan {
+        name: x,
+        init_ty,
+        sema,
+        count: 0,
+        ok: true,
+    };
+    for s in stmts {
+        uses.stmt(s, false);
+    }
+    if let Some(t) = tail {
+        uses.expr(t, false);
+    }
+    uses.ok && uses.count > 0
 }
 
-/// Is `e` an expression that may be duplicated and re-evaluated at an arbitrary later point in the
-/// same function without changing what the program computes?
+/// Is `e` an expression that may be duplicated and re-evaluated at any later point in this region
+/// without changing what the program computes?
 ///
-/// Deliberately tiny: integer literals, immutable integer variables, and `+ - *` (which wrap
-/// identically however many times they are evaluated). `/` and `%` are excluded because they can
-/// trap, and moving a trap under a branch that may not be taken *removes* a fault the original
-/// program had. Calls, indexing and field access are excluded because their value depends on memory
-/// that a later statement may have written.
-fn pure_index_expr(
-    e: &Expr,
-    facts: &FnFacts,
-    sema: &SemaResult,
-    shadowed: &HashSet<Symbol>,
-) -> bool {
+/// Deliberately tiny: integer literals, integer variables the region cannot disturb, and `+ - *`
+/// (which wrap identically however many times they are evaluated). `/` and `%` are excluded because
+/// they can trap, and re-siting a trap under a branch that may not be taken *removes* a fault the
+/// original program had. Calls, indexing and field access are excluded because their value depends
+/// on memory a later statement may have written.
+fn pure_index_expr(e: &Expr, facts: &RegionFacts, sema: &SemaResult) -> bool {
     match &e.kind {
         ExprKind::Int(_) => true,
         ExprKind::Path(p) => {
@@ -358,12 +314,10 @@ fn pure_index_expr(
                 return false;
             }
             let sym = p.first().sym;
-            // A free variable of the initializer must be a local that cannot change between the
-            // `let` and any use, and cannot be a differently-scoped homonym.
-            if shadowed.contains(&sym) || facts.decls.get(&sym) != Some(&1) {
-                return false;
-            }
-            if facts.assigned.contains(&sym) || facts.addressed.contains(&sym) {
+            if facts.declared.contains(&sym)
+                || facts.assigned.contains(&sym)
+                || facts.addressed.contains(&sym)
+            {
                 return false;
             }
             matches!(sema.types.get(&e.id), Some(Ty::Scalar(s)) if s.is_int())
@@ -371,21 +325,20 @@ fn pure_index_expr(
         ExprKind::Unary {
             op: UnOp::Neg,
             expr,
-        } => pure_index_expr(expr, facts, sema, shadowed),
+        } => pure_index_expr(expr, facts, sema),
         ExprKind::Binary { op, lhs, rhs } => {
-            use wukong_ast::BinOp::*;
+            use wukong_ast::BinOp::{Add, Mul, Sub};
             matches!(op, Add | Sub | Mul)
-                && pure_index_expr(lhs, facts, sema, shadowed)
-                && pure_index_expr(rhs, facts, sema, shadowed)
+                && pure_index_expr(lhs, facts, sema)
+                && pure_index_expr(rhs, facts, sema)
         }
         _ => false,
     }
 }
 
-/// Walks the body checking that every occurrence of `name` sits in **index position** and carries
-/// exactly `init_ty`. Index position is the point of the whole pass: those are the occurrences the
-/// recognizers' affine analysis needs to see through. Restricting to them also bounds the blast
-/// radius — a binding read anywhere else is left completely alone.
+/// Checks that every occurrence of `name` in the region sits in **index position** and carries
+/// exactly `init_ty`. A single occurrence that fails disqualifies the whole binding, so the `let`
+/// is only deleted when every reader has been rewritten.
 struct UseScan<'a> {
     name: Symbol,
     init_ty: &'a Ty,
@@ -452,8 +405,6 @@ impl UseScan<'_> {
         }
         match &e.kind {
             ExprKind::Path(p) if p.is_single() && p.first().sym == self.name => {
-                // A use outside an index, or one whose recorded type differs from the initializer's
-                // (a narrowing/widening `let` annotation), disqualifies the whole binding.
                 if !in_index || self.sema.types.get(&e.id) != Some(self.init_ty) {
                     self.ok = false;
                 } else {
@@ -482,6 +433,7 @@ impl UseScan<'_> {
                     self.expr(a, in_index);
                 }
             }
+            // The one place `in_index` turns on: an index expression of `base[i0, .., in]`.
             ExprKind::Index { base, indices } => {
                 self.expr(base, in_index);
                 for i in indices {
@@ -530,9 +482,139 @@ impl UseScan<'_> {
     }
 }
 
-// ---- the one-shot fact scan --------------------------------------------------------------------
+// ---- substitution ------------------------------------------------------------------------------
 
-fn scan_block(b: &Block, f: &mut FnFacts) {
+fn subst_block(b: &mut Block, x: Symbol, init: &Expr) {
+    for s in &mut b.stmts {
+        subst_stmt(s, x, init);
+    }
+    if let Some(t) = &mut b.tail {
+        subst_expr(t, x, init);
+    }
+}
+
+fn subst_stmt(s: &mut Stmt, x: Symbol, init: &Expr) {
+    match &mut s.kind {
+        StmtKind::Let { init: i, .. } => {
+            if let Some(e) = i {
+                subst_expr(e, x, init);
+            }
+        }
+        StmtKind::Assign { target, value, .. } => {
+            subst_expr(target, x, init);
+            subst_expr(value, x, init);
+        }
+        StmtKind::Expr(e) | StmtKind::Defer(e) => subst_expr(e, x, init),
+        StmtKind::Return(e) | StmtKind::Break(_, e) => {
+            if let Some(e) = e {
+                subst_expr(e, x, init);
+            }
+        }
+        StmtKind::Continue(_) => {}
+        StmtKind::While { cond, body, .. } => {
+            subst_expr(cond, x, init);
+            subst_block(body, x, init);
+        }
+        StmtKind::For { iter, body, .. } => {
+            match iter {
+                ForIter::Range {
+                    start, end, step, ..
+                } => {
+                    subst_expr(start, x, init);
+                    if let Some(e) = end {
+                        subst_expr(e, x, init);
+                    }
+                    if let Some(e) = step {
+                        subst_expr(e, x, init);
+                    }
+                }
+                ForIter::Expr(e) => subst_expr(e, x, init),
+            }
+            subst_block(body, x, init);
+        }
+    }
+}
+
+fn subst_expr(e: &mut Expr, x: Symbol, init: &Expr) {
+    if let ExprKind::Path(p) = &e.kind {
+        if p.is_single() && p.first().sym == x {
+            *e = init.clone();
+            return;
+        }
+    }
+    match &mut e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => {}
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Field { base: expr, .. }
+        | ExprKind::TupleField { base: expr, .. } => subst_expr(expr, x, init),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            subst_expr(lhs, x, init);
+            subst_expr(rhs, x, init);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            subst_expr(callee, x, init);
+            for a in args {
+                subst_expr(a, x, init);
+            }
+        }
+        ExprKind::Index { base, indices } => {
+            subst_expr(base, x, init);
+            for i in indices {
+                subst_expr(i, x, init);
+            }
+        }
+        ExprKind::StructLit { fields, rest, .. } => {
+            for f in fields {
+                subst_expr(&mut f.value, x, init);
+            }
+            if let Some(r) = rest {
+                subst_expr(r, x, init);
+            }
+        }
+        ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
+            for v in xs {
+                subst_expr(v, x, init);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            subst_expr(value, x, init);
+            subst_expr(count, x, init);
+        }
+        ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => subst_block(b, x, init),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            subst_expr(cond, x, init);
+            subst_block(then_branch, x, init);
+            if let Some(v) = else_branch {
+                subst_expr(v, x, init);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            subst_expr(scrutinee, x, init);
+            for a in arms {
+                if let Some(g) = &mut a.guard {
+                    subst_expr(g, x, init);
+                }
+                subst_expr(&mut a.body, x, init);
+            }
+        }
+    }
+}
+
+// ---- the region fact scan ----------------------------------------------------------------------
+
+fn scan_block(b: &Block, f: &mut RegionFacts) {
     for s in &b.stmts {
         scan_stmt(s, f);
     }
@@ -541,9 +623,11 @@ fn scan_block(b: &Block, f: &mut FnFacts) {
     }
 }
 
-fn scan_pattern(p: &Pattern, f: &mut FnFacts) {
+fn scan_pattern(p: &Pattern, f: &mut RegionFacts) {
     match &p.kind {
-        PatKind::Ident(s) => *f.decls.entry(*s).or_insert(0) += 1,
+        PatKind::Ident(s) => {
+            f.declared.insert(*s);
+        }
         PatKind::Tuple(subs) | PatKind::Or(subs) => {
             for s in subs {
                 scan_pattern(s, f);
@@ -571,8 +655,8 @@ fn scan_pattern(p: &Pattern, f: &mut FnFacts) {
     }
 }
 
-/// The name whose *storage* an assignment target names — the root of a `x`, `x.f`, `x[i]`, `x.0`
-/// chain. `x[i] = v` writes through `x`, so `x` is recorded; `i` is only read and is not.
+/// The name whose *storage* an assignment target names — the root of an `x`, `x.f`, `x[i]`, `x.0`,
+/// `*x` chain. `x[i] = v` writes through `x`, so `x` is recorded and `i` is not.
 fn assign_root(e: &Expr) -> Option<Symbol> {
     match &e.kind {
         ExprKind::Path(p) if p.is_single() => Some(p.first().sym),
@@ -584,7 +668,7 @@ fn assign_root(e: &Expr) -> Option<Symbol> {
     }
 }
 
-fn scan_stmt(s: &Stmt, f: &mut FnFacts) {
+fn scan_stmt(s: &Stmt, f: &mut RegionFacts) {
     match &s.kind {
         StmtKind::Let { pat, init, .. } => {
             scan_pattern(pat, f);
@@ -599,11 +683,7 @@ fn scan_stmt(s: &Stmt, f: &mut FnFacts) {
             scan_expr(target, f);
             scan_expr(value, f);
         }
-        StmtKind::Expr(e) => scan_expr(e, f),
-        StmtKind::Defer(e) => {
-            f.has_defer = true;
-            scan_expr(e, f);
-        }
+        StmtKind::Expr(e) | StmtKind::Defer(e) => scan_expr(e, f),
         StmtKind::Return(e) | StmtKind::Break(_, e) => {
             if let Some(e) = e {
                 scan_expr(e, f);
@@ -637,7 +717,7 @@ fn scan_stmt(s: &Stmt, f: &mut FnFacts) {
     }
 }
 
-fn scan_expr(e: &Expr, f: &mut FnFacts) {
+fn scan_expr(e: &Expr, f: &mut RegionFacts) {
     match &e.kind {
         ExprKind::Int(_)
         | ExprKind::Float(_)
@@ -716,77 +796,57 @@ fn scan_expr(e: &Expr, f: &mut FnFacts) {
     }
 }
 
-/// Every `let <ident> = <init>;` in the function, innermost blocks included, in source order.
-fn collect_candidates<'a>(b: &'a Block, out: &mut Vec<(Symbol, &'a Expr)>) {
+// ---- `defer` detection -------------------------------------------------------------------------
+
+fn block_has_defer(b: &Block) -> bool {
+    let mut found = false;
+    scan_defer_block(b, &mut found);
+    found
+}
+
+fn scan_defer_block(b: &Block, found: &mut bool) {
     for s in &b.stmts {
-        cand_stmt(s, out);
+        scan_defer_stmt(s, found);
     }
     if let Some(t) = &b.tail {
-        cand_expr(t, out);
+        scan_defer_expr(t, found);
     }
 }
 
-fn cand_stmt<'a>(s: &'a Stmt, out: &mut Vec<(Symbol, &'a Expr)>) {
+fn scan_defer_stmt(s: &Stmt, found: &mut bool) {
     match &s.kind {
-        StmtKind::Let { pat, init, .. } => {
-            if let (PatKind::Ident(sym), Some(e)) = (&pat.kind, init) {
-                out.push((*sym, e));
-                cand_expr(e, out);
-            } else if let Some(e) = init {
-                cand_expr(e, out);
-            }
+        StmtKind::Defer(_) => *found = true,
+        StmtKind::While { body, .. } | StmtKind::For { body, .. } => scan_defer_block(body, found),
+        StmtKind::Let {
+            init: Some(e), ..
         }
+        | StmtKind::Expr(e)
+        | StmtKind::Return(Some(e))
+        | StmtKind::Break(_, Some(e)) => scan_defer_expr(e, found),
         StmtKind::Assign { target, value, .. } => {
-            cand_expr(target, out);
-            cand_expr(value, out);
+            scan_defer_expr(target, found);
+            scan_defer_expr(value, found);
         }
-        StmtKind::Expr(e) | StmtKind::Defer(e) => cand_expr(e, out),
-        StmtKind::Return(e) | StmtKind::Break(_, e) => {
-            if let Some(e) = e {
-                cand_expr(e, out);
-            }
-        }
-        StmtKind::Continue(_) => {}
-        StmtKind::While { cond, body, .. } => {
-            cand_expr(cond, out);
-            collect_candidates(body, out);
-        }
-        StmtKind::For { iter, body, .. } => {
-            match iter {
-                ForIter::Range {
-                    start, end, step, ..
-                } => {
-                    cand_expr(start, out);
-                    if let Some(e) = end {
-                        cand_expr(e, out);
-                    }
-                    if let Some(e) = step {
-                        cand_expr(e, out);
-                    }
-                }
-                ForIter::Expr(e) => cand_expr(e, out),
-            }
-            collect_candidates(body, out);
-        }
+        _ => {}
     }
 }
 
-fn cand_expr<'a>(e: &'a Expr, out: &mut Vec<(Symbol, &'a Expr)>) {
+fn scan_defer_expr(e: &Expr, found: &mut bool) {
     match &e.kind {
-        ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => collect_candidates(b, out),
+        ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => scan_defer_block(b, found),
         ExprKind::If {
             then_branch,
             else_branch,
             ..
         } => {
-            collect_candidates(then_branch, out);
+            scan_defer_block(then_branch, found);
             if let Some(x) = else_branch {
-                cand_expr(x, out);
+                scan_defer_expr(x, found);
             }
         }
         ExprKind::Match { arms, .. } => {
             for a in arms {
-                cand_expr(&a.body, out);
+                scan_defer_expr(&a.body, found);
             }
         }
         _ => {}
