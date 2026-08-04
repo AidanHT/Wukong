@@ -135,7 +135,11 @@ struct Fact {
     /// Round number in which this value's *definition* was visited by the provenance pass. Compared
     /// against the current round instead of being reset, so "have I seen the definition yet?" costs
     /// no clearing sweep between rounds. `0` means never.
-    seen: u32,
+    ///
+    /// `u16`, not `usize`: the round never exceeds `MAX_PROV_ROUNDS`, and this way the stamp fits
+    /// the padding `alloca_bytes`/`escaped` already leave, keeping `Fact` at 32 bytes. See
+    /// `fact_stays_one_cache_friendly_record`.
+    seen: u16,
 }
 
 /// Sentinel for "no constant / no known offset". A real offset this large is unreachable (it would
@@ -158,7 +162,7 @@ impl Default for Fact {
 /// Hard cap on provenance rounds. A `gep` chain is a DAG (SSA has no value cycles), so the pass
 /// converges in at most its depth; the cap only bounds the pathological case, and exhausting it
 /// falls back to "every slot escaped", which is sound.
-const MAX_PROV_ROUNDS: u32 = 8;
+const MAX_PROV_ROUNDS: u16 = 8;
 
 /// The result of running [`AliasInfo::analyze`] over one function: one `Fact` per SSA value —
 /// provenance, constant offset, alloca size and escape bit, in a flat vector indexed by `ValueId`.
@@ -214,7 +218,7 @@ impl AliasInfo {
         // points into as escaped — reporting a published slot as private. So sweep until every
         // `gep` has seen its base, tracked with a round stamp so the common (already-ordered) case
         // still costs exactly one pass.
-        let mut round = 0u32;
+        let mut round = 0u16;
         let stalled = loop {
             round += 1;
             let mut late_base = false;
@@ -486,6 +490,14 @@ mod tests {
     use super::*;
     use wukong_mir::{BinOp, Builder};
     use wukong_span::Interner;
+
+    /// `Fact` is allocated one-per-SSA-value on the compiler's hot path, so its size is a real
+    /// cost. Pinned here: the round stamp must fit in the padding that `alloca_bytes`/`escaped`
+    /// already leave, not push the record into another 8 bytes.
+    #[test]
+    fn fact_stays_one_cache_friendly_record() {
+        assert_eq!(std::mem::size_of::<Fact>(), 32, "Fact grew");
+    }
 
     fn blob(bytes: u32) -> MirType {
         MirType::Array(Box::new(MirType::I8), bytes)
