@@ -27,6 +27,7 @@ enum Act {
     Neg(ValueId),
     Not(ValueId),
     Cast(CastKind, ValueId),
+    Gep(ValueId, ValueId),
 }
 
 impl Pass for Simplify {
@@ -76,6 +77,7 @@ impl Pass for Simplify {
                     Op::Neg(v) => Act::Neg(*v),
                     Op::Not(v) => Act::Not(*v),
                     Op::Cast(k, v, _) => Act::Cast(*k, *v),
+                    Op::Gep { ptr, index, .. } => Act::Gep(*ptr, *index),
                     _ => continue,
                 };
 
@@ -178,6 +180,18 @@ impl Pass for Simplify {
                                 consts.insert(res.0, CV::Int(nv));
                                 changed = true;
                             }
+                        }
+                    }
+                    Act::Gep(ptr, index) => {
+                        // `gep p, 0 : T` is `p + 0 * sizeof(T)` — the pointer itself, for every
+                        // element type and on both backends (the interpreter strides by
+                        // `slot_count(elem)`, native by `size_of(elem)`; either way times zero).
+                        // The front end emits one for every `[]T` slice access (`gep base, 0 : i8`
+                        // reaching the fat pointer's data field), so this is the difference between
+                        // a slice-typed loop and an array-typed loop having the same MIR.
+                        if matches!(consts.get(&index.0), Some(CV::Int(0))) {
+                            subst.insert(res.0, ptr);
+                            changed = true;
                         }
                     }
                 }
