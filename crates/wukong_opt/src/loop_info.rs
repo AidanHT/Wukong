@@ -738,6 +738,18 @@ pub(crate) fn analyze_with(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Lo
     forest
 }
 
+/// Loop **structure only** — headers, latches, block sets, preheaders, exits and the nesting forest
+/// — skipping the induction-variable, trip-count, affine and dependence stages.
+///
+/// For a consumer that only rewires edges (`loop_canon`), the value analyses are pure cost: they
+/// walk every instruction of every loop and build an affine expression for each integer result, and
+/// they would be thrown away and recomputed after each rewrite. Every field they fill is left at its
+/// default here, so `ivs` is empty, `primary_iv` is `None` and `trip` is `TripCount::Unknown` —
+/// **do not read them off this result**; call [`analyze_with`] if you need them.
+pub(crate) fn structure_with(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> LoopForest {
+    find_loops(f, idom, preds)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Stage 1: loop structure
 // ---------------------------------------------------------------------------------------------
