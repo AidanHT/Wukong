@@ -44,10 +44,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   the late-initialization exclusion, and the aliasing case where the pointer is promoted to a block
   parameter merging two addresses whose pointees must stay in memory, and a finite-difference-gated
   `raw_pointer_parameter_grad` in `wukong_driver`.
-- **Not measured**: no wall-clock number is claimed. An A/A control (identical binary, interleaved,
-  core-pinned, best-of-10) showed ±3.6–8% spread, and the same binary on the same program varied
-  2.3× across adjacent rounds while ~20 other processes were building on the box. The instruction and
-  load counts above are static and exactly reproducible; the run-time consequence is not yet measured.
+- **No wall-clock claim.** The instruction and load counts above are static and exactly reproducible;
+  the run-time consequence is *not* established. The best round obtained (interleaved, core-pinned,
+  high priority, best-of-14 minima) put the A/B at 1.014–1.020× against an **A/A control on the
+  identical binary of 0.965–0.991×** — the effect is inside the instrument's own noise band. Earlier
+  rounds were worse still: the same binary on the same program varied 2.3× across adjacent rounds
+  while ~20 other build processes shared the machine. A real number needs a quiet box.
 
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
