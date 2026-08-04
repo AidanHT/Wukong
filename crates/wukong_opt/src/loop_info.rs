@@ -33,11 +33,13 @@
 
 use std::fmt::Write as _;
 
-use wukong_mir::{BlockId, Function, MirType, Program, Terminator, ValueId};
+use wukong_mir::{
+    BinOp, BlockId, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
+};
 use wukong_span::Interner;
 
 use crate::fxhash::{FxHashMap, FxHashSet};
-use crate::{cfg, dom};
+use crate::{cfg, dom, each_op_use};
 
 /// Sentinel for "no immediate dominator" (an unreachable block).
 const NO_IDOM: u32 = u32::MAX;
@@ -71,6 +73,12 @@ pub struct NaturalLoop {
     pub preheader: Option<BlockId>,
     /// Edges that leave the loop, as `(block inside, block outside)`, ascending.
     pub exits: Vec<(BlockId, BlockId)>,
+    /// Blocks inside the loop that leave it without an edge — a `return` or an `unreachable` in the
+    /// body. They are invisible to [`Self::exits`] (those terminators have no successors), so any
+    /// consumer that reasons about "how many times the body runs" has to check this list too: a
+    /// loop with an early `return` runs its exit test the same number of times but its body fewer.
+    /// [`TripCount`] is only ever computed when this is empty.
+    pub abnormal_exits: Vec<BlockId>,
     /// The innermost loop that strictly contains this one.
     pub parent: Option<LoopId>,
     /// Loops immediately nested in this one, ascending by header.
@@ -84,6 +92,8 @@ pub struct NaturalLoop {
     /// Index into [`Self::ivs`] of the IV the exit test compares — the one every affine
     /// expression in this loop is expressed against.
     pub primary_iv: Option<usize>,
+    /// How many times the body runs, where provable.
+    pub trip: TripCount,
     /// Values defined in the loop that are affine functions of the primary IV.
     pub derived: Vec<DerivedIv>,
     /// Reductions found among the header parameters.
@@ -169,7 +179,8 @@ impl LoopForest {
 pub enum IvStep {
     /// `i_next = i + k` with a literal `k` (negative for a countdown).
     Const(i64),
-    /// `i_next = i + s` with a loop-invariant but non-constant `s`.
+    /// `i_next = i + s` with a non-constant `s` that is defined **outside** the loop, so a
+    /// consumer can read it in the preheader.
     Invariant(ValueId),
 }
 
@@ -576,16 +587,27 @@ pub enum RedKind {
 }
 
 impl RedKind {
-    /// May the partial sums be reassociated — i.e. may a vectorizer keep N independent
+    /// May the partial results be reassociated — i.e. may a vectorizer keep N independent
     /// accumulators and fold them at the end?
     ///
-    /// Integer `add`/`mul`/bitwise and min/max are associative, so yes. Float `add`/`mul` are
-    /// **not**: `(a+b)+c != a+(b+c)` in IEEE-754, and Wukong's interpreter is the language spec,
-    /// so reassociating one changes the program's answer and breaks the differential gate. A
-    /// vectorizer may still widen the *body* that feeds such a reduction and keep the accumulate
-    /// serial — which is exactly what `gcc -O3` does without `-ffast-math`.
+    /// Integer `add`/`mul`/bitwise and integer min/max are associative, so yes.
+    ///
+    /// Float `add`/`mul` are **not**: `(a+b)+c != a+(b+c)` in IEEE-754, and Wukong's interpreter is
+    /// the language spec, so reassociating one changes the program's answer and breaks the
+    /// differential gate. A vectorizer may still widen the *body* that feeds such a reduction and
+    /// keep the accumulate serial — exactly what `gcc -O3` does without `-ffast-math`.
+    ///
+    /// Float min/max are **also not** associative here, which is easy to get wrong. Wukong spells
+    /// them `select(a > b, a, b)`, i.e. "`b` unless `a > b`", and every ordered compare against a
+    /// NaN is false. With `a = 1, b = NaN, c = 0`: folding left gives
+    /// `max(max(1, NaN), 0) = max(NaN, 0) = 0`, folding right gives
+    /// `max(1, max(NaN, 0)) = max(1, 0) = 1`. Different answers, so lane-wise partial maxima may
+    /// not be recombined in a different order than the source loop takes them.
     pub fn reassociable(self) -> bool {
-        !matches!(self, RedKind::FAdd | RedKind::FMul)
+        !matches!(
+            self,
+            RedKind::FAdd | RedKind::FMul | RedKind::FMax | RedKind::FMin
+        )
     }
 
     pub fn name(self) -> &'static str {
@@ -815,6 +837,20 @@ fn find_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> LoopForest {
         exits.sort_unstable_by_key(|(a, b)| (a.0, b.0));
         exits.dedup();
 
+        // A `ret`/`unreachable` inside the loop leaves it with no edge at all, so it never appears
+        // in `exits`. Record it separately rather than let a consumer mistake the loop for
+        // single-exit.
+        let abnormal_exits: Vec<BlockId> = blocks
+            .iter()
+            .filter(|&&b| {
+                matches!(
+                    f.blocks[b as usize].term,
+                    Terminator::Ret(_) | Terminator::Unreachable
+                )
+            })
+            .map(|&b| BlockId(b))
+            .collect();
+
         loops.push(NaturalLoop {
             id: LoopId(i as u32),
             header: BlockId(*h),
@@ -823,11 +859,13 @@ fn find_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> LoopForest {
             entering: entering.into_iter().map(BlockId).collect(),
             preheader,
             exits,
+            abnormal_exits,
             parent: None,
             children: Vec::new(),
             depth: 0,
             ivs: Vec::new(),
             primary_iv: None,
+            trip: TripCount::Unknown,
             derived: Vec::new(),
             reductions: Vec::new(),
             carried: Vec::new(),
@@ -896,11 +934,503 @@ fn find_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> LoopForest {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Stage 2+: per-loop value analyses (filled in by later stages of this module)
+// Stage 2: induction variables, trip counts, affine expressions
 // ---------------------------------------------------------------------------------------------
 
-fn analyze_loop(_f: &Function, _forest: &mut LoopForest, _idx: usize) {
-    // Filled in by the induction-variable, memory-access and dependence stages.
+/// Everything the value analyses need about one loop, computed once.
+struct LoopCtx<'a> {
+    f: &'a Function,
+    /// Value id -> `(block, inst)` of its defining instruction. `None` for block parameters and
+    /// for ids no instruction defines.
+    def: Vec<Option<(u32, u32)>>,
+    /// Blocks in the loop.
+    blocks: FxHashSet<u32>,
+    /// Values defined inside the loop: every loop block's parameters and instruction results.
+    defined_in_loop: FxHashSet<u32>,
+    /// The induction variable every [`AffineExpr`] in this loop is written against.
+    primary: Option<ValueId>,
+    /// Memo for [`LoopCtx::is_value_invariant`].
+    inv_memo: std::cell::RefCell<FxHashMap<u32, bool>>,
+}
+
+/// How deep `affine_of` will chase an operand chain. Cycles are impossible (every cycle in SSA
+/// runs through a block parameter, which is a base case), so this only guards against a
+/// pathologically long straight-line chain.
+const AFFINE_DEPTH_LIMIT: u32 = 64;
+
+impl<'a> LoopCtx<'a> {
+    fn new(f: &'a Function, l: &NaturalLoop) -> LoopCtx<'a> {
+        let mut def: Vec<Option<(u32, u32)>> = vec![None; f.value_types.len()];
+        for b in &f.blocks {
+            for (i, inst) in b.insts.iter().enumerate() {
+                if let Some(r) = inst.result {
+                    if (r.0 as usize) < def.len() {
+                        def[r.0 as usize] = Some((b.id.0, i as u32));
+                    }
+                }
+            }
+        }
+        let blocks: FxHashSet<u32> = l.blocks.iter().map(|b| b.0).collect();
+        let mut defined_in_loop = FxHashSet::default();
+        for &b in &blocks {
+            let blk = &f.blocks[b as usize];
+            for p in &blk.params {
+                defined_in_loop.insert(p.0);
+            }
+            for inst in &blk.insts {
+                if let Some(r) = inst.result {
+                    defined_in_loop.insert(r.0);
+                }
+            }
+        }
+        LoopCtx {
+            f,
+            def,
+            blocks,
+            defined_in_loop,
+            primary: None,
+            inv_memo: Default::default(),
+        }
+    }
+
+    /// Memoized [`LoopCtx::value_invariant`].
+    fn is_value_invariant(&self, v: ValueId) -> bool {
+        let mut seen = self.inv_memo.take();
+        let r = self.value_invariant(v, &mut seen, 0);
+        self.inv_memo.replace(seen);
+        r
+    }
+
+    fn op_of(&self, v: ValueId) -> Option<&'a Op> {
+        let (b, i) = (*self.def.get(v.0 as usize)?)?;
+        Some(&self.f.blocks[b as usize].insts[i as usize].op)
+    }
+
+    /// Is `v` unchanged by the loop — i.e. defined outside it?
+    fn is_invariant(&self, v: ValueId) -> bool {
+        !self.defined_in_loop.contains(&v.0)
+    }
+
+    /// Does `v` hold the same value on every iteration, even if the instruction computing it sits
+    /// *inside* the loop? True when every operand is itself loop-invariant and the operation is
+    /// pure integer/boolean arithmetic — a `Load` is excluded, because an invariant address can
+    /// still yield a different value after a store.
+    ///
+    /// This is what keeps the analysis independent of whether LICM has run. Before `-O2`, the row
+    /// base `i*n` of an `a[i*n + k]` is still computed inside the `k` loop; without this the `k`
+    /// loop's index would look non-affine at `-O1` and affine at `-O2`.
+    fn value_invariant(&self, v: ValueId, seen: &mut FxHashMap<u32, bool>, depth: u32) -> bool {
+        if !self.defined_in_loop.contains(&v.0) {
+            return true;
+        }
+        if let Some(&cached) = seen.get(&v.0) {
+            return cached;
+        }
+        if depth > AFFINE_DEPTH_LIMIT {
+            return false;
+        }
+        // A block parameter defined in the loop is where a cycle closes: assume it varies.
+        let Some(op) = self.op_of(v) else { return false };
+        let pure = matches!(
+            op,
+            Op::ConstInt(..)
+                | Op::ConstFloat(..)
+                | Op::Bin(..)
+                | Op::Cmp(..)
+                | Op::Neg(..)
+                | Op::Not(..)
+                | Op::Cast(..)
+                | Op::Select(..)
+        );
+        if !pure {
+            seen.insert(v.0, false);
+            return false;
+        }
+        // Insert `false` before recursing so a (impossible in SSA, but cheap to guard) cycle
+        // resolves to "varies" rather than looping forever.
+        seen.insert(v.0, false);
+        let mut uses = Vec::new();
+        each_op_use(op, &mut |u| uses.push(u));
+        let ok = uses.into_iter().all(|u| self.value_invariant(u, seen, depth + 1));
+        seen.insert(v.0, ok);
+        ok
+    }
+
+    /// `v` as a compile-time integer constant, wherever it is defined.
+    fn const_int(&self, v: ValueId) -> Option<i64> {
+        match self.op_of(v)? {
+            Op::ConstInt(c, ty) if ty.is_int() => i64::try_from(*c).ok(),
+            _ => None,
+        }
+    }
+
+    /// Express `v` as `coeff·iv + invariants + konst`, or `None` if it is not affine in the
+    /// loop's primary induction variable. See [`AffineExpr`] for the no-wraparound assumption.
+    fn affine_of(
+        &self,
+        v: ValueId,
+        memo: &mut FxHashMap<u32, Option<AffineExpr>>,
+        depth: u32,
+    ) -> Option<AffineExpr> {
+        if let Some(cached) = memo.get(&v.0) {
+            return cached.clone();
+        }
+        if depth > AFFINE_DEPTH_LIMIT {
+            return None;
+        }
+        let r = self.affine_uncached(v, memo, depth);
+        memo.insert(v.0, r.clone());
+        r
+    }
+
+    fn affine_uncached(
+        &self,
+        v: ValueId,
+        memo: &mut FxHashMap<u32, Option<AffineExpr>>,
+        depth: u32,
+    ) -> Option<AffineExpr> {
+        if Some(v) == self.primary {
+            return Some(AffineExpr::iv());
+        }
+        if self.is_invariant(v) {
+            // A loop-invariant value is either a literal we can fold into `konst`, or an opaque
+            // symbol we carry along. Either way it does not move with the IV.
+            return Some(match self.const_int(v) {
+                Some(c) => AffineExpr::constant(c),
+                None => AffineExpr::symbol(v),
+            });
+        }
+        // Defined in the loop. A block parameter (other than the primary IV) is where every SSA
+        // cycle closes, so it is also where the recursion stops: a second induction variable, a
+        // reduction, or a merge we do not model.
+        let op = self.op_of(v)?;
+        match op {
+            Op::ConstInt(c, ty) if ty.is_int() => Some(AffineExpr::constant(i64::try_from(*c).ok()?)),
+            Op::Bin(BinOp::Add, a, b) => {
+                let (x, y) = (self.affine_of(*a, memo, depth + 1)?, self.affine_of(*b, memo, depth + 1)?);
+                x.add(&y)
+            }
+            Op::Bin(BinOp::Sub, a, b) => {
+                let (x, y) = (self.affine_of(*a, memo, depth + 1)?, self.affine_of(*b, memo, depth + 1)?);
+                x.sub(&y)
+            }
+            Op::Bin(BinOp::Mul, a, b) => {
+                let (x, y) = (self.affine_of(*a, memo, depth + 1)?, self.affine_of(*b, memo, depth + 1)?);
+                x.mul(&y)
+            }
+            // `x << k` with a literal k is `x * 2^k`. Signed shifts by >= 63 are not modelled.
+            Op::Bin(BinOp::Shl, a, b) => {
+                let k = self.const_int(*b)?;
+                if !(0..63).contains(&k) {
+                    return None;
+                }
+                self.affine_of(*a, memo, depth + 1)?.scale(1i64 << k)
+            }
+            Op::Neg(a) => self.affine_of(*a, memo, depth + 1)?.neg(),
+            // `sext x == x` whenever `x` did not overflow its own width — the assumption the whole
+            // affine model already rests on. `zext` is NOT transparent (a negative narrow value
+            // becomes a large positive one), nor are `trunc`/`bitcast`.
+            Op::Cast(CastKind::SExt, a, _) => self.affine_of(*a, memo, depth + 1),
+            _ => None,
+        }
+        // A computation this decomposition cannot take apart — most often a product of two
+        // loop-invariant values, like the row base `i*n` of an inner loop — is still a usable
+        // opaque symbol as long as its value does not change across iterations.
+        .or_else(|| self.is_value_invariant(v).then(|| AffineExpr::symbol(v)))
+    }
+}
+
+/// The argument every latch passes to the header at parameter position `k`, when they all agree.
+fn latch_arg(f: &Function, l: &NaturalLoop, k: usize) -> Option<ValueId> {
+    let mut seen: Option<ValueId> = None;
+    for latch in &l.latches {
+        let args = args_to(&f.blocks[latch.0 as usize].term, l.header)?;
+        let v = *args.get(k)?;
+        match seen {
+            Some(prev) if prev != v => return None,
+            _ => seen = Some(v),
+        }
+    }
+    seen
+}
+
+/// The argument every entering edge passes to the header at parameter position `k`, when they all
+/// agree.
+fn entry_arg(f: &Function, l: &NaturalLoop, k: usize) -> Option<ValueId> {
+    let mut seen: Option<ValueId> = None;
+    for pred in &l.entering {
+        let args = args_to(&f.blocks[pred.0 as usize].term, l.header)?;
+        let v = *args.get(k)?;
+        match seen {
+            Some(prev) if prev != v => return None,
+            _ => seen = Some(v),
+        }
+    }
+    seen
+}
+
+/// Basic induction variables: header parameters whose latch argument is `param + step` with a
+/// loop-invariant step.
+fn find_basic_ivs(ctx: &LoopCtx<'_>, l: &NaturalLoop) -> Vec<InductionVar> {
+    let f = ctx.f;
+    let header = &f.blocks[l.header.0 as usize];
+    let mut ivs = Vec::new();
+    for (k, &p) in header.params.iter().enumerate() {
+        let Some(next) = latch_arg(f, l, k) else { continue };
+        if next == p {
+            continue; // carried unchanged — an invariant, not an IV
+        }
+        let Some(op) = ctx.op_of(next) else { continue };
+        let step = match op {
+            Op::Bin(BinOp::Add, a, b) => {
+                // `p + s` or `s + p`, with `s` loop-invariant.
+                let s = if *a == p && *b != p {
+                    *b
+                } else if *b == p && *a != p {
+                    *a
+                } else {
+                    continue;
+                };
+                match ctx.const_int(s) {
+                    Some(c) => IvStep::Const(c),
+                    None if ctx.is_invariant(s) => IvStep::Invariant(s),
+                    None => continue,
+                }
+            }
+            // `p - c` is a countdown. Only a literal is accepted: there is no MIR value for `-s`
+            // to point `IvStep::Invariant` at, and inventing one would be a transform.
+            Op::Bin(BinOp::Sub, a, b) if *a == p => match ctx.const_int(*b).and_then(i64::checked_neg) {
+                Some(c) => IvStep::Const(c),
+                None => continue,
+            },
+            _ => continue,
+        };
+        ivs.push(InductionVar {
+            value: p,
+            param_index: k,
+            start: entry_arg(f, l, k),
+            next,
+            step,
+            ty: f.value_type(p).clone(),
+        });
+    }
+    ivs
+}
+
+/// The exit test, if the loop has exactly one exit edge and it is a comparison of a basic IV
+/// against a loop-invariant bound. Returns `(iv index, continue-predicate, bound, exiting block)`,
+/// where the predicate is oriented as `iv <pred> bound` **while the loop keeps going**.
+fn exit_test(
+    ctx: &LoopCtx<'_>,
+    l: &NaturalLoop,
+    ivs: &[InductionVar],
+) -> Option<(usize, CmpOp, ValueId, BlockId)> {
+    if l.exits.len() != 1 {
+        return None;
+    }
+    let (from, to) = l.exits[0];
+    let Terminator::CondBr {
+        cond,
+        then_blk,
+        else_blk,
+        ..
+    } = &ctx.f.blocks[from.0 as usize].term
+    else {
+        return None;
+    };
+    // Which arm stays in the loop? (`to` is the arm that leaves.)
+    let continue_on_true = if *else_blk == to && *then_blk != to {
+        true
+    } else if *then_blk == to && *else_blk != to {
+        false
+    } else {
+        return None;
+    };
+    let Some(Op::Cmp(pred, a, b)) = ctx.op_of(*cond) else {
+        return None;
+    };
+    // Orient as `iv <pred> bound`.
+    let (idx, pred, bound) = if let Some(i) = ivs.iter().position(|iv| iv.value == *a) {
+        (i, *pred, *b)
+    } else if let Some(i) = ivs.iter().position(|iv| iv.value == *b) {
+        (i, swap_cmp(*pred)?, *a)
+    } else {
+        return None;
+    };
+    if !ctx.is_value_invariant(bound) {
+        return None;
+    }
+    let pred = if continue_on_true { pred } else { negate_cmp(pred)? };
+    Some((idx, pred, bound, from))
+}
+
+/// The predicate that means the same thing with the operands exchanged (`a < b` == `b > a`).
+fn swap_cmp(p: CmpOp) -> Option<CmpOp> {
+    use CmpOp::*;
+    Some(match p {
+        Eq => Eq,
+        Ne => Ne,
+        Slt => Sgt,
+        Sle => Sge,
+        Sgt => Slt,
+        Sge => Sle,
+        Ult => Ugt,
+        Ule => Uge,
+        Ugt => Ult,
+        Uge => Ule,
+        // Float compares never bound an integer induction variable.
+        Foeq | Fone | Folt | Fole | Fogt | Foge => return None,
+    })
+}
+
+/// The negation of an integer predicate.
+fn negate_cmp(p: CmpOp) -> Option<CmpOp> {
+    use CmpOp::*;
+    Some(match p {
+        Eq => Ne,
+        Ne => Eq,
+        Slt => Sge,
+        Sle => Sgt,
+        Sgt => Sle,
+        Sge => Slt,
+        Ult => Uge,
+        Ule => Ugt,
+        Ugt => Ule,
+        Uge => Ult,
+        // `!(a < b)` is NOT `a >= b` for floats (both are false on NaN).
+        Foeq | Fone | Folt | Fole | Fogt | Foge => return None,
+    })
+}
+
+/// The number of iterations, from the exit test. Requires the single exit to be tested in the
+/// **header** — a bottom-tested loop runs its body once before the test, which is a different
+/// count — and a constant step in the direction the predicate walks.
+fn trip_count(ctx: &LoopCtx<'_>, l: &NaturalLoop, iv: &InductionVar, pred: CmpOp, bound: ValueId, from: BlockId) -> TripCount {
+    use CmpOp::*;
+    if from != l.header {
+        return TripCount::Unknown;
+    }
+    // An early `return` in the body cuts the count short with no exit edge to see it.
+    if !l.abnormal_exits.is_empty() {
+        return TripCount::Unknown;
+    }
+    let Some(step) = iv.step.as_const() else {
+        return TripCount::Unknown;
+    };
+    let (inclusive, signed, ascending) = match pred {
+        Slt => (false, true, true),
+        Sle => (true, true, true),
+        Ult => (false, false, true),
+        Ule => (true, false, true),
+        Sgt => (false, true, false),
+        Sge => (true, true, false),
+        Ugt => (false, false, false),
+        Uge => (true, false, false),
+        _ => return TripCount::Unknown,
+    };
+    // The IV must walk toward the bound, or the loop is infinite / zero-trip in a way this does
+    // not model.
+    if (ascending && step <= 0) || (!ascending && step >= 0) {
+        return TripCount::Unknown;
+    }
+    let Some(start_v) = iv.start else {
+        return TripCount::Unknown;
+    };
+
+    if let (Some(s), Some(e)) = (ctx.const_int(start_v), ctx.const_int(bound)) {
+        // An unsigned predicate on a negative literal would compare as a huge positive; decline
+        // rather than guess.
+        if !signed && (s < 0 || e < 0) {
+            return TripCount::Unknown;
+        }
+        let span = if ascending { e.checked_sub(s) } else { s.checked_sub(e) };
+        let Some(span) = span else {
+            return TripCount::Unknown;
+        };
+        let mag = step.unsigned_abs() as i64;
+        let n = if inclusive {
+            if span < 0 {
+                0
+            } else {
+                span / mag + 1
+            }
+        } else if span <= 0 {
+            0
+        } else {
+            // ceil(span / mag), both positive.
+            (span + mag - 1) / mag
+        };
+        return TripCount::Const(n as u64);
+    }
+
+    // A symbolic count is only useful if both endpoints are evaluable *before* the loop, so a
+    // consumer can compute the count in the preheader.
+    if !ctx.is_invariant(start_v) || !ctx.is_invariant(bound) {
+        return TripCount::Unknown;
+    }
+    TripCount::Affine {
+        start: start_v,
+        end: bound,
+        step,
+        inclusive,
+        signed,
+    }
+}
+
+fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize) {
+    let l = &forest.loops[idx];
+    let mut ctx = LoopCtx::new(f, l);
+
+    let ivs = find_basic_ivs(&ctx, l);
+    let test = exit_test(&ctx, l, &ivs);
+    // The IV every affine expression is written against: the one the exit test walks, or — when
+    // there is no usable exit test — the single constant-step IV, if there is exactly one.
+    let primary = match test {
+        Some((i, ..)) => Some(i),
+        None => {
+            let mut cands = ivs
+                .iter()
+                .enumerate()
+                .filter(|(_, iv)| iv.step.as_const().is_some());
+            match (cands.next(), cands.next()) {
+                (Some((i, _)), None) => Some(i),
+                _ => None,
+            }
+        }
+    };
+    ctx.primary = primary.map(|i| ivs[i].value);
+
+    let trip = match (primary, test) {
+        (Some(i), Some((_, pred, bound, from))) => trip_count(&ctx, l, &ivs[i], pred, bound, from),
+        _ => TripCount::Unknown,
+    };
+
+    // Derived IVs: everything in the loop that moves with the primary IV.
+    let mut memo: FxHashMap<u32, Option<AffineExpr>> = FxHashMap::default();
+    let mut derived = Vec::new();
+    if ctx.primary.is_some() {
+        let mut blocks: Vec<u32> = ctx.blocks.iter().copied().collect();
+        blocks.sort_unstable();
+        for b in blocks {
+            for inst in &f.blocks[b as usize].insts {
+                let Some(r) = inst.result else { continue };
+                if !f.value_type(r).is_int() || Some(r) == ctx.primary {
+                    continue;
+                }
+                if let Some(e) = ctx.affine_of(r, &mut memo, 0) {
+                    if !e.is_invariant() {
+                        derived.push(DerivedIv { value: r, expr: e });
+                    }
+                }
+            }
+        }
+    }
+
+    let l = &mut forest.loops[idx];
+    l.ivs = ivs;
+    l.primary_iv = primary;
+    l.trip = trip;
+    l.derived = derived;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -989,8 +1519,50 @@ pub fn dump_function_loops(f: &Function, name: &str) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        for (i, iv) in l.ivs.iter().enumerate() {
+            let step = match iv.step {
+                IvStep::Const(k) => format!("{k:+}"),
+                IvStep::Invariant(s) => format!("+v{}", s.0),
+            };
+            let start = iv
+                .start
+                .map(|s| format!("v{}", s.0))
+                .unwrap_or_else(|| "?".into());
+            let mark = if l.primary_iv == Some(i) { " [primary]" } else { "" };
+            let _ = writeln!(
+                out,
+                "    iv v{} {} start {start} step {step} next v{}{mark}",
+                iv.value.0,
+                iv.ty.display(),
+                iv.next.0
+            );
+        }
+        let _ = writeln!(out, "    trip: {}", fmt_trip(&l.trip));
+        for d in &l.derived {
+            let _ = writeln!(out, "    derived v{} = {}", d.value.0, d.expr.display());
+        }
     }
     out
+}
+
+fn fmt_trip(t: &TripCount) -> String {
+    match t {
+        TripCount::Const(n) => format!("{n}"),
+        TripCount::Affine {
+            start,
+            end,
+            step,
+            inclusive,
+            signed,
+        } => format!(
+            "v{} .. {}v{} step {step} ({})",
+            start.0,
+            if *inclusive { "=" } else { "" },
+            end.0,
+            if *signed { "signed" } else { "unsigned" }
+        ),
+        TripCount::Unknown => "unknown".into(),
+    }
 }
 
 /// Render the loop analysis of a whole program. `interner` resolves function names when the caller
@@ -1388,5 +1960,330 @@ mod tests {
         assert!(p.mul(&p).is_none());
         // Overflow is rejected, never wrapped.
         assert!(AffineExpr::constant(i64::MAX).scale(2).is_none());
+    }
+
+    // ---- induction variables and trip counts ----
+
+    /// The only loop of a function with exactly one.
+    fn only_loop(forest: &LoopForest) -> &NaturalLoop {
+        assert_eq!(forest.loops.len(), 1, "expected exactly one loop");
+        &forest.loops[0]
+    }
+
+    #[test]
+    fn basic_iv_step_and_symbolic_trip_count() {
+        let f = opt_mir_of(
+            "fn s(n: i32) -> i32 { let mut a: i32 = 0; let mut i: i32 = 0; \
+             while i < n { a = a + i; i = i + 1; } return a; } \
+             fn main() -> i32 { return s(4); }",
+            "s",
+            1,
+        );
+        let forest = analyze_function(&f);
+        let l = only_loop(&forest);
+        let iv = l.primary().expect("the exit test names an IV");
+        assert_eq!(iv.step, IvStep::Const(1));
+        assert!(iv.ty.is_int());
+        // `i < n` with a runtime `n`: the pieces are known, the count is not.
+        match &l.trip {
+            TripCount::Affine {
+                step,
+                inclusive,
+                signed,
+                ..
+            } => {
+                assert_eq!(*step, 1);
+                assert!(!*inclusive);
+                assert!(*signed);
+            }
+            other => panic!("expected an affine trip count, got {other:?}: {}", dump_function_loops(&f, "s")),
+        }
+        // `i + 1` is derived from `i`.
+        assert!(l.derived.iter().any(|d| d.value == iv.next && d.expr.coeff == Coeff::Const(1)));
+    }
+
+    #[test]
+    fn constant_trip_counts_for_every_predicate_and_step() {
+        // (source, expected iterations). Written as `while` loops so the front-end cannot fold
+        // them into a recognized kernel.
+        let cases: [(&str, u64, i64); 6] = [
+            ("let mut i: i32 = 0; while i < 100 { a = a + i; i = i + 1; }", 100, 1),
+            ("let mut i: i32 = 0; while i <= 9 { a = a + i; i = i + 1; }", 10, 1),
+            ("let mut i: i32 = 0; while i < 10 { a = a + i; i = i + 3; }", 4, 3),
+            ("let mut i: i32 = 0; while i < 0 { a = a + i; i = i + 1; }", 0, 1),
+            ("let mut i: i32 = 10; while i > 0 { a = a + i; i = i - 1; }", 10, -1),
+            ("let mut i: i32 = 10; while i >= 0 { a = a + i; i = i - 2; }", 6, -2),
+        ];
+        for (body, want, step) in cases {
+            let src = format!("fn t() -> i32 {{ let mut a: i32 = 0; {body} return a; }} fn main() -> i32 {{ return t(); }}");
+            let f = opt_mir_of(&src, "t", 1);
+            let forest = analyze_function(&f);
+            let l = only_loop(&forest);
+            assert_eq!(
+                l.primary().map(|iv| iv.step),
+                Some(IvStep::Const(step)),
+                "step for `{body}`\n{}",
+                dump_function_loops(&f, "t")
+            );
+            assert_eq!(
+                l.trip,
+                TripCount::Const(want),
+                "trip for `{body}`\n{}",
+                dump_function_loops(&f, "t")
+            );
+        }
+    }
+
+    #[test]
+    fn for_range_over_a_constant_is_a_constant_trip_count() {
+        let f = opt_mir_of(
+            "fn t() -> i32 { let mut a: i32 = 0; for i in 0..64 { a = a + (i as i32); } return a; } \
+             fn main() -> i32 { return t(); }",
+            "t",
+            1,
+        );
+        let forest = analyze_function(&f);
+        let l = only_loop(&forest);
+        assert_eq!(l.trip, TripCount::Const(64), "{}", dump_function_loops(&f, "t"));
+    }
+
+    #[test]
+    fn runtime_step_is_an_iv_with_no_trip_count() {
+        let f = opt_mir_of(
+            "fn t(n: i32, s: i32) -> i32 { let mut a: i32 = 0; let mut i: i32 = 0; \
+             while i < n { a = a + i; i = i + s; } return a; } \
+             fn main() -> i32 { return t(4, 2); }",
+            "t",
+            1,
+        );
+        let forest = analyze_function(&f);
+        let l = only_loop(&forest);
+        let iv = l.primary().expect("still a basic IV");
+        assert!(
+            matches!(iv.step, IvStep::Invariant(_)),
+            "a loop-invariant step is still an IV: {}",
+            dump_function_loops(&f, "t")
+        );
+        assert_eq!(
+            l.trip,
+            TripCount::Unknown,
+            "an unknown step means an unknown count"
+        );
+    }
+
+    #[test]
+    fn a_second_counter_is_an_iv_but_not_the_primary() {
+        let f = opt_mir_of(
+            "fn t(n: i32) -> i32 { let mut a: i32 = 0; let mut i: i32 = 0; let mut j: i32 = 5; \
+             while i < n { a = a + j; i = i + 1; j = j + 3; } return a; } \
+             fn main() -> i32 { return t(4); }",
+            "t",
+            1,
+        );
+        let forest = analyze_function(&f);
+        let l = only_loop(&forest);
+        assert_eq!(l.ivs.len(), 2, "both counters are basic IVs: {}", dump_function_loops(&f, "t"));
+        let primary = l.primary().expect("the exit test picks one");
+        assert_eq!(primary.step, IvStep::Const(1), "the exit test walks `i`");
+        assert!(l.ivs.iter().any(|iv| iv.step == IvStep::Const(3)));
+        // The secondary IV is a block parameter, so it is deliberately NOT expressed as an affine
+        // function of the primary — see `affine_uncached`.
+        let secondary = l.ivs.iter().find(|iv| iv.step == IvStep::Const(3)).unwrap();
+        assert!(!l.derived.iter().any(|d| d.value == secondary.value));
+    }
+
+    #[test]
+    fn derived_ivs_record_constant_and_symbolic_strides() {
+        let f = opt_mir_of(
+            "fn mm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64], n: i32) { \
+               let mut i: i32 = 0; \
+               while i < n { let mut j: i32 = 0; \
+                 while j < n { let mut s: f32 = 0.0; let mut k: i32 = 0; \
+                   while k < n { s = s + a[i*n+k] * b[k*n+j]; k = k + 1; } \
+                   c[i*n+j] = s; j = j + 1; } \
+                 i = i + 1; } } \
+             fn main() -> i32 { return 0; }",
+            "mm",
+            1,
+        );
+        let forest = analyze_function(&f);
+        let inner = forest
+            .loops
+            .iter()
+            .max_by_key(|l| l.depth)
+            .expect("the k loop");
+        assert_eq!(inner.depth, 2);
+        let dump = dump_function_loops(&f, "mm");
+        // `a[i*n + k]`: unit stride in k, with the row base `i*n` carried as an invariant term.
+        assert!(
+            inner
+                .derived
+                .iter()
+                .any(|d| d.expr.coeff == Coeff::Const(1) && d.expr.terms.len() == 1),
+            "expected a unit-stride derived IV\n{dump}"
+        );
+        // `b[k*n + j]`: the stride is the runtime pitch `n`, so it is symbolic, not constant.
+        assert!(
+            inner
+                .derived
+                .iter()
+                .any(|d| matches!(d.expr.coeff, Coeff::Sym(..)) && d.expr.coeff.as_const().is_none()),
+            "expected a symbolic-stride derived IV\n{dump}"
+        );
+    }
+
+    #[test]
+    fn a_scaled_index_has_the_scaled_stride() {
+        let src = "fn t(x: [f32; 64], mut o: [f32; 64], n: i32) { let mut i: i32 = 0; \
+                   while i <= n - 1 { o[2*i] = x[i] + 1.0; i = i + 2; } } \
+                   fn main() -> i32 { return 0; }";
+        for level in [1, 2] {
+            let f = opt_mir_of(src, "t", level);
+            let forest = analyze_function(&f);
+            let l = only_loop(&forest);
+            let dump = dump_function_loops(&f, "t");
+            assert_eq!(
+                l.primary().map(|iv| iv.step),
+                Some(IvStep::Const(2)),
+                "-O{level}\n{dump}"
+            );
+            // `2*i` walks 2 elements per iteration.
+            assert!(
+                l.derived.iter().any(|d| d.expr.coeff == Coeff::Const(2)),
+                "expected a stride-2 derived IV at -O{level}\n{dump}"
+            );
+        }
+
+        // The trip count needs endpoints a consumer can evaluate in the *preheader*. At `-O2` LICM
+        // has hoisted `n - 1` out, so the count is reported; at `-O1` the bound is still computed
+        // inside the loop and the analysis declines rather than hand back a value that is not
+        // available where the count would be computed.
+        let f1 = opt_mir_of(src, "t", 1);
+        assert_eq!(analyze_function(&f1).loops[0].trip, TripCount::Unknown);
+
+        let f2 = opt_mir_of(src, "t", 2);
+        let forest = analyze_function(&f2);
+        let dump = dump_function_loops(&f2, "t");
+        // `i <= n - 1` is reported inclusive against `n - 1`, never normalized to `n`: that
+        // addition can overflow.
+        match &forest.loops[0].trip {
+            TripCount::Affine {
+                inclusive, step, ..
+            } => {
+                assert!(*inclusive, "{dump}");
+                assert_eq!(*step, 2);
+            }
+            other => panic!("expected an affine trip count, got {other:?}\n{dump}"),
+        }
+    }
+
+    #[test]
+    fn a_loop_with_no_recognizable_exit_test_still_reports_its_iv() {
+        // Two exits (an early `return` inside the body), so no trip count — but the counter is
+        // still a basic IV and still the primary, because it is the only constant-step one.
+        let f = opt_mir_of(
+            "fn t(x: [i32; 64], n: i32) -> i32 { let mut i: i32 = 0; \
+             while i < n { if x[i] < 0 { return i; } i = i + 1; } return -1; } \
+             fn main() -> i32 { return 0; }",
+            "t",
+            1,
+        );
+        let forest = analyze_function(&f);
+        let l = only_loop(&forest);
+        let dump = dump_function_loops(&f, "t");
+        assert!(l.exits.len() >= 2, "the early return is a second exit\n{dump}");
+        assert_eq!(l.trip, TripCount::Unknown, "{dump}");
+        assert_eq!(l.primary().map(|iv| iv.step), Some(IvStep::Const(1)), "{dump}");
+    }
+
+    #[test]
+    fn zext_is_not_treated_as_transparent() {
+        // Hand-built: `q = zext(i)` then `p = gep(base, q)`. `sext` would be folded through;
+        // `zext` must not be, because a negative narrow value becomes a huge positive one.
+        let ctx_expr = |cast: CastKind| {
+            //  v0: i32 base ptr slot (unused), v1: i1 cond, v2: i32 IV param, v3: i32 one,
+            //  v4: i32 next, v5: i64 widened iv
+            let f = build(
+                vec![
+                    MirType::I1,
+                    MirType::I32,
+                    MirType::I32,
+                    MirType::I32,
+                    MirType::I64,
+                ],
+                vec![
+                    (
+                        vec![],
+                        vec![
+                            Inst {
+                                result: Some(ValueId(0)),
+                                op: Op::ConstInt(1, MirType::I1),
+                            },
+                            Inst {
+                                result: Some(ValueId(1)),
+                                op: Op::ConstInt(0, MirType::I32),
+                            },
+                            Inst {
+                                result: Some(ValueId(3)),
+                                op: Op::ConstInt(1, MirType::I32),
+                            },
+                        ],
+                        Terminator::Br {
+                            target: BlockId(1),
+                            args: vec![ValueId(1)],
+                        },
+                    ),
+                    (
+                        vec![2],
+                        vec![],
+                        Terminator::CondBr {
+                            cond: ValueId(0),
+                            then_blk: BlockId(2),
+                            then_args: vec![],
+                            else_blk: BlockId(3),
+                            else_args: vec![],
+                        },
+                    ),
+                    (
+                        vec![],
+                        vec![
+                            Inst {
+                                result: Some(ValueId(4)),
+                                op: Op::Cast(cast, ValueId(2), MirType::I64),
+                            },
+                        ],
+                        Terminator::Br {
+                            target: BlockId(1),
+                            args: vec![ValueId(2)],
+                        },
+                    ),
+                    (vec![], vec![], Terminator::Ret(None)),
+                ],
+            );
+            f
+        };
+        // The IV never advances here (the latch passes the param straight back), so instead build
+        // the real shape below; this test only checks the cast rule, via `affine_of` directly.
+        let f = ctx_expr(CastKind::SExt);
+        let forest = analyze_function(&f);
+        assert_eq!(forest.loops.len(), 1);
+        let mut ctx = LoopCtx::new(&f, &forest.loops[0]);
+        ctx.primary = Some(ValueId(2));
+        let mut memo = FxHashMap::default();
+        assert_eq!(
+            ctx.affine_of(ValueId(4), &mut memo, 0).map(|e| e.coeff),
+            Some(Coeff::Const(1)),
+            "sext of the IV is the IV"
+        );
+
+        let f = ctx_expr(CastKind::ZExt);
+        let forest = analyze_function(&f);
+        let mut ctx = LoopCtx::new(&f, &forest.loops[0]);
+        ctx.primary = Some(ValueId(2));
+        let mut memo = FxHashMap::default();
+        assert!(
+            ctx.affine_of(ValueId(4), &mut memo, 0).is_none(),
+            "zext of the IV is not affine in it"
+        );
     }
 }
