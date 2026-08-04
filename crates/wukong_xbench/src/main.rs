@@ -1059,9 +1059,9 @@ fn rust_matmul(ns: usize) -> String {
 /// `C = Aᵀ·B` — the **weight-gradient** GEMM of a training backward pass (`dW = dYᵀ·X`). A is stored
 /// `[K, M]` (the contraction/batch axis is the OUTER index of A's storage), so its logical operand is
 /// the transpose of its layout. Wukong recognizes `a[k*M+i]*b[k*N+j]` and dispatches to
-/// `wukong_sgemm_tn` (transpose A once, then the tuned NN kernel); idiomatic C/Rust compile the
-/// column-strided A reads (one cache line per element) as a near-scalar k-loop gcc cannot vectorize —
-/// the regime the domain lowering should dominate hardest. Square M=K=N for the shared-buffer ABI.
+/// `wukong_sgemm_tn` (transpose A once, then the tuned NN kernel); the C/Rust peers run the natural
+/// `kij` nest, which hoists `a[k*M+i]` and streams B and C contiguously (see [`c_matmul_tn`] for the
+/// spelling correction and its measured cost). Square M=K=N for the shared-buffer ABI.
 fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
     for ns in [256usize, 512, 1024] {
         let n2 = ns * ns;
@@ -1179,14 +1179,22 @@ fn wk_matmul_tn(ns: usize, parallel: bool) -> String {
     )
 }
 
+/// The C weight-gradient peer, in the natural **`kij`** order: hoist `a[k*M+i]` out of the inner
+/// loop and stream `b[k*N+·]` and `c[i*N+·]` contiguously, exactly as [`c_matmul`] does for the
+/// untransposed nest. The previous spelling was `ijk` with **both** operands read column-strided
+/// (`s += a[k*NS+i]*b[k*NS+j]`) — a k-loop that touches two fresh cache lines per iteration and that
+/// gcc cannot vectorize, which is not how a competent C programmer writes `C = Aᵀ·B`. The `kij` order
+/// accumulates each `c[i][j]` over k in the identical ascending order, so the result is unchanged.
+/// Measured standalone at `-O3 -march=native`, 512³: **20.965 ms `ijk` vs 8.805 ms `kij` +
+/// `restrict`, a 2.4× handicap**.
 fn c_matmul_tn(ns: usize) -> String {
     format!(
         "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
-         \x20 for (long i=0;i<NS;i++){{\n\
-         \x20   for (long j=0;j<NS;j++){{\n\
-         \x20     float s=0.0f;\n\
-         \x20     for (long k=0;k<NS;k++) s += a[k*NS+i]*b[k*NS+j];\n\
-         \x20     c[i*NS+j]=s;\n\
+         \x20 for (long t=0;t<(long)NS*NS;t++) c[t]=0.0f;\n\
+         \x20 for (long k=0;k<NS;k++){{\n\
+         \x20   for (long i=0;i<NS;i++){{\n\
+         \x20     float aki=a[k*NS+i];\n\
+         \x20     for (long j=0;j<NS;j++) c[i*NS+j] += aki*b[k*NS+j];\n\
          \x20   }}\n\
          \x20 }}\n}}\n"
     )
@@ -1195,11 +1203,16 @@ fn c_matmul_tn(ns: usize) -> String {
 fn rust_matmul_tn(ns: usize) -> String {
     format!(
         "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
-         \x20 for i in 0..NS {{\n\
-         \x20   for j in 0..NS {{\n\
-         \x20     let mut s=0.0f32;\n\
-         \x20     for k in 0..NS {{ s += *a.add(k*NS+i) * *b.add(k*NS+j); }}\n\
-         \x20     *c.add(i*NS+j)=s;\n\
+         \x20 let a = core::slice::from_raw_parts(a, NS*NS);\n\
+         \x20 let b = core::slice::from_raw_parts(b, NS*NS);\n\
+         \x20 let c = core::slice::from_raw_parts_mut(c, NS*NS);\n\
+         \x20 for v in c.iter_mut() {{ *v = 0.0; }}\n\
+         \x20 for k in 0..NS {{\n\
+         \x20   let brow = &b[k*NS..k*NS+NS];\n\
+         \x20   for i in 0..NS {{\n\
+         \x20     let aki = a[k*NS+i];\n\
+         \x20     let crow = &mut c[i*NS..i*NS+NS];\n\
+         \x20     for (cv, &bv) in crow.iter_mut().zip(brow) {{ *cv += aki*bv; }}\n\
          \x20   }}\n\
          \x20 }}\n}}\n"
     )
