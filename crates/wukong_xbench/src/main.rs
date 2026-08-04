@@ -210,6 +210,20 @@ fn bench_c_fast(
     relaxed_peer_ok(label, "C(fast)", m, &cf).then_some(cf)
 }
 
+/// Print a `Wukong @parallel` standing **direction-aware**. `r` is `peer_ns / wukong_ns`, so `r < 1`
+/// means Wukong is SLOWER. Twenty of these call sites printed the bare ratio — `"@parallel is 0.73x
+/// idiomatic single-threaded C"` — which reads as a win at a glance and is in fact a 27% loss. Every
+/// other summary in this file ([`report_relaxed_ratio`], [`report_ratio`], the geomeans) already
+/// picks the word; these per-bench lines were the exception, and the exception only became visible
+/// once the corrected peers started beating Wukong on some rows.
+fn par_standing(peer: &str, r: f64) {
+    println!(
+        "  -> Wukong @parallel is {:.2}x {} than {peer}",
+        if r >= 1.0 { r } else { 1.0 / r },
+        if r >= 1.0 { "faster" } else { "slower" }
+    );
+}
+
 /// Print Wukong's standing vs a relaxed-FP peer (C(fast) / C(omp)) — reported ALONGSIDE the
 /// honest-flags C ratio above it, never replacing it.
 fn report_relaxed_ratio(
@@ -1280,7 +1294,7 @@ fn bench_gemv(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x idiomatic single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         println!();
     }
@@ -1382,7 +1396,7 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x idiomatic single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         if let (Some(ms), Some(mn)) = (&wuk, &wk_noscale) {
             // >1 ⇒ the α costs time; ~1.0 ⇒ the scale is free (folded into the writeback).
@@ -1998,14 +2012,14 @@ fn bench_transpose(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &wuk, &wk_par, &comp);
         println!();
@@ -2162,14 +2176,14 @@ fn bench_colsum(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         report_relaxed_ratio("C(omp) [-fopenmp -ffast-math, all cores]", &wuk, &wk_par, &comp);
@@ -2299,7 +2313,7 @@ fn bench_biasadd(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let ratio = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {ratio:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", ratio);
         }
         println!();
     }
@@ -2441,7 +2455,7 @@ fn dequant_ratio(
     }
     if let (Some(mp), Some(c)) = (wk_par, cm) {
         let r = c.ns_per_call / mp.ns_per_call;
-        println!("  -> Wukong @parallel is {r:.2}x single-threaded C");
+        par_standing("single-threaded C", r);
     }
 }
 
@@ -2581,14 +2595,14 @@ fn bench_colmax(cc: &str, dir: &Path) {
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
             println!();
         }
@@ -2750,14 +2764,14 @@ fn bench_rowarg(cc: &str, dir: &Path) {
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
             println!();
         }
@@ -2816,11 +2830,11 @@ fn rust_colarg(rows: usize, cols: usize, is_max: bool) -> String {
     )
 }
 
-/// Per-column argmax/argmin (axis-0 top-1) returning the ROW index. The STRIDED column-outer
-/// (value,index) scan defeats gcc/rustc auto-vectorization (the column-reduction lever — verified
-/// scalar), while Wukong streams row-major tracking 8 column lanes via blend. Output is a `cols`-long
-/// i32 buffer; the cross-check reinterprets the f32 harness slots as i32 and compares EXACTLY. GB/s =
-/// `R·C·4` (matrix read once); the ratio vs naive C is the figure.
+/// Per-column argmax/argmin (axis-0 top-1) returning the ROW index. Wukong streams row-major
+/// tracking 8 column lanes via blend; the C/Rust peers do the same traversal over a `C`-long
+/// running-best vector (see [`c_colarg`] — they used to scan column-outer, which is what the ratio
+/// was really measuring). Output is a `cols`-long i32 buffer; the cross-check reinterprets the f32
+/// harness slots as i32 and compares EXACTLY. GB/s = `R·C·4` (matrix read once).
 fn bench_colarg(cc: &str, dir: &Path) {
     for (is_max, label) in [(true, "colargmax"), (false, "colargmin")] {
         for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
@@ -2882,14 +2896,14 @@ fn bench_colarg(cc: &str, dir: &Path) {
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
             println!();
         }
@@ -3034,14 +3048,14 @@ fn bench_lrscan(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C (4-row-interleaved ILP vs C's single serial chain)",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C (4-row-interleaved ILP vs C's single serial chain)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         println!();
     }
@@ -3152,14 +3166,14 @@ fn bench_cumprod(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C (4-row-interleaved ILP vs C's serial chain)",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C (4-row-interleaved ILP vs C's serial chain)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         println!();
     }
@@ -3238,14 +3252,14 @@ fn bench_cumsum(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         println!();
     }
@@ -3350,14 +3364,14 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
             println!();
         }
@@ -3451,14 +3465,14 @@ fn bench_colstat(cc: &str, dir: &Path) {
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
             report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
             println!();
@@ -3606,14 +3620,14 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r2);
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
@@ -3711,14 +3725,14 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r2);
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
@@ -3912,14 +3926,14 @@ fn bench_xent(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r2);
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
@@ -4020,14 +4034,14 @@ fn bench_rope(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r2);
         }
         println!();
     }
@@ -4426,7 +4440,7 @@ fn rust_row_loss(rows: usize, cols: usize, kind: &str) -> String {
 }
 
 /// Shared 4-column ratio report for the backward/gate benches (Wuk 1-core / Wuk par / C / Rust + the
-/// single-core and @parallel ratios vs naive C). The cross-check (when both present) uses a magnitude-
+/// single-core and @parallel ratios vs idiomatic C). The cross-check (when both present) uses a magnitude-
 /// normalized tolerance, since the transcendental reductions reassociate / differ from libm by ~1 ULP.
 /// `cfast` is the optional relaxed-FP C(fast) peer column (already loose-cross-checked by the caller);
 /// benches whose C baseline is not an IEEE-serial reduction pass `&None`.
@@ -4465,14 +4479,14 @@ fn report_ratio(
     if let (Some(ms), Some(c2)) = (wuk, cm) {
         let r2 = c2.ns_per_call / ms.ns_per_call;
         println!(
-            "  -> Wukong single-core is {:.2}x {} than naive C",
+            "  -> Wukong single-core is {:.2}x {} than idiomatic C",
             if r2 >= 1.0 { r2 } else { 1.0 / r2 },
             if r2 >= 1.0 { "faster" } else { "slower" }
         );
     }
     if let (Some(mp), Some(c2)) = (wk_par, cm) {
         let r2 = c2.ns_per_call / mp.ns_per_call;
-        println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+        par_standing("idiomatic single-threaded C", r2);
     }
     report_relaxed_ratio("C(fast) [-ffast-math]", wuk, wk_par, cfast);
     println!();
@@ -4562,7 +4576,7 @@ fn bench_act_backward(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x scalar single-threaded C");
+            par_standing("scalar single-threaded C", r2);
         }
         println!();
     }
