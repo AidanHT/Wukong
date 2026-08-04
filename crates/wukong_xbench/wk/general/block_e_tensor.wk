@@ -1,0 +1,144 @@
+module gblock_e
+
+// STRUCTURE TAX, variant (e): SHAPE-TYPED `Tensor[f32, S, D]`.
+//
+// Variant (a)'s monolith again — the same statement order, the same compile-time-constant extents,
+// the same arithmetic — with one change: every buffer carries its shape in its type and every access
+// is a multi-index (`a[i, j]`) instead of a flat `a[i*D + j]`. This is Wukong's headline feature, the
+// spelling the language guide leads with, so it is the one a new user writes first.
+//
+// (e) vs (a) therefore isolates exactly the cost of using the type system as advertised.
+//
+// The only structural difference forced by the notation: `for i in 0..S*D { nrm[i] = x[i]; }` cannot
+// be written flat over a shaped 2-D tensor, so the elementwise passes are 2-D nests here. They cover
+// the same elements in the same order and store the same values.
+
+fn kbench(
+    x: Tensor[f32, $S$, $D$],
+    g1: Tensor[f32, $D$], g2: Tensor[f32, $D$],
+    wq: Tensor[f32, $D$, $D$], wk: Tensor[f32, $D$, $D$],
+    wv: Tensor[f32, $D$, $D$], wo: Tensor[f32, $D$, $D$],
+    w1: Tensor[f32, $F$, $D$], w3: Tensor[f32, $F$, $D$], w2: Tensor[f32, $D$, $F$],
+    b1: Tensor[f32, $F$],
+    rc: Tensor[f32, $S$, $HD2$], rs: Tensor[f32, $S$, $HD2$],
+    mut nrm: Tensor[f32, $S$, $D$],
+    mut q: Tensor[f32, $S$, $D$], mut k: Tensor[f32, $S$, $D$], mut v: Tensor[f32, $S$, $D$],
+    mut sc: Tensor[f32, $S$, $S$],
+    mut qh: Tensor[f32, $S$, $HD$], mut kh: Tensor[f32, $S$, $HD$],
+    mut vt: Tensor[f32, $HD$, $S$], mut ah: Tensor[f32, $S$, $HD$],
+    mut ctx: Tensor[f32, $S$, $D$],
+    mut h: Tensor[f32, $S$, $D$],
+    mut f1: Tensor[f32, $S$, $F$], mut f3: Tensor[f32, $S$, $F$],
+    mut out: Tensor[f32, $S$, $D$],
+) {
+    // ---- 1. RMSNorm(x) * g1 -> nrm ----
+    for r in 0..$S$ { for i in 0..$D$ { nrm[r, i] = x[r, i]; } }
+    for r in 0..$S$ {
+        let mut s: f32 = 0.0;
+        for i in 0..$D$ { s = s + nrm[r, i] * nrm[r, i]; }
+        let inv: f32 = rsqrt(s / $D$.0 + 0.00001);
+        for i in 0..$D$ { nrm[r, i] = nrm[r, i] * inv * g1[i]; }
+    }
+
+    // ---- 2. Q/K/V projections, NT layout ----
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i, p] * wq[j, p]; }
+        q[i, j] = s;
+    } }
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i, p] * wk[j, p]; }
+        k[i, j] = s;
+    } }
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i, p] * wv[j, p]; }
+        v[i, j] = s;
+    } }
+
+    // ---- 3. RoPE (rotate-half) on q and k, per head ----
+    for r in 0..$S$ {
+        for hh in 0..$H$ {
+            for t in 0..$HD2$ {
+                let cc: f32 = rc[r, t];
+                let ss: f32 = rs[r, t];
+                let q0: f32 = q[r, hh*$HD$ + t];
+                let q1: f32 = q[r, hh*$HD$ + t + $HD2$];
+                q[r, hh*$HD$ + t] = q0*cc - q1*ss;
+                q[r, hh*$HD$ + t + $HD2$] = q0*ss + q1*cc;
+                let k0: f32 = k[r, hh*$HD$ + t];
+                let k1: f32 = k[r, hh*$HD$ + t + $HD2$];
+                k[r, hh*$HD$ + t] = k0*cc - k1*ss;
+                k[r, hh*$HD$ + t + $HD2$] = k0*ss + k1*cc;
+            }
+        }
+    }
+
+    // ---- 4. Causal multi-head attention ----
+    for hh in 0..$H$ {
+        for i in 0..$S$ { for p in 0..$HD$ { qh[i, p] = q[i, hh*$HD$ + p]; } }
+        for i in 0..$S$ { for p in 0..$HD$ { kh[i, p] = k[i, hh*$HD$ + p]; } }
+        for j in 0..$HD$ { for p in 0..$S$ { vt[j, p] = v[p, hh*$HD$ + j]; } }
+        for i in 0..$S$ { for j in 0..$S$ {
+            let mut s: f32 = 0.0;
+            for p in 0..$HD$ { s = s + qh[i, p] * kh[j, p]; }
+            sc[i, j] = $SCALE$ * s;
+        } }
+        for i in 0..$S$ { for j in 0..$S$ { if j > i { sc[i, j] = 0.0 - 1.0e30; } } }
+        for r in 0..$S$ {
+            let mut m: f32 = sc[r, 0];
+            for i in 0..$S$ { m = fmax(m, sc[r, i]); }
+            for i in 0..$S$ { sc[r, i] = exp(sc[r, i] - m); }
+            let mut sm: f32 = 0.0;
+            for i in 0..$S$ { sm = sm + sc[r, i]; }
+            let inv: f32 = 1.0 / sm;
+            for i in 0..$S$ { sc[r, i] = sc[r, i] * inv; }
+        }
+        for i in 0..$S$ { for j in 0..$HD$ {
+            let mut s: f32 = 0.0;
+            for p in 0..$S$ { s = s + sc[i, p] * vt[j, p]; }
+            ah[i, j] = s;
+        } }
+        for i in 0..$S$ { for j in 0..$HD$ { ctx[i, hh*$HD$ + j] = ah[i, j]; } }
+    }
+
+    // ---- 5. Output projection + residual ----
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + ctx[i, p] * wo[j, p]; }
+        h[i, j] = s;
+    } }
+    for r in 0..$S$ { for i in 0..$D$ { h[r, i] = x[r, i] + h[r, i]; } }
+
+    // ---- 6. RMSNorm(h) * g2 -> nrm ----
+    for r in 0..$S$ { for i in 0..$D$ { nrm[r, i] = h[r, i]; } }
+    for r in 0..$S$ {
+        let mut s: f32 = 0.0;
+        for i in 0..$D$ { s = s + nrm[r, i] * nrm[r, i]; }
+        let inv: f32 = rsqrt(s / $D$.0 + 0.00001);
+        for i in 0..$D$ { nrm[r, i] = nrm[r, i] * inv * g2[i]; }
+    }
+
+    // ---- 7. SwiGLU MLP ----
+    for i in 0..$S$ { for j in 0..$F$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i, p] * w1[j, p]; }
+        f1[i, j] = b1[j] + s;
+    } }
+    for i in 0..$S$ { for j in 0..$F$ { f1[i, j] = silu(f1[i, j]); } }
+    for i in 0..$S$ { for j in 0..$F$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i, p] * w3[j, p]; }
+        f3[i, j] = s;
+    } }
+    for i in 0..$S$ { for j in 0..$F$ { f1[i, j] = f1[i, j] * f3[i, j]; } }
+
+    // ---- 8. Down projection + residual ----
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$F$ { s = s + f1[i, p] * w2[j, p]; }
+        out[i, j] = s;
+    } }
+    for r in 0..$S$ { for i in 0..$D$ { out[r, i] = h[r, i] + out[r, i]; } }
+}

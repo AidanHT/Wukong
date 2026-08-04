@@ -1540,6 +1540,88 @@ single-threaded C:
 multithreaded-C comparison, and — on the reduction rows (dot/ssd/max/absmax/argmax) — the `C(fast)`
 column for the reassociation-normalized single-thread baseline.*
 
+### General code — Wukong OUTSIDE the recognizer dialect
+
+Every row above this one is written in the **recognizer dialect**: the syntactic loop shapes
+`wukong_mir_build` pattern-matches and replaces with a hand-written AVX2 kernel. That makes the suite
+above structurally unable to measure what a program that *misses* those patterns costs — and
+recognized kernels are **gate-blind** (both backends call the same symbol at every `-O` level), so no
+correctness gate can see the difference either. `cargo run -p wukong_xbench --release -- general` is
+the suite that can. It prints the dispatch census for every program it times, and checks every lane
+against an f64 scalar reference.
+
+**Recognizer fragility** (census only — nothing timed, so this table holds in any power state). Each
+pair computes bit-identical results and differs by one edit:
+
+| probe | edit | dispatches |
+|---|---|---|
+| gemm | *baseline*, flat `a[i*256+p]` | `wukong_sgemm_nt` |
+| gemm | `let ib = i*256;` then `a[ib+p]` | **nothing** |
+| gemm | only **one** of the three bases hoisted | **nothing** |
+| gemm | `let n: i64 = 256;` then `a[i*n+p]` | **nothing** |
+| epilogue | *baseline*, activation as its own loop | `wukong_sgemm_nt_epi`, `wukong_vmath_f32` |
+| epilogue | `c[..] = silu(b[j] + s)` | **nothing** |
+| residual | *baseline*, add as its own loop | `wukong_sgemm_nt`, `wukong_velem_f32` |
+| residual | `c[..] = x[..] + s` | **nothing** |
+| rmsnorm | *baseline*, flat `x[r*256+i]` (out-of-place is fine too) | `wukong_norm_affine_f32` |
+| rmsnorm | `let rb = r*256;` then `x[rb+i]` | **nothing** |
+
+The dominant cause is **common-subexpression hoisting of the row base** — a rewrite every programmer
+does by reflex, that every optimizer would do anyway, and that changes no floating-point result.
+
+**Structure tax.** One pre-norm transformer block (RMSNorm → RoPE → causal MHA → RMSNorm → SwiGLU
+MLP), S=D=256, H=4, F=512, written five ways that compute the same f32 arithmetic in the same order,
+against **one** C peer written once (correct loop order for the NT layout, `__restrict__` on all 27
+distinct buffers, V transposed once per head). Two adjacent rounds, same power state (AC+charging;
+every row single-threaded, so the all-core cap does not apply):
+
+| spelling | vs C | vs C(fast) | dispatch census |
+|---|---|---|---|
+| (a) monolithic, recognizer dialect | **15.4–18.9× faster** | 2.5–3.2× faster | 16 sites: 9 GEMM + 3 norm + 4 elementwise |
+| (b) monolithic, natural spelling | 1.6–2.0× faster | 3.0–3.8× slower | **nothing** |
+| (c) factored into `[]f32` helpers | **2.6–2.7× slower** | 15.7–16.5× slower | 3 sites, no GEMM, no norm |
+| (d) (a) with weights in a `struct` | **2.2–2.7× slower** | 13.2–16.3× slower | 7 sites; only the 2 GEMMs with no struct operand |
+| (e) (a) in `Tensor[f32, S, D]` | 7.0–7.5× faster | 1.1–1.3× faster | 9 sites: all GEMMs, **no** norm, no elementwise |
+
+**Spread across the five spellings of one block: 41–50×.** gcc's spread across the same five
+spellings is 1.0 by construction — it compiles one source. Putting a model's weights in a `struct`
+costs 7 of 9 GEMMs and both affine norms; factoring the model into reusable `[]f32` helpers costs
+everything. The shape-typed spelling keeps every GEMM and loses every norm.
+
+Every variant agrees with the f64 reference to **≤2.1e-4** worst-lane relative, the same order as C
+(2.1e-4), C(fast) (7.4e-5) and Rust (2.3e-4) — the spread is speed, not accuracy. No two spellings
+are bit-identical to each other, because they dispatch different kernel sets and the kernels
+reassociate.
+
+**Two programs with no pattern to match**, same rounds:
+
+| program | Wukong vs C | vs C(fast) | vs C++ | vs Rust | census |
+|---|---|---|---|---|---|
+| fused focal loss + label smoothing + class weights, fwd **and** hand-written bwd, `[8192, 1024]` | **3.7–3.9× slower** | 5.0–5.3× slower | 3.9–4.0× slower | 4.3–4.6× slower | **nothing** |
+| Mamba/S6 selective scan, vector state, T=2048 D=256 N=16 | **2.3–2.4× slower** | 2.3× slower | 2.3× slower | 1.8–1.9× slower | **nothing** |
+
+`wukong_lrscan_f32` covers only a *scalar*-state recurrence with precomputed gates, so the S6 form
+gets nothing; and a loss invented after the recognizer table was written cannot be in it. Both agree
+with the f64 reference at 4.2e-6 (loss gradient, identical to every peer) and 1.0e-4 (scan, ~2× C's
+5.0e-5).
+
+*Reported ratios are same-run adjacent A/B minima from two rounds at one power state. The absolute
+GFLOP/s the harness prints is round-local — this laptop's clock swings ~3× with power and thermal
+state — and is deliberately not reproduced here.*
+
+**Read the `C(fast)` column, not the `C` column, when Wukong is winning here.** Neither the C nor the
+Rust peer can vectorize an f32 dot product under honest flags — reassociation is not allowed — while
+Wukong's dispatched `wukong_sgemm*` kernels reassociate freely, so a `-O3 -march=native` C column
+flatters every dispatching variant. A competent C programmer who wanted the vectorization *without*
+`-ffast-math` would hand-unroll the reduction into several independent accumulators, which is a
+specific valid association gcc can lower to SIMD lanes; that peer would land between the two columns
+reported here, and `C(fast)` (13.4 ms) bounds it. Against that bar, (a) is 2.5–3.2× ahead and (e) is
+1.1–1.3× ahead, not 15–19× and 7×. Two further asymmetries are structural rather than fixable here:
+variant (a) is effectively calling Wukong's own tuned GEMM library while the peers are compiler-only
+(the library-vs-library question is answered by the matmul and `nn.Linear` rows above, which compare
+`wukong_sgemm` to oneMKL and `matrixmultiply`), and rustc has no `-ffast-math` on stable, so the Rust
+column pairs with `C`, never with `C(fast)`.
+
 ## GPU backend (NVIDIA RTX 4050 Laptop, `sm_89`)
 
 Wukong has a **GPU backend** (`wukong_codegen_gpu`, behind `--features gpu`). Being a compiler, it
@@ -2109,6 +2191,19 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
 
 ## Honest summary
 
+- **Every win below is a win IN THE RECOGNIZER DIALECT — read this first.** The kernels in this
+  document are written in the syntactic loop shapes `wukong_mir_build` pattern-matches; that is what
+  makes them dispatch to the tuned AVX2 kernels the rest of this summary describes. Outside those
+  shapes the picture inverts, and the inversion is not gradual. Measured by the
+  `general` suite (see *General code — Wukong OUTSIDE the recognizer dialect*): one transformer block
+  written five ways that compute the same arithmetic in the same order spans **41–50×**, from 15–19×
+  *faster* than C in the recognizer dialect to **2.2–2.7× slower** with the weights held in a
+  `struct` or the model factored into `[]f32` helpers. Hoisting a row base out of a loop — a rewrite
+  that changes no floating-point result and that every optimizer performs anyway — is on its own
+  enough to make a GEMM, an epilogue or an RMSNorm decline. Two realistic programs with no pattern to
+  match (a custom focal loss with a hand-written backward; a Mamba/S6 selective scan with a vector
+  state) run **2.3–3.9× slower than C**. Recognized kernels are gate-blind, so nothing in the test
+  suite reports this; the `general` mode prints the dispatch census for exactly that reason.
 - **Compile time:** the xbench figure — ~100–680× faster than gcc/rustc (latest full-board geomean
   **306×**; drifts ~150–310× with the C/Rust toolchain's spawn time) — is **in-process JIT/embedding
   latency** vs spawning a toolchain; the both-subprocess `compile-vs` mode is the headline
