@@ -7,9 +7,12 @@ module examples.gpt2_forward_bench_small
 // WHY THIS FILE EXISTS. The two programs that carry the GPT-2 dispatch surface (gpt2_forward_bench.wk
 // and its _par twin) are native-only and 500 MB-of-weights-only, so under `cargo test` they take the
 // data-absent early return and gate nothing. The reduced twins that DO run under the examples gate —
-// gpt2_infer.wk / gpt2_infer_small.wk — dispatch no recognized kernel at all (bare imported-const dims;
-// measured: only rt_alloc/rt_free). So every kernel the GPT-2 headline runs on had zero automated
-// coverage: a regression in the sgemv's bare `w[vt*d+dd]` form, or in norm_affine_f32's gathered
+// gpt2_infer.wk / gpt2_infer_small.wk — used to dispatch no recognized kernel at all (bare
+// imported-const dims; measured: only rt_alloc/rt_free); since `canon` folds an integer const into its
+// uses they now dispatch their projections (sgemm_nt_epi + sgemm_nt), but still not the norm, softmax,
+// gelu, residual or LM-head forms this file carries. So every kernel the GPT-2 headline runs on had
+// zero automated coverage, and most still would without this file:
+// a regression in the sgemv's bare `w[vt*d+dd]` form, or in norm_affine_f32's gathered
 // gamma/beta form, or in the []f32-slice pointer/stride each kernel call is lowered with, would change
 // the 124M argmax with nothing in the test suite firing. That is the documented "recognized kernels are
 // gate-blind" landmine.
