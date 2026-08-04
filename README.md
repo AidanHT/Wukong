@@ -40,12 +40,16 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   MKL-1c across sizes, at or above parity at 2048³/4096³**. (Disclosure: threaded MKL itself swings
   ~1.4–2× with this laptop's power state, so ratios are same-run only and reported as ranges; the
   residual mid-size gap is parallel-grain scaling, honestly open);
-- **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
-  over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
-  column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
-  **RoPE** rotary embedding **~29–54×** (up to **~156× parallel**), **strided column reductions**
-  (bias-grad / per-channel quant stats) **~29–50×**, and the training-backward kernels
-  (activation/softmax/LayerNorm-RMSNorm backward, cross-entropy) **~3–13×**;
+- **dispatches the whole transformer/training kernel surface** to tuned microkernels: the
+  **weight-gradient GEMM** `dW=Aᵀ·B` (training backward) **~2.6–5.3× single / ~3.1–13.9× parallel**,
+  the **fused FFN** `silu(A·Bᵀ)` **~24–26×**, **RoPE** rotary embedding **~29–54×** (up to **~156×
+  parallel**), and the training-backward kernels (activation/softmax/LayerNorm-RMSNorm backward,
+  cross-entropy) **~3–13×**. *(Corrected 2026-08-04. The weight-gradient figure previously read "up
+  to ~128× single / ~445× parallel"; that was measured against a C peer written `ijk` with **both**
+  operands read column-strided, not the natural `kij` nest. **Strided column reductions**, previously
+  listed here at ~29–50×, are now measured as a **1.05–1.8× loss** against a peer written row-outer,
+  and have been removed from this list. See the [peer-strength
+  correction](BENCHMARKS.md#-peer-strength-correction--2026-08-04).)*;
 - **wins the transcendental/activation family ~4.7–11.5× vs C** (**~28× under `@parallel`**) — the
   cleanest compute-bound win — and stands near Intel oneMKL VML, the hand-tuned
   vector-math SOTA: same-run across thermal states, **tanh 2.7–2.9× FASTER than VML**, with
@@ -61,7 +65,9 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   hyperbolic/Poincaré-embedding inverse trio) to a **256-bit AVX2 ≈1-ULP poly kernel**, where gcc/rustc
   call scalar `libm` and **cannot vectorize a loop containing the call**;
 - **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form)
-  **~1.9–6.6×** and **convolution** (im2col + GEMM) **~6–7×**;
+  **~1.9–6.6×**; **convolution** (im2col + GEMM) is **~1.55×**, and a slight loss (1.12×) against the
+  same direct-convolution C at `-ffast-math` *(corrected 2026-08-04: the previous ~6–7× was measured
+  against a peer whose buffers were not `restrict`-qualified, which cost gcc 4.3× on that kernel)*;
 - **runs a full 12-layer GPT-2-class transformer end-to-end** (d=768, 12 heads, causal attention,
   GELU MLP — ordinary Wukong source through the real pipeline, gated bit-exact against the
   interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~19–21× idiomatic C** and

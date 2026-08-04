@@ -233,16 +233,23 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Matrix transpose → cache-blocked kernel**: the nest `for i { for j { dst[j*R+i] = src[i*C+j] } }`
   dispatches to a `B=32` cache-blocked `wukong_transpose_f32[_parallel]`. The naive transpose writes
   `dst` with stride `R` (a cache miss per element for large `R`) and gcc/rustc do not loop-tile it at
-  `-O3`, so the blocked kernel wins ~1.5× single-core / ~9–14× `@parallel` on this memory-bound layout
-  op (attention score / weight-layout transposes). A permutation, so bit-exact (`tests/run/transpose_f32.wk`).
+  `-O3`. Against a peer that is ALSO 32×32 blocked (which is what a competent C programmer writes,
+  and what the xbench peer does since 2026-08-04) the blocked kernel is a **single-core tie**
+  (1.00–1.03×); the win is the `@parallel` form, ~4.8–7.1× vs 1-thread C and ~1.0–1.1× vs an all-core
+  OpenMP peer running the same blocked nest. This is a memory-bound layout op (attention score /
+  weight-layout transposes). A permutation, so bit-exact (`tests/run/transpose_f32.wk`).
   **bf16/f16** transposes dispatch to the same blocked kernel at 16-bit width (`wukong_transpose_u16`, one
   kernel for both — a transpose moves the raw bits) for the half-precision KV/attention layouts (`transpose_bf16.wk`).
 - **Column reduction → SIMD colsum kernel**: the column-outer nest `for j { for i { s += x[i*N+j] }; out[j]=s }`
   (the bias gradient `db = Σ_batch dY`, batch sum, reduce-along-axis-0) dispatches to
   `wukong_colsum_f32[_parallel]`, which streams `x` row-major and accumulates eight columns at a time into
-  a cache-resident `out[]`. The naive form strides `x` down the rows *and* — verified on the emitted assembly —
-  gcc/rustc leave it fully scalar (no `vaddps`), so the kernel wins ~29–47× single-core / ~52–55× `@parallel`.
-  Each column sums in `i`-ascending order, so it is bit-exact (`tests/run/colsum.wk`). The **max**/**min**/
+  a cache-resident `out[]`. Each column sums in `i`-ascending order, so it is bit-exact
+  (`tests/run/colsum.wk`). **This family is a measured LOSS, not a win** (corrected 2026-08-04): the
+  ~29–47× single-core figure previously published here was measured against a C peer written
+  column-outer, the worst loop order for a row-major axis-0 reduction. Against the natural row-outer
+  nest `for i { for j { out[j] += x[i*N+j] } }`, which gcc auto-vectorizes, the kernel is
+  **1.05–1.8× slower** on every shape and every op, and `@parallel` only ties single-threaded C. The
+  recognizer fires correctly — the gap is in the kernel, and closing it is open work. The **max**/**min**/
   **abs-max** down the same axis (`out[j] = max/min_i x[i,j]`, `max_i |x[i,j]|` — per-channel quant stats,
   axis-0 max/min pooling, and the symmetric int8-quant scale `amax_j`) dispatch to
   `wukong_col{max,min,maxabs}_f32[_parallel]` (first-row seed + `_mm256_max_ps`/`_mm256_min_ps` fold, abs
@@ -330,8 +337,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   MIR that the native backend rejected and the interpreter ran lossily (`tests/run/int_math.wk`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Wukong
-  runs a 3×3 conv **~6–7× faster** than idiomatic hand-written direct convolution in C. See
-  `tests/run/conv_im2col.wk`.
+  runs a 3×3 conv **~1.55× faster** than a hand-written direct convolution in C — and 1.12× *slower*
+  than the same nest at `-ffast-math`. See `tests/run/conv_im2col.wk`. *(Corrected 2026-08-04: the
+  previous ~6–7× was measured against a peer whose buffers carried no `restrict`, which forced gcc to
+  reload the accumulation operands per output pixel and cost it 4.3×.)*
 - **Operator fusion**: adjacent same-range elementwise loops (e.g. a linear map then ReLU) fuse into
   one loop when the combined body is dependence-safe; CSE then forwards the intermediate through
   registers rather than memory.
