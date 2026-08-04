@@ -808,6 +808,78 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_chain_collapses_in_one_sweep() {
+        // `main -> outer -> mid -> leaf`. Inlining bottom-up means `mid` has already absorbed
+        // `leaf` by the time `outer` is considered, so the whole chain folds to a constant.
+        // Leaf-only inlining spliced `leaf` into `mid` and stopped: `outer` and `main` kept their
+        // calls, and the abstraction blocked every downstream transform.
+        let src = "fn leaf(x: i32) -> i32 { return x * x + 1; } \
+                   fn mid(x: i32) -> i32 { return leaf(x) + leaf(x + 1); } \
+                   fn outer(x: i32) -> i32 { return mid(x) * 2; } \
+                   fn main() -> i32 { return outer(3); }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 54, "level {lvl}");
+        }
+        let (mut prog, interner) = lower(src);
+        optimize(&mut prog, 2);
+        let main = find_fn(&prog, &interner, "main");
+        let calls = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i.op, wukong_mir::Op::Call { .. }))
+            .count();
+        assert_eq!(calls, 0, "the whole helper chain should be gone from main");
+    }
+
+    #[test]
+    fn a_non_leaf_helper_is_inlined() {
+        // The old rule refused any callee that called another user function, no matter how small.
+        // `wrap` calls `inner`, so it was permanently un-inlinable; now it collapses.
+        let src = "fn inner(x: i32) -> i32 { return x + 5; } \
+                   fn wrap(x: i32, y: i32) -> i32 { return inner(x) * inner(y); } \
+                   fn main() -> i32 { let a: i32 = 3; return wrap(a, a + 1); }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 72, "level {lvl}");
+        }
+        let (mut prog, interner) = lower(src);
+        optimize(&mut prog, 2);
+        let main = find_fn(&prog, &interner, "main");
+        assert!(
+            !main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i.op, wukong_mir::Op::Call { .. })),
+            "a non-leaf helper must be inlinable"
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_is_not_inlined() {
+        // `is_even`/`is_odd` call each other, so they share one SCC of the call graph and neither
+        // may be spliced — splicing either into the other could not terminate. The leaf-only rule
+        // got this right by accident (neither is a leaf); the SCC rule gets it right on purpose.
+        let src = "fn is_even(n: i32) -> i32 { if n == 0 { return 1; } return is_odd(n - 1); } \
+                   fn is_odd(n: i32) -> i32 { if n == 0 { return 0; } return is_even(n - 1); } \
+                   fn main() -> i32 { return is_even(10) + is_odd(7); }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 2, "level {lvl}");
+        }
+        let (mut prog, interner) = lower(src);
+        optimize(&mut prog, 2);
+        for name in ["is_even", "is_odd"] {
+            let f = find_fn(&prog, &interner, name);
+            let calls = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i.op, wukong_mir::Op::Call { .. }))
+                .count();
+            assert!(calls >= 1, "{name} must keep its mutually recursive call");
+        }
+    }
+
+    #[test]
     fn recursion_is_not_inlined() {
         // A recursive function is not a leaf, so it must survive -O2 with its self-call intact and
         // still compute correctly.
