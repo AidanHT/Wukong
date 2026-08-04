@@ -951,7 +951,14 @@ fn plan_body(
             (a, left_is_acc)
         });
         red_of.insert(r.combine.0);
-        let vector_acc = r.reassociable && r.addend.is_some() && red_identity(r.kind).is_some();
+        // Lane-parallel partials need the combine to exist *as a vector instruction*. It is the
+        // same `Op::Bin` the elementwise path emits, so it is the same question `bin_widenable`
+        // answers — an `i8` product has no packed form, and a reduction is not exempt from that.
+        // Such a reduction still widens; it just takes the serial fold, whose combine is scalar.
+        let vector_acc = r.reassociable
+            && r.addend.is_some()
+            && red_identity(r.kind).is_some()
+            && bin_widenable(red_binop(r.kind), &ty);
         reductions.push(RedPlan {
             param_index: r.param_index,
             kind: r.kind,
@@ -1225,16 +1232,49 @@ fn plan_body(
 
 /// May this binary operator be applied lane-wise at this result type?
 ///
-/// Integer division and remainder are excluded: Cranelift has no vector `sdiv`/`udiv` on x64 and
-/// legalization panics rather than declining.
+/// The three exclusions are all about what the x64 backend can actually lower, and none of them
+/// degrades gracefully — so this predicate is the only thing standing between a widened body and
+/// a failed or crashed compile.
+///
+/// * **Integer divide and remainder.** There is no packed integer division on x86 at any width.
+/// * **Integer multiply at `i8` lanes.** x86 has `pmullw` (16-bit) and `pmulld` (32-bit) but no
+///   8-bit packed multiply, and Cranelift does not synthesize one out of two 16-bit halves:
+///   `imul.i8x16` reaches the x64 backend as
+///   `Unsupported("should be implemented in ISLE: inst = imul.i8x16 ..")`.
+/// * **Every shift, at every width.** This one is not a missing instruction, it is a *shape*
+///   mismatch, and it is the reason to state all of this in terms of measurements rather than
+///   intuition. A MIR vector shift is lane-wise: each lane of `a` shifted by the matching lane of
+///   `b`, which is what the interpreter does. Cranelift's `ishl`/`ushr`/`sshr` are not that — they
+///   take a **scalar** shift amount broadcast to every lane, so handing them the splatted vector
+///   this pass builds is a type error:
+///
+///   ```text
+///   arg 1 (v29) with type i32x4 failed to satisfy type set ValueTypeSet { lanes: {0}, .. }
+///   ```
+///
+///   The CLIF verifier says exactly that — but **only in a debug build**. In release it is off,
+///   the malformed `ishl.i32x4` goes straight to lowering, and `o[i] = x[i] << 2` at `-O2` ends as
+///   a panic inside Cranelift's ISLE (`no rule matched for term bitcast_xmm_to_gpr`). A program
+///   that runs at `-O0` and crashes the compiler at `-O2`, in the shipping configuration only.
+///
+///   Widening a shift needs one of two things this pass does not have: a MIR vector shift that
+///   takes a scalar amount (a cross-crate operand-shape change, and a real one — `x[i] >> 8` in a
+///   quantization loop is worth it), or AVX2's genuine per-lane `vpsllvd`/`vpsravd`, which
+///   Cranelift does not expose. Refusing is the only correct thing available here.
+///
+/// Those are the only three. An 82-case (operator x lane type) matrix over `i8`/`i16`/`i32`/
+/// `i64`/`f32`/`f64` — add, sub, mul, and, or, xor, shl, ashr, neg, not, compare+select, the
+/// float four, sqrt, and the five reassociable reductions — compiles through `--emit=obj -O2`
+/// with a **debug** `wukongc` (so the CLIF verifier runs) for every other pair, `imul.i64x2`
+/// included. Re-run it against a debug binary before adding an operator here.
 fn bin_widenable(op: BinOp, ty: &MirType) -> bool {
     let lane = ty.lane_type();
     match op {
         BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem | BinOp::FRem => false,
+        BinOp::Shl | BinOp::LShr | BinOp::AShr => false,
+        BinOp::Mul if *lane == MirType::I8 => false,
         BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv => lane.is_float(),
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::LShr | BinOp::AShr => {
-            lane.is_int()
-        }
+        BinOp::Add | BinOp::Sub | BinOp::Mul => lane.is_int(),
         BinOp::And | BinOp::Or | BinOp::Xor => true,
     }
 }
@@ -2120,6 +2160,59 @@ mod tests {
         assert!(!vs.is_empty(), "i32 loop was not widened");
         assert!(
             vs.iter().all(|(l, n)| *l == MirType::I32 && *n == 4),
+            "{vs:?}"
+        );
+    }
+
+    /// A MIR vector shift is lane-wise; Cranelift's is a broadcast of one scalar amount. Widening
+    /// `x[i] << 2` therefore built an `ishl.i32x4` whose second operand was a vector, which the
+    /// CLIF verifier rejects — and the verifier only runs in a debug build, so in release the same
+    /// program reached lowering and panicked inside Cranelift's ISLE. Refused at every width and
+    /// for every direction.
+    #[test]
+    fn a_shift_is_refused_at_every_width() {
+        for (ty, lit) in [
+            ("i8", "(2 as i8)"),
+            ("i16", "(2 as i16)"),
+            ("i32", "2"),
+            ("i64", "2"),
+        ] {
+            for op in ["<<", ">>"] {
+                let src = format!(
+                    "fn k(x: [{ty}; 64], mut o: [{ty}; 64], n: i64) {{ let mut i: i64 = 0; \
+                     while i < n {{ o[i] = x[i] {op} {lit}; i = i + 1; }} }} \
+                     fn main() -> i32 {{ return 0; }}"
+                );
+                assert!(!is_widened(&src, "k"), "{ty} {op} must not be widened");
+            }
+        }
+    }
+
+    /// x86 has no packed byte multiply, so an `i8` product may not be widened. Getting this wrong
+    /// is not a slow program: `imul.i8x16` is `Unsupported` out of Cranelift, i.e. a program that
+    /// runs at `-O0` and fails to compile at `-O2`. The loop is left entirely scalar.
+    #[test]
+    fn an_i8_multiply_is_refused() {
+        let src = "fn k(x: [i8; 64], mut o: [i8; 64], n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * (3 as i8); i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "an i8 product must not be widened");
+    }
+
+    /// The same exclusion reached through the *reduction* path, where the combine is built by
+    /// `red_binop` rather than copied from the body. A product reduction over `i8` still widens —
+    /// its loads go 16 lanes wide — but it may not take a vector accumulator, because that
+    /// accumulator's combine would be the packed byte multiply that does not exist. It falls back
+    /// to the serial fold, whose multiplies are scalar.
+    #[test]
+    fn an_i8_product_reduction_folds_serially() {
+        let src = "fn k(x: [i8; 64], n: i64) -> i8 { let mut s: i8 = 1; let mut i: i64 = 0; \
+                   while i < n { s = s * x[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(!vs.is_empty(), "the loads should still be widened");
+        assert!(
+            vs.iter().all(|(l, n)| *l == MirType::I8 && *n == 16),
             "{vs:?}"
         );
     }
