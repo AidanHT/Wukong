@@ -12,23 +12,29 @@ or `.wk` source changed; only the benchmark peers and the documents that quote t
 - **`__restrict__` on every generated C/C++ peer kernel.** `grep -c restrict` over
   `crates/wukong_xbench/src/main.rs` previously returned **0**: not one of the 43 C kernels told gcc
   its output buffer does not overlap its inputs, so gcc could not vectorize or reorder any nested
-  kernel, while Wukong's tensor parameters carry non-overlap in the type system. Largest single
-  effect: the direct-convolution peer went from **4.9 to 21.1 GFLOP/s (4.3×)**, taking the published
-  conv multiple from 5.90× to **1.55×**. Two latent aliasing hazards were removed first so the
-  qualifier is true rather than merely fast (`fused_linear_relu`'s const-cast-away write, and a
-  dequant bench that passed its own output buffer as the unused middle pointer).
+  kernel, while Wukong's tensor parameters carry non-overlap in the type system. Isolated with the
+  kernels in their own translation unit — the harness compiles each peer to a shared library, so a
+  one-TU probe over `static` arrays lets gcc's IPA prove non-overlap by itself and makes `restrict`
+  look like a no-op — `restrict` alone is worth **8.7× on `matmul_tn` 512³ (176.6 → 20.2 ms)**,
+  **5.0× on the direct convolution (1.99 → 0.40 ms)**, **4.2× on the column-outer `colsum`**, 1.33×
+  on `saxpy`, and nothing at all on `relu`/`biasadd` (0.96×/1.01×). The conv peer went from **4.9 to
+  21.1 GFLOP/s** in the suite, taking the published conv multiple from 5.90× to **1.55×**. Two latent
+  aliasing hazards were removed first so the qualifier is true rather than merely fast
+  (`fused_linear_relu`'s const-cast-away write, and a dequant bench that passed its own output buffer
+  as the unused middle pointer).
 - **Column reductions / column argmax rewritten row-outer.** `c_colsum`, `c_colmax`/`min`/`absmax`,
   `c_colstat` (mean/sum-sq/L2/RMS) and `c_colarg` all scanned `for j { for i { … x[i*N+j] } }` — the
-  worst loop order for a row-major axis-0 reduction, and the only order measured. Standalone at `-O3
-  -march=native`, 4096×1024: colsum **3.739 → 0.563 ms**, colmax **5.730 → 0.888 ms**, colmean
-  **5.990 → 0.509 ms**, colargmax **4.043 → 0.954 ms**, output identical. **The published ~29–50×
-  column-reduction win becomes a 1.05–1.8× LOSS**, and the column argmax's ~2.7–4.1× becomes a
-  1.5–2.5× loss.
+  worst loop order for a row-major axis-0 reduction, and the only order measured. Isolated at `-O3
+  -march=native`, 4096×1024: colsum **21.33 → 0.58 ms (36.7×)**, colmax **34.82 → 0.86 ms (40.6×)**,
+  colmean **33.03 → 1.24 ms (26.7×)**, colargmax **9.87 → 1.57 ms (6.3×)**, output identical.
+  **The published ~29–50× column-reduction win becomes a 1.05–1.8× LOSS**, and the column argmax's
+  ~2.7–4.1× becomes a 1.5–2.5× loss.
 - **`matmul_tn` peer given the natural `kij` order.** It was `ijk` with **both** operands read
-  column-strided. Standalone 512³: **20.965 → 8.805 ms**. The weight-gradient GEMM's ~128× single /
-  ~445× parallel becomes **2.6–5.3× / 3.1–13.9×**.
-- **Transpose peer cache-blocked 32×32**, matching Wukong's own kernel. Standalone 2048²: **24.184 →
-  14.298 ms**. Single-core transpose becomes a **tie**.
+  column-strided. Isolated 512³: **176.6 → 9.70 ms (18.2× total: 8.7× `restrict` × 2.1× loop
+  order)**. The weight-gradient GEMM's ~128× single / ~445× parallel becomes **2.6–5.3× /
+  3.1–13.9×**.
+- **Transpose peer cache-blocked 32×32**, matching Wukong's own kernel. Isolated 2048²: **29.51 →
+  14.09 ms (2.09×)**. Single-core transpose becomes a **tie**.
 - **Ten reduction-bearing benches gained the `C(fast)` [-ffast-math] column** their own fairness rule
   required (gemv, scaled_gemm, linear_bf16, conv, colmax/min/absmax, rowarg, colarg, bf16 dot/sum,
   cumsum, xent_bwd). Four of them turn out to be ties or losses once it exists: the bf16 reductions
