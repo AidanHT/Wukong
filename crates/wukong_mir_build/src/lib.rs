@@ -19,6 +19,8 @@
 //! driver stops before any backend — the front end accepts the construct, only lowering to runnable
 //! code refuses, so this crate never hands a backend knowingly-broken MIR.
 
+mod canon;
+
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use wukong_ast::{
@@ -705,6 +707,14 @@ pub fn lower_program(
     sema: &SemaResult,
     interner: &mut Interner,
 ) -> (Program, Vec<Diagnostic>) {
+    // Canonicalize the *spelling* before anything looks at the AST. Every recognizer below matches a
+    // syntactic loop-nest shape on the raw tree, so a semantics-preserving respelling — hoisting a
+    // row base into a local, which is plain CSE and changes no result — was on its own enough to
+    // lose the kernel. `canon` rewrites those forms back to the canonical one every matcher already
+    // understands; it returns `None`, having cloned nothing, for a module it cannot help (see
+    // `canon` for the soundness conditions).
+    let canonical = canon::canonicalize_module(module, sema);
+    let module = canonical.as_ref().unwrap_or(module);
     let mut diags = Vec::new();
     let mut program = Program::new();
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
@@ -26707,6 +26717,93 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
                 verify_function(f).is_empty(),
                 "verify failed for a function"
             );
+        }
+    }
+
+    /// A GEMM whose row bases are hoisted into locals (`let ib = i*8;` … `a[ib + p]`) — plain CSE,
+    /// which changes no result and which every optimizer performs anyway — computed the same values
+    /// as the flat spelling but lost the kernel entirely, because the recognizers match the raw AST
+    /// and `i*8 + p` was no longer *in* the index. `canon` forward-substitutes the base back in.
+    #[test]
+    fn hoisted_row_base_still_dispatches_the_gemm() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let jb = j * 8;
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[jb + p]; }
+            c[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a hoisted row base must not cost the GEMM kernel"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
+    /// The same normalization on the norm family: an affine RMSNorm whose row base is hoisted must
+    /// still fold into one `wukong_norm_affine_f32` call.
+    #[test]
+    fn hoisted_row_base_still_dispatches_the_norm() {
+        let src = "module m
+fn rms(mut x: [f32; 64], g: [f32; 8], bb: [f32; 8]) {
+    for r in 0..8 {
+        let rb = r * 8;
+        let mut ss: f32 = 0.0;
+        for i in 0..8 { ss = ss + x[rb + i] * x[rb + i]; }
+        let inv: f32 = rsqrt(ss / 8.0 + 0.00001);
+        for i in 0..8 { x[rb + i] = x[rb + i] * inv * g[i] + bb[i]; }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_norm_affine_f32"),
+            "a hoisted row base must not cost the fused norm kernel"
+        );
+    }
+
+    /// The DECLINE that keeps the substitution sound: a base that is *reassigned* does not hold the
+    /// same value at its uses as at its `let`, so inlining the initializer would compute a different
+    /// address. `canon` must leave it alone — and leaving it alone means the nest keeps its scalar
+    /// lowering. This asserts the decline, so loosening the purity rule to accept a mutable local
+    /// (which would be a silent miscompile) fails here.
+    #[test]
+    fn a_reassigned_index_base_is_not_substituted() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..8 {
+        let mut ib = i * 8;
+        ib = ib + 0;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a reassigned base must not be forward-substituted"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
         }
     }
 }
