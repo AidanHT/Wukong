@@ -183,7 +183,16 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Constant-shape tensors** `Tensor[f32, R, C]`: multi-dimensional indexing `a[i, j]` lowers to a
   row-major GEP (the shape-typed surface), so elementwise tensor kernels and tensor matmuls execute
   on both backends (`tests/run/tensor_*.wk`) — and a matmul written in tensor notation dispatches to
-  the tuned GEMM kernel (see below).
+  the tuned GEMM kernel (see below). **The shape-typed spelling costs nothing**: a statically-shaped
+  contiguous tensor is normalized to its flat row-major index (`a[i, j]` → `a[i*C + j]`) before
+  lowering and binds as the buffer it is, so it reaches every kernel recognizer and the
+  autovectorizer exactly as `[f32; R*C]` does — the two spellings compile to **byte-identical MIR**
+  (`crates/wukongc/tests/tensor_parity.rs` pins this for 2-D elementwise, matmul and a non-square
+  rank-3 nest). `tests/run/transformer_block_tensor.wk` is a whole pre-norm transformer block in
+  tensor notation with the same GEMM and fused-norm dispatch as its hand-flattened twin. The one
+  structural difference that remains: a rank-2 tensor cannot be swept by a single flat index (that
+  is the shape check working), so a whole-buffer elementwise pass over one is written as a nest and
+  vectorizes per row rather than as a single stream.
 - **Symbolic-generic tensor shapes** `fn f<M, N>(a: Tensor[f32, M, N])` **execute** — the capstone of
   the shape-safety story: a shape-generic tensor function *proves* its shapes at compile time (the
   dims are rigid generics in the body, so no shape-lie; see the shape-checking limitation note below)

@@ -181,9 +181,18 @@ an aggregate field initialized from a *non-literal* value is a leaf-precise deep
 `memcpy` (which would skip a padded non-leading scalar slot under the interpreter's slot-indexed
 memory). Pointers/references reuse the same `Alloca`/`Load`/`Store`/`Gep` ops: `&mut x` takes a slot's
 address, `*p` loads/stores through it, and `mem2reg` refuses to promote a slot whose address escapes,
-so `-O0` ≡ `-O3`. A **constant-shape tensor** lowers like an array — the parameter is a base pointer
-and a multi-dimensional index `a[i, j]` flattens to a row-major `Gep` — so the shape-typed surface
-*executes*, not just shape-checks. A matmul written in that tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`,
+so `-O0` ≡ `-O3`. A **constant-shape tensor** lowers like an array — literally: a `tindex` pre-pass
+rewrites every multi-dimensional index `a[i, j]` into the flat row-major index expression
+`a[i*N + j]` *before* lowering, and the parameter binds as the buffer it is (`[T; d0·…·dn]`, not an
+opaque `Ptr`), so the base pointer is not reloaded per element. That matters far more than it sounds:
+every kernel recognizer and the whole autovectorizer match a **single-index** `ExprKind::Index`, so
+until the normalization existed a 2-index access was invisible to all of them and the shape-typed
+spelling of an elementwise loop measured 5.69× slower than its hand-flattened twin. The two spellings
+now compile to byte-identical MIR (`crates/wukongc/tests/tensor_parity.rs`). The rewrite is confined
+to a contiguous tensor with all-`Const` extents, ≤ `i32::MAX` elements and one ≥32-bit index type —
+the bounds that make the flat offset value-identical to the `i64` one it replaces — so a *symbolic*
+`Tensor[f32, M, N]` keeps the runtime-dim path below unchanged.
+A matmul written in that tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`,
 both the dot-product and accumulate spellings) dispatches to the tuned `wukong_sgemm` microkernel
 just like the flat `a[i*K+k]` form, because a 2-index access supplies its row stride from the
 operand's inner tensor dimension. A *symbolic*-generic nest `matmul<M, N, K>` reaches the same

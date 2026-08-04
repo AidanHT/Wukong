@@ -5,6 +5,33 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Performance — the shape-typed surface stops costing anything
+`Tensor[f32, M, N]` was the language's slowest data type. Every kernel recognizer and the whole
+autovectorizer match a **single-index** `ExprKind::Index`, so the idiomatic multi-index access
+`a[i, j]` fell off the end of all of them and lowered to a scalar GEP nest — and a tensor *parameter*
+was spilled to a stack slot and reloaded on every element, where the `[f32; M*N]` spelling of the
+identical buffer is bound directly. Measured on a 64×64 elementwise map (release, `--backend=native
+-O2`, adjacent same-run A/B, best-of-5 minima): the shape-typed spelling ran **5.69× slower** than the
+hand-flattened one. The tell was in the corpus — only 11 of 332 `tests/run` programs mentioned
+`Tensor[`, and all 11 were tests *of* the feature; not one model program used it.
+- **`a[i, j]` is normalized to `a[i*N + j]` before lowering** (`wukong_mir_build::tindex`) — the same
+  row-major offset the lowering computed anyway, now spelled as an index expression every matcher
+  already understands. Applies to a contiguous tensor whose every extent is a compile-time constant,
+  whose element count is ≤ `i32::MAX`, and whose indices share one ≥32-bit integer type; those bounds
+  are what make it value-identical to the old sign-extend-to-`i64` offset for every in-bounds access.
+  A symbolic `Tensor[f32, M, N]` is untouched and keeps the hidden runtime-dim path.
+- **A statically-shaped tensor parameter binds as the buffer it is**, `[T; d0·…·dn]`, not an opaque
+  pointer — so it is not reloaded per element. The call ABI is unchanged (still one base pointer).
+- **The autovectorizer streams tensors**, and the whole-function GEMM/int8-GEMM wrappers no longer
+  emit a dead spill slot per tensor parameter.
+- Result: the shape-typed and hand-flattened spellings of the same program now compile to
+  **byte-identical MIR** — pinned by `crates/wukongc/tests/tensor_parity.rs` for 2-D elementwise, a
+  matmul and a non-square rank-3 nest — and the measured ratio is **0.999** (same-run A/B, from 5.69).
+  `tests/run/transformer_block_tensor.wk` is a full pre-norm transformer block written in tensor
+  notation: it dispatches the same four GEMMs and three fused norms as the flat fixture, where before
+  it would have dispatched none. Programs with no statically-shaped tensor are byte-identical to
+  before (the pass returns early on a type-table scan).
+
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
 write-sets → adversarial re-verification), plus a harness-hardening wave. Almost nothing here is a new
