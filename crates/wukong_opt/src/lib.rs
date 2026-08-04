@@ -23,6 +23,7 @@ mod dse;
 mod fxhash;
 mod inline;
 mod licm;
+pub mod loop_info;
 mod mem2reg;
 mod phi;
 mod simplify;
