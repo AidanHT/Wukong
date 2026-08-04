@@ -14,6 +14,7 @@
 //! At `-O2` and above, whole-program inlining of small leaf functions ([`inline_program`]) runs once
 //! before the per-function pipeline. `-O3` adds nothing to either — see [`PassManager::standard`].
 
+pub mod alias;
 mod cache;
 mod cfg;
 mod cse;
@@ -28,6 +29,7 @@ mod phi;
 mod simplify;
 mod simplify_cfg;
 
+pub use alias::{AliasInfo, Prov};
 pub use cache::CfgAnalyses;
 pub use cse::Cse;
 pub use dce::Dce;
