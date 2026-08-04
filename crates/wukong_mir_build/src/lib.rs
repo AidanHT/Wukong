@@ -1817,7 +1817,11 @@ fn lower_parallel(
         let env = fl.builder.add_param(MirType::Ptr);
         // Recover each array base pointer from env[k] and bind it to the parameter name.
         for (idx_k, (p, pty)) in f.params.iter().zip(&param_tys).enumerate() {
-            let mty = mir_ty(pty);
+            // `param_slot_ty`, not `mir_ty`: `base` here *is* the buffer's base pointer recovered
+            // from the env, and only an `Array(..)` binding makes a read of the name yield that
+            // pointer. Bound as `Ptr`, a statically-shaped tensor param would instead `Load` through
+            // it — reading the tensor's first 8 data bytes as an address.
+            let mty = param_slot_ty(pty);
             let kidx = fl
                 .builder
                 .build(MirType::I64, Op::ConstInt(idx_k as i128, MirType::I64));
@@ -13570,6 +13574,23 @@ impl FnLowerer<'_> {
     fn array_elem(&self, base: &Expr) -> Option<MirType> {
         match self.expr_ty(base) {
             Ty::Array { elem, .. } => Some(mir_ty(&elem)),
+            // A statically-shaped contiguous tensor *is* an array of its element type — the same
+            // buffer with a shape attached — so a loop over it is exactly as vectorizable as the
+            // `[T; N]` spelling. Without this the autovectorizer declined every tensor stream even
+            // after `tindex` normalized `a[i, j]` to the single-index form it can analyse.
+            //
+            // Both gates are load-bearing. `tensor_buffer_mir` is the same predicate the parameter
+            // binding uses, and requiring the *binding* to be `Array` is what proves `lookup(base).0`
+            // is the buffer's base pointer: a tensor bound as `Ptr` (a symbolic shape, or a tensor
+            // local) holds the pointer in a stack slot, and the emitters gep straight off the value
+            // `lookup` returns — so accepting one here would address the slot, not the data.
+            t @ Ty::Tensor { .. } => {
+                let (elem, _) = tensor_buffer_mir(&t)?;
+                match self.lookup(single_path(base)?) {
+                    Some((_, MirType::Array(..))) => Some(elem),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -19193,6 +19214,18 @@ fn tensor_buffer_mir(ty: &Ty) -> Option<(MirType, u32)> {
     Some((MirType::from_scalar(*elem), n))
 }
 
+/// The MIR type a parameter's **binding** carries — `mir_ty`, except that a statically-shaped
+/// contiguous tensor binds as the buffer it is (`[T; d0·…·dn]`) rather than an opaque `Ptr`. Only
+/// the `Array(..)` shape takes the "the value *is* the storage" branch at every binding site, so
+/// this is what stops a tensor parameter being spilled to a stack slot and reloaded per element.
+/// The **call ABI is unaffected** — `param_abi_ty` maps `Array(..)` straight back to `Ptr`.
+fn param_slot_ty(ty: &Ty) -> MirType {
+    match tensor_buffer_mir(ty) {
+        Some((elem, n)) => MirType::Array(Box::new(elem), n),
+        None => mir_ty(ty),
+    }
+}
+
 /// The MIR type a parameter is passed as at the call boundary. Arrays decay to a base pointer.
 fn param_abi_ty(ty: &Ty) -> MirType {
     match mir_ty(ty) {
@@ -22557,7 +22590,10 @@ fn lower_matmul_fn(
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
-        let mty = mir_ty(pty);
+        // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
+        // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
+        // into every caller that inlined this wrapper).
+        let mty = param_slot_ty(pty);
         if matches!(mty, MirType::Array(..)) {
             fl.bind(p.name.sym, val, mty);
         } else {
@@ -25455,7 +25491,10 @@ fn lower_i8matmul_fn(
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
-        let mty = mir_ty(pty);
+        // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
+        // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
+        // into every caller that inlined this wrapper).
+        let mty = param_slot_ty(pty);
         if matches!(mty, MirType::Array(..)) {
             fl.bind(p.name.sym, val, mty);
         } else {
