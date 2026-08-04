@@ -47,7 +47,7 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   cross-entropy) **~3–13×**. *(Corrected 2026-08-04. The weight-gradient figure previously read "up
   to ~128× single / ~445× parallel"; that was measured against a C peer written `ijk` with **both**
   operands read column-strided, not the natural `kij` nest. **Strided column reductions**, previously
-  listed here at ~29–50×, are now measured as a **1.05–1.8× loss** against a peer written row-outer,
+  listed here at ~29–50×, are now measured as **a tie at best and a 1.8× loss** against a peer written row-outer,
   and have been removed from this list. See the [peer-strength
   correction](BENCHMARKS.md#-peer-strength-correction--2026-08-04).)*;
 - **wins the transcendental/activation family ~4.7–11.5× vs C** (**~28× under `@parallel`**) — the

@@ -248,7 +248,8 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   ~29–47× single-core figure previously published here was measured against a C peer written
   column-outer, the worst loop order for a row-major axis-0 reduction. Against the natural row-outer
   nest `for i { for j { out[j] += x[i*N+j] } }`, which gcc auto-vectorizes, the kernel is
-  **1.05–1.8× slower** on every shape and every op, and `@parallel` only ties single-threaded C. The
+  **a tie at best and 1.8× slower at worst** (15 of 16 measured rows are losses; the >L3 shape is a
+  consistent ~1.65× loss across two rounds), and `@parallel` only ties single-threaded C. The
   recognizer fires correctly — the gap is in the kernel, and closing it is open work. The **max**/**min**/
   **abs-max** down the same axis (`out[j] = max/min_i x[i,j]`, `max_i |x[i,j]|` — per-channel quant stats,
   axis-0 max/min pooling, and the symmetric int8-quant scale `amax_j`) dispatch to
