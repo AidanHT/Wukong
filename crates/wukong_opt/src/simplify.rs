@@ -2,7 +2,7 @@
 
 use crate::fxhash::FxHashMap;
 
-use wukong_mir::{BinOp, CmpOp, Function, MirType, Op, ValueId};
+use wukong_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, ValueId};
 
 use crate::{map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
@@ -26,6 +26,7 @@ enum Act {
     Cmp(CmpOp, ValueId, ValueId),
     Neg(ValueId),
     Not(ValueId),
+    Cast(CastKind, ValueId),
 }
 
 impl Pass for Simplify {
@@ -74,6 +75,7 @@ impl Pass for Simplify {
                     Op::Cmp(c, l, r) => Act::Cmp(*c, *l, *r),
                     Op::Neg(v) => Act::Neg(*v),
                     Op::Not(v) => Act::Not(*v),
+                    Op::Cast(k, v, _) => Act::Cast(*k, *v),
                     _ => continue,
                 };
 
@@ -167,6 +169,17 @@ impl Pass for Simplify {
                             changed = true;
                         }
                     }
+                    Act::Cast(k, v) => {
+                        if let Some(CV::Int(i)) = consts.get(&v.0).copied() {
+                            let from = f.value_types[v.0 as usize].clone();
+                            let rty = f.value_types[res.0 as usize].clone();
+                            if let Some(nv) = fold_int_cast(k, i, &from, &rty) {
+                                set_const(f, bi, ii, CV::Int(nv), &rty);
+                                consts.insert(res.0, CV::Int(nv));
+                                changed = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -212,6 +225,32 @@ fn round_float_to_ty(v: f64, ty: &MirType) -> f64 {
         MirType::F32 | MirType::F16 | MirType::BF16 => v as f32 as f64,
         _ => v,
     }
+}
+
+/// Fold an **integer-to-integer** cast of a constant, mirroring `wukong_interp::apply_cast` exactly:
+/// `SExt`/`Trunc` re-mask the sign-extended value to the target width, `ZExt` first reads the source
+/// in its own width as unsigned. The interpreter is the language spec, so this table is a copy of
+/// its arms, not a re-derivation.
+///
+/// Only int -> int is folded. The other ten `CastKind`s are declined on purpose:
+/// * anything touching a float would have to reproduce the backends' *single* rounding step, and
+///   `round_float_to_ty` rounds bf16/f16 to the f32 grid rather than the narrow grid the backends
+///   use at runtime — the same reason `fold_bin` refuses bf16/f16 arithmetic and `Act::Cmp` refuses
+///   to compare them (see `narrow_float_constant_compares_are_not_folded`);
+/// * `Bitcast`, `IntToPtr` and `PtrToInt` are representation reinterpretations, and a folded pointer
+///   constant is not something the rest of the pipeline is prepared for.
+///
+/// A vector operand or result is declined too: `set_const` writes a *scalar* `ConstInt`, which is
+/// malformed MIR for a `<N x iW>` result, exactly as in the `Alg::Const` arm above.
+fn fold_int_cast(k: CastKind, x: i128, from: &MirType, to: &MirType) -> Option<i128> {
+    if !from.is_int() || !to.is_int() {
+        return None;
+    }
+    Some(match k {
+        CastKind::SExt | CastKind::Trunc => mask(x, to),
+        CastKind::ZExt => mask(uval(x, int_bits(from)) as i128, to),
+        _ => return None,
+    })
 }
 
 fn fold_bin(b: BinOp, a: CV, c: CV, ty: &MirType) -> Option<CV> {
@@ -487,5 +526,127 @@ fn uval(v: i128, bits: u32) -> u128 {
         v as u128
     } else {
         (v as u128) & ((1u128 << bits) - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wukong_mir::CastKind::*;
+    use wukong_span::{Interner, SourceId};
+
+    /// Compile, optimize at `opt`, and run `main` in the interpreter — the language spec.
+    fn run(src: &str, opt: u8) -> i64 {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (mut program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        crate::optimize(&mut program, opt);
+        for f in &program.funcs {
+            assert!(
+                wukong_mir::verify::verify_function(f).is_empty(),
+                "verify after -O{opt}"
+            );
+        }
+        let main = interner.intern("main");
+        wukong_interp::run(&program, main, &interner).unwrap()
+    }
+
+    #[test]
+    fn int_cast_folding_matches_the_interpreter() {
+        // Every arm of `fold_int_cast`, at the widths where a wrong rule shows: `zext` of a
+        // high-bit-set narrow value (the case that would come out negative if it were a `sext`),
+        // `trunc` that drops a sign bit, and `sext` of a negative.
+        let cases: [(CastKind, i128, MirType, MirType, i128); 8] = [
+            (SExt, -1, MirType::I32, MirType::I64, -1),
+            (SExt, 1, MirType::I32, MirType::I64, 1),
+            (SExt, i32::MIN as i128, MirType::I32, MirType::I64, i32::MIN as i128),
+            // `u32::MAX` is stored sign-extended as -1; zero-extending reads its own 32 bits.
+            (ZExt, -1, MirType::I32, MirType::I64, u32::MAX as i128),
+            (ZExt, -1, MirType::I8, MirType::I32, u8::MAX as i128),
+            (ZExt, 1, MirType::I1, MirType::I32, 1),
+            // 0x1_0000_0080 truncated to i8 is 0x80 == -128, not +128.
+            (Trunc, 0x1_0000_0080, MirType::I64, MirType::I8, -128),
+            (Trunc, 0x1_0000_0000, MirType::I64, MirType::I32, 0),
+        ];
+        for (k, x, from, to, want) in cases {
+            assert_eq!(
+                fold_int_cast(k, x, &from, &to),
+                Some(want),
+                "{} {x} : {} -> {}",
+                k.name(),
+                from.display(),
+                to.display()
+            );
+        }
+        // Float, pointer and representation casts are declined outright.
+        for k in [FpToSi, SiToFp, FpExt, FpTrunc, Bitcast, IntToPtr, PtrToInt] {
+            assert_eq!(fold_int_cast(k, 1, &MirType::I32, &MirType::I64), None, "{}", k.name());
+        }
+        // A vector operand or result would need a splatted const, which `set_const` cannot write.
+        let v4 = MirType::Vec(Box::new(MirType::I32), 4);
+        assert_eq!(fold_int_cast(SExt, 1, &v4, &MirType::I64), None);
+        assert_eq!(fold_int_cast(SExt, 1, &MirType::I32, &v4), None);
+    }
+
+    #[test]
+    fn folded_casts_agree_with_the_unoptimized_program() {
+        // The differential that matters: whatever the fold computes must equal what `-O0` (a real
+        // `Op::Cast` executed by the interpreter) computes. Sign/zero-extension of a high-bit-set
+        // value and a truncation that flips a sign bit are where a wrong rule diverges.
+        let cases = [
+            // u32::MAX widened: zero-extension, so 4294967295, not -1.
+            ("fn main() -> i32 { let a: u32 = 4294967295; let b: i64 = a as i64; \
+              if b == 4294967295 { return 1; } return 0; }", 1),
+            // i32 -1 widened: sign-extension.
+            ("fn main() -> i32 { let a: i32 = -1; let b: i64 = a as i64; \
+              if b == -1 { return 1; } return 0; }", 1),
+            // Truncation to i8 keeps the low byte, sign-extended.
+            ("fn main() -> i32 { let a: i64 = 4294967424; let b: i8 = a as i8; return b as i32; }", -128),
+            // u8 widened to i32 is unsigned.
+            ("fn main() -> i32 { let a: u8 = 255; return a as i32; }", 255),
+            // Round trip through a narrow type inside an expression the folder now sees through.
+            ("fn main() -> i32 { let a: i32 = 300; return ((a as i8) as i32) + 1; }", 45),
+            // bool widening.
+            ("fn main() -> i32 { let a: bool = true; return a as i32; }", 1),
+        ];
+        for (src, want) in cases {
+            for lvl in [0, 1, 2, 3] {
+                assert_eq!(run(src, lvl), want as i64, "-O{lvl}: {src}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_widened_loop_step_folds_to_a_literal() {
+        // The canonicalization this fold exists for: `while i < n { ...; i = i + 1; }` with an
+        // `i64` counter lowers the literal `1` as `sext (const.i32 1) to i64`, so the loop's step
+        // is an opaque value and `loop_info` reports `IvStep::Invariant`, not `Const(1)`. After
+        // folding it is a plain `const.i64 1` and the `while` spelling describes the same induction
+        // variable as `for i in 0..n`.
+        let src = "fn t(n: i64) -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; \
+                   while i < n { s = s + i; i = i + 1; } return s; } \
+                   fn main() -> i32 { return t(10) as i32; }";
+        let mut interner = Interner::new();
+        let (module, _) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (mut program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        crate::PassManager::standard(2).run(&mut program);
+        let sym = interner.intern("t");
+        let f = program.function(sym).expect("fn t");
+        let forest = crate::loop_info::analyze_function(f);
+        assert_eq!(forest.loops.len(), 1);
+        let iv = forest.loops[0].primary().expect("a primary IV");
+        assert_eq!(
+            iv.step,
+            crate::loop_info::IvStep::Const(1),
+            "the widened literal step must fold to a constant\n{}",
+            crate::loop_info::dump_function_loops(f, "t")
+        );
+        assert_eq!(run(src, 2), 45);
+        assert_eq!(run(src, 0), 45);
     }
 }
