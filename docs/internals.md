@@ -174,14 +174,18 @@ SSA registers (see below), which is what makes the value-based passes effective.
 
 There is **no dedicated aggregate MIR type**. A tuple or struct is a flat, padded byte buffer whose
 local value *is* its base pointer (the convention arrays already follow); `t.0` / `s.f` is a typed
-`load`/`store` at the field's byte offset, and `mem2reg` leaves the slot in memory. Nested aggregates
+`load`/`store` at the field's byte offset, and `mem2reg` leaves the aggregate slot in memory (its
+address is taken by every `gep`). Nested aggregates
 (a struct/tuple field that is itself a struct, or an array of structs) lay out recursively — the
 registry-aware layout helpers resolve a named-struct field that the leaf type crate marks unsized — and
 an aggregate field initialized from a *non-literal* value is a leaf-precise deep copy, not a flat
 `memcpy` (which would skip a padded non-leading scalar slot under the interpreter's slot-indexed
 memory). Pointers/references reuse the same `Alloca`/`Load`/`Store`/`Gep` ops: `&mut x` takes a slot's
 address, `*p` loads/stores through it, and `mem2reg` refuses to promote a slot whose address escapes,
-so `-O0` ≡ `-O3`. A **constant-shape tensor** lowers like an array — the parameter is a base pointer
+so `-O0` ≡ `-O3`. The *pointer itself* is promoted when the entry block initializes it, which is why
+`p = &a` / `p = &b` merging at a loop header becomes a `ptr` block parameter while `a` and `b` — now
+escaping as branch arguments — stay in memory (`tests/run/ptr_slot_promotion.wk`).
+A **constant-shape tensor** lowers like an array — the parameter is a base pointer
 and a multi-dimensional index `a[i, j]` flattens to a row-major `Gep` — so the shape-typed surface
 *executes*, not just shape-checks. A matmul written in that tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`,
 both the dot-product and accumulate spellings) dispatches to the tuned `wukong_sgemm` microkernel
@@ -251,7 +255,7 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
 | `inline_program`| -O2   | inline small, non-recursive **leaf** functions (whole-program), then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
-| `Mem2Reg`       | -O1   | promote scalar int/float `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename |
+| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when the entry block stores to it before any load — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
@@ -269,9 +273,30 @@ the callee's recipes into the caller and rebase every copied index (see the vect
 
 `Mem2Reg` is the keystone: the front-end's memory traffic hides constants, common subexpressions,
 and induction variables, so promoting slots to SSA is what lets the rest of the pipeline fire. It
-leaves arrays, address-taken, and pointer slots in memory; a read before any write becomes a zero
-constant, matching the interpreter's zero-initialized memory. `Cse`/`Dse` still handle the residual
-memory (load forwarding and its dual) for the slots that stay in memory. `Licm` uses the dominator
+promotes integer, float and pointer slots and leaves arrays, vectors, address-taken slots, and any
+slot accessed at a width other than its own type in memory. For an integer or float slot a read
+before any write becomes a zero constant, matching the interpreter's zero-initialized memory.
+
+A **pointer** slot has no such zero — `inttoptr 0` is a genuine null on the native backend but a
+*valid, addressable* slot in the interpreter, so materializing one would trade a stack slot for an
+interp-vs-native divergence — so only the definitely-initialized subset is promoted: the entry block
+must store to the slot before any load of it. The entry block dominates every block and is
+straight-line, so that store dominates every point at which the renamer asks for a reaching
+definition (every load, and every terminator that has to hand a phi its argument), and the rename
+stack is never empty. That admits the case the restriction exists for: `mir_build` gives every
+pointer-typed parameter — `*T`, `&T`, and every `Tensor[…]`, all `MirType::Ptr` — an `alloca ptr`
+plus a `store <param>` in the entry block, and then re-loads that base pointer at *every* element
+access. Promoting them removes 3 of the 5 loads per element from a three-operand `Tensor` loop
+(`tests/run/ptr_slot_promotion.wk`), and it compounds: deleting `store <slot>, <ptr slot>` can
+un-escape the pointee so a later fixpoint round promotes that too. A pointer local first assigned
+inside an `if` or a loop keeps its slot.
+
+A `[]T` **slice** parameter is *not* covered: a slice is a 16-byte `{ data, len }` fat pointer passed
+by address, so its base comes from `load ptr (gep <param>, 0)` — caller-owned memory, not a local
+slot. Hoisting that needs loop-invariant load motion, which `licm` does not do.
+
+`Cse`/`Dse` still handle the residual memory (load forwarding and its dual) for the slots that stay
+in memory. `Licm` uses the dominator
 analysis to find natural loops and only hoists into loops that already have a preheader, so it is
 always legal; loads, stores, calls, vector-kernel calls, allocas, and integer division/remainder
 (which can trap on a zero divisor) are never moved. Float predicates are never folded on

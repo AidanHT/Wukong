@@ -641,8 +641,20 @@ single-block SSA (mem2reg + simplify-cfg).
   buffer, classic UB like C (and an optimization level can even change the garbage observed). An
   out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
   `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
-- `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
-  stay in memory (the interpreter and `cse`/`dse` handle those directly).
+- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot qualifies only when
+  the entry block stores to it before any load — which covers every pointer-typed *parameter*
+  (`*T`, `&T`, and every `Tensor[…]`, all of which lower to one MIR `ptr`), the case that matters,
+  since the front end otherwise re-loads the base pointer from its stack slot at every element
+  access. A pointer local first assigned inside an `if` or a loop keeps its slot: promoting it would
+  need a typed "undefined" pointer for the read-before-write path, and there is no sound one
+  (`inttoptr 0` is a genuine null natively but a *valid, addressable* slot in the interpreter).
+  Arrays, vectors, and address-taken locals of any type stay in memory (the interpreter and
+  `cse`/`dse` handle those directly).
+- A **`[]T` slice parameter still re-loads its data pointer at every element access.** A slice is a
+  16-byte `{ data, len }` fat pointer passed *by address*, so the base comes from
+  `load ptr (gep <param>, 0)` — a load out of caller-owned memory, not out of a local slot — and
+  `mem2reg` has nothing to promote. Removing it needs loop-invariant load motion (or a `noalias`
+  fact about the fat pointer), not slot promotion; `licm` does not hoist loads today.
 - **String literals live in a read-only static-data section** (`.rodata`), referenced by address via
   `Op::GlobalAddr` and deduped by content (one blob per unique literal). So **returning or threading a
   `*u8`** that points at a literal created inside a callee is valid — the pointer outlives the frame,
