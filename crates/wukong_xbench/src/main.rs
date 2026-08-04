@@ -1914,9 +1914,10 @@ fn rust_linear_bf16(ns: usize) -> String {
 
 /// Matrix transpose `dst = srcᵀ` — the memory-bound layout op (attention score transposes, weight
 /// layout conversions). Wukong folds the `dst[j*R+i] = src[i*C+j]` nest to the cache-blocked
-/// `wukong_transpose_f32`; C/Rust are the idiomatic naive transpose at `-O3 -march=native`. The naive
-/// transpose writes `dst` with stride `R` — a fresh cache line per element once `R` is large — while
-/// the blocked kernel keeps a `B×B` tile L1-resident; gcc/rustc do not loop-tile a transpose at `-O3`.
+/// `wukong_transpose_f32`; the C/Rust peers are **also** 32×32 cache-blocked (see [`c_transpose`]),
+/// so what is measured is Wukong's tile-mover against gcc's/rustc's codegen for the same algorithm —
+/// not blocked-vs-unblocked. gcc still does not loop-tile a transpose *by itself*, which is why the
+/// blocking has to be written out; the point is that a competent programmer writes it.
 /// The kernels carry an unused middle pointer so they share the `(src, _, dst)` `KernelFn` ABI and the
 /// f32 harness. Square shapes large enough to spill L2 (where the cache pattern dominates), reported as
 /// GB/s (`2·N²·4` bytes moved per call: read `src` + write `dst`). Transpose is a permutation, so the
@@ -2025,32 +2026,45 @@ fn wk_transpose(ns: usize, parallel: bool) -> String {
     )
 }
 
+/// The C transpose peer, **cache-blocked at 32×32** — the textbook optimization for a transpose and
+/// the same algorithm Wukong's `wukong_transpose_f32` uses, so the comparison is kernel-vs-kernel
+/// rather than blocked-vs-unblocked. The old peer was the naive `for i { for j { dst[j*NS+i] =
+/// src[i*NS+j] } }`, which writes `dst` with stride `NS` (a fresh cache line per element); the
+/// bench's own commentary named that as the reason Wukong won, which makes it a peer defect, not a
+/// compiler win. Measured standalone at `-O3 -march=native`, 2048²: **24.184 ms naive vs 14.298 ms
+/// 32×32-blocked + `restrict`, a 1.7× handicap**. `NS` is 1024/2048 here, both multiples of 32, so
+/// the blocked nest needs no remainder handling.
 fn c_transpose(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n\
+        "#define NS {ns}\n#define TB 32\n\
          __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
-         \x20 for (long i=0;i<NS;i++)\n\
-         \x20   for (long j=0;j<NS;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+         \x20 for (long ii=0;ii<NS;ii+=TB) for (long jj=0;jj<NS;jj+=TB)\n\
+         \x20   for (long i=ii;i<ii+TB;i++)\n\
+         \x20     for (long j=jj;j<jj+TB;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
     )
 }
 
-/// The OpenMP twin of [`c_transpose`]: rows across cores. A permutation, so it stays exact.
+/// The OpenMP twin of [`c_transpose`]: blocked tile rows across cores. A permutation, so it stays exact.
 fn c_transpose_omp(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n\
+        "#define NS {ns}\n#define TB 32\n\
          __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
          #pragma omp parallel for\n\
-         \x20 for (long i=0;i<NS;i++)\n\
-         \x20   for (long j=0;j<NS;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+         \x20 for (long ii=0;ii<NS;ii+=TB) for (long jj=0;jj<NS;jj+=TB)\n\
+         \x20   for (long i=ii;i<ii+TB;i++)\n\
+         \x20     for (long j=jj;j<jj+TB;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
     )
 }
 
 fn rust_transpose(ns: usize) -> String {
     format!(
-        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
-         \x20 for i in 0..NS {{ for j in 0..NS {{ *dst.add(j*NS+i) = *src.add(i*NS+j); }} }}\n}}\n"
+        "const NS: usize = {ns};\nconst TB: usize = 32;\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
+         \x20 let s = core::slice::from_raw_parts(src, NS*NS);\n\
+         \x20 let d = core::slice::from_raw_parts_mut(dst, NS*NS);\n\
+         \x20 for ii in (0..NS).step_by(TB) {{ for jj in (0..NS).step_by(TB) {{\n\
+         \x20   for i in ii..ii+TB {{ for j in jj..jj+TB {{ d[j*NS+i] = s[i*NS+j]; }} }} }} }}\n}}\n"
     )
 }
 
