@@ -12,6 +12,8 @@
 //!  * **loop-canon** — one shape per loop: a preheader, a single latch, one exit-test polarity
 //!    (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
+//!  * **vectorize** — widen a canonical loop body to 128-bit SIMD, with the original loop kept as
+//!    its scalar epilogue (`-O2`).
 //!
 //! At `-O2` and above, whole-program inlining of small leaf functions ([`inline_program`]) runs once
 //! before the per-function pipeline. `-O3` adds nothing to either — see [`PassManager::standard`].
@@ -31,6 +33,7 @@ mod mem2reg;
 mod phi;
 mod simplify;
 mod simplify_cfg;
+mod vectorize;
 
 pub use cache::CfgAnalyses;
 pub use cse::Cse;
@@ -43,6 +46,7 @@ pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
+pub use vectorize::Vectorize;
 
 use std::time::{Duration, Instant};
 
@@ -141,6 +145,11 @@ impl PassManager {
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
+            // Widening comes last, on the cleanest MIR the pipeline produces: canonical loops with
+            // one latch and one exit-test polarity, invariants already hoisted, and dead code gone.
+            // Everything it emits is fed back through the fixpoint, so the vector body gets the
+            // same simplification, CSE and DCE the scalar body did.
+            pm.add(Box::new(Vectorize::default()));
         }
         pm
     }
