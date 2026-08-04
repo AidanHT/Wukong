@@ -7988,6 +7988,131 @@ mod tests {
         }
     }
 
+    // ---- PEER-STRENGTH GUARDS ------------------------------------------------------------------
+    //
+    // A benchmark peer can be weakened without breaking anything: the suite still runs, the
+    // cross-language check still passes (a slow kernel is not a wrong kernel), and the only visible
+    // effect is that Wukong's published multiple goes UP. That is the failure mode this file
+    // actually suffered — `restrict` absent from all 43 C kernels, column reductions written
+    // column-outer, `matmul_tn` written with both operands column-strided, the transpose unblocked —
+    // and it survived for as long as it did precisely because nothing tested for it.
+    //
+    // These tests are the guard. THE CHECKLIST for adding or editing a C/C++/Rust peer:
+    //   1. Distinct in/out buffers  -> `__restrict__` on every pointer parameter (guarded below).
+    //      If a parameter genuinely may alias, leave it off AND say why at the call site.
+    //   2. Loop order  -> the innermost loop must walk memory with unit stride wherever the
+    //      algorithm allows it (guarded below for the families that got this wrong).
+    //   3. Same algorithmic opportunity as Wukong's kernel: if Wukong dispatches a cache-blocked
+    //      kernel, the peer is blocked too (transpose); if Wukong reassociates a float reduction,
+    //      a `C(fast)` [-ffast-math] column exists AND is printed.
+    //   4. Ask the question the whole exercise turns on: *is this how a competent C programmer
+    //      would write it?* If the answer needs a caveat, the caveat belongs in BENCHMARKS.md.
+
+    /// EVERY generated C kernel must declare its pointer parameters `__restrict__`. Scanned out of
+    /// this file's own source text rather than from a hand-kept list, so a NEW peer generator added
+    /// later is covered automatically — a list would have to be remembered, and the thing being
+    /// guarded against is exactly a peer nobody remembered to check.
+    #[test]
+    fn every_generated_c_kernel_declares_restrict() {
+        const SRC: &str = include_str!("main.rs");
+        // Split so this needle does not occur contiguously in the file it scans — otherwise the
+        // test matches its own source line and reports its own Rust code as an unqualified peer.
+        const OPEN: &str = concat!("__declspec(dllexport)", " void kbench(");
+        let mut seen = 0usize;
+        let mut rest = SRC;
+        while let Some(i) = rest.find(OPEN) {
+            let after = &rest[i + OPEN.len()..];
+            let end = after.find(')').expect("kbench parameter list must close on one line");
+            let params = &after[..end];
+            for p in params.split(',') {
+                assert!(
+                    p.contains("__restrict__"),
+                    "C peer parameter `{}` is not __restrict__ (full list: `{params}`). Without it \
+                     gcc must assume the output aliases the inputs and cannot vectorize the kernel \
+                     — see the peer-strength checklist above.",
+                    p.trim()
+                );
+            }
+            seen += 1;
+            rest = &after[end..];
+        }
+        // A floor, so that deleting or renaming the peer generators cannot make this pass vacuously
+        // with zero matches. 43 signatures at the time of writing.
+        assert!(seen >= 40, "only {seen} C kbench signatures found — did the peer generators move?");
+    }
+
+    /// The column-reduction / column-argmax / weight-gradient peers must keep the loop order that
+    /// walks `x` sequentially. Each of these was published as a 4-50x Wukong win purely because the
+    /// peer traversed a row-major matrix down its columns.
+    #[test]
+    fn column_family_peers_stay_row_outer() {
+        // colsum / colstat: `for (i) for (j) out[j] += ...` — i OUTSIDE j.
+        let s = c_colsum(64, 32);
+        assert!(
+            s.contains("for (long i=0;i<M;i++) for (long j=0;j<N;j++)"),
+            "c_colsum regressed to a column-outer fold:\n{s}"
+        );
+        for op in 0u8..4 {
+            let s = c_colstat(64, 32, op);
+            assert!(
+                s.contains("for (long i=0;i<M;i++) for (long j=0;j<N;j++)"),
+                "c_colstat(op={op}) regressed to a column-outer fold:\n{s}"
+            );
+        }
+        // colmax/min/absmax: row 0 seeds `out[]`, then i OUTSIDE j from row 1.
+        for op in 0u8..3 {
+            let s = c_colmax(64, 32, op);
+            assert!(
+                s.contains("for (long i=1;i<M;i++) for (long j=0;j<N;j++)"),
+                "c_colmax(op={op}) regressed to a column-outer fold:\n{s}"
+            );
+        }
+        // colarg: same, over a C-long running-best vector.
+        for is_max in [true, false] {
+            let s = c_colarg(64, 32, is_max);
+            assert!(
+                s.contains("for (long i=1;i<R;i++) for (long j=0;j<C;j++)"),
+                "c_colarg(is_max={is_max}) regressed to a column-outer scan:\n{s}"
+            );
+            assert!(s.contains("float bv[C];"), "c_colarg lost its running-best vector:\n{s}");
+        }
+    }
+
+    /// `C = Aᵀ·B` must be the `kij` nest (hoisted `a[k*M+i]`, contiguous B and C), not the `ijk`
+    /// nest that reads BOTH operands column-strided.
+    #[test]
+    fn matmul_tn_peer_stays_kij() {
+        let s = c_matmul_tn(64);
+        let k = s.find("for (long k=").expect("no k loop in c_matmul_tn");
+        let i = s.find("for (long i=").expect("no i loop in c_matmul_tn");
+        assert!(k < i, "c_matmul_tn regressed to an i-outer (ijk) nest:\n{s}");
+        assert!(
+            s.contains("float aki=a[k*NS+i];"),
+            "c_matmul_tn no longer hoists the A element out of the inner loop:\n{s}"
+        );
+        assert!(
+            !s.contains("a[k*NS+i]*b[k*NS+j]"),
+            "c_matmul_tn is back to the both-column-strided dot product:\n{s}"
+        );
+    }
+
+    /// Wukong dispatches a cache-blocked transpose; the peer must be blocked too, or the bench
+    /// measures loop tiling rather than codegen.
+    #[test]
+    fn transpose_peer_stays_cache_blocked() {
+        for ns in [1024usize, 2048] {
+            let s = c_transpose(ns);
+            assert!(s.contains("#define TB 32"), "c_transpose lost its blocking:\n{s}");
+            assert!(
+                s.contains("for (long ii=0;ii<NS;ii+=TB)"),
+                "c_transpose is back to the naive un-tiled nest:\n{s}"
+            );
+            assert_eq!(ns % 32, 0, "the blocked transpose peer needs NS % 32 == 0");
+            // The OpenMP twin must stay the same algorithm, or the C(omp) column is not comparable.
+            assert!(c_transpose_omp(ns).contains("for (long ii=0;ii<NS;ii+=TB)"));
+        }
+    }
+
     /// The headline summary numbers are geometric means of ratios; an arithmetic mean would not be
     /// symmetric under inverting the comparison.
     #[test]
