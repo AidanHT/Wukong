@@ -642,14 +642,17 @@ single-block SSA (mem2reg + simplify-cfg).
   out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
   `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
 - `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot qualifies only when
-  the entry block stores to it before any load — which covers every pointer-typed *parameter*
-  (`*T`, `&T`, and every `Tensor[…]`, all of which lower to one MIR `ptr`), the case that matters,
-  since the front end otherwise re-loads the base pointer from its stack slot at every element
-  access. A pointer local first assigned inside an `if` or a loop keeps its slot: promoting it would
-  need a typed "undefined" pointer for the read-before-write path, and there is no sound one
-  (`inttoptr 0` is a genuine null natively but a *valid, addressable* slot in the interpreter).
-  Arrays, vectors, and address-taken locals of any type stay in memory (the interpreter and
-  `cse`/`dse` handle those directly).
+  it is provably written before it is read: the first access inside its own `alloca`'s block must be
+  a store, and that block must be the entry block or have an empty dominance frontier. That covers
+  every pointer-typed *parameter* (`*T`, `&T`, and every `Tensor[…]`, all of which lower to one MIR
+  `ptr`) — the case that matters, since the front end otherwise re-loads the base pointer from its
+  stack slot at every element access — including after `-O2` inlining has spliced a callee's entry
+  block into the middle of a caller block. A pointer local whose `alloca` and initializing store are
+  separated by a branch keeps its slot: promoting it would need a typed "undefined" pointer for the
+  read-before-write path, and there is no sound one (`inttoptr 0` is a genuine null natively but a
+  *valid, addressable* slot in the interpreter). Arrays, vectors, address-taken locals of any type,
+  and any slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse`
+  handle those directly).
 - A **`[]T` slice parameter still re-loads its data pointer at every element access.** A slice is a
   16-byte `{ data, len }` fat pointer passed *by address*, so the base comes from
   `load ptr (gep <param>, 0)` — a load out of caller-owned memory, not out of a local slot — and

@@ -255,7 +255,7 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
 | `inline_program`| -O2   | inline small, non-recursive **leaf** functions (whole-program), then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
-| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when the entry block stores to it before any load — see below) |
+| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when it is provably written before it is read — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
@@ -279,17 +279,26 @@ before any write becomes a zero constant, matching the interpreter's zero-initia
 
 A **pointer** slot has no such zero — `inttoptr 0` is a genuine null on the native backend but a
 *valid, addressable* slot in the interpreter, so materializing one would trade a stack slot for an
-interp-vs-native divergence — so only the definitely-initialized subset is promoted: the entry block
-must store to the slot before any load of it. The entry block dominates every block and is
-straight-line, so that store dominates every point at which the renamer asks for a reaching
-definition (every load, and every terminator that has to hand a phi its argument), and the rename
-stack is never empty. That admits the case the restriction exists for: `mir_build` gives every
-pointer-typed parameter — `*T`, `&T`, and every `Tensor[…]`, all `MirType::Ptr` — an `alloca ptr`
-plus a `store <param>` in the entry block, and then re-loads that base pointer at *every* element
-access. Promoting them removes 3 of the 5 loads per element from a three-operand `Tensor` loop
-(`tests/run/ptr_slot_promotion.wk`), and it compounds: deleting `store <slot>, <ptr slot>` can
-un-escape the pointee so a later fixpoint round promotes that too. A pointer local first assigned
-inside an `if` or a loop keeps its slot.
+interp-vs-native divergence — so only the definitely-initialized subset is promoted: the **first
+access to the slot inside its own `alloca`'s block `B` must be a store**, and `B` must be the entry
+block or have an empty dominance frontier. SSA dominance makes `B` dominate every block that
+mentions the slot (a use is dominated by the `alloca` that defines it) and a block is straight-line,
+so every access outside `B` happens after all of `B`. `DF(B) = ∅` makes the set of blocks `B`
+dominates closed under both successors and predecessors, so the iterated dominance frontier of the
+store blocks — and every predecessor of every block that receives a phi, which is exactly where the
+renamer asks for a reaching definition — stays inside it, and the rename stack is never empty. The
+entry block gets its own arm because a back edge can put it in its own frontier while it still
+dominates everything.
+
+That admits the case the restriction exists for: `mir_build` gives every pointer-typed parameter —
+`*T`, `&T`, and every `Tensor[…]`, all `MirType::Ptr` — an `alloca ptr` plus a `store <param>` in
+the entry block, and then re-loads that base pointer at *every* element access; the `DF(B) = ∅` arm
+adds the same parameters after `-O2` inlining has spliced a callee's entry block into the middle of
+a caller block. Promoting them removes 3 of the 5 loads per element from a three-operand `Tensor`
+loop (`tests/run/ptr_slot_promotion.wk`) and leaves **no `alloca ptr` at all** across the run corpus
+at `-O2`, and it compounds: deleting `store <slot>, <ptr slot>` can un-escape the pointee so a later
+fixpoint round promotes that too. A pointer local whose `alloca` and initializing store are separated
+by a branch keeps its slot.
 
 A `[]T` **slice** parameter is *not* covered: a slice is a 16-byte `{ data, len }` fat pointer passed
 by address, so its base comes from `load ptr (gep <param>, 0)` — caller-owned memory, not a local
