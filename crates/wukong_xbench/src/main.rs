@@ -210,6 +210,109 @@ fn bench_c_fast(
     relaxed_peer_ok(label, "C(fast)", m, &cf).then_some(cf)
 }
 
+/// The C(fast) peer for an **index-output** bench (`rowarg` / `colarg`). Same C source at
+/// [`C_FAST_FLAGS`]. gcc will only vectorize a float max-with-index reduction under relaxed FP (the
+/// comparison has to be reassociable), so withholding `-ffast-math` here compares Wukong's
+/// branchless 8-lane (value,index) fold against a compiler that is *forbidden* from doing the same
+/// thing — exactly the asymmetry `is_reduction_kernel` already normalizes for the elementwise
+/// `argmax` row. Unlike [`bench_c_fast`] the validity check is EXACT index equality: the output is
+/// an i32 buffer riding the f32 slots, so a magnitude-normalized tolerance would be meaningless.
+#[allow(clippy::too_many_arguments)]
+fn bench_c_fast_idx(
+    label: &str,
+    c_src: &str,
+    dir: &Path,
+    cc: &str,
+    wuk: &Option<Measure>,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+) -> Option<Measure> {
+    let m = wuk.as_ref()?;
+    let cf = bench_external(
+        "c",
+        c_src,
+        dir,
+        &format!("{label}_fast"),
+        cc,
+        C_FAST_FLAGS,
+        out,
+        xp,
+        yp,
+    )?;
+    if m.out != cf.out {
+        println!(
+            "  ! {label}: C(fast) picks different indices under -ffast-math — C(fast) column skipped"
+        );
+        return None;
+    }
+    Some(cf)
+}
+
+/// The C(fast) peer for the **bf16** benches (`linear_bf16`, the bf16 dot/sum), whose ABI writes an
+/// f32 scalar rather than a buffer so [`bench_c_fast`] does not fit. Same C source at
+/// [`C_FAST_FLAGS`]; the validity bar is the loose 1e-2 relative check the plain column already uses
+/// on that scalar. Without this column the bf16 GEMM row compared Wukong's blocked, reassociated
+/// f32 accumulation against a C peer required to keep the K-long sum strictly in order.
+#[allow(clippy::too_many_arguments)]
+fn bench_bf16_fast(
+    label: &str,
+    c_src: &str,
+    dir: &Path,
+    cc: &str,
+    wuk: &Option<MeasureBf16>,
+    out: &mut [f32],
+    xp: *const u16,
+    yp: *const u16,
+) -> Option<MeasureBf16> {
+    let m = wuk.as_ref()?;
+    let cf = bench_external_bf16(
+        "c",
+        c_src,
+        dir,
+        &format!("{label}_fast"),
+        cc,
+        C_FAST_FLAGS,
+        out,
+        xp,
+        yp,
+    )?;
+    let rel = ((m.out - cf.out).abs() / cf.out.abs().max(1e-6)) as f64;
+    if rel > 1e-2 {
+        println!(
+            "  ! {label}: C(fast) disagrees with Wukong (rel {rel:.2e} > 1e-2) — C(fast) column skipped"
+        );
+        return None;
+    }
+    Some(cf)
+}
+
+/// [`report_relaxed_ratio`] for the scalar-output bf16 [`MeasureBf16`] harness.
+fn bf16_relaxed_ratio(
+    peer: &str,
+    wuk: &Option<MeasureBf16>,
+    wk_par: &Option<MeasureBf16>,
+    p: &Option<MeasureBf16>,
+) {
+    let Some(pm) = p else { return };
+    if let Some(m) = wuk {
+        let r = pm.ns_per_call / m.ns_per_call;
+        println!(
+            "  -> Wukong single-core is {:.2}x {} than {peer}",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+    if let Some(mp) = wk_par {
+        let r = pm.ns_per_call / mp.ns_per_call;
+        println!(
+            "  -> Wukong @parallel is {:.2}x {} than {peer}",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+}
+
 /// Print a `Wukong @parallel` standing **direction-aware**. `r` is `peer_ns / wukong_ns`, so `r < 1`
 /// means Wukong is SLOWER. Twenty of these call sites printed the bare ratio — `"@parallel is 0.73x
 /// idiomatic single-threaded C"` — which reads as a win at a glance and is in fact a 27% loss. Every
@@ -1262,13 +1365,18 @@ fn bench_gemv(cc: &str, dir: &Path) {
             "rs", &rust_gemv(m, n), dir, "gemv", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut y, ap, xp,
         );
+        // Reassociation-normalized peer. Wukong's `wukong_sgemv` folds each row across four 8-wide
+        // accumulators — it REASSOCIATES the dot — so a plain-flags C column that must keep the sum
+        // strictly left-to-right is not the like-for-like comparison. Printed alongside, never
+        // instead of, the honest-default C ratio.
+        let cfast = bench_c_fast("gemv", &c_gemv(m, n), dir, cc, &wuk, &mut y, ap, xp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&rm)
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cfast), gbps(&rm)
         );
         // The 8-wide row dot reassociates → magnitude-normalized tolerance (max|Δ| / max|C|), not a
         // pointwise ratio (mean-zero inputs put outputs near 0). Same basis as the reduction cross-checks.
@@ -1296,6 +1404,7 @@ fn bench_gemv(cc: &str, dir: &Path) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
     }
 }
@@ -1361,13 +1470,16 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
             "rs", &rust_scaled_scores(s, d), dir, "scaled_gemm", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, qp, kp,
         );
+        // Reassociation-normalized peer: the D-long score dot is a float reduction Wukong's blocked
+        // GEMM accumulates out of order, so C is given the same freedom in this column.
+        let cfast = bench_c_fast("scaled_gemm", &c_scaled_scores(s, d), dir, cc, &wuk, &mut out, qp, kp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "GFLOP/s", gflops(&wuk), gflops(&wk_par), gflops(&cm), gflops(&rm)
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "GFLOP/s", gflops(&wuk), gflops(&wk_par), gflops(&cm), gflops(&cfast), gflops(&rm)
         );
         // The D-long score dot reassociates (FMA + blocked accumulation vs C's naive scalar order), and
         // the small mixed-sign Q/K put some scores near 0 → a pointwise relative check divides by ~0 and
@@ -1398,6 +1510,7 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         if let (Some(ms), Some(mn)) = (&wuk, &wk_noscale) {
             // >1 ⇒ the α costs time; ~1.0 ⇒ the scale is free (folded into the writeback).
             let r = ms.ns_per_call / mn.ns_per_call;
@@ -1843,16 +1956,21 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
             ap,
             bp,
         );
+        // Reassociation-normalized peer: the K-long f32 accumulation is a float reduction, and
+        // Wukong's widen-prepass + tuned GEMM accumulates it blocked. Validity-checked at the loose
+        // 1e-2 bar on c[0], the same sanity guard the plain column uses.
+        let cfast = bench_bf16_fast("linear_bf16", &c_linear_bf16(ns), dir, cc, &wuk, &mut c, ap, bp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GFLOP/s",
             gflops(&wuk),
             gflops(&wk_par),
             gflops(&cm),
+            gflops(&cfast),
             gflops(&rm)
         );
         // Sanity cross-check on c[0] (the bf16 widen is lossless, so all three compute the same GEMM
@@ -1882,6 +2000,7 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
+        bf16_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
     }
 }
@@ -2574,16 +2693,21 @@ fn bench_colmax(cc: &str, dir: &Path) {
                 xp,
                 yp,
             );
+            // Reassociation-normalized peer. `fmax`/`fmin` are not associative, so at honest flags
+            // gcc keeps a max/min reduction in source order; `-ffast-math` lets it vectorize the
+            // fold, which is what Wukong's `_mm256_max_ps` lane fold does.
+            let cfast = bench_c_fast(label, &c_colmax(m, n, opc), dir, cc, &wuk, &mut out, xp, yp);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&wuk),
                 gbps(&wk_par),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             // Both fold each column i-ascending, so the full-buffer cross-check is bit equality.
@@ -2604,6 +2728,7 @@ fn bench_colmax(cc: &str, dir: &Path) {
                 let r = c2.ns_per_call / mp.ns_per_call;
                 par_standing("idiomatic single-threaded C", r);
             }
+            report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
             println!();
         }
     }
@@ -2741,16 +2866,20 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                 xp,
                 yp,
             );
+            // Reassociation-normalized peer (exact-index-checked, see `bench_c_fast_idx`).
+            let cfast =
+                bench_c_fast_idx(label, &c_rowarg(rows, cols, is_max), dir, cc, &wuk, &mut out, xp, yp);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&wuk),
                 gbps(&wk_par),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             // Output is an i32 index buffer — reinterpret the f32 harness slots as i32 and compare exactly
@@ -2773,6 +2902,7 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                 let r = c2.ns_per_call / mp.ns_per_call;
                 par_standing("idiomatic single-threaded C", r);
             }
+            report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
             println!();
         }
     }
@@ -2875,16 +3005,20 @@ fn bench_colarg(cc: &str, dir: &Path) {
                 xp,
                 yp,
             );
+            // Reassociation-normalized peer (exact-index-checked, see `bench_c_fast_idx`).
+            let cfast =
+                bench_c_fast_idx(label, &c_colarg(rows, cols, is_max), dir, cc, &wuk, &mut out, xp, yp);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&wuk),
                 gbps(&wk_par),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
@@ -2905,6 +3039,7 @@ fn bench_colarg(cc: &str, dir: &Path) {
                 let r = c2.ns_per_call / mp.ns_per_call;
                 par_standing("idiomatic single-threaded C", r);
             }
+            report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
             println!();
         }
     }
@@ -3221,16 +3356,24 @@ fn bench_cumsum(cc: &str, dir: &Path) {
             xp,
             yp,
         );
+        // Reassociation-normalized peer. Wukong's Hillis-Steele in-lane tree scan REASSOCIATES the
+        // prefix sum (that is exactly why this bench's cross-check is a tolerance and not bit
+        // equality), so the plain-flags C column — which must keep `out[i]=out[i-1]+x[i]` in source
+        // order — is not the like-for-like peer. This is the rule the file applies to `dot`/`ssd`;
+        // `cumsum` is the one scan that also needs it (cumprod / cummax / cummin / lrscan stay
+        // bit-exact in Wukong, so their plain-flags column already IS like-for-like).
+        let cfast = bench_c_fast("cumsum", &c_cumsum(rows, cols), dir, cc, &wuk, &mut out, xp, yp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GB/s",
             gbps(&wuk),
             gbps(&wk_par),
             gbps(&cm),
+            gbps(&cfast),
             gbps(&rm)
         );
         // The in-lane tree scan reassociates → a **magnitude-normalized** tolerance (max|Δ| over the
@@ -3261,6 +3404,7 @@ fn bench_cumsum(cc: &str, dir: &Path) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
     }
 }
@@ -4121,7 +4265,12 @@ fn bench_xent_bwd(cc: &str, dir: &Path) {
             "rs", &rust_xent_bwd(r, c), dir, "xent_bwd", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, tp,
         );
-        report_ratio("xent_bwd", &wuk, &wk_par, &cm, &rm, &None, &gbps);
+        // Reassociation-normalized peer: the per-row `max` and `Σexp` are float reductions Wukong
+        // folds 8 lanes wide, so the plain-flags C column is the strictly-in-order one. (`rope`,
+        // `rope_bwd`, `gate` and `act_backward` deliberately pass `&None` here — they are pure
+        // elementwise maps with no reduction, so `-ffast-math` normalizes nothing for them.)
+        let cfast = bench_c_fast("xent_bwd", &c_xent_bwd(r, c), dir, cc, &wuk, &mut dx, xp, tp);
+        report_ratio("xent_bwd", &wuk, &wk_par, &cm, &rm, &cfast, &gbps);
     }
 }
 
@@ -4850,15 +4999,20 @@ fn bench_bf16(cc: &str, dir: &Path) {
                 xp,
                 yp,
             );
+            // Reassociation-normalized peer: this row IS a float reduction (bf16 in, f32
+            // accumulate) and Wukong folds it 8 lanes wide, so the honest-flags C column is the
+            // in-order sum and C(fast) is the like-for-like one.
+            let cfast = bench_bf16_fast("bf16", &c_bf16(n, is_dot), dir, cc, &wuk, &mut o, xp, yp);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11}",
-                kind, "Wukong", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                kind, "Wukong", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&wuk),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             // All-positive, well-conditioned reduction → a tight relative tolerance is the right
@@ -4883,6 +5037,7 @@ fn bench_bf16(cc: &str, dir: &Path) {
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
+            bf16_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &None, &cfast);
             // Compile time (Wukong front-end + JIT vs gcc/rustc to a shared lib).
             let cms = |m: &Option<MeasureBf16>| {
                 m.as_ref()
@@ -4890,10 +5045,11 @@ fn bench_bf16(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             println!(
-                "  {:<10} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
                 "compile ms",
                 cms(&wuk),
                 cms(&cm),
+                cms(&cfast),
                 cms(&rm)
             );
         }
@@ -5164,15 +5320,19 @@ fn bench_conv(cc: &str, dir: &Path) {
         ip,
         wp,
     );
+    // Reassociation-normalized peer: the direct convolution's `Cin·K·K`-long accumulation is a float
+    // reduction, and Wukong's im2col+GEMM path accumulates it in a blocked (reassociated) order.
+    let cfast = bench_c_fast("conv", &c_conv(cin, h, cout, k), dir, cc, &wuk, &mut output, ip, wp);
     println!(
-        "  {:<18} {:>14} {:>14} {:>14}",
-        "", "Wuk im2col+GEMM", "C (direct)", "Rust (direct)"
+        "  {:<18} {:>14} {:>14} {:>14} {:>14}",
+        "", "Wuk im2col+GEMM", "C (direct)", "C(fast) direct", "Rust (direct)"
     );
     println!(
-        "  {:<18} {:>14} {:>14} {:>14}",
+        "  {:<18} {:>14} {:>14} {:>14} {:>14}",
         "GFLOP/s",
         gflops(&wuk),
         gflops(&cm),
+        gflops(&cfast),
         gflops(&rm)
     );
     if let (Some(m), Some(c)) = (&wuk, &cm) {
@@ -5190,6 +5350,7 @@ fn bench_conv(cc: &str, dir: &Path) {
             if r >= 1.0 { "faster" } else { "slower" }
         );
     }
+    report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &None, &cfast);
     println!();
 }
 
