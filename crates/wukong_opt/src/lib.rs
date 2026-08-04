@@ -2,7 +2,7 @@
 //!
 //! Passes run to a fixpoint at `-O1` and above, in this order. The pipeline first promotes stack
 //! slots to SSA registers, which is what makes the value-based transforms bite:
-//!  * **mem2reg** — promote scalar `alloca`/`load`/`store` to block-parameter SSA.
+//!  * **mem2reg** — promote scalar and pointer `alloca`/`load`/`store` to block-parameter SSA.
 //!  * **simplify** — constant folding and algebraic identities (`x+0`, `x*1`, `x*0`, ...).
 //!  * **simplify-cfg** — fold constant branches, merge straight-line blocks, prune dead blocks.
 //!  * **simplify-phis** — drop dead/trivial block parameters mem2reg introduced.
@@ -755,6 +755,140 @@ mod tests {
         }
         let main = interner.intern("main");
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 4);
+    }
+
+    /// Count `alloca ptr` slots and `load`s whose result is a pointer — the two symptoms of a
+    /// base pointer that lives in memory and is re-fetched at every element access.
+    fn count_ptr_slots_and_reloads(f: &wukong_mir::Function) -> (usize, usize) {
+        use wukong_mir::{MirType, Op};
+        let mut slots = 0;
+        let mut reloads = 0;
+        for i in f.blocks.iter().flat_map(|b| &b.insts) {
+            match &i.op {
+                Op::Alloca(MirType::Ptr) => slots += 1,
+                Op::Load(_, MirType::Ptr) => reloads += 1,
+                _ => {}
+            }
+        }
+        (slots, reloads)
+    }
+
+    #[test]
+    fn mem2reg_promotes_pointer_parameter_slots() {
+        // `mir_build` gives every pointer-typed parameter — `*T`, `&T` and every `Tensor[…]` — an
+        // `alloca ptr` + `store <param>` in the entry block, and then re-`load`s that base pointer
+        // at EVERY element access. Before pointer promotion this loop body carried three redundant
+        // `load ptr`s per iteration (x, y and o) that no other pass could remove: `licm` will not
+        // hoist a load out of a loop and `cse` cannot forward one across a block boundary.
+        //
+        // The data-dependent branch keeps every elementwise recognizer from firing, so this is
+        // general code, not a dispatched kernel.
+        let src = "fn work(x: Tensor[f32, 8], y: Tensor[f32, 8], mut o: Tensor[f32, 8]) { \
+                     for i in 0..8 { \
+                       if x[i] > y[i] { o[i] = x[i] * 3.0; } else { o[i] = y[i] * 2.0; } } } \
+                   fn main() -> i32 { \
+                     let a: [f32; 8] = [1.0, 9.0, 1.0, 9.0, 1.0, 9.0, 1.0, 9.0]; \
+                     let b: [f32; 8] = [4.0; 8]; \
+                     let mut c: [f32; 8] = [0.0; 8]; \
+                     work(a, b, c); \
+                     return (c[0] as i32) * 100 + (c[1] as i32); }";
+        let (mut prog, mut interner) = lower(src);
+        let (slots, reloads) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "work"));
+        assert!(
+            slots >= 3 && reloads >= 3,
+            "front end should alloca + reload each pointer param, got {slots} slots / {reloads} reloads"
+        );
+        optimize(&mut prog, 2);
+        let (slots, reloads) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "work"));
+        assert_eq!(
+            (slots, reloads),
+            (0, 0),
+            "pointer parameter slots must be promoted and their reloads gone"
+        );
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        // b[i] = 4 wins at i=0 (4*2 = 8), a[i] = 9 wins at i=1 (9*3 = 27).
+        let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 827);
+        assert_eq!(run_main_opt(src, 0), 827);
+    }
+
+    #[test]
+    fn mem2reg_promotes_an_inlined_callees_pointer_parameter() {
+        // `-O2` splices a callee's entry block into the MIDDLE of a caller block, so the pointer
+        // parameter's `alloca ptr` + `store` no longer sit in the entry block — yet the reload it
+        // guards is inside the callee's own loop, which is the worst place to leave one. The slot
+        // still qualifies because its initializing store is in its own alloca's block and that
+        // block's dominance frontier is empty, so the store dominates every point the renamer asks
+        // about. Checked across every function so the assertion holds whether or not `sum` inlines.
+        let src = "fn sum(p: *f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                     while i < n { s = s + p[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { let a: [f32; 4] = [1.0, 2.0, 4.0, 8.0]; \
+                     return sum(&a[0], 4) as i32; }";
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 2);
+        let totals = prog
+            .funcs
+            .iter()
+            .map(count_ptr_slots_and_reloads)
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert_eq!(
+            totals,
+            (0, 0),
+            "an inlined pointer parameter must still be promoted"
+        );
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
+        assert_eq!(run_main_opt(src, 0), 15);
+    }
+
+    #[test]
+    fn mem2reg_leaves_a_late_initialized_pointer_slot_in_memory() {
+        // A pointer slot first written *outside* the entry block can be read before it is written
+        // on some path. Promotion would have to materialize an "undefined" pointer, and there is no
+        // sound one: `inttoptr 0` is null natively but a valid, addressable slot in the interpreter.
+        // Such a slot must stay in memory. Here `p`'s store is inside the loop body, so the entry
+        // block never initializes it.
+        let src = "fn main() -> i32 { let mut a: i32 = 5; let mut t: i32 = 0; \
+                   let mut i: i32 = 0; \
+                   while i < 3 { let p: *mut i32 = &mut a; t = t + *p; i = i + 1; } \
+                   return t; }";
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 2);
+        let (slots, _) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main"));
+        assert_eq!(slots, 1, "a late-initialized pointer slot must stay in memory");
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
+        assert_eq!(run_main_opt(src, 0), 15);
+    }
+
+    #[test]
+    fn mem2reg_ptr_promotion_keeps_the_pointee_in_memory() {
+        // Promoting the *pointer* must not promote what it points at. `p` starts at `&a` and
+        // becomes `&b`, so once promoted it is a loop-header block parameter that merges the two
+        // addresses, and every `*p` is a load/store through that parameter. Both `a` and `b` must
+        // therefore stay in memory — the escape test now sees them as `br` arguments, which is the
+        // only thing keeping them there once `store a_slot, p_slot` is gone.
+        //
+        // Iteration 0 writes a = 1 + 10; iteration 1 writes b = 2 + 10; the answer is 1112.
+        let src = "fn main() -> i32 { let mut a: i32 = 1; let mut b: i32 = 2; \
+                   let mut i: i32 = 0; let mut p: *mut i32 = &mut a; \
+                   while i < 2 { *p = *p + 10; p = &mut b; i = i + 1; } \
+                   return a * 100 + b; }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 1112, "level {lvl}");
+        }
+        let (mut prog, interner) = lower(src);
+        optimize(&mut prog, 2);
+        let (slots, _) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main"));
+        assert_eq!(slots, 0, "the pointer itself must still be promoted here");
     }
 
     #[test]
