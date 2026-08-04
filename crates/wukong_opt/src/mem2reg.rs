@@ -77,17 +77,29 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
     }
 
     // Any appearance other than `load <slot>` / `store _, <slot>` means the address escapes.
+    // A load or store whose *type* disagrees with the slot's own is a type-punned access: the value
+    // that flows through the promoted register would then have the wrong MIR type, which the
+    // verifier rejects (and, unverified, is a silent reinterpret). Leave those in memory.
     let mut bad: FxHashSet<u32> = FxHashSet::default();
     for b in &f.blocks {
         for inst in &b.insts {
             match &inst.op {
                 // The pointer operand of a load is fine; a load has no other operands.
-                Op::Load(_, _) => {}
+                Op::Load(p, ty) => {
+                    if cand.get(&p.0).is_some_and(|slot| slot != ty) {
+                        bad.insert(p.0);
+                    }
+                }
                 // The pointer operand of a store is fine, but the stored *value* being the slot
                 // pointer means the address escapes.
-                Op::Store { value, .. } => {
+                Op::Store { ptr, value } => {
                     if cand.contains_key(&value.0) {
                         bad.insert(value.0);
+                    }
+                    if let Some(slot) = cand.get(&ptr.0) {
+                        if f.value_types.get(value.0 as usize) != Some(slot) {
+                            bad.insert(ptr.0);
+                        }
                     }
                 }
                 other => each_op_use(other, &mut |v| {
