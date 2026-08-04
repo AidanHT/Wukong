@@ -16,7 +16,15 @@
 //! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
 //! same cse/simplify/dce treatment as everything else. `-O3` adds nothing to any of it — see
 //! [`PassManager::standard`].
+//! `cse`, `dse` and `licm` all consult [`alias`], the provenance analysis that answers *can a store
+//! through `q` be seen by a load through `p`?* — the question `mir_build`'s type erasure
+//! (`Ty::Ptr`/`Ref`/`Tensor`/`Slice` all become a bare `MirType::Ptr`) otherwise makes unanswerable.
+//! It is a pure analysis, safe to build from anywhere, and the Cranelift backend uses it too.
+//!
+//! At `-O2` and above, whole-program inlining of small leaf functions ([`inline_program`]) runs once
+//! before the per-function pipeline. `-O3` adds nothing to either — see [`PassManager::standard`].
 
+pub mod alias;
 mod cache;
 mod cfg;
 mod cse;
@@ -32,6 +40,7 @@ mod simplify;
 mod simplify_cfg;
 mod unroll;
 
+pub use alias::{type_bytes, AliasInfo, Prov};
 pub use cache::CfgAnalyses;
 pub use cse::Cse;
 pub use dce::Dce;
