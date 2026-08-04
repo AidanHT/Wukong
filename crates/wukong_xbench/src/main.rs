@@ -24,6 +24,14 @@
 //!    that non-overlap in the type system, so withholding `restrict` from the peer compared a
 //!    no-alias compiler against a may-alias one. Every call site in this file passes three (or four)
 //!    genuinely distinct allocations, which is what makes the qualifier true and not just fast.
+//!    MEASURING THIS CORRECTLY MATTERS: a standalone probe that puts the kernel and its caller in
+//!    ONE translation unit over `static` arrays lets gcc's interprocedural alias analysis prove
+//!    non-overlap by itself, and `restrict` then looks like a no-op. It is not — the peers here are
+//!    compiled to a **shared library**, where gcc sees only pointer parameters. Re-measured in that
+//!    model (kernels in their own TU, gcc 14.2 `-O3 -march=native`, best-of-N, one process):
+//!    `matmul_tn` 512³ **176.6 -> 20.2 ms (8.7x)**, `colsum` 4096x1024 **21.3 -> 5.0 ms (4.2x)`,
+//!    the direct convolution **1.99 -> 0.40 ms (5.0x)**, `saxpy` 1.33x; `relu`/`biasadd` genuinely
+//!    unaffected (0.96x / 1.01x — gcc already versions those loops with a runtime alias check).
 //!  * FMA: Wukong now contracts `x + y*z` to a fused multiply-add, so gcc is given its *default*
 //!    `-ffp-contract=fast` (the old `-ffp-contract=off` was actually suppressing C's natural FMA).
 //!    Both Wukong and gcc-compiled C therefore fuse. Idiomatic Rust does *not* contract unless the
@@ -1302,8 +1310,9 @@ fn wk_matmul_tn(ns: usize, parallel: bool) -> String {
 /// (`s += a[k*NS+i]*b[k*NS+j]`) — a k-loop that touches two fresh cache lines per iteration and that
 /// gcc cannot vectorize, which is not how a competent C programmer writes `C = Aᵀ·B`. The `kij` order
 /// accumulates each `c[i][j]` over k in the identical ascending order, so the result is unchanged.
-/// Measured standalone at `-O3 -march=native`, 512³: **20.965 ms `ijk` vs 8.805 ms `kij` +
-/// `restrict`, a 2.4× handicap**.
+/// Measured standalone at `-O3 -march=native`, 512³, kernels in their own TU: **176.6 ms `ijk` →
+/// 20.25 ms `ijk` + `restrict` → 9.70 ms `kij` + `restrict`, an 18.2× total handicap** — of which
+/// 8.7× is `restrict` alone and 2.1× the loop order.
 fn c_matmul_tn(ns: usize) -> String {
     format!(
         "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
@@ -2164,9 +2173,10 @@ fn wk_transpose(ns: usize, parallel: bool) -> String {
 /// rather than blocked-vs-unblocked. The old peer was the naive `for i { for j { dst[j*NS+i] =
 /// src[i*NS+j] } }`, which writes `dst` with stride `NS` (a fresh cache line per element); the
 /// bench's own commentary named that as the reason Wukong won, which makes it a peer defect, not a
-/// compiler win. Measured standalone at `-O3 -march=native`, 2048²: **24.184 ms naive vs 14.298 ms
-/// 32×32-blocked + `restrict`, a 1.7× handicap**. `NS` is 1024/2048 here, both multiples of 32, so
-/// the blocked nest needs no remainder handling.
+/// compiler win. Measured standalone at `-O3 -march=native`, 2048², kernels in their own TU:
+/// **29.51 ms naive → 24.31 ms naive + `restrict` → 14.09 ms 32×32-blocked + `restrict`, a 2.09×
+/// total handicap**. `NS` is 1024/2048 here, both multiples of 32, so the blocked nest needs no
+/// remainder handling.
 fn c_transpose(ns: usize) -> String {
     format!(
         "#define NS {ns}\n#define TB 32\n\
@@ -2214,8 +2224,10 @@ fn rust_transpose(ns: usize) -> String {
 /// published was mostly the peer's loop order, not Wukong's kernel. The peers are now **row-outer**,
 /// `for i { for j { out[j] += x[i*N+j]; } }` — the natural, cache-friendly spelling, which folds each
 /// column in the identical i-ascending order (so the bit-exact cross-check still holds) and which
-/// gcc auto-vectorizes. Measured standalone at `-O3 -march=native`, 4096×1024: **3.739 ms
-/// column-outer vs 0.563 ms row-outer + `restrict`, a 6.6× handicap**, with byte-identical output.
+/// gcc auto-vectorizes. Measured standalone at `-O3 -march=native`, 4096×1024, with the kernels in
+/// their own translation unit so gcc sees only pointer parameters (the shared-library model this
+/// harness actually uses): **21.33 ms column-outer → 5.03 ms column-outer + `restrict` → 0.58 ms
+/// row-outer + `restrict`, a 36.7× total handicap**, with byte-identical output (sum |Δ| = 0).
 fn bench_colsum(cc: &str, dir: &Path) {
     for (m, n) in [(1024usize, 1024usize), (4096, 1024)] {
         let mn = m * n;
@@ -2646,8 +2658,8 @@ fn rust_dequant_perchan(r: usize, c: usize, is_i8: bool) -> String {
 /// They are now row-outer (`out[]` seeded from row 0, then `for i { for j { … } }`), which keeps the
 /// identical i-ascending fold *and* the identical `s{cmp}v?s:v` expression (so NaN behaviour and
 /// bit-exactness are preserved) while streaming `x` sequentially. Measured standalone at `-O3
-/// -march=native`, 4096×1024 max: **5.730 ms column-outer vs 0.888 ms row-outer + `restrict`, a
-/// 6.5× handicap**, output identical.
+/// -march=native`, 4096×1024 max, kernels in their own TU: **34.82 ms column-outer vs 0.857 ms
+/// row-outer + `restrict`, a 40.6× handicap**, output identical (sum |Δ| = 0).
 fn bench_colmax(cc: &str, dir: &Path) {
     // 0 = max, 1 = min, 2 = abs-max (the per-channel symmetric-quant scale).
     for (opc, label, sym) in [
@@ -2932,8 +2944,8 @@ fn wk_colarg(rows: usize, cols: usize, is_max: bool, parallel: bool) -> String {
 /// `argmax(axis=0)` does internally), rather than the column-outer scan that reads `x` with stride
 /// `C`. The comparison is `v {cmp} bv[j]` exactly as before, so the first-extremum tie-break and the
 /// resulting index buffer are unchanged; only the traversal order of `x` moves. Measured standalone
-/// at `-O3 -march=native`, 4096×1024 argmax: **4.043 ms column-outer vs 0.954 ms row-outer +
-/// `restrict`, a 4.2× handicap**, with identical output on every column.
+/// at `-O3 -march=native`, 4096×1024 argmax, kernels in their own TU: **9.87 ms column-outer vs
+/// 1.569 ms row-outer + `restrict`, a 6.3× handicap**, with identical output on every column.
 fn c_colarg(rows: usize, cols: usize, is_max: bool) -> String {
     let cmp = if is_max { ">" } else { "<" };
     format!(
@@ -3532,8 +3544,8 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
 /// PEER SPELLING (corrected 2026-08-04) — the third instance of the [`bench_colsum`] defect. The
 /// C/Rust peers were column-outer; they are now row-outer (accumulate into `out[]` row by row, then
 /// one finalize pass), same fold order, same result. Measured standalone at `-O3 -march=native`,
-/// 4096×1024 column mean: **5.990 ms column-outer vs 0.509 ms row-outer + `restrict`, an 11.8×
-/// handicap** — the largest single peer-spelling inflation found in this file.
+/// 4096×1024 column mean, kernels in their own TU: **33.03 ms column-outer vs 1.238 ms row-outer +
+/// `restrict`, a 26.7× handicap**.
 fn bench_colstat(cc: &str, dir: &Path) {
     // 0 = mean, 1 = sumsq (energy), 2 = L2, 3 = RMS.
     for (opc, label, sym) in [

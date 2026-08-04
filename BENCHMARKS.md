@@ -365,12 +365,24 @@ Sign convention: **a positive multiple means Wukong is faster**; "slower" is spe
 
 ### The four defects and what each cost
 
-| defect | families affected | standalone cost to the peer (gcc 14.2 `-O3 -march=native`, best-of-N, one process) |
+**Measuring this correctly is itself a landmine.** A standalone probe that puts the peer kernel and
+its caller in ONE translation unit over `static` arrays lets gcc's interprocedural alias analysis
+prove non-overlap by itself, and `restrict` then measures as a no-op — the first pass of this audit
+made exactly that mistake and briefly recorded `restrict` as worthless for `colsum` and `conv`. The
+peers are compiled to a **shared library**, where gcc sees only pointer parameters. Every figure
+below is re-derived with the kernels in their **own translation unit**, which is the harness's real
+compilation model.
+
+| defect | families affected | isolated cost to the peer (gcc 14.2 `-O3 -march=native -ffp-contract=fast`, own TU, best-of-N, one process) |
 |---|---|---|
-| no `restrict` on any of 43 C kernels | all | conv2d **4.9 → 21.1 GFLOP/s (4.3×)**; xent_bwd 2.3×; negligible on flat 1-D elementwise (saxpy 0.316 → 0.331 ms, i.e. none — gcc versions the loop with a runtime alias check there) |
-| column-outer loop order | colsum, colmax/min/absmax, colmean/sumsq/L2/RMS, colargmax/min | colsum 4096×1024 **3.739 → 0.563 ms (6.6×)**; colmax **5.730 → 0.888 ms (6.5×)**; colmean **5.990 → 0.509 ms (11.8×)**; colargmax **4.043 → 0.954 ms (4.2×)** |
-| `ijk` with both operands column-strided | matmul_tn (weight-gradient GEMM) | 512³ **20.965 → 8.805 ms (2.4×)** |
-| unblocked transpose vs Wukong's blocked kernel | transpose | 2048² **24.184 → 14.298 ms (1.7×)** |
+| no `restrict` on any of 43 C kernels | all | `matmul_tn` 512³ **176.6 → 20.2 ms (8.7×)**; direct conv2d **1.99 → 0.40 ms (5.0×)**; `colsum` col-outer **21.3 → 5.0 ms (4.2×)**; `transpose` **29.5 → 24.3 ms (1.21×)**; `saxpy` **1.33×**; `relu` **0.96×** and `biasadd` **1.01×** — genuinely unaffected, because gcc already versions a flat 1-D map with a runtime alias check |
+| column-outer loop order | colsum, colmax/min/absmax, colmean/sumsq/L2/RMS, colargmax/min | colsum 4096×1024 **21.33 → 0.58 ms (36.7× total, of which 8.7× is the loop order on top of `restrict`)**; colmax **34.82 → 0.86 ms (40.6×)**; colmean **33.03 → 1.24 ms (26.7×)**; colargmax **9.87 → 1.57 ms (6.3×)** |
+| `ijk` with both operands column-strided | matmul_tn (weight-gradient GEMM) | 512³ **176.6 → 9.70 ms (18.2× total: 8.7× `restrict` × 2.1× loop order)** |
+| unblocked transpose vs Wukong's blocked kernel | transpose | 2048² **29.51 → 14.09 ms (2.09× total: 1.21× `restrict` × 1.73× blocking)** |
+
+Every one of these preserves the output exactly: colsum / colmax / colmean sum |Δ| = 0, colargmax 0
+mismatched columns, transpose 0 mismatched elements, conv2d sum |Δ| = 0, and `matmul_tn` max |Δ| =
+1.5e-5 on values of order 10² (the k-order is unchanged; the residue is gcc's vectorized rounding).
 
 Plus a fifth, of a different kind: **ten reduction-bearing benches had no `C(fast)` column at all**,
 so their published multiple was measured only against a C peer forbidden from reassociating — the
@@ -459,13 +471,28 @@ within the session's run-to-run noise.
   `restrict` or `-ffast-math` on this mingw toolchain (no `libmvec`).
 - **The fused norms, RoPE, the norm backwards, row losses, the int8 GEMM.**
 - **The flat elementwise rows** (saxpy, relu, poly, hadamard) — `restrict` measurably does nothing
-  for a 1-D map (standalone: saxpy 0.316 ms plain vs 0.331 ms with `restrict`; biasadd 0.287 vs
-  0.282), because gcc already versions those loops with a runtime alias check. Their A/B pairs moved
+  for a 1-D map: `relu` **0.96×** and `biasadd` **1.01×**, because gcc already versions those loops
+  with a runtime alias check. (`saxpy` is the exception at **1.33×**, which is why this is stated per
+  kernel rather than as a rule.) Their A/B pairs moved
   1.27× ↔ 2.33× in *both* directions across the session, which is the noise floor at this power
   state, not a peer effect.
 
 ### What was NOT re-measured
 
+- **The norm-backward, cross-entropy, gate, row-loss, act-backward and scan families.** Their peers
+  changed only by `restrict`, and their A/B pairs at this power state moved in *both* directions by
+  up to ~2× (e.g. `xent` 1024×1024 read 3.59× before and 7.72× after; `softmax_bwd` 1024×1024 read
+  2.37× before and 3.43× after; `layernorm_bwd` 4096×512 read 3.23× before and 2.24× after). That is
+  the noise floor, not a measurement, so **no corrected figure is published for them** — their
+  existing numbers stand, with the caveat that they were taken against non-`restrict` peers and
+  should be re-derived at AC+full.
+- **The norm-backward, cross-entropy, gate, row-loss, act-backward and scan families.** Their peers
+  changed only by `restrict`, and their A/B pairs at this power state moved in *both* directions by
+  up to ~2× (e.g. `xent` 1024×1024 read 3.59× before and 7.72× after; `softmax_bwd` 1024×1024 read
+  2.37× before and 3.43× after; `layernorm_bwd` 4096×512 read 3.23× before and 2.24× after). That is
+  the noise floor, not a measurement, so **no corrected figure is published for them** — their
+  existing numbers stand, with the caveat that they were taken against non-`restrict` peers and
+  should be re-derived at AC+full.
 - **The end-to-end `model` section** (the 12-layer GPT-2-class stack and its PyTorch peers). It uses
   its own peer sources in `model.rs`, which this audit did not touch; its numbers stand as previously
   published and are **not** covered by the corrections above. Auditing `model.rs`'s peers the same
@@ -839,7 +866,8 @@ operands, so A is stored `[k,m]`. Wukong recognizes `a[k*M+i]·b[k*N+j]` and dis
 > pointers by NS floats. Nobody writes `C = Aᵀ·B` that way. With A stored `[K,M]`, k is already A's
 > *outer* index, so the natural nest is `kij`: hoist `a[k*NS+i]`, then stream `b[k*NS+·]` and
 > `c[i*NS+·]` contiguously — exactly what the same file's untransposed `c_matmul` already did.
-> Standalone at `-O3 -march=native`, 512³: **20.965 ms `ijk` vs 8.805 ms `kij` + `restrict`**.
+> Isolated at `-O3 -march=native`, kernels in their own translation unit, 512³: **176.6 ms `ijk` →
+> 20.25 ms `ijk` + `restrict` → 9.70 ms `kij` + `restrict`, an 18.2× total handicap.**
 > The prose below also used to claim a hand-transposed C would recover only ~4–5 GFLOP/s and leave a
 > "durable ~10×"; the measured `kij` peer does substantially better than that, and the durable win is
 > 2.6–5.3×.
@@ -1175,8 +1203,9 @@ cross-language check is **bit-exact** — a stronger bar than the GEMM tolerance
 > about the benchmark's source. Loop blocking a transpose is the textbook optimization; a competent C
 > programmer writes the tiles, and comparing a blocked kernel against an unblocked peer measures the
 > blocking, which Wukong did not invent here. The peers are now 32×32 blocked, matching Wukong's own
-> algorithm. Standalone at `-O3 -march=native`, 2048²: **24.184 ms naive vs 14.298 ms
-> 32×32-blocked + `restrict` — a 1.7× handicap.**
+> algorithm. Isolated at `-O3 -march=native`, kernels in their own translation unit, 2048²:
+> **29.51 ms naive → 24.31 ms naive + `restrict` → 14.09 ms 32×32-blocked + `restrict` — a 2.09×
+> total handicap.**
 
 Measured with the blocked peer (2026-08-04, same-run adjacent, AC+charging — all-core directional):
 
@@ -1226,7 +1255,8 @@ the cross-language check is **bit-exact**.
 >
 > It folds each column in the identical i-ascending order (so the bit-exact cross-check still
 > holds — verified, sum |Δ| = 0) and it auto-vectorizes. Standalone at `-O3 -march=native`,
-> 4096×1024: **3.739 ms column-outer vs 0.563 ms row-outer + `restrict` — a 6.6× handicap.**
+> kernels in their own translation unit, 4096×1024: **21.33 ms column-outer → 5.03 ms column-outer +
+> `restrict` → 0.58 ms row-outer + `restrict` — a 36.7× total handicap.**
 
 Measured with the corrected peer (2026-08-04, same-run adjacent pairs, AC+charging — the all-core
 column is directional only). **>1 means Wukong is faster; a negative sign means Wukong is slower:**
@@ -1340,8 +1370,9 @@ shapes and folds each to one i32-output kernel that tracks 8 `(value, index)` la
   **Corrected 2026-08-04 — this is now a LOSS.** The C/Rust peers scanned column-outer, reading `x`
   with stride `C`; the natural spelling for an axis-0 arg-reduction is row-outer over a `C`-long
   running-best vector (what NumPy's `argmax(axis=0)` does internally, and what Wukong's own kernel
-  does). Standalone at `-O3 -march=native`, 4096×1024 argmax: **4.043 ms column-outer vs 0.954 ms
-  row-outer + `restrict` — a 4.2× handicap**, with identical indices on every column.
+  does). Isolated at `-O3 -march=native`, kernels in their own TU, 4096×1024 argmax: **9.87 ms
+  column-outer vs 1.57 ms row-outer + `restrict` — a 6.3× handicap**, with identical indices on
+  every column.
 
   | shape | argmax 1-core (vs C / vs C(fast)) | argmin 1-core (vs C / vs C(fast)) | was (argmax / argmin) |
   |---|---|---|---|
