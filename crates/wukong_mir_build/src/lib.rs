@@ -26775,6 +26775,83 @@ fn main() -> i32 { return 0; }
         );
     }
 
+    /// Substitution is scoped to the **region** a binding dominates — the rest of its own block — so
+    /// two sibling loops may each spell `let ib = …` without either disqualifying the other. Under a
+    /// whole-function "declared exactly once" rule they knocked each other out, and re-using an
+    /// obvious base name across the loops of one function is the normal way to write a model.
+    #[test]
+    fn sibling_loops_may_reuse_a_base_name() {
+        let src = "module m
+fn two(a: [f32; 64], b: [f32; 64], mut c: [f32; 64], mut e: [f32; 64]) {
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+    }
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + c[ib + p] * b[j * 8 + p]; }
+            e[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let two = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == "two")
+            .expect("fn two");
+        let gemms = two
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(
+                |i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == "wukong_sgemm_nt"),
+            )
+            .count();
+        assert_eq!(gemms, 2, "both sibling nests must dispatch the GEMM kernel");
+    }
+
+    /// The DECLINE that makes region scoping sound: an operand of the initializer that the region
+    /// later *assigns* would make the inlined expression evaluate to a different value than it did
+    /// at the `let`. `canon` must refuse — flow-insensitively, so an assignment anywhere in the
+    /// region counts, even one that follows every use.
+    #[test]
+    fn a_base_whose_operand_is_reassigned_in_the_region_is_not_substituted() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    let mut t: i64 = 0;
+    for i in 0..8 {
+        let ib = t * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+        t = t + 1;
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a base built from a variable the region reassigns must not be substituted"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
     /// The DECLINE that keeps the substitution sound: a base that is *reassigned* does not hold the
     /// same value at its uses as at its `let`, so inlining the initializer would compute a different
     /// address. `canon` must leave it alone — and leaving it alone means the nest keeps its scalar
