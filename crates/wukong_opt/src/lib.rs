@@ -9,6 +9,8 @@
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
 //!  * **cse** — dominator-tree value numbering with intra-block load forwarding (`-O2`).
 //!  * **dse** — dead-store elimination (`-O2`).
+//!  * **loop-canon** — one shape per loop: a preheader, a single latch, one exit-test polarity
+//!    (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
 //!
 //! At `-O2` and above, whole-program inlining of small leaf functions ([`inline_program`]) runs once
@@ -23,6 +25,7 @@ mod dse;
 mod fxhash;
 mod inline;
 mod licm;
+mod loop_canon;
 pub mod loop_info;
 mod mem2reg;
 mod phi;
@@ -35,6 +38,7 @@ pub use dce::Dce;
 pub use dse::Dse;
 pub use inline::inline_program;
 pub use licm::Licm;
+pub use loop_canon::LoopCanon;
 pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
@@ -131,6 +135,9 @@ impl PassManager {
             // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
             pm.add(Box::new(Cse));
             pm.add(Box::new(Dse));
+            // Put every loop into one shape before LICM runs: LICM hoists only into a preheader
+            // that already exists, so a loop given one here becomes hoistable in the same sweep.
+            pm.add(Box::new(LoopCanon));
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
