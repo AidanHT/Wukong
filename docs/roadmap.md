@@ -474,7 +474,7 @@ megakernel stores pointer values homed in the shared frame **unconditionally** r
 `tid==0`-guarded — a frame pointer slot is uniform across the SPMD threads, and the old guard left
 threads ≠ 0 loading a zero-initialized slot and dereferencing null in non-recognized scalar loops
 (the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus standing is printed by the gates
-themselves, over every fixture in `tests/run` (332 today): `lower::tests::run_corpus_matches_interp_oracle`
+themselves, over every fixture in `tests/run` (333 today): `lower::tests::run_corpus_matches_interp_oracle`
 sweeps each program at `-O0` and `-O3`, requires zero mismatches and zero device faults and non-zero
 coverage, and reports the rest as honest `UNSUPPORTED:` skips; `megakernel::tests::mega_corpus_matches_oracle`
 does the same over the megakernel-eligible subset, counting (program, opt-level) configs and treating a
@@ -580,7 +580,16 @@ single-block SSA (mem2reg + simplify-cfg).
   threshold an out-of-line 256-bit reduction call would lose to the inlined 128-bit path, so small or
   runtime-unknown *reduction* trips stay 128-bit + 4× unrolling; there compute-bound kernels use 2×
   the FMA ports they could, but the vectorized **transcendentals still beat scalar `libm` ~2.5–3×**.
-  The loop vectorizer assumes distinct array parameters do not alias.
+  The AST loop vectorizer assumes distinct array parameters do not alias. **That assumption is
+  informal and unchecked, and it is not the language's rule** — nothing rejects `f(a, a)`, and there
+  is no `restrict`/`&mut` annotation to carry the promise. The MIR alias analysis
+  (`wukong_opt::alias`, see `docs/internals.md`) deliberately does *not* adopt it: `may_alias` answers
+  "may alias" for two distinct pointer parameters, and `tests/run/alias_slice_params.wk` pins a
+  program whose answer depends on it. Making the promise real is a **language** decision — an opt-in
+  parameter annotation, or a rule that a `mut` aggregate parameter may not alias another parameter —
+  not something an analysis can derive. Until then the analysis exploits only what *is* guaranteed:
+  distinct stack slots, a local slot versus a parameter, non-escaping slots versus everything, and
+  disjoint constant offsets.
 - Array *length* in a type may be an integer literal or a top-level `const` (resolved through
   const-to-const chains; `tests/run/const_array_length.wk`). It may also be **arithmetic over those** —
   `[i32; 2 + 2]`, or a `const N: i32 = 2 + 2` used as a length — because sema's `eval_usize` and
