@@ -1,11 +1,20 @@
 # The compile-time floor — code → object at its principled minimum
 
-> **STATUS: measured (2026-07-11 central run).** The method and floor model below are now populated
-> by an authoritative AC, release, warm best-of-N run over the 296-file corpus: §4–§6 carry real
-> numbers (168.1 ms front→object, the per-stage split, the compile-vs and spawn tables). Absolute
-> compile-time numbers are single-machine and clock-sensitive; the clock-invariant stage
-> **shares/ratios** are the portable figures. The earlier battery-state provisional shares are
-> retained (clearly labeled) only where they corroborate the central run.
+> **STATUS: measured (2026-07-11 central run); partially re-measured 2026-07-30.** The method and
+> floor model below are populated by an authoritative AC, release, warm best-of-N run over the
+> **296-file** corpus: §4–§6 carry real numbers (168.1 ms front→object, the per-stage split, the
+> compile-vs and spawn tables). Absolute compile-time numbers are single-machine and clock-sensitive;
+> the clock-invariant stage **shares/ratios** are the portable figures. The earlier battery-state
+> provisional shares are retained (clearly labeled) only where they corroborate the central run.
+>
+> **Corpus drift — read before comparing to a fresh run.** The corpus has since grown from 296 to
+> **354 files** (332 `tests/run` + 17 `examples` + 5 `bench/kernels`), almost entirely small hardening
+> fixtures. So the 2026-07-11 *totals* and *per-file* figures are not directly comparable to a new
+> run, while the *shares* remain the portable comparison. Re-measured on 2026-07-30 over the
+> 354-file corpus: the **optimizer share of front→O2 is 61.3%** and the per-pass ranking has changed
+> (§4a). The full-pipeline stage table (§4) and the spawn table (§6) were **not** re-measured on
+> 2026-07-30 — the measurement window closed when the machine's adapter was disconnected — so they
+> remain the 2026-07-11 figures and are labeled as such.
 
 ## 1. The question
 
@@ -136,6 +145,38 @@ is **object-write ≈ 7–8% of the backend stage** (i.e. the analytic expectati
 cost is Cranelift codegen, not container serialization). Central run 2026-07-11 (AC): **Cranelift
 codegen 91.7% / object-write 8.3%** of the `codegen+obj` stage.
 
+### 4a. Optimizer share and per-pass attribution — re-measured 2026-07-30 (354-file corpus)
+
+`wukong-bench compile-time tests/run examples bench/kernels`, release, warm best-of-N, **347 files
+measured / 7 skipped**. Instrument: AC+charging, batt 94%, charge rate ~10 W, CPU clock identical
+before and after. This mode times `lex..optimize` only — **no backend**, hence no per-function
+parallel codegen — so it is a single-threaded measurement and the package-power cap that limits
+all-core work does not apply. The headline is a ratio of two same-run single-threaded totals, so it
+is clock-invariant; the absolute ms are not.
+
+- front total **24.98 ms** vs optimize-at-`-O3` **39.57 ms** → **optimizer = 61.3% of front→O2**.
+  This confirms the full-corpus cross-check recorded below (~62%) and refutes carrying the ~80–85%
+  figure into a full-corpus context: that figure's basis is the 400-function synthetic of session X1.
+
+| pass | time | % of optimizer | calls |
+|---|---|---|---|
+| simplify-cfg | 10.22 ms | **19.8%** | 1372 |
+| cse | 9.76 ms | **18.9%** | 979 |
+| simplify-phis | 8.94 ms | 17.3% | 1362 |
+| mem2reg | 7.38 ms | 14.3% | 1374 |
+| licm | 5.95 ms | 11.5% | 979 |
+| dce | 4.47 ms | 8.7% | 1362 |
+| simplify | 3.04 ms | 5.9% | 1372 |
+| dse | 0.898 ms | 1.7% | 979 |
+| inline | 0.876 ms | 1.7% | 1 |
+
+**§7 item 1 needs re-pointing.** That item says "`compile-time`'s per-pass table names the hottest
+pass; that is the standing lever" and the historical lever was CSE. After the packed-key CSE change,
+CSE is no longer the single hottest pass: `simplify-cfg` (19.8%) now edges it (18.9%) — a ~4.7% gap,
+close enough that the honest reading is **co-leading**, not a flip. The top three
+(simplify-cfg + cse + simplify-phis = 56.0%) are the standing lever, and `simplify-cfg`'s 1372 calls
+against `cse`'s 979 suggest call-count, not per-call cost, is what put it on top.
+
 ### Provisional shares (clock-invariant; smoke-test only — SUPERSEDED by the 2026-07-11 central run above)
 
 > These are shape observations from battery-state smoke runs, kept only because *ratios* survive
@@ -196,6 +237,21 @@ apples-to-apples with the other CLIs):
 | gemm4x4 | 7.94 ms | 8.40× | 8.69× | 11.40× |
 | saxpy | 8.64 ms | 7.82× | 7.44× | 10.21× |
 | dot | 7.72 ms | 8.02× | 8.21× | 11.66× |
+
+Re-measured 2026-07-30 (release, same-run best-of-N). Instrument disclosure: this round ran at
+**AC+charging** (batt 92%, charge rate ~11 W, identical before and after), *not* AC+full. That is
+acceptable for this particular mode and is worth stating why — per §6 the wukongc CLI wall is ~90%
+process-spawn tax, so `compile-vs` is dominated by a term the package-power cap barely touches, and
+the round reproducing the 2026-07-11 AC figures to within a few percent is itself the evidence:
+
+| kernel | wukongc | gcc/mc | g++/mc | rustc/mc |
+|---|---|---|---|---|
+| gemm4x4 | 8.09 ms | 7.62× | 8.25× | 10.56× |
+| saxpy | 7.52 ms | 7.76× | 7.67× | 11.03× |
+| dot | 7.75 ms | 7.34× | 7.63× | 10.35× |
+
+Span **7.34–11.03×**, against 7.44–11.66× in the 2026-07-11 round — so the §5 standing is stable at
+HEAD and the "~7.4–11.7×" band below needs no revision.
 
 **Composition disclosure (both directions).** Per §6, wukongc's CLI wall is ~90% spawn tax
 (process creation + driver init + I/O ≈ 7–8 ms); its in-process compile core is 0.5–1.0 ms on

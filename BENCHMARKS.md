@@ -35,12 +35,41 @@ cargo run -p wukong_xbench --release      # CC=gcc by default; set CC to overrid
   MSYS2 toolchains. **No LLVM, no MSVC, no AVX-512** (Intel disabled AVX-512 on this consumer part);
   **AVX2/FMA + AVX-VNNI** are present (the int8 GEMM uses `vpdpbusd`, and so does gcc `-march=native`).
 - `gcc` 14.2, `rustc` 1.94, Wukong via Cranelift 0.124 (JIT) + AVX2/FMA runtime microkernels.
-- Elementwise/reduction kernels: f32 arrays of N = 2²⁰ (1,048,576). Matmul/linear: 256/512/1024 square.
+- **Library/framework peers** (their versions decide how hard the bar is, so they are recorded):
+  oneMKL via `mkl_rt.2.dll` (Anaconda, 16 threads max); **PyTorch 2.12.1+cpu** (16 threads) as of the
+  2026-07-30 round — note the harness's `detect_torch` selects the *newest* torch among `python` on
+  `PATH` and `tools/torch-venv`, so the peer can change without the benchmark changing; the
+  `torch.compile` columns are pinned to the ATEN/MKL GEMM backend because Inductor's CPP FP32 GEMM
+  template is broken on Windows/MSVC (disclosed in-run by the harness).
+- Elementwise/reduction kernels: f32 arrays of N = 2²⁰ (1,048,576). Matmul: 256/512/1024/**2048**
+  square by default (4096 additionally under `XBENCH_HUGE`; `XBENCH_MATMUL_SIZES` narrows the sweep);
+  `nn.Linear` and the fused FFN: 512/1024; TN weight-gradient: 256/512/1024.
 
 **Variance.** This is a busy hybrid laptop; the all-core and matmul numbers swing run-to-run (P-core
 boost, E-core scheduling, thermals). The harness reports the best of many batches (the least-
 interfered estimate); the ranges below span several runs. Treat them as representative, not exact —
 but the *ratios* (who wins, by roughly how much) are stable.
+
+**Three instrument axes, not one** (learned the hard way on 2026-07-30; each has bitten a round):
+
+1. **Power state** — battery / AC+charging / AC+full are three different machines. The harness reads
+   it and labels every run; on battery the measured single-core roofline fell to **105 GFLOP/s** vs
+   **131–142** on AC, so *nothing* is reportable there, not even single-core. While charging, all-core
+   is capped ~25% (GEMM `@parallel` read **52% of MKL-all @512³** charging vs **97%** at AC+full —
+   same binary, same shape) while single-core is unaffected.
+2. **Thermal / recent-load history** — independent of (1). The measured roofline is *instantaneous
+   boost headroom*: ~138–142 after an idle period, but 91–111 across ten back-to-back probes, and 78
+   when probed immediately after a heavy elementwise battery. So the roofline reading is a valid
+   *round-validity gate only if the probe starts from a comparable idle state*, and a `% of measured
+   roofline` figure inherits that denominator's noise.
+3. **Hybrid core placement** — nothing pins the single-threaded work to a P-core, so an unpinned
+   single-core row can land on an E-core and read ~2× slow at an otherwise perfect power state (see
+   the 2026-07-30 note in the model section: 277.8 ms vs 617.6 ms for identical work). **Single-core
+   rows are comparable within a round, not across rounds**, and any ratio whose denominator is a
+   single-core column (notably `@parallel` scaling) inherits the problem.
+
+The practical rule this yields, and the one the tables below follow: **report same-run adjacent
+peer ratios**; treat absolute GFLOP/s, `% of roofline`, and scaling factors as round-local.
 
 ## Headline results
 
@@ -58,7 +87,17 @@ quality, not just beating textbook code:
   faster than C/Rust** (latest full-board geomean ~306×; ~0.3–1.5 ms vs ~125–245 ms) — measures
   **in-process JIT/embedding latency** (Wukong's front-end + Cranelift JIT in-process vs *spawning*
   a toolchain), the right number for JIT-style embedding but not a process-to-process comparison.
-- **Geomean across the elementwise/reduction battery: 4.86× faster than C** (provisional — derivation not shown).
+- **Geomean across the elementwise/reduction battery: 3.8–4.4× faster than C** (3.7–4.3× vs C++) —
+  re-measured 2026-07-30 and now *derived* rather than provisional: it is the geometric mean the
+  harness prints over the **29 single-threaded rows**, with the 9 `@parallel` rows kept in a separate
+  accumulator (they are all-core-vs-1-thread and must never be pooled into a figure printed under a
+  single-threaded heading). Two same-day rounds read **3.76×** and **4.39×**. Reported as a range
+  deliberately: the two rounds' measured single-core rooflines were 131 and 78 GFLOP/s, and the
+  geomean moved *with* that — so even a ratio of two same-run single-threaded columns is not fully
+  clock-invariant here, because Wukong's vectorized kernels and gcc's scalar ones lose throughput at
+  different rates as the machine heats. The previously recorded **4.86×** (marked "derivation not
+  shown") is therefore not refuted by these rounds; it is plausibly the same quantity measured on a
+  cooler machine, and the honest form is the range plus its instrument state.
 - **End-to-end: a 12-layer GPT-2-class transformer stack (768/12/3072, S=128/512) runs ~19–21×
   faster than idiomatic C and 3.6–4.9× faster than `-ffast-math` C single-core** (three independent
   same-day rounds — see the [End-to-end model](#end-to-end-model--a-12-layer-gpt-2-class-transformer-stack-cpu-inference)
@@ -330,14 +369,29 @@ run; the geomean drifts between ~150× and ~310× across sessions, the latest fu
 `compile-vs` above. For an ML compiler — where edit/recompile/run iteration dominates developer
 time — compile latency is the most robust result of all, under either measurement.
 
-The pipeline's own hot stage is the **optimizer** (~80–85% of the front→`-O2` time *only*; once the
-Cranelift backend is counted the full-pipeline split is backend 73.4% / optimize 16.3% — see
-`docs/compile-floor.md`; the recognizer sweep and sema are negligible). Two output-preserving changes cut it **~31%** (in-process, 400-function
-`-O2`: **18.0 ms → 12.5 ms**): the CSE value-numbering key became a packed allocation-free `enum`
-instead of a `format!` string built per pure instruction (CSE is the costliest pass), and the fixpoint
-loop now skips passes already at fixpoint — dropping the final all-passes no-op *confirmation* sweep
-without changing the sequence of mutations. The resulting MIR is bit-identical (the differential and
-`-O0`≡`-O{1,2,3}` gates both still pass), so the speedup is free of any correctness cost.
+The pipeline's own hot stage within the front end is the **optimizer**, but its share is strongly
+corpus-dependent and the basis must be named. Re-measured 2026-07-30 (`wukong-bench compile-time`,
+release, warm best-of-N, `tests/run` + `examples` + `bench/kernels` = 354 files, 347 measured /
+7 skipped): front total 24.98 ms vs optimize-at-`-O3` 39.57 ms → **the optimizer is 61.3% of the
+front→`-O2` time** on the full corpus. The often-quoted ~80–85% is a *different basis* — the
+400-function synthetic of the session-X1 compile-time work — and the many tiny `tests/run` fixtures
+dilute the optimizer here; `docs/compile-floor.md` records the same effect (~72% on the model-kernel
+subset vs ~62% full-corpus). Once the Cranelift backend is counted the optimizer is not the dominant
+*wall-time* stage at all: the full-pipeline split was **backend 73.4% / optimize 16.3%** on the
+2026-07-11 central `compile-profile` run (not re-measured on 2026-07-30 — see
+`docs/compile-floor.md` §4). The recognizer sweep and sema are negligible either way.
+
+Two output-preserving changes cut the optimizer **~31%** (in-process, 400-function `-O2`:
+**18.0 ms → 12.5 ms**): the CSE value-numbering key became a packed allocation-free `enum` instead of
+a `format!` string built per pure instruction, and the fixpoint loop now skips passes already at
+fixpoint — dropping the final all-passes no-op *confirmation* sweep without changing the sequence of
+mutations. The resulting MIR is bit-identical (the differential and `-O0`≡`-O{1,2,3}` gates both still
+pass), so the speedup is free of any correctness cost. That change also moved the ranking it was
+derived from: CSE is **no longer the single costliest pass** — on the 2026-07-30 corpus run
+`simplify-cfg` (19.8%, 10.22 ms) and `cse` (18.9%, 9.76 ms) are effectively co-leading, ahead of
+`simplify-phis` 17.3%, `mem2reg` 14.3%, `licm` 11.5%, `dce` 8.7%, `simplify` 5.9%, and `dse`/`inline`
+1.7% each. (Pass *shares* are ratios within one run, so they survive this laptop's clock swing; the
+absolute ms do not.)
 
 ### End-to-end model — a 12-layer GPT-2-class transformer stack (CPU inference)
 
@@ -438,6 +492,35 @@ a clock bound. The residual multicore headroom vs 16 physical cores now concentr
 parallel-GEMM grain (2048³/4096³ 91–93% of MKL-all; 512³–1024³ at/above parity — see the library table above), the one
 honestly-open lever. Compiling the whole block takes Wukong **~3–12 ms vs gcc's ~0.4–0.9 s** for the
 equivalent TU; tokens/sec = S ÷ ms/forward.
+
+**2026-07-30 re-measurement — two rounds, and a methodological caveat that limits what they prove.**
+Two full-suite rounds were run at HEAD. Correctness reproduced exactly in both: the interp gate
+(interpreter == native == `@parallel` native) **bit-exact** over all 1024 outputs, serial ==
+`@parallel` **bit-exact** at both S, and Wukong-vs-C / vs-C(fast) / vs-torch-eager / vs-torch-compiled
+cross-checks at 1.93e-6 / 1.05e-6 / 9.12e-7 / 9.53e-7 against a 1e-3 tolerance. The per-layer
+dispatch set printed from the optimized MIR is **identical to the one documented above**, and the
+`@parallel` set contains the `wukong_parallel_for` head-loop region — so no recognizer regressed.
+
+The timings, however, exposed a hybrid-CPU effect that the existing protocol does not control for.
+Round 1 (AC+charging, measured roofline 131) read Wuk(1c) **277.8 ms** at S=128; Round 2 (AC+full,
+roofline probe 78) read **617.6 ms** for the same work — 2.2× slower *on the healthier power state*.
+On this 6 P-core + 8 E-core + 2 LP-E part a single-threaded measurement is at the mercy of which core
+type the scheduler picks, and nothing in the harness pins it (the note above that "pinned to a P-core
+it reaches a stable ~117–126" is the same effect seen from the other side). Consequences, stated
+rather than papered over:
+
+- **Single-core rows are only comparable within a round**, and a round's `Wuk(1c)` column should be
+  sanity-checked against its own roofline probe before any cross-round claim is made.
+- **`@parallel` scaling figures (par ÷ 1c) inherit that noise in their denominator.** Round 2's
+  apparent 6.81× (S=128) / 8.42× (S=512) are *inflated by a slow 1c*, not evidence of improved
+  scaling, and are deliberately **not** claimed here.
+- Peer ratios that do not involve Wukong's own 1c column are the robust ones. At AC+full, Wukong
+  `@parallel` measured **1.60× (S=128) and 3.98× (S=512) faster than all-threads compiled torch**,
+  and GEMM `@parallel` measured **99% / 97% / 114% / 128% of MKL-all** at 256³/512³/1024³/2048³ —
+  at or above the standing band, one round, warm machine.
+- Single-thread vs compiled-torch-1T came out **1.07× and 1.28× faster** (S=128/S=512) in Round 1 but
+  **1.20× slower** at S=128 in Round 2, tracking that round's degraded 1c. The recorded claim is left
+  as it stands; one round cannot overturn it, and one round cannot confirm it either.
 
 **A real compiler finding along the way (since resolved):** in the first preliminary sessions the
 `@parallel` column was only *partially* multicore — `wukong_mir_build`'s statement-path matmul

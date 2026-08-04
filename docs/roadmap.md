@@ -20,12 +20,18 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
-  than the native backend's machine frames, so the interpreter overflows at a far shallower recursion
-  depth (~tens of thousands of nested calls) than native (which handles millions). Recursion past the
-  interpreter's stack bound is a **resource limit outside the bit-for-bit differential contract** — the
-  oracle aborts where the native backend may still complete, the same "outside the defined contract"
-  status as an out-of-bounds access. Matching native's depth would need ~10× the interpreter stack
-  (impractical); a real program rarely recurses that deep on a stackful backend.
+  than the native backend's machine frames, so it recurses less deeply than native. Its ceiling is an
+  explicit, measured cap rather than whatever the stack happens to allow: past `MAX_CALL_DEPTH` —
+  **300,000** nested Wukong calls in a release build — the largest value that rejects no depth measured
+  to complete on the 512 MiB worker — and **40,000** in a debug build, deliberately below that build's
+  measured ceiling but above the depth the `differential_deep_recursion` gate exercises, so the oracle
+  never refuses a depth that gate needs — the interpreter reports
+  `error: interpreter call-depth limit exceeded (likely unbounded recursion)` and exits 1. That is a
+  **diagnostic**, never an uncatchable process abort, so an unbounded recursion can no longer take the
+  differential oracle down with it. Recursion past the cap is still a **resource limit outside the
+  bit-for-bit differential contract** — the oracle *refuses* where the native backend still completes,
+  the same "outside the defined contract" status as an out-of-bounds access. Raising the cap past its
+  measured ceiling would reintroduce the abort; lowering it would reject working programs.
 - `let`/`let mut`/`const`, shadowing, block-as-expression values, **`let` tuple destructuring**
   (`let (a, b) = …`, nested patterns, `_`; `tests/run/let_destructure.wk`), and a **top-level
   `const` used as a value** (its initializer inlined at every use site — arithmetic, array index,
@@ -53,7 +59,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
     `wukong_sreduce_f32_parallel` (`tests/run/parallel_reduce_lowp.wk`);
   - **streaming axpby** `out = a·x + b·y` (`wukong_axpby_{bf16,f16}`), half-in/f32-out, ~1.3× ≫ L3
     (requires two additive terms; a 1-term scale would force a `0*inf` the source lacks);
-  - **activations** — the full 36-op transcendental set over a half-precision input
+  - **activations** — the full **36**-op transcendental set over a half-precision input
     (`wukong_vmath_{bf16,f16}`, `out[i] = f((x[i] as f32))`).
   The recognizers are precision-generic (`match_lowp_reduction`/`match_lowp_axpby`/`match_vmath_stmt`),
   and the interpreter marshals through the identical kernel, so native == interp bit-for-bit. C/Rust
@@ -68,7 +74,9 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - All arithmetic/comparison/bitwise/boolean operators (`&&`/`||` **short-circuit**), compound
   assignment, casts — including a float → narrow-int cast (`1e30 as i8`) that **saturates** identically
   on both backends (`tests/run/float_cast_narrow.wk`).
-- `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`, `loop { … }` with
+- `if`/`else` (statement and value position), `while`, `for … in a..b` / `a..=b` (half-open or
+  inclusive) `[step s]` (the inclusive and stepped forms are correct but neither vectorized nor
+  kernel-dispatched — see the SIMD bullet), `loop { … }` with
   `break`/`continue`, including **labeled loops** `'outer: for … { … break 'outer; continue 'outer; }`
   — a labeled `break`/`continue` targets the named enclosing loop, not just the innermost (the lexer
   tells a label `'outer` from a char literal `'a'` the way Rust does; `tests/run/labeled_loop.wk`).
@@ -124,8 +132,24 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   mark-and-forget (harmless, never a crash) in the interpreter. interp == native bit-for-bit and
   -O0 == -O3 (`tests/run/heap_{alloc,alloc_fn,zero_init,len}.wk`, `differential_heap_alloc`, and
   `heap_alloc.wk` in the linked-exe AOT gate — the rustc link resolves the two runtime symbols
-  from the `wukong_runtime` rlib). Loops over alloc'd slices currently take the scalar path (the
-  auto-vectorizer declines a slice base — a future perf lever, correctness unaffected).
+  from the `wukong_runtime` rlib). Loops over alloc'd slices reach the **recognized-kernel** path:
+  every kernel buffer operand resolves through `kernel_base_ptr`, which loads a `[]T`'s data pointer
+  out of its 16-byte fat pointer, so `for i in 0..n { y[i] = exp(x[i]); }` over two `alloc_f32` slices
+  emits `wukong_vmath_f32`, and velem / GEMM / reduction nests over slices dispatch too. What still
+  declines on a slice base is the *general* auto-vectorizer — the same loop written over slices emits
+  no vector ops where the fixed-array form does (a future perf lever, correctness unaffected).
+- **Typed file I/O** — `read_<T>(path, buf) -> i64` and `write_<T>(path, buf) -> i64` over the dtypes
+  {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}, where `path` is a `*u8` string literal and `buf` a `[]T`
+  slice (typically from `alloc_<T>`). The on-disk format is frozen and **headerless: raw contiguous
+  little-endian elements**, no magic and no length prefix, encoded with `to_le_bytes`/`from_le_bytes`
+  regardless of host endianness, so a blob written by one backend is byte-identical to the other's.
+  Contract: the open is attempted **first**, so a missing or unopenable path is `-1` even for
+  `len <= 0`; a read then transfers `n = min(len, file_size / sizeof)` elements (a trailing partial
+  element is ignored, `buf[n..]` left as allocated) and returns `n`, or `-2` on a mid-read I/O error;
+  a write creates/truncates and returns `len` (`-1` create failed, `-2` write error). Lowered to
+  opaque `wukong_rt_{read,write}_<T>` runtime calls — **no new MIR op** — and the interpreter
+  implements the identical contract, so interp == native
+  (`tests/run/io_roundtrip_{f32,f64,i32,i64,i8,u8}.wk`, `io_missing_file.wk`, `io_partial_read.wk`).
 - **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
   digit separators and type suffixes (`tests/run/radix_literals.wk`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
@@ -250,10 +274,22 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `tests/run/{ffn_block,attention,multi_head_attention,causal_attention,conv_im2col,transformer_block,rmsnorm,log_softmax}.wk`).
 - **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
   if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
-  on the native backend; and for **large, compile-time-known trips (~≥2048 elems)** the loop is
-  instead emitted as **true 256-bit AVX2** by a raw machine-code path
+  on the native backend (only a **half-open, unit-step** range vectorizes: an inclusive `a..=b` or a
+  `step s` loop lowers as the plain scalar loop — correct, just unaccelerated — and the
+  recognized-kernel cascade declines those two forms for the same reason). Where the body fits the
+  raw-AVX2 recipe (f32 lanes, register pressure within the 16 YMM registers) an **elementwise** loop
+  is instead emitted as **true 256-bit AVX2** by a raw machine-code path
   (`crates/wukong_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`) that sidesteps
-  Cranelift's 128-bit CLIF cap (`WUKONG_P4_NO_256` disables it). saxpy/poly/relu/relu6 vectorize.
+  Cranelift's 128-bit CLIF cap (`WUKONG_P4_NO_256` disables it) — with **no** trip-count requirement,
+  so a 32-element loop and a runtime-`n` loop both take it. Only a float **reduction** additionally
+  requires a *compile-time-known* trip ≥ 2048 (`VEC256_REDUCTION_MIN_TRIP`), below which the inlined
+  128-bit reduction wins. The raw-AVX2 emitter is **host-gated**: `host_supports_kernels()` requires
+  **x86-64 Windows with AVX2 + FMA** (the emitted body hardcodes the Win64 rcx/rdx/r8 argument
+  registers, and there is no in-kernel fallback), and `assemble_kernel` refuses otherwise. The refusal
+  is *not* a fallback: `mir_build` attaches the kernel recipe with no host check, so on any other host
+  native codegen fails the compile with that error rather than silently reverting to the 128-bit CLIF
+  form (`WUKONG_P4_NO_256=1` is the knob that actually keeps the 128-bit form).
+  saxpy/poly/relu/relu6 vectorize.
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.
@@ -320,14 +356,38 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   in its writeback. The accumulate store would otherwise block the matmul recognizer and drop the whole
   nest to a scalar loop, so this recovers the full GEMM dispatch + the fused residual/bias/activation
   with no backend change (`match_matmul_residual`, `tests/run/linear_residual{,_relu}.wk`).
+- **int8 quantized `nn.Linear` → VNNI GEMM (+ fused dequant)**: a `u8`×`i8`→`i32` matmul nest in the
+  `C = A·Bᵀ` spelling dispatches to `wukong_i8gemm_nt[_parallel]`, and when it is immediately followed
+  by a per-channel dequant loop the two fold into one `wukong_i8gemm_nt_deq[_parallel]` call — the
+  scale applied in the GEMM's own writeback. Whole-function and statement forms both fire, and the
+  integer accumulate is exact mod 2^32, so interp == native bit-for-bit and `-O0` == `-O3`
+  (`tests/run/{i8_linear,i8_linear_dequant,i8_linear_parallel,dequant_perchan}.wk`). The
+  per-tensor/per-channel `absmax` that produces the symmetric quantization scale is the
+  column-reduction family above.
 - **`@parallel`** functions execute across CPU cores (rayon runtime); the per-core chunk is itself
   vectorized. The interpreter runs the same range sequentially, so results stay differential-equal.
+  `@parallel` is a *request*, and a shape it cannot prove safe **falls back to serial lowering with no
+  diagnostic** — the answer stays right, the parallelism silently does not happen. The whole-function
+  form applies only when every parameter is an array (captures are the parameters, passed by pointer),
+  the body is exactly one `for` statement over an unlabelled half-open unit-step range starting at
+  literal 0 (`0..n`; no label, no `..=`, no `step`), and no `return` or loop-level `break`/`continue`
+  escapes the parallelized loop — a `break`/`continue` inside an *inner* loop is fine. Each of those
+  used to change what the loop means (a dropped label lowered `break 'l` to `unreachable`: an
+  interpreter error, a native SIGILL), so declining is the fix. The mid-function region outliner adds
+  one more decline: a modelled body-local that is reassigned inside an inner loop, whose snapshot is
+  not flow-sensitive. Verify with `wukongc --emit=mir -O2 f.wk` and look for a `_parallel` symbol or a
+  `wukong$par$` region.
 - Intrinsics `print`/`println`/`assert`.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining** of
   leaf functions, **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
   with block merging, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
   forwarding, DSE, and **loop-invariant code motion**. Guarded by an `-O0`-vs-`-O{1,2,3}` differential
-  test and post-pass MIR verification; across the run suite and kernels it removes ~42% of IR ops
+  test plus two layers of MIR verification: a per-pass verify-each that names the offending pass,
+  `#[cfg(debug_assertions)]` so it runs in tests and CI but is compiled out of a release build; and a
+  whole-program verify in the driver before **every** backend entry — `--run`, `--emit=llvm-ir`,
+  `--emit=obj`, `--emit=exe` — which is what guards a release compiler (`--emit=mir`/`--emit=mir-high`
+  verify *after* dumping on purpose, so a broken program still prints the MIR that explains why).
+  Across the run suite and kernels it removes ~42% of IR ops
   (~48–54% on the heavy transformer/GEMM kernels) and runs ~1.5–2.5x faster than `-O0`.
 
 ## GPU backend (NVIDIA RTX 4050, behind `--features gpu`)
@@ -342,18 +402,40 @@ mobile 4050 (see `BENCHMARKS.md`):
 - **Tensor-core GEMM** (fp16/bf16/fp8 inputs, f32 accumulate): WMMA `m16n16k16` for fp16/bf16
   (**~5–6× the f32 path** same-run; absolute TFLOP/s is clock-bound — ~7× GPU-clock swing — so only
   the ratio is quoted); **fp8 (E4M3)** via hand-laid `mma.sync.m16n8k32` (no WMMA fp8 on
-  `sm_89`), validated bit-exact. Its fragment-reuse multi-tile kernel (`fp8_gemm_mt_ptx`, 2×4 block of
+  `sm_89`), validated against an E4M3-rounded reference (`fp8_gemm_matches_reference_within_tol`), not
+  bit-exact. Its fragment-reuse multi-tile kernel (`fp8_gemm_mt_ptx`, 2×4 block of
   16×8 tiles per warp) is now the **fastest** tensor-core path — ~2.1–2.4× the naive single-tile fp8 and
-  ~1.3–2.3× fp16/bf16 in the same run (single-tile retained as the fallback for non-divisible shapes).
+  ~1.3–2.3× fp16/bf16 in the same run (dispatch order inside `gemm_nt_fp8`: the cp.async-pipelined
+  kernel `fp8_gemm_pipe` when its 128/128/64 tile divides the shape, then the fragment-reuse `_mt`
+  kernel, then the single-tile kernel as the fallback for everything else).
 - **Fused flash-attention** (online softmax, never materializes the `S×S` scores — the kernel that
   *loses* on CPU): warp-per-query-row + `cp.async` double-buffering — **beats the genuinely-fused
   cuDNN + cutlass fMHA in the causal-S≤512 and fused-RoPE regimes** (and is 3.6–5.0× the unfused
   cuBLAS chain, 205–738× naive CUDA-C), trailing cuDNN only at long context (S≥2048).
 - **Fused row norms** (softmax/LayerNorm/RMSNorm, one warp per row), **activations** (SFU), **reductions**
   (deterministic; max bit-exact), **conv2d**, and elementwise.
+- **Quantized GEMM**: int8 **W8A8** (`u8`×`i8`→`i32` via `mma.sync.m16n8k32`, `ldmatrix` +
+  XOR-swizzle staging, fused per-channel dequant, split-K) and **W4A16** group-wise int4 weight-only
+  decode (`lop3` unpack → the same fp16 tensor cores). Because the int8 accumulate is integer, this
+  the `i32`-output int8 kernels are gated **bit-for-bit** (`assert_eq!`) against a wrapping-`i32` CPU
+  reference rather than by tolerance — the one place the tolerance contract above is replaced by exact
+  equality. The f32-output variants (the fused dequant epilogue, W4A16) stay tolerance-gated.
+  `QuantWeight` discriminates symmetric vs asymmetric purely on its `zeros: Option<..>` field. Both are
+  Rust launch wrappers in
+  `wukong_codegen_gpu`: no `wukongc` flag reaches *these* kernels — `--backend=gpu` offloads only the
+  five `Accelerator` families, none of them quantized. (A `.wk` int8 nest does reach the GPU by a
+  different route: `--backend=gpu-native` lowers `wukong_i8gemm_nt` to its own scalar `mrt_i8gemm_nt`
+  device kernel, not to the tensor-core wrappers here.)
 - **A whole pre-norm transformer layer runs end-to-end GPU-resident** — RMSNorm → QKV → flash-attn →
   output proj → residual → RMSNorm → FFN(SiLU) → residual, all on device buffers with no host round-trip
   between ops, matching a CPU f64 reference to max_rel 2.7e-4 and **deterministic** run-to-run.
+- **Device-resident training and serving exist as Rust APIs in `wukong_codegen_gpu`, not as language
+  features.** `train_resident::MlpTrainer` runs forward + backward + a fused AdamW step entirely on
+  device buffers (`ptx_optim.rs`, `ptx_autodiff_bwd.rs`); `serving.rs` / `paged_kv.rs` /
+  `paged_attention.rs` implement a paged-KV cache, batched autoregressive decode with Orca selective
+  batching, a graph-capturable step, and int8 KV. **Neither is reachable from `.wk` source or from any
+  `wukongc` flag** — `--backend=gpu` offloads only the five `Accelerator` families and
+  `--backend=gpu-native` lowers MIR. They are library surface with their own gates.
 
 **End-to-end `--backend=gpu`.** Built with `--features gpu` (a *cargo build* flag, not a `wukongc`
 runtime flag), `wukongc --backend=gpu --run foo.wk` executes the
@@ -362,9 +444,16 @@ control flow, buffer layout, and every non-kernel op to the oracle), but recogni
 / reduction / fused-norm calls run on the device via an `Accelerator` seam (`wukong_interp`) the
 driver implements with `wukong_codegen_gpu` (`GpuAccel`). With no accelerator — every other caller,
 the differential oracle — the path is byte-for-byte unchanged, so the toolchain-free core is
-untouched. The CPU↔GPU boundary is tolerance-gated, so a device error surfaces as an error rather than
-a silent CPU fallback. Gated by `gpu_backend_*` tests (driver, `--features gpu`): each family runs on
-the interp oracle and the GPU over identical buffers and matches within tolerance (GEMM bit-exact;
+untouched. Coverage of the offload menu is partial and the fallback is silent-but-correct: a
+recognized call the GPU wrappers do not cover **declines to the CPU kernel** rather than failing.
+Today that means the 6 activation op codes `vmath_supported` lists (relu, exp, sigmoid, tanh, silu,
+gelu); the sum/dot/max reductions; softmax/LayerNorm/RMSNorm but **not** log-softmax or L2-norm
+(`norm_supported` covers op codes 0..=2, so `tests/run/log_softmax_fused.wk` and `l2norm.wk` run their
+CPU kernels); and the fused epilogue only at `beta == 0` with `M`, `N` multiples of 64 and `K` a
+multiple of 16. A genuine *device* error is a different thing and is always surfaced as an error —
+`Some(Err(..))` — never turned into a CPU fallback. Gated by `gpu_backend_*` tests (driver,
+`--features gpu`): each family runs on the interp oracle and the GPU over identical buffers and matches
+within tolerance (GEMM tolerance-gated too, not bit-exact — the device reduces K in a different order;
 silu ~5e-7, dot ~7e-7, softmax ~3e-8 abs), asserting the offload actually fired.
 
 Run the kernel suite with `cargo test -p wukong_codegen_gpu --features gpu` (skips cleanly with no
@@ -384,9 +473,13 @@ of truncating mod 2^w (`float_cast_narrow`: `300.0 as u8 == 255`, `-300.0 as i8 
 megakernel stores pointer values homed in the shared frame **unconditionally** rather than
 `tid==0`-guarded — a frame pointer slot is uniform across the SPMD threads, and the old guard left
 threads ≠ 0 loading a zero-initialized slot and dereferencing null in non-recognized scalar loops
-(the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus standing:
-`run_corpus_matches_interp_oracle` 193/274 (`-O0`==`-O3`, 81 honest UNSUPPORTED skips, zero
-mismatches/faults); `mega_corpus_matches_oracle` 81 ran / 89 eligible (8 launch-time declines).
+(the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus standing is printed by the gates
+themselves, over every fixture in `tests/run` (332 today): `lower::tests::run_corpus_matches_interp_oracle`
+sweeps each program at `-O0` and `-O3`, requires zero mismatches and zero device faults and non-zero
+coverage, and reports the rest as honest `UNSUPPORTED:` skips; `megakernel::tests::mega_corpus_matches_oracle`
+does the same over the megakernel-eligible subset, counting (program, opt-level) configs and treating a
+launch-time `Ok(None)` decline as neither coverage nor a miscompile. Re-run them for the current
+numbers — they are a function of the corpus, not a fixed figure.
 Both gates now also **isolate device faults**: a genuine `ILLEGAL_ADDRESS` poisons the CUDA state
 **process-fatally** — measured on this driver (RTX 4050, Windows/WDDM), `cuDevicePrimaryCtxReset`
 returns Ok but re-retaining the primary context still returns error 700, and cudarc exposes no
@@ -403,7 +496,20 @@ vector-Jacobian product). Matmul adjoints ride the same tuned GEMM kernels, and 
 emitted as one kernel. Every VJP rule is **finite-difference-gated** (forward + backward run in f64)
 against a closed-form reference. It is reachable from `wukongc`: `--emit=grad` dumps the backward MIR
 of a loss function, and `--train` runs a fwd→bwd→optimizer loop (`--grad-of`/`--grad-wrt` select the
-loss and parameters; `--train-opt=sgd|adamw` the optimizer).
+loss and parameters; `--train-opt=sgd|adamw` the optimizer). The envelope is deliberately narrow and
+every hole outside it is a **loud refusal, never a zeroed gradient**. The forward function must be a
+single basic block in SSA terminated by `ret <float scalar>`. Five kernel families have rules —
+`wukong_sreduce_f32` (SUM / DOT / SSD, including the self-dot `Σ x²`), `wukong_sgemm_nt`,
+`wukong_vmath_f32` (relu/sigmoid/tanh/exp differentiated as a synthesized loop; silu/gelu/elu/softplus
+as one fused `wukong_vmath2_f32` backward call), `wukong_velem_f32` (**identity-affine only** — the
+Hadamard `x⊙y` and division compute modes are refused by name), and `wukong_norm_f32` (softmax /
+LayerNorm / RMSNorm) — each with its `@parallel` twin. A norm with learned γ/β
+(`wukong_norm_affine_f32`), a mid-function `@parallel` region, an autovectorized `VecKernelCall`, and
+any buffer that would need accumulation from two non-matmul contributions all decline with a message
+naming the construct. One known gap is documented rather than fixed: when a loss reads a kernel-written
+buffer with a scalar load instead of through another recognized kernel, that kernel's output adjoint is
+never seeded. Both `--emit=grad` and `--train` force `-O1` or higher, since the transform needs
+single-block SSA (mem2reg + simplify-cfg).
 
 ## Checked but not yet executed
 
@@ -411,11 +517,22 @@ loss and parameters; `--train-opt=sgd|adamw` the optimizer).
   *values* are not yet executed, and the native ISA path (Cranelift) caps vector SSA at 128-bit
   (`f32x4`), so a wider explicit `f32x8` cannot lower even once execution lands — it must split into
   128-bit halves. (Loop auto-vectorization above is separate and *does* run — 128-bit + unrolling by
-  default, and now **true 256-bit AVX2 for large, compile-time-known trips (~≥2048 elems)** via a raw
-  machine-code emitter that sidesteps this CLIF cap; the recognized kernels get 256-bit AVX2 via the
+  default, and now **true 256-bit AVX2** via a raw machine-code emitter that sidesteps this CLIF cap —
+  no trip-count requirement for an elementwise body; only a float *reduction* needs a
+  compile-time-known trip ≥ 2048; the recognized kernels get 256-bit AVX2 via the
   runtime microkernels.)
-- **Attributes** `@simd`/`@tile`/`@align`/`@extern`/`@export`: parse and validate; consumers in
-  progress. (`@parallel` now executes — see above.)
+- **Attributes** other than `@parallel`: **parsed but not validated and not consumed.**
+  `@simd`/`@tile`/`@align`/`@extern`/`@export` are shaped by the parser and then ignored — there is no
+  name check, so an unknown or misspelled attribute (`@bogus(nonsense = 3)`, `@align(3)`) compiles
+  clean with no diagnostic, and no crate reads them (`wukong_sema` never inspects `.attrs`). The single
+  consumer in the tree is `mir_build`'s `has_parallel_attr`, a name test for `"parallel"`; even
+  `@parallel`'s own arguments (e.g. `grain = …`) are parsed and discarded. `E0207` fires only for a
+  malformed argument such as a missing value after `=`. (`@parallel` itself executes — see above.)
+- **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
+  layout name is `E0204`), they are part of the tensor type, and they are enforced across a call
+  boundary — passing a `.col_major` tensor to a `Contiguous`-typed parameter is `E0502`. But **indexing
+  one cannot be lowered**: `a[i, j]` on any non-contiguous or symbolically-strided tensor is a hard
+  `C0001`. Only the default row-major `.contiguous` layout executes.
 
 ## Planned
 
@@ -447,20 +564,37 @@ loss and parameters; `--train-opt=sgd|adamw` the optimizer).
   a footprint win on the call-bound activations); see "Works end to end" above.
 - The *general* vectorizer emits **128-bit CLIF by default** — Cranelift's vector ISA still rejects a
   256-bit `f32x8` SSA value (verified empirically on Cranelift 0.124, pinned as the
-  `cranelift_still_rejects_f32x8`/`p4_probe_vec256_ops` tripwire tests). For **large,
-  compile-time-known trip counts (~≥2048 elems)** it now dispatches the loop to a **raw-AVX2 256-bit
-  machine-code emitter** (`crates/wukong_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`;
+  `cranelift_still_rejects_f32x8`/`p4_probe_vec256_ops` tripwire tests). An elementwise f32 loop is
+  instead dispatched to a **raw-AVX2 256-bit machine-code emitter** at any trip count; a float
+  **reduction** takes it only at a **large, compile-time-known trip (~≥2048 elems)**
+  (`crates/wukong_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`;
   `WUKONG_P4_NO_256` disables it) — the same way the GEMM/vmath runtime microkernels reach 256-bit,
-  and precisely *why* that raw emitter exists (Cranelift can't legalize the wider lane). Below the
-  threshold an out-of-line 256-bit call would lose to the inlined 128-bit path, so small or
-  runtime-unknown trips stay 128-bit + 4× unrolling; there compute-bound *elementwise* kernels use 2×
+  and precisely *why* that raw emitter exists (Cranelift can't legalize the wider lane). That path is
+  **platform-gated**: `avx2::host_supports_kernels()` requires x86-64 **Windows** with runtime
+  AVX2 + FMA3, because the Win64 argument registers (rcx/rdx/r8) are literal in the emitted bytes and
+  there is no in-kernel dispatch; on any other host `assemble_kernel` refuses and the compile reports a
+  diagnostic rather than emitting non-executable code. `WUKONG_P4_NO_256=1` forces the 128-bit CLIF
+  path and is **result-identical** — the 256-bit recipe contracts `x + y*z` into one FMA exactly like
+  its scalar tail, so the knob changes instruction selection and never the answer (pinned by
+  `p4_kill_switch_is_result_identical`). Below that
+  threshold an out-of-line 256-bit reduction call would lose to the inlined 128-bit path, so small or
+  runtime-unknown *reduction* trips stay 128-bit + 4× unrolling; there compute-bound kernels use 2×
   the FMA ports they could, but the vectorized **transcendentals still beat scalar `libm` ~2.5–3×**.
   The loop vectorizer assumes distinct array parameters do not alias.
 - Array *length* in a type may be an integer literal or a top-level `const` (resolved through
-  const-to-const chains; `tests/run/const_array_length.wk`); a **symbolic** length (a generic `N`) or
-  a **computed** one (a const whose initializer is an expression, e.g. `const N = 2 + 2`) still falls
-  back to an opaque pointer. matmul *dimensions* may be runtime values — a runtime-dimension matmul
-  still dispatches to the GEMM kernel.
+  const-to-const chains; `tests/run/const_array_length.wk`). It may also be **arithmetic over those** —
+  `[i32; 2 + 2]`, or a `const N: i32 = 2 + 2` used as a length — because sema's `eval_usize` and
+  mir_build's `const_usize_expr` fold through the one shared `wukong_ast::BinOp::fold_const_len`, so
+  the allocated slot and the compile-time bounds check cannot disagree (`a[9]` on such a length-4 array
+  is still `E0501`). Radix prefixes, `_` separators and integer suffixes all decode (`[i32; 0x10]` is
+  16). The ceiling is `MAX_CONST_ARRAY_LEN = u32::MAX`: a longer literal length is `E0401`, and the
+  shared folder declines (yielding the invalid-length sentinel 0) whenever an operand or the result
+  exceeds it or the arithmetic would wrap — deliberately, because sema folds in `u64` while mir_build
+  narrows the slot to `u32`. A length naming something that is neither a `const` nor a declared generic
+  is `E0301` rather than a silent length 0. A **symbolic** length (a generic `N`) still has no
+  compile-time value: an array *parameter* `[i32; N]` is just a base pointer and runs, but a *local*
+  `let a: [i32; N]` types as `[T; 0]` and is rejected `E0401`. matmul *dimensions* may be runtime
+  values — a runtime-dimension matmul still dispatches to the GEMM kernel.
 - Ordered comparison (`< <= > >=`) is not defined on `bool`, so a **chained comparison** `a < b < c`
   (which parses left-associatively as `(a < b) < c`) is a compile error (`E0401`) rather than a silent
   wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.wk`). Equality `==`/`!=`
@@ -484,7 +618,16 @@ loss and parameters; `--train-opt=sgd|adamw` the optimizer).
   a diagnostic: an **undeclared** dim name in a tensor type (not a declared generic, integer, `?`, or
   `const`) is rejected with **E0504** and a did-you-mean hint, so a typo like `Tensor[f32, KK]` for `K`
   no longer silently introduces a fresh implicit dim and drops the shared constraint
-  (`tests/fail/generic_shape_unknown_dim.wk`).
+  (`tests/fail/generic_shape_unknown_dim.wk`). Three more parts of the callee contract are checked. A
+  tensor's **layout** is part of unification: passing a `.col_major` tensor to a `Contiguous`-typed
+  parameter is `E0502` (`tensor layout mismatch`), and a fixed-size array's row-major decay is checked
+  the same way — previously the value was silently reinterpreted row-major one call away from the
+  `C0001` the same access gets in place. A **slice `[]T`, tuple, or declared struct/enum value is not a
+  tensor base**: against a `Tensor` parameter it is `E0501`, where it used to fall through the lenient
+  arm and hand the callee the address of the slice's 16-byte fat-pointer header (both backends agreed
+  on the garbage, so the differential gate could not see it). And the `E0504` unknown-dimension check
+  now applies to **struct field types, enum payload types and `extern` block signatures** as well as
+  function signatures, so `struct S { t: Tensor[f32, ZZ] }` reports rather than inventing a dim.
 - A `for i in 0..n` loop **re-reads its upper bound `n` live each iteration** (it lowers to a C-style
   `while (i < n)`), not Rust-style range capture: mutating `n` inside the body changes the remaining
   iteration count. Defensible for a low-level kernel language, but worth knowing. A descending range
@@ -514,7 +657,14 @@ loss and parameters; `--train-opt=sgd|adamw` the optimizer).
   `wukong_runtime` as a dependency; a generated shim supplies the `wukong_rt_*` runtime), which also
   links the string `.rodata` relocations — neither of which the MinGW `cc` path on this host can do.
   It falls back to the C-runtime `cc` link (scalar, no-data, no-kernel programs) when rustc or the
-  runtime rlib is unavailable, and the exe gate skips cleanly when no toolchain can link. `--emit=obj`
+  runtime rlib is unavailable, and the exe gate skips cleanly when no toolchain can link. The generated
+  link inputs (`{stem}_shim.rs` for the rustc path, `{stem}_rt.c` for the `cc` fallback) are written
+  into a **pid-keyed temporary scratch directory that is removed when the link finishes**, not into the
+  working directory — they used to overwrite and then delete any user file of the same name, and two
+  concurrent links on one stem raced on them; the working directory is used only if the temp directory
+  cannot be created. The intermediate `{stem}.o` is still written beside the invocation. The rustc link
+  passes `-C panic=abort` because the workspace release profile sets `panic = "abort"`, and a strategy
+  mismatch is a hard metadata error that rejects the link outright. `--emit=obj`
   writes the object unchanged. The differential oracle remains `--run`.
 - **A `mut` aggregate parameter aliases the caller's value — now opt-in.** Aggregate arguments
   (`struct`/array/tuple/tensor) are passed by pointer, the zero-copy tensor-kernel convention, so a

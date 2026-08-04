@@ -92,20 +92,36 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   compile vs Triton's 30–120 s**.
 
 The domain-aware paths (GEMM, the `vmath` transcendentals, the `velem` streaming elementwise, the
-fused norms) all emit **true 256-bit AVX2/FMA** via hand-written runtime microkernels — the width
-Cranelift's *general* vectorizer can't legalize (it caps at 128-bit `f32x4`). So even the
+fused norms) emit **true 256-bit AVX2/FMA** via hand-written runtime microkernels — and the
+**general** loop vectorizer reaches the same width by a second route: a vectorizable f32 loop body is
+captured as a flat `VecKernel` recipe and assembled into raw 256-bit AVX2 machine code
+([`crates/wukong_codegen_cranelift/src/avx2.rs`](crates/wukong_codegen_cranelift/src/avx2.rs)),
+sidestepping the 128-bit `f32x4` cap on Cranelift's vector SSA that the CLIF path is stuck behind
+(`WUKONG_P4_NO_256=1` forces the 128-bit path — a result-identical A/B knob and kill-switch). So
+even the
 memory-bandwidth-bound elementwise kernels are now small **wins** (saxpy ~1.25–1.45×, poly ~1.1–1.2×,
 widening to ~1.3–1.6× at realistic >L3 tensor sizes via non-temporal stores); the one honest **tie** left is
 `relu` at an L3-resident size, where both languages are pinned to the same cache bandwidth.
 
 Where Wukong is built to win for the ML/DL niche:
 
-- **Compile-time shape safety.** Tensor shapes live in the type system:
-  `Tensor[f32, M, K] * Tensor[f32, K, N] -> Tensor[f32, M, N]`. A shape mismatch is a *type error*,
-  not a segfault at 3 a.m. C/C++ cannot express this; Rust cannot express it ergonomically.
-- **The knobs kernels need, as language constructs.** SIMD width, data layout (row-/col-major,
-  strides, tiling), alignment, arenas, and parallel schedules are first-class — not a soup of
-  intrinsics and `#pragma`s.
+- **Compile-time shape safety.** Tensor shapes live in the type system: a `Tensor[f32, M, K]`
+  parameter carries its dims — and its layout — into the callee contract, so handing a
+  `Tensor[f32, 512, 512]` to a `Tensor[f32, 513, 512]` parameter, or returning the wrong shape, is a *type
+  error* (E0501/E0502), not a segfault at 3 a.m. There is no whole-tensor `*` operator:
+  whole-tensor arithmetic is rejected outright (E0401, "operate on elements in a loop"), and a
+  matmul is written as an indexed loop nest — which the compiler then recognizes and dispatches
+  (below). C/C++ cannot express this; Rust cannot express it ergonomically.
+- **The knobs kernels need, as language constructs.** SIMD vector types (`vec[f32, 8]`), tensor data
+  layout declared in the type (`Tensor[f32, 512, 512, .col_major]`, `.tiled(64, 64)`, strided) and
+  parallel schedules (`@parallel`) are part of the language rather than a soup of intrinsics and
+  `#pragma`s. Honest status: a user-written `vec[f32, 8]` *value* parses and type-checks but does not
+  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` is the only attribute with a consumer
+  today, and only its bare form — `@simd`/`@tile`/`@align`/`@extern`/`@export` and `@parallel`'s
+  `grain =` argument parse and are inert — layout is
+  enforced across call boundaries but only the default row-major (contiguous) layout lowers a
+  multi-dimensional index, and arena/scratch/pool allocator selection is not implemented (the
+  language's only runtime-sized memory today is `alloc_<T>`/`free`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization that runs today.** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and lowers it to a tuned
@@ -115,10 +131,14 @@ Where Wukong is built to win for the ML/DL niche:
   elementwise loops, and **auto-parallelizes** `@parallel` loops across cores — things a
   general-purpose C compiler won't do to naively-written source. Underneath, an SSA optimizer
   (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM) removes ~42% of IR ops on the benchmark kernels
-  (~48–54% on the heavy transformer/GEMM kernels). Op-graph fusion across tensor ops is still planned.
+  (~48–54% on the heavy transformer/GEMM kernels). Op-graph fusion across tensor ops is still planned
+  **as a CPU MIR pass**; on the GPU it exists today — `wukong_codegen_gpu`'s fusion planner classifies
+  the recognized op graph and `--backend=gpu-native` compiles an eligible whole program into a single
+  cooperative megakernel.
 - **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
-  BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. The attributes parse and validate
-  today; symbol export/import is not yet wired (see the roadmap).
+  BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. The attributes parse today but are
+  neither validated nor consumed (an unknown attribute name is accepted silently); symbol
+  export/import is not yet wired (see the roadmap).
 
 ## Runs the real GPT-2 124M end-to-end
 
@@ -144,6 +164,15 @@ wukongc --run --backend=native examples/gpt2_infer.wk   # runs the model, writes
 python tools/verify_gpt2.py                             # rel 1.87e-6, argmax 1757 → "GPT2 VERIFY PASS"
 ```
 
+The export directory is resolved as `$GPT2_DATA_DIR`, then an explicit directory argument, then
+`data/gpt2` — [`tools/verify_gpt2.py`](tools/verify_gpt2.py) uses the same order, so both tools agree
+on any checkout. The exporter also regenerates the committed
+[`examples/gpt2_config.wk`](examples/gpt2_config.wk) offset table (the single source of truth for
+every weight offset) and writes a `MANIFEST.md` beside the blobs. The verifier treats the logits
+artifact's **age** as part of its verdict (`--max-age-seconds`, default 3600) so a check cannot
+re-assert a result for a run that never happened; pass `--no-age-check` to re-verify an archived
+artifact.
+
 **Honest scope.** This is a **numerical-correctness and capability** result, not a speed claim — **no
 throughput comparison against PyTorch was measured**, and none is made here. It is **inference, not
 training**. **Tokenization is external**: the `.wk` program consumes integer token ids produced by the
@@ -166,8 +195,12 @@ fn saxpy<N>(a: f32, x: Tensor[f32, N], y: Tensor[f32, N], mut out: Tensor[f32, N
 }
 ```
 
-That tensor/`@parallel`/`@simd` form is the target surface (it type- and shape-checks today). The
-same kernel over fixed-size arrays **runs today** on the interpreter:
+That tensor/`@parallel` form **runs today**, on both backends — the constant-shape spelling and the
+symbolic-generic `<N>` spelling alike (`tests/run/tensor_matmul.wk`, `tests/run/generic_shape.wk`,
+`tests/run/generic_shape_parallel.wk`),
+with a fixed-size array decaying to the rank-1 tensor view at the call. (`@simd` is accepted but
+inert: loop auto-vectorization is unconditional and needs no attribute.) The same kernel written over
+fixed-size arrays runs too:
 
 ```wukong
 fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
@@ -184,6 +217,9 @@ wukongc --run examples/saxpy_array.wk   # -> 12, 24, 36, 48 (one value per line)
 wukongc --run examples/dot.wk           # 120
 ```
 
+`--run` defaults to the interpreter; add `--backend=native` for the same output through the Cranelift
+JIT — the examples are gated to agree.
+
 ## Architecture
 
 ```
@@ -193,12 +229,15 @@ source.wk
    │  mir_build  (lowering + matmul→GEMM dispatch + SIMD auto-vectorization:
    │              elementwise, reductions, FMA, fusion)
    ▼
-Wukong IR (MIR)         one SSA IR that lowers progressively from "High" to "Low"
+Wukong IR (MIR)         one block-parameter SSA IR; mir_build emits it scalar-and-low directly —
+   │                    there is no second level (`--emit=mir-high` means MIR *before* the
+   │                    optimizer, not a different IR level)
    │  optimization passes (mem2reg → SSA, const-fold, CSE, DSE, DCE, LICM, simplify-cfg;
-   │                       inlining; op-graph fusion across tensor ops is planned)
+   │                       inlining; op-graph fusion across tensor ops is planned on the CPU path;
+   │                       the GPU backend has it — see below)
    ▼
-MIR (Low)
-   ├──────────────► interpreter      (always available, zero deps; the reference oracle)
+MIR
+   ├──────────────► interpreter      (always available, no toolchain; the reference oracle)
    ├──────────────► Cranelift backend (native JIT + object/exe; NO LLVM — the fast path)
    ├──────────────► GPU backend      (PTX + cudarc driver-JIT; --backend=gpu offload + --backend=gpu-native MIR→PTX)   [feature = "gpu"]
    └──────────────► LLVM backend     (textual IR for external clang/llc — always available, no feature flag)
@@ -207,7 +246,13 @@ MIR (Low)
 The front-end, optimizer, the from-scratch **MIR interpreter**, *and* the **Cranelift native
 backend** build and test with plain `cargo test` on any machine — no LLVM, no toolchain. The native
 backend JIT-compiles in-process (and emits host objects) and is differentially tested against the
-interpreter bit-for-bit. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
+interpreter bit-for-bit; the interpreter links the same `wukong_runtime` microkernels the native
+backend calls, which is what keeps the two bit-exact. One platform caveat: the raw 256-bit AVX2
+vec-kernel emitter hardcodes the Win64 argument registers and VEX.256 AVX2+FMA encodings, so it
+requires an **x86-64 Windows host with AVX2 + FMA** (`avx2::host_supports_kernels`). On any other
+host `assemble_kernel` refuses and native codegen of a program containing a 256-bit recipe fails —
+build and run with `WUKONG_P4_NO_256=1` to keep the whole tree on the portable 128-bit CLIF path. The
+interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
 behind `--features gpu`, and LLVM is an optional *textual-IR* emitter exposed via `--emit=llvm-ir` (always built; no feature flag).
 
 ## Status
@@ -226,7 +271,10 @@ an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), point
 that a nested `break 'outer` / `continue 'outer` can target) execute end-to-end on both backends — as do
 **`match`** (literal / range / or / enum-variant / tuple patterns, with guards), **C-style and
 data-carrying (tagged-union) enums**, **slices `[]T`** (fat-pointer views with `.len()`, indexing,
-iteration, and array→slice unsizing), top-level **`const`** values, **`let` tuple destructuring**, **radix `0xFF`/`0o17`/`0b1010` and char
+iteration, and array→slice unsizing — and, since every kernel operand resolves through one
+base-pointer helper, a legal operand to the whole recognized-kernel family: GEMM/GEMV, the fused
+norms, the scans, and the streaming elementwise kernels), top-level **`const`** values, **`let` tuple
+destructuring**, **radix `0xFF`/`0o17`/`0b1010` and char
 `'A'` literals**, and **`"string"` literals** (typed `*u8`, rendered by `print`). And
 **constant-shape tensors run** —
 a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
@@ -247,6 +295,7 @@ hidden runtime dim params (`tests/run/generic_shape.wk`). See the docs:
 ```sh
 cargo build                 # the whole compiler incl. the native Cranelift backend — no LLVM
 cargo test                  # unit + golden + end-to-end + differential (interp vs native) tests
+cargo check --features gpu --all-targets  # other half of the gate: `cargo test` never builds the GPU
 cargo run -p wukongc -- --help
 cargo run -p wukongc -- --run examples/fib.wk
 cargo run -p wukong_bench --release -- tests/run examples bench/kernels   # optimizer report
@@ -256,6 +305,12 @@ cargo run -p wukong_xbench --release      # cross-language benchmark vs C/C++/Ru
 The native backend (Cranelift) is built in by default and needs no toolchain. The optional LLVM
 backend emits textual IR only (for an external `clang`/`llc`), exposed via `wukongc --emit=llvm-ir`
 — it is always built and needs no feature flag.
+
+The GPU backend is the only opt-in part of the tree, so `cargo test` neither compiles nor runs it:
+pair every run with `cargo check --features gpu --all-targets`. With `--features gpu` on a machine
+that really has a device, set `WUKONG_GPU_REQUIRED=1` (and `WUKONG_PEER_REQUIRED=1` for the peer
+sweeps) so a missing device turns the suite's `[skip]` lines into failures instead of a silently
+passing test.
 
 ## License
 
