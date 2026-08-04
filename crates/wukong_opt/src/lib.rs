@@ -789,6 +789,38 @@ mod tests {
     }
 
     #[test]
+    fn mem2reg_promotes_an_inlined_callees_pointer_parameter() {
+        // `-O2` splices a callee's entry block into the MIDDLE of a caller block, so the pointer
+        // parameter's `alloca ptr` + `store` no longer sit in the entry block — yet the reload it
+        // guards is inside the callee's own loop, which is the worst place to leave one. The slot
+        // still qualifies because its initializing store is in its own alloca's block and that
+        // block's dominance frontier is empty, so the store dominates every point the renamer asks
+        // about. Checked across every function so the assertion holds whether or not `sum` inlines.
+        let src = "fn sum(p: *f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                     while i < n { s = s + p[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { let a: [f32; 4] = [1.0, 2.0, 4.0, 8.0]; \
+                     return sum(&a[0], 4) as i32; }";
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 2);
+        let totals = prog
+            .funcs
+            .iter()
+            .map(count_ptr_slots_and_reloads)
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert_eq!(
+            totals,
+            (0, 0),
+            "an inlined pointer parameter must still be promoted"
+        );
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
+        assert_eq!(run_main_opt(src, 0), 15);
+    }
+
+    #[test]
     fn mem2reg_leaves_a_late_initialized_pointer_slot_in_memory() {
         // A pointer slot first written *outside* the entry block can be read before it is written
         // on some path. Promotion would have to materialize an "undefined" pointer, and there is no
