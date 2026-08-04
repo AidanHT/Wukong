@@ -170,6 +170,19 @@ after every pass that ran and panics naming the culprit, so run the tests in a d
 Add a test asserting both an effect (e.g. instruction-count reduction) and that results are
 unchanged. The opt-level differential test (`crates/wukongc/tests/run.rs`) will also exercise it.
 
+Two transforms deliberately sit **outside** the fixpoint, in `optimize` itself: `inline_program`
+before it (it needs whole-program information) and `unroll_program` after it (it needs the canonical
+two-block loop the fixpoint produces, and re-running it on its own output would unroll the same loop
+every sweep). If you write a pass like that, give it a way to recognize what it already did, and
+measure its compile-time cost — `cargo run --release -p wukong_bench -- compile-time` reports each
+stage's in-process share, and a whole-program pass that rebuilds a dominator tree per function will
+show up there immediately.
+
+**Never trade exactness for speed in a pass.** Reassociating float arithmetic — the classic
+multiple-accumulator reduction unroll — computes a different number, which breaks both the
+interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`. `wukong_opt::unroll` unrolls without
+reassociating for exactly this reason, and takes the smaller win.
+
 ## Adding a language feature
 
 Prefer to land it end to end: parse → type/shape-check → lower → run via the interpreter, with a
