@@ -3,8 +3,9 @@
 //!
 //! These are the GPU analogue of the AVX2 microkernels in `wukong_runtime`: each recognized op
 //! (saxpy, elementwise, reduction, GEMM, …) gets a kernel the host launches over device buffers.
-//! Target is `sm_89` (Ada / RTX 4050). Kept deliberately simple and correct first; tiling and
-//! tensor-core variants are added in later phases.
+//! Target is `sm_89` (Ada / RTX 4050). This file holds the deliberately simple *base* kernels; the
+//! register-blocked and tensor-core GEMMs live in the `ptx_gemm` / `ptx_wmma` / `ptx_fp8` / `ptx_int8`
+//! / `ptx_int4` siblings, and the fused norms in `ptx_norm`.
 
 /// `y[i] = a*x[i] + y[i]` (the canonical Phase-0 spike). `a` is fused via `fma.rn` so a CPU
 /// reference using `f32::mul_add` matches bit-for-bit.
@@ -713,8 +714,10 @@ END:
 /// entries: `gemm_nn` (`C = A·B`) and `gemm_nt` (`C = A·Bᵀ`, the nn.Linear spelling). 16×16 thread
 /// blocks each compute a 16×16 C tile; A and B tiles are staged in shared memory (`As`/`Bs`) and the
 /// `TILE=16` inner product runs from there, so each global element is loaded once per tile instead of
-/// once per MAC. One C element per thread (no register blocking yet) — a clear win over a naive nest;
-/// the register-blocked / vectorized version that chases cuBLAS comes next. Uses **named PTX
+/// once per MAC. One C element per thread (no register blocking) — a clear win over a naive nest; the
+/// register-blocked variant is `ptx_gemm::gemm_rb_ptx` and the tensor-core ones are in `ptx_wmma`;
+/// this stays the plain f32 tile `gpu::gemm_nt`/`gemm_nn` (and so the `--backend=gpu` offload's
+/// `sgemm_nt`) load. Uses **named PTX
 /// registers** for legibility. Out-of-range threads load zeros (keeping `bar.sync` uniform) and skip
 /// the C store, so ragged M/N/K are handled. `A,B,C` are f32; `fma.rn` accumulation.
 pub const GEMM: &str = r#"

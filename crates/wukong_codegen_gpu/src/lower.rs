@@ -7,7 +7,10 @@
 //! function), then driver-JIT-loads and launches it via the shared [`crate::gpu::Gpu`] harness — so an
 //! *arbitrary* Wukong program runs on the GPU. It mirrors the Cranelift backend
 //! (`wukong_codegen_cranelift`): same `Backend` seam, same `jit_run(program, entry, interner) ->
-//! (exit_code, stdout)` shape, PTX virtual registers instead of CLIF SSA values.
+//! (exit_code, stdout)` shape, PTX virtual registers instead of CLIF SSA values. (The `Backend` impl
+//! below is the *declared* seam only — nothing in the workspace calls `Backend::compile`;
+//! `wukong_driver::run_on_gpu_lower` calls [`jit_run`](crate::lower::jit_run) directly off its own
+//! `BackendKind::GpuLower`.)
 //!
 //! Mapping (the seams the prompt names):
 //! - **SSA values -> PTX virtual registers.** Integers/pointers live in 64-bit `%rd` registers kept
@@ -25,11 +28,16 @@
 //!   with the *identical* `format!("{}\n")` the interpreter/Cranelift runtime uses — byte-identical
 //!   integer output, tolerance-comparable float output.
 //!
-//! Recognized ops (matmul / vmath / norm / reduce / `@parallel`) are *not yet* lowered here; they
-//! return a classifiable `UNSUPPORTED:` error so the coverage gate reports them honestly as
-//! not-yet-covered (the fast-path dispatch + grid-stride `@parallel` lowering land in later
-//! increments). The headline for this phase is **coverage measured against the interpreter oracle**,
-//! never an asserted speed.
+//! Recognized ops (matmul / vmath / norm / reduce / `@parallel`) *are* lowered here: `rt_helper` maps
+//! each recognized `wukong_*` runtime symbol — and its `_parallel` twin — to an `mrt_*` PTX `.func`
+//! reproducing the CPU microkernel's numeric contract as a naive single-thread device loop, and
+//! `wukong_parallel_for(n, func_addr F, ctx)` lowers to the single sequential chunk `F(0, n, ctx)`
+//! (correct because the outlined body is chunk-decomposable; grid-stride parallelism is a later
+//! performance increment, and the *cooperative* forms of these ops are emitted by `lower_call_mega`
+//! in mega mode, which [`crate::megakernel`] drives).
+//! A symbol with no helper — and an op code the helper does not implement — returns a classifiable
+//! `UNSUPPORTED:` error so the coverage gate reports it honestly as not-yet-covered. The headline for
+//! this phase is **coverage measured against the interpreter oracle**, never an asserted speed.
 //!
 //! Correctness gate: a sweep of `tests/run/*.wk` run through this backend matches the interpreter
 //! oracle (integer/control-flow programs bit-exact; float programs within the CPU<->GPU tolerance) and
@@ -224,8 +232,9 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
 
 /// Emit the **cooperative-megakernel** PTX module for `program` with `entry` as the single
 /// `.visible .entry wukong_mega` (run by a block of threads — see [`crate::megakernel`]). The entry
-/// is lowered SPMD with its frame in a shared `.global` buffer; recognized ops emit a cooperative
-/// (`mrt_sreduce_coop`) or `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Eligibility
+/// is lowered SPMD with its frame in a shared `.global` buffer; recognized ops emit a block-wide-tree
+/// (`mrt_sreduce_coop`), chunked-cooperative (the serial `mrt_*` over per-thread sub-ranges) or
+/// `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Eligibility
 /// (`crate::fusion::analyze`) guarantees the entry calls no other user function, so no `mfn_*`
 /// bodies are emitted — only the helpers it uses + the kernel. Public so `megakernel.rs` and tooling
 /// can JIT / inspect it.
@@ -1682,9 +1691,13 @@ impl<'a> FnEmit<'a> {
 
     /// Mega-mode dispatch of one recognized op: bracket it with `bar.sync` (so the cooperating
     /// threads see the prior `tid==0` setup and the next `tid==0` read sees this op's output), and run
-    /// it either cooperatively across the block (reductions, broadcast result) or `tid==0`-serial
-    /// (everything else for now — a later increment adds their cooperative bodies). An unsupported op
-    /// code declines with `UNSUPPORTED:` so the whole program falls back to the single-thread path.
+    /// it one of three ways — a block-wide *tree* (`Reduce`, result broadcast to every thread),
+    /// **chunked-cooperative** over disjoint per-thread sub-ranges of the serial helper
+    /// (`Vmath`/`Vmath2`/`Velem` by elements, `Gemm*`/`I8GemmNt` by output rows, `Norm`/`NormAffine`
+    /// by rows — see [`emit_chunked_call`](Self::emit_chunked_call)), or `tid==0`-serial (the
+    /// remaining ops, e.g. axpby and the bf16/f16 reductions). An unsupported op code — and
+    /// `wukong_parallel_for`, which has no cooperative form — declines with `UNSUPPORTED:` so the
+    /// whole program falls back to the single-thread path.
     fn lower_call_mega(
         &mut self,
         name: &str,
@@ -2783,7 +2796,10 @@ I8_EI:
 /// uses `lg2.approx·ln2` (both match the offload path; the CPU oracle's Cephes `exp`/`log` differ by
 /// <~1e-6, inside the tolerance gate). `eps_bits` is the f32 bits of epsilon (used by layernorm/
 /// rmsnorm/l2norm; softmax/log-softmax ignore it). Sequential per-row reductions (CPU uses an 8-lane
-/// tree) — tolerance-gated. The dispatch has an explicit branch for each op (0..4), no wrong fall-through.
+/// tree) — tolerance-gated. Ops 0..=3 branch explicitly and 4 (l2norm) is the *default* arm, so no op
+/// falls into the wrong body — but the arm is a bare `bra`, not an equality test: extending the
+/// recognizer past code 4 must add a branch here (and an op gate in `lower_call`, which currently
+/// gates only vmath/vmath2) or the new code would silently run l2norm.
 const PTX_NORM: &str = r#".func mrt_norm (.param .b64 px, .param .b64 pout, .param .b64 prows, .param .b64 pcols, .param .b64 peps, .param .b64 pop)
 {
     .reg .b64 %rd<16>;

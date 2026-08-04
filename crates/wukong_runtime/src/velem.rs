@@ -1,6 +1,11 @@
 //! Streaming elementwise affine + activation — `out[i] = act(a·x[i] + b·y[i] + c)` — the **256-bit
 //! AVX2** kernel a recognized streaming map loop (saxpy / scale / residual-add / bias / ReLU / ReLU6)
-//! lowers to. Two reasons it beats the Cranelift-vectorized form gcc/rustc also emit:
+//! lowers to. Two flag bits switch the *compute mode* away from the affine FMA to a two-array product
+//! or quotient — [`VE_HADAMARD`] (`act(x·y)`) and [`VE_DIV`] (`act(x/y)`), the gating / mask /
+//! normalize-by-scale forms — while everything below (twins, NT stores, chunking) applies unchanged.
+//! [`wukong_vhorner_f32`], the streaming Horner-polynomial kernel, shares this file's store policy and
+//! prefetch rules but has no `_parallel` twin. Two reasons this beats the Cranelift-vectorized form
+//! gcc/rustc also emit:
 //!
 //!  1. **256-bit width.** Cranelift's generic vectorizer is stuck at 128-bit SSE (`f32x8` does not
 //!     legalize), so a Wukong saxpy ran ~15% *behind* gcc's 256-bit AVX2. This kernel restores the
@@ -377,7 +382,9 @@ unsafe fn velem_avx2(
 /// so the store policy matches too — and NT stores write the same bits regardless.
 ///
 /// Below [`velem_par_min`] elements the fork-join wake/join cost outweighs a single-core streaming
-/// map, so the call falls back to the serial kernel (still bit-identical).
+/// map, so the call falls back to the serial kernel (still bit-identical) — as it also does on a
+/// width-1 unified pool (`RAYON_NUM_THREADS=1`), which has no second core to win with. Otherwise the
+/// chunks fork on that unified pool via [`crate::run_on_wuk_pool`].
 ///
 /// # Safety
 /// `x`/`out` valid for `n` f32; `y` valid for `n` f32 when the op reads it (`VE_USE_Y`/Hadamard/Div).

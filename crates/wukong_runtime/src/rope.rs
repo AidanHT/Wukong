@@ -1,7 +1,9 @@
 //! RoPE (rotary position embedding) with **inline sin/cos** — the per-attention-layer positional
 //! rotation in LLaMA/Mistral/Qwen/GPT-NeoX. Applied over a row-major `[rows, dim]` f32 tensor with
 //! `dim = 2*half`, the **half-split** (GPT-NeoX/LLaMA) convention: the first `half` channels pair with
-//! the last `half`, and row `r`'s absolute position is the row index `r`.
+//! the last `half`, and row `r`'s absolute position is the row index `r`. The C entries take
+//! **`half`**, not `dim` — the extent guard is `rows <= 0 || half <= 0`, and `dim` is derived as
+//! `2*half` inside.
 //!
 //! Per row `r` and each pair `j ∈ 0..half`:
 //!

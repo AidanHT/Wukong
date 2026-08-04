@@ -10,9 +10,12 @@
 //!
 //! Determinism: FxHash is a pure function of the key bytes (no random seed), so unlike `std`'s
 //! randomly-seeded `HashMap` its iteration order is fixed run-to-run. Nothing in the front-end may
-//! iterate one of these maps to *produce* observable output order; that this holds is guarded by the
-//! byte-identical `--emit=mir` determinism gate (which already passed under the randomly-seeded
-//! SipHash, proving no output depends on map iteration order).
+//! iterate one of these maps to *produce* observable output order. The swap away from SipHash was
+//! output-neutral, because the byte-identical `--emit=mir` determinism gate already passed while
+//! these maps were randomly seeded. But that argument only covers the swap: LANDMINE — with a fixed
+//! seed the gate (`crates/wukongc/tests/determinism.rs`, three fresh processes) can no longer detect
+//! an iteration- or insertion-order dependency introduced in an `FxHash*` map, and the file records
+//! that caveat itself. Where order matters, sort explicitly or use an ordered container.
 //!
 //! This mirrors the optimizer's private `fxhash` (kept separate so the crates stay decoupled); the
 //! two must agree on the algorithm only insofar as both want a fast integer hash — neither's bits

@@ -1,13 +1,21 @@
 //! The MIR verifier — checks well-formedness invariants. A failure here is an *internal compiler
 //! error* (a bug in a pass), not a user error, so violations are returned as plain strings.
 //!
-//! It runs after MIR construction, between optimization passes (under `--verify-each`), and
-//! before backend entry. Checks: every value is defined exactly once, inside the value arena, and
+//! It runs before every backend entry and before printing MIR (`wukong_driver::verify_or_ice`, which
+//! gates `--run` and `--emit=llvm-ir`/`obj`/`exe`, plus `emit_mir` after the dump so a broken program
+//! still shows why), and after each optimization pass that ran — but that per-pass "verify-each" is a
+//! `#[cfg(debug_assertions)]` block inside `wukong_opt::optimize`, **not** a CLI flag: there is no
+//! `--verify-each` option and the check is compiled out of release, so a release-only invalid form can
+//! slip past it.
+//!
+//! Checks: every value is defined exactly once, inside the value arena, and
 //! before — in the dominance order — every use of it; the entry block matches the function's
-//! parameters and has no predecessors; block-parameter arities and types line up across edges;
-//! per-operation operand/result types are consistent; a `veckernel` index is in range; and
-//! terminators are type-correct (including the function return type). Given a whole [`Program`],
-//! [`verify_program`] additionally checks each call against its callee's declared signature.
+//! parameters and has no predecessors; block ids match their index; block-parameter arities and types
+//! line up across edges; per-operation operand/result types are consistent; a `veckernel` index is in
+//! range and its result presence matches the recipe's kind; and terminators are type-correct
+//! (including the function return type). Given a whole [`Program`], [`verify_program`] additionally
+//! checks each call against its callee's declared signature — but only [`verify_function`] is wired
+//! into the pipeline, so that call-vs-callee cross-check runs in tests only (see its doc).
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,6 +31,13 @@ type FnSigs = HashMap<Symbol, (Vec<MirType>, MirType)>;
 /// Verify every function in a program. Returns a list of human-readable problems (empty = ok).
 /// Unlike [`verify_function`] this also cross-checks each call against its callee's signature,
 /// which needs the whole program in hand.
+///
+/// LANDMINE: no compiler path calls this. `wukong_driver::verify_or_ice` and `wukong_opt`'s
+/// debug-only per-pass check both loop over the functions calling [`verify_function`], so the
+/// call-vs-callee signature cross-check exists only in this crate's `mod tests` and one
+/// `wukong_interp` test. Change a callee's MIR signature and nothing in the pipeline objects — the
+/// symptom is an interp/native divergence with a silent zero on the oracle side, so run the
+/// differential gate by hand.
 pub fn verify_program(p: &Program) -> Vec<String> {
     let mut sigs: FnSigs = HashMap::new();
     for f in &p.funcs {
@@ -45,8 +60,9 @@ pub fn verify_program(p: &Program) -> Vec<String> {
     errors
 }
 
-/// Verify a single function. Calls are checked for operand definition only — cross-checking a call
-/// against its callee needs [`verify_program`].
+/// Verify a single function. This is the entry point the pipeline uses (`wukong_driver::verify_or_ice`
+/// and `wukong_opt`'s debug-only per-pass check both call it per function). Calls are checked for
+/// operand definition only — cross-checking a call against its callee needs [`verify_program`].
 pub fn verify_function(f: &Function) -> Vec<String> {
     verify(f, None)
 }
@@ -352,7 +368,8 @@ impl Verifier<'_> {
 
     fn check_op(&mut self, op: &Op, result: Option<ValueId>) {
         // `Store` never produces a result; `Call` may be void (e.g. the `print` intrinsic) or
-        // value-producing. Every other op must produce exactly one result.
+        // value-producing; `VecKernelCall` is void when elementwise and f32 when a reduction (checked
+        // against the recipe below). Every other op must produce exactly one result.
         let must_produce = !matches!(op, Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. });
         if must_produce && result.is_none() {
             self.err(format!("operation {op:?} must produce a result value"));
@@ -543,10 +560,11 @@ impl Verifier<'_> {
                 n,
             } => {
                 // `kernel` is a bare index into the *owning* function's `vec_kernels`; nothing else
-                // in the instruction can recover it, and both backends index their kernel table
-                // with it unchecked (Cranelift `kernel_refs[k]`, the interpreter `vec_kernels[k]`).
-                // A pass that re-parents the call into another function leaves it dangling, so
-                // range-check it here — this is the one operand the type rules below cannot see.
+                // in the instruction can recover it, and Cranelift indexes its kernel table with it
+                // unchecked (`kernel_refs[k]`, a slice panic on a stale index; the interpreter is the
+                // gentler of the two — it `get`s and reports "unknown kernel index"). A pass that
+                // re-parents the call into another function leaves it dangling, so range-check it
+                // here — this is the one operand the type rules below cannot see.
                 let kind = self
                     .f
                     .vec_kernels

@@ -8,7 +8,15 @@
 //! so the working set thrashes — while the blocked form keeps a `B×B` tile of *both* `src` and `dst`
 //! L1-resident, turning the strided stream into B sequential runs. gcc/rustc do **not** tile a
 //! transpose at `-O3` (loop tiling is a polyhedral pass outside `-O3`), so this is a real algorithmic
-//! win on the memory-bound op, independent of SIMD width.
+//! win on the memory-bound op, independent of SIMD width — there are in fact **no intrinsics in this
+//! module at all**; the tile loop is plain scalar moves and the blocking is the whole lever.
+//!
+//! One generic `transpose_rows<T: Copy>` core serves four C entries: `wukong_transpose_f32[_parallel]`
+//! and `wukong_transpose_u16[_parallel]` (the `bf16`/`f16` bit-mover — a transpose never inspects the
+//! value, so the 16-bit halves move as raw `u16`). A non-positive `rows` or `cols` is a no-op. The
+//! `_parallel` forms spread the independent `B`-row blocks across cores, each owning a disjoint set of
+//! `dst` entries, so they are bit-identical to the serial form (a permutation, no accumulation) and run
+//! serial below `TRANSPOSE_PAR_MIN` elements.
 
 /// Block edge: a `B×B` f32 tile is `B²·4` bytes; `B = 32` → 4 KB per tile, so both the `src` and `dst`
 /// tiles sit comfortably in a 32 KB L1 together.

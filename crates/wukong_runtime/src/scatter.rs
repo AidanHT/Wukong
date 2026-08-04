@@ -41,6 +41,15 @@
 //! such a token is simply **skipped** (it contributes nothing — there is no row to accumulate into),
 //! identically in the AVX2, scalar, and parallel paths. In-range ids — the only case a well-typed program
 //! produces — accumulate exactly.
+//!
+//! **Extent ABI — LANDMINE, and the exception to the crate rule.** Both entries declare `t`/`h`/`v` as
+//! **`usize`**, not the `i64` every sibling kernel takes, and their only guard is `t == 0 || h == 0 ||
+//! v == 0`. Cranelift still hands them a 64-bit value (`coerce_to_i64` on the MIR operand), so a
+//! *negative* extent arrives as a near-`usize::MAX` magnitude, passes the `== 0` test, and the `0..t`
+//! scan walks off `ids`/`grad_out` — exactly the failure `embedding.rs` documents having fixed by
+//! switching to signed extents. The interpreter does not reproduce it either: its `dim!` macro returns
+//! early on any `<= 0`, so a negative extent silently no-ops on one backend and runs off the end on the
+//! other. Nothing in the compiler is known to emit a negative here, and no test covers it.
 
 /// Accumulate one gradient row into one weight-gradient row: `grad_w_row[0..h] += grad_out_row[0..h]`,
 /// 8 f32 per step with a scalar tail. AVX2 when available, else the scalar twin — both perform the

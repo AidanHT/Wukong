@@ -1,14 +1,18 @@
 //! `wukong_opt` — the optimizer: a pass manager plus MIR transforms.
 //!
-//! Passes run to a fixpoint at `-O1` and above. The pipeline first promotes stack slots to SSA
-//! registers, which is what makes the value-based transforms bite:
+//! Passes run to a fixpoint at `-O1` and above, in this order. The pipeline first promotes stack
+//! slots to SSA registers, which is what makes the value-based transforms bite:
 //!  * **mem2reg** — promote scalar `alloca`/`load`/`store` to block-parameter SSA.
 //!  * **simplify** — constant folding and algebraic identities (`x+0`, `x*1`, `x*0`, ...).
 //!  * **simplify-cfg** — fold constant branches, merge straight-line blocks, prune dead blocks.
 //!  * **simplify-phis** — drop dead/trivial block parameters mem2reg introduced.
-//!  * **cse** — local value numbering with load forwarding (`-O2`).
-//!  * **dse** — dead-store elimination (`-O2`).
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
+//!  * **cse** — dominator-tree value numbering with intra-block load forwarding (`-O2`).
+//!  * **dse** — dead-store elimination (`-O2`).
+//!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
+//!
+//! At `-O2` and above, whole-program inlining of small leaf functions ([`inline_program`]) runs once
+//! before the per-function pipeline. `-O3` adds nothing to either — see [`PassManager::standard`].
 
 mod cache;
 mod cfg;
@@ -108,7 +112,9 @@ impl PassManager {
         self.passes.push(p);
     }
 
-    /// The standard pipeline for an optimization level. `-O0` does nothing.
+    /// The standard pipeline for an optimization level. `-O0` does nothing. The only level tests are
+    /// `>= 1` and `>= 2`, so `-O3` builds the identical pipeline as `-O2` — a contract the
+    /// differential gates rely on; do not add an `-O3`-only pass without revisiting it.
     pub fn standard(opt_level: u8) -> PassManager {
         let mut pm = PassManager::new();
         if opt_level >= 1 {

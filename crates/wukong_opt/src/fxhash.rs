@@ -2,11 +2,11 @@
 //!
 //! `std`'s default `HashMap`/`HashSet` use SipHash: DoS-resistant, but slow — a fixed per-key cost
 //! that dominates when the keys are tiny and the maps are hit millions of times. Every pass here
-//! keys its maps on small integers (`ValueId`/`BlockId` inner `u32`s, `(u32,u32)` pairs, `Symbol`s)
-//! drawn from the program being compiled, never from untrusted network input, so SipHash's collision
-//! resistance buys nothing. This is the "FxHash" — rotate, xor, multiply — that `rustc` and Firefox
-//! use internally for exactly this reason. It is ~30 lines, no dependency, and keeps `cargo test`
-//! toolchain-free.
+//! keys its maps on small values drawn from the program being compiled — `ValueId`/`BlockId` inner
+//! `u32`s, `(u32,u32)` pairs, `Symbol`s, a `MirType`, or CSE's `Key` (a handful of those in one enum)
+//! — never on untrusted network input, so SipHash's collision resistance buys nothing. This is the
+//! "FxHash" — rotate, xor, multiply — that `rustc` and Firefox use internally for exactly this
+//! reason. It is a few dozen lines, no dependency, and keeps `cargo test` toolchain-free.
 //!
 //! Determinism: FxHash is a pure function of the key bytes (no random seed), so unlike `std`'s
 //! randomly-seeded `HashMap` its iteration order is fixed run-to-run. The optimizer must never

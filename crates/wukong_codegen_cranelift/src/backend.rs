@@ -6,7 +6,13 @@ use wukong_span::{Interner, Symbol};
 
 /// Native backend. Lowers Low MIR to machine code via Cranelift and executes `entry` directly,
 /// capturing stdout and the exit code into [`Artifact::Executed`] — the same shape the interpreter
-/// produces, so the driver and the differential gate treat the two interchangeably.
+/// produces, so anything written against the `Backend` seam can treat the two interchangeably.
+///
+/// LANDMINE: this impl is the *declared* seam, not the live dispatch path. Nothing in the workspace
+/// constructs `CraneliftBackend` or calls [`Backend::compile`] — `wukong_driver::compile` matches on
+/// its own `BackendKind` and calls `crate::jit_run` directly, and the differential gate calls
+/// `jit_run` / `wukong_interp::run_with_output` itself. Editing this file does not change what
+/// `--backend=native` does.
 pub struct CraneliftBackend;
 
 impl Backend for CraneliftBackend {

@@ -11,14 +11,16 @@
 //! This module is split so the *policy* is testable with no device:
 //! - [`BlockManager`] — **pure host logic**: the free-list allocator + per-slot block tables +
 //!   context lengths. Every `allocate`/`append`/`free`/`flatten` path is unit-tested on a GPU-less box.
-//! - [`PagedKvCache`] — the **device storage**: the K and V f16 slabs (`[layers, num_blocks,
+//! - [`PagedKvCache`] — the **device storage**: the K and V slabs (`[layers, num_blocks,
 //!   block_size, heads, head_dim]`) plus the host→device upload of the block table + context lengths
 //!   the [paged-attention kernel](crate::paged_attention) reads. Built only with a live `Gpu`.
 //!
 //! ### Why f16 storage
 //! The cache is the dominant device footprint at serving time; storing it f16 (not f32) halves it,
 //! matches the tensor-core projection dtype, and is the precision the decode-attention kernel widens
-//! from. [`PagedKvCache::footprint_bytes`] reports the slab size against the 6 GB budget.
+//! from. [`PagedKvCache::footprint_bytes`] reports the slab size against the 6 GB budget. `KvDtype::Int8`
+//! storage halves it again — i8 values plus two per-(token, head) f32 scale slabs — at the cost of being
+//! lossy (tolerance-gated, not bit-exact vs f32 K/V); f16 stays the default.
 //!
 //! ### The first-law property this layout guarantees
 //! The block table changes only *where* a token's K/V is fetched from, never the value or the order it
@@ -399,10 +401,6 @@ impl BlockManager {
     }
 }
 
-/// The **device** paged KV-cache: one f16 K slab + one f16 V slab laid out
-/// `[layers, num_blocks, block_size, heads, head_dim]`, plus the [`BlockManager`] policy and reusable
-/// device buffers for the block table / context lengths the attention kernel reads. Built only with a
-/// live `Gpu` (the host policy in [`BlockManager`] is what the unit tests cover).
 /// Which dtype the device cache stores the K/V values in. `F16` is the default and the bit-exact
 /// path every existing gate runs; `Int8` (per-(token, head) scaled — the
 /// [`crate::paged_attention::quantize_kv_int8`] scheme) halves the footprint again, lossy and
@@ -434,6 +432,10 @@ impl KvStorage {
     }
 }
 
+/// The **device** paged KV-cache: the K and V slabs (f16, or int8 + scale slabs — see [`KvStorage`])
+/// laid out `[layers, num_blocks, block_size, heads, head_dim]`, plus the [`BlockManager`] policy and
+/// reusable device buffers for the block table / context lengths the attention kernel reads. Built only
+/// with a live `Gpu` (the host policy in [`BlockManager`] is what the unit tests cover).
 #[cfg(feature = "gpu")]
 pub struct PagedKvCache {
     cfg: KvConfig,

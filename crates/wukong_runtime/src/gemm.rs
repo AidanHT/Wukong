@@ -1,16 +1,27 @@
 //! Single-precision GEMM — the heavy ML kernel.
 //!
 //! Computes `C[M,N] = A[M,K] · B[K,N]` (row-major f32) with a `beta` flag: `beta == 0` overwrites
-//! `C`, `beta == 1` accumulates into it. This is the tuned microkernel the Wukong compiler lowers a
-//! recognized matmul loop nest to (see `wukong_mir_build`'s matmul recognizer) — analogous to how
-//! XLA/TVM/oneDNN lower a matmul op to an optimized microkernel rather than emitting the naive nest.
+//! `C`, any other `beta` accumulates into it (it is a flag, never a scale). This is the tuned
+//! microkernel the Wukong compiler lowers a recognized matmul loop nest to (see `wukong_mir_build`'s
+//! matmul recognizer) — analogous to how XLA/TVM/oneDNN lower a matmul op to an optimized
+//! microkernel rather than emitting the naive nest.
+//!
+//! The whole exported family lives here: `nn`/`nt` (`A·Bᵀ`)/`tn` (`Aᵀ·B`, transpose prepass), the
+//! fused epilogue `_nt_epi` (`act(A·Bᵀ + bias)`), the α-scaled `_nt_alpha`, bf16/f16 input forms
+//! (lossless widen prepass into the same f32 kernel), and a `_parallel` twin of each. LANDMINE:
+//! `alpha` folds into the same final-K-block writeback that performs the accumulate, so it scales the
+//! beta-accumulated value — only `beta == 0` is supported with a non-unit α (see [`Epilogue`] and the
+//! `debug_assert` in [`gemm_dispatch`]). This module also owns [`gemm_pool`], the crate's unified
+//! physical-core worker pool.
 //!
 //! Structure (the classic BLIS five-loop GEMM):
 //!   * register-block: a `MR×NR` tile of C is held in vector registers across the K loop;
 //!   * cache-block: `MC×KC` panels of A and `KC×NC` panels of B are packed into contiguous,
 //!     aligned scratch so the microkernel streams them with unit stride;
 //!   * the microkernel is AVX2 + FMA (true 256-bit, 8 f32/lane) — the width Cranelift can't emit —
-//!     with a portable scalar fallback selected at runtime via `is_x86_feature_detected!`.
+//!     with a portable scalar fallback selected at runtime via `is_x86_feature_detected!`, and a
+//!     bit-identical AVX-512 twin ([`micro_6x16_avx512`]) that takes over only the full-tile,
+//!     no-epilogue case where `avx512f` is detected (false on this box, so it is dead code here).
 //!
 //! The native backend calls this directly; the interpreter marshals its abstract memory into real
 //! buffers and calls the *same* function, so the differential oracle stays bit-for-bit exact.
@@ -1561,7 +1572,7 @@ unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
     }
 }
 
-// --- 2D block-parallel path (WUKONG_GEMM_2D=1) ------------------------------------------------
+// --- 2D block-parallel path (the DEFAULT; `WUKONG_GEMM_2D=0` opts out) --------------------------
 
 // Reusable per-WORKER pack scratch for the 2D block path: each rayon worker thread keeps one
 // (A-slice, B-slice) buffer pair and reuses it across every block it claims (and across calls —
@@ -3939,7 +3950,8 @@ mod tests {
         }
     }
 
-    /// The 2D block-parallel path (`WUKONG_GEMM_2D=1` routes here — see [`sgemm_2d_blocks`],
+    /// The static-scheduled 2D block-parallel path (reached with `WUKONG_GEMM_DYN=0` — see
+    /// [`sgemm_2d_blocks`],
     /// called DIRECTLY so the test is immune to the process env) must be **bit-for-bit** identical
     /// to the serial kernel: each C block has one owner running the whole ascending-pc K loop with
     /// the serial kernel's `select_kc` grouping, packers, and epilogue discipline. Shapes exercise

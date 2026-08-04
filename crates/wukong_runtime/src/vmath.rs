@@ -1,7 +1,10 @@
 //! Vectorized elementwise transcendentals — the **256-bit AVX2** path the Cranelift backend cannot
 //! emit (`f32x8` does not legalize, so the generic vectorizer is stuck at 128-bit SSE). These are the
 //! transformer/vision activation family — `exp`, `log`, `tanh`, `sigmoid`, `relu`, `silu`, `gelu`,
-//! `elu`, `leaky_relu`, `softplus`, `mish`, `selu`, `tanhshrink`, `hardsigmoid`, `hardswish` — and the
+//! `elu`, `leaky_relu`, `softplus`, `mish`, `selu`, `tanhshrink`, `hardsigmoid`, `hardswish` — plus the
+//! general single-argument math the same machinery carries (trig/inverse-trig, hyperbolics, `erf`,
+//! the `exp2`/`exp10`/`expm1` and `log2`/`log10`/`log1p` families, `softsign`, `logsigmoid`, `cbrt`):
+//! **36 codes in all, `VM_EXP == 0` through `VM_CBRT == 35`.** The
 //! transcendental ones are *compute*-bound (a ~20-flop minimax polynomial per element, more for the
 //! composed ones), so doubling the SIMD width nearly doubles throughput. The transcendental
 //! activations all build on the shared `exp`/`log` polynomials (e.g. `silu = x·sigmoid`,
@@ -14,6 +17,20 @@
 //! [`wukong_vmath_f32`] call (the same play as the matmul→GEMM dispatch). The interpreter marshals
 //! its abstract memory through the **identical** kernel, so the differential oracle stays bit-for-bit
 //! exact even though the kernel reassociates across lanes.
+//!
+//! Sibling entry points in this module: [`wukong_vmath_f32_parallel`] (fixed [`VMATH_CHUNK`] spans, so
+//! it is bit-identical to the serial kernel on any pool width — unlike the reduction kernels, this map
+//! has nothing to reassociate), [`wukong_vmath_bf16`] / [`wukong_vmath_f16`] (half input, f32 output,
+//! widened through `lowp`'s shared widen so they equal the f32 kernel), and [`wukong_vmath2_f32`] — the
+//! two-input family on its own `VM2_*` code namespace (`pow`/`atan2`/`hypot`, the activation
+//! *backward* derivatives, and the SwiGLU/GeGLU/GLU gates).
+//!
+//! INVARIANT — **an unknown op code is identity, never a no-write.** [`apply1`] and [`vmath8_for`] are
+//! mirrored total tables over `0..=VM_CBRT` and both fall through to "return the input" outside it, so
+//! `out[i] == x[i]` for an unrecognized code on the f32, vmath2, bf16 and f16 paths alike (the AVX2
+//! dispatcher used to return early and leave `out` untouched — invisible garbage). Adding a `VM_*` to
+//! one table only is a test failure, not a silent scalar fallback:
+//! `vmath_op_tables_cover_the_declared_code_space` pins the mirroring.
 //!
 //! The per-element op sequence mirrors the inlined MIR polynomials in `wukong_mir_build`
 //! (`emit_exp_f32` / `emit_log_f32`) — same Cephes constants, same FMA structure — so a dispatched
@@ -1394,9 +1411,12 @@ unsafe fn vmath2_scalar(x: *const f32, y: *const f32, out: *mut f32, n: usize, o
     }
 }
 
-/// `out[i] = f(x[i], y[i])` for the two-input transcendentals (`VM2_*`). The 256-bit AVX2 twin of the
-/// inlined two-arg poly an `out[i] = pow/atan2/hypot(x[i], y[i])` loop lowers to; mirrors the inlined
+/// `out[i] = f(x[i], y[i])` for the whole two-input family (`VM2_*`, a code namespace separate from the
+/// one-input `VM_*`): `pow`/`atan2`/`hypot`, the activation-**backward** derivatives (`(x, dy)` →
+/// `dy·act'(x)`), and the SwiGLU/GeGLU/GLU gates (`(a, b)` → `act(a)·b`). The 256-bit AVX2 twin of the
+/// inlined two-arg poly such a loop lowers to; mirrors the inlined
 /// MIR op-for-op, so the interpreter marshalling through this kernel keeps native == interp exact.
+/// An unrecognized `op` is identity in the first argument (`out[i] == x[i]`), never a no-write.
 ///
 /// # Safety
 /// `x`, `y`, and `out` must each be valid for `n` `f32` elements.
@@ -1487,7 +1507,7 @@ unsafe fn vmath2_avx2(x: *const f32, y: *const f32, out: *mut f32, n: usize, op:
     }
 }
 
-/// `out[i] = f(widen(x[i]))` — the **bf16-input** twin of [`wukong_vmath_f32`]: the same 28-op
+/// `out[i] = f(widen(x[i]))` — the **bf16-input** twin of [`wukong_vmath_f32`]: the same 36-op
 /// activation/transcendental dispatch (selected by `op`), but reading bf16 (2 bytes/elem, widened
 /// *losslessly* to f32 with the shared [`crate::lowp::widen_bf16`]) and writing f32. Because the
 /// widen is exact and `f` is the *same* kernel the f32 path uses, this equals
@@ -1552,7 +1572,7 @@ unsafe fn vmath_bf16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
     }
 }
 
-/// `out[i] = f(widen(x[i]))` — the **IEEE-f16** twin of [`wukong_vmath_bf16`]: same 28-op dispatch,
+/// `out[i] = f(widen(x[i]))` — the **IEEE-f16** twin of [`wukong_vmath_bf16`]: same 36-op dispatch,
 /// reading f16 (widened with F16C `vcvtph2ps`, lossless) and writing f32. Equals
 /// `wukong_vmath_f32(widen(x), …)` bit-for-bit (the widen is exact and `f` is the same kernel), so
 /// the interpreter marshals through this kernel and interp == native.

@@ -230,7 +230,7 @@ fn p4_vec256_coverage_sweep() {
     }
 }
 
-/// `WUKONG_P4_NO_256=1` is documented as two things at once (wukong_mir_build/src/lib.rs:13864): a
+/// `WUKONG_P4_NO_256=1` is documented as two things at once (wukong_mir_build/src/lib.rs:13929): a
 /// same-run A/B knob for measuring the 256-bit win, and a kill-switch should a body ever be found
 /// miscompiled. Both readings require the same property — flipping it must not change what a program
 /// computes — and nothing demonstrated that. This test does: for each body it compiles the SAME source
@@ -340,8 +340,9 @@ fn jit_ok(src: &str) -> (i64, String) {
 /// Tripwire documenting *why* the vectorizer caps at 128-bit (`VEC_REG_BYTES = 16`): Cranelift
 /// 0.124 cannot legalize a 256-bit `f32x8` value and rejects it at `define_function`. We therefore
 /// get true 256-bit AVX throughput on the width-sensitive kernels (GEMM, etc.) via runtime
-/// microkernels, not via wider CLIF vectors. If a future Cranelift starts accepting `f32x8`, this
-/// test flips to passing — a signal to widen `VEC_REG_BYTES` and revisit the dispatch story.
+/// microkernels, not via wider CLIF vectors. It passes today *because* the definition errors; if a
+/// future Cranelift starts accepting `f32x8` this test fails, which is the signal to widen
+/// `VEC_REG_BYTES` and revisit the dispatch story — not a regression to paper over.
 #[test]
 #[allow(clippy::result_large_err)] // Cranelift's ModuleError is large; irrelevant in a test.
 fn cranelift_still_rejects_f32x8() {
@@ -398,8 +399,10 @@ fn cranelift_still_rejects_f32x8() {
 
 /// P4 exploratory probe: which 256-bit vector ops does Cranelift 0.124.3 legalize on THIS host
 /// (AVX2/FMA on)? Each op is built in a fresh module inside `catch_unwind`, so a panic in one does
-/// not stop the others. Prints OK / ERR(msg) / PANIC per op. Run with `--nocapture`. Not a gate —
-/// pure fact-finding for the raw-AVX2-vs-CLIF-widen architecture decision. Deleted before commit.
+/// not stop the others. Prints OK / ERR(msg) / PANIC per op. Run with `--nocapture`. It began as pure
+/// fact-finding for the raw-AVX2-vs-CLIF-widen decision, but it now also *asserts* that no `f32x8` op
+/// legalizes, so it is a standing tripwire alongside `cranelift_still_rejects_f32x8` — leave it in
+/// place; a failure means Cranelift widened and the decision should be revisited.
 #[test]
 fn p4_probe_vec256_ops() {
     use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature, Value};

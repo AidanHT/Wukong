@@ -269,8 +269,10 @@ pub fn int8_gemm_smdb128_ptx() -> &'static str {
 
 /// Generate an SMEM-staged + `cp.async` double-buffered int8 GEMM entry for a `bm×bn` CTA tile computed
 /// by `warps_m×warps_n` warps. `bm`,`bn` must be multiples of `16*warps_m` / `8*warps_n`; the staging
-/// assumes `INT8_BK==32` (16-byte chunks = half a K-slab row) and `threads <= bm*BK/16` so every chunk
-/// has a thread. Each generated module owns its own `smemA`/`smemB` (no cross-module symbol clash).
+/// asserts `INT8_BK==32` (16-byte chunks = half a K-slab row), `bm == bn` (smemA/smemB and the single
+/// buffer toggle are all sized from `bm*bk`), and that `threads*16` divides — and does not exceed —
+/// `bm*BK`, so every chunk has exactly one thread. Each generated module owns its own `smemA`/`smemB`
+/// (no cross-module symbol clash).
 fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant: bool) -> String {
     {
         let bk = INT8_BK;
@@ -470,7 +472,13 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
 /// `ldmatrix` matrices map to the A operand as {m0:r0-7/k0-15, m1:r8-15/k0-15, m2:r0-7/k16-31,
 /// m3:r8-15/k16-31} = {a0,a1,a2,a3} — exactly the fp16 register order. Bit-exact mod 2³² vs the CPU i32
 /// reference (the swizzle only reorders SMEM; the integer arithmetic is untouched). Entry `name`;
-/// requires M%bm==0, N%bn==0, K%64==0, bm%(16·wm)==0, bn%(8·wn)==0, (bm/wm)%8==(bn/wn)%8==0.
+/// requires M%bm==0, N%bn==0, K%64==0, bm%(16·wm)==0, bn%(8·wn)==0, (bm/wm)%8==(bn/wn)%8==0, `bm·bk`
+/// and `bn·bk` powers of two (the XOR buffer toggle) and each a multiple of `threads·16` (128-bit
+/// cp.async staging), and `stages·(bm+bn)·bk` ≤ 48 KiB. Every *tile-shape* condition is asserted in
+/// [`gen_int8_smdb_swz_impl`], so an untileable tile config panics at generation rather than staging
+/// a partial slab; the M/N/K divisibility is asserted only when `static_dims` bakes the dims in — on
+/// the dynamic-dims entries (the default, and the only ones split-K uses) M/N/K are runtime
+/// `.param .u32`s the caller must honour.
 #[allow(clippy::too_many_arguments)]
 fn gen_int8_smdb_swz(
     name: &str,

@@ -1,8 +1,9 @@
 //! Optimizer steps as Wukong MIR kernels.
 //!
 //! The backward pass produces gradients; an optimizer turns them into a parameter update. SGD is a
-//! single streaming-affine op (`w -= lr*g` is one `wukong_velem_f32` call), so it needs no kernel
-//! of its own. **AdamW** does — moments, bias correction, an `rsqrt`, and decoupled weight decay,
+//! single streaming-affine op (`w -= lr*g` is one `wukong_velem_f32` call — and the driver's `--train`
+//! SGD arm just applies it in Rust), so it needs no kernel of its own. **AdamW** does — moments,
+//! bias correction, a `sqrt` in the denominator, and decoupled weight decay,
 //! fused into one pass over the parameters — so [`build_adamw_step`] emits it as a counted-loop MIR
 //! function. Keeping it in MIR means the *same* update runs on the interpreter (gated here against a
 //! reference) and, once lowered, on the GPU as one fused kernel — the fusion a tensor library splits

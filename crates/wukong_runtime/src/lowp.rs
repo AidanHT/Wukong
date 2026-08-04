@@ -8,6 +8,17 @@
 //! `8k+l` in ascending `k`) and combines them with a fixed tree; the scalar twin keeps the identical
 //! 8 logical lanes, so SIMD == scalar **bit-for-bit** (a test pins this across partial tails). The
 //! widen is exact, so the only float rounding is the f32 accumulation — identical in both paths.
+//! NOTE the `_parallel` reduction twins fold over the fixed `reduce::RCHUNK` decomposition, which
+//! reassociates against the flat serial kernel: a `@parallel` reduction here is deterministic on any
+//! thread count but **not** bit-equal to its serial sibling (see [`par_chunk_reduce`]).
+//!
+//! Beyond the reductions this module also owns the half-precision **elementwise** family: the
+//! mixed-precision `axpby` (`wukong_axpby_{bf16,f16}`, half in / f32 out) and the narrowing-output
+//! kernels (`wukong_axpby_{bf16,f16}_out`, `wukong_vmath_{bf16,f16}_out`) that compute in f32 and
+//! round the store through the shared `f32_to_{bf16,f16}_bits` shim. Those are pure maps — no
+//! accumulation to reorder — so their SIMD lanes equal the scalar twin element-for-element, and the
+//! narrowing store's non-temporal path (the `stream_narrow!` skeleton) writes the same bits as the cacheable
+//! one. None of the elementwise entries has a `_parallel` twin.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;

@@ -11,13 +11,18 @@
 //! flat [`VecKernel`] recipe (in `wukong_mir`, backend-agnostic) and this module assembles it into a
 //! self-contained function that both the Cranelift JIT/object backend installs (via
 //! `define_function_bytes`) and — for the differential oracle — the interpreter marshals lane-wise
-//! from the *same* recipe. Elementwise lanes are bit-identical across the two; the gate polices it.
+//! from the *same* recipe. Both agree bit-for-bit — lane-wise for an elementwise body, and for a
+//! reduction because `VecKernel::eval_reduction` and `plan_registers` take the accumulator count from
+//! the same `wukong_mir` source, so the two reassociate identically. The gate polices it.
 //!
-//! ABI of an assembled kernel: `fn(ptrs: *const *mut u8, scalars: *const f32, n: u64)`. `ptrs[k]` is
-//! the base of stream `k`, `scalars[k]` the k-th loop-invariant f32, `n` the (multiple-of-8) element
-//! count the caller assigns to the vector part; the caller runs the scalar remainder itself. The
-//! kernel touches only volatile registers, makes no calls, and ends with `vzeroupper` — so no
-//! prologue/epilogue is needed beyond the callee-saved xmm halves Win64 requires.
+//! ABI of an assembled kernel: `fn(ptrs: *const *mut u8, scalars: *const f32, n: u64)`, returning
+//! nothing for an elementwise body and the `f32` horizontal fold (in XMM0) for a reduction — the
+//! Cranelift side declares the two signatures accordingly. `ptrs[k]` is the base of stream `k`,
+//! `scalars[k]` the k-th loop-invariant f32, `n` the (multiple-of-8) element count the caller assigns
+//! to the vector part; the caller runs the scalar remainder itself. The kernel touches only volatile
+//! GPRs and makes no calls, so it needs no shadow space and no frame — the only prologue/epilogue is
+//! saving the low xmm halves of any of ymm6..ymm15 it allocates (callee-saved under Win64), and it
+//! ends with `vzeroupper`.
 //!
 //! The body reads its three arguments out of **rcx/rdx/r8** — the Win64 integer argument registers —
 //! and executes VEX.256 AVX2 + FMA3 encodings. Neither is negotiable here: the register mapping is
@@ -26,7 +31,9 @@
 //! which is the only CPU-feature gate on this path — the Cranelift side declares the kernel with the
 //! module's `default_call_conv` and installs the bytes verbatim, so a mismatch is silent corruption.
 
-#![allow(dead_code)] // Phase A: assembler proven in isolation before the vectorizer wires it in.
+// Covers the test-only `assemble_saxpy_probe` reference emitter plus `GROUP_BYTES` and
+// `Plan::hoist_scalars`, which the recipe path computes but no longer reads.
+#![allow(dead_code)]
 
 use iced_x86::code_asm::*;
 use wukong_mir::{VecBin, VecCmp, VecKernel, VecOp, VecPressure, VecRedOp};

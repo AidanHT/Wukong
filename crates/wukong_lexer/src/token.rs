@@ -177,8 +177,9 @@ impl TokenKind {
         )
     }
 
-    /// A short human-readable description, used in "expected X" diagnostics. Punctuation
-    /// returns its glyph in backticks-free form; categories return a noun.
+    /// A short human-readable description, used in "expected X" diagnostics. A fixed token
+    /// (keyword or punctuation) falls back to its bare [`glyph`](Self::glyph) with no surrounding
+    /// backticks; a lexical category returns a noun.
     pub fn describe(self) -> &'static str {
         use TokenKind::*;
         match self {

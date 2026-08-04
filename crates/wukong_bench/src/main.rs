@@ -7,13 +7,21 @@
 //!     costs a caller; the report measures that floor and prints both the raw and the floor-net
 //!     speedup so the two are never confused.
 //!
-//! Every program is also a correctness check: the `-O0` and `-O3` builds must verify and must
-//! produce the same result, otherwise it is reported and skipped. This quantifies the optimizer
-//! and guards against regressions without needing an LLVM toolchain. Run with:
+//! Every program is also a correctness check: the `-O0` and `-O3` builds must both verify, must
+//! agree on **exit code and stdout**, and the Cranelift backend at `-O3` must agree with the
+//! interpreter at `-O3`; a program that lowered cleanly and then breaks any of those is reported as
+//! `*** FAILED` and the process exits 1. (Programs that never lower, or that error identically at
+//! both levels, are merely skipped — that is not a regression.) This quantifies the optimizer and
+//! guards against regressions without needing an LLVM toolchain. Run with:
 //!
 //! ```text
 //! cargo run -p wukong_bench --release -- tests/run examples bench/kernels
 //! ```
+//!
+//! The default report above is one of five modes; the first CLI argument selects among them
+//! (`compile-time`, `compile-profile` and `spawn-overhead` — see the `compile_time` and `profile`
+//! modules — plus `compile-vs`, see `compile_vs`). Anything that is not a mode word is a corpus
+//! directory, and with no arguments at all the corpus defaults to `tests/run`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -238,12 +246,14 @@ fn main() {
 
 /// The result of benchmarking one program.
 enum Outcome {
-    /// Lowered, optimized, verified, and produced identical results at -O0 and -O3.
+    /// Lowered, optimized, verified, produced identical (exit code, stdout) at -O0 and -O3, and the
+    /// Cranelift backend at -O3 agreed with the interpreter at -O3.
     Ran(Res),
     /// Did not lower to runnable MIR (e.g. uses tensor/SIMD constructs codegen doesn't support),
     /// or fails identically at both levels (e.g. a deliberate runtime assertion). Not a regression.
     Skipped(String),
-    /// Lowered but the optimizer changed behavior or produced invalid MIR — a real bug.
+    /// Lowered but the optimizer changed behavior, produced invalid MIR, or the native backend
+    /// disagreed with the interpreter at -O3 — a real bug. Any `Failed` exits the process 1.
     Failed(String),
 }
 

@@ -1,6 +1,10 @@
 //! Machine-readable diagnostics: one JSON object per line (JSON Lines), emitted under
 //! `--error-format=json`. Tooling (editors, CI) can parse these without scraping the terminal
 //! renderer's output. Hand-written to keep `wukong_diag` dependency-free.
+//!
+//! CONTRACT: `crates/wukongc/tests/fail.rs` — the whole compile-fail suite — greps stderr for the
+//! exact substring `"code":"Ennnn"`, so `field_str`'s lack of whitespace around `:`, and the fact
+//! that the code is emitted as a quoted string, are load-bearing, not cosmetic.
 
 use crate::{Diagnostic, NoteKind, Severity};
 use wukong_span::SourceMap;
@@ -51,7 +55,9 @@ pub fn to_json(d: &Diagnostic, sm: &SourceMap) -> String {
     }
     field_str(&mut out, "message", &d.message, true);
 
-    // Spans -> array of {file, line, col, primary, message}.
+    // Spans -> array of {file, line, col, primary, label}. `line`/`col` are the 1-based position
+    // *of* the span's `lo`; there is no end position. Dummy spans are skipped, so a diagnostic whose only labels are dummy emits an
+    // empty `spans` array.
     out.push_str(",\"spans\":[");
     let mut first = true;
     for l in &d.labels {

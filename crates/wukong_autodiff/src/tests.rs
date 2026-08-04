@@ -1,9 +1,14 @@
 //! Finite-difference gradient gate.
 //!
-//! Each test builds a forward MIR function (in `f64`, so the central-difference reference stays far
-//! below tolerance), runs it through [`grad`], and asserts the analytic gradient the transform emits
-//! matches the central finite difference over the whole gradient buffer — and, where a closed form
-//! exists, matches that exactly. Both passes run on the `wukong_interp` oracle.
+//! Each test builds a forward MIR function, runs it through [`grad`], and asserts the analytic
+//! gradient the transform emits matches the central finite difference over the whole gradient buffer
+//! — and, where a closed form exists, matches that too. Both passes run on the `wukong_interp` oracle.
+//!
+//! Two gates, because the two adjoint models have different arithmetic: the scalar-rule tests build
+//! their forward in `f64` and check it with [`gate`] (`run_kernel_f64`, so the central-difference
+//! reference stays far below tolerance), while the kernel-tape tests must be `f32` — the runtime
+//! kernels are f32-only — and use [`tape_gate`] (loose f32 finite difference *plus* a tight f64
+//! closed form, which is the real gate) or [`tape_gate_fd`] where no closed form exists.
 
 use crate::grad;
 use wukong_interp::run_kernel_f64;

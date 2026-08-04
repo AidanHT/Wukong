@@ -89,8 +89,9 @@ fn print_explanation(code: &str) -> Result<(), String> {
     }
 }
 
-/// Parse CLI arguments. `Ok(None)` means a help/version message was printed and we should exit
-/// successfully without compiling.
+/// Parse CLI arguments. `Ok(None)` means a help / version / `--explain` message was already printed
+/// and we should exit successfully without compiling. The two rejected flag *combinations* are
+/// checked at the end, after the whole argv has been seen.
 fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut opts = Options::default();
     let mut input: Option<PathBuf> = None;

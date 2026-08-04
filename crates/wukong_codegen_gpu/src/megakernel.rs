@@ -8,17 +8,19 @@
 //! the SPMD threads never diverge and deadlock a `bar.sync`; single entry function; recognized ops
 //! only). [`crate::lower::emit_mega_ptx`] then lowers the entry SPMD: the alloca frame moves to one
 //! shared `.global` buffer the whole block sub-allocates, every store / side effect is `tid==0`-only,
-//! and each recognized op is `bar.sync`-bracketed and run *cooperatively* (a block-wide tree for
-//! reductions) or `tid==0`-serial. [`try_run`] launches it as a single block of [`MEGA_BLOCK`]
+//! and each recognized op is `bar.sync`-bracketed and run *cooperatively* — a block-wide tree for
+//! reductions, or chunked over disjoint per-thread sub-ranges of the serial helper for elementwise /
+//! GEMM / norm — with the remaining ops `tid==0`-serial. [`try_run`] launches it as a single block of [`MEGA_BLOCK`]
 //! threads and decodes the same print/exit context buffer the single-thread path uses — so the output
 //! is byte-identical, while the cooperative ops use the whole block instead of one lane.
 //!
 //! This is **additive and opt-in**: [`try_run`] returns `Ok(None)` for any program it can't accelerate
 //! (the caller falls back to the correct single-thread `--backend=gpu-native` path), and the existing
 //! offload `--backend=gpu` path and plain `cargo test` are untouched. The megakernel is the spine the
-//! op-graph fusion ([`crate::fusion`]) and the resident-chain comparison ([M13]) build on; cooperative
-//! bodies for the remaining recognized ops (GEMM, vmath, norm) and multi-block grid execution are the
-//! follow-on perf increments.
+//! op-graph fusion ([`crate::fusion`]) and the resident-chain comparison ([M13]) build on; GEMM, vmath
+//! and norm now have chunked-cooperative bodies (see `lower::lower_call_mega`), so what remains for
+//! later increments is cooperative bodies for the leftover ops (axpby, the bf16/f16 reductions) and
+//! multi-block grid execution.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

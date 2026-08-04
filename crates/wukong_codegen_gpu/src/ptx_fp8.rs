@@ -3,12 +3,19 @@
 //! requires loading the A/B fragments into registers in the exact per-lane layout the PTX ISA
 //! defines (no `wmma.load` to do it for us). This module pins that layout with a single 16×8 output
 //! tile (M=16, N=8, K=32 per `mma`) so it can be validated against a CPU reference with **asymmetric,
-//! e4m3-exact** data (all-ones would hide a layout bug); the full tiled GEMM builds on it once the
-//! core is proven. f32 accumulate (the mixed-precision contract).
+//! e4m3-exact** data (all-ones would hide a layout bug), and everything else in this file builds on
+//! that proven fragment layout: [`fp8_gemm_ptx`] (one 16×8 tile per warp), [`fp8_gemm_mt_ptx`]
+//! (fragment-reuse), and [`fp8_pipe_ptx`] (the `cp.async`-pipelined workhorse plus its fused
+//! bias/activation/residual and gated-FFN entries). f32 accumulate (the mixed-precision contract).
 
 /// OCP **E4M3** (1 sign, 4 exp bias 7, 3 mantissa; max normal 448, no Inf) round-to-nearest-even from
 /// `f32`, returning the 8 stored bits. Exact for the e4m3-representable values the validation uses;
-/// subnormals (|x| below 2⁻⁶) flush toward zero — fine here, the test data is normal.
+/// subnormals (|x| below 2⁻⁶) flush toward zero and `-0.0` returns `+0` (the `x == 0.0` early return)
+/// — fine here, the test data is normal. KNOWN GAP: the E5M2 twin
+/// [`crate::ptx_fp8_train::f32_to_e5m2`] encodes both, because it is gated byte-for-byte against Ada's
+/// `cvt.rn.satfinite.e5m2x2.f32`; this encoder has no such device gate, so if an E4M3 tile is ever
+/// quantized on-device (`quantize_scaled_e4m3`) and compared against a host-quantized one, these two
+/// cases will disagree.
 pub fn f32_to_e4m3(x: f32) -> u8 {
     if x == 0.0 {
         return 0;
@@ -148,9 +155,13 @@ fn fp8_veclist(prefix: &str, n: usize) -> String {
 /// SMEM pipeline, padded conflict-free fragment loads, and threadblock rasterization. Mirrors the
 /// fp16/bf16 `entry_mma_pipe` but for 1-byte e4m3 and the K=32 mma step. `C = A·Bᵀ`, A `[M,K]` / B `[N,K]`
 /// row-major, f32 accumulate. Per-warp tile `(bm/wm)×(bn/wn)` = `tm` m16-blocks × `tn` n8-blocks;
-/// requires `M%bm==0`, `N%bn==0`, `K%bk==0`, `bk%32==0`, `bk%16==0` chunking, `bm%(16·wm)==0`,
-/// `bn%(8·wn)==0`, and `bm·bk`,`bn·bk` multiples of `threads·16` (128-bit staging). Static SMEM
-/// `stages·(bm+bn)·(bk+pad)` ≤ 48 KiB.
+/// requires `M%bm==0`, `N%bn==0`, `K%bk==0`, `bk%32==0` with `bk/16` a power of two (shift-based
+/// staging address math), `pad%16==0`, `bm%(16·wm)==0`, `bn%(8·wn)==0`, a **power-of-two warp grid**
+/// (`warpRow`/`warpCol` are a shift and a mask), and `bm·bk`,`bn·bk` multiples of `threads·16`
+/// (128-bit staging). Static SMEM `stages·(bm+bn)·(bk+pad)` ≤ 48 KiB. Every one of the *tile-shape*
+/// conditions is asserted below, so an illegal tile config panics at generation instead of emitting a
+/// silently wrong kernel. The `M`/`N`/`K` divisibility is the CALLER's: they are runtime kernel params
+/// (`pM`/`pN`/`pK`), not generator arguments, so nothing here can check them — the launch wrapper must.
 fn fp8_pipe_entry(
     name: &str,
     bm: usize,
@@ -641,7 +652,10 @@ fn fp8_gate_entry(
     s
 }
 
-/// Pipelined fp8 GEMM module — entry `fp8_gemm_pipe` (see [`fp8_pipe_entry`] / `FP8_PIPE_*`).
+/// Pipelined fp8 GEMM module (see [`fp8_pipe_entry`] / `FP8_PIPE_*`). Twelve entries — the 128×128
+/// `fp8_gemm_pipe`, the small/mid-M `fp8_gemm_pipe_m64`, the fused `fp8_gemm_pipe_bias{,_relu,_silu,
+/// _gelu}` / `_bias_residual`, and the five `fp8_gemm_pipe_gate_*` dual-B gated-FFN tiles; the exact
+/// list and order is pinned by `tests::PIPE_ENTRIES`.
 pub fn fp8_pipe_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {

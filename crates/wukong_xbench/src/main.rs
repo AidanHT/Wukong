@@ -1,10 +1,19 @@
 //! `wukong-xbench` — an honest cross-language benchmark.
 //!
-//! For each kernel it builds the *same* computation three ways — Wukong (compiled to native code
-//! by the Cranelift backend), C (gcc `-O3 -march=native`), and Rust (rustc `-C opt-level=3 -C
-//! target-cpu=native`) — and times all three through one identical Rust loop over the same
-//! buffers. C/Rust are compiled to shared libraries and called via their C ABI; Wukong is
-//! JIT-compiled in process. It also reports each toolchain's compile time.
+//! For each kernel it builds the *same* computation several ways — Wukong (compiled to native code
+//! by the Cranelift backend), C (gcc `-O3 -march=native`), C++ (g++ at the same flags over the same
+//! numeric body, rendered from the C source by [`cpp_from_c`]), and Rust (rustc `-C opt-level=3 -C
+//! target-cpu=native`) — and times them all through one identical Rust loop over the same
+//! buffers. The peers are compiled to shared libraries at **runtime** and called via their C ABI
+//! (`CC` / `CXX` override the C / C++ compiler, default `gcc` / `g++`; the Rust peer is always
+//! `rustc` — there is no clang/llc on this box); Wukong is JIT-compiled in process, and its `.wk`
+//! sources are likewise generated and compiled at runtime. It also reports each toolchain's compile
+//! time. Further peer columns appear only where they apply: `C(fast)` (the same C source at
+//! `-ffast-math`, on the reduction-bearing rows), `C(omp)` (the same kernel under `#pragma omp
+//! parallel for`, on the `@parallel` rows), oneMKL (cblas + VML), the pure-Rust `matrixmultiply`
+//! sgemm, and — in the `model` section — PyTorch. A missing toolchain prints a note and shows
+//! `n/a`; it never fails the run. The first CLI argument, if given, is a substring filter over
+//! kernel/section names.
 //!
 //! Fairness notes:
 //!  * FMA: Wukong now contracts `x + y*z` to a fused multiply-add, so gcc is given its *default*
@@ -35,8 +44,9 @@ type I8KernelFn = unsafe extern "C" fn(*const u8, *const i8, *mut i32);
 
 const N: usize = 1 << 20; // 1,048,576 elements (4 MiB per f32 array)
 
-/// One row of the elementwise table: the same computation in three languages behind the shared
-/// `(x, y, out)` ABI. `x` and `out` are read-only input / write-only output for every row; the
+/// One row of the elementwise table: the same computation in three source languages behind the
+/// shared `(x, y, out)` ABI (the C++ column is rendered from `c` by [`cpp_from_c`], so it carries no
+/// field of its own). `x` and `out` are read-only input / write-only output for every row; the
 /// MIDDLE buffer `y` is an input for most rows but is used as a WRITABLE scratch array by
 /// `fused_linear_relu` (whose peers stream the fused intermediate through it), so `main` derives
 /// `yp` with `as_mut_ptr` rather than `as_ptr`.
@@ -227,7 +237,8 @@ fn report_relaxed_ratio(
 /// vectorize a float max-with-index reduction only under relaxed FP (the comparison must be
 /// reassociable), so withholding `-ffast-math` from the serial row alone would publish its
 /// un-normalized ratio while its parallel twin published a normalized one. Every name here must
-/// exist in [`kernels()`] — pinned by `reduction_rows_exist`.
+/// exist in [`kernels()`] — pinned by the `peer_selector_names_exist_in_the_catalogue` test (and the
+/// byte-identical-source rule by `identical_c_sources_get_identical_peer_columns`).
 fn is_reduction_kernel(name: &str) -> bool {
     matches!(
         name,
@@ -5666,7 +5677,9 @@ fn report(
     row("GB/s", &|x| {
         format!("{:.1}", k.bytes_per_call as f64 / x.ns_per_call)
     });
-    // Cross-check that all backends computed the same thing, element by element (within f32 tol).
+    // Cross-check the two gcc-family peers against Wukong element by element (within f32 tol). The
+    // Rust column is timed but NOT diffed here, and C(fast)/C(omp) were already loose-checked at the
+    // caller (`bench_c_fast` / `relaxed_peer_ok`), so this loop covers C and C++ only.
     for (lang, peer) in [("C", c), ("C++", cpp)] {
         if let (Some(m), Some(p)) = (m, peer) {
             let (rel, at) = max_rel_err(&m.out, &p.out);

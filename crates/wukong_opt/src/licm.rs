@@ -9,8 +9,9 @@
 //! We hoist only into a loop that already has a preheader — a single out-of-loop predecessor that
 //! reaches the header by an unconditional branch and dominates it — rather than synthesizing one,
 //! which keeps the transform simple and always legal. Only side-effect-free, non-trapping
-//! operations are moved (no loads, stores, calls, or integer division), so hoisting a computation
-//! onto a path that would not have executed it can never change observable behavior.
+//! operations are moved (see `safe_to_hoist`: no loads, stores, calls, vector kernels, allocas, or
+//! integer division/remainder), so hoisting a computation onto a path that would not have executed it
+//! can never change observable behavior.
 
 use crate::fxhash::{FxHashMap, FxHashSet};
 

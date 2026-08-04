@@ -1,6 +1,6 @@
 //! Device memory **pool** — bump-arena sub-allocation over one big device slab (milestone M7).
 //!
-//! Today every resident op draws its scratch from `stream.alloc_zeros::<T>(n)`, which in `cudarc`
+//! Unpooled, every resident op draws its scratch from `stream.alloc_zeros::<T>(n)`, which in `cudarc`
 //! 0.16 is a stream-ordered `cuMemAllocAsync` + a `cuMemsetD8Async` (see `CudaStream::alloc_zeros`),
 //! and frees it again on drop with `cuMemFreeAsync` (see `CudaSlice::drop`). At decode / small-batch
 //! sizes — where each kernel touches only a few KB and the layer is replayed thousands of times —

@@ -11,7 +11,8 @@
 //!
 //! (Unscaled — the caller multiplies by `1/rows` when averaging.) This is *exactly* softmax's
 //! stabilizing **row max + Σexp(x−m)** reduction followed by the normalize (multiply by `1/Z`), with a
-//! single scalar `− 1.0` fixup at the target column. So the writeback is byte-identical to softmax's
+//! single scalar `− 1.0` fixup at the target column. So on finite logits the writeback is byte-identical
+//! to softmax's
 //! (`norm::softmax_row_avx2`): the max pass uses the same fixed 8-lane accumulator + balanced
 //! horizontal combine, the Σexp pass reuses the *exact* shared `exp` polynomials — AVX2
 //! [`crate::vmath::exp8`] on the 8-lane body, the scalar [`crate::vmath::exp1`] on the tail and the
@@ -20,9 +21,17 @@
 //! 256-bit kernel wins for the same reason the softmax / cross-entropy-forward dispatch does.
 //!
 //! **Bit-exactness.** Because the per-element value is the standard softmax computed the standard way,
-//! `dx` (before the onehot fixup) is bit-identical to a dispatched `softmax`; the `− 1.0` at column `t`
-//! is a single exact scalar subtraction (a write-after-read at one index). The AVX2 path and the
-//! scalar twin agree **bit-for-bit** (pinned by a unit test across non-multiple-of-8 `cols`).
+//! `dx` (before the onehot fixup) is bit-identical to a dispatched `softmax` **on finite logits**; the
+//! `− 1.0` at column `t` is a single exact scalar subtraction (a write-after-read at one index). The
+//! AVX2 path and the scalar twin agree **bit-for-bit** (pinned by a unit test across non-multiple-of-8
+//! `cols`, and on NaN rows by test (g)).
+//!
+//! **NaN divergence from `norm.rs`.** Like [`crate::xent`], this module resolves the `MAXPS`-vs-`maxNum`
+//! hazard the *opposite* way from [`crate::norm`]: the scalar twin folds the row max with `f32::max`
+//! (drops a NaN) and `xent_bwd_row_avx2` blends its accumulator back over the unordered lanes so
+//! `_mm256_max_ps` cannot erase them. `norm::softmax_row_scalar` instead mirrors the raw NaN-absorbing
+//! `maxps` chain. Both files are internally twin-consistent but pick **different** row maxima on a row
+//! containing a NaN, so this kernel is *not* byte-identical to `NORM_SOFTMAX` on such a row.
 //!
 //! **Out-of-range labels.** `onehot(t)[i]` is `i == t`, so a `target[r]` outside `[0, C)` — negative
 //! (PyTorch's `ignore_index = -100` idiom) or `>= C` — matches no column and the row is the plain
@@ -48,9 +57,11 @@ fn hsum8(a: [f32; 8]) -> f32 {
     ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]))
 }
 
-/// Fixed-order horizontal max of 8 lane accumulators (balanced tree). On finite inputs this matches
-/// `_mm256_max_ps` lane-for-lane; the same `hmax8` softmax / `xent` use. The twin test pins the
-/// agreement on finite data.
+/// Fixed-order horizontal max of 8 lane accumulators (balanced tree), folded with `f32::max`
+/// (= `maxNum`, which drops a NaN) — the same expression `norm::hmax8` / `xent::hmax8` use, and called by
+/// both of this module's paths, so the two agree by construction on every input including NaN rows
+/// (pinned by test (g)). The *lane* accumulation feeding it is `f32::max` here too, unlike `norm.rs`'s
+/// `maxps` fold; see the module header.
 #[inline(always)]
 fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))

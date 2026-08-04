@@ -1,11 +1,16 @@
-//! `wukong_codegen_llvm` — the LLVM backend.
+//! `wukong_codegen_llvm` — the LLVM **IR emitter**. An inspection path, not the native fast path
+//! (that is `wukong_codegen_cranelift`, which also needs no LLVM): nothing here assembles, links, or
+//! runs anything, so it is never the differential oracle's peer.
 //!
 //! We emit **textual LLVM IR** rather than driving libLLVM in-process. This was a deliberate
 //! call: on this Windows + MinGW host, linking `llvm-sys`/inkwell is fragile (ABI matching, the
-//! missing dev libraries in the stock installer), whereas textual IR needs only the LLVM command
-//! line tools on PATH and no build-time dependency at all. The same MIR lowering would feed an
-//! inkwell builder; this implementation sits behind the shared [`Backend`] seam so it can be
-//! swapped later without touching the driver.
+//! missing dev libraries in the stock installer), whereas textual IR needs no build-time dependency
+//! at all — turning it into a binary would need `clang`/`llc` on PATH, an out-of-process step this
+//! crate never performs. The same MIR lowering would feed an inkwell builder.
+//!
+//! [`LlvmBackend`] declares the [`Backend`] seam, but it is not how the IR is reached: nothing in the
+//! workspace calls [`Backend::compile`], and `--emit=llvm-ir` has `wukong_driver` call
+//! [`emit_llvm_ir`] directly (no feature gate).
 //!
 //! Wukong MIR uses block-parameter SSA (à la Cranelift/MLIR); LLVM uses phi nodes. The emitter
 //! bridges the two: each non-entry block parameter becomes a `phi` whose incoming values are the

@@ -1,7 +1,10 @@
 //! Column reductions along the **outer** (batch / row) axis of a `[rows, cols]` row-major matrix,
-//! producing a per-column `[cols]` result: the **sum** `out[j] = Σ_i x[i,j]` (bias gradient
-//! `db = Σ_batch dY`, batch sum, reduce-along-axis-0), the **max** `out[j] = max_i x[i,j]`, and the
-//! **min** `out[j] = min_i x[i,j]` (per-channel statistics for quantization, axis-0 max/min pooling).
+//! producing a per-column `[cols]` result. Eight kinds ([`ColKind`]), one `wukong_col*_f32[_parallel]`
+//! entry pair each: the **sum** `out[j] = Σ_i x[i,j]` (bias gradient `db = Σ_batch dY`, batch sum,
+//! reduce-along-axis-0), **max** / **min** / **maxabs** (per-channel statistics for quantization,
+//! axis-0 max/min pooling), **sumsq**, and the three that add a scalar finalize over the folded column
+//! — **mean** (`/rows`), **l2** (`sqrt`), **rms** (`sqrt(_/rows)`), applied by [`colreduce_finalize`]
+//! per column and so independent of the parallel column split.
 //!
 //! The naive spelling `for j { for i { s ⊕= x[i*N+j] } }` reads `x` with stride `N` — a *strided
 //! reduction* gcc/rustc do **not** vectorize (verified: scalar `vaddss`/`vmaxss`, no packed

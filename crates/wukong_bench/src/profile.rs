@@ -52,8 +52,9 @@ const MAX_REPS: u32 = 3000;
 // compile-profile
 // ===================================================================================================
 
-/// The seven pipeline stages, in order. `Backend` is Cranelift codegen + object serialization
-/// together (see the module docs for why they are not split here).
+/// The six pipeline stages, in order. `Backend` is Cranelift codegen + object serialization as one
+/// stage; its internal split is measured separately via `emit_object_timed` and printed under the
+/// table rather than as two stage rows (see the module docs).
 #[derive(Clone, Copy)]
 enum Stage {
     Lex,

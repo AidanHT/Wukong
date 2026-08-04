@@ -174,6 +174,9 @@ impl Builder {
         });
     }
 
+    /// Freeze the builder into a [`Function`]. `params` is taken from the entry block's parameter
+    /// list, so a function built here always satisfies the verifier's `entry.params == f.params`
+    /// rule — a hand-assembled `Function` must maintain that itself.
     pub fn finish(self) -> Function {
         let params = self.blocks[self.entry.0 as usize].params.clone();
         Function {

@@ -8,7 +8,11 @@
 //! launches — `dW2 = dYᵀ·H`, `dH = dY·W2`, `dH_pre = dH ⊙ relu'(H_pre)`, `dW1 = dH_preᵀ·X` — and the
 //! update is the fused AdamW kernel. All intermediates live in device buffers the [`MlpTrainer`]
 //! keeps alive across the step, so nothing crosses the bus except the inputs (once) and the scalar
-//! loss (gate only). Gated: gradients vs an f64 closed-form backprop, and the loss strictly falls.
+//! loss (gate only). Gated: gradients vs an f64 closed-form backprop, and the loss falls over a run of
+//! AdamW steps — *not* monotonically (the gate counts up-blips and bounds them, since AdamW legitimately
+//! overshoots on a single step). The GEMMs run f32 by default or on the fp16 tensor cores
+//! (`Precision::F16Mixed`, f32 master weights), and the backward can either stash or
+//! `MlpTrainer::recompute_activations` the hidden activations (gradient checkpointing).
 
 use crate::gpu::Gpu;
 use crate::ptx_autodiff_bwd::{

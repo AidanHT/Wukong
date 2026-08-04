@@ -5,8 +5,15 @@
 //!   1. interp == native on (exit code, stdout), and
 //!   2. -O0 == -O2 == -O3 on (exit code, stdout),
 //!
+//! plus, per compile, that every function passes `wukong_mir::verify` after the pass pipeline (a
+//! verify failure is reported like a compile failure). The five executions compared are interp at
+//! -O0/-O2/-O3 and native at -O0/-O3.
+//!
 //! Sixteen manual "gap-hunt sweeps" found real miscompiles by hand-writing probe programs in
-//! exactly this space (scalar arithmetic, casts, control flow, arrays, calls, if-values). This
+//! exactly this space (scalar arithmetic, casts, control flow, arrays, calls, if-values); the
+//! generator has since grown past it — every program also carries a by-reference `mut` aggregate
+//! param (`h0`) and an aggregate return by value (`h1`, the sret path), and the body may draw struct,
+//! nested-aggregate and enum-`match` locals. This
 //! automates that: a deterministic SplitMix64-seeded generator (a failure reproduces exactly —
 //! the panic prints the seed and full source) emits programs that sema must ACCEPT — the
 //! generator respects every deliberate rejection (same-type comparisons only, no chained

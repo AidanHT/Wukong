@@ -41,7 +41,12 @@ impl Interner {
         sym
     }
 
-    /// Resolve a symbol back to its string. Panics on a symbol from a different interner.
+    /// Resolve a symbol back to its string.
+    ///
+    /// A `Symbol` is only meaningful inside the interner that minted it: this indexes `strings`
+    /// directly, so a foreign symbol panics if its index is out of range and — worse — silently
+    /// resolves to the *wrong* string if it happens to be in range. There is one interner per
+    /// compilation; never persist or cross-compare a `Symbol` value.
     pub fn resolve(&self, sym: Symbol) -> &str {
         &self.strings[sym.0 as usize]
     }

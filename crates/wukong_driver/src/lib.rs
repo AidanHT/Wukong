@@ -1,8 +1,14 @@
 //! `wukong_driver` — orchestrates the compilation pipeline.
 //!
-//! The driver owns the [`SourceMap`] and the [`DiagnosticSink`], runs each stage in order, and
-//! honors the requested `--emit` target. Stages are wired in as they come online; today the
-//! lexer is connected and `--emit=tokens` works end to end.
+//! The driver owns the [`SourceMap`], the [`Interner`] and the [`DiagnosticSink`], runs each stage in
+//! order, and honors the requested `--emit` target. [`compile`] wires the whole pipeline: lex
+//! (`--emit=tokens`) → parse (`--emit=ast`) → import loading (the `loader` module) → sema → MIR
+//! construction (`--emit=mir-high`) → optimization → the autodiff surface (`--train`,
+//! `--emit=grad`) → `--run` on the selected backend → `--emit=mir` → the verify gate → the
+//! LLVM-IR / object / exe emitters.
+//!
+//! Flag *combinations* are not validated here: that is `wukongc`'s `parse_args`, the layer that knows
+//! whether a flag was given explicitly. This crate owns the option *types* and the stage dispatch.
 
 use std::path::{Path, PathBuf};
 
@@ -103,7 +109,9 @@ pub struct GradOptions {
     /// The function to differentiate (`--grad-of=<name>`). Defaults to `loss` when unset.
     pub of: Option<String>,
     /// Parameter indices to differentiate w.r.t. (`--grad-wrt=0,1`). Empty means *every* pointer
-    /// (buffer) parameter — the gradient of an unread/output buffer is simply zero, so this is safe.
+    /// (buffer) parameter — the gradient of an unread/output buffer is simply zero, so this is safe —
+    /// except under `--train`, where the default excludes the **last** parameter (the scalar loss
+    /// output) because `train_loop` rejects it as a trainable weight (see `grad_wrt`).
     pub wrt: Vec<usize>,
     /// Run a fwd→bwd→optimizer training loop instead of just emitting the backward (`--train`).
     pub train: bool,
@@ -438,9 +446,12 @@ fn run_on_gpu_lower(
         .into())
 }
 
-/// The C runtime linked into native executables: it backs the `print`/`assert` intrinsics that the
-/// Cranelift object leaves as undefined imports. The JIT path binds the same symbols to Rust
-/// functions instead, so the two stay in lockstep.
+/// The C runtime linked into native executables by the **`cc` fallback** path: it backs the
+/// `print`/`assert`/`fmod` and heap intrinsics that the Cranelift object leaves as undefined imports.
+/// The JIT path binds those same symbols to Rust functions instead. It is deliberately *not* a full
+/// mirror — there is no `wukong_rt_print_str` here and `printf("%g")` is under-precise for floats —
+/// which is why this path is for scalar, no-string programs only; [`WUKONG_RT_SHIM`] on the preferred
+/// [`rustc_link`] path is the one whose output is byte-identical to the interpreter oracle.
 const WUKONG_RT_C: &str = "#include <stdio.h>\n\
 #include <stdlib.h>\n\
 #include <math.h>\n\
@@ -501,8 +512,15 @@ fn scratch_path(scratch: Option<&ScratchDir>, name: String) -> PathBuf {
     }
 }
 
-/// Emit a native object via Cranelift (no LLVM) and, for `--emit=exe`, link it with a small C
-/// runtime using the system C compiler. `CC` overrides the compiler (default `cc`).
+/// Emit a native object via Cranelift (no LLVM) and, for `--emit=exe`, link it into an executable.
+///
+/// The link is attempted in one order: [`rustc_link`] first (rustc as the *link driver*, which pulls
+/// in the `wukong_runtime` rlib plus the generated [`WUKONG_RT_SHIM`]), and only on
+/// [`LinkOutcome::Unavailable`] (no rustc on PATH, or no rlib next to `current_exe()`) the `$CC` /
+/// `cc` fallback with the generated C runtime shim [`WUKONG_RT_C`]. A [`LinkOutcome::Failed`] — rustc
+/// ran and the link itself failed — is a real error and exits [`exit::COMPILE_ERROR`] without falling
+/// back. If the `cc` fallback cannot even be spawned, the object file has already been written, so the
+/// driver says where it is and exits [`exit::UNIMPLEMENTED`] (2).
 fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
     use std::process::Command;
 
@@ -745,8 +763,9 @@ fn rustc_link(
 ///
 /// The loss function must already be single-block SSA (the caller forces `-O1`); its buffer
 /// parameters lower to `Ptr` and the scalar loss is `ret`-ed. Any recognized kernel calls in it
-/// (`wukong_sgemm_nt`, `wukong_vmath_f32`, `wukong_sreduce_f32[_parallel]`, `wukong_norm_f32`,
-/// `wukong_velem_f32`) get their **tuned-kernel** backward — so the emitted gradient rides the same
+/// (`wukong_sgemm_nt`, `wukong_vmath_f32`, `wukong_sreduce_f32`, `wukong_norm_f32`,
+/// `wukong_velem_f32` — each recognized in its serial *and* its `_parallel` spelling) get their
+/// **tuned-kernel** backward — so the emitted gradient rides the same
 /// kernels as the forward. A differentiable value with no VJP rule is a hard error, never a
 /// silently-zero gradient (see `wukong_autodiff`).
 fn emit_grad(program: &wukong_mir::Program, interner: &mut Interner, opts: &Options) -> i32 {

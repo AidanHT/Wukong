@@ -5,10 +5,10 @@
 //! quantity: the wall-clock time to compile an *equivalent* tensor kernel to a native object file,
 //! measured **same-run** and back-to-back so the laptop's clock state cancels out of the ratio.
 //!
-//!   wukongc:  <wukongc> --emit=obj -O2 k.wk
-//!   gcc:       gcc -O2 -c k.c
-//!   g++:       g++ -O2 -c k.cpp
-//!   rustc:     rustc -O --crate-type=lib --emit=obj k.rs
+//!   wukongc:  <wukongc> --emit=obj -O2 k.wk -o out.o
+//!   gcc:       gcc -O2 -c k.c -o out.o
+//!   g++:       g++ -O2 -c k.cpp -o out.o
+//!   rustc:     rustc -O --crate-type=lib --emit=obj -A warnings k.rs -o out.o
 //!
 //! Each is compile-only (no link), producing an object from the same computation, so the numbers
 //! reflect the compilers' own work — front-end + optimizer + native codegen + process startup. That
@@ -18,8 +18,10 @@
 //!
 //! Fairness: the C/C++ kernels are **bare translation units** — a `void`-returning exported
 //! function whose result escapes through an out-parameter, with **no `#include` and no `main`** —
-//! matching the .rs kernels (a bare `#[no_mangle]` fn), so all four languages compile a comparable
-//! pure kernel to an object. (Earlier versions gave C/C++ a `#include <stdio.h>` + `main`/`printf`
+//! matching the .rs kernels (a bare `#[no_mangle]` fn), so the three peers compile a comparable pure
+//! kernel to an object. The `.wk` arm is *not* bare — it is a full program with `main` and a `print`
+//! — which is the one asymmetry left, and it is printed under the table with the ratios rather than
+//! only recorded here. (Earlier versions gave C/C++ a `#include <stdio.h>` + `main`/`printf`
 //! harness, charging them a header-parse cost the .rs kernels never paid — flagged and fixed by the
 //! benchmark-fairness audit.) rustc keeps `-O` (= opt-level 2) because gcc/g++ compile at `-O2`:
 //! level 2 across the board is the symmetric choice for a *compile-time* measurement.

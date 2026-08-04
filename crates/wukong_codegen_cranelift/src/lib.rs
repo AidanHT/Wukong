@@ -1,14 +1,20 @@
 //! `wukong_codegen_cranelift` — native code generation via Cranelift (no LLVM toolchain required).
 //!
-//! Lowers fully-lowered (Low) scalar MIR to Cranelift IR and either JIT-compiles and runs it in
+//! Lowers fully-lowered (Low) MIR to Cranelift IR and either JIT-compiles and runs it in
 //! process (`jit_run`, the fast execution path and a differential oracle alongside the interpreter)
-//! or emits a native object file (`emit_object`, linked into an executable by the driver).
+//! or emits a native object file (`emit_object`). Linking an object into an executable is **not**
+//! done here — that is `wukong_driver::emit_native`.
 //!
 //! The MIR maps onto Cranelift almost one-to-one: it is already block-parameter SSA (exactly
 //! Cranelift's model), integers are signless with signedness on the op, and memory is explicit
-//! `alloca`/`load`/`store`/`gep`. The only semantic gaps we bridge to stay bit-identical to the
-//! interpreter oracle are: divide-by-zero yields 0 (no trap), float→int casts saturate, and `i1`
-//! results are normalised to their low bit.
+//! `alloca`/`load`/`store`/`gep`. It is mostly scalar but not exclusively: `mir_build`'s vectorizer
+//! leaves `MirType::Vec` values (CLIF-legal only up to 128 bits) and `Op::VecKernelCall`s whose
+//! 256-bit bodies this crate assembles as raw machine code itself (see the `avx2` module).
+//!
+//! The semantic gaps we bridge to stay bit-identical to the interpreter oracle: divide-by-zero yields
+//! 0 (no trap), float→int casts saturate, `i1` results are normalised to their low bit, float `%`
+//! calls an `rt_fmod_*` shim (Cranelift has no `frem`), and f16/bf16 are rounded at the value —
+//! inline for bf16, through the runtime's `half`-crate shims for f16.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,8 +107,9 @@ extern "C" fn rt_fmod_f32(a: f32, b: f32) -> f32 {
     a % b
 }
 
-/// Names of the runtime symbols, shared by the JIT (which binds them to the `rt_*` functions) and
-/// the object emitter (which leaves them as undefined imports resolved at link time).
+/// Names of the runtime symbols, shared by the JIT (which binds each to its in-process
+/// implementation — one of the `rt_*` shims above, or the matching `wukong_runtime` kernel) and the
+/// object emitter (which leaves them as undefined imports resolved at link time).
 const RT_PRINT_I64: &str = "wukong_rt_print_i64";
 const RT_PRINT_U64: &str = "wukong_rt_print_u64";
 const RT_PRINT_F64: &str = "wukong_rt_print_f64";
@@ -393,7 +400,9 @@ fn float_cc(op: CmpOp) -> FloatCC {
 }
 
 fn align_shift(bytes: u32) -> u8 {
-    // Align stack slots to their (rounded-up power-of-two) size, capped at 16 bytes.
+    // Align stack slots to their (rounded-up power-of-two) size, capped at 16 bytes. This is the
+    // slot BASE only — an interior address such as `base + 4` is not 16-byte aligned, which is why
+    // [`mem_flags`] must never set Cranelift's `aligned` bit.
     let mut a = 1u32;
     let mut shift = 0u8;
     while a < bytes && a < 16 {
@@ -725,7 +734,8 @@ impl<'a> FnTranslator<'a> {
             // A synthesized 256-bit AVX2 vector kernel. The kernel is installed as raw machine code
             // (see `avx2::assemble_kernel` + `define_function_bytes`) under the module's default call
             // conv (Win64 here: ptrs->RCX, scalars->RDX, n->R8), so a plain Cranelift `call` reaches
-            // it. It writes through the stream pointers and returns nothing.
+            // it. It writes through the stream pointers; an elementwise kernel returns nothing, a
+            // reduction kernel returns its horizontal fold in XMM0 (see the `res` match below).
             Op::VecKernelCall {
                 kernel,
                 ptrs,
@@ -3688,9 +3698,11 @@ fn build_function_clif(
                 layout_err: None,
             };
             t.translate();
-            // A type whose byte layout overflows `u32` is recorded as a clean error during lowering
-            // rather than panicking; abort now, before this half-built function is finalized/defined
-            // (the `?` at each `populate_module` call site surfaces it as `error: <msg>`, exit 1).
+            // `layout_err` carries every unrecoverable lowering failure — a type whose byte layout
+            // overflows `u32`, and a runtime kernel that reached `lower_call` with an arity no
+            // dispatch arm accepts — recorded during lowering rather than panicking. Abort now,
+            // before this half-built function is finalized/defined (the `?` at each
+            // `populate_module` call site surfaces it as `error: <msg>`, exit 1).
             if let Some(e) = t.layout_err.take() {
                 return Err(e);
             }
@@ -3998,7 +4010,9 @@ fn run_on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
-/// JIT-compile `program`, returning a callable handle to `entry`.
+/// JIT-compile `program`, returning a callable handle to `entry`. `entry` must name a function that
+/// takes **no parameters** — a parameterized entry is an `Err`, not a wrong call. Unlike
+/// `emit_object`, the JIT paths always populate the module serially (no `WUKONG_PAR_CODEGEN` effect).
 pub fn jit_compile(
     program: &Program,
     entry: Symbol,
@@ -5142,8 +5156,12 @@ pub struct ObjTimings {
     pub object_write: std::time::Duration,
 }
 
-/// Compile `program` to a native object file (bytes) for the host target. The runtime symbols are
-/// left as undefined imports for the linker to resolve against a small C runtime.
+/// Compile `program` to a native object file (bytes) for the host target. The runtime symbols (the
+/// `wukong_rt_*` shims and every recognized `wukong_*` kernel) are left as undefined imports; this
+/// crate never links. Resolving them belongs to `wukong_driver::emit_native`, which prefers a
+/// **rustc-driven** link (rustc pulls in the `wukong_runtime` rlib, so kernel symbols and the
+/// read-only string relocations both resolve) and only falls back to `$CC`/`cc` plus a generated C
+/// runtime shim when rustc or that rlib is unavailable.
 pub fn emit_object(program: &Program, interner: &Interner) -> Result<Vec<u8>, String> {
     emit_object_ex(program, interner, EmitOptions::production()).map(|(bytes, _)| bytes)
 }

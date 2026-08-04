@@ -4,7 +4,9 @@
 //! compiler. A [`Span`] is a half-open byte range within a [`SourceId`]; the [`SourceMap`]
 //! owns the actual text and translates byte offsets into human-readable line/column
 //! [`Location`]s. The [`Interner`] turns repeated identifier strings into cheap copyable
-//! [`Symbol`]s.
+//! [`Symbol`]s. The crate also carries the workspace's zero-dep [`FxHasher`] and re-exports
+//! [`FxHashMap`]/[`FxHashSet`] — see the [`fxhash`] module for the determinism rule a fixed-seed
+//! hasher imposes on any caller.
 
 pub mod fxhash;
 mod intern;
@@ -41,6 +43,11 @@ impl Span {
     }
 
     /// A placeholder span for compiler-synthesized nodes that have no backing source text.
+    ///
+    /// Its `source` is `SourceId(u32::MAX)`, which is *not* a file in any [`SourceMap`]: always
+    /// [`is_dummy`](Span::is_dummy)-guard before handing `span.source` to the map, or the lookup
+    /// indexes out of bounds and panics. Both `wukong_diag` renderers drop dummy labels for this
+    /// reason.
     pub const fn dummy() -> Self {
         Span {
             source: SourceId(u32::MAX),

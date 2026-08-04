@@ -418,8 +418,9 @@ unsafe fn gemm_2rows_nt_vnni(
 }
 
 /// Quantized `nn.Linear` `C = A·Bᵀ` (serial): `A` is `[m,k]` `u8` row-major, `B` is `[n,k]` `i8`
-/// row-major (so `B`'s rows are the weight vectors), `C` is `[m,n]` `i32` row-major. Detects AVX2
-/// **once** (not per element) and runs the register-blocked AVX2 nest, else the scalar nest.
+/// row-major (so `B`'s rows are the weight vectors), `C` is `[m,n]` `i32` row-major. Detects the SIMD
+/// tier **once** per call (not per element) — AVX-VNNI (2×4 register tile) → widen+`vpmaddwd` AVX2
+/// (1×4) → scalar nest — and all three are bit-identical (wrapping `i32` is order-immaterial).
 ///
 /// # Safety
 /// `a` valid for `m*k` `u8`, `b` for `n*k` `i8`, `c` for `m*n` `i32`.

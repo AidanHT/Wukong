@@ -97,8 +97,9 @@ pub enum PatKind {
     Or(Vec<Pattern>),
     /// A path pattern — an enum variant such as `Color::Red`, matched by its integer discriminant.
     Path(Path),
-    /// A range pattern `lo..hi` (half-open) or `lo..=hi` (inclusive). The bounds are integer-literal
-    /// patterns (`PatKind::Int`); the scrutinee matches when it falls within the range.
+    /// A range pattern `lo..hi` (half-open) or `lo..=hi` (inclusive). The bounds are literal
+    /// patterns — `PatKind::Int` or `PatKind::Char`, the two forms the parser accepts as a range's
+    /// lower bound; the scrutinee matches when it falls within the range.
     Range {
         lo: Box<Pattern>,
         hi: Box<Pattern>,

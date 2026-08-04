@@ -29,9 +29,13 @@
 //!
 //! Every rule is gated by **finite differences** (see the test module): perturb each input element
 //! by +-eps, evaluate the loss, and assert the central difference `(L(x+eps) - L(x-eps)) / 2eps`
-//! matches the analytic gradient the transform emits, over the full gradient buffer. The reference
-//! forward pass runs in `f64` (via `wukong_interp::run_kernel_f64`) so eps-noise stays far below
-//! the tolerance. A wrong gradient is a miscompile — it must be fixed before any throughput counts.
+//! matches the analytic gradient the transform emits, over the full gradient buffer. For the scalar
+//! rules the reference forward pass runs in `f64` (via `wukong_interp::run_kernel_f64`) so eps-noise
+//! stays far below the tolerance. The buffer-tape rules (`tape.rs`) can only run in `f32` — the
+//! runtime kernels they call are f32-only — so there the loose f32 finite difference is the sanity
+//! check and a tight **f64 closed form** is the real gate wherever one exists (the smooth activations
+//! whose kernel evaluates an f32 polynomial have none, and are FD-gated only).
+//! A wrong gradient is a miscompile — it must be fixed before any throughput counts.
 
 use wukong_mir::{BasicBlock, BinOp, Function, Inst, MirType, Op, Terminator, ValueId};
 use wukong_span::{Interner, Symbol};
@@ -88,10 +92,13 @@ pub fn grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<F
     Ok(vjp.finish())
 }
 
-/// The worker that builds one gradient function. It threads three maps:
+/// The worker that builds one gradient function. Its three core maps are:
 /// - `fwd_to_new`: a forward (old) value -> its replayed value in the new function;
 /// - `adj`: a forward value -> the new value holding its *currently accumulated* adjoint;
 /// - `grad_buf`: a forward `wrt` parameter -> the new gradient-output parameter it routes to.
+///
+/// The buffer tape adds `buf_adj` / `buf_count` / `contributed` (see `tape.rs`), and `def_op` indexes
+/// the forward block so pointer provenance and constant operands can be traced.
 struct Vjp<'a> {
     fwd: &'a Function,
     b: wukong_mir::Builder,

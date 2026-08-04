@@ -1,10 +1,16 @@
-//! `wukong_diag` — compiler diagnostics and a rustc-style terminal renderer.
+//! `wukong_diag` — compiler diagnostics, the stable error-code catalogue, and two renderers.
 //!
 //! A [`Diagnostic`] carries a severity, an optional stable error code, a headline message,
 //! any number of source [`Label`]s, and trailing note/help lines. Producers (lexer, parser,
-//! sema, the MIR verifier) build diagnostics with the fluent API and push them into a
-//! [`DiagnosticSink`]; the [`Renderer`] turns them into the familiar `error[E0501]: ...`
-//! terminal output.
+//! sema, MIR lowering, and the driver's import loader) build diagnostics with the fluent API
+//! and push them into a [`DiagnosticSink`]; only `wukong_driver` renders, picking between the
+//! [`Renderer`] — the familiar `error[E0501]: ...` terminal output — and [`to_json`], one JSON
+//! object per line. [`explain`] backs `wukongc --explain <CODE>` from the `catalog.rs` table.
+//!
+//! The MIR verifier is *not* a producer: `wukong_mir` does not depend on this crate and reports
+//! malformed IR as plain strings, which `wukong_driver::verify_or_ice` prints as
+//! `internal compiler error (MIR verify): …` before stopping the pipeline. Nothing outside this
+//! crate constructs [`Severity::Bug`] either.
 
 mod catalog;
 mod json;

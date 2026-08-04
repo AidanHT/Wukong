@@ -1,21 +1,30 @@
 //! 2D **convolution** on the GPU (the op category attention/GEMM don't cover). Single batch:
-//! input `X[C,H,W]`, weights `W[K,C,R,S]`, output `O[K,P,Q]` with `P=H-R+1`, `Q=W-S+1` (stride 1,
-//! no padding) -- the valid cross-correlation deep-learning frameworks call conv2d.
+//! input `X[C,H,W]`, weights `W[K,C,R,S]`, output `O[K,P,Q]` -- the valid cross-correlation
+//! deep-learning frameworks call conv2d. The f32 kernels are stride-1 / no-padding
+//! (`P=H-R+1`, `Q=W-S+1`); the fp16 tensor-core family below also covers the general affine case
+//! (`stride`, `pad`: `P=(H+2·pad-R)/stride+1`).
 //!
 //! Wukong knows `C,H,W,K,R,S` at *compile* time (shapes live in the type system), so this is a
-//! **generator**, not a fixed kernel: [`conv2d_ptx`] emits a kernel **specialized to the exact shape**
-//! -- the `r,s` window fully unrolled, every extent a baked-in literal, no dynamic bounds, no tail
-//! logic. The lever no shape-agnostic library has.
+//! **generator**, not a fixed kernel: every function here emits a kernel **specialized to the exact
+//! shape** -- the `r,s` window fully unrolled, every extent a baked-in literal, no dynamic bounds, no
+//! tail logic. The lever no shape-agnostic library has.
 //!
-//! ## Kernels (best-effort fastest first; the launcher in `gpu.rs` picks)
+//! ## Kernels (the launcher in `gpu.rs` picks; `*_applies` gates each fast path)
 //! * [`CONV2D`] -- the original **naive** one-thread-per-output kernel (looping `c,r,s` from global),
 //!   kept as the honest worst-case reference and the fallback for shapes the tiled path rejects.
-//! * [`conv2d_ptx`] -- **SMEM-tiled, static-shape-specialized direct conv.** One CTA computes a
-//!   `TILE_P x TILE_Q` output tile for one output channel `k` (grid `= (ceil(Q/TQ), ceil(P/TP), K)`).
-//!   Per input channel `c` the CTA cooperatively stages the input **halo** `(TP+R-1) x (TQ+S-1)` and
-//!   the `R*S` weights into shared memory **once**, then every thread reuses them across the whole
-//!   tile -- killing the naive kernel's dominant cost (each input pixel re-read from global `R*S`
-//!   times). The `r,s` reduction is fully unrolled into an `fma.rn.f32` chain over `c`.
+//! * [`conv2d_ptx`] -- **SMEM-tiled, static-shape-specialized direct f32 conv.** One CTA computes a
+//!   `TILE_P x TILE_Q` output tile for [`kblock`]`(K)` output channels at once (grid
+//!   `= (ceil(Q/TQ), ceil(P/TP), K/KB)`, `KB` f32 accumulators per thread). Per input channel `c` the
+//!   CTA cooperatively stages the input **halo** `(TP+R-1) x (TQ+S-1)` and the `KB*R*S` weights into
+//!   shared memory **once**, then every thread reuses them across the whole tile -- killing the naive
+//!   kernel's dominant cost (each input pixel re-read from global `R*S` times). The `r,s` reduction is
+//!   fully unrolled into an `fma.rn.f32` chain over `c`.
+//! * The fp16 tensor-core **implicit-GEMM** family (the cuDNN-class path, see the section comment
+//!   further down): [`conv_wmma_ptx`] and its split-K ([`conv_wmma_splitk_ptx`] +
+//!   [`conv_splitk_reduce_ptx`]), fused bias/activation ([`conv_wmma_epi_ptx`]), strided
+//!   ([`conv_wmma_strided_ptx`]), padded ([`conv_wmma_pad_ptx`], [`conv_wmma_pad_splitk_ptx`]) and
+//!   *register*-double-buffered ([`conv_wmma_db_ptx`]) variants, plus the standalone
+//!   [`pad_nchw_copy_ptx`] scatter and the unfused [`bias_relu_ptx`] baseline.
 
 /// Output-tile height a tiled-conv CTA computes (threads in `y`).
 pub const TILE_P: usize = 16;

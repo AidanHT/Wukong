@@ -5,9 +5,19 @@
 //! `mem2reg` pass promotes the slots to SSA registers. Control flow is lowered directly to a CFG
 //! of basic blocks with `br`/`cond_br`.
 //!
-//! The lowerer covers the scalar + pointer + control-flow + direct-call core end to end. Tensor,
-//! SIMD-method, and parallel-loop constructs are not yet lowered; encountering one records a
-//! diagnostic and substitutes a placeholder so the rest of the function still lowers.
+//! Beyond that core the crate also owns type-generic monomorphization, `@parallel` outlining (both
+//! the whole-function form and mid-function loop regions), and **every kernel recognizer** — the
+//! loop nests rewritten into a call to a `wukong_runtime` kernel. Scalars, pointers, aggregates,
+//! slices, tensors, `@parallel` loops and control flow all lower end to end; what
+//! `FnLowerer::unsupported` still rejects is a small, explicit residue — `defer`; an array literal
+//! / `[v; n]` repeat used as a general value expression rather than an initializer; `sizeof` or
+//! `alignof` in *any* position (neither is lowered at all); a path naming neither a local nor a
+//! top-level `const`; a `for` over an iterand that is neither a range nor a statically-sized array;
+//! a call to a symbolic-generic tensor function whose dims cannot be inferred; and a few pattern /
+//! assignment-target forms. Each of those is a hard `C0001` error: a placeholder value is still
+//! substituted so the rest of the function keeps lowering, but the diagnostic is an *error*, so the
+//! driver stops before any backend — the front end accepts the construct, only lowering to runnable
+//! code refuses, so this crate never hands a backend knowingly-broken MIR.
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -677,7 +687,19 @@ fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
     }
 }
 
-/// Lower a whole module to a MIR [`Program`]. Only functions with bodies are lowered.
+/// Lower a whole module to a MIR [`Program`]. Only functions with bodies are lowered, and a
+/// type-generic template is skipped in favour of its monomorphized instances.
+///
+/// `Program::funcs` comes out in three appended runs: the module's own functions in source order
+/// (a whole-function recognizer or the `@parallel` outliner may replace one with a differently
+/// named pair), then one specialized copy per collected monomorphization instance in discovery
+/// order, then every outlined mid-function `@parallel` region body. All three orders are
+/// deterministic; backends resolve functions by name, so the order itself carries no meaning.
+///
+/// Needs `&mut Interner` because it interns the ~160 runtime kernel symbols (`GemmSyms`), the
+/// monomorphized instance names (`id$f32`), the `.rodata` string-literal blobs, and the
+/// `PAR_REGION_MAX`-entry pool of outlined-region symbols — the per-function lowerer holds only a
+/// shared `&Interner` and cannot mint names itself.
 pub fn lower_program(
     module: &Module,
     sema: &SemaResult,
@@ -1243,7 +1265,8 @@ fn has_parallel_attr(item: &ast::Item, interner: &Interner) -> bool {
 /// Does this `@parallel` loop body contain control flow that only makes sense under SERIAL
 /// iteration? The outliner runs the body over one CHUNK of `[0, hi)` per worker, so a `return` or a
 /// `break` out of the parallelized loop ends that chunk alone — every other chunk still runs to
-/// completion, and the answer becomes a function of the pool's chunking. `depth` counts the loops
+/// completion, and the answer becomes a function of the pool's chunking. A `defer` is rejected on the
+/// same grounds (it would run once per chunk, not once). `depth` counts the loops
 /// nested inside the body, so a `break`/`continue` at depth 0 targets the parallelized loop itself;
 /// one inside an inner loop is that loop's own control flow and stays legal. Any *labelled* form
 /// declines outright: the outliner drops the loop's label, so a labelled break finds no matching loop
@@ -1363,6 +1386,14 @@ fn escapes_parallel_chunk_expr(e: &Expr, depth: u32) -> bool {
 /// Recognize a parallelizable function: its entire body is a single `for idx in 0..hi { … }` over
 /// pointer (array) parameters. Returns the index name, the upper-bound expression, and the loop
 /// body. Anything else falls back to ordinary sequential lowering.
+///
+/// The declines are load-bearing, not stylistic — every one of them is a shape the
+/// `wukong_parallel_for` chunking contract cannot express: an empty parameter list or any parameter
+/// whose `mir_ty` is not `MirType::Array` (which excludes a `[]T` slice — free `mir_ty` maps a slice
+/// to `Ptr` — so the outlined body never has to carry a `slice_slots` record); a body that is not
+/// exactly one `for` statement; a *labelled* loop; a `..=` or `step` range; a start other than
+/// literal `0` (the runtime iterates `[0, hi)`); a non-`Ident` index pattern; and any body that
+/// escapes its chunk (see [`escapes_parallel_chunk_block`]).
 fn parallel_spec<'a>(
     f: &'a FnDecl,
     body: &'a Block,
@@ -2457,10 +2488,17 @@ struct FnLowerer<'a> {
     /// labeled `break`/`continue` `'l` searches this stack for the matching label; an unlabeled one
     /// targets the innermost (the top).
     loops: Vec<(Option<Symbol>, wukong_mir::BlockId, wukong_mir::BlockId)>,
-    /// Pre-interned runtime symbols the matmul recognizer lowers a GEMM nest to.
+    /// Every pre-interned `wukong_runtime` symbol any recognizer can lower to — not just the GEMM
+    /// family. Interned once at the top of [`lower_program`] and copied down, because `FnLowerer`
+    /// holds only a shared `&Interner` and cannot mint a name itself.
     gemm: GemmSyms,
-    /// True while lowering the body of a `@parallel` function: a recognized reduction loop dispatches
-    /// to the multicore `wukong_sreduce_f32_parallel` instead of the sequential vectorizer.
+    /// True while lowering the body of a `@parallel` function: wherever a recognizer has a `_parallel`
+    /// twin (GEMM, int8/lowp GEMM, gemv/gevm, transpose, pool2d, the column and row families, the fused
+    /// norms and their backwards, the losses, RoPE, the scans, embedding/scatter, the fused
+    /// epilogues, the reductions, vmath/velem/dequant/bias-bcast) that twin is dispatched instead of
+    /// the serial kernel or the sequential vectorizer. Every such twin is bit-equal to its serial
+    /// form, which is what keeps the interpreter (always serial) an exact oracle. False inside an
+    /// outlined `@parallel` body — the region already supplies the threading.
     parallel_fn: bool,
     /// Within one vectorized loop-body copy, the vector already loaded for an index expression
     /// (keyed by its canonical text), so `x[i]` read twice (e.g. relu's `if x[i]>0 {x[i]}`) loads
@@ -2527,8 +2565,11 @@ impl FnLowerer<'_> {
     /// Bind a name whose sema type is `[]T` — a slice. Identical to [`Self::bind`] plus a record
     /// that `slot` holds a fat pointer, which is the only way `kernel_base_ptr` can tell a slice
     /// apart from the `[i8; 16]`/tuple/struct locals that share its `Array(I8, 16)` MIR slot shape.
-    /// A binding site that forgets to use this keeps the pre-existing (fat-pointer-as-data)
-    /// behaviour rather than corrupting an unrelated operand, so the record is fail-safe.
+    /// A binding site that calls [`Self::bind`] instead does *not* fail safe: it hands any kernel
+    /// dispatched over that name the 16-byte fat-pointer buffer as the data base, and the program
+    /// silently prints zeros on both backends at every `-O` level. Every binding path that can bind a
+    /// `Ty::Slice` must route through here (params, `let`, tuple/match/variant bindings, the for-each
+    /// element, the `@parallel` region env).
     fn bind_slice(&mut self, name: Symbol, slot: ValueId, ty: MirType, is_slice: bool) {
         self.bind(name, slot, ty);
         if is_slice {
@@ -7648,13 +7689,12 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Emit a call to the GEMM microkernel for a recognized nest. Returns `false` (and emits
-    /// nothing) if any operand array is not a pointer in scope, so the caller lowers it normally.
-    /// The base pointer of a kernel operand `sym`. An array operand binds *directly* to its base
-    /// pointer (a `MirType::Array` slot value), so it is used as-is; a tensor (or pointer) operand has
-    /// MIR type `Ptr` and binds to a *slot* holding the pointer, so it must be loaded first. A no-op
-    /// for every array operand (so existing matmuls are byte-identical) — it only adds the load that
-    /// makes a shape-typed `Tensor[..]` operand reach the kernel as its actual base pointer.
+    /// The base pointer of a kernel operand `sym`. A fixed `[T; N]` array operand binds *directly* to
+    /// its base pointer (a `MirType::Array` slot value), so it is used as-is; a tensor (or pointer)
+    /// operand has MIR type `Ptr` and binds to a *slot* holding the pointer, and a `[]T` slice binds to
+    /// its 16-byte fat-pointer buffer — both of those need one extra `Load` first. A no-op for every
+    /// fixed-array operand (so existing matmuls stay byte-identical); `None` when `sym` is not bound
+    /// here at all, which every caller turns into "decline, lower the scalar nest".
     fn kernel_base_ptr(&mut self, sym: Symbol) -> Option<ValueId> {
         let (val, ty) = self.lookup(sym)?;
         // A pointer/tensor operand keeps its base pointer in the slot; a `[]T` slice keeps a fat
@@ -7705,6 +7745,12 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Emit a call to the GEMM microkernel for a recognized nest, returning whether it fired.
+    /// Declines (`false`) when an operand array or a runtime dim is not in scope, for `Aᵀ·Bᵀ` and for
+    /// a *batched* `Aᵀ·B` (no kernel), and — because the fused-bias and α kernels are both **NT
+    /// only** — for a nest carrying a bias or an α in any other shape. The scalar nest the caller
+    /// then lowers computes `bias + s` / `alpha·s` correctly, so declining is always safe; the α and
+    /// bias declines happen after a few dim/GEP instructions have been built, which are simply dead.
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
         let (Some(a), Some(b), Some(c)) = (
             self.kernel_base_ptr(nest.a),
@@ -8529,9 +8575,11 @@ impl FnLowerer<'_> {
     /// Fuse a `nn.Linear` matmul immediately followed by its bias-add / activation epilogue into one
     /// `wukong_sgemm_nt_epi` call (`C = act(A·Bᵀ + bias)`), folding the epilogue into the GEMM's C
     /// writeback so C is written once instead of paying a separate read-modify-write pass. Fires only
-    /// for the plain 2-D `C = A·Bᵀ` form (no batch offsets) immediately followed by the recognized
-    /// epilogue loop over the same C; returns the number of statements consumed (always 2), else
-    /// `None`. The match is strict (dims/strides/output/column all verified) so it never misfires.
+    /// for the plain 2-D `C = A·Bᵀ` form (no batch offsets, no transposed A) immediately followed by
+    /// the recognized epilogue loop over the same C; returns the number of statements consumed (always
+    /// 2), else `None`. The match is strict (dims/strides/output/column all verified) so it never
+    /// misfires, and a nest carrying a peeled α or a fused store bias declines here — `emit_sgemm_epi`
+    /// reads neither field, so accepting one silently dropped the scale/bias (see the guard below).
     fn try_fuse_matmul_epilogue(&mut self, stmts: &[Stmt]) -> Option<usize> {
         if stmts.len() < 2 {
             return None;
@@ -11016,6 +11064,11 @@ impl FnLowerer<'_> {
     /// `wukong_parallel_for(N, &outlined, env)` here, and build the outlined body function (the
     /// untouched loop body under `lower_ranged_loop`, captures re-bound from env). Mirrors
     /// [`lower_parallel`]'s two halves, but as a *statement* inside a larger function.
+    ///
+    /// Returns `false` — emitting nothing, so the caller lowers the loop serially — when the module's
+    /// pre-interned region-symbol pool (`PAR_REGION_MAX`) is exhausted. A captured `[]T` slice must
+    /// have its `slice_slots` record carried across the env into the outlined body's re-bind, or
+    /// `kernel_base_ptr` in there would mistake the fat-pointer buffer for the data.
     fn emit_parallel_region(
         &mut self,
         hh: Symbol,
@@ -20505,7 +20558,9 @@ fn offset_invariant(off: &[&Expr], vars: &[Symbol]) -> bool {
         .all(|t| vars.iter().all(|&v| !expr_mentions(t, v)))
 }
 
-/// Try both recognized matmul spellings: the `ikj` accumulate form and the `ijk` dot-product form.
+/// Try every recognized matmul spelling, in order: the `ikj` accumulate form
+/// ([`match_matmul`]), the `ijk` dot-product form with a scalar accumulator ([`match_matmul_ijk`]),
+/// and the `ijk` form that accumulates straight into `c[i*N+j]` ([`match_matmul_ijk_memacc`]).
 fn recognize_matmul<'a>(
     pat: &Pattern,
     iter: &ForIter,
@@ -25908,7 +25963,10 @@ const ATAN_P: [f64; 4] = [
     -0.333_329_491_539,
 ];
 
-/// Names that lower to runtime/interpreter intrinsics rather than user functions.
+/// Names that lower to runtime/interpreter intrinsics rather than user functions. Exactly the three
+/// statement-shaped builtins — *not* a general "is this a builtin" predicate: the ~50 math/activation
+/// names live in `math_intrinsic`, and the heap, file-I/O, `now_ns` and `sdpa` builtins are matched by
+/// name inside `lower_call`. `lower_call` is its only caller (no callers outside this crate).
 pub fn is_intrinsic(name: &str) -> bool {
     matches!(name, "print" | "println" | "assert")
 }

@@ -17,10 +17,19 @@
 //! **Reuse for bit-exactness.** The max pass uses the same fixed 8-lane accumulator + balanced
 //! horizontal combine softmax uses, and the Σexp pass reuses the *exact* shared `exp` polynomials —
 //! AVX2 [`crate::vmath::exp8`] on the 8-lane body, the scalar [`crate::vmath::exp1`] on the tail and the
-//! no-AVX2 fallback — with the row sum's `log` taken through the shared [`crate::vmath::log1`]. So the
-//! loss is bit-identical to a softmax/log-softmax computed the standard way, and the AVX2 path and the
-//! scalar twin agree **bit-for-bit** (pinned by a unit test across non-multiple-of-8 `cols`). The
-//! `− x[r, target[r]]` is a single scalar gather load in both paths.
+//! no-AVX2 fallback — with the row sum's `log` taken through the shared [`crate::vmath::log1`]. So on
+//! finite logits the loss is bit-identical to a softmax/log-softmax computed the standard way, and the
+//! AVX2 path and the scalar twin agree **bit-for-bit** (pinned by a unit test across non-multiple-of-8
+//! `cols`). The `− x[r, target[r]]` is a single scalar gather load in both paths.
+//!
+//! **NaN divergence from `norm.rs` — read this before "unifying" the max fold.** This module resolves
+//! the `MAXPS`-vs-`maxNum` hazard the *opposite* way from [`crate::norm`]. Here the scalar twin folds
+//! with `f32::max` (= `maxNum`, which drops a NaN and keeps the real peak) and `xent_row_avx2` blends
+//! its accumulator back over the unordered lanes so `_mm256_max_ps` cannot erase them — pinned by
+//! `nan_logit_keeps_scalar_and_avx2_in_agreement`. `norm::softmax_row_scalar` instead folds with the raw
+//! `maxps` semantics (`(a > b) ? a : b`, NaN-absorbing) to mirror an unblended AVX2 chain. Both files are
+//! internally twin-consistent, but they pick **different** row maxima on a row containing a NaN, so
+//! `wukong_xent_fwd_f32` is *not* byte-identical to `NORM_SOFTMAX` on such a row.
 //!
 //! **Out-of-range labels.** A `target[r]` outside `[0, C)` — negative (PyTorch's `ignore_index = -100`
 //! idiom) or `>= C` — has no logit to gather, so the kernel writes `NaN` into `loss[r]` rather than
@@ -46,9 +55,10 @@ fn hsum8(a: [f32; 8]) -> f32 {
     ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]))
 }
 
-/// Fixed-order horizontal max of 8 lane accumulators (balanced tree). On finite inputs this matches
-/// `_mm256_max_ps` lane-for-lane; the same `hmax8` softmax uses. The twin test pins the agreement on
-/// finite data.
+/// Fixed-order horizontal max of 8 lane accumulators (balanced tree), folded with `f32::max`
+/// (= `maxNum`, which drops a NaN) — the same expression `norm::hmax8` uses, and called by both this
+/// module's paths, so the two agree by construction. Note the *lane* accumulation feeding it is
+/// `f32::max` here too, unlike `norm.rs`'s `maxps` fold; see the module header.
 #[inline(always)]
 fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))
@@ -60,9 +70,10 @@ fn hmax8(a: [f32; 8]) -> f32 {
 /// `lse − x[t]` where `lse = m + log(Σ exp(x − m))`, `m = max(x)`, `t = target`.
 ///
 /// The max pass (8 lanes; lane `j` folds elements `≡ j (mod 8)`, tail into lanes `0..`) and the Σexp
-/// pass are byte-identical to softmax's in `norm.rs` — same `hmax8`, same `exp1`, same `hsum8` — so `m`
-/// and the sum are bit-identical to softmax's; the only new ops are one scalar `log1` on the row sum
-/// and the single scalar subtraction of the target logit.
+/// pass have softmax's shape in `norm.rs` — same `hmax8`, same `exp1`, same `hsum8` — so on a row of
+/// finite logits `m` and the sum are bit-identical to softmax's; the only new ops are one scalar `log1`
+/// on the row sum and the single scalar subtraction of the target logit. On a row containing a NaN they
+/// diverge: this fold is `f32::max` (drops the NaN), softmax's is `maxps` (absorbs it) — module header.
 ///
 /// # Safety
 /// `x` valid for `n` `f32`. `target` is unconstrained: a value outside `[0, n)` yields `NaN`.
@@ -104,9 +115,11 @@ unsafe fn xent_row_scalar(x: *const f32, target: usize, n: usize) -> f32 {
 
 // --- AVX2 kernel (mirrors the scalar twin lane-for-lane on finite inputs) --------------------------
 
-/// Cross-entropy loss of one row, AVX2/FMA. The max + Σexp passes are byte-identical to
-/// `softmax_row_avx2` in `norm.rs` (so `m` and the sum match bit-for-bit), capped with one scalar
-/// `log1` and the single scalar subtraction of `x[target]`.
+/// Cross-entropy loss of one row, AVX2/FMA. The Σexp pass is byte-identical to `softmax_row_avx2` in
+/// `norm.rs`, and so is the max pass **on finite logits** (so `m` and the sum match bit-for-bit there);
+/// unlike softmax's, this max blends the accumulator back over unordered lanes so a NaN logit cannot
+/// erase a lane, matching *this* module's `f32::max` scalar twin. Capped with one scalar `log1` and the
+/// single scalar subtraction of `x[target]`.
 ///
 /// # Safety
 /// `x` valid for `n` `f32`; AVX2+FMA available. `target` is unconstrained: a value outside `[0, n)`

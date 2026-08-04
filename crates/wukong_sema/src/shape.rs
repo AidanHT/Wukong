@@ -1,11 +1,30 @@
 //! Shape checking — the part of sema that makes tensor dimensions a compile-time guarantee.
 //!
-//! Two checks live here:
-//!  * **Call unification**: when a (user-defined) generic function is called, its declared
-//!    parameter shapes are unified against the argument shapes. Dimension variables (`M`, `N`,
-//!    `K`) are bound either from an explicit turbofish or inferred from the arguments; a
-//!    conflicting binding is a `E0502` dimension mismatch and a differing rank is `E0501`.
-//!  * **Index rank**: indexing a tensor with the wrong number of indices is a `E0501`.
+//! An `impl Sema<'_>` continuation of `lib.rs` (same struct, same private helpers), holding:
+//!  * **Call typing** (`type_call`): every call expression. A resolved user function goes to
+//!    `check_fn_call`; otherwise this is where the nominally-typed builtins live (the math
+//!    intrinsics, `alloc_*`/`free`, the `read_*`/`write_*` file-I/O family, `now_ns`, `print`/
+//!    `println`, `assert`, and `.len()` on a slice), each with its arity/argument rules. Anything
+//!    else — an unmodeled builtin, a method, a multi-segment path — stays `Ty::Unknown`.
+//!  * **Call unification** (`check_fn_call`): the callee's declared parameter types are unified
+//!    against the argument types — for *every* resolved call, generic or not, so a plain scalar
+//!    mismatch is caught here too. Dimension variables (`M`, `N`, `K`) are bound either from an
+//!    explicit turbofish or inferred from the arguments; a conflicting binding is a `E0502`
+//!    dimension mismatch and a differing rank is `E0501`. Value-*type* generics (`fn f<T>`) are
+//!    bound by `infer_type_generics` and substituted by `apply_subst`.
+//!  * **Indexing** (`type_index`): a non-indexable base is `E0401`, a wrong index count is `E0501`,
+//!    and a compile-time-constant index outside a static dimension / array length is `E0501` too.
+//!
+//! `unify` has **two modes**, and the `rigid` flag is load-bearing (see `unify_dim`):
+//!  * `rigid == false` — **call sites only**. The callee's dim vars are inference variables to bind
+//!    from the argument shapes.
+//!  * `rigid == true` — **body checks** (`check_return_shape`, `check_binop_shapes`). Both shapes are
+//!    already fully determined, so the function's own generic dims are universally quantified and
+//!    match by *identity* (`dims_equal`); nothing binds. This is what stops a generic function lying
+//!    about the shape it returns or merges.
+//!
+//! `Dim::Dynamic` (`?`) is the documented lenient escape hatch in both modes, and `Unknown`/`Error`
+//! on either side short-circuits `unify` — the crate-wide leniency rule.
 
 use wukong_span::FxHashMap as HashMap;
 
@@ -16,9 +35,11 @@ use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 use crate::{DefKind, FnSig, Sema};
 
 /// Result types for the math intrinsics the backends lower directly (`sqrt`, `rsqrt`, `exp`, `log`,
-/// `fmax`, `fmin`). The result is the float type of the first argument, defaulting to `f32` so a
-/// bare `exp(x)` is still typed when the argument's type is unknown. Returns `None` for any other
-/// callee — that keeps `type_call` lenient on the unmodeled-builtin path (`min`, `f32x8::load`, …).
+/// `fmax`, `fmin`, …). The result is the float type of the first argument (an `f32`/`f64` scalar or a
+/// float SIMD vector), defaulting to `f32` so a bare `exp(x)` is still typed when the argument's type
+/// is unknown — except for `abs`/`round`/`floor`/`ceil`/`trunc`, which *preserve* the argument's type
+/// including an integer one (see the comment below). Returns `None` for any other callee — that keeps
+/// `type_call` lenient on the unmodeled-builtin path (`min`, `f32x8::load`, …).
 fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
     let float_ty = match args.first() {
         Some(Ty::Scalar(s)) if s.is_float() => Ty::Scalar(*s),
@@ -854,9 +875,11 @@ impl Sema<'_> {
         }
     }
 
-    /// Evaluate a compile-time index: a literal (or negated literal) directly, or a top-level `const`
-    /// name resolved to its recorded initializer (recursing for a const-references-const). Without the
-    /// const resolution, `xs[I]` for `const I = 99` slipped past the bounds check — sema accepted it,
+    /// Evaluate a compile-time index: a literal, a negation or fold of literals (`eval_const_int`), an
+    /// enum variant's discriminant, or a top-level `const` name resolved to its recorded initializer
+    /// (recursing for a const-references-const). `None` means "not compile-time known", which leaves
+    /// the index unconstrained rather than erroring. Without the const resolution, `xs[I]` for
+    /// `const I = 99` slipped past the bounds check — sema accepted it,
     /// then mir_build inlined the const and the index went out of bounds (interp traps, native reads
     /// past the buffer: a backend divergence on a program that should never have compiled). The depth
     /// cap guards against a recursive const (separately reported as E0403) looping here.
@@ -904,7 +927,12 @@ impl Sema<'_> {
         // GEPed off a non-pointer, which the verifier/Cranelift reject (an ICE for a scalar) or which
         // the two backends lower divergently (a by-pointer tuple/struct base: interp 0, native the
         // real element). Reject those three; an `Unknown`/`Ref`/other base stays lenient (it may be an
-        // indexable construct sema does not yet model, and `Unknown` unifies with anything).
+        // indexable construct sema does not yet model, and `Unknown` unifies with anything). NOTE: a
+        // bare generic type variable is also spelled `Ty::Named`, so `x[i]` on an `x: T` parameter is
+        // rejected here as well — unlike `unify`, this arm does not filter through
+        // `is_declared_named_ty`. No fixture indexes a generic-typed value (they annotate the
+        // container instead: `let a: [T; 2]`, whose base type is an `Array`), so the leniency
+        // asymmetry with `unify` has never been exercised.
         if matches!(base_ty, Ty::Scalar(_) | Ty::Named(_) | Ty::Tuple(_)) {
             let disp = base_ty.display(self.interner);
             self.error(
@@ -1010,9 +1038,10 @@ fn dims_equal(a: Dim, b: Dim) -> bool {
 }
 
 /// Infer value-type generics from a concrete argument: bind each `Ty::Named(g)` parameter position
-/// (with `g` in `generics`) to the corresponding argument type, recursing through pointer / slice /
-/// array / tuple structure exactly like [`apply_subst`]. Only *type* generics are bound (a dimension
-/// generic is a `Dim::Var` inside a shape, never a `Ty::Named`); a first binding wins.
+/// (with `g` in `generics`) to the corresponding argument type, recursing through pointer /
+/// reference / slice / array / tuple structure exactly like [`apply_subst`]. Only *type* generics are
+/// bound (a dimension generic is a `Dim::Var` inside a shape, never a `Ty::Named`); a first binding
+/// wins, and an `Unknown`/`Error` argument binds nothing (it would poison every later use of `g`).
 fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut HashMap<Symbol, Ty>) {
     match (param, arg) {
         (Ty::Named(g), a) if generics.contains(g) => {
@@ -1035,6 +1064,10 @@ fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut Hash
     }
 }
 
+/// Substitute a call's resolved generics into a declared type: a `Ty::Named` in `tys` becomes the
+/// bound type, and each `Dim::Var` in a tensor shape becomes its binding in `dims`. A var with no
+/// binding is left **as-is** (not an error): the caller unifies parameter by parameter, so a dim can
+/// still be bound by a later argument, and an unbound dim in the *return* type stays symbolic.
 fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) -> Ty {
     match ty {
         Ty::Named(v) => tys.get(v).cloned().unwrap_or_else(|| ty.clone()),
