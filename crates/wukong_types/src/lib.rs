@@ -4,6 +4,13 @@
 //! resolves to a concrete size/alignment (for sized types), and a [`Tensor`](Ty::Tensor) carries
 //! its [`Shape`] — the dimensions checked at compile time, which is what makes shape mismatches
 //! type errors rather than runtime crashes.
+//!
+//! This crate is the **layout authority**: [`Ty::size_of`], [`Ty::align_of`] and
+//! [`Ty::tuple_offsets`] are the answer, and a 64-bit target is assumed throughout (`usize`/`isize`
+//! and every `Ptr`/`Ref` are hard-coded 8/8). Do not recompute a size downstream — the one
+//! sanctioned extension is `wukong_mir_build`'s registry-aware `ty_size`/`ty_align`/
+//! `aggregate_layout`, which resolves `Ty::Named` through the sema defs and delegates here for
+//! everything else.
 
 use wukong_span::{Interner, Symbol};
 
@@ -95,6 +102,8 @@ impl Scalar {
         matches!(self, Scalar::F16 | Scalar::Bf16 | Scalar::F32 | Scalar::F64)
     }
 
+    /// Every non-float, non-`Bool` scalar — so `Char` counts as an integer here (it lowers to a
+    /// 32-bit integer in MIR), and so does `Usize`/`Isize`. `is_signed()` is the separate axis.
     pub fn is_int(self) -> bool {
         !self.is_float() && self != Scalar::Bool
     }
@@ -125,8 +134,10 @@ impl Shape {
 
     /// The symbolic (`Var`) dimensions of this shape, in axis order (repeats preserved — a shape
     /// like `[N, N]` yields `[N, N]`; de-duplication across a whole signature is the caller's job).
-    /// This is the source of truth for the hidden runtime-dim ABI that lets a symbolic-generic tensor
-    /// function execute: each such dim is threaded to the callee as a hidden `i64` parameter.
+    /// This feeds the hidden runtime-dim ABI that lets a symbolic-generic tensor function execute —
+    /// each such dim is threaded to the callee as a hidden `i64` parameter — but the ABI *order* is
+    /// decided by `wukong_mir_build::symbolic_dim_params`, which de-duplicates across the parameter
+    /// list. Both sides must keep it a `Vec`: an unordered container here is a nondeterministic ABI.
     pub fn symbolic_dims(&self) -> Vec<Symbol> {
         self.0
             .iter()
@@ -261,9 +272,13 @@ impl Ty {
     }
 
     /// The padded byte offset and type of each field of a `Tuple`, in declaration order — the
-    /// single source of truth for aggregate layout (the same `round_up` accumulation as
-    /// [`size_of`](Ty::size_of)). `None` for a non-tuple or a tuple with an unsized field. The MIR
-    /// builder uses this to lower tuple construction/field-access as byte-offset GEPs.
+    /// reference definition of aggregate layout (the same `round_up` accumulation as
+    /// [`size_of`](Ty::size_of)). `None` for a non-tuple or a tuple with an unsized field.
+    ///
+    /// It has **no caller in the workspace**: `wukong_mir_build`'s `FnLowerer::aggregate_layout`
+    /// repeats this accumulation because it must resolve `Ty::Named` struct/enum fields through the
+    /// sema def registry, which this leaf crate cannot see. The two must therefore agree field-for-
+    /// field; `tuple_offsets_are_alignment_correct` pins this side so they cannot drift.
     pub fn tuple_offsets(&self) -> Option<Vec<(u64, Ty)>> {
         let Ty::Tuple(fields) = self else {
             return None;

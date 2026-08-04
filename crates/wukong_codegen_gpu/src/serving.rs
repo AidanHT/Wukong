@@ -18,7 +18,16 @@
 //!   `[Bcap,D]` ping-pong activations. One [`step_on`](DecodeModel::step_on) advances every active
 //!   sequence by one token: append a cache slot per sequence (host), upload the metadata once (shared
 //!   across layers), then run all `N` layers GPU-resident. This is the unit a whole-model CUDA graph
-//!   captures (P4) and a continuous-batching scheduler drives (P5).
+//!   captures (P4) and the scheduler below drives (P5).
+//! - `Scheduler` — Orca-style **continuous (in-flight) batching** over one fixed-`Bcap` `DecodeModel`:
+//!   `Request`s are admitted into free slots (first-fit with bounded look-ahead), `Scheduler::step`
+//!   advances every active slot one token, and a finished sequence is evicted and its slot refilled the
+//!   same iteration. `Scheduler::step_graphed` replays the whole-step CUDA graph, captured once
+//!   (admission/eviction only changes device-buffer *contents*). `Scheduler::new_static` is the same
+//!   machinery with static-batching admission — the honest peer the goodput comparison is made against.
+//!
+//! Cache storage is f16 by default; `new_with_dtype` swaps in the int8 append/attention kernel pair
+//! (lossy, tolerance-gated) with everything else — including graph capture — unchanged.
 //!
 //! Pooled + on-an-explicit-stream throughout ([`DecodeLayer::forward_step_on`]) so the whole decode
 //! step records cleanly into one [`crate::graph::Graph`] (no synchronizing alloc inside the capture).

@@ -8,8 +8,10 @@
 //!
 //! Loads are forwarded **within a block**: per `alloca` slot we track the value it currently holds —
 //! a `store slot, v` makes `v` current, the first `load slot` becomes current and later loads reuse
-//! it. A store through an unknown pointer or any call conservatively forgets all slots (they may
-//! alias). Cross-block memory forwarding needs memory SSA and is left to DSE/the LLVM backend.
+//! it. A store through an unknown pointer, or any call or vector kernel, conservatively forgets all
+//! slots (they may alias). Cross-block memory forwarding would need memory SSA, which this pass does
+//! not build, so it is simply not attempted here — whatever survives is left to the native backend's
+//! own optimizer.
 //!
 //! Forwarding loads to a common value lets the pure value-numbering then collapse the expressions
 //! built on top of them. DCE deletes the dead remains.

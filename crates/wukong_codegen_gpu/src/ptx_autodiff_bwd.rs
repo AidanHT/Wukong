@@ -4,14 +4,18 @@
 //! The tape's forward VJPs already ride the tuned `wukong_*` kernels (matmul gradients reuse the
 //! GEMM, reductions reuse `sreduce`, …). What it *synthesizes* as plain counted loops — buffer
 //! transpose (for `dB = dCᵀ·A`), the elementwise activation-backward `dx = dout ⊙ f'(x)`, and the
-//! per-row norm-backward combines — are CPU device-loops today. This module provides their GPU
-//! kernels so the whole backward stays device-resident, plus the **flash-attention backward**
-//! (dQ/dK/dV) gated against a two-pass-softmax f64 reference (increment 4).
+//! per-row norm-backward combines — are CPU loops today. This module provides their GPU kernels so the
+//! whole backward stays device-resident, plus the **attention backward** (`attention_backward`,
+//! dQ/dK/dV) gated against a two-pass-softmax f64 reference (increment 4). NB: that one is the
+//! *materialized* O(S²) form built from the gated primitives here — not a fused/tiled flash backward
+//! (see the section comment above it).
 //!
 //! Each kernel mirrors the exact math the tape emits (`wukong_autodiff::tape`), so it is gated
 //! tolerance-/bit-equal to that op — and the tape's CPU form is finite-difference-gated, which
-//! transitively makes the device form correct. PTX is pure ASCII; target `sm_89`. Kernels are
-//! grid-stride / one-CTA-per-row, so correctness is independent of the launch grid.
+//! transitively makes the device form correct. PTX is pure ASCII; target `sm_89`. The elementwise and
+//! transpose kernels are grid-stride, so for those correctness is independent of the launch grid;
+//! the row-norm ones are one-CTA-per-row and the GEMM entries and `ptx::CAST_F32_F16` are
+//! one-thread-per-output, so those launchers must size the grid to cover the rows / the output.
 
 use crate::gpu::Gpu;
 use crate::ptx_gemm::{gemm_rb_ptx, TILE_M, TILE_N};

@@ -1,18 +1,27 @@
-//! Fused single-pass row-wise normalizations — **softmax / LayerNorm / RMSNorm** over the last axis
-//! of a `[rows, cols]` f32 matrix. These are the per-token normalizations every transformer block
+//! Fused single-pass row-wise normalizations — **softmax / log-softmax / LayerNorm / RMSNorm /
+//! L2-norm** (the five `NORM_*` op codes below) over the last axis of a `[rows, cols]` f32 matrix.
+//! These are the per-token normalizations every transformer block
 //! runs (softmax in attention; LayerNorm/RMSNorm around the sublayers), and they are *memory-bound*:
 //! a naive implementation streams each row from memory two or three times (max+exp+sum+normalize for
 //! softmax; mean+var+normalize for LayerNorm). The win here is **fusion** — each row is loaded once
 //! into registers/L1 and all passes run on it before moving on — plus the 256-bit AVX2 width (and,
 //! for softmax, the same hand-vectorized `exp` the activation kernel uses, which Cranelift can't emit).
 //!
-//! The compiler recognizes the canonical row-wise norm loop nest and lowers it to one
-//! [`wukong_norm_f32`] call (the same play as matmul→GEMM, activation→`wukong_vmath_f32`, and
+//! Four C entries: [`wukong_norm_f32`] / [`wukong_norm_f32_parallel`] for the plain forms, and
+//! [`wukong_norm_affine_f32`] / [`wukong_norm_affine_f32_parallel`] for LayerNorm/RMSNorm with a
+//! per-column `gamma` scale and optional `beta` shift (either pointer may be null; the affine entries
+//! accept **only** `NORM_LAYERNORM`/`NORM_RMSNORM` and silently do nothing for any other code).
+//!
+//! The compiler recognizes the canonical row-wise norm loop nest and lowers it to one of those calls
+//! (the same play as matmul→GEMM, activation→`wukong_vmath_f32`, and
 //! reduction→`wukong_sreduce_f32`). The interpreter marshals its abstract memory through the
 //! **identical** kernel, so the differential oracle stays bit-for-bit exact.
 //!
-//! **Determinism.** Rows are independent, so the `_parallel` entry just maps the identical per-row
-//! routine across rows — `serial == parallel` bit-for-bit with no cross-row combine. Within a row the
+//! **Determinism.** Rows are independent, so the `_parallel` entries just map the identical per-row
+//! routine across rows — `serial == parallel` bit-for-bit with no cross-row combine (and at
+//! `wuk_pool_width() <= 1` they skip the pool entirely and tail-call the serial sibling, which is the
+//! same bits by that argument). A non-positive `rows` or `cols` is a no-op at every entry, never a
+//! walk off the end. Within a row the
 //! two reductions (softmax's max+sum, LayerNorm's mean+var, RMSNorm's mean-square) use a fixed 8-lane
 //! accumulator and a fixed-order horizontal combine, and the AVX2 path stores its accumulator to the
 //! same `[f32; 8]` the scalar twin builds and calls the *same* combine — so the AVX2 kernel and the
@@ -38,9 +47,12 @@ fn hsum8(a: [f32; 8]) -> f32 {
     ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]))
 }
 
-/// Fixed-order horizontal max of 8 lane accumulators (balanced tree). On finite inputs this matches
-/// `_mm256_max_ps` lane-for-lane; softmax never sees NaN/±0 rows in practice and the twin test pins
-/// the agreement on finite data.
+/// Fixed-order horizontal max of 8 lane accumulators (balanced tree). Note it folds with `f32::max`
+/// (= `maxNum`, which *drops* a NaN), **not** the [`maxps`] semantics the 8-lane accumulation below
+/// uses — which is safe only because this is the very same function on both paths: the AVX2 body
+/// stores its `__m256` to `[f32; 8]` and calls this, so the two row maxima agree by construction, on
+/// NaN rows as well as finite ones (pinned by `scalar_matches_avx2_on_nan_rows`, which places the NaN
+/// past the first 8-block so it reaches this fold through a lane accumulator).
 #[inline(always)]
 fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))
@@ -49,8 +61,10 @@ fn hmax8(a: [f32; 8]) -> f32 {
 /// `_mm256_max_ps(a, b)` semantics spelled out: `a > b ? a : b`. **Not** `f32::max` (= `maxNum`),
 /// which returns the non-NaN operand — MAXPS returns its *second* source whenever the compare is
 /// unordered, so a NaN in the freshly loaded operand poisons the accumulator lane while a NaN already
-/// in the accumulator is dropped. The scalar row-max twin folds with this, not with `f32::max`, so it
-/// mirrors the AVX2 body bit-for-bit on NaN rows too and not only on finite data (pinned by
+/// in the accumulator is dropped. The scalar row-max twin's 8-block loop folds with this, not with
+/// `f32::max`, so it mirrors the AVX2 `_mm256_max_ps` chain bit-for-bit on NaN rows too and not only on
+/// finite data (its ragged tail *does* use `f32::max`, but so does the AVX2 tail — same fold both
+/// sides, and [`hmax8`] likewise; pinned by
 /// `scalar_matches_avx2_on_nan_rows`; `exp1`/`exp8` saturate NaN rather than propagating it, so a
 /// divergent row max would survive into the output).
 #[inline(always)]

@@ -3,14 +3,18 @@
 //! the S² scores traffic isn't the bottleneck) but is GPU-shaped: it never materializes S = Q·Kᵀ in
 //! HBM, using the online-softmax recurrence to stream K/V once.
 //!
-//! Layout: single head, Q/K/V/O are `[S, D]` row-major, `D` a multiple of 32. **One warp per query
-//! row**; the 32 lanes split the head dim (lane `t` owns d ∈ {t, t+32, …}, i.e. `R = D/32` values).
-//! For each key j: each lane computes its partial of Q[i]·K[j], a warp butterfly all-reduce gives
-//! the full score, then the online-softmax update rescales the running denominator `l` and the
-//! per-lane output accumulators `acc[r]`. `R` is unrolled at PTX-gen time (acc/q in registers), so a
-//! kernel is generated per supported D. exp uses `ex2.approx`; tolerance-gated vs a CPU f64 reference.
+//! Layout: single head, Q/K/V/O are `[S, D]` row-major (f32 for the CUDA-core kernels, f16 for the
+//! tensor-core ones), `D` a multiple of 32. Every kernel here streams K/V in ascending key order under
+//! the same online-softmax recurrence; `exp` is `ex2.approx`, so all of them are tolerance-gated vs a
+//! CPU f64 reference (`ref_attn`), never bit-exact against it.
 //!
-//! **Two kernels** (`gpu::flash_plan` selects; see [`FLASH_TILE_MIN`]):
+//! ## The f32 CUDA-core pair (`gpu::flash_plan` selects; see [`FLASH_TILE_MIN`])
+//!
+//! **One warp per query row**; the 32 lanes split the head dim (lane `t` owns d ∈ {t, t+32, …}, i.e.
+//! `R = D/32` values). For each key j: each lane computes its partial of Q[i]·K[j], a warp butterfly
+//! all-reduce gives the full score, then the online-softmax update rescales the running denominator `l`
+//! and the per-lane output accumulators `acc[r]`. `R` is unrolled at PTX-gen time (acc/q in registers),
+//! so a kernel is generated per supported D.
 //!
 //!  * `flash_d{D}_t` — *key-block tiled*, **the default at every S**. [`FLASH_TWARPS`]=8 query-row warps
 //!    per CTA **cooperatively stage a block of `BK = 1024/D` keys** (K and V) into shared memory once,
@@ -24,8 +28,8 @@
 //!    streaming all of K/V from L2 (2 warps/CTA just fills past the blocks-per-SM cap). Retained as the
 //!    A/B reference and the gate's cross-check; not used in production while the crossover is 0.
 //!
-//! The per-key arithmetic and the ascending key order are **identical** between the two kernels, so for
-//! any S they produce **bit-identical** output — tiling is a pure data-movement optimisation, and the
+//! The per-key arithmetic and the ascending key order are **identical** between these two kernels, so
+//! for any S they produce **bit-identical** output — tiling is a pure data-movement optimisation, and the
 //! tolerance gate (which runs *both*) confirms the SMEM plumbing is correct.
 //!
 //! **No-deadlock (tiled).** Threads are `32·FLASH_TWARPS` per CTA, `row = ctaid·W + warpId`. The
@@ -33,6 +37,27 @@
 //! store is predicated on `row < S`. So the warps of a ragged final CTA (when `FLASH_TWARPS ∤ S`) still
 //! help stage K/V and still reach both barriers — they just skip their own compute — so the barriers
 //! can never deadlock. Shared memory is static, so the launch config reserves no dynamic SMEM.
+//!
+//! ## The fp16 tensor-core family (`gpu::wmma_flash_entry` / `gpu::ws_flash_route` select)
+//!
+//! Everything else in this file is a *tensor-core* flash generator for a 16-query tile per warp, gated
+//! to `D ∈ {64, 128}`. In rough order of the levers they add (each generator's own doc comment carries
+//! the derivation and the A/B verdict):
+//!
+//!  * `flash_d64_w` / `flash_d64_w4` — opaque `wmma` QKᵀ and PV, 16- and 64-key tiles.
+//!  * `flash_d64_m` / `flash_d64_mc` (causal) — hand-placed `mma.sync.m16n8k16`, O/m/l
+//!    **register-resident** (no SMEM round-trip of the accumulator).
+//!  * `flash_d{64,128}_mp{,c}{,_lm}` — the production family: the `_m` kernel plus a `cp.async` K/V
+//!    pipeline; `c` = causal, `_lm` = `ldmatrix` SMEM feed (the D=128 default). Plus `flash_d64_m1`
+//!    (single-buffer occupancy probe), `flash_d64_mp{4,8}` (multi-warp) and `flash_d64_mpw{2,4}`
+//!    (wide key tile).
+//!  * `flash_d64_msp` (softmax/QKᵀ software pipeline), `flash_d128_hs` (head-dim warp split),
+//!    `flash_d64_mprope` (fused RoPE, two extra `cos`/`sin` params).
+//!  * `flash_d64_ws{,c}`, `flash_d128_ws{,c}_lm` and the 3-stage `flash_d64_ws3` /
+//!    `flash_d128_ws3_lm` — FA2/FA3-style **warp-specialized ping-pong** over disjoint query tiles
+//!    sharing one staged K/V stream; dispatched only under `WUKONG_FLASH_WS=1`.
+//!
+//! `every_dispatchable_flash_entry_is_defined` pins each routing decision to a defined entry.
 
 use std::sync::OnceLock;
 
@@ -2732,9 +2757,12 @@ fn entry_mma_reg_pipe_ws3(d: usize, pv_ldmatrix: bool) -> String {
     s
 }
 
-/// Flash-attention module: untiled `flash_d{D}` + tiled `flash_d{D}_t` per supported head dim, the
-/// tensor-core `flash_d64_w` (16-key tile) and wide-key `flash_d64_w4` (64-key tile), plus the
-/// register-resident `flash_d64_m` (hand-placed `mma.sync`, O/m/l in registers — no SMEM round-trip).
+/// Flash-attention module — **every** flash kernel in one `&'static str` (one module key, so `gpu.rs`
+/// loads it once): untiled `flash_d{D}` + tiled `flash_d{D}_t` per [`SUPPORTED_D`], the `wmma`
+/// `flash_d64_w`/`flash_d64_w4`, the register-resident `flash_d64_m{,c}`, the whole `cp.async`-pipelined
+/// `flash_d{64,128}_mp*` family (± causal, ± `_lm`, `_m1`, `_mp{4,8}`, `_mpw{2,4}`, `_msp`, `_hs`,
+/// `_mprope`) and the warp-specialized `flash_d{64,128}_ws*` / `_ws3*`. See the crate header for what
+/// each family is for; `every_dispatchable_flash_entry_is_defined` pins the dispatched names.
 pub fn flash_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {

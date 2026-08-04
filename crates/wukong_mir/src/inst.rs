@@ -57,7 +57,8 @@ impl BinOp {
     }
 }
 
-/// A comparison predicate (integer signed/unsigned, or ordered float). Result is `i1`.
+/// A comparison predicate (integer signed/unsigned, or ordered float). The result of a scalar compare
+/// is `i1`; of a vector compare, a lane mask of the same width as the operands (`Vec(_, n)`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmpOp {
     Eq,
@@ -210,8 +211,10 @@ pub enum Op {
     /// over the vector part `[0, n)` of a loop the general vectorizer widened past Cranelift's 128-bit
     /// CLIF-vector ceiling. `ptrs` points at a stack array of the stream base pointers (each already
     /// offset to the loop start); `scalars` at the loop-invariant f32s; `n` is a multiple of 8 (the
-    /// caller runs the scalar remainder). Side-effecting — it stores through the output stream
-    /// pointers — and yields no value. The interpreter marshals the recipe lane-wise (the differential
+    /// caller runs the scalar remainder). An *elementwise* recipe (`VecKernel::reduce == None`) is
+    /// side-effecting — it stores through the output stream pointers — and yields no value; a
+    /// *reduction* recipe stores nothing and yields its horizontal fold as an `F32`. The verifier
+    /// enforces that pairing. The interpreter marshals the recipe lane-wise (the differential
     /// oracle); the Cranelift backend assembles it to raw AVX2 (`avx2.rs`) and calls it. `kernel` is a
     /// pure index, not a `ValueId`, so it is invisible to SSA renaming.
     VecKernelCall {

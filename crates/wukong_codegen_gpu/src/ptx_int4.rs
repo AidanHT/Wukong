@@ -6,7 +6,8 @@
 //! integer zero-point — GPTQ/AWQ style); the activations stay fp16. The kernel reads the **packed
 //! int4 weight from global** (8 weights per 32-bit word — a **4× smaller weight footprint** than fp16,
 //! the bandwidth win that makes decode memory-bound-friendly), **unpacks int4 → fp16 on the fly inside
-//! the K-loop** (`bfe` → `cvt.f16` → `mul.f16` by the group scale), stages the dequantized fp16 tile
+//! the K-loop** (one `lop3` per interleaved nibble *pair* → `sub.rn.f16x2` the zero-offset →
+//! `mul.rn.f16x2` the group scale, two weights per op), stages the dequantized fp16 tile
 //! into shared memory, and then runs the **identical fp16 tensor-core MMA** as the dense `wmma`
 //! path (`wmma.mma.sync.m16n16k16`, f32 accumulate). So the only deviation from an *exact* dequant of
 //! the weight is the same f32-accumulation-order tolerance the fp16 GEMM already carries (~2e-3) — a
@@ -240,8 +241,9 @@ pub fn reference_w4a16(a: &[f32], qw: &QuantWeight, m: usize) -> Vec<f32> {
 // warps_m×warps_n warps cooperatively stages an SM_BM×16 A tile and an SM_BN×16 *dequantized* B tile
 // into shared memory each K-step, then every warp computes its tm×tn grid of 16×16 WMMA tiles out of
 // shared memory. The ONE departure from the fp16 path is the B staging: instead of a 128-bit fp16
-// copy, each thread loads one packed int4 `u32` (8 weights) from global, unpacks `bfe`→`cvt.f16`→
-// `mul.f16`(group scale)[−zero], and stores 8 fp16 into the SMEM B tile in the identical row-major
+// copy, each thread loads one packed int4 `u32` (8 weights) from global, unpacks it as four f16x2
+// pairs (`lop3` → `sub.rn.f16x2` the zero-offset → `mul.rn.f16x2` the group scale), and stores 8 fp16
+// into the SMEM B tile with one `st.shared.v4` in the identical row-major
 // `[bn,16]` layout `wmma.load.b.col` expects — so the global B traffic is 4-bit while the MMA is the
 // byte-identical fp16 tile. Requires M%bm==0, N%bn==0, K%group==0 (group a multiple of 16).
 

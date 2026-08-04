@@ -58,8 +58,12 @@ pub enum MirType {
     F64,
     Ptr,
     Vec(Box<MirType>, u32),
-    /// A fixed-size array of `count` elements, laid out contiguously. Used as the operand type of
-    /// an `alloca` for an array local; the alloca's *result* is still a `Ptr` to the first element.
+    /// A fixed-size array of `count` elements, laid out contiguously. Used as the operand type of an
+    /// `alloca` for any aggregate local — an array of `elem`, or a struct/tuple/slice as an
+    /// `Array(I8, size_in_bytes)` byte blob — and as a `Gep`'s `elem` when the element being indexed
+    /// is itself an aggregate (`mir_build`'s `gep_elem`: native scales the index by `size_of(elem)`,
+    /// the interpreter by `slot_count(elem)`). It is never a *value* type: the alloca's *result* is
+    /// still a `Ptr` to the first element.
     Array(Box<MirType>, u32),
     Void,
 }
@@ -187,7 +191,8 @@ pub struct StaticData {
     pub bytes: Vec<u8>,
 }
 
-/// A whole compiled program: its functions, read-only static data, and the current lowering level.
+/// A whole compiled program: its functions, read-only static data, and an inert `level` field
+/// (always [`MirLevel::Low`] — read that type's note before relying on it).
 #[derive(Clone, Debug)]
 pub struct Program {
     pub funcs: Vec<Function>,

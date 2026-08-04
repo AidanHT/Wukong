@@ -9,6 +9,18 @@
 //! never produces a false positive. Errors are reserved for things we can be sure about — an
 //! unresolved name, a `let` whose annotation contradicts its initializer, or a genuine shape
 //! conflict.
+//!
+//! Alongside names, types and shapes, sema owns the rejections that keep the backends from
+//! disagreeing on an *accepted* program: `match` exhaustiveness, `mut`/immutability, cast validity,
+//! literal well-formedness and range, definite return, and the reserved `wukong_` kernel-name
+//! prefix. That is every `E03xx`/`E04xx`/`E05xx` code except `E0305` (unresolved import), which
+//! belongs to the driver's import loader.
+//!
+//! [`check`] is the sole entry point, and its stage order is load-bearing: `collect` (register every
+//! top-level definition with its signature lowered) → `check_recursive_types` →
+//! `check_recursive_consts` → set `checking_bodies` → `recheck_item_signatures` → `check_bodies`.
+//! Several diagnostics are gated on the `checking_bodies` flag so they fire only once every generic
+//! and `const` is registered.
 
 mod shape;
 
@@ -151,7 +163,6 @@ pub struct SemaResult {
     pub consts: HashMap<Symbol, Expr>,
 }
 
-/// Analyze a module, returning per-expression types and any diagnostics.
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
 /// array/tuple element. Pointer/reference fields are excluded: they have a fixed size and break a
 /// size cycle. Non-struct `Named`s are pushed too but resolve to nothing contained (dead ends).
@@ -291,6 +302,12 @@ fn collect_block_const_refs(b: &Block, consts: &HashSet<Symbol>, out: &mut Vec<S
     }
 }
 
+/// Analyze a module: returns per-expression types (plus the def map and the checked `const`
+/// initializers) and every diagnostic collected along the way. Checking does not stop at the first
+/// error — a [`SemaResult`] comes back even when `diags` holds errors, and a rejected definition can
+/// still be registered (a reserved `wukong_`-prefixed function is) so its call sites do not cascade.
+/// The caller stops the pipeline: `wukong_driver::compile` refuses to run `mir_build` if any returned
+/// diagnostic `is_error()`.
 pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnostic>) {
     let mut s = Sema {
         interner,
@@ -500,8 +517,9 @@ impl Sema<'_> {
     /// the unknown-array-length check).
     ///
     /// Those types are lowered exactly ONCE — during `collect`, with the flag still false — while the
-    /// only types re-lowered in the body pass are the parameters and return type of functions WITH a
-    /// body. So an undeclared dimension name in a struct field or an `extern` signature was silently
+    /// only types the body pass re-lowers on its own are the parameters and return type of functions
+    /// WITH a body (`check_fn`) and a top-level `const`'s annotation (`check_const`). So an undeclared
+    /// dimension name in a struct field, an enum payload or an `extern` signature was silently
     /// turned into a fresh unconstrained `Dim::Var`, precisely the hole E0504 exists to close:
     /// `extern { fn dot(a: Tensor[f32, K], b: Tensor[f32, KK]) -> f32; }` — a one-character typo —
     /// gave the two parameters independent dims, so a length-4 and a length-8 buffer unified without
@@ -639,7 +657,7 @@ impl Sema<'_> {
     /// Reject a `const` whose initializer depends on its own value — directly (`const A = A + 1`) or
     /// transitively (`A` uses `B`, `B` uses `A`). `mir_build` inlines a const's initializer at each
     /// use site and recurses for a const-references-const, so a cycle stack-overflows the compiler
-    /// (a crash on a plausible typo). Mirrors `check_recursive_structs`: a DFS over the
+    /// (a crash on a plausible typo). Mirrors `check_recursive_types`: a DFS over the
     /// const-reference graph that flags reaching the root. Runs after `collect`, when every const is
     /// registered, and (like the struct check) before `check_bodies`, so the error halts the pipeline
     /// ahead of mir_build's inliner.
@@ -973,10 +991,11 @@ impl Sema<'_> {
         n
     }
 
-    /// If `e` is a C-style enum-variant access `E::V` (a `Field` whose base is a single-segment
-    /// path naming a declared enum), its integer discriminant — the value the variant lowers to.
-    /// Mirrors `mir_build`'s `enum_variant_value` exactly, so compile-time evaluation (array
-    /// lengths, index bounds) agrees with what lowering emits.
+    /// If `e` is an enum-variant access `E::V` (a `Field` whose base is a single-segment path naming
+    /// a declared enum), its integer discriminant — the value the variant lowers to. Payload-ness is
+    /// not consulted (a data-carrying variant has a discriminant too; using one *bare* is rejected
+    /// separately as an incomplete constructor). Mirrors `mir_build`'s `enum_variant_value` exactly,
+    /// so compile-time evaluation (array lengths, index bounds) agrees with what lowering emits.
     fn enum_variant_disc(&self, e: &Expr) -> Option<i64> {
         let ExprKind::Field { base, name } = &e.kind else {
             return None;
@@ -993,12 +1012,16 @@ impl Sema<'_> {
         variants.iter().find(|v| v.name == name.sym).map(|v| v.disc)
     }
 
-    /// Evaluate a compile-time array length: a plain integer literal, or a single-segment path
-    /// naming a top-level `const` whose initializer is itself such a length (so `const N: usize = 4;
-    /// [i32; N]` sizes the array). `self.consts` is populated in `collect` before any body is
-    /// checked, so this is order-independent. `mir_build`'s `const_usize_expr` mirrors this exactly
-    /// — the two must agree on the length, else the slot size desyncs from these bounds checks. The
-    /// depth bound guards against a cyclic const initializer (also rejected by `check_recursive_consts`).
+    /// Evaluate a compile-time array length (or a `const` tensor dimension): a plain integer literal,
+    /// a single-segment path naming a top-level `const` whose initializer is itself such a length (so
+    /// `const N: usize = 4; [i32; N]` sizes the array), constant arithmetic folded through the shared
+    /// `BinOp::fold_const_len`, or an enum variant's discriminant. Anything else — and any
+    /// negative discriminant — is the `0` fallback, not an error (`array_len` reports the unresolvable
+    /// *name* case). `self.consts` is populated in `collect` before any body is checked, so this is
+    /// order-independent. `mir_build`'s `const_usize_expr`/`const_usize_depth` mirrors this arm for
+    /// arm — the two must agree on the length, else the slot size desyncs from these bounds checks.
+    /// The depth bound guards against a cyclic const initializer (also rejected by
+    /// `check_recursive_consts`).
     fn eval_usize_depth(&self, e: &Expr, depth: u32) -> u64 {
         if depth > 64 {
             return 0;
@@ -1157,11 +1180,12 @@ impl Sema<'_> {
         self.generics.clear();
     }
 
-    /// Check a returned value's type against the declared return type `self.ret_ty`. Only tensor /
-    /// vector SHAPE agreement is enforced — a function must not lie about its output shape, since
-    /// callers propagate the declared return shape into downstream shape checks (a single wrong
-    /// return silently poisons every caller). Scalars and other kinds stay lenient (numeric coercion
-    /// at lowering, like `let`/assignment), so this never over-fires on e.g. `return 5` from `-> i64`.
+    /// Check a returned value's type against the declared return type `self.ret_ty`. Three checks, in
+    /// order: tensor / vector SHAPE agreement in RIGID mode — a function must not lie about its output
+    /// shape, since callers propagate the declared return shape into downstream shape checks (a single
+    /// wrong return silently poisons every caller); a scalar-vs-pointer/aggregate KIND clash; and
+    /// scalar-type agreement for a non-literal value. An unsuffixed literal still adapts, so this
+    /// never over-fires on e.g. `return 5` from `-> i64`; every other kind stays lenient.
     fn check_return_shape(&mut self, val_ty: &Ty, val: &Expr, span: Span) {
         let ret = self.ret_ty.clone();
         if matches!(ret, Ty::Tensor { .. } | Ty::Vector { .. })
@@ -1213,11 +1237,12 @@ impl Sema<'_> {
 
     /// An elementwise binary operator requires its operand *shapes* to agree: adding two tensors of
     /// different shape (`Tensor[f32,2,3] + Tensor[f32,3,2]`) is meaningless, yet the result-type
-    /// `join` picks one operand and lets it through. This applies the headline shape check to
-    /// operators — the call-site unifier already covers function arguments, so this closes the last
-    /// of the three shape-bearing contexts. Only fires when *both* sides are tensors, or both are
-    /// vectors: a tensor/scalar pairing stays lenient (scalar broadcast), and two scalars promote via
-    /// `join` (mixed precision like `(i as f64) + 1.0` must not error).
+    /// `join` picks one operand and lets it through. This is the RIGID-mode shape check for every
+    /// *body* context where two shapes meet — binary operands, an assignment's place and value,
+    /// `if`/`match` arm merges, and a `loop`'s `break` values — while `check_fn_call` covers call
+    /// arguments and `check_return_shape` the return. Only fires when *both* sides are tensors, or
+    /// both are vectors: a tensor/scalar pairing stays lenient (scalar broadcast), and two scalars
+    /// promote via `join` (mixed precision like `(i as f64) + 1.0` must not error).
     fn check_binop_shapes(&mut self, l: &Ty, r: &Ty, span: Span) {
         if matches!(
             (l, r),
@@ -1337,11 +1362,12 @@ impl Sema<'_> {
         }
     }
 
-    /// The permitted `as` conversions: scalar↔scalar (every numeric/bool/char pairing — a real
-    /// numeric conversion), scalar↔enum (a C-style discriminant), and pointer→pointer only when the
-    /// pointee types match (a same-layout retype). Everything else — pointer↔integer,
-    /// aggregate↔scalar, differing-element pointer casts — is a byte reinterpret the two backends
-    /// disagree on, so it is rejected.
+    /// The permitted `as` conversions: identity (`from == to`), scalar→scalar (every numeric/bool/char
+    /// pairing — a real numeric conversion), C-style enum→scalar (its discriminant), integer→pointer
+    /// (forming an address, including `0 as *T`), and pointer→pointer only when the pointee types
+    /// match (a same-layout retype). Everything else — pointer→integer, *scalar→enum* (it would forge
+    /// a discriminant no variant holds), aggregate↔scalar, data-carrying-enum↔scalar, differing-element
+    /// pointer casts — is a byte reinterpret the two backends disagree on, so it is rejected.
     fn cast_is_valid(&self, from: &Ty, to: &Ty) -> bool {
         if from == to {
             return true;
@@ -1552,9 +1578,10 @@ impl Sema<'_> {
     }
 
     /// Whether parameter `name`'s declared type is an aggregate passed BY REFERENCE (struct / tuple /
-    /// array / tensor / vector) — the kinds whose through-projection mutation reaches the caller.
-    /// Scalars, pointers, and references are excluded: a scalar can't be projected, and a pointer /
-    /// reference projection dereferences to a pointee that is legitimately mutable.
+    /// array / tensor / vector — and a `[]T` slice, whose elements live in the caller's buffer) — the
+    /// kinds whose through-projection mutation reaches the caller. Implemented as the complement of
+    /// scalar / pointer / reference / `()` / `Unknown` / `Error`: a scalar can't be projected, and a
+    /// pointer / reference projection dereferences to a pointee that is legitimately mutable.
     fn param_is_aggregate(&self, name: Symbol) -> bool {
         match self.param_tys.get(&name) {
             Some(ty) => !matches!(
@@ -2349,7 +2376,8 @@ impl Sema<'_> {
 
     /// Whether `init` can initialize a `let` annotated `ann`. Besides ordinary compatibility,
     /// an *unsuffixed* numeric literal adapts to any integer/float annotation (Rust's `{integer}`
-    /// inference, in miniature).
+    /// inference, in miniature) — as does an all-literal arithmetic expression or an array/tuple
+    /// literal of adapting elements; see [`Sema::literal_adapts`] for the exact set.
     fn let_compatible(&self, ann: &Ty, init: &Expr, init_ty: &Ty) -> bool {
         if compatible(ann, init_ty) {
             return true;
@@ -3418,10 +3446,6 @@ fn is_vector_name(s: &str) -> bool {
     false
 }
 
-/// The inclusive value range of a narrow integer scalar, as `i64` bounds. `None` for `bool`/floats
-/// and for `i64`/`u64`/`usize`/`isize` — a literal that parses to an `i64` always fits those, and a
-/// `u64` near its top doesn't fit an `i64` to compare, so they are left unchecked rather than
-/// mis-flagged.
 /// Whether `b` is guaranteed to diverge on every path — return from the function or loop forever —
 /// so control never falls off its end. The basis for the definite-return check. **Conservative
 /// toward `true`**: it only reports `false` when a fall-through path is *certain*, so a function that
@@ -3478,12 +3502,10 @@ fn arm_is_catch_all(a: &MatchArm) -> bool {
     a.guard.is_none() && matches!(a.pat.kind, PatKind::Wildcard | PatKind::Ident(_))
 }
 
-/// Record every enum-variant name a (guard-less) pattern covers, flattening or-patterns. A `Path`
-/// pattern's last segment is the variant name (`Color::Red` → `Red`); other pattern kinds contribute
-/// nothing. Used by `match_is_provably_nonexhaustive` for enum coverage.
-/// Enum-coverage contribution of one (guard-less) pattern: a variant pattern covers its NAME, an
-/// int-literal / range pattern covers a numeric SPAN of discriminants (an enum matches by its
-/// discriminant), a wildcard/ident alternative covers everything, and or-patterns recurse.
+/// Enum-coverage contribution of one (guard-less) pattern, for `match_is_provably_nonexhaustive`:
+/// a variant pattern covers its NAME (the path's last segment, `Color::Red` → `Red`), an int-literal
+/// / range pattern covers a numeric SPAN of discriminants (an enum matches by its discriminant), a
+/// wildcard/ident alternative covers everything, and or-patterns recurse.
 /// Returns `false` — "cannot reason, stay lenient" — for any other pattern kind (char/bool/tuple:
 /// ill-typed for an enum scrutinee or unmodeled here), so E0405 only fires on *certain* misses.
 fn collect_enum_coverage(
@@ -3590,6 +3612,10 @@ fn expr_contains_break(e: &Expr) -> bool {
     }
 }
 
+/// The inclusive value range of a narrow integer scalar, as `i64` bounds. `None` for `bool`/`char`/
+/// floats and for `i64`/`u64`/`usize`/`isize` — a literal that parses to an `i64` always fits those,
+/// and a `u64` near its top doesn't fit an `i64` to compare, so they are left unchecked rather than
+/// mis-flagged.
 fn int_lit_range(sc: Scalar) -> Option<(i64, i64)> {
     use Scalar::*;
     Some(match sc {
@@ -3667,9 +3693,13 @@ fn has_float_suffix(text: &str) -> bool {
         .any(|s| text.ends_with(s))
 }
 
-/// Evaluate a constant integer expression — an integer literal (with an optional unary minus) — to
-/// its value, for resolving an enum variant's explicit discriminant (`A = 10`). Returns `None` for
-/// anything not a compile-time integer literal (the variant then auto-increments).
+/// Evaluate a constant integer expression to its value: an integer literal, a unary `-`/`!` of one,
+/// or folded arithmetic / bitwise / shift over such operands (wrapping, matching the optimizer's
+/// constant folder; a division or remainder by zero declines). Returns `None` for anything else — a
+/// name, a call, a comparison. Used for an enum variant's explicit discriminant (`A = 10`, which then
+/// auto-increments when this declines), for `range_check_int_literal`, and for the compile-time
+/// index-bounds check via `eval_index_const`. NOTE: this is *not* the array-length evaluator —
+/// lengths go through `eval_usize_depth`, which is the arm-for-arm mirror of `mir_build`.
 fn eval_const_int(e: &Expr, interner: &Interner) -> Option<i64> {
     match &e.kind {
         ExprKind::Int(s) => parse_int_text(interner.resolve(*s)),
@@ -3721,8 +3751,6 @@ fn eval_const_int(e: &Expr, interner: &Interner) -> Option<i64> {
     }
 }
 
-/// Parse an integer literal's source text (decimal, `0x`/`0o`/`0b` radix, `_` separators, optional
-/// type suffix, optional leading sign) to an `i64`, or `None` if it isn't a valid integer literal.
 /// Whether an integer literal's text denotes a value Wukong can represent — it parses, after the
 /// optional sign / type suffix / `_` separators and in its radix, as an i64 *or* a u64. A mistyped
 /// radix like `0z123` (lexed as one `Int` token with a bogus `z123` suffix), an empty/garbled radix
@@ -3810,6 +3838,9 @@ fn bad_unicode_escape(text: &str) -> Option<u32> {
     None
 }
 
+/// Parse an integer literal's source text (decimal, `0x`/`0o`/`0b` radix, `_` separators, optional
+/// type suffix, optional leading sign) to an `i64`, or `None` if it isn't a valid integer literal —
+/// including a magnitude that overflows `i64` (see [`parse_u64_text`] for that rung).
 fn parse_int_text(text: &str) -> Option<i64> {
     let mut s = text.trim();
     let neg = s.starts_with('-');

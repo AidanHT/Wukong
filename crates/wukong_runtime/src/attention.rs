@@ -11,10 +11,17 @@
 //! state at `O(D)` and reads `Q`/`K`/`V` straight through, which is exactly the memory wall
 //! flash-attention was built to break — the win grows with the sequence length.
 //!
+//! One C entry, [`wukong_attention_f32`], and — unlike almost every other family in this crate —
+//! **no `_parallel` twin**: multi-head work is spread by the caller (an outlined `@parallel` head
+//! loop), not inside the kernel. A non-positive `s` or `d` is a no-op.
+//!
 //! The native backend calls this directly; the interpreter marshals its abstract memory into real
 //! buffers and calls the *same* function, so the differential oracle stays bit-for-bit exact (the
 //! online recurrence reassociates the softmax, so — like the GEMM kernel and the reassociated
-//! reductions — the shared kernel *is* the oracle: both backends run it and must agree).
+//! reductions — the shared kernel *is* the oracle: both backends run it and must agree). Note the
+//! twin relation *inside* the kernel is weaker than elsewhere: [`attention_avx2`] reassociates the
+//! `q_i·k_j` dot across 8 lanes where [`attention_scalar`] sums sequentially, so those two agree only
+//! to tolerance — the naive materialized reference in the tests is what gates both.
 
 /// `O = softmax(scale · Q·Kᵀ [+ causal mask]) · V` for one head. Row-major `[S,D]`.
 ///

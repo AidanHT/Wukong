@@ -2,8 +2,10 @@
 //!
 //! Hand-written recursive descent for items, statements, and types; a Pratt (precedence-climbing)
 //! parser for expressions. The parser allocates [`NodeId`]s, interns identifiers/literals, and
-//! recovers from errors so a single mistake doesn't abort the whole parse. Items and the module
-//! header are added in a later commit; this module covers types, expressions, and statements.
+//! recovers from errors so a single mistake doesn't abort the whole parse. This module covers
+//! types, expressions, statements, patterns and attributes; the module header and the item forms
+//! (`fn`/`struct`/`enum`/`const`/`import`/`extern`) live in `items.rs`, which also defines the three
+//! `parse_module*` entry points re-exported below.
 
 use wukong_ast::*;
 use wukong_diag::Diagnostic;
@@ -646,9 +648,10 @@ impl<'a> Parser<'a> {
             // built *iteratively* (this loop, not recursion), so the parser's own descent stays
             // shallow — but the resulting tree does not, and a later recursive consumer (sema,
             // lowering, even the `Box` chain's `Drop`) overflows the stack on it. Charge every fold
-            // to the shared budget, exactly like the binop fold at :502 and the cast fold at :536;
-            // the `_ => break` arm below builds nothing, so it is not charged. No restore is needed
-            // here: the sole caller `parse_prefix` snapshots and restores `self.depth` around us.
+            // to the shared budget, exactly like the binop fold in `parse_expr_bp` and the cast fold
+            // in `parse_cast`; the `_ => break` arm below builds nothing, so it is not charged. No
+            // restore is needed here: the sole caller `parse_prefix` snapshots and restores
+            // `self.depth` around us.
             if matches!(self.kind(), T::LParen | T::LBracket | T::Dot | T::ColonColon) {
                 self.depth += 1;
                 if self.depth > Self::MAX_DEPTH {
@@ -1439,7 +1442,8 @@ impl<'a> Parser<'a> {
     }
 
     /// A primary pattern optionally followed by a range tail `..hi` / `..=hi`. A range is recognized
-    /// only after an integer-literal lower bound, so it never shadows `_`/identifier/tuple patterns.
+    /// only after an integer- or char-literal lower bound, so it never shadows `_`/identifier/tuple
+    /// patterns.
     fn parse_pattern_range(&mut self) -> Pattern {
         let start = self.span();
         let lo = self.parse_pattern_primary();
@@ -1645,7 +1649,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ---- Attributes (also used by items in a later commit) ----
+    // ---- Attributes (also used by the item level in `items.rs`) ----
 
     pub(crate) fn parse_attrs(&mut self) -> Vec<Attr> {
         let mut attrs = Vec::new();
@@ -1748,11 +1752,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Split a float-token text of the form `N.M` (two non-empty runs of ASCII digits separated by a
-/// single `.`, with no exponent or type suffix) into the tuple-index pair `(N, M)`. This recovers
-/// the two indices the lexer glues together in a nested tuple-field access like `t.0.0` (it lexes
-/// the trailing `0.0` as one float literal). Returns `None` for any genuine float (one with an
-/// exponent, a suffix, or a missing side), which is not a valid tuple-index pair.
 /// Decode an integer literal's source text as an unsigned value. Handles the radix prefixes
 /// `0x`/`0o`/`0b` (case-insensitive), digit separators `_`, and an explicit integer type suffix
 /// (`16usize`). Returns `None` for a negative, malformed, or out-of-`u64`-range literal.
@@ -1790,6 +1789,11 @@ fn parse_u64_literal(text: &str) -> Option<u64> {
     }
 }
 
+/// Split a float-token text of the form `N.M` (two non-empty runs of ASCII digits separated by a
+/// single `.`, with no exponent or type suffix) into the tuple-index pair `(N, M)`. This recovers
+/// the two indices the lexer glues together in a nested tuple-field access like `t.0.0` (it lexes
+/// the trailing `0.0` as one float literal). Returns `None` for any genuine float (one with an
+/// exponent, a suffix, or a missing side), which is not a valid tuple-index pair.
 fn split_tuple_float(text: &str) -> Option<(u32, u32)> {
     let (a, b) = text.split_once('.')?;
     if a.is_empty() || b.is_empty() {

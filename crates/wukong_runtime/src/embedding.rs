@@ -22,6 +22,11 @@
 //! bounds the kernel writes that output row as all-zeros (a safe, deterministic fallback identical in
 //! the AVX2, scalar, and parallel paths). In-range ids — the only case a well-typed program produces —
 //! copy exactly.
+//!
+//! **Signed extents.** `t`/`h`/`v` are `i64`, never `usize` — a non-positive `t` or `h` is a no-op and
+//! a non-positive `v` makes every id out of range, so every output row is zeroed. This module is where
+//! that rule was learned (taking them as `usize` read `t = -1` as `usize::MAX` and walked off `out`);
+//! `negative_extents_are_noops` pins it, `i64::MIN` included.
 
 /// Copy one weight row into one output row: `out_row[0..h] = weight_row[0..h]`, 8 f32 per step with a
 /// scalar tail. AVX2 when available, else the scalar copy — both move the identical bytes (a copy is

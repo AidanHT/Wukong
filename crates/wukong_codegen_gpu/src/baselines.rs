@@ -9,17 +9,23 @@
 //!   hand, compiled at runtime by **NVRTC** and launched through the same driver as Wukong's PTX.
 //!   This is the literal "beat C/C++/Rust on the GPU" — the GPU twin of beating scalar C on the CPU.
 //! * **Tier B — cuBLAS** (`cublas_gemm_nt_f16`): NVIDIA's hand-tuned closed-source GEMM, the gold
-//!   standard. Wukong is reported as a **% of cuBLAS**, same-run, same buffers.
+//!   standard. Wukong is reported as a **% of cuBLAS**, same-run, same buffers. The Tier-B bench also
+//!   grew siblings as the kernel families landed: **cuBLASLt** (raw-`sys` — the only surface that
+//!   exposes fp8 E4M3 matmul), int8 IMMA through classic `cublasGemmEx`, **cuDNN** for conv2d
+//!   (`cudnnConvolutionForward` with the v7 heuristic choosing the engine), and an *optional*
+//!   out-of-process **PyTorch SDPA** fused-attention peer driven through a Python script. Some shapes
+//!   have no library peer at all (W4A16 decode) and are honestly measured against Tier A only.
 //!
-//! Both peers `dlopen` their redistributable DLLs (`nvrtc64_120_0.dll`, `cublas64_12.dll`) exactly
-//! the way `cudarc` already `dlopen`s the driver (`nvcuda.dll`). So *building* this crate still needs
-//! no CUDA toolkit; only *running these benches* needs the DLLs reachable on the loader path. On this
-//! box they live in a git-ignored `tools/cuda-redist/` (see `peer_env_hint`), put on `PATH` by the
-//! bench invocation. If they are absent the loader would `panic!`, so [`peers_available`] probes for
-//! them under `catch_unwind` and the peer benches skip when they are missing — the same "green
-//! without the hardware" discipline the GPU tests already follow. **A skip is not silent**: a run
-//! that is *supposed* to have the peers sets `WUKONG_PEER_REQUIRED=1` and the skip becomes a
-//! failure, and [`peer_probe`] names which library was unreachable (§3A P3).
+//! Every peer `dlopen`s its redistributable DLLs (`nvrtc64_120_0.dll`, `cublas64_12.dll`,
+//! `cublasLt64_12.dll`, `cudnn64_9.dll`) exactly the way `cudarc` already `dlopen`s the driver
+//! (`nvcuda.dll`). So *building* this crate still needs no CUDA toolkit; only *running these benches*
+//! needs the DLLs reachable on the loader path. On this box they live in a git-ignored
+//! `tools/cuda-redist/` (see `peer_env_hint`), put on `PATH` by the bench invocation. If they are
+//! absent the loader would `panic!`, so [`peers_available`] (NVRTC + cuBLAS), [`cudnn_available`] and
+//! [`fa2_peer_available`] probe under `catch_unwind` and the peer benches skip when they are missing —
+//! the same "green without the hardware" discipline the GPU tests already follow. **A skip is not
+//! silent**: a run that is *supposed* to have the peers sets `WUKONG_PEER_REQUIRED=1` and the skip
+//! becomes a failure, and [`peer_probe`] names which library was unreachable (§3A P3).
 //!
 //! Correctness first (the plan's first law): every peer is cross-checked against the **same f64 CPU
 //! reference** as Wukong's own kernels before any speed number counts, so a fast-but-wrong peer

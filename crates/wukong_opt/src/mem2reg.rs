@@ -14,8 +14,11 @@
 //! that keeps a per-slot stack of the reaching definition. Reads become the reaching value, writes
 //! update it, and each CFG edge is given the arguments its destination's phis expect.
 //!
-//! Only integer and float slots are promoted. Pointer/array/vector slots stay in memory (they are
-//! rare as scalars and avoid having to synthesize a typed "undefined" value).
+//! Only integer and float slots are promoted. A slot read before any write on some path becomes a
+//! zero constant of its type, materialized once per type at the top of the entry block, which is what
+//! the interpreter's zero-initialized memory would have yielded. Pointer/array/vector slots stay in
+//! memory: they are rare as scalars and have no such natural zero, so promoting them would mean
+//! synthesizing a typed "undefined" value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use crate::fxhash::{FxHashMap, FxHashSet};

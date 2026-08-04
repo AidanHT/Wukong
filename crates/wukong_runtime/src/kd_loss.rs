@@ -24,9 +24,18 @@
 //! AVX2 [`crate::vmath::exp8`] on the 8-lane body, the scalar [`crate::vmath::exp1`] on the tail and
 //! the no-AVX2 fallback — with the row sum's `log` taken through the shared [`crate::vmath::log1`].
 //! The final `Σ q·(lse − x)` pass uses a second fixed 8-lane accumulator with the same balanced
-//! `hsum8` (one FMA per lane: `q·lse − q·x` accumulated). So the loss is bit-identical to the
-//! hard-label kernel's `lse` computation, and the AVX2 path and the scalar twin agree **bit-for-bit**
-//! (pinned by a unit test across non-multiple-of-8 `cols`).
+//! `hsum8` (one FMA per lane: `fmadd(q, lse, -(q*x))` == the scalar `q.mul_add(lse, -(q*x))`). So on
+//! **finite** logits the loss is bit-identical to the hard-label kernel's `lse` computation, and the
+//! AVX2 path and the scalar twin agree **bit-for-bit** (pinned by a unit test across
+//! non-multiple-of-8 `cols`).
+//!
+//! **LANDMINE — the max fold is not NaN-safe here.** Unlike [`crate::xent`] / [`crate::xent_bwd`], whose
+//! AVX2 bodies blend the accumulator back over unordered lanes, `kd_loss_row_avx2` folds a raw
+//! `_mm256_max_ps(mxv, v)` (returns the freshly loaded `v` on an unordered compare) while
+//! `kd_loss_row_scalar` folds `f32::max` (= `maxNum`, drops the NaN). The two therefore pick different
+//! row maxima on a row containing a NaN logit, and the twin test uses finite data only — so no gate
+//! covers it. `norm.rs`'s softmax is a third variant again (`maxps` on *both* sides). Do not assume the
+//! four modules' row maxima agree on non-finite input.
 //!
 //! **Determinism.** Rows are independent, so the `_parallel` entry just maps the identical per-row
 //! routine across rows — `serial == parallel` bit-for-bit with no cross-row combine (thread count is
@@ -47,9 +56,10 @@ fn hsum8(a: [f32; 8]) -> f32 {
     ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]))
 }
 
-/// Fixed-order horizontal max of 8 lane accumulators (balanced tree). On finite inputs this matches
-/// `_mm256_max_ps` lane-for-lane; the same `hmax8` softmax / `xent` uses. The twin test pins the
-/// agreement on finite data.
+/// Fixed-order horizontal max of 8 lane accumulators (balanced tree), folded with `f32::max`
+/// (= `maxNum`, which drops a NaN) — the same expression `norm::hmax8` / `xent::hmax8` use, and called by
+/// both of this module's paths, so *this* fold cannot split the twins. The **lane** accumulation feeding
+/// it can: see the max-fold LANDMINE in the module header. The twin test pins agreement on finite data.
 #[inline(always)]
 fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))
@@ -61,8 +71,10 @@ fn hmax8(a: [f32; 8]) -> f32 {
 /// `Σ_i q_i·(lse − x_i)` where `lse = m + log(Σ exp(x − m))`, `m = max(x)`.
 ///
 /// The max pass (8 lanes; lane `j` folds elements `≡ j (mod 8)`, tail into lanes `0..`) and the Σexp
-/// pass are byte-identical to softmax's / `xent`'s in `norm.rs`/`xent.rs` — same `hmax8`, same
-/// `exp1`, same `hsum8` — so `m` and the `lse` are bit-identical to the hard-label kernel's. The new
+/// pass are byte-identical to `xent_row_scalar`'s in `xent.rs` — same `f32::max` fold, same `hmax8`,
+/// same `exp1`, same `hsum8` — so `m` and the `lse` are bit-identical to the hard-label kernel's.
+/// (The Σexp pass matches `norm.rs`'s softmax too, but *its* 8-block row max folds the raw `maxps`
+/// semantics, so those two agree only on finite rows — module header.) The new
 /// pass folds `q·(lse − x)` with the same 8-lane layout and `hsum8`: per lane one `mul_add` of
 /// `q·(lse − x)` computed as `q.mul_add(lse, -(q*x))` accumulated — the same op order the AVX2 path
 /// uses.
@@ -116,7 +128,9 @@ unsafe fn kd_loss_row_scalar(x: *const f32, q: *const f32, n: usize) -> f32 {
 // --- AVX2 kernel (mirrors the scalar twin lane-for-lane on finite inputs) --------------------------
 
 /// Soft-label cross-entropy of one row, AVX2/FMA. The max + Σexp passes are byte-identical to
-/// `softmax_row_avx2` / `xent_row_avx2` (so `m` and `lse` match bit-for-bit), capped with one scalar
+/// `softmax_row_avx2` and, on **finite** logits, to `xent_row_avx2` (so `m` and `lse` match
+/// bit-for-bit there; xent blends its max accumulator over unordered lanes and this does not — see
+/// the module header), capped with one scalar
 /// `log1`; then the q-weighted sum keeps one `__m256` accumulator whose lane `j` folds elements
 /// `≡ j (mod 8)` exactly as the scalar twin does (`fmadd(q, lse, -(q*x))` == the scalar `mul_add`),
 /// stores to `[f32; 8]` and calls the same `hsum8`.
@@ -127,7 +141,8 @@ unsafe fn kd_loss_row_scalar(x: *const f32, q: *const f32, n: usize) -> f32 {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn kd_loss_row_avx2(x: *const f32, q: *const f32, n: usize) -> f32 {
     use std::arch::x86_64::*;
-    // 1) max — identical to softmax_row_avx2 / xent_row_avx2.
+    // 1) max — identical to softmax_row_avx2; NOT to xent_row_avx2, which blends its accumulator
+    // back over unordered lanes, so the two agree only on finite rows (module-header LANDMINE).
     let mut mxv = _mm256_set1_ps(f32::NEG_INFINITY);
     let mut i = 0;
     while i + 8 <= n {

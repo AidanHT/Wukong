@@ -1,7 +1,9 @@
 //! The GPU implementation of [`wukong_interp::Accelerator`] — the bridge that makes `--backend=gpu`
 //! run recognized kernel calls on the device while the rest of the program is still tree-walked by
 //! the interpreter (so control flow, buffer layout, and every non-kernel op are bit-identical to the
-//! CPU oracle; only the recognized GEMM/norm/activation/reduction calls move to the GPU).
+//! CPU oracle; only the recognized GEMM/norm/activation/reduction calls move to the GPU). The offload
+//! menu is exactly the five [`Accelerator`] hooks implemented below: `sgemm_nt`, the fused
+//! `sgemm_nt_epi` epilogue (`act(x·Wᵀ [+ bias])`), `vmath`, `norm` and `sreduce`.
 //!
 //! Behind the driver's `gpu` feature, so the default toolchain-free build never compiles `cudarc`.
 //! A GPU error is surfaced as `Some(Err(..))`, never `None`: declining (`None`) means "fall back to
@@ -26,8 +28,9 @@ impl<'g> GpuAccel<'g> {
     }
 }
 
-/// Whether `wukong_codegen_gpu::gpu::norm` has a PTX entry for this `NORM_*` op code — the sibling
-/// of `gpu::vmath_supported` / `gpu::reduce_supported`, which `norm` does not provide.
+/// Whether `wukong_codegen_gpu::gpu::norm` has a PTX entry for this `NORM_*` op code — the driver-side
+/// mirror of `gpu::norm_supported`, itself the sibling of `gpu::vmath_supported` /
+/// `gpu::reduce_supported`. This copy and that predicate must agree op-for-op.
 ///
 /// MIRROR: the op codes are defined in `wukong_runtime/src/norm.rs` — SOFTMAX=0, LAYERNORM=1,
 /// RMSNORM=2, LOGSOFTMAX=3, L2NORM=4 — and `gpu::norm` maps only the first three, ending its match

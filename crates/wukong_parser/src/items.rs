@@ -200,7 +200,8 @@ impl Parser<'_> {
         } else {
             None
         };
-        // `where` bounds are accepted but not yet enforced.
+        // `where` bounds are accepted syntactically and then dropped: the clause is skipped to the
+        // body/`;`/`=` and never reaches the AST, so nothing downstream can enforce it.
         if self.at(T::Where) {
             while !matches!(self.kind(), T::LBrace | T::Semi | T::Eq | T::Eof) {
                 self.bump();

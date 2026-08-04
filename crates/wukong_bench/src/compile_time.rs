@@ -7,6 +7,11 @@
 //! (the minimum single-run time is the least perturbed by scheduler noise), and separately runs one
 //! instrumented [`wukong_opt::optimize_timed`] pass to attribute time per optimizer pass.
 //!
+//! That instrumented pass is also gated: `measure_one` renders both the `optimize` and the
+//! `optimize_timed` program with `wukong_mir::print::print_program` and requires the two texts to be
+//! byte-identical, so the timing path can never quietly become a second optimizer. A divergence is
+//! reported as `*** FAILED` and this mode exits 1.
+//!
 //! Because ~80–85% of front→O2 compile time is the optimizer, the per-pass table is the map of where
 //! the time goes — the thing this harness exists to expose so it can be cut. Run with:
 //!

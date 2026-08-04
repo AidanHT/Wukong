@@ -2,7 +2,8 @@
 //!
 //! Wukong lowers tensor ops to runtime-kernel calls (`wukong_sgemm_nt` = `nn.Linear`,
 //! `wukong_vmath_f32` = elementwise activation, `wukong_sreduce_f32` = reduction,
-//! `wukong_velem_f32` = streaming affine/residual) — the interpreter runs the *same* kernels, so a
+//! `wukong_velem_f32` = streaming affine/residual, `wukong_norm_f32` = row-wise softmax/LayerNorm/
+//! RMSNorm; each also in its `@parallel` spelling) — the interpreter runs the *same* kernels, so a
 //! forward MIR function can be a tape of these calls plus a final scalar loss. Where the scalar core
 //! ([`crate::Vjp`]) tracks an adjoint per SSA value, this module tracks an adjoint per **buffer**
 //! (memory), the PyTorch-style picture tensor ops need: each forward buffer has a gradient buffer,
@@ -11,7 +12,9 @@
 //! elementwise (Hadamard) combines that no single existing kernel covers.
 //!
 //! Buffers are differentiated under the same single-block contract as the scalar core; the only new
-//! control flow is the counted loops this module synthesizes for transpose / activation-backward.
+//! control flow is the counted loops this module synthesizes — one for the transpose and for an
+//! algebraic activation backward, a nested rows x cols pair for the norm backwards. (So the *emitted*
+//! gradient function is multi-block: it is not itself re-differentiable.)
 
 use crate::Vjp;
 use wukong_mir::{BinOp, BlockId, CastKind, CmpOp, MirType, Op, ValueId};
@@ -249,8 +252,10 @@ impl<'a> Vjp<'a> {
     // --- reductions: scalar adjoint -> buffer adjoint ------------------------------------------
 
     /// `loss = sreduce(x, y, n, op)` produces the scalar loss. Its adjoint `g = adj[loss]` flows back
-    /// into a *buffer* gradient. SUM: `dx = g` (broadcast). SSD (`sum (x-y)^2`): `dx = 2g(x-y)`,
-    /// `dy = -2g(x-y)` — the MSE-loss backbone — each one streaming-affine, so a single velem call.
+    /// into a *buffer* gradient. SUM: `dx = g` (broadcast). DOT (`sum x[i]y[i]`): `dx = g*y`,
+    /// `dy = g*x` — or, when both operands are the SAME buffer (the sum-of-squares loss), the single
+    /// `dx = 2g*x`. SSD (`sum (x-y)^2`): `dx = 2g(x-y)`, `dy = -2g(x-y)` — the MSE-loss backbone.
+    /// Every case is streaming-affine, so each gradient is a single velem call.
     fn diff_sreduce(&mut self, args: &[ValueId], result: Option<ValueId>) -> Result<(), String> {
         let loss = result.ok_or("autodiff: sreduce call must produce the scalar loss")?;
         let g = match self.adj.get(&loss).copied() {

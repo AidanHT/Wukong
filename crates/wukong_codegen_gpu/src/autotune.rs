@@ -17,9 +17,16 @@
 //! applicable candidate as the reference and asserts every other candidate matches before trusting any
 //! timing — a miscompiled or mis-launched candidate fails the search, it never gets cached as a "winner".
 //!
+//! Two op families are tuned: the int8 GEMM candidate set above, and **W4A16** (int4 weight-only
+//! decode), whose search is over the split-K count `sk ∈ {1,2,4,8}` — cross-checked against the
+//! un-split output within fp16 tolerance rather than bit-exactly, since split-K reassociates the f16
+//! accumulation.
+//!
 //! The cache is a tiny hand-rolled text file (no serde dependency): one line per entry,
-//! `int8 <m> <n> <k> = <config> <gflops>`. `<config>` is a candidate token understood by
-//! [`launch_int8_tuned`].
+//! `<dtype> <m> <n> <k> = <config> <gflops>`, where `<dtype>` is `int8` or `w4a16`. `<config>` is a
+//! candidate token understood by [`launch_int8_tuned`] / [`launch_w4a16_tuned`]. It outlives the
+//! candidate set, so a hit is *validated* (`int8_token_usable` / `w4a16_token_usable`) before it is
+//! trusted — an unknown or mis-tiling token is a miss and re-tunes.
 
 use crate::gpu::Gpu;
 use cudarc::driver::{CudaFunction, CudaSlice, DriverError, LaunchConfig, PushKernelArg};

@@ -57,7 +57,8 @@ pub struct Dim {
 pub enum DimKind {
     /// A compile-time constant extent: `512`.
     Int(u64),
-    /// A symbolic extent bound by a generic parameter: `M`.
+    /// A named extent: `M`. Usually a generic dimension parameter, but sema also resolves a
+    /// same-named top-level `const` to its integer value (a declared generic shadows the const).
     Named(Symbol),
     /// A dynamic (runtime) extent: `?`.
     Dynamic,

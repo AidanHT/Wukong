@@ -398,8 +398,10 @@ fn entry_smem(
     // The whole-multiple staging constraint stated above must be CHECKED, not assumed: the division
     // truncates, so a tile that does not tile the CTA emits a kernel that stages only part of A/B (or,
     // at `*_chunks == 0`, nothing at all) while every `bar.sync`/`wmma.load`/`wmma.mma` stays
-    // well-formed — it JITs cleanly and computes C from stale shared memory. Same guard the sibling
-    // generators (`entry_smem_pipe`, `entry_mma_pipe`, `entry_mma_gate`) already carry.
+    // well-formed — it JITs cleanly and computes C from stale shared memory. LANDMINE: the sibling
+    // generators (`entry_smem_pipe`, `entry_mma_pipe`, `entry_mma_gate`) assert only the `>= 1` half,
+    // so a partial-multiple tile is still generatable there; every dispatched config is an exact
+    // multiple, but a new row in `PIPE_VARIANTS`/`CLIFF_VARIANTS` is not checked for it.
     assert!(
         a_chunks >= 1 && a_chunks * threads * 8 == bm * SM_BK,
         "{name}: A tile {bm}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
@@ -2012,8 +2014,13 @@ pub fn wmma_f16_sm_static_entry(use_128: bool) -> &'static str {
     if use_128 { "wmma_nt_f16_sm128_static" } else { "wmma_nt_f16_sm_static" }
 }
 
-/// fp16 tensor-core GEMM module: `wmma_nt_f16` (single 16×16 tile/warp, any 16-multiple dims) and
-/// `wmma_nt_f16_mt` (2×4 tiles/warp = 32×64, fragment-reuse, the fast path for large GEMMs).
+/// fp16 tensor-core GEMM module — the whole dispatched fp16 family in one module, in emission order:
+/// `wmma_nt_f16` (single 16×16 tile/warp, any 16-multiple dims), `wmma_nt_f16_mt` (2×4 tiles/warp =
+/// 32×64, fragment-reuse), the SMEM-staged `_sm`/`_sm128` and their `cp.async` double-buffered `_db`
+/// twins, every [`PIPE_VARIANTS`] multi-stage pipe (WMMA or `mma.sync`), the `_swz`/`_w22swz` no-pad
+/// swizzle twins of the `mma.sync` workhorse, and the fused-epilogue families (`_bias[_act]`,
+/// `_bias_residual`, the `mma_nt_f16_128x64_gate_*` gated-FFN tiles). The
+/// `every_dispatched_tensor_core_entry_is_defined` gate pins the names `gpu.rs` looks up.
 pub fn wmma_f16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
@@ -2261,10 +2268,12 @@ pub fn wmma_f16_ptx() -> &'static str {
 }
 
 /// bf16 tensor-core GEMM module: `wmma_nt_bf16` (single tile), `wmma_nt_bf16_mt` (fragment-reuse), the
-/// `cp.async` double-buffered `wmma_nt_bf16_sm_db`, and the fused-epilogue `wmma_nt_bf16_sm_db_{relu,
-/// silu,gelu}`. The pipelined + fused generators are precision-generic (`entry_smem_db` keys the
-/// fragment width / mma type off `ty`), so bf16 — the dominant *training* precision — gets the same
-/// beat-the-cuBLAS-chain fusion as fp16.
+/// [`PIPE_BF16`] `mma.sync` large-GEMM workhorse plus its `_swz`/`_w22swz` twins and `_bias*`/
+/// `_bias_residual` fused epilogues, the `mma_nt_bf16_128x64_gate_*` gated-FFN tiles, the `cp.async`
+/// double-buffered `wmma_nt_bf16_sm_db`, and the fused-epilogue `wmma_nt_bf16_sm_db_{relu,silu,gelu}`
+/// / `_bias{,_relu,_silu,_gelu}`. Every generator is precision-generic (`entry_smem_db` /
+/// `entry_mma_pipe` / `entry_mma_gate` key the fragment width and mma type off `ty`), so bf16 — the
+/// dominant *training* precision — gets the same beat-the-cuBLAS-chain fusion as fp16.
 pub fn wmma_bf16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {

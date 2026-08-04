@@ -16,18 +16,34 @@
 //! The `m` (row max) and `s` (Σexp) passes are **byte-identical** to `norm.rs`'s softmax /
 //! log-softmax — same fixed 8-lane accumulator, same `hmax8`/`hsum8` balanced combine, the same
 //! `exp8`/`exp1` from `vmath` — so these kernels are bit-for-bit consistent with the existing
-//! `NORM_LOGSOFTMAX` dispatch (and with a composed/scalar `exp`/`log`). log-softmax then writes
+//! `NORM_LOGSOFTMAX` dispatch (pinned by `matches_norm_logsoftmax_bit_for_bit`). A hand-composed
+//! `exp`/`log` expression in source is *not* bit-identical — it has no 8-lane accumulator — and only
+//! the f64-reference test holds these to it, to a tolerance. log-softmax then writes
 //! `x_i − off` with `off = m + log(s)` (one subtract, folding the two −m, −log s into one rounding,
 //! matching `norm.rs`); log-sum-exp writes the single `off`.
 //!
-//! **The differential gate (non-negotiable).** The interpreter marshals its abstract memory through
-//! these exact kernels, so:
+//! **Only the log-sum-exp pair is wired into the pipeline.** `wukong_logsumexp_f32[_parallel]` has a
+//! recognizer (`match_logsumexp`), an `RT_LOGSUMEXP` Cranelift symbol and an interpreter marshal arm;
+//! `wukong_logsoftmax_f32[_parallel]` has **none of the three** — every recognized log-softmax is
+//! emitted as `norm::wukong_norm_f32(.., NORM_LOGSOFTMAX)` instead. The log-softmax entries here are
+//! exported for external C callers and held to the live `norm.rs` copy by
+//! `matches_norm_logsoftmax_bit_for_bit`, which is what keeps the duplicated core from drifting.
+//!
+//! **The differential gate (non-negotiable).** For the log-sum-exp pair the interpreter marshals its
+//! abstract memory through these exact kernels (always the *serial* entry, even for a `_parallel`
+//! symbol), so:
 //! - the **scalar twin equals the AVX2 path bit-for-bit** (same 8-lane reduction layout + horizontal
 //!   combine in both; the only transcendental ops are `exp8`/`exp1` which already agree, and one
 //!   scalar `log1` on the *same* sum bits) — pinned by a unit test across non-multiple-of-8 tails;
 //! - the **`_parallel` variant equals the serial one bit-for-bit** — rows are independent, so the
 //!   parallel entry just maps the identical per-row routine across rows (no cross-row combine, no
-//!   thread-count-dependent chunking), so the result does not depend on core count.
+//!   thread-count-dependent chunking), so the result does not depend on core count; below
+//!   `LOGSOFTMAX_PAR_MIN` rows it tail-calls the serial entry outright, same bits again.
+//!
+//! A non-positive `rows` or `cols` is a no-op at all four entries. Unlike `norm.rs`, these `_parallel`
+//! entries fork with a bare `into_par_iter()` on the **global** pool (after `ensure_global_pool()`)
+//! rather than through `run_on_wuk_pool`, so they are not part of the unified-pool routing — which is
+//! a scheduling difference only, by the row-independence above.
 //! (Each reduction's lane reassociation is the documented reassociated-reduction exception: every
 //! backend runs this same kernel, so they agree.)
 
@@ -44,9 +60,11 @@ fn hsum8(a: [f32; 8]) -> f32 {
     ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]))
 }
 
-/// Fixed-order horizontal max of 8 lane accumulators (balanced tree). On finite inputs this matches
-/// `_mm256_max_ps` lane-for-lane; the twin test pins the agreement on finite data. Same shape as
-/// `norm::hmax8`.
+/// Fixed-order horizontal max of 8 lane accumulators (balanced tree). It folds with `f32::max`
+/// (= `maxNum`, which *drops* a NaN), **not** the [`maxps`] semantics the 8-lane accumulation uses —
+/// safe only because it is the same function on both paths (the AVX2 body stores its `__m256` to
+/// `[f32; 8]` and calls this), so the two row maxima agree by construction on NaN rows as well as
+/// finite ones; `scalar_matches_avx2_on_nan_rows` pins that. Same shape as `norm::hmax8`.
 #[inline(always)]
 fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))

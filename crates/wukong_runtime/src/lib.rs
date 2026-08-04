@@ -1,8 +1,10 @@
 //! `wukong_runtime` — the minimal runtime that Wukong programs link against.
 //!
 //! Kept deliberately tiny and allocation-explicit, matching the language's philosophy. The
-//! interpreter calls these implementations directly; native (LLVM) builds link the same logic
-//! compiled as a static library. The surface is overwhelmingly the dispatched kernel family
+//! interpreter calls these implementations directly; the native (Cranelift) backend calls the very
+//! same functions — bound as JIT symbols for `--run`, or as object imports that the `--emit=exe`
+//! link resolves out of this crate's rlib (rustc drives that link; its C fallback runtime does not
+//! carry the kernels). The surface is overwhelmingly the dispatched kernel family
 //! re-exported below (GEMM/GEMV, vmath, reductions, norms, …), fronted by [`wukong_sgemm`] (the
 //! matmul microkernel the compiler lowers a matmul nest to). The bump [`Arena`] and the sequential
 //! [`parallel_for`] are *reference* implementations with no caller anywhere in the workspace: no
@@ -466,9 +468,12 @@ pub(crate) fn wuk_pool_width() -> usize {
     rayon::current_num_threads()
 }
 
-/// The C-ABI parallel-for the native backend lowers `@parallel for` to. Splits `[0, n)` into one
-/// contiguous chunk per worker of the unified kernel pool ([`run_on_wuk_pool`]) and runs
-/// `body(start, end, env)` on each concurrently, returning only once every chunk has completed.
+/// The C-ABI parallel-for the native backend lowers `@parallel for` to. Splits `[0, n)` into
+/// contiguous spans and runs `body(start, end, env)` on the workers of the unified kernel pool
+/// ([`run_on_wuk_pool`]) concurrently, returning only once every span has completed. How many spans
+/// there are and who runs them depends on the scheduler (see **Scheduling** below): the default
+/// dynamic path calls `body` once per claimed granule, so a worker generally runs several
+/// non-adjacent spans, while `WUKONG_PFOR_DYN=0` gives exactly one contiguous chunk per worker.
 ///
 /// Bodies must be data-parallel: each index is processed exactly once and the chunks must not have
 /// cross-iteration dependencies (the interpreter runs the whole range sequentially and must agree).
@@ -561,8 +566,10 @@ const HEAP_HDR: usize = 16;
 /// call ABI but consumed only by the interpreter's typed-zero slot model; it is ignored here.
 ///
 /// Returns **null** for a zero/negative byte count (a zero-length slice has no dereferenceable
-/// element, so the null is never read through by a well-formed program), on multiply overflow, or
-/// on allocator exhaustion. The compiler clamps a negative `count` to 0 before the call; the clamp
+/// element, so the null is never read through by a well-formed program), when the byte product does
+/// not leave room for the header below `isize::MAX` (the product itself is computed in saturating
+/// `u128`, so it cannot wrap), or on allocator exhaustion. The compiler clamps a negative `count`
+/// to 0 before the call; the clamp
 /// here is defense in depth.
 #[no_mangle]
 pub extern "C" fn wukong_rt_alloc(count: i64, elem_size: i64, _elem_is_float: i64) -> *mut u8 {

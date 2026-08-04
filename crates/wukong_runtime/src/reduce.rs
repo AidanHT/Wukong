@@ -5,7 +5,10 @@
 //! (maxabs) }` folded by `fmax`/`fmin`. These are the reductions transformer math leans on: attention
 //! scores and projections (dot), the L2 loss (ssd), LayerNorm/RMSNorm mean & variance (sum, sumsq),
 //! the **L1 norm / mean-absolute-error** (abssum, absdiff), and the per-tensor **max/absmax** that
-//! softmax stability and dynamic int8 quantization scale-computation need (max, min). The compiler recognizes
+//! softmax stability and dynamic int8 quantization scale-computation need (max, min). Those nine ride
+//! [`wukong_sreduce_f32`] (`-> f32`); the two **arg**-reductions `RED_ARGMAX`/`RED_ARGMIN` return an
+//! *index* and so ride a separate `-> i64` entry, [`wukong_argreduce_f32`], with `-1` reserved for
+//! `n <= 0`. The compiler recognizes
 //! the reduction loop in a `@parallel` function and lowers it to one of these calls — the same play as
 //! the matmul→GEMM and activation→`wukong_vmath_f32` dispatch. The interpreter marshals its abstract
 //! memory through the **identical serial kernel**, so the differential oracle stays bit-for-bit exact.
@@ -14,7 +17,10 @@
 //! many cores ran it. So the array is cut into FIXED-size chunks (count independent of thread count);
 //! each chunk is reduced to a partial by the identical [`reduce_chunk`]; the partials are folded in
 //! ascending chunk order. The serial and parallel entries call the same per-chunk function and combine
-//! in the same order, so `serial == parallel == interpreter`, bit for bit, on any machine. (`fmax`/
+//! in the same order, so `serial == parallel == interpreter`, bit for bit, on any machine (the arg
+//! entries do the same with [`argreduce_chunk`] and [`arg_fold`], whose lowest-index-wins tie-break is
+//! what makes *that* fold decomposition-independent; and both `_parallel` entries just call their
+//! serial sibling when there is one chunk or `wuk_pool_width() <= 1`). (`fmax`/
 //! `fmin` are *not* associative on NaN/±0, but determinism here rests on the FIXED decomposition and
 //! ascending combine, not on associativity — the serial and parallel forms evaluate the identical
 //! expression tree.) Within a chunk the AVX2 path and the scalar twin are also bit-identical (lane `j`

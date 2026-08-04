@@ -28,7 +28,9 @@ pub struct FnDecl {
     pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
-    /// `None` for declarations without a body (extern fns, trait signatures).
+    /// `None` for a declaration with no body: an `extern` fn, or any `fn` header the parser found
+    /// followed by neither a `{…}` block nor `= expr;`. `Some` for both body forms — an `= expr;`
+    /// body is a synthesized `Block` whose `tail` is that expression.
     pub body: Option<Block>,
 }
 

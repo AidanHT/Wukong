@@ -6,9 +6,13 @@
 //! the GPU analogue of the CPU seam: a recognizer picks a kernel symbol, this crate provides the
 //! kernel (as PTX) + a host launcher, and the interpreter remains the (tolerance) oracle.
 //!
-//! Everything is behind the `gpu` feature so the toolchain-free CPU core stays untouched: a plain
-//! `cargo test` compiles an essentially empty crate; `cargo test -p wukong_codegen_gpu --features
-//! gpu` builds the `cudarc` path and runs kernels on the local device.
+//! Every module that touches `cudarc` is behind the `gpu` feature so the toolchain-free CPU core stays
+//! untouched: a plain `cargo test` compiles only the two device-free modules declared below
+//! (`paged_kv`, `paged_attention` — host policy, PTX text generators and f64 references, plus their
+//! shape/ASCII gates); `cargo test -p wukong_codegen_gpu --features gpu` builds the `cudarc` path and
+//! runs kernels on the local device. **A plain `cargo test` therefore does not type-check most of this
+//! crate** — only a `--features gpu` build does, and `cargo check --features gpu --all-targets` is the
+//! cheap way to get that coverage without a device.
 
 /// Whether this build has the GPU backend compiled in (`--features gpu`).
 pub const GPU_ENABLED: bool = cfg!(feature = "gpu");
@@ -56,10 +60,12 @@ pub mod ptx_fp8;
 #[cfg(feature = "gpu")]
 pub mod pool;
 
-/// General MIR->PTX lowering (Phase 4): a real `Backend` that consumes MIR and emits PTX, so
-/// *arbitrary* Wukong programs run on the GPU — recognized ops still dispatch to the tuned kernels
-/// as a fast path, everything else lowers generally. Additive to the existing recognizer-offload
-/// path (`--backend=gpu`); this is the separate `--backend=gpu-native` path.
+/// General MIR->PTX lowering (Phase 4): consumes MIR and emits PTX, so *arbitrary* Wukong programs
+/// run on the GPU — recognized runtime symbols lower to per-op `mrt_*` device helpers, everything else
+/// lowers generally, and anything unhandled declines with `lower::UNSUPPORTED`. Additive to the
+/// existing recognizer-offload path (`--backend=gpu`); this is the separate `--backend=gpu-native`
+/// path, which the driver drives through `lower::jit_run` (the `Backend` impl is the declared seam,
+/// not the call path).
 #[cfg(feature = "gpu")]
 pub mod lower;
 
@@ -118,7 +124,8 @@ pub use lower::{jit_run as lower_jit_run, GpuLowerBackend};
 // Owned, append-only. The host block allocator (`paged_kv::BlockManager`) is pure policy with no device
 // dependency, so this module is declared *un-gated*: it compiles and unit-tests in a plain (no-`gpu`)
 // `cargo test`. Only the device cache (`PagedKvCache`) and the decode kernels are `#[cfg(feature =
-// "gpu")]` within. `paged_attention` and `serving` (GPU launchers/loops) are declared as they land.
+// "gpu")]` within. `paged_attention` below is un-gated for the same reason; `serving` (the GPU
+// launchers / decode loop) is `gpu`-gated whole.
 pub mod paged_kv;
 
 /// Paged decode-attention kernel: single-query attention against the paged KV-cache, gathering K/V
@@ -131,6 +138,7 @@ pub mod paged_attention;
 
 /// Batched autoregressive decode layer/model over the paged KV-cache (`DecodeLayer`/`DecodeModel`) —
 /// the serving forward pass: projections + append-to-cache + paged attention + FFN, whole-stack
-/// GPU-resident, pooled/on-stream so a CUDA graph captures the whole decode step.
+/// GPU-resident, pooled/on-stream so a CUDA graph captures the whole decode step — plus the
+/// continuous-batching `Scheduler` (`Request` admission, eviction, `step_graphed`) that drives it.
 #[cfg(feature = "gpu")]
 pub mod serving;

@@ -2,6 +2,8 @@
 //! GPT-NeoX per-attention-layer positional rotation). Pairs with the forward [`crate::rope`] over a
 //! row-major `[rows, dim]` f32 tensor with `dim = 2*half`, the **half-split** convention: the first
 //! `half` channels pair with the last `half`, and row `r`'s absolute position is the row index `r`.
+//! As in the forward, the C entries take **`half`**, not `dim` — the extent guard is
+//! `rows <= 0 || half <= 0`, and `dim` is derived as `2*half` inside.
 //!
 //! RoPE forward rotates each pair `(a, b)` by `+theta` (the matrix `[[c, -s], [s, c]]`). The backward
 //! pass propagates the upstream gradient `g` through that rotation, which — since a rotation's Jacobian

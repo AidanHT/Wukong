@@ -4,8 +4,9 @@
 //! same block overwrites it with no intervening read of `slot`. We track, per alloca slot, the
 //! index of a pending (not-yet-read) store; a second store to the same slot marks the first dead.
 //!
-//! Reads clear a slot's pending store (the value was observed): a `load slot`, or — conservatively
-//! — any `load`/`store` through an unknown pointer, or any `call` (which may read through pointers).
+//! Reads clear a slot's pending store (the value was observed): a `load slot` clears that slot, and
+//! — conservatively — any `load`/`store` through an unknown pointer, or any `call`/vector-kernel call
+//! (either may read through a pointer it was given), clears *every* pending store.
 //! Pending stores that survive to the end of the block are kept: a successor block may read them.
 
 use crate::fxhash::{FxHashMap, FxHashSet};

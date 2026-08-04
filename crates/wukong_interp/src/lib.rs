@@ -1,8 +1,12 @@
 //! `wukong_interp` — a from-scratch MIR interpreter.
 //!
-//! Zero external dependencies by design: this is the always-available execution path and the
-//! oracle that differential tests compare LLVM output against. It walks the CFG block by block,
-//! keeping a per-call register file and a shared flat memory for `alloca`/`load`/`store`/`gep`.
+//! No crates.io dependencies of its own by design: this is the always-available execution path and
+//! the oracle differential tests compare the **native** (Cranelift) backend against — the textual
+//! LLVM emitter is never assembled or run, so it is not what the gate judges. It walks the CFG block
+//! by block, keeping a per-call register file and a shared flat memory for
+//! `alloca`/`load`/`store`/`gep` — **one slot per scalar leaf, not bytes** (see `slot_count`). It
+//! does depend on the workspace's `wukong_runtime`, so a recognized kernel call runs the *identical*
+//! microkernel the native backend links.
 
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
@@ -12,14 +16,17 @@ use wukong_span::{Interner, Symbol};
 use std::collections::HashMap;
 
 /// A runtime value. Integers are stored width-agnostically in an `i128` and masked per result
-/// type; pointers are indices into the interpreter's flat memory.
+/// type; pointers are **slot** indices into the interpreter's flat memory (one slot per scalar
+/// leaf, not a byte address).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
     Int(i128),
     Float(f64),
     Ptr(usize),
     /// A SIMD vector value: an index into the interpreter's `vecs` side arena (keeps `Value` cheap
-    /// and `Copy`). Produced by `Splat`/vector `Load`/vector `Bin`; consumed by vector `Store`.
+    /// and `Copy`). Produced by `Splat`, a vector `Load`, and every lane-wise arm of `eval`
+    /// (`Bin`/`Cmp`/`Neg`/`Not`/`Cast`/`Select`/`Fma`/`Sqrt`/`Round`); consumed by a vector `Store`
+    /// and by `vec_lanes` on the way into those arms.
     VecRef(u32),
     Unit,
 }
@@ -53,6 +60,11 @@ impl Value {
 const FUNC_TAG: usize = 1 << 60;
 
 /// The interpreter backend.
+///
+/// The `Backend` impl below is a *declared* seam, not the live dispatch path: nothing in the
+/// workspace calls `Backend::compile`. `wukong_driver` matches its own `BackendKind::Interp` and
+/// calls [`run_with_output`] directly, and the fuzzers/autodiff gate go straight to the
+/// `run_kernel_*` entry points. Keep the impl three lines and put behavior in the free functions.
 pub struct Interpreter;
 
 impl Backend for Interpreter {
@@ -79,12 +91,15 @@ impl Backend for Interpreter {
 ///
 /// Each method mirrors one `wukong_runtime` kernel over already-marshalled f32 buffers. Returning
 /// `None` means "not handled here — fall back to the CPU kernel", so partial / precision-restricted
-/// support is fine. With no accelerator installed (the default, and every existing caller), the
-/// differential oracle path is **byte-for-byte unchanged**; the CPU↔GPU gate is therefore a
-/// *tolerance* differential (interp-CPU vs interp-with-this-accelerator over identical inputs).
+/// support is fine. With no accelerator installed — the default, and every entry point except
+/// [`run_with_output_accel`] / [`run_kernel_f32_accel`] (which only `--backend=gpu` and the driver's
+/// GPU tolerance gates reach) — the differential oracle path is **byte-for-byte unchanged**; the
+/// CPU↔GPU gate is therefore a *tolerance* differential (interp-CPU vs interp-with-this-accelerator
+/// over identical inputs).
 pub trait Accelerator {
-    /// `C = A·Bᵀ` (the `_nt` form) with `beta == 0` (overwrite). Return `None` for the `beta != 0`
-    /// or non-transposed forms the GPU GEMM wrapper does not cover.
+    /// `C = A·Bᵀ` (the `_nt` form) with `beta == 0` (overwrite). Only that form is ever offered —
+    /// the GEMM arm pre-filters `beta != 0`, the plain `A·B`, and `_tn` (`C = Aᵀ·B`) to the CPU
+    /// kernel — so return `None` only for shapes the device kernel itself cannot take.
     fn sgemm_nt(
         &mut self,
         _a: &[f32],
@@ -100,7 +115,9 @@ pub trait Accelerator {
     fn vmath(&mut self, _op: i64, _x: &[f32], _out: &mut [f32]) -> Option<Result<(), String>> {
         None
     }
-    /// Fused row norm (softmax / LayerNorm / RMSNorm): `out` = norm over each `cols`-wide row of `x`.
+    /// Fused row norm: `out` = norm over each `cols`-wide row of `x`. `op` is the runtime `NORM_*`
+    /// code, and the interpreter forwards **all** of them (softmax, LayerNorm, RMSNorm, log-softmax,
+    /// L2) — decline the ones the device has no kernel for or it aborts instead of falling back.
     fn norm(
         &mut self,
         _op: i64,
@@ -119,9 +136,10 @@ pub trait Accelerator {
     }
     /// **Fused-epilogue Linear** `C = act(A·Bᵀ + bias)` with `beta == 0` (the `wukong_sgemm_nt_epi`
     /// shape a `act(matmul(x,w)[+bias])` Wukong expression lowers to). `bias` is `None` for the
-    /// bias-free SwiGLU form; `act` is the runtime `ACT_*` code (1=relu, 2=gelu, 3=silu). Return `None`
-    /// for any case the device kernel doesn't cover (non-zero beta, a bias it can't fuse, an unsupported
-    /// activation, or an unaligned shape) so it falls back to the CPU fused kernel.
+    /// bias-free SwiGLU form; `act` is the runtime `ACT_*` code (0=identity — the bias-only affine
+    /// Linear, 1=relu, 2=gelu, 3=silu). Return `None` for any case the device kernel doesn't cover
+    /// (non-zero beta, a bias it can't fuse, an unsupported activation, or an unaligned shape) so it
+    /// falls back to the CPU fused kernel.
     fn sgemm_nt_epi(
         &mut self,
         _a: &[f32],
@@ -181,8 +199,10 @@ pub fn run_with_output(
 /// Run `f` on a worker thread with a large stack, returning its result and re-raising any panic on
 /// the caller so behavior is otherwise identical to a direct call. This gives the recursive
 /// tree-walker headroom: 512 MiB of stack is *reserved* virtual address space (committed lazily by
-/// the OS), so deep Wukong recursion hits the interpreter's 100M-step guard or completes instead
-/// of overflowing the host's ~8 MiB default and aborting the process.
+/// the OS), so deep Wukong recursion completes, or is rejected by the [`MAX_CALL_DEPTH`] ceiling
+/// measured against that reservation, instead of overflowing the host's ~8 MiB default and aborting
+/// the process. (`exec`'s step guard cannot help: it is a local of one `exec` invocation and never
+/// sees recursion.)
 fn with_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     const STACK: usize = 512 * 1024 * 1024;
     std::thread::scope(|s| {
@@ -546,8 +566,8 @@ const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) { 40_000 } else { 300_00
 /// A non-positive extent is reachable from ordinary source: these shapes are loop bounds, and
 /// `for i in 0..n` with `n <= 0` runs zero iterations — a well-defined no-op in the language — so
 /// the *recognized* form of the same nest must be a no-op too. Every `wukong_runtime` kernel
-/// implements exactly that, opening with `if rows <= 0 || cols <= 0 { return; }` (`norm.rs:739`,
-/// `gemm.rs:596`, `attention.rs:37`, `rowarg.rs:142`, `velem.rs:185`, ...), so `--backend=native`
+/// implements exactly that, opening with `if rows <= 0 || cols <= 0 { return; }` (`norm.rs:769`,
+/// `gemm.rs:638`, `attention.rs:44`, `rowarg.rs:154`, `velem.rs:192`, ...), so `--backend=native`
 /// completes and leaves the output buffer untouched.
 ///
 /// Reading the argument with a bare `as usize` instead wrapped a negative extent to ~`usize::MAX`,
@@ -611,8 +631,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                     // Normalize integer results to their declared width: this gives correct
                     // two's-complement wrapping and keeps booleans (`i1`) as 0/1 (so e.g. `!true`
                     // is 0, not a sign-extended -2). Float results narrower than `f64` are rounded
-                    // to their declared precision so the interpreter matches the native backend
-                    // bit-for-bit (`f32` arithmetic must round at `f32`, not `f64`).
+                    // to `f32` (`is_narrow_float`) so the interpreter matches the native backend
+                    // bit-for-bit (`f32` arithmetic must round at `f32`, not `f64`). A `bf16`/`f16`
+                    // result is rounded to `f32` here too, *not* to its own grid: sub-`f32` types
+                    // live as their rounded `f32` and take the grid rounding at `ConstFloat`, at
+                    // every cast, and on load.
                     //
                     // **`Load` is exempt from the integer mask**: memory is one *typed value* per
                     // scalar slot, so a load returns the slot's value verbatim. A same-typed load
@@ -2710,8 +2733,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `wukong_{row,col}arg{max,min}_i32[_parallel](x, out, rows, cols)` — the per-row /
             // per-column argmax/argmin a recognized classification-head / axis-0 top-1 nest lowers to.
             // Marshal `rows*cols` f32 from x, call the *serial* kernel (bit-identical to the parallel one
-            // — rows/columns independent), write the index vector back as `Value::Int` (the only
-            // output-buffer kernels that write integers, not floats). row-arg writes `rows` indices,
+            // — rows/columns independent), write the index vector back as `Value::Int` (one of the
+            // two output-buffer families that write integers rather than floats — `wukong_i8gemm_nt`
+            // and its `i32` accumulator is the other). row-arg writes `rows` indices,
             // col-arg writes `cols`; the kernel and the output length are selected by name.
             "wukong_rowargmax_i32"
             | "wukong_rowargmax_i32_parallel"
@@ -3511,8 +3535,11 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpretation differs), so the marshalling is identical; only the runtime fn called
             // differs. Reconstruct the exact stored 16 bits of each input via `f32_to_{bf16,f16}_bits`
             // (idempotent on an already-rounded value, so the buffer is bit-identical to the native
-            // backend's 2-byte storage — same as the bf16/f16 reductions/axpby), marshal the f32 `c`
-            // output exactly like `wukong_sgemm_nt`, and call the *serial* runtime kernel for BOTH the
+            // backend's 2-byte storage — same as the bf16/f16 reductions/axpby), hand the kernel a
+            // ZEROED f32 `c` buffer rather than reading C back as `wukong_sgemm_nt` does — the
+            // recognizer pins `beta = 0` on every lowp arm (`emit_lowp_gemm`/`emit_lowp_gemm_epi`),
+            // i.e. the overwrite form, so there is no prior C to accumulate onto; a future `beta != 0`
+            // lowp arm would have to marshal C in — and call the *serial* runtime kernel for BOTH the
             // serial and `_parallel` names: the runtime pins serial == parallel == interpreter
             // bit-for-bit, and the interpreter is the oracle, so the differential gate stays exact
             // despite the kernel's wider/reassociated accumulation.
@@ -4477,7 +4504,7 @@ mod tests {
     }
 
     /// The typed kernel-entry ABI must give the tree-walker the same recursion headroom `run` gets
-    /// (`deep_recursion_does_not_overflow_oracle` above). It used to run on the caller's default
+    /// (`deep_recursion_does_not_overflow_oracle` below). It used to run on the caller's default
     /// ~8 MiB stack, so this depth — an eighth of what `run` survives — aborted the whole test
     /// binary with STATUS_STACK_OVERFLOW.
     #[test]

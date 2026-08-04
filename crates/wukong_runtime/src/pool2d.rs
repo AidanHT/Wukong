@@ -22,11 +22,19 @@
 //! (`v0`=[0..7], `v1`=[8..15]) and **deinterleave the even lanes** (a cross-lane
 //! `_mm256_permutevar8x32_ps` with index `{0,2,4,6,0,2,4,6}` on each, then blend the 128-bit halves) to
 //! get exactly `{v0[0],v0[2],v0[4],v0[6], v1[0],v1[2],v1[4],v1[6]}` = the eight strided-by-2 columns.
-//! For any other `sw` (> 2, or 0) the per-window reads are strided, so a clean scalar path streams each
-//! window contiguously.
+//! For any other `sw` (> 2) the per-window reads are strided, so a clean scalar path streams each
+//! window contiguously. `sw == 0` never gets that far: `out_dims` rejects every non-positive extent
+//! (`h`/`w`/`kh`/`kw`/`sh`/`sw`) *and* a window that does not fit (`kh > h`, `kw > w`), returning `None`
+//! so the kernel writes nothing; `channels <= 0` is likewise a no-op.
 //!
-//! **Bit-exactness.** Max is idempotent and associative, so any window-traversal order (and any
-//! serial/parallel channel split) agrees. The average **sum order is fixed** — the window is folded in
+//! **Bit-exactness.** Max is idempotent, and on finite data order-independent, so any window-traversal
+//! order (and any serial/parallel channel split) agrees. LANDMINE: that is *finite* data only, and the
+//! two paths do not spell the fold the same way — the AVX2 band folds `_mm256_max_ps(acc, v)` (returns
+//! the freshly loaded `v` when the compare is unordered) while `pool_window_scalar` folds
+//! `if v > m { m = v }` (keeps the accumulator). So a window containing a NaN can pool to different bits
+//! on the two paths, in either direction, and no test covers it — unlike `cumminmax.rs`/`norm.rs`, which
+//! align their scalar twins to the `maxps` operand order deliberately. The average **sum order is
+//! fixed** — the window is folded in
 //! `(dy, dx)` ascending order in *both* the scalar twin and the AVX2 path (the 8-wide path accumulates
 //! into eight independent lanes in the same `(dy, dx)` sequence, so lane `l` receives exactly the
 //! scalar fold for output column `ox+l`), then a single divide by `kh·kw` — so the SIMD path equals the

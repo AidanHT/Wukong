@@ -1,9 +1,14 @@
-//! **Winograd** convolution F(2×2,3×3) and F(4×4,3×3) — a *verified f64 CPU reference*.
+//! **Winograd** convolution F(2×2,3×3) and F(4×4,3×3) — a *verified f64 CPU reference* plus the GPU
+//! transform / batched-GEMM PTX generators built on it.
 //!
-//! This module is the correctness oracle the GPU Winograd kernel will be built on top of. It is
-//! pure `f64` Rust with **no GPU symbols**, so a plain `cargo test` (no `--features gpu`) compiles
-//! and checks it. The whole point is the `#[cfg(test)]` differential against the naive direct conv:
-//! in f64, Winograd is exact up to floating rounding, so `winograd ≈ direct` to < 1e-9.
+//! [`direct_conv`] / [`winograd_f23`] / [`winograd_f43`] are the correctness oracle: pure `f64` Rust
+//! with **no device calls** (nothing here touches `cudarc`), so every gate in this file runs without a
+//! GPU — though the module itself is still `#[cfg(feature = "gpu")]` in `lib.rs`, so a plain
+//! `cargo test` does not compile it at all; use `cargo test -p wukong_codegen_gpu --features gpu`.
+//! The core check is the `#[cfg(test)]` differential against the naive direct conv: in f64, Winograd
+//! is exact up to floating rounding, so `winograd ≈ direct` to < 1e-9. The four
+//! `wino_*_ptx` generators below emit the device pipeline (filter/input transform → batched GEMM in
+//! the transform domain → output transform) against that same math.
 //!
 //! Same op the rest of the crate's conv2d calls: single batch, stride 1, no padding, **valid
 //! cross-correlation**. Input `X[C,H,W]` (row-major), weights `W[K,C,R,S]` with `R=S=3`, output
@@ -308,9 +313,11 @@ pub fn winograd_f43(x: &[f64], w: &[f64], c: usize, h: usize, wd: usize, k: usiz
 //   1. **filter transform**  U[ξν,k,c] = (G g_kc Gᵀ)[ξν]      — one thread per (k,c); one-time (weights).
 //   2. **input transform**   V[ξν,c,t] = (Bᵀ d_{c,t} B)[ξν]   — one thread per (c, output-tile t).
 //   3. **batched GEMM**      M[ξν,k,t] = Σ_c U[ξν,k,c]·V[ξν,c,t] — α² independent [K×C]·[C×T] GEMMs,
-//      each reusing the **proven `conv_wmma` tensor-core kernel** with R=S=1 (it computes exactly
-//      `O[K,N] = W[K,C]·X[C,N]`); the (ξν) batch is the launcher loop. This is where the FLOPs are, and
-//      where Winograd's 2.25–4× multiply reduction pays — the transforms are cheap elementwise maps.
+//      all in ONE launch by [`wino_bgemm_ptx`] (`z = ctaid.z` selects the plane): a plain row-major NN
+//      fp16 `m16n16k16` WMMA GEMM sharing `conv2d_wmma`'s tensor-core core and tile constants, but with
+//      no im2col gather and the plane loop folded into `gridDim.z` rather than run host-side. This is
+//      where the FLOPs are, and where Winograd's 2.25–4× multiply reduction pays — the transforms are
+//      cheap elementwise maps.
 //   4. **output transform**  O[k,p,q] = (Aᵀ M_{k,t} A)[..]    — one thread per (k, tile), scatter.
 //
 // Each transform `out = Mat · in` is a constant linear map (the B/G/A matrices are sparse integers /
@@ -579,7 +586,7 @@ pub fn wino_output_xform_ptx(k: usize, h: usize, w: usize, m: usize) -> String {
 /// each (≈4 on a feature map) and runs them serially — ~idle on a 20-SM GPU — whereas batching puts
 /// `α²·that` CTAs in flight at once. Plane strides (U:`K·C`, V:`C·T`, M:`K·T`) are baked; `M` is **f32**
 /// (read directly by the output transform). Launch: block `(WMMA_THREADS,1,1)`, grid
-/// `(ceil(T/BN), ceil(K/BN), α²)`.
+/// `(ceil(T/WMMA_BN), ceil(K/WMMA_BM), α²)`.
 pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
     use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS, WMMA_WM, WMMA_WN};
     use std::fmt::Write as _;

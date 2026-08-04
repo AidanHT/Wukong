@@ -5,8 +5,9 @@
 //!   1. [`megakernel`](crate::megakernel) — decides whether an entry function can be compiled into a
 //!      *cooperative single-block megakernel* (the SPMD whole-program kernel where recognized ops run
 //!      cooperatively across threads), and inventories the recognized cooperative ops it contains.
-//!   2. [`lower`](crate::lower) — the fast-path dispatch + grid-stride `@parallel` increments consume
-//!      the same op classification.
+//!   2. [`lower`](crate::lower) — `lower_call_mega` consumes the same
+//!      [`classify_call`](crate::fusion::classify_call) classification to pick each recognized op's
+//!      mega-mode form (block-wide tree / chunked-cooperative / `tid==0`-serial).
 //!
 //! ## The megakernel safety gate (the load-bearing analysis)
 //! The cooperative megakernel runs the **whole program SPMD** (every thread executes the scalar glue;
@@ -32,7 +33,8 @@ use wukong_span::{Interner, Symbol};
 /// `wukong_*` symbol family). A call not in this menu is either a side effect or general code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoopKind {
-    /// `wukong_sreduce_f32[_parallel](x, y, n, op) -> f32` — dot/ssd/sum/max/min/absmax.
+    /// `wukong_sreduce_f32[_parallel](x, y, n, op) -> f32` — dot/ssd/sum/sumsq/max/min/maxabs plus
+    /// sumabs(9)/absdiff(10). (The arg-reductions 7/8 have a `-> i64` ABI and are not in this menu.)
     Reduce,
     /// bf16/f16 reductions: `wukong_{dot,sum,reduce}_{bf16,f16}(...) -> f32`.
     ReduceLowp,
@@ -167,9 +169,11 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         Op::Store { ptr, value } => vec![*ptr, *value],
         Op::Gep { ptr, index, .. } => vec![*ptr, *index],
         Op::Call { args, .. } => args.clone(),
-        // A CPU raw-AVX2 microkernel call reads its buffer, scalar, and length operands. It is not
-        // PTX-lowerable (see `lower.rs`), so a function containing one is reported ineligible upstream;
-        // reporting its reads keeps the taint fixpoint total.
+        // A CPU raw-AVX2 microkernel call reads its buffer, scalar, and length operands. `analyze`
+        // does not inspect this op at all (it only classifies `Op::Call`), so such a program can be
+        // reported *eligible* here and is instead declined during lowering — `lower.rs` emits
+        // `UNSUPPORTED: VecKernelCall`, which `megakernel::try_run` turns into `Ok(None)` (fall back
+        // to the single-thread path). Reporting its reads keeps the taint fixpoint total.
         Op::VecKernelCall { ptrs, scalars, n, .. } => vec![*ptrs, *scalars, *n],
     }
 }

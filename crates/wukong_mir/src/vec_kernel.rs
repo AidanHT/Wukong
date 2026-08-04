@@ -6,14 +6,18 @@
 //! * the **Cranelift** backend assembles it into true 256-bit AVX2 machine code — the width Cranelift's
 //!   128-bit CLIF vector ISA cannot legalize (see `wukong_codegen_cranelift::avx2`).
 //!
-//! Both derive their per-lane semantics from [`VecKernel::eval_lane`] below, so the recipe is the
-//! single source of truth; the differential gate polices that the two executors match on the
-//! non-multiple-of-8 tails the caller runs scalar-side.
+//! Both derive their semantics from the reference evaluators below — [`VecKernel::eval_lane`] for an
+//! elementwise recipe, [`VecKernel::eval_reduction`] for a reduction one (both funnel through the same
+//! private `eval_all`) — so the recipe is the single source of truth, tails included: the caller runs
+//! the non-multiple-of-8 remainder scalar-side and the differential gate polices the whole loop.
 //!
 //! A kernel has the fixed ABI `fn(ptrs: *const *mut u8, scalars: *const f32, n: u64)`: `ptrs[k]` is
 //! the (already `start`-offset) base of unit-stride stream `k`, `scalars[k]` the k-th loop-invariant
 //! f32 (a param, an outer local, or a stride-0 array read the caller pre-loaded), and `n` the
 //! multiple-of-8 element count assigned to the vector part. The caller runs the scalar remainder.
+//! An elementwise kernel returns nothing and writes through its output streams; a reduction kernel
+//! (`reduce.is_some()`) writes no memory and returns its horizontal fold as an `f32`. Both shapes are
+//! declared to Cranelift from this one signature, so `reduce` is what picks between them.
 
 use wukong_span::Symbol;
 
@@ -26,9 +30,11 @@ pub enum VecBin {
     Div,
 }
 
-/// A lane-wise ordered float comparison producing a boolean mask (1.0 / 0.0 in the reference
-/// evaluator; all-ones / all-zero lanes under `vcmpps`). Ordered ⇒ false on NaN, matching Rust's
-/// `<`,`<=`,`>`,`>=`,`==`,`!=` for every finite/inf case, which is what the interpreter oracle uses.
+/// A lane-wise float comparison producing a boolean mask (1.0 / 0.0 in the reference evaluator;
+/// all-ones / all-zero lanes under `vcmpps`). Each predicate is picked to match the corresponding Rust
+/// operator on *every* input including NaN, which is what the interpreter oracle evaluates:
+/// `Lt`/`Le`/`Gt`/`Ge`/`Eq` are ordered (false on NaN, `vcmpps` `*_OS`/`EQ_OQ`) and `Ne` is
+/// **unordered** (true on NaN, `NEQ_UQ`) — exactly as `!=` behaves in Rust.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VecCmp {
     Lt,
@@ -60,6 +66,9 @@ pub enum VecOp {
     /// Lane-wise ordered compare → mask.
     Cmp { pred: VecCmp, a: u32, b: u32 },
     /// Blend: `mask ? a : b` (`vblendvps`; the reference picks `a` when the mask lane is non-zero).
+    /// PRECONDITION: `mask` must be a `Cmp` result. `vblendvps` keys on the lane's *sign bit* while the
+    /// reference keys on non-zero, and only the all-ones / all-zero masks a compare produces make the
+    /// two agree (e.g. a `-0.0` mask would diverge).
     Select { mask: u32, a: u32, b: u32 },
     /// Unit-stride vector store of value `val` to stream `s`.
     Store { stream: u32, val: u32 },
@@ -142,7 +151,8 @@ impl VecKernel {
     /// current element, `scalar(k)` the k-th invariant, `store(stream, v)` writes an output. This is
     /// the reference semantics the AVX2 assembler reproduces per lane and the interpreter marshals
     /// element-by-element — the two must agree bit-for-bit (all arithmetic is f32; `Fma` is
-    /// single-rounded via `mul_add`; `Neg` flips the sign bit; ordered compares are false on NaN).
+    /// single-rounded via `mul_add`; `Neg` flips the sign bit; each compare follows the matching Rust
+    /// operator on NaN — see [`VecCmp`]).
     pub fn eval_lane(
         &self,
         load: impl FnMut(u32) -> f32,

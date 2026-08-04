@@ -26,7 +26,10 @@
 //!   its f32 dot reductions stay serial, the same disclosed convention as `bench_linear`/`dot`).
 //!   **C(fast)** is the identical source at `-O3 -march=native -ffast-math` (the `llama2.c
 //!   -Ofast` basis), which lets gcc reassociate + vectorize the dot products — the strongest
-//!   flags-only C column.
+//!   flags-only C column. Note the split by size: `C(fast)` runs at every S, but the *plain* C
+//!   column is measured only at S ≤ 128 by default, because one serial-reduction forward is
+//!   prohibitively slow at S=512 (the same rule `bench_matmul` applies to its naive nests);
+//!   `XBENCH_MODEL_NAIVE` forces it, and its omission is printed per size.
 //! * **PyTorch (the industry peer)** — when `python` + `torch` import (probed gracefully; a
 //!   printed note + skipped columns otherwise), the harness dumps the *exact* weight/input
 //!   buffers as little-endian f32 blobs and generates a self-contained PyTorch script that

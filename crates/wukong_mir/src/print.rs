@@ -1,9 +1,15 @@
-//! A deterministic textual rendering of MIR, used by `--emit=mir` and snapshot tests.
+//! A deterministic textual rendering of MIR, used by `--emit=mir` / `--emit=mir-high` and snapshot
+//! tests. It is also the equality oracle for `wukong_bench`'s check that `optimize_timed` matches the
+//! production `optimize` byte-for-byte, and the grep surface tests use to assert the vectorizer fired
+//! (`<4 x f32>` for the 128-bit path, `veckernel` for the 256-bit one), so the output must stay a pure
+//! function of the `Program`.
 
 use crate::{Function, Inst, Op, Program, Terminator, ValueId};
 use wukong_span::Interner;
 
-/// Render a whole program.
+/// Render a whole program: every function in `funcs` order, one blank line apart. `Program::statics`
+/// is *not* rendered, so a `global_addr <sym>` line is the only trace a string literal leaves in the
+/// dump. Neither are `Function::vec_kernels` — a `veckernel #k(…)` line shows the call, not the recipe.
 pub fn print_program(p: &Program, interner: &Interner) -> String {
     let mut out = String::new();
     for f in &p.funcs {

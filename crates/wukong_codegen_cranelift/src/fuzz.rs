@@ -13,6 +13,11 @@
 //!
 //! Both backends execute the same lowered MIR and marshal through the same runtime microkernels, so
 //! bit-exactness is the correct (strongest) bar — not a tolerance. A divergence is a real miscompile.
+//!
+//! The file also carries `vmath_kernels_match_f64_reference`, which is deliberately *not* a
+//! differential test: it checks the transcendental vmath kernels against an f64 reference under a
+//! per-op relative-error bound, since interp-vs-native cannot catch a kernel that both backends
+//! compute identically wrong. Its bounds are recorded measurements — do not "tidy" them.
 
 use wukong_span::{Interner, SourceId, Symbol};
 

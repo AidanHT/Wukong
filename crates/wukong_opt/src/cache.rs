@@ -2,10 +2,13 @@
 //!
 //! `predecessors`, `reverse_postorder`, `idoms`, `dominance_frontiers`, and `dom_children` all
 //! depend **only** on the block set and each terminator's successor edges — never on instructions,
-//! block parameters, or edge arguments. Across the standard pipeline, only `simplify-cfg` (folding a
-//! `cond_br` to a `br`, merging straight-line blocks) and unreachable-block pruning change that
-//! structure; mem2reg, simplify, simplify-phis, dce, cse, dse, and licm all rewrite/move/remove
-//! instructions and rewire block parameters but leave the block graph intact.
+//! block parameters, or edge arguments. Across the standard pipeline the only transforms that change
+//! that structure are `simplify-cfg` (folding a `cond_br` to a `br`, merging straight-line blocks,
+//! then pruning) and the unreachable-block pruning that mem2reg/cse/licm run first to make dominance
+//! well-defined — which is a no-op, and so free, once nothing is unreachable. Everything else
+//! (mem2reg's phi placement and renaming, simplify, simplify-phis, dce, dse, and licm's hoisting)
+//! rewrites/moves/removes instructions and rewires block parameters but leaves the block graph
+//! intact.
 //!
 //! So instead of every pass rebuilding these analyses from scratch on each fixpoint iteration (the
 //! old code recomputed `idoms` — an O(V·E) iterative fixpoint — and `predecessors` several times per

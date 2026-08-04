@@ -1,8 +1,9 @@
 //! A deterministic, indented pretty-printer for the AST.
 //!
-//! Used by `--emit=ast` and by snapshot tests. The output is a stable indented tree — leaves
-//! carry their scalar payload inline (literals, names, fully-resolved type syntax), while
-//! compound nodes break their children onto indented lines.
+//! Used by `--emit=ast` and by snapshot tests. The output is a stable two-space-indented tree —
+//! leaves carry their payload inline (literal text exactly as written, names, type syntax as
+//! written), while compound nodes break their children onto indented lines. It is deliberately
+//! **lossy**: it is for humans and snapshots, not for round-tripping back to source.
 
 use crate::*;
 use wukong_span::{Interner, Symbol};
@@ -130,7 +131,10 @@ impl AstPrinter<'_> {
         }
     }
 
-    /// A compact inline form for small expressions (array lengths, const generics).
+    /// A compact inline form for the two places an expression appears inside a one-line rendering:
+    /// an array length in `type_str` and an enum variant's explicit discriminant. Literals, paths and
+    /// simple unary/binary expressions render; anything else is intentionally lossy and prints as
+    /// `<expr>`.
     fn expr_inline(&self, e: &Expr) -> String {
         match &e.kind {
             ExprKind::Int(s) | ExprKind::Float(s) | ExprKind::Str(s) | ExprKind::Char(s) => {

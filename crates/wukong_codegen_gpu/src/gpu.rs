@@ -47,6 +47,11 @@ impl Gpu {
     /// function. The first load consults the persistent **cubin cache** (M10): a warm process loads
     /// precompiled SASS instead of re-JITing the PTX. The driver compiles PTX→SASS internally, so no
     /// external `ptxas` is required either way.
+    ///
+    /// **LANDMINE — the cache keys on `key` alone and never re-examines `ptx` on a hit.** Two
+    /// *different* generated PTX texts sharing one `&'static str` key silently share one compiled
+    /// module: the second caller gets the first's kernel (the entry name matches, so there is no
+    /// error). Use a distinct key per generated variant/shape.
     pub fn function(
         &mut self,
         key: &'static str,
