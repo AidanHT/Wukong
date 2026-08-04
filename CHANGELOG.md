@@ -27,7 +27,9 @@ or `.wk` source changed; only the benchmark peers and the documents that quote t
   worst loop order for a row-major axis-0 reduction, and the only order measured. Isolated at `-O3
   -march=native`, 4096×1024: colsum **21.33 → 0.58 ms (36.7×)**, colmax **34.82 → 0.86 ms (40.6×)**,
   colmean **33.03 → 1.24 ms (26.7×)**, colargmax **9.87 → 1.57 ms (6.3×)**, output identical.
-  **The published ~29–50× column-reduction win becomes a 1.05–1.8× LOSS**, and the column argmax's
+  **The published ~29–50× column-reduction win becomes a tie at best and a 1.8× LOSS at worst**
+  (15 of 16 measured rows are losses; the >L3 shape is a consistent ~1.65× loss across two
+  independent A/B rounds), and the column argmax's
   ~2.7–4.1× becomes a 1.5–2.5× loss.
 - **`matmul_tn` peer given the natural `kij` order.** It was `ijk` with **both** operands read
   column-strided. Isolated 512³: **176.6 → 9.70 ms (18.2× total: 8.7× `restrict` × 2.1× loop

@@ -55,8 +55,10 @@ cargo run -p wukong_xbench --release      # CC=gcc by default; set CC to overrid
 > Four regression tests in `crates/wukong_xbench/src/main.rs` now pin the peers so this cannot recur
 > silently.
 >
-> **The headline effect.** The "strided column reduction" family (~29–50× 1-core) is now a **1.05–1.8×
-> LOSS**. The weight-gradient GEMM (~128× 1-core / ~445× `@parallel`) is now **2.6–5.3× / 3.1–13.9×**.
+> **The headline effect.** The "strided column reduction" family (~29–50× 1-core) is now **a tie at
+> best and a 1.8× LOSS at worst** (15 of the 16 measured rows are losses; the >L3 shape is a
+> consistent ~1.65× loss across two independent rounds).
+> The weight-gradient GEMM (~128× 1-core / ~445× `@parallel`) is now **2.6–5.3× / 3.1–13.9×**.
 > The transpose (~1.5×) is now a **tie**. The bf16 reduction family, once given the `-ffast-math`
 > column its own rule required, is a **1.1–1.8× loss**. Wins that did *not* move — GEMM, `nn.Linear`,
 > the transcendentals, row-argmax, the fused norms — are exactly the ones that were real.
@@ -153,11 +155,12 @@ where gcc/rustc won't vectorize — disclosed per section, never a rigged baseli
 | Fused FFN `silu(A·Bᵀ)` (the Dense layer) | ~24–26× | ~48–95× | unchanged |
 | RoPE (rotary embedding) | ~29–54× | **~146–156×** | unchanged |
 | Reductions / transcendentals / **row**-argmax | ~2.5–9× | ~9–26× | unchanged |
-| ~~Strided column reductions (sum/max/absmax)~~ | **1.05–1.8× SLOWER** | ~1.0–1.4× | ~~~29–50× / ~37–107×~~ — **the peer was written column-outer; see below** |
+| ~~Strided column reductions (sum/max/absmax)~~ | **tie → 1.8× SLOWER** | ~1.0–1.4× | ~~~29–50× / ~37–107×~~ — **the peer was written column-outer; see below** |
 
 The last row is the single largest correction in this document: what was published as a ~29–50×
 single-core win is, against a C peer written the way a competent programmer writes an axis-0
-reduction, a 1.05–1.8× **loss**. It is kept in the table, struck through, rather than quietly deleted.
+reduction, a tie at best and a 1.8× **loss** at worst. It is kept in the table, struck through,
+rather than quietly deleted.
 
 **GPU backend** (`--features gpu`, mobile RTX 4050, same-run clock-invariant ratios — full section
 [below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): fp16 tensor-core GEMM reaches **cuBLAS parity
@@ -213,7 +216,7 @@ tolerance for the reassociated-float ones).
 | **Fused FFN** (`silu(A·Bᵀ)`, the Dense layer) | ~24–26× | ~48–95× | matmul + activation folded into one C-write; C re-streams C through a separate scalar-`expf` pass |
 | **TN weight-gradient** (`dW=dYᵀ·X`) | **~2.6–5.3×** | ~3.1–13.9× | transpose-prepass + the tiled kernel, vs the natural `kij` nest gcc vectorizes but does not tile *(corrected 2026-08-04: was ~128×/~445× against a peer that read both operands column-strided)* |
 | **int8 `nn.Linear`** (`vpdpbusd`) | ~1.5–2.5× | ~4.6–14.7× | 2×4 register tile halves B traffic (vs gcc's own `vpdpbusd`) |
-| **Column reductions** (sum/max/min/absmax/mean/L2/RMS) | **1.05–1.8× SLOWER** | ~1.0–1.4× | *nothing* — gcc auto-vectorizes the natural row-outer nest and matches or beats the kernel. The old ~29–50× was the peer's column-outer loop order *(corrected 2026-08-04)* |
+| **Column reductions** (sum/max/min/absmax/mean/L2/RMS) | **tie → 1.8× SLOWER** | ~1.0–1.4× | *nothing* — gcc auto-vectorizes the natural row-outer nest and matches or beats the kernel. The old ~29–50× was the peer's column-outer loop order *(corrected 2026-08-04)* |
 | **Transpose** (f32) | ≈tie (1.00–1.03×) | ~4.8–7.1× | *nothing single-core* once the peer is blocked too; `@parallel` adds cross-core bandwidth *(corrected 2026-08-04: was ~1.5× against an unblocked peer)* |
 | **Fused norms** (softmax/LN/RMS) | ~1.9–6.6× | memory-bound | single-pass fusion + 256-bit `exp`; their float reductions stay sequential |
 | **Reductions** (dot / ssd) | ~2.6–2.9× | ~8–26× | lane accumulators; their reduction is a serial `vaddss` chain |
@@ -1281,9 +1284,14 @@ column is directional only). **>1 means Wukong is faster; a negative sign means 
 | RMS      | 4096×1024 | 1.58× slower | 1.87× slower | 1.37× faster | ~~35.7×~~ | 23× |
 
 **There is no column-reduction win.** Against a peer written the way the operation is normally
-written, `wukong_colsum_f32` and its six siblings are **1.05–1.8× slower** than what gcc emits for
-the row-outer nest, on every shape and every op. `@parallel` does not rescue it either: it is
-between 1.9× slower and 1.4× faster, i.e. all-core Wukong roughly ties single-threaded C. The
+written, `wukong_colsum_f32` and its six siblings land between **a tie and 1.8× slower** than what
+gcc emits for the row-outer nest. 15 of the 16 rows above are losses; a second independent A/B round
+(same method, later in the session) reproduced the collapse everywhere — colsum 1024×1024 read
+**56.78× → 1.51×** and colsum 4096×1024 **43.62× → 1.64× slower** — with `colsum` at the L3-resident
+1024² shape the one row whose *sign* moves between rounds (1.23× slower, then 1.51× faster), i.e. a
+tie. The >L3 4096×1024 shape is a consistent ~1.65× loss in both rounds.
+`@parallel` does not rescue it either: it is between 1.9× slower and 1.4× faster, i.e. all-core
+Wukong roughly ties single-threaded C. The
 kernels remain correct (`tests/run/colsum.wk` etc. still pin them bit-exact against the scalar
 fold, and the cross-language check still passes element-for-element); they are simply not faster
 than the compiler on this operation, and the "strided column-outer fold gcc/rustc leave *scalar*"
@@ -2197,8 +2205,9 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
 **Where Wukong does NOT win** (measured 2026-08-04 against corrected peers, and listed here because
 every one of these was previously published as a win):
 
-- **Column reductions** (sum/max/min/absmax/mean/sum-sq/L2/RMS down axis 0): **1.05–1.8× slower**
-  than gcc on the natural row-outer nest, at every shape and every op. Was ~29–50×.
+- **Column reductions** (sum/max/min/absmax/mean/sum-sq/L2/RMS down axis 0): between **a tie and
+  1.8× slower** than gcc on the natural row-outer nest — 15 of the 16 measured rows are losses, and
+  the >L3 4096×1024 shape is a consistent ~1.65× loss across two independent rounds. Was ~29–50×.
 - **Column argmax/argmin** (axis-0): **1.5–2.5× slower**. Was ~2.7–5.3×.
 - **f32 transpose, single core:** a **tie** (1.00–1.03×) once the peer is blocked too. Was ~1.5×.
   (`@parallel` still wins 4.8–7.1× vs 1-thread C, ~1.0–1.1× vs all-core OpenMP.)
