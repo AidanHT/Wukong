@@ -191,6 +191,20 @@ pub enum Op {
     /// lane type matches the operand; the vectorizer uses it to lift loop-invariant scalars into
     /// vector form. Pure and side-effect-free.
     Splat(ValueId),
+    /// Read one lane out of a SIMD vector: the operand is a `Vec(elem, n)`, the index is `< n`, and
+    /// the result has the lane type. The inverse of [`Op::Splat`], and the *only* way back from
+    /// vector to scalar form.
+    ///
+    /// It exists for one job: a float reduction may not be reassociated (IEEE addition is not
+    /// associative and Wukong's interpreter is the language specification), so a vectorizer that
+    /// widens the body feeding an accumulator has to fold the `n` lane values into it **one at a
+    /// time, in index order**. Without a lane read that has to go through memory — store the vector
+    /// to a stack slot and load the elements back — which costs a store-forwarding stall per group;
+    /// `extractlane` is one shuffle, and lane 0 is free.
+    ///
+    /// Pure and side-effect-free. The interpreter indexes its lane arena; the Cranelift backend
+    /// emits `extractlane`; the textual-LLVM emitter emits `extractelement`.
+    ExtractLane(ValueId, u32),
     /// Fused multiply-add: `a * b + c` with a *single* rounding. The front-end contracts a float
     /// `x + y*z` into this; it is faster (one instruction) and more accurate than separate
     /// `FMul`+`FAdd`. All three operands and the result share one float type (scalar or `Vec`).

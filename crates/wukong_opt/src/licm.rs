@@ -144,6 +144,7 @@ fn safe_to_hoist(op: &Op) -> bool {
         | Op::FuncAddr(..)
         | Op::GlobalAddr(..)
         | Op::Splat(..)
+        | Op::ExtractLane(..)
         | Op::Fma(..)
         | Op::Sqrt(..)
         | Op::Round(..) => true,
