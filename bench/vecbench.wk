@@ -82,6 +82,24 @@ fn ssm(a: []f32, b: []f32, mut o: []f32, n: i64) -> f32 {
     return h;
 }
 
+// ---- 8. plain float sum: a serial `fadd` chain, NOT contracted into an fma ---------------------
+fn fsum(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..n {
+        s = s + x[i];
+    }
+    return s;
+}
+
+// ---- 9. integer sum: associative, so the accumulate order is free ------------------------------
+fn isum(x: []i32, n: i64) -> i32 {
+    let mut s: i32 = 0;
+    for i in 0..n {
+        s = s + x[i];
+    }
+    return s;
+}
+
 fn main() -> i32 {
     let mut x: []f32 = alloc_f32(N);
     let mut y: []f32 = alloc_f32(N);
@@ -177,6 +195,32 @@ fn main() -> i32 {
     }
     print(7); print(best); print((o[12345] * 1000.0) as i64);
 
-    free(o); free(z); free(y); free(x);
+    // --- 8 ---
+    best = 9223372036854775807; r = 0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        acc = fsum(x, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(8); print(best); print((acc * 1000.0) as i64);
+
+    // --- 9 ---
+    let mut xi: []i32 = alloc_i32(N);
+    i = 0;
+    while i < N { xi[i] = (i % 1000) as i32; i = i + 1; }
+    best = 9223372036854775807; r = 0;
+    let mut iacc: i32 = 0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        iacc = isum(xi, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(9); print(best); print(iacc as i64);
+
+    free(xi); free(o); free(z); free(y); free(x);
     return 0;
 }
