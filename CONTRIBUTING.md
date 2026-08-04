@@ -88,6 +88,37 @@ fields (`version.workspace = true`, …); it becomes a member automatically
 a leaf binary nothing depends on (`wukong_bench`, `wukong_xbench` and `wukongc` are intentionally
 absent), then add only downward edges.
 
+## Adding or editing a benchmark peer
+
+`crates/wukong_xbench` generates a C, a C++ and a Rust peer for every kernel and compiles them at
+runtime. **A weakened peer breaks nothing observable** — the suite still runs, the cross-language
+check still passes (a slow kernel is not a wrong kernel), and the only symptom is that Wukong's
+published multiple goes up. That failure mode is not hypothetical: a 2026-08-04 audit found four
+systematic peer defects that had inflated published figures by up to 63×. So:
+
+1. **`__restrict__` on every pointer parameter** whose buffer is genuinely distinct from the others
+   at the call site. If one may legitimately alias, leave it off *and* say why at the call site.
+2. **Natural loop order.** The innermost loop must walk memory with unit stride wherever the
+   algorithm allows. Column-outer traversals of a row-major matrix are the classic strawman.
+3. **The same algorithmic opportunity Wukong's kernel has.** If Wukong dispatches a cache-blocked
+   kernel, the peer is blocked. If Wukong's kernel reassociates a float reduction, a `C(fast)`
+   [`-ffast-math`] column must exist *and be printed*, not merely computed.
+4. Ask the question the whole exercise turns on: **is this how a competent C/C++/Rust programmer
+   would write it?** If the answer needs a caveat, the caveat belongs in `BENCHMARKS.md`.
+5. **Cross-check the peer's output**, not just its time — otherwise a peer can get "faster" by not
+   doing the work.
+
+Four tests in `crates/wukong_xbench/src/main.rs` enforce (1) and (2) mechanically
+(`every_generated_c_kernel_declares_restrict`, `column_family_peers_stay_row_outer`,
+`matmul_tn_peer_stays_kij`, `transpose_peer_stays_cache_blocked`); the rest is review.
+
+**Measuring a peer change: use the harness's compilation model.** A standalone probe that puts the
+kernel and its caller in one translation unit over `static` arrays lets gcc's interprocedural alias
+analysis prove non-overlap by itself, so `restrict` measures as a no-op. The harness compiles each
+peer to a **shared library**. Put the kernel in its own TU with heap buffers, or the probe answers a
+different question — measured: the direct-convolution kernel reads 0.42 vs 0.47 ms (`restrict`
+"hurts") in one TU, and 1.99 vs 0.40 ms (`restrict` is worth 5×) in its own.
+
 ## Adding a diagnostic
 
 Pick the next free code in the range for the stage that emits it: `E00xx` generic/internal, `E01xx`
