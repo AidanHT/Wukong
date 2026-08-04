@@ -489,13 +489,6 @@ within the session's run-to-run noise.
   the noise floor, not a measurement, so **no corrected figure is published for them** — their
   existing numbers stand, with the caveat that they were taken against non-`restrict` peers and
   should be re-derived at AC+full.
-- **The norm-backward, cross-entropy, gate, row-loss, act-backward and scan families.** Their peers
-  changed only by `restrict`, and their A/B pairs at this power state moved in *both* directions by
-  up to ~2× (e.g. `xent` 1024×1024 read 3.59× before and 7.72× after; `softmax_bwd` 1024×1024 read
-  2.37× before and 3.43× after; `layernorm_bwd` 4096×512 read 3.23× before and 2.24× after). That is
-  the noise floor, not a measurement, so **no corrected figure is published for them** — their
-  existing numbers stand, with the caveat that they were taken against non-`restrict` peers and
-  should be re-derived at AC+full.
 - **The end-to-end `model` section** (the 12-layer GPT-2-class stack and its PyTorch peers). It uses
   its own peer sources in `model.rs`, which this audit did not touch; its numbers stand as previously
   published and are **not** covered by the corrections above. Auditing `model.rs`'s peers the same
