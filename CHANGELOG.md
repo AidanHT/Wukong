@@ -5,6 +5,34 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Optimizer — inlining across the call graph, and loop unrolling (2026-08-04)
+- **The inliner now works bottom-up over the call graph** instead of only on leaves. Callees are
+  spliced before their callers, in reverse topological order taken from Tarjan SCCs (computed
+  iteratively, so a deep call graph cannot blow the compiler's own stack), so a chain of helpers
+  collapses in one sweep instead of one layer per never-taken round; recursion is refused by the SCC
+  itself rather than by forbidding all calls. `should_inline` now *scores* a site — a sole call site
+  gets a much larger budget, a site inside a loop doubles it, a callee carrying a loop nest earns a
+  bonus because inlining hands that nest to LICM/CSE — starting from the old blanket 40-instruction
+  cap, so it can only ever approve more sites than before. Growth is bounded three ways so compile
+  time cannot run away.
+- **Partial loop unrolling** (`crates/wukong_opt/src/unroll.rs`, `-O2` and above): the counted
+  two-block loop the front end emits for `for i in a..b` becomes a four-at-a-time main loop plus a
+  one-at-a-time remainder loop. **It never reassociates** — float addition is not associative, so
+  splitting a reduction across accumulators would compute a different number and break both the
+  interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`; the unrolled body is the original body
+  four times, in order, computing the original values, and what it recovers is loop overhead and ILP
+  between successive iterations. The main loop's guard is wrap-safe: `bound - 3` can wrap when the
+  bound sits near the bottom of its type, so the preheader computes
+  `select (bound-3 < bound), bound-3, INT_MIN` and a wrapped limit sends every iteration to the
+  remainder loop instead of running the body past the end of the range.
+  Measured on non-recognizer kernels (release, `--backend=native -O2`, n = 2²⁰, interleaved
+  best-of-8 against `WUKONG_NO_UNROLL=1`, with an un-unrollable loop as the control for the noise
+  floor): integer reduction **28%** faster, elementwise store loop **10%**, float reduction **4%** —
+  the ordering a non-reassociating unroller should produce. Cost: the unrolling stage is 22% of
+  optimizer time and optimizer time rises 27% at `-O2`, which end-to-end stays inside `compile-vs`'s
+  run-to-run spread (−4.3% to +6.2%) with the gcc/g++/rustc ratios unchanged at 7.3–11.9×. The
+  default `-O0` compile is untouched. `WUKONG_NO_UNROLL=1` disables the pass.
+
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
 write-sets → adversarial re-verification), plus a harness-hardening wave. Almost nothing here is a new
