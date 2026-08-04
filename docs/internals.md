@@ -66,7 +66,8 @@ wukong_mir       MIR data, builder, pretty-printer, verifier, `VecKernel` (the 2
                   recipe). `MirLevel` lives here too but is inert — see Design bet 2.
 wukong_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
 wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
-                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
+                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm) plus
+                  the `alias` provenance analysis every memory transform queries
 wukong_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
                   rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
 wukong_backend   `Backend` trait + `Artifact`
@@ -256,9 +257,9 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
 | `Dce`         | -O1   | remove pure instructions whose results are unused, and dead allocas |
-| `Cse`         | -O2   | dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table) plus **intra-block** alloca-aware load forwarding — a store makes its value current for the slot, and a store through an unknown pointer or any `Call`/`VecKernelCall` forgets all slots |
-| `Dse`         | -O2   | dead-store elimination (overwritten stores to a slot with no intervening read) |
-| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader |
+| `Cse`         | -O2   | dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table) plus **intra-block** load forwarding keyed on `(address value, accessed type)`, with `alias` deciding which entries a store or call invalidates |
+| `Dse`         | -O2   | dead-store elimination (a store fully overwritten by a later one with no intervening read that `alias` says could observe it) |
+| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load**, when `alias` proves nothing in the body writes it *and* the access is dereferenceable |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).
@@ -273,9 +274,39 @@ leaves arrays, address-taken, and pointer slots in memory; a read before any wri
 constant, matching the interpreter's zero-initialized memory. `Cse`/`Dse` still handle the residual
 memory (load forwarding and its dual) for the slots that stay in memory. `Licm` uses the dominator
 analysis to find natural loops and only hoists into loops that already have a preheader, so it is
-always legal; loads, stores, calls, vector-kernel calls, allocas, and integer division/remainder
-(which can trap on a zero divisor) are never moved. Float predicates are never folded on
-self-comparison (NaN != NaN).
+always legal; stores, calls, vector-kernel calls, allocas, and integer division/remainder (which can
+trap on a zero divisor) are never moved. Float predicates are never folded on self-comparison
+(NaN != NaN).
+
+### Alias analysis (`wukong_opt::alias`)
+
+`mir_build` erases every pointer-ish source type — `Ty::Ptr`, `Ty::Ref`, `Ty::Tensor` and `Ty::Slice`
+all become a bare `MirType::Ptr` — so no later pass can tell one buffer from another by *type*. What
+survives is **provenance**, and `AliasInfo::analyze` recovers it: every pointer value is classified as
+the `alloca` it came from, the *parameter* it came from, the `.rodata` blob it came from, or
+`Unknown`; a `gep` inherits its base and tracks the constant byte offset when it has one. `Cse`,
+`Dse`, `Licm` and the Cranelift backend all query it.
+
+`may_alias(a, b)` answers `false` only for facts the language actually guarantees: two distinct
+`alloca`s; an `alloca` of this function versus a *parameter* of it (the slot is created after entry,
+so the caller cannot have handed us its address — not even under recursion, where the incoming
+pointer belongs to another frame's slot); an `alloca` versus a `.rodata` blob, and two distinct
+blobs; a **non-escaping** `alloca` versus anything untracked, including whatever a `call` may write;
+and disjoint constant byte intervals off one base (`may_alias_sized`). "Non-escaping" is checked
+literally — the address may appear only as the pointer operand of a `gep`/`load`/`store`, and any
+other use publishes it.
+
+**Two distinct pointer parameters may alias.** Wukong makes no promise otherwise: nothing rejects
+`f(a, a)`, and there is no `restrict`/`&mut` annotation to carry a promise, so the analysis returns
+"may alias" and `tests/run/alias_slice_params.wk` pins the behaviour that depends on it. This is the
+single biggest fact the optimizer is missing, and closing it is a **language** decision, not an
+analysis one — see the roadmap.
+
+`is_dereferenceable(ptr, bytes)` is a separate question that only a *speculating* transform asks: may
+this access run on a path the program might not have taken? It is true only for a known in-bounds
+offset into an `alloca` of this function, which is live for the whole function and default-initialized
+by both backends. That is what lets `Licm` hoist a loop-invariant load out of a possibly-zero-trip
+loop for a local `[]T`/struct/tuple, and what stops it doing the same through a parameter.
 
 Two more folds are refused for the same `-O0` ≡ `-O{1,2,3}` reason. A bf16/f16 constant is never
 folded — arithmetic or comparison — because the folder rounds to the f32 grid while the backends round
@@ -519,7 +550,7 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
 ## Testing strategy
 
 - **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).
-- **End-to-end** (`tests/run/*.wk`, 332 fixtures): the real `wukongc` binary compiles and runs each
+- **End-to-end** (`tests/run/*.wk`, 333 fixtures): the real `wukongc` binary compiles and runs each
   program; stdout/exit are checked against the `// EXPECT-EXIT:` / `// EXPECT-OUT:` directives embedded
   in the file, and a `// RUN:` directive replaces the default `--run` argument list (a fixture that must
   pin the *native* side carries `// RUN: --run --backend=native`). Placement rule: everything here must

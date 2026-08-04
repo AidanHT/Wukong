@@ -5,6 +5,41 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Optimizer — alias analysis (`wukong_opt::alias`)
+The optimizer can now tell one buffer from another. `mir_build` erases every pointer-ish source type
+(`Ty::Ptr`, `Ty::Ref`, `Ty::Tensor`, `Ty::Slice` all become a bare `MirType::Ptr`), so the memory
+transforms had been giving up wholesale: CSE forwarded a load only when its pointer was *literally* an
+`alloca` result and cleared its whole table on any other store, DSE had the mirror rule, and LICM
+refused `Op::Load` outright. A new provenance analysis answers `may_alias(a, b)` from the SSA chain
+that produced each address, and all three passes plus the Cranelift backend query it.
+- **What it proves** (and only this): two distinct `alloca`s are distinct storage; an `alloca` of this
+  function is never a *parameter* of it; an `alloca` is never a `.rodata` blob and two blobs are never
+  each other; a **non-escaping** `alloca` is unreachable through any untracked pointer and by anything
+  a `call` writes; and disjoint constant byte intervals off one base do not overlap.
+- **What it refuses to prove**: two distinct pointer parameters **may alias**. Wukong makes no promise
+  otherwise — nothing rejects `f(a, a)` — so adopting the informal assumption `docs/roadmap.md`
+  recorded for the AST loop vectorizer would be an unsound noalias, i.e. a miscompile. Closing that
+  gap is a language decision, not an analysis one. `tests/run/alias_slice_params.wk` pins a program
+  whose printed answer depends on it (and on a zero-trip loop over a caller-owned buffer, which is why
+  a parameter's loop-invariant load is never speculated into a preheader).
+- **CSE** now keys load forwarding on `(address value, accessed type)` and invalidates only what a
+  store may alias; the type in the key also closes a latent hazard where a `store f32` forwarded raw
+  bits into a `load i64`, and `bf16`/`f16` are excluded so the narrowing round is never skipped.
+- **LICM** hoists a loop-invariant load when nothing in the body may write it *and* the access is
+  dereferenceable — a known in-bounds offset into a stack slot of this function. Every `[]T` / struct /
+  tuple local is such a slot, so the fat-pointer header's `data` and `len` fields stop being re-read on
+  every subscript.
+- **Cranelift** tags every access to a never-escaping stack slot with `MemFlags::alias_region`, so a
+  store elsewhere no longer invalidates it in Cranelift's own redundant-load elimination.
+- **Measured** over the whole `tests/run` corpus (`--emit=mir -O2` / `--emit=obj -O2`, same-run A/B of
+  two release binaries, 0 programs regressed): MIR loads **3071 → 2324 (−24.3%)**, MIR instructions
+  45653 → 44757, machine instructions 68396 → 67944. Wall clock on four hand-written *general*
+  (non-recognized) kernels over distinct slice buffers, P-core-pinned ABBA rounds, best-of-10 minima,
+  is a **wash** (0.987–1.008) with one 6.6% loss traced to Cranelift rematerializing `f32const` inside
+  the loop once the freed register changed its allocation — the removed header loads were L1-hot and
+  not on the critical path. The gain is in the IR, which is what the interpreter executes and what a
+  future MIR vectorizer has to match.
+
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
 write-sets → adversarial re-verification), plus a harness-hardening wave. Almost nothing here is a new

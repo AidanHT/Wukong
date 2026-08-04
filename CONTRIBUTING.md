@@ -188,7 +188,11 @@ Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primit
    `Op` reads; miss one and the passes silently corrupt SSA.
 8. `crates/wukong_opt/src/cse.rs` — a `pure_key` arm if the op is cacheable (include *every*
    parameter in the key), and `safe_to_hoist` in `crates/wukong_opt/src/licm.rs` (default `false` if
-   it can trap or write memory).
+   it can trap or write memory). If the op **produces or consumes a pointer**, also
+   `crates/wukong_opt/src/alias.rs`: a new pointer-producing op must get a `Prov` (default
+   `Unknown`), and a new *writer* must be added to `AliasInfo::may_clobber` and to the escape scan —
+   an op that writes memory and is not listed there is an unsound no-alias answer, i.e. a
+   miscompile.
 9. `crates/wukong_codegen_gpu/src/lower.rs` — `lower_inst` **and** `lower_vec_inst`, plus
    `op_operands` in `src/fusion.rs` (these live behind `--features gpu`, so only
    `cargo check --features gpu --all-targets` sees them); and `crates/wukong_autodiff/src/lib.rs` —
