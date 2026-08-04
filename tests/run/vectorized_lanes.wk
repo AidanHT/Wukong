@@ -1,0 +1,223 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 58
+// EXPECT-OUT: 59
+// EXPECT-OUT: 60
+// EXPECT-OUT: 61
+// EXPECT-OUT: 62
+// EXPECT-OUT: 63
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: -27
+// EXPECT-OUT: -24
+// EXPECT-OUT: -21
+// EXPECT-OUT: -18
+// EXPECT-OUT: -15
+// EXPECT-OUT: -12
+// EXPECT-OUT: -9
+// EXPECT-OUT: -6
+// EXPECT-OUT: -3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 9
+// EXPECT-OUT: 12
+// EXPECT-OUT: 15
+// EXPECT-OUT: 18
+// EXPECT-OUT: 21
+// EXPECT-OUT: 24
+// EXPECT-OUT: 27
+// EXPECT-OUT: 14
+// EXPECT-OUT: -8997
+// EXPECT-OUT: -7997
+// EXPECT-OUT: -6997
+// EXPECT-OUT: -5997
+// EXPECT-OUT: -4997
+// EXPECT-OUT: -3997
+// EXPECT-OUT: -2997
+// EXPECT-OUT: -1997
+// EXPECT-OUT: -997
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 2003
+// EXPECT-OUT: 3003
+// EXPECT-OUT: 4003
+// EXPECT-OUT: 5003
+// EXPECT-OUT: 6003
+// EXPECT-OUT: 7003
+// EXPECT-OUT: 8003
+// EXPECT-OUT: 9003
+// EXPECT-OUT: -80
+// EXPECT-OUT: 234567899123370
+// EXPECT-OUT: 190
+//
+// Loop vectorization at the lane widths the rest of the corpus does not reach.
+//
+// `tests/run/vectorized_loops.wk` covers f32 (4 lanes), i32 (4) and f64 (2). This file covers the
+// two NARROW element types, where one 128-bit vector holds 8 or 16 elements — and where every
+// off-by-one in the lane arithmetic has the most room to show:
+//
+//   * `i8`  -> `<16 x i8>`, the widest group the pass ever forms.
+//   * `i16` -> `<8 x i16>`.
+//
+// N is 19, which is not a multiple of 16, 8, 4 or 2, so *every* kernel here runs a vector part and
+// a scalar epilogue whatever its width — the case where the two must hand over correctly.
+//
+// The two things worth stating about what is being checked:
+//
+//   * **Every lane is printed** for the map kernels, never a checksum. A reduction hides a
+//     partially-correct buffer: three wrong lanes that happen to cancel still sum right.
+//   * **The expected values come from the scalar semantics of the loop**, computed by hand at the
+//     stated wraparound width, never recorded from compiler output. `i8sum` accumulates
+//     `i*13 + 5`, whose partial sums leave the `i8` range on the tenth element and keep wrapping —
+//     so the answer is only 14 if the 16 lane-parallel partials wrap exactly the way the scalar
+//     chain does. That is the property the vector accumulator claims and it is claimed at the
+//     width with the most partials.
+//
+// `i16xor` is here for the other reason the vector accumulator can be wrong: its identity. `xor`
+// starts at 0 like `add`, but `and` starts at all-ones and `mul` at one, and a wrong identity is
+// invisible on a reduction over a full number of groups. 19 elements is 2 groups of 8 plus 3, so
+// the identity is folded in alongside a live epilogue.
+
+const N: i64 = 19;
+
+/// 16 lanes per group, 3 elements of epilogue.
+fn i8map(x: [i8; 19], mut o: [i8; 19], n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = (x[i] + (3 as i8)) & (63 as i8);
+        i = i + 1;
+    }
+}
+
+/// The one (operator, lane type) pair the x64 backend cannot lower: there is no packed BYTE
+/// multiply on x86 (`pmullw` is 16-bit, `pmulld` 32-bit, and no 8-bit form exists), so the pass
+/// has to leave this loop scalar. It is here because getting that wrong is not a slow program but
+/// a failed compile, and nothing else in the corpus multiplies `i8` in a loop.
+fn i8mul(x: [i8; 19], mut o: [i8; 19], n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] * (3 as i8);
+        i = i + 1;
+    }
+}
+
+/// A wrapping `i8` sum: 16 independent partials, folded once on the way out of the vector loop.
+/// Integer addition is associative *including* its wraparound, so this must be exact.
+fn i8sum(x: [i8; 19], n: i64) -> i8 {
+    let mut s: i8 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + x[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+/// 8 lanes per group, 3 elements of epilogue.
+fn i16map(x: [i16; 19], mut o: [i16; 19], n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] + (3 as i16);
+        i = i + 1;
+    }
+}
+
+/// `xor` has identity 0 but is not `add`: a reduction that folded the wrong operator or seeded the
+/// wrong identity gives a different answer here.
+fn i16xor(x: [i16; 19], n: i64) -> i16 {
+    let mut s: i16 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s ^ x[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+/// 2 lanes per group at the widest integer lane.
+fn i64sum(x: [i64; 19], n: i64) -> i64 {
+    let mut s: i64 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + x[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The float rule at 2 lanes: the loads widen, the accumulate does not. Every value is a multiple
+/// of 1/4 and the sum stays small, so the answer is exact in binary64 and any reassociation would
+/// still have to produce it — which is why the wrapping `i8` sum above, not this, is the test that
+/// the fold order is respected. This one is here for the width.
+fn f64sum(x: [f64; 19], n: i64) -> f64 {
+    let mut s: f64 = 0.0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + x[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let mut a8: [i8; 19] = [0; 19];
+    let mut o8: [i8; 19] = [0; 19];
+    let mut b8: [i8; 19] = [0; 19];
+    let mut a16: [i16; 19] = [0; 19];
+    let mut o16: [i16; 19] = [0; 19];
+    let mut a64: [i64; 19] = [0; 19];
+    let mut af: [f64; 19] = [0.0; 19];
+
+    let mut i: i64 = 0;
+    while i < N {
+        a8[i] = (i - 9) as i8;
+        o8[i] = 0 as i8;
+        b8[i] = (i * 13 + 5) as i8;
+        a16[i] = ((i - 9) * 1000) as i16;
+        o16[i] = 0 as i16;
+        a64[i] = (i + 1) * 1234567890123;
+        af[i] = ((i + 1) as f64) * 0.25;
+        i = i + 1;
+    }
+
+    // (1) o8[i] = ((i - 9) + 3) & 63, every lane.
+    i8map(a8, o8, N);
+    let mut k: i64 = 0;
+    while k < N { print(o8[k] as i32); k = k + 1; }
+
+    // (2) o8[i] = 3*(i - 9), every lane -- the loop the backend forces to stay scalar.
+    i8mul(a8, o8, N);
+    k = 0;
+    while k < N { print(o8[k] as i32); k = k + 1; }
+
+    // (3) the wrapping i8 sum.
+    print(i8sum(b8, N) as i32);
+
+    // (4) o16[i] = 1000*(i - 9) + 3, every lane.
+    i16map(a16, o16, N);
+    k = 0;
+    while k < N { print(o16[k] as i32); k = k + 1; }
+
+    // (5) the i16 xor fold.
+    print(i16xor(a16, N) as i32);
+
+    // (6) sum of (i+1)*1234567890123 for i in 0..19 = 190 * 1234567890123.
+    print(i64sum(a64, N));
+
+    // (7) sum of (i+1)/4 = 190/4, printed x4 so it is an integer.
+    print((f64sum(af, N) * 4.0) as i64);
+
+    return 0;
+}
