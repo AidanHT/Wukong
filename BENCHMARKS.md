@@ -29,6 +29,38 @@ Reproduce:
 cargo run -p wukong_xbench --release      # CC=gcc by default; set CC to override
 ```
 
+> ## ⚠ Peer-strength correction — 2026-08-04
+>
+> **Several figures previously published in this document were measured against a miswritten C/Rust
+> peer, and were wrong by up to 63×.** A deliberately adversarial audit of every peer kernel in
+> `crates/wukong_xbench` found four systematic defects, all of which happened to flatter Wukong:
+>
+> 1. **No `restrict`, anywhere.** Not one of the 43 generated C kernels declared its output buffer
+>    non-overlapping with its inputs, so gcc had to assume `out[i] = f(x[i])` might clobber a later
+>    `x[j]` and could not vectorize or reorder any nested kernel. Wukong's tensor parameters carry
+>    non-overlap in the type system. The comparison was a no-alias compiler against a may-alias one.
+> 2. **The column reductions were written column-outer** — `for j { s=0; for i { s += x[i*N+j] } }`
+>    — the single worst loop order for a row-major axis-0 reduction, and the *only* order measured.
+>    (This document already conceded the row-outer spelling auto-vectorizes, and published the
+>    column-outer multiple anyway.)
+> 3. **The weight-gradient GEMM peer read BOTH operands column-strided** (`ijk` with `a[k*NS+i] *
+>    b[k*NS+j]`), rather than the natural `kij` nest that hoists `a[k*NS+i]`.
+> 4. **The transpose peer was unblocked** while Wukong's kernel is 32×32 cache-blocked — the bench
+>    measured loop tiling, which Wukong did not invent, not codegen.
+>
+> All four are fixed. Every peer now carries `__restrict__`, walks memory in the natural order, and
+> gets the same algorithmic opportunity as Wukong's kernel; ten reduction-bearing benches that had no
+> `C(fast)` [-ffast-math] column now print one. The corrected numbers are throughout this document,
+> and the full before/after table is in **[Corrected peer measurements](#corrected-peer-measurements-2026-08-04)**.
+> Four regression tests in `crates/wukong_xbench/src/main.rs` now pin the peers so this cannot recur
+> silently.
+>
+> **The headline effect.** The "strided column reduction" family (~29–50× 1-core) is now a **1.05–1.8×
+> LOSS**. The weight-gradient GEMM (~128× 1-core / ~445× `@parallel`) is now **2.6–5.3× / 3.1–13.9×**.
+> The transpose (~1.5×) is now a **tie**. The bf16 reduction family, once given the `-ffast-math`
+> column its own rule required, is a **1.1–1.8× loss**. Wins that did *not* move — GEMM, `nn.Linear`,
+> the transcendentals, row-argmax, the fused norms — are exactly the ones that were real.
+
 ## Test machine & toolchains
 
 - Windows 11, Intel Core Ultra 7 155H (Meteor Lake: 6 P-cores + 8 E-cores + 2 LP-E, 22 threads),
@@ -109,17 +141,23 @@ quality, not just beating textbook code:
   interpreter-gated bit-for-bit at a reduced config.
 
 The largest domain-lowering blowouts (each is multicore-vs-1-core, or vs idiomatic scalar source
-where gcc/rustc won't vectorize — disclosed per section, never a rigged baseline):
+where gcc/rustc won't vectorize — disclosed per section, never a rigged baseline). **Corrected
+2026-08-04** against the fixed peers; the struck values are what this table said before, and the
+[correction section](#corrected-peer-measurements-2026-08-04) shows every ratio that moved:
 
-| What | 1-core vs C | `@parallel` vs C |
-|---|---|---|
-| Weight-gradient GEMM `dW=Aᵀ·B` (vs naive C; ~10× vs hand-transposed C) | **up to ~128×** | **up to ~445×** |
-| `nn.Linear` `C=A·Bᵀ` | ~19–26× | up to **~104×** |
-| bf16 `nn.Linear` | ~24–25× | up to ~109× |
-| Fused FFN `silu(A·Bᵀ)` (the Dense layer) | ~24–26× | ~48–95× |
-| Strided column reductions (sum/max/absmax) | **~29–50×** | ~37–107× |
-| RoPE (rotary embedding) | ~29–54× | **~146–156×** |
-| Reductions / transcendentals / argmax | ~2.5–9× | ~9–26× |
+| What | 1-core vs C | `@parallel` vs C | was |
+|---|---|---|---|
+| Weight-gradient GEMM `dW=Aᵀ·B` | **~2.6–5.3×** | **~3.1–13.9×** | ~~~128× / ~445×~~ (peer read both operands column-strided) |
+| `nn.Linear` `C=A·Bᵀ` | ~19–26× | up to **~104×** | unchanged |
+| bf16 `nn.Linear` | ~23–28× (**~4.6–5.6× vs C(fast)**) | ~50–91× | ~24–25×; the C(fast) column is new |
+| Fused FFN `silu(A·Bᵀ)` (the Dense layer) | ~24–26× | ~48–95× | unchanged |
+| RoPE (rotary embedding) | ~29–54× | **~146–156×** | unchanged |
+| Reductions / transcendentals / **row**-argmax | ~2.5–9× | ~9–26× | unchanged |
+| ~~Strided column reductions (sum/max/absmax)~~ | **1.05–1.8× SLOWER** | ~1.0–1.4× | ~~~29–50× / ~37–107×~~ — **the peer was written column-outer; see below** |
+
+The last row is the single largest correction in this document: what was published as a ~29–50×
+single-core win is, against a C peer written the way a competent programmer writes an axis-0
+reduction, a 1.05–1.8× **loss**. It is kept in the table, struck through, rather than quietly deleted.
 
 **GPU backend** (`--features gpu`, mobile RTX 4050, same-run clock-invariant ratios — full section
 [below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): fp16 tensor-core GEMM reaches **cuBLAS parity
@@ -171,12 +209,12 @@ tolerance for the reassociated-float ones).
 | Kernel family | 1-core vs C | `@parallel` vs C | Why Wukong wins (what gcc/rustc won't do) |
 |---|---|---|---|
 | **f32 GEMM** (matmul / `nn.Linear`) | ~3–3.6× | up to ~100× | register-block + cache-tile + pack; they vectorize the inner loop but never tile |
-| **bf16/f16 GEMM** | ~25× (idiomatic) | large | lossless widen-prepass → the tuned f32 microkernel |
+| **bf16/f16 GEMM** | ~23–28× (idiomatic) / **~4.6–5.6× vs C(fast)** | ~50–91× | lossless widen-prepass → the tuned f32 microkernel |
 | **Fused FFN** (`silu(A·Bᵀ)`, the Dense layer) | ~24–26× | ~48–95× | matmul + activation folded into one C-write; C re-streams C through a separate scalar-`expf` pass |
-| **TN weight-gradient** (`dW=dYᵀ·X`) | ~10× (hand-T C) | large | transpose-prepass; the idiomatic nest reads A column-strided (they can't vectorize) |
+| **TN weight-gradient** (`dW=dYᵀ·X`) | **~2.6–5.3×** | ~3.1–13.9× | transpose-prepass + the tiled kernel, vs the natural `kij` nest gcc vectorizes but does not tile *(corrected 2026-08-04: was ~128×/~445× against a peer that read both operands column-strided)* |
 | **int8 `nn.Linear`** (`vpdpbusd`) | ~1.5–2.5× | ~4.6–14.7× | 2×4 register tile halves B traffic (vs gcc's own `vpdpbusd`) |
-| **Column reductions** (sum/max/min/absmax) | **~29–50×** | **~37–107×** | the strided column-outer fold gcc/rustc leave *scalar* |
-| **Transpose** (f32 / bf16) | ~1.5× | ~9–14× | `B=32` cache tiling; `-O3` doesn't loop-tile a transpose |
+| **Column reductions** (sum/max/min/absmax/mean/L2/RMS) | **1.05–1.8× SLOWER** | ~1.0–1.4× | *nothing* — gcc auto-vectorizes the natural row-outer nest and matches or beats the kernel. The old ~29–50× was the peer's column-outer loop order *(corrected 2026-08-04)* |
+| **Transpose** (f32) | ≈tie (1.00–1.03×) | ~4.8–7.1× | *nothing single-core* once the peer is blocked too; `@parallel` adds cross-core bandwidth *(corrected 2026-08-04: was ~1.5× against an unblocked peer)* |
 | **Fused norms** (softmax/LN/RMS) | ~1.9–6.6× | memory-bound | single-pass fusion + 256-bit `exp`; their float reductions stay sequential |
 | **Reductions** (dot / ssd) | ~2.6–2.9× | ~8–26× | lane accumulators; their reduction is a serial `vaddss` chain |
 | **Activations** (35-op `vmath`) | ~2–11.5× | ~28× | hand-AVX2 256-bit transcendentals vs scalar libm |
@@ -187,20 +225,27 @@ tolerance for the reassociated-float ones).
 | **Row losses** (KL-div / entropy / soft-label xent) | ~3.6–7.5× | ~15–39× | the per-row `logf`/`expf` reduction gcc/rustc keep scalar (measured in tests/run; per-size table not reproduced here) |
 | **RoPE** (rotary embedding fwd / bwd) | **~29–54×** | **~146–156×** | the per-pair sin/cos — C calls scalar `sincosf`; Wukong one 256-bit `sincos` |
 | **Gate** (SwiGLU / GeGLU `act(a)·b`) | ~5–13× | ~13–27× | the gate's silu/gelu folds an `expf` C/Rust keep scalar (measured in tests/run; per-size table not reproduced here) |
-| **Argmax/argmin** (global / row / column) | **~2.6–9×** | ~3.4–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize; global + column are AVX2 single-pass |
-| **Scans** (cumsum / cummax / cummin / cumprod) | ~1.4–2.9× | ~5.3–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan, or 4-row-interleaved ILP for cumprod / `lrscan` (cummax/cummin/cumprod bit-exact) |
+| **Argmax/argmin** — global + **row** | **~2.3–4.9×** (row; ~3.3–3.5× vs C(fast)) | ~5.8–12× | the within-row `(value,index)` bookkeeping gcc/rustc won't auto-vectorize even at `-ffast-math` — this one is real |
+| **Argmax/argmin** — **column** (axis-0) | **1.5–2.5× SLOWER** | ~1.1–1.3× | *nothing* — the old ~2.7–5.3× was the peer's column-outer scan *(corrected 2026-08-04)* |
+| **Scans** (cumsum / cummax / cummin / cumprod) | ~1.3–2.9× (cumsum **1.03–1.42× vs C(fast)**) | ~4.1–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan, or 4-row-interleaved ILP for cumprod / `lrscan` (cummax/cummin/cumprod bit-exact). Cumsum's `C(fast)` column is new (2026-08-04) and shows that row is ≈ a tie |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu / bias-add | ≈tie | — | already bandwidth-bound; no headroom standalone (won when *fused*) |
 
-> **Reduction-bearing rows** (dot/ssd, `nn.Linear`, FFN, weight-gradient, bf16 GEMM, column
-> reductions, norms and their backwards, cross-entropy, row losses): IEEE-serial C baseline; see the
-> **C(fast)** column xbench prints for the reassociation-normalized comparison, and the **C(omp)**
-> column on `@parallel` rows for the multithreaded-C comparison (Fairness notes below).
+> **Reduction-bearing rows** (dot/ssd, `nn.Linear`, FFN, weight-gradient, bf16 GEMM + bf16 dot/sum,
+> gemv, scaled GEMM, conv, column reductions, column/row argmax, cumsum, norms and their backwards,
+> cross-entropy, row losses): IEEE-serial C baseline; see the **C(fast)** column xbench prints for
+> the reassociation-normalized comparison, and the **C(omp)** column on `@parallel` rows for the
+> multithreaded-C comparison (Fairness notes below). *Ten of those families had no `C(fast)` column
+> at all before 2026-08-04; four of them (gemv, conv, the bf16 reductions, cumsum) turn out to be
+> ties or losses once it exists.*
 
-The pattern: Wukong **heavily** exceeds C/Rust wherever domain knowledge lets a tensor compiler do
-what a scalar C compiler won't (tiling, packing, register-blocking, fusion, 256-bit transcendentals,
-vectorizing strided/reduction folds). On already-bandwidth-bound elementwise work it ties; on the
-recognized kernel surface it wins, often by one to two orders of magnitude.
+The pattern, restated after the 2026-08-04 peer audit: Wukong exceeds C/Rust where domain knowledge
+lets a tensor compiler do what a scalar C compiler won't — **tiling, packing and register-blocking a
+GEMM** (the durable 3–26× family), **fusing** a matmul with its epilogue or a norm's passes, and
+**256-bit transcendentals** where gcc has only a scalar `libm` call. It does **not** exceed C on
+strided reductions, column arg-reductions, transposes, or bandwidth-bound half-precision reductions:
+those rows previously read as one-to-two-order-of-magnitude wins, and every one of them was a peer
+defect or a withheld `-ffast-math`. On already-bandwidth-bound elementwise work it ties.
 
 **Additional recognized coverage** (correctness-gated, interp == native bit-for-bit): the **embedding
 lookup** `out[t,:] = weight[ids[t],:]` (the token-id row gather that is the first layer of every LLM —
@@ -226,12 +271,14 @@ naively-written source:
   for both its `Q·Kᵀ` and `P·V` matmuls.
 - **Transposed-A weight-gradient dispatch (`C = Aᵀ·B`).** The training backward pass needs
   `dW = dYᵀ·X`, where the contraction (batch) axis is the *outer* index of both operands — so A's
-  logical `[m,k]` operand is the transpose of its `[k,m]` storage and the inner loop reads A
-  column-strided (one cache line per element), which gcc/rustc cannot vectorize. Wukong recognizes
+  logical `[m,k]` operand is the transpose of its `[k,m]` storage. Wukong recognizes
   `a[k*M+i]·b[k*N+j]` and dispatches to `wukong_sgemm_tn`, which transposes A into scratch once —
-  O(m·k), ~1/n of the O(m·n·k) GEMM — then runs the *same* tuned NN microkernel. The automatic
-  transpose-prepass-then-tile is precisely the lowering gcc won't do for the idiomatic nest; the
-  result is bit-for-bit the kernel the interpreter oracle marshals (no new accumulation order).
+  O(m·k), ~1/n of the O(m·n·k) GEMM — then runs the *same* tuned NN microkernel. The result is
+  bit-for-bit the kernel the interpreter oracle marshals (no new accumulation order). **The win is
+  the tiling, not the transpose**: a competent C programmer writes this nest `kij` (hoisting
+  `a[k*M+i]`), which gcc vectorizes fine, and against that peer the dispatch is worth **2.6–5.3×** —
+  not the ~128× this document published against an `ijk` nest that read both operands column-strided
+  (corrected 2026-08-04).
 - **int8 quantized `nn.Linear` dispatch.** The quantized-inference GEMM — `u8` activations × `i8`
   weights → an `i32` accumulator (`C = A·Bᵀ`, the QNNPACK/oneDNN layout) — is recognized and lowered
   to an **AVX-VNNI `vpdpbusd`** microkernel, register-blocked four B-rows at a time (and the
@@ -247,14 +294,18 @@ naively-written source:
   **`max`/`min`/`absmax`** (`wukong_reduce_{bf16,f16}` — the per-tensor absmax is the symmetric-quant
   scale), **streaming `axpby`** (`wukong_axpby_{bf16,f16}`, half-in/f32-out), and the **36-op activation
   set** (`wukong_vmath_{bf16,f16}`). Because half precision moves **half the input bytes** of f32, the
-  memory-bound ops are *bandwidth* wins that grow as the data spills cache: **~3.0–3.5× vs C** for dot,
-  **~6–8×** for sum; and C/Rust can vectorize neither a `libm` call nor the half→f32 widen, so the
+  memory-bound ops are *bandwidth* wins that grow as the data spills cache: **~4–7.6× vs C** for dot,
+  **~6–8×** for sum — **but 1.1–1.8× SLOWER than the same C at `-ffast-math`**, which is the
+  like-for-like basis for a reassociated accumulate and was not measured until 2026-08-04. C/Rust can
+  vectorize neither a `libm` call nor the half→f32 widen, so the
   activation gap is structural. Half storage is bit-exact across backends (f16 via shared `half`-crate
   shims, since Cranelift x64 lacks f16 convert lowering), and both call the identical kernel, so the gate
   stays exact. The dispatch now reaches the **mixed-precision GEMM** too: a bf16/f16 `C = A·Bᵀ`
   `nn.Linear` nest folds to `wukong_sgemm_{bf16,f16}_nt` (a lossless widen prepass + the tuned f32
-  microkernel), **~25× single-core / ~47–109× `@parallel`** vs the idiomatic bf16 C that leaves the
-  inline widen + reduction scalar (~10× vs a hand-optimized widen-then-tile bf16 C — the durable part).
+  microkernel), **~23–28× single-core / ~50–91× `@parallel`** vs the idiomatic bf16 C that leaves the
+  inline widen + reduction scalar — and **~4.6–5.6× vs the same C at `-ffast-math`**, which is the
+  durable part (measured 2026-08-04; the previous "~10× vs a hand-optimized widen-then-tile bf16 C"
+  was an estimate, not a measurement).
 - **Reduction vectorization + multicore dispatch.** A naive f32 reduction (`s += x[i]*y[i]`) is one
   FMA down a single dependency chain — latency-bound. Wukong reassociates it across vector lanes ×
   unrolled accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without
@@ -285,13 +336,169 @@ naively-written source:
   a sibling **`wukong_norm_affine_f32`** and hold the same win (**~1.7–3.7×**) — γ/β fold into the
   writeback for free.
 - **Convolution via im2col + GEMM.** A conv expressed as im2col + matmul has its matmul recognized
-  and dispatched to the GEMM microkernel — so Wukong beats hand-written direct convolution ~6–7×,
-  the same way XLA/cuDNN lower conv.
+  and dispatched to the GEMM microkernel, the same way XLA/cuDNN lower conv — so conv is accelerated
+  for free, with no conv-specific kernel. Against a direct-convolution peer that is allowed to keep
+  its accumulator in a register (`restrict`), the margin is **1.55×**, and **1.12× slower** at
+  `-ffast-math`; the ~6–7× this document published was measured without `restrict` (corrected
+  2026-08-04).
 - **Auto-parallelization** of `@parallel` loops across all cores, with each per-thread chunk itself
   vectorized.
 
+## Corrected peer measurements (2026-08-04)
+
+The complete before/after board for the peer-strength audit described at the top of this document.
+
+**Method.** Two release binaries were built from the same tree — one at the pre-audit commit (the
+strawman peers) and one with the corrections — and run **adjacently, family by family**, so each
+before/after pair shares a thermal and power window. This is the only instrument this laptop
+supports (see the three-axes note above): the *ratios* are comparable within a pair, the absolute
+GB/s and GFLOP/s are not comparable across pairs.
+
+**Instrument state.** AC + charging, battery 11–35%. Per the power-state rule that means
+**single-core rows are valid and every all-core row is directional only** (AC+charging caps all-core
+at roughly 25%). The single-core rows are where the corrections live, so this does not soften the
+conclusion; the `@parallel` columns below should be read as "which side of 1.0", not as a magnitude.
+The measured single-core AVX2-FMA roofline drifted 43–120 GFLOP/s across the session, which is the
+usual thermal spread and is why nothing here is quoted as an absolute.
+
+Sign convention: **a positive multiple means Wukong is faster**; "slower" is spelled out.
+
+### The four defects and what each cost
+
+| defect | families affected | standalone cost to the peer (gcc 14.2 `-O3 -march=native`, best-of-N, one process) |
+|---|---|---|
+| no `restrict` on any of 43 C kernels | all | conv2d **4.9 → 21.1 GFLOP/s (4.3×)**; xent_bwd 2.3×; negligible on flat 1-D elementwise (saxpy 0.316 → 0.331 ms, i.e. none — gcc versions the loop with a runtime alias check there) |
+| column-outer loop order | colsum, colmax/min/absmax, colmean/sumsq/L2/RMS, colargmax/min | colsum 4096×1024 **3.739 → 0.563 ms (6.6×)**; colmax **5.730 → 0.888 ms (6.5×)**; colmean **5.990 → 0.509 ms (11.8×)**; colargmax **4.043 → 0.954 ms (4.2×)** |
+| `ijk` with both operands column-strided | matmul_tn (weight-gradient GEMM) | 512³ **20.965 → 8.805 ms (2.4×)** |
+| unblocked transpose vs Wukong's blocked kernel | transpose | 2048² **24.184 → 14.298 ms (1.7×)** |
+
+Plus a fifth, of a different kind: **ten reduction-bearing benches had no `C(fast)` column at all**,
+so their published multiple was measured only against a C peer forbidden from reassociating — the
+exact asymmetry this document's own fairness rule exists to remove (gemv, scaled_gemm, linear_bf16,
+conv, colmax/min/absmax, rowarg, colarg, the bf16 dot/sum, cumsum, xent_bwd).
+
+### Every ratio that moved
+
+Single-core, vs the plain (honest-flags) C column unless stated. `~~struck~~` = the previously
+published value.
+
+#### Collapsed to a loss
+
+| bench | shape | before | after | after, vs C(fast) | inflation |
+|---|---|---|---|---|---|
+| colsum | 1024×1024 | ~~77.67×~~ | **1.23× slower** | 1.31× slower | **63×** |
+| colsum | 4096×1024 | ~~25.51×~~ | **1.70× slower** | 1.55× slower | 15× |
+| colmax | 1024×1024 | ~~22.71×~~ | 1.40× slower | 1.91× slower | 16× |
+| colmax | 4096×1024 | ~~31.38×~~ | 1.72× slower | 1.99× slower | 18× |
+| colmin | 1024×1024 | ~~65.68×~~ | 1.37× slower | 1.58× slower | 48× |
+| colmin | 4096×1024 | ~~23.60×~~ | 1.81× slower | 1.26× slower | 13× |
+| colmaxabs | 1024×1024 | ~~43.73×~~ | 1.57× slower | 2.01× slower | 28× |
+| colmaxabs | 4096×1024 | ~~43.99×~~ | 1.05× slower | 1.22× slower | 42× |
+| colmean | 1024×1024 | ~~48.70×~~ | 1.60× slower | 1.71× slower | 30× |
+| colmean | 4096×1024 | ~~23.19×~~ | 1.26× slower | 1.35× slower | 18× |
+| colsumsq | 1024×1024 | ~~73.47×~~ | 1.57× slower | 1.69× slower | 47× |
+| colsumsq | 4096×1024 | ~~24.38×~~ | 1.46× slower | 1.44× slower | 17× |
+| coll2 | 1024×1024 | ~~56.49×~~ | 1.08× slower | 1.14× slower | 52× |
+| coll2 | 4096×1024 | ~~26.33×~~ | 1.43× slower | 1.58× slower | 18× |
+| colrms | 1024×1024 | ~~49.56×~~ | 1.25× slower | 1.52× slower | 40× |
+| colrms | 4096×1024 | ~~35.71×~~ | 1.58× slower | 1.87× slower | 23× |
+| colargmax | 1024×1024 | ~~3.09×~~ | 1.49× slower | 1.98× slower | 2.1× |
+| colargmax | 4096×1024 | ~~4.10×~~ | 2.47× slower | 2.46× slower | 1.7× |
+| colargmin | 1024×1024 | ~~2.69×~~ | 1.68× slower | 1.86× slower | 1.6× |
+| colargmin | 4096×1024 | ~~3.48×~~ | 1.71× slower | 1.98× slower | 2.0× |
+| transpose | 2048×2048 | ~~2.20×~~ | 1.00× (tie) | — | 2.2× |
+
+The `@parallel` column for these collapses too: colsum/colmax/colmin/colmaxabs/colstat move from
++16× … +55× down to between 2.0× *slower* and 1.4× faster, i.e. **all-core Wukong roughly ties
+single-threaded C** on the column-reduction family.
+
+#### Shrank but survived
+
+| bench | shape | before | after | after, vs C(fast) | inflation |
+|---|---|---|---|---|---|
+| matmul_tn (weight-grad GEMM) | 256³ | ~~43.83×~~ | **2.61×** | 2.68× | 16.8× |
+| matmul_tn | 512³ | ~~50.69×~~ | **2.72×** | 2.65× | 18.6× |
+| matmul_tn | 1024³ | ~~120.34×~~ | **5.28×** | 5.38× | 22.8× |
+| matmul_tn `@parallel` | 1024³ | ~~436.23×~~ | **13.90×** | 14.16× | 31.4× |
+| conv2d 3×3 | Cin16 20² → 64@18² | ~~5.90×~~ | **1.55×** | **1.12× slower** | 3.8× |
+| transpose | 1024×1024 | ~~1.48×~~ | 1.03× (tie) | — | 1.4× |
+| transpose `@parallel` | 2048² | ~~14.83×~~ | 7.05× (1.12× vs C(omp)) | — | 2.1× |
+| rowargmax | 1024×1024 | ~~3.35×~~ | 2.45× | 1.92× | 1.4× |
+| rowargmin | 4096×1024 | ~~3.45×~~ | 2.29× | 2.08× | 1.5× |
+| gemv | 4096×4096 | ~~3.57×~~ | 3.16× | **1.09× slower** | 1.1× |
+| gemv | 8192×2048 | ~~4.99×~~ | 3.55× | 1.11× | 1.4× |
+| gemv | 16384×1024 | ~~3.58×~~ | 3.01× | **1.01× slower** | 1.2× |
+| linear_bf16 | 512² | ~~25.67×~~ | 22.70× | **4.59×** | 1.1× |
+| linear_bf16 | 1024² | ~~37.29×~~ | 27.52× | **5.62×** | 1.4× |
+| scaled_gemm (Q·Kᵀ·α) | S=512 D=64 | ~~17.82×~~ | 11.26× | **1.19×** | 1.6× |
+| scaled_gemm | S=512 D=128 | ~~24.24×~~ | 21.55× | **3.00×** | 1.1× |
+| xent_bwd | 1024×1024 | ~~26.18×~~ | 11.31× | 8.65× | 2.3× |
+| xent_bwd | 4096×512 | ~~9.78×~~ | 9.54× | 8.37× | 1.0× |
+| cumsum | 1024×1024 | ~~1.35×~~ | 1.31× | 1.03× | 1.0× |
+| cumsum | 4096×1024 | ~~2.02×~~ | 1.57× | 1.42× | 1.3× |
+| bf16 dot | N=2²⁰ | ~~7.50×~~ | 7.64× | **1.36× slower** | — |
+| bf16 dot | N=2²⁴ | ~~5.15×~~ | 6.41× | **1.16× slower** | — |
+
+The pattern in the right-hand column is the important one. For `gemv`, `conv`, the `bf16` reductions
+and `cumsum`, the plain-C multiple survives the peer fix but the **`C(fast)` column shows the win was
+the withheld `-ffast-math`, not the kernel**. For `matmul_tn`, `linear_bf16` and `scaled_gemm` the
+C(fast) column is far below the plain one too — those are GEMM-family wins that are real but 3–6×,
+not 20–40×.
+
+#### Did not move (the wins that were real)
+
+Measured, not assumed: these were re-run through the identical A/B and their ratios changed only
+within the session's run-to-run noise.
+
+- **`nn.Linear` `C=A·Bᵀ`, matmul, fused FFN** — the peers were already the natural contiguous `ijk`
+  nest; `restrict` changes nothing there because the accumulator is already a register.
+- **Row argmax/argmin** — the peer already walked each row contiguously; 2.3–4.9× survives, and
+  **3.3–3.5× vs `C(fast)`**, so gcc genuinely will not vectorize a within-row `(value,index)` scan
+  even under relaxed FP.
+- **The 35-op transcendental/activation family** — a `libm` call cannot vectorize with or without
+  `restrict` or `-ffast-math` on this mingw toolchain (no `libmvec`).
+- **The fused norms, RoPE, the norm backwards, row losses, the int8 GEMM.**
+- **The flat elementwise rows** (saxpy, relu, poly, hadamard) — `restrict` measurably does nothing
+  for a 1-D map (standalone: saxpy 0.316 ms plain vs 0.331 ms with `restrict`; biasadd 0.287 vs
+  0.282), because gcc already versions those loops with a runtime alias check. Their A/B pairs moved
+  1.27× ↔ 2.33× in *both* directions across the session, which is the noise floor at this power
+  state, not a peer effect.
+
+### What was NOT re-measured
+
+- **The end-to-end `model` section** (the 12-layer GPT-2-class stack and its PyTorch peers). It uses
+  its own peer sources in `model.rs`, which this audit did not touch; its numbers stand as previously
+  published and are **not** covered by the corrections above. Auditing `model.rs`'s peers the same
+  way is open work.
+- **The whole-suite geomean headline** ("3.8–4.4× faster than C"). It is dominated by the
+  elementwise/reduction table, whose peers changed only by `restrict` — measured to be a no-op there
+  — so the figure is expected to hold, but it was not re-derived in a single full-suite run at a
+  valid power state and should be treated as unconfirmed until it is.
+- **The GPU section.** Untouched by this audit (no C/C++/Rust CPU peers involved).
+- **Anything at AC+full.** Every number above is AC+charging. Re-running the single-core rows at
+  AC+full is expected to move absolutes but not the direction of any conclusion, since every figure
+  quoted is a same-run adjacent ratio.
+
 ## Fairness notes
 
+- **Aliasing — every C/C++ peer declares its buffers `__restrict__`** (added 2026-08-04; before that
+  date, *none* of the 43 generated C kernels did). Without it gcc must assume `out[i] = f(x[i])` may
+  clobber a later `x[j]` and cannot vectorize, interchange or reorder a nested kernel at all, while
+  Wukong's tensor parameters carry non-overlap in the type system and its recognized kernels are
+  hand-written AVX2 code that assumes it. `__restrict__` is the GCC spelling accepted in both C and
+  C++ mode, so the g++ column inherits it. Every call site in `wukong_xbench` passes three (or four)
+  genuinely distinct allocations, which is what makes the qualifier true rather than merely fast; the
+  one bench that passed an aliasing filler pointer was fixed in the same commit.
+- **Peer loop order — the peer must walk memory the way a competent programmer would** (audited
+  2026-08-04). Four peers failed this and were rewritten: the column reductions (column-outer → row-
+  outer), the column argmax (column-outer → row-outer with a running-best vector), the weight-gradient
+  GEMM (`ijk` with both operands column-strided → `kij`), and the transpose (unblocked → 32×32
+  blocked, matching Wukong's own kernel). Every one of the four failures inflated Wukong's published
+  number, by 1.4× to 63×. Four tests in `crates/wukong_xbench/src/main.rs`
+  (`every_generated_c_kernel_declares_restrict`, `column_family_peers_stay_row_outer`,
+  `matmul_tn_peer_stays_kij`, `transpose_peer_stays_cache_blocked`) now pin all of it, because a
+  weakened peer breaks nothing observable — the suite still runs, the cross-language check still
+  passes, and the only symptom is a bigger multiple.
 - **FMA:** Wukong contracts `x + y*z` to a fused multiply-add, so gcc is given its **default**
   `-ffp-contract=fast` (both fuse). Idiomatic Rust does not contract unless the author writes
   `f32::mul_add`, so the Rust column reflects rustc's default — a real toolchain-defaults difference,
@@ -619,27 +826,39 @@ GFLOP/s ≈ its plain-`linear` GFLOP/s, so the silu pass is not a strawman). sil
 whole buffer to a tight tolerance (the GEMM reassociates, silu is poly-vs-libm ~1 ULP).
 *IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison.*
 
-### Weight-gradient `C = Aᵀ·B` — the training backward GEMM Wukong dispatches, gcc cannot
+### Weight-gradient `C = Aᵀ·B` — the training backward GEMM
 
 The backward pass computes `dW = dYᵀ·X`: the contraction (batch) axis is the **outer** index of both
-operands, so A is stored `[k,m]` and the idiomatic nest reads it **column-strided** (`a[k*M+i]`, one
-cache line per element). Wukong recognizes `a[k*M+i]·b[k*N+j]` and dispatches to `wukong_sgemm_tn`,
-which transposes A into scratch once (O(m·k), ~1/n of the GEMM) then runs the *same* tuned NN kernel.
+operands, so A is stored `[k,m]`. Wukong recognizes `a[k*M+i]·b[k*N+j]` and dispatches to
+`wukong_sgemm_tn`, which transposes A into scratch once (O(m·k), ~1/n of the GEMM) then runs the
+*same* tuned NN kernel.
 
-| size  | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
-|-------|-----------|---------------|---------|------|-------------|---------------|
-| 256²  | ~46 | ~48 | ~1.1 | ~1.1 | **~42×** | **~44×** |
-| 512²  | ~55 | ~84 | ~1.1 | ~1.2 | **~48×** | **~74×** |
-| 1024² | ~39 | ~135 | ~0.3 | ~0.3 | **~128×** | **~445×** |
+> **Corrected 2026-08-04.** This section previously published **~42–128× single-core and ~44–445×
+> `@parallel`**, measured against a C peer written as an `ijk` dot-product nest in which BOTH
+> operands are read column-strided (`s += a[k*NS+i]*b[k*NS+j]`) — every k step advancing both
+> pointers by NS floats. Nobody writes `C = Aᵀ·B` that way. With A stored `[K,M]`, k is already A's
+> *outer* index, so the natural nest is `kij`: hoist `a[k*NS+i]`, then stream `b[k*NS+·]` and
+> `c[i*NS+·]` contiguously — exactly what the same file's untransposed `c_matmul` already did.
+> Standalone at `-O3 -march=native`, 512³: **20.965 ms `ijk` vs 8.805 ms `kij` + `restrict`**.
+> The prose below also used to claim a hand-transposed C would recover only ~4–5 GFLOP/s and leave a
+> "durable ~10×"; the measured `kij` peer does substantially better than that, and the durable win is
+> 2.6–5.3×.
 
-Two effects compound here, and honesty requires separating them. The idiomatic C falls to ~0.3–1.1
-GFLOP/s because the column-strided A reads defeat vectorization **and** the dot-product reduction stays
-serial — so the raw ratio is inflated by the strided access. A *hand-transposed* C (transpose A first,
-the very thing Wukong does automatically) would recover the ~4–5 GFLOP/s serial-reduction baseline of
-the `nn.Linear` row — still ~10× behind Wukong's tiled kernel. So the durable domain-lowering win is
-~10× even against optimized C; the larger headline numbers are what you get versus the code a person
-actually writes for `dW`. (Single-run, clock-sensitive absolute GFLOP/s; the ratio is the stable part.)
-*IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison.*
+Measured with the corrected `kij` + `restrict` peer (2026-08-04, AC+charging so the all-core column
+is directional; each pair is same-run adjacent):
+
+| size  | 1-core vs C | 1-core vs C(fast) | `@parallel` vs C | was (1-core / `@parallel`) |
+|-------|-------------|-------------------|------------------|-----------------------------|
+| 256²  | **2.61×** | 2.68× | 3.11× | ~~43.8× / 50.4×~~ |
+| 512²  | **2.72×** | 2.65× | 5.08× | ~~50.7× / 89.4×~~ |
+| 1024² | **5.28×** | 5.38× | 13.90× | ~~120.3× / 436.2×~~ |
+
+So the inflation was **16.8–22.8× on the single-core row and 16.2–31.4× on `@parallel`**. Wukong
+still wins this family — the transpose-prepass plus a tiled, packed, register-blocked GEMM beats a
+vectorized-but-untiled `kij` nest, and the lead grows with size exactly as the cache argument
+predicts — it just wins by 2.6–5.3×, not by two orders of magnitude. The `C(fast)` column is
+essentially identical to the plain one, which is the expected result: the win here is tiling, not
+reassociation. (Absolute GFLOP/s is clock-sensitive; the ratio is the stable part.)
 
 ### Convolution — im2col + GEMM vs idiomatic direct conv
 
@@ -648,14 +867,24 @@ gather builds the `[Cin·K·K, OH·OW]` column matrix, then the conv is a matmul
 recognizer dispatches to the tuned GEMM. C and Rust run the idiomatic **six-deep direct-convolution
 nest** (the loop everyone writes by hand).
 
-| kernel | Wuk (im2col+GEMM) | C (direct) | Rust (direct) | Wukong vs C |
-|--------|-------------------|------------|---------------|--------------|
-| conv2d 3×3 | ~30–40 GFLOP/s | ~3.6–6.6 | ~3.7–6.5 | **~6–7× faster** |
+> **Corrected 2026-08-04 — the largest single `restrict` effect in the suite.** This section
+> published **~6–7×**. The direct-convolution peer accumulates into a scalar `s` and then stores to
+> `output`; without `restrict` gcc must assume that store may alias `input`/`weight`, which forces a
+> reload of the whole inner nest's operands on every output pixel. Adding `__restrict__` — changing
+> nothing else about the loop — took the C peer from **4.9 to 21.1 GFLOP/s, a 4.3× peer speedup**,
+> and the published multiple from 5.90× to **1.55×**. With the (new) `-ffast-math` column the direct
+> conv is **faster than Wukong** (1.12×).
+
+| kernel | 1-core vs C | 1-core vs C(fast) | was |
+|--------|-------------|-------------------|-----|
+| conv2d 3×3 (Cin=16, 20×20 → 64@18×18) | **1.55×** | **1.12× slower** | ~~5.90×~~ |
 
 Same result (checksum cross-checked). The conv's GEMM is small (M=64, K=144, N=324) so it runs below
-the large-matmul peak, but it still beats hand-written direct convolution ~6–7× — the im2col gather
-is cheap data movement and the GEMM microkernel does the FLOPs. So Wukong accelerates conv *for
-free* through the existing matmul dispatch (`tests/run/conv_im2col.wk`).
+the large-matmul peak. Against a peer that is allowed to keep its accumulator in a register, the
+im2col+GEMM route is a **1.55× win at honest flags and a slight loss once the peer may reassociate**
+— it is not the 6–7× this document claimed. What remains true is the structural point: Wukong gets
+whatever conv performance it has *for free* through the existing matmul dispatch
+(`tests/run/conv_im2col.wk`), with no conv-specific kernel.
 
 ### Transcendentals / activations — Wukong dispatches to a 256-bit AVX2 kernel; C calls scalar `libm`
 
@@ -933,73 +1162,105 @@ line per element — so this compounds the bf16 widen win with the transpose-pre
 weight-gradient GEMM already documents (`~42–445×` idiomatic C there). `tests/run/matmul_{bf16,f16}_tn.wk`;
 the runtime twin pins both precisions == the f32 TN kernel on the widened operands, serial == parallel.
 
-### Matrix transpose — cache blocking the layout op
+### Matrix transpose — a tie once the peer is blocked too
 
 `dst = srcᵀ` is the memory-bound layout op behind attention score transposes and weight-layout
-conversions. The naive `for i { for j { dst[j*R+i] = src[i*C+j] } }` writes `dst` with stride `R` — a
-fresh cache line per element once `R` is large, so the working set thrashes — and **gcc/rustc do not
-loop-tile a transpose at `-O3`** (tiling is a polyhedral pass outside it). Wukong folds the nest to
-the `B=32` cache-blocked **`wukong_transpose_f32`**, which keeps a `B×B` tile of both operands
-L1-resident. Transpose is a *permutation* (no arithmetic), so the cross-language check is **bit-exact**
-— a stronger bar than the GEMM tolerance gate.
+conversions. Wukong folds the nest to the `B=32` cache-blocked **`wukong_transpose_f32`**, which
+keeps a `B×B` tile of both operands L1-resident. Transpose is a *permutation* (no arithmetic), so the
+cross-language check is **bit-exact** — a stronger bar than the GEMM tolerance gate.
 
-| size  | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
-|-------|-----------|---------------|---------|------|-------------|---------------|
-| 1024² | ~2.1–2.2 | ~13.8–14.1 | ~1.4–1.6 | ~1.3–1.5 | **~1.35–1.49×** | **~8.8–10×** |
-| 2048² | ~2.0–2.2 | ~16.3–17.5 | ~1.2–1.4 | ~1.2 | **~1.52–1.65×** | **~11.4–14.2×** |
+> **Corrected 2026-08-04.** The C/Rust peers were the *unblocked* `for i { for j { dst[j*R+i] =
+> src[i*C+j] } }`, and this section's own explanation of the win was "**gcc/rustc do not loop-tile a
+> transpose at `-O3`**". That is true, and it is not a statement about codegen — it is a statement
+> about the benchmark's source. Loop blocking a transpose is the textbook optimization; a competent C
+> programmer writes the tiles, and comparing a blocked kernel against an unblocked peer measures the
+> blocking, which Wukong did not invent here. The peers are now 32×32 blocked, matching Wukong's own
+> algorithm. Standalone at `-O3 -march=native`, 2048²: **24.184 ms naive vs 14.298 ms
+> 32×32-blocked + `restrict` — a 1.7× handicap.**
 
-(GB/s = `2·N²·4` bytes moved per call; higher is better.) The single-core lead is the cache-blocking
-win the naive compilers leave on the table; `@parallel` adds aggregate cross-core bandwidth on top
-(the op is latency-bound on the strided writes, so spreading the row blocks across cores hides it).
-Absolute GB/s is low precisely because a transpose is latency- not throughput-bound, so the **ratio**
-is the clock-invariant figure — it holds across runs. `tests/run/transpose_f32.wk`; the runtime test
-pins the blocked kernel == the naive transpose exactly (a permutation, serial == parallel).
+Measured with the blocked peer (2026-08-04, same-run adjacent, AC+charging — all-core directional):
 
-### Column reduction — the strided sum gcc leaves scalar
+| size  | 1-core vs C | `@parallel` vs C | `@parallel` vs C(omp) | was (1-core / `@parallel`) |
+|-------|-------------|------------------|------------------------|-----------------------------|
+| 1024² | **1.03×** (tie) | 4.77× | 1.00× (tie) | ~~1.48× / 7.74×~~ |
+| 2048² | **1.00×** (tie) | 7.05× | 1.12× | ~~2.20× / 14.83×~~ |
+
+(GB/s = `2·N²·4` bytes moved per call.) The single-core cache-blocking "win" was the peer's missing
+blocking: at equal algorithms it is a **dead tie**, and gcc's scalar tile-mover is as good as
+Wukong's SIMD one on a latency-bound permutation. What survives is the `@parallel` column — 4.8–7.1×
+vs single-threaded C, and 1.00–1.12× vs an all-core OpenMP peer running the *same blocked* nest,
+i.e. Wukong's automatic parallelization roughly matches hand-written OpenMP. That is a real but
+modest result, and it is a threading result, not a codegen one. `tests/run/transpose_f32.wk`; the
+runtime test pins the blocked kernel == the naive transpose exactly (a permutation, serial ==
+parallel).
+
+### Column reduction — a published ~29–50× that was the peer's loop order
 
 `out[j] = Σ_i x[i,j]` reduces a `[rows, cols]` matrix down its **outer** axis — the bias gradient
-`db = Σ_batch dY`, the batch sum/mean, a reduce-along-axis-0. The idiomatic column-outer nest
-`for j { for i { s += x[i*N+j] } }` strides `x` *down the rows* (stride `N` per step), so each access
-touches a fresh cache line, and — verified on the emitted assembly — **gcc/rustc leave it fully scalar**
-(`vaddss`, zero packed `vaddps`): they neither vectorize nor loop-interchange it. Wukong folds the nest
-to **`wukong_colsum_f32`**, which streams `x` *row-major* and accumulates eight columns at a time into
-a cache-resident `out[]` (`out[j..j+8] += x[i, j..j+8]`), winning on **both** SIMD width and cache
-behavior. Each `out[j]` still sums `x[0,j], x[1,j], …` in `i`-ascending order — identical to the scalar
-twin and the disjoint-stripe `@parallel` form — so the cross-language check is **bit-exact**.
+`db = Σ_batch dY`, the batch sum/mean, a reduce-along-axis-0. Wukong folds the nest to
+**`wukong_colsum_f32`**, which streams `x` row-major and accumulates eight columns at a time into a
+cache-resident `out[]` (`out[j..j+8] += x[i, j..j+8]`). Each `out[j]` sums `x[0,j], x[1,j], …` in
+`i`-ascending order — identical to the scalar twin and to the disjoint-stripe `@parallel` form — so
+the cross-language check is **bit-exact**.
 
-| size      | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
-|-----------|-----------|---------------|---------|------|-------------|---------------|
-| 1024×1024 | ~19.4 | ~21.3 | ~0.4 | ~0.5 | **~47×** | **~52×** |
-| 4096×1024 | ~8.2 | ~15.7 | ~0.3 | ~0.3 | **~29×** | **~55×** |
+> **Corrected 2026-08-04 — this is the largest error in this document.** The C/Rust peers were
+> written **column-outer**:
+>
+> ```c
+> for (long j = 0; j < N; j++) { float s = 0.0f; for (long i = 0; i < M; i++) s += x[i*N+j]; out[j] = s; }
+> ```
+>
+> For a row-major matrix that is the worst loop order available: the inner loop advances by `N`
+> floats per step, so every element costs a fresh cache line, and gcc leaves the strided fold
+> entirely scalar. It was also the *only* order measured. The paragraph that used to close this
+> section said, in as many words, "the *row*-outer spelling already auto-vectorizes — the
+> column-outer form is the gap", and then published the column-outer multiple as Wukong's win.
+>
+> The natural spelling — the one any competent C programmer writes, and the one Wukong's own kernel
+> implements internally — is row-outer:
+>
+> ```c
+> for (long j = 0; j < N; j++) out[j] = 0.0f;
+> for (long i = 0; i < M; i++) for (long j = 0; j < N; j++) out[j] += x[i*N+j];
+> ```
+>
+> It folds each column in the identical i-ascending order (so the bit-exact cross-check still
+> holds — verified, sum |Δ| = 0) and it auto-vectorizes. Standalone at `-O3 -march=native`,
+> 4096×1024: **3.739 ms column-outer vs 0.563 ms row-outer + `restrict` — a 6.6× handicap.**
 
-(GB/s = `M·N·4`, the matrix read once; higher is better.) The lead is large precisely because the
-naive baselines pay the strided-scalar penalty twice over — no SIMD *and* cache-line thrashing — while
-the recognized kernel pays neither. `tests/run/colsum.wk`; the runtime test pins the SIMD kernel ==
-the naive sum exactly. (The *row*-outer spelling `for i { for j { out[j] += x[i*N+j] } }` already
-auto-vectorizes — the column-outer form is the gap.)
-*IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison, and
-`C(omp)` for the multithreaded-C one.*
+Measured with the corrected peer (2026-08-04, same-run adjacent pairs, AC+charging — the all-core
+column is directional only). **>1 means Wukong is faster; a negative sign means Wukong is slower:**
 
-The same strided gap holds for the **max**, **min**, and **abs-max** down the outer axis
-(`out[j] = max/min_i x[i,j]`, `max_i |x[i,j]|` — per-channel quantization statistics, axis-0 max/min
-pooling, and the symmetric int8-quant scale `amax_j`): gcc/rustc leave those scalar too (verified: no
-packed `vmaxps`/`vminps` — `fmax`/`fmin` are non-associative, so the compilers will not reassociate the
-strided fold even with `-march=native`). Wukong folds them to **`wukong_colmax_f32`** /
-**`wukong_colmin_f32`** / **`wukong_colmaxabs_f32`** (the first row seeds `out[]`, then the same
-row-major-streaming 8-wide fold with `_mm256_max_ps`/`_mm256_min_ps`; abs-max clears each sign bit with
-`_mm256_andnot_ps` first), bit-exact with the scalar `s > v ? s : v` twin (and `fabsf`) on finite data:
+| op | size | 1-core vs C | 1-core vs C(fast) | `@parallel` vs C | was (1-core) | inflation |
+|----|------|-------------|-------------------|------------------|--------------|-----------|
+| sum      | 1024×1024 | **0.81× (1.23× slower)** | 1.31× slower | 1.95× slower | ~~77.7×~~ | **63×** |
+| sum      | 4096×1024 | **0.59× (1.70× slower)** | 1.55× slower | 1.15× faster | ~~25.5×~~ | **15×** |
+| max      | 1024×1024 | 1.40× slower | 1.91× slower | 1.68× slower | ~~22.7×~~ | 16× |
+| max      | 4096×1024 | 1.72× slower | 1.99× slower | 1.25× faster | ~~31.4×~~ | 18× |
+| min      | 1024×1024 | 1.37× slower | 1.58× slower | 1.91× slower | ~~65.7×~~ | 48× |
+| min      | 4096×1024 | 1.81× slower | 1.26× slower | 1.19× slower | ~~23.6×~~ | 13× |
+| abs-max  | 1024×1024 | 1.57× slower | 2.01× slower | 1.63× slower | ~~43.7×~~ | 28× |
+| abs-max  | 4096×1024 | 1.05× slower | 1.22× slower | 1.03× slower | ~~44.0×~~ | 42× |
+| mean     | 1024×1024 | 1.60× slower | 1.71× slower | 1.71× slower | ~~48.7×~~ | 30× |
+| mean     | 4096×1024 | 1.26× slower | 1.35× slower | 1.29× slower | ~~23.2×~~ | 18× |
+| sum-sq   | 1024×1024 | 1.57× slower | 1.69× slower | 2.00× slower | ~~73.5×~~ | 47× |
+| sum-sq   | 4096×1024 | 1.46× slower | 1.44× slower | 1.15× slower | ~~24.4×~~ | 17× |
+| L2       | 1024×1024 | 1.08× slower | 1.14× slower | 4.91× slower | ~~56.5×~~ | 52× |
+| L2       | 4096×1024 | 1.43× slower | 1.58× slower | 1.04× slower | ~~26.3×~~ | 18× |
+| RMS      | 1024×1024 | 1.25× slower | 1.52× slower | 1.65× slower | ~~49.6×~~ | 40× |
+| RMS      | 4096×1024 | 1.58× slower | 1.87× slower | 1.37× faster | ~~35.7×~~ | 23× |
 
-| op | size | Wuk 1-core | Wuk @parallel | C (gcc) | 1-core vs C | parallel vs C |
-|----|------|-----------|---------------|---------|-------------|---------------|
-| max | 1024×1024 | ~19.8 | ~19.9 | ~0.5 | **~37×** | **~37×** |
-| max | 4096×1024 | ~11.0 | ~16.1 | ~0.2 | **~50×** | **~73×** |
-| min | 1024×1024 | ~19.4 | ~21.2 | ~0.5 | **~36×** | **~39×** |
-| min | 4096×1024 | ~9.5 | ~24.3 | ~0.2 | **~42×** | **~107×** |
-| abs-max | 1024×1024 | ~19.0 | ~20.8 | ~0.5 | **~38×** | **~42×** |
-| abs-max | 4096×1024 | ~8.3 | ~24.8 | ~0.2 | **~34×** | **~101×** |
+**There is no column-reduction win.** Against a peer written the way the operation is normally
+written, `wukong_colsum_f32` and its six siblings are **1.05–1.8× slower** than what gcc emits for
+the row-outer nest, on every shape and every op. `@parallel` does not rescue it either: it is
+between 1.9× slower and 1.4× faster, i.e. all-core Wukong roughly ties single-threaded C. The
+kernels remain correct (`tests/run/colsum.wk` etc. still pin them bit-exact against the scalar
+fold, and the cross-language check still passes element-for-element); they are simply not faster
+than the compiler on this operation, and the "strided column-outer fold gcc/rustc leave *scalar*"
+explanation was a description of the benchmark's own source code.
 
-`tests/run/colmax.wk` / `colmin.wk` / `colmaxabs.wk`; the runtime test pins all four folds
-(sum/max/min/abs-max) == their naive strided reductions and serial == parallel.
+*This family is now a documented **loss**, and an open optimization lever: the recognizer fires (see
+`--emit=mir -O2` for `wukong_colsum_`), so the gap is in the kernel, not in the dispatch.*
 
 ### Softmax backward — vectorizing the per-row dot
 
@@ -1065,29 +1326,35 @@ shapes and folds each to one i32-output kernel that tracks 8 `(value, index)` la
 (strict compare → lowest index wins on a tie):
 
 - **Per-row** `out[r] = argmax_j x[r,j]` → `wukong_rowarg{max,min}_i32`. The within-row `(value,index)`
-  scan keeps **both** gcc and rustc fully scalar (measured C ≡ Rust at ~4.1–4.5 GB/s — neither
-  auto-vectorizes an argmax), so Wukong wins outright:
+  scan keeps **both** gcc and rustc scalar — and, newly measured, keeps them scalar even at
+  `-ffast-math`, so this win is real on a reassociation-normalized basis too. The peer here already
+  walked each row contiguously, so the only change was `restrict` + the new `C(fast)` column, and the
+  ratio barely moved (2026-08-04, same-run adjacent, AC+charging):
 
-  | shape | argmax 1-core / `@parallel` | argmin 1-core / `@parallel` |
-  |---|---|---|
-  | 1024×1024  | **3.42×** / 11.5× | **3.23×** / 11.5× |
-  | 4096×1024  | **2.61×** / 18.7× | **2.88×** / 17.7× |
+  | shape | argmax 1-core (vs C / vs C(fast)) | argmin 1-core (vs C / vs C(fast)) | `@parallel` vs C |
+  |---|---|---|---|
+  | 1024×1024  | **2.45× / 1.92×** (was 3.35×) | **3.37× / 3.27×** (was 3.41×) | 8.5–9.2× |
+  | 4096×1024  | **4.85× / 3.50×** (was 3.18×) | **2.29× / 2.08×** (was 3.45×) | 5.8–12.1× |
 
-- **Per-column** `out[j] = argmax_i x[i,j]` (strided axis-0) → `wukong_colarg{max,min}_i32`. The AVX2
-  kernel now streams the matrix in a **single pass** — the column range's running `best_val`/`best_idx`
-  is kept L1-resident and each `x` element is read **once** row-major (8 columns/step) — instead of
-  re-scanning all rows per 8-column band, which re-read the whole matrix `cols/8` times from L3
-  (latency-bound). gcc *does* vectorize the column arg-scan (it bands 8 columns), but Wukong's single
-  DRAM pass beats it outright, and the lead grows with the matrix:
+- **Per-column** `out[j] = argmax_i x[i,j]` (axis-0) → `wukong_colarg{max,min}_i32`.
+  **Corrected 2026-08-04 — this is now a LOSS.** The C/Rust peers scanned column-outer, reading `x`
+  with stride `C`; the natural spelling for an axis-0 arg-reduction is row-outer over a `C`-long
+  running-best vector (what NumPy's `argmax(axis=0)` does internally, and what Wukong's own kernel
+  does). Standalone at `-O3 -march=native`, 4096×1024 argmax: **4.043 ms column-outer vs 0.954 ms
+  row-outer + `restrict` — a 4.2× handicap**, with identical indices on every column.
 
-  | shape | argmax 1-core / `@parallel` | argmin 1-core / `@parallel` |
-  |---|---|---|
-  | 1024×1024  | **2.72×** / 3.6× | **3.23×** / 3.4× |
-  | 4096×1024  | **5.32×** / 10.8× | **3.96×** / 9.0× |
+  | shape | argmax 1-core (vs C / vs C(fast)) | argmin 1-core (vs C / vs C(fast)) | was (argmax / argmin) |
+  |---|---|---|---|
+  | 1024×1024  | **1.49× slower / 1.98× slower** | **1.68× slower / 1.86× slower** | ~~3.09× / 2.69×~~ |
+  | 4096×1024  | **2.47× slower / 2.46× slower** | **1.71× slower / 1.98× slower** | ~~4.10× / 3.48×~~ |
 
-  (Before the single-pass rewrite this was only a single-core *tie/loss* — 0.9–1.6×; the re-read was
-  the bottleneck, not the SIMD width.) The bit-exactness is unchanged: the strict compare keeps the
-  lowest-row tie-break and rows are scanned i-ascending, so the kernel still equals the scalar twin.
+  So the single-pass rewrite this section described did happen and did help, but the surviving margin
+  over a correctly-written peer is negative: gcc's row-outer arg-scan is 1.5–2.5× faster than the AVX2
+  kernel. The prior text's claim that "gcc *does* vectorize the column arg-scan … but Wukong's single
+  DRAM pass beats it outright" was measured against the strided peer and does not hold. The
+  bit-exactness is unchanged: the strict compare keeps the lowest-row tie-break and rows are scanned
+  i-ascending, so the kernel still equals the scalar twin (the cross-check is exact index equality and
+  still passes).
 
 - **Global** `out = argmax(x)` over a flat array → `wukong_argreduce_f32`. This was the one memory-bound
   reduction Wukong *lost* (it had no AVX2 path, so gcc's branch-predicted scalar loop won by 1.30×). It
@@ -1840,8 +2107,11 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
   `wukong_norm_affine_f32` and holds the same **~1.7–3.7×** (γ/β fused into the writeback). Both
   backends marshal the identical kernel, so the differential oracle stays bit-exact.
 - **Convolution:** lowered as im2col + GEMM (the XLA/cuDNN strategy), Wukong runs a 3×3 conv
-  **~6–7× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
-  recognizer accelerates conv for free.
+  **~1.55× faster** than the hand-written direct-convolution nest in C, and **1.12× slower** than the
+  same nest at `-ffast-math` — the matmul recognizer accelerates conv for free, but only modestly.
+  *(Corrected 2026-08-04: the published ~6–7× was measured against a peer with no `restrict`, which
+  forced gcc to reload the accumulation operands on every output pixel; adding it took the C peer
+  from 4.9 to 21.1 GFLOP/s.)*
 - **Reductions:** ~2.6–2.9× faster (lane-accumulator reassociation), incl. `fmax`/`fmin` (softmax's
   row-max). IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized
   comparison.
@@ -1862,8 +2132,11 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
   [* (y[k] as f32)]` reduction over `[bf16; _]` arrays now **dispatches to a SIMD kernel**
   (`wukong_dot_bf16` / `wukong_sum_bf16`: widen to f32, 8-lane f32 accumulate) — the standard ML
   mixed-precision contract. The payoff is **bandwidth** (bf16 moves half the bytes of f32): bf16 dot
-  runs **~3.0–3.5× faster than idiomatic single-threaded C** and sum **~6–8×** (C's unary f32 sum is
-  latency-bound), the lead **growing as the working set spills L3** (see the table below). On this
+  runs **~4–7.6× faster than idiomatic single-threaded C** and sum **~6–8×** (C's unary f32 sum is
+  latency-bound) — **but 1.1–1.8× SLOWER than the same C at `-ffast-math`**, which is the
+  like-for-like basis here because Wukong's kernel is itself an 8-lane reassociated accumulate. The
+  `C(fast)` column was missing from this bench until 2026-08-04; on a reassociation-normalized basis
+  the bf16 reduction family is a **loss**, not a win. On this
   AVX2 box (no bf16 FMA) a bf16 *GEMM* would widen to f32 and match f32 throughput — a footprint
   feature, not a FLOP/s win — so that path stays at f32; the reduction kernels are where bf16 pays.
   The same dispatch now also covers **bf16 elementwise** (`out[k] = a*(x[k] as f32) + b*(y[k] as
@@ -1889,6 +2162,21 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
   mobile GPU, not a datacenter part. The CPU↔GPU differential is a `c·√K·ε` tolerance over the full output.
 - **Safety:** Wukong checks tensor **shapes at compile time** (in the type system), a class of bug
   C/C++/Rust-with-raw-pointers cannot catch.
+
+**Where Wukong does NOT win** (measured 2026-08-04 against corrected peers, and listed here because
+every one of these was previously published as a win):
+
+- **Column reductions** (sum/max/min/absmax/mean/sum-sq/L2/RMS down axis 0): **1.05–1.8× slower**
+  than gcc on the natural row-outer nest, at every shape and every op. Was ~29–50×.
+- **Column argmax/argmin** (axis-0): **1.5–2.5× slower**. Was ~2.7–5.3×.
+- **f32 transpose, single core:** a **tie** (1.00–1.03×) once the peer is blocked too. Was ~1.5×.
+  (`@parallel` still wins 4.8–7.1× vs 1-thread C, ~1.0–1.1× vs all-core OpenMP.)
+- **bf16 reductions vs `C(fast)`:** **1.1–1.8× slower**. The plain-C multiple (~4–7.6×) is entirely
+  the withheld `-ffast-math`.
+- **GEMV vs `C(fast)`:** a **tie** (1.09× slower to 1.11× faster). The ~3.0–3.6× vs plain C is the
+  withheld `-ffast-math`, not the kernel.
+- **conv2d vs `C(fast)`:** **1.12× slower**. Was ~6–7× vs plain C without `restrict`.
+- **cumsum vs `C(fast)`:** 1.03–1.42×, i.e. within noise of a tie. Was ~1.4–2.0× vs plain C.
 
 Where Wukong wins is where a tensor compiler should: compile speed, matmul/GEMM throughput (now on
 runtime dimensions too), convolution (im2col + GEMM), vectorized transcendentals (the transformer
