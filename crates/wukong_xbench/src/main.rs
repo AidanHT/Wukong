@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use wukong_span::{Interner, SourceId};
 
+mod general;
 mod model;
 
 /// The shared C ABI of every kernel: `(x, y, out)` over `N` `f32` elements (`N` baked in).
@@ -848,6 +849,11 @@ fn main() {
     }
     if want("model") {
         model::bench_model(&cc, &dir);
+    }
+    // The general-code suite: Wukong written OUTSIDE the recognizer dialect. Opt-in (`general`),
+    // because every other row above deliberately writes the pattern.
+    if filter.as_deref() == Some("general") {
+        general::bench_general(&cc, &cxx, &dir);
     }
 }
 

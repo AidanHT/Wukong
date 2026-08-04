@@ -1,0 +1,51 @@
+module gscan
+
+// Program 3: a MAMBA / S6 SELECTIVE SCAN with a VECTOR state.
+//
+//   for t in 0..T, for d in 0..D, for n in 0..N:
+//       h[d,n] = exp(dt[t,d] * A[d,n]) * h[d,n] + dt[t,d] * B[t,n] * x[t,d]
+//       y[t,d] = sum_n C[t,n] * h[d,n]  +  Dskip[d] * x[t,d]
+//
+// Wukong ships `wukong_lrscan_f32`, but it covers a SCALAR-state linear recurrence with precomputed
+// gates (`h = a[i]*h + b[i]`). This is the modern form: the state is a [D, N] matrix, and both the
+// decay and the input gate are computed inside the loop from selective (time-varying, input-
+// dependent) parameters. Nothing in the recognizer table matches it, and nothing could without a
+// new recognizer per state-space variant.
+//
+// The `t` loop is genuinely sequential — the state is carried — so this is also the case where a
+// compiler's only lever is the inner (d, n) work, and where a language that leans on whole-loop
+// pattern replacement has nothing to replace.
+//
+// Written naturally: the row bases hoisted, `dt`'s per-(t,d) value read once into a local, the
+// state read-modify-written in place.
+
+fn kbench(
+    x: [f32; $TD$],
+    dt: [f32; $TD$],
+    a: [f32; $DN$],
+    bmat: [f32; $TN$],
+    cmat: [f32; $TN$],
+    dskip: [f32; $D$],
+    mut h: [f32; $DN$],
+    mut y: [f32; $TD$],
+) {
+    for i in 0..$DN$ { h[i] = 0.0; }
+    for t in 0..$T$ {
+        let tb: i32 = t * $D$;
+        let nb: i32 = t * $N$;
+        for d in 0..$D$ {
+            let db: i32 = d * $N$;
+            let dtv: f32 = dt[tb+d];
+            let xv: f32 = x[tb+d];
+            let gate: f32 = dtv * xv;
+            let mut acc: f32 = 0.0;
+            for n in 0..$N$ {
+                let decay: f32 = exp(dtv * a[db+n]);
+                let hn: f32 = decay * h[db+n] + gate * bmat[nb+n];
+                h[db+n] = hn;
+                acc = acc + cmat[nb+n] * hn;
+            }
+            y[tb+d] = acc + dskip[d] * xv;
+        }
+    }
+}
