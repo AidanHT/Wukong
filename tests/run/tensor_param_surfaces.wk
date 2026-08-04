@@ -1,0 +1,68 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 10
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 16
+// EXPECT-OUT: 10
+// EXPECT-OUT: 10
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 16
+module tests.run.tensor_param_surfaces
+
+// A statically-shaped tensor parameter is bound as the buffer it is (`[T; d0*..*dn]`) rather than
+// spilled to a reloaded `ptr` slot — that is what removed three loads per element from every
+// shape-typed loop. This fixture walks every *other* thing you can do with such a parameter and
+// asserts each behaves exactly as the `[f32; N]` spelling does, by running both halves and printing
+// both: forward it to another function, return it by value, bind it to an unannotated `let`, bind it
+// to an annotated tensor `let`, and reduce over it inside an `@parallel` whole function (whose
+// region-env binding is a separate code path that recovers the base pointer from the env array).
+//
+// The `@parallel` line is the sharpest of these: bound as a `Ptr`, a read of the name would `Load`
+// *through* the recovered base pointer — reading the tensor's first 8 data bytes as an address.
+
+fn sum4_t(a: Tensor[f32, 4]) -> f32 { return a[0] + a[1] + a[2] + a[3]; }
+fn fwd_t(a: Tensor[f32, 4]) -> f32 { return sum4_t(a); }
+fn ident_t(a: Tensor[f32, 4]) -> Tensor[f32, 4] { return a; }
+fn via_let_t(a: Tensor[f32, 4]) -> f32 { let b = a; return b[1]; }
+fn via_ann_t(a: Tensor[f32, 4]) -> f32 { let b: Tensor[f32, 4] = a; return b[2]; }
+@parallel fn ptotal_t(a: Tensor[f32, 8]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..8 { s = s + a[i]; }
+    return s;
+}
+
+fn sum4_a(a: [f32; 4]) -> f32 { return a[0] + a[1] + a[2] + a[3]; }
+fn fwd_a(a: [f32; 4]) -> f32 { return sum4_a(a); }
+fn ident_a(a: [f32; 4]) -> [f32; 4] { return a; }
+fn via_let_a(a: [f32; 4]) -> f32 { let b = a; return b[1]; }
+fn via_ann_a(a: [f32; 4]) -> f32 { let b: [f32; 4] = a; return b[2]; }
+@parallel fn ptotal_a(a: [f32; 8]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..8 { s = s + a[i]; }
+    return s;
+}
+
+fn main() -> i32 {
+    let v: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let w: [f32; 8] = [2.0; 8];
+
+    print(sum4_t(v) as i32);     // 10
+    print(fwd_t(v) as i32);      // 10 — forwarded to another tensor-param function
+    print(ident_t(v)[3] as i32); // 4  — returned by value, then indexed
+    print(via_let_t(v) as i32);  // 2  — through an unannotated local
+    print(via_ann_t(v) as i32);  // 3  — through an annotated tensor local
+    print(ptotal_t(w) as i32);   // 16 — @parallel whole-function reduction
+
+    print(sum4_a(v) as i32);     // the `[f32; N]` spelling must agree line for line
+    print(fwd_a(v) as i32);
+    print(ident_a(v)[3] as i32);
+    print(via_let_a(v) as i32);
+    print(via_ann_a(v) as i32);
+    print(ptotal_a(w) as i32);
+    return 0;
+}
