@@ -323,6 +323,14 @@ struct RedPlan {
     /// `Fma`: the two multiplicands, re-fused per lane so the rounding is unchanged.
     fma_factors: Option<(ValueId, ValueId)>,
     ty: MirType,
+    /// May the partials be kept in `W` independent lanes and folded once, after the loop?
+    ///
+    /// Only for an operator that really is associative — integer `add`/`mul`/bitwise. A float
+    /// `add` is not, and giving it lane-parallel partials would change the program's answer, so it
+    /// keeps a scalar accumulator and folds `W` lanes into it inside the body every iteration.
+    /// That is a `W`-long dependent chain per group either way, which is exactly what `gcc -O3`
+    /// emits without `-ffast-math`.
+    vector_acc: bool,
 }
 
 /// One pair of bases the vector loop is only legal over if they are equal or disjoint.
@@ -943,12 +951,14 @@ fn plan_body(
             (a, left_is_acc)
         });
         red_of.insert(r.combine.0);
+        let vector_acc = r.reassociable && r.addend.is_some() && red_identity(r.kind).is_some();
         reductions.push(RedPlan {
             param_index: r.param_index,
             kind: r.kind,
             addend,
             fma_factors: r.fma_factors,
             ty,
+            vector_acc,
         });
     }
 
@@ -1356,18 +1366,6 @@ impl<'a> Emit<'a> {
             .push(Inst { result: None, op });
     }
 
-    /// Insert an instruction just before the entry block's terminator (where an `alloca` belongs:
-    /// executed once per call, dominating every block).
-    fn push_entry(&mut self, ty: MirType, op: Op) -> ValueId {
-        let r = self.value(ty);
-        let e = self.f.entry.0 as usize;
-        self.f.blocks[e].insts.push(Inst {
-            result: Some(r),
-            op,
-        });
-        r
-    }
-
     fn block(&mut self, params: Vec<ValueId>, term: Terminator) -> BlockId {
         let id = BlockId(self.f.blocks.len() as u32);
         self.f.blocks.push(BasicBlock {
@@ -1393,10 +1391,20 @@ fn apply(f: &mut Function, p: &VecPlan) {
 
     let mut e = Emit { f };
 
+    // Reassociable reductions carry an extra, vector-typed accumulator through the vector loop —
+    // `W` independent partials that are folded into the scalar accumulator once, on the way out.
+    // The scalar parameter is still carried (unchanged) so the block signatures stay aligned with
+    // the original header's.
+    let vacc: Vec<&RedPlan> = p.reductions.iter().filter(|r| r.vector_acc).collect();
+
     // ---- the four new blocks (terminators are patched in once every block exists) --------------
     let guard_params: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
     let guard = e.block(guard_params.clone(), Terminator::Unreachable);
-    let vh_params: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
+    let mut vh_params: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
+    for r in &vacc {
+        let vt = vec_of(&r.ty, p.w);
+        vh_params.push(e.value(vt));
+    }
     let vh = e.block(vh_params.clone(), Terminator::Unreachable);
     let vb = e.block(Vec::new(), Terminator::Unreachable);
     let vx = e.block(Vec::new(), Terminator::Unreachable);
@@ -1413,9 +1421,16 @@ fn apply(f: &mut Function, p: &VecPlan) {
         None => n_vec,
     };
     let vec_end = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, n_vec));
+    let mut guard_args = guard_params.clone();
+    for r in &vacc {
+        let id = red_identity(r.kind).expect("vector_acc implies an identity");
+        let scalar = e.push(guard, r.ty.clone(), Op::ConstInt(id as i128, r.ty.clone()));
+        let vt = vec_of(&r.ty, p.w);
+        guard_args.push(e.push(guard, vt, Op::Splat(scalar)));
+    }
     e.f.blocks[guard.0 as usize].term = Terminator::Br {
         target: vh,
-        args: guard_params.clone(),
+        args: guard_args,
     };
 
     // ---- vector header: `while iv != vec_end` --------------------------------------------------
@@ -1436,9 +1451,22 @@ fn apply(f: &mut Function, p: &VecPlan) {
     };
 
     // ---- vector exit: hand the original loop the advanced values -------------------------------
+    // A vector accumulator is folded here, once, rather than in the body — the whole point of
+    // keeping `W` independent partials.
+    let mut exit_args = vh_params[..header_tys.len()].to_vec();
+    for (i, r) in vacc.iter().enumerate() {
+        let vec = vh_params[header_tys.len() + i];
+        let mut acc = exit_args[r.param_index];
+        let op = red_binop(r.kind);
+        for k in 0..p.w {
+            let lane = e.push(vx, r.ty.clone(), Op::ExtractLane(vec, k));
+            acc = e.push(vx, r.ty.clone(), Op::Bin(op, acc, lane));
+        }
+        exit_args[r.param_index] = acc;
+    }
     e.f.blocks[vx.0 as usize].term = Terminator::Br {
         target: p.header,
-        args: vh_params.clone(),
+        args: exit_args,
     };
 
     // ---- vector body ---------------------------------------------------------------------------
@@ -1703,11 +1731,27 @@ fn emit_body(
         }
     }
 
-    // The serial accumulate, after every load and store of the group has happened. Moving it here
-    // is safe: an accumulator is a register value, so no store in the body can change what it
-    // reads, and its own operands are all defined above.
+    // The accumulates, after every load and store of the group has happened. Moving them here is
+    // safe: an accumulator is a register value, so no store in the body can change what it reads,
+    // and its own operands are all defined above.
+    //
+    // A reassociable reduction just combines the whole addend vector into its vector accumulator —
+    // one instruction, `W` independent partials. A float one folds `W` lanes into the scalar
+    // accumulator in index order, which is a `W`-long dependent chain and is the price of not
+    // reassociating.
     let mut acc_of: FxHashMap<usize, ValueId> = FxHashMap::default();
+    let mut vacc_next: Vec<ValueId> = Vec::new();
+    let header_len = header_params.len();
     for r in &p.reductions {
+        if r.vector_acc {
+            let vt = vec_of(&r.ty, p.w);
+            let cur = vh_params[header_len + vacc_next.len()];
+            let (a, _) = r.addend.expect("vector_acc implies a binary combine");
+            let addend = to_vector(e, vb, &map, a, &r.ty, p.w);
+            let next = e.push(vb, vt, Op::Bin(red_binop(r.kind), cur, addend));
+            vacc_next.push(next);
+            continue;
+        }
         let init = vh_params[r.param_index];
         let out = emit_reduction_fold(e, vb, &map, r, init, p.w);
         acc_of.insert(r.param_index, out);
@@ -1741,10 +1785,19 @@ fn emit_body(
             ));
         } else if let Some(&acc) = acc_of.get(&k) {
             out.push(acc);
+        } else if p
+            .reductions
+            .iter()
+            .any(|r| r.vector_acc && r.param_index == k)
+        {
+            // The scalar accumulator of a vector-accumulated reduction is carried unchanged; the
+            // partials live in the extra parameter appended below.
+            out.push(vh_params[k]);
         } else {
             out.push(resolve_uniform(&map, *a));
         }
     }
+    out.extend(vacc_next);
     out
 }
 
@@ -1759,10 +1812,10 @@ fn emit_body(
 /// An `fma` accumulate re-fuses its two factors per lane rather than multiplying and adding
 /// separately, because `fma(x, y, acc)` rounds once and `acc + x*y` rounds twice.
 ///
-/// Lanes are extracted by storing the vector to a private stack slot and reading the elements back.
-/// MIR has no extract-lane operation, and adding one would touch every backend; a stack round-trip
-/// costs one store per group and is exact in both execution models (the interpreter scatters lanes
-/// to consecutive slots, the native backend writes consecutive elements).
+/// Lanes come out through [`Op::ExtractLane`], which is one shuffle (and free for lane 0). The
+/// first version of this pass spilled the vector to a stack slot and loaded the elements back,
+/// because MIR had no lane read; that cost a store-forwarding stall per group and left the
+/// reduction kernel 1.8x behind `gcc -O3`, which is what motivated adding the operation.
 fn emit_reduction_fold(
     e: &mut Emit<'_>,
     vb: BlockId,
@@ -1774,7 +1827,7 @@ fn emit_reduction_fold(
     let mut acc = init;
     match (r.addend, r.fma_factors) {
         (Some((a, left_is_acc)), None) => {
-            let lanes = spill_lanes(e, vb, map, a, &r.ty, w);
+            let lanes = extract_lanes(e, vb, map, a, &r.ty, w);
             let op = red_binop(r.kind);
             for lane in lanes {
                 let (x, y) = if left_is_acc { (acc, lane) } else { (lane, acc) };
@@ -1782,8 +1835,8 @@ fn emit_reduction_fold(
             }
         }
         (None, Some((x, y))) => {
-            let xs = spill_lanes(e, vb, map, x, &r.ty, w);
-            let ys = spill_lanes(e, vb, map, y, &r.ty, w);
+            let xs = extract_lanes(e, vb, map, x, &r.ty, w);
+            let ys = extract_lanes(e, vb, map, y, &r.ty, w);
             for k in 0..w as usize {
                 acc = e.push(vb, r.ty.clone(), Op::Fma(xs[k], ys[k], acc));
             }
@@ -1793,8 +1846,8 @@ fn emit_reduction_fold(
     acc
 }
 
-/// Spill a vector to a stack slot and read its lanes back, lowest index first.
-fn spill_lanes(
+/// The `w` lane values of a vector, lowest index first.
+fn extract_lanes(
     e: &mut Emit<'_>,
     vb: BlockId,
     map: &FxHashMap<u32, Wide>,
@@ -1806,32 +1859,21 @@ fn spill_lanes(
         Some(Wide::Vector(x)) => *x,
         _ => unreachable!("plan_body proved this operand is a vector"),
     };
-    let slot = e.push_entry(
-        MirType::Ptr,
-        Op::Alloca(MirType::Array(Box::new(lane.clone()), w)),
-    );
-    e.push_void(
-        vb,
-        Op::Store {
-            ptr: slot,
-            value: vec,
-        },
-    );
     (0..w)
-        .map(|k| {
-            let idx = e.push(vb, MirType::I64, Op::ConstInt(k as i128, MirType::I64));
-            let at = e.push(
-                vb,
-                MirType::Ptr,
-                Op::Gep {
-                    ptr: slot,
-                    index: idx,
-                    elem: lane.clone(),
-                },
-            );
-            e.push(vb, lane.clone(), Op::Load(at, lane.clone()))
-        })
+        .map(|k| e.push(vb, lane.clone(), Op::ExtractLane(vec, k)))
         .collect()
+}
+
+/// The identity element of a reassociable reduction, as a raw integer constant: the value every
+/// lane of a vector accumulator starts at, so that folding the lanes afterwards reproduces the
+/// scalar answer exactly. `And` is all-ones, which sign-extends from `-1` at every integer width.
+fn red_identity(k: RedKind) -> Option<i64> {
+    Some(match k {
+        RedKind::Add | RedKind::Or | RedKind::Xor => 0,
+        RedKind::Mul => 1,
+        RedKind::And => -1,
+        _ => return None,
+    })
 }
 
 fn red_binop(k: RedKind) -> BinOp {
@@ -2273,6 +2315,27 @@ mod tests {
             (0, "0\n".to_string()),
             "the accumulate was reassociated"
         );
+        scalar_and_vector_agree(src);
+    }
+
+    /// Integer addition is associative *including its wraparound*, so `W` lane partials folded at
+    /// the end give the identical answer mod 2^32 — even when every partial overflows. A sum of
+    /// `i * 400000009` over 23 elements wraps many times over; the vectorized answer must still be
+    /// the scalar one to the bit.
+    #[test]
+    fn a_wrapping_integer_reduction_is_exact() {
+        let alone = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
+                     while i < n { s = s + x[i]; i = i + 1; } return s; } \
+                     fn main() -> i32 { return 0; }";
+        assert!(is_widened(alone, "k"), "an integer reduction must be widened");
+
+        let src = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
+                   while i < n { s = s + x[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { \
+                     let mut x: []i32 = alloc_i32(23); \
+                     let mut i: i64 = 0; \
+                     while i < 23 { x[i] = (i as i32) * 400000009; i = i + 1; } \
+                     print(k(x, 23)); free(x); return 0; }";
         scalar_and_vector_agree(src);
     }
 
