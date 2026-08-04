@@ -72,8 +72,11 @@
 //! # Scheduling
 //!
 //! The pass runs **once**, after the main fixpoint, and only the functions it changed are then run
-//! through the pipeline again — so cse/simplify/dce clean up the duplicated address arithmetic and
-//! fold the guard when `bound` is a constant, without paying a second whole-program pipeline.
+//! through a reduced cleanup pipeline (cse + dce — see [`crate::PassManager::unroll_cleanup`]) to
+//! collapse the now four-fold address arithmetic. Nothing here builds a dominator tree or a
+//! reachability map, and a linear pre-filter rejects a function with no two-block loop before any
+//! analysis is allocated, because this pass is on the compile-time critical path of every `-O2`
+//! build and compile speed is one of this compiler's few genuine strengths.
 //! `WUKONG_NO_UNROLL=1` turns it off (bisecting a miscompile, or A/B measurement).
 //!
 //! Autodiff is unaffected even though `wukong_driver` runs it after `optimize`: `wukong_autodiff::grad`
@@ -87,31 +90,43 @@
 //! versus on, four hand-written kernels that dispatch no recognizer (confirmed with
 //! `--emit=mir -O2 | grep wukong_`: only `now_ns`/`rt_alloc`/`rt_free`):
 //!
-//! | kernel (per iteration)                | unrolled | ratio |
-//! |---------------------------------------|----------|-------|
-//! | `s += (a[i]-b[i])*(a[i]-b[i])*c` f32   | 4x       | 0.937 |
-//! | `s += (a[i]-b[i])*(a[i]-b[i])`   i32   | 4x       | 0.750 |
-//! | `o[i] = (a[i]-b[i])^2*c`         f32   | 4x       | 1.008 |
-//! | `if a[i] > t { k += 1 }`         i64   | no (3 blocks in the body) | 1.038 |
+//! | kernel (per iteration)                 | unrolled | round 1 | round 2 |
+//! |----------------------------------------|----------|---------|---------|
+//! | `s += (a[i]-b[i])*(a[i]-b[i])*c`  f32  | 4x       | 0.874   | 0.959   |
+//! | `s += (a[i]-b[i])*(a[i]-b[i])`    i32  | 4x       | 0.719   | 0.702   |
+//! | `o[i] = (a[i]-b[i])^2*c`          f32  | 4x       | 0.801   | 0.904   |
+//! | `if a[i] > t { k += 1 }`          i64  | no       | 0.988   | 1.011   |
 //!
 //! The last row is the control: that loop has an `if` in it, so it is not the two-block shape and
-//! neither arm unrolls it — its 3.8% spread is the noise floor of this instrument, and no smaller
-//! difference in the table is meaningful. So: **integer reduction 25% faster, float reduction ~6%,
-//! store-bound elementwise unchanged**. That ordering is what a non-reassociating unroller should
-//! produce. The float reduction's critical path is the 4-cycle `addss` chain, which this pass does
-//! not and must not shorten; the elementwise loop is already at the one-store-per-cycle port limit.
+//! **neither arm unrolls it** — the 1.2% it moves anyway is this instrument's noise floor, and
+//! nothing smaller in the table would mean anything. So, taking the conservative end of each pair:
+//! **integer reduction 28% faster, elementwise store loop 10%, float reduction 4%.** That ordering
+//! is what a non-reassociating unroller should produce — the float reduction's critical path is the
+//! serial `addss` chain, which this pass deliberately does not shorten, so all it can recover there
+//! is the loop overhead.
 //!
-//! Two variants were tried against this configuration and **refuted**, both by the same interleaved
-//! two-binary A/B at n = 8:
+//! Two variants were tried and **refuted**, each by an interleaved two-binary A/B at n = 8 on the
+//! same four kernels (against the then-current configuration, whose control band was 3.8%):
 //!
 //!  * **Flattening the induction variable** — emitting `iv + j*step` off the header parameter for
 //!    each copy instead of letting copy `j` inherit copy `j-1`'s `iv + step`, so the copies' address
-//!    arithmetic does not serialize. Exact (wrapping integer addition is associative). Measured
-//!    0.993–1.039 across the four kernels, i.e. entirely inside the 3.8% control band, while costing
-//!    two extra instructions per copy. Not kept.
-//!  * **Factor 8 for bodies under 12 instructions.** Measured 0.962/1.067/0.987/0.986; the one
-//!    kernel that unrolling actually helps (the integer reduction) got *worse*, and code size
-//!    doubles. Not kept.
+//!    arithmetic does not serialize. Exact (wrapping integer addition is associative), and the
+//!    textbook thing to do. Measured 0.993 / 1.039 / 0.987 / 1.033 — every one inside the control
+//!    band, and the kernel unrolling most helps came out nominally *worse* — while costing two extra
+//!    instructions per copy. Not kept.
+//!  * **Factor 8 for bodies under 12 instructions.** Measured 0.962 / 1.067 / 0.987 / 0.986: the
+//!    integer reduction, the clearest winner at 4x, regressed 6.7%, and code size doubles. Not kept.
+//!
+//! # What it costs
+//!
+//! Unrolling is `-O2`+ only, so the default `-O0` compile is untouched. At `-O2`, measured
+//! in-process over the 331-program `tests/run` corpus (`wukong_bench compile-time`, best-of-4
+//! interleaved with `WUKONG_NO_UNROLL=1`), the whole unrolling stage — the scan, the transform and
+//! the cleanup sweep — is **22% of optimizer time**, and optimizer time goes from 41.5 ms to
+//! 52.7 ms, **+27%**. End to end that mostly disappears into everything else a compile does:
+//! `wukong_bench compile-vs`, which times whole `--emit=obj -O2` processes, moved -4.3% / +1.8% /
+//! +6.2% on its three kernels — inside its own run-to-run spread — and the gcc/g++/rustc speedup
+//! ratios were unchanged at 7.3-11.9x.
 
 use std::sync::OnceLock;
 
@@ -119,13 +134,15 @@ use wukong_mir::{
     BasicBlock, BinOp, BlockId, CmpOp, Function, Inst, MirType, Op, Program, Terminator, ValueId,
 };
 
-use crate::{cfg, dom, map_op_uses, map_term_uses};
+use crate::{cfg, map_op_uses, map_term_uses};
 
-/// Bodies up to this many instructions unroll 4x.
-const BODY_FOR_4X: usize = 24;
-/// Bodies up to this many instructions unroll 2x. Larger bodies are left alone: they already
-/// amortize the loop overhead, and duplicating them costs i-cache and compile time for nothing.
-const BODY_FOR_2X: usize = 64;
+/// Bodies up to this many instructions unroll 4x. Anything larger is left alone: a big body already
+/// amortizes the per-iteration loop overhead, so there is little to win, and every loop unrolled is
+/// a function that has to be run through a cleanup sweep at four times its old size — which is what
+/// unrolling costs at compile time. The measured wins are all on bodies of seven to ten
+/// instructions, so the threshold sits just above that rather than wherever duplication is merely
+/// affordable.
+const BODY_FOR_4X: usize = 16;
 /// At most this many loops per function, so a pathological function cannot blow up compile time.
 const MAX_LOOPS_PER_FN: usize = 16;
 /// A function may not grow past this many instructions in total.
@@ -154,9 +171,21 @@ pub fn unroll_program(program: &mut Program) -> Vec<usize> {
 
 /// Unroll the counted loops of one function. Returns whether anything changed.
 pub(crate) fn unroll_function(f: &mut Function) -> bool {
-    // Dominance is only defined over reachable blocks, and a stale unreachable block would make the
-    // "dominated by the header" rewrite set wrong.
-    cfg::prune_unreachable(f);
+    // Cheap structural pre-filter, before any analysis is built. Most functions in a program have no
+    // two-block loop at all, and paying a reachability DFS plus a dominator fixpoint per function to
+    // discover that is most of what this pass costs at compile time.
+    if !has_two_block_loop(f) {
+        return false;
+    }
+    // No `prune_unreachable` and no dominator analysis: nothing below needs either. An unreachable
+    // block can only make a loop look *less* like the accepted shape (an extra predecessor edge into
+    // the header), which costs an unroll but never correctness, and the live-out rewrite visits
+    // every block rather than a dominance-derived subset.
+
+    // `ValueId -> constant`, built once. The induction step is a constant whose defining instruction
+    // is usually nowhere near the loop, and re-scanning the whole function for it per candidate was
+    // quadratic in a function with many loops.
+    let consts = const_index(f);
 
     // Headers we must not consider: the loops this pass itself produced. The remainder loop `R`/`RB`
     // is a verbatim copy of the original and would otherwise match again, forever.
@@ -166,7 +195,7 @@ pub(crate) fn unroll_function(f: &mut Function) -> bool {
         if inst_count(f) >= MAX_FN_INSTS {
             break;
         }
-        let Some((cand, factor)) = find_candidate(f, &banned) else {
+        let Some((cand, factor)) = find_candidate(f, &banned, &consts) else {
             break;
         };
         // `apply` rewrites the header and the body in place and appends exactly two blocks, the
@@ -184,6 +213,37 @@ pub(crate) fn unroll_function(f: &mut Function) -> bool {
 
 fn inst_count(f: &Function) -> usize {
     f.blocks.iter().map(|b| b.insts.len()).sum()
+}
+
+/// Is there any block that conditionally enters a block whose only exit branches straight back? That
+/// is the skeleton of the shape `candidate_at` accepts, testable in one linear scan with no CFG
+/// analysis and no allocation — and it is false for the overwhelming majority of functions, which is
+/// what keeps this pass off the compile-time critical path.
+fn has_two_block_loop(f: &Function) -> bool {
+    f.blocks.iter().any(|hb| {
+        let Terminator::CondBr { then_blk, .. } = &hb.term else {
+            return false;
+        };
+        then_blk.0 != hb.id.0
+            && matches!(
+                &f.blocks[then_blk.0 as usize].term,
+                Terminator::Br { target, .. } if target.0 == hb.id.0
+            )
+    })
+}
+
+/// `ValueId -> the integer constant it holds`, for every `ConstInt` in the function. Values that are
+/// not integer constants (and every value created after this snapshot) map to `None`.
+fn const_index(f: &Function) -> Vec<Option<i128>> {
+    let mut idx = vec![None; f.value_types.len()];
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let (Some(r), Op::ConstInt(k, _)) = (inst.result, &inst.op) {
+                idx[r.0 as usize] = Some(*k);
+            }
+        }
+    }
+    idx
 }
 
 /// A recognized counted loop, with everything `apply` needs already validated.
@@ -230,40 +290,6 @@ fn unrollable_body_op(op: &Op) -> bool {
     )
 }
 
-/// Does `a` dominate `b`? An unreachable `b` (`dom::idoms_from` leaves it at `u32::MAX`) is
-/// dominated by nothing — it is not on any path, so no value has to reach it.
-fn dominates(a: u32, b: u32, idom: &[u32]) -> bool {
-    let mut x = b;
-    loop {
-        if x == a {
-            return true;
-        }
-        let Some(&id) = idom.get(x as usize) else {
-            return false;
-        };
-        if id == x || id == u32::MAX {
-            return false;
-        }
-        x = id;
-    }
-}
-
-/// The constant an integer value holds, if it is one — searched across the whole function, because
-/// the constant feeding the induction step is usually hoisted far from the loop.
-fn const_int_of(f: &Function, v: ValueId) -> Option<i128> {
-    for b in &f.blocks {
-        for inst in &b.insts {
-            if inst.result == Some(v) {
-                return match inst.op {
-                    Op::ConstInt(k, _) => Some(k),
-                    _ => None,
-                };
-            }
-        }
-    }
-    None
-}
-
 /// The largest value the type can hold when read as a *signed* integer. Used to reject an unroll
 /// factor whose `(U-1)*step` offset would not fit.
 fn signed_max(ty: &MirType) -> i128 {
@@ -293,26 +319,43 @@ fn sentinel(cmp: CmpOp, ty: &MirType) -> i128 {
     }
 }
 
+/// How many times the loop runs, when both the induction variable's initial value (the preheader's
+/// branch argument) and the bound are compile-time constants. `None` means "not known", which is the
+/// interesting case — a runtime bound is exactly the loop worth unrolling.
+fn const_trip_count(f: &Function, c: &Candidate, consts: &[Option<i128>]) -> Option<i128> {
+    let Terminator::Br { args, .. } = &f.blocks[c.preheader as usize].term else {
+        return None;
+    };
+    let init = (*consts.get(args.get(c.iv_idx)?.0 as usize)?)?;
+    let bound = (*consts.get(c.bound.0 as usize)?)?;
+    if bound <= init {
+        return Some(0);
+    }
+    // `step` is positive and the predicate is strict, so this ceiling division is exact.
+    Some((bound - init + c.step - 1) / c.step)
+}
+
 /// Find the lowest-numbered unrolled-able loop header, and the factor to use. Deterministic: blocks
-/// are scanned in id order and nothing here iterates a hash container.
-fn find_candidate(f: &Function, banned: &[bool]) -> Option<(Candidate, u32)> {
+/// are scanned in id order and nothing here iterates a hash container. No dominator analysis: the
+/// only dominance fact the shape check needs is that the preheader dominates the header, and that
+/// follows from the predecessor set alone (see `candidate_at`).
+fn find_candidate(
+    f: &Function,
+    banned: &[bool],
+    consts: &[Option<i128>],
+) -> Option<(Candidate, u32)> {
     let preds = cfg::predecessors(f);
-    let rpo = cfg::reverse_postorder(f);
-    let idom = dom::idoms_from(f, &rpo, &preds);
 
     for h in 0..f.blocks.len() as u32 {
         if banned.get(h as usize).copied().unwrap_or(false) {
             continue;
         }
-        if let Some(c) = candidate_at(f, h, &preds, &idom) {
+        if let Some(c) = candidate_at(f, h, &preds, consts) {
             let cost = f.blocks[c.header as usize].insts.len() + f.blocks[c.body as usize].insts.len();
-            let mut factor: i128 = if cost <= BODY_FOR_4X {
-                4
-            } else if cost <= BODY_FOR_2X {
-                2
-            } else {
+            if cost > BODY_FOR_4X {
                 continue;
-            };
+            }
+            let mut factor: i128 = 4;
             // `(U-1)*step` becomes a constant of the induction variable's own type, and the
             // wrap-safety argument needs it to be a genuinely positive value in that type. A step so
             // large it does not fit halves the factor, then gives up.
@@ -323,6 +366,15 @@ fn find_candidate(f: &Function, banned: &[bool]) -> Option<(Candidate, u32)> {
                 continue;
             }
             let factor = factor as u32;
+            // A loop whose trip count is a compile-time constant and smaller than 2*factor spends
+            // most or all of itself in the remainder loop, so unrolling it adds `factor` body copies
+            // that barely run — pure code growth, and a cleanup sweep over a function that got
+            // bigger for nothing. Corpora of small programs are mostly such loops.
+            if let Some(trip) = const_trip_count(f, &c, consts) {
+                if trip < 2 * factor as i128 {
+                    continue;
+                }
+            }
             // Growth: (factor - 1) extra body copies, plus the verbatim remainder loop, plus the
             // four preheader instructions and the new header compare.
             let growth = cost * factor as usize + cost + 5;
@@ -335,7 +387,12 @@ fn find_candidate(f: &Function, banned: &[bool]) -> Option<(Candidate, u32)> {
     None
 }
 
-fn candidate_at(f: &Function, h: u32, preds: &[Vec<u32>], idom: &[u32]) -> Option<Candidate> {
+fn candidate_at(
+    f: &Function,
+    h: u32,
+    preds: &[Vec<u32>],
+    consts: &[Option<i128>],
+) -> Option<Candidate> {
     let hb = &f.blocks[h as usize];
     let Terminator::CondBr {
         cond,
@@ -372,7 +429,12 @@ fn candidate_at(f: &Function, h: u32, preds: &[Vec<u32>], idom: &[u32]) -> Optio
         return None;
     }
 
-    // Exactly one entry from outside, by an unconditional branch we can append to.
+    // Exactly one entry from outside, by an unconditional branch we can append to. That single
+    // outside predecessor necessarily *dominates* the header, with no dominator analysis needed:
+    // control reaches the header either from it or from the body, and the body is only reachable
+    // through the header, so the first arrival at the header is always through this block — hence
+    // every path to the header contains it. That is what makes it legal to compute the loop-invariant
+    // limit there.
     if preds[h as usize].len() != 2 || !preds[h as usize].contains(&body) {
         return None;
     }
@@ -381,9 +443,6 @@ fn candidate_at(f: &Function, h: u32, preds: &[Vec<u32>], idom: &[u32]) -> Optio
         return None;
     }
     if !matches!(&f.blocks[preheader as usize].term, Terminator::Br { target, .. } if target.0 == h) {
-        return None;
-    }
-    if !dominates(preheader, h, idom) {
         return None;
     }
 
@@ -431,7 +490,7 @@ fn candidate_at(f: &Function, h: u32, preds: &[Vec<u32>], idom: &[u32]) -> Optio
         Op::Bin(BinOp::Add, l, r) if r == iv => l,
         _ => return None,
     };
-    let step = const_int_of(f, step_val)?;
+    let step = *consts.get(step_val.0 as usize)?.as_ref()?;
     if step <= 0 {
         return None;
     }
@@ -485,14 +544,6 @@ fn apply(f: &mut Function, c: &Candidate, factor: u32) {
     let b = c.body;
     let nvals = f.value_types.len();
 
-    // Dominance over the *pre-transform* CFG: it decides which blocks read the loop's live-out
-    // values, and it must be taken before the header's terminator starts pointing at blocks that do
-    // not exist yet.
-    let idom = {
-        let preds = cfg::predecessors(f);
-        let rpo = cfg::reverse_postorder(f);
-        dom::idoms_from(f, &rpo, &preds)
-    };
     let n_before = f.blocks.len() as u32;
 
     let h_params = f.blocks[h as usize].params.clone();
@@ -605,8 +656,14 @@ fn apply(f: &mut Function, c: &Candidate, factor: u32) {
     };
 
     // ---- re-point the loop's live-out values at R ----
+    // Every block but the loop's own two, and no dominator analysis to decide which. The blocks that
+    // must be rewritten are exactly those the old header dominates (minus the header and body); the
+    // blocks that must NOT be are the rest — and those, by SSA's own dominance rule, cannot mention
+    // a value defined in the header at all, so visiting them finds nothing to rename. Sweeping all
+    // of them is therefore identical in effect to computing the dominator tree, and this pass ran a
+    // full O(V*E) dominator fixpoint per unrolled loop to learn it.
     for x in 0..n_before {
-        if x == h || x == b || !dominates(h, x, &idom) {
+        if x == h || x == b {
             continue;
         }
         let blk = &mut f.blocks[x as usize];
@@ -698,6 +755,46 @@ mod tests {
         let after_first = f.blocks.len();
         assert!(!unroll_function(&mut f));
         assert_eq!(f.blocks.len(), after_first);
+    }
+
+    /// The same loop, but with a compile-time-constant bound so the trip count is known.
+    fn counted_loop_const_bound(n: i128) -> Function {
+        let mut i = Interner::new();
+        let mut bld = Builder::new(i.intern("f"), MirType::I64);
+        let zero = bld.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one = bld.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let nc = bld.build(MirType::I64, Op::ConstInt(n, MirType::I64));
+        let header = bld.new_block();
+        let body = bld.new_block();
+        let exit = bld.new_block();
+        bld.br(header, vec![zero, zero]);
+
+        bld.switch_to(header);
+        let acc = bld.block_param(header, MirType::I64);
+        let iv = bld.block_param(header, MirType::I64);
+        let c = bld.build(MirType::I1, Op::Cmp(CmpOp::Slt, iv, nc));
+        bld.cond_br(c, body, vec![], exit, vec![]);
+
+        bld.switch_to(body);
+        let acc2 = bld.build(MirType::I64, Op::Bin(BinOp::Add, acc, iv));
+        let iv2 = bld.build(MirType::I64, Op::Bin(BinOp::Add, iv, one));
+        bld.br(header, vec![acc2, iv2]);
+
+        bld.switch_to(exit);
+        bld.ret(Some(acc));
+        bld.finish()
+    }
+
+    #[test]
+    fn refuses_a_known_short_trip_count() {
+        // Seven iterations against a 4x factor: the remainder loop would run three of them, so the
+        // four body copies exist to serve one pass. Not worth the code, and a corpus of small
+        // programs is mostly loops like this.
+        let mut short = counted_loop_const_bound(7);
+        assert!(!unroll_function(&mut short));
+        // Eight is the cutoff: two full passes of the unrolled body.
+        let mut long = counted_loop_const_bound(8);
+        assert!(unroll_function(&mut long));
     }
 
     #[test]
