@@ -16,6 +16,14 @@
 //! kernel/section names.
 //!
 //! Fairness notes:
+//!  * ALIASING: every generated C/C++ peer declares its kernel parameters `__restrict__` (the GCC
+//!    spelling accepted in both gcc's C mode and g++'s C++ mode, so the C++ column rendered by
+//!    [`cpp_from_c`] inherits it). Without it gcc must assume the output buffer may overlap the
+//!    inputs and cannot vectorize or reorder a nested kernel — a handicap no competent C programmer
+//!    would accept for a kernel with distinct in/out buffers. Wukong's own tensor parameters carry
+//!    that non-overlap in the type system, so withholding `restrict` from the peer compared a
+//!    no-alias compiler against a may-alias one. Every call site in this file passes three (or four)
+//!    genuinely distinct allocations, which is what makes the qualifier true and not just fast.
 //!  * FMA: Wukong now contracts `x + y*z` to a fused multiply-add, so gcc is given its *default*
 //!    `-ffp-contract=fast` (the old `-ffp-contract=off` was actually suppressing C's natural FMA).
 //!    Both Wukong and gcc-compiled C therefore fuse. Idiomatic Rust does *not* contract unless the
@@ -1007,7 +1015,7 @@ fn wk_matmul(ns: usize, parallel: bool) -> String {
 
 fn c_matmul(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++){{\n\
          \x20   for (long j=0;j<NS;j++) c[i*NS+j]=0.0f;\n\
          \x20   for (long k=0;k<NS;k++){{\n\
@@ -1023,7 +1031,7 @@ fn c_matmul(ns: usize) -> String {
 /// serial nest exactly; the parallelism only partitions rows.
 fn c_matmul_omp(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          #pragma omp parallel for\n\
          \x20 for (long i=0;i<NS;i++){{\n\
          \x20   for (long j=0;j<NS;j++) c[i*NS+j]=0.0f;\n\
@@ -1173,7 +1181,7 @@ fn wk_matmul_tn(ns: usize, parallel: bool) -> String {
 
 fn c_matmul_tn(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++){{\n\
          \x20   for (long j=0;j<NS;j++){{\n\
          \x20     float s=0.0f;\n\
@@ -1281,7 +1289,7 @@ fn wk_gemv(m: usize, n: usize, parallel: bool) -> String {
 fn c_gemv(m: usize, n: usize) -> String {
     format!(
         "#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* a, const float* x, float* y){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ x, float* __restrict__ y){{\n\
          \x20 for (long i=0;i<M;i++){{ float s=0.0f; for (long j=0;j<N;j++) s+=a[i*N+j]*x[j]; y[i]=s; }} }}\n"
     )
 }
@@ -1406,7 +1414,7 @@ fn wk_scores_noscale(s: usize, d: usize, parallel: bool) -> String {
 fn c_scaled_scores(s: usize, d: usize) -> String {
     format!(
         "#define S {s}\n#define D {d}\n\
-         __declspec(dllexport) void kbench(const float* q, const float* k, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ q, const float* __restrict__ k, float* __restrict__ out){{\n\
          \x20 for (long i=0;i<S;i++){{ for (long j=0;j<S;j++){{ float s=0.0f; for (long p=0;p<D;p++) s+=q[i*D+p]*k[j*D+p]; out[i*S+j]=0.125f*s; }} }} }}\n"
     )
 }
@@ -1562,7 +1570,7 @@ fn wk_linear_rect(m: usize, k: usize, n: usize, parallel: bool) -> String {
 
 fn c_linear(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
          \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
@@ -1575,7 +1583,7 @@ fn c_linear(ns: usize) -> String {
 /// vectorize — the strongest honest multithreaded C for `nn.Linear`).
 fn c_linear_omp(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          #pragma omp parallel for\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
@@ -1732,7 +1740,7 @@ fn wk_ffn(ns: usize, parallel: bool) -> String {
 
 fn c_ffn(ns: usize) -> String {
     format!(
-        "#include <math.h>\n#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#include <math.h>\n#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
          \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
@@ -1872,7 +1880,7 @@ fn c_linear_bf16(ns: usize) -> String {
     format!(
         "#include <stdint.h>\n#include <string.h>\n#define NS {ns}\n\
          static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
-         __declspec(dllexport) void kbench(const uint16_t* a, const uint16_t* b, float* c){{\n\
+         __declspec(dllexport) void kbench(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, float* __restrict__ c){{\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
          \x20     for (long k=0;k<NS;k++) s += bf(a[i*NS+k]) * bf(b[j*NS+k]);\n\
@@ -2007,7 +2015,7 @@ fn wk_transpose(ns: usize, parallel: bool) -> String {
 fn c_transpose(ns: usize) -> String {
     format!(
         "#define NS {ns}\n\
-         __declspec(dllexport) void kbench(const float* src, const float* y, float* dst){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
@@ -2018,7 +2026,7 @@ fn c_transpose(ns: usize) -> String {
 fn c_transpose_omp(ns: usize) -> String {
     format!(
         "#define NS {ns}\n\
-         __declspec(dllexport) void kbench(const float* src, const float* y, float* dst){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
          #pragma omp parallel for\n\
          \x20 for (long i=0;i<NS;i++)\n\
@@ -2153,7 +2161,7 @@ fn wk_colsum(m: usize, n: usize, parallel: bool) -> String {
 fn c_colsum(m: usize, n: usize) -> String {
     format!(
         "#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
     )
@@ -2164,7 +2172,7 @@ fn c_colsum(m: usize, n: usize) -> String {
 fn c_colsum_omp(m: usize, n: usize) -> String {
     format!(
         "#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          #pragma omp parallel for\n\
          \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
@@ -2268,7 +2276,7 @@ fn wk_biasadd(r: usize, c: usize, parallel: bool) -> String {
 fn c_biasadd(r: usize, c: usize) -> String {
     format!(
         "#define R {r}\n#define C {c}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* bias, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ bias, float* __restrict__ out){{\n\
          \x20 for (long r=0;r<R;r++){{ for (long c=0;c<C;c++){{ out[r*C+c] = x[r*C+c] + bias[c]; }} }}\n}}\n"
     )
 }
@@ -2300,7 +2308,14 @@ fn bench_dequant(cc: &str, cxx: &str, dir: &Path) {
         let qi8: Vec<i8> = (0..n).map(|i| ((i * 37 + 5) % 251) as i64 as i8).collect();
         let mut out = vec![0.0f32; n];
         let qp = if is_i8 { qi8.as_ptr() as *const f32 } else { qi32.as_ptr() as *const f32 };
-        let dummy = out.as_ptr(); // the unused middle pointer (kernel never reads it)
+        // A REAL, distinct filler for the unused middle pointer. It used to be `out.as_ptr()`, which
+        // aliased the output buffer the kernel writes — harmless while the C peer never dereferenced
+        // it, but a latent `restrict` violation the moment the peer's parameters carry `__restrict__`
+        // (an unused-but-aliasing `restrict` pointer to a modified object). No peer — Wukong, C, C++
+        // or Rust — ever indexes this parameter, so one element is enough; the point is only that it
+        // is not the output buffer.
+        let dummy_buf = vec![0.0f32; 1];
+        let dummy = dummy_buf.as_ptr();
         let bytes = (in_bytes + 4) as f64 * n as f64;
         let gbps = |v: &Option<Measure>| {
             v.as_ref()
@@ -2400,7 +2415,7 @@ fn c_dequant_1d(n: usize, is_i8: bool) -> String {
     let ty = if is_i8 { "signed char" } else { "int" };
     format!(
         "#define N {n}\n\
-         __declspec(dllexport) void kbench(const {ty}* q, const float* u, float* out){{\n\
+         __declspec(dllexport) void kbench(const {ty}* __restrict__ q, const float* __restrict__ u, float* __restrict__ out){{\n\
          \x20 (void)u; for (long j=0;j<N;j++){{ out[j] = (float)q[j] * 0.0125f; }}\n}}\n"
     )
 }
@@ -2429,7 +2444,7 @@ fn c_dequant_perchan(r: usize, c: usize, is_i8: bool) -> String {
     let ty = if is_i8 { "signed char" } else { "int" };
     format!(
         "#define R {r}\n#define C {c}\n\
-         __declspec(dllexport) void kbench(const {ty}* q, const float* scale, float* out){{\n\
+         __declspec(dllexport) void kbench(const {ty}* __restrict__ q, const float* __restrict__ scale, float* __restrict__ out){{\n\
          \x20 for (long i=0;i<R;i++){{ for (long j=0;j<C;j++){{ out[i*C+j] = (float)q[i*C+j] * scale[j]; }} }}\n}}\n"
     )
 }
@@ -2554,7 +2569,7 @@ fn c_colmax(m: usize, n: usize, op: u8) -> String {
     let (lo, hi) = if op == 2 { ("fabsf(", ")") } else { ("", "") };
     format!(
         "#include <math.h>\n#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long j=0;j<N;j++){{ float s={lo}x[j]{hi}; for (long i=1;i<M;i++){{ float v={lo}x[i*N+j]{hi}; s = s{cmp}v?s:v; }} out[j]=s; }}\n}}\n"
     )
@@ -2593,7 +2608,7 @@ fn c_rowarg(rows: usize, cols: usize, is_max: bool) -> String {
     let cmp = if is_max { ">" } else { "<" };
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, int* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, int* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long r=0;r<R;r++){{ float bv=x[r*C]; int bi=0;\n\
          \x20   for (long j=1;j<C;j++){{ float v=x[r*C+j]; if (v {cmp} bv){{ bv=v; bi=j; }} }}\n\
@@ -2718,7 +2733,7 @@ fn c_colarg(rows: usize, cols: usize, is_max: bool) -> String {
     let cmp = if is_max { ">" } else { "<" };
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, int* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, int* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long j=0;j<C;j++){{ float bv=x[j]; int bi=0;\n\
          \x20   for (long i=1;i<R;i++){{ float v=x[i*C+j]; if (v {cmp} bv){{ bv=v; bi=i; }} }}\n\
@@ -2835,7 +2850,7 @@ fn wk_cumsum(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_cumsum(rows: usize, cols: usize) -> String {
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long r=0;r<R;r++){{ float acc=0.0f; for (long i=0;i<C;i++){{ acc+=x[r*C+i]; out[r*C+i]=acc; }} }} }}\n"
     )
@@ -2864,7 +2879,7 @@ fn wk_lrscan(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_lrscan(rows: usize, cols: usize) -> String {
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out){{\n\
          \x20 for (long r=0;r<R;r++){{ float h=0.0f; for (long t=0;t<C;t++){{ h = a[r*C+t]*h + b[r*C+t]; out[r*C+t]=h; }} }} }}\n"
     )
 }
@@ -2983,7 +2998,7 @@ fn wk_cumprod(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_cumprod(rows: usize, cols: usize) -> String {
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long r=0;r<R;r++){{ float p=1.0f; for (long i=0;i<C;i++){{ p*=x[r*C+i]; out[r*C+i]=p; }} }} }}\n"
     )
@@ -3192,7 +3207,7 @@ fn c_cumminmax(rows: usize, cols: usize, is_max: bool) -> String {
     let cmp = if is_max { ">" } else { "<" };
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long r=0;r<R;r++){{ float m=x[r*C]; for (long i=0;i<C;i++){{ float v=x[r*C+i]; if (v {cmp} m) m=v; out[r*C+i]=m; }} }} }}\n"
     )
@@ -3414,7 +3429,7 @@ fn c_colstat(m: usize, n: usize, op: u8) -> String {
     };
     format!(
         "#include <math.h>\n#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++){{ {fold} }} out[j]={fin}; }}\n}}\n"
     )
@@ -3547,7 +3562,7 @@ fn wk_softmax_bwd(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_softmax_bwd(rows: usize, cols: usize) -> String {
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* y, const float* dy, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ y, const float* __restrict__ dy, float* __restrict__ dx){{\n\
          \x20 for (long r=0;r<R;r++){{ float s=0.0f; for (long j=0;j<C;j++) s += y[r*C+j]*dy[r*C+j];\n\
          \x20   for (long i=0;i<C;i++) dx[r*C+i] = y[r*C+i]*(dy[r*C+i]-s); }}\n}}\n"
     )
@@ -3656,7 +3671,7 @@ fn wk_rmsnorm_bwd(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_rmsnorm_bwd(rows: usize, cols: usize) -> String {
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* dy, const float* gamma, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ dy, const float* __restrict__ gamma, float* __restrict__ dx){{\n\
          \x20 for (long r=0;r<R;r++){{\n\
          \x20   float ms=0.0f; for(long i=0;i<C;i++) ms += x[r*C+i]*x[r*C+i];\n\
          \x20   float rinv = 1.0f/sqrtf(ms/(float)C + 0.00001f);\n\
@@ -3745,7 +3760,7 @@ fn wk_layernorm_bwd(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_layernorm_bwd(rows: usize, cols: usize) -> String {
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* dy, const float* gamma, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ dy, const float* __restrict__ gamma, float* __restrict__ dx){{\n\
          \x20 for (long r=0;r<R;r++){{\n\
          \x20   float sm=0.0f; for(long i=0;i<C;i++) sm+=x[r*C+i]; float mean=sm/(float)C;\n\
          \x20   float vv=0.0f; for(long i=0;i<C;i++){{ float d=x[r*C+i]-mean; vv+=d*d; }} float rstd=1.0f/sqrtf(vv/(float)C+0.00001f);\n\
@@ -3855,7 +3870,7 @@ fn wk_xent(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_xent(rows: usize, cols: usize) -> String {
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* target_f, float* loss){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ target_f, float* __restrict__ loss){{\n\
          \x20 const int* target = (const int*)target_f;\n\
          \x20 for (long r=0;r<R;r++){{\n\
          \x20   float m=x[r*C]; for(long i=0;i<C;i++) if(x[r*C+i]>m) m=x[r*C+i];\n\
@@ -3967,7 +3982,7 @@ fn c_rope(rows: usize, half: usize) -> String {
     let d = 2 * half;
     format!(
         "#include <math.h>\n#define R {rows}\n#define H {half}\n#define D {d}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* inv_freq, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ inv_freq, float* __restrict__ out){{\n\
          \x20 for (long r=0;r<R;r++) for (long j=0;j<H;j++){{\n\
          \x20   float theta=(float)r*inv_freq[j]; float c=cosf(theta), s=sinf(theta);\n\
          \x20   float a=x[r*D+j], b=x[r*D+j+H];\n\
@@ -4040,7 +4055,7 @@ fn wk_xent_bwd(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_xent_bwd(rows: usize, cols: usize) -> String {
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* target_f, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ target_f, float* __restrict__ dx){{\n\
          \x20 const int* target = (const int*)target_f;\n\
          \x20 for (long r=0;r<R;r++){{\n\
          \x20   float m=x[r*C]; for(long i=0;i<C;i++) if(x[r*C+i]>m) m=x[r*C+i];\n\
@@ -4118,7 +4133,7 @@ fn c_rope_bwd(rows: usize, half: usize) -> String {
     let d = 2 * half;
     format!(
         "#include <math.h>\n#define R {rows}\n#define H {half}\n#define D {d}\n\
-         __declspec(dllexport) void kbench(const float* g, const float* inv_freq, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ g, const float* __restrict__ inv_freq, float* __restrict__ dx){{\n\
          \x20 for (long r=0;r<R;r++) for (long j=0;j<H;j++){{\n\
          \x20   float theta=(float)r*inv_freq[j]; float c=cosf(theta), s=sinf(theta);\n\
          \x20   float a=g[r*D+j], b=g[r*D+j+H];\n\
@@ -4186,7 +4201,7 @@ fn c_gate(n: usize, act: &str) -> String {
     };
     format!(
         "#include <math.h>\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out){{\n\
          \x20 for (long i=0;i<N;i++){{ float x=a[i]; out[i]=({actexpr})*b[i]; }}\n}}\n"
     )
 }
@@ -4315,7 +4330,7 @@ fn c_row_loss(rows: usize, cols: usize, kind: &str) -> String {
     };
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out){{\n\
          \x20 for (long r=0;r<R;r++){{ {body} }}\n}}\n"
     )
 }
@@ -4501,7 +4516,7 @@ fn c_act_backward(n: usize, op: &str) -> String {
     };
     format!(
         "#include <math.h>\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* dy, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ dx){{\n\
          \x20 for (long i=0;i<N;i++){{ float v=x[i]; {body} dx[i]=dy[i]*g; }}\n}}\n"
     )
 }
@@ -4661,7 +4676,7 @@ fn wk_i8gemm(ns: usize, parallel: bool) -> String {
 fn c_i8gemm(ns: usize) -> String {
     format!(
         "#include <stdint.h>\n#define NS {ns}\n\
-         __declspec(dllexport) void kbench(const uint8_t* a, const int8_t* b, int32_t* c) {{\n\
+         __declspec(dllexport) void kbench(const uint8_t* __restrict__ a, const int8_t* __restrict__ b, int32_t* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ int32_t s=0;\n\
          \x20     for (long k=0;k<NS;k++) s += (int32_t)a[i*NS+k] * (int32_t)b[j*NS+k];\n\
@@ -4824,7 +4839,7 @@ fn c_bf16(n: usize, is_dot: bool) -> String {
     format!(
         "#include <stdint.h>\n#include <string.h>\n#define N {n}\n\
          static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
-         __declspec(dllexport) void kbench(const uint16_t* x, const uint16_t* y, float* o){{\n\
+         __declspec(dllexport) void kbench(const uint16_t* __restrict__ x, const uint16_t* __restrict__ y, float* __restrict__ o){{\n\
          \x20   float s=0.0f;\n\
          \x20   for (long k=0;k<N;k++) s += {term};\n\
          \x20   o[0]=s;\n}}\n"
@@ -4996,7 +5011,7 @@ fn c_axpby_half_out(n: usize, a: f32, b: f32) -> String {
         "#include <stdint.h>\n#include <string.h>\n#define N {n}\n\
          static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
          static inline uint16_t nb(float f){{ uint32_t u; memcpy(&u,&f,4); uint32_t bias=0x7fffu+((u>>16)&1u); return (uint16_t)((u+bias)>>16); }}\n\
-         __declspec(dllexport) void kbench(const uint16_t* x, const uint16_t* y, uint16_t* out){{\n\
+         __declspec(dllexport) void kbench(const uint16_t* __restrict__ x, const uint16_t* __restrict__ y, uint16_t* __restrict__ out){{\n\
          \x20   for (long k=0;k<N;k++) out[k] = nb({a:?}f*bf(x[k]) + {b:?}f*bf(y[k]));\n}}\n"
     )
 }
@@ -5117,7 +5132,7 @@ fn c_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
     let oh = h - k + 1;
     let (hw, ohw, ckk, kk) = (h * h, oh * oh, cin * k * k, k * k);
     format!(
-        "__declspec(dllexport) void kbench(const float* input, const float* weight, float* output) {{\n\
+        "__declspec(dllexport) void kbench(const float* __restrict__ input, const float* __restrict__ weight, float* __restrict__ output) {{\n\
          \x20 for (long oc=0; oc<{cout}; oc++)\n\
          \x20  for (long oy=0; oy<{oh}; oy++)\n\
          \x20   for (long ox=0; ox<{oh}; ox++) {{\n\
@@ -5361,7 +5376,7 @@ fn c_norm(cols: usize, op: &str) -> String {
         }
     };
     format!(
-        "#include <math.h>\n#define C {cols}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{ \
+        "#include <math.h>\n#define C {cols}\n__declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{ \
          for(long i=0;i<C;i++) out[i]=x[i]; {body} }}\n"
     )
 }
@@ -5594,7 +5609,7 @@ fn c_norm_batched(rows: usize, cols: usize, op: &str) -> String {
     };
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{ \
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{ \
          for(long i=0;i<N;i++) out[i]=x[i]; \
          for(long r=0;r<R;r++){{ float* o=out+(long)r*C; {body} }} }}\n"
     )
@@ -7262,9 +7277,9 @@ fn kernels() -> Vec<Kernel> {
                  for i in 0..{N} {{ y[i] = 2.0 * x[i] + 1.0; }} \
                  for i in 0..{N} {{ out[i] = if y[i] > 0.0 {{ y[i] }} else {{ 0.0 }}; }}\n}}\n"
             ),
-            c: c_kernel(
-                "float* t=(float*)y; for(long i=0;i<N;i++) t[i]=2.0f*x[i]+1.0f; \
-                 for(long i=0;i<N;i++){ float v=t[i]; out[i]= v>0.0f? v:0.0f; }",
+            c: c_kernel_rw(
+                "for(long i=0;i<N;i++) y[i]=2.0f*x[i]+1.0f; \
+                 for(long i=0;i<N;i++){ float v=y[i]; out[i]= v>0.0f? v:0.0f; }",
             ),
             rust: rust_kernel(
                 "let t = y as *mut f32; for i in 0..N { *t.add(i)=2.0* *x.add(i)+1.0; } \
@@ -7549,7 +7564,18 @@ fn wk_par_kernel(loop_body: &str) -> String {
 }
 
 fn c_kernel(body: &str) -> String {
-    format!("#include <math.h>\n#define N {N}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{\n  {body}\n}}\n")
+    format!("#include <math.h>\n#define N {N}\n__declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{\n  {body}\n}}\n")
+}
+
+/// [`c_kernel`] with a **writable** middle buffer. `fused_linear_relu` streams its intermediate
+/// through `y` (the harness derives `yp` with `as_mut_ptr`, so the write has provenance), and the
+/// old spelling reached it by casting the `const` away: `float* t = (float*)y;`. That is fatal once
+/// the parameters carry `__restrict__` — C11 6.7.3.1p4 makes it undefined behaviour to modify an
+/// object designated by a `restrict` pointer to a **const-qualified** type, so gcc would be entitled
+/// to assume `y` never changes and hoist the second loop's loads above the first loop's stores.
+/// Declaring the middle `float* __restrict__ y` states the truth instead of casting it away.
+fn c_kernel_rw(body: &str) -> String {
+    format!("#include <math.h>\n#define N {N}\n__declspec(dllexport) void kbench(const float* __restrict__ x, float* __restrict__ y, float* __restrict__ out) {{\n  {body}\n}}\n")
 }
 
 fn rust_kernel(body: &str) -> String {
@@ -7575,7 +7601,7 @@ fn wk_kernel_n(n: usize, body: &str) -> String {
     format!("module bench\nfn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [f32; {n}]) {{\n    {body}\n}}\n")
 }
 fn c_kernel_n(n: usize, body: &str) -> String {
-    format!("#include <math.h>\n#define N {n}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{\n  {body}\n}}\n")
+    format!("#include <math.h>\n#define N {n}\n__declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{\n  {body}\n}}\n")
 }
 fn rust_kernel_n(n: usize, body: &str) -> String {
     format!("const N: usize = {n};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
