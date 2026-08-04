@@ -1,0 +1,200 @@
+module gblock_b
+
+// STRUCTURE TAX, variant (b): the NATURAL spelling.
+//
+// Byte-for-byte the same arithmetic, in the same order, as variant (a) — every value that reaches
+// a store is computed from the same operands by the same f32 operations. Only the SPELLING differs,
+// in the four ways a working ML engineer actually writes this code:
+//
+//   1. row bases hoisted out of the inner loops (`let xb: i32 = i * D;`, then `nrm[xb + p]`);
+//   2. the activation written into the store (`f1[..] = silu(b1[j] + s)`) instead of as a
+//      separate follow-up loop;
+//   3. the residual added at the store (`h[..] = x[..] + s`) instead of as a separate vector add;
+//   4. the norm reading its input directly instead of copy-then-normalize-in-place.
+//
+// None of these changes a single floating-point result. Every one of them is invisible to
+// `wukong_mir_build`'s recognizers, which match on syntactic index shapes.
+
+fn kbench(
+    x: [f32; $SD$],
+    g1: [f32; $D$], g2: [f32; $D$],
+    wq: [f32; $DD$], wk: [f32; $DD$], wv: [f32; $DD$], wo: [f32; $DD$],
+    w1: [f32; $FD$], w3: [f32; $FD$], w2: [f32; $DF$],
+    b1: [f32; $F$],
+    rc: [f32; $SH2$], rs: [f32; $SH2$],
+    mut nrm: [f32; $SD$],
+    mut q: [f32; $SD$], mut k: [f32; $SD$], mut v: [f32; $SD$],
+    mut sc: [f32; $SS$],
+    mut qh: [f32; $SHD$], mut kh: [f32; $SHD$], mut vt: [f32; $SHD$], mut ah: [f32; $SHD$],
+    mut ctx: [f32; $SD$],
+    mut h: [f32; $SD$],
+    mut f1: [f32; $SF$], mut f3: [f32; $SF$],
+    mut out: [f32; $SD$],
+) {
+    // ---- 1. RMSNorm(x) * g1 -> nrm ----
+    for r in 0..$S$ {
+        let rb: i32 = r * $D$;
+        let mut ss: f32 = 0.0;
+        for i in 0..$D$ { ss = ss + x[rb+i] * x[rb+i]; }
+        let inv: f32 = rsqrt(ss / $D$.0 + 0.00001);
+        for i in 0..$D$ { nrm[rb+i] = x[rb+i] * inv * g1[i]; }
+    }
+
+    // ---- 2. Q/K/V projections ----
+    for i in 0..$S$ {
+        let ib: i32 = i * $D$;
+        for j in 0..$D$ {
+            let jb: i32 = j * $D$;
+            let mut acc: f32 = 0.0;
+            for p in 0..$D$ { acc = acc + nrm[ib+p] * wq[jb+p]; }
+            q[ib+j] = acc;
+        }
+    }
+    for i in 0..$S$ {
+        let ib: i32 = i * $D$;
+        for j in 0..$D$ {
+            let jb: i32 = j * $D$;
+            let mut acc: f32 = 0.0;
+            for p in 0..$D$ { acc = acc + nrm[ib+p] * wk[jb+p]; }
+            k[ib+j] = acc;
+        }
+    }
+    for i in 0..$S$ {
+        let ib: i32 = i * $D$;
+        for j in 0..$D$ {
+            let jb: i32 = j * $D$;
+            let mut acc: f32 = 0.0;
+            for p in 0..$D$ { acc = acc + nrm[ib+p] * wv[jb+p]; }
+            v[ib+j] = acc;
+        }
+    }
+
+    // ---- 3. RoPE (rotate-half) on q and k, per head ----
+    for r in 0..$S$ {
+        let tb: i32 = r * $HD2$;
+        let rb: i32 = r * $D$;
+        for hh in 0..$H$ {
+            let hb: i32 = rb + hh * $HD$;
+            for t in 0..$HD2$ {
+                let cc: f32 = rc[tb+t];
+                let sn: f32 = rs[tb+t];
+                let q0: f32 = q[hb+t];
+                let q1: f32 = q[hb+t+$HD2$];
+                q[hb+t] = q0*cc - q1*sn;
+                q[hb+t+$HD2$] = q0*sn + q1*cc;
+                let k0: f32 = k[hb+t];
+                let k1: f32 = k[hb+t+$HD2$];
+                k[hb+t] = k0*cc - k1*sn;
+                k[hb+t+$HD2$] = k0*sn + k1*cc;
+            }
+        }
+    }
+
+    // ---- 4. Causal multi-head attention ----
+    for hh in 0..$H$ {
+        let ho: i32 = hh * $HD$;
+        for i in 0..$S$ {
+            let src: i32 = i * $D$ + ho;
+            let dst: i32 = i * $HD$;
+            for p in 0..$HD$ { qh[dst+p] = q[src+p]; kh[dst+p] = k[src+p]; }
+        }
+        for j in 0..$HD$ {
+            let dst: i32 = j * $S$;
+            for p in 0..$S$ { vt[dst+p] = v[p*$D$ + ho + j]; }
+        }
+        for i in 0..$S$ {
+            let ib: i32 = i * $HD$;
+            let so: i32 = i * $S$;
+            for j in 0..$S$ {
+                let jb: i32 = j * $HD$;
+                let mut acc: f32 = 0.0;
+                for p in 0..$HD$ { acc = acc + qh[ib+p] * kh[jb+p]; }
+                sc[so+j] = $SCALE$ * acc;
+            }
+        }
+        for i in 0..$S$ {
+            let so: i32 = i * $S$;
+            for j in 0..$S$ { if j > i { sc[so+j] = 0.0 - 1.0e30; } }
+        }
+        for r in 0..$S$ {
+            let so: i32 = r * $S$;
+            let mut m: f32 = sc[so];
+            for i in 0..$S$ { m = fmax(m, sc[so+i]); }
+            let mut sm: f32 = 0.0;
+            for i in 0..$S$ { sc[so+i] = exp(sc[so+i] - m); }
+            for i in 0..$S$ { sm = sm + sc[so+i]; }
+            let inv: f32 = 1.0 / sm;
+            for i in 0..$S$ { sc[so+i] = sc[so+i] * inv; }
+        }
+        for i in 0..$S$ {
+            let so: i32 = i * $S$;
+            let ib: i32 = i * $HD$;
+            for j in 0..$HD$ {
+                let jb: i32 = j * $S$;
+                let mut acc: f32 = 0.0;
+                for p in 0..$S$ { acc = acc + sc[so+p] * vt[jb+p]; }
+                ah[ib+j] = acc;
+            }
+        }
+        for i in 0..$S$ {
+            let dst: i32 = i * $D$ + ho;
+            let ib: i32 = i * $HD$;
+            for j in 0..$HD$ { ctx[dst+j] = ah[ib+j]; }
+        }
+    }
+
+    // ---- 5. Output projection, residual folded into the store ----
+    for i in 0..$S$ {
+        let ib: i32 = i * $D$;
+        for j in 0..$D$ {
+            let jb: i32 = j * $D$;
+            let mut acc: f32 = 0.0;
+            for p in 0..$D$ { acc = acc + ctx[ib+p] * wo[jb+p]; }
+            h[ib+j] = x[ib+j] + acc;
+        }
+    }
+
+    // ---- 6. RMSNorm(h) * g2 -> nrm ----
+    for r in 0..$S$ {
+        let rb: i32 = r * $D$;
+        let mut ss: f32 = 0.0;
+        for i in 0..$D$ { ss = ss + h[rb+i] * h[rb+i]; }
+        let inv: f32 = rsqrt(ss / $D$.0 + 0.00001);
+        for i in 0..$D$ { nrm[rb+i] = h[rb+i] * inv * g2[i]; }
+    }
+
+    // ---- 7. SwiGLU MLP, activation and gate product folded into the stores ----
+    for i in 0..$S$ {
+        let ib: i32 = i * $D$;
+        let ob: i32 = i * $F$;
+        for j in 0..$F$ {
+            let jb: i32 = j * $D$;
+            let mut acc: f32 = 0.0;
+            for p in 0..$D$ { acc = acc + nrm[ib+p] * w1[jb+p]; }
+            f1[ob+j] = silu(b1[j] + acc);
+        }
+    }
+    for i in 0..$S$ {
+        let ib: i32 = i * $D$;
+        let ob: i32 = i * $F$;
+        for j in 0..$F$ {
+            let jb: i32 = j * $D$;
+            let mut acc: f32 = 0.0;
+            for p in 0..$D$ { acc = acc + nrm[ib+p] * w3[jb+p]; }
+            f3[ob+j] = acc;
+            f1[ob+j] = f1[ob+j] * acc;
+        }
+    }
+
+    // ---- 8. Down projection, residual folded into the store ----
+    for i in 0..$S$ {
+        let ib: i32 = i * $D$;
+        let fb: i32 = i * $F$;
+        for j in 0..$D$ {
+            let jb: i32 = j * $F$;
+            let mut acc: f32 = 0.0;
+            for p in 0..$F$ { acc = acc + f1[fb+p] * w2[jb+p]; }
+            out[ib+j] = h[ib+j] + acc;
+        }
+    }
+}
