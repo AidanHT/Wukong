@@ -1,0 +1,182 @@
+module bench.vecbench
+
+// ===================================================================================================
+// The general-code vectorization benchmark: six loop kernels that NO `mir_build` recognizer matches
+// (except #1, kept as the dispatched control), each with a gcc `-O3 -march=native` twin in
+// bench/vecbench.c computing bit-identical arithmetic in the same order.
+//
+// Each kernel is timed best-of-REPS in-process with `now_ns()` and prints
+//     <name-tag> <best ns> <checksum*1000 as i64>
+// The checksum is printed so a "fast" run that computes the wrong thing is visible.
+//
+// NOT a correctness fixture — it prints wall-clock numbers, so it must never live in tests/run.
+// ===================================================================================================
+
+const N: i64 = 1048576;   // 2^20 elements = 4 MiB per f32 stream
+const REPS: i64 = 11;
+
+// ---- 1. saxpy, `for i in 0..n` — the DISPATCHED control (wukong_velem_f32 fires) ----------------
+fn saxpy_for(a: f32, x: []f32, y: []f32, mut o: []f32, n: i64) {
+    for i in 0..n {
+        o[i] = a * x[i] + y[i];
+    }
+}
+
+// ---- 2. saxpy, `while` — identical math, nothing fires ------------------------------------------
+fn saxpy_while(a: f32, x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = a * x[i] + y[i];
+        i = i + 1;
+    }
+}
+
+// ---- 3. saxpy with hoisted local temporaries — nothing fires ------------------------------------
+fn saxpy_locals(a: f32, x: []f32, y: []f32, mut o: []f32, n: i64) {
+    for i in 0..n {
+        let xi: f32 = x[i];
+        let yi: f32 = y[i];
+        let t: f32 = a * xi;
+        o[i] = t + yi;
+    }
+}
+
+// ---- 4. custom elementwise expression -----------------------------------------------------------
+fn elemwise(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    for i in 0..n {
+        let xi: f32 = x[i];
+        let yi: f32 = y[i];
+        o[i] = xi * xi + 2.0 * yi - xi * yi * 0.5;
+    }
+}
+
+// ---- 5. weighted sum-of-squared-error reduction -------------------------------------------------
+fn wsse(w: []f32, a: []f32, b: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..n {
+        let d: f32 = a[i] - b[i];
+        s = s + w[i] * d * d;
+    }
+    return s;
+}
+
+// ---- 6. conditional body (if-conversion candidate) ----------------------------------------------
+fn condbody(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    for i in 0..n {
+        let xi: f32 = x[i];
+        if xi > 0.0 {
+            o[i] = xi * 2.0 + y[i];
+        } else {
+            o[i] = y[i] - xi;
+        }
+    }
+}
+
+// ---- 7. SSM first-order recurrence — a TRUE loop-carried dependence; must be declined -----------
+fn ssm(a: []f32, b: []f32, mut o: []f32, n: i64) -> f32 {
+    let mut h: f32 = 0.0;
+    for i in 0..n {
+        h = a[i] * h + b[i];
+        o[i] = h;
+    }
+    return h;
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(N);
+    let mut y: []f32 = alloc_f32(N);
+    let mut z: []f32 = alloc_f32(N);
+    let mut o: []f32 = alloc_f32(N);
+
+    let mut i: i64 = 0;
+    while i < N {
+        let fi: f32 = (i % 1000) as f32;
+        x[i] = fi * 0.001 - 0.5;
+        y[i] = fi * 0.002 - 1.0;
+        z[i] = fi * 0.0005 + 0.25;
+        o[i] = 0.0;
+        i = i + 1;
+    }
+
+    // --- 1 ---
+    let mut best: i64 = 9223372036854775807;
+    let mut r: i64 = 0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        saxpy_for(1.5, x, y, o, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(1); print(best); print((o[12345] * 1000.0) as i64);
+
+    // --- 2 ---
+    best = 9223372036854775807; r = 0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        saxpy_while(1.5, x, y, o, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(2); print(best); print((o[12345] * 1000.0) as i64);
+
+    // --- 3 ---
+    best = 9223372036854775807; r = 0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        saxpy_locals(1.5, x, y, o, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(3); print(best); print((o[12345] * 1000.0) as i64);
+
+    // --- 4 ---
+    best = 9223372036854775807; r = 0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        elemwise(x, y, o, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(4); print(best); print((o[12345] * 1000.0) as i64);
+
+    // --- 5 ---
+    best = 9223372036854775807; r = 0;
+    let mut acc: f32 = 0.0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        acc = wsse(z, x, y, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(5); print(best); print((acc * 1000.0) as i64);
+
+    // --- 6 ---
+    best = 9223372036854775807; r = 0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        condbody(x, y, o, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(6); print(best); print((o[12345] * 1000.0) as i64);
+
+    // --- 7 ---
+    best = 9223372036854775807; r = 0;
+    while r < REPS {
+        let t0: i64 = now_ns();
+        acc = ssm(z, y, o, N);
+        let dt: i64 = now_ns() - t0;
+        if r > 0 { if dt < best { best = dt; } }
+        r = r + 1;
+    }
+    print(7); print(best); print((o[12345] * 1000.0) as i64);
+
+    free(o); free(z); free(y); free(x);
+    return 0;
+}
