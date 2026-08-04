@@ -118,10 +118,16 @@ impl NaturalLoop {
     ///
     /// This is **not** a licence to reassociate: a float `Add`/`Mul` reduction still has to keep
     /// its accumulate serial. Check [`Reduction::reassociable`] per reduction.
+    ///
+    /// Nor is it, on its own, a licence to *run*: [`MemDep::IndependentIfBasesDisjoint`] carries a
+    /// proof obligation the consumer has to discharge with a runtime pointer-range check. Read that
+    /// variant before acting on a `true` here.
     pub fn is_vectorizable_shape(&self) -> bool {
         matches!(
             self.dep.memory,
-            MemDep::Independent | MemDep::IndependentIfBasesStable
+            MemDep::Independent
+                | MemDep::IndependentIfBasesStable
+                | MemDep::IndependentIfBasesDisjoint
         ) && self
             .carried
             .iter()
@@ -530,6 +536,33 @@ pub enum AddrForm {
     Unknown,
 }
 
+impl MemBase {
+    /// Do these two bases denote the *same* object? Two `ReloadedOuter`s are the same object when
+    /// they re-load the same invariant address — their `value`s differ (they are two separate load
+    /// instructions) but the pointer they yield is the same, which is exactly the assumption
+    /// [`MemDep::IndependentIfBasesStable`] names.
+    pub fn same_object(self, other: MemBase) -> bool {
+        match (self, other) {
+            (MemBase::Outer(a), MemBase::Outer(b)) => a == b,
+            (MemBase::ReloadedOuter { addr: a, .. }, MemBase::ReloadedOuter { addr: b, .. }) => {
+                a == b
+            }
+            _ => false,
+        }
+    }
+
+    /// The value a consumer can read in the preheader to get this base's pointer: the pointer
+    /// itself for an [`MemBase::Outer`], or the *address it is re-loaded from* for a
+    /// [`MemBase::ReloadedOuter`] (which has to be re-loaded there, since the load instruction
+    /// itself lives inside the loop and is not available outside it).
+    pub fn outer_handle(self) -> ValueId {
+        match self {
+            MemBase::Outer(v) => v,
+            MemBase::ReloadedOuter { addr, .. } => addr,
+        }
+    }
+}
+
 impl AddrForm {
     /// The element stride per iteration, when it is a compile-time constant. `Some(1)` is the
     /// unit-stride case a vectorizer wants; `Some(0)` means the address never moves.
@@ -693,6 +726,17 @@ pub enum MemDep {
     /// understands that nevertheless lands on the slice header. Promote this to
     /// [`Self::Independent`] with a real alias analysis, or guard it at runtime.
     IndependentIfBasesStable,
+    /// Every pair of accesses the analysis *could* relate is at distance 0 (same element, same
+    /// iteration), and every pair it could not relate sits on two different [`MemBase`]s whose
+    /// relationship is unknown — two `[]T` slice parameters, say, which the caller is free to have
+    /// aliased. There is no loop-carried dependence **provided** those bases denote either the very
+    /// same pointer (distance 0 again) or disjoint objects.
+    ///
+    /// That is not an assumption: it is a runtime-checkable fact, and the consumer owes the check.
+    /// `vectorize` emits it in the loop's preheader as a pointer range test per unrelated pair and
+    /// runs zero vector iterations when it fails, so the original scalar loop still does all the
+    /// work. Anything that reads this verdict without emitting such a check is unsound.
+    IndependentIfBasesDisjoint,
     /// A loop-carried dependence exists, or could not be ruled out.
     Carried,
 }
@@ -1389,6 +1433,360 @@ fn trip_count(ctx: &LoopCtx<'_>, l: &NaturalLoop, iv: &InductionVar, pred: CmpOp
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Stage 3: memory accesses
+// ---------------------------------------------------------------------------------------------
+
+/// How many nested `gep`s `addr_form` will fold into one index expression.
+const GEP_CHAIN_LIMIT: u32 = 4;
+
+impl<'a> LoopCtx<'a> {
+    /// The object `p` points at, when the loop does not recompute it.
+    ///
+    /// Two shapes qualify. A pointer *defined outside* the loop is an [`MemBase::Outer`]. A
+    /// `load ptr <loop-invariant address>` executed *inside* the loop is a
+    /// [`MemBase::ReloadedOuter`]: that is how every `[]T` slice reads its data pointer today, and
+    /// refusing it would leave the analysis blind to every slice loop in the corpus.
+    fn mem_base(&self, p: ValueId) -> Option<MemBase> {
+        if self.is_invariant(p) {
+            return Some(MemBase::Outer(p));
+        }
+        match self.op_of(p)? {
+            Op::Load(addr, MirType::Ptr) if self.is_invariant(*addr) => {
+                Some(MemBase::ReloadedOuter {
+                    addr: *addr,
+                    value: p,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Decompose the address `p` into `base + index · elem`.
+    ///
+    /// A chain of `gep`s over the *same* element type folds into one index (`gep(gep(b, j), k)` is
+    /// `b + (j + k)·elem`); a chain that changes element type is not foldable without a size ratio
+    /// this pass does not track, so it declines. Anything else is [`AddrForm::Unknown`], which every
+    /// consumer must read as "may touch any address".
+    fn addr_form(&self, p: ValueId, memo: &mut FxHashMap<u32, Option<AffineExpr>>) -> AddrForm {
+        // The pointer value itself may already be the base — a whole-object load/store, or a
+        // pointer the loop never recomputes.
+        if let Some(b) = self.mem_base(p) {
+            return AddrForm::Invariant(b);
+        }
+        let mut cur = p;
+        let mut acc: Option<AffineExpr> = None;
+        let mut elem_ty: Option<MirType> = None;
+        for _ in 0..GEP_CHAIN_LIMIT {
+            let Some(Op::Gep { ptr, index, elem }) = self.op_of(cur) else {
+                return AddrForm::Unknown;
+            };
+            if let Some(prev) = &elem_ty {
+                if prev != elem {
+                    return AddrForm::Unknown; // a change of stride unit mid-chain
+                }
+            } else {
+                elem_ty = Some(elem.clone());
+            }
+            let Some(e) = self.affine_of(*index, memo, 0) else {
+                return AddrForm::Unknown;
+            };
+            acc = match acc {
+                None => Some(e),
+                Some(a) => match a.add(&e) {
+                    Some(s) => Some(s),
+                    None => return AddrForm::Unknown,
+                },
+            };
+            if let Some(base) = self.mem_base(*ptr) {
+                let (Some(index), Some(elem)) = (acc, elem_ty) else {
+                    return AddrForm::Unknown;
+                };
+                return AddrForm::Affine { base, index, elem };
+            }
+            cur = *ptr;
+        }
+        AddrForm::Unknown
+    }
+}
+
+/// Every load and store in the loop, in block-then-instruction order, with its address decomposed.
+fn collect_accesses(
+    ctx: &LoopCtx<'_>,
+    l: &NaturalLoop,
+    memo: &mut FxHashMap<u32, Option<AffineExpr>>,
+) -> Vec<MemAccess> {
+    let mut out = Vec::new();
+    for &b in &l.blocks {
+        for (i, inst) in ctx.f.blocks[b.0 as usize].insts.iter().enumerate() {
+            let (kind, ptr, value_ty) = match &inst.op {
+                Op::Load(p, ty) => (AccessKind::Load, *p, ty.clone()),
+                Op::Store { ptr, value } => {
+                    (AccessKind::Store, *ptr, ctx.f.value_type(*value).clone())
+                }
+                _ => continue,
+            };
+            let addr = ctx.addr_form(ptr, memo);
+            out.push(MemAccess {
+                block: b,
+                inst: i,
+                kind,
+                ptr,
+                value_ty,
+                addr,
+            });
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 4: loop-carried values and dependence
+// ---------------------------------------------------------------------------------------------
+
+/// The reduction operator a combining instruction implements, given that one operand is the
+/// accumulator `p`. Returns `(kind, the other operand, fma factors)`.
+///
+/// Only *associative-shaped* combines are recognized — `acc ⊕ x` where `⊕` is one of the operators
+/// [`RedKind`] names. Whether the partials may then be reassociated is a separate question that
+/// [`RedKind::reassociable`] answers; a float `add` is a reduction here and is still not
+/// reassociable. Subtraction is deliberately absent: `acc - x` has no [`RedKind`], and inventing
+/// one by negating `x` would be a transform, not an analysis.
+fn combine_kind(
+    ctx: &LoopCtx<'_>,
+    p: ValueId,
+    next: ValueId,
+) -> Option<(RedKind, Option<ValueId>, Option<(ValueId, ValueId)>)> {
+    match ctx.op_of(next)? {
+        Op::Bin(b, a, c) => {
+            let other = if *a == p && *c != p {
+                *c
+            } else if *c == p && *a != p {
+                *a
+            } else {
+                return None; // `acc ⊕ acc` is not a reduction over the loop's data
+            };
+            let kind = match b {
+                BinOp::Add => RedKind::Add,
+                BinOp::Mul => RedKind::Mul,
+                BinOp::And => RedKind::And,
+                BinOp::Or => RedKind::Or,
+                BinOp::Xor => RedKind::Xor,
+                BinOp::FAdd => RedKind::FAdd,
+                BinOp::FMul => RedKind::FMul,
+                _ => return None,
+            };
+            Some((kind, Some(other), None))
+        }
+        // `acc = fma(x, y, acc)` — the front end contracts `acc + x*y` into this, so it is the
+        // shape a dot-product / weighted-sum reduction actually has after lowering. The addend is
+        // the never-materialized product `x*y`; a consumer that widens the body has to produce
+        // both factors and re-fuse them per lane, or it changes the rounding.
+        Op::Fma(x, y, c) if *c == p && *x != p && *y != p => {
+            Some((RedKind::FAdd, None, Some((*x, *y))))
+        }
+        _ => None,
+    }
+}
+
+/// How many times `v` is read inside the loop (instruction operands and terminator arguments).
+fn uses_in_loop(ctx: &LoopCtx<'_>, l: &NaturalLoop, v: ValueId) -> usize {
+    let mut n = 0;
+    for &b in &l.blocks {
+        let blk = &ctx.f.blocks[b.0 as usize];
+        for inst in &blk.insts {
+            each_op_use(&inst.op, &mut |u| {
+                if u == v {
+                    n += 1;
+                }
+            });
+        }
+        crate::each_term_use(&blk.term, &mut |u| {
+            if u == v {
+                n += 1;
+            }
+        });
+    }
+    n
+}
+
+/// Classify every header block parameter, and collect the reductions among them.
+///
+/// A parameter is a *reduction* when the latch passes back `param ⊕ x` and the parameter's **only**
+/// use in the whole loop is that combine (plus the latch's branch argument, which reads the
+/// combine, not the parameter). The second condition is what rules out `s = s + x; use(s); s = s +
+/// y` shapes where an intermediate partial is observed: reordering the accumulate would change what
+/// that observer sees.
+///
+/// SSA does the hardest part for free. The combine's value is an argument of the latch's
+/// terminator, so the combine's block *dominates* the latch; and with a single latch and the only
+/// exit in the header, every iteration that enters the body reaches the latch. A conditionally
+/// updated accumulator (`if c { s = s + x }`) therefore cannot be mistaken for a reduction: its
+/// latch argument is a merge *parameter*, not a combining instruction, so it falls through to
+/// [`Carried::Recurrence`].
+fn classify_carried(
+    ctx: &LoopCtx<'_>,
+    l: &NaturalLoop,
+    ivs: &[InductionVar],
+) -> (Vec<CarriedValue>, Vec<Reduction>) {
+    let f = ctx.f;
+    let header = &f.blocks[l.header.0 as usize];
+    let mut carried = Vec::with_capacity(header.params.len());
+    let mut reductions = Vec::new();
+    for (k, &p) in header.params.iter().enumerate() {
+        if let Some(i) = ivs.iter().position(|iv| iv.param_index == k) {
+            carried.push(CarriedValue {
+                param: p,
+                kind: Carried::Iv(i),
+            });
+            continue;
+        }
+        let next = latch_arg(f, l, k);
+        if next == Some(p) {
+            carried.push(CarriedValue {
+                param: p,
+                kind: Carried::Invariant,
+            });
+            continue;
+        }
+        let kind = next
+            .and_then(|n| {
+                let (kind, addend, fma_factors) = combine_kind(ctx, p, n)?;
+                if uses_in_loop(ctx, l, p) != 1 {
+                    return None; // an intermediate partial is observed somewhere else
+                }
+                reductions.push(Reduction {
+                    param: p,
+                    param_index: k,
+                    start: entry_arg(f, l, k),
+                    kind,
+                    combine: n,
+                    addend,
+                    fma_factors,
+                    reassociable: kind.reassociable(),
+                });
+                Some(Carried::Reduction(reductions.len() - 1))
+            })
+            .unwrap_or(Carried::Recurrence);
+        carried.push(CarriedValue { param: p, kind });
+    }
+    (carried, reductions)
+}
+
+/// The loop-carried memory-dependence verdict.
+///
+/// The test is deliberately blunt, because a blunt test that is *right* beats a clever one that is
+/// nearly right when the consumer is a vectorizer. Two accesses conflict unless one of these holds:
+///
+/// * they are both loads (read/read is never a dependence);
+/// * their bases are provably different objects (two distinct `alloca`s);
+/// * their bases are the same object *and* their index expressions are identical, which puts them
+///   at dependence distance 0 — the same element in the same iteration, which is a
+///   loop-*independent* dependence that widening preserves.
+///
+/// A same-object pair at a **non-zero** distance is reported [`MemDep::Carried`] even when the
+/// distance is large enough to be harmless at a given width: the width is not known here, and
+/// leaving the refinement to the consumer would put the unsafe default on the wrong side.
+///
+/// Pairs whose bases could not be related at all downgrade the verdict to
+/// [`MemDep::IndependentIfBasesDisjoint`] instead of failing it — see that variant for the
+/// obligation that creates.
+fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> DepSummary {
+    let carried = |why: &str| DepSummary {
+        memory: MemDep::Carried,
+        reason: why.to_string(),
+    };
+    // A call may read or write anything, and `VecKernelCall` writes through its output streams.
+    for &b in &l.blocks {
+        for inst in &ctx.f.blocks[b.0 as usize].insts {
+            if matches!(inst.op, Op::Call { .. } | Op::VecKernelCall { .. }) {
+                return carried("a call in the loop may touch any memory");
+            }
+        }
+    }
+    if accesses
+        .iter()
+        .any(|a| matches!(a.addr, AddrForm::Unknown))
+    {
+        return carried("an address the analysis could not decompose");
+    }
+    let mut needs_runtime_check = false;
+    let mut reloaded_base = false;
+    for (i, a) in accesses.iter().enumerate() {
+        for b in &accesses[i + 1..] {
+            if a.kind == AccessKind::Load && b.kind == AccessKind::Load {
+                continue;
+            }
+            let (Some(ba), Some(bb)) = (a.addr.base(), b.addr.base()) else {
+                return carried("an access with no identifiable base");
+            };
+            if matches!(ba, MemBase::ReloadedOuter { .. })
+                || matches!(bb, MemBase::ReloadedOuter { .. })
+            {
+                reloaded_base = true;
+            }
+            if ba.same_object(bb) {
+                // Same object: the distance is the difference of the two index expressions, and
+                // only an exactly-zero distance is safe at every width.
+                let same_index = match (&a.addr, &b.addr) {
+                    (
+                        AddrForm::Affine {
+                            index: ia,
+                            elem: ea,
+                            ..
+                        },
+                        AddrForm::Affine {
+                            index: ib,
+                            elem: eb,
+                            ..
+                        },
+                    ) => ea == eb && ia == ib,
+                    (AddrForm::Invariant(_), AddrForm::Invariant(_)) => true,
+                    _ => false,
+                };
+                if !same_index {
+                    return carried("two accesses to one object at a non-zero distance");
+                }
+                continue;
+            }
+            if distinct_allocas(ctx, ba, bb) {
+                continue;
+            }
+            needs_runtime_check = true;
+        }
+    }
+    let memory = if needs_runtime_check {
+        MemDep::IndependentIfBasesDisjoint
+    } else if reloaded_base {
+        MemDep::IndependentIfBasesStable
+    } else {
+        MemDep::Independent
+    };
+    DepSummary {
+        memory,
+        reason: match memory {
+            MemDep::Independent => "every conflicting pair is provably independent".into(),
+            MemDep::IndependentIfBasesStable => {
+                "independent, assuming a re-loaded base pointer does not change".into()
+            }
+            MemDep::IndependentIfBasesDisjoint => {
+                "independent if unrelated bases are equal or disjoint (runtime check owed)".into()
+            }
+            MemDep::Carried => unreachable!(),
+        },
+    }
+}
+
+/// Are these two bases two *different* `alloca`s? Distinct stack slots are distinct objects, which
+/// is the one disjointness fact available without an alias analysis.
+fn distinct_allocas(ctx: &LoopCtx<'_>, a: MemBase, b: MemBase) -> bool {
+    let is_alloca = |m: MemBase| match m {
+        MemBase::Outer(v) => matches!(ctx.op_of(v), Some(Op::Alloca(..))),
+        MemBase::ReloadedOuter { .. } => false,
+    };
+    is_alloca(a) && is_alloca(b) && !a.same_object(b)
+}
+
 fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize) {
     let l = &forest.loops[idx];
     let mut ctx = LoopCtx::new(f, l);
@@ -1438,11 +1836,27 @@ fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize) {
         }
     }
 
+    // Stage 3/4. The access decomposition is written against the primary IV, so it is only
+    // meaningful once `ctx.primary` is set; without one every index would be `Unknown` and the
+    // dependence test would answer `Carried` for reasons that say nothing about the loop.
+    let (accesses, carried, reductions, dep) = if ctx.primary.is_some() {
+        let accesses = collect_accesses(&ctx, l, &mut memo);
+        let (carried, reductions) = classify_carried(&ctx, l, &ivs);
+        let dep = dependence(&ctx, l, &accesses);
+        (accesses, carried, reductions, dep)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new(), DepSummary::default())
+    };
+
     let l = &mut forest.loops[idx];
     l.ivs = ivs;
     l.primary_iv = primary;
     l.trip = trip;
     l.derived = derived;
+    l.accesses = accesses;
+    l.carried = carried;
+    l.reductions = reductions;
+    l.dep = dep;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1553,8 +1967,60 @@ pub fn dump_function_loops(f: &Function, name: &str) -> String {
         for d in &l.derived {
             let _ = writeln!(out, "    derived v{} = {}", d.value.0, d.expr.display());
         }
+        for c in &l.carried {
+            let kind = match c.kind {
+                Carried::Iv(i) => format!("iv#{i}"),
+                Carried::Reduction(i) => {
+                    format!("reduction#{i} ({})", l.reductions[i].kind.name())
+                }
+                Carried::Invariant => "invariant".to_string(),
+                Carried::Recurrence => "RECURRENCE".to_string(),
+            };
+            let _ = writeln!(out, "    carried v{} {kind}", c.param.0);
+        }
+        for a in &l.accesses {
+            let k = match a.kind {
+                AccessKind::Load => "load ",
+                AccessKind::Store => "store",
+            };
+            let _ = writeln!(
+                out,
+                "    {k} bb{}#{} {} @ {}",
+                a.block.0,
+                a.inst,
+                a.value_ty.display(),
+                fmt_addr(&a.addr)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "    dep: {:?} — {}  vectorizable-shape {}",
+            l.dep.memory,
+            l.dep.reason,
+            l.is_vectorizable_shape()
+        );
     }
     out
+}
+
+fn fmt_base(b: MemBase) -> String {
+    match b {
+        MemBase::Outer(v) => format!("v{}", v.0),
+        MemBase::ReloadedOuter { addr, .. } => format!("*v{}", addr.0),
+    }
+}
+
+fn fmt_addr(a: &AddrForm) -> String {
+    match a {
+        AddrForm::Affine { base, index, elem } => format!(
+            "{}[{}] : {}",
+            fmt_base(*base),
+            index.display(),
+            elem.display()
+        ),
+        AddrForm::Invariant(b) => format!("{} (invariant)", fmt_base(*b)),
+        AddrForm::Unknown => "unknown".to_string(),
+    }
 }
 
 fn fmt_trip(t: &TripCount) -> String {
@@ -2297,5 +2763,241 @@ mod tests {
             ctx.affine_of(ValueId(4), &mut memo, 0).is_none(),
             "zext of the IV is not affine in it"
         );
+    }
+
+    // ---- stage 3: memory accesses ------------------------------------------------------------
+
+    /// The *kernel* loop of `func` at `-O1`: the one with the most decomposed memory accesses.
+    ///
+    /// A source line like `let mut a: [f32; 64] = [1.0; 64]` lowers to its own initializer loop, so
+    /// "the function's only loop" is usually wrong; and the loop under test is always the one that
+    /// touches the most memory. Ties break toward the later header, which is the body of a
+    /// `let`-then-loop function.
+    fn kernel_loop(src: &str, func: &str) -> (Function, NaturalLoop) {
+        let f = opt_mir_of(src, func, 1);
+        let forest = analyze_function(&f);
+        let best = forest
+            .loops
+            .iter()
+            .max_by_key(|l| {
+                (
+                    l.accesses
+                        .iter()
+                        .filter(|a| matches!(a.addr, AddrForm::Affine { .. }))
+                        .count(),
+                    l.header.0,
+                )
+            })
+            .unwrap_or_else(|| panic!("no loop in {func}"))
+            .clone();
+        (f, best)
+    }
+
+    #[test]
+    fn a_slice_access_decomposes_to_base_plus_iv() {
+        // The `while` spelling on purpose: `for i in 0..n { o[i] = x[i] * 2.0; }` is matched by a
+        // `mir_build` recognizer and reaches the optimizer as a `wukong_velem_f32` call, with no
+        // loop left to analyze.
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * 2.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let l = &l;
+        // Two data accesses; the `[]f32` base re-loads are `Invariant`, not `Affine`.
+        let affine: Vec<&MemAccess> = l
+            .accesses
+            .iter()
+            .filter(|a| matches!(a.addr, AddrForm::Affine { .. }))
+            .collect();
+        assert_eq!(affine.len(), 2, "one load and one store: {:?}", l.accesses);
+        for a in &affine {
+            assert_eq!(a.addr.const_stride(), Some(1), "unit stride: {:?}", a.addr);
+            assert_eq!(a.value_ty, MirType::F32);
+        }
+        assert_eq!(affine[0].kind, AccessKind::Load);
+        assert_eq!(affine[1].kind, AccessKind::Store);
+    }
+
+    #[test]
+    fn a_constant_offset_shows_up_in_the_index_constant() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
+                   for i in 0..n { o[i] = x[i + 3]; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let l = &l;
+        let konsts: Vec<i64> = l
+            .accesses
+            .iter()
+            .filter_map(|a| match &a.addr {
+                AddrForm::Affine { index, .. } => Some(index.konst),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(konsts, vec![3, 0], "load at iv+3, store at iv+0");
+    }
+
+    #[test]
+    fn a_data_dependent_index_is_unknown() {
+        let src = "fn k(idx: []i32, x: []f32, mut o: []f32, n: i64) { \
+                   for i in 0..n { o[i] = x[idx[i] as i64]; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let l = &l;
+        assert!(
+            l.accesses.iter().any(|a| matches!(a.addr, AddrForm::Unknown)),
+            "a gathered address is not affine: {:?}",
+            l.accesses
+        );
+        assert_eq!(l.dep.memory, MemDep::Carried);
+        assert!(!l.is_vectorizable_shape());
+    }
+
+    // ---- stage 4: carried values -------------------------------------------------------------
+
+    #[test]
+    fn a_float_sum_is_a_non_reassociable_reduction() {
+        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
+                   for i in 0..n { s = s + x[i]; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let l = &l;
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        assert_eq!(l.reductions[0].kind, RedKind::FAdd);
+        assert!(
+            !l.reductions[0].reassociable,
+            "IEEE addition is not associative"
+        );
+        assert!(l.is_vectorizable_shape());
+    }
+
+    #[test]
+    fn an_integer_sum_is_a_reassociable_reduction() {
+        let src = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; \
+                   for i in 0..n { s = s + x[i]; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let l = &l;
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        assert_eq!(l.reductions[0].kind, RedKind::Add);
+        assert!(l.reductions[0].reassociable, "integer add is associative");
+    }
+
+    /// `s = s + w[i]*d*d` reaches MIR as `s = fma(w[i]*d, d, s)` — the front end contracts the
+    /// multiply into the accumulate. A consumer that missed this shape would see a `Recurrence` and
+    /// decline every dot product in the corpus.
+    #[test]
+    fn a_contracted_fma_accumulate_is_a_reduction() {
+        let src = "fn k(w: []f32, a: []f32, b: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
+                   for i in 0..n { let d: f32 = a[i] - b[i]; s = s + w[i] * d * d; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        let (f, l) = kernel_loop(src, "k");
+        let l = &l;
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::FAdd);
+        assert!(r.addend.is_none(), "the addend is the fused product");
+        let (x, y) = r.fma_factors.expect("fma factors");
+        assert!(matches!(f.value_type(x), MirType::F32));
+        assert!(matches!(f.value_type(y), MirType::F32));
+    }
+
+    #[test]
+    fn a_true_recurrence_is_not_a_reduction() {
+        let src = "fn k(a: []f32, b: []f32, mut o: []f32, n: i64) -> f32 { let mut h: f32 = 0.0; \
+                   for i in 0..n { h = a[i] * h + b[i]; o[i] = h; } return h; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let l = &l;
+        assert!(
+            l.carried.iter().any(|c| c.kind == Carried::Recurrence),
+            "h = a*h + b is a recurrence: {:?}",
+            l.carried
+        );
+        assert!(!l.is_vectorizable_shape(), "must decline the SSM shape");
+    }
+
+    /// An accumulator whose partial value is *read* mid-loop cannot be reordered, even though the
+    /// combine itself looks like a textbook reduction.
+    #[test]
+    fn an_observed_partial_sum_is_not_a_reduction() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
+                   for i in 0..n { o[i] = s; s = s + x[i]; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let l = &l;
+        assert!(l.reductions.is_empty(), "{:?}", l.carried);
+        assert!(l.carried.iter().any(|c| c.kind == Carried::Recurrence));
+    }
+
+    /// A conditionally-updated accumulator reaches the latch as a *merge parameter*, not as a
+    /// combining instruction, so SSA alone keeps it out of the reduction set.
+    #[test]
+    fn a_conditional_accumulate_is_not_a_reduction() {
+        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
+                   for i in 0..n { if x[i] > 0.0 { s = s + x[i]; } } return s; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let l = &l;
+        assert!(l.reductions.is_empty(), "{:?}", l.carried);
+        assert!(!l.is_vectorizable_shape());
+    }
+
+    // ---- stage 4: dependence -----------------------------------------------------------------
+
+    #[test]
+    fn a_call_in_the_loop_forces_a_carried_verdict() {
+        let src = "fn g(x: f32) -> f32 { return x * 2.0; } \
+                   fn k(x: []f32, mut o: []f32, n: i64) { \
+                   for i in 0..n { o[i] = g(x[i]); } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.dep.memory, MemDep::Carried);
+    }
+
+    /// Two `[]f32` parameters could be the same buffer; only a runtime check can rule it out, and
+    /// the verdict says so rather than quietly claiming independence.
+    #[test]
+    fn two_slice_parameters_need_a_runtime_check() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * 2.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.dep.memory, MemDep::IndependentIfBasesDisjoint);
+    }
+
+    /// Two distinct stack arrays are distinct objects: no check needed, no assumption taken.
+    #[test]
+    fn two_distinct_allocas_are_provably_independent() {
+        let src = "fn main() -> i32 { let mut a: [f32; 64] = [0.0; 64]; \
+                   let mut b: [f32; 64] = [0.0; 64]; \
+                   for i in 0..64 { b[i] = a[i] * 2.0; } \
+                   return b[3] as i32; }";
+        let (_, l) = kernel_loop(src, "main");
+        assert_eq!(l.dep.memory, MemDep::Independent);
+        assert!(l.is_vectorizable_shape());
+    }
+
+    /// `a[i] = a[i-1] + 1` writes what the next iteration reads: distance 1, a real carried
+    /// dependence. This is the case a vectorizer must never widen.
+    #[test]
+    fn a_nonzero_distance_on_one_object_is_carried() {
+        let src = "fn main() -> i32 { let mut a: [f32; 64] = [1.0; 64]; \
+                   for i in 1..64 { a[i] = a[i - 1] + 1.0; } \
+                   return a[63] as i32; }";
+        let (_, l) = kernel_loop(src, "main");
+        assert_eq!(l.dep.memory, MemDep::Carried);
+        assert!(!l.is_vectorizable_shape());
+    }
+
+    /// A load and a store at the *same* address in the same iteration is a loop-*independent*
+    /// dependence, which widening preserves — `a[i] = a[i] + 1` must stay vectorizable.
+    #[test]
+    fn a_read_modify_write_of_one_element_is_independent() {
+        let src = "fn main() -> i32 { let mut a: [f32; 64] = [1.0; 64]; \
+                   for i in 0..64 { a[i] = a[i] + 1.0; } \
+                   return a[63] as i32; }";
+        let (_, l) = kernel_loop(src, "main");
+        assert_eq!(l.dep.memory, MemDep::Independent);
+        assert!(l.is_vectorizable_shape());
     }
 }
