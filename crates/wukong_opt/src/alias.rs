@@ -47,6 +47,27 @@
 //! flows through a block parameter therefore loses its provenance, and any `alloca` whose address
 //! reaches a branch argument is marked escaped. This costs precision on loop-carried pointers and
 //! buys a single linear pass with no fixpoint — revisit only if a measurement demands it.
+//!
+//! # The query API
+//!
+//! Build it once per function with [`AliasInfo::analyze`] (three linear passes, one allocation, no
+//! hashing — cheap enough to run per pass invocation, and measured to be so), then ask:
+//!
+//! | question | call |
+//! |---|---|
+//! | can these two accesses touch the same byte? | [`AliasInfo::may_alias`] |
+//! | ... knowing both access widths | [`AliasInfo::may_alias_sized`] |
+//! | can this `Op` write what `ptr` reads? | [`AliasInfo::may_clobber`] |
+//! | may this access run on a path the program would not have taken? | [`AliasInfo::is_dereferenceable`] |
+//! | where did this pointer come from? | [`AliasInfo::prov`] |
+//! | is this a stack slot no callee can name? | [`AliasInfo::is_private_stack`] |
+//!
+//! A **loop vectorizer** wants the first three. To decide whether two array references in one loop
+//! body carry a dependence, ask `may_alias` on their *base* pointers first: `false` settles it for
+//! the whole loop with no index reasoning at all (this is what proves a local scratch buffer
+//! independent of everything else). Only when the bases may alias do you need a subscript test.
+//! `may_clobber` answers the same question against a whole instruction, including calls. Never
+//! invert an answer: `true` means "not proven", not "proven to alias".
 
 use wukong_mir::{Function, MirType, Op, ValueId};
 use wukong_span::Symbol;
@@ -123,7 +144,8 @@ impl Default for Fact {
     }
 }
 
-/// The result of running [`AliasInfo::analyze`] over one function: one [`Fact`] per SSA value.
+/// The result of running [`AliasInfo::analyze`] over one function: one `Fact` per SSA value —
+/// provenance, constant offset, alloca size and escape bit, in a flat vector indexed by `ValueId`.
 pub struct AliasInfo {
     facts: Vec<Fact>,
 }
