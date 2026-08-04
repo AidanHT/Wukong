@@ -1254,14 +1254,17 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
                 );
             }
         }
-        // Cross-language correctness: the transpose-once-then-NN result must match the naive nest.
-        if let (Some(m), Some(c)) = (&wuk, &cm) {
-            let (rel, at) = max_rel_err(&m.out, &c.out);
-            if rel > 1e-3 {
-                println!(
-                    "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                    m.out[at], c.out[at], rel
-                );
+        // Cross-language correctness: the transpose-once-then-NN result must match the `kij` nest,
+        // in BOTH peers (each was re-spelled in the 2026-08-04 peer audit).
+        for (lang, peer) in [("C", &cm), ("Rust", &rm)] {
+            if let (Some(m), Some(c)) = (&wuk, peer) {
+                let (rel, at) = max_rel_err(&m.out, &c.out);
+                if rel > 1e-3 {
+                    println!(
+                        "  ! full-buffer mismatch vs {lang} at [{at}]: Wukong={} {lang}={} (rel {:.2e})",
+                        m.out[at], c.out[at], rel
+                    );
+                }
             }
         }
         if let (Some(ms), Some(c)) = (&wuk, &cm) {
@@ -2132,9 +2135,16 @@ fn bench_transpose(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         // Transpose is a permutation — exact, so the full-buffer cross-check is bit equality.
+        // BOTH peers are checked: a peer whose spelling changed (blocked, sliced) could in principle
+        // get "faster" by not doing the work, and an unchecked column would never say so.
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             if m.out != c2.out {
                 println!("  ! transpose output mismatch vs C");
+            }
+        }
+        if let (Some(m), Some(r2)) = (&wuk, &rm) {
+            if m.out != r2.out {
+                println!("  ! transpose output mismatch vs Rust");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
@@ -2302,6 +2312,11 @@ fn bench_colsum(cc: &str, dir: &Path) {
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
             if a.out != c2.out {
                 println!("  ! colsum output mismatch vs C");
+            }
+        }
+        if let (Some(a), Some(r2)) = (&wuk, &rm) {
+            if a.out != r2.out {
+                println!("  ! colsum output mismatch vs Rust");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
@@ -2728,6 +2743,11 @@ fn bench_colmax(cc: &str, dir: &Path) {
                     println!("  ! {label} output mismatch vs C");
                 }
             }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if a.out != r2.out {
+                    println!("  ! {label} output mismatch vs Rust");
+                }
+            }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
@@ -2902,6 +2922,11 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                     println!("  ! {label} index mismatch vs C");
                 }
             }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if as_i32(&a.out) != as_i32(&r2.out) {
+                    println!("  ! {label} index mismatch vs Rust");
+                }
+            }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
@@ -3037,6 +3062,11 @@ fn bench_colarg(cc: &str, dir: &Path) {
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
                 if as_i32(&a.out) != as_i32(&c2.out) {
                     println!("  ! {label} index mismatch vs C");
+                }
+            }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if as_i32(&a.out) != as_i32(&r2.out) {
+                    println!("  ! {label} index mismatch vs Rust");
                 }
             }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
@@ -3517,6 +3547,11 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
                     println!("  ! {label} output mismatch vs C");
                 }
             }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if a.out != r2.out {
+                    println!("  ! {label} output mismatch vs Rust");
+                }
+            }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
@@ -3616,6 +3651,11 @@ fn bench_colstat(cc: &str, dir: &Path) {
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
                 if a.out != c2.out {
                     println!("  ! {label} output mismatch vs C");
+                }
+            }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if a.out != r2.out {
+                    println!("  ! {label} output mismatch vs Rust");
                 }
             }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
