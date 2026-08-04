@@ -66,7 +66,8 @@ wukong_mir       MIR data, builder, pretty-printer, verifier, `VecKernel` (the 2
                   recipe). `MirLevel` lives here too but is inert — see Design bet 2.
 wukong_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
 wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
-                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
+                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm,
+                  loop unrolling)
 wukong_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
                   rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
 wukong_backend   `Backend` trait + `Artifact`
@@ -231,7 +232,9 @@ the operand's defining line for its type.
 ## Optimizer
 
 `wukong_opt::optimize` first runs a whole-program **inliner** (`-O2`), then `PassManager` runs a
-list of function-level `Pass`es to a per-function fixpoint (capped at 100 sweeps). The fixpoint uses
+list of function-level `Pass`es to a per-function fixpoint (capped at 100 sweeps), then a
+whole-program **loop unroller** (`-O2`) with a reduced cleanup sweep over just the functions it
+changed. The fixpoint uses
 per-pass **clean-tracking**: a pass is a deterministic function of the MIR, so one that reported "no
 change" cannot fire again until some *other* pass mutates the function; clean passes are skipped and
 any mutation re-dirties all of them. That changes only how often a pass runs, never the sequence of
@@ -250,7 +253,7 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
-| `inline_program`| -O2   | inline small, non-recursive **leaf** functions (whole-program), then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
+| `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
 | `Mem2Reg`       | -O1   | promote scalar int/float `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
@@ -259,9 +262,25 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | `Cse`         | -O2   | dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table) plus **intra-block** alloca-aware load forwarding — a store makes its value current for the slot, and a store through an unknown pointer or any `Call`/`VecKernelCall` forgets all slots |
 | `Dse`         | -O2   | dead-store elimination (overwritten stores to a slot with no intervening read) |
 | `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader |
+| `unroll_program`| -O2 | unroll a counted two-block loop 4x, with a wrap-safe guard and a remainder loop; runs **after** the function pipeline, and the functions it changed get a reduced cse+dce cleanup sweep |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).
+
+**Unrolling never reassociates.** Splitting a float reduction across several accumulators would
+break the 4-cycle `addss` dependency chain, and it computes a different number — which breaks both
+the interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`. So the unrolled body is the original
+body, four times, in the original order, computing the original values; what it recovers is loop
+overhead and the instruction-level parallelism between the independent parts of successive
+iterations. The pass recognizes only the two-block counted loop the front end emits for
+`for i in a..b` (header = compare + `cond_br`, body = straight line + back edge, single unconditional
+preheader, positive constant step, loop-invariant bound, no call/alloca/vector-kernel in the body).
+The main loop's guard is `iv < bound - 3`, and because that subtraction wraps when `bound` sits
+within 3 of the bottom of its type, the preheader computes it as
+`select (bound-3 < bound), bound-3, INT_MIN` — all loop-invariant, so the steady-state cost is zero,
+and a wrapped limit sends every iteration to the remainder loop instead of running the body past the
+end of the range. `tests/run/loop_unroll.wk` pins that guard, the `trip mod 4` remainder, and the
+zero-trip case. `WUKONG_NO_UNROLL=1` disables the pass.
 
 One splice detail generalizes to every MIR pass: `Op::VecKernelCall.kernel` is a **function-local**
 index, not a `ValueId`, so value renaming neither sees nor fixes it, and `inline_call_site` must carry
