@@ -11,8 +11,11 @@
 //!  * **dse** — dead-store elimination (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
 //!
-//! At `-O2` and above, whole-program inlining of small leaf functions ([`inline_program`]) runs once
-//! before the per-function pipeline. `-O3` adds nothing to either — see [`PassManager::standard`].
+//! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
+//! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
+//! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
+//! same cse/simplify/dce treatment as everything else. `-O3` adds nothing to any of it — see
+//! [`PassManager::standard`].
 
 mod cache;
 mod cfg;
@@ -27,6 +30,7 @@ mod mem2reg;
 mod phi;
 mod simplify;
 mod simplify_cfg;
+mod unroll;
 
 pub use cache::CfgAnalyses;
 pub use cse::Cse;
@@ -38,6 +42,7 @@ pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
+pub use unroll::unroll_program;
 
 use std::time::{Duration, Instant};
 
@@ -64,6 +69,9 @@ pub struct Timings {
     pub per_pass: Vec<PassStat>,
     /// Whole-program inlining time (runs at `-O2`+).
     pub inline: Duration,
+    /// Loop-unrolling time (runs at `-O2`+, after the pipeline). The re-optimization of the
+    /// functions it changed is attributed to the per-pass buckets, not here.
+    pub unroll: Duration,
     /// Total time inside `optimize` (inlining + every pass + fixpoint bookkeeping).
     pub total: Duration,
     /// The largest per-function fixpoint iteration count observed across the program.
@@ -221,7 +229,17 @@ pub fn optimize(program: &mut Program, opt_level: u8) {
     if opt_level >= 2 {
         inline_program(program);
     }
-    PassManager::standard(opt_level).run(program);
+    let pm = PassManager::standard(opt_level);
+    pm.run(program);
+    // Unrolling runs after the pipeline, not inside its fixpoint: it needs the canonical two-block
+    // counted loop that mem2reg/simplify-cfg produce, and re-running it on its own output would
+    // unroll the same loop again every sweep. Only the functions it touched are re-optimized, so a
+    // program with no unrollable loop pays one scan and nothing more.
+    if opt_level >= 2 {
+        for i in unroll_program(program) {
+            pm.run_function(&mut program.funcs[i], None);
+        }
+    }
 }
 
 /// Like [`optimize`], but returns an in-process [`Timings`] breakdown (whole-optimizer total,
@@ -239,6 +257,14 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
     let pm = PassManager::standard(opt_level);
     for f in &mut program.funcs {
         pm.run_function(f, Some(&mut t));
+    }
+    if opt_level >= 2 {
+        let u0 = Instant::now();
+        let changed = unroll_program(program);
+        t.unroll = u0.elapsed();
+        for i in changed {
+            pm.run_function(&mut program.funcs[i], Some(&mut t));
+        }
     }
     t.total = start.elapsed();
     t
