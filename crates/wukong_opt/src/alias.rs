@@ -70,6 +70,10 @@ pub enum Prov {
 /// Byte size of a MIR type, mirroring `wukong_codegen_cranelift::size_of` and the interpreter's
 /// byte layout. `None` when the extent overflows a `u32` (an absurd array length) — callers treat
 /// that as "size unknown", i.e. conservatively large.
+pub fn type_bytes(t: &MirType) -> Option<u32> {
+    byte_size(t)
+}
+
 fn byte_size(t: &MirType) -> Option<u32> {
     Some(match t {
         MirType::I1 | MirType::I8 => 1,
