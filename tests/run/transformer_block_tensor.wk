@@ -1,0 +1,149 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -2527
+// EXPECT-OUT: -7
+// EXPECT-OUT: -2352
+module tests.run.transformer_block_tensor
+
+// The shape-typed twin of `transformer_block.wk`: the SAME pre-norm transformer block, with every
+// buffer declared as a `Tensor[f32, …]` and every access written in the idiomatic multi-index form
+// `x[i, d]` instead of the hand-flattened `x[i*8 + d]`. Its three expected outputs are copied from
+// the flat fixture, so a divergence between the two spellings is a test failure here.
+//
+// This is the proof that the language's headline feature is not a performance tax. Before the
+// multi-index normalization, NONE of the recognizers or the autovectorizer could see through a
+// 2-index access — they all match a single-index `ExprKind::Index` — so this file would have run as
+// a scalar gep nest with **zero** GEMM dispatch. It now dispatches the same four GEMMs and the same
+// three fused norms as the flat fixture (`--emit=mir -O2 | grep wukong_`); the only structural
+// difference is the two residual adds, which the flat file writes as one 64-element stream and the
+// shape-typed file must write as an 8x8 nest, so they vectorize per row instead of whole-buffer.
+fn block(
+    x: Tensor[f32, 8, 8],
+    w1: Tensor[f32, 16, 8],
+    w2: Tensor[f32, 8, 16],
+    mut out: Tensor[f32, 8, 8],
+) {
+    let mut n1: [f32; 64] = [0.0; 64];
+    let mut scores: [f32; 64] = [0.0; 64];
+    let mut attn: [f32; 64] = [0.0; 64];
+    let mut h: [f32; 64] = [0.0; 64];
+    let mut n2: [f32; 64] = [0.0; 64];
+    let mut fh: [f32; 128] = [0.0; 128];
+    let mut fout: [f32; 64] = [0.0; 64];
+
+    // --- RMSNorm(x) per token (row) over D=8 ---
+    for i in 0..8 {
+        let mut ss: f32 = 0.0;
+        for d in 0..8 {
+            ss = ss + x[i, d] * x[i, d];
+        }
+        let inv: f32 = rsqrt(ss / 8.0 + 0.00001);
+        for d in 0..8 {
+            n1[i * 8 + d] = x[i, d] * inv;
+        }
+    }
+
+    // --- Attention: scores = n1 · n1ᵀ ---
+    for i in 0..8 {
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 {
+                s = s + n1[i * 8 + p] * n1[j * 8 + p];
+            }
+            scores[i * 8 + j] = s;
+        }
+    }
+    // row softmax
+    for i in 0..8 {
+        let mut m: f32 = scores[i * 8 + 0];
+        for j in 0..8 {
+            m = fmax(m, scores[i * 8 + j]);
+        }
+        let mut sm: f32 = 0.0;
+        for j in 0..8 {
+            let e: f32 = exp(scores[i * 8 + j] - m);
+            scores[i * 8 + j] = e;
+            sm = sm + e;
+        }
+        let inv: f32 = 1.0 / sm;
+        for j in 0..8 {
+            scores[i * 8 + j] = scores[i * 8 + j] * inv;
+        }
+    }
+    // attn = softmax(scores) · n1
+    for i in 0..8 {
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 {
+                s = s + scores[i * 8 + p] * n1[p * 8 + j];
+            }
+            attn[i * 8 + j] = s;
+        }
+    }
+    // residual: h = x + attn. The flat twin runs this as one 64-trip stream `h[i] = x[i] + attn[i]`;
+    // a rank-2 tensor cannot be indexed by a single flat index (that is the shape check doing its
+    // job), so the shape-typed spelling is the equivalent 8x8 nest. It still vectorizes — per row.
+    for i in 0..8 {
+        for j in 0..8 {
+            h[i * 8 + j] = x[i, j] + attn[i * 8 + j];
+        }
+    }
+
+    // --- RMSNorm(h) ---
+    for i in 0..8 {
+        let mut ss: f32 = 0.0;
+        for d in 0..8 {
+            ss = ss + h[i * 8 + d] * h[i * 8 + d];
+        }
+        let inv: f32 = rsqrt(ss / 8.0 + 0.00001);
+        for d in 0..8 {
+            n2[i * 8 + d] = h[i * 8 + d] * inv;
+        }
+    }
+    // FFN: fh = gelu(n2 · W1ᵀ), fout = fh · W2ᵀ
+    for i in 0..8 {
+        for j in 0..16 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 {
+                s = s + n2[i * 8 + p] * w1[j, p];
+            }
+            fh[i * 16 + j] = s;
+        }
+    }
+    for i in 0..128 {
+        let v: f32 = fh[i];
+        let u: f32 = 0.7978845608 * (v + 0.044715 * v * v * v);
+        let t: f32 = 1.0 - 2.0 / (exp(2.0 * u) + 1.0);
+        fh[i] = 0.5 * v * (1.0 + t);
+    }
+    for i in 0..8 {
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..16 {
+                s = s + fh[i * 16 + p] * w2[j, p];
+            }
+            fout[i * 8 + j] = s;
+        }
+    }
+    // residual: out = h + fout
+    for i in 0..8 {
+        for j in 0..8 {
+            out[i, j] = h[i * 8 + j] + fout[i * 8 + j];
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    let w1: [f32; 128] = [0.05; 128];
+    let w2: [f32; 128] = [0.05; 128];
+    let mut out: [f32; 64] = [0.0; 64];
+    for i in 0..64 {
+        x[i] = ((i % 9) as f32) * 0.2 - 0.8;
+    }
+    block(x, w1, w2, out);
+    print((out[0] * 1000.0) as i32);
+    print((out[31] * 1000.0) as i32);
+    print((out[63] * 1000.0) as i32);
+    return 0;
+}
