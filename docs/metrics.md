@@ -147,9 +147,12 @@ GPU-native (whole-program MIR→PTX megakernel). Standing: real; GPU-native cove
 sumabs(9)/absdiff(10) (`parallel_abssum`); float→narrow-int casts saturate (Rust-`as`/Cranelift
 semantics, `float_cast_narrow`); and pointer slots in the megakernel's shared frame are stored
 unconditionally so SPMD threads no longer dereference a null base (`tensor_1d_kernels@O3`
-illegal-address). The `tests/run` corpus gate stands at 193/274 programs matching the interp
-oracle at `-O0`==`-O3` (81 honest UNSUPPORTED skips, zero mismatches, zero device faults), and
-the megakernel gate at 81 ran / 89 eligible (8 launch-time declines). The corpus gates also
+illegal-address). Re-measured 2026-07-30 at HEAD (`WUKONG_GPU_REQUIRED=1`, 2 passed / 0 failed): the
+`tests/run` corpus gate stands at **217/332 programs** matching the interp oracle at `-O0`==`-O3`
+(**115** honest UNSUPPORTED skips, zero mismatches, zero device faults), and the megakernel gate at
+**83 ran / 91 eligible** (8 launch-time declines). Absolute coverage rose 193→217 as the corpus grew
+274→332 with the hardening campaign's fixtures, so the *fraction* moved 70.4%→65.4% — the added
+fixtures are mostly recognizer/element-type cases gpu-native honestly declines. The corpus gates also
 isolate any future device fault: a `CUDA_ERROR_ILLEGAL_ADDRESS` is a **process-fatal sticky**
 CUDA error (measured on this driver: `cuDevicePrimaryCtxReset` returns Ok but the re-retain
 still errors — only a process restart recovers), so the harness records the root fault on its

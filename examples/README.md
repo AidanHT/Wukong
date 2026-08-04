@@ -6,11 +6,15 @@ Run any example through the interpreter (no LLVM required):
 cargo run -p wukongc -- --run examples/<name>.wk
 ```
 
-Inspect any pipeline stage with `--emit=tokens|ast|mir-high|mir|llvm-ir`, e.g.:
+Inspect any stdout-printing stage with `--emit=tokens|ast|mir-high|mir|grad|llvm-ir` (only
+`--emit=obj` and `--emit=exe` write a file, via `-o`), e.g.:
 
 ```sh
 cargo run -p wukongc -- --emit=mir -O3 examples/dot.wk
 ```
+
+`--run` and an explicit `--emit=<stage>` are mutually exclusive: the compiler honours exactly one of
+them, so the combination is rejected rather than silently discarding half the work.
 
 ## Runnable today (interpreter)
 
@@ -37,10 +41,17 @@ speed claim (see [../README.md](../README.md) and [../BENCHMARKS.md](../BENCHMAR
 
 | File | What it shows | How to run |
 |------|---------------|------------|
-| `gpt2_infer.wk` | Full GPT-2 124M forward: loads the **real pretrained weights** (124,439,808 params) + prompt token ids from disk via the `read_f32` / `read_i32` file-I/O intrinsics, runs embed → 12 pre-LayerNorm blocks (biased QKV, 12-head causal attention, tanh-GELU MLP, residuals) → final LayerNorm → tied LM head → logits `[5, 50257]`, writes them back, and prints the argmax (**1757 " John"** for *"Hello, my name is"*). **Native-only** — the interpreter cannot hold 124M params. | export the weights (below), then `wukongc --run --backend=native examples/gpt2_infer.wk` from the repo root; check with `python tools/verify_gpt2.py` (rel 2.05e-6) |
-| `gpt2_infer_small.wk` | The **same** forward pass at a reduced, interpreter-runnable config (D=64, H=4, DFF=256, SEQ=8, LAYERS=2) with synthetic in-loop weights and no file I/O — the differential gate that runs **bit-identically on interpreter and native**. Like `gpt2_infer.wk` it uses bare const dims, so (measured) it dispatches **no** recognized kernel: it gates the scalar pipeline. | `cargo run -p wukongc -- --run examples/gpt2_infer_small.wk` |
+| `gpt2_infer.wk` | Full GPT-2 124M forward: loads the **real pretrained weights** (124,439,808 params) + prompt token ids from disk via the `read_f32` / `read_i32` file-I/O intrinsics, runs embed → 12 pre-LayerNorm blocks (biased QKV, 12-head causal attention, tanh-GELU MLP, residuals) → final LayerNorm → tied LM head → logits `[5, 50257]`, writes them back to `data/gpt2/gpt2_wuk_logits.bin`, and prints four integers — the argmax of the last position (**1757 " John"** for *"Hello, my name is"*), then three signature values: the top logit ×1000, `logits[0,0]` ×1000, and the element count written. **Native-only** — the interpreter cannot hold 124M params. | export the weights (below), then `wukongc --run --backend=native examples/gpt2_infer.wk` from the repo root; check with `python tools/verify_gpt2.py` (rel 2.05e-6) |
+| `gpt2_infer_small.wk` | The **same** forward pass at a reduced, interpreter-runnable config (D=64, H=4, DFF=256, SEQ=8, LAYERS=2) with synthetic in-loop weights and no file I/O — the differential gate that runs **bit-identically on interpreter and native**. Like `gpt2_infer.wk` it uses bare const dims, so (measured) it dispatches **no** recognized kernel at all — not even the residual adds the full-size `gpt2_infer.wk` still reaches (2 `velem_f32`): it gates the scalar pipeline. | `cargo run -p wukongc -- --run examples/gpt2_infer_small.wk` |
 | `gpt2_forward_bench_small.wk` | The same config again, but spelled in the **recognized dispatch forms** (local `let` dims, per-head repack, `gelu()`, gathered γ/β, bare-index LM-head GEMV) — measured: 6 `sgemm_nt_epi`, 3 `norm_affine_f32`, 2 `velem_f32`, 1 each of `sgemm_nt_alpha` / `sgemm_nt` / `norm_f32` / `vmath_f32` / `sgemv`, the identical set `gpt2_forward_bench.wk` emits. This is the differential fixture for the **kernel-call lowering seam**; its output cross-checks against the all-scalar `gpt2_infer_small.wk` (argmax 15, −14352, 9521). | `cargo run -p wukongc -- --run examples/gpt2_forward_bench_small.wk` |
-| `gpt2_config.wk` | GPT-2 124M layout constants (dims + flat-blob element offsets) imported by `gpt2_infer.wk`; **generated** by `tools/export_gpt2.py` (the single source of truth for the offset table) — not run directly | imported, not run |
+| `gpt2_forward_bench.wk` | The same 124M forward as `gpt2_infer.wk`, at `s_len = 512` with deterministic in-program token ids and a warmup + min-of-K timing loop, respelled in the **recognized dispatch forms** (model dims bound to local `let`s, per-head repack, `gelu()`, gathered γ/β, bare-index LM-head GEMV) — measured at `-O2`: 6 `sgemm_nt_epi`, 3 `norm_affine_f32`, 2 `velem_f32`, 1 each of `sgemm_nt_alpha` / `sgemm_nt` / `norm_f32` / `vmath_f32` / `sgemv`, the identical set `gpt2_forward_bench_small.wk` emits. Writes the last-position logit row to `data/gpt2/gpt2_bench_lastrow.bin` and prints three integers: the argmax of that row, the min forward time in microseconds, and the repetition count. **Native-only**; it probes the blob with a one-element read first, so with `data/gpt2/` unreachable it prints `-1` and exits 1 identically on both backends. | export the weights (below), then `wukongc --run --backend=native examples/gpt2_forward_bench.wk` from the repo root |
+| `gpt2_forward_bench_par.wk` | The all-core companion to `gpt2_forward_bench.wk`: the per-layer block is a `@parallel fn`, so measured at `-O2` the whole-`[S, D]` ops dispatch their multicore twins (6 `sgemm_nt_epi_parallel`, 2 `norm_affine_f32_parallel`, 2 `velem_f32_parallel`, 1 `vmath_f32_parallel`). The final LayerNorm and the last-position LM head live in the non-`@parallel` `main()`, so they stay serial (`norm_affine_f32`, `sgemv`), and the 12-head attention loop is a **serial** chain that fans cores *within* each head (`sgemm_nt_alpha_parallel`, one outlined `wukong_parallel_for` region for the causal-mask write, `norm_f32_parallel`, `sgemm_nt_parallel`) — not across heads. Same prints, same `-1` data guard, same native-only restriction as the serial bench. | `wukongc --run --backend=native examples/gpt2_forward_bench_par.wk` from the repo root (`RAYON_NUM_THREADS=1` forces a single worker for the same-program single-core cross-check) |
+| `gpt2_config.wk` | GPT-2 124M layout constants (dims + flat-blob element offsets) imported by `gpt2_infer.wk`, `gpt2_forward_bench.wk` and `gpt2_forward_bench_par.wk`; **generated** by `tools/export_gpt2.py` (the single source of truth for the offset table) — not run directly. `crates/wukongc/tests/gpt2_config.rs` re-derives every constant from the exporter's own `LAYER_TENSORS` order, so a hand edit or an un-regenerated layout change fails `cargo test` without needing torch or the blob. | imported, not run |
+
+The three data-guarded programs (`gpt2_infer.wk` and the two benches) are excluded from the
+interpreter-vs-native and `-O` invariance agreement checks *while the blob is reachable*: they are
+native-only and two of them print a wall clock, so their stdout is only a valid differential fixture
+when the data is absent and both backends take the `-1` early return.
 
 **Obtaining the weight blob.** The weights are large and not committed to the repo. Export them from
 HuggingFace `transformers` (needs `torch` + `transformers` + `numpy`):
@@ -50,8 +61,13 @@ python tools/export_gpt2.py
 ```
 
 This downloads `GPT2LMHeadModel.from_pretrained("gpt2")`, writes the flat little-endian f32 weight blob,
-the prompt token ids, and the authoritative HuggingFace reference logits under `<repo>/data/gpt2/`
-(override with `$GPT2_DATA_DIR` or a positional argument), and regenerates `examples/gpt2_config.wk`.
+the prompt token ids, the authoritative HuggingFace reference logits and a `MANIFEST.md` (the small
+*committed* layout doc — dtypes, byte sizes, and every top-level and within-layer element offset;
+force-added past the `/data/` gitignore) under `<repo>/data/gpt2/` (override with `$GPT2_DATA_DIR` or a
+positional argument), and regenerates `examples/gpt2_config.wk`. Before reporting success the exporter
+runs a mandatory self-check — an independent numpy forward that slices the *just-written* blob at the
+*computed* offsets, so it validates the Conv1D transposes and the offset table at once — and either
+prints `EXPORTER SELF-CHECK PASS …` or exits 1 with `SELF-CHECK FAILED …`.
 Then run `gpt2_infer.wk` on the native backend and verify with `tools/verify_gpt2.py`. Tokenization is
 performed by the HuggingFace tokenizer inside the exporter; the `.wk` program only ever consumes the
 integer token ids it produces.

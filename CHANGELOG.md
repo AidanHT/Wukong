@@ -5,12 +5,423 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Correctness + robustness — code-map-hardening campaign (2026-07-29)
+A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
+write-sets → adversarial re-verification), plus a harness-hardening wave. Almost nothing here is a new
+feature: the dominant shape is a construct that used to be silently accepted and miscompiled now being
+**rejected with a catalogued diagnostic**, and a kernel recognizer that used to fire on a shape its
+kernel cannot represent now **declining to the (correct) scalar path**. Several uncatchable process
+aborts and ICEs became ordinary diagnostics.
+- **Diagnostics — a closed, two-directionally gated error-code catalogue**: `E0001` ("malformed type
+  syntax") is **retired** — no stage ever emitted it, the parser reports malformed types as
+  `E0203`/`E0204`, and `--explain E0001` now reports it as an unknown error code (a usage error, exit
+  2) instead of printing an explanation. The live catalogue is exactly the
+  29 codes `E0101`–`E0104`, `E0200`–`E0209`, `E0300`–`E0305`, `E0401`–`E0403`, `E0405`,
+  `E0501`–`E0504`, `C0001` (plus the internal `E9999` fallback). Codes are stable: never renumbered,
+  and a retired number is never reused. Two gates keep it honest — every code any crate emits must
+  have a catalogue entry *and* every entry must have an emitter
+  (`crates/wukong_diag/tests/catalog_coverage.rs`; the scanner skips comment lines, so prose may cite
+  codes freely), and every catalogued code must be reached by a `tests/fail` fixture or an inline
+  lexer/parser probe (`crates/wukongc/tests/fail.rs`, with a floor on catalogue size so it cannot pass
+  vacuously). Adding a diagnostic now means adding a catalogue entry **and** a fixture.
+- **Three `--explain` bodies corrected to what the checks actually do**: `E0304` now states that
+  mutating through a non-`mut` **aggregate parameter** (`p.f = …`, `p[i] = …`) is rejected — such a
+  parameter is passed by reference, so the write would land in the caller's value — while the same
+  writes through a `let` binding, and `*p = …` through a pointer parameter, stay legal; `E0402` is
+  retitled *recursive struct or enum has infinite size* (a data-carrying enum is reported too); and
+  `E0405` drops the value-position framing — a non-exhaustive `match` is rejected in **every**
+  position, including statement position and an empty `match`.
+- **Diagnostic rendering**: the human renderer expands tabs to a fixed width of 4 on **both** the
+  echoed source line and the caret padding, so carets land under the construct in tab-indented source
+  (reported line/col — and therefore `--error-format=json` — are unchanged), and the JSON writer
+  escapes any control character with no short escape as `\u00xx` so the line stays parseable JSON.
+- **Lexer**: an empty char literal `''` is now `E0104` instead of silently decoding to `0` (i.e. being
+  indistinguishable from `'\0'`), and a multi-codepoint `'ab'` reports one `E0104` and resyncs past its
+  own closing quote instead of re-lexing that quote as an opening one and swallowing the next token.
+- **Parser**: the recursion-depth budget is charged for every `.field` / `[i]` / `(args)` / `::name`
+  postfix fold, so a long postfix chain reports `E0209` rather than overflowing the compile thread's
+  stack with no diagnostic at all; integer literals in **type** positions (tensor dimension, SIMD lane
+  count, `.tiled(…)` extent, tuple index) are decoded with full radix / `_`-separator / suffix support,
+  and an undecodable or out-of-range one is a catalogued error instead of a silent `0`; attribute
+  parsing no longer consumes tokens it does not own (a stray `@` no longer eats the following item and
+  silently deletes it, `extern` is the only keyword spelling accepted as an attribute name, and a
+  missing attribute value reports `E0207` at the missing value); and struct **functional update**
+  `S { x: 1, ..base }` — which has an AST slot but no lowering — is a single clean rejection naming the
+  unsupported feature, with `rest` deliberately left `None` so it cannot silently leave fields
+  uninitialized (it previously cascaded five errors and fell out of the function body into module
+  scope). Struct functional update is **not** a language feature.
+- **Sema — new rules and closed holes**: a function name beginning with `wukong_` is **rejected**
+  (`E0300`) — the prefix is reserved for the symbols the kernel recognizers emit, and such a function
+  used to silently hijack kernel dispatch; a `\u{…}` escape above `10FFFF`, or in the surrogate range
+  `D800..=DFFF`, is rejected, so the promise that a `char` holds a Unicode scalar value is now
+  enforced; an enum discriminant the constant folder cannot read (typically a reference to a top-level
+  `const`) is `E0401` instead of being silently replaced by the auto-increment value — a discriminant
+  must be an integer literal or arithmetic on integer literals; integer-literal **patterns**, and both
+  bounds of a range pattern, are range-checked against the scrutinee type instead of being truncated
+  to its width; an array-repeat initializer's count must equal its annotation's length
+  (`let a: [i32; 4] = [7; 2];` is `E0401`); an unresolvable name used as an **array length** is `E0301`
+  instead of typing the array as length `0` (parity with tensor dims' `E0504`); struct field, enum
+  payload and `extern`-block types are re-lowered in the body pass purely for their diagnostics, so an
+  unknown tensor dim reports `E0504`/`E0301` there exactly as in a function signature; and const array
+  lengths and turbofish dim values decode radix prefixes, `_` separators and integer suffixes like the
+  rest of the language.
+- **Call unification tightened**: a `[]T` slice, struct or tuple argument against a `Tensor` parameter
+  is rejected instead of falling through a lenient wildcard arm (a slice is not a tensor base); a
+  const-dim parameter against a caller's variable dim is rejected in inference mode as it already was
+  in rigid mode (`?` stays the escape hatch); and tensor **layout** is part of unification, so a
+  `.col_major` tensor can no longer route silently through a contiguous-typed callee.
+- **A documented language limit — `MAX_CONST_ARRAY_LEN` = `u32::MAX`**: the const folder shared by
+  sema's index bounds check and `mir_build`'s slot sizing declines — folding to the invalid-length
+  sentinel `0`, which sema then rejects at the first index — when an **operand** or the result exceeds
+  it, and uses checked arithmetic so a wrapping `+`/`-`/`*` declines instead of producing a colossal
+  length. No in-range length changes value. The *operand* bound is load-bearing, because sema folds in
+  `u64` while `mir_build` narrows to `u32`.
+- **Layout invariant restored**: the alignment of a vector type is always a power of two
+  (`next_power_of_two(elem_size * lanes)`), re-establishing the mirror with `mir_build`'s bitmask
+  round-up so the two aggregate-layout authorities agree. Identity for every power-of-two lane count,
+  so no existing program's layout moves.
+- **MIR: the two-level story was false, and is now marked so.** `MirLevel::High` is constructed
+  nowhere, `Program::new` starts at `Low`, and nothing reads `Program::level` — there is **no**
+  High→Low lowering invariant, and `--emit=mir-high` means *pre-optimization* MIR, not a different IR
+  level. The enum and field remain in place, documented as unused.
+- **MIR verifier, materially stronger**: it now enforces true SSA — a value is defined exactly once,
+  inside the value arena, and its definition **dominates** every use (dominator-tree preorder walk) —
+  rejects an entry block whose parameters disagree with `Function::params` and any predecessor of the
+  entry block, range-checks `Op::VecKernelCall.kernel` against the function's `vec_kernels` table and
+  checks the call's result against the recipe kind, and, given a whole `Program`, cross-checks every
+  call against its **callee's** declared signature (arity, argument types, result type) — available
+  through `verify_program` only, which no compile path calls: `verify_or_ice` and the optimizer's
+  debug-only per-pass check both go through `verify_function`, so that one check is test-only today.
+  Callees with no MIR body — `print` and the `wukong_*` runtime kernels — are external symbols and stay unchecked;
+  blocks unreachable from entry keep their type checks but skip the dominance rule. These are the
+  invariants `cse`/`licm`/`mem2reg`/`simplify-phis` argue from. Known gap: operand *lane counts* are
+  not yet checked, so a mis-shaped vector `Cast` still reaches the backends (where it is now a
+  diagnostic rather than a panic).
+- **Optimizer — three `-O0`-vs-`-On` divergences closed**: constant folding no longer folds bf16/f16
+  **comparisons** (two distinct f32 literals landing on one narrow-precision grid point folded to "not
+  equal" while the runtime compare says equal, flipping an `if`; `fold_bin` already refused narrow
+  arithmetic, so the comparison path now matches — bf16/f16 constants are never folded, arithmetic or
+  comparison); the self-operand folds `x - x` / `x ^ x` / `x <cmp> x` decline when the instruction's
+  result type is a **vector**, where they used to materialize a scalar constant the verifier rejects;
+  and inlining now merges the callee's `vec_kernels` recipe table into the caller and rebases every
+  copied `VecKernelCall.kernel` index — a vectorized leaf inlined at `-O2` previously ran one of the
+  caller's unrelated recipes or indexed an empty table. Contract for anyone writing a MIR pass:
+  `VecKernelCall.kernel` is a **function-local index** and must be rebased when instructions move
+  between functions.
+- **Slices `[]T` are legal operands to the whole recognized-kernel family** (a genuine capability
+  expansion): every kernel buffer operand now resolves through one `kernel_base_ptr` helper, and every
+  emitter declines to the scalar nest when an operand is unbound. Around thirty emitters previously
+  took a slot address directly, handing the kernel the address of the 16-byte **fat pointer** instead
+  of its data. Slice-ness comes from a `slice_slots` set recorded from the *sema* type at every binding
+  site — parameters, `let`, tuple fields, `@parallel` region captures, the whole-scrutinee `match`
+  binding, tuple sub-patterns, data-carrying-variant payloads, and the element binding of a `for`-each
+  over an array of slices — never from the MIR slot shape, which cannot distinguish `[]T` from a
+  16-byte struct, a tuple or `[u8; 16]`.
+- **The recognized-kernel family is f32-only (`i32` labels)**: element-type gates were added to the
+  fused norms, LayerNorm backward, the row-loss heads (KL divergence, entropy), RoPE, per-row
+  argmax/argmin, the four scan bodies (cumsum, cumprod, gated carry, lrscan), the shared reduction
+  index base, and the cross-entropy label gather. `f64`, bf16/f16 data and `i64` labels **decline to
+  the scalar nest**. This class was a hard interp/native divergence: the interpreter marshals
+  slot-per-scalar and converted, while native reinterpreted the bytes. The explicitly cast spelling
+  `(x[k] as f32)` still routes to the low-precision kernels, so the mixed-precision suite above is
+  unaffected.
+- **Recognizer preconditions that used to be assumed are now checked**, each declining to the correct
+  (unaccelerated) scalar path: only half-open unit-step `for` ranges dispatch — a `step` or `..=` range
+  used to have its trip count read as `end - start` and dispatch a kernel that walks each index once;
+  `pool2d` requires literal dims and the nest's own output extent to equal the full no-padding extent
+  the kernel recomputes, so a sub-region pool declines instead of writing the full extent at the wrong
+  row stride into a smaller buffer; the fused matmul epilogue declines a peeled alpha, a peeled store
+  bias and a transposed A (the alpha folds into the scaled GEMM and the bias into its own epilogue
+  call, so declining costs nothing); a **whole-function** matmul whose shape the GEMM emitter declines
+  now lowers as the ordinary scalar nest instead of leaving the wrapper as dead constants plus a bare
+  `ret`; the batched-norm matcher requires a per-row width independent of the row; the cumulative-max
+  seed must be an actual infinity; recognizer coefficients must be loop-invariant **and**
+  side-effect-free (a body-local capture silently changed the polynomial, and an arbitrary call ran
+  once instead of per element); the activation peelers respect shadowing through one shared predicate,
+  so a user `fn gelu` / `fn silu` / `fn fmax` is no longer fused away in favour of the runtime's
+  builtin curve; the arg-reduce nest guards its `x[ki]` load under `ki >= 0` (the kernel returns `-1`
+  for an empty span or an all-NaN row) and uses the loop's own strict compare for the tie-break, so a
+  runtime-zero trip count leaves the seed untouched; and the 256-bit AVX2 recipe path declines when a
+  stream base is not a scope binding — a module-level `const` array — reporting the catalogued,
+  spanned `C0001` instead of panicking the compiler.
+- **The 256-bit recipe contracts a float `x + y*z` into one `Fma`**, matching both the scalar tail and
+  the 128-bit CLIF path. The vector part previously rounded twice where the tail rounded once, so one
+  loop returned two different answers across its own lane/tail boundary and `WUKONG_P4_NO_256=1`
+  changed a program's *numbers* rather than only its instruction selection. That kill-switch is now a
+  result-identical A/B knob, gated by a test.
+- **Run-time disjointness for the parallel gather/scatter**: `wukong_embedding_f32_parallel` and
+  `wukong_scatter_add_f32_parallel` are selected under a run-time byte-range non-overlap test (through
+  `PtrToInt`, the one pointer cast both backends implement). An aliased call — two *distinct* array
+  parameters bound to the same array at the call site, which the old symbol-equality guard could not
+  see — lands on the serial kernel, and a weight with no compile-time extent (a slice) keeps the serial
+  kernel outright. Aliased buffers are therefore correct, just serial.
+- **`sdpa`'s operand contract is enforced in lowering** (sema has no signature for `sdpa` at all): the
+  four buffer arguments must be f32 arrays, slices or tensor views, and when `s` and `d` are
+  compile-time constants every buffer whose type pins an extent must hold `s*d` elements. A violation
+  declines the lowering so the call reports `C0001` at its own span rather than segfaulting; slice
+  arguments now pass their **data** pointer. Pinned by `tests/fail/sdpa_operand_{type,extent}.wk`.
+- **Lowering-core fixes**: a binary operator reads each operand's width off the value the builder
+  produced and widens an integer operation to hold *both* operands instead of truncating the loop
+  counter back to sema's narrower type — closing a whole class of ICEs on `for i in 1..n` with
+  `n: i64`; ordered-comparison signedness is derived from both operands by one shared width-aware rule
+  faithful to C's usual arithmetic conversions (only an equal-rank mixed-sign pair goes unsigned), and
+  the range-`for` counter uses the same rule, so `for i in 0..big` with `big: u32` no longer runs zero
+  iterations; the counting-`while` normalization's hoisted bound is restricted to a **pure**
+  loop-invariant bound, so a bound with a side effect or one the body mutates re-evaluates per
+  iteration; every literal `match` pattern is materialized through one checked helper that declines a
+  non-integer scrutinee, a `true`/`false` pattern against a non-bool scrutinee, an out-of-range literal
+  (including the i64/u64 widths sema's own check cannot cover) and a non-literal range bound — MIR
+  integers are signless, so the accepted range is the union of the signed and unsigned ranges of the
+  scrutinee's width; array-initializer length is checked on **every** path that reaches lowering,
+  including an assignment RHS and a data-enum tuple payload, with a mismatch reported as `E0401`
+  instead of writing outside the buffer or leaving the tail unwritten; the monomorphization key
+  separator is `$`, which no user identifier can contain, so a structural-type instantiation can no
+  longer share a namespace with a user type name and mint one instance for two ABIs (the remaining
+  catch-all that collapses every vector/tensor/fn instantiation onto one key is a documented gap); and
+  `parse_float` strips the same suffix list sema accepts, including the bare C-style `f`, so
+  `let a: f32 = 5f;` no longer emits `const.f32 0` at every opt level on both backends.
+- **`@parallel` declines four shapes and lowers serially**: a labelled loop, a plain `break` out of the
+  parallelized loop, a `return` out of it, and a modelled body-local reassigned inside an inner loop. A
+  `break`/`continue` inside an **inner** loop remains legal. Each of these used to change what the loop
+  means — unreachable code, a chunk-dependent answer, or a race. The failure mode is a silent serial
+  fallback (correct), not an error.
+- **Interpreter: three uncatchable process aborts became diagnostics.** Unbounded or very deep
+  recursion reports `interpreter call-depth limit exceeded (likely unbounded recursion)` through a call
+  depth counter; all **five** public entry points now run on the 512 MiB big-stack worker (four
+  previously skipped it); and the runtime allocation intrinsic uses `try_reserve` and returns an error
+  instead of reaching Rust's allocation-error handler. The interpreter reports resource exhaustion as a
+  diagnostic with exit 1, never a process abort. It cannot mirror the runtime's null-return on OOM,
+  because interpreter pointers are slot indices and index `0` is a live slot.
+- **Interpreter: a non-positive kernel extent means zero iterations on both backends.** All 81
+  output-buffer shape reads go through one `dim!` macro that bails out of the arm with the kernel's
+  documented no-op when the extent is `<= 0`, mirroring every runtime kernel's own `<= 0` guard, and
+  the eight value-returning reduction reads clamp with `.max(0)` so the kernel's empty-input identity
+  applies. Such an extent previously wrapped to `~usize::MAX` and aborted with a raw `capacity
+  overflow` out of the backend that is supposed to be the semantic oracle. Zero extents were corrected
+  the same way.
+- **Interpreter: three semantic-oracle repairs.** Integer SIMD lanes are truncated to their declared
+  lane width in the vector `Bin`, `Neg` and `Not` arms — a lane used to keep its full-width product and
+  was observably scattered to memory, disagreeing with Cranelift; `wukong_embedding_f32` gathers
+  row-at-a-time straight from live interpreter memory in ascending order, so an in-place gather
+  (`out == weight`) matches the source nest and native, and the real vocabulary argument drives the
+  out-of-range zeroing rule instead of a snapshot heuristic; and a mis-shaped vector operand produces a
+  diagnostic instead of an index-out-of-bounds panic.
+- **Cranelift: the native backend no longer promises 16-byte alignment.** Generated loads and stores
+  use `notrap` memory flags rather than `trusted` (`notrap|aligned`). Cranelift's `aligned` is a
+  *caller* promise this backend cannot make — the 128-bit CLIF vectorizer emits vector loads at
+  addresses it knows are not 16-byte aligned, and on an x86-64 host without AVX the old flag let the
+  x64 lowering embed the misaligned operand in a legacy SSE instruction and fault on the first
+  vectorized iteration. Strictly weaker: it can only make Cranelift materialize a load it would
+  otherwise have folded.
+- **Cranelift: the raw 256-bit AVX2 emitter is gated on host ISA *and* ABI.** It requires AVX2 + FMA
+  **and** `x86_64` + Windows, because the emitted body hardcodes the Win64 `rcx`/`rdx`/`r8` argument
+  mapping and there is no in-kernel fallback; an unsupported host now gets a compile diagnostic rather
+  than SIGILL or silent memory corruption. The module's earlier claim that Windows and SysV both pass
+  the first arguments in registers it normalizes to was false and is corrected. Its lane/register
+  constants alias the vectorizer's so the two bounds cannot drift, and the register free list releases
+  a repeated vector operand exactly once (`a*a`, or an `Fma` sharing an operand, used to push the
+  register twice and compute the wrong expression).
+- **Cranelift: a narrow-float entry point returns through its own ABI.** `f32`/`f16`/`bf16` `main`
+  transmutes to `extern "C" fn() -> f32` instead of sharing the `f64` arm — all three are computed in
+  f32 registers, so reading 64 bits back reinterpreted a live float as a denormal and
+  `fn main() -> f32 { return 42.9; }` disagreed with the interpreter oracle.
+- **Cranelift: recognizer/backend drift is a loud compile failure.** A `wukong_*` kernel reaching
+  `lower_call` with an arity no arm handles fails the compile naming the symbol and the arity, instead
+  of lowering to nothing — which silently deleted a void kernel's call and left its destination buffer
+  stale, a native-only wrong answer since the interpreter dispatches on the symbol name with no arity
+  check. This is the check that catches a missed arm when adding a runtime kernel. Parallel object
+  codegen reports the **first failing function by index**, matching the `WUKONG_PAR_CODEGEN=0` serial
+  path, so which diagnostic is reported is deterministic. And the JIT's contract is now stated:
+  `JitProgram::run` executes the entry on the 512 MiB worker, while `JitProgram::call` invokes it on
+  the caller's stack.
+- **Runtime: scalar/AVX2 twin agreement extended to non-finite data and past the f32 mantissa limit.**
+  The row-max folds in the norm and log-softmax paths make the **scalar twin** adopt MAXPS semantics
+  (`(a > b) ? a : b`) so it mirrors the unblended AVX2 chain, while the cross-entropy path resolves the
+  same hazard the other way — its scalar twin keeps `f32::max` (= `maxNum`) and its AVX2 fold blends the
+  accumulator back over the NaN lanes; each file is internally twin-exact, and the two deliberately pick
+  **different** row maxima on a row containing a NaN; the cummax/cummin vector scan folds NaN-bearing
+  blocks with the scalar recurrence; the vector arg-reduce delegates any span leaving a sentinel lane
+  to its scalar twin, so an all-identity span argmaxes to index `0` rather than `-1`; the row and
+  column arg-reductions dispatch to AVX2 only while the running index — which rides in an f32 lane —
+  is exactly representable, handing wider rows to the exact-integer scalar twin; and an unknown vmath
+  op code runs the named scalar twin instead of leaving the output untouched. The module headers'
+  unconditional bit-identity claims are now true.
+- **Runtime: kernel contracts stated rather than hoped for.** Cross-entropy **bounds the label** at the
+  one place each kernel uses it (a negative `i32` sign-extends above the row width, so one `<` covers
+  both directions): an out-of-range `target[r]` yields `NaN` loss forward and a plain-softmax gradient
+  backward, never a read or write past the row, and the unenforceable in-range precondition is dropped
+  from the safety blocks. `wukong_embedding_f32[_parallel]` takes its three extents as `i64` — matching
+  the compiler's own import declaration — and returns early on a non-positive `t` or `h` (a non-positive
+  `v` leaves no valid weight row, so every output row is zeroed instead). The scaled NT GEMM's
+  doc states what its writeback implements (alpha applied **after** the beta accumulate, not the BLAS
+  ordering), and only the `beta = 0` combination is reachable from `.wk` source, now pinned by a debug
+  assertion at the single dispatch choke point. The file-I/O read intrinsics attempt the **open before**
+  the zero-length short-circuit, so a missing or unopenable path is `-1` even when `len <= 0`, matching
+  the interpreter — ordering is part of that frozen contract.
+- **Runtime: thread-pool provisioning is now an invariant.** Every `_parallel` kernel that can be the
+  process's first rayon touch calls `ensure_global_pool()` before forking; otherwise rayon builds its
+  default small-stack registry and the runtime's later 16 MiB `build_global()` silently loses the race
+  for the whole process. As a backstop the pool helper records whether `build_global` actually
+  installed the pool and otherwise falls back to a lazily built private 16 MiB pool. Provisioning and
+  scheduling only: no chunk boundary or fold order moves, so serial == parallel stays bit-exact. Known
+  gap, documented not fixed: at pool width 1 the helper runs the body **inline on the caller**, so an
+  outlined `@parallel` region body is not on a 16 MiB stack there — the gate that proves a fork lands
+  on a runtime-configured pool returns early at that width for exactly this reason.
+- **Runtime: env knobs and reference surface.** Two GEMM instrument knobs validate their input in pure
+  helpers instead of trapping inside an `extern "C"` kernel (a `0` divisor is treated as unset; a
+  KiB→byte scale saturates), so a sweep script walking either range falls back rather than aborting,
+  and the bump `Arena` rejects a non-power-of-two alignment (`align - 1` wrapped and the round-up mask
+  became `0`, aliasing every live region).
+- **Autodiff: every silent-zero or silently-wrong gradient in reach became a refusal.** The elementwise
+  VJP uses a **whitelist** of the two `velem` spellings the affine rule is valid for, so a Hadamard or
+  quotient kernel is refused by name instead of differentiated with the linear rule; an `Op::Store`
+  into a buffer that already has a live adjoint, whose stored value is not a constant, is refused
+  (constant stores — zero-init and the loss sink — stay skippable); `Op::VecKernelCall` is covered by
+  the same loud guard as an unrecognized `Op::Call`; and a call to a recognized kernel **name** with a
+  non-ABI arity — reachable by declaring the symbol in an `extern "C"` block — is a clean diagnostic
+  instead of an index-out-of-bounds panic. Consequence: a mixed scalar+kernel loss that previously
+  "succeeded" with a clobbered or zero gradient now fails to compile under `--emit=grad` / `--train`.
+  The supported envelope is narrower than the old behaviour suggested, and `--emit=grad` never emits a
+  silently-zero gradient — a missing rule is a hard error.
+- **Autodiff: two rules added, and the coupling contract reinforced.** A self-dot reduction —
+  `loss = Σ x[i]²`, lowered with both reduction operands the same buffer — now differentiates to one
+  elementwise scaling (it used to fail with a misleading multiple-contributions error), so a
+  sum-of-squares loss / L2 regularizer works. And `wukong_norm_f32_parallel` is mirrored into the tape
+  (`Syms` / `is_kernel` / `diff_kernel_call`), so a `@parallel` batched norm — the shipped transformer
+  shape — differentiates through the same rule as its serial twin. This is the standing rule: every new
+  `_parallel` recognizer arm in `mir_build` **must** get a tape counterpart, or every `@parallel`
+  backward through it breaks. Diagnostics now name the offending callee, and the reduction fallback
+  message lists its supported set correctly.
+- **Autodiff: known limitation, documented not fixed.** When a loss reads a kernel-written buffer with
+  a scalar `load` rather than through another recognized kernel, the kernel's output adjoint is never
+  seeded and the gradient is silently zero. The scalar-load path does now register its buffer as
+  having contributed, so a later kernel-path overwrite cannot clobber it, and a matmul adjoint into a
+  scalar-loaded buffer accumulates rather than overwrites.
+- **GPU (`--backend=gpu` offload)**: the LayerNorm PTX computes variance in the numerically stable
+  two-pass form `mean((x - mean)²)` instead of the one-pass `E[x²] - mean²`, which catastrophically
+  cancels in f32 and made whole rows NaN; both siblings — the CPU runtime kernel it replaces and the
+  gpu-native lowering — already used the stable form, so this was a CPU-vs-GPU divergence, and
+  LayerNorm now agrees across interp / native / gpu / gpu-native. The norm offload also **declines** op
+  codes with no PTX entry (log-softmax, L2-norm) and falls back to the CPU kernel instead of aborting
+  the process on ordinary user input, joining the existing vmath and reduction gates.
+- **GPU (gpu-native MIR→PTX)**: an `i1` in memory is accessed as **one byte** — it fell through to the
+  i32 arm, and a 4-byte access at an odd address is `CUDA_ERROR_MISALIGNED_ADDRESS`, reachable from
+  `struct F { a: bool, b: bool }` or `[bool; 8]`; a narrow unsigned float→int cast stays sign-extended
+  to its MIR width, so it compares equal to the same number materialized as a constant; bf16/f16 values
+  round to their grid at a **const** and at an `FpExt` widen, not only at a store, so gpu-native's own
+  `-O0` and `-O3` agree (interp and Cranelift already rounded at all three points); and an aggregate or
+  void load/store declines with `UNSUPPORTED:` rather than emitting a plausible 4-byte access. Coverage
+  grew as well: the seven `_parallel` runtime symbols `mir_build` emits — the f32 activation kernel and
+  the six low-precision `{dot,sum,reduce}_{bf16,f16}` symbols — are classified as their serial kinds, so a program whose
+  `@parallel` function is recognized as an activation or a low-precision reduction is no longer refused
+  outright by gpu-native nor declined by the megakernel, and the remaining `expect` sites became
+  `UNSUPPORTED:` declines.
+- **GPU: an out-of-contract launch is a recoverable decline, never a panic or a sticky driver fault.**
+  The reduction launch derives its argument list from the op (a mismatched pair read one slot past the
+  argument vector and latched a process-sticky illegal-address error); the autotune cache honours a
+  cached token only when this build has that candidate and it is applicable at the shape, otherwise
+  counting it as a miss and re-tuning; the resident-backward, AdamW and paged-KV launchers check every
+  buffer length against the geometry the kernel recomputes; the flash planner owns the (entry, config)
+  pairing so a shape no kernel covers cannot be built; the tile generators assert their shared-memory
+  staging and warp-grid preconditions; and an op with no kernel declines with
+  `CUDA_ERROR_NOT_SUPPORTED` instead of panicking inside the compiler process. In the serving stack a
+  request's generation length is floored at 1 (a zero-length request underflowed its remaining counter,
+  so its slot never retired and never returned its KV blocks) and the host-side decode advance is
+  all-or-nothing behind a feasibility pass. The int4 dequant reference discriminates on the field every
+  launcher dispatches on (`zeros`) rather than the descriptive `signed` flag, and the host fp8 E5M2
+  encoder handles subnormals and signed zero like the hardware instruction — the E4M3 twin has the
+  identical defect and is a known open item.
+- **CLI: two flag combinations are now rejected instead of silently doing half the work.** `--run`
+  cannot be combined with `--emit=<stage>` — the driver dispatches exactly one of them and dropped the
+  other while still exiting 0, and *which* one won depended on where the stage sat relative to the run
+  block. And `-o` is accepted only with `--emit=obj` or `--emit=exe`, and never with `--run`; `USAGE`
+  now states the real semantics: **only `--emit=obj` and `--emit=exe` write a file; every other stage
+  prints its artifact on stdout.**
+- **Driver: MIR is verified before every backend exit.** `--emit=llvm-ir`, `--emit=obj` and
+  `--emit=exe` verify through the same helper `--run` uses. `--emit=mir` / `--emit=mir-high` stay
+  ungated at that point on purpose — they verify *after* dumping, so a broken program still prints the
+  MIR that shows why. Note the optimizer's per-pass verify-each is `#[cfg(debug_assertions)]`, so
+  before this a release compiler verified nothing at all on the AOT path.
+- **Driver: the compiler no longer aborts when its output pipe closes.** Artifact writes (tokens, ast,
+  llvm-ir, mir) and the diagnostic and verifier-ICE lines go through fallible writes, so
+  `wukongc --emit=mir p.wk | head -1` exits with the compile status instead of crashing — the
+  workspace's `panic = "abort"` had turned a failed `print!` into a process abort. Exit codes are
+  meaningful under truncation.
+- **Driver: `--emit=exe` generates its link inputs in a pid-keyed scratch directory** that is removed
+  when the link finishes, instead of writing `{stem}_shim.rs` / `{stem}_rt.c` into the process's CWD —
+  which overwrote and then deleted a user file of the same name and raced between concurrent same-stem
+  links. The object still lands beside the source. The rustc-driven link also passes `-C panic=abort` to
+  match the workspace's release panic strategy, without which a release-built compiler's sibling rlib
+  rejects the shim.
+- **Driver: three `--grad`/`--train` defects fixed.** The default `--grad-wrt` has a *training* flavour
+  that excludes the loss-output parameter, so `--train --grad-of=<fn>` works with the documented
+  default instead of always failing; a repeated index (`--grad-wrt=0,0`) is rejected rather than
+  emitting a backward whose extra gradient buffer is never written; `--train-steps` no longer
+  pre-reserves its trajectory vector, so a huge value is not an allocator abort; and `--emit=grad`
+  propagates verification failure instead of printing an ICE and exiting 0.
+- **Test gates now pin documented contracts.** Object emission must be byte-identical across three
+  fresh `--emit=obj -O2` processes per program, and the `WUKONG_PAR_CODEGEN=0` serial path must be
+  byte-equal to the parallel one on the 24 largest programs (the ones with enough functions for the
+  parallel path to engage); diagnostic emission must be identical across three fresh
+  `--error-format=json` processes per compile-fail fixture; all three determinism tests count
+  comparisons and require corpus coverage so they cannot pass vacuously. The limit is stated: the
+  seeds only perturb std `HashMap`/`HashSet`, and the optimizer's `FxHash` maps have a fixed seed, so
+  these gates say nothing about insertion-order dependence there. The AOT-exe gate probes **once**
+  which of the driver's two link paths is available, fails on a genuine link failure with the captured
+  stderr, refuses to pass having linked zero fixtures, and uses a per-process scratch directory.
+- **The examples corpus carries declared classes.** `examples/*.wk` are automatically interp-vs-native
+  differential and opt-invariance fixtures — and an example that *fails to compile* satisfied both
+  agreement checks, because both backends failed identically. Each example now declares what running it
+  must produce: `Runs` (exit 0, non-empty stdout) is the default, so a new example must execute or be
+  declared; `NotLowered` (exit 1 + `C0001`) covers `matmul.wk`, `softmax.wk` and `vadd.wk`; `NoEntry`
+  covers `gpt2_config.wk`; and `DataGuarded` covers the three GPT-2 programs that take a data-absent
+  early return and are excluded from the agreement checks, with a printed reason, when the weight blob
+  *is* reachable. A separate gate re-derives the whole GPT-2 offset table from the exporter's own
+  tensor order, needing neither torch nor the blob. Five example headers were rewritten to the dispatch
+  the emitted MIR actually shows — `--emit=mir -O2` is the only authority, because recognized kernels
+  are gate-blind — and `examples/gpt2_forward_bench_small.wk` was added to carry the same dispatch
+  surface at tiny dims with no file I/O, so it is fit to be a differential fixture. The GPT-2 export
+  tool resolves its output directory from `$GPT2_DATA_DIR`, then `argv[1]`, then `<repo>/data/gpt2`
+  instead of hard-coding one machine's path, and the verifier makes the logits artifact's **age** part
+  of its verdict so a verify cannot re-assert a result for a run that never happened.
+- **Corpus shape and placement rule.** `tests/run` holds 332 `.wk` fixtures and `tests/fail` 110, plus
+  eleven inline lexer/parser probes — together covering all 29 catalogued codes. A program that must be
+  **rejected** belongs in `tests/fail`, because every `tests/run` program is required to reach
+  `--emit={mir-high,mir,llvm-ir}` successfully (two `sdpa`-decline fixtures moved for exactly that
+  reason). `tests/run/*.wk` supports a non-default `// RUN:` directive, and eleven element-type and
+  aliasing fixtures carry `// RUN: --run --backend=native` so their expected output pins the backend
+  that was wrong.
+- **GPU test knobs.** `WUKONG_GPU_REQUIRED=1` turns the GPU suite's `[skip]` lines into assertions and
+  `WUKONG_PEER_REQUIRED=1` does the same for every peer/toolchain skip — both no-ops by default, so a
+  genuinely CPU-only or peer-less box still passes. Skip lines now carry the driver's actual error, so
+  an exclusive-mode device or an empty `CUDA_VISIBLE_DEVICES` is not misreported as a machine with no
+  GPU, and the paged-attention module's device-free parts (PTX generators, int8 quantizer, f64
+  reference) run under a plain `cargo test`.
+- **Reverted: the pointer arm of `lower_bool_cond`.** `PtrToInt(p) != 0` is **not** a null test in the
+  interpreter, whose addresses are slot indices starting at `0`, so the first pointer taken in a
+  function reads as null (`if p` printed 0 under interp and 1 natively) — trading a loud error for a
+  silent interp/native divergence, the worse failure. A **pointer** condition (`if p`, `while p`,
+  `if p && …`, `assert(p)`) therefore still reaches `cond_br` unchanged and both backends reject it
+  with raw verifier text and no span. Do **not** document C-like truthiness for pointers: a correct
+  lowering needs a null test the two backends genuinely share — a dedicated `IsNull` op, or the
+  interpreter reserving address `0` as never-allocated. The same commit's coercion of integer operands
+  to the six activation-**backward** intrinsics was kept and is pinned by a fixture.
+- **Refuted, then raised: the interpreter's release call-depth cap.** Each limit is the largest value
+  that rejects **no** depth known to complete, so an earlier, lower pair was refuted for rejecting
+  depths that run fine — the pre-guard interpreter simply ran until the stack gave out, and a cap
+  chosen for "safety margin" is a regression over that band, not a precaution. The debug limit
+  additionally has to clear the depth the Cranelift differential gate exercises, or the *interpreter* —
+  the semantic oracle — refuses a depth native completes, reintroducing the very divergence that gate
+  exists to catch.
+
 ### Capability — GPT-2 124M end-to-end inference + typed file-I/O intrinsics (2026-07-13)
 - **File-I/O intrinsics — headerless raw little-endian typed blobs**: `read_<T>` / `write_<T>` for `T`
   in `{f32, f64, i32, i64, i8, u8}` read and write a flat file of that element type
   into / out of a `[]T` buffer, with no header. `read_<T>(path, buf)` returns
   `min(buf.len, file_bytes / sizeof T)` on success, `-1` if the file cannot be opened, and `-2` on a
-  mid-read I/O error (`0` when the buffer length is `≤ 0`); `write_<T>(path, buf)` creates/truncates the
+  mid-read I/O error (`0` when the buffer length is `≤ 0` **on an openable path** — the open is
+  attempted first, so a missing file is `-1` regardless of the buffer length; that ordering is part of
+  the frozen contract); `write_<T>(path, buf)` creates/truncates the
   file and returns the element count written (`-1` if the file cannot be created, `-2` on a write
   error). Both are differentially tested **interp == native** (round-trip, partial-read, and
   missing-file run tests), with compile-fail tests for path / buffer / arity misuse.
@@ -196,8 +607,11 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
 - **Types & semantics**: the shared type vocabulary (`wukong_types`), name resolution, type
   checking, and **compile-time shape checking** for tensors (rank/dimension unification, symbolic
   dims), with errors `E0501`/`E0502`.
-- **Middle-end**: block-parameter SSA MIR, a builder, a pretty-printer, and a verifier with a
-  `MirLevel` invariant; AST → MIR lowering (alloca-per-local).
+- **Middle-end**: block-parameter SSA MIR, a builder, a pretty-printer, and an SSA/dominance
+  verifier; AST → MIR lowering (alloca-per-local). There is **no** `MirLevel` invariant —
+  `MirLevel::High` is constructed nowhere, `Program::new` starts at `Low`, nothing reads
+  `Program::level`, and `--emit=mir-high` means *pre-optimization* MIR, not a different IR level. See
+  the 2026-07-29 entry for the verifier's actual rule list.
 - **Optimizer**: a fixpoint pass manager backed by CFG and dominator analyses (Cooper–Harvey–Kennedy
   immediate dominators + dominance frontiers), with whole-program leaf-function `inlining`, `mem2reg`
   (promote scalar slots to block-parameter SSA), `simplify` (constant folding + algebraic identities
@@ -229,7 +643,9 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   run ~2.6–2.8× faster than serial C. The general vectorizer emits 128-bit CLIF by default (Cranelift's
   x64 vector ISA still caps there — a 256-bit `f32x8` SSA value is rejected, per the
   `cranelift_still_rejects_f32x8` tripwire) and dispatches to a **raw 256-bit AVX2 machine-code path**
-  (VEX-encoded via `iced-x86`) for large trip counts (trip-gated; kill-switch `WUKONG_P4_NO_256`).
+  (VEX-encoded via `iced-x86`) for large trip counts (trip-gated; kill-switch `WUKONG_P4_NO_256`;
+  **x86-64 Windows hosts with AVX2 + FMA only** — the emitted body hardcodes the Win64 `rcx`/`rdx`/`r8`
+  argument mapping, and any other host gets a compile diagnostic rather than a fallback).
 - **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **35** functions —
   `exp`/`log`/`expm1`/`log1p`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
   `hardsigmoid`/`hardswish` plus **`softsign`** (bounded poly activation) and **`logsigmoid`** (the stable
@@ -316,7 +732,11 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   (an sret ABI) now lower too (see the language-surface additions below); **symbolic-generic tensor
   dimensions now execute too** (`fn f<M, N>(t: Tensor[f32, M, N])`, via hidden dim params — see below).
 - **Intrinsics**: `print`/`println` (captured stdout) and `assert` (traps on false).
-- **Runtime**: a bump `Arena` allocator and a deterministic `parallel_for`.
+- **Runtime**: a bump `Arena` allocator and a deterministic `parallel_for` — both *reference* surface
+  with no caller in the workspace (kernels use thread-local `Vec` scratch, and the native `@parallel`
+  lowering target is `wukong_parallel_for`). The runtime's real surface is the dispatched kernel family
+  (GEMM/GEMV, vmath, reductions, norms, …). `Arena::alloc` rejects a non-power-of-two alignment rather
+  than aliasing a live region.
 - **Diagnostics**: rustc-style renderer, a stable error-code catalog with `--explain <CODE>`, and
   `--error-format=json` (JSON Lines).
 - **Tooling & tests**: end-to-end run-suite with `// EXPECT-*` directives, an opt-level differential
@@ -330,11 +750,16 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
 - **Embedding-lookup dispatch**: the LLM token-id row gather `out[t,:] = weight[ids[t],:]` (over an
   `i32` index array — the first recognized dispatch with an integer *index input*) is recognized and
   lowered to `wukong_embedding_f32[_parallel]` (a 256-bit row copy; bit-exact data movement, mapped
-  across the independent output rows under `@parallel`).
+  across the independent output rows under `@parallel` — since 2026-07-29 the parallel kernel is
+  selected under a **run-time** byte-range non-overlap test on the two buffers, so an aliased call runs
+  the serial kernel, and a slice weight with no compile-time extent keeps it outright).
 - **2D pooling dispatch**: the idiomatic 5-deep max/avg-pool nest lowers to
   `wukong_{max,avg}pool2d_f32[_parallel]` (the CNN spatial downsampler; `@parallel` across channels;
   bit-exact — max is idempotent, the avg `(dy,dx)` sum order is fixed). Honest sharp edge: gcc
   auto-vectorizes regular-stride (e.g. 2×2/s2) pooling, so single-core is a tie there, not a win.
+  **Superseded (2026-07-29):** dispatch additionally requires all eight dims to be literal and the
+  nest's own `OH`/`OW` bounds to equal the full no-padding extent the kernel recomputes; a
+  partial-window / sub-region pool declines to the (correct, unaccelerated) scalar nest.
 - **xbench**: a broadcast bias-add (`out[r,c] = x[r,c] + bias[c]`) cross-language row, plus a
   **fused FFN** row (`C = silu(A·Bᵀ)` — the real Dense/SwiGLU layer, matmul + activation folded into
   one `wukong_sgemm_nt_epi` C-write; **~24–26× single-core, ~48–95× `@parallel`** vs C, where C pays
@@ -429,7 +854,10 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   - **Deep recursion** in the interpreter no longer aborts the process: `run_with_output` runs on a
     scoped 512 MiB-stack worker thread, so a deeply recursive program returns instead of overflowing the
     ~8 MiB main stack (which had taken the whole differential gate down). Gated by
-    `deep_recursion_does_not_overflow_oracle`.
+    `deep_recursion_does_not_overflow_oracle`. **Superseded (2026-07-29):** all *five* public entry
+    points run on that worker (four previously skipped it), and *unbounded* recursion is now a
+    diagnostic — `interpreter call-depth limit exceeded (likely unbounded recursion)`, exit 1 — rather
+    than an eventual overflow of the 512 MiB reservation.
   - **int → f32 casts above 2⁵³** round in one step in the interpreter oracle — it had double-rounded
     `int → f64 → f32`, disagreeing with native's single `fcvt_from_*` by a full ULP. Gated by
     `differential_int_to_f32_rounding`.
