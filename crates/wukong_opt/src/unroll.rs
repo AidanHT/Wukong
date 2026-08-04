@@ -80,6 +80,38 @@
 //! refuses any function with more than one basic block and differentiates calls by callee *symbol*,
 //! never by re-entering a callee's body — so a function it accepts has no loop for this pass to
 //! touch, and a function this pass touches was already rejected.
+//!
+//! # What it buys, measured
+//!
+//! Release binary, `--backend=native -O2`, n = 2^20, best-of-8 interleaved `WUKONG_NO_UNROLL=1`
+//! versus on, four hand-written kernels that dispatch no recognizer (confirmed with
+//! `--emit=mir -O2 | grep wukong_`: only `now_ns`/`rt_alloc`/`rt_free`):
+//!
+//! | kernel (per iteration)                | unrolled | ratio |
+//! |---------------------------------------|----------|-------|
+//! | `s += (a[i]-b[i])*(a[i]-b[i])*c` f32   | 4x       | 0.937 |
+//! | `s += (a[i]-b[i])*(a[i]-b[i])`   i32   | 4x       | 0.750 |
+//! | `o[i] = (a[i]-b[i])^2*c`         f32   | 4x       | 1.008 |
+//! | `if a[i] > t { k += 1 }`         i64   | no (3 blocks in the body) | 1.038 |
+//!
+//! The last row is the control: that loop has an `if` in it, so it is not the two-block shape and
+//! neither arm unrolls it — its 3.8% spread is the noise floor of this instrument, and no smaller
+//! difference in the table is meaningful. So: **integer reduction 25% faster, float reduction ~6%,
+//! store-bound elementwise unchanged**. That ordering is what a non-reassociating unroller should
+//! produce. The float reduction's critical path is the 4-cycle `addss` chain, which this pass does
+//! not and must not shorten; the elementwise loop is already at the one-store-per-cycle port limit.
+//!
+//! Two variants were tried against this configuration and **refuted**, both by the same interleaved
+//! two-binary A/B at n = 8:
+//!
+//!  * **Flattening the induction variable** — emitting `iv + j*step` off the header parameter for
+//!    each copy instead of letting copy `j` inherit copy `j-1`'s `iv + step`, so the copies' address
+//!    arithmetic does not serialize. Exact (wrapping integer addition is associative). Measured
+//!    0.993–1.039 across the four kernels, i.e. entirely inside the 3.8% control band, while costing
+//!    two extra instructions per copy. Not kept.
+//!  * **Factor 8 for bodies under 12 instructions.** Measured 0.962/1.067/0.987/0.986; the one
+//!    kernel that unrolling actually helps (the integer reduction) got *worse*, and code size
+//!    doubles. Not kept.
 
 use std::sync::OnceLock;
 
