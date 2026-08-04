@@ -12,6 +12,12 @@ wukong_span = { workspace = true }
 wukong_backend = { workspace = true }
 wukong_runtime = { workspace = true }
 
+# For `wukong_opt::alias`, the MIR provenance analysis. This backend is the consumer that turns a
+# no-alias proof into something the machine sees: a Cranelift `AliasRegion` on the load/store, which
+# is the only channel Cranelift 0.124 offers for "these two accesses are disjoint". Layering is
+# respected — `wukong_opt` sits below every backend and does not depend on any of them.
+wukong_opt = { workspace = true }
+
 cranelift-codegen = "0.124"
 cranelift-frontend = "0.124"
 cranelift-module = "0.124"
@@ -34,5 +40,4 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "cod
 wukong_parser = { workspace = true }
 wukong_sema = { workspace = true }
 wukong_mir_build = { workspace = true }
-wukong_opt = { workspace = true }
 wukong_interp = { workspace = true }
