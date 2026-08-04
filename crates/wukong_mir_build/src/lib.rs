@@ -7332,11 +7332,11 @@ impl FnLowerer<'_> {
                 // (Compound assignment on an aggregate is not a valid program, so only `=`.) The
                 // aggregate check is a pure type query (`expr_mir` emits no MIR), so the common
                 // scalar path below keeps its original RHS-then-place evaluation order untouched.
-                if matches!(op, ast::AssignOp::Assign)
-                    && matches!(self.expr_mir(target), MirType::Array(..))
+                if let Some(dst_ty) = matches!(op, ast::AssignOp::Assign)
+                    .then(|| self.whole_buffer_assign_ty(target))
+                    .flatten()
                 {
                     let (ptr, _) = self.lower_place(target);
-                    let dst_ty = self.expr_ty(target);
                     // A struct/tuple/array *literal* whose field initializers may read the
                     // destination (e.g. the swap `p = Pt { x: p.y, y: p.x }`) must be materialized
                     // into a fresh temporary and THEN deep-copied in. `init_field` builds a literal
@@ -13571,6 +13571,39 @@ impl FnLowerer<'_> {
     }
 
     /// The element MIR type of an array-valued base expression, via sema.
+    /// The buffer type a whole-aggregate assignment `target = value` must deep-copy through, or
+    /// `None` when `target` is an ordinary scalar place. A `MirType::Array` destination is a flat
+    /// byte buffer: a plain `Op::Store` there writes the RHS buffer's *base pointer* into the
+    /// destination's first slot instead of its contents.
+    ///
+    /// A statically-shaped contiguous tensor bound as its buffer needs the same treatment and did
+    /// not get it: its `expr_mir` is still `Ptr` (only the *binding* became `Array`), so `t = other`
+    /// took the scalar path and stored `other`'s base pointer over the first element of `t`'s data.
+    /// It reports the tensor as the `[T; d0·…·dn]` it is, so the copy is the same leaf-by-leaf
+    /// `emit_copy` an array destination gets — the `[f32; N]` spelling's semantics, exactly.
+    ///
+    /// The binding check is required, not defensive: only an `Array`-bound name has `lower_place`
+    /// yield the buffer's base pointer. A `Ptr`-bound tensor (a symbolic shape, or a tensor local)
+    /// yields its stack *slot*, which the old pointer-store path is correct for and a deep copy
+    /// would corrupt — so those keep the pre-existing behaviour untouched.
+    fn whole_buffer_assign_ty(&self, target: &Expr) -> Option<Ty> {
+        let ty = self.expr_ty(target);
+        if matches!(self.mir_ty_of(&ty), MirType::Array(..)) {
+            return Some(ty);
+        }
+        let (_, n) = tensor_buffer_mir(&ty)?;
+        let Ty::Tensor { elem, .. } = ty else {
+            return None;
+        };
+        match self.lookup(single_path(target)?) {
+            Some((_, MirType::Array(..))) => Some(Ty::Array {
+                elem: Box::new(Ty::Scalar(elem)),
+                len: n as u64,
+            }),
+            _ => None,
+        }
+    }
+
     fn array_elem(&self, base: &Expr) -> Option<MirType> {
         match self.expr_ty(base) {
             Ty::Array { elem, .. } => Some(mir_ty(&elem)),
