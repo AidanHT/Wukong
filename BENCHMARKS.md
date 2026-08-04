@@ -1292,6 +1292,19 @@ with the f64 reference at 4.2e-6 (loss gradient, identical to every peer) and 1.
 GFLOP/s the harness prints is round-local — this laptop's clock swings ~3× with power and thermal
 state — and is deliberately not reproduced here.*
 
+**Read the `C(fast)` column, not the `C` column, when Wukong is winning here.** Neither the C nor the
+Rust peer can vectorize an f32 dot product under honest flags — reassociation is not allowed — while
+Wukong's dispatched `wukong_sgemm*` kernels reassociate freely, so a `-O3 -march=native` C column
+flatters every dispatching variant. A competent C programmer who wanted the vectorization *without*
+`-ffast-math` would hand-unroll the reduction into several independent accumulators, which is a
+specific valid association gcc can lower to SIMD lanes; that peer would land between the two columns
+reported here, and `C(fast)` (13.4 ms) bounds it. Against that bar, (a) is 2.5–3.2× ahead and (e) is
+1.1–1.3× ahead, not 15–19× and 7×. Two further asymmetries are structural rather than fixable here:
+variant (a) is effectively calling Wukong's own tuned GEMM library while the peers are compiler-only
+(the library-vs-library question is answered by the matmul and `nn.Linear` rows above, which compare
+`wukong_sgemm` to oneMKL and `matrixmultiply`), and rustc has no `-ffast-math` on stable, so the Rust
+column pairs with `C`, never with `C(fast)`.
+
 ## GPU backend (NVIDIA RTX 4050 Laptop, `sm_89`)
 
 Wukong has a **GPU backend** (`wukong_codegen_gpu`, behind `--features gpu`). Being a compiler, it
