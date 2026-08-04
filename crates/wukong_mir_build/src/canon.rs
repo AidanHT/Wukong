@@ -65,6 +65,27 @@ const MAX_ROUNDS: usize = 8;
 /// function admits a rewrite, so the output stays byte-identical for the programs this cannot help.
 pub(crate) fn canonicalize_module(module: &Module, sema: &SemaResult) -> Option<Module> {
     let consts = int_literal_consts(sema);
+    // Read-only feasibility first. Every legality test below is a pure analysis, so it can be run on
+    // the borrowed module; only the rewrite needs an owned one. A compile this pass cannot help must
+    // not pay for a deep copy of the AST — compile speed is one of this compiler's few genuine
+    // strengths. A later fixpoint round can only find work because an earlier one rewrote something,
+    // so "round 1 finds nothing" is a sound answer for the whole fixpoint.
+    if !module.items.iter().any(|item| {
+        let ItemKind::Fn(f) = &item.kind else {
+            return false;
+        };
+        let Some(body) = f.body.as_ref() else {
+            return false;
+        };
+        if block_has_defer(body) {
+            return false;
+        }
+        let params: Vec<Symbol> = f.params.iter().map(|p| p.name.sym).collect();
+        !consts_to_fold(body, &params, &consts, sema).is_empty() || block_admits_any(body, sema)
+    }) {
+        return None;
+    }
+
     let mut out = module.clone();
     let mut changed = false;
     for item in &mut out.items {
@@ -146,15 +167,16 @@ fn is_int_literal(e: &Expr) -> bool {
     }
 }
 
-/// Inline every foldable const into one function body. Returns whether anything was rewritten.
-fn fold_consts(
-    body: &mut Block,
+/// Which of `consts` this function body actually uses and may have folded in. Read-only, so it also
+/// answers the feasibility question before anything is cloned.
+fn consts_to_fold<'a>(
+    body: &Block,
     params: &[Symbol],
-    consts: &[(Symbol, &Expr)],
+    consts: &'a [(Symbol, &'a Expr)],
     sema: &SemaResult,
-) -> bool {
+) -> Vec<(Symbol, &'a Expr)> {
     if consts.is_empty() {
-        return false;
+        return Vec::new();
     }
     // `lower_expr` resolves a single-segment `Path` in the LOCALS first and only falls through to
     // `sema.consts`, so a function that declares — or takes as a parameter — a name equal to a
@@ -165,31 +187,151 @@ fn fold_consts(
     }
     scan_block(body, &mut decls);
 
-    let mut changed = false;
-    for (name, init) in consts {
-        if decls.declared.contains(name) {
-            continue;
-        }
-        let Some(ty) = sema.types.get(&init.id) else {
-            continue;
-        };
-        let mut uses = UseScan {
-            name: *name,
-            init_ty: ty,
-            sema,
-            require_index: false,
-            count: 0,
-            ok: true,
-        };
-        uses.block(body, false);
-        // `ok` can only be false here if some use site is typed differently from the initializer,
-        // which sema should never produce for a const — treat it as a decline rather than assume.
-        if uses.ok && uses.count > 0 {
-            subst_block(body, *name, init);
-            changed = true;
+    consts
+        .iter()
+        .filter(|(name, init)| {
+            if decls.declared.contains(name) {
+                return false;
+            }
+            let Some(ty) = sema.types.get(&init.id) else {
+                return false;
+            };
+            let mut uses = UseScan {
+                name: *name,
+                init_ty: ty,
+                sema,
+                require_index: false,
+                count: 0,
+                ok: true,
+            };
+            uses.block(body, false);
+            // `ok` can only be false if a use site is typed differently from the initializer, which
+            // sema should never produce for a const — treat it as a decline rather than assume.
+            uses.ok && uses.count > 0
+        })
+        .copied()
+        .collect()
+}
+
+/// Inline every foldable const into one function body. Returns whether anything was rewritten.
+fn fold_consts(
+    body: &mut Block,
+    params: &[Symbol],
+    consts: &[(Symbol, &Expr)],
+    sema: &SemaResult,
+) -> bool {
+    let chosen = consts_to_fold(body, params, consts, sema);
+    for (name, init) in &chosen {
+        subst_block(body, *name, init);
+    }
+    !chosen.is_empty()
+}
+
+/// Read-only twin of [`canon_block`]: would any `let` in this block, or in a block nested inside it,
+/// be forward-substituted? Used to decide whether the module is worth cloning at all.
+fn block_admits_any(b: &Block, sema: &SemaResult) -> bool {
+    for (i, s) in b.stmts.iter().enumerate() {
+        if let StmtKind::Let {
+            pat:
+                Pattern {
+                    kind: PatKind::Ident(x),
+                    ..
+                },
+            init: Some(e),
+            ..
+        } = &s.kind
+        {
+            if s.attrs.is_empty() && region_admits(&b.stmts[i + 1..], b.tail.as_deref(), *x, e, sema)
+            {
+                return true;
+            }
         }
     }
-    changed
+    b.stmts.iter().any(|s| stmt_admits_any(s, sema))
+        || b.tail.as_deref().is_some_and(|t| expr_admits_any(t, sema))
+}
+
+fn stmt_admits_any(s: &Stmt, sema: &SemaResult) -> bool {
+    match &s.kind {
+        StmtKind::Let { init, .. } => init.as_ref().is_some_and(|e| expr_admits_any(e, sema)),
+        StmtKind::Assign { target, value, .. } => {
+            expr_admits_any(target, sema) || expr_admits_any(value, sema)
+        }
+        StmtKind::Expr(e) | StmtKind::Defer(e) => expr_admits_any(e, sema),
+        StmtKind::Return(e) | StmtKind::Break(_, e) => {
+            e.as_ref().is_some_and(|e| expr_admits_any(e, sema))
+        }
+        StmtKind::Continue(_) => false,
+        StmtKind::While { cond, body, .. } => {
+            expr_admits_any(cond, sema) || block_admits_any(body, sema)
+        }
+        StmtKind::For { iter, body, .. } => {
+            let it = match iter {
+                ForIter::Range {
+                    start, end, step, ..
+                } => {
+                    expr_admits_any(start, sema)
+                        || end.as_ref().is_some_and(|e| expr_admits_any(e, sema))
+                        || step.as_ref().is_some_and(|e| expr_admits_any(e, sema))
+                }
+                ForIter::Expr(e) => expr_admits_any(e, sema),
+            };
+            it || block_admits_any(body, sema)
+        }
+    }
+}
+
+fn expr_admits_any(e: &Expr, sema: &SemaResult) -> bool {
+    match &e.kind {
+        ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => block_admits_any(b, sema),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_admits_any(cond, sema)
+                || block_admits_any(then_branch, sema)
+                || else_branch.as_ref().is_some_and(|x| expr_admits_any(x, sema))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            expr_admits_any(scrutinee, sema)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().is_some_and(|g| expr_admits_any(g, sema))
+                        || expr_admits_any(&a.body, sema)
+                })
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Field { base: expr, .. }
+        | ExprKind::TupleField { base: expr, .. } => expr_admits_any(expr, sema),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            expr_admits_any(lhs, sema) || expr_admits_any(rhs, sema)
+        }
+        ExprKind::Call { callee, args, .. } => {
+            expr_admits_any(callee, sema) || args.iter().any(|a| expr_admits_any(a, sema))
+        }
+        ExprKind::Index { base, indices } => {
+            expr_admits_any(base, sema) || indices.iter().any(|i| expr_admits_any(i, sema))
+        }
+        ExprKind::StructLit { fields, rest, .. } => {
+            fields.iter().any(|f| expr_admits_any(&f.value, sema))
+                || rest.as_ref().is_some_and(|r| expr_admits_any(r, sema))
+        }
+        ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
+            xs.iter().any(|x| expr_admits_any(x, sema))
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            expr_admits_any(value, sema) || expr_admits_any(count, sema)
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => false,
+    }
 }
 
 /// Rewrite one block: first every `let` it declares itself (each against the remainder of *this*
@@ -370,6 +512,12 @@ fn region_admits(
     if !matches!(init_ty, Ty::Scalar(s) if s.is_int()) {
         return false;
     }
+    // Reject on the initializer's SHAPE before scanning anything. Everything below this line is
+    // linear in the size of the region, and the overwhelming majority of `let`s in real code
+    // (`let n = a.len()`, `let t = f(x)`, `let q = a / b`) die here for free.
+    if !pure_shape(init, sema) {
+        return false;
+    }
     let mut facts = RegionFacts::default();
     for s in stmts {
         scan_stmt(s, &mut facts);
@@ -400,14 +548,36 @@ fn region_admits(
     uses.ok && uses.count > 0
 }
 
-/// Is `e` an expression that may be duplicated and re-evaluated at any later point in this region
-/// without changing what the program computes?
+/// The region-independent half of the purity test: is `e` built only from integer literals, integer
+/// variables and `+ - *`?
 ///
-/// Deliberately tiny: integer literals, integer variables the region cannot disturb, and `+ - *`
-/// (which wrap identically however many times they are evaluated). `/` and `%` are excluded because
-/// they can trap, and re-siting a trap under a branch that may not be taken *removes* a fault the
-/// original program had. Calls, indexing and field access are excluded because their value depends
-/// on memory a later statement may have written.
+/// Deliberately tiny. `+ - *` wrap identically however many times they are evaluated; `/` and `%`
+/// are excluded because they can trap, and re-siting a trap under a branch that may not be taken
+/// *removes* a fault the original program had. Calls, indexing and field access are excluded
+/// because their value depends on memory a later statement may have written. This is a cheap,
+/// purely local check, so `region_admits` runs it before any scan of the region.
+fn pure_shape(e: &Expr, sema: &SemaResult) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) => true,
+        ExprKind::Path(p) => {
+            p.is_single() && matches!(sema.types.get(&e.id), Some(Ty::Scalar(s)) if s.is_int())
+        }
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => pure_shape(expr, sema),
+        ExprKind::Binary { op, lhs, rhs } => {
+            use wukong_ast::BinOp::{Add, Mul, Sub};
+            matches!(op, Add | Sub | Mul) && pure_shape(lhs, sema) && pure_shape(rhs, sema)
+        }
+        _ => false,
+    }
+}
+
+/// The region-dependent half: on top of [`pure_shape`], every free variable must be one the region
+/// cannot disturb — not re-declared (a homonym would be a different binding at the use site), not
+/// assigned and not `&`-taken — so the expression evaluates to the same value at a use as it did at
+/// the `let`.
 fn pure_index_expr(e: &Expr, facts: &RegionFacts, sema: &SemaResult) -> bool {
     match &e.kind {
         ExprKind::Int(_) => true,
