@@ -33,7 +33,7 @@ or `.wk` source changed; only the benchmark peers and the documents that quote t
   ~2.7–4.1× becomes a 1.5–2.5× loss.
 - **`matmul_tn` peer given the natural `kij` order.** It was `ijk` with **both** operands read
   column-strided. Isolated 512³: **176.6 → 9.70 ms (18.2× total: 8.7× `restrict` × 2.1× loop
-  order)**. The weight-gradient GEMM's ~128× single / ~445× parallel becomes **2.6–5.3× /
+  order)**. The weight-gradient GEMM's ~128× single / ~445× parallel becomes **2.6–9.2× /
   3.1–13.9×**.
 - **Transpose peer cache-blocked 32×32**, matching Wukong's own kernel. Isolated 2048²: **29.51 →
   14.09 ms (2.09×)**. Single-core transpose becomes a **tie**.
