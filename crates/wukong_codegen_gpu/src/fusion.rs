@@ -161,7 +161,8 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
             Vec::new()
         }
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) => vec![*a, *b],
-        Op::Neg(a) | Op::Not(a) | Op::Sqrt(a) | Op::Splat(a) | Op::Round(_, a) => vec![*a],
+        Op::Neg(a) | Op::Not(a) | Op::Sqrt(a) | Op::Splat(a) | Op::Round(_, a)
+        | Op::ExtractLane(a, _) => vec![*a],
         Op::Cast(_, a, _) => vec![*a],
         Op::Select(c, a, b) => vec![*c, *a, *b],
         Op::Fma(a, b, c) => vec![*a, *b, *c],
