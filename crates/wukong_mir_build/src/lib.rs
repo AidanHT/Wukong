@@ -1624,7 +1624,16 @@ fn lower_fn(
         .map(|abi| fl.builder.add_param(abi.clone()))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
-        let mty = fl.mir_ty_of(pty);
+        // A statically-shaped contiguous tensor param binds as the buffer it *is* — `[T; d0·…·dn]` —
+        // not as an opaque `Ptr`. Both spellings arrive as the same base pointer (`param_abi` maps
+        // `Array(..)` back to `Ptr`, so the ABI is byte-identical), but only the `Array` form takes
+        // the "the value *is* the storage" branch below. As a `Ptr` the base pointer was copied into
+        // an `alloca` and reloaded on **every** element access, which is why `Tensor[f32, M, N]` code
+        // carried 3 extra loads per element over the `[f32; M*N]` spelling of the same buffer.
+        let mty = match tensor_buffer_mir(pty) {
+            Some((elem, n)) => MirType::Array(Box::new(elem), n),
+            None => fl.mir_ty_of(pty),
+        };
         let is_slice = matches!(pty, Ty::Slice(_));
         if matches!(mty, MirType::Array(..)) {
             // The parameter value *is* the aggregate's base pointer; bind it directly so field/index
@@ -19126,6 +19135,44 @@ impl FnLowerer<'_> {
 }
 
 // ---- free helpers ----
+
+/// The **static facts** a `Tensor[T, d0, …, dn]` carries into MIR, when it carries any: a contiguous
+/// (row-major) layout whose every extent is a compile-time `Const`. Returns `(element MIR type,
+/// element count)` — the exact pair `[T; d0·…·dn]` would give, because at run time the two are the
+/// *same object*: a base pointer to `d0·…·dn` contiguous `T`s.
+///
+/// This is the whole point of the shape-typed surface. `mir_ty` collapses every tensor to a bare
+/// `MirType::Ptr`, throwing rank, extents and element type away at the AST→MIR boundary — and a
+/// `Ptr` is not "the storage", so a tensor *parameter* was spilled to a stack slot and reloaded on
+/// every single use, while the `[f32; N]` spelling of the identical buffer was bound directly.
+/// Declines (→ `None`, caller keeps the `Ptr` behaviour) for a non-tensor, a non-contiguous layout,
+/// a rank-0 tensor, a symbolic (`Var`) or runtime (`Dynamic`) extent, an aggregate element, or a
+/// count that overflows the `u32` an `MirType::Array` extent is stored in.
+fn tensor_buffer_mir(ty: &Ty) -> Option<(MirType, u32)> {
+    let Ty::Tensor {
+        elem,
+        shape,
+        layout,
+    } = ty
+    else {
+        return None;
+    };
+    if !matches!(layout, wukong_types::Layout::Contiguous) || shape.0.is_empty() {
+        return None;
+    }
+    let mut count: u64 = 1;
+    for d in &shape.0 {
+        let wukong_types::Dim::Const(n) = d else {
+            return None; // a symbolic/runtime extent — the buffer's size is not a compile-time fact
+        };
+        count = count.checked_mul(*n)?;
+    }
+    let n = u32::try_from(count).ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some((MirType::from_scalar(*elem), n))
+}
 
 /// The MIR type a parameter is passed as at the call boundary. Arrays decay to a base pointer.
 fn param_abi_ty(ty: &Ty) -> MirType {
