@@ -130,7 +130,8 @@ Where Wukong is built to win for the ML/DL niche:
   **reductions** to SIMD, contracts `x + y*z` to a **fused multiply-add**, **fuses** adjacent
   elementwise loops, and **auto-parallelizes** `@parallel` loops across cores — things a
   general-purpose C compiler won't do to naively-written source. Underneath, an SSA optimizer
-  (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM) removes ~42% of IR ops on the benchmark kernels
+  (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM, loop unrolling) removes ~42% of IR ops on the
+  benchmark kernels
   (~48–54% on the heavy transformer/GEMM kernels). Op-graph fusion across tensor ops is still planned
   **as a CPU MIR pass**; on the GPU it exists today — `wukong_codegen_gpu`'s fusion planner classifies
   the recognized op graph and `--backend=gpu-native` compiles an eligible whole program into a single
@@ -233,7 +234,7 @@ Wukong IR (MIR)         one block-parameter SSA IR; mir_build emits it scalar-an
    │                    there is no second level (`--emit=mir-high` means MIR *before* the
    │                    optimizer, not a different IR level)
    │  optimization passes (mem2reg → SSA, const-fold, CSE, DSE, DCE, LICM, simplify-cfg;
-   │                       inlining; op-graph fusion across tensor ops is planned on the CPU path;
+   │                       inlining; partial loop unrolling (-O2, never reassociating); op-graph fusion across tensor ops is planned on the CPU path;
    │                       the GPU backend has it — see below)
    ▼
 MIR
