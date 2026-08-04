@@ -511,6 +511,14 @@ buffer with a scalar load instead of through another recognized kernel, that ker
 never seeded. Both `--emit=grad` and `--train` force `-O1` or higher, since the transform needs
 single-block SSA (mem2reg + simplify-cfg).
 
+A loss whose buffers are **raw `*T` / `*mut T` parameters** now differentiates. It previously could
+not: the front end gives a pointer parameter an `alloca ptr` + `store`, so its base reached autodiff
+as `load ptr <slot>` and `Vjp::canon` refused to route through a load whose result is a pointer
+(*"cannot route gradient for load pointer … (not a parameter or a one-level gep of a parameter)"*).
+`mem2reg` now promotes that slot, so the base pointer *is* the parameter value and every access is a
+one-level gep off a parameter (`raw_pointer_parameter_grad`, finite-difference-gated). `--train` still
+declines on such a loss — a raw pointer carries no extent, so the trainer cannot size its buffers.
+
 ## Checked but not yet executed
 
 - **Explicit SIMD vector types** `f32x8` etc. in *source*: parse and type-check; user-written vector

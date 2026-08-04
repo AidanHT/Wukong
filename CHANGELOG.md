@@ -32,10 +32,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Hardening**: `mem2reg` now also refuses a slot whose `load`/`store` type disagrees with the slot's
   own — a type-punned access whose promoted value would carry the wrong MIR type. Verified to change
   no emitted MIR on its own (332/332 corpus programs byte-identical).
-- New gate: `tests/run/ptr_slot_promotion.wk` (every lane printed, values derived from the scalar
-  semantics of each loop) plus four `wukong_opt` unit tests covering promotion, the inlined-callee
-  case, the late-initialization exclusion, and the aliasing case where the pointer is promoted to a
-  block parameter merging two addresses whose pointees must stay in memory.
+- **`--emit=grad` now works on a loss whose buffers are raw `*T` / `*mut T` parameters.** It used to
+  refuse outright — the parameter's base pointer reached autodiff as `load ptr <slot>` and
+  `Vjp::canon` will not route a gradient through a load whose result is a pointer (*"cannot route
+  gradient for load pointer … (not a parameter or a one-level gep of a parameter)"*). With the slot
+  promoted the base pointer *is* the parameter value, so every access is a one-level gep off a
+  parameter. `--train` still declines on such a loss: a raw pointer carries no extent, so the trainer
+  cannot size its buffers.
+- New gates: `tests/run/ptr_slot_promotion.wk` (every lane printed, values derived from the scalar
+  semantics of each loop), four `wukong_opt` unit tests covering promotion, the inlined-callee case,
+  the late-initialization exclusion, and the aliasing case where the pointer is promoted to a block
+  parameter merging two addresses whose pointees must stay in memory, and a finite-difference-gated
+  `raw_pointer_parameter_grad` in `wukong_driver`.
 - **Not measured**: no wall-clock number is claimed. An A/A control (identical binary, interleaved,
   core-pinned, best-of-10) showed ±3.6–8% spread, and the same binary on the same program varied
   2.3× across adjacent rounds while ~20 other processes were building on the box. The instruction and
