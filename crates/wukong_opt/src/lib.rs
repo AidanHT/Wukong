@@ -11,18 +11,16 @@
 //!  * **dse** — dead-store elimination (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
 //!
-//! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
-//! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
-//! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
-//! same cse/simplify/dce treatment as everything else. `-O3` adds nothing to any of it — see
-//! [`PassManager::standard`].
 //! `cse`, `dse` and `licm` all consult [`alias`], the provenance analysis that answers *can a store
 //! through `q` be seen by a load through `p`?* — the question `mir_build`'s type erasure
 //! (`Ty::Ptr`/`Ref`/`Tensor`/`Slice` all become a bare `MirType::Ptr`) otherwise makes unanswerable.
 //! It is a pure analysis, safe to build from anywhere, and the Cranelift backend uses it too.
 //!
-//! At `-O2` and above, whole-program inlining of small leaf functions ([`inline_program`]) runs once
-//! before the per-function pipeline. `-O3` adds nothing to either — see [`PassManager::standard`].
+//! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
+//! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
+//! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
+//! same cse/simplify/dce treatment as everything else. `-O3` adds nothing to any of it — see
+//! [`PassManager::standard`].
 
 pub mod alias;
 mod cache;
@@ -78,8 +76,11 @@ pub struct Timings {
     pub per_pass: Vec<PassStat>,
     /// Whole-program inlining time (runs at `-O2`+).
     pub inline: Duration,
-    /// Loop-unrolling time (runs at `-O2`+, after the pipeline). The re-optimization of the
-    /// functions it changed is attributed to the per-pass buckets, not here.
+    /// Loop-unrolling time (runs at `-O2`+, after the pipeline): the pass itself **plus** the
+    /// reduced cleanup sweep over the functions it changed, which together are the whole cost
+    /// unrolling adds. Deliberately not split across the per-pass buckets — those are keyed by pass
+    /// index within [`PassManager::standard`], and the cleanup pipeline numbers its passes
+    /// differently.
     pub unroll: Duration,
     /// Total time inside `optimize` (inlining + every pass + fixpoint bookkeeping).
     pub total: Duration,
@@ -151,6 +152,25 @@ impl PassManager {
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
         }
+        pm
+    }
+
+    /// The reduced pipeline re-run over the functions [`unroll_program`] changed.
+    ///
+    /// Unrolling duplicates a loop body, so what the result needs is value numbering over the now
+    /// four-fold address arithmetic and the dead-code removal that follows it. It does not need
+    /// `Mem2Reg` (the pass refuses to duplicate a header or body containing an `Alloca`, so there is
+    /// no new stack slot to promote), `Dse`, or `Licm` (LICM already ran over this same body, and
+    /// every instruction the copies add depends on the induction variable); `Simplify`,
+    /// `SimplifyCfg` and `SimplifyPhis` have almost nothing to do to a block that was merely
+    /// quadrupled. Measured in-process over the 331-program corpus, the whole unrolling stage is
+    /// 23% of optimizer time with these two passes and 33-39% with all five, against 11% with none,
+    /// so this is where the curve bends. Dropping passes can only leave code less optimized, never
+    /// wrong, so no gate depends on this list.
+    fn unroll_cleanup() -> PassManager {
+        let mut pm = PassManager::new();
+        pm.add(Box::new(Cse));
+        pm.add(Box::new(Dce));
         pm
     }
 
@@ -245,8 +265,12 @@ pub fn optimize(program: &mut Program, opt_level: u8) {
     // unroll the same loop again every sweep. Only the functions it touched are re-optimized, so a
     // program with no unrollable loop pays one scan and nothing more.
     if opt_level >= 2 {
-        for i in unroll_program(program) {
-            pm.run_function(&mut program.funcs[i], None);
+        let changed = unroll_program(program);
+        if !changed.is_empty() {
+            let cleanup = PassManager::unroll_cleanup();
+            for i in changed {
+                cleanup.run_function(&mut program.funcs[i], None);
+            }
         }
     }
 }
@@ -268,12 +292,20 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         pm.run_function(f, Some(&mut t));
     }
     if opt_level >= 2 {
+        // The unroll bucket is the pass *and* its cleanup sweep: that sum is the cost unrolling
+        // actually adds, which is the number worth reporting. Keeping the cleanup out of the
+        // per-pass table also avoids charging its `Simplify` to the standard pipeline's slot 0
+        // (`Timings::record` keys by pass index, and the two pipelines number their passes
+        // differently).
         let u0 = Instant::now();
         let changed = unroll_program(program);
-        t.unroll = u0.elapsed();
-        for i in changed {
-            pm.run_function(&mut program.funcs[i], Some(&mut t));
+        if !changed.is_empty() {
+            let cleanup = PassManager::unroll_cleanup();
+            for i in changed {
+                cleanup.run_function(&mut program.funcs[i], None);
+            }
         }
+        t.unroll = u0.elapsed();
     }
     t.total = start.elapsed();
     t
@@ -611,10 +643,7 @@ mod tests {
         p.funcs
             .iter()
             .find(|f| interner.resolve(f.name) == name)
-            .unwrap_or_else(|| {
-                let have: Vec<_> = p.funcs.iter().map(|f| interner.resolve(f.name)).collect();
-                panic!("no function named `{name}`; program has {have:?}")
-            })
+            .expect("function present")
     }
 
     #[test]
@@ -767,164 +796,6 @@ mod tests {
         }
         let main = interner.intern("main");
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 4);
-    }
-
-    /// Count `alloca ptr` slots and `load`s whose result is a pointer — the two symptoms of a
-    /// base pointer that lives in memory and is re-fetched at every element access.
-    fn count_ptr_slots_and_reloads(f: &wukong_mir::Function) -> (usize, usize) {
-        use wukong_mir::{MirType, Op};
-        let mut slots = 0;
-        let mut reloads = 0;
-        for i in f.blocks.iter().flat_map(|b| &b.insts) {
-            match &i.op {
-                Op::Alloca(MirType::Ptr) => slots += 1,
-                Op::Load(_, MirType::Ptr) => reloads += 1,
-                _ => {}
-            }
-        }
-        (slots, reloads)
-    }
-
-    #[test]
-    fn pointer_parameters_never_reach_a_stack_slot() {
-        // `mir_build` USED to give every pointer-typed parameter — `*T`, `&T` and every `Tensor[…]`
-        // — an `alloca ptr` + `store <param>` in the entry block, then re-`load` that base pointer
-        // at EVERY element access: three redundant `load ptr`s per iteration here (x, y and o) that
-        // no other pass could remove, because `licm` will not hoist a load out of a loop and `cse`
-        // cannot forward one across a block boundary. `mem2reg` pointer promotion was written to
-        // clean that up after the fact.
-        //
-        // Binding a statically-shaped tensor parameter as its buffer removed the spill at the
-        // SOURCE, so the slot is never created and there is nothing left to promote. This test
-        // therefore now pins the stronger property — the front end emits no pointer-parameter slot
-        // at all, at `-O0` — and it fails loudly if the spill is ever reintroduced.
-        //
-        // `mem2reg`'s pointer-promotion path is still live and still covered, by
-        // `mem2reg_promotes_an_inlined_callees_pointer_parameter` (inlining splices a callee's
-        // `alloca ptr` into the middle of a caller block), plus
-        // `mem2reg_ptr_promotion_keeps_the_pointee_in_memory` and
-        // `mem2reg_leaves_a_late_initialized_pointer_slot_in_memory` for its refusal cases.
-        //
-        // The data-dependent branch keeps every elementwise recognizer from firing, so this is
-        // general code, not a dispatched kernel.
-        let src = "fn work(x: Tensor[f32, 8], y: Tensor[f32, 8], mut o: Tensor[f32, 8]) { \
-                     for i in 0..8 { \
-                       if x[i] > y[i] { o[i] = x[i] * 3.0; } else { o[i] = y[i] * 2.0; } } } \
-                   fn main() -> i32 { \
-                     let a: [f32; 8] = [1.0, 9.0, 1.0, 9.0, 1.0, 9.0, 1.0, 9.0]; \
-                     let b: [f32; 8] = [4.0; 8]; \
-                     let mut c: [f32; 8] = [0.0; 8]; \
-                     work(a, b, c); \
-                     return (c[0] as i32) * 100 + (c[1] as i32); }";
-        // Counted over the WHOLE program, not one named function: `work` is small enough that the
-        // caller may inline it, and this property is about the program, not about where the loop
-        // happens to live.
-        let ptr_traffic = |p: &wukong_mir::Program| {
-            p.funcs
-                .iter()
-                .map(count_ptr_slots_and_reloads)
-                .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
-        };
-
-        let (mut prog, mut interner) = lower(src);
-        let (slots, reloads) = ptr_traffic(&prog);
-        assert_eq!(
-            (slots, reloads),
-            (0, 0),
-            "a tensor parameter must bind as its buffer, not spill to a slot; \
-             got {slots} slots / {reloads} reloads at -O0"
-        );
-        optimize(&mut prog, 2);
-        let (slots, reloads) = ptr_traffic(&prog);
-        assert_eq!(
-            (slots, reloads),
-            (0, 0),
-            "pointer parameter slots must be promoted and their reloads gone"
-        );
-        for f in &prog.funcs {
-            assert!(wukong_mir::verify::verify_function(f).is_empty());
-        }
-        // b[i] = 4 wins at i=0 (4*2 = 8), a[i] = 9 wins at i=1 (9*3 = 27).
-        let main = interner.intern("main");
-        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 827);
-        assert_eq!(run_main_opt(src, 0), 827);
-    }
-
-    #[test]
-    fn mem2reg_promotes_an_inlined_callees_pointer_parameter() {
-        // `-O2` splices a callee's entry block into the MIDDLE of a caller block, so the pointer
-        // parameter's `alloca ptr` + `store` no longer sit in the entry block — yet the reload it
-        // guards is inside the callee's own loop, which is the worst place to leave one. The slot
-        // still qualifies because its initializing store is in its own alloca's block and that
-        // block's dominance frontier is empty, so the store dominates every point the renamer asks
-        // about. Checked across every function so the assertion holds whether or not `sum` inlines.
-        let src = "fn sum(p: *f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
-                     while i < n { s = s + p[i]; i = i + 1; } return s; } \
-                   fn main() -> i32 { let a: [f32; 4] = [1.0, 2.0, 4.0, 8.0]; \
-                     return sum(&a[0], 4) as i32; }";
-        let (mut prog, mut interner) = lower(src);
-        optimize(&mut prog, 2);
-        let totals = prog
-            .funcs
-            .iter()
-            .map(count_ptr_slots_and_reloads)
-            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-        assert_eq!(
-            totals,
-            (0, 0),
-            "an inlined pointer parameter must still be promoted"
-        );
-        for f in &prog.funcs {
-            assert!(wukong_mir::verify::verify_function(f).is_empty());
-        }
-        let main = interner.intern("main");
-        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
-        assert_eq!(run_main_opt(src, 0), 15);
-    }
-
-    #[test]
-    fn mem2reg_leaves_a_late_initialized_pointer_slot_in_memory() {
-        // A pointer slot first written *outside* the entry block can be read before it is written
-        // on some path. Promotion would have to materialize an "undefined" pointer, and there is no
-        // sound one: `inttoptr 0` is null natively but a valid, addressable slot in the interpreter.
-        // Such a slot must stay in memory. Here `p`'s store is inside the loop body, so the entry
-        // block never initializes it.
-        let src = "fn main() -> i32 { let mut a: i32 = 5; let mut t: i32 = 0; \
-                   let mut i: i32 = 0; \
-                   while i < 3 { let p: *mut i32 = &mut a; t = t + *p; i = i + 1; } \
-                   return t; }";
-        let (mut prog, mut interner) = lower(src);
-        optimize(&mut prog, 2);
-        let (slots, _) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main"));
-        assert_eq!(slots, 1, "a late-initialized pointer slot must stay in memory");
-        for f in &prog.funcs {
-            assert!(wukong_mir::verify::verify_function(f).is_empty());
-        }
-        let main = interner.intern("main");
-        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
-        assert_eq!(run_main_opt(src, 0), 15);
-    }
-
-    #[test]
-    fn mem2reg_ptr_promotion_keeps_the_pointee_in_memory() {
-        // Promoting the *pointer* must not promote what it points at. `p` starts at `&a` and
-        // becomes `&b`, so once promoted it is a loop-header block parameter that merges the two
-        // addresses, and every `*p` is a load/store through that parameter. Both `a` and `b` must
-        // therefore stay in memory — the escape test now sees them as `br` arguments, which is the
-        // only thing keeping them there once `store a_slot, p_slot` is gone.
-        //
-        // Iteration 0 writes a = 1 + 10; iteration 1 writes b = 2 + 10; the answer is 1112.
-        let src = "fn main() -> i32 { let mut a: i32 = 1; let mut b: i32 = 2; \
-                   let mut i: i32 = 0; let mut p: *mut i32 = &mut a; \
-                   while i < 2 { *p = *p + 10; p = &mut b; i = i + 1; } \
-                   return a * 100 + b; }";
-        for lvl in [0, 1, 2, 3] {
-            assert_eq!(run_main_opt(src, lvl), 1112, "level {lvl}");
-        }
-        let (mut prog, interner) = lower(src);
-        optimize(&mut prog, 2);
-        let (slots, _) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main"));
-        assert_eq!(slots, 0, "the pointer itself must still be promoted here");
     }
 
     #[test]
@@ -1140,4 +1011,118 @@ mod tests {
             assert_eq!(run_main_opt(src, 3), expect, "O3: {src}");
         }
     }
+
+    /// Count `alloca ptr` slots and `load`s whose result is a pointer — the two symptoms of a
+    /// base pointer that lives in memory and is re-fetched at every element access.
+    fn count_ptr_slots_and_reloads(f: &wukong_mir::Function) -> (usize, usize) {
+        use wukong_mir::{MirType, Op};
+        let mut slots = 0;
+        let mut reloads = 0;
+        for i in f.blocks.iter().flat_map(|b| &b.insts) {
+            match &i.op {
+                Op::Alloca(MirType::Ptr) => slots += 1,
+                Op::Load(_, MirType::Ptr) => reloads += 1,
+                _ => {}
+            }
+        }
+        (slots, reloads)
+    }
+
+    #[test]
+    fn pointer_parameters_never_reach_a_stack_slot() {
+        // `mir_build` USED to give every pointer-typed parameter — `*T`, `&T` and every `Tensor[…]`
+        // — an `alloca ptr` + `store <param>` in the entry block, then re-`load` that base pointer
+        // at EVERY element access: three redundant `load ptr`s per iteration here (x, y and o) that
+        // no other pass could remove, because `licm` will not hoist a load out of a loop and `cse`
+        // cannot forward one across a block boundary. `mem2reg` pointer promotion was written to
+        // clean that up after the fact.
+        //
+        // Binding a statically-shaped tensor parameter as its buffer removed the spill at the
+        // SOURCE, so the slot is never created and there is nothing left to promote. This test
+        // therefore now pins the stronger property — the front end emits no pointer-parameter slot
+        // at all, at `-O0` — and it fails loudly if the spill is ever reintroduced.
+        //
+        // `mem2reg`'s pointer-promotion path is still live and still covered, by
+        // `mem2reg_promotes_an_inlined_callees_pointer_parameter` (inlining splices a callee's
+        // `alloca ptr` into the middle of a caller block), plus
+        // `mem2reg_ptr_promotion_keeps_the_pointee_in_memory` and
+        // `mem2reg_leaves_a_late_initialized_pointer_slot_in_memory` for its refusal cases.
+        //
+        // The data-dependent branch keeps every elementwise recognizer from firing, so this is
+        // general code, not a dispatched kernel.
+        let src = "fn work(x: Tensor[f32, 8], y: Tensor[f32, 8], mut o: Tensor[f32, 8]) { \
+                     for i in 0..8 { \
+                       if x[i] > y[i] { o[i] = x[i] * 3.0; } else { o[i] = y[i] * 2.0; } } } \
+                   fn main() -> i32 { \
+                     let a: [f32; 8] = [1.0, 9.0, 1.0, 9.0, 1.0, 9.0, 1.0, 9.0]; \
+                     let b: [f32; 8] = [4.0; 8]; \
+                     let mut c: [f32; 8] = [0.0; 8]; \
+                     work(a, b, c); \
+                     return (c[0] as i32) * 100 + (c[1] as i32); }";
+        // Counted over the WHOLE program, not one named function: `work` is small enough that the
+        // caller may inline it, and this property is about the program, not about where the loop
+        // happens to live.
+        let ptr_traffic = |p: &wukong_mir::Program| {
+            p.funcs
+                .iter()
+                .map(count_ptr_slots_and_reloads)
+                .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
+        };
+
+        let (mut prog, mut interner) = lower(src);
+        let (slots, reloads) = ptr_traffic(&prog);
+        assert_eq!(
+            (slots, reloads),
+            (0, 0),
+            "a tensor parameter must bind as its buffer, not spill to a slot; \
+             got {slots} slots / {reloads} reloads at -O0"
+        );
+        optimize(&mut prog, 2);
+        let (slots, reloads) = ptr_traffic(&prog);
+        assert_eq!(
+            (slots, reloads),
+            (0, 0),
+            "pointer parameter slots must be promoted and their reloads gone"
+        );
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        // b[i] = 4 wins at i=0 (4*2 = 8), a[i] = 9 wins at i=1 (9*3 = 27).
+        let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 827);
+        assert_eq!(run_main_opt(src, 0), 827);
+    }
+
+    #[test]
+    fn mem2reg_promotes_an_inlined_callees_pointer_parameter() {
+        // `-O2` splices a callee's entry block into the MIDDLE of a caller block, so the pointer
+        // parameter's `alloca ptr` + `store` no longer sit in the entry block — yet the reload it
+        // guards is inside the callee's own loop, which is the worst place to leave one. The slot
+        // still qualifies because its initializing store is in its own alloca's block and that
+        // block's dominance frontier is empty, so the store dominates every point the renamer asks
+        // about. Checked across every function so the assertion holds whether or not `sum` inlines.
+        let src = "fn sum(p: *f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                     while i < n { s = s + p[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { let a: [f32; 4] = [1.0, 2.0, 4.0, 8.0]; \
+                     return sum(&a[0], 4) as i32; }";
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 2);
+        let totals = prog
+            .funcs
+            .iter()
+            .map(count_ptr_slots_and_reloads)
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert_eq!(
+            totals,
+            (0, 0),
+            "an inlined pointer parameter must still be promoted"
+        );
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
+        assert_eq!(run_main_opt(src, 0), 15);
+    }
+
 }

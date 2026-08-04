@@ -397,10 +397,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   not flow-sensitive. Verify with `wukongc --emit=mir -O2 f.wk` and look for a `_parallel` symbol or a
   `wukong$par$` region.
 - Intrinsics `print`/`println`/`assert`.
-- The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining** of
-  leaf functions, **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
+- The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
+  bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
+  **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
   with block merging, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
-  forwarding, DSE, and **loop-invariant code motion**. Guarded by an `-O0`-vs-`-O{1,2,3}` differential
+  forwarding, DSE, **loop-invariant code motion**, and **partial loop unrolling** (4×, with a
+  wrap-safe guard and a remainder loop; it never reassociates, so a float reduction keeps its exact
+  serial accumulate — measured 28% on an integer reduction, 10% on an elementwise store loop, 4% on a
+  float reduction). Guarded by an `-O0`-vs-`-O{1,2,3}` differential
   test plus two layers of MIR verification: a per-pass verify-each that names the offending pass,
   `#[cfg(debug_assertions)]` so it runs in tests and CI but is compiled out of a release build; and a
   whole-program verify in the driver before **every** backend entry — `--run`, `--emit=llvm-ir`,

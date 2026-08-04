@@ -45,6 +45,7 @@ pub fn report(files: &[PathBuf]) {
     // Per-pass aggregate over the whole corpus, in pipeline order (index-stable across files).
     let mut agg: Vec<wukong_opt::PassStat> = Vec::new();
     let mut tot_inline = Duration::ZERO;
+    let mut tot_unroll = Duration::ZERO;
     let mut measured = 0u32;
     let mut skipped = 0u32;
     let mut failures: Vec<String> = Vec::new();
@@ -55,6 +56,7 @@ pub fn report(files: &[PathBuf]) {
                 tot_front += m.front;
                 tot_opt += m.opt;
                 tot_inline += m.timed.inline;
+                tot_unroll += m.timed.unroll;
                 merge_passes(&mut agg, &m.timed.per_pass);
                 measured += 1;
                 println!(
@@ -87,10 +89,12 @@ pub fn report(files: &[PathBuf]) {
     );
 
     // Per-pass breakdown: where the optimizer spends its time across the whole corpus. Sorted by
-    // cost so the hottest pass — the lever — is on top. `inline` is a whole-program prepass, listed
-    // alongside. Times here come from the instrumented run (a small `Instant`-per-call overhead), so
+    // cost so the hottest pass — the lever — is on top. `inline` is a whole-program prepass and
+    // `unroll` a whole-program postpass; both are listed alongside (leave neither out of
+    // `timed_total`, or every other pass's share reads high). Times here come from the instrumented run (a small `Instant`-per-call overhead), so
     // they are for *attribution*; the headline opt time above is the clean best-of-N.
-    let timed_total: Duration = agg.iter().map(|p| p.time).sum::<Duration>() + tot_inline;
+    let timed_total: Duration =
+        agg.iter().map(|p| p.time).sum::<Duration>() + tot_inline + tot_unroll;
     println!("\nper-pass share of the optimizer (summed over corpus):");
     println!(
         "  {:<14} {:>10} {:>7} {:>10}",
@@ -99,6 +103,7 @@ pub fn report(files: &[PathBuf]) {
     let mut rows: Vec<(&'static str, Duration, u64)> =
         agg.iter().map(|p| (p.name, p.time, p.calls)).collect();
     rows.push(("inline", tot_inline, if tot_inline > Duration::ZERO { 1 } else { 0 }));
+    rows.push(("unroll", tot_unroll, if tot_unroll > Duration::ZERO { 1 } else { 0 }));
     rows.sort_by(|a, b| b.1.cmp(&a.1));
     for (name, time, calls) in rows {
         println!(
