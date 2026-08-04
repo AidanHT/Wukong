@@ -64,12 +64,14 @@ const MAX_ROUNDS: usize = 8;
 /// Canonicalize `module` for the recognizers. Returns `None` — having cloned nothing — when no
 /// function admits a rewrite, so the output stays byte-identical for the programs this cannot help.
 pub(crate) fn canonicalize_module(module: &Module, sema: &SemaResult) -> Option<Module> {
+    let consts = int_literal_consts(sema);
     let mut out = module.clone();
     let mut changed = false;
     for item in &mut out.items {
         let ItemKind::Fn(f) = &mut item.kind else {
             continue;
         };
+        let params: Vec<Symbol> = f.params.iter().map(|p| p.name.sym).collect();
         let Some(body) = f.body.as_mut() else { continue };
         // A `defer` runs its expression at a *scope exit*, where a substituted loop variable no
         // longer holds the value it had at the `let`. Decline the whole function rather than reason
@@ -77,6 +79,7 @@ pub(crate) fn canonicalize_module(module: &Module, sema: &SemaResult) -> Option<
         if block_has_defer(body) {
             continue;
         }
+        changed |= fold_consts(body, &params, &consts, sema);
         for _ in 0..MAX_ROUNDS {
             if !canon_block(body, sema) {
                 break;
@@ -89,6 +92,104 @@ pub(crate) fn canonicalize_module(module: &Module, sema: &SemaResult) -> Option<
     } else {
         None
     }
+}
+
+/// Module-level `const`s that may be inlined at their uses: integer scalars whose initializer is a
+/// plain integer literal that sema stamped with the *declared* type.
+///
+/// This one is MIR-identical by construction rather than merely value-identical: `FnLowerer`'s
+/// `Path` arm already lowers a const reference by inlining this very initializer expression, because
+/// the def map records only a const's type, not its value. Doing it in the AST first changes nothing
+/// about what is lowered — it only lets the recognizers, which run *before* lowering, see the
+/// literal. Without it `as_dim` reads a bare const path as an opaque `Dim::Var`, the strides and
+/// bounds still compare equal symbolically, and then `dim_value` finds no local slot of that name
+/// and the whole nest declines. That is the sharp edge documented in
+/// `examples/gpt2_forward_bench.wk` — "only literal or local-variable dims resolve; a bare imported
+/// const used directly as a dim does not" — which is why that model re-binds every dimension to a
+/// local `let` before use.
+///
+/// The initializer's own recorded type must equal the declared type. Sema re-stamps an *adapting*
+/// literal with the annotation, but an initializer that type-checks merely via `compatible` keeps
+/// its own, possibly narrower, type; inlining that where the declared type is expected would change
+/// the arithmetic width. Requiring a literal (optionally negated) is what makes the two agree.
+fn int_literal_consts(sema: &SemaResult) -> Vec<(Symbol, &Expr)> {
+    // Substitutions of distinct names are independent — each replacement is a literal containing no
+    // `Path` — so the order this is iterated in cannot affect the result.
+    sema.consts
+        .iter()
+        .filter_map(|(name, init)| {
+            let Some(wukong_sema::DefKind::Const(decl)) =
+                sema.defs.lookup(*name).map(|d| &d.kind)
+            else {
+                return None;
+            };
+            if !matches!(decl, Ty::Scalar(s) if s.is_int()) {
+                return None;
+            }
+            if !is_int_literal(init) || sema.types.get(&init.id) != Some(decl) {
+                return None;
+            }
+            Some((*name, init))
+        })
+        .collect()
+}
+
+/// An integer literal, or a negated one (`const NEG: i64 = -1;` — sema re-stamps through the `-`).
+fn is_int_literal(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) => true,
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => matches!(expr.kind, ExprKind::Int(_)),
+        _ => false,
+    }
+}
+
+/// Inline every foldable const into one function body. Returns whether anything was rewritten.
+fn fold_consts(
+    body: &mut Block,
+    params: &[Symbol],
+    consts: &[(Symbol, &Expr)],
+    sema: &SemaResult,
+) -> bool {
+    if consts.is_empty() {
+        return false;
+    }
+    // `lower_expr` resolves a single-segment `Path` in the LOCALS first and only falls through to
+    // `sema.consts`, so a function that declares — or takes as a parameter — a name equal to a
+    // const's shadows it there and the const must be left alone in this function.
+    let mut decls = RegionFacts::default();
+    for p in params {
+        decls.declared.insert(*p);
+    }
+    scan_block(body, &mut decls);
+
+    let mut changed = false;
+    for (name, init) in consts {
+        if decls.declared.contains(name) {
+            continue;
+        }
+        let Some(ty) = sema.types.get(&init.id) else {
+            continue;
+        };
+        let mut uses = UseScan {
+            name: *name,
+            init_ty: ty,
+            sema,
+            require_index: false,
+            count: 0,
+            ok: true,
+        };
+        uses.block(body, false);
+        // `ok` can only be false here if some use site is typed differently from the initializer,
+        // which sema should never produce for a const — treat it as a decline rather than assume.
+        if uses.ok && uses.count > 0 {
+            subst_block(body, *name, init);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Rewrite one block: first every `let` it declares itself (each against the remainder of *this*
@@ -286,6 +387,7 @@ fn region_admits(
         name: x,
         init_ty,
         sema,
+        require_index: true,
         count: 0,
         ok: true,
     };
@@ -343,6 +445,10 @@ struct UseScan<'a> {
     name: Symbol,
     init_ty: &'a Ty,
     sema: &'a SemaResult,
+    /// Demand index position. True for a `let` binding, where index position is both the payoff and
+    /// the blast-radius bound; false for a module `const`, whose value is a compile-time literal that
+    /// `lower_expr` already inlines at *every* position, so there is nothing to restrict.
+    require_index: bool,
     count: u32,
     ok: bool,
 }
@@ -405,7 +511,9 @@ impl UseScan<'_> {
         }
         match &e.kind {
             ExprKind::Path(p) if p.is_single() && p.first().sym == self.name => {
-                if !in_index || self.sema.types.get(&e.id) != Some(self.init_ty) {
+                if (self.require_index && !in_index)
+                    || self.sema.types.get(&e.id) != Some(self.init_ty)
+                {
                     self.ok = false;
                 } else {
                     self.count += 1;
