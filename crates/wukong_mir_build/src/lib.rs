@@ -19,6 +19,8 @@
 //! driver stops before any backend — the front end accepts the construct, only lowering to runnable
 //! code refuses, so this crate never hands a backend knowingly-broken MIR.
 
+mod tindex;
+
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use wukong_ast::{
@@ -705,6 +707,23 @@ pub fn lower_program(
     sema: &SemaResult,
     interner: &mut Interner,
 ) -> (Program, Vec<Diagnostic>) {
+    // Normalize the shape-typed surface onto the flat surface *before* anything looks at the AST:
+    // `a[i, j]` on a statically-shaped `Tensor[T, M, N]` becomes `a[i*N + j]`, the row-major offset
+    // the lowering was going to compute anyway. Every kernel recognizer and the autovectorizer match
+    // on a single-index `ExprKind::Index`, so without this the idiomatic tensor spelling was invisible
+    // to all of them and lowered to a scalar gep nest (see `tindex`). Returns `None` — and costs one
+    // flat scan of the type table — for a module with no statically-shaped tensor, which is the
+    // common case, so nothing is cloned and the output is byte-identical for those programs.
+    let normalized = tindex::linearize_module(module, sema, interner);
+    let merged_sema = normalized.as_ref().map(|(_, extra)| {
+        let mut s = sema.clone();
+        s.types
+            .extend(extra.iter().map(|(id, t)| (*id, t.clone())));
+        s
+    });
+    let module: &Module = normalized.as_ref().map(|(m, _)| m).unwrap_or(module);
+    let sema: &SemaResult = merged_sema.as_ref().unwrap_or(sema);
+
     let mut diags = Vec::new();
     let mut program = Program::new();
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
@@ -1631,7 +1650,7 @@ fn lower_fn(
         // an `alloca` and reloaded on **every** element access, which is why `Tensor[f32, M, N]` code
         // carried 3 extra loads per element over the `[f32; M*N]` spelling of the same buffer.
         let mty = match tensor_buffer_mir(pty) {
-            Some((elem, n)) => MirType::Array(Box::new(elem), n),
+            Some((elem, n)) => MirType::Array(Box::new(elem), n), // = `param_slot_ty`, registry-aware
             None => fl.mir_ty_of(pty),
         };
         let is_slice = matches!(pty, Ty::Slice(_));
@@ -26705,13 +26724,27 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
             "verify: {:?}",
             verify_function(k)
         );
-        // The inner stride is the trailing dim N=4: expect a `* 4` in the offset arithmetic.
+        // The inner stride is the trailing dim N=4: expect a `* 4` in the offset arithmetic. The
+        // width is deliberately not pinned — `tindex` now builds the flat offset in the *index's*
+        // own integer type (`i32` for a plain `for i in 0..3` counter) instead of sign-extending
+        // every index to `i64` first, which is what makes `a[i, j]` lower to the same instructions
+        // as the hand-flattened `a[i*4 + j]`.
         assert!(
             k.blocks
                 .iter()
                 .flat_map(|b| &b.insts)
-                .any(|i| matches!(&i.op, Op::ConstInt(4, MirType::I64))),
+                .any(|i| matches!(&i.op, Op::ConstInt(4, t) if t.is_int())),
             "expected a stride-4 (trailing dim) constant in the flat-index arithmetic"
+        );
+        // A statically-shaped tensor param is the buffer's base pointer, so it must NOT be spilled
+        // to a `ptr` slot and reloaded — that cost three extra loads per element (see
+        // `tensor_buffer_mir`). An array param has never been spilled; a tensor param must not be.
+        assert!(
+            !k.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(&i.op, Op::Alloca(MirType::Ptr))),
+            "a statically-shaped tensor param must bind directly, not through a reloaded ptr slot"
         );
     }
 
