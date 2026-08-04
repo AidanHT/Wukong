@@ -1,0 +1,93 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 14
+// EXPECT-OUT: 5
+// EXPECT-OUT: 30
+// EXPECT-OUT: 6
+// EXPECT-OUT: 55
+// EXPECT-OUT: 7
+// EXPECT-OUT: 91
+// EXPECT-OUT: 8
+// EXPECT-OUT: 140
+// EXPECT-OUT: 9
+// EXPECT-OUT: 204
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: -2147483647
+module tests.run.loop_unroll
+
+/// Partial loop unrolling (`wukong_opt::unroll`, `-O2` and above) rewrites a counted loop into a
+/// four-at-a-time main loop plus a one-at-a-time remainder loop. Three things can go wrong, and the
+/// differential and invariance gates would catch none of them on their own, because at `-O0`/`-O1`
+/// the pass never runs and the *unrolled* path is only reachable at `-O2`:
+///
+///  * the remainder must run exactly `trip mod 4` iterations — off by one either way and every trip
+///    count that is not a multiple of four is wrong;
+///  * a zero-trip loop must still run zero times;
+///  * the main loop's guard is `iv < bound - 3`, and that subtraction *wraps* when `bound` sits
+///    within three of the bottom of its type. A wrapped limit is a huge positive number, which would
+///    admit the unrolled body when only one or two iterations remain — running the body past the end
+///    of the range. The pass guards this with a `select`; this fixture is what proves the guard is
+///    there and works.
+///
+/// Every quantity is printed individually rather than reduced to one total, so a run that gets some
+/// iterations right and others wrong cannot pass by cancellation.
+///
+/// ADVERSARIALLY CHECKED, because a fixture nobody has watched fail is a decoration. Replacing the
+/// pass's `select ok, bound-3, INT_MIN` with a bare `bound-3` and rebuilding makes this program
+/// **hang forever** instead of printing its last three values: with `bound = i32::MIN + 2` the
+/// subtraction wraps to `i32::MAX`, `i < i32::MAX` is then true at every induction value, and the
+/// four-copy body runs off the end of the range and around the whole of `i32`. Restoring the select
+/// restores the output below.
+fn main() -> i32 {
+    // An opaque zero: it comes back out of heap memory, which the optimizer cannot fold through, so
+    // every bound below stays a runtime value and the guard is really executed rather than
+    // constant-folded away.
+    let mut z: []i32 = alloc_i32(4);
+    z[0] = 0;
+    let o: i32 = z[0];
+
+    // Trip counts 0..9, covering every remainder 0, 1, 2 and 3 at least twice.
+    let mut k: i32 = 0;
+    while k < 10 {
+        let mut s: i32 = 0;
+        let mut c: i32 = 0;
+        for i in 0..(k + o) {
+            s = s + i * i;
+            c = c + 1;
+        }
+        print(c);
+        print(s);
+        k = k + 1;
+    }
+
+    // A bound two above i32::MIN, so the guard's `bound - 3` really does wrap (to i32::MAX). Exactly
+    // two iterations, and they must be the two real ones. The body stays branch-free so the loop is
+    // the two-block shape the unroller accepts — an `if` inside it would make this fixture pin
+    // nothing.
+    let lo: i32 = -2147483648i32 + o;
+    let hi: i32 = -2147483646i32 + o;
+    let mut n2: i32 = 0;
+    let mut acc: i32 = 0;
+    let mut last: i32 = 0;
+    for i in lo..hi {
+        acc = acc ^ i;
+        last = i;
+        n2 = n2 + 1;
+    }
+    print(n2);
+    print(acc);
+    print(last);
+
+    free(z);
+    return 0;
+}
