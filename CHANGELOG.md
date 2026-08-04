@@ -31,14 +31,19 @@ that produced each address, and all three passes plus the Cranelift backend quer
   every subscript.
 - **Cranelift** tags every access to a never-escaping stack slot with `MemFlags::alias_region`, so a
   store elsewhere no longer invalidates it in Cranelift's own redundant-load elimination.
-- **Measured** over the whole `tests/run` corpus (`--emit=mir -O2` / `--emit=obj -O2`, same-run A/B of
-  two release binaries, 0 programs regressed): MIR loads **3071 → 2324 (−24.3%)**, MIR instructions
-  45653 → 44757, machine instructions 68396 → 67944. Wall clock on four hand-written *general*
-  (non-recognized) kernels over distinct slice buffers, P-core-pinned ABBA rounds, best-of-10 minima,
-  is a **wash** (0.987–1.008) with one 6.6% loss traced to Cranelift rematerializing `f32const` inside
-  the loop once the freed register changed its allocation — the removed header loads were L1-hot and
-  not on the critical path. The gain is in the IR, which is what the interpreter executes and what a
-  future MIR vectorizer has to match.
+- **Measured** over the whole `tests/run` corpus (333 programs, `--emit=mir -O2` and `--emit=obj -O2`,
+  same-run A/B of two release binaries): MIR loads **3100 → 2345 (−24.4%)**, MIR instructions
+  45871 → 44964, machine instructions 68660 → 68205 (82 programs' MIR improved and none regressed; of
+  60 whose machine code changed, 8 grew, the largest by 18 instructions). Compile time is at parity
+  with the branch point (in-process `wukong_bench compile-time`, ABBA rounds normalized by the
+  untouched front-end column: 1.005 and 0.994 over two rounds).
+- Wall clock on four hand-written *general* (non-recognized) kernels over distinct slice buffers,
+  P-core-pinned ABBA rounds, best-of-10 minima, is a **wash**: 0.990 / 1.008 / 0.987, and one kernel
+  at **1.066 (a 6.6% loss)** traced to Cranelift rematerializing `f32const` inside the loop once the
+  freed register changed its allocation. The header loads that were removed were L1-hot and not on the
+  critical path of an out-of-order core with two load ports, so the IR win does not show up as speed.
+  The gain is in the IR — which is what the interpreter executes, and what a MIR vectorizer will have
+  to pattern-match.
 
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
