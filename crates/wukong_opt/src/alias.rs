@@ -442,11 +442,33 @@ impl AliasInfo {
     /// A `call` (or a vector-kernel call, which stores through the pointers handed to it) can write
     /// anything the caller can name — *except* a stack slot of this function whose address never
     /// escaped, which no callee can have an address for.
+    /// The match below is **deliberately exhaustive — never add a `_` arm.** An op that writes
+    /// memory and is not classified as a writer here silently answers "cannot clobber", which is an
+    /// unsound no-alias answer, i.e. a miscompile. Listing every non-writing variant makes a newly
+    /// added `Op` a compile error at this site instead of a silent wrong answer, so the requirement
+    /// is enforced by the compiler rather than by `CONTRIBUTING.md`.
     pub fn may_clobber(&self, ptr: ValueId, bytes: u32, op: &Op) -> bool {
         match op {
             Op::Store { ptr: q, value: _ } => self.may_alias_sized(ptr, bytes, *q, u32::MAX),
             Op::Call { .. } | Op::VecKernelCall { .. } => !self.is_private_stack(ptr),
-            _ => false,
+            // Everything below provably writes no memory.
+            Op::ConstInt(..)
+            | Op::ConstFloat(..)
+            | Op::Bin(..)
+            | Op::Cmp(..)
+            | Op::Neg(..)
+            | Op::Not(..)
+            | Op::Cast(..)
+            | Op::Select(..)
+            | Op::Alloca(..)
+            | Op::Load(..)
+            | Op::Gep { .. }
+            | Op::FuncAddr(..)
+            | Op::GlobalAddr(..)
+            | Op::Splat(..)
+            | Op::Fma(..)
+            | Op::Sqrt(..)
+            | Op::Round(..) => false,
         }
     }
 
