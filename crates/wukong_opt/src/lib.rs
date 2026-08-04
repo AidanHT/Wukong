@@ -611,7 +611,10 @@ mod tests {
         p.funcs
             .iter()
             .find(|f| interner.resolve(f.name) == name)
-            .expect("function present")
+            .unwrap_or_else(|| {
+                let have: Vec<_> = p.funcs.iter().map(|f| interner.resolve(f.name)).collect();
+                panic!("no function named `{name}`; program has {have:?}")
+            })
     }
 
     #[test]
@@ -783,12 +786,24 @@ mod tests {
     }
 
     #[test]
-    fn mem2reg_promotes_pointer_parameter_slots() {
-        // `mir_build` gives every pointer-typed parameter — `*T`, `&T` and every `Tensor[…]` — an
-        // `alloca ptr` + `store <param>` in the entry block, and then re-`load`s that base pointer
-        // at EVERY element access. Before pointer promotion this loop body carried three redundant
-        // `load ptr`s per iteration (x, y and o) that no other pass could remove: `licm` will not
-        // hoist a load out of a loop and `cse` cannot forward one across a block boundary.
+    fn pointer_parameters_never_reach_a_stack_slot() {
+        // `mir_build` USED to give every pointer-typed parameter — `*T`, `&T` and every `Tensor[…]`
+        // — an `alloca ptr` + `store <param>` in the entry block, then re-`load` that base pointer
+        // at EVERY element access: three redundant `load ptr`s per iteration here (x, y and o) that
+        // no other pass could remove, because `licm` will not hoist a load out of a loop and `cse`
+        // cannot forward one across a block boundary. `mem2reg` pointer promotion was written to
+        // clean that up after the fact.
+        //
+        // Binding a statically-shaped tensor parameter as its buffer removed the spill at the
+        // SOURCE, so the slot is never created and there is nothing left to promote. This test
+        // therefore now pins the stronger property — the front end emits no pointer-parameter slot
+        // at all, at `-O0` — and it fails loudly if the spill is ever reintroduced.
+        //
+        // `mem2reg`'s pointer-promotion path is still live and still covered, by
+        // `mem2reg_promotes_an_inlined_callees_pointer_parameter` (inlining splices a callee's
+        // `alloca ptr` into the middle of a caller block), plus
+        // `mem2reg_ptr_promotion_keeps_the_pointee_in_memory` and
+        // `mem2reg_leaves_a_late_initialized_pointer_slot_in_memory` for its refusal cases.
         //
         // The data-dependent branch keeps every elementwise recognizer from firing, so this is
         // general code, not a dispatched kernel.
@@ -801,14 +816,26 @@ mod tests {
                      let mut c: [f32; 8] = [0.0; 8]; \
                      work(a, b, c); \
                      return (c[0] as i32) * 100 + (c[1] as i32); }";
+        // Counted over the WHOLE program, not one named function: `work` is small enough that the
+        // caller may inline it, and this property is about the program, not about where the loop
+        // happens to live.
+        let ptr_traffic = |p: &wukong_mir::Program| {
+            p.funcs
+                .iter()
+                .map(count_ptr_slots_and_reloads)
+                .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
+        };
+
         let (mut prog, mut interner) = lower(src);
-        let (slots, reloads) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "work"));
-        assert!(
-            slots >= 3 && reloads >= 3,
-            "front end should alloca + reload each pointer param, got {slots} slots / {reloads} reloads"
+        let (slots, reloads) = ptr_traffic(&prog);
+        assert_eq!(
+            (slots, reloads),
+            (0, 0),
+            "a tensor parameter must bind as its buffer, not spill to a slot; \
+             got {slots} slots / {reloads} reloads at -O0"
         );
         optimize(&mut prog, 2);
-        let (slots, reloads) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "work"));
+        let (slots, reloads) = ptr_traffic(&prog);
         assert_eq!(
             (slots, reloads),
             (0, 0),
