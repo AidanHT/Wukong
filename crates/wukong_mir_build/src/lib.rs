@@ -19,6 +19,7 @@
 //! driver stops before any backend — the front end accepts the construct, only lowering to runnable
 //! code refuses, so this crate never hands a backend knowingly-broken MIR.
 
+mod canon;
 mod tindex;
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -707,13 +708,13 @@ pub fn lower_program(
     sema: &SemaResult,
     interner: &mut Interner,
 ) -> (Program, Vec<Diagnostic>) {
-    // Normalize the shape-typed surface onto the flat surface *before* anything looks at the AST:
-    // `a[i, j]` on a statically-shaped `Tensor[T, M, N]` becomes `a[i*N + j]`, the row-major offset
-    // the lowering was going to compute anyway. Every kernel recognizer and the autovectorizer match
-    // on a single-index `ExprKind::Index`, so without this the idiomatic tensor spelling was invisible
-    // to all of them and lowered to a scalar gep nest (see `tindex`). Returns `None` — and costs one
-    // flat scan of the type table — for a module with no statically-shaped tensor, which is the
-    // common case, so nothing is cloned and the output is byte-identical for those programs.
+    // Two AST normalizations run back to back, before anything looks at the tree, because every
+    // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
+    //
+    // First `tindex`: `a[i, j]` on a statically-shaped `Tensor[T, M, N]` becomes `a[i*N + j]`, the
+    // row-major offset the lowering was going to compute anyway. Every matcher keys on a
+    // single-index `ExprKind::Index`, so without this the idiomatic tensor spelling was invisible to
+    // all of them and lowered to a scalar gep nest.
     let normalized = tindex::linearize_module(module, sema, interner);
     let merged_sema = normalized.as_ref().map(|(_, extra)| {
         let mut s = sema.clone();
@@ -723,6 +724,17 @@ pub fn lower_program(
     });
     let module: &Module = normalized.as_ref().map(|(m, _)| m).unwrap_or(module);
     let sema: &SemaResult = merged_sema.as_ref().unwrap_or(sema);
+
+    // Then `canon`: a semantics-preserving respelling — hoisting a row base into a local, which is
+    // plain CSE and changes no result — was on its own enough to lose the kernel. `canon` rewrites
+    // those forms back to the canonical one every matcher already understands.
+    //
+    // Order is load-bearing: `tindex` runs first so that a tensor nest is already flat by the time
+    // `canon` looks for hoisted index locals, and both surfaces get both normalizations. Each
+    // returns `None`, having cloned nothing, for a module it cannot help — the common case — so
+    // output stays byte-identical for programs neither one touches.
+    let canonical = canon::canonicalize_module(module, sema);
+    let module: &Module = canonical.as_ref().unwrap_or(module);
 
     let mut diags = Vec::new();
     let mut program = Program::new();
@@ -26859,6 +26871,239 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
                 verify_function(f).is_empty(),
                 "verify failed for a function"
             );
+        }
+    }
+
+    /// A GEMM whose row bases are hoisted into locals (`let ib = i*8;` … `a[ib + p]`) — plain CSE,
+    /// which changes no result and which every optimizer performs anyway — computed the same values
+    /// as the flat spelling but lost the kernel entirely, because the recognizers match the raw AST
+    /// and `i*8 + p` was no longer *in* the index. `canon` forward-substitutes the base back in.
+    #[test]
+    fn hoisted_row_base_still_dispatches_the_gemm() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let jb = j * 8;
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[jb + p]; }
+            c[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a hoisted row base must not cost the GEMM kernel"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
+    /// The same normalization on the norm family: an affine RMSNorm whose row base is hoisted must
+    /// still fold into one `wukong_norm_affine_f32` call.
+    #[test]
+    fn hoisted_row_base_still_dispatches_the_norm() {
+        let src = "module m
+fn rms(mut x: [f32; 64], g: [f32; 8], bb: [f32; 8]) {
+    for r in 0..8 {
+        let rb = r * 8;
+        let mut ss: f32 = 0.0;
+        for i in 0..8 { ss = ss + x[rb + i] * x[rb + i]; }
+        let inv: f32 = rsqrt(ss / 8.0 + 0.00001);
+        for i in 0..8 { x[rb + i] = x[rb + i] * inv * g[i] + bb[i]; }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_norm_affine_f32"),
+            "a hoisted row base must not cost the fused norm kernel"
+        );
+    }
+
+    /// A module-level `const` used directly as a dimension left the nest matching symbolically
+    /// (`Dim::Var(N)` on every side) and then declining at `dim_value`, which looks the name up in
+    /// the *locals*. That is the sharp edge `examples/gpt2_forward_bench.wk` documents and works
+    /// around by re-binding every dimension to a local `let`. Folding the literal in beforehand —
+    /// which is exactly what `FnLowerer`'s const arm does at lowering time anyway — makes the bare
+    /// const spelling dispatch.
+    #[test]
+    fn a_const_dimension_dispatches_the_gemm() {
+        let src = "module m
+const N: i64 = 8;
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..N {
+        for j in 0..N {
+            let mut s: f32 = 0.0;
+            for p in 0..N { s = s + a[i * N + p] * b[j * N + p]; }
+            c[i * N + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a const dimension must not cost the GEMM kernel"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
+    /// The DECLINE for the const fold: a local (or parameter) of the same name shadows the const —
+    /// `lower_expr` resolves a `Path` in the locals first — so the const must be left alone in a
+    /// function that declares that name, or the loop would read the wrong stride.
+    #[test]
+    fn a_shadowed_const_is_not_folded() {
+        let src = "module m
+const N: i64 = 8;
+fn f() -> i64 {
+    let N: i64 = 3;
+    return N * 2;
+}
+fn main() -> i32 { return f() as i32; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        // The body must still compute 3*2, never 8*2.
+        let f = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == "f")
+            .expect("fn f");
+        let eights = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(&i.op, Op::ConstInt(8, _)))
+            .count();
+        let threes = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(&i.op, Op::ConstInt(3, _)))
+            .count();
+        assert!(threes >= 1, "the local N = 3 must survive");
+        assert_eq!(eights, 0, "the shadowed const must not be folded in");
+    }
+
+    /// Substitution is scoped to the **region** a binding dominates — the rest of its own block — so
+    /// two sibling loops may each spell `let ib = …` without either disqualifying the other. Under a
+    /// whole-function "declared exactly once" rule they knocked each other out, and re-using an
+    /// obvious base name across the loops of one function is the normal way to write a model.
+    #[test]
+    fn sibling_loops_may_reuse_a_base_name() {
+        let src = "module m
+fn two(a: [f32; 64], b: [f32; 64], mut c: [f32; 64], mut e: [f32; 64]) {
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+    }
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + c[ib + p] * b[j * 8 + p]; }
+            e[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let two = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == "two")
+            .expect("fn two");
+        let gemms = two
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(
+                |i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == "wukong_sgemm_nt"),
+            )
+            .count();
+        assert_eq!(gemms, 2, "both sibling nests must dispatch the GEMM kernel");
+    }
+
+    /// The DECLINE that makes region scoping sound: an operand of the initializer that the region
+    /// later *assigns* would make the inlined expression evaluate to a different value than it did
+    /// at the `let`. `canon` must refuse — flow-insensitively, so an assignment anywhere in the
+    /// region counts, even one that follows every use.
+    #[test]
+    fn a_base_whose_operand_is_reassigned_in_the_region_is_not_substituted() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    let mut t: i64 = 0;
+    for i in 0..8 {
+        let ib = t * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+        t = t + 1;
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a base built from a variable the region reassigns must not be substituted"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
+    /// The DECLINE that keeps the substitution sound: a base that is *reassigned* does not hold the
+    /// same value at its uses as at its `let`, so inlining the initializer would compute a different
+    /// address. `canon` must leave it alone — and leaving it alone means the nest keeps its scalar
+    /// lowering. This asserts the decline, so loosening the purity rule to accept a mutable local
+    /// (which would be a silent miscompile) fails here.
+    #[test]
+    fn a_reassigned_index_base_is_not_substituted() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..8 {
+        let mut ib = i * 8;
+        ib = ib + 0;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a reassigned base must not be forward-substituted"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
         }
     }
 }

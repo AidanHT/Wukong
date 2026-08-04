@@ -1657,6 +1657,48 @@ standard reduction optimization) — sound because both backends execute the sam
 the differential oracle still holds bit-for-bit. Reductions vectorize only on the sequential path,
 never the `@parallel` one (folding into a shared accumulator across threads would race).
 
+## Spelling canonicalization before recognition
+
+Every recognizer below matches a *syntactic* shape on the raw AST, inside `lower_program` — before
+`wukong_opt` has run mem2reg, CSE or any canonicalization of its own. That made recognition brittle
+in a way that has nothing to do with the arithmetic. Hoisting a row base into a local
+(`let ib = i*256;` then `a[ib + p]`) is plain common-subexpression elimination — it changes no
+floating-point result and every optimizer performs it anyway — but it moves the index arithmetic
+*out* of the index expression, so `match_row_col` no longer saw `i*N + p` and the whole GEMM fell
+back to a scalar nest. A dimension written as a bare module `const` was worse: every stride/bound
+comparison succeeded *symbolically* (`Dim::Var(N)` on both sides) and the nest then declined at
+`dim_value`, which resolves a `Dim::Var` by looking the name up in the function's **locals**.
+
+`wukong_mir_build::canon` closes that gap with a pure source-to-source AST rewrite run once at the
+top of `lower_program`, before anything else looks at the tree:
+
+- **Index-local forward substitution.** A `let` bound to a pure integer expression — integer
+  literals, integer variables and `+ - *` — whose every use is in index position is inlined at
+  those uses, and the now-dead `let` is deleted. The deletion matters as much as the substitution: a
+  leftover statement in a loop body is by itself enough to make a whole-nest matcher (which requires
+  the body to be exactly the inner `for`) decline.
+- **Integer const folding.** A module-level `const` of integer scalar type whose initializer is a
+  plain integer literal is inlined at its uses. This is exactly what `FnLowerer`'s `Path` arm already
+  does at lowering time — the def map records a const's type, not its value — so the emitted MIR is
+  unchanged and only the recognizers, which run earlier, see a difference.
+
+Both rewrites are value-identical at *every node*, which is what lets the moved subtree keep its
+`NodeId`s: `sema.types` answers for it exactly as before, and `SemaResult::defs` is keyed by name
+rather than by `NodeId`, so a duplicated id is read-only aliasing and never a collision. No new sema
+entries are minted.
+
+Legality is proved over the **region** a binding dominates — the statements after its `let` in the
+same block, plus that block's tail. Over that region neither the binding nor any free variable of
+its initializer may be re-declared, assigned or `&`-taken (which is what rejects `let b = t*4;` in a
+loop that later does `t = t + 1`), and every use site's recorded type must **equal** the
+initializer's (which is what rejects a narrowing annotation like `let ib: i32 = i*256;` with
+`i: i64` silently becoming full-width arithmetic). `/` and `%` are excluded from the pure set
+because they can trap and a trap must not be re-sited under a branch that may not be taken; calls,
+indexing and field access are excluded because their value depends on memory a later statement may
+have written. A function containing a `defer` declines outright, and a local or parameter that
+shadows a const keeps that const unfolded in that function. The pass answers "nothing to do" from a
+read-only feasibility scan, so a program it cannot help never pays for the AST copy.
+
 ## Matmul recognition → tuned GEMM microkernel
 
 The width that matters most for ML is the matmul inner product, and it is exactly where a 128-bit
@@ -1771,7 +1813,7 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
 ## Testing strategy
 
 - **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).
-- **End-to-end** (`tests/run/*.wk`, 332 fixtures): the real `wukongc` binary compiles and runs each
+- **End-to-end** (`tests/run/*.wk`, 333 fixtures): the real `wukongc` binary compiles and runs each
   program; stdout/exit are checked against the `// EXPECT-EXIT:` / `// EXPECT-OUT:` directives embedded
   in the file, and a `// RUN:` directive replaces the default `--run` argument list (a fixture that must
   pin the *native* side carries `// RUN: --run --backend=native`). Placement rule: everything here must

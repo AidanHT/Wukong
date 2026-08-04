@@ -3855,6 +3855,40 @@ All notable changes to Wukong are documented here. The format is loosely based o
   optimizer time and optimizer time rises 27% at `-O2`, which end-to-end stays inside `compile-vs`'s
   run-to-run spread (−4.3% to +6.2%) with the gcc/g++/rustc ratios unchanged at 7.3–11.9×. The
   default `-O0` compile is untouched. `WUKONG_NO_UNROLL=1` disables the pass.
+### Performance — kernel recognition no longer depends on spelling (2026-08-04)
+Every kernel recognizer matches a *syntactic* loop-nest shape on the raw AST, inside `lower_program`
+and therefore before the optimizer has run mem2reg or CSE. A semantics-preserving respelling that
+changed no result could silently cost the kernel — and the two that cost the most are things every
+programmer and every optimizer does. A new pre-lowering AST normalization
+(`wukong_mir_build::canon`) rewrites them back to the canonical form the matchers already
+understand, so natural, readable code dispatches the same kernels the hand-tuned dialect does.
+- **A hoisted row base is no longer fatal.** `let ib = i*256;` followed by `a[ib + p]` is plain
+  common-subexpression elimination, but it moved the index arithmetic out of the index expression:
+  `match_row_col` stopped seeing `i*N + p` and the whole GEMM fell back to a scalar nest. The same
+  edit on an affine RMSNorm lost `wukong_norm_affine_f32`. Such a binding is now forward-substituted
+  into its index uses and the dead `let` removed. Measured: a pre-norm FFN block (RMSNorm → Linear
+  → +bias → gelu → Linear → +bias → residual) written with per-loop row bases and `let`-bound dims
+  dispatched **1** kernel before and dispatches the same **4** its flat twin does now
+  (1 `norm_affine_f32`, 2 `sgemm_nt_epi`, 1 `velem_f32`), printing byte-identical values.
+- **A module `const` used directly as a dimension now resolves.** `const N: i64 = 768;` matched every
+  stride/bound comparison symbolically and then declined at `dim_value`, which resolves a `Dim::Var`
+  in the function's locals — the sharp edge `examples/gpt2_forward_bench.wk` documents and works
+  around by re-binding every dimension to a local `let`. Integer consts with a literal initializer
+  are now folded into their uses, which is exactly what lowering does with them anyway. As a result
+  `examples/gpt2_infer.wk` (the real GPT-2 124M forward) gained 1 `sgemm_nt` + 6 `sgemm_nt_epi` and
+  its reduced twin `gpt2_infer_small.wk` gained 1 + 4, with byte-identical logits and argmax on both
+  backends at `-O0` and `-O2`.
+
+Both rewrites are value-identical at every node and are proved legal over the region a binding
+dominates; a reassigned binding, a reassigned operand, a narrowing `let` annotation, a `/` or `%`, a
+call, an index, a `defer` in the function, or a local shadowing a const all decline. Because a
+recognizer is invisible to the differential and opt-invariance gates (both backends call the same
+runtime symbol at every `-O` level), the change was gated by a **dispatch census** — the multiset of
+`wukong_*` symbols in `--emit=mir -O2` over all 332 `tests/run` + 17 `examples` programs — which
+reports 345 files identical, 2 gained, **0 lost**, 742 → 754 dispatch sites. Compile time is
+unaffected: measured with a kill-switch build, front-end 30.0 ms with the pass vs 30.3 ms without
+(best of 3 adjacent rounds over the 342-file corpus), and total optimizer time *falls*, since the
+deleted `let`s and folded consts hand `wukong_opt` less MIR.
 
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint

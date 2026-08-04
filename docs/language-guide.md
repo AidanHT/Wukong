@@ -446,7 +446,11 @@ deterministic multicore reduction kernel that reaches aggregate memory bandwidth
 C), with a result independent of core count (✅) — provided the data is **`f32`** and the loop is a
 **half-open, unit-step** range. A `step k` or `..=` range declines to the ordinary (correct, but
 single-threaded) scalar loop with no diagnostic (`tests/run/for_step_gemm.wk`), and that
-half-open/unit-step precondition holds for every recognized kernel. Element type is handled case by
+half-open/unit-step precondition holds for every recognized kernel. What does *not* matter is how the
+index is spelled: a row base hoisted into a local (`let ib = i*K;` then `a[ib + p]`) and a dimension
+written as a bare module `const` are normalized back to the canonical `a[i*K + p]` form before
+recognition (`wukong_mir_build::canon`), so ordinary refactoring does not silently cost you the
+kernel. Element type is handled case by
 case rather than being an f32-only gate: a `bf16`/`f16` array read through the explicit widening cast —
 `s = s + (x[k] as f32)` — dispatches to the multicore low-precision reduction kernels
 (`tests/run/parallel_reduce_lowp.wk`), while the *uncast* spelling `s = s + x[k]` stays a scalar loop
