@@ -5,6 +5,47 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Benchmark honesty — peer-strength audit (2026-08-04)
+An adversarial audit of every C/C++/Rust peer kernel in `crates/wukong_xbench` found four systematic
+defects, all of which inflated Wukong's published numbers, and corrected them. **No compiler, kernel
+or `.wk` source changed; only the benchmark peers and the documents that quote them.**
+- **`__restrict__` on every generated C/C++ peer kernel.** `grep -c restrict` over
+  `crates/wukong_xbench/src/main.rs` previously returned **0**: not one of the 43 C kernels told gcc
+  its output buffer does not overlap its inputs, so gcc could not vectorize or reorder any nested
+  kernel, while Wukong's tensor parameters carry non-overlap in the type system. Largest single
+  effect: the direct-convolution peer went from **4.9 to 21.1 GFLOP/s (4.3×)**, taking the published
+  conv multiple from 5.90× to **1.55×**. Two latent aliasing hazards were removed first so the
+  qualifier is true rather than merely fast (`fused_linear_relu`'s const-cast-away write, and a
+  dequant bench that passed its own output buffer as the unused middle pointer).
+- **Column reductions / column argmax rewritten row-outer.** `c_colsum`, `c_colmax`/`min`/`absmax`,
+  `c_colstat` (mean/sum-sq/L2/RMS) and `c_colarg` all scanned `for j { for i { … x[i*N+j] } }` — the
+  worst loop order for a row-major axis-0 reduction, and the only order measured. Standalone at `-O3
+  -march=native`, 4096×1024: colsum **3.739 → 0.563 ms**, colmax **5.730 → 0.888 ms**, colmean
+  **5.990 → 0.509 ms**, colargmax **4.043 → 0.954 ms**, output identical. **The published ~29–50×
+  column-reduction win becomes a 1.05–1.8× LOSS**, and the column argmax's ~2.7–4.1× becomes a
+  1.5–2.5× loss.
+- **`matmul_tn` peer given the natural `kij` order.** It was `ijk` with **both** operands read
+  column-strided. Standalone 512³: **20.965 → 8.805 ms**. The weight-gradient GEMM's ~128× single /
+  ~445× parallel becomes **2.6–5.3× / 3.1–13.9×**.
+- **Transpose peer cache-blocked 32×32**, matching Wukong's own kernel. Standalone 2048²: **24.184 →
+  14.298 ms**. Single-core transpose becomes a **tie**.
+- **Ten reduction-bearing benches gained the `C(fast)` [-ffast-math] column** their own fairness rule
+  required (gemv, scaled_gemm, linear_bf16, conv, colmax/min/absmax, rowarg, colarg, bf16 dot/sum,
+  cumsum, xent_bwd). Four of them turn out to be ties or losses once it exists: the bf16 reductions
+  (1.1–1.8× slower), gemv (a tie), conv (1.12× slower), cumsum (1.03–1.42×).
+- **The `@parallel` standing lines are direction-aware.** Twenty sites printed a bare ratio, so a
+  0.73× — a 27% loss — rendered as "Wukong @parallel is 0.73x idiomatic single-threaded C".
+- **Four regression tests** (`every_generated_c_kernel_declares_restrict`,
+  `column_family_peers_stay_row_outer`, `matmul_tn_peer_stays_kij`,
+  `transpose_peer_stays_cache_blocked`) plus a written peer-strength checklist now pin all of it,
+  because a weakened peer breaks nothing observable — the suite still runs, the cross-language check
+  still passes, and the only symptom is a bigger multiple.
+- `BENCHMARKS.md`, `README.md` and `docs/roadmap.md` republish the corrected figures with the old
+  ones struck through, and every "why Wukong wins" explanation that was in fact describing a peer
+  defect is rewritten. `BENCHMARKS.md` gains a full before/after board and an explicit list of what
+  was **not** re-measured (the end-to-end model peers in `model.rs`, the whole-suite geomean, the GPU
+  section).
+
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
 write-sets → adversarial re-verification), plus a harness-hardening wave. Almost nothing here is a new
