@@ -14,11 +14,13 @@
 //! that keeps a per-slot stack of the reaching definition. Reads become the reaching value, writes
 //! update it, and each CFG edge is given the arguments its destination's phis expect.
 //!
-//! Only integer and float slots are promoted. A slot read before any write on some path becomes a
-//! zero constant of its type, materialized once per type at the top of the entry block, which is what
-//! the interpreter's zero-initialized memory would have yielded. Pointer/array/vector slots stay in
-//! memory: they are rare as scalars and have no such natural zero, so promoting them would mean
-//! synthesizing a typed "undefined" value.
+//! Integer, float and pointer slots are promoted. An integer/float slot read before any write on
+//! some path becomes a zero constant of its type, materialized once per type at the top of the entry
+//! block, which is what the interpreter's zero-initialized memory would have yielded. A pointer slot
+//! has no such natural zero, so only the definitely-initialized subset is promoted
+//! ([`entry_initialized`]) — which is exactly the case that matters, since `mir_build` gives every
+//! pointer-typed parameter (`*T`, `&T`, `Tensor[…]`) an `alloca ptr` + `store` in the entry block and
+//! then re-`load`s the base pointer at *every* element access. Array and vector slots stay in memory.
 
 use std::collections::{BTreeMap, BTreeSet};
 use crate::fxhash::{FxHashMap, FxHashSet};
@@ -53,10 +55,11 @@ impl Pass for Mem2Reg {
     }
 }
 
-/// A slot type is promotable to a register if it is a scalar integer or float. Pointers, arrays,
-/// and vectors are left in memory (so we never need a typed "undef" for a read-before-write).
+/// A slot type is promotable to a register if it is a scalar integer or float. Arrays and vectors
+/// are left in memory. Pointers are handled too, but only for the definitely-initialized subset —
+/// see [`entry_initialized`] for why they need the extra condition.
 fn is_promotable_ty(ty: &MirType) -> bool {
-    ty.is_int() || ty.is_float()
+    ty.is_int() || ty.is_float() || matches!(ty, MirType::Ptr)
 }
 
 /// Find allocas whose pointer is used *only* as the address of `load`/`store`. Returns a map from
@@ -118,7 +121,37 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
     for x in bad {
         cand.remove(&x);
     }
+    cand.retain(|slot, ty| !matches!(ty, MirType::Ptr) || entry_initialized(f, *slot));
     cand
+}
+
+/// Does the entry block store to `slot` before any load of it?
+///
+/// A read-before-write slot is promoted to a zero constant of the slot's type — what the
+/// interpreter's zero-initialized memory would have yielded. There is no such constant for a
+/// pointer: `inttoptr 0` is a genuine null on the native backend but a *valid, addressable* slot in
+/// the interpreter (interp address 0 is a real address — the standing cross-cutting landmine), so
+/// synthesizing one would trade a stack slot for an interp-vs-native divergence.
+///
+/// Rather than reason about undef we simply refuse any pointer slot that could be read first. The
+/// entry block dominates every block and is straight-line, so a store to `slot` in it with no
+/// earlier load means *every* point at which the renamer asks for a reaching definition — every
+/// load, and every block terminator that has to hand a phi its argument — is dominated by that
+/// store, and the renamer's stack is therefore never empty.
+///
+/// This admits the case the pass exists for: `mir_build` gives every pointer-typed parameter
+/// (`*T`, `&T`, and every `Tensor[…]`) an `alloca ptr` immediately followed by `store <param>` in
+/// the entry block. It excludes a pointer local whose first assignment is inside an `if` or a loop;
+/// those keep their stack slot.
+fn entry_initialized(f: &Function, slot: u32) -> bool {
+    for inst in &f.blocks[f.entry.0 as usize].insts {
+        match &inst.op {
+            Op::Store { ptr, .. } if ptr.0 == slot => return true,
+            Op::Load(p, _) if p.0 == slot => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut CfgAnalyses) {
@@ -297,6 +330,13 @@ impl Rename<'_> {
             return *top;
         }
         let ty = self.promotable[&var].clone();
+        // `find_promotable` only admits a pointer slot that the entry block stores to before any
+        // load, so a pointer slot's reaching definition is dominated by that store and this
+        // read-before-write path is unreachable for it. There is no `const.ptr 0` to fall back on.
+        debug_assert!(
+            !matches!(ty, MirType::Ptr),
+            "pointer slot v{var} reached the read-before-write path; entry_initialized is wrong"
+        );
         if let Some(z) = self.zero_for.get(&ty) {
             return *z;
         }
