@@ -65,6 +65,18 @@ static float ssm(const float *a, const float *b, float *o, long n) {
     return h;
 }
 
+static float fsum(const float *x, long n) {
+    float s = 0.0f;
+    for (long i = 0; i < n; i++) s = s + x[i];
+    return s;
+}
+
+static int isum(const int *x, long n) {
+    int s = 0;
+    for (long i = 0; i < n; i++) s = s + x[i];
+    return s;
+}
+
 int main(void) {
     float *x = malloc(N * sizeof(float));
     float *y = malloc(N * sizeof(float));
@@ -96,6 +108,12 @@ int main(void) {
     TIME(5, acc = wsse(z, x, y, N),       (int64_t)(acc * 1000.0f))
     TIME(6, condbody(x, y, o, N),         (int64_t)(o[12345] * 1000.0f))
     TIME(7, acc = ssm(z, y, o, N),        (int64_t)(o[12345] * 1000.0f))
+    TIME(8, acc = fsum(x, N),             (int64_t)(acc * 1000.0f))
+    int *xi = malloc(N * sizeof(int));
+    for (long i = 0; i < N; i++) xi[i] = (int)(i % 1000);
+    int iacc = 0;
+    TIME(9, iacc = isum(xi, N),           (int64_t)iacc)
+    free(xi);
 
     free(o); free(z); free(y); free(x);
     return 0;

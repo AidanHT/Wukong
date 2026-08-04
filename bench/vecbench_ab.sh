@@ -13,7 +13,7 @@ SRC=${SRC:-bench/vecbench.wk}
 ROUNDS=${1:-3}
 
 declare -A best_off best_on best_c
-names=(1 2 3 4 5 6 7)
+names=(1 2 3 4 5 6 7 8 9)
 
 declare -A chks
 run_into() {           # $1 = assoc array name, $2.. = command
