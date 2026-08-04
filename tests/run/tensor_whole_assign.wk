@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+module tests.run.tensor_whole_assign
+
+// Whole-buffer assignment `a = b` must mean the same thing for a `Tensor[f32, 4]` parameter as for
+// the `[f32; 4]` spelling of the same buffer: a **deep copy** into the caller's storage, not a
+// pointer rebind. Both halves below print the same three numbers, and that is the assertion.
+//
+// This is the one behaviour that binding a statically-shaped tensor param as its buffer (rather than
+// as a reloaded `ptr` slot) could have silently changed: the whole-aggregate assignment path keys on
+// the *destination's* MIR type being an `Array`, and a tensor's `expr_mir` is still `Ptr`, so the
+// assignment fell through to the scalar path and stored `b`'s **base pointer** over `a`'s first four
+// data bytes. `a[0]` then read a pointer's low bits as an f32 (it printed 0). No fixture covered
+// whole-tensor assignment, so nothing caught it; this one does.
+
+fn f_tensor(mut a: Tensor[f32, 4], b: Tensor[f32, 4]) {
+    a = b;
+    a[0] = 9.0; // writes the copy — which now lives in the caller's buffer, not in `b`
+}
+
+fn f_array(mut a: [f32; 4], b: [f32; 4]) {
+    a = b;
+    a[0] = 9.0;
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 4] = [1.0; 4];
+    let mut y: [f32; 4] = [2.0; 4];
+    f_tensor(x, y);
+    print(x[0] as i32); // 9   — the copy landed in the caller's buffer and was then written
+    print(x[3] as i32); // 2   — the rest of `b` was copied in
+    print(y[0] as i32); // 2   — `b` itself is untouched (a copy, not an alias)
+
+    let mut p: [f32; 4] = [1.0; 4];
+    let mut q: [f32; 4] = [2.0; 4];
+    f_array(p, q);
+    print(p[0] as i32); // 9   — identical to the tensor spelling, which is the point
+    print(p[3] as i32); // 2
+    print(q[0] as i32); // 2
+    return 0;
+}
