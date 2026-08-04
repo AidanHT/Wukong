@@ -1192,7 +1192,7 @@ fn plan_body(
                     let from = vector_ty.get(&v.0)?;
                     if lane_bytes(from) != lane_bytes(to)
                         || lanes_of(to)? != w
-                        || !cast_widenable(*kind)
+                        || !cast_widenable(*kind, to)
                     {
                         return None;
                     }
@@ -1279,12 +1279,25 @@ fn bin_widenable(op: BinOp, ty: &MirType) -> bool {
     }
 }
 
-/// Casts that are one-for-one at a fixed lane width.
-fn cast_widenable(k: CastKind) -> bool {
-    matches!(
-        k,
-        CastKind::SiToFp | CastKind::UiToFp | CastKind::FpToSi | CastKind::FpToUi | CastKind::Bitcast
-    )
+/// Casts that are one-for-one at a fixed lane width, and that the x64 backend can lower at that
+/// width.
+///
+/// `to` is the *result* lane type; the caller has already required it to be the same width as the
+/// source, so this is a question about one width, not two.
+///
+/// **Float to integer at 64-bit lanes is refused.** Cranelift lowers `fcvt_to_sint_sat.i32x4`
+/// (SSE2 `cvttps2dq` plus the saturation fix-ups) but has no rule for `.i64x2`, which needs
+/// AVX512DQ's `vcvttpd2qq`; it comes back as `Unsupported("should be implemented in ISLE")`, the
+/// same failed-at-`-O2`-but-runs-at-`-O0` shape as the entries in [`bin_widenable`]. The reverse
+/// direction is fine at both widths, and so is `f32 -> i32`. Enumerated the same way, with a debug
+/// `wukongc` so the CLIF verifier runs: all four conversion kinds at both lane widths, of which
+/// exactly `FpToSi`/`FpToUi` at 8 bytes fail.
+fn cast_widenable(k: CastKind, to: &MirType) -> bool {
+    match k {
+        CastKind::FpToSi | CastKind::FpToUi => lane_bytes(to.lane_type()) != Some(8),
+        CastKind::SiToFp | CastKind::UiToFp | CastKind::Bitcast => true,
+        _ => false,
+    }
 }
 
 /// The runtime pointer-range checks this loop needs.
@@ -2162,6 +2175,26 @@ mod tests {
             vs.iter().all(|(l, n)| *l == MirType::I32 && *n == 4),
             "{vs:?}"
         );
+    }
+
+    /// `f32 -> i32` widens (Cranelift lowers `fcvt_to_sint_sat.i32x4`); `f64 -> i64` must not,
+    /// because the `.i64x2` form needs AVX512DQ and Cranelift has no rule for it. The reverse
+    /// direction widens at both widths, which is what makes this a per-width question rather than
+    /// a per-kind one.
+    #[test]
+    fn a_float_to_int_cast_widens_only_at_32_bit_lanes() {
+        let narrow = "fn k(x: []f32, mut o: []i32, n: i64) { let mut i: i64 = 0; \
+                      while i < n { o[i] = x[i] as i32; i = i + 1; } } \
+                      fn main() -> i32 { return 0; }";
+        let wide = "fn k(x: []f64, mut o: []i64, n: i64) { let mut i: i64 = 0; \
+                    while i < n { o[i] = x[i] as i64; i = i + 1; } } \
+                    fn main() -> i32 { return 0; }";
+        let back = "fn k(x: []i64, mut o: []f64, n: i64) { let mut i: i64 = 0; \
+                    while i < n { o[i] = x[i] as f64; i = i + 1; } } \
+                    fn main() -> i32 { return 0; }";
+        assert!(is_widened(narrow, "k"), "f32 -> i32 should widen");
+        assert!(!is_widened(wide, "k"), "f64 -> i64 must not widen");
+        assert!(is_widened(back, "k"), "i64 -> f64 should widen");
     }
 
     /// A MIR vector shift is lane-wise; Cranelift's is a broadcast of one scalar amount. Widening
