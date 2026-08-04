@@ -16,6 +16,22 @@
 //! kernel/section names.
 //!
 //! Fairness notes:
+//!  * ALIASING: every generated C/C++ peer declares its kernel parameters `__restrict__` (the GCC
+//!    spelling accepted in both gcc's C mode and g++'s C++ mode, so the C++ column rendered by
+//!    [`cpp_from_c`] inherits it). Without it gcc must assume the output buffer may overlap the
+//!    inputs and cannot vectorize or reorder a nested kernel — a handicap no competent C programmer
+//!    would accept for a kernel with distinct in/out buffers. Wukong's own tensor parameters carry
+//!    that non-overlap in the type system, so withholding `restrict` from the peer compared a
+//!    no-alias compiler against a may-alias one. Every call site in this file passes three (or four)
+//!    genuinely distinct allocations, which is what makes the qualifier true and not just fast.
+//!    MEASURING THIS CORRECTLY MATTERS: a standalone probe that puts the kernel and its caller in
+//!    ONE translation unit over `static` arrays lets gcc's interprocedural alias analysis prove
+//!    non-overlap by itself, and `restrict` then looks like a no-op. It is not — the peers here are
+//!    compiled to a **shared library**, where gcc sees only pointer parameters. Re-measured in that
+//!    model (kernels in their own TU, gcc 14.2 `-O3 -march=native`, best-of-N, one process):
+//!    `matmul_tn` 512³ **176.6 -> 20.2 ms (8.7x)**, `colsum` 4096x1024 **21.3 -> 5.0 ms (4.2x)`,
+//!    the direct convolution **1.99 -> 0.40 ms (5.0x)**, `saxpy` 1.33x; `relu`/`biasadd` genuinely
+//!    unaffected (0.96x / 1.01x — gcc already versions those loops with a runtime alias check).
 //!  * FMA: Wukong now contracts `x + y*z` to a fused multiply-add, so gcc is given its *default*
 //!    `-ffp-contract=fast` (the old `-ffp-contract=off` was actually suppressing C's natural FMA).
 //!    Both Wukong and gcc-compiled C therefore fuse. Idiomatic Rust does *not* contract unless the
@@ -200,6 +216,123 @@ fn bench_c_fast(
         yp,
     )?;
     relaxed_peer_ok(label, "C(fast)", m, &cf).then_some(cf)
+}
+
+/// The C(fast) peer for an **index-output** bench (`rowarg` / `colarg`). Same C source at
+/// [`C_FAST_FLAGS`]. gcc will only vectorize a float max-with-index reduction under relaxed FP (the
+/// comparison has to be reassociable), so withholding `-ffast-math` here compares Wukong's
+/// branchless 8-lane (value,index) fold against a compiler that is *forbidden* from doing the same
+/// thing — exactly the asymmetry `is_reduction_kernel` already normalizes for the elementwise
+/// `argmax` row. Unlike [`bench_c_fast`] the validity check is EXACT index equality: the output is
+/// an i32 buffer riding the f32 slots, so a magnitude-normalized tolerance would be meaningless.
+#[allow(clippy::too_many_arguments)]
+fn bench_c_fast_idx(
+    label: &str,
+    c_src: &str,
+    dir: &Path,
+    cc: &str,
+    wuk: &Option<Measure>,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+) -> Option<Measure> {
+    let m = wuk.as_ref()?;
+    let cf = bench_external(
+        "c",
+        c_src,
+        dir,
+        &format!("{label}_fast"),
+        cc,
+        C_FAST_FLAGS,
+        out,
+        xp,
+        yp,
+    )?;
+    if m.out != cf.out {
+        println!(
+            "  ! {label}: C(fast) picks different indices under -ffast-math — C(fast) column skipped"
+        );
+        return None;
+    }
+    Some(cf)
+}
+
+/// The C(fast) peer for the **bf16** benches (`linear_bf16`, the bf16 dot/sum), whose ABI writes an
+/// f32 scalar rather than a buffer so [`bench_c_fast`] does not fit. Same C source at
+/// [`C_FAST_FLAGS`]; the validity bar is the loose 1e-2 relative check the plain column already uses
+/// on that scalar. Without this column the bf16 GEMM row compared Wukong's blocked, reassociated
+/// f32 accumulation against a C peer required to keep the K-long sum strictly in order.
+#[allow(clippy::too_many_arguments)]
+fn bench_bf16_fast(
+    label: &str,
+    c_src: &str,
+    dir: &Path,
+    cc: &str,
+    wuk: &Option<MeasureBf16>,
+    out: &mut [f32],
+    xp: *const u16,
+    yp: *const u16,
+) -> Option<MeasureBf16> {
+    let m = wuk.as_ref()?;
+    let cf = bench_external_bf16(
+        "c",
+        c_src,
+        dir,
+        &format!("{label}_fast"),
+        cc,
+        C_FAST_FLAGS,
+        out,
+        xp,
+        yp,
+    )?;
+    let rel = ((m.out - cf.out).abs() / cf.out.abs().max(1e-6)) as f64;
+    if rel > 1e-2 {
+        println!(
+            "  ! {label}: C(fast) disagrees with Wukong (rel {rel:.2e} > 1e-2) — C(fast) column skipped"
+        );
+        return None;
+    }
+    Some(cf)
+}
+
+/// [`report_relaxed_ratio`] for the scalar-output bf16 [`MeasureBf16`] harness.
+fn bf16_relaxed_ratio(
+    peer: &str,
+    wuk: &Option<MeasureBf16>,
+    wk_par: &Option<MeasureBf16>,
+    p: &Option<MeasureBf16>,
+) {
+    let Some(pm) = p else { return };
+    if let Some(m) = wuk {
+        let r = pm.ns_per_call / m.ns_per_call;
+        println!(
+            "  -> Wukong single-core is {:.2}x {} than {peer}",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+    if let Some(mp) = wk_par {
+        let r = pm.ns_per_call / mp.ns_per_call;
+        println!(
+            "  -> Wukong @parallel is {:.2}x {} than {peer}",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+}
+
+/// Print a `Wukong @parallel` standing **direction-aware**. `r` is `peer_ns / wukong_ns`, so `r < 1`
+/// means Wukong is SLOWER. Twenty of these call sites printed the bare ratio — `"@parallel is 0.73x
+/// idiomatic single-threaded C"` — which reads as a win at a glance and is in fact a 27% loss. Every
+/// other summary in this file ([`report_relaxed_ratio`], [`report_ratio`], the geomeans) already
+/// picks the word; these per-bench lines were the exception, and the exception only became visible
+/// once the corrected peers started beating Wukong on some rows.
+fn par_standing(peer: &str, r: f64) {
+    println!(
+        "  -> Wukong @parallel is {:.2}x {} than {peer}",
+        if r >= 1.0 { r } else { 1.0 / r },
+        if r >= 1.0 { "faster" } else { "slower" }
+    );
 }
 
 /// Print Wukong's standing vs a relaxed-FP peer (C(fast) / C(omp)) — reported ALONGSIDE the
@@ -1007,7 +1140,7 @@ fn wk_matmul(ns: usize, parallel: bool) -> String {
 
 fn c_matmul(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++){{\n\
          \x20   for (long j=0;j<NS;j++) c[i*NS+j]=0.0f;\n\
          \x20   for (long k=0;k<NS;k++){{\n\
@@ -1023,7 +1156,7 @@ fn c_matmul(ns: usize) -> String {
 /// serial nest exactly; the parallelism only partitions rows.
 fn c_matmul_omp(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          #pragma omp parallel for\n\
          \x20 for (long i=0;i<NS;i++){{\n\
          \x20   for (long j=0;j<NS;j++) c[i*NS+j]=0.0f;\n\
@@ -1051,9 +1184,9 @@ fn rust_matmul(ns: usize) -> String {
 /// `C = Aᵀ·B` — the **weight-gradient** GEMM of a training backward pass (`dW = dYᵀ·X`). A is stored
 /// `[K, M]` (the contraction/batch axis is the OUTER index of A's storage), so its logical operand is
 /// the transpose of its layout. Wukong recognizes `a[k*M+i]*b[k*N+j]` and dispatches to
-/// `wukong_sgemm_tn` (transpose A once, then the tuned NN kernel); idiomatic C/Rust compile the
-/// column-strided A reads (one cache line per element) as a near-scalar k-loop gcc cannot vectorize —
-/// the regime the domain lowering should dominate hardest. Square M=K=N for the shared-buffer ABI.
+/// `wukong_sgemm_tn` (transpose A once, then the tuned NN kernel); the C/Rust peers run the natural
+/// `kij` nest, which hoists `a[k*M+i]` and streams B and C contiguously (see [`c_matmul_tn`] for the
+/// spelling correction and its measured cost). Square M=K=N for the shared-buffer ABI.
 fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
     for ns in [256usize, 512, 1024] {
         let n2 = ns * ns;
@@ -1121,14 +1254,17 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
                 );
             }
         }
-        // Cross-language correctness: the transpose-once-then-NN result must match the naive nest.
-        if let (Some(m), Some(c)) = (&wuk, &cm) {
-            let (rel, at) = max_rel_err(&m.out, &c.out);
-            if rel > 1e-3 {
-                println!(
-                    "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                    m.out[at], c.out[at], rel
-                );
+        // Cross-language correctness: the transpose-once-then-NN result must match the `kij` nest,
+        // in BOTH peers (each was re-spelled in the 2026-08-04 peer audit).
+        for (lang, peer) in [("C", &cm), ("Rust", &rm)] {
+            if let (Some(m), Some(c)) = (&wuk, peer) {
+                let (rel, at) = max_rel_err(&m.out, &c.out);
+                if rel > 1e-3 {
+                    println!(
+                        "  ! full-buffer mismatch vs {lang} at [{at}]: Wukong={} {lang}={} (rel {:.2e})",
+                        m.out[at], c.out[at], rel
+                    );
+                }
             }
         }
         if let (Some(ms), Some(c)) = (&wuk, &cm) {
@@ -1171,14 +1307,23 @@ fn wk_matmul_tn(ns: usize, parallel: bool) -> String {
     )
 }
 
+/// The C weight-gradient peer, in the natural **`kij`** order: hoist `a[k*M+i]` out of the inner
+/// loop and stream `b[k*N+·]` and `c[i*N+·]` contiguously, exactly as [`c_matmul`] does for the
+/// untransposed nest. The previous spelling was `ijk` with **both** operands read column-strided
+/// (`s += a[k*NS+i]*b[k*NS+j]`) — a k-loop that touches two fresh cache lines per iteration and that
+/// gcc cannot vectorize, which is not how a competent C programmer writes `C = Aᵀ·B`. The `kij` order
+/// accumulates each `c[i][j]` over k in the identical ascending order, so the result is unchanged.
+/// Measured standalone at `-O3 -march=native`, 512³, kernels in their own TU: **176.6 ms `ijk` →
+/// 20.25 ms `ijk` + `restrict` → 9.70 ms `kij` + `restrict`, an 18.2× total handicap** — of which
+/// 8.7× is `restrict` alone and 2.1× the loop order.
 fn c_matmul_tn(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
-         \x20 for (long i=0;i<NS;i++){{\n\
-         \x20   for (long j=0;j<NS;j++){{\n\
-         \x20     float s=0.0f;\n\
-         \x20     for (long k=0;k<NS;k++) s += a[k*NS+i]*b[k*NS+j];\n\
-         \x20     c[i*NS+j]=s;\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
+         \x20 for (long t=0;t<(long)NS*NS;t++) c[t]=0.0f;\n\
+         \x20 for (long k=0;k<NS;k++){{\n\
+         \x20   for (long i=0;i<NS;i++){{\n\
+         \x20     float aki=a[k*NS+i];\n\
+         \x20     for (long j=0;j<NS;j++) c[i*NS+j] += aki*b[k*NS+j];\n\
          \x20   }}\n\
          \x20 }}\n}}\n"
     )
@@ -1187,11 +1332,16 @@ fn c_matmul_tn(ns: usize) -> String {
 fn rust_matmul_tn(ns: usize) -> String {
     format!(
         "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
-         \x20 for i in 0..NS {{\n\
-         \x20   for j in 0..NS {{\n\
-         \x20     let mut s=0.0f32;\n\
-         \x20     for k in 0..NS {{ s += *a.add(k*NS+i) * *b.add(k*NS+j); }}\n\
-         \x20     *c.add(i*NS+j)=s;\n\
+         \x20 let a = core::slice::from_raw_parts(a, NS*NS);\n\
+         \x20 let b = core::slice::from_raw_parts(b, NS*NS);\n\
+         \x20 let c = core::slice::from_raw_parts_mut(c, NS*NS);\n\
+         \x20 for v in c.iter_mut() {{ *v = 0.0; }}\n\
+         \x20 for k in 0..NS {{\n\
+         \x20   let brow = &b[k*NS..k*NS+NS];\n\
+         \x20   for i in 0..NS {{\n\
+         \x20     let aki = a[k*NS+i];\n\
+         \x20     let crow = &mut c[i*NS..i*NS+NS];\n\
+         \x20     for (cv, &bv) in crow.iter_mut().zip(brow) {{ *cv += aki*bv; }}\n\
          \x20   }}\n\
          \x20 }}\n}}\n"
     )
@@ -1227,13 +1377,18 @@ fn bench_gemv(cc: &str, dir: &Path) {
             "rs", &rust_gemv(m, n), dir, "gemv", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut y, ap, xp,
         );
+        // Reassociation-normalized peer. Wukong's `wukong_sgemv` folds each row across four 8-wide
+        // accumulators — it REASSOCIATES the dot — so a plain-flags C column that must keep the sum
+        // strictly left-to-right is not the like-for-like comparison. Printed alongside, never
+        // instead of, the honest-default C ratio.
+        let cfast = bench_c_fast("gemv", &c_gemv(m, n), dir, cc, &wuk, &mut y, ap, xp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&rm)
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cfast), gbps(&rm)
         );
         // The 8-wide row dot reassociates → magnitude-normalized tolerance (max|Δ| / max|C|), not a
         // pointwise ratio (mean-zero inputs put outputs near 0). Same basis as the reduction cross-checks.
@@ -1259,8 +1414,9 @@ fn bench_gemv(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x idiomatic single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
     }
 }
@@ -1281,7 +1437,7 @@ fn wk_gemv(m: usize, n: usize, parallel: bool) -> String {
 fn c_gemv(m: usize, n: usize) -> String {
     format!(
         "#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* a, const float* x, float* y){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ x, float* __restrict__ y){{\n\
          \x20 for (long i=0;i<M;i++){{ float s=0.0f; for (long j=0;j<N;j++) s+=a[i*N+j]*x[j]; y[i]=s; }} }}\n"
     )
 }
@@ -1326,13 +1482,16 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
             "rs", &rust_scaled_scores(s, d), dir, "scaled_gemm", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, qp, kp,
         );
+        // Reassociation-normalized peer: the D-long score dot is a float reduction Wukong's blocked
+        // GEMM accumulates out of order, so C is given the same freedom in this column.
+        let cfast = bench_c_fast("scaled_gemm", &c_scaled_scores(s, d), dir, cc, &wuk, &mut out, qp, kp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "GFLOP/s", gflops(&wuk), gflops(&wk_par), gflops(&cm), gflops(&rm)
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "GFLOP/s", gflops(&wuk), gflops(&wk_par), gflops(&cm), gflops(&cfast), gflops(&rm)
         );
         // The D-long score dot reassociates (FMA + blocked accumulation vs C's naive scalar order), and
         // the small mixed-sign Q/K put some scores near 0 → a pointwise relative check divides by ~0 and
@@ -1361,8 +1520,9 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x idiomatic single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         if let (Some(ms), Some(mn)) = (&wuk, &wk_noscale) {
             // >1 ⇒ the α costs time; ~1.0 ⇒ the scale is free (folded into the writeback).
             let r = ms.ns_per_call / mn.ns_per_call;
@@ -1406,7 +1566,7 @@ fn wk_scores_noscale(s: usize, d: usize, parallel: bool) -> String {
 fn c_scaled_scores(s: usize, d: usize) -> String {
     format!(
         "#define S {s}\n#define D {d}\n\
-         __declspec(dllexport) void kbench(const float* q, const float* k, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ q, const float* __restrict__ k, float* __restrict__ out){{\n\
          \x20 for (long i=0;i<S;i++){{ for (long j=0;j<S;j++){{ float s=0.0f; for (long p=0;p<D;p++) s+=q[i*D+p]*k[j*D+p]; out[i*S+j]=0.125f*s; }} }} }}\n"
     )
 }
@@ -1562,7 +1722,7 @@ fn wk_linear_rect(m: usize, k: usize, n: usize, parallel: bool) -> String {
 
 fn c_linear(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
          \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
@@ -1575,7 +1735,7 @@ fn c_linear(ns: usize) -> String {
 /// vectorize — the strongest honest multithreaded C for `nn.Linear`).
 fn c_linear_omp(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          #pragma omp parallel for\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
@@ -1732,7 +1892,7 @@ fn wk_ffn(ns: usize, parallel: bool) -> String {
 
 fn c_ffn(ns: usize) -> String {
     format!(
-        "#include <math.h>\n#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+        "#include <math.h>\n#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
          \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
@@ -1808,16 +1968,21 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
             ap,
             bp,
         );
+        // Reassociation-normalized peer: the K-long f32 accumulation is a float reduction, and
+        // Wukong's widen-prepass + tuned GEMM accumulates it blocked. Validity-checked at the loose
+        // 1e-2 bar on c[0], the same sanity guard the plain column uses.
+        let cfast = bench_bf16_fast("linear_bf16", &c_linear_bf16(ns), dir, cc, &wuk, &mut c, ap, bp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GFLOP/s",
             gflops(&wuk),
             gflops(&wk_par),
             gflops(&cm),
+            gflops(&cfast),
             gflops(&rm)
         );
         // Sanity cross-check on c[0] (the bf16 widen is lossless, so all three compute the same GEMM
@@ -1847,6 +2012,7 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
+        bf16_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
     }
 }
@@ -1872,7 +2038,7 @@ fn c_linear_bf16(ns: usize) -> String {
     format!(
         "#include <stdint.h>\n#include <string.h>\n#define NS {ns}\n\
          static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
-         __declspec(dllexport) void kbench(const uint16_t* a, const uint16_t* b, float* c){{\n\
+         __declspec(dllexport) void kbench(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, float* __restrict__ c){{\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
          \x20     for (long k=0;k<NS;k++) s += bf(a[i*NS+k]) * bf(b[j*NS+k]);\n\
@@ -1893,9 +2059,10 @@ fn rust_linear_bf16(ns: usize) -> String {
 
 /// Matrix transpose `dst = srcᵀ` — the memory-bound layout op (attention score transposes, weight
 /// layout conversions). Wukong folds the `dst[j*R+i] = src[i*C+j]` nest to the cache-blocked
-/// `wukong_transpose_f32`; C/Rust are the idiomatic naive transpose at `-O3 -march=native`. The naive
-/// transpose writes `dst` with stride `R` — a fresh cache line per element once `R` is large — while
-/// the blocked kernel keeps a `B×B` tile L1-resident; gcc/rustc do not loop-tile a transpose at `-O3`.
+/// `wukong_transpose_f32`; the C/Rust peers are **also** 32×32 cache-blocked (see [`c_transpose`]),
+/// so what is measured is Wukong's tile-mover against gcc's/rustc's codegen for the same algorithm —
+/// not blocked-vs-unblocked. gcc still does not loop-tile a transpose *by itself*, which is why the
+/// blocking has to be written out; the point is that a competent programmer writes it.
 /// The kernels carry an unused middle pointer so they share the `(src, _, dst)` `KernelFn` ABI and the
 /// f32 harness. Square shapes large enough to spill L2 (where the cache pattern dominates), reported as
 /// GB/s (`2·N²·4` bytes moved per call: read `src` + write `dst`). Transpose is a permutation, so the
@@ -1968,22 +2135,29 @@ fn bench_transpose(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         // Transpose is a permutation — exact, so the full-buffer cross-check is bit equality.
+        // BOTH peers are checked: a peer whose spelling changed (blocked, sliced) could in principle
+        // get "faster" by not doing the work, and an unchecked column would never say so.
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             if m.out != c2.out {
                 println!("  ! transpose output mismatch vs C");
             }
         }
+        if let (Some(m), Some(r2)) = (&wuk, &rm) {
+            if m.out != r2.out {
+                println!("  ! transpose output mismatch vs Rust");
+            }
+        }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &wuk, &wk_par, &comp);
         println!();
@@ -2004,42 +2178,66 @@ fn wk_transpose(ns: usize, parallel: bool) -> String {
     )
 }
 
+/// The C transpose peer, **cache-blocked at 32×32** — the textbook optimization for a transpose and
+/// the same algorithm Wukong's `wukong_transpose_f32` uses, so the comparison is kernel-vs-kernel
+/// rather than blocked-vs-unblocked. The old peer was the naive `for i { for j { dst[j*NS+i] =
+/// src[i*NS+j] } }`, which writes `dst` with stride `NS` (a fresh cache line per element); the
+/// bench's own commentary named that as the reason Wukong won, which makes it a peer defect, not a
+/// compiler win. Measured standalone at `-O3 -march=native`, 2048², kernels in their own TU:
+/// **29.51 ms naive → 24.31 ms naive + `restrict` → 14.09 ms 32×32-blocked + `restrict`, a 2.09×
+/// total handicap**. `NS` is 1024/2048 here, both multiples of 32, so the blocked nest needs no
+/// remainder handling.
 fn c_transpose(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n\
-         __declspec(dllexport) void kbench(const float* src, const float* y, float* dst){{\n\
+        "#define NS {ns}\n#define TB 32\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
-         \x20 for (long i=0;i<NS;i++)\n\
-         \x20   for (long j=0;j<NS;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+         \x20 for (long ii=0;ii<NS;ii+=TB) for (long jj=0;jj<NS;jj+=TB)\n\
+         \x20   for (long i=ii;i<ii+TB;i++)\n\
+         \x20     for (long j=jj;j<jj+TB;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
     )
 }
 
-/// The OpenMP twin of [`c_transpose`]: rows across cores. A permutation, so it stays exact.
+/// The OpenMP twin of [`c_transpose`]: blocked tile rows across cores. A permutation, so it stays exact.
 fn c_transpose_omp(ns: usize) -> String {
     format!(
-        "#define NS {ns}\n\
-         __declspec(dllexport) void kbench(const float* src, const float* y, float* dst){{\n\
+        "#define NS {ns}\n#define TB 32\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
          #pragma omp parallel for\n\
-         \x20 for (long i=0;i<NS;i++)\n\
-         \x20   for (long j=0;j<NS;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+         \x20 for (long ii=0;ii<NS;ii+=TB) for (long jj=0;jj<NS;jj+=TB)\n\
+         \x20   for (long i=ii;i<ii+TB;i++)\n\
+         \x20     for (long j=jj;j<jj+TB;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
     )
 }
 
 fn rust_transpose(ns: usize) -> String {
     format!(
-        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
-         \x20 for i in 0..NS {{ for j in 0..NS {{ *dst.add(j*NS+i) = *src.add(i*NS+j); }} }}\n}}\n"
+        "const NS: usize = {ns};\nconst TB: usize = 32;\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
+         \x20 let s = core::slice::from_raw_parts(src, NS*NS);\n\
+         \x20 let d = core::slice::from_raw_parts_mut(dst, NS*NS);\n\
+         \x20 for ii in (0..NS).step_by(TB) {{ for jj in (0..NS).step_by(TB) {{\n\
+         \x20   for i in ii..ii+TB {{ for j in jj..jj+TB {{ d[j*NS+i] = s[i*NS+j]; }} }} }} }}\n}}\n"
     )
 }
 
 /// Column reduction `out[j] = Σ_i x[i, j]` — the sum over the outer (batch/row) axis (the bias gradient
-/// `db = Σ_batch dY`, batch sum, reduce-along-axis-0). The naive `for j { for i { s += x[i*N+j] } }`
-/// reads `x` with stride `N` — a strided reduction gcc/rustc leave **scalar** (verified: no packed
-/// `vaddps` at `-O3 -march=native`). Wukong folds the nest to `wukong_colsum_f32`, which streams `x`
-/// row-major + 8 columns at a time. The kernels carry an unused middle pointer so they share the
-/// `(x, _, out)` 3-pointer harness. Reported as GB/s (`M·N·4` bytes — the matrix read once). Both
-/// languages sum each column i-ascending, so the cross-check is **bit-exact** (no reassociation).
+/// `db = Σ_batch dY`, batch sum, reduce-along-axis-0). Wukong folds the nest to `wukong_colsum_f32`,
+/// which streams `x` row-major + 8 columns at a time. The kernels carry an unused middle pointer so
+/// they share the `(x, _, out)` 3-pointer harness. Reported as GB/s (`M·N·4` bytes — the matrix read
+/// once). Every language sums each column i-ascending, so the cross-check is **bit-exact**.
+///
+/// PEER SPELLING (corrected 2026-08-04). The C/Rust peers used to be written **column-outer**,
+/// `for j { float s=0; for i { s += x[i*N+j]; } out[j]=s; }` — the single worst loop order for a
+/// row-major column reduction (stride-`N` reads, one cache line touched per element, and gcc/rustc
+/// leave it fully scalar). That was the *only* order measured, and the ~29–50× multiple this bench
+/// published was mostly the peer's loop order, not Wukong's kernel. The peers are now **row-outer**,
+/// `for i { for j { out[j] += x[i*N+j]; } }` — the natural, cache-friendly spelling, which folds each
+/// column in the identical i-ascending order (so the bit-exact cross-check still holds) and which
+/// gcc auto-vectorizes. Measured standalone at `-O3 -march=native`, 4096×1024, with the kernels in
+/// their own translation unit so gcc sees only pointer parameters (the shared-library model this
+/// harness actually uses): **21.33 ms column-outer → 5.03 ms column-outer + `restrict` → 0.58 ms
+/// row-outer + `restrict`, a 36.7× total handicap**, with byte-identical output (sum |Δ| = 0).
 fn bench_colsum(cc: &str, dir: &Path) {
     for (m, n) in [(1024usize, 1024usize), (4096, 1024)] {
         let mn = m * n;
@@ -2116,17 +2314,22 @@ fn bench_colsum(cc: &str, dir: &Path) {
                 println!("  ! colsum output mismatch vs C");
             }
         }
+        if let (Some(a), Some(r2)) = (&wuk, &rm) {
+            if a.out != r2.out {
+                println!("  ! colsum output mismatch vs Rust");
+            }
+        }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         report_relaxed_ratio("C(omp) [-fopenmp -ffast-math, all cores]", &wuk, &wk_par, &comp);
@@ -2153,28 +2356,36 @@ fn wk_colsum(m: usize, n: usize, parallel: bool) -> String {
 fn c_colsum(m: usize, n: usize) -> String {
     format!(
         "#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
-         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
+         \x20 for (long j=0;j<N;j++) out[j]=0.0f;\n\
+         \x20 for (long i=0;i<M;i++) for (long j=0;j<N;j++) out[j] += x[i*N+j];\n}}\n"
     )
 }
 
-/// The OpenMP twin of [`c_colsum`]: columns across cores (each `out[j]` owned by one thread, so no
-/// combine — the per-column fold order is unchanged). Compiled with [`C_OMP_FAST_FLAGS`].
+/// The OpenMP twin of [`c_colsum`]: **column blocks** across cores, each block folded row-outer
+/// inside. Every `out[j]` is owned by exactly one thread, so there is no cross-thread combine and
+/// the per-column fold order stays i-ascending — identical to the serial peer and to Wukong.
+/// Compiled with [`C_OMP_FAST_FLAGS`].
 fn c_colsum_omp(m: usize, n: usize) -> String {
     format!(
-        "#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+        "#define M {m}\n#define N {n}\n#define JB 64\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          #pragma omp parallel for\n\
-         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
+         \x20 for (long jb=0;jb<N;jb+=JB){{ long je = jb+JB<N ? jb+JB : N;\n\
+         \x20   for (long j=jb;j<je;j++) out[j]=0.0f;\n\
+         \x20   for (long i=0;i<M;i++) for (long j=jb;j<je;j++) out[j] += x[i*N+j]; }}\n}}\n"
     )
 }
 
 fn rust_colsum(m: usize, n: usize) -> String {
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 for j in 0..N {{ let mut s=0.0f32; for i in 0..M {{ s += *x.add(i*N+j); }} *out.add(j)=s; }}\n}}\n"
+         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
+         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+         \x20 for o in os.iter_mut() {{ *o = 0.0; }}\n\
+         \x20 for i in 0..M {{ let row = &xs[i*N..i*N+N]; for (o, &v) in os.iter_mut().zip(row) {{ *o += v; }} }}\n}}\n"
     )
 }
 
@@ -2248,7 +2459,7 @@ fn bench_biasadd(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let ratio = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {ratio:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", ratio);
         }
         println!();
     }
@@ -2268,7 +2479,7 @@ fn wk_biasadd(r: usize, c: usize, parallel: bool) -> String {
 fn c_biasadd(r: usize, c: usize) -> String {
     format!(
         "#define R {r}\n#define C {c}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* bias, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ bias, float* __restrict__ out){{\n\
          \x20 for (long r=0;r<R;r++){{ for (long c=0;c<C;c++){{ out[r*C+c] = x[r*C+c] + bias[c]; }} }}\n}}\n"
     )
 }
@@ -2300,7 +2511,14 @@ fn bench_dequant(cc: &str, cxx: &str, dir: &Path) {
         let qi8: Vec<i8> = (0..n).map(|i| ((i * 37 + 5) % 251) as i64 as i8).collect();
         let mut out = vec![0.0f32; n];
         let qp = if is_i8 { qi8.as_ptr() as *const f32 } else { qi32.as_ptr() as *const f32 };
-        let dummy = out.as_ptr(); // the unused middle pointer (kernel never reads it)
+        // A REAL, distinct filler for the unused middle pointer. It used to be `out.as_ptr()`, which
+        // aliased the output buffer the kernel writes — harmless while the C peer never dereferenced
+        // it, but a latent `restrict` violation the moment the peer's parameters carry `__restrict__`
+        // (an unused-but-aliasing `restrict` pointer to a modified object). No peer — Wukong, C, C++
+        // or Rust — ever indexes this parameter, so one element is enough; the point is only that it
+        // is not the output buffer.
+        let dummy_buf = vec![0.0f32; 1];
+        let dummy = dummy_buf.as_ptr();
         let bytes = (in_bytes + 4) as f64 * n as f64;
         let gbps = |v: &Option<Measure>| {
             v.as_ref()
@@ -2383,7 +2601,7 @@ fn dequant_ratio(
     }
     if let (Some(mp), Some(c)) = (wk_par, cm) {
         let r = c.ns_per_call / mp.ns_per_call;
-        println!("  -> Wukong @parallel is {r:.2}x single-threaded C");
+        par_standing("single-threaded C", r);
     }
 }
 
@@ -2400,7 +2618,7 @@ fn c_dequant_1d(n: usize, is_i8: bool) -> String {
     let ty = if is_i8 { "signed char" } else { "int" };
     format!(
         "#define N {n}\n\
-         __declspec(dllexport) void kbench(const {ty}* q, const float* u, float* out){{\n\
+         __declspec(dllexport) void kbench(const {ty}* __restrict__ q, const float* __restrict__ u, float* __restrict__ out){{\n\
          \x20 (void)u; for (long j=0;j<N;j++){{ out[j] = (float)q[j] * 0.0125f; }}\n}}\n"
     )
 }
@@ -2429,7 +2647,7 @@ fn c_dequant_perchan(r: usize, c: usize, is_i8: bool) -> String {
     let ty = if is_i8 { "signed char" } else { "int" };
     format!(
         "#define R {r}\n#define C {c}\n\
-         __declspec(dllexport) void kbench(const {ty}* q, const float* scale, float* out){{\n\
+         __declspec(dllexport) void kbench(const {ty}* __restrict__ q, const float* __restrict__ scale, float* __restrict__ out){{\n\
          \x20 for (long i=0;i<R;i++){{ for (long j=0;j<C;j++){{ out[i*C+j] = (float)q[i*C+j] * scale[j]; }} }}\n}}\n"
     )
 }
@@ -2443,14 +2661,20 @@ fn rust_dequant_perchan(r: usize, c: usize, is_i8: bool) -> String {
 }
 
 /// Column max / min / **abs-max** `out[j] = max/min_i x[i,j]` (and `max_i |x[i,j]|`, the per-channel
-/// symmetric-quant scale) — per-channel statistics / axis-0 pooling, the siblings of `colsum`. The naive
-/// `for j { let s=x[j]; for i { s = max(s, x[i*N+j]) } }` strides `x` by `N` and — verified — gcc/rustc
-/// leave all three **scalar** (no packed `vmaxps`/`vminps` at `-O3 -march=native`: `fmax`/`fmin` are
-/// non-associative so they will not reassociate the strided fold). Wukong folds them to
-/// `wukong_col{max,min,maxabs}_f32`, streaming `x` row-major + 8 columns at a time. Reported as GB/s
-/// (`M·N·4`, the matrix read once); the kernels carry an unused middle pointer to share the `(x, _, out)`
-/// 3-pointer harness. Both fold each column i-ascending (`s ⊕ v` mirrors `_mm256_{max,min}_ps`, abs via
-/// sign-mask == `fabsf`), so the cross-check is **bit-exact** on finite data.
+/// symmetric-quant scale) — per-channel statistics / axis-0 pooling, the siblings of `colsum`. Wukong
+/// folds them to `wukong_col{max,min,maxabs}_f32`, streaming `x` row-major + 8 columns at a time.
+/// Reported as GB/s (`M·N·4`, the matrix read once); the kernels carry an unused middle pointer to
+/// share the `(x, _, out)` 3-pointer harness. Every language folds each column i-ascending (`s ⊕ v`
+/// mirrors `_mm256_{max,min}_ps`, abs via sign-mask == `fabsf`), so the cross-check is **bit-exact**
+/// on finite data.
+///
+/// PEER SPELLING (corrected 2026-08-04) — same defect as [`bench_colsum`]: the C/Rust peers were
+/// written column-outer, `for j { s=x[j]; for i { s = s>v?s:v } out[j]=s; }`, striding `x` by `N`.
+/// They are now row-outer (`out[]` seeded from row 0, then `for i { for j { … } }`), which keeps the
+/// identical i-ascending fold *and* the identical `s{cmp}v?s:v` expression (so NaN behaviour and
+/// bit-exactness are preserved) while streaming `x` sequentially. Measured standalone at `-O3
+/// -march=native`, 4096×1024 max, kernels in their own TU: **34.82 ms column-outer vs 0.857 ms
+/// row-outer + `restrict`, a 40.6× handicap**, output identical (sum |Δ| = 0).
 fn bench_colmax(cc: &str, dir: &Path) {
     // 0 = max, 1 = min, 2 = abs-max (the per-channel symmetric-quant scale).
     for (opc, label, sym) in [
@@ -2496,16 +2720,21 @@ fn bench_colmax(cc: &str, dir: &Path) {
                 xp,
                 yp,
             );
+            // Reassociation-normalized peer. `fmax`/`fmin` are not associative, so at honest flags
+            // gcc keeps a max/min reduction in source order; `-ffast-math` lets it vectorize the
+            // fold, which is what Wukong's `_mm256_max_ps` lane fold does.
+            let cfast = bench_c_fast(label, &c_colmax(m, n, opc), dir, cc, &wuk, &mut out, xp, yp);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&wuk),
                 gbps(&wk_par),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             // Both fold each column i-ascending, so the full-buffer cross-check is bit equality.
@@ -2514,18 +2743,24 @@ fn bench_colmax(cc: &str, dir: &Path) {
                     println!("  ! {label} output mismatch vs C");
                 }
             }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if a.out != r2.out {
+                    println!("  ! {label} output mismatch vs Rust");
+                }
+            }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
+            report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
             println!();
         }
     }
@@ -2554,9 +2789,10 @@ fn c_colmax(m: usize, n: usize, op: u8) -> String {
     let (lo, hi) = if op == 2 { ("fabsf(", ")") } else { ("", "") };
     format!(
         "#include <math.h>\n#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
-         \x20 for (long j=0;j<N;j++){{ float s={lo}x[j]{hi}; for (long i=1;i<M;i++){{ float v={lo}x[i*N+j]{hi}; s = s{cmp}v?s:v; }} out[j]=s; }}\n}}\n"
+         \x20 for (long j=0;j<N;j++) out[j]={lo}x[j]{hi};\n\
+         \x20 for (long i=1;i<M;i++) for (long j=0;j<N;j++){{ float s=out[j], v={lo}x[i*N+j]{hi}; out[j] = s{cmp}v?s:v; }}\n}}\n"
     )
 }
 
@@ -2565,7 +2801,11 @@ fn rust_colmax(m: usize, n: usize, op: u8) -> String {
     let (lo, hi) = if op == 2 { ("(", ").abs()") } else { ("", "") };
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 for j in 0..N {{ let mut s={lo}*x.add(j){hi}; for i in 1..M {{ let v={lo}*x.add(i*N+j){hi}; s = if s{cmp}v {{s}} else {{v}}; }} *out.add(j)=s; }}\n}}\n"
+         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
+         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+         \x20 for (o, &v) in os.iter_mut().zip(&xs[0..N]) {{ *o = {lo}v{hi}; }}\n\
+         \x20 for i in 1..M {{ let row = &xs[i*N..i*N+N];\n\
+         \x20   for (o, &r) in os.iter_mut().zip(row) {{ let s=*o; let v={lo}r{hi}; *o = if s{cmp}v {{s}} else {{v}}; }} }}\n}}\n"
     )
 }
 
@@ -2593,7 +2833,7 @@ fn c_rowarg(rows: usize, cols: usize, is_max: bool) -> String {
     let cmp = if is_max { ">" } else { "<" };
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, int* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, int* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long r=0;r<R;r++){{ float bv=x[r*C]; int bi=0;\n\
          \x20   for (long j=1;j<C;j++){{ float v=x[r*C+j]; if (v {cmp} bv){{ bv=v; bi=j; }} }}\n\
@@ -2658,16 +2898,20 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                 xp,
                 yp,
             );
+            // Reassociation-normalized peer (exact-index-checked, see `bench_c_fast_idx`).
+            let cfast =
+                bench_c_fast_idx(label, &c_rowarg(rows, cols, is_max), dir, cc, &wuk, &mut out, xp, yp);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&wuk),
                 gbps(&wk_par),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             // Output is an i32 index buffer — reinterpret the f32 harness slots as i32 and compare exactly
@@ -2678,18 +2922,24 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                     println!("  ! {label} index mismatch vs C");
                 }
             }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if as_i32(&a.out) != as_i32(&r2.out) {
+                    println!("  ! {label} index mismatch vs Rust");
+                }
+            }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
+            report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
             println!();
         }
     }
@@ -2714,15 +2964,22 @@ fn wk_colarg(rows: usize, cols: usize, is_max: bool, parallel: bool) -> String {
     )
 }
 
+/// The C column-argmax peer, written **row-outer** with a `C`-long running-best scratch vector — the
+/// spelling any performance-aware C programmer uses for an axis-0 arg-reduction (and what NumPy's
+/// `argmax(axis=0)` does internally), rather than the column-outer scan that reads `x` with stride
+/// `C`. The comparison is `v {cmp} bv[j]` exactly as before, so the first-extremum tie-break and the
+/// resulting index buffer are unchanged; only the traversal order of `x` moves. Measured standalone
+/// at `-O3 -march=native`, 4096×1024 argmax, kernels in their own TU: **9.87 ms column-outer vs
+/// 1.569 ms row-outer + `restrict`, a 6.3× handicap**, with identical output on every column.
 fn c_colarg(rows: usize, cols: usize, is_max: bool) -> String {
     let cmp = if is_max { ">" } else { "<" };
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, int* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, int* __restrict__ out){{\n\
          \x20 (void)y;\n\
-         \x20 for (long j=0;j<C;j++){{ float bv=x[j]; int bi=0;\n\
-         \x20   for (long i=1;i<R;i++){{ float v=x[i*C+j]; if (v {cmp} bv){{ bv=v; bi=i; }} }}\n\
-         \x20   out[j]=bi; }} }}\n"
+         \x20 float bv[C];\n\
+         \x20 for (long j=0;j<C;j++){{ bv[j]=x[j]; out[j]=0; }}\n\
+         \x20 for (long i=1;i<R;i++) for (long j=0;j<C;j++){{ float v=x[i*C+j]; if (v {cmp} bv[j]){{ bv[j]=v; out[j]=(int)i; }} }}\n}}\n"
     )
 }
 
@@ -2731,17 +2988,20 @@ fn rust_colarg(rows: usize, cols: usize, is_max: bool) -> String {
     format!(
         "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
          pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut i32) {{\n\
-         \x20 for j in 0..C {{ let mut bv=*x.add(j); let mut bi=0i32;\n\
-         \x20   for i in 1..R {{ let v=*x.add(i*C+j); if v {cmp} bv {{ bv=v; bi=i as i32; }} }}\n\
-         \x20   *out.add(j)=bi; }} }}\n"
+         \x20 let xs = core::slice::from_raw_parts(x, R*C);\n\
+         \x20 let os = core::slice::from_raw_parts_mut(out, C);\n\
+         \x20 let mut bv = vec![0.0f32; C];\n\
+         \x20 for j in 0..C {{ bv[j]=xs[j]; os[j]=0; }}\n\
+         \x20 for i in 1..R {{ let row = &xs[i*C..i*C+C];\n\
+         \x20   for j in 0..C {{ let v=row[j]; if v {cmp} bv[j] {{ bv[j]=v; os[j]=i as i32; }} }} }}\n}}\n"
     )
 }
 
-/// Per-column argmax/argmin (axis-0 top-1) returning the ROW index. The STRIDED column-outer
-/// (value,index) scan defeats gcc/rustc auto-vectorization (the column-reduction lever — verified
-/// scalar), while Wukong streams row-major tracking 8 column lanes via blend. Output is a `cols`-long
-/// i32 buffer; the cross-check reinterprets the f32 harness slots as i32 and compares EXACTLY. GB/s =
-/// `R·C·4` (matrix read once); the ratio vs naive C is the figure.
+/// Per-column argmax/argmin (axis-0 top-1) returning the ROW index. Wukong streams row-major
+/// tracking 8 column lanes via blend; the C/Rust peers do the same traversal over a `C`-long
+/// running-best vector (see [`c_colarg`] — they used to scan column-outer, which is what the ratio
+/// was really measuring). Output is a `cols`-long i32 buffer; the cross-check reinterprets the f32
+/// harness slots as i32 and compares EXACTLY. GB/s = `R·C·4` (matrix read once).
 fn bench_colarg(cc: &str, dir: &Path) {
     for (is_max, label) in [(true, "colargmax"), (false, "colargmin")] {
         for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
@@ -2782,16 +3042,20 @@ fn bench_colarg(cc: &str, dir: &Path) {
                 xp,
                 yp,
             );
+            // Reassociation-normalized peer (exact-index-checked, see `bench_c_fast_idx`).
+            let cfast =
+                bench_c_fast_idx(label, &c_colarg(rows, cols, is_max), dir, cc, &wuk, &mut out, xp, yp);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&wuk),
                 gbps(&wk_par),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
@@ -2800,18 +3064,24 @@ fn bench_colarg(cc: &str, dir: &Path) {
                     println!("  ! {label} index mismatch vs C");
                 }
             }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if as_i32(&a.out) != as_i32(&r2.out) {
+                    println!("  ! {label} index mismatch vs Rust");
+                }
+            }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
+            report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
             println!();
         }
     }
@@ -2835,7 +3105,7 @@ fn wk_cumsum(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_cumsum(rows: usize, cols: usize) -> String {
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long r=0;r<R;r++){{ float acc=0.0f; for (long i=0;i<C;i++){{ acc+=x[r*C+i]; out[r*C+i]=acc; }} }} }}\n"
     )
@@ -2864,7 +3134,7 @@ fn wk_lrscan(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_lrscan(rows: usize, cols: usize) -> String {
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out){{\n\
          \x20 for (long r=0;r<R;r++){{ float h=0.0f; for (long t=0;t<C;t++){{ h = a[r*C+t]*h + b[r*C+t]; out[r*C+t]=h; }} }} }}\n"
     )
 }
@@ -2955,14 +3225,14 @@ fn bench_lrscan(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C (4-row-interleaved ILP vs C's single serial chain)",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C (4-row-interleaved ILP vs C's single serial chain)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         println!();
     }
@@ -2983,7 +3253,7 @@ fn wk_cumprod(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_cumprod(rows: usize, cols: usize) -> String {
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long r=0;r<R;r++){{ float p=1.0f; for (long i=0;i<C;i++){{ p*=x[r*C+i]; out[r*C+i]=p; }} }} }}\n"
     )
@@ -3073,14 +3343,14 @@ fn bench_cumprod(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C (4-row-interleaved ILP vs C's serial chain)",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C (4-row-interleaved ILP vs C's serial chain)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
         println!();
     }
@@ -3128,16 +3398,24 @@ fn bench_cumsum(cc: &str, dir: &Path) {
             xp,
             yp,
         );
+        // Reassociation-normalized peer. Wukong's Hillis-Steele in-lane tree scan REASSOCIATES the
+        // prefix sum (that is exactly why this bench's cross-check is a tolerance and not bit
+        // equality), so the plain-flags C column — which must keep `out[i]=out[i-1]+x[i]` in source
+        // order — is not the like-for-like peer. This is the rule the file applies to `dot`/`ssd`;
+        // `cumsum` is the one scan that also needs it (cumprod / cummax / cummin / lrscan stay
+        // bit-exact in Wukong, so their plain-flags column already IS like-for-like).
+        let cfast = bench_c_fast("cumsum", &c_cumsum(rows, cols), dir, cc, &wuk, &mut out, xp, yp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GB/s",
             gbps(&wuk),
             gbps(&wk_par),
             gbps(&cm),
+            gbps(&cfast),
             gbps(&rm)
         );
         // The in-lane tree scan reassociates → a **magnitude-normalized** tolerance (max|Δ| over the
@@ -3159,15 +3437,16 @@ fn bench_cumsum(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r);
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
     }
 }
@@ -3192,7 +3471,7 @@ fn c_cumminmax(rows: usize, cols: usize, is_max: bool) -> String {
     let cmp = if is_max { ">" } else { "<" };
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
          \x20 for (long r=0;r<R;r++){{ float m=x[r*C]; for (long i=0;i<C;i++){{ float v=x[r*C+i]; if (v {cmp} m) m=v; out[r*C+i]=m; }} }} }}\n"
     )
@@ -3268,17 +3547,22 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
                     println!("  ! {label} output mismatch vs C");
                 }
             }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if a.out != r2.out {
+                    println!("  ! {label} output mismatch vs Rust");
+                }
+            }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
             println!();
         }
@@ -3286,12 +3570,17 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
 }
 
 /// Column **statistics** `out[j] = mean/sumsq/L2/RMS_i x[i,j]` — the per-channel BatchNorm mean, 2nd
-/// moment / energy, column L2 norm, and per-feature RMS. Same strided `Σ`/`Σx²` column-outer fold as
-/// `colsum` that gcc/rustc leave **scalar** (verified: no packed `vaddps` for the stride-N reduction);
-/// Wukong folds each nest to `wukong_col{mean,sumsq,l2,rms}_f32[_parallel]` (row-major streaming + a
-/// per-column finalize). Reported as GB/s (`M·N·4`, the matrix read once), reusing the `(x, _, out)`
-/// 3-pointer harness via the unused middle. Each folds its column i-ascending — exactly the naive C
-/// order — and `/M`/`sqrt` are correctly-rounded, so the full-buffer cross-check is **bit-exact**.
+/// moment / energy, column L2 norm, and per-feature RMS. Wukong folds each nest to
+/// `wukong_col{mean,sumsq,l2,rms}_f32[_parallel]` (row-major streaming + a per-column finalize).
+/// Reported as GB/s (`M·N·4`, the matrix read once), reusing the `(x, _, out)` 3-pointer harness via
+/// the unused middle. Each language folds its column i-ascending and `/M`/`sqrt` are correctly
+/// rounded, so the full-buffer cross-check is **bit-exact**.
+///
+/// PEER SPELLING (corrected 2026-08-04) — the third instance of the [`bench_colsum`] defect. The
+/// C/Rust peers were column-outer; they are now row-outer (accumulate into `out[]` row by row, then
+/// one finalize pass), same fold order, same result. Measured standalone at `-O3 -march=native`,
+/// 4096×1024 column mean, kernels in their own TU: **33.03 ms column-outer vs 1.238 ms row-outer +
+/// `restrict`, a 26.7× handicap**.
 fn bench_colstat(cc: &str, dir: &Path) {
     // 0 = mean, 1 = sumsq (energy), 2 = L2, 3 = RMS.
     for (opc, label, sym) in [
@@ -3364,17 +3653,22 @@ fn bench_colstat(cc: &str, dir: &Path) {
                     println!("  ! {label} output mismatch vs C");
                 }
             }
+            if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                if a.out != r2.out {
+                    println!("  ! {label} output mismatch vs Rust");
+                }
+            }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
                 println!(
-                    "  -> Wukong single-core is {:.2}x {} than naive C",
+                    "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
             if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
                 let r = c2.ns_per_call / mp.ns_per_call;
-                println!("  -> Wukong @parallel is {r:.2}x naive single-threaded C");
+                par_standing("idiomatic single-threaded C", r);
             }
             report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
             println!();
@@ -3406,30 +3700,37 @@ fn wk_colstat(m: usize, n: usize, parallel: bool, op: u8) -> String {
 }
 
 fn c_colstat(m: usize, n: usize, op: u8) -> String {
+    // Row-outer: accumulate the column folds into `out[]` sweeping `x` sequentially, then finalize.
     let (fold, fin) = match op {
-        0 => ("s += x[i*N+j];", "s / (float)M"),
-        1 => ("s += x[i*N+j]*x[i*N+j];", "s"),
-        2 => ("s += x[i*N+j]*x[i*N+j];", "sqrtf(s)"),
-        _ => ("s += x[i*N+j]*x[i*N+j];", "sqrtf(s / (float)M)"),
+        0 => ("out[j] += x[i*N+j];", "s / (float)M"),
+        1 => ("{ float v=x[i*N+j]; out[j] += v*v; }", "s"),
+        2 => ("{ float v=x[i*N+j]; out[j] += v*v; }", "sqrtf(s)"),
+        _ => ("{ float v=x[i*N+j]; out[j] += v*v; }", "sqrtf(s / (float)M)"),
     };
     format!(
         "#include <math.h>\n#define M {m}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out){{\n\
          \x20 (void)y;\n\
-         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++){{ {fold} }} out[j]={fin}; }}\n}}\n"
+         \x20 for (long j=0;j<N;j++) out[j]=0.0f;\n\
+         \x20 for (long i=0;i<M;i++) for (long j=0;j<N;j++) {fold}\n\
+         \x20 for (long j=0;j<N;j++){{ float s=out[j]; out[j]={fin}; }}\n}}\n"
     )
 }
 
 fn rust_colstat(m: usize, n: usize, op: u8) -> String {
     let (fold, fin) = match op {
-        0 => ("s += *x.add(i*N+j);", "s / M as f32"),
-        1 => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "s"),
-        2 => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "s.sqrt()"),
-        _ => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "(s / M as f32).sqrt()"),
+        0 => ("*o += r;", "s / M as f32"),
+        1 => ("*o += r*r;", "s"),
+        2 => ("*o += r*r;", "s.sqrt()"),
+        _ => ("*o += r*r;", "(s / M as f32).sqrt()"),
     };
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 for j in 0..N {{ let mut s=0.0f32; for i in 0..M {{ {fold} }} *out.add(j)={fin}; }}\n}}\n"
+         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
+         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+         \x20 for o in os.iter_mut() {{ *o = 0.0; }}\n\
+         \x20 for i in 0..M {{ let row = &xs[i*N..i*N+N]; for (o, &r) in os.iter_mut().zip(row) {{ {fold} }} }}\n\
+         \x20 for o in os.iter_mut() {{ let s = *o; *o = {fin}; }}\n}}\n"
     )
 }
 
@@ -3515,14 +3816,14 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r2);
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
@@ -3547,7 +3848,7 @@ fn wk_softmax_bwd(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_softmax_bwd(rows: usize, cols: usize) -> String {
     format!(
         "#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* y, const float* dy, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ y, const float* __restrict__ dy, float* __restrict__ dx){{\n\
          \x20 for (long r=0;r<R;r++){{ float s=0.0f; for (long j=0;j<C;j++) s += y[r*C+j]*dy[r*C+j];\n\
          \x20   for (long i=0;i<C;i++) dx[r*C+i] = y[r*C+i]*(dy[r*C+i]-s); }}\n}}\n"
     )
@@ -3620,14 +3921,14 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r2);
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
@@ -3656,7 +3957,7 @@ fn wk_rmsnorm_bwd(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_rmsnorm_bwd(rows: usize, cols: usize) -> String {
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* dy, const float* gamma, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ dy, const float* __restrict__ gamma, float* __restrict__ dx){{\n\
          \x20 for (long r=0;r<R;r++){{\n\
          \x20   float ms=0.0f; for(long i=0;i<C;i++) ms += x[r*C+i]*x[r*C+i];\n\
          \x20   float rinv = 1.0f/sqrtf(ms/(float)C + 0.00001f);\n\
@@ -3745,7 +4046,7 @@ fn wk_layernorm_bwd(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_layernorm_bwd(rows: usize, cols: usize) -> String {
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* dy, const float* gamma, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ dy, const float* __restrict__ gamma, float* __restrict__ dx){{\n\
          \x20 for (long r=0;r<R;r++){{\n\
          \x20   float sm=0.0f; for(long i=0;i<C;i++) sm+=x[r*C+i]; float mean=sm/(float)C;\n\
          \x20   float vv=0.0f; for(long i=0;i<C;i++){{ float d=x[r*C+i]-mean; vv+=d*d; }} float rstd=1.0f/sqrtf(vv/(float)C+0.00001f);\n\
@@ -3821,14 +4122,14 @@ fn bench_xent(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r2);
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
@@ -3855,7 +4156,7 @@ fn wk_xent(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_xent(rows: usize, cols: usize) -> String {
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* target_f, float* loss){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ target_f, float* __restrict__ loss){{\n\
          \x20 const int* target = (const int*)target_f;\n\
          \x20 for (long r=0;r<R;r++){{\n\
          \x20   float m=x[r*C]; for(long i=0;i<C;i++) if(x[r*C+i]>m) m=x[r*C+i];\n\
@@ -3929,14 +4230,14 @@ fn bench_rope(cc: &str, dir: &Path) {
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
             println!(
-                "  -> Wukong single-core is {:.2}x {} than naive C",
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
             );
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+            par_standing("idiomatic single-threaded C", r2);
         }
         println!();
     }
@@ -3967,7 +4268,7 @@ fn c_rope(rows: usize, half: usize) -> String {
     let d = 2 * half;
     format!(
         "#include <math.h>\n#define R {rows}\n#define H {half}\n#define D {d}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* inv_freq, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ inv_freq, float* __restrict__ out){{\n\
          \x20 for (long r=0;r<R;r++) for (long j=0;j<H;j++){{\n\
          \x20   float theta=(float)r*inv_freq[j]; float c=cosf(theta), s=sinf(theta);\n\
          \x20   float a=x[r*D+j], b=x[r*D+j+H];\n\
@@ -4016,7 +4317,12 @@ fn bench_xent_bwd(cc: &str, dir: &Path) {
             "rs", &rust_xent_bwd(r, c), dir, "xent_bwd", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, tp,
         );
-        report_ratio("xent_bwd", &wuk, &wk_par, &cm, &rm, &None, &gbps);
+        // Reassociation-normalized peer: the per-row `max` and `Σexp` are float reductions Wukong
+        // folds 8 lanes wide, so the plain-flags C column is the strictly-in-order one. (`rope`,
+        // `rope_bwd`, `gate` and `act_backward` deliberately pass `&None` here — they are pure
+        // elementwise maps with no reduction, so `-ffast-math` normalizes nothing for them.)
+        let cfast = bench_c_fast("xent_bwd", &c_xent_bwd(r, c), dir, cc, &wuk, &mut dx, xp, tp);
+        report_ratio("xent_bwd", &wuk, &wk_par, &cm, &rm, &cfast, &gbps);
     }
 }
 
@@ -4040,7 +4346,7 @@ fn wk_xent_bwd(rows: usize, cols: usize, parallel: bool) -> String {
 fn c_xent_bwd(rows: usize, cols: usize) -> String {
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* target_f, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ target_f, float* __restrict__ dx){{\n\
          \x20 const int* target = (const int*)target_f;\n\
          \x20 for (long r=0;r<R;r++){{\n\
          \x20   float m=x[r*C]; for(long i=0;i<C;i++) if(x[r*C+i]>m) m=x[r*C+i];\n\
@@ -4118,7 +4424,7 @@ fn c_rope_bwd(rows: usize, half: usize) -> String {
     let d = 2 * half;
     format!(
         "#include <math.h>\n#define R {rows}\n#define H {half}\n#define D {d}\n\
-         __declspec(dllexport) void kbench(const float* g, const float* inv_freq, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ g, const float* __restrict__ inv_freq, float* __restrict__ dx){{\n\
          \x20 for (long r=0;r<R;r++) for (long j=0;j<H;j++){{\n\
          \x20   float theta=(float)r*inv_freq[j]; float c=cosf(theta), s=sinf(theta);\n\
          \x20   float a=g[r*D+j], b=g[r*D+j+H];\n\
@@ -4186,7 +4492,7 @@ fn c_gate(n: usize, act: &str) -> String {
     };
     format!(
         "#include <math.h>\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out){{\n\
          \x20 for (long i=0;i<N;i++){{ float x=a[i]; out[i]=({actexpr})*b[i]; }}\n}}\n"
     )
 }
@@ -4315,7 +4621,7 @@ fn c_row_loss(rows: usize, cols: usize, kind: &str) -> String {
     };
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
-         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out){{\n\
          \x20 for (long r=0;r<R;r++){{ {body} }}\n}}\n"
     )
 }
@@ -4335,7 +4641,7 @@ fn rust_row_loss(rows: usize, cols: usize, kind: &str) -> String {
 }
 
 /// Shared 4-column ratio report for the backward/gate benches (Wuk 1-core / Wuk par / C / Rust + the
-/// single-core and @parallel ratios vs naive C). The cross-check (when both present) uses a magnitude-
+/// single-core and @parallel ratios vs idiomatic C). The cross-check (when both present) uses a magnitude-
 /// normalized tolerance, since the transcendental reductions reassociate / differ from libm by ~1 ULP.
 /// `cfast` is the optional relaxed-FP C(fast) peer column (already loose-cross-checked by the caller);
 /// benches whose C baseline is not an IEEE-serial reduction pass `&None`.
@@ -4374,14 +4680,14 @@ fn report_ratio(
     if let (Some(ms), Some(c2)) = (wuk, cm) {
         let r2 = c2.ns_per_call / ms.ns_per_call;
         println!(
-            "  -> Wukong single-core is {:.2}x {} than naive C",
+            "  -> Wukong single-core is {:.2}x {} than idiomatic C",
             if r2 >= 1.0 { r2 } else { 1.0 / r2 },
             if r2 >= 1.0 { "faster" } else { "slower" }
         );
     }
     if let (Some(mp), Some(c2)) = (wk_par, cm) {
         let r2 = c2.ns_per_call / mp.ns_per_call;
-        println!("  -> Wukong @parallel is {r2:.2}x naive single-threaded C");
+        par_standing("idiomatic single-threaded C", r2);
     }
     report_relaxed_ratio("C(fast) [-ffast-math]", wuk, wk_par, cfast);
     println!();
@@ -4471,7 +4777,7 @@ fn bench_act_backward(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
-            println!("  -> Wukong @parallel is {r2:.2}x scalar single-threaded C");
+            par_standing("scalar single-threaded C", r2);
         }
         println!();
     }
@@ -4501,7 +4807,7 @@ fn c_act_backward(n: usize, op: &str) -> String {
     };
     format!(
         "#include <math.h>\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* dy, float* dx){{\n\
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ dx){{\n\
          \x20 for (long i=0;i<N;i++){{ float v=x[i]; {body} dx[i]=dy[i]*g; }}\n}}\n"
     )
 }
@@ -4661,7 +4967,7 @@ fn wk_i8gemm(ns: usize, parallel: bool) -> String {
 fn c_i8gemm(ns: usize) -> String {
     format!(
         "#include <stdint.h>\n#define NS {ns}\n\
-         __declspec(dllexport) void kbench(const uint8_t* a, const int8_t* b, int32_t* c) {{\n\
+         __declspec(dllexport) void kbench(const uint8_t* __restrict__ a, const int8_t* __restrict__ b, int32_t* __restrict__ c) {{\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ int32_t s=0;\n\
          \x20     for (long k=0;k<NS;k++) s += (int32_t)a[i*NS+k] * (int32_t)b[j*NS+k];\n\
@@ -4745,15 +5051,20 @@ fn bench_bf16(cc: &str, dir: &Path) {
                 xp,
                 yp,
             );
+            // Reassociation-normalized peer: this row IS a float reduction (bf16 in, f32
+            // accumulate) and Wukong folds it 8 lanes wide, so the honest-flags C column is the
+            // in-order sum and C(fast) is the like-for-like one.
+            let cfast = bench_bf16_fast("bf16", &c_bf16(n, is_dot), dir, cc, &wuk, &mut o, xp, yp);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11}",
-                kind, "Wukong", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                kind, "Wukong", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&wuk),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             // All-positive, well-conditioned reduction → a tight relative tolerance is the right
@@ -4778,6 +5089,7 @@ fn bench_bf16(cc: &str, dir: &Path) {
                     if r >= 1.0 { "faster" } else { "slower" }
                 );
             }
+            bf16_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &None, &cfast);
             // Compile time (Wukong front-end + JIT vs gcc/rustc to a shared lib).
             let cms = |m: &Option<MeasureBf16>| {
                 m.as_ref()
@@ -4785,10 +5097,11 @@ fn bench_bf16(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             println!(
-                "  {:<10} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
                 "compile ms",
                 cms(&wuk),
                 cms(&cm),
+                cms(&cfast),
                 cms(&rm)
             );
         }
@@ -4824,7 +5137,7 @@ fn c_bf16(n: usize, is_dot: bool) -> String {
     format!(
         "#include <stdint.h>\n#include <string.h>\n#define N {n}\n\
          static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
-         __declspec(dllexport) void kbench(const uint16_t* x, const uint16_t* y, float* o){{\n\
+         __declspec(dllexport) void kbench(const uint16_t* __restrict__ x, const uint16_t* __restrict__ y, float* __restrict__ o){{\n\
          \x20   float s=0.0f;\n\
          \x20   for (long k=0;k<N;k++) s += {term};\n\
          \x20   o[0]=s;\n}}\n"
@@ -4996,7 +5309,7 @@ fn c_axpby_half_out(n: usize, a: f32, b: f32) -> String {
         "#include <stdint.h>\n#include <string.h>\n#define N {n}\n\
          static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
          static inline uint16_t nb(float f){{ uint32_t u; memcpy(&u,&f,4); uint32_t bias=0x7fffu+((u>>16)&1u); return (uint16_t)((u+bias)>>16); }}\n\
-         __declspec(dllexport) void kbench(const uint16_t* x, const uint16_t* y, uint16_t* out){{\n\
+         __declspec(dllexport) void kbench(const uint16_t* __restrict__ x, const uint16_t* __restrict__ y, uint16_t* __restrict__ out){{\n\
          \x20   for (long k=0;k<N;k++) out[k] = nb({a:?}f*bf(x[k]) + {b:?}f*bf(y[k]));\n}}\n"
     )
 }
@@ -5059,15 +5372,19 @@ fn bench_conv(cc: &str, dir: &Path) {
         ip,
         wp,
     );
+    // Reassociation-normalized peer: the direct convolution's `Cin·K·K`-long accumulation is a float
+    // reduction, and Wukong's im2col+GEMM path accumulates it in a blocked (reassociated) order.
+    let cfast = bench_c_fast("conv", &c_conv(cin, h, cout, k), dir, cc, &wuk, &mut output, ip, wp);
     println!(
-        "  {:<18} {:>14} {:>14} {:>14}",
-        "", "Wuk im2col+GEMM", "C (direct)", "Rust (direct)"
+        "  {:<18} {:>14} {:>14} {:>14} {:>14}",
+        "", "Wuk im2col+GEMM", "C (direct)", "C(fast) direct", "Rust (direct)"
     );
     println!(
-        "  {:<18} {:>14} {:>14} {:>14}",
+        "  {:<18} {:>14} {:>14} {:>14} {:>14}",
         "GFLOP/s",
         gflops(&wuk),
         gflops(&cm),
+        gflops(&cfast),
         gflops(&rm)
     );
     if let (Some(m), Some(c)) = (&wuk, &cm) {
@@ -5085,6 +5402,7 @@ fn bench_conv(cc: &str, dir: &Path) {
             if r >= 1.0 { "faster" } else { "slower" }
         );
     }
+    report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &None, &cfast);
     println!();
 }
 
@@ -5117,7 +5435,7 @@ fn c_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
     let oh = h - k + 1;
     let (hw, ohw, ckk, kk) = (h * h, oh * oh, cin * k * k, k * k);
     format!(
-        "__declspec(dllexport) void kbench(const float* input, const float* weight, float* output) {{\n\
+        "__declspec(dllexport) void kbench(const float* __restrict__ input, const float* __restrict__ weight, float* __restrict__ output) {{\n\
          \x20 for (long oc=0; oc<{cout}; oc++)\n\
          \x20  for (long oy=0; oy<{oh}; oy++)\n\
          \x20   for (long ox=0; ox<{oh}; ox++) {{\n\
@@ -5361,7 +5679,7 @@ fn c_norm(cols: usize, op: &str) -> String {
         }
     };
     format!(
-        "#include <math.h>\n#define C {cols}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{ \
+        "#include <math.h>\n#define C {cols}\n__declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{ \
          for(long i=0;i<C;i++) out[i]=x[i]; {body} }}\n"
     )
 }
@@ -5594,7 +5912,7 @@ fn c_norm_batched(rows: usize, cols: usize, op: &str) -> String {
     };
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n#define N {n}\n\
-         __declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{ \
+         __declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{ \
          for(long i=0;i<N;i++) out[i]=x[i]; \
          for(long r=0;r<R;r++){{ float* o=out+(long)r*C; {body} }} }}\n"
     )
@@ -7262,9 +7580,9 @@ fn kernels() -> Vec<Kernel> {
                  for i in 0..{N} {{ y[i] = 2.0 * x[i] + 1.0; }} \
                  for i in 0..{N} {{ out[i] = if y[i] > 0.0 {{ y[i] }} else {{ 0.0 }}; }}\n}}\n"
             ),
-            c: c_kernel(
-                "float* t=(float*)y; for(long i=0;i<N;i++) t[i]=2.0f*x[i]+1.0f; \
-                 for(long i=0;i<N;i++){ float v=t[i]; out[i]= v>0.0f? v:0.0f; }",
+            c: c_kernel_rw(
+                "for(long i=0;i<N;i++) y[i]=2.0f*x[i]+1.0f; \
+                 for(long i=0;i<N;i++){ float v=y[i]; out[i]= v>0.0f? v:0.0f; }",
             ),
             rust: rust_kernel(
                 "let t = y as *mut f32; for i in 0..N { *t.add(i)=2.0* *x.add(i)+1.0; } \
@@ -7549,7 +7867,18 @@ fn wk_par_kernel(loop_body: &str) -> String {
 }
 
 fn c_kernel(body: &str) -> String {
-    format!("#include <math.h>\n#define N {N}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{\n  {body}\n}}\n")
+    format!("#include <math.h>\n#define N {N}\n__declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{\n  {body}\n}}\n")
+}
+
+/// [`c_kernel`] with a **writable** middle buffer. `fused_linear_relu` streams its intermediate
+/// through `y` (the harness derives `yp` with `as_mut_ptr`, so the write has provenance), and the
+/// old spelling reached it by casting the `const` away: `float* t = (float*)y;`. That is fatal once
+/// the parameters carry `__restrict__` — C11 6.7.3.1p4 makes it undefined behaviour to modify an
+/// object designated by a `restrict` pointer to a **const-qualified** type, so gcc would be entitled
+/// to assume `y` never changes and hoist the second loop's loads above the first loop's stores.
+/// Declaring the middle `float* __restrict__ y` states the truth instead of casting it away.
+fn c_kernel_rw(body: &str) -> String {
+    format!("#include <math.h>\n#define N {N}\n__declspec(dllexport) void kbench(const float* __restrict__ x, float* __restrict__ y, float* __restrict__ out) {{\n  {body}\n}}\n")
 }
 
 fn rust_kernel(body: &str) -> String {
@@ -7575,7 +7904,7 @@ fn wk_kernel_n(n: usize, body: &str) -> String {
     format!("module bench\nfn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [f32; {n}]) {{\n    {body}\n}}\n")
 }
 fn c_kernel_n(n: usize, body: &str) -> String {
-    format!("#include <math.h>\n#define N {n}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{\n  {body}\n}}\n")
+    format!("#include <math.h>\n#define N {n}\n__declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{\n  {body}\n}}\n")
 }
 fn rust_kernel_n(n: usize, body: &str) -> String {
     format!("const N: usize = {n};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
@@ -7708,6 +8037,131 @@ mod tests {
         // Round-trip through widen is idempotent.
         for v in [0.5f32, -1.25, 3.0, -0.0, 256.0] {
             assert_eq!(to_bf16_bits(widen_bf16(to_bf16_bits(v))), to_bf16_bits(v));
+        }
+    }
+
+    // ---- PEER-STRENGTH GUARDS ------------------------------------------------------------------
+    //
+    // A benchmark peer can be weakened without breaking anything: the suite still runs, the
+    // cross-language check still passes (a slow kernel is not a wrong kernel), and the only visible
+    // effect is that Wukong's published multiple goes UP. That is the failure mode this file
+    // actually suffered — `restrict` absent from all 43 C kernels, column reductions written
+    // column-outer, `matmul_tn` written with both operands column-strided, the transpose unblocked —
+    // and it survived for as long as it did precisely because nothing tested for it.
+    //
+    // These tests are the guard. THE CHECKLIST for adding or editing a C/C++/Rust peer:
+    //   1. Distinct in/out buffers  -> `__restrict__` on every pointer parameter (guarded below).
+    //      If a parameter genuinely may alias, leave it off AND say why at the call site.
+    //   2. Loop order  -> the innermost loop must walk memory with unit stride wherever the
+    //      algorithm allows it (guarded below for the families that got this wrong).
+    //   3. Same algorithmic opportunity as Wukong's kernel: if Wukong dispatches a cache-blocked
+    //      kernel, the peer is blocked too (transpose); if Wukong reassociates a float reduction,
+    //      a `C(fast)` [-ffast-math] column exists AND is printed.
+    //   4. Ask the question the whole exercise turns on: *is this how a competent C programmer
+    //      would write it?* If the answer needs a caveat, the caveat belongs in BENCHMARKS.md.
+
+    /// EVERY generated C kernel must declare its pointer parameters `__restrict__`. Scanned out of
+    /// this file's own source text rather than from a hand-kept list, so a NEW peer generator added
+    /// later is covered automatically — a list would have to be remembered, and the thing being
+    /// guarded against is exactly a peer nobody remembered to check.
+    #[test]
+    fn every_generated_c_kernel_declares_restrict() {
+        const SRC: &str = include_str!("main.rs");
+        // Split so this needle does not occur contiguously in the file it scans — otherwise the
+        // test matches its own source line and reports its own Rust code as an unqualified peer.
+        const OPEN: &str = concat!("__declspec(dllexport)", " void kbench(");
+        let mut seen = 0usize;
+        let mut rest = SRC;
+        while let Some(i) = rest.find(OPEN) {
+            let after = &rest[i + OPEN.len()..];
+            let end = after.find(')').expect("kbench parameter list must close on one line");
+            let params = &after[..end];
+            for p in params.split(',') {
+                assert!(
+                    p.contains("__restrict__"),
+                    "C peer parameter `{}` is not __restrict__ (full list: `{params}`). Without it \
+                     gcc must assume the output aliases the inputs and cannot vectorize the kernel \
+                     — see the peer-strength checklist above.",
+                    p.trim()
+                );
+            }
+            seen += 1;
+            rest = &after[end..];
+        }
+        // A floor, so that deleting or renaming the peer generators cannot make this pass vacuously
+        // with zero matches. 43 signatures at the time of writing.
+        assert!(seen >= 40, "only {seen} C kbench signatures found — did the peer generators move?");
+    }
+
+    /// The column-reduction / column-argmax / weight-gradient peers must keep the loop order that
+    /// walks `x` sequentially. Each of these was published as a 4-50x Wukong win purely because the
+    /// peer traversed a row-major matrix down its columns.
+    #[test]
+    fn column_family_peers_stay_row_outer() {
+        // colsum / colstat: `for (i) for (j) out[j] += ...` — i OUTSIDE j.
+        let s = c_colsum(64, 32);
+        assert!(
+            s.contains("for (long i=0;i<M;i++) for (long j=0;j<N;j++)"),
+            "c_colsum regressed to a column-outer fold:\n{s}"
+        );
+        for op in 0u8..4 {
+            let s = c_colstat(64, 32, op);
+            assert!(
+                s.contains("for (long i=0;i<M;i++) for (long j=0;j<N;j++)"),
+                "c_colstat(op={op}) regressed to a column-outer fold:\n{s}"
+            );
+        }
+        // colmax/min/absmax: row 0 seeds `out[]`, then i OUTSIDE j from row 1.
+        for op in 0u8..3 {
+            let s = c_colmax(64, 32, op);
+            assert!(
+                s.contains("for (long i=1;i<M;i++) for (long j=0;j<N;j++)"),
+                "c_colmax(op={op}) regressed to a column-outer fold:\n{s}"
+            );
+        }
+        // colarg: same, over a C-long running-best vector.
+        for is_max in [true, false] {
+            let s = c_colarg(64, 32, is_max);
+            assert!(
+                s.contains("for (long i=1;i<R;i++) for (long j=0;j<C;j++)"),
+                "c_colarg(is_max={is_max}) regressed to a column-outer scan:\n{s}"
+            );
+            assert!(s.contains("float bv[C];"), "c_colarg lost its running-best vector:\n{s}");
+        }
+    }
+
+    /// `C = Aᵀ·B` must be the `kij` nest (hoisted `a[k*M+i]`, contiguous B and C), not the `ijk`
+    /// nest that reads BOTH operands column-strided.
+    #[test]
+    fn matmul_tn_peer_stays_kij() {
+        let s = c_matmul_tn(64);
+        let k = s.find("for (long k=").expect("no k loop in c_matmul_tn");
+        let i = s.find("for (long i=").expect("no i loop in c_matmul_tn");
+        assert!(k < i, "c_matmul_tn regressed to an i-outer (ijk) nest:\n{s}");
+        assert!(
+            s.contains("float aki=a[k*NS+i];"),
+            "c_matmul_tn no longer hoists the A element out of the inner loop:\n{s}"
+        );
+        assert!(
+            !s.contains("a[k*NS+i]*b[k*NS+j]"),
+            "c_matmul_tn is back to the both-column-strided dot product:\n{s}"
+        );
+    }
+
+    /// Wukong dispatches a cache-blocked transpose; the peer must be blocked too, or the bench
+    /// measures loop tiling rather than codegen.
+    #[test]
+    fn transpose_peer_stays_cache_blocked() {
+        for ns in [1024usize, 2048] {
+            let s = c_transpose(ns);
+            assert!(s.contains("#define TB 32"), "c_transpose lost its blocking:\n{s}");
+            assert!(
+                s.contains("for (long ii=0;ii<NS;ii+=TB)"),
+                "c_transpose is back to the naive un-tiled nest:\n{s}"
+            );
+            assert_eq!(ns % 32, 0, "the blocked transpose peer needs NS % 32 == 0");
+            // The OpenMP twin must stay the same algorithm, or the C(omp) column is not comparable.
+            assert!(c_transpose_omp(ns).contains("for (long ii=0;ii<NS;ii+=TB)"));
         }
     }
 
