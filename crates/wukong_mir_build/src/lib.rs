@@ -13570,7 +13570,6 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The element MIR type of an array-valued base expression, via sema.
     /// The buffer type a whole-aggregate assignment `target = value` must deep-copy through, or
     /// `None` when `target` is an ordinary scalar place. A `MirType::Array` destination is a flat
     /// byte buffer: a plain `Op::Store` there writes the RHS buffer's *base pointer* into the
@@ -13604,6 +13603,7 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// The element MIR type of an array- or tensor-valued base expression, via sema.
     fn array_elem(&self, base: &Expr) -> Option<MirType> {
         match self.expr_ty(base) {
             Ty::Array { elem, .. } => Some(mir_ty(&elem)),

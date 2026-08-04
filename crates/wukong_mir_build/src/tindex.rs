@@ -29,9 +29,10 @@
 //! out of bounds is exactly where the flat spelling already differed from itself, and matching the
 //! flat spelling bit-for-bit is the point.
 //!
-//! Synthesized nodes get fresh [`NodeId`]s above every id sema assigned, and their types are handed
-//! back to the caller to merge into the type table, so `expr_ty` answers for them like any other
-//! node. Node ids are allocated in AST order, so the pass is a pure function of its input.
+//! Synthesized nodes get fresh [`NodeId`]s minted downward from just under `NodeId::DUMMY` (see
+//! [`FRESH_ID_TOP`] for why "one past the largest *typed* id" is not collision-free), and their
+//! types are handed back to the caller to merge into the type table, so `expr_ty` answers for them
+//! like any other node. Ids are allocated in AST order, so the pass is a pure function of its input.
 
 use wukong_ast::{
     self as ast, Block, Expr, ExprKind, ForIter, ItemKind, Module, NodeId, Stmt, StmtKind,
@@ -58,7 +59,7 @@ pub(crate) fn linearize_module(
         types: &sema.types,
         interner,
         extra: HashMap::default(),
-        next_id: next_node_id(sema),
+        next_id: FRESH_ID_TOP,
         changed: false,
     };
     let mut out = module.clone();
@@ -75,18 +76,19 @@ pub(crate) fn linearize_module(
     Some((out, lz.extra))
 }
 
-/// The first [`NodeId`] no sema-typed node uses. `NodeId::DUMMY` (`u32::MAX`) is a sentinel the
-/// parser hands to synthetic nodes, so it is excluded from the maximum rather than treated as a
-/// real id — otherwise one dummy-id node would push the counter to overflow on the first bump.
-fn next_node_id(sema: &SemaResult) -> u32 {
-    sema.types
-        .keys()
-        .map(|k| k.0)
-        .filter(|&k| k != NodeId::DUMMY.0)
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(0)
-}
+/// Fresh [`NodeId`]s are handed out **downward** from just below [`NodeId::DUMMY`], because the
+/// parser hands them out upward from 0 and never runs out. Any id in `[FRESH_ID_TOP - synthesized,
+/// FRESH_ID_TOP]` is therefore unreachable by a parsed node, whatever the program's size.
+///
+/// The obvious alternative — `max(sema.types.keys()) + 1` — is **not** collision-free: `sema.types`
+/// records expression nodes only, so a statement, block, pattern, or an expression sema never typed
+/// (an array-length expression inside a type, say) can carry an id above that maximum. Reusing one
+/// would make `expr_ty` answer for that real node with a synthesized node's type.
+const FRESH_ID_TOP: u32 = u32::MAX - 1;
+
+/// The smallest id this pass will mint. Reaching it needs ~2 billion synthesized nodes; the check
+/// exists so the counter can never wrap into parser territory rather than because it can be hit.
+const FRESH_ID_FLOOR: u32 = u32::MAX / 2;
 
 struct Linearizer<'a> {
     types: &'a HashMap<NodeId, Ty>,
@@ -99,29 +101,41 @@ struct Linearizer<'a> {
 impl Linearizer<'_> {
     // ---- synthesis ----
 
-    fn fresh(&mut self) -> NodeId {
+    /// A `NodeId` no parsed node can hold, or `None` once the (unreachable) floor is hit — which
+    /// declines the whole rewrite rather than minting an id that might already be in use.
+    fn fresh(&mut self) -> Option<NodeId> {
+        if self.next_id <= FRESH_ID_FLOOR {
+            return None;
+        }
         let id = NodeId(self.next_id);
-        self.next_id += 1;
-        id
+        self.next_id -= 1;
+        Some(id)
     }
 
     /// An integer literal node of scalar type `sc`. The literal's text is what `parse_int` reads at
     /// lowering, so it must be plain decimal — `n` is a row-major stride, always non-negative.
-    fn int_lit(&mut self, n: u64, sc: Scalar, span: Span) -> Expr {
+    fn int_lit(&mut self, n: u64, sc: Scalar, span: Span) -> Option<Expr> {
         let sym = self.interner.intern(&n.to_string());
-        let id = self.fresh();
+        let id = self.fresh()?;
         self.extra.insert(id, Ty::Scalar(sc));
-        Expr {
+        Some(Expr {
             id,
             kind: ExprKind::Int(sym),
             span,
-        }
+        })
     }
 
-    fn binary(&mut self, op: ast::BinOp, lhs: Expr, rhs: Expr, sc: Scalar, span: Span) -> Expr {
-        let id = self.fresh();
+    fn binary(
+        &mut self,
+        op: ast::BinOp,
+        lhs: Expr,
+        rhs: Expr,
+        sc: Scalar,
+        span: Span,
+    ) -> Option<Expr> {
+        let id = self.fresh()?;
         self.extra.insert(id, Ty::Scalar(sc));
-        Expr {
+        Some(Expr {
             id,
             kind: ExprKind::Binary {
                 op,
@@ -129,7 +143,7 @@ impl Linearizer<'_> {
                 rhs: Box::new(rhs),
             },
             span,
-        }
+        })
     }
 
     /// The row-major flat index for `base[indices…]`, or `None` to leave the access alone (see the
@@ -176,14 +190,14 @@ impl Linearizer<'_> {
             let term = if st == 1 {
                 ix.clone()
             } else {
-                let lit = self.int_lit(st, sc, ix.span);
-                self.binary(ast::BinOp::Mul, ix.clone(), lit, sc, ix.span)
+                let lit = self.int_lit(st, sc, ix.span)?;
+                self.binary(ast::BinOp::Mul, ix.clone(), lit, sc, ix.span)?
             };
             acc = Some(match acc {
                 None => term,
                 Some(a) => {
                     let span = a.span;
-                    self.binary(ast::BinOp::Add, a, term, sc, span)
+                    self.binary(ast::BinOp::Add, a, term, sc, span)?
                 }
             });
         }
