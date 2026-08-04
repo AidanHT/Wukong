@@ -479,7 +479,7 @@ megakernel stores pointer values homed in the shared frame **unconditionally** r
 `tid==0`-guarded — a frame pointer slot is uniform across the SPMD threads, and the old guard left
 threads ≠ 0 loading a zero-initialized slot and dereferencing null in non-recognized scalar loops
 (the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus standing is printed by the gates
-themselves, over every fixture in `tests/run` (332 today): `lower::tests::run_corpus_matches_interp_oracle`
+themselves, over every fixture in `tests/run` (333 today): `lower::tests::run_corpus_matches_interp_oracle`
 sweeps each program at `-O0` and `-O3`, requires zero mismatches and zero device faults and non-zero
 coverage, and reports the rest as honest `UNSUPPORTED:` skips; `megakernel::tests::mega_corpus_matches_oracle`
 does the same over the megakernel-eligible subset, counting (program, opt-level) configs and treating a

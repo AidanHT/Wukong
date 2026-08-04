@@ -1,0 +1,128 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 83
+// EXPECT-OUT: 24
+// EXPECT-OUT: 18
+// EXPECT-OUT: 46
+// EXPECT-OUT: 63
+// EXPECT-OUT: 130
+// EXPECT-OUT: 184
+module tests.run.canon_decline
+
+// The DECLINE side of `wukong_mir_build::canon`, the pre-lowering spelling canonicalization that
+// forward-substitutes an index-only integer local into its uses (and deletes the dead `let`) and
+// folds an integer module `const` into its uses. Those rewrites are what make a hoisted row base
+// (`let ib = i*K;` then `a[ib + p]`) still dispatch the tuned GEMM kernel — but each of them is a
+// silent wrong answer if it fires where the substituted expression would not evaluate to the same
+// value at the use site as it did at the `let`. Every function below is one such case, written so
+// the correct answer and the answer a naive substitution would give are DIFFERENT and both in
+// bounds. The expected values are derived from the scalar semantics of the loops, not recorded from
+// the compiler.
+//
+// Data: a[i] = i*i + 1, i.e. 1 2 5 10 17 26 37 50 65 82 101 122 145 170 197 226.
+
+const K: i64 = 3;
+
+// (1) An OPERAND of the initializer is reassigned inside the region, before the use. Inlining
+// `t * 4` at `a[ib]` would read the incremented `t`.
+//   correct:  a[0] + a[4] + a[8]  = 1 + 17 + 65 = 83
+//   inlined:  a[4] + a[8] + a[12] = 17 + 65 + 145 = 227
+fn f1(a: [i64; 16]) -> i64 {
+    let mut t: i64 = 0;
+    let mut acc: i64 = 0;
+    for i in 0..3 {
+        let ib = t * 4;
+        t = t + 1;
+        acc = acc + a[ib];
+    }
+    return acc;
+}
+
+// (2) An inner block SHADOWS a free variable of the initializer. Inlining `i * 4` inside that block
+// would capture the inner `i`, not the loop's.
+//   correct:  (a[0] + 3) + (a[4] + 3) = 4 + 20 = 24
+//   inlined:  (a[12] + 3) * 2         = 296
+fn f2(a: [i64; 16]) -> i64 {
+    let mut acc: i64 = 0;
+    for i in 0..2 {
+        let ib = i * 4;
+        {
+            let i: i64 = 3;
+            acc = acc + a[ib] + i;
+        }
+    }
+    return acc;
+}
+
+// (3) The initializer contains a CAST, which is outside the pure set: its value is not a plain
+// wrapping `+ - *` of the operands, and here the `as i32` is what makes the index small.
+//   correct:  a[0] + a[4] = 1 + 17 = 18
+fn f3(a: [i64; 16]) -> i64 {
+    let mut acc: i64 = 0;
+    for i in 0..2 {
+        let ib: i32 = (i * 4 + 4294967296) as i32;
+        acc = acc + a[ib as i64];
+    }
+    return acc;
+}
+
+// (4) The BINDING itself is reassigned between its two uses.
+//   correct:  a[0] + a[1] + a[4] + a[5] = 1 + 2 + 17 + 26 = 46
+//   inlined:  a[0] + a[0] + a[4] + a[4] = 36
+fn f4(a: [i64; 16]) -> i64 {
+    let mut acc: i64 = 0;
+    for i in 0..2 {
+        let mut ib = i * 4;
+        acc = acc + a[ib];
+        ib = ib + 1;
+        acc = acc + a[ib];
+    }
+    return acc;
+}
+
+// (5) A local SHADOWS the module const `K`. `lower_expr` resolves a `Path` in the locals first, so
+// folding the const here would index with 3 instead of 5.
+//   correct:  a[5] + a[6] = 26 + 37 = 63
+//   folded:   a[3] + a[4] = 10 + 17 = 27
+fn f5(a: [i64; 16]) -> i64 {
+    let K: i64 = 5;
+    return a[K] + a[K + 1];
+}
+
+// (6) The positive control: the const used directly as a stride, with nothing shadowing it, DOES
+// fold — and must still compute the same thing.
+//   a[0] + a[3] + a[6] + a[9] = 1 + 10 + 37 + 82 = 130
+fn f6(a: [i64; 16]) -> i64 {
+    let mut acc: i64 = 0;
+    for i in 0..4 {
+        acc = acc + a[i * K];
+    }
+    return acc;
+}
+
+// (7) A base read in index position AND outside one. Substitution is all-or-nothing (the `let` is
+// only deleted when every reader has been rewritten), so this binding is left entirely alone.
+//   a[0]*10 + 0 + a[4]*10 + 4 = 10 + 174 = 184
+fn f7(a: [i64; 16]) -> i64 {
+    let mut acc: i64 = 0;
+    for i in 0..2 {
+        let ib = i * 4;
+        acc = acc + a[ib] * 10 + ib;
+    }
+    return acc;
+}
+
+fn main() -> i32 {
+    let mut a: [i64; 16] = [0; 16];
+    for i in 0..16 {
+        a[i] = (i as i64) * (i as i64) + 1;
+    }
+    print(f1(a));
+    print(f2(a));
+    print(f3(a));
+    print(f4(a));
+    print(f5(a));
+    print(f6(a));
+    print(f7(a));
+    return 0;
+}

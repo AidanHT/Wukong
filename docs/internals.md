@@ -561,7 +561,7 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
 ## Testing strategy
 
 - **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).
-- **End-to-end** (`tests/run/*.wk`, 332 fixtures): the real `wukongc` binary compiles and runs each
+- **End-to-end** (`tests/run/*.wk`, 333 fixtures): the real `wukongc` binary compiles and runs each
   program; stdout/exit are checked against the `// EXPECT-EXIT:` / `// EXPECT-OUT:` directives embedded
   in the file, and a `// RUN:` directive replaces the default `--run` argument list (a fixture that must
   pin the *native* side carries `// RUN: --run --backend=native`). Placement rule: everything here must
