@@ -15,7 +15,8 @@
 //! body here is the original body, `U` times, in the original order, computing the original values.
 //! The win is loop overhead and instruction-level parallelism between the *independent* parts of
 //! successive iterations, not a shorter dependency chain. On a loop whose critical path is a serial
-//! float accumulate, that win is small — see the pass's own note in the commit that added it.
+//! float accumulate, that win is the small one — 4%, against 28% on the same loop in integer, see
+//! "What it buys, measured" below.
 //!
 //! # Shape recognized
 //!
@@ -64,10 +65,15 @@
 //!
 //! `E` is reached only through `R` after the transform, so every value the code after the loop reads
 //! out of the old header — its block parameters and its instruction results — has to be re-pointed at
-//! `R`'s copies. The set of blocks needing that rewrite is exactly `{X : H dominates X} \ {H, B}`:
-//! once control is in `H` the only way to anything else is out through `E`, so every such `X` is
-//! dominated by `E`, hence by `R`. Nothing defined in `B` can be live out (it does not dominate `E`),
-//! so the body's own values need no repair.
+//! `R`'s copies. The blocks needing that rewrite are exactly `{X : H dominates X} \ {H, B}`: once
+//! control is in `H` the only way to anything else is out through `E`, so every such `X` is
+//! dominated by `E`, hence by `R` afterwards. Nothing defined in `B` can be live out (it does not
+//! dominate `E`), so the body's own values need no repair.
+//!
+//! The pass does **not** compute that set. Every block outside `{H, B}` is swept instead, because a
+//! block `H` does not dominate cannot mention a value defined in `H` — that is SSA's own dominance
+//! rule — so visiting it finds nothing to rename and the result is identical. Building a dominator
+//! tree per unrolled loop to learn the same thing cost a third of the optimizer.
 //!
 //! # Scheduling
 //!
