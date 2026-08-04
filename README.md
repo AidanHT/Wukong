@@ -41,7 +41,7 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   ~1.4–2× with this laptop's power state, so ratios are same-run only and reported as ranges; the
   residual mid-size gap is parallel-grain scaling, honestly open);
 - **dispatches the whole transformer/training kernel surface** to tuned microkernels: the
-  **weight-gradient GEMM** `dW=Aᵀ·B` (training backward) **~2.6–5.3× single / ~3.1–13.9× parallel**,
+  **weight-gradient GEMM** `dW=Aᵀ·B` (training backward) **~2.6–9.2× single / ~3.1–13.9× parallel**,
   the **fused FFN** `silu(A·Bᵀ)` **~24–26×**, **RoPE** rotary embedding **~29–54×** (up to **~156×
   parallel**), and the training-backward kernels (activation/softmax/LayerNorm-RMSNorm backward,
   cross-entropy) **~3–13×**. *(Corrected 2026-08-04. The weight-gradient figure previously read "up
