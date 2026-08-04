@@ -5,6 +5,38 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Optimizer — `mem2reg` promotes pointer slots (2026-08-04)
+- **Pointer-typed stack slots are now promoted to SSA.** `mem2reg` accepted only integer and float
+  slots, so every pointer-typed *parameter* — `*T`, `&T`, and every `Tensor[…]`, all of which lower to
+  one MIR `ptr` — stayed in its `alloca` for the life of the function and had its base pointer
+  re-loaded from memory at *every* element access. No other pass could remove it: `licm` will not
+  hoist a load out of a loop and `cse` only forwards a load within one block. A three-operand
+  `Tensor[f32, N]` loop with a data-dependent branch went from 17 MIR instructions and 5 loads per
+  element to 14 and 2, and from **23 x86 instructions and 12 loads per element to 17 and 7** on an
+  eight-pointer probe. Corpus-wide (`--emit=obj -O2` over all 333 `tests/run/*.wk`): 86 → 5
+  `alloca ptr`, x86 instructions −0.33%, memory-referencing instructions −0.95%, **0 programs got
+  larger**. The win compounds — deleting `store <slot>, <ptr slot>` can un-escape the pointee, so a
+  later fixpoint round promotes that too.
+- **Only the definitely-initialized subset is promoted.** A read-before-write slot is promoted to a
+  zero constant of its type; there is no sound one for a pointer, because `inttoptr 0` is a genuine
+  null on the native backend but a *valid, addressable* slot in the interpreter. A pointer slot
+  therefore qualifies only when the entry block stores to it before any load of it — which is exactly
+  how `mir_build` lowers a pointer parameter. A pointer local first assigned inside an `if` or a loop
+  keeps its slot. A `[]T` **slice** parameter is unaffected: its base comes from
+  `load ptr (gep <param>, 0)`, caller-owned memory rather than a local slot, and removing that needs
+  loop-invariant load motion.
+- **Hardening**: `mem2reg` now also refuses a slot whose `load`/`store` type disagrees with the slot's
+  own — a type-punned access whose promoted value would carry the wrong MIR type. Verified to change
+  no emitted MIR on its own (332/332 corpus programs byte-identical).
+- New gate: `tests/run/ptr_slot_promotion.wk` (every lane printed, values derived from the scalar
+  semantics of each loop) plus three `wukong_opt` unit tests covering promotion, the
+  late-initialization exclusion, and the aliasing case where the pointer is promoted to a block
+  parameter merging two addresses whose pointees must stay in memory.
+- **Not measured**: no wall-clock number is claimed. An A/A control (identical binary, interleaved,
+  core-pinned, best-of-10) showed ±3.6–8% spread, and the same binary on the same program varied
+  2.3× across adjacent rounds while ~20 other processes were building on the box. The instruction and
+  load counts above are static and exactly reproducible; the run-time consequence is not yet measured.
+
 ### Correctness + robustness — code-map-hardening campaign (2026-07-29)
 A codebase-wide correctness pass over every crate (read-only audit groups → fix branches over disjoint
 write-sets → adversarial re-verification), plus a harness-hardening wave. Almost nothing here is a new
