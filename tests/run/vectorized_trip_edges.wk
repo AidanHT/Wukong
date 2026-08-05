@@ -1,0 +1,898 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -14
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -14
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -14
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -14
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 14
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -14
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 14
+// EXPECT-OUT: 21
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -14
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 14
+// EXPECT-OUT: 21
+// EXPECT-OUT: 28
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -14
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 14
+// EXPECT-OUT: 21
+// EXPECT-OUT: 28
+// EXPECT-OUT: 35
+// EXPECT-OUT: 42
+// EXPECT-OUT: 49
+// EXPECT-OUT: 56
+// EXPECT-OUT: 63
+// EXPECT-OUT: 70
+// EXPECT-OUT: 77
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -28
+// EXPECT-OUT: -21
+// EXPECT-OUT: -14
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 14
+// EXPECT-OUT: 21
+// EXPECT-OUT: 28
+// EXPECT-OUT: 35
+// EXPECT-OUT: 42
+// EXPECT-OUT: 49
+// EXPECT-OUT: 56
+// EXPECT-OUT: 63
+// EXPECT-OUT: 70
+// EXPECT-OUT: 77
+// EXPECT-OUT: 84
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -64
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -64
+// EXPECT-OUT: -58
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -64
+// EXPECT-OUT: -58
+// EXPECT-OUT: -52
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -64
+// EXPECT-OUT: -58
+// EXPECT-OUT: -52
+// EXPECT-OUT: -46
+// EXPECT-OUT: -40
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -64
+// EXPECT-OUT: -58
+// EXPECT-OUT: -52
+// EXPECT-OUT: -46
+// EXPECT-OUT: -40
+// EXPECT-OUT: -34
+// EXPECT-OUT: -28
+// EXPECT-OUT: -22
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -64
+// EXPECT-OUT: -58
+// EXPECT-OUT: -52
+// EXPECT-OUT: -46
+// EXPECT-OUT: -40
+// EXPECT-OUT: -34
+// EXPECT-OUT: -28
+// EXPECT-OUT: -22
+// EXPECT-OUT: -16
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -6216
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -55
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -55
+// EXPECT-OUT: -42
+// EXPECT-OUT: -29
+// EXPECT-OUT: -16
+// EXPECT-OUT: -3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 49
+// EXPECT-OUT: 62
+// EXPECT-OUT: 75
+// EXPECT-OUT: 88
+// EXPECT-OUT: 101
+// EXPECT-OUT: 114
+// EXPECT-OUT: 127
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -55
+// EXPECT-OUT: -42
+// EXPECT-OUT: -29
+// EXPECT-OUT: -16
+// EXPECT-OUT: -3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 49
+// EXPECT-OUT: 62
+// EXPECT-OUT: 75
+// EXPECT-OUT: 88
+// EXPECT-OUT: 101
+// EXPECT-OUT: 114
+// EXPECT-OUT: 127
+// EXPECT-OUT: -116
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -55
+// EXPECT-OUT: -42
+// EXPECT-OUT: -29
+// EXPECT-OUT: -16
+// EXPECT-OUT: -3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 49
+// EXPECT-OUT: 62
+// EXPECT-OUT: 75
+// EXPECT-OUT: 88
+// EXPECT-OUT: 101
+// EXPECT-OUT: 114
+// EXPECT-OUT: 127
+// EXPECT-OUT: -116
+// EXPECT-OUT: -103
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -55
+// EXPECT-OUT: -42
+// EXPECT-OUT: -29
+// EXPECT-OUT: -16
+// EXPECT-OUT: -3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 49
+// EXPECT-OUT: 62
+// EXPECT-OUT: 75
+// EXPECT-OUT: 88
+// EXPECT-OUT: 101
+// EXPECT-OUT: 114
+// EXPECT-OUT: 127
+// EXPECT-OUT: -116
+// EXPECT-OUT: -103
+// EXPECT-OUT: -90
+// EXPECT-OUT: -77
+// EXPECT-OUT: -64
+// EXPECT-OUT: -51
+// EXPECT-OUT: -38
+// EXPECT-OUT: -25
+// EXPECT-OUT: -12
+// EXPECT-OUT: 1
+// EXPECT-OUT: 14
+// EXPECT-OUT: 27
+// EXPECT-OUT: 40
+// EXPECT-OUT: 53
+// EXPECT-OUT: 66
+// EXPECT-OUT: 79
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -55
+// EXPECT-OUT: -42
+// EXPECT-OUT: -29
+// EXPECT-OUT: -16
+// EXPECT-OUT: -3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 49
+// EXPECT-OUT: 62
+// EXPECT-OUT: 75
+// EXPECT-OUT: 88
+// EXPECT-OUT: 101
+// EXPECT-OUT: 114
+// EXPECT-OUT: 127
+// EXPECT-OUT: -116
+// EXPECT-OUT: -103
+// EXPECT-OUT: -90
+// EXPECT-OUT: -77
+// EXPECT-OUT: -64
+// EXPECT-OUT: -51
+// EXPECT-OUT: -38
+// EXPECT-OUT: -25
+// EXPECT-OUT: -12
+// EXPECT-OUT: 1
+// EXPECT-OUT: 14
+// EXPECT-OUT: 27
+// EXPECT-OUT: 40
+// EXPECT-OUT: 53
+// EXPECT-OUT: 66
+// EXPECT-OUT: 79
+// EXPECT-OUT: 92
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -55
+// EXPECT-OUT: -42
+// EXPECT-OUT: -29
+// EXPECT-OUT: -16
+// EXPECT-OUT: -3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 49
+// EXPECT-OUT: 62
+// EXPECT-OUT: 75
+// EXPECT-OUT: 88
+// EXPECT-OUT: 101
+// EXPECT-OUT: 114
+// EXPECT-OUT: 127
+// EXPECT-OUT: -116
+// EXPECT-OUT: -103
+// EXPECT-OUT: -90
+// EXPECT-OUT: -77
+// EXPECT-OUT: -64
+// EXPECT-OUT: -51
+// EXPECT-OUT: -38
+// EXPECT-OUT: -25
+// EXPECT-OUT: -12
+// EXPECT-OUT: 1
+// EXPECT-OUT: 14
+// EXPECT-OUT: 27
+// EXPECT-OUT: 40
+// EXPECT-OUT: 53
+// EXPECT-OUT: 66
+// EXPECT-OUT: 79
+// EXPECT-OUT: 92
+// EXPECT-OUT: 105
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -160
+// EXPECT-OUT: -140
+// EXPECT-OUT: -120
+// EXPECT-OUT: -100
+// EXPECT-OUT: -80
+// EXPECT-OUT: -60
+// EXPECT-OUT: -40
+// EXPECT-OUT: -20
+// EXPECT-OUT: 0
+// EXPECT-OUT: 20
+// EXPECT-OUT: 40
+// EXPECT-OUT: 60
+// EXPECT-OUT: 80
+// EXPECT-OUT: 100
+// EXPECT-OUT: 120
+// EXPECT-OUT: 140
+// EXPECT-OUT: 160
+// EXPECT-OUT: 180
+// EXPECT-OUT: 200
+// EXPECT-OUT: 220
+// EXPECT-OUT: 240
+// EXPECT-OUT: 104
+// EXPECT-OUT: 112
+// EXPECT-OUT: 120
+// EXPECT-OUT: 128
+// EXPECT-OUT: 136
+// EXPECT-OUT: 144
+// EXPECT-OUT: 152
+// EXPECT-OUT: 160
+// EXPECT-OUT: 168
+// EXPECT-OUT: 176
+// EXPECT-OUT: 184
+// EXPECT-OUT: -160
+// EXPECT-OUT: -140
+// EXPECT-OUT: -120
+// EXPECT-OUT: -100
+// EXPECT-OUT: -80
+// EXPECT-OUT: -60
+// EXPECT-OUT: -40
+// EXPECT-OUT: -20
+// EXPECT-OUT: 0
+// EXPECT-OUT: 20
+// EXPECT-OUT: 40
+// EXPECT-OUT: 60
+// EXPECT-OUT: 80
+// EXPECT-OUT: 100
+// EXPECT-OUT: 120
+// EXPECT-OUT: 140
+// EXPECT-OUT: 160
+// EXPECT-OUT: 180
+// EXPECT-OUT: 200
+// EXPECT-OUT: 220
+// EXPECT-OUT: 240
+// EXPECT-OUT: 104
+// EXPECT-OUT: 112
+// EXPECT-OUT: 120
+// EXPECT-OUT: 128
+// EXPECT-OUT: 136
+// EXPECT-OUT: 144
+// EXPECT-OUT: 152
+// EXPECT-OUT: 160
+// EXPECT-OUT: 168
+// EXPECT-OUT: 176
+// EXPECT-OUT: 184
+// EXPECT-OUT: -112
+// EXPECT-OUT: -96
+// EXPECT-OUT: -80
+// EXPECT-OUT: -64
+// EXPECT-OUT: -48
+// EXPECT-OUT: -32
+// EXPECT-OUT: -16
+// EXPECT-OUT: 0
+// EXPECT-OUT: 16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 48
+// EXPECT-OUT: 64
+// EXPECT-OUT: 80
+// EXPECT-OUT: 96
+// EXPECT-OUT: 112
+// EXPECT-OUT: 128
+// EXPECT-OUT: 144
+// EXPECT-OUT: 160
+// EXPECT-OUT: 176
+// EXPECT-OUT: 192
+// EXPECT-OUT: 208
+// EXPECT-OUT: 104
+// EXPECT-OUT: 112
+// EXPECT-OUT: 120
+// EXPECT-OUT: 128
+// EXPECT-OUT: 136
+// EXPECT-OUT: 144
+// EXPECT-OUT: 152
+// EXPECT-OUT: 160
+// EXPECT-OUT: 168
+// EXPECT-OUT: 176
+// EXPECT-OUT: 184
+// EXPECT-OUT: -64
+// EXPECT-OUT: -128
+// EXPECT-OUT: -256
+// EXPECT-OUT: -512
+// EXPECT-OUT: -1024
+// EXPECT-OUT: -2048
+// EXPECT-OUT: -4096
+// EXPECT-OUT: -8192
+// EXPECT-OUT: -16384
+// EXPECT-OUT: -32768
+// EXPECT-OUT: -65536
+// EXPECT-OUT: -131072
+// EXPECT-OUT: -262144
+// EXPECT-OUT: -524288
+// EXPECT-OUT: -1048576
+// EXPECT-OUT: -2097152
+// EXPECT-OUT: -4194304
+// EXPECT-OUT: -8388608
+// EXPECT-OUT: -16777216
+// EXPECT-OUT: -33554432
+// EXPECT-OUT: -67108864
+// EXPECT-OUT: 104
+// EXPECT-OUT: 112
+// EXPECT-OUT: 120
+// EXPECT-OUT: 128
+// EXPECT-OUT: 136
+// EXPECT-OUT: 144
+// EXPECT-OUT: 152
+// EXPECT-OUT: 160
+// EXPECT-OUT: 168
+// EXPECT-OUT: 176
+// EXPECT-OUT: 184
+// EXPECT-OUT: -112
+// EXPECT-OUT: -96
+// EXPECT-OUT: -80
+// EXPECT-OUT: -64
+// EXPECT-OUT: -48
+// EXPECT-OUT: -32
+// EXPECT-OUT: -16
+// EXPECT-OUT: 0
+// EXPECT-OUT: 16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 48
+// EXPECT-OUT: 64
+// EXPECT-OUT: 80
+// EXPECT-OUT: 96
+// EXPECT-OUT: 112
+// EXPECT-OUT: 128
+// EXPECT-OUT: 144
+// EXPECT-OUT: 160
+// EXPECT-OUT: 176
+// EXPECT-OUT: 192
+// EXPECT-OUT: 208
+// EXPECT-OUT: 104
+// EXPECT-OUT: 112
+// EXPECT-OUT: 120
+// EXPECT-OUT: 128
+// EXPECT-OUT: 136
+// EXPECT-OUT: 144
+// EXPECT-OUT: 152
+// EXPECT-OUT: 160
+// EXPECT-OUT: 168
+// EXPECT-OUT: 176
+// EXPECT-OUT: 184
+module tests.run.vectorized_trip_edges
+
+// Trip-count and aliasing edges for `wukong_opt::vectorize`.
+//
+// A widened loop is only half visible to the gates: `native_matches_interpreter` cannot see a
+// widening bug, because both backends execute the same widened MIR. The witness is
+// `optimization_is_observationally_invariant` -- `-O0` runs the scalar loop the front end emitted,
+// `-O2` runs the vector loop plus its scalar epilogue. This file is written to make that comparison
+// bite on the two properties the transform is built around:
+//
+//  * **The vector loop owns exactly `[start, start + n_vec)` and the epilogue exactly the rest.**
+//    Every output buffer is pre-filled with a sentinel and printed IN FULL, so one element written
+//    past `n` -- or one element the epilogue forgot -- shows up as a changed line. The trip counts
+//    are chosen to straddle each lane boundary from below and above: `W-1, W, W+1` at `W = 4`
+//    (f32), `W = 2` (f64) and `W = 16` (i8), plus 0 and 1, where the vector loop must run zero
+//    iterations.
+//  * **The runtime alias check.** Section 4 passes ONE buffer through two parameters at three
+//    relative offsets. At offset 0 the dependence is loop-independent and widening must go ahead;
+//    at +/-1 it is a real loop-carried dependence and the pointer-range test must set `n_vec` to
+//    zero so the original loop does all the work. Getting either half wrong changes a printed lane.
+//
+// Every expected value is computed from the scalar semantics of the loop in exact IEEE
+// single/double and wrapping two's-complement integer arithmetic, not recorded from compiler
+// output. The `while` spelling is used throughout so no `mir_build` recognizer intercepts the loop
+// before the optimizer sees it.
+
+fn sax(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = 1.5 * x[i] + y[i]; i = i + 1; }
+}
+fn dsc(x: []f64, mut o: []f64, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] * 3.0 + 1.0; i = i + 1; }
+}
+fn badd(x: []i8, mut o: []i8, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] + 5i8; i = i + 1; }
+}
+/// read at the SAME index as the store: distance 0, legal to widen even in place
+fn shift0(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = 1.5 * x[i] + y[i]; i = i + 1; }
+}
+/// read one AHEAD of the store
+fn shift_dn(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i + 1] * 2.0; i = i + 1; }
+}
+/// read one BEHIND the store
+fn shift_up(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 1;
+    while i < n { o[i] = x[i - 1] * 2.0; i = i + 1; }
+}
+
+fn show32(p: []f32, cap: i64) {
+    let mut k: i64 = 0;
+    while k < cap { print((p[k] * 8.0) as i32); k = k + 1; }
+}
+fn show64(p: []f64, cap: i64) {
+    let mut k: i64 = 0;
+    while k < cap { print((p[k] * 8.0) as i32); k = k + 1; }
+}
+fn show8(p: []i8, cap: i64) {
+    let mut k: i64 = 0;
+    while k < cap { print(p[k] as i32); k = k + 1; }
+}
+fn showa(p: []f32, cap: i64) {
+    let mut k: i64 = 0;
+    while k < cap { print((p[k] * 16.0) as i32); k = k + 1; }
+}
+fn reseta(mut p: []f32, cap: i64) {
+    let mut k: i64 = 0;
+    while k < cap { p[k] = (k as f32) * 0.5 - 4.0; k = k + 1; }
+}
+
+fn main() -> i32 {
+    // ---- 1. f32, W = 4 ----------------------------------------------------------------------
+    let mut x: []f32 = alloc_f32(20);
+    let mut y: []f32 = alloc_f32(20);
+    let mut o: []f32 = alloc_f32(20);
+    let mut j: i64 = 0;
+    while j < 20 {
+        x[j] = (j as f32) * 0.25 - 3.0;      // exact: a multiple of 1/4
+        y[j] = (j as f32) * 0.5 + 1.0;       // exact: a multiple of 1/2
+        j = j + 1;
+    }
+    let ns32: [i64; 11] = [0, 1, 2, 3, 4, 5, 7, 8, 9, 16, 17];
+    let mut t: i64 = 0;
+    while t < 11 {
+        j = 0;
+        while j < 20 { o[j] = -777.0; j = j + 1; }   // sentinel
+        sax(x, y, o, ns32[t]);
+        show32(o, 20);
+        t = t + 1;
+    }
+    free(o); free(y); free(x);
+
+    // ---- 2. f64, W = 2 ----------------------------------------------------------------------
+    let mut xd: []f64 = alloc_f64(12);
+    let mut od: []f64 = alloc_f64(12);
+    j = 0;
+    while j < 12 { xd[j] = (j as f64) * 0.25 - 3.0; j = j + 1; }
+    let ns64: [i64; 7] = [0, 1, 2, 3, 5, 8, 9];
+    t = 0;
+    while t < 7 {
+        j = 0;
+        while j < 12 { od[j] = -777.0; j = j + 1; }
+        dsc(xd, od, ns64[t]);
+        show64(od, 12);
+        t = t + 1;
+    }
+    free(od); free(xd);
+
+    // ---- 3. i8, W = 16 ----------------------------------------------------------------------
+    let mut xb: []i8 = alloc_i8(36);
+    let mut ob: []i8 = alloc_i8(36);
+    j = 0;
+    while j < 36 { xb[j] = (j as i8) * 13i8 - 60i8; j = j + 1; }
+    let ns8: [i64; 8] = [0, 1, 15, 16, 17, 31, 32, 33];
+    t = 0;
+    while t < 8 {
+        j = 0;
+        while j < 36 { ob[j] = -99i8; j = j + 1; }
+        badd(xb, ob, ns8[t]);
+        show8(ob, 36);
+        t = t + 1;
+    }
+    free(ob); free(xb);
+
+    // ---- 4. aliasing ------------------------------------------------------------------------
+    let mut a: []f32 = alloc_f32(32);
+    let mut b: []f32 = alloc_f32(32);
+
+    reseta(a, 32); shift0(a, a, a, 21);            showa(a, 32);
+    reseta(a, 32); reseta(b, 32);
+    shift0(b, a, a, 21);                                  showa(a, 32);
+    reseta(a, 32); shift_dn(a, a, 21);              showa(a, 32);
+    reseta(a, 32); shift_up(a, a, 21);              showa(a, 32);
+    reseta(a, 32); reseta(b, 32);
+    shift_dn(a, b, 21);                                   showa(b, 32);
+
+    free(b); free(a);
+    return 0;
+}

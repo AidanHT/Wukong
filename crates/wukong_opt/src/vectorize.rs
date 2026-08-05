@@ -152,8 +152,8 @@ impl Pass for Vectorize {
         let mut changed = false;
         for _ in 0..MAX_LOOPS_PER_CALL {
             let (idom, preds) = cache.idoms_and_preds(f);
-            let forest = loop_info::analyze_with(f, idom, preds);
-            let Some(plan) = pick(f, &forest, done) else {
+            let mut forest = loop_info::structure_with(f, idom, preds);
+            let Some(plan) = pick(f, &mut forest, done) else {
                 break;
             };
             done.insert(plan.header.0);
@@ -357,22 +357,55 @@ struct GuardBase {
 // ---------------------------------------------------------------------------------------------
 
 /// The first loop of `f` this pass can widen, innermost first.
-fn pick(f: &Function, forest: &LoopForest, done: &FxHashSet<u32>) -> Option<VecPlan> {
+///
+/// `forest` arrives carrying **structure only** ([`loop_info::structure_with`]); the value analyses
+/// are run here, one loop at a time and only as far as the next decision needs. That is not a
+/// micro-optimization: the full analysis builds an affine expression for every integer instruction
+/// of every loop in the function, this pass is re-entered by the optimizer's fixpoint, and over
+/// `tests/run` it made `vectorize` 37-42% of the whole optimizer. The staging is safe because
+/// [`crate::loop_info::Stages`]'s unrun stages leave *conservative* defaults — `dep` reads
+/// `MemDep::Carried`, so a loop whose memory was never analyzed cannot be widened by accident —
+/// and because both early filters call the same code `plan_loop` does.
+fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<VecPlan> {
     let trace = std::env::var_os("WUKONG_VEC_TRACE").is_some();
+    let decline = |header: u32, why: &str| {
+        if trace {
+            eprintln!("vectorize: declined loop at bb{header}: {why}");
+        }
+    };
     for id in forest.innermost_first() {
+        let idx = id.0 as usize;
+        // Structure first: no value analysis has run yet, and none of these checks needs one.
+        {
+            let l = forest.get(id);
+            if done.contains(&l.header.0) || already_vector(f, l) {
+                continue;
+            }
+            if is_someones_epilogue(f, forest, l) {
+                continue;
+            }
+            if let Err(why) = structural_verdict(f, l) {
+                decline(l.header.0, why);
+                continue;
+            }
+        }
+        // Stage 1+2 only: is it a unit-stride counted loop? This rejects more of the corpus than
+        // any other single check, and it costs a fraction of the memory analysis below.
+        loop_info::analyze_one(f, forest, idx, loop_info::Stages::Ivs);
+        {
+            let l = forest.get(id);
+            if let Err(why) = iv_verdict(l) {
+                decline(l.header.0, why);
+                continue;
+            }
+        }
+        // Stage 3+4: accesses, carried values and dependence. Still not the derived-IV list, which
+        // nothing here reads.
+        loop_info::analyze_one(f, forest, idx, loop_info::Stages::Memory);
         let l = forest.get(id);
-        if done.contains(&l.header.0) || already_vector(f, l) {
-            continue;
-        }
-        if is_someones_epilogue(f, forest, l) {
-            continue;
-        }
         match plan_loop(f, l) {
             Ok(p) => return Some(p),
-            Err(why) if trace => {
-                eprintln!("vectorize: declined loop at bb{}: {why}", l.header.0)
-            }
-            Err(_) => {}
+            Err(why) => decline(l.header.0, why),
         }
     }
     None
@@ -407,8 +440,16 @@ fn is_someones_epilogue(f: &Function, forest: &LoopForest, l: &NaturalLoop) -> b
         .any(|v| v.id != l.id && v.exits.iter().any(|&(_, to)| to == ph) && already_vector(f, v))
 }
 
-fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
-    // ---- structure -------------------------------------------------------------------------
+/// The half of [`plan_loop`] that reads only the loop's **structure** — block sets, latches, exits
+/// and the instructions themselves — and none of the induction-variable, access or dependence
+/// analysis.
+///
+/// It exists so that [`pick`] can decline a loop before paying for those analyses, and it is a
+/// function rather than a copy of the checks so the two cannot drift: `plan_loop` calls it, so
+/// anything it rejects is exactly something `plan_loop` rejects.
+///
+/// Returns the loop's preheader and its latch (the body block that carries the back edge).
+fn structural_verdict(f: &Function, l: &NaturalLoop) -> Result<(BlockId, BlockId), &'static str> {
     let preheader = l.preheader.ok_or("no preheader")?;
     if l.latches.len() != 1 || !l.abnormal_exits.is_empty() || l.exits.len() != 1 {
         return Err("not one latch / one exit / no abnormal exit");
@@ -417,25 +458,47 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if exit_from != l.header {
         return Err("exit is not tested in the header");
     }
-    // The body is either one straight-line block (which is then also the latch), or a diamond /
-    // triangle that if-conversion flattens into one. Either way the latch carries the back edge.
-    let body = l.latches[0];
-    let lin = linearize_region(f, l, body)?;
+    // The cheap half of `linearize_region`'s precondition: one straight-line body block, or a
+    // diamond / triangle. Anything larger is not a shape if-conversion can flatten.
+    if l.blocks.len() > 5 {
+        return Err("body has more blocks than one diamond");
+    }
     if !header_is_test_only(f, l) {
         return Err("the header computes more than the exit test");
     }
+    Ok((preheader, l.latches[0]))
+}
 
-    // ---- induction variable and trip count ---------------------------------------------------
-    let iv_idx_in_ivs = l.primary_iv.ok_or("no primary induction variable")?;
-    let iv = &l.ivs[iv_idx_in_ivs];
+/// Is this a unit-stride counted loop over an integer induction variable?
+///
+/// Everything here is answered by [`crate::loop_info::Stages::Ivs`], the cheapest analysis stage —
+/// and it is the largest single reason the corpus declines (a step that is not 1 accounts for more
+/// declines over `tests/run` than any other check). `plan_loop` repeats it, so this can only
+/// decline loops `plan_loop` would have declined.
+fn iv_verdict(l: &NaturalLoop) -> Result<(), &'static str> {
+    let idx = l.primary_iv.ok_or("no primary induction variable")?;
+    let iv = &l.ivs[idx];
     if iv.step != IvStep::Const(1) {
         return Err("induction step is not 1");
     }
-    let iv_index = iv.param_index;
-    let iv_ty = iv.ty.clone();
-    if !iv_ty.is_int() || iv_ty == MirType::I1 {
+    if !iv.ty.is_int() || iv.ty == MirType::I1 {
         return Err("induction variable is not an integer");
     }
+    Ok(())
+}
+
+fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
+    // ---- structure -------------------------------------------------------------------------
+    let (preheader, body) = structural_verdict(f, l)?;
+    // The body is either one straight-line block (which is then also the latch), or a diamond /
+    // triangle that if-conversion flattens into one. Either way the latch carries the back edge.
+    let lin = linearize_region(f, l, body)?;
+
+    // ---- induction variable and trip count ---------------------------------------------------
+    iv_verdict(l)?;
+    let iv = &l.ivs[l.primary_iv.expect("iv_verdict accepted a primary induction variable")];
+    let iv_index = iv.param_index;
+    let iv_ty = iv.ty.clone();
 
     // ---- dependence ---------------------------------------------------------------------------
     if !l.is_vectorizable_shape() {
