@@ -9,10 +9,12 @@ module examples.gpt2_forward_bench
 // logits cross-check against real PyTorch GPT-2 is exact — and (3) a warmup + min-of-K timing loop
 // using the now_ns() intrinsic.
 //
-// The model dimensions are bound to local `let`s (d, dff, hd, hh, voc) from the gpt2_config consts:
-// the recognizers key stride/bound/divisor equality on the *binding*, and only literal or local-variable
-// dims resolve (a bare imported-const used directly as a dim does not). Runtime OFFSETS stay as consts.
-// With that binding, every compute-heavy op is spelled in its recognized form and dispatches to the
+// The model dimensions are bound to local `let`s (d, dff, hd, hh, voc) from the gpt2_config consts.
+// That binding is no longer REQUIRED — `wukong_mir_build::canon` now folds an integer const with a
+// literal initializer into its uses before the recognizers run, so a bare imported-const dim resolves
+// too (see gpt2_infer.wk, which uses them directly and dispatches) — but it is kept here because it
+// is the form the measured counts below were taken in. Runtime OFFSETS stay as consts either way.
+// Every compute-heavy op is spelled in its recognized form and dispatches to the
 // tuned runtime kernel (verify with `wukongc --emit=mir -O2 … | grep wukong_`):
 //   * Q/K/V/O/W1/W2 projections  -> wukong_sgemm_nt_epi   (fused bias epilogue)
 //   * scaled scores  α·(Qh·Khᵀ)  -> wukong_sgemm_nt_alpha

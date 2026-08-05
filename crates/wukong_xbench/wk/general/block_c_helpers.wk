@@ -1,0 +1,210 @@
+module gblock_c
+
+// STRUCTURE TAX, variant (c): FACTORED into reusable helpers over `[]f32` slices.
+//
+// The same arithmetic in the same order as (a) and (b), but written the way anyone builds a model
+// they intend to reuse: one `rmsnorm` / `linear` / `rope` / `attend` / `swiglu` / `residual` each,
+// taking `[]f32` slices and i64 dimensions, called from a thin `kbench`. The dimensions are
+// therefore RUNTIME values inside every helper body, not compile-time constants.
+//
+// This is the spelling a library author reaches for first, and the one every real model in
+// `examples/` avoids.
+
+fn rmsnorm(x: []f32, g: []f32, mut o: []f32, rows: i64, d: i64) {
+    for r in 0..rows {
+        let rb: i64 = r * d;
+        let mut ss: f32 = 0.0;
+        for i in 0..d { ss = ss + x[rb+i] * x[rb+i]; }
+        let inv: f32 = rsqrt(ss / (d as f32) + 0.00001);
+        for i in 0..d { o[rb+i] = x[rb+i] * inv * g[i]; }
+    }
+}
+
+/// `c = a . w'` in the NT weight layout: `c[i,j] = sum_p a[i,p] * w[j,p]`.
+fn linear(a: []f32, w: []f32, mut c: []f32, m: i64, n: i64, kk: i64) {
+    for i in 0..m {
+        let ib: i64 = i * kk;
+        let ob: i64 = i * n;
+        for j in 0..n {
+            let jb: i64 = j * kk;
+            let mut acc: f32 = 0.0;
+            for p in 0..kk { acc = acc + a[ib+p] * w[jb+p]; }
+            c[ob+j] = acc;
+        }
+    }
+}
+
+/// `c = a . w' + bias`, activation applied by the caller.
+fn linear_bias(a: []f32, w: []f32, b: []f32, mut c: []f32, m: i64, n: i64, kk: i64) {
+    for i in 0..m {
+        let ib: i64 = i * kk;
+        let ob: i64 = i * n;
+        for j in 0..n {
+            let jb: i64 = j * kk;
+            let mut acc: f32 = 0.0;
+            for p in 0..kk { acc = acc + a[ib+p] * w[jb+p]; }
+            c[ob+j] = b[j] + acc;
+        }
+    }
+}
+
+fn rope(mut q: []f32, mut k: []f32, rc: []f32, rs: []f32, s: i64, d: i64, hh: i64, hd: i64) {
+    let hd2: i64 = hd / 2i64;
+    for r in 0..s {
+        let tb: i64 = r * hd2;
+        let rb: i64 = r * d;
+        for e in 0..hh {
+            let hb: i64 = rb + e * hd;
+            for t in 0..hd2 {
+                let cc: f32 = rc[tb+t];
+                let sn: f32 = rs[tb+t];
+                let q0: f32 = q[hb+t];
+                let q1: f32 = q[hb+t+hd2];
+                q[hb+t] = q0*cc - q1*sn;
+                q[hb+t+hd2] = q0*sn + q1*cc;
+                let k0: f32 = k[hb+t];
+                let k1: f32 = k[hb+t+hd2];
+                k[hb+t] = k0*cc - k1*sn;
+                k[hb+t+hd2] = k0*sn + k1*cc;
+            }
+        }
+    }
+}
+
+fn softmax_causal(mut sc: []f32, s: i64) {
+    for i in 0..s {
+        let so: i64 = i * s;
+        for j in 0..s { if j > i { sc[so+j] = 0.0 - 1.0e30; } }
+    }
+    for r in 0..s {
+        let so: i64 = r * s;
+        let mut m: f32 = sc[so];
+        for i in 0..s { m = fmax(m, sc[so+i]); }
+        for i in 0..s { sc[so+i] = exp(sc[so+i] - m); }
+        let mut sm: f32 = 0.0;
+        for i in 0..s { sm = sm + sc[so+i]; }
+        let inv: f32 = 1.0 / sm;
+        for i in 0..s { sc[so+i] = sc[so+i] * inv; }
+    }
+}
+
+fn attend(
+    q: []f32, k: []f32, v: []f32,
+    mut sc: []f32, mut ctx: []f32,
+    mut qh: []f32, mut kh: []f32, mut vt: []f32, mut ah: []f32,
+    s: i64, d: i64, nh: i64, hd: i64, scale: f32,
+) {
+    for e in 0..nh {
+        let ho: i64 = e * hd;
+        for i in 0..s {
+            let src: i64 = i * d + ho;
+            let dst: i64 = i * hd;
+            for p in 0..hd { qh[dst+p] = q[src+p]; kh[dst+p] = k[src+p]; }
+        }
+        for j in 0..hd {
+            let dst: i64 = j * s;
+            for p in 0..s { vt[dst+p] = v[p*d + ho + j]; }
+        }
+        for i in 0..s {
+            let ib: i64 = i * hd;
+            let so: i64 = i * s;
+            for j in 0..s {
+                let jb: i64 = j * hd;
+                let mut acc: f32 = 0.0;
+                for p in 0..hd { acc = acc + qh[ib+p] * kh[jb+p]; }
+                sc[so+j] = scale * acc;
+            }
+        }
+        softmax_causal(sc, s);
+        for i in 0..s {
+            let so: i64 = i * s;
+            let ib: i64 = i * hd;
+            for j in 0..hd {
+                let jb: i64 = j * s;
+                let mut acc: f32 = 0.0;
+                for p in 0..s { acc = acc + sc[so+p] * vt[jb+p]; }
+                ah[ib+j] = acc;
+            }
+        }
+        for i in 0..s {
+            let dst: i64 = i * d + ho;
+            let ib: i64 = i * hd;
+            for j in 0..hd { ctx[dst+j] = ah[ib+j]; }
+        }
+    }
+}
+
+fn swiglu(mut gate: []f32, up: []f32, n: i64) {
+    for i in 0..n { gate[i] = silu(gate[i]) * up[i]; }
+}
+
+fn residual(a: []f32, b: []f32, mut o: []f32, n: i64) {
+    for i in 0..n { o[i] = a[i] + b[i]; }
+}
+
+fn kbench(
+    x: [f32; $SD$],
+    g1: [f32; $D$], g2: [f32; $D$],
+    wq: [f32; $DD$], wk: [f32; $DD$], wv: [f32; $DD$], wo: [f32; $DD$],
+    w1: [f32; $FD$], w3: [f32; $FD$], w2: [f32; $DF$],
+    b1: [f32; $F$],
+    rc: [f32; $SH2$], rs: [f32; $SH2$],
+    mut nrm: [f32; $SD$],
+    mut q: [f32; $SD$], mut k: [f32; $SD$], mut v: [f32; $SD$],
+    mut sc: [f32; $SS$],
+    mut qh: [f32; $SHD$], mut kh: [f32; $SHD$], mut vt: [f32; $SHD$], mut ah: [f32; $SHD$],
+    mut ctx: [f32; $SD$],
+    mut h: [f32; $SD$],
+    mut f1: [f32; $SF$], mut f3: [f32; $SF$],
+    mut out: [f32; $SD$],
+) {
+    let s: i64 = $S$i64;
+    let d: i64 = $D$i64;
+    let nh: i64 = $H$i64;
+    let hd: i64 = $HD$i64;
+    let f: i64 = $F$i64;
+
+    let sx: []f32 = x;
+    let sg1: []f32 = g1;
+    let sg2: []f32 = g2;
+    let swq: []f32 = wq;
+    let swk: []f32 = wk;
+    let swv: []f32 = wv;
+    let swo: []f32 = wo;
+    let sw1: []f32 = w1;
+    let sw3: []f32 = w3;
+    let sw2: []f32 = w2;
+    let sb1: []f32 = b1;
+    let srcos: []f32 = rc;
+    let srs: []f32 = rs;
+    let mut snrm: []f32 = nrm;
+    let mut sq: []f32 = q;
+    let mut sk: []f32 = k;
+    let mut sv: []f32 = v;
+    let mut ssc: []f32 = sc;
+    let mut sctx: []f32 = ctx;
+    let mut sh: []f32 = h;
+    let mut sf1: []f32 = f1;
+    let mut sf3: []f32 = f3;
+    let mut sout: []f32 = out;
+
+    let mut sqh: []f32 = qh;
+    let mut skh: []f32 = kh;
+    let mut svt: []f32 = vt;
+    let mut sah: []f32 = ah;
+
+    rmsnorm(sx, sg1, snrm, s, d);
+    linear(snrm, swq, sq, s, d, d);
+    linear(snrm, swk, sk, s, d, d);
+    linear(snrm, swv, sv, s, d, d);
+    rope(sq, sk, srcos, srs, s, d, nh, hd);
+    attend(sq, sk, sv, ssc, sctx, sqh, skh, svt, sah, s, d, nh, hd, $SCALE$);
+    linear(sctx, swo, sh, s, d, d);
+    residual(sx, sh, sh, s * d);
+    rmsnorm(sh, sg2, snrm, s, d);
+    linear_bias(snrm, sw1, sb1, sf1, s, f, d);
+    linear(snrm, sw3, sf3, s, f, d);
+    swiglu(sf1, sf3, s * f);
+    linear(sf1, sw2, sout, s, d, f);
+    residual(sh, sout, sout, s * d);
+}

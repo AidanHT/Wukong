@@ -1,0 +1,68 @@
+module gloss
+
+// Program 2: a FUSED CUSTOM LOSS — focal loss with label smoothing and per-class weights, forward
+// and a hand-written backward, over logits [R, C].
+//
+// Every loss Wukong ships a kernel for (softmax, cross-entropy, the norm family) is a *pre-baked*
+// pattern. This is the case the recognizer table cannot cover by construction: a loss that did not
+// exist when the recognizers were written. It is also the single most common thing a researcher
+// writes — the whole point of a new paper is usually a new objective — and it is written here
+// exactly as it would be in a research codebase: one pass over the row for the softmax, one fused
+// pass computing the loss and dL/dp together, one pass turning dL/dp into dL/dz.
+//
+//   p       = softmax(z_r)                                   (numerically stable)
+//   q_c     = (1 - eps) + eps/C   if c == target,  else eps/C  (label smoothing)
+//   L_r     = -sum_c alpha_c q_c (1 - p_c)^2 log p_c           (focal, gamma = 2)
+//   dL/dp_c = alpha_c q_c [ 2(1 - p_c) log p_c - (1 - p_c)^2 / p_c ]
+//   dL/dz_j = p_j ( dL/dp_j - sum_c dL/dp_c p_c )              (softmax Jacobian, contracted)
+//
+// gamma is fixed at 2 so the focal term is a multiplication, not a `pow` — which is what anyone
+// writing this by hand does, and it keeps the C and Rust peers on exactly the same operations.
+//
+// `dz` doubles as the scratch for dL/dp: the second pass rewrites it in place. That is the natural
+// way to avoid a third [R, C] buffer, and it is what the peers do too.
+
+fn kbench(
+    z: [f32; $RC$],
+    alpha: [f32; $C$],
+    tgt: [i32; $R$],
+    mut p: [f32; $RC$],
+    mut loss: [f32; $R$],
+    mut dz: [f32; $RC$],
+) {
+    for r in 0..$R$ {
+        let rb: i32 = r * $C$;
+
+        // ---- numerically stable softmax over the row ----
+        let mut m: f32 = z[rb];
+        for c in 0..$C$ { m = fmax(m, z[rb+c]); }
+        let mut sm: f32 = 0.0;
+        for c in 0..$C$ {
+            let e: f32 = exp(z[rb+c] - m);
+            p[rb+c] = e;
+            sm = sm + e;
+        }
+        let inv: f32 = 1.0 / sm;
+        for c in 0..$C$ { p[rb+c] = p[rb+c] * inv; }
+
+        // ---- fused forward + dL/dp, one pass ----
+        let t: i32 = tgt[r];
+        let mut lr: f32 = 0.0;
+        let mut sg: f32 = 0.0;
+        for c in 0..$C$ {
+            let q: f32 = if c == t { $QT$ } else { $QO$ };
+            let pc: f32 = p[rb+c];
+            let om: f32 = 1.0 - pc;
+            let lg: f32 = log(fmax(pc, 1.0e-30));
+            let aq: f32 = alpha[c] * q;
+            lr = lr - aq * om * om * lg;
+            let gc: f32 = aq * (2.0 * om * lg - om * om / pc);
+            dz[rb+c] = gc;
+            sg = sg + gc * pc;
+        }
+        loss[r] = lr;
+
+        // ---- contract through the softmax Jacobian ----
+        for c in 0..$C$ { dz[rb+c] = p[rb+c] * (dz[rb+c] - sg); }
+    }
+}

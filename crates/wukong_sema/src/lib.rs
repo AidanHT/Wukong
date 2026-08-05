@@ -141,7 +141,7 @@ pub struct Def {
 }
 
 /// All top-level definitions, indexed by name.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct DefMap {
     pub defs: Vec<Def>,
     by_name: HashMap<Symbol, usize>,
@@ -154,6 +154,11 @@ impl DefMap {
 }
 
 /// The result of analyzing a module: types attached to expression nodes, and the def map.
+///
+/// `Clone` so a consumer that *adds* typed nodes to the AST after checking (the tensor multi-index
+/// normalization in `wukong_mir_build`) can extend the type table without needing `&mut` access to
+/// the analysis result, which the whole pipeline shares immutably.
+#[derive(Clone)]
 pub struct SemaResult {
     pub types: HashMap<NodeId, Ty>,
     pub defs: DefMap,

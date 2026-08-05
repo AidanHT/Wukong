@@ -22,8 +22,8 @@ use std::sync::Mutex;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    types, AbiParam, Block, BlockArg, FuncRef, GlobalValue, InstBuilder, MemFlags, Signature,
-    StackSlotData, StackSlotKind, Type, Value,
+    types, AbiParam, AliasRegion, Block, BlockArg, FuncRef, GlobalValue, InstBuilder, MemFlags,
+    Signature, StackSlotData, StackSlotKind, Type, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -303,6 +303,26 @@ fn mem_flags() -> MemFlags {
     MemFlags::new().with_notrap()
 }
 
+/// The alias region every access to a **private stack slot** carries — a slot created by an
+/// `Op::Alloca` of this function whose address provably never escapes it
+/// ([`wukong_opt::AliasInfo::is_private_stack`]).
+///
+/// Cranelift 0.124 partitions memory into four static categories — `None` ("other"), `Heap`,
+/// `Table`, `Vmctx` — and its `alias_analysis.rs` tracks a *separate* last-store per category, so a
+/// store tagged `None` does not invalidate a load tagged `Vmctx`. That is the only channel this
+/// version offers for "these two accesses are disjoint"; the `readonly` bit is a strictly stronger
+/// claim (nothing writes the location for the whole function) and was measured to change nothing on
+/// the shapes Wukong emits, so it is deliberately not set. The category names are wasmtime's; the
+/// analysis only ever compares them for equality within one function, so the choice of `Vmctx` is
+/// arbitrary.
+///
+/// SOUNDNESS: Cranelift requires that one memory location is never accessed under two different
+/// categories within a function. A slot that never escapes can, by the definition of escaping, only
+/// be reached through values whose provenance is that same `alloca` — its address never becomes a
+/// store's value, a call argument, a branch argument or an integer — so every access to it is tagged
+/// here, and no untracked pointer can name it. Every *other* access keeps `None`.
+const PRIVATE_STACK_REGION: AliasRegion = AliasRegion::Vmctx;
+
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
 enum Intrinsic {
@@ -449,6 +469,10 @@ struct FnTranslator<'a> {
     /// FuncRefs for this function's synthesized AVX2 vector kernels, indexed by `Op::VecKernelCall`'s
     /// `kernel` field (the position in the owning `Function::vec_kernels`).
     kernel_refs: &'a [FuncRef],
+    /// MIR provenance facts for `func`, used only to pick the [`MemFlags`] alias region of each
+    /// load/store (see [`PRIVATE_STACK_REGION`]). Purely an optimization hint: dropping it would
+    /// emit the same instructions with weaker flags.
+    alias: wukong_opt::AliasInfo,
     /// First unrecoverable lowering failure seen while lowering this function, if any: a "type too
     /// large to lay out" overflow ([`FnTranslator::size_of_or_err`]), or a runtime kernel that
     /// reached [`FnTranslator::lower_call`] with an arity no dispatch arm accepts. Recorded
@@ -488,6 +512,17 @@ impl<'a> FnTranslator<'a> {
 
     fn ty_of(&self, v: ValueId) -> &MirType {
         self.func.value_type(v)
+    }
+
+    /// [`mem_flags`] plus the alias region for an access through `ptr`. See
+    /// [`PRIVATE_STACK_REGION`] for why only a never-escaping stack slot gets one, and why that is
+    /// sound.
+    fn mem_flags_for(&self, ptr: ValueId) -> MemFlags {
+        let mut fl = mem_flags();
+        if self.alias.is_private_stack(ptr) {
+            fl.set_alias_region(Some(PRIVATE_STACK_REGION));
+        }
+        fl
     }
 
     fn dfg_ty(&self, v: Value) -> Type {
@@ -665,13 +700,11 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Load(p, ty) => {
                 let addr = self.val(*p);
+                let flags = self.mem_flags_for(*p);
                 if matches!(ty, MirType::BF16) {
                     // bf16 storage is 2 bytes; load the 16 bits and widen to f32 exactly (the bits
                     // become the top half of the f32). Register type is f32 (see `cl_type`).
-                    let half = self
-                        .builder
-                        .ins()
-                        .load(types::I16, mem_flags(), addr, 0);
+                    let half = self.builder.ins().load(types::I16, flags, addr, 0);
                     let ext = self.builder.ins().uextend(types::I32, half);
                     let shifted = self.builder.ins().ishl_imm(ext, 16);
                     self.builder
@@ -680,21 +713,19 @@ impl<'a> FnTranslator<'a> {
                 } else if matches!(ty, MirType::F16) {
                     // f16 storage is 2 bytes; widen via the runtime shim (no cheap inline bit-extend
                     // like bf16). Register type is f32.
-                    let half = self
-                        .builder
-                        .ins()
-                        .load(types::I16, mem_flags(), addr, 0);
+                    let half = self.builder.ins().load(types::I16, flags, addr, 0);
                     let ext = self.builder.ins().uextend(types::I32, half);
                     let fref = self.rt_refs[RT_F16_TO_F32];
                     let call = self.builder.ins().call(fref, &[ext]);
                     self.builder.inst_results(call)[0]
                 } else {
                     let t = cl_type(ty, self.ptr_ty).unwrap_or(self.ptr_ty);
-                    self.builder.ins().load(t, mem_flags(), addr, 0)
+                    self.builder.ins().load(t, flags, addr, 0)
                 }
             }
             Op::Store { ptr, value } => {
                 let addr = self.val(*ptr);
+                let flags = self.mem_flags_for(*ptr);
                 if matches!(self.ty_of(*value), MirType::BF16) {
                     // Round the f32 register to bf16 and store the top 16 bits (2 bytes).
                     let v = self.val(*value);
@@ -705,7 +736,7 @@ impl<'a> FnTranslator<'a> {
                         .bitcast(types::I32, MemFlags::new(), rounded);
                     let hi = self.builder.ins().ushr_imm(bits, 16);
                     let half = self.builder.ins().ireduce(types::I16, hi);
-                    self.builder.ins().store(mem_flags(), half, addr, 0);
+                    self.builder.ins().store(flags, half, addr, 0);
                 } else if matches!(self.ty_of(*value), MirType::F16) {
                     // Round the f32 register to f16 via the runtime shim, store the 16 bits (2 bytes).
                     let v = self.val(*value);
@@ -713,10 +744,10 @@ impl<'a> FnTranslator<'a> {
                     let call = self.builder.ins().call(fref, &[v]);
                     let bits = self.builder.inst_results(call)[0]; // i32, low 16 = f16 bits
                     let half = self.builder.ins().ireduce(types::I16, bits);
-                    self.builder.ins().store(mem_flags(), half, addr, 0);
+                    self.builder.ins().store(flags, half, addr, 0);
                 } else {
                     let v = self.val(*value);
-                    self.builder.ins().store(mem_flags(), v, addr, 0);
+                    self.builder.ins().store(flags, v, addr, 0);
                 }
                 return;
             }
@@ -777,6 +808,13 @@ impl<'a> FnTranslator<'a> {
                 let vec_ty = cl_type(&rty, self.ptr_ty).unwrap_or(self.ptr_ty);
                 let x = self.val(*v);
                 self.builder.ins().splat(vec_ty, x)
+            }
+            // One lane of a vector, by constant index: one shuffle, and free for lane 0. This is
+            // how the loop vectorizer keeps a float reduction's accumulate serial without a stack
+            // round-trip. The MIR verifier has already checked the index is in range.
+            Op::ExtractLane(v, k) => {
+                let x = self.val(*v);
+                self.builder.ins().extractlane(x, *k as u8)
             }
             // Fused multiply-add: Cranelift `fma(a, b, c)` is `a*b + c` with one rounding, lowering
             // to a hardware `vfmadd` (scalar or 128-bit vector) on FMA3 hosts.
@@ -3695,6 +3733,7 @@ fn build_function_clif(
                 rt_refs: &rt_refs,
                 data_refs: &data_refs,
                 kernel_refs: &kernel_refs,
+                alias: wukong_opt::AliasInfo::analyze(f),
                 layout_err: None,
             };
             t.translate();

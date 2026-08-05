@@ -806,6 +806,11 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} SIMD `Splat` (vectorized MIR) not yet lowered to PTX"
                 ))
             }
+            Op::ExtractLane(..) => {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX"
+                ))
+            }
             Op::FuncAddr(sym) => {
                 // Record the target for the `wukong_parallel_for` special-case; the value itself is
                 // never materialized as a device function pointer, so emit no instruction.

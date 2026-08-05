@@ -19,6 +19,9 @@
 //! driver stops before any backend — the front end accepts the construct, only lowering to runnable
 //! code refuses, so this crate never hands a backend knowingly-broken MIR.
 
+mod canon;
+mod tindex;
+
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use wukong_ast::{
@@ -705,6 +708,34 @@ pub fn lower_program(
     sema: &SemaResult,
     interner: &mut Interner,
 ) -> (Program, Vec<Diagnostic>) {
+    // Two AST normalizations run back to back, before anything looks at the tree, because every
+    // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
+    //
+    // First `tindex`: `a[i, j]` on a statically-shaped `Tensor[T, M, N]` becomes `a[i*N + j]`, the
+    // row-major offset the lowering was going to compute anyway. Every matcher keys on a
+    // single-index `ExprKind::Index`, so without this the idiomatic tensor spelling was invisible to
+    // all of them and lowered to a scalar gep nest.
+    let normalized = tindex::linearize_module(module, sema, interner);
+    let merged_sema = normalized.as_ref().map(|(_, extra)| {
+        let mut s = sema.clone();
+        s.types
+            .extend(extra.iter().map(|(id, t)| (*id, t.clone())));
+        s
+    });
+    let module: &Module = normalized.as_ref().map(|(m, _)| m).unwrap_or(module);
+    let sema: &SemaResult = merged_sema.as_ref().unwrap_or(sema);
+
+    // Then `canon`: a semantics-preserving respelling — hoisting a row base into a local, which is
+    // plain CSE and changes no result — was on its own enough to lose the kernel. `canon` rewrites
+    // those forms back to the canonical one every matcher already understands.
+    //
+    // Order is load-bearing: `tindex` runs first so that a tensor nest is already flat by the time
+    // `canon` looks for hoisted index locals, and both surfaces get both normalizations. Each
+    // returns `None`, having cloned nothing, for a module it cannot help — the common case — so
+    // output stays byte-identical for programs neither one touches.
+    let canonical = canon::canonicalize_module(module, sema);
+    let module: &Module = canonical.as_ref().unwrap_or(module);
+
     let mut diags = Vec::new();
     let mut program = Program::new();
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
@@ -1624,7 +1655,16 @@ fn lower_fn(
         .map(|abi| fl.builder.add_param(abi.clone()))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
-        let mty = fl.mir_ty_of(pty);
+        // A statically-shaped contiguous tensor param binds as the buffer it *is* — `[T; d0·…·dn]` —
+        // not as an opaque `Ptr`. Both spellings arrive as the same base pointer (`param_abi` maps
+        // `Array(..)` back to `Ptr`, so the ABI is byte-identical), but only the `Array` form takes
+        // the "the value *is* the storage" branch below. As a `Ptr` the base pointer was copied into
+        // an `alloca` and reloaded on **every** element access, which is why `Tensor[f32, M, N]` code
+        // carried 3 extra loads per element over the `[f32; M*N]` spelling of the same buffer.
+        let mty = match tensor_buffer_mir(pty) {
+            Some((elem, n)) => MirType::Array(Box::new(elem), n), // = `param_slot_ty`, registry-aware
+            None => fl.mir_ty_of(pty),
+        };
         let is_slice = matches!(pty, Ty::Slice(_));
         if matches!(mty, MirType::Array(..)) {
             // The parameter value *is* the aggregate's base pointer; bind it directly so field/index
@@ -1789,7 +1829,11 @@ fn lower_parallel(
         let env = fl.builder.add_param(MirType::Ptr);
         // Recover each array base pointer from env[k] and bind it to the parameter name.
         for (idx_k, (p, pty)) in f.params.iter().zip(&param_tys).enumerate() {
-            let mty = mir_ty(pty);
+            // `param_slot_ty`, not `mir_ty`: `base` here *is* the buffer's base pointer recovered
+            // from the env, and only an `Array(..)` binding makes a read of the name yield that
+            // pointer. Bound as `Ptr`, a statically-shaped tensor param would instead `Load` through
+            // it — reading the tensor's first 8 data bytes as an address.
+            let mty = param_slot_ty(pty);
             let kidx = fl
                 .builder
                 .build(MirType::I64, Op::ConstInt(idx_k as i128, MirType::I64));
@@ -7300,11 +7344,11 @@ impl FnLowerer<'_> {
                 // (Compound assignment on an aggregate is not a valid program, so only `=`.) The
                 // aggregate check is a pure type query (`expr_mir` emits no MIR), so the common
                 // scalar path below keeps its original RHS-then-place evaluation order untouched.
-                if matches!(op, ast::AssignOp::Assign)
-                    && matches!(self.expr_mir(target), MirType::Array(..))
+                if let Some(dst_ty) = matches!(op, ast::AssignOp::Assign)
+                    .then(|| self.whole_buffer_assign_ty(target))
+                    .flatten()
                 {
                     let (ptr, _) = self.lower_place(target);
-                    let dst_ty = self.expr_ty(target);
                     // A struct/tuple/array *literal* whose field initializers may read the
                     // destination (e.g. the swap `p = Pt { x: p.y, y: p.x }`) must be materialized
                     // into a fresh temporary and THEN deep-copied in. `init_field` builds a literal
@@ -13538,10 +13582,60 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The element MIR type of an array-valued base expression, via sema.
+    /// The buffer type a whole-aggregate assignment `target = value` must deep-copy through, or
+    /// `None` when `target` is an ordinary scalar place. A `MirType::Array` destination is a flat
+    /// byte buffer: a plain `Op::Store` there writes the RHS buffer's *base pointer* into the
+    /// destination's first slot instead of its contents.
+    ///
+    /// A statically-shaped contiguous tensor bound as its buffer needs the same treatment and did
+    /// not get it: its `expr_mir` is still `Ptr` (only the *binding* became `Array`), so `t = other`
+    /// took the scalar path and stored `other`'s base pointer over the first element of `t`'s data.
+    /// It reports the tensor as the `[T; d0·…·dn]` it is, so the copy is the same leaf-by-leaf
+    /// `emit_copy` an array destination gets — the `[f32; N]` spelling's semantics, exactly.
+    ///
+    /// The binding check is required, not defensive: only an `Array`-bound name has `lower_place`
+    /// yield the buffer's base pointer. A `Ptr`-bound tensor (a symbolic shape, or a tensor local)
+    /// yields its stack *slot*, which the old pointer-store path is correct for and a deep copy
+    /// would corrupt — so those keep the pre-existing behaviour untouched.
+    fn whole_buffer_assign_ty(&self, target: &Expr) -> Option<Ty> {
+        let ty = self.expr_ty(target);
+        if matches!(self.mir_ty_of(&ty), MirType::Array(..)) {
+            return Some(ty);
+        }
+        let (_, n) = tensor_buffer_mir(&ty)?;
+        let Ty::Tensor { elem, .. } = ty else {
+            return None;
+        };
+        match self.lookup(single_path(target)?) {
+            Some((_, MirType::Array(..))) => Some(Ty::Array {
+                elem: Box::new(Ty::Scalar(elem)),
+                len: n as u64,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The element MIR type of an array- or tensor-valued base expression, via sema.
     fn array_elem(&self, base: &Expr) -> Option<MirType> {
         match self.expr_ty(base) {
             Ty::Array { elem, .. } => Some(mir_ty(&elem)),
+            // A statically-shaped contiguous tensor *is* an array of its element type — the same
+            // buffer with a shape attached — so a loop over it is exactly as vectorizable as the
+            // `[T; N]` spelling. Without this the autovectorizer declined every tensor stream even
+            // after `tindex` normalized `a[i, j]` to the single-index form it can analyse.
+            //
+            // Both gates are load-bearing. `tensor_buffer_mir` is the same predicate the parameter
+            // binding uses, and requiring the *binding* to be `Array` is what proves `lookup(base).0`
+            // is the buffer's base pointer: a tensor bound as `Ptr` (a symbolic shape, or a tensor
+            // local) holds the pointer in a stack slot, and the emitters gep straight off the value
+            // `lookup` returns — so accepting one here would address the slot, not the data.
+            t @ Ty::Tensor { .. } => {
+                let (elem, _) = tensor_buffer_mir(&t)?;
+                match self.lookup(single_path(base)?) {
+                    Some((_, MirType::Array(..))) => Some(elem),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -19127,6 +19221,56 @@ impl FnLowerer<'_> {
 
 // ---- free helpers ----
 
+/// The **static facts** a `Tensor[T, d0, …, dn]` carries into MIR, when it carries any: a contiguous
+/// (row-major) layout whose every extent is a compile-time `Const`. Returns `(element MIR type,
+/// element count)` — the exact pair `[T; d0·…·dn]` would give, because at run time the two are the
+/// *same object*: a base pointer to `d0·…·dn` contiguous `T`s.
+///
+/// This is the whole point of the shape-typed surface. `mir_ty` collapses every tensor to a bare
+/// `MirType::Ptr`, throwing rank, extents and element type away at the AST→MIR boundary — and a
+/// `Ptr` is not "the storage", so a tensor *parameter* was spilled to a stack slot and reloaded on
+/// every single use, while the `[f32; N]` spelling of the identical buffer was bound directly.
+/// Declines (→ `None`, caller keeps the `Ptr` behaviour) for a non-tensor, a non-contiguous layout,
+/// a rank-0 tensor, a symbolic (`Var`) or runtime (`Dynamic`) extent, an aggregate element, or a
+/// count that overflows the `u32` an `MirType::Array` extent is stored in.
+fn tensor_buffer_mir(ty: &Ty) -> Option<(MirType, u32)> {
+    let Ty::Tensor {
+        elem,
+        shape,
+        layout,
+    } = ty
+    else {
+        return None;
+    };
+    if !matches!(layout, wukong_types::Layout::Contiguous) || shape.0.is_empty() {
+        return None;
+    }
+    let mut count: u64 = 1;
+    for d in &shape.0 {
+        let wukong_types::Dim::Const(n) = d else {
+            return None; // a symbolic/runtime extent — the buffer's size is not a compile-time fact
+        };
+        count = count.checked_mul(*n)?;
+    }
+    let n = u32::try_from(count).ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some((MirType::from_scalar(*elem), n))
+}
+
+/// The MIR type a parameter's **binding** carries — `mir_ty`, except that a statically-shaped
+/// contiguous tensor binds as the buffer it is (`[T; d0·…·dn]`) rather than an opaque `Ptr`. Only
+/// the `Array(..)` shape takes the "the value *is* the storage" branch at every binding site, so
+/// this is what stops a tensor parameter being spilled to a stack slot and reloaded per element.
+/// The **call ABI is unaffected** — `param_abi_ty` maps `Array(..)` straight back to `Ptr`.
+fn param_slot_ty(ty: &Ty) -> MirType {
+    match tensor_buffer_mir(ty) {
+        Some((elem, n)) => MirType::Array(Box::new(elem), n),
+        None => mir_ty(ty),
+    }
+}
+
 /// The MIR type a parameter is passed as at the call boundary. Arrays decay to a base pointer.
 fn param_abi_ty(ty: &Ty) -> MirType {
     match mir_ty(ty) {
@@ -22491,7 +22635,10 @@ fn lower_matmul_fn(
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
-        let mty = mir_ty(pty);
+        // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
+        // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
+        // into every caller that inlined this wrapper).
+        let mty = param_slot_ty(pty);
         if matches!(mty, MirType::Array(..)) {
             fl.bind(p.name.sym, val, mty);
         } else {
@@ -25389,7 +25536,10 @@ fn lower_i8matmul_fn(
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
-        let mty = mir_ty(pty);
+        // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
+        // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
+        // into every caller that inlined this wrapper).
+        let mty = param_slot_ty(pty);
         if matches!(mty, MirType::Array(..)) {
             fl.bind(p.name.sym, val, mty);
         } else {
@@ -26658,13 +26808,27 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
             "verify: {:?}",
             verify_function(k)
         );
-        // The inner stride is the trailing dim N=4: expect a `* 4` in the offset arithmetic.
+        // The inner stride is the trailing dim N=4: expect a `* 4` in the offset arithmetic. The
+        // width is deliberately not pinned — `tindex` now builds the flat offset in the *index's*
+        // own integer type (`i32` for a plain `for i in 0..3` counter) instead of sign-extending
+        // every index to `i64` first, which is what makes `a[i, j]` lower to the same instructions
+        // as the hand-flattened `a[i*4 + j]`.
         assert!(
             k.blocks
                 .iter()
                 .flat_map(|b| &b.insts)
-                .any(|i| matches!(&i.op, Op::ConstInt(4, MirType::I64))),
+                .any(|i| matches!(&i.op, Op::ConstInt(4, t) if t.is_int())),
             "expected a stride-4 (trailing dim) constant in the flat-index arithmetic"
+        );
+        // A statically-shaped tensor param is the buffer's base pointer, so it must NOT be spilled
+        // to a `ptr` slot and reloaded — that cost three extra loads per element (see
+        // `tensor_buffer_mir`). An array param has never been spilled; a tensor param must not be.
+        assert!(
+            !k.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(&i.op, Op::Alloca(MirType::Ptr))),
+            "a statically-shaped tensor param must bind directly, not through a reloaded ptr slot"
         );
     }
 
@@ -26707,6 +26871,239 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
                 verify_function(f).is_empty(),
                 "verify failed for a function"
             );
+        }
+    }
+
+    /// A GEMM whose row bases are hoisted into locals (`let ib = i*8;` … `a[ib + p]`) — plain CSE,
+    /// which changes no result and which every optimizer performs anyway — computed the same values
+    /// as the flat spelling but lost the kernel entirely, because the recognizers match the raw AST
+    /// and `i*8 + p` was no longer *in* the index. `canon` forward-substitutes the base back in.
+    #[test]
+    fn hoisted_row_base_still_dispatches_the_gemm() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let jb = j * 8;
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[jb + p]; }
+            c[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a hoisted row base must not cost the GEMM kernel"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
+    /// The same normalization on the norm family: an affine RMSNorm whose row base is hoisted must
+    /// still fold into one `wukong_norm_affine_f32` call.
+    #[test]
+    fn hoisted_row_base_still_dispatches_the_norm() {
+        let src = "module m
+fn rms(mut x: [f32; 64], g: [f32; 8], bb: [f32; 8]) {
+    for r in 0..8 {
+        let rb = r * 8;
+        let mut ss: f32 = 0.0;
+        for i in 0..8 { ss = ss + x[rb + i] * x[rb + i]; }
+        let inv: f32 = rsqrt(ss / 8.0 + 0.00001);
+        for i in 0..8 { x[rb + i] = x[rb + i] * inv * g[i] + bb[i]; }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_norm_affine_f32"),
+            "a hoisted row base must not cost the fused norm kernel"
+        );
+    }
+
+    /// A module-level `const` used directly as a dimension left the nest matching symbolically
+    /// (`Dim::Var(N)` on every side) and then declining at `dim_value`, which looks the name up in
+    /// the *locals*. That is the sharp edge `examples/gpt2_forward_bench.wk` documents and works
+    /// around by re-binding every dimension to a local `let`. Folding the literal in beforehand —
+    /// which is exactly what `FnLowerer`'s const arm does at lowering time anyway — makes the bare
+    /// const spelling dispatch.
+    #[test]
+    fn a_const_dimension_dispatches_the_gemm() {
+        let src = "module m
+const N: i64 = 8;
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..N {
+        for j in 0..N {
+            let mut s: f32 = 0.0;
+            for p in 0..N { s = s + a[i * N + p] * b[j * N + p]; }
+            c[i * N + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a const dimension must not cost the GEMM kernel"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
+    /// The DECLINE for the const fold: a local (or parameter) of the same name shadows the const —
+    /// `lower_expr` resolves a `Path` in the locals first — so the const must be left alone in a
+    /// function that declares that name, or the loop would read the wrong stride.
+    #[test]
+    fn a_shadowed_const_is_not_folded() {
+        let src = "module m
+const N: i64 = 8;
+fn f() -> i64 {
+    let N: i64 = 3;
+    return N * 2;
+}
+fn main() -> i32 { return f() as i32; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        // The body must still compute 3*2, never 8*2.
+        let f = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == "f")
+            .expect("fn f");
+        let eights = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(&i.op, Op::ConstInt(8, _)))
+            .count();
+        let threes = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(&i.op, Op::ConstInt(3, _)))
+            .count();
+        assert!(threes >= 1, "the local N = 3 must survive");
+        assert_eq!(eights, 0, "the shadowed const must not be folded in");
+    }
+
+    /// Substitution is scoped to the **region** a binding dominates — the rest of its own block — so
+    /// two sibling loops may each spell `let ib = …` without either disqualifying the other. Under a
+    /// whole-function "declared exactly once" rule they knocked each other out, and re-using an
+    /// obvious base name across the loops of one function is the normal way to write a model.
+    #[test]
+    fn sibling_loops_may_reuse_a_base_name() {
+        let src = "module m
+fn two(a: [f32; 64], b: [f32; 64], mut c: [f32; 64], mut e: [f32; 64]) {
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+    }
+    for i in 0..8 {
+        let ib = i * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + c[ib + p] * b[j * 8 + p]; }
+            e[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let two = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == "two")
+            .expect("fn two");
+        let gemms = two
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(
+                |i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == "wukong_sgemm_nt"),
+            )
+            .count();
+        assert_eq!(gemms, 2, "both sibling nests must dispatch the GEMM kernel");
+    }
+
+    /// The DECLINE that makes region scoping sound: an operand of the initializer that the region
+    /// later *assigns* would make the inlined expression evaluate to a different value than it did
+    /// at the `let`. `canon` must refuse — flow-insensitively, so an assignment anywhere in the
+    /// region counts, even one that follows every use.
+    #[test]
+    fn a_base_whose_operand_is_reassigned_in_the_region_is_not_substituted() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    let mut t: i64 = 0;
+    for i in 0..8 {
+        let ib = t * 8;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+        t = t + 1;
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a base built from a variable the region reassigns must not be substituted"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
+        }
+    }
+
+    /// The DECLINE that keeps the substitution sound: a base that is *reassigned* does not hold the
+    /// same value at its uses as at its `let`, so inlining the initializer would compute a different
+    /// address. `canon` must leave it alone — and leaving it alone means the nest keeps its scalar
+    /// lowering. This asserts the decline, so loosening the purity rule to accept a mutable local
+    /// (which would be a silent miscompile) fails here.
+    #[test]
+    fn a_reassigned_index_base_is_not_substituted() {
+        let src = "module m
+fn gemm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..8 {
+        let mut ib = i * 8;
+        ib = ib + 0;
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + a[ib + p] * b[j * 8 + p]; }
+            c[ib + j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a reassigned base must not be forward-substituted"
+        );
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed");
         }
     }
 }
