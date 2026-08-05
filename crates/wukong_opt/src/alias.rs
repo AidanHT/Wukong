@@ -56,8 +56,7 @@
 //! # The query API
 //!
 //! Build it once per function with [`AliasInfo::analyze`] (a linear provenance sweep, a constant
-//! sweep and an escape sweep; one allocation, no hashing — cheap enough to run per pass invocation,
-//! and measured to be so), then ask:
+//! sweep and an escape sweep; one allocation, no hashing), then ask:
 //!
 //! | question | call |
 //! |---|---|
@@ -74,6 +73,15 @@
 //! independent of everything else). Only when the bases may alias do you need a subscript test.
 //! `may_clobber` answers the same question against a whole instruction, including calls. Never
 //! invert an answer: `true` means "not proven", not "proven to alias".
+//!
+//! # Cost
+//!
+//! It is **not free**. `Cse`, `Dse` and `Licm` each build their own on every invocation of every
+//! fixpoint iteration, which measures at ~15-19% of optimizer time over `tests/run` (`CHANGELOG.md`
+//! carries the ABBA numbers). Sharing one instance across the three is the obvious lever and is
+//! deliberately not taken: all three mutate instructions as they go, and an alias fact that outlives
+//! the IR it described is an unsound no-alias answer. Anything cheaper has to come from making the
+//! sweep itself do less, not from caching it across a mutation.
 
 use wukong_mir::{Function, MirType, Op, ValueId};
 use wukong_span::Symbol;

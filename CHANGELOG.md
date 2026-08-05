@@ -31,12 +31,22 @@ that produced each address, and all three passes plus the Cranelift backend quer
   every subscript.
 - **Cranelift** tags every access to a never-escaping stack slot with `MemFlags::alias_region`, so a
   store elsewhere no longer invalidates it in Cranelift's own redundant-load elimination.
-- **Measured** over the whole `tests/run` corpus (333 programs, `--emit=mir -O2` and `--emit=obj -O2`,
-  same-run A/B of two release binaries): MIR loads **3100 → 2345 (−24.4%)**, MIR instructions
-  45871 → 44964, machine instructions 68660 → 68205 (82 programs' MIR improved and none regressed; of
-  60 whose machine code changed, 8 grew, the largest by 18 instructions). Compile time is at parity
-  with the branch point (in-process `wukong_bench compile-time`, ABBA rounds normalized by the
-  untouched front-end column: 1.005 and 0.994 over two rounds).
+- **Measured** over the whole `tests/run` corpus (333 programs, branch-point vs branch-tip compilers
+  in one session). MIR counted as 4-space-indented lines of `--emit=mir -O2`, machine code as
+  `objdump -d` mnemonic lines of `--emit=obj -O2`: MIR loads **3100 → 2341 (−24.5%)**, MIR
+  instructions 41943 → 41056, machine instructions 67936 → 67480 (82 programs' MIR improved and
+  **none regressed**; of 60 whose machine code changed, 8 grew, the largest by 18 instructions).
+- **Compile time is NOT at parity — the analysis costs ~15–19% of optimizer time**, and the entry
+  previously published here claiming parity was wrong. In-process `wukong_bench compile-time`,
+  three-way ABBA over 12 samples per arm (branch point / branch tip before the provenance fixpoint /
+  branch tip), all three measuring the same 332 programs, normalized by the untouched front-end
+  column: the branch costs **1.15× (minima) / 1.19× (medians)** of the branch point's optimizer time,
+  of which the provenance fixpoint is only 1.02× / 1.01×. The optimizer's share of a compile moves
+  61.4% → 64.6%; on a ~70 ms compile that is roughly +11% wall clock. The cause is structural, not a
+  hot spot: `Cse`, `Dse` and `Licm` each call `AliasInfo::analyze` on every invocation of every
+  fixpoint iteration, so the function is walked three times per round. Caching one analysis across
+  the three passes is the obvious lever and is *not* done here, because every one of those passes
+  mutates instructions and a stale alias fact is an unsound no-alias answer.
 - Wall clock on four hand-written *general* (non-recognized) kernels over distinct slice buffers,
   P-core-pinned ABBA rounds, best-of-10 minima, is a **wash**: 0.990 / 1.008 / 0.987, and one kernel
   at **1.066 (a 6.6% loss)** traced to Cranelift rematerializing `f32const` inside the loop once the
