@@ -799,6 +799,43 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_block_parameter_cycle_is_removed() {
+        // `t` is declared *inside* the inner loop and never read after it. The front end still
+        // gives it one alloca in the entry block, so mem2reg places a block parameter for it at the
+        // inner header *and* at the outer one — the outer header is in the inner header's iterated
+        // dominance frontier. Those two feed each other and nothing else: the outer latch passes
+        // the inner parameter out, the inner preheader passes the outer parameter back in. Both
+        // therefore have a non-zero use count, and the old "is this parameter used?" scan removed
+        // neither.
+        //
+        // Only `s` and the counter have to cross either back edge, so no block may carry more than
+        // two parameters. Before the liveness fixpoint, both headers carried three.
+        let src = "fn main() -> i32 { let mut s: i32 = 0; let mut r: i32 = 0; \
+                   while r < 4 { \
+                     let mut i: i32 = 0; \
+                     while i < 10 { let t: i32 = i * 3 + 1; s = s + t; i = i + 1; } \
+                     r = r + 1; } \
+                   return s; }";
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 1);
+        let main = find_fn(&prog, &interner, "main");
+        for b in &main.blocks {
+            if b.id == main.entry {
+                continue;
+            }
+            assert!(
+                b.params.len() <= 2,
+                "bb{} carries {} parameters; only `s` and a counter cross a back edge",
+                b.id.0,
+                b.params.len()
+            );
+        }
+        let m = interner.intern("main");
+        // sum of 3i + 1 for i in 0..10 is 3*45 + 10 = 145, accumulated over 4 outer passes.
+        assert_eq!(wukong_interp::run(&prog, m, &interner).unwrap(), 580);
+    }
+
+    #[test]
     fn mem2reg_leaves_arrays_and_address_taken_in_memory() {
         // Array locals are addressed by gep, so they must NOT be promoted; the program is still
         // correct and the array alloca remains.

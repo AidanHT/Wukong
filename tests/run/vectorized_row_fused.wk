@@ -1,0 +1,206 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 12
+// EXPECT-OUT: 63
+// EXPECT-OUT: 32
+// EXPECT-OUT: 45
+// EXPECT-OUT: 180
+// EXPECT-OUT: 77
+// EXPECT-OUT: 96
+// EXPECT-OUT: 108
+// EXPECT-OUT: 50
+// EXPECT-OUT: 66
+// EXPECT-OUT: 252
+// EXPECT-OUT: 104
+// EXPECT-OUT: 126
+// EXPECT-OUT: 450
+// EXPECT-OUT: 176
+// EXPECT-OUT: 204
+// EXPECT-OUT: 216
+// EXPECT-OUT: 95
+// EXPECT-OUT: 120
+// EXPECT-OUT: 441
+// EXPECT-OUT: 176
+// EXPECT-OUT: 207
+// EXPECT-OUT: 720
+// EXPECT-OUT: 275
+// EXPECT-OUT: 312
+// EXPECT-OUT: 510
+// EXPECT-OUT: 1536
+// EXPECT-OUT: 2562
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+module tests.run.vectorized_row_fused
+
+// The ROW-WISE fused loop: what a custom loss, a norm or an attention row actually looks like, and
+// the three things about it that used to stop `wukong_opt::vectorize` cold.
+//
+//   1. **A 2-D index.** `a[r*C + c]` over `c` decomposes to `1·c + (r*C)` — an affine index with one
+//      loop-INVARIANT term. The runtime alias guard could only express `1·iv + constant`, so every
+//      row-major inner loop that also wrote memory was declined ("the runtime alias check cannot be
+//      expressed"). Both loops below use it, and `fused` reads two 1-D streams (`alpha`, `sel`) with
+//      no invariant term alongside two 2-D streams, so the guard has to handle both in one loop.
+//
+//   2. **A `let` inside the body.** The front end gives every local one `alloca` in the entry block,
+//      so a temporary declared inside a loop becomes a loop-carried block parameter after `mem2reg`
+//      — and when nothing after the loop reads it, that parameter's only consumer is the branch
+//      argument feeding the next one round the cycle. Every member of the cycle then has a non-zero
+//      use count, `simplify-phis` removed none of them, `loop_info` classified them
+//      `Carried::Recurrence`, and the loop was refused as carrying a dependence. `q`, `v` and `e`
+//      here are exactly that: written every iteration, never read after the loop.
+//
+//   3. **A conditional with two constant arms.** `let q = if <mask> { A } else { B };` if-converts to
+//      one lane-wise `select`, but the planner required both arms to be vectors already — a literal
+//      is not — so it refused. That same check refused every inlined `exp`/`log`: their range
+//      reduction is a chain of `select(bit, table_a, table_b)` over f32 literals.
+//
+// EVERY LANE IS PRINTED, never a checksum: a reduction hides three wrong lanes that cancel.
+//
+// WHERE THE EXPECTED VALUES COME FROM. They are computed by hand from the scalar semantics of the
+// loops, not recorded from the compiler. Every input is a dyadic rational with a short mantissa
+// (halves, quarters, sixteenths) and every product and partial sum stays under 2^12, so the whole
+// computation is EXACT in f32 and the answer does not depend on the evaluation order. Results are
+// printed scaled by 32 and truncated to `i32` so the expectations are integers.
+//
+//   z[i]     = i/2                       alpha[c] = 1 + c/4        sel[c] = c mod 3
+//   q[c]     = 3/4 if sel[c] == 0 else 1/4
+//   out[r*9+c] = z[r*9+c] * alpha[c] * q[c]
+//   rsum[r]    = sum_c out[r*9+c]
+//
+// e.g. r=2, c=3:  z = 21/2, alpha = 7/4, q = 3/4  ->  (21/2)(7/4) = 147/8, x 3/4 = 441/32,
+// printed as 441. r=1 sums to exactly 48, printed as 1536.
+//
+// The `rowsoftmax` half is the one that exercises the widened inline `exp`, and its expectations are
+// hand-derivable for a different reason: every logit in a row is the SAME value, so the stable-max
+// subtraction makes every argument exactly 0.0, and `exp(0)` is exactly 1.0 in Wukong's inline
+// expansion (the round-to-magic-constant lands on 1.5*2^23, the biased exponent field comes out
+// 127*8, the 2^(j/8) table selects j = 0, and the polynomial evaluates to 1 — so the product is
+// 2^0 * 1 * 1). The store `p[r*9+c] = e * w[c]` with `w[c] = c+1` then makes the row LANE-SENSITIVE:
+// a misplaced lane prints the wrong number even though every `exp` returned the same value.
+//
+// What is NOT pinned here: the fold ORDER of the float reduction. Every value is exact, so any
+// reassociation would still produce the same sum. That property is covered by
+// `optimization_is_observationally_invariant` over the whole corpus — `vectorize` runs only at
+// `-O2`, so `-O0` output IS the unwidened scalar answer, which makes the level gate a real
+// differential for this pass (unlike a `mir_build` recognizer, which fires at every level).
+
+const R: i32 = 3;
+const C: i32 = 9;
+
+/// One fused pass over each row: a masked per-class weight, a 2-D read, a 2-D write and a serial
+/// float accumulate, with two dead-after-the-loop temporaries in the body.
+fn fused(
+    z: [f32; 27],
+    alpha: [f32; 9],
+    sel: [i32; 9],
+    mut out: [f32; 27],
+    mut rsum: [f32; 3],
+) {
+    for r in 0..R {
+        let rb: i32 = r * C;
+        let mut s: f32 = 0.0;
+        for c in 0..C {
+            let q: f32 = if sel[c] == 0 { 0.75 } else { 0.25 };
+            let v: f32 = z[rb + c] * alpha[c] * q;
+            out[rb + c] = v;
+            s = s + v;
+        }
+        rsum[r] = s;
+    }
+}
+
+/// The numerically stable row softmax, spelled the way anyone writes it. The max pass is a float
+/// MAX reduction and must STAY scalar — `max` here is `select(a > b, a, b)`, which is not
+/// associative once a NaN or a tie is in play, so lane-parallel partial maxima may not be
+/// recombined. The `exp` pass is the one that widens.
+fn rowsoftmax(zc: [f32; 27], w: [f32; 9], mut p: [f32; 27], mut rs: [f32; 3]) {
+    for r in 0..R {
+        let rb: i32 = r * C;
+        let mut m: f32 = zc[rb];
+        for c in 0..C {
+            m = fmax(m, zc[rb + c]);
+        }
+        let mut sm: f32 = 0.0;
+        for c in 0..C {
+            let e: f32 = exp(zc[rb + c] - m);
+            p[rb + c] = e * w[c];
+            sm = sm + e;
+        }
+        rs[r] = sm;
+    }
+}
+
+fn main() -> i32 {
+    let mut z: [f32; 27] = [0.0; 27];
+    let mut zc: [f32; 27] = [0.0; 27];
+    let mut out: [f32; 27] = [0.0; 27];
+    let mut p: [f32; 27] = [0.0; 27];
+    let mut alpha: [f32; 9] = [0.0; 9];
+    let mut w: [f32; 9] = [0.0; 9];
+    let mut sel: [i32; 9] = [0; 9];
+    let mut rsum: [f32; 3] = [0.0; 3];
+    let mut rs: [f32; 3] = [0.0; 3];
+
+    for i in 0..27 {
+        z[i] = (i as f32) * 0.5;
+    }
+    for r in 0..R {
+        for c in 0..C {
+            // Constant across the row, different per row: the stable-max subtraction is then
+            // exactly 0.0 in every lane and exp(0) == 1.0 exactly.
+            zc[r * C + c] = ((r + 1) as f32);
+        }
+    }
+    for c in 0..C {
+        alpha[c] = 1.0 + (c as f32) * 0.25;
+        w[c] = (c + 1) as f32;
+        sel[c] = c % 3;
+    }
+
+    fused(z, alpha, sel, out, rsum);
+    for i in 0..27 {
+        print((out[i] * 32.0) as i32);
+    }
+    for r in 0..R {
+        print((rsum[r] * 32.0) as i32);
+    }
+
+    rowsoftmax(zc, w, p, rs);
+    for i in 0..27 {
+        print(p[i] as i32);
+    }
+    for r in 0..R {
+        print(rs[r] as i32);
+    }
+    return 0;
+}
