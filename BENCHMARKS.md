@@ -681,18 +681,22 @@ transparent; one block dispatches
 (contiguous loops, its own per-head attention, two-pass LayerNorm, tanh-approx GELU with Wukong's
 constants) at the suite's standard `gcc -O3 -march=native -ffp-contract=fast`; **C(fast)** is the
 identical source at `-O3 -march=native -ffast-math` (the `llama2.c -Ofast` basis, letting gcc
-reassociate + vectorize the dot products — the strongest flags-only C). Since 2026-08-05 a
-**C++(g++)** column runs the identical translation unit through the other GCC front end at the same
-flags, so the "C++ tracks C" claim is measured here too. The naive-dot C forward is tens of seconds
-per call at S=512, so it is skipped there by default (`XBENCH_MODEL_NAIVE` forces it), the same rule
-as the ≥2048³ naive matmuls.
+reassociate + vectorize the dot products — the strongest flags-only C). Since 2026-08-05 the section
+also runs a **C++(g++)** column — the identical translation unit through the other GCC front end at
+the same flags, so the "C++ tracks C" claim is measured here too — and a **Rust** column
+(`rustc -C opt-level=3 -C target-cpu=native`), the same block written as one cdylib, which this row
+never had at all. The Rust peer slices its foreign pointers once (`from_raw_parts`), which is both the
+idiomatic spelling and the one that gives LLVM the `noalias` that `__restrict__` gives the C peer — so
+the two are given the same aliasing information rather than Rust being silently handicapped. The
+naive-dot forward is tens of seconds per call at S=512, so all three are skipped there by default
+(`XBENCH_MODEL_NAIVE` forces them), the same rule as the ≥2048³ naive matmuls.
 
 > **The published ratios in this section predate the `__restrict__` fix to that translation unit**
 > (see [the 2026-08-05 correction](#-follow-up-correction--2026-08-05-the-model-peer-never-got-defect-1)).
 > Every pointer parameter of `c_model` — 24 on `kbench`, plus `linear_nt` and `layernorm_affine` —
 > was unqualified, so gcc compiled the peer under a may-alias assumption Wukong never carries. The
 > numbers below are an **upper bound** on Wukong's advantage until the next full round re-measures
-> them; the C++ column has no numbers here at all yet.
+> them; the C++ and Rust columns have no numbers here at all yet.
 
 **PyTorch peer (the industry baseline).** When `python` + `torch` import (probed gracefully; a
 printed note + `n/a` columns otherwise), the bench adds **PyTorch CPU** — both **eager**
