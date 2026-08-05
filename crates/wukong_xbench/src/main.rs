@@ -8067,33 +8067,67 @@ mod tests {
     //      would write it?* If the answer needs a caveat, the caveat belongs in BENCHMARKS.md.
 
     /// EVERY generated C kernel must declare its pointer parameters `__restrict__`. Scanned out of
-    /// this file's own source text rather than from a hand-kept list, so a NEW peer generator added
+    /// the crate's own source text rather than from a hand-kept list, so a NEW peer generator added
     /// later is covered automatically — a list would have to be remembered, and the thing being
     /// guarded against is exactly a peer nobody remembered to check.
+    ///
+    /// **`model.rs` is scanned too (added 2026-08-05).** This test used to read `main.rs` alone, and
+    /// the hole was not hypothetical: `c_model` — the peer for the flagship 12-layer end-to-end row —
+    /// carried the exact defect the 2026-08-04 audit was about, 24 unqualified pointer parameters plus
+    /// two unqualified static helpers, for as long as the guard existed. A guard that covers one file
+    /// certifies one file. It also now accepts a parameter list spanning several LINES (`c_model`'s
+    /// does) and only requires the qualifier on parameters that are actually pointers, so a `long n`
+    /// dimension argument does not have to lie.
     #[test]
     fn every_generated_c_kernel_declares_restrict() {
-        const SRC: &str = include_str!("main.rs");
-        // Split so this needle does not occur contiguously in the file it scans — otherwise the
+        // Split so these needles do not occur contiguously in the files they scan — otherwise the
         // test matches its own source line and reports its own Rust code as an unqualified peer.
-        const OPEN: &str = concat!("__declspec(dllexport)", " void kbench(");
+        let exported = concat!("__declspec(dllexport)", " void ");
+        let helper = concat!("static", " void ");
         let mut seen = 0usize;
-        let mut rest = SRC;
-        while let Some(i) = rest.find(OPEN) {
-            let after = &rest[i + OPEN.len()..];
-            let end = after.find(')').expect("kbench parameter list must close on one line");
-            let params = &after[..end];
-            for p in params.split(',') {
-                assert!(
-                    p.contains("__restrict__"),
-                    "C peer parameter `{}` is not __restrict__ (full list: `{params}`). Without it \
-                     gcc must assume the output aliases the inputs and cannot vectorize the kernel \
-                     — see the peer-strength checklist above.",
-                    p.trim()
-                );
+        let mut model_seen = 0usize;
+        for (file, src) in [
+            ("main.rs", include_str!("main.rs")),
+            ("model.rs", include_str!("model.rs")),
+        ] {
+            for open in [exported, helper] {
+                let mut rest = src;
+                while let Some(i) = rest.find(open) {
+                    let after = &rest[i + open.len()..];
+                    // `<name>(` … `)` — the generated prototypes have no nested parentheses.
+                    let Some(lp) = after.find('(') else { break };
+                    let end = after[lp..]
+                        .find(')')
+                        .expect("a generated C prototype must close its parameter list");
+                    let name = after[..lp].trim();
+                    let params = &after[lp + 1..lp + end];
+                    for p in params.split(',') {
+                        // Dimension scalars (`long m`) are not pointers and need no qualifier.
+                        if !p.contains('*') {
+                            continue;
+                        }
+                        assert!(
+                            p.contains("__restrict__"),
+                            "{file}: C peer `{name}` parameter `{}` is not __restrict__ (full list: \
+                             `{params}`). Without it gcc must assume the output aliases the inputs \
+                             and cannot vectorize the kernel — see the peer-strength checklist above.",
+                            p.trim()
+                        );
+                    }
+                    seen += 1;
+                    if file == "model.rs" {
+                        model_seen += 1;
+                    }
+                    rest = &after[lp + end..];
+                }
             }
-            seen += 1;
-            rest = &after[end..];
         }
+        // The model peer contributes `kbench`, `kfinal`, `linear_nt` and `layernorm_affine`; a floor
+        // here is what makes the model.rs half of this test impossible to satisfy vacuously.
+        assert!(
+            model_seen >= 4,
+            "only {model_seen} C prototypes found in model.rs — did c_model move or lose its exports?"
+        );
         // A floor, so that deleting or renaming the peer generators cannot make this pass vacuously
         // with zero matches. 43 signatures at the time of writing.
         assert!(seen >= 40, "only {seen} C kbench signatures found — did the peer generators move?");
