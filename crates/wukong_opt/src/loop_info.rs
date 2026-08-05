@@ -777,9 +777,24 @@ pub fn analyze_function(f: &Function) -> LoopForest {
 pub(crate) fn analyze_with(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> LoopForest {
     let mut forest = find_loops(f, idom, preds);
     for i in 0..forest.loops.len() {
-        analyze_loop(f, &mut forest, i);
+        analyze_loop(f, &mut forest, i, Stages::All);
     }
     forest
+}
+
+/// Run the value analyses for **one** loop of an already-structured forest, out to `stages`.
+///
+/// This is what a transform wants instead of [`analyze_with`]. The full analysis walks every
+/// instruction of every loop and builds an affine expression for each integer result; a transform
+/// that widens — or declines — one loop at a time pays that for every loop in the function, on
+/// every re-entry from the optimizer's fixpoint. Stopping at [`Stages::Ivs`] answers "unit-stride
+/// counted loop?" for a fraction of the cost, and [`Stages::Memory`] skips the derived-IV list.
+///
+/// Calling it again on the same loop with a wider `stages` recomputes the earlier stages. That is
+/// deliberate: the alternative is caching a half-analysis whose defaults no longer read as "not
+/// analyzed", which is exactly the property that makes partial analysis safe.
+pub(crate) fn analyze_one(f: &Function, forest: &mut LoopForest, idx: usize, stages: Stages) {
+    analyze_loop(f, forest, idx, stages);
 }
 
 /// Loop **structure only** — headers, latches, block sets, preheaders, exits and the nesting forest
@@ -1787,7 +1802,29 @@ fn distinct_allocas(ctx: &LoopCtx<'_>, a: MemBase, b: MemBase) -> bool {
     is_alloca(a) && is_alloca(b) && !a.same_object(b)
 }
 
-fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize) {
+/// How far [`analyze_loop`] runs. The stages are strictly nested, and each is materially more
+/// expensive than the one before it, so a consumer that can decide from an early stage should stop
+/// there rather than pay for the rest.
+///
+/// A loop analyzed to less than [`Stages::All`] leaves the later stages' fields at their defaults —
+/// and those defaults are the **conservative** answers, not empty ones: `primary_iv` is `None`,
+/// `trip` is [`TripCount::Unknown`] and `dep` is [`MemDep::Carried`] ("not analyzed"). A consumer
+/// that reads a field it did not ask for therefore declines to transform, rather than transforming
+/// on a fact nobody established. That is what makes partial analysis safe to expose at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Stages {
+    /// Basic induction variables, the primary one, and the trip count. Enough to answer "is this a
+    /// unit-stride counted loop?" — which rejects more of `tests/run` than any other single check.
+    Ivs,
+    /// … plus memory accesses, carried-value classification and the dependence verdict: everything
+    /// a transform reads, *except* the derived-IV list, which no transform consumes.
+    Memory,
+    /// … plus the derived-IV list — an affine expression for every integer instruction in the loop.
+    /// Only [`dump_function_loops`] and this module's own tests read it.
+    All,
+}
+
+fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize, stages: Stages) {
     let l = &forest.loops[idx];
     let mut ctx = LoopCtx::new(f, l);
 
@@ -1815,10 +1852,18 @@ fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize) {
         _ => TripCount::Unknown,
     };
 
+    if stages == Stages::Ivs {
+        let l = &mut forest.loops[idx];
+        l.ivs = ivs;
+        l.primary_iv = primary;
+        l.trip = trip;
+        return;
+    }
+
     // Derived IVs: everything in the loop that moves with the primary IV.
     let mut memo: FxHashMap<u32, Option<AffineExpr>> = FxHashMap::default();
     let mut derived = Vec::new();
-    if ctx.primary.is_some() {
+    if stages == Stages::All && ctx.primary.is_some() {
         let mut blocks: Vec<u32> = ctx.blocks.iter().copied().collect();
         blocks.sort_unstable();
         for b in blocks {
