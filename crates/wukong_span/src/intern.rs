@@ -41,6 +41,17 @@ impl Interner {
         sym
     }
 
+    /// The symbol for `s` **if it has already been interned**, without minting a new one.
+    ///
+    /// The read-only half of [`Interner::intern`], for the passes that hold a shared `&Interner`
+    /// and must ask "does this name exist?" rather than create it (`wukong_mir_build`'s recognizers
+    /// resolve a struct-field buffer base `l.w` through the synthetic name `"l.w"`, pre-interned by
+    /// `lower_program`, which is the only place that holds `&mut Interner`). A `None` therefore
+    /// means "not a name this compilation minted", which every caller must treat as a decline.
+    pub fn get(&self, s: &str) -> Option<Symbol> {
+        self.lookup.get(s).copied()
+    }
+
     /// Resolve a symbol back to its string.
     ///
     /// A `Symbol` is only meaningful inside the interner that minted it: this indexes `strings`
@@ -75,6 +86,17 @@ mod tests {
         assert_eq!(i.resolve(a), "matmul");
         assert_eq!(i.resolve(b), "tensor");
         assert_eq!(i.len(), 2);
+    }
+
+    #[test]
+    fn get_is_read_only() {
+        let mut i = Interner::new();
+        assert_eq!(i.get("matmul"), None);
+        let a = i.intern("matmul");
+        assert_eq!(i.get("matmul"), Some(a));
+        // `get` must not mint: the miss above left the table untouched.
+        assert_eq!(i.len(), 1);
+        assert_eq!(i.get("l.wq"), None);
     }
 
     #[test]
