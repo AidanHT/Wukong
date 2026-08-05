@@ -2143,6 +2143,10 @@ fn red_binop(k: RedKind) -> BinOp {
         RedKind::Xor => BinOp::Xor,
         RedKind::FAdd => BinOp::FAdd,
         RedKind::FMul => BinOp::FMul,
+        // Never reassociable, so it only ever reaches the serial fold, which re-emits the combine
+        // with the accumulator on the left exactly as the scalar loop had it.
+        RedKind::Sub => BinOp::Sub,
+        RedKind::FSub => BinOp::FSub,
         // `plan_body` only ever records the operators above; min/max reductions are spelled with a
         // `select` and are classified `Recurrence` by the analysis, so they never reach here.
         other => unreachable!("{} is not a binary-combine reduction", other.name()),
@@ -2504,6 +2508,40 @@ mod tests {
                k(a, b, 11); i = 0; \
                while i < 11 { print((b[i] * 2.0) as i32); i = i + 1; } \
                free(a); free(b); return 0; }",
+        );
+    }
+
+    /// `acc = acc - x[i]` is an accumulate with a FIXED operand order, and it is how a loss is
+    /// spelled — `lr = lr - alpha*q*(1-p)^2*log p`. It is never reassociable (`((a-x)-y)` is
+    /// `a - (x+y)`, so lane-parallel partials would need a different combining operator and a
+    /// different identity), so it takes the serial fold, and the fold has to keep the accumulator
+    /// on the LEFT. Putting it on the right turns `-sum` into something unrelated, which the
+    /// `-O0` vs `-O2` comparison catches.
+    #[test]
+    fn a_subtract_accumulate_is_a_reduction() {
+        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = s - x[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(is_widened(src, "k"), "a subtract accumulate was not widened");
+        scalar_and_vector_agree(
+            "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+             while i < n { s = s - x[i] * 2.0; i = i + 1; } return s; } \
+             fn main() -> i32 { let mut a: []f32 = alloc_f32(11); let mut i: i64 = 0; \
+               while i < 11 { a[i] = (i as f32) * 0.5 + 1.0; i = i + 1; } \
+               print((k(a, 11) * 2.0) as i32); free(a); return 0; }",
+        );
+    }
+
+    /// `acc = x[i] - acc` is NOT an accumulate: it negates the whole history every iteration, so
+    /// the iterations cannot be grouped at all. It has to stay a `Carried::Recurrence`.
+    #[test]
+    fn a_reversed_subtract_is_not_a_reduction() {
+        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = x[i] - s; i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "k"),
+            "`x[i] - acc` must not widen as a reduction"
         );
     }
 
