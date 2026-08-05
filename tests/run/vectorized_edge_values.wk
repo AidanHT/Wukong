@@ -1,0 +1,643 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9000
+// EXPECT-OUT: -9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: -1048576
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 11
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: -11
+// EXPECT-OUT: 2097152
+// EXPECT-OUT: 2097152
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: -11
+// EXPECT-OUT: 11
+// EXPECT-OUT: -9000
+// EXPECT-OUT: -9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: -1048576
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: -9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: 2097152
+// EXPECT-OUT: -2097152
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 9000
+// EXPECT-OUT: -9000
+// EXPECT-OUT: -11
+// EXPECT-OUT: -11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 11
+// EXPECT-OUT: -11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 7777
+// EXPECT-OUT: -11
+// EXPECT-OUT: 9000
+// EXPECT-OUT: -9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: -11
+// EXPECT-OUT: -11
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: 11
+// EXPECT-OUT: -9000
+// EXPECT-OUT: 7777
+// EXPECT-OUT: -9000
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 7777
+// EXPECT-OUT: -1048576
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: -1048576
+// EXPECT-OUT: 7777
+// EXPECT-OUT: -9000
+// EXPECT-OUT: -11
+// EXPECT-OUT: 7777
+// EXPECT-OUT: -1048576
+// EXPECT-OUT: -9000
+// EXPECT-OUT: -9000
+// EXPECT-OUT: -11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9000
+// EXPECT-OUT: -11
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: -1048576
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 0
+// EXPECT-OUT: -9000
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: -2097152
+// EXPECT-OUT: 11
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: -11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 11
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 7777
+// EXPECT-OUT: -11
+// EXPECT-OUT: 1482910
+// EXPECT-OUT: -11
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 11
+// EXPECT-OUT: -11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 11
+// EXPECT-OUT: -1048576
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9000
+// EXPECT-OUT: -9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: 2097152
+// EXPECT-OUT: -11
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 9000
+// EXPECT-OUT: -11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 1048576
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 9000
+// EXPECT-OUT: -11
+// EXPECT-OUT: 2097152
+// EXPECT-OUT: 2097152
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 7777
+// EXPECT-OUT: 0
+// EXPECT-OUT: 14
+// EXPECT-OUT: 214748378
+// EXPECT-OUT: 429496742
+// EXPECT-OUT: 644245106
+// EXPECT-OUT: 858993470
+// EXPECT-OUT: 1073741834
+// EXPECT-OUT: 1288490198
+// EXPECT-OUT: 1503238562
+// EXPECT-OUT: 1717986926
+// EXPECT-OUT: 1932735290
+// EXPECT-OUT: -2147483642
+// EXPECT-OUT: -1932735278
+// EXPECT-OUT: -1717986914
+// EXPECT-OUT: -1503238550
+// EXPECT-OUT: -1288490186
+// EXPECT-OUT: -1073741822
+// EXPECT-OUT: -858993458
+// EXPECT-OUT: -644245094
+// EXPECT-OUT: -429496730
+// EXPECT-OUT: -214748366
+// EXPECT-OUT: -2
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -32385431
+// EXPECT-OUT: 670853117
+// EXPECT-OUT: 1374091665
+// EXPECT-OUT: 2077330213
+// EXPECT-OUT: -1514398535
+// EXPECT-OUT: -811159987
+// EXPECT-OUT: -107921439
+// EXPECT-OUT: 595317109
+// EXPECT-OUT: 1298555657
+// EXPECT-OUT: 2001794205
+// EXPECT-OUT: -1589934543
+// EXPECT-OUT: -886695995
+// EXPECT-OUT: -183457447
+// EXPECT-OUT: 519781101
+// EXPECT-OUT: 1223019649
+// EXPECT-OUT: 1926258197
+// EXPECT-OUT: -1665470551
+// EXPECT-OUT: -962232003
+// EXPECT-OUT: -258993455
+// EXPECT-OUT: 444245093
+// EXPECT-OUT: 1147483641
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 2147483633
+// EXPECT-OUT: 1932735269
+// EXPECT-OUT: 1717986905
+// EXPECT-OUT: 1503238541
+// EXPECT-OUT: 1288490177
+// EXPECT-OUT: 1073741813
+// EXPECT-OUT: 858993449
+// EXPECT-OUT: 644245085
+// EXPECT-OUT: 429496721
+// EXPECT-OUT: 214748357
+// EXPECT-OUT: -7
+// EXPECT-OUT: -214748371
+// EXPECT-OUT: -429496735
+// EXPECT-OUT: -644245099
+// EXPECT-OUT: -858993463
+// EXPECT-OUT: -1073741827
+// EXPECT-OUT: -1288490191
+// EXPECT-OUT: -1503238555
+// EXPECT-OUT: -1717986919
+// EXPECT-OUT: -1932735283
+// EXPECT-OUT: -2147483647
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -2147483403
+// EXPECT-OUT: -1932735242
+// EXPECT-OUT: -1717986817
+// EXPECT-OUT: -1503238404
+// EXPECT-OUT: -1288489991
+// EXPECT-OUT: -1073741570
+// EXPECT-OUT: -858993413
+// EXPECT-OUT: -644244996
+// EXPECT-OUT: -429496579
+// EXPECT-OUT: -214748162
+// EXPECT-OUT: 255
+// EXPECT-OUT: 214748204
+// EXPECT-OUT: 429496673
+// EXPECT-OUT: 644245142
+// EXPECT-OUT: 858993611
+// EXPECT-OUT: 1073742076
+// EXPECT-OUT: 1288490037
+// EXPECT-OUT: 1503238502
+// EXPECT-OUT: 1717986975
+// EXPECT-OUT: 1932735436
+// EXPECT-OUT: 2147483401
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 195225784
+// EXPECT-OUT: 193273526
+// EXPECT-OUT: 190887433
+// EXPECT-OUT: 187904817
+// EXPECT-OUT: 184070025
+// EXPECT-OUT: 178956968
+// EXPECT-OUT: 171798689
+// EXPECT-OUT: 161061271
+// EXPECT-OUT: 143165573
+// EXPECT-OUT: 107374178
+// EXPECT-OUT: -7
+// EXPECT-OUT: -1
+// EXPECT-OUT: 429496735
+// EXPECT-OUT: 322122549
+// EXPECT-OUT: 286331154
+// EXPECT-OUT: 268435456
+// EXPECT-OUT: 257698038
+// EXPECT-OUT: 250539759
+// EXPECT-OUT: 245426702
+// EXPECT-OUT: 241591910
+// EXPECT-OUT: 238609294
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -9
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -5
+// EXPECT-OUT: -2
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 96
+// EXPECT-OUT: 109
+// EXPECT-OUT: 122
+// EXPECT-OUT: -121
+// EXPECT-OUT: -108
+// EXPECT-OUT: -95
+// EXPECT-OUT: -82
+// EXPECT-OUT: -69
+// EXPECT-OUT: -56
+// EXPECT-OUT: -43
+// EXPECT-OUT: -30
+// EXPECT-OUT: -17
+// EXPECT-OUT: -4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 22
+// EXPECT-OUT: 35
+// EXPECT-OUT: 48
+// EXPECT-OUT: 61
+// EXPECT-OUT: 74
+// EXPECT-OUT: 87
+// EXPECT-OUT: 100
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 147
+// EXPECT-OUT: -463680713
+// EXPECT-OUT: 3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 0
+// EXPECT-OUT: -66
+module tests.run.vectorized_edge_values
+
+// Value edges for `wukong_opt::vectorize`: what the widened body computes on the inputs that
+// separate a correct lane-wise transform from a nearly-correct one.
+//
+// The pass is only half visible to the gates -- `native_matches_interpreter` runs the SAME widened
+// MIR on both backends, so the witness is `optimization_is_observationally_invariant` (`-O0` runs
+// the scalar loop, `-O2` the vector loop plus its epilogue). These are the inputs where the two
+// could differ:
+//
+//  * **NaN, +/-0, both infinities, subnormals and the f32 maximum**, pushed through every widened
+//    float operation (add, sub, mul, div, neg, sqrt, fma) and through an if-converted `select`.
+//    `x > y` is false whenever either side is NaN, so the else arm must win in EVERY lane -- a
+//    mask built with the wrong compare polarity shows up here and nowhere else. Values are printed
+//    through `code()`, which separates +0 from -0 (by the sign of `1/v`), NaN from everything, the
+//    infinities from the finite maximum, and a subnormal from zero.
+//  * **A reassociation canary.** `2^24 + 1 + 1 + ...` is exactly `2^24` when summed in order --
+//    every `2^24 + 1` is a tie that rounds back to even. Group the ones first, which is what
+//    reassociating a float reduction does, and the answer is larger. The fixture prints the
+//    difference from `2^24`, so the expected `0` is a proof that the accumulate stayed serial.
+//  * **Integer wrap-around** at i8/i32/i64 through add, multiply and negate at the extremes, and
+//    **a division whose divisor is zero in one lane**, written as an if-converted body: widening
+//    it by speculating both arms would fault. Every integer reduction operator (add, mul, and, or,
+//    xor) is exercised, because a reassociable one is folded with W lane-parallel partials that a
+//    wrong identity element would silently corrupt.
+//
+// Output buffers are pre-filled with a sentinel and printed in full, so a write past `n` or a lane
+// the epilogue missed changes a line. Every expected value is computed from the scalar semantics of
+// the loop, not recorded from compiler output. `while` is used throughout so that no `mir_build`
+// recognizer intercepts a loop before the optimizer sees it.
+
+const NF: i64 = 19;
+const NI: i64 = 21;
+const CAPI: i64 = 28;
+
+/// Classify a float so that -0.0, +0.0, NaN, the infinities and a subnormal are all distinguishable
+/// in an `i32` print. `1048576.0` is 2^20, so the scaling is exact and `as i32` never saturates.
+fn code(v: f32) -> i32 {
+    if v != v { return 7777; }
+    if v == 0.0 {
+        if (1.0 / v) > 0.0 { return 11; }
+        return -11;
+    }
+    let s: f32 = v * 1048576.0;
+    if s > 2000000000.0 { return 9000; }
+    if s < -2000000000.0 { return -9000; }
+    if s == 0.0 {
+        if v > 0.0 { return 5; }
+        return -5;
+    }
+    return s as i32;
+}
+
+fn f_add(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] + y[i]; i = i + 1; }
+}
+fn f_sub(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] - y[i]; i = i + 1; }
+}
+fn f_mul(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] * y[i]; i = i + 1; }
+}
+fn f_div(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] / y[i]; i = i + 1; }
+}
+fn f_neg(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = -x[i]; i = i + 1; }
+}
+fn f_sqrt(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = sqrt(x[i]); i = i + 1; }
+}
+fn f_fma(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] * y[i] + x[i]; i = i + 1; }
+}
+/// An if-converted maximum. `a > b` is false when either side is NaN, so the else arm must win.
+fn f_sel(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let a: f32 = x[i];
+        let b: f32 = y[i];
+        if a > b { o[i] = a; } else { o[i] = b; }
+        i = i + 1;
+    }
+}
+fn f_sum(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    let mut i: i64 = 0;
+    while i < n { s = s + x[i]; i = i + 1; }
+    return s;
+}
+fn f_dot(x: []f32, y: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    let mut i: i64 = 0;
+    while i < n { s = s + x[i] * y[i]; i = i + 1; }
+    return s;
+}
+
+fn i_add(x: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] + 2147483647; i = i + 1; }
+}
+fn i_mul(x: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] * 1000000007; i = i + 1; }
+}
+fn i_neg(x: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = -x[i]; i = i + 1; }
+}
+fn i_bits(x: []i32, y: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = (x[i] & y[i]) | (x[i] ^ 255); i = i + 1; }
+}
+/// A division whose divisor is zero in one lane: if-conversion must refuse to speculate it.
+fn i_div(x: []i32, y: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        if y[i] != 0 { o[i] = x[i] / y[i]; } else { o[i] = -1; }
+        i = i + 1;
+    }
+}
+fn i_rem(x: []i32, y: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        if y[i] != 0 { o[i] = x[i] % y[i]; } else { o[i] = -2; }
+        i = i + 1;
+    }
+}
+fn b_sub(x: []i8, mut o: []i8, n: i64) {
+    let mut i: i64 = 0;
+    while i < n { o[i] = x[i] - 100i8; i = i + 1; }
+}
+fn r_add(x: []i32, n: i64) -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i64 = 0;
+    while i < n { s = s + x[i]; i = i + 1; }
+    return s;
+}
+fn r_mul(x: []i32, n: i64) -> i32 {
+    let mut s: i32 = 1;
+    let mut i: i64 = 0;
+    while i < n { s = s * x[i]; i = i + 1; }
+    return s;
+}
+fn r_and(x: []i32, n: i64) -> i32 {
+    let mut s: i32 = -1;
+    let mut i: i64 = 0;
+    while i < n { s = s & x[i]; i = i + 1; }
+    return s;
+}
+fn r_or(x: []i32, n: i64) -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i64 = 0;
+    while i < n { s = s | x[i]; i = i + 1; }
+    return s;
+}
+fn r_xor(x: []i32, n: i64) -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i64 = 0;
+    while i < n { s = s ^ x[i]; i = i + 1; }
+    return s;
+}
+fn r_add64(x: []i64, n: i64) -> i64 {
+    let mut s: i64 = 0;
+    let mut i: i64 = 0;
+    while i < n { s = s + x[i]; i = i + 1; }
+    return s;
+}
+fn r_add8(x: []i8, n: i64) -> i8 {
+    let mut s: i8 = 0i8;
+    let mut i: i64 = 0;
+    while i < n { s = s + x[i]; i = i + 1; }
+    return s;
+}
+
+fn showf(p: []f32, n: i64) {
+    let mut k: i64 = 0;
+    while k < n { print(code(p[k])); k = k + 1; }
+}
+fn showi(p: []i32) {
+    let mut k: i64 = 0;
+    while k < CAPI { print(p[k]); k = k + 1; }
+}
+fn seti(mut p: []i32) {
+    let mut k: i64 = 0;
+    while k < CAPI { p[k] = -7; k = k + 1; }
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(NF);
+    let mut y: []f32 = alloc_f32(NF);
+    let mut o: []f32 = alloc_f32(NF);
+
+    let inf: f32 = 1.0 / 0.0;
+    let nan: f32 = 0.0 / 0.0;
+    let den: f32 = 1.0e-40;
+    let zp: f32 = 0.0;
+    let zn: f32 = -0.0;
+    x[0] = nan;  y[0] = 1.0;
+    x[1] = 1.0;  y[1] = nan;
+    x[2] = inf;  y[2] = inf;
+    x[3] = inf;  y[3] = -inf;
+    x[4] = zp;  y[4] = zn;
+    x[5] = zn;  y[5] = zp;
+    x[6] = den;  y[6] = den;
+    x[7] = den;  y[7] = 1000000015047466219876688855040.0;
+    x[8] = -inf;  y[8] = zp;
+    x[9] = zp;  y[9] = zp;
+    x[10] = -1.0;  y[10] = zp;
+    x[11] = 1.0;  y[11] = zp;
+    x[12] = nan;  y[12] = nan;
+    x[13] = -den;  y[13] = den;
+    x[14] = 339999995214436424907732413799364296704.0;  y[14] = 339999995214436424907732413799364296704.0;
+    x[15] = -339999995214436424907732413799364296704.0;  y[15] = 339999995214436424907732413799364296704.0;
+    x[16] = zn;  y[16] = zn;
+    x[17] = 2.0;  y[17] = zn;
+    x[18] = zn;  y[18] = 2.0;
+    f_add(x, y, o, NF);  showf(o, NF);
+    f_sub(x, y, o, NF);  showf(o, NF);
+    f_mul(x, y, o, NF);  showf(o, NF);
+    f_div(x, y, o, NF);  showf(o, NF);
+    f_neg(x, o, NF);     showf(o, NF);
+    f_sqrt(x, o, NF);    showf(o, NF);
+    f_fma(x, y, o, NF);  showf(o, NF);
+    f_sel(x, y, o, NF);  showf(o, NF);
+    print(code(f_sum(x, NF)));
+    print(code(f_sum(y, NF)));
+    print(code(f_dot(x, y, NF)));
+
+    // the reassociation canary: 2^24 followed by 22 ones sums, in order, to exactly 2^24
+    let mut c: []f32 = alloc_f32(23);
+    let mut j: i64 = 0;
+    while j < 23 { c[j] = 1.0; j = j + 1; }
+    c[0] = 16777216.0;
+    print((f_sum(c, 23) - 16777216.0) as i32);
+    free(c);
+    free(o); free(y); free(x);
+
+    // ---- integer edges ----------------------------------------------------------------------
+    let mut a: []i32 = alloc_i32(CAPI);
+    let mut b: []i32 = alloc_i32(CAPI);
+    let mut q: []i32 = alloc_i32(CAPI);
+    let mut xb: []i8 = alloc_i8(CAPI);
+    let mut ob: []i8 = alloc_i8(CAPI);
+    let mut xl: []i64 = alloc_i64(CAPI);
+    j = 0;
+    while j < CAPI {
+        a[j] = ((j as i32) - 10) * 214748364 + 7;
+        b[j] = (j as i32) - 11;                       // b[11] == 0
+        xb[j] = (j as i8) * 13i8 - 60i8;
+        xl[j] = ((j as i64) - 10) * 1234567890123456789;
+        j = j + 1;
+    }
+
+    seti(q); i_add(a, q, NI);     showi(q);
+    seti(q); i_mul(a, q, NI);     showi(q);
+    seti(q); i_neg(a, q, NI);     showi(q);
+    seti(q); i_bits(a, b, q, NI); showi(q);
+    seti(q); i_div(a, b, q, NI);  showi(q);
+    seti(q); i_rem(a, b, q, NI);  showi(q);
+    j = 0; while j < CAPI { ob[j] = -7i8; j = j + 1; }
+    b_sub(xb, ob, NI);
+    j = 0; while j < CAPI { print(ob[j] as i32); j = j + 1; }
+
+    print(r_add(a, NI));
+    print(r_mul(a, NI));
+    print(r_and(a, NI));
+    print(r_or(a, NI));
+    print(r_xor(a, NI));
+    print(r_add64(xl, NI) as i32);
+    print(r_add8(xb, NI) as i32);
+
+    free(xl); free(ob); free(xb); free(q); free(b); free(a);
+    return 0;
+}
