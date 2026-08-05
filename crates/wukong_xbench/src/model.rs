@@ -781,15 +781,19 @@ struct CModel {
     compile: Duration,
 }
 
+/// Compile one C-family model peer. `ext` is the source extension (`"c"` for the gcc columns,
+/// `"cpp"` for the g++ column) — it selects the file name and therefore the language the compiler
+/// front end picks, so the same `compiler`/`args` pair drives both.
 fn compile_c_model(
     src: &str,
     dir: &Path,
     name: &str,
+    ext: &str,
     cc: &str,
     args: &[&str],
 ) -> Option<CModel> {
-    let src_path = dir.join(format!("{name}.c"));
-    let dll = dir.join(format!("{name}_c.dll"));
+    let src_path = dir.join(format!("{name}.{ext}"));
+    let dll = dir.join(format!("{name}_{ext}.dll"));
     std::fs::write(&src_path, src).ok()?;
     let t = Instant::now();
     let status = Command::new(cc)
@@ -802,7 +806,7 @@ fn compile_c_model(
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => {
-            eprintln!("{cc} failed to compile {name}.c");
+            eprintln!("{cc} failed to compile {name}.{ext}");
             return None;
         }
         Err(_) => {
@@ -1717,8 +1721,12 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
          -O3 -march=native -ffp-contract=fast"
     );
     println!(
-        "  (the suite's standard basis); C(fast) = same source with -ffast-math (the llama2.c \
-         -Ofast basis). Lower ms is better;"
+        "  (the suite's standard basis); C++(g++) = the IDENTICAL translation unit at the same \
+         flags through the other GCC front end"
+    );
+    println!(
+        "  (so \"C++ tracks C\" is measured, not assumed); C(fast) = same source with -ffast-math \
+         (the llama2.c -Ofast basis). Lower ms is better;"
     );
     println!("  absolute numbers are thermal-bound — the Wukong/C ratio is the stable metric.");
     // Power state: sustained-load timings taken on battery are not comparable to AC runs.
@@ -2081,6 +2089,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             &c_src,
             dir,
             &format!("model_s{}", cfg.s),
+            "c",
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
         )
@@ -2111,11 +2120,44 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         None
     };
 
+    // --- C++ (g++): the identical translation unit through the other GCC front end, at the same
+    // flags, run under the same naive-forward gate as the C column. Until 2026-08-05 the end-to-end
+    // row had no C++ number at all and BENCHMARKS.md asserted that the C ratio stood for C++; the
+    // point of this column is that the assertion can now be wrong out loud. `cpp_from_c` prepends
+    // `extern "C"` to BOTH exports (`kbench` and `kfinal`), which is all a numeric TU needs.
+    let cpp_m = if run_c_slow {
+        compile_c_model(
+            &crate::cpp_from_c(&c_src),
+            dir,
+            &format!("model_s{}", cfg.s),
+            "cpp",
+            crate::cxx(),
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+        )
+        .map(|cm| {
+            let mut run = || unsafe {
+                run_forward(
+                    cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
+                    &mut y,
+                )
+            };
+            let ns = time_forward(&mut run);
+            MeasureModel {
+                compile: cm.compile,
+                ns_per_fwd: ns,
+                out: y.clone(),
+            }
+        })
+    } else {
+        None
+    };
+
     // --- C(fast): identical source, -ffast-math ---
     let cfast_m = if no_c { None } else { compile_c_model(
         &c_src,
         dir,
         &format!("model_s{}_fast", cfg.s),
+        "c",
         cc,
         &["-O3", "-march=native", "-ffast-math", "-shared"],
     )
@@ -2298,10 +2340,11 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         None => (None, None, None, None, None),
     };
 
-    let cols: [(&str, &Option<MeasureModel>); 9] = [
+    let cols: [(&str, &Option<MeasureModel>); 10] = [
         ("Wuk(1c)", &wk_m),
         ("Wuk(par)", &wk_par_m),
         ("C(gcc)", &c_m),
+        ("C++(g++)", &cpp_m),
         ("C(fast)", &cfast_m),
         ("T1(sdpa)", &torch1_m),
         ("T1(man)", &torchman_m),
@@ -2414,6 +2457,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         }
     };
     ratio_line(&wk_m, &c_m, "(1 core)", "C (gcc -O3 -march=native)");
+    ratio_line(&wk_m, &cpp_m, "(1 core)", "C++ (g++ -O3 -march=native)");
     ratio_line(&wk_m, &cfast_m, "(1 core)", "C(fast) (gcc -ffast-math)");
     ratio_line(&wk_par_m, &cfast_m, "@parallel", "C(fast) (single-threaded)");
     ratio_line(
@@ -2502,6 +2546,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         }
     };
     check(&wk_m, &c_m, "Wukong vs C", 1e-3);
+    check(&wk_m, &cpp_m, "Wukong vs C++", 1e-3);
     check(&wk_m, &cfast_m, "Wukong vs C(fast)", 1e-3);
     // Wukong vs torch: same GELU flavor (tanh approx) and eps, so the residual is the same
     // reassociation + poly-vs-libm class as vs C — expect ~1e-5-ish at the standard 1e-3.

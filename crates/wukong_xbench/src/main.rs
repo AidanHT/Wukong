@@ -911,7 +911,7 @@ fn main() {
         bench_matmul(&cc, &dir, roof);
     }
     if want("matmul_skinny") {
-        bench_matmul_skinny(roof);
+        bench_matmul_skinny(&cc, &dir, roof);
     }
     if want("linear") {
         bench_linear(&cc, &dir, roof);
@@ -1068,11 +1068,21 @@ fn bench_matmul(cc: &str, dir: &Path, roof: f64) {
 /// shapes in the `nn.Linear` NT layout (`C = A·Bᵀ`) — attention/output projections (K=N=768) and
 /// the FFN up/down projections (768→3072, 3072→768), at S=128 and S=512 rows. The square sweeps
 /// never enter this low-M regime, where the parallel grid's grain (not peak FLOPs) decides the
-/// gap to MKL(all). Library peers only (oneMKL 1c/all — the bar at these shapes; the naive-C
-/// columns of the square section add nothing here). Thermal order follows the standing law:
-/// single-core group first (Wuk(1c), MKL(1c) adjacent), then MKL(all), Wuk(par) LAST — residual
+/// gap to MKL(all).
+///
+/// **The C / C++ / Rust reference columns (added 2026-08-05).** This section used to print library
+/// peers ONLY — "the naive-C columns of the square section add nothing here" — which left the one
+/// table that carries a library bar with no plain-language baseline at all. A reader could see how
+/// far Wukong was from oneMKL and had no way to see how far *either* was from the loop a programmer
+/// writes, at the shapes a real transformer actually runs. That is the same blank-cell problem as a
+/// missing C++ column, one table over. They are naive `ijk` NT nests ([`c_linear_rect`]), the exact
+/// spelling the square section uses, so the two tables' C columns mean the same thing.
+///
+/// Thermal order follows the standing law: the single-core group first (Wuk(1c), MKL(1c) adjacent,
+/// then the naive C/C++/Rust peers at its TAIL — the same placement `bench_matmul_size` uses, so
+/// their long scalar runs pollute no library number), then MKL(all), then Wuk(par) LAST — residual
 /// heat lands on Wukong, never the peer.
-fn bench_matmul_skinny(roof: f64) {
+fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
     for (m, k, n) in [
         (128usize, 768usize, 768usize),
         (128, 768, 3072),
@@ -1096,16 +1106,51 @@ fn bench_matmul_skinny(roof: f64) {
         );
         let wuk = bench_wukong(&wk_linear_rect(m, k, n, false), &mut c, ap, bp);
         let mkl_1c = bench_mm_mkl_rect(m, k, n, true, 1, &a, &b, &mut c);
+        // Naive single-core peers, at the tail of the single-core group.
+        let (cm, cm_cpp) = bench_c_cpp(
+            "linear_rect",
+            &c_linear_rect(m, k, n),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut c,
+            ap,
+            bp,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_linear_rect(m, k, n),
+            dir,
+            "linear_rect",
+            "rustc",
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut c,
+            ap,
+            bp,
+        );
+        // The reassociation-normalized C column: the inner K-dot is an IEEE-serial float reduction at
+        // honest flags, and Wukong's tiled kernel accumulates it in a blocked (reassociated) order —
+        // the same disclosure the square GEMM sections carry.
+        let cfast = bench_c_fast("linear_rect", &c_linear_rect(m, k, n), dir, cc, &wuk, &mut c, ap, bp);
         let mkl_all = mkl()
             .map(|api| api.max_threads)
             .and_then(|t| bench_mm_mkl_rect(m, k, n, true, t, &a, &b, &mut c));
         let wk_par = bench_wukong(&wk_linear_rect(m, k, n, true), &mut c, ap, bp);
         println!(
-            "  GFLOP/s     Wuk(1c) {:>7}   Wuk(par) {:>7}   MKL(1c) {:>7}   MKL(all) {:>7}",
+            "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "", "Wuk(1c)", "Wuk(par)", "MKL(1c)", "MKL(all)", "C(gcc)", "C++(g++)", "C(fast)", "Rust"
+        );
+        println!(
+            "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "GFLOP/s",
             gflops(&wuk),
             gflops(&wk_par),
             gflops(&mkl_1c),
             gflops(&mkl_all),
+            gflops(&cm),
+            gflops(&cm_cpp),
+            gflops(&cfast),
+            gflops(&rm),
         );
         if roof > 0.0 {
             if let Some(w) = &wuk {
@@ -1128,7 +1173,32 @@ fn bench_matmul_skinny(roof: f64) {
                 None => println!("  cross-check Wukong serial vs @parallel: BIT-EXACT"),
             }
         }
+        // Cross-language correctness against the naive C reference: the tiled kernel reassociates
+        // the K-dot, so the bar is the suite's tight magnitude-normalized 1e-3, as in bench_matmul.
+        if let (Some(mm), Some(c2)) = (&wuk, &cm) {
+            let (rel, at) = max_rel_err(&mm.out, &c2.out);
+            if rel > 1e-3 {
+                println!(
+                    "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {rel:.2e})",
+                    mm.out[at], c2.out[at]
+                );
+            }
+        }
         report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
+        if let (Some(mm), Some(c2)) = (&wuk, &cm) {
+            let r = c2.ns_per_call / mm.ns_per_call;
+            println!(
+                "  -> Wukong single-core is {:.2}x {} than idiomatic C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            par_standing("idiomatic single-threaded C", r);
+        }
+        report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
+        report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
         println!();
     }
 }
@@ -1913,12 +1983,21 @@ fn wk_linear_rect(m: usize, k: usize, n: usize, parallel: bool) -> String {
 }
 
 fn c_linear(ns: usize) -> String {
+    c_linear_rect(ns, ns, ns)
+}
+
+/// The RECTANGULAR `nn.Linear` C peer `C[M,N] = A[M,K]·B[N,K]ᵀ` — the same `ijk` dot-product nest as
+/// [`c_linear`], with the three dimensions independent. Needed by the skinny-GEMM sweep, whose shapes
+/// (M=128/512 rows against the GPT-2 block's 768/3072 weight dims) are never square. Both operands are
+/// walked with unit stride over `k`, which is the natural spelling for the NT layout — the row-major
+/// competence rule the 2026-08-04 audit added.
+fn c_linear_rect(m: usize, k: usize, n: usize) -> String {
     format!(
-        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
-         \x20 for (long i=0;i<NS;i++)\n\
-         \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
-         \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
-         \x20     c[i*NS+j]=s; }}\n}}\n"
+        "#define M {m}\n#define K {k}\n#define N {n}\n__declspec(dllexport) void kbench(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c) {{\n\
+         \x20 for (long i=0;i<M;i++)\n\
+         \x20   for (long j=0;j<N;j++){{ float s=0.0f;\n\
+         \x20     for (long p=0;p<K;p++) s+=a[i*K+p]*b[j*K+p];\n\
+         \x20     c[i*N+j]=s; }}\n}}\n"
     )
 }
 
@@ -1937,12 +2016,17 @@ fn c_linear_omp(ns: usize) -> String {
 }
 
 fn rust_linear(ns: usize) -> String {
+    rust_linear_rect(ns, ns, ns)
+}
+
+/// The rectangular Rust twin of [`c_linear_rect`].
+fn rust_linear_rect(m: usize, k: usize, n: usize) -> String {
     format!(
-        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
-         \x20 for i in 0..NS {{\n\
-         \x20   for j in 0..NS {{ let mut s=0.0f32;\n\
-         \x20     for k in 0..NS {{ s+=*a.add(i*NS+k)* *b.add(j*NS+k); }}\n\
-         \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
+        "const M: usize = {m};\nconst K: usize = {k};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
+         \x20 for i in 0..M {{\n\
+         \x20   for j in 0..N {{ let mut s=0.0f32;\n\
+         \x20     for p in 0..K {{ s+=*a.add(i*K+p)* *b.add(j*K+p); }}\n\
+         \x20     *c.add(i*N+j)=s; }} }}\n}}\n"
     )
 }
 
@@ -4707,11 +4791,22 @@ fn rust_rope_bwd(rows: usize, half: usize) -> String {
     )
 }
 
-/// Gated-FFN activation `out[i] = act(a[i]) * b[i]` (SwiGLU silu / GeGLU gelu) at N=2²⁰. The
-/// activation's exp gcc/rustc keep scalar → Wukong's 256-bit `wukong_vmath2_f32` gate op. The op is
-/// selected 0=silu/1=gelu. All-f32 3-pointer harness `(a, b, out)`.
+/// Gated-FFN activation `out[i] = act(a[i]) * b[i]` (SwiGLU silu / GeGLU gelu). The activation's exp
+/// gcc/rustc keep scalar → Wukong's 256-bit `wukong_vmath2_f32` gate op. The op is selected
+/// 0=silu/1=gelu. All-f32 3-pointer harness `(a, b, out)`.
+///
+/// **Two sizes (added 2026-08-05).** `BENCHMARKS.md` carried this family as "~5–13×" with the note
+/// "per-size table not reproduced here", and the reason there was no per-size table is that the bench
+/// measured exactly one size. `N=2²⁰` (3 × 4 MiB, ~L3-resident) is the compute-bound regime where the
+/// vectorized `exp` is the whole story; `N=2²⁴` (3 × 64 MiB, ≫L3) is the streaming regime where DRAM
+/// bandwidth caps both languages and the ratio must compress. A one-size row cannot distinguish them.
 fn bench_gate(cc: &str, dir: &Path) {
-    let n = 1usize << 20;
+    for n in [1usize << 20, 1usize << 24] {
+        bench_gate_n(cc, dir, n);
+    }
+}
+
+fn bench_gate_n(cc: &str, dir: &Path, n: usize) {
     let a: Vec<f32> = (0..n).map(|i| (i as f32 - (n / 2) as f32) * (12.0 / n as f32)).collect();
     let b: Vec<f32> = (0..n).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
     let mut out = vec![0.0f32; n];
@@ -4723,7 +4818,10 @@ fn bench_gate(cc: &str, dir: &Path) {
             .unwrap_or_else(|| "n/a".into())
     };
     for (name, act) in [("silu (SwiGLU)", "silu"), ("gelu (GeGLU)", "gelu")] {
-        println!("=== gate {name}: out = {act}(a)*b, N=2^20 (GB/s, higher is better) ===");
+        println!(
+            "=== gate {name}: out = {act}(a)*b, N=2^{} (GB/s, higher is better) ===",
+            n.trailing_zeros()
+        );
         let wuk = bench_wukong(&wk_gate(n, act, false), &mut out, ap, bp);
         let wk_par = bench_wukong(&wk_gate(n, act, true), &mut out, ap, bp);
         let (cm, cm_cpp) = bench_c_cpp(
@@ -4980,8 +5078,20 @@ fn report_ratio(
 /// form spreads (128-bit) SIMD across cores. Same `(x, dy, dx)` 3-pointer harness as softmax_bwd (all
 /// three used). The poly derivative differs from C's libm by ~1 ULP, so the cross-check is a
 /// magnitude-normalized tolerance (`max|Δ|/max|C| < 1e-3`), like the norm/softmax benches.
+///
+/// **Two sizes (added 2026-08-05).** This family published a single N and therefore no per-size
+/// table, so a reader could not tell whether the ratio was a compute win or a cache artefact — the
+/// same blank-cell problem as a missing language column. `N=2²⁰` keeps all three buffers (12 MiB)
+/// near L3 so the transcendental cost dominates; `N=2²⁴` (192 MiB) spills it, so the row becomes
+/// bandwidth-bound and the ratio has to fall towards a tie. Both regimes are real; publishing only
+/// the first is picking the flattering one.
 fn bench_act_backward(cc: &str, dir: &Path) {
-    let n = 1usize << 20;
+    for n in [1usize << 20, 1usize << 24] {
+        bench_act_backward_n(cc, dir, n);
+    }
+}
+
+fn bench_act_backward_n(cc: &str, dir: &Path, n: usize) {
     // A realistic pre-activation range [-8, 8) and a small varying upstream gradient.
     let x: Vec<f32> = (0..n)
         .map(|i| (i as f32 - (n / 2) as f32) * (16.0 / n as f32))
@@ -4996,7 +5106,10 @@ fn bench_act_backward(cc: &str, dir: &Path) {
             .unwrap_or_else(|| "n/a".into())
     };
     for op in ["silu", "gelu", "sigmoid", "tanh", "elu", "softplus"] {
-        println!("=== {op}_backward (dx = dy·{op}'(x)) N={n} (GB/s, higher is better) ===");
+        println!(
+            "=== {op}_backward (dx = dy·{op}'(x)) N=2^{} (GB/s, higher is better) ===",
+            n.trailing_zeros()
+        );
         let wuk = bench_wukong(&wk_act_backward(n, op, false), &mut dx, xp, dyp);
         let wk_par = bench_wukong(&wk_act_backward(n, op, true), &mut dx, xp, dyp);
         let (cm, cm_cpp) = bench_c_cpp(
