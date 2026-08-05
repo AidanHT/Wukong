@@ -485,6 +485,16 @@ fn kbench(x: [f32; {sd}], g: [f32; {d}], b: [f32; {d}], mut out: [f32; {sd}]) {{
 /// The same 12-layer block + final LayerNorm as one competent C translation unit. Same loop
 /// structure, same per-head slice extraction, same scratch (passed in), tanh-approx GELU with
 /// Wukong's constants. Exported as `kbench` (block) and `kfinal` (final LayerNorm).
+///
+/// **`__restrict__` on every pointer** (added 2026-08-05). The 2026-08-04 peer audit put the
+/// qualifier on all 43 kernel peers in `main.rs` and its regression test scans that file only — so
+/// the *model* peer, the flagship end-to-end row, kept the exact defect the audit was about: 24
+/// unqualified pointer parameters, plus the `linear_nt` / `layernorm_affine` helpers. gcc therefore
+/// had to assume `out` might alias `in`/`w` and could not vectorize or reorder the GEMM, the slice
+/// extraction or the elementwise passes, while Wukong's tensor parameters carry non-overlap in the
+/// type system — a no-alias compiler measured against a may-alias one, in Wukong's favour.
+/// The qualifier is TRUE here: `run_forward` passes the two ping-pong activation buffers, one
+/// distinct `Vec` per scratch field, and per-layer weight `Vec`s — no two arguments ever overlap.
 fn c_model(cfg: Cfg) -> String {
     let (s, d, h, dff, hd) = (cfg.s, cfg.d, cfg.h, cfg.dff, cfg.hd());
     let scale = 1.0 / (hd as f64).sqrt();
@@ -497,7 +507,7 @@ fn c_model(cfg: Cfg) -> String {
 #define HD {hd}
 #define SCALE {scale}f
 
-static void layernorm_affine(float* t, const float* g, const float* b) {{
+static void layernorm_affine(float* __restrict__ t, const float* __restrict__ g, const float* __restrict__ b) {{
   for (long r = 0; r < S; r++) {{
     float sm = 0.0f;
     for (long i = 0; i < D; i++) sm += t[r*D+i];
@@ -510,7 +520,7 @@ static void layernorm_affine(float* t, const float* g, const float* b) {{
 }}
 
 /* nn.Linear: out[M,N] = in[M,K] . w[N,K]^T (contiguous dot over K for both operands) */
-static void linear_nt(const float* in, const float* w, float* out, long m, long kk, long n) {{
+static void linear_nt(const float* __restrict__ in, const float* __restrict__ w, float* __restrict__ out, long m, long kk, long n) {{
   for (long i = 0; i < m; i++)
     for (long j = 0; j < n; j++) {{
       float acc = 0.0f;
@@ -520,15 +530,15 @@ static void linear_nt(const float* in, const float* w, float* out, long m, long 
 }}
 
 __declspec(dllexport) void kbench(
-    const float* x,
-    const float* ln1g, const float* ln1b,
-    const float* wq, const float* wk, const float* wv, const float* wo,
-    const float* ln2g, const float* ln2b,
-    const float* w1, const float* w2,
-    float* nrm, float* q, float* k, float* v,
-    float* qh, float* kh, float* vt,
-    float* scores, float* ah, float* attn, float* a, float* ff1,
-    float* out) {{
+    const float* __restrict__ x,
+    const float* __restrict__ ln1g, const float* __restrict__ ln1b,
+    const float* __restrict__ wq, const float* __restrict__ wk, const float* __restrict__ wv, const float* __restrict__ wo,
+    const float* __restrict__ ln2g, const float* __restrict__ ln2b,
+    const float* __restrict__ w1, const float* __restrict__ w2,
+    float* __restrict__ nrm, float* __restrict__ q, float* __restrict__ k, float* __restrict__ v,
+    float* __restrict__ qh, float* __restrict__ kh, float* __restrict__ vt,
+    float* __restrict__ scores, float* __restrict__ ah, float* __restrict__ attn, float* __restrict__ a, float* __restrict__ ff1,
+    float* __restrict__ out) {{
   /* 1. LayerNorm1(x) -> nrm */
   for (long i = 0; i < S*D; i++) nrm[i] = x[i];
   layernorm_affine(nrm, ln1g, ln1b);
@@ -587,9 +597,167 @@ __declspec(dllexport) void kbench(
   for (long i = 0; i < S*D; i++) out[i] = a[i] + out[i];
 }}
 
-__declspec(dllexport) void kfinal(const float* x, const float* g, const float* b, float* out) {{
+__declspec(dllexport) void kfinal(const float* __restrict__ x, const float* __restrict__ g, const float* __restrict__ b, float* __restrict__ out) {{
   for (long i = 0; i < S*D; i++) out[i] = x[i];
   layernorm_affine(out, g, b);
+}}
+"
+    )
+}
+
+/// The same 12-layer block + final LayerNorm as one competent **Rust** translation unit — the column
+/// this section never had. Every kernel family in `main.rs` has carried a Rust peer since the suite
+/// existed; the flagship end-to-end row compared Wukong against C and PyTorch only, so the document's
+/// "vs C, C++, and Rust" framing had no Rust behind its most-cited number.
+///
+/// Written the way a competent Rust programmer writes a numeric kernel over foreign buffers: the raw
+/// pointers are turned into **slices** once at the top (`from_raw_parts`), which is both the idiomatic
+/// spelling AND the one that gives LLVM `noalias` — the exact property `__restrict__` gives the C peer,
+/// so the two languages get the same aliasing information rather than Rust being silently handicapped
+/// by raw-pointer may-alias semantics. The inner loops index a pre-sliced ROW (`&a[i*k..i*k+k]`), so
+/// the bounds check is provably redundant and LLVM removes it instead of paying it per element. Same
+/// loop structure, same per-head slice extraction, same caller-provided scratch, same tanh-approx GELU
+/// constants, same strictly-sequential f32 accumulation as the C peer (`acc += …`, not `.sum()` over a
+/// reassociable iterator) — so the comparison is the toolchain, not the algorithm.
+fn rust_model(cfg: Cfg) -> String {
+    let (s, d, h, dff, hd) = (cfg.s, cfg.d, cfg.h, cfg.dff, cfg.hd());
+    let scale = 1.0 / (hd as f64).sqrt();
+    format!(
+        "#![allow(clippy::too_many_arguments)]
+const S: usize = {s};
+const D: usize = {d};
+const H: usize = {h};
+const DFF: usize = {dff};
+const HD: usize = {hd};
+const SCALE: f32 = {scale}f32;
+
+#[inline(always)]
+unsafe fn rp<'a>(p: *const f32, n: usize) -> &'a [f32] {{ core::slice::from_raw_parts(p, n) }}
+#[inline(always)]
+unsafe fn rmp<'a>(p: *mut f32, n: usize) -> &'a mut [f32] {{ core::slice::from_raw_parts_mut(p, n) }}
+
+fn layernorm_affine(t: &mut [f32], g: &[f32], b: &[f32]) {{
+    for r in 0..S {{
+        let row = &mut t[r * D..r * D + D];
+        let mut sm = 0.0f32;
+        for i in 0..D {{ sm += row[i]; }}
+        let mean = sm / D as f32;
+        let mut vv = 0.0f32;
+        for i in 0..D {{ let d0 = row[i] - mean; vv += d0 * d0; }}
+        let inv = 1.0f32 / (vv / D as f32 + 1e-5f32).sqrt();
+        for i in 0..D {{ row[i] = (row[i] - mean) * inv * g[i] + b[i]; }}
+    }}
+}}
+
+/* nn.Linear: out[M,N] = in[M,K] . w[N,K]^T (contiguous dot over K for both operands) */
+fn linear_nt(inp: &[f32], w: &[f32], out: &mut [f32], m: usize, kk: usize, n: usize) {{
+    for i in 0..m {{
+        let arow = &inp[i * kk..i * kk + kk];
+        let orow = &mut out[i * n..i * n + n];
+        for j in 0..n {{
+            let wrow = &w[j * kk..j * kk + kk];
+            let mut acc = 0.0f32;
+            for p in 0..kk {{ acc += arow[p] * wrow[p]; }}
+            orow[j] = acc;
+        }}
+    }}
+}}
+
+#[no_mangle]
+pub unsafe extern \"C\" fn kbench(
+    px: *const f32,
+    pln1g: *const f32, pln1b: *const f32,
+    pwq: *const f32, pwk: *const f32, pwv: *const f32, pwo: *const f32,
+    pln2g: *const f32, pln2b: *const f32,
+    pw1: *const f32, pw2: *const f32,
+    pnrm: *mut f32, pq: *mut f32, pk: *mut f32, pv: *mut f32,
+    pqh: *mut f32, pkh: *mut f32, pvt: *mut f32,
+    pscores: *mut f32, pah: *mut f32, pattn: *mut f32, pa: *mut f32, pff1: *mut f32,
+    pout: *mut f32,
+) {{
+    /* The peers are built without `--edition`, i.e. edition 2015, where a `use core::…` needs an
+       `extern crate`; a fully-qualified path expression does not. Same spelling as every other Rust
+       peer in this suite (see `rust_colsum` in main.rs). */
+    let x = rp(px, S * D);
+    let (ln1g, ln1b) = (rp(pln1g, D), rp(pln1b, D));
+    let (wq, wk, wv, wo) = (rp(pwq, D * D), rp(pwk, D * D), rp(pwv, D * D), rp(pwo, D * D));
+    let (ln2g, ln2b) = (rp(pln2g, D), rp(pln2b, D));
+    let (w1, w2) = (rp(pw1, DFF * D), rp(pw2, D * DFF));
+    let nrm = rmp(pnrm, S * D);
+    let (q, k, v) = (rmp(pq, S * D), rmp(pk, S * D), rmp(pv, S * D));
+    let (qh, kh, vt) = (rmp(pqh, S * HD), rmp(pkh, S * HD), rmp(pvt, HD * S));
+    let (scores, ah) = (rmp(pscores, S * S), rmp(pah, S * HD));
+    let (attn, a, ff1) = (rmp(pattn, S * D), rmp(pa, S * D), rmp(pff1, S * DFF));
+    let out = rmp(pout, S * D);
+
+    /* 1. LayerNorm1(x) -> nrm */
+    nrm.copy_from_slice(x);
+    layernorm_affine(nrm, ln1g, ln1b);
+    /* 2. Q/K/V projections */
+    linear_nt(nrm, wq, q, S, D, D);
+    linear_nt(nrm, wk, k, S, D, D);
+    linear_nt(nrm, wv, v, S, D, D);
+    /* 3. multi-head causal attention over contiguous head slices */
+    for hh in 0..H {{
+        for i in 0..S {{ for p in 0..HD {{ qh[i * HD + p] = q[i * D + hh * HD + p]; }} }}
+        for i in 0..S {{ for p in 0..HD {{ kh[i * HD + p] = k[i * D + hh * HD + p]; }} }}
+        for j in 0..HD {{ for p in 0..S {{ vt[j * S + p] = v[p * D + hh * HD + j]; }} }}
+        for i in 0..S {{
+            let qr = &qh[i * HD..i * HD + HD];
+            for j in 0..S {{
+                let kr = &kh[j * HD..j * HD + HD];
+                let mut acc = 0.0f32;
+                for p in 0..HD {{ acc += qr[p] * kr[p]; }}
+                scores[i * S + j] = SCALE * acc;
+            }}
+        }}
+        for i in 0..S {{ for j in i + 1..S {{ scores[i * S + j] = -1.0e30f32; }} }}
+        for r in 0..S {{
+            let row = &mut scores[r * S..r * S + S];
+            let mut m = row[0];
+            for i in 0..S {{ if row[i] > m {{ m = row[i]; }} }}
+            let mut sm = 0.0f32;
+            for i in 0..S {{ let e = (row[i] - m).exp(); row[i] = e; sm += e; }}
+            let inv = 1.0f32 / sm;
+            for i in 0..S {{ row[i] *= inv; }}
+        }}
+        for i in 0..S {{
+            let sr = &scores[i * S..i * S + S];
+            for j in 0..HD {{
+                let vr = &vt[j * S..j * S + S];
+                let mut acc = 0.0f32;
+                for p in 0..S {{ acc += sr[p] * vr[p]; }}
+                ah[i * HD + j] = acc;
+            }}
+        }}
+        for i in 0..S {{ for j in 0..HD {{ attn[i * D + hh * HD + j] = ah[i * HD + j]; }} }}
+    }}
+    /* 4. output projection + residual */
+    linear_nt(attn, wo, a, S, D, D);
+    for i in 0..S * D {{ a[i] = x[i] + a[i]; }}
+    /* 5. LayerNorm2(a) -> nrm */
+    nrm.copy_from_slice(a);
+    layernorm_affine(nrm, ln2g, ln2b);
+    /* 6. MLP up-projection + tanh-approx GELU (Wukong's gelu constants) */
+    linear_nt(nrm, w1, ff1, S, D, DFF);
+    for i in 0..S * DFF {{
+        let t = ff1[i];
+        let inner = 0.7978846f32 * (0.044715f32 * t * t * t + t);
+        ff1[i] = 0.5f32 * t * (1.0f32 + inner.tanh());
+    }}
+    /* 7. MLP down-projection + residual */
+    linear_nt(ff1, w2, out, S, DFF, D);
+    for i in 0..S * D {{ out[i] = a[i] + out[i]; }}
+}}
+
+#[no_mangle]
+pub unsafe extern \"C\" fn kfinal(px: *const f32, pg: *const f32, pb: *const f32, pout: *mut f32) {{
+    let x = core::slice::from_raw_parts(px, S * D);
+    let g = core::slice::from_raw_parts(pg, D);
+    let b = core::slice::from_raw_parts(pb, D);
+    let out = core::slice::from_raw_parts_mut(pout, S * D);
+    out.copy_from_slice(x);
+    layernorm_affine(out, g, b);
 }}
 "
     )
@@ -751,8 +919,12 @@ fn cross_check_rel(ours: &[f32], peer: &[f32]) -> Result<f64, String> {
     Ok((maxerr / maxabs) as f64)
 }
 
-/// Count the parameters of a generated C prototype. The lists `c_model` emits are flat `float*`
-/// declarations with no nested parentheses, so the commas before the first `)` are the separators.
+/// Count the parameters of a generated peer prototype (C, C++ or Rust). The lists `c_model` and
+/// `rust_model` emit are flat pointer declarations with no nested parentheses, so the comma-separated
+/// segments before the first `)` are the parameters. Non-empty segments are counted rather than
+/// `commas + 1`, because Rust's idiomatic multi-line signature ends with a TRAILING comma — counting
+/// separators reported 25 parameters for a 24-parameter `kbench` and tripped the pre-transmute
+/// assert on a peer that was in fact correct.
 fn c_proto_params(src: &str, marker: &str) -> usize {
     let Some(i) = src.find(marker) else {
         return 0;
@@ -761,7 +933,10 @@ fn c_proto_params(src: &str, marker: &str) -> usize {
     let Some(close) = rest.find(')') else {
         return 0;
     };
-    rest[..close].matches(',').count() + 1
+    rest[..close]
+        .split(',')
+        .filter(|p| !p.trim().is_empty())
+        .count()
 }
 
 struct CModel {
@@ -771,15 +946,23 @@ struct CModel {
     compile: Duration,
 }
 
+/// Compile one model peer. `ext` is the source extension (`"c"` for the gcc columns, `"cpp"` for the
+/// g++ column, `"rs"` for the rustc column) — it selects the file name and therefore the language the
+/// compiler front end picks, so one function drives all three. `kb_marker`/`kf_marker` are the
+/// language's prototype spellings, used only for the pre-transmute arity assert.
+#[allow(clippy::too_many_arguments)]
 fn compile_c_model(
     src: &str,
     dir: &Path,
     name: &str,
+    ext: &str,
     cc: &str,
     args: &[&str],
+    kb_marker: &str,
+    kf_marker: &str,
 ) -> Option<CModel> {
-    let src_path = dir.join(format!("{name}.c"));
-    let dll = dir.join(format!("{name}_c.dll"));
+    let src_path = dir.join(format!("{name}.{ext}"));
+    let dll = dir.join(format!("{name}_{ext}.dll"));
     std::fs::write(&src_path, src).ok()?;
     let t = Instant::now();
     let status = Command::new(cc)
@@ -792,7 +975,7 @@ fn compile_c_model(
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => {
-            eprintln!("{cc} failed to compile {name}.c");
+            eprintln!("{cc} failed to compile {name}.{ext}");
             return None;
         }
         Err(_) => {
@@ -801,19 +984,21 @@ fn compile_c_model(
         }
     }
     // SAFETY (for the two `libloading::get` casts below): `kbench`/`kfinal` are generated by
-    // `c_model`, whose parameter lists and the `BlockFn`/`LnFn` types are edited in separate
-    // places with nothing linking them. Calling a 25-parameter callee through a 24-argument fn
-    // pointer would have it read an uninitialized register as `out` and write S*D f32 through it,
-    // so the generated prototype's arity is counted rather than trusted.
+    // `c_model` / `rust_model`, whose parameter lists and the `BlockFn`/`LnFn` types are edited in
+    // separate places with nothing linking them. Calling a 25-parameter callee through a
+    // 24-argument fn pointer would have it read an uninitialized register as `out` and write S*D
+    // f32 through it, so the generated prototype's arity is counted rather than trusted. The
+    // markers differ per language (`void kbench(` in C, `fn kbench(` in Rust) but the counting rule
+    // — commas before the first `)` — is the same, because neither prototype nests parentheses.
     assert_eq!(
-        c_proto_params(src, "void kbench("),
+        c_proto_params(src, kb_marker),
         C_BLOCK_PARAMS,
-        "c_model's kbench prototype changed but BlockFn was not updated"
+        "the generated kbench prototype changed but BlockFn was not updated"
     );
     assert_eq!(
-        c_proto_params(src, "void kfinal("),
+        c_proto_params(src, kf_marker),
         LN_PARAMS,
-        "c_model's kfinal prototype changed but LnFn was not updated"
+        "the generated kfinal prototype changed but LnFn was not updated"
     );
     unsafe {
         let lib = libloading::Library::new(&dll).ok()?;
@@ -1707,9 +1892,18 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
          -O3 -march=native -ffp-contract=fast"
     );
     println!(
-        "  (the suite's standard basis); C(fast) = same source with -ffast-math (the llama2.c \
-         -Ofast basis). Lower ms is better;"
+        "  (the suite's standard basis); C++(g++) = the IDENTICAL translation unit at the same \
+         flags through the other GCC front end"
     );
+    println!(
+        "  (so \"C++ tracks C\" is measured, not assumed); Rust = the same block as one rustc \
+         -Copt-level=3 -Ctarget-cpu=native cdylib"
+    );
+    println!(
+        "  (foreign pointers sliced once, so LLVM gets the noalias __restrict__ gives the C peer); \
+         C(fast) = same C source with -ffast-math"
+    );
+    println!("  (the llama2.c -Ofast basis). Lower ms is better;");
     println!("  absolute numbers are thermal-bound — the Wukong/C ratio is the stable metric.");
     // Power state: sustained-load timings taken on battery are not comparable to AC runs.
     println!("  {}\n", power_status_line());
@@ -2071,8 +2265,11 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             &c_src,
             dir,
             &format!("model_s{}", cfg.s),
+            "c",
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            "void kbench(",
+            "void kfinal(",
         )
         .map(|cm| {
             let mut run = || unsafe {
@@ -2101,13 +2298,83 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         None
     };
 
+    // --- C++ (g++): the identical translation unit through the other GCC front end, at the same
+    // flags, run under the same naive-forward gate as the C column. Until 2026-08-05 the end-to-end
+    // row had no C++ number at all and BENCHMARKS.md asserted that the C ratio stood for C++; the
+    // point of this column is that the assertion can now be wrong out loud. `cpp_from_c` prepends
+    // `extern "C"` to BOTH exports (`kbench` and `kfinal`), which is all a numeric TU needs.
+    let cpp_m = if run_c_slow {
+        compile_c_model(
+            &crate::cpp_from_c(&c_src),
+            dir,
+            &format!("model_s{}", cfg.s),
+            "cpp",
+            crate::cxx(),
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            "void kbench(",
+            "void kfinal(",
+        )
+        .map(|cm| {
+            let mut run = || unsafe {
+                run_forward(
+                    cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
+                    &mut y,
+                )
+            };
+            let ns = time_forward(&mut run);
+            MeasureModel {
+                compile: cm.compile,
+                ns_per_fwd: ns,
+                out: y.clone(),
+            }
+        })
+    } else {
+        None
+    };
+
+    // --- Rust (rustc -Copt-level=3 -Ctarget-cpu=native): the column this section never had. Same
+    // naive-forward gate as the C column (its `linear_nt` is the same serial-dot nest, so it is just
+    // as slow at S=512). `rust_model` slices the foreign pointers once, which is both the idiomatic
+    // spelling and the one that gives LLVM the `noalias` the C peer gets from `__restrict__`.
+    let rust_m = if run_c_slow {
+        compile_c_model(
+            &rust_model(cfg),
+            dir,
+            &format!("model_s{}", cfg.s),
+            "rs",
+            "rustc",
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            "fn kbench(",
+            "fn kfinal(",
+        )
+        .map(|cm| {
+            let mut run = || unsafe {
+                run_forward(
+                    cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
+                    &mut y,
+                )
+            };
+            let ns = time_forward(&mut run);
+            MeasureModel {
+                compile: cm.compile,
+                ns_per_fwd: ns,
+                out: y.clone(),
+            }
+        })
+    } else {
+        None
+    };
+
     // --- C(fast): identical source, -ffast-math ---
     let cfast_m = if no_c { None } else { compile_c_model(
         &c_src,
         dir,
         &format!("model_s{}_fast", cfg.s),
+        "c",
         cc,
         &["-O3", "-march=native", "-ffast-math", "-shared"],
+        "void kbench(",
+        "void kfinal(",
     )
     .map(|cm| {
         let mut run = || unsafe {
@@ -2288,10 +2555,12 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         None => (None, None, None, None, None),
     };
 
-    let cols: [(&str, &Option<MeasureModel>); 9] = [
+    let cols: [(&str, &Option<MeasureModel>); 11] = [
         ("Wuk(1c)", &wk_m),
         ("Wuk(par)", &wk_par_m),
         ("C(gcc)", &c_m),
+        ("C++(g++)", &cpp_m),
+        ("Rust", &rust_m),
         ("C(fast)", &cfast_m),
         ("T1(sdpa)", &torch1_m),
         ("T1(man)", &torchman_m),
@@ -2404,6 +2673,8 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         }
     };
     ratio_line(&wk_m, &c_m, "(1 core)", "C (gcc -O3 -march=native)");
+    ratio_line(&wk_m, &cpp_m, "(1 core)", "C++ (g++ -O3 -march=native)");
+    ratio_line(&wk_m, &rust_m, "(1 core)", "Rust (rustc -Copt-level=3 -Ctarget-cpu=native)");
     ratio_line(&wk_m, &cfast_m, "(1 core)", "C(fast) (gcc -ffast-math)");
     ratio_line(&wk_par_m, &cfast_m, "@parallel", "C(fast) (single-threaded)");
     ratio_line(
@@ -2492,6 +2763,8 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         }
     };
     check(&wk_m, &c_m, "Wukong vs C", 1e-3);
+    check(&wk_m, &cpp_m, "Wukong vs C++", 1e-3);
+    check(&wk_m, &rust_m, "Wukong vs Rust", 1e-3);
     check(&wk_m, &cfast_m, "Wukong vs C(fast)", 1e-3);
     // Wukong vs torch: same GELU flavor (tanh approx) and eps, so the residual is the same
     // reassociation + poly-vs-libm class as vs C — expect ~1e-5-ish at the standard 1e-3.
@@ -2609,6 +2882,17 @@ mod tests {
         let c = c_model(cfg);
         assert_eq!(c_proto_params(&c, "void kbench("), C_BLOCK_PARAMS, "BlockFn arity");
         assert_eq!(c_proto_params(&c, "void kfinal("), LN_PARAMS, "LnFn arity (C)");
+
+        // The C++ column is the C source through `cpp_from_c`, which must not disturb the prototype.
+        let cpp = crate::cpp_from_c(&c);
+        assert_eq!(c_proto_params(&cpp, "void kbench("), C_BLOCK_PARAMS, "BlockFn arity (C++)");
+        assert_eq!(c_proto_params(&cpp, "void kfinal("), LN_PARAMS, "LnFn arity (C++)");
+
+        // The Rust peer is transmuted through the SAME `BlockFn`/`LnFn`, so it needs the same
+        // assert — with its own prototype spelling, since `c_proto_params` matches a marker.
+        let rs = rust_model(cfg);
+        assert_eq!(c_proto_params(&rs, "fn kbench("), C_BLOCK_PARAMS, "BlockFn arity (Rust)");
+        assert_eq!(c_proto_params(&rs, "fn kfinal("), LN_PARAMS, "LnFn arity (Rust)");
     }
 
     /// Pin the model block's recognized-kernel dispatch sets for BOTH variants. The recognizers
