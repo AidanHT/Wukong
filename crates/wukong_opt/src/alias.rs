@@ -46,12 +46,17 @@
 //! Block parameters are `Unknown` rather than the meet of their incoming arguments. A pointer that
 //! flows through a block parameter therefore loses its provenance, and any `alloca` whose address
 //! reaches a branch argument is marked escaped. This costs precision on loop-carried pointers and
-//! buys a single linear pass with no fixpoint — revisit only if a measurement demands it.
+//! keeps the provenance sweep a simple forward walk — revisit only if a measurement demands it.
+//!
+//! The provenance sweep *does* iterate, but only when it must. The IR contract is dominance, not
+//! block layout, so a `gep`'s base may be defined in a block laid out after it; the sweep repeats
+//! until no fact moves. Measured over `tests/run` (2682 `analyze` calls): 2667 settle in one round,
+//! 15 take three, and the `MAX_PROV_ROUNDS` cap is never reached.
 //!
 //! # The query API
 //!
-//! Build it once per function with [`AliasInfo::analyze`] (three linear passes, one allocation, no
-//! hashing — cheap enough to run per pass invocation, and measured to be so), then ask:
+//! Build it once per function with [`AliasInfo::analyze`] (a linear provenance sweep, a constant
+//! sweep and an escape sweep; one allocation, no hashing), then ask:
 //!
 //! | question | call |
 //! |---|---|
@@ -68,6 +73,15 @@
 //! independent of everything else). Only when the bases may alias do you need a subscript test.
 //! `may_clobber` answers the same question against a whole instruction, including calls. Never
 //! invert an answer: `true` means "not proven", not "proven to alias".
+//!
+//! # Cost
+//!
+//! It is **not free**. `Cse`, `Dse` and `Licm` each build their own on every invocation of every
+//! fixpoint iteration, which measures at ~15-19% of optimizer time over `tests/run` (`CHANGELOG.md`
+//! carries the ABBA numbers). Sharing one instance across the three is the obvious lever and is
+//! deliberately not taken: all three mutate instructions as they go, and an alias fact that outlives
+//! the IR it described is an unsound no-alias answer. Anything cheaper has to come from making the
+//! sweep itself do less, not from caching it across a mutation.
 
 use wukong_mir::{Function, MirType, Op, ValueId};
 use wukong_span::Symbol;
@@ -126,6 +140,14 @@ struct Fact {
     /// `store` addressing, and which may therefore be reached through an `Unknown` pointer or by a
     /// callee.
     escaped: bool,
+    /// Round number in which this value's *definition* was visited by the provenance pass. Compared
+    /// against the current round instead of being reset, so "have I seen the definition yet?" costs
+    /// no clearing sweep between rounds. `0` means never.
+    ///
+    /// `u16`, not `usize`: the round never exceeds `MAX_PROV_ROUNDS`, and this way the stamp fits
+    /// the padding `alloca_bytes`/`escaped` already leave, keeping `Fact` at 32 bytes. See
+    /// `fact_stays_one_cache_friendly_record`.
+    seen: u16,
 }
 
 /// Sentinel for "no constant / no known offset". A real offset this large is unreachable (it would
@@ -140,9 +162,15 @@ impl Default for Fact {
             konst: UNKNOWN_OFF,
             alloca_bytes: u32::MAX,
             escaped: false,
+            seen: 0,
         }
     }
 }
+
+/// Hard cap on provenance rounds. A `gep` chain is a DAG (SSA has no value cycles), so the pass
+/// converges in at most its depth; the cap only bounds the pathological case, and exhausting it
+/// falls back to "every slot escaped", which is sound.
+const MAX_PROV_ROUNDS: u16 = 8;
 
 /// The result of running [`AliasInfo::analyze`] over one function: one `Fact` per SSA value —
 /// provenance, constant offset, alloca size and escape bit, in a flat vector indexed by `ValueId`.
@@ -188,52 +216,97 @@ impl AliasInfo {
             }
         }
 
-        // Provenance. `alloca` and `global_addr` seed bases; `gep` walks them. Because MIR is SSA
-        // and every definition precedes its uses within a block, and blocks are emitted in a order
-        // where a `gep` chain's links stay together, a single layout-order pass settles the common
-        // shapes; anything it cannot see stays `Unknown`, which is the safe answer.
-        for b in &f.blocks {
-            for inst in &b.insts {
-                let Some(res) = inst.result else { continue };
-                let r = res.0 as usize;
-                if r >= n {
-                    continue;
+        // Provenance. `alloca` and `global_addr` seed bases; `gep` walks them.
+        //
+        // The IR contract is **dominance, not layout order**: `wukong_mir`'s verifier walks the
+        // dominator tree precisely so a definition may sit in a block laid out *after* a block that
+        // uses it. A single layout-order sweep would then read a not-yet-visited base as `Unknown`.
+        // For `may_alias` that is merely imprecise, but it is *unsound* for the escape scan below,
+        // which would see `call sink(%g)` with `%g` unclassified and fail to mark the slot `%g`
+        // points into as escaped — reporting a published slot as private. So sweep until every
+        // `gep` has seen its base, tracked with a round stamp so the common (already-ordered) case
+        // still costs exactly one pass.
+        let mut round = 0u16;
+        let stalled = loop {
+            round += 1;
+            let mut late_base = false;
+            let mut changed = false;
+
+            for b in &f.blocks {
+                for &p in &b.params {
+                    if let Some(fact) = info.facts.get_mut(p.0 as usize) {
+                        fact.seen = round;
+                    }
                 }
-                match &inst.op {
-                    Op::Alloca(ty) => {
-                        let fact = &mut info.facts[r];
-                        fact.prov = Prov::Alloca(res);
-                        fact.offset = 0;
-                        fact.alloca_bytes = byte_size(ty).unwrap_or(u32::MAX);
+                for inst in &b.insts {
+                    let Some(res) = inst.result else { continue };
+                    let r = res.0 as usize;
+                    if r >= n {
+                        continue;
                     }
-                    Op::GlobalAddr(sym) => {
-                        let fact = &mut info.facts[r];
-                        fact.prov = Prov::Global(*sym);
-                        fact.offset = 0;
+                    match &inst.op {
+                        Op::Alloca(ty) => {
+                            let fact = &mut info.facts[r];
+                            fact.prov = Prov::Alloca(res);
+                            fact.offset = 0;
+                            fact.alloca_bytes = byte_size(ty).unwrap_or(u32::MAX);
+                        }
+                        Op::GlobalAddr(sym) => {
+                            let fact = &mut info.facts[r];
+                            fact.prov = Prov::Global(*sym);
+                            fact.offset = 0;
+                        }
+                        Op::Gep { ptr, index, elem } => {
+                            // A base whose own definition has not been visited this round is not
+                            // yet classified; its `Unknown` is an artefact of layout, not a fact.
+                            if info
+                                .facts
+                                .get(ptr.0 as usize)
+                                .is_none_or(|fa| fa.seen != round)
+                            {
+                                late_base = true;
+                            }
+                            let base = info.prov(*ptr);
+                            let base_off = info.offset_of(*ptr);
+                            let idx = info
+                                .facts
+                                .get(index.0 as usize)
+                                .map(|fa| fa.konst)
+                                .unwrap_or(UNKNOWN_OFF);
+                            let off = match (base_off, idx) {
+                                (Some(o), k) if k != UNKNOWN_OFF => byte_size(elem)
+                                    .and_then(|e| k.checked_mul(e as i64))
+                                    .and_then(|d| o.checked_add(d))
+                                    .filter(|d| *d != UNKNOWN_OFF),
+                                _ => None,
+                            };
+                            let off = off.unwrap_or(UNKNOWN_OFF);
+                            let fact = &mut info.facts[r];
+                            changed |= fact.prov != base || fact.offset != off;
+                            fact.prov = base;
+                            fact.offset = off;
+                        }
+                        _ => {}
                     }
-                    Op::Gep { ptr, index, elem } => {
-                        let base = info.prov(*ptr);
-                        let base_off = info.offset_of(*ptr);
-                        let idx = info
-                            .facts
-                            .get(index.0 as usize)
-                            .map(|fa| fa.konst)
-                            .unwrap_or(UNKNOWN_OFF);
-                        let off = match (base_off, idx) {
-                            (Some(o), k) if k != UNKNOWN_OFF => byte_size(elem)
-                                .and_then(|e| k.checked_mul(e as i64))
-                                .and_then(|d| o.checked_add(d))
-                                .filter(|d| *d != UNKNOWN_OFF),
-                            _ => None,
-                        };
-                        let fact = &mut info.facts[r];
-                        fact.prov = base;
-                        fact.offset = off.unwrap_or(UNKNOWN_OFF);
-                    }
-                    _ => {}
+                    info.facts[r].seen = round;
                 }
             }
-        }
+
+            // Every `gep` saw its base already classified, so this round used final values and
+            // there is nothing a further round could add. The overwhelmingly common case: one pass.
+            if !late_base {
+                break false;
+            }
+            // Some base was defined in a later-laid-out block. `late_base` says nothing about
+            // progress — it is a property of the *layout*, so it recurs identically every round and
+            // must never be the termination test. The fixpoint test is whether a fact moved.
+            if !changed {
+                break false;
+            }
+            if round >= MAX_PROV_ROUNDS {
+                break true;
+            }
+        };
 
         // Escape. Every use of an alloca-derived value that is not "the pointer operand of a gep,
         // load or store" loses track of the address, so the slot must be assumed reachable through
@@ -241,6 +314,15 @@ impl AliasInfo {
         // to escape, so the whole scan is skipped — worth checking because it is a third of the
         // analysis and this runs on the compiler's hot path.
         if !info.facts.iter().any(|fa| matches!(fa.prov, Prov::Alloca(_))) {
+            return info;
+        }
+        // Provenance never settled (see `MAX_PROV_ROUNDS`). Some `gep` may still be carrying a
+        // spurious `Unknown`, so the escape scan below could miss the slot it belongs to. Concede
+        // every slot instead: "escaped" is always the safe answer.
+        if stalled {
+            for fa in info.facts.iter_mut() {
+                fa.escaped = true;
+            }
             return info;
         }
         for b in &f.blocks {
@@ -368,11 +450,33 @@ impl AliasInfo {
     /// A `call` (or a vector-kernel call, which stores through the pointers handed to it) can write
     /// anything the caller can name — *except* a stack slot of this function whose address never
     /// escaped, which no callee can have an address for.
+    /// The match below is **deliberately exhaustive — never add a `_` arm.** An op that writes
+    /// memory and is not classified as a writer here silently answers "cannot clobber", which is an
+    /// unsound no-alias answer, i.e. a miscompile. Listing every non-writing variant makes a newly
+    /// added `Op` a compile error at this site instead of a silent wrong answer, so the requirement
+    /// is enforced by the compiler rather than by `CONTRIBUTING.md`.
     pub fn may_clobber(&self, ptr: ValueId, bytes: u32, op: &Op) -> bool {
         match op {
             Op::Store { ptr: q, value: _ } => self.may_alias_sized(ptr, bytes, *q, u32::MAX),
             Op::Call { .. } | Op::VecKernelCall { .. } => !self.is_private_stack(ptr),
-            _ => false,
+            // Everything below provably writes no memory.
+            Op::ConstInt(..)
+            | Op::ConstFloat(..)
+            | Op::Bin(..)
+            | Op::Cmp(..)
+            | Op::Neg(..)
+            | Op::Not(..)
+            | Op::Cast(..)
+            | Op::Select(..)
+            | Op::Alloca(..)
+            | Op::Load(..)
+            | Op::Gep { .. }
+            | Op::FuncAddr(..)
+            | Op::GlobalAddr(..)
+            | Op::Splat(..)
+            | Op::Fma(..)
+            | Op::Sqrt(..)
+            | Op::Round(..) => false,
         }
     }
 
@@ -416,6 +520,14 @@ mod tests {
     use super::*;
     use wukong_mir::{BinOp, Builder};
     use wukong_span::Interner;
+
+    /// `Fact` is allocated one-per-SSA-value on the compiler's hot path, so its size is a real
+    /// cost. Pinned here: the round stamp must fit in the padding that `alloca_bytes`/`escaped`
+    /// already leave, not push the record into another 8 bytes.
+    #[test]
+    fn fact_stays_one_cache_friendly_record() {
+        assert_eq!(std::mem::size_of::<Fact>(), 32, "Fact grew");
+    }
 
     fn blob(bytes: u32) -> MirType {
         MirType::Array(Box::new(MirType::I8), bytes)
@@ -536,6 +648,69 @@ mod tests {
         assert!(!info.is_dereferenceable(adyn, 1));
         // ... and a parameter's validity is the caller's business, never ours.
         assert!(!info.is_dereferenceable(p0, 1));
+    }
+
+    /// The IR contract is **dominance**, not layout order: `wukong_mir`'s verifier walks the
+    /// dominator tree precisely so a definition may sit in a block laid out *after* its use. A
+    /// provenance pass that trusts layout order would classify the `gep` below as `Unknown` (its
+    /// base is not visited yet), and the escape scan would then fail to notice that the slot's
+    /// address reached a call — reporting a *published* slot as private. That is an unsound
+    /// no-alias answer, i.e. a miscompile, so provenance must settle before the escape scan
+    /// regardless of how the blocks happen to be ordered.
+    #[test]
+    fn provenance_settles_even_when_a_base_is_laid_out_after_its_use() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("late"), MirType::Void);
+        let use_blk = b.new_block();
+        let def_blk = b.new_block();
+
+        // entry -> def_blk -> use_blk, but the *layout* is entry, use_blk, def_blk.
+        b.br(def_blk, vec![]);
+
+        // `Builder::alloca` always lands in the entry block, so the base itself is never late.
+        // A `gep` is not so constrained: the *middle* of a gep chain can sit in any block, and
+        // here `g1`'s block is laid out after the block that consumes it.
+        let a = b.alloca(blob(16));
+        let z = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        b.br(def_blk, vec![]);
+
+        b.switch_to(def_blk);
+        let g1 = gep(&mut b, a, z);
+        b.br(use_blk, vec![]);
+
+        b.switch_to(use_blk);
+        let g = gep(&mut b, g1, z);
+        b.build_void(Op::Call {
+            func: it.intern("sink"),
+            args: vec![g],
+        });
+        b.ret(None);
+        let f = b.finish();
+
+        // The function really is well-formed: def_blk dominates use_blk.
+        assert!(
+            wukong_mir::verify::verify_function(&f).is_empty(),
+            "{:?}",
+            wukong_mir::verify::verify_function(&f)
+        );
+
+        let info = AliasInfo::analyze(&f);
+        assert_eq!(info.prov(g1), Prov::Alloca(a));
+        assert_eq!(info.prov(g), Prov::Alloca(a), "gep lost its base");
+
+        // The consequence that makes this a miscompile rather than a missed optimization: with
+        // the base lost, nothing marks the slot escaped, so a callee holding its address is told
+        // it cannot write it.
+        assert!(
+            info.alloca_escapes(a),
+            "a slot whose address reached a call was reported private"
+        );
+        assert!(!info.is_private_stack(g));
+        let call = Op::Call {
+            func: it.intern("sink"),
+            args: vec![],
+        };
+        assert!(info.may_clobber(a, 8, &call));
     }
 
     #[test]
