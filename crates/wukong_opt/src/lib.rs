@@ -9,7 +9,11 @@
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
 //!  * **cse** — dominator-tree value numbering with intra-block load forwarding (`-O2`).
 //!  * **dse** — dead-store elimination (`-O2`).
+//!  * **loop-canon** — one shape per loop: a preheader, a single latch, one exit-test polarity
+//!    (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
+//!  * **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting a conditional
+//!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`).
 //!
 //! `cse`, `dse` and `licm` all consult [`alias`], the provenance analysis that answers *can a store
 //! through `q` be seen by a load through `p`?* — the question `mir_build`'s type erasure
@@ -32,11 +36,14 @@ mod dse;
 mod fxhash;
 mod inline;
 mod licm;
+mod loop_canon;
+pub mod loop_info;
 mod mem2reg;
 mod phi;
 mod simplify;
 mod simplify_cfg;
 mod unroll;
+mod vectorize;
 
 pub use alias::{type_bytes, AliasInfo, Prov};
 pub use cache::CfgAnalyses;
@@ -45,11 +52,13 @@ pub use dce::Dce;
 pub use dse::Dse;
 pub use inline::inline_program;
 pub use licm::Licm;
+pub use loop_canon::LoopCanon;
 pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
 pub use unroll::unroll_program;
+pub use vectorize::Vectorize;
 
 use std::time::{Duration, Instant};
 
@@ -148,9 +157,17 @@ impl PassManager {
             // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
             pm.add(Box::new(Cse));
             pm.add(Box::new(Dse));
+            // Put every loop into one shape before LICM runs: LICM hoists only into a preheader
+            // that already exists, so a loop given one here becomes hoistable in the same sweep.
+            pm.add(Box::new(LoopCanon));
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
+            // Widening comes last, on the cleanest MIR the pipeline produces: canonical loops with
+            // one latch and one exit-test polarity, invariants already hoisted, and dead code gone.
+            // Everything it emits is fed back through the fixpoint, so the vector body gets the
+            // same simplification, CSE and DCE the scalar body did.
+            pm.add(Box::new(Vectorize::default()));
         }
         pm
     }
@@ -325,6 +342,7 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
         | Op::Cast(_, a, _)
         | Op::Load(a, _)
         | Op::Splat(a)
+        | Op::ExtractLane(a, _)
         | Op::Sqrt(a)
         | Op::Round(_, a) => {
             *a = f(*a);
@@ -401,6 +419,7 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
         | Op::Cast(_, a, _)
         | Op::Load(a, _)
         | Op::Splat(a)
+        | Op::ExtractLane(a, _)
         | Op::Sqrt(a)
         | Op::Round(_, a) => f(*a),
         Op::Select(c, a, b) | Op::Fma(c, a, b) => {

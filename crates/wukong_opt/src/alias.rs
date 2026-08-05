@@ -474,6 +474,7 @@ impl AliasInfo {
             | Op::FuncAddr(..)
             | Op::GlobalAddr(..)
             | Op::Splat(..)
+            | Op::ExtractLane(..)
             | Op::Fma(..)
             | Op::Sqrt(..)
             | Op::Round(..) => false,

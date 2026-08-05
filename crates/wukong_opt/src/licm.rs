@@ -220,6 +220,7 @@ fn safe_to_hoist(f: &Function, op: &Op, alias: &AliasInfo, mem: &LoopMem) -> boo
         | Op::FuncAddr(..)
         | Op::GlobalAddr(..)
         | Op::Splat(..)
+        | Op::ExtractLane(..)
         | Op::Fma(..)
         | Op::Sqrt(..)
         | Op::Round(..) => true,

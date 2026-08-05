@@ -130,6 +130,7 @@ enum Key {
     FuncAddr(u32),
     GlobalAddr(u32),
     Splat(u32),
+    ExtractLane(u32, u32),
     Fma(u32, u32, u32),
     Sqrt(u32),
     Round(u8, u32),
@@ -251,6 +252,7 @@ fn pure_key(op: &Op, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
         Op::FuncAddr(s) => Key::FuncAddr(s.0),
         Op::GlobalAddr(s) => Key::GlobalAddr(s.0),
         Op::Splat(a) => Key::Splat(m(*a)),
+        Op::ExtractLane(a, k) => Key::ExtractLane(m(*a), *k),
         Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
         Op::Sqrt(a) => Key::Sqrt(m(*a)),
         Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
@@ -362,5 +364,129 @@ mod tests {
         let mut cache = CfgAnalyses::default();
         Cse.run_function(&mut f, &mut cache);
         assert_eq!(count_loads(&f), 2, "{}", wukong_mir::print::print_function(&f, &it));
+    }
+
+    use wukong_mir::{BasicBlock, BlockId, Inst, Terminator};
+
+    /// Two loads of *different types* from one slot must not be forwarded to each other.
+    ///
+    /// The forwarding table used to be keyed by the slot alone, so the second load below was
+    /// rewritten to the first one's value and an `f32` operand ended up holding a `<4 x f32>`.
+    /// Nothing in the corpus reached it — the front end always addresses a slot through a
+    /// `gep slot, 0 : T`, and the two geps are distinct *values*, so the table was never consulted
+    /// with two types for one slot. Folding that zero-index gep to the slot itself (a
+    /// canonicalization) makes both loads name the slot directly and reaches it immediately.
+    #[test]
+    fn loads_of_different_types_from_one_slot_are_not_forwarded() {
+        let v4 = MirType::Vec(Box::new(MirType::F32), 4);
+        let mut interner = Interner::new();
+        let mut f = Function {
+            name: interner.intern("t"),
+            params: Vec::new(),
+            ret: MirType::F32,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                insts: vec![
+                    // v0 = alloca [4 x f32]
+                    Inst {
+                        result: Some(ValueId(0)),
+                        op: Op::Alloca(MirType::Array(Box::new(MirType::F32), 4)),
+                    },
+                    // v1 = load <4 x f32> v0   (the vectorizer's lane load)
+                    Inst {
+                        result: Some(ValueId(1)),
+                        op: Op::Load(ValueId(0), v4.clone()),
+                    },
+                    // v2 = load f32 v0         (the same address, read as one scalar)
+                    Inst {
+                        result: Some(ValueId(2)),
+                        op: Op::Load(ValueId(0), MirType::F32),
+                    },
+                ],
+                term: Terminator::Ret(Some(ValueId(2))),
+            }],
+            value_types: vec![MirType::Ptr, v4, MirType::F32],
+            entry: BlockId(0),
+            vec_kernels: Vec::new(),
+        };
+        assert!(
+            wukong_mir::verify::verify_function(&f).is_empty(),
+            "the input is well-formed"
+        );
+        let mut cache = CfgAnalyses::default();
+        Cse.run_function(&mut f, &mut cache);
+        let errs = wukong_mir::verify::verify_function(&f);
+        assert!(errs.is_empty(), "cse produced invalid MIR: {errs:?}");
+        assert!(
+            matches!(f.blocks[0].term, Terminator::Ret(Some(v)) if v == ValueId(2)),
+            "the f32 load must survive as its own value"
+        );
+    }
+
+    /// A store invalidates *every* view of the slot, not just the one at the stored type: writing
+    /// one `f32` lane leaves a previously loaded `<4 x f32>` stale in three lanes.
+    #[test]
+    fn a_scalar_store_invalidates_a_wider_cached_load() {
+        let v4 = MirType::Vec(Box::new(MirType::F32), 4);
+        let mut interner = Interner::new();
+        let mut f = Function {
+            name: interner.intern("t"),
+            params: Vec::new(),
+            ret: MirType::Void,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                insts: vec![
+                    Inst {
+                        result: Some(ValueId(0)),
+                        op: Op::Alloca(MirType::Array(Box::new(MirType::F32), 4)),
+                    },
+                    // v1 = load <4 x f32> v0
+                    Inst {
+                        result: Some(ValueId(1)),
+                        op: Op::Load(ValueId(0), v4.clone()),
+                    },
+                    // v2 = 1.0f32 ; store v2 -> v0
+                    Inst {
+                        result: Some(ValueId(2)),
+                        op: Op::ConstFloat(1.0, MirType::F32),
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::Store {
+                            ptr: ValueId(0),
+                            value: ValueId(2),
+                        },
+                    },
+                    // v3 = load <4 x f32> v0  -- must NOT be forwarded to v1
+                    Inst {
+                        result: Some(ValueId(3)),
+                        op: Op::Load(ValueId(0), v4.clone()),
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::Store {
+                            ptr: ValueId(0),
+                            value: ValueId(3),
+                        },
+                    },
+                ],
+                term: Terminator::Ret(None),
+            }],
+            value_types: vec![MirType::Ptr, v4.clone(), MirType::F32, v4],
+            entry: BlockId(0),
+            vec_kernels: Vec::new(),
+        };
+        let mut cache = CfgAnalyses::default();
+        Cse.run_function(&mut f, &mut cache);
+        assert!(wukong_mir::verify::verify_function(&f).is_empty());
+        let reload_survives = f.blocks[0].insts.iter().any(
+            |i| matches!(&i.op, Op::Store { value, .. } if *value == ValueId(3)),
+        );
+        assert!(
+            reload_survives,
+            "the reload after the scalar store must not be forwarded to the pre-store value"
+        );
     }
 }

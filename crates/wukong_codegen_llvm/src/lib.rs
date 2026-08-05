@@ -339,6 +339,10 @@ impl Emitter<'_> {
                     self.operand(*v),
                 )
             }
+            Op::ExtractLane(v, k) => {
+                let vty = self.ty(*v);
+                format!("{res}extractelement {vty} {}, i32 {k}", self.operand(*v))
+            }
             Op::Fma(a, b, c) => {
                 // `a*b + c`. Emitted as a `contract`-flagged mul/add pair so llc fuses it into a
                 // hardware FMA under `-ffp-contract=fast` — no module-level intrinsic `declare`
