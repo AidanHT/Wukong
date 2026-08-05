@@ -690,6 +690,172 @@ fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
     }
 }
 
+// ---- struct-field buffer bases ----------------------------------------------------------------
+//
+// A weight held in a struct field (`l.wq[j*D+p]`) is the way every real model groups its
+// parameters, but every kernel recognizer names its buffer operands by a bare `Symbol` — so a
+// `Field` base fell out of `single_path` and the whole nest declined, at every `-O`, on both
+// backends. The fix keeps the `Symbol` vocabulary: the projection `l.wq` is named by the
+// **synthetic symbol** for the text `"l.wq"`, which cannot collide with a user identifier because
+// `.` is not an identifier character.
+//
+// `FnLowerer` holds only a shared `&Interner`, so the names must be minted here, in the one place
+// that has `&mut Interner`. Only projections that actually appear as the base of an `Index` are
+// interned, so a program that never indexes a struct field pays nothing and mints nothing.
+
+/// Intern `"<base>.<field>"` for every `base.field[…]` index in the module — the synthetic names
+/// [`buffer_base`] resolves a struct-field kernel operand through. Walk order is source order, so
+/// the symbol numbering is a deterministic function of the input (`determinism.rs`).
+fn intern_field_bases(module: &Module, interner: &mut Interner) {
+    let mut pairs: Vec<(Symbol, Symbol)> = Vec::new();
+    for item in &module.items {
+        if let ast::ItemKind::Fn(f) = &item.kind {
+            if let Some(body) = &f.body {
+                collect_field_bases_block(body, &mut pairs);
+            }
+        }
+    }
+    for (base, field) in pairs {
+        let key = format!("{}.{}", interner.resolve(base), interner.resolve(field));
+        interner.intern(&key);
+    }
+}
+
+fn collect_field_bases_block(b: &Block, out: &mut Vec<(Symbol, Symbol)>) {
+    for s in &b.stmts {
+        collect_field_bases_stmt(s, out);
+    }
+    if let Some(t) = &b.tail {
+        collect_field_bases_expr(t, out);
+    }
+}
+
+fn collect_field_bases_stmt(s: &Stmt, out: &mut Vec<(Symbol, Symbol)>) {
+    match &s.kind {
+        StmtKind::Let { init, .. } => {
+            if let Some(e) = init {
+                collect_field_bases_expr(e, out);
+            }
+        }
+        StmtKind::Assign { target, value, .. } => {
+            collect_field_bases_expr(target, out);
+            collect_field_bases_expr(value, out);
+        }
+        StmtKind::Expr(e) | StmtKind::Defer(e) => collect_field_bases_expr(e, out),
+        StmtKind::Return(o) => {
+            if let Some(e) = o {
+                collect_field_bases_expr(e, out);
+            }
+        }
+        StmtKind::Break(_, val) => {
+            if let Some(v) = val {
+                collect_field_bases_expr(v, out);
+            }
+        }
+        StmtKind::Continue(_) => {}
+        StmtKind::While { cond, body, .. } => {
+            collect_field_bases_expr(cond, out);
+            collect_field_bases_block(body, out);
+        }
+        StmtKind::For { iter, body, .. } => {
+            match iter {
+                ForIter::Range {
+                    start, end, step, ..
+                } => {
+                    collect_field_bases_expr(start, out);
+                    if let Some(e) = end {
+                        collect_field_bases_expr(e, out);
+                    }
+                    if let Some(e) = step {
+                        collect_field_bases_expr(e, out);
+                    }
+                }
+                ForIter::Expr(e) => collect_field_bases_expr(e, out),
+            }
+            collect_field_bases_block(body, out);
+        }
+    }
+}
+
+fn collect_field_bases_expr(e: &Expr, out: &mut Vec<(Symbol, Symbol)>) {
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => {}
+        ExprKind::Unary { expr, .. } => collect_field_bases_expr(expr, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_field_bases_expr(lhs, out);
+            collect_field_bases_expr(rhs, out);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            collect_field_bases_expr(callee, out);
+            for a in args {
+                collect_field_bases_expr(a, out);
+            }
+        }
+        ExprKind::Index { base, indices } => {
+            // The one shape that mints a name: `<local>.<field>[…]`.
+            if let ExprKind::Field { base: sbase, name } = &base.kind {
+                if let Some(b) = single_path(sbase) {
+                    out.push((b, name.sym));
+                }
+            }
+            collect_field_bases_expr(base, out);
+            for i in indices {
+                collect_field_bases_expr(i, out);
+            }
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+            collect_field_bases_expr(base, out)
+        }
+        ExprKind::Cast { expr, .. } => collect_field_bases_expr(expr, out),
+        ExprKind::StructLit { fields, rest, .. } => {
+            for f in fields {
+                collect_field_bases_expr(&f.value, out);
+            }
+            if let Some(r) = rest {
+                collect_field_bases_expr(r, out);
+            }
+        }
+        ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => {
+            for it in items {
+                collect_field_bases_expr(it, out);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            collect_field_bases_expr(value, out);
+            collect_field_bases_expr(count, out);
+        }
+        ExprKind::Block(b) => collect_field_bases_block(b, out),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_field_bases_expr(cond, out);
+            collect_field_bases_block(then_branch, out);
+            if let Some(e) = else_branch {
+                collect_field_bases_expr(e, out);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_field_bases_expr(scrutinee, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_field_bases_expr(g, out);
+                }
+                collect_field_bases_expr(&arm.body, out);
+            }
+        }
+        ExprKind::Loop { body, .. } => collect_field_bases_block(body, out),
+    }
+}
+
 /// Lower a whole module to a MIR [`Program`]. Only functions with bodies are lowered, and a
 /// type-generic template is skipped in favour of its monomorphized instances.
 ///
@@ -910,6 +1076,10 @@ pub fn lower_program(
     let (str_table, statics) = collect_static_strings(module, sema, interner);
     mono.strings = str_table;
     program.statics = statics;
+    // Mint the synthetic `"<local>.<field>"` names for every struct-field buffer base the module
+    // indexes, so a recognizer holding only `&Interner` can name `l.wq` as an operand and
+    // `kernel_base_ptr` can resolve it. Must run before any recognizer probe looks at the tree.
+    intern_field_bases(module, interner);
     // Pre-intern the outlined-body symbol pool for mid-function `@parallel` loop regions (the
     // lowerer itself holds only a shared `&Interner`, so it cannot intern lazily). Only a module
     // that has at least one `@parallel` item pays for the pool.
@@ -1519,6 +1689,7 @@ fn is_batched_norm_fn(
         interner,
         diags: &mut diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -1566,6 +1737,7 @@ fn is_bias_bcast_fn(
         interner,
         diags: &mut diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -1618,6 +1790,7 @@ fn lower_fn(
         interner,
         diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -1670,6 +1843,9 @@ fn lower_fn(
             // The parameter value *is* the aggregate's base pointer; bind it directly so field/index
             // access geps off it (no copy into a local slot).
             fl.bind_slice(p.name.sym, val, mty, is_slice);
+            // A struct parameter arrives as its buffer pointer, so its buffer fields are addressable
+            // right here: record them so `l.wq[…]` is a kernel operand like a bare `wq[…]`.
+            fl.bind_field_bases(p.name.sym, val, pty);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {
@@ -1811,6 +1987,7 @@ fn lower_parallel(
             interner,
             diags: &mut *diags,
             scopes: vec![HashMap::default()],
+            field_bases: vec![HashMap::default()],
             terminated: false,
             loops: Vec::new(),
             gemm,
@@ -1851,6 +2028,10 @@ fn lower_parallel(
             // slice — same reasoning as the tensor case above, and what lets `kernel_base_ptr`
             // load the data pointer for a kernel dispatched inside the outlined body.
             fl.bind_slice(p.name.sym, base, mty, matches!(pty, Ty::Slice(_)));
+            // A struct param's buffer fields are addressable off the env-loaded base pointer, so a
+            // kernel dispatched inside the outlined body can name `l.wq` exactly as `lower_fn` lets
+            // the serial spelling.
+            fl.bind_field_bases(p.name.sym, base, pty);
         }
         // The index variable's source type (the range's element type) drives the loop so the
         // body's index arithmetic matches sema; the i64 runtime bounds are coerced into it.
@@ -1871,6 +2052,7 @@ fn lower_parallel(
             interner,
             diags: &mut *diags,
             scopes: vec![HashMap::default()],
+            field_bases: vec![HashMap::default()],
             terminated: false,
             loops: Vec::new(),
             gemm,
@@ -2581,6 +2763,19 @@ struct FnLowerer<'a> {
     /// data matrix as a base pointer. A slot value is unique within a function, so this needs no
     /// scope discipline: a shadowing binding gets a fresh slot and is simply absent from the set.
     slice_slots: HashSet<ValueId>,
+    /// Struct-**field** buffer bases: the synthetic `"<local>.<field>"` symbol (minted by
+    /// [`intern_field_bases`]) mapped to `(base name, base slot, field address, field slot type)` —
+    /// the address of that field inside the struct local's byte buffer, plus the binding it was
+    /// derived from so [`FnLowerer::field_base`] can revalidate it. Recorded by
+    /// [`FnLowerer::bind_field_bases`] at every site that binds a struct local/parameter, and read
+    /// **only** by [`FnLowerer::kernel_base_ptr`].
+    ///
+    /// Deliberately *not* in `scopes`: a synthetic symbol must be unresolvable by the plain
+    /// `lookup` every non-kernel path uses, so a consumer that skipped `kernel_base_ptr` gets
+    /// `None` and declines instead of silently using the field's *address* as its data pointer —
+    /// the fail-closed form of LANDMINE 1. Stacked in lockstep with `scopes` (`push_scope` /
+    /// `pop_scope`) so a shadowing `let l: Other` in an inner block does not outlive its scope.
+    field_bases: Vec<HashMap<Symbol, (Symbol, ValueId, ValueId, MirType)>>,
 }
 
 impl FnLowerer<'_> {
@@ -2600,14 +2795,105 @@ impl FnLowerer<'_> {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::default());
+        self.field_bases.push(HashMap::default());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.field_bases.pop();
     }
 
     fn bind(&mut self, name: Symbol, slot: ValueId, ty: MirType) {
         self.scopes.last_mut().unwrap().insert(name, (slot, ty));
+    }
+
+    /// Record the buffer fields of a struct local/parameter `name` bound at `slot`, so a kernel
+    /// operand written `name.field[…]` resolves through the *same* base-pointer path as a bare
+    /// local. Each buffer field's address inside the struct's byte buffer is GEP'd once here and
+    /// filed under the synthetic `"name.field"` symbol; [`Self::kernel_base_ptr`] then applies the
+    /// ordinary rule — a `Ptr`/slice slot is loaded, an `Array` slot *is* the storage.
+    ///
+    /// A `[]T` field goes into `slice_slots` exactly like a `[]T` local: the field holds the
+    /// 16-byte fat pointer, so the data pointer is one `Load` at `SLICE_PTR_OFF`. Omitting that
+    /// would hand the kernel the fat-pointer buffer and print zeros on both backends at every
+    /// `-O` (LANDMINE 1). Only *buffer* fields are recorded — a scalar field is not a kernel
+    /// operand, and recording it would let a future consumer treat its address as a base pointer.
+    ///
+    /// A no-op (no GEP emitted) unless the module actually indexes that field, because the
+    /// synthetic name only exists when [`intern_field_bases`] saw a `name.field[…]` somewhere.
+    /// Nothing here is a struct *pointer* (`p: *mut S`): the field address would be derived from a
+    /// pointer value snapshotted at bind time, which a later `p = …` would invalidate.
+    fn bind_field_bases(&mut self, name: Symbol, slot: ValueId, ty: &Ty) {
+        let Ty::Named(sname) = ty else { return };
+        if self.enum_is_data_carrying(*sname) {
+            return;
+        }
+        let (Some(layout), Some(ftys)) = (self.struct_layout(*sname), self.struct_field_tys(*sname))
+        else {
+            return;
+        };
+        let base_txt = self.interner.resolve(name).to_string();
+        for ((fname, off, fmty), (_, fty)) in layout.into_iter().zip(ftys) {
+            if !ty_is_kernel_buffer(&fty) {
+                continue;
+            }
+            let Some(sym) = self
+                .interner
+                .get(&format!("{base_txt}.{}", self.interner.resolve(fname)))
+            else {
+                continue;
+            };
+            let p = self.field_ptr(slot, off);
+            if matches!(fty, Ty::Slice(_)) {
+                self.slice_slots.insert(p);
+            }
+            self.field_bases
+                .last_mut()
+                .unwrap()
+                .insert(sym, (name, slot, p, fmty.clone()));
+        }
+    }
+
+    /// The semantic type of a `let` binding, for [`Self::bind_field_bases`]: the initializer's sema
+    /// type when there is one (the authority — it already resolves a call's return type, a generic
+    /// instantiation, and a struct literal), else a bare `Name` annotation taken as `Ty::Named`.
+    /// `Ty::Unknown` otherwise, which `bind_field_bases` ignores.
+    fn let_binding_ty(&self, ty: Option<&ast::TypeExpr>, init: Option<&Expr>) -> Ty {
+        if let Some(e) = init {
+            let t = self.expr_ty(e);
+            if !matches!(t, Ty::Unknown) {
+                return t;
+            }
+        }
+        match ty.map(|t| &t.kind) {
+            Some(ast::TypeKind::Path(p)) => {
+                let sym = p.segments.last().unwrap().sym;
+                match self.subst.get(&sym) {
+                    Some(concrete) => concrete.clone(),
+                    None => Ty::Named(sym),
+                }
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// The recorded `(address, slot type)` of a struct-field buffer base, innermost scope first.
+    ///
+    /// **Revalidated against the current binding of the base name.** The record is only meaningful
+    /// while `base` still names the very slot the field address was GEP'd from: an inner
+    /// `let l: *mut Layer` / `let l: &Layer` shadows the outer struct in `scopes` but records no
+    /// field bases of its own (a pointer's target can be reassigned, so no address may be
+    /// snapshotted), and without this check the outer struct's field address would leak into the
+    /// inner scope and hand a kernel the wrong buffer. A failed check declines outright rather than
+    /// continuing to an outer scope — the name has been shadowed, so no outer record applies.
+    fn field_base(&self, name: Symbol) -> Option<(ValueId, MirType)> {
+        for s in self.field_bases.iter().rev() {
+            if let Some((base, base_slot, ptr, ty)) = s.get(&name) {
+                let (cur, _) = self.lookup(*base)?;
+                return (cur == *base_slot).then(|| (*ptr, ty.clone()));
+            }
+        }
+        None
     }
 
     /// Bind a name whose sema type is `[]T` — a slice. Identical to [`Self::bind`] plus a record
@@ -3953,8 +4239,13 @@ impl FnLowerer<'_> {
 
     /// `arr[v]` where `arr != x` (the data) → `arr`: a per-column affine parameter array (gamma/beta)
     /// indexed by the normalize loop variable. Pure.
+    ///
+    /// A struct-field gamma (`l.g1[i]` — the RMSNorm weight of every real transformer block) is
+    /// admitted through [`buffer_base`]: `emit_norm` is the only consumer and resolves both gamma
+    /// and beta with `kernel_base_ptr`, the same path the data buffer takes.
     fn affine_index(&self, e: &Expr, v: Symbol, x: Symbol) -> Option<Symbol> {
-        match self.index_by_loopvar(e, v) {
+        let base = self.index_off_base(e, v, None)?;
+        match buffer_base(base, self.interner) {
             Some(a) if a != x => Some(a),
             _ => None,
         }
@@ -7322,7 +7613,16 @@ impl FnLowerer<'_> {
                     (None, None) => false,
                 };
                 match &pat.kind {
-                    ast::PatKind::Ident(name) => self.bind_slice(*name, slot, mty, is_slice),
+                    ast::PatKind::Ident(name) => {
+                        self.bind_slice(*name, slot, mty, is_slice);
+                        // `let l: Layer = Layer { … }` — record the struct's buffer fields so a
+                        // kernel nest over `l.wq[…]` resolves its base like a bare local's. The
+                        // slot is this `let`'s own storage, so the field addresses stay valid for
+                        // the whole scope, and `kernel_base_ptr` re-loads a slice field's data
+                        // pointer at the call site (a later `l.wq = other` is therefore seen).
+                        let lty = self.let_binding_ty(ty.as_ref(), init.as_ref());
+                        self.bind_field_bases(*name, slot, &lty);
+                    }
                     // Destructuring `let (a, b) = …`: bind each sub-pattern to its tuple field's
                     // place within the slot (a scalar field reads via a `Load`, an aggregate field
                     // binds its pointer). Recurses for a nested tuple pattern.
@@ -7744,7 +8044,14 @@ impl FnLowerer<'_> {
     /// fixed-array operand (so existing matmuls stay byte-identical); `None` when `sym` is not bound
     /// here at all, which every caller turns into "decline, lower the scalar nest".
     fn kernel_base_ptr(&mut self, sym: Symbol) -> Option<ValueId> {
-        let (val, ty) = self.lookup(sym)?;
+        // A struct-field operand (`l.wq`) is named by a synthetic `"l.wq"` symbol that no binding
+        // ever puts in `scopes`, so `lookup` misses and `field_bases` supplies the field's address
+        // and slot type. From there the rule below is *identical* to a bare local's — which is the
+        // whole point: a weight in a struct must resolve like any other base.
+        let (val, ty) = match self.lookup(sym) {
+            Some(v) => v,
+            None => self.field_base(sym)?,
+        };
         // A pointer/tensor operand keeps its base pointer in the slot; a `[]T` slice keeps a fat
         // pointer whose *data* pointer is the first word (SLICE_PTR_OFF = 0) — both are read by loading
         // `Ptr` from the slot. A fixed `[T; N]` array's slot *is* its storage, so its base is the slot
@@ -11189,6 +11496,7 @@ impl FnLowerer<'_> {
                 interner: self.interner,
                 diags: &mut tmp_diags,
                 scopes: vec![HashMap::default()],
+                field_bases: vec![HashMap::default()],
                 terminated: false,
                 loops: Vec::new(),
                 gemm: self.gemm,
@@ -11418,6 +11726,20 @@ impl FnLowerer<'_> {
     /// and the per-row width. With `batch = None` it is exactly `base[j]` (the single-row case). The
     /// `row*cols` term may be written either factor order. Returns the base array symbol. Pure.
     fn index_off(&self, e: &Expr, j: Symbol, batch: Option<(Symbol, &Expr)>) -> Option<Symbol> {
+        single_path(self.index_off_base(e, j, batch)?)
+    }
+
+    /// [`Self::index_off`] restricted to *reading the base expression* — the shared index-shape
+    /// check, split out so a caller whose result is consumed by
+    /// [`Self::kernel_base_ptr`] can also admit a struct-field base via [`buffer_base`], while every
+    /// other caller (there are ~60, many feeding vectorizer paths that read a slot directly) keeps
+    /// the strict single-path rule and is unaffected.
+    fn index_off_base<'e>(
+        &self,
+        e: &'e Expr,
+        j: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<&'e Expr> {
         let ExprKind::Index { base, indices } = &e.kind else {
             return None;
         };
@@ -11449,7 +11771,7 @@ impl FnLowerer<'_> {
                 }
             }
         }
-        single_path(base)
+        Some(base)
     }
 
     /// Is `e` the product `row * cols` (either factor order) — the row base offset of a flat
@@ -19543,6 +19865,45 @@ fn single_path(e: &Expr) -> Option<Symbol> {
     }
 }
 
+/// The operand symbol of a kernel **buffer base** expression: a bare local `w` (→ its own symbol),
+/// or a struct-field projection `l.w` (→ the synthetic `"l.w"` symbol [`intern_field_bases`] minted
+/// for it). `None` for anything else, which every caller turns into "decline".
+///
+/// This is the *only* widening of the recognizers' base vocabulary: a buffer held in a struct field
+/// — how every real model groups its weights — used to fall out of [`single_path`] and take the
+/// whole nest with it, so a transformer block written with `l.wq[j*D+p]` dispatched 7 kernels where
+/// the identical block over bare params dispatched 16.
+///
+/// Use it **only** where the result is consumed by [`FnLowerer::kernel_base_ptr`]. A synthetic
+/// symbol is deliberately invisible to `lookup`, so a consumer that reads the slot directly gets
+/// `None` and declines rather than mistaking the field's address for its data pointer.
+fn buffer_base(e: &Expr, interner: &Interner) -> Option<Symbol> {
+    if let Some(s) = single_path(e) {
+        return Some(s);
+    }
+    let ExprKind::Field { base, name } = &e.kind else {
+        return None;
+    };
+    let b = single_path(base)?;
+    // `get`, never `intern`: a name that was not minted from a real `l.f[…]` in this module is not
+    // one `bind_field_bases` can have recorded, so declining is the only sound answer.
+    interner.get(&format!(
+        "{}.{}",
+        interner.resolve(b),
+        interner.resolve(name.sym)
+    ))
+}
+
+/// Can a value of this type be a kernel buffer operand — i.e. does it hold (or *is* it) a base
+/// pointer a `wukong_runtime` kernel can read elements from? Drives which struct fields
+/// [`FnLowerer::bind_field_bases`] records; a scalar field is never a kernel operand.
+fn ty_is_kernel_buffer(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Slice(_) | Ty::Array { .. } | Ty::Tensor { .. } | Ty::Ptr { .. }
+    )
+}
+
 /// The single statement of a one-statement, tail-less block (the shape every per-pass norm loop body
 /// has); `None` otherwise.
 fn single_stmt(body: &Block) -> Option<&Stmt> {
@@ -19907,6 +20268,7 @@ fn match_bias_dot_store<'a>(
     s_sym: Symbol,
     jvar: Symbol,
     bound: &[Symbol],
+    interner: &Interner,
 ) -> Option<(Symbol, Vec<&'a Expr>)> {
     let ExprKind::Binary {
         op: ast::BinOp::Add,
@@ -19924,7 +20286,7 @@ fn match_bias_dot_store<'a>(
     } else {
         return None;
     };
-    let (base, off) = match_bias_index(bias_expr, jvar)?;
+    let (base, off) = match_bias_index(bias_expr, jvar, interner)?;
     // The bias base offset must not depend on the matmul's own loop vars (else it is not a per-call
     // constant pointer shift): exactly the `offset_invariant` discipline used for a/b/c offsets.
     if !offset_invariant(&off, bound) {
@@ -19937,14 +20299,20 @@ fn match_bias_dot_store<'a>(
 /// flattened index must contain the bare `col` term exactly once; whatever remains is the (checked
 /// loop-invariant) base offset — `w[base + REL_BQ + j]` → `(w, [base, REL_BQ])`, `bias[j]` → `(bias,
 /// [])`. `None` for anything that is not a single-index array read carrying the bare `col`.
-fn match_bias_index<'a>(e: &'a Expr, col: Symbol) -> Option<(Symbol, Vec<&'a Expr>)> {
+fn match_bias_index<'a>(
+    e: &'a Expr,
+    col: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, Vec<&'a Expr>)> {
     let ExprKind::Index { base, indices } = &e.kind else {
         return None;
     };
     if indices.len() != 1 {
         return None;
     }
-    let base_sym = single_path(base)?;
+    // A struct-field bias (`l.b1[j]`, the shape a real MLP writes) resolves like a bare one;
+    // `emit_sgemm`'s fused-epilogue arm takes it through `kernel_base_ptr`.
+    let base_sym = buffer_base(base, interner)?;
     let mut terms = Vec::new();
     flatten_add_terms(&indices[0], &mut terms);
     let col_pos = terms.iter().position(|t| single_path(t) == Some(col))?;
@@ -20584,7 +20952,10 @@ fn match_operand_row_col_off<'a>(
 ) -> Option<(Symbol, Dim, Vec<&'a Expr>)> {
     match &f.kind {
         ExprKind::Index { base, indices } if indices.len() == 1 => {
-            let abase = single_path(base)?;
+            // `buffer_base`, not `single_path`: a weight held in a struct field (`l.wq[j*D+p]`) is
+            // a legal GEMM operand, resolved by `emit_sgemm` through `kernel_base_ptr` exactly like
+            // a bare local. Every consumer of this symbol goes through that one resolver.
+            let abase = buffer_base(base, interner)?;
             let (stride, off) = match_row_col_off(&indices[0], row, col, interner)?;
             Some((abase, stride, off))
         }
@@ -20592,7 +20963,7 @@ fn match_operand_row_col_off<'a>(
             if single_path(&indices[0])? != row || single_path(&indices[1])? != col {
                 return None;
             }
-            let abase = single_path(base)?;
+            let abase = buffer_base(base, interner)?;
             let stride = tensor_inner_stride(base, sema)?;
             Some((abase, stride, Vec::new()))
         }
@@ -20612,7 +20983,9 @@ fn match_operand_row_then_col(
 ) -> Option<(Symbol, Dim, Symbol)> {
     match &f.kind {
         ExprKind::Index { base, indices } if indices.len() == 1 => {
-            let abase = single_path(base)?;
+            // A struct-field weight base (`l.wq[…]`) resolves here too — see
+            // `match_operand_row_col_off`.
+            let abase = buffer_base(base, interner)?;
             let (stride, col) = match_row_col(&indices[0], row, interner)?;
             Some((abase, stride, col))
         }
@@ -20621,7 +20994,7 @@ fn match_operand_row_then_col(
                 return None;
             }
             let col = single_path(&indices[1])?;
-            let abase = single_path(base)?;
+            let abase = buffer_base(base, interner)?;
             let stride = tensor_inner_stride(base, sema)?;
             Some((abase, stride, col))
         }
@@ -21704,7 +22077,13 @@ fn match_matmul_ijk<'a>(
         Some(a) => (a, None),
         None => (
             None,
-            Some(match_bias_dot_store(cv, s_sym, jvar, &[row, jvar, kvar])?),
+            Some(match_bias_dot_store(
+                cv,
+                s_sym,
+                jvar,
+                &[row, jvar, kvar],
+                interner,
+            )?),
         ),
     };
     // The output store `c[i*N + j (+ off)] = …` or the shape-typed `c[i, j] = …` (sema-aware).
@@ -22627,6 +23006,7 @@ fn lower_matmul_fn(
         interner,
         diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -22660,6 +23040,10 @@ fn lower_matmul_fn(
         let mty = param_slot_ty(pty);
         if matches!(mty, MirType::Array(..)) {
             fl.bind_slice(p.name.sym, val, mty, is_slice);
+            // Mirrors `lower_fn`: a struct parameter's buffer fields are kernel operands too, and
+            // this wrapper's whole body IS a kernel call — without the record `emit_sgemm` cannot
+            // resolve a `l.wq` operand and declines (falling back to `lower_fn`, which can).
+            fl.bind_field_bases(p.name.sym, val, pty);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {
@@ -24287,6 +24671,7 @@ fn xent_bwd_fn(
         interner,
         diags: &mut diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -24329,6 +24714,7 @@ fn xent_fn(
         interner,
         diags: &mut diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -24379,6 +24765,7 @@ fn logsumexp_fn(
         interner,
         diags: &mut diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -24517,6 +24904,7 @@ fn probe_single_for(
         interner,
         diags: &mut diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -25539,6 +25927,7 @@ fn lower_i8matmul_fn(
         interner,
         diags,
         scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
@@ -25564,6 +25953,8 @@ fn lower_i8matmul_fn(
         let mty = param_slot_ty(pty);
         if matches!(mty, MirType::Array(..)) {
             fl.bind_slice(p.name.sym, val, mty, is_slice);
+            // The int8 twin of the `lower_matmul_fn` record — same reasoning.
+            fl.bind_field_bases(p.name.sym, val, pty);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {

@@ -1,0 +1,57 @@
+// RUN: --run
+// A struct-field kernel base is recorded under the synthetic name `"<local>.<field>"`, which is
+// scoped — but scope discipline ALONE is not enough. An inner binding of the same name that records
+// no field bases of its own (a `*mut Layer` / `&Layer`, whose target may be reassigned, so no field
+// address may be snapshotted) shadows the outer struct in `scopes` while leaving the OUTER scope's
+// record reachable. `FnLowerer::field_base` therefore revalidates: the record only applies while
+// its base name still resolves to the very slot the field address was GEP'd from.
+//
+// Without that check this program dispatched `wukong_sgemm_nt` over the OUTER `l.w` (all 1.0) and
+// printed `3 3 3 3 3 3 3 3` — a silent wrong answer on BOTH backends at EVERY -O level, invisible to
+// every differential and opt-invariance gate because a recognized kernel fires identically on all of
+// them. With the check the nest declines and lowers scalar, reading the shadowing `l` as written.
+//
+// Scalar semantics, by hand: inside the block `l` is `&mut other`, whose `w` is `wb` = all 2.0.
+//   x = all 1.0 (M=2, K=3); y[i*4+j] = sum_{p<3} x[i*3+p] * l.w[j*3+p] = 3 * (1.0 * 2.0) = 6
+// Every one of the 8 lanes is 6 — printed individually, never summed.
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+module tests.run.struct_field_base_shadowed
+
+struct Layer { w: []f32, }
+
+fn main() -> i32 {
+    let mut wa: [f32; 12] = [0.0; 12];
+    for i in 0..12 { wa[i] = 1.0; }   // the OUTER `l.w` — must NOT be what the block reads
+    let mut wb: [f32; 12] = [0.0; 12];
+    for i in 0..12 { wb[i] = 2.0; }   // the shadowing `l.w`
+
+    let sa: []f32 = wa;
+    let sb: []f32 = wb;
+    let l: Layer = Layer { w: sa };
+    let mut other: Layer = Layer { w: sb };
+
+    let mut x: [f32; 6] = [0.0; 6];
+    for i in 0..6 { x[i] = 1.0; }
+    let mut y: [f32; 8] = [0.0; 8];
+
+    {
+        let l: *mut Layer = &mut other;
+        for i in 0..2 {
+            for j in 0..4 {
+                let mut s: f32 = 0.0;
+                for p in 0..3 { s = s + x[i*3+p] * l.w[j*3+p]; }
+                y[i*4+j] = s;
+            }
+        }
+    }
+    for i in 0..8 { print(y[i]); }
+    return 0;
+}
