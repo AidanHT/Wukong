@@ -1,0 +1,168 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 72
+// EXPECT-OUT: 84
+// EXPECT-OUT: 96
+// EXPECT-OUT: 108
+// EXPECT-OUT: 120
+// EXPECT-OUT: 132
+// EXPECT-OUT: 144
+// EXPECT-OUT: 156
+// EXPECT-OUT: 84
+// EXPECT-OUT: 99
+// EXPECT-OUT: 114
+// EXPECT-OUT: 129
+// EXPECT-OUT: 144
+// EXPECT-OUT: 159
+// EXPECT-OUT: 174
+// EXPECT-OUT: 189
+// EXPECT-OUT: 96
+// EXPECT-OUT: 114
+// EXPECT-OUT: 132
+// EXPECT-OUT: 150
+// EXPECT-OUT: 168
+// EXPECT-OUT: 186
+// EXPECT-OUT: 204
+// EXPECT-OUT: 222
+// EXPECT-OUT: 7
+// EXPECT-OUT: 18
+// EXPECT-OUT: 33
+// EXPECT-OUT: 67
+// EXPECT-OUT: 99
+// EXPECT-OUT: 135
+// EXPECT-OUT: 228
+// EXPECT-OUT: 289
+// EXPECT-OUT: 354
+// EXPECT-OUT: 10000
+// EXPECT-OUT: 3679
+// EXPECT-OUT: 1353
+// EXPECT-OUT: 498
+// EXPECT-OUT: 183
+// EXPECT-OUT: 67
+// EXPECT-OUT: 25
+// EXPECT-OUT: 9
+// EXPECT-OUT: 6065
+// EXPECT-OUT: 2231
+// EXPECT-OUT: 821
+// EXPECT-OUT: 302
+// EXPECT-OUT: 111
+// EXPECT-OUT: 41
+// EXPECT-OUT: 15
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3679
+// EXPECT-OUT: 1353
+// EXPECT-OUT: 498
+// EXPECT-OUT: 183
+// EXPECT-OUT: 67
+// EXPECT-OUT: 25
+// EXPECT-OUT: 9
+// EXPECT-OUT: 3
+module tests.run.selective_scan_state
+
+// A MAMBA / S6 **selective scan with a vector state**, at T=3 D=3 N=8.
+//
+//   for t, for d, for n:
+//       h[d,n] = exp(dt[t,d] * A[d,n]) * h[d,n] + (dt[t,d] * x[t,d]) * B[t,n]
+//       y[t,d] = sum_n C[t,n] * h[d,n] + Dskip[d] * x[t,d]
+//
+// The `t` loop is a genuine loop-carried recurrence, but the (d, n) work at each step is fully
+// data-parallel: `wukong_opt`'s vectorizer widens the inner `n` loop four lanes, including the
+// inlined `exp` (a masked coefficient table, a bitcast and integer arithmetic — every one of those
+// widened) and the read-modify-write of `h[d,n]` at distance 0. No recognizer matches this shape
+// and none should: `wukong_lrscan_f32` covers a SCALAR-state recurrence with precomputed gates.
+//
+// N=8 is two full four-lane groups with no remainder, so a wrong lane cannot hide in the scalar
+// epilogue. **Every state lane is printed**, never a reduction — a partially-correct `h` buffer
+// would pass a sum.
+//
+// WHERE THE EXPECTED VALUES COME FROM (never recorded from compiler output):
+//
+//   Phase A sets A = 0, so `decay = exp(0) = 1` exactly and the update is `h += gate * B`. With
+//   dt = 0.5, x[k] = k+1 and B[t,n] = t + n/4, the state after all three steps is the closed form
+//       h[d,n] = sum_t (0.5 * x[t*3+d]) * (t + n/4)
+//   which is  h[0,n] = 9 + 1.5n,  h[1,n] = 10.5 + 1.875n,  h[2,n] = 12 + 2.25n.
+//   Every intermediate is a dyadic rational well inside f32's exact range, so `h * 8` and `y * 2`
+//   are exact integers and the printed values are the arithmetic, not a rounding of it.
+//
+//   Phase B makes the exponent lane-varying and nonzero: A[d,n] = -(n/2) - (d/4) with dt = 1, and
+//   feeds one unit impulse (gate 1, B = 1 at t=0; gate 0 afterwards). The state is then decayed
+//   twice with nothing added, so
+//       h[d,n] = exp(-(n/2) - (d/4))^2 = exp(-n - d/2)
+//   and the printed value is `round(h * 10000)` of the *mathematical* exponential. The tightest
+//   rounding margin in the table is 3.2e-5 relative (lane d=1,n=0: 6065.3066), which any exp worth
+//   shipping clears by three orders of magnitude — so this pins the widened transcendental against
+//   real mathematics rather than against itself.
+
+fn scan(
+    x: [f32; 9],
+    dt: [f32; 9],
+    a: [f32; 24],
+    bmat: [f32; 24],
+    cmat: [f32; 24],
+    dskip: [f32; 3],
+    mut h: [f32; 24],
+    mut y: [f32; 9],
+) {
+    for i in 0..24 { h[i] = 0.0; }
+    for t in 0..3 {
+        let tb: i32 = t * 3;
+        let nb: i32 = t * 8;
+        for d in 0..3 {
+            let db: i32 = d * 8;
+            let dtv: f32 = dt[tb + d];
+            let xv: f32 = x[tb + d];
+            let gate: f32 = dtv * xv;
+            let mut acc: f32 = 0.0;
+            for n in 0..8 {
+                let decay: f32 = exp(dtv * a[db + n]);
+                let hn: f32 = decay * h[db + n] + gate * bmat[nb + n];
+                h[db + n] = hn;
+                acc = acc + cmat[nb + n] * hn;
+            }
+            y[tb + d] = acc + dskip[d] * xv;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 9] = [0.0; 9];
+    let mut dt: [f32; 9] = [0.0; 9];
+    let mut a: [f32; 24] = [0.0; 24];
+    let mut bmat: [f32; 24] = [0.0; 24];
+    let mut cmat: [f32; 24] = [0.0; 24];
+    let mut dskip: [f32; 3] = [0.0; 3];
+    let mut h: [f32; 24] = [0.0; 24];
+    let mut y: [f32; 9] = [0.0; 9];
+
+    // ---- phase A: A == 0, so every decay is exactly 1 and the whole scan is exact ----
+    for k in 0..9 { x[k] = (k as f32) + 1.0; }
+    for k in 0..9 { dt[k] = 0.5; }
+    for t in 0..3 {
+        for n in 0..8 {
+            bmat[t * 8 + n] = (t as f32) + (n as f32) * 0.25;
+            cmat[t * 8 + n] = 1.0;
+        }
+    }
+    for d in 0..3 { dskip[d] = d as f32; }
+
+    scan(x, dt, a, bmat, cmat, dskip, h, y);
+
+    for i in 0..24 { print(round(h[i] * 8.0) as i32); }
+    for k in 0..9 { print(round(y[k] * 2.0) as i32); }
+
+    // ---- phase B: a lane-varying, nonzero exponent through the same widened loop ----
+    for k in 0..3 { x[k] = 1.0; }
+    for k in 3..9 { x[k] = 0.0; }
+    for k in 0..9 { dt[k] = 1.0; }
+    for d in 0..3 {
+        for n in 0..8 { a[d * 8 + n] = 0.0 - (n as f32) * 0.5 - (d as f32) * 0.25; }
+    }
+    for i in 0..24 { bmat[i] = 0.0; cmat[i] = 0.0; }
+    for n in 0..8 { bmat[n] = 1.0; }
+    for d in 0..3 { dskip[d] = 0.0; }
+
+    scan(x, dt, a, bmat, cmat, dskip, h, y);
+
+    for i in 0..24 { print(round(h[i] * 10000.0) as i32); }
+    return 0;
+}
