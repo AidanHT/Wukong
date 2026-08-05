@@ -8,12 +8,22 @@
 //!
 //! The naive spelling `for j { for i { s ⊕= x[i*N+j] } }` reads `x` with stride `N` — a *strided
 //! reduction* gcc/rustc do **not** vectorize (verified: scalar `vaddss`/`vmaxss`, no packed
-//! `vaddps`/`vmaxps`, at `-O3 -march=native`). These kernels instead stream `x` **row-major** and fold
-//! 8 columns at a time into a cache-resident `out[]`, so they are SIMD *and* cache-friendly. The fold
-//! order is **i-ascending per column** — identical to the scalar nest — in the AVX2 and scalar paths
-//! and across serial/parallel (disjoint column stripes, no cross-stripe combine), so each kernel is
-//! its own bit-exact oracle (the interpreter marshals the serial form; the differential gate compares
-//! interp vs native, both folding the same `_mm256_add_ps`/`_mm256_max_ps`/`_mm256_min_ps` lane tree).
+//! `vaddps`/`vmaxps`, at `-O3 -march=native`). These kernels instead stream `x` **row-major**, so they
+//! are SIMD *and* cache-friendly.
+//!
+//! Row-major streaming alone is not enough, though: it is also what a *competent* C peer writes
+//! (`for i { for j { out[j] ⊕= x[i*N+j] } }` with `__restrict__`), and gcc vectorizes that. Against
+//! that peer the earlier form of these kernels — 8 columns per step, accumulator re-read and
+//! re-written from `out[]` on **every** row — lost. The traversal is now **[`COL_RB`] rows x 32
+//! columns per tile with the four accumulators resident in YMM registers**, which divides the `out[]`
+//! load/store traffic by `COL_RB` and keeps `COL_RB` independent `x` row streams in flight (the
+//! memory-level parallelism a single sequential stream cannot reach). See [`colreduce_avx2`].
+//!
+//! The fold order is **i-ascending per column** — identical to the scalar nest — in the AVX2 and
+//! scalar paths, across the row blocking, and across serial/parallel (disjoint column stripes, no
+//! cross-stripe combine), so each kernel is its own bit-exact oracle (the interpreter marshals the
+//! serial form; the differential gate compares interp vs native, both folding the same
+//! `_mm256_add_ps`/`_mm256_max_ps`/`_mm256_min_ps` lane tree).
 
 /// Which column reduction to fold: `Sum` seeds `0` and folds rows `[0, rows)`; `Max`/`Min`/`MaxAbs`
 /// seed the **first row** (`x[0,j]`, or `|x[0,j]|` for `MaxAbs`) and fold rows `[1, rows)` (idempotent,
@@ -37,6 +47,14 @@ enum ColKind {
     L2,
     Rms,
 }
+
+/// Rows folded per pass with the column accumulators held in **registers** (see [`colreduce_avx2`]).
+/// Four is what measured best on this box across both the L2-resident (4 MiB) and the L3-resident
+/// (16 MiB) shapes: it cuts the `out[]` load/store traffic 4x *and* keeps four independent `x` row
+/// streams in flight (the memory-level parallelism that lifts a single core off its one-stream
+/// bandwidth ceiling). Two streams left bandwidth on the table; eight or more started to thrash the
+/// L1 set that every `cols*4`-strided row lands in.
+const COL_RB: usize = 4;
 
 /// Apply the per-column finalize for the statistics kinds over `out[j0..j1]` (after all rows folded):
 /// `Mean` → `/rows`, `L2` → `sqrt`, `Rms` → `sqrt(_/rows)`. `Sum`/`SumSq`/`Max`/`Min`/`MaxAbs` are
@@ -69,10 +87,69 @@ unsafe fn colreduce_finalize(out: *mut f32, j0: usize, j1: usize, rows: usize, k
     }
 }
 
+/// The five per-element folds, as ordinary (non-`target_feature`) `#[inline(always)]` functions so
+/// that the AVX2 kernel's scalar tails, the scalar twin [`colreduce_scalar`] and the unit tests all
+/// use **literally the same code** — the fold order is the correctness contract of this file, and a
+/// second hand-written copy is exactly how a twin drifts. `max`/`min` are spelled `(a > v) ? a : v` /
+/// `(a < v) ? a : v` deliberately, NOT `f32::max`/`f32::min`: that is what `_mm256_max_ps` /
+/// `_mm256_min_ps` compute (the second operand wins a tie and any NaN comparison), so the vector and
+/// scalar paths agree on NaN, ±0 and ties.
+#[inline(always)]
+fn sfold_add(a: f32, v: f32) -> f32 {
+    a + v
+}
+/// `a + v*v` as a separate multiply then add (never an FMA) — see [`colreduce_avx2`].
+#[inline(always)]
+fn sfold_sq(a: f32, v: f32) -> f32 {
+    a + v * v
+}
+#[inline(always)]
+fn sfold_max(a: f32, v: f32) -> f32 {
+    if a > v {
+        a
+    } else {
+        v
+    }
+}
+#[inline(always)]
+fn sfold_min(a: f32, v: f32) -> f32 {
+    if a < v {
+        a
+    } else {
+        v
+    }
+}
+#[inline(always)]
+fn sfold_maxabs(a: f32, v: f32) -> f32 {
+    let v = v.abs();
+    if a > v {
+        a
+    } else {
+        v
+    }
+}
+
 /// Fold rows `[0, rows)` of `x` into the column range `[j0, j1)` of `out` (`out[j] = ⊕_i x[i*cols+j]`),
-/// AVX2, 8 columns/step. Seeds the range (0 for `Sum`, the first row for `Max`/`Min`), then streams `x`
-/// row-major folding into `out`. The per-`kind` inner loop is selected **once per call** (no per-element
-/// branch); each fold is the exact `_mm256_{add,max,min}_ps` whose scalar twin is in [`colreduce_scalar`].
+/// AVX2. Seeds the range (0 for `Sum`, the first row for `Max`/`Min`), then streams `x` row-major
+/// folding into `out`. The per-`kind` inner loop is selected **once per call** (no per-element
+/// branch); each fold is the exact `_mm256_{add,max,min}_ps` whose scalar twin is `sfold_*` above.
+///
+/// TRAVERSAL. The tile is **[`COL_RB`] rows x 32 columns**: four `__m256` accumulators are loaded
+/// from `out[j..j+32]`, folded against `COL_RB` consecutive rows *while resident in registers*, and
+/// stored back once. The earlier form re-read and re-wrote `out[j]` for **every** row, so a
+/// `rows x cols` fold cost `rows*cols` accumulator loads plus `rows*cols` accumulator stores on top
+/// of the unavoidable `x` read; blocking divides both by `COL_RB` and, just as importantly, keeps
+/// `COL_RB` independent `x` row streams in flight, which is what lifts a single core off its
+/// one-stream memory-bandwidth ceiling. A competent row-outer C peer (`for i { for j { out[j] +=
+/// x[i*N+j] } }`, `__restrict__`, gcc `-O3 -march=native`) is exactly the un-blocked form, and it is
+/// what this kernel used to lose to.
+///
+/// BIT-EXACTNESS IS UNAFFECTED, which is the only reason the reshape is admissible: for a fixed
+/// column `j` the sequence is still `out[j] <- ((out[j] (+) x[i,j]) (+) x[i+1,j]) ...` with `i`
+/// strictly ascending and no reassociation — the tile only changes *where the running accumulator
+/// lives*, never the order it is folded in. The `rows % COL_RB` trailing rows fold one row at a time
+/// afterwards, continuing the same ascending sequence, and the `(j1-j0) % 32` trailing columns fold
+/// 8-wide and then scalar inside each row block.
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32; `j0 <= j1 <= cols`; AVX2 available.
@@ -111,100 +188,110 @@ unsafe fn colreduce_avx2(
         }
     };
     let sign = _mm256_set1_ps(-0.0); // for MaxAbs: clear the sign bit with andnot
-    // The fold loop, monomorphic per kind (the match is hoisted out of the row loop).
-    match kind {
-        // Σ x[i,j] (Mean reuses the Sum fold, then divides in the finalize).
-        ColKind::Sum | ColKind::Mean => {
-            for i in i0..rows {
-                let xr = x.add(i * cols);
+
+    // The tiled fold, monomorphic per kind: the `match` below is hoisted out of every loop and each
+    // arm pastes its own vector fold (`|a, v| …`) and scalar fold (`sfold_…`) into ONE traversal.
+    // Writing the traversal once is deliberate — five hand-copied nests are five chances for one of
+    // them to lose the ascending-`i` order that the whole file's bit-exactness rests on.
+    macro_rules! fold_all {
+        (|$a:ident, $v:ident| $vfold:expr, $sfold:ident) => {{
+            let mut i = i0;
+            // Main tile: COL_RB rows x 32 columns, accumulators resident in 4 YMM registers.
+            while i + COL_RB <= rows {
                 let mut j = j0;
+                while j + 32 <= j1 {
+                    let mut a0 = _mm256_loadu_ps(out.add(j));
+                    let mut a1 = _mm256_loadu_ps(out.add(j + 8));
+                    let mut a2 = _mm256_loadu_ps(out.add(j + 16));
+                    let mut a3 = _mm256_loadu_ps(out.add(j + 24));
+                    let mut k = 0usize;
+                    while k < COL_RB {
+                        let xr = x.add((i + k) * cols + j);
+                        a0 = {
+                            let ($a, $v) = (a0, _mm256_loadu_ps(xr));
+                            $vfold
+                        };
+                        a1 = {
+                            let ($a, $v) = (a1, _mm256_loadu_ps(xr.add(8)));
+                            $vfold
+                        };
+                        a2 = {
+                            let ($a, $v) = (a2, _mm256_loadu_ps(xr.add(16)));
+                            $vfold
+                        };
+                        a3 = {
+                            let ($a, $v) = (a3, _mm256_loadu_ps(xr.add(24)));
+                            $vfold
+                        };
+                        k += 1;
+                    }
+                    _mm256_storeu_ps(out.add(j), a0);
+                    _mm256_storeu_ps(out.add(j + 8), a1);
+                    _mm256_storeu_ps(out.add(j + 16), a2);
+                    _mm256_storeu_ps(out.add(j + 24), a3);
+                    j += 32;
+                }
+                // (j1-j0) % 32 trailing columns of this row block: 8-wide, then scalar.
                 while j + 8 <= j1 {
-                    let acc = _mm256_loadu_ps(out.add(j));
-                    let v = _mm256_loadu_ps(xr.add(j));
-                    _mm256_storeu_ps(out.add(j), _mm256_add_ps(acc, v));
+                    let mut acc = _mm256_loadu_ps(out.add(j));
+                    let mut k = 0usize;
+                    while k < COL_RB {
+                        acc = {
+                            let ($a, $v) = (acc, _mm256_loadu_ps(x.add((i + k) * cols + j)));
+                            $vfold
+                        };
+                        k += 1;
+                    }
+                    _mm256_storeu_ps(out.add(j), acc);
                     j += 8;
                 }
                 while j < j1 {
-                    *out.add(j) += *xr.add(j);
+                    let mut s = *out.add(j);
+                    let mut k = 0usize;
+                    while k < COL_RB {
+                        s = $sfold(s, *x.add((i + k) * cols + j));
+                        k += 1;
+                    }
+                    *out.add(j) = s;
                     j += 1;
                 }
+                i += COL_RB;
             }
-        }
+            // rows % COL_RB trailing rows, one at a time — the same ascending-`i` continuation.
+            while i < rows {
+                let xr = x.add(i * cols);
+                let mut j = j0;
+                while j + 8 <= j1 {
+                    let acc = {
+                        let ($a, $v) = (_mm256_loadu_ps(out.add(j)), _mm256_loadu_ps(xr.add(j)));
+                        $vfold
+                    };
+                    _mm256_storeu_ps(out.add(j), acc);
+                    j += 8;
+                }
+                while j < j1 {
+                    *out.add(j) = $sfold(*out.add(j), *xr.add(j));
+                    j += 1;
+                }
+                i += 1;
+            }
+        }};
+    }
+    match kind {
+        // Σ x[i,j] (Mean reuses the Sum fold, then divides in the finalize).
+        ColKind::Sum | ColKind::Mean => fold_all!(|a, v| _mm256_add_ps(a, v), sfold_add),
         // Σ x[i,j]² (L2/Rms reuse this, then sqrt[/rows] in the finalize). The square is a separate
         // `mul` then `add` (NOT an FMA) so the scalar twin `a + v*v` matches it bit-for-bit (no `fma`
         // target feature assumed here, and one rounding model shared by both paths).
         ColKind::SumSq | ColKind::L2 | ColKind::Rms => {
-            for i in i0..rows {
-                let xr = x.add(i * cols);
-                let mut j = j0;
-                while j + 8 <= j1 {
-                    let acc = _mm256_loadu_ps(out.add(j));
-                    let v = _mm256_loadu_ps(xr.add(j));
-                    _mm256_storeu_ps(out.add(j), _mm256_add_ps(acc, _mm256_mul_ps(v, v)));
-                    j += 8;
-                }
-                while j < j1 {
-                    let v = *xr.add(j);
-                    *out.add(j) += v * v;
-                    j += 1;
-                }
-            }
+            fold_all!(|a, v| _mm256_add_ps(a, _mm256_mul_ps(v, v)), sfold_sq)
         }
-        ColKind::Max => {
-            for i in i0..rows {
-                let xr = x.add(i * cols);
-                let mut j = j0;
-                while j + 8 <= j1 {
-                    let acc = _mm256_loadu_ps(out.add(j));
-                    let v = _mm256_loadu_ps(xr.add(j));
-                    _mm256_storeu_ps(out.add(j), _mm256_max_ps(acc, v));
-                    j += 8;
-                }
-                while j < j1 {
-                    let a = *out.add(j);
-                    let v = *xr.add(j);
-                    *out.add(j) = if a > v { a } else { v };
-                    j += 1;
-                }
-            }
-        }
-        ColKind::Min => {
-            for i in i0..rows {
-                let xr = x.add(i * cols);
-                let mut j = j0;
-                while j + 8 <= j1 {
-                    let acc = _mm256_loadu_ps(out.add(j));
-                    let v = _mm256_loadu_ps(xr.add(j));
-                    _mm256_storeu_ps(out.add(j), _mm256_min_ps(acc, v));
-                    j += 8;
-                }
-                while j < j1 {
-                    let a = *out.add(j);
-                    let v = *xr.add(j);
-                    *out.add(j) = if a < v { a } else { v };
-                    j += 1;
-                }
-            }
-        }
+        ColKind::Max => fold_all!(|a, v| _mm256_max_ps(a, v), sfold_max),
+        ColKind::Min => fold_all!(|a, v| _mm256_min_ps(a, v), sfold_min),
+        // |v| = andnot(-0.0, v) (clear the sign bit), then fold by max — the same sign-mask abs the
+        // RED_MAXABS reduction uses, so it agrees lane-for-lane with `sfold_maxabs`'s `v.abs()`.
         ColKind::MaxAbs => {
-            for i in i0..rows {
-                let xr = x.add(i * cols);
-                let mut j = j0;
-                while j + 8 <= j1 {
-                    let acc = _mm256_loadu_ps(out.add(j));
-                    // |v| = andnot(-0.0, v) (clear the sign bit), then fold by max — the same
-                    // sign-mask abs the RED_MAXABS reduction uses, so it agrees lane-for-lane.
-                    let v = _mm256_andnot_ps(sign, _mm256_loadu_ps(xr.add(j)));
-                    _mm256_storeu_ps(out.add(j), _mm256_max_ps(acc, v));
-                    j += 8;
-                }
-                while j < j1 {
-                    let a = *out.add(j);
-                    let v = (*xr.add(j)).abs();
-                    *out.add(j) = if a > v { a } else { v };
-                    j += 1;
-                }
-            }
+            fold_all!(|a, v| _mm256_max_ps(a, _mm256_andnot_ps(sign, v)), sfold_maxabs)
         }
     }
     // Per-column finalize for the statistics kinds (Mean -> /rows, L2 -> sqrt, Rms -> sqrt(/rows));
@@ -213,9 +300,11 @@ unsafe fn colreduce_avx2(
 }
 
 /// Scalar twin of [`colreduce_avx2`] (the no-AVX2 fallback and the bit-exact reference). Same
-/// i-ascending per-column order and the same fold (`a > v ? a : v` == `_mm256_max_ps(a, v)`,
-/// `a < v ? a : v` == `_mm256_min_ps(a, v)` on the non-NaN data the recognizer targets), so it agrees
-/// with the AVX2 path lane-for-lane.
+/// i-ascending per-column order and — literally — the same `sfold_*` fold functions the vector path's
+/// tails call (`a > v ? a : v` == `_mm256_max_ps(a, v)`, `a < v ? a : v` == `_mm256_min_ps(a, v)`),
+/// so it agrees with the AVX2 path lane-for-lane. This twin is deliberately left **un-blocked**: it
+/// is the reference, and `out[j] <- fold(out[j], x[i,j])` for ascending `i` is the definition the
+/// blocked vector path must reproduce.
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32; `j0 <= j1 <= cols`.
@@ -248,39 +337,25 @@ unsafe fn colreduce_scalar(
             1
         }
     };
-    for i in i0..rows {
-        let xr = x.add(i * cols);
-        for j in j0..j1 {
-            let a = *out.add(j);
-            let v = *xr.add(j);
-            *out.add(j) = match kind {
-                // `a + v*v` (a separate mul then add) matches the AVX2 `add(acc, mul(v,v))` exactly.
-                ColKind::SumSq | ColKind::L2 | ColKind::Rms => a + v * v,
-                ColKind::Sum | ColKind::Mean => a + v,
-                ColKind::Max => {
-                    if a > v {
-                        a
-                    } else {
-                        v
-                    }
+    // The `match` is hoisted out of both loops (one dispatch per call, not one per element); each arm
+    // pastes the same `sfold_*` the AVX2 path's scalar tails use.
+    macro_rules! run {
+        ($sfold:ident) => {{
+            for i in i0..rows {
+                let xr = x.add(i * cols);
+                for j in j0..j1 {
+                    *out.add(j) = $sfold(*out.add(j), *xr.add(j));
                 }
-                ColKind::Min => {
-                    if a < v {
-                        a
-                    } else {
-                        v
-                    }
-                }
-                ColKind::MaxAbs => {
-                    let v = v.abs();
-                    if a > v {
-                        a
-                    } else {
-                        v
-                    }
-                }
-            };
-        }
+            }
+        }};
+    }
+    match kind {
+        // `a + v*v` (a separate mul then add) matches the AVX2 `add(acc, mul(v,v))` exactly.
+        ColKind::SumSq | ColKind::L2 | ColKind::Rms => run!(sfold_sq),
+        ColKind::Sum | ColKind::Mean => run!(sfold_add),
+        ColKind::Max => run!(sfold_max),
+        ColKind::Min => run!(sfold_min),
+        ColKind::MaxAbs => run!(sfold_maxabs),
     }
     colreduce_finalize(out, j0, j1, rows, kind);
 }
@@ -337,10 +412,13 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
     // whole process, leaving later outlined @parallel region bodies (~1.5 MiB of privatized scratch at
     // S=512) on 2 MiB stacks. Configuration only -- the stripe split is unchanged, so the bits are too.
     crate::ensure_global_pool();
-    // One stripe per core, each a multiple of 8 columns (keep the AVX2 main loop aligned to the
-    // stripe boundary); the last stripe absorbs the remainder.
+    // One stripe per core, each a multiple of 32 columns — the width of one [`colreduce_avx2`] tile,
+    // so a stripe runs the blocked main loop rather than falling into its 8-wide tail; the last
+    // stripe absorbs the remainder. The stripe width is a *partition* of the columns, and every
+    // column is folded i-ascending over all rows whichever stripe owns it, so widening the stripe
+    // cannot move a bit.
     let nthreads = rayon::current_num_threads().max(1);
-    let per = (c.div_ceil(nthreads)).next_multiple_of(8).max(8);
+    let per = (c.div_ceil(nthreads)).next_multiple_of(32).max(32);
     let nstripes = c.div_ceil(per);
     let (x_addr, out_addr) = (x as usize, out as usize);
     (0..nstripes).into_par_iter().for_each(|s| {
@@ -635,7 +713,12 @@ mod tests {
     fn colreduce_matches_naive_and_parallel() {
         for (rows, cols) in [
             (1, 1),
+            (2, 3), // rows < COL_RB: the tiled loop never runs, only the trailing-row path
+            (3, 39),
+            (4, 32), // exactly one COL_RB x 32 tile
             (5, 7),
+            (5, 33), // rows % COL_RB == 1 and cols just past the 32-column tile
+            (7, 31), // cols one short of a tile: the 8-wide + scalar tails inside a row block
             (8, 8),
             (33, 17),
             (64, 100),
@@ -679,5 +762,149 @@ mod tests {
                 assert_eq!(got, got_par, "{:?} serial vs parallel {rows}x{cols}", kind as u8);
             }
         }
+    }
+
+    /// Every `ColKind`, both paths, compared by **raw bits**. `assert_eq!` on `f32` is the wrong
+    /// oracle for this file: `NaN != NaN` makes a NaN column vacuously "equal" whatever the other
+    /// path produced, and `-0.0 == 0.0` hides a sign flip — precisely the two cases where
+    /// `_mm256_max_ps` and `f32::max` disagree, and the reason [`sfold_max`] is spelled
+    /// `(a > v) ? a : v`.
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    /// The AVX2 tile must equal the un-blocked scalar twin **bit for bit** on ordinary data, over
+    /// shapes that straddle every edge the [`COL_RB`] x 32 tile introduced: `rows` below / at / just
+    /// past a row block, and `cols` below / at / just past the 32-column tile plus its 8-wide and
+    /// scalar tails. Without this the only cross-check was against `naive`, which on a non-AVX2 host
+    /// would compare the scalar twin with itself.
+    ///
+    /// The data is deliberately **order-sensitive**: every fifth cell is `1e7` while the rest are
+    /// small non-dyadic values, so a running sum that has swallowed a `1e7` rounds a subsequent small
+    /// addend away entirely. Summing the same column in a different order therefore lands on a
+    /// different f32. An earlier version of this test used a small exact-integer range, whose sum is
+    /// order-*independent* — it passed unchanged when the tile was mutated to fold its `COL_RB` rows
+    /// descending, which is exactly the regression this test exists to catch.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn scalar_matches_avx2_bit_for_bit() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for &cols in &[1usize, 7, 8, 9, 15, 16, 31, 32, 33, 39, 40, 41, 64, 65, 100, 257] {
+            for &rows in &[1usize, 2, 3, 4, 5, 8, 9, 33, 100] {
+                let x: Vec<f32> = (0..rows * cols)
+                    .map(|t| {
+                        if t % 5 == 0 {
+                            1.0e7
+                        } else {
+                            ((t * 13 + 5) % 97) as f32 * 0.1 + 0.333_333_34
+                        }
+                    })
+                    .collect();
+                for kind in [
+                    ColKind::Sum,
+                    ColKind::Max,
+                    ColKind::Min,
+                    ColKind::MaxAbs,
+                    ColKind::Mean,
+                    ColKind::L2,
+                    ColKind::Rms,
+                    ColKind::SumSq,
+                ] {
+                    let mut s = vec![f32::from_bits(0x7f80_0001); cols]; // sentinel: a signalling NaN
+                    let mut v = vec![f32::from_bits(0x7f80_0001); cols];
+                    unsafe {
+                        colreduce_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, kind);
+                        colreduce_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, kind);
+                    }
+                    assert_eq!(
+                        bits(&s),
+                        bits(&v),
+                        "scalar != avx2 at rows={rows} cols={cols} kind={}",
+                        kind as u8
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fold order and comparison shape are the contract, so pin them on the values where a
+    /// "reasonable-looking" rewrite breaks: **NaN, ±0.0 and exact ties**.
+    ///
+    /// `_mm256_max_ps(a, v)` returns `v` whenever `a > v` is false — including when *either* operand
+    /// is NaN and on a tie. `f32::max` does the opposite (it is NaN-suppressing and returns the other
+    /// operand), and `f32::max(-0.0, 0.0)` is unspecified between the two zeros. So a twin written
+    /// with `f32::max` diverges from the vector path on exactly this input. The assertion here is
+    /// only scalar-twin == AVX2 **by bits**; it deliberately does NOT hard-code which zero or which
+    /// NaN payload wins, because that is the hardware's definition, not ours — what must hold is that
+    /// both paths agree, at every row-block and column-tile offset.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn nan_signed_zero_and_ties_agree_between_paths() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let nan = f32::NAN;
+        let nan2 = f32::from_bits(0x7fc0_1234); // a different quiet-NaN payload
+        // 12 rows (3 full COL_RB blocks) x 37 columns (one 32-tile + a 5-column tail) so the awkward
+        // values land in the tiled body, the 8-wide tail and the scalar tail alike.
+        let (rows, cols) = (12usize, 37usize);
+        let pool = [
+            0.0f32, -0.0, nan, nan2, 1.0, -1.0, 3.5, -3.5, f32::INFINITY, f32::NEG_INFINITY, 2.0,
+            2.0, // an exact tie with the entry before it
+        ];
+        let mut x = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            for j in 0..cols {
+                // A shifting permutation so every column sees the awkward values at a different row,
+                // and every (row block, column tile) position sees a NaN / ±0 / tie somewhere.
+                x[i * cols + j] = pool[(i * 5 + j * 7) % pool.len()];
+            }
+        }
+        for kind in [
+            ColKind::Sum,
+            ColKind::Max,
+            ColKind::Min,
+            ColKind::MaxAbs,
+            ColKind::Mean,
+            ColKind::L2,
+            ColKind::Rms,
+            ColKind::SumSq,
+        ] {
+            let mut s = vec![0.0f32; cols];
+            let mut v = vec![0.0f32; cols];
+            let mut p = vec![0.0f32; cols];
+            unsafe {
+                colreduce_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, kind);
+                colreduce_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, kind);
+                // …and the two-stripe split, so the parallel entry is held to the same bits.
+                colreduce_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 0, 16, kind);
+                colreduce_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 16, cols, kind);
+            }
+            assert_eq!(bits(&s), bits(&v), "NaN/±0/tie: scalar != avx2, kind={}", kind as u8);
+            assert_eq!(bits(&s), bits(&p), "NaN/±0/tie: scalar != striped, kind={}", kind as u8);
+        }
+    }
+
+    /// A tie must resolve the way `_mm256_max_ps`/`_mm256_min_ps` resolve it — **the second operand
+    /// (the newer row) wins** — and `sfold_max`/`sfold_min` must say the same thing. Checked on ±0.0,
+    /// where the two candidate answers are distinguishable by bits: folding `max` over a column of
+    /// `[+0.0, -0.0]` yields `-0.0` (because `+0.0 > -0.0` is false, so the fold takes the new row),
+    /// which `f32::max` would NOT give.
+    #[test]
+    fn signed_zero_tie_takes_the_newer_row() {
+        assert_eq!(sfold_max(0.0, -0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(sfold_max(-0.0, 0.0).to_bits(), (0.0f32).to_bits());
+        assert_eq!(sfold_min(0.0, -0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(sfold_min(-0.0, 0.0).to_bits(), (0.0f32).to_bits());
+        // …and through the public entry point, over a 2-row column.
+        let x = [0.0f32, -0.0];
+        let mut got = [1.0f32];
+        unsafe { wukong_colmax_f32(x.as_ptr(), got.as_mut_ptr(), 2, 1) };
+        assert_eq!(got[0].to_bits(), (-0.0f32).to_bits(), "colmax lost the ±0 tie rule");
+        let mut got = [1.0f32];
+        unsafe { wukong_colmin_f32(x.as_ptr(), got.as_mut_ptr(), 2, 1) };
+        assert_eq!(got[0].to_bits(), (-0.0f32).to_bits(), "colmin lost the ±0 tie rule");
     }
 }
