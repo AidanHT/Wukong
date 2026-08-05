@@ -40,6 +40,17 @@
 /// the other parallel column kernels use.
 const COLARG_PAR_MIN: usize = 256;
 
+/// Rows scanned per pass with the running best-value vectors held in **registers** (see
+/// [`colarg_avx2`]). Four keeps four independent `x` row streams in flight without exhausting the
+/// eight `bv` registers a [`COLARG_JB`]-wide tile needs.
+const COLARG_RB: usize = 4;
+
+/// Columns per [`colarg_avx2`] tile — eight `__m256` lanes of running best value. Wider than the
+/// column reductions' 32 on purpose: the tile's cost is dominated by the ONE `vptest` + branch that
+/// decides whether any of its lanes moved, and 64 columns amortizes that branch over twice as much
+/// work. Must stay a multiple of 8.
+const COLARG_JB: usize = 64;
+
 /// Scalar per-column argmax/argmin reference (the no-AVX2 fallback **and** the bit-exact oracle the
 /// AVX2 path must match lane-for-lane). For each column `j` in `[j0, j1)`: seed `best_row = 0`,
 /// `best_val = x[0*cols + j]`, then scan rows `1..rows` with a **strict** compare
@@ -80,16 +91,29 @@ unsafe fn colarg_scalar(
 }
 
 /// AVX2 per-column argmax/argmin over the column range `[j0, j1)`, streaming `x` **row-major in a
-/// SINGLE pass** with the full column range's running best held in L1 scratch (8 columns/AVX2 step).
-/// Bit-identical to [`colarg_scalar`]: each column updates only where the new value **strictly** beats
-/// its running best (`_mm256_cmp_ps(v, best, GT/LT)` → `_mm256_blendv_ps`), so a tie keeps the earlier
-/// (lower) row index; rows are scanned ascending (seed row 0, then `1..rows`), the identical order.
+/// SINGLE pass** with the full column range's running best held in L1 scratch. Bit-identical to
+/// [`colarg_scalar`]: each column updates only where the new value **strictly** beats its running
+/// best (`_mm256_cmp_ps(v, best, GT/LT)` → `_mm256_blendv_ps`), so a tie keeps the earlier (lower)
+/// row index; rows are scanned ascending (seed row 0, then `1..rows`), the identical order.
 ///
-/// The previous form scanned all rows **per 8-column band**, re-reading the whole matrix `cols/8`
-/// times (L3-rebound, latency-bound ~ tied gcc). This form keeps `best_val`/`best_idx` for the whole
-/// range L1-resident and reads each `x` element **once** from DRAM — the same single-pass, cache-
-/// resident-accumulator structure as [`crate::wukong_colsum_f32`]. The `width % 8` trailing columns
-/// fold in a per-row scalar tail (same strict compare), so the range is covered in one pass.
+/// TRAVERSAL — two levers, both of which a competent row-outer C peer already gets from gcc and this
+/// kernel used to lack:
+///
+/// 1. **Register-resident running best.** The tile is [`COLARG_RB`] rows x [`COLARG_JB`] columns: the
+///    eight `bv` lanes are loaded once, compared against `COLARG_RB` consecutive rows while resident
+///    in registers, and stored back once. Previously `bv` *and* `bi` were re-read and re-written for
+///    every single row, three loads and two stores per eight elements.
+/// 2. **`vptest` early-out.** If no lane of a row strictly beats its running best, both blends are
+///    the identity and both stores are redundant — so OR the tile's eight compare masks and skip the
+///    whole update with one `_mm256_testz_ps`. This is a pure *skip of a no-op*, not an
+///    approximation: the branch is taken exactly when the update would have written back what it
+///    read. `bi` is left in memory and touched only inside that branch, since a settled running
+///    maximum almost never moves. gcc emits the same idiom for the C peer (`vptest` + `je` around a
+///    `vmaskmovps`), which is most of why the peer was winning.
+///
+/// The `width % COLARG_JB` trailing columns and the `rows % COLARG_RB` trailing rows fall back to the
+/// per-row 8-wide form and then a scalar tail — same strict compare, same ascending rows, so the
+/// range is still covered in one pass and in one order.
 ///
 /// # Safety
 /// `x` valid for `rows*cols` `f32`; `out` valid for `cols` `i32`; `j0 <= j1 <= cols`; `rows >= 1`;
@@ -119,42 +143,135 @@ unsafe fn colarg_avx2(
         *bvp.add(jj) = *x.add(j0 + jj); // x[0, j0+jj]
         // best_idx already 0.0 (row 0)
     }
-    // Stream rows 1..rows ONCE, updating the resident accumulators 8 columns at a time.
+    const NB: usize = COLARG_JB / 8; // YMM lanes per tile
     let n8 = width & !7; // floor to multiple of 8
-    let mut i = 1usize;
-    while i < rows {
-        let row_i = _mm256_set1_ps(i as f32);
-        let xrow = x.add(i * cols + j0);
-        let mut jj = 0usize;
-        while jj < n8 {
-            let bv = _mm256_loadu_ps(bvp.add(jj));
-            let bi = _mm256_loadu_ps(bip.add(jj));
-            let v = _mm256_loadu_ps(xrow.add(jj)); // 8 columns of row i
-            // STRICT compare: argmax updates where v > best; argmin where v < best (tie keeps lower row).
-            let mask = if is_max {
-                _mm256_cmp_ps(v, bv, _CMP_GT_OQ)
-            } else {
-                _mm256_cmp_ps(v, bv, _CMP_LT_OQ)
-            };
-            _mm256_storeu_ps(bvp.add(jj), _mm256_blendv_ps(bv, v, mask));
-            _mm256_storeu_ps(bip.add(jj), _mm256_blendv_ps(bi, row_i, mask));
-            jj += 8;
-        }
-        // Per-row scalar tail for the `width % 8` trailing columns (same strict-compare update).
-        while jj < width {
-            let v = *xrow.add(jj);
-            let better = if is_max {
-                v > *bvp.add(jj)
-            } else {
-                v < *bvp.add(jj)
-            };
-            if better {
-                *bvp.add(jj) = v;
-                *bip.add(jj) = i as f32;
+
+    // The whole scan, monomorphic in the compare direction: `is_max` is a per-call constant, and
+    // pasting the compare in keeps it out of the innermost loop entirely.
+    macro_rules! scan {
+        ($cmp:expr, |$a:ident, $b:ident| $better:expr) => {{
+            let mut i = 1usize;
+            // Main tile: COLARG_RB rows x COLARG_JB columns, `bv` resident in NB YMM registers.
+            while i + COLARG_RB <= rows {
+                let mut jj = 0usize;
+                while jj + COLARG_JB <= width {
+                    let mut bv = [_mm256_setzero_ps(); NB];
+                    let mut b = 0usize;
+                    while b < NB {
+                        bv[b] = _mm256_loadu_ps(bvp.add(jj + b * 8));
+                        b += 1;
+                    }
+                    let mut dirty = false;
+                    let mut k = 0usize;
+                    while k < COLARG_RB {
+                        let xr = x.add((i + k) * cols + j0 + jj);
+                        let mut v = [_mm256_setzero_ps(); NB];
+                        let mut m = [_mm256_setzero_ps(); NB];
+                        let mut any = _mm256_setzero_ps();
+                        let mut b = 0usize;
+                        while b < NB {
+                            v[b] = _mm256_loadu_ps(xr.add(b * 8));
+                            // STRICT compare: argmax updates where v > best, argmin where v < best,
+                            // so a tie keeps the earlier (lower) row.
+                            m[b] = _mm256_cmp_ps(v[b], bv[b], $cmp);
+                            any = _mm256_or_ps(any, m[b]);
+                            b += 1;
+                        }
+                        // No lane strictly beats its running best => both blends are the identity
+                        // and both stores write back what they read. Skipping is exact.
+                        if _mm256_testz_ps(any, any) == 0 {
+                            let row = _mm256_set1_ps((i + k) as f32);
+                            let mut b = 0usize;
+                            while b < NB {
+                                bv[b] = _mm256_blendv_ps(bv[b], v[b], m[b]);
+                                let bi = _mm256_loadu_ps(bip.add(jj + b * 8));
+                                _mm256_storeu_ps(
+                                    bip.add(jj + b * 8),
+                                    _mm256_blendv_ps(bi, row, m[b]),
+                                );
+                                b += 1;
+                            }
+                            dirty = true;
+                        }
+                        k += 1;
+                    }
+                    if dirty {
+                        let mut b = 0usize;
+                        while b < NB {
+                            _mm256_storeu_ps(bvp.add(jj + b * 8), bv[b]);
+                            b += 1;
+                        }
+                    }
+                    jj += COLARG_JB;
+                }
+                // width % COLARG_JB trailing columns of this row block: 8-wide, then scalar.
+                while jj + 8 <= width {
+                    let mut bv = _mm256_loadu_ps(bvp.add(jj));
+                    let mut bi = _mm256_loadu_ps(bip.add(jj));
+                    let mut k = 0usize;
+                    while k < COLARG_RB {
+                        let row = _mm256_set1_ps((i + k) as f32);
+                        let v = _mm256_loadu_ps(x.add((i + k) * cols + j0 + jj));
+                        let m = _mm256_cmp_ps(v, bv, $cmp);
+                        bv = _mm256_blendv_ps(bv, v, m);
+                        bi = _mm256_blendv_ps(bi, row, m);
+                        k += 1;
+                    }
+                    _mm256_storeu_ps(bvp.add(jj), bv);
+                    _mm256_storeu_ps(bip.add(jj), bi);
+                    jj += 8;
+                }
+                while jj < width {
+                    let mut s = *bvp.add(jj);
+                    let mut si = *bip.add(jj);
+                    let mut k = 0usize;
+                    while k < COLARG_RB {
+                        let v = *x.add((i + k) * cols + j0 + jj);
+                        let ($a, $b) = (v, s);
+                        if $better {
+                            s = v;
+                            si = (i + k) as f32;
+                        }
+                        k += 1;
+                    }
+                    *bvp.add(jj) = s;
+                    *bip.add(jj) = si;
+                    jj += 1;
+                }
+                i += COLARG_RB;
             }
-            jj += 1;
-        }
-        i += 1;
+            // rows % COLARG_RB trailing rows, one at a time — the same ascending-`i` continuation.
+            while i < rows {
+                let row_i = _mm256_set1_ps(i as f32);
+                let xrow = x.add(i * cols + j0);
+                let mut jj = 0usize;
+                while jj < n8 {
+                    let bv = _mm256_loadu_ps(bvp.add(jj));
+                    let bi = _mm256_loadu_ps(bip.add(jj));
+                    let v = _mm256_loadu_ps(xrow.add(jj)); // 8 columns of row i
+                    let mask = _mm256_cmp_ps(v, bv, $cmp);
+                    _mm256_storeu_ps(bvp.add(jj), _mm256_blendv_ps(bv, v, mask));
+                    _mm256_storeu_ps(bip.add(jj), _mm256_blendv_ps(bi, row_i, mask));
+                    jj += 8;
+                }
+                // Per-row scalar tail for the `width % 8` trailing columns (same strict compare).
+                while jj < width {
+                    let v = *xrow.add(jj);
+                    let ($a, $b) = (v, *bvp.add(jj));
+                    if $better {
+                        *bvp.add(jj) = v;
+                        *bip.add(jj) = i as f32;
+                    }
+                    jj += 1;
+                }
+                i += 1;
+            }
+        }};
+    }
+    if is_max {
+        scan!(_CMP_GT_OQ, |a, b| a > b);
+    } else {
+        scan!(_CMP_LT_OQ, |a, b| a < b);
     }
     // Write the winning row indices as i32 (round-toward-zero recovers the exact integers).
     let mut jj = 0usize;
@@ -237,12 +354,15 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
     // whole process, leaving later outlined @parallel region bodies (~1.5 MiB of privatized scratch at
     // S=512) on 2 MiB stacks. Configuration only -- the stripe split is unchanged, so the bits are too.
     crate::ensure_global_pool();
-    // One stripe per core, each a multiple of 8 columns (keep the AVX2 8-wide main loop aligned to the
-    // stripe boundary so every stripe's tail is only its own `cols % 8`); the last stripe absorbs the
-    // remainder. Raw pointers cross the rayon closure boundary as integers (the same pattern as the
-    // parallel column reductions / GEMM); each task reads all rows and writes a disjoint `out[]` stripe.
+    // One stripe per core, each a multiple of [`COLARG_JB`] columns — a narrower stripe would never
+    // enter [`colarg_avx2`]'s blocked tile at all and would run the whole parallel entry on the
+    // 8-wide tail path; the last stripe absorbs the remainder. The stripe width only *partitions* the
+    // columns — every column is still scanned over all rows, i-ascending, whichever stripe owns it —
+    // so widening it cannot move a bit. Raw pointers cross the rayon closure boundary as integers
+    // (the same pattern as the parallel column reductions / GEMM); each task reads all rows and
+    // writes a disjoint `out[]` stripe.
     let nthreads = rayon::current_num_threads().max(1);
-    let per = (c.div_ceil(nthreads)).next_multiple_of(8).max(8);
+    let per = (c.div_ceil(nthreads)).next_multiple_of(COLARG_JB).max(COLARG_JB);
     let nstripes = c.div_ceil(per);
     let (x_addr, out_addr) = (x as usize, out as usize);
     (0..nstripes).into_par_iter().for_each(|s| {
@@ -332,13 +452,30 @@ mod tests {
     }
 
     /// Deterministic, varied integer-valued input (no RNG) so ties are EXACT. Integer-valued f32s mean
-    /// equal extrema compare bit-equal, which is what pins the lowest-index tie-break. A small range
-    /// (`-50..=50`) → many exact duplicates within a column, so ties happen naturally and the
-    /// lowest-row-index rule is exercised everywhere, not only in the planted columns.
+    /// equal extrema compare bit-equal, which is what pins the lowest-index tie-break.
+    ///
+    /// HALF THE COLUMNS REPEAT WITH PERIOD 7 IN `i`. The previous generator was
+    /// `((t*31 + 7) % 101) - 50` over the flattened index, which its comment claimed produced "many
+    /// exact duplicates within a column" — it does not: within a column the value repeats only every
+    /// 101 rows, so for the `rows <= 100` shapes these tests use, **no column contained a single
+    /// tie** and the lowest-index tie-break was untested here. (Confirmed by mutation: relaxing the
+    /// AVX2 compare from `>` to `>=` left `scalar_matches_avx2_bit_for_bit` green.) The even columns
+    /// now depend on `i % 7`, so every column with 8 or more rows has exact duplicate extrema; the odd
+    /// columns keep the long-period sequence so a broken *update* — not just a broken tie-break —
+    /// still shows.
     fn fill(rows: usize, cols: usize) -> Vec<f32> {
-        (0..rows * cols)
-            .map(|t| (((t * 31 + 7) % 101) as i32 - 50) as f32)
-            .collect()
+        let mut v = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            for j in 0..cols {
+                let t = i * cols + j;
+                v[t] = if j % 2 == 0 {
+                    (((i % 7) * 3 + (j % 5)) % 11) as f32 - 5.0
+                } else {
+                    (((t * 31 + 7) % 101) as i32 - 50) as f32
+                };
+            }
+        }
+        v
     }
 
     /// The column arg-reductions (AVX2 serial and the multicore stripe split) must equal the naive
@@ -483,8 +620,12 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        for &cols in &[1usize, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 257] {
-            for &rows in &[1usize, 2, 7, 33, 100] {
+        // Widths and heights straddle every edge of the COLARG_RB x COLARG_JB tile as well as the
+        // 8-lane edge: below / at / just past one tile, and the 8-wide + scalar tails inside a block.
+        for &cols in
+            &[1usize, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 71, 72, 100, 127, 128, 129, 257]
+        {
+            for &rows in &[1usize, 2, 3, 4, 5, 7, 8, 9, 33, 100] {
                 let x = fill(rows, cols);
                 for is_max in [true, false] {
                     let mut s = vec![-7i32; cols]; // sentinel: never a legal row index
@@ -496,6 +637,86 @@ mod tests {
                     assert_eq!(s, v, "scalar != avx2 at rows={rows} cols={cols} is_max={is_max}");
                 }
             }
+        }
+    }
+
+    /// The `vptest` early-out in [`colarg_avx2`] is only sound because "no lane strictly beats its
+    /// running best" makes the blends the identity. Exercise BOTH sides of that branch, and the
+    /// awkward values where a sloppy compare would change the answer, against the scalar twin:
+    ///
+    ///  * a **strictly increasing** column — every row wins, so the branch is never taken and the
+    ///    update path runs on every row of every tile (answer: the LAST row);
+    ///  * a **strictly decreasing** column — argmax never updates after row 0, so the branch is taken
+    ///    for the whole scan (answer: row 0), which is the path the early-out was added for;
+    ///  * a **constant** column — every compare is an exact tie, so a non-strict compare would walk
+    ///    the index forward to the last row instead of keeping row 0;
+    ///  * **NaN** rows — `v > bv` and `v < bv` are both false for a NaN `v`, so a NaN must never win;
+    ///    and a NaN sitting in `bv` (row 0) must let the first non-NaN row take over;
+    ///  * **±0.0** — `0.0 > -0.0` is false, so the earlier zero must keep the column.
+    ///
+    /// 137 columns x 13 rows spans two full [`COLARG_JB`] tiles plus an 8-wide and a scalar tail, and
+    /// three full [`COLARG_RB`] row blocks plus a one-row remainder, so every column pattern is seen
+    /// at every position in the tiling.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn early_out_branch_and_nan_signed_zero_match_the_scalar_twin() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let (rows, cols) = (13usize, 137usize);
+        let nan = f32::NAN;
+        let mut x = vec![0.0f32; rows * cols];
+        for j in 0..cols {
+            for i in 0..rows {
+                x[i * cols + j] = match j % 7 {
+                    0 => i as f32,             // strictly increasing: update on every row
+                    1 => -(i as f32),          // strictly decreasing: never updates after row 0
+                    2 => 4.0,                  // constant: every compare is an exact tie
+                    3 => {
+                        if i % 3 == 1 {
+                            nan
+                        } else {
+                            i as f32 * 0.5
+                        }
+                    } // NaN sprinkled through
+                    4 => {
+                        if i == 0 {
+                            nan
+                        } else {
+                            1.0
+                        }
+                    } // NaN in the row-0 seed
+                    5 => {
+                        if i % 2 == 0 {
+                            0.0
+                        } else {
+                            -0.0
+                        }
+                    } // +0/-0 ties
+                    _ => f32::INFINITY * (if i == 6 { 1.0 } else { 0.0 }), // one +inf, rest NaN(0*inf)
+                };
+            }
+        }
+        for is_max in [true, false] {
+            let mut s = vec![-7i32; cols];
+            let mut v = vec![-7i32; cols];
+            let mut p = vec![-7i32; cols];
+            unsafe {
+                colarg_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, is_max);
+                colarg_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, is_max);
+                // …and a two-stripe split, so the parallel entry is held to the same indices.
+                colarg_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 0, 64, is_max);
+                colarg_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 64, cols, is_max);
+            }
+            assert_eq!(s, v, "early-out/NaN/±0: scalar != avx2 (is_max={is_max})");
+            assert_eq!(s, p, "early-out/NaN/±0: scalar != striped (is_max={is_max})");
+            // Spot-pin the three columns whose answer is forced by the tie-break rule itself, so a
+            // twin that drifted *together with* the vector path would still be caught.
+            let inc = if is_max { rows as i32 - 1 } else { 0 };
+            assert_eq!(v[0], inc, "increasing column (is_max={is_max})");
+            assert_eq!(v[1], rows as i32 - 1 - inc, "decreasing column (is_max={is_max})");
+            assert_eq!(v[2], 0, "constant column must keep row 0 (is_max={is_max})");
+            assert_eq!(v[5], 0, "±0.0 tie must keep row 0 (is_max={is_max})");
         }
     }
 }
