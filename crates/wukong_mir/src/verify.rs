@@ -663,6 +663,38 @@ impl Verifier<'_> {
                     }
                 }
             }
+            // The operand must really be a vector and the index must really be in range: the
+            // interpreter indexes its lane arena directly, so an out-of-range lane there would be a
+            // panic rather than a diagnostic, and a scalar operand would read a lane that does not
+            // exist.
+            Op::ExtractLane(v, k) => {
+                if self.use_val(*v) {
+                    if let (Some(vt), Some(res)) = (self.ty(*v).cloned(), self.result_ty(result)) {
+                        match &vt {
+                            MirType::Vec(lane, n) => {
+                                if *k >= *n {
+                                    self.err(format!(
+                                        "extractlane index {k} is out of range for {}",
+                                        vt.display()
+                                    ));
+                                }
+                                if **lane != res {
+                                    self.err(format!(
+                                        "extractlane of {} must yield {}, got {}",
+                                        vt.display(),
+                                        lane.display(),
+                                        res.display()
+                                    ));
+                                }
+                            }
+                            _ => self.err(format!(
+                                "extractlane operand must be a vector, got {}",
+                                vt.display()
+                            )),
+                        }
+                    }
+                }
+            }
         }
     }
 

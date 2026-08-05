@@ -1,0 +1,124 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 15
+// EXPECT-OUT: 18
+// EXPECT-OUT: 21
+// EXPECT-OUT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: 22
+// EXPECT-OUT: 133
+// EXPECT-OUT: 144
+// EXPECT-OUT: 155
+// EXPECT-OUT: 2122
+// EXPECT-OUT: 47
+// EXPECT-OUT: 47
+module tests.run.ptr_slot_promotion
+
+// `mem2reg` promotes POINTER-typed stack slots, not just int/float ones.
+//
+// `mir_build` gives every pointer-typed parameter — `*T`, `&T`, and every `Tensor[…]`, all of which
+// lower to `MirType::Ptr` — an `alloca ptr` plus a `store <param>` in the entry block, then re-loads
+// that base pointer at every element access. Promoting the slot deletes the reload; the risk is that
+// the promoted pointer VALUE is wrong (a stale or mis-merged base), or that promoting the pointer
+// wrongly lets its POINTEE be promoted too and an aliasing write disappears.
+//
+// mem2reg runs only at `-O1`+, so `-O0` vs `-O1/-O2/-O3` is the gate that can see a bad promotion —
+// interp-vs-native cannot, since both backends consume the same post-optimizer MIR. Every lane is
+// printed (never a reduction: a sum hides a single wrong lane) and every expected value below is
+// computed from the scalar semantics of the loop, not read back from the compiler. All values are
+// small integers, exact in f32.
+
+// A data-dependent branch keeps every elementwise recognizer from firing, so the loop stays general
+// code and the three pointer params are the only base pointers in play.
+fn blend(x: Tensor[f32, 8], y: Tensor[f32, 8], mut o: Tensor[f32, 8]) {
+    for i in 0..8 {
+        if x[i] > y[i] {
+            o[i] = x[i] * 3.0;
+        } else {
+            o[i] = y[i] * 2.0 + 1.0;
+        }
+    }
+}
+
+// A 2-D shape: the row-major flattening `i*3 + j` geps off the same promoted base pointer.
+fn scale2d(m: Tensor[i32, 2, 3], mut o: Tensor[i32, 2, 3], k: i32) {
+    for i in 0..2 {
+        for j in 0..3 {
+            o[i, j] = m[i, j] * k + (i as i32) * 100;
+        }
+    }
+}
+
+// A raw `*mut i32` parameter: its slot is promoted, but the storage it points AT is the caller's and
+// must still be written through.
+fn bump(p: *mut i32, k: i32) -> i32 {
+    *p = *p + k;
+    return *p;
+}
+
+// A promoted pointer that MERGES two addresses at a loop header. After promotion `p` is a block
+// parameter, so `*p = *p + 10` writes through whichever of `&a` / `&b` reaches — and both `a` and `b`
+// must stay in memory (the escape test sees them as `br` arguments). `p`'s `store` is in the entry
+// block here, which is what makes it eligible; the same `let` placed after a loop would not be.
+// At `-O1` this is the promoted form — `bb1(v27 ptr, v28 i32)`, a pointer block parameter, with
+// `store v13, v27` writing through it; at `-O2` the whole helper is inlined into `main` and the
+// spliced slot falls back to memory, so the two levels agreeing is itself part of the check.
+//   i=0: a = 1+10 = 11    i=1: a = 11+10 = 21, then p switches to &b
+//   i=2: b = 2+10 = 12    i=3: b = 12+10 = 22        ->  21 * 100 + 22 = 2122
+fn swaploop() -> i32 {
+    let mut a: i32 = 1;
+    let mut b: i32 = 2;
+    let mut p: *mut i32 = &mut a;
+    let mut i: i32 = 0;
+    while i < 4 {
+        *p = *p + 10;
+        if i == 1 {
+            p = &mut b;
+        }
+        i = i + 1;
+    }
+    return a * 100 + b;
+}
+
+fn main() -> i32 {
+    // ---- promoted Tensor base pointers ----
+    // x = 0..7, y = 4 everywhere.  x[i] > 4 only for i = 5,6,7.
+    //   i <= 4 -> 4*2 + 1 = 9;  i = 5 -> 15;  i = 6 -> 18;  i = 7 -> 21
+    let mut x: [f32; 8] = [0.0; 8];
+    let y: [f32; 8] = [4.0; 8];
+    let mut o: [f32; 8] = [0.0; 8];
+    for i in 0..8 {
+        x[i] = (i as f32);
+    }
+    blend(x, y, o);
+    for i in 0..8 {
+        print(o[i] as i32);
+    }
+
+    // ---- promoted base pointer under a 2-D index ----
+    // m = 0..5 row-major, k = 11  ->  row 0: 0, 11, 22   row 1: 33+100, 44+100, 55+100
+    let mut m: [i32; 6] = [0; 6];
+    let mut m2: [i32; 6] = [0; 6];
+    for i in 0..6 {
+        m[i] = i;
+    }
+    scale2d(m, m2, 11);
+    for i in 0..6 {
+        print(m2[i]);
+    }
+
+    // ---- a promoted pointer that MERGES two addresses at a loop header ----
+    print(swaploop()); // 2122
+
+    // ---- a promoted `*mut i32` parameter writes through to the caller's local ----
+    // c = 40, bump(&mut c, 7) returns 47 and c is 47 afterwards.
+    let mut c: i32 = 40;
+    print(bump(&mut c, 7)); // 47
+    print(c); // 47
+    return 0;
+}

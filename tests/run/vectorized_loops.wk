@@ -1,0 +1,351 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -2000
+// EXPECT-OUT: -1500
+// EXPECT-OUT: -1000
+// EXPECT-OUT: -500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1500
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 3500
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 4500
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 5500
+// EXPECT-OUT: 6000
+// EXPECT-OUT: 6500
+// EXPECT-OUT: 7000
+// EXPECT-OUT: 7500
+// EXPECT-OUT: 8000
+// EXPECT-OUT: 8500
+// EXPECT-OUT: 9000
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 30
+// EXPECT-OUT: 60
+// EXPECT-OUT: 90
+// EXPECT-OUT: 120
+// EXPECT-OUT: 150
+// EXPECT-OUT: 180
+// EXPECT-OUT: 210
+// EXPECT-OUT: 240
+// EXPECT-OUT: 270
+// EXPECT-OUT: 300
+// EXPECT-OUT: 330
+// EXPECT-OUT: 360
+// EXPECT-OUT: 390
+// EXPECT-OUT: 420
+// EXPECT-OUT: 450
+// EXPECT-OUT: 480
+// EXPECT-OUT: 510
+// EXPECT-OUT: 540
+// EXPECT-OUT: 570
+// EXPECT-OUT: 600
+// EXPECT-OUT: 630
+// EXPECT-OUT: 660
+// EXPECT-OUT: 253
+// EXPECT-OUT: -2000
+// EXPECT-OUT: -1750
+// EXPECT-OUT: -1500
+// EXPECT-OUT: -1250
+// EXPECT-OUT: -1000
+// EXPECT-OUT: -750
+// EXPECT-OUT: -500
+// EXPECT-OUT: -250
+// EXPECT-OUT: 0
+// EXPECT-OUT: 250
+// EXPECT-OUT: 500
+// EXPECT-OUT: 750
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1250
+// EXPECT-OUT: 1500
+// EXPECT-OUT: 1750
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 2250
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 2750
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 3250
+// EXPECT-OUT: 3500
+// EXPECT-OUT: 2
+// EXPECT-OUT: 92
+// EXPECT-OUT: 182
+// EXPECT-OUT: 272
+// EXPECT-OUT: 362
+// EXPECT-OUT: 452
+// EXPECT-OUT: 542
+// EXPECT-OUT: 632
+// EXPECT-OUT: 722
+// EXPECT-OUT: 812
+// EXPECT-OUT: 902
+// EXPECT-OUT: 992
+// EXPECT-OUT: 1082
+// EXPECT-OUT: 1172
+// EXPECT-OUT: 1262
+// EXPECT-OUT: 1352
+// EXPECT-OUT: 1442
+// EXPECT-OUT: 1532
+// EXPECT-OUT: 1622
+// EXPECT-OUT: 1712
+// EXPECT-OUT: 1802
+// EXPECT-OUT: 1892
+// EXPECT-OUT: 1982
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 2875
+// EXPECT-OUT: 2750
+// EXPECT-OUT: 2625
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 2375
+// EXPECT-OUT: 2250
+// EXPECT-OUT: 2125
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 2625
+// EXPECT-OUT: 3250
+// EXPECT-OUT: 3875
+// EXPECT-OUT: 4500
+// EXPECT-OUT: 5125
+// EXPECT-OUT: 5750
+// EXPECT-OUT: 6375
+// EXPECT-OUT: 7000
+// EXPECT-OUT: 7625
+// EXPECT-OUT: 8250
+// EXPECT-OUT: 8875
+// EXPECT-OUT: 9500
+// EXPECT-OUT: 10125
+// EXPECT-OUT: 10750
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 250
+// EXPECT-OUT: 500
+// EXPECT-OUT: 750
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1250
+// EXPECT-OUT: 1500
+// EXPECT-OUT: 1750
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 2250
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 2750
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 3250
+// EXPECT-OUT: 3500
+// EXPECT-OUT: -2000
+// EXPECT-OUT: -1500
+// EXPECT-OUT: -1000
+// EXPECT-OUT: -500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1500
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 3500
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 4500
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 5500
+// EXPECT-OUT: 6000
+// EXPECT-OUT: 6500
+// EXPECT-OUT: 7000
+// EXPECT-OUT: 7500
+// EXPECT-OUT: 8000
+// EXPECT-OUT: 8500
+// EXPECT-OUT: 9000
+module tests.run.vectorized_loops
+
+// The correctness fixture for `wukong_opt::vectorize`, and the reason it is shaped the way it is:
+// a vectorized loop is **half gate-blind**. `native_matches_interpreter` cannot see a widening bug,
+// because both backends execute the same widened MIR. The only witness is
+// `optimization_is_observationally_invariant`, where `-O0` runs the scalar loop the front end
+// emitted and `-O2` runs the vector loop plus its scalar epilogue. So this file is written to make
+// that comparison bite:
+//
+//  * **Every lane is printed, never a checksum.** The one miscompile this pass produced during
+//    development wrote four copies of every fourth element (a lane-varying value splatted across
+//    the group), and a sum over the buffer would have been identical.
+//  * **N = 23**, which is not a multiple of 4 (f32/i32 lanes) or 2 (f64 lanes), so the scalar
+//    epilogue runs 3 and 1 elements respectively. A multiple of the width would leave it untested.
+//  * **A reassociation canary.** `fsum` over `[2^24, 1, 1, …]` is exactly 2^24 when summed in
+//    order: every `2^24 + 1` is a tie that rounds to even, i.e. back to 2^24. Group the ones
+//    together first — which is what reassociating a float reduction does — and the answer is
+//    2^24 + 6 or larger. The fixture prints the difference from 2^24, so the expected `0` is a
+//    proof that the accumulate stayed serial, not merely that it was close.
+//  * **A deliberately aliased call**, `saxpy_while(1.5, o, y, o, N)`, where the output buffer is
+//    also an input. The runtime pointer-range check must reject it and let the scalar loop do all
+//    the work.
+//  * **The `while` spelling** wherever a `for` would be matched by a `mir_build` recognizer: a
+//    recognized loop never reaches the optimizer and would gate nothing here.
+//
+// Every expected value is derived from the scalar arithmetic in the comment beside it, not
+// recorded from compiler output.
+
+const N: i64 = 23;
+
+/// `o[i] = a*x[i] + y[i]` — three distinct streams, the elementwise case.
+fn saxpy_while(a: f32, x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = a * x[i] + y[i];
+        i = i + 1;
+    }
+}
+
+/// A float reduction: the body widens, the accumulate stays serial.
+fn fsum(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + x[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+/// i32 elementwise — 4 lanes of `i32`.
+fn imul(x: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] * 30;
+        i = i + 1;
+    }
+}
+
+/// An i32 reduction. Integer addition is associative, so serial and lane-folded orders agree —
+/// this checks the fold's arithmetic, not its order.
+fn isum(x: []i32, n: i64) -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + x[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+/// `f64` doubles 2 lanes at a time — a different width, and a 1-element epilogue.
+fn dscale(x: []f64, mut o: []f64, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] * 2.0;
+        i = i + 1;
+    }
+}
+
+/// A load and a store at the *same* address: a loop-independent dependence at distance 0, which
+/// widening must preserve rather than decline.
+fn rmw(mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = o[i] * 3 + 2;
+        i = i + 1;
+    }
+}
+
+/// A diamond body: both arms store to the same address, so if-conversion turns the branch into a
+/// lane mask and the two stores into one masked store.
+fn condbody(x: []f32, y: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let xi: f32 = x[i];
+        if xi > 0.0 { o[i] = xi * 2.0 + y[i]; } else { o[i] = y[i] - xi; }
+        i = i + 1;
+    }
+}
+
+/// A triangle body: the `then` arm has no instructions at all, and the merge is a `select` on the
+/// join block's parameter.
+fn clamp0(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let mut t: f32 = x[i];
+        if t < 0.0 { t = 0.0; }
+        o[i] = t;
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(N);
+    let mut y: []f32 = alloc_f32(N);
+    let mut o: []f32 = alloc_f32(N);
+    let mut c: []f32 = alloc_f32(N);
+    let mut xi: []i32 = alloc_i32(N);
+    let mut oi: []i32 = alloc_i32(N);
+    let mut xd: []f64 = alloc_f64(N);
+    let mut od: []f64 = alloc_f64(N);
+
+    let mut i: i64 = 0;
+    while i < N {
+        x[i] = (i as f32) * 0.25 - 2.0;      // exact: a multiple of 1/4
+        y[i] = (i as f32) * 0.125 + 1.0;     // exact: a multiple of 1/8
+        o[i] = 0.0;
+        c[i] = 1.0;
+        xi[i] = i as i32;
+        oi[i] = 0;
+        xd[i] = (i as f64) * 0.25 - 2.0;
+        od[i] = 0.0;
+        i = i + 1;
+    }
+    c[0] = 16777216.0;                        // 2^24, where the f32 ulp is 2
+
+    // (1) o[i] = 1.5*(0.25i - 2) + (0.125i + 1) = 0.5i - 2, printed x1000.
+    saxpy_while(1.5, x, y, o, N);
+    let mut k: i64 = 0;
+    while k < N { print((o[k] * 1000.0) as i32); k = k + 1; }
+
+    // (2) sum in order = 2^24 (each `2^24 + 1` ties to even); any regrouping gives more.
+    print((fsum(c, N) - 16777216.0) as i32);
+
+    // (3) o[i] = 30i.
+    imul(xi, oi, N);
+    k = 0;
+    while k < N { print(oi[k]); k = k + 1; }
+
+    // (4) sum of 0..22 = 253.
+    print(isum(xi, N));
+
+    // (5) od[i] = 2*(0.25i - 2) = 0.5i - 4, printed x500.
+    dscale(xd, od, N);
+    k = 0;
+    while k < N { print((od[k] * 500.0) as i32); k = k + 1; }
+
+    // (6) oi[i] = 30i, then 3*(30i) + 2 = 90i + 2.
+    rmw(oi, N);
+    k = 0;
+    while k < N { print(oi[k]); k = k + 1; }
+
+    // (7) if-converted diamond. x[i] = 0.25i - 2 is positive from i = 9 on, so both arms run:
+    //     i < 8  -> o[i] = (0.125i + 1) - (0.25i - 2) = 3 - 0.125i
+    //     i >= 9 -> o[i] = 2*(0.25i - 2) + (0.125i + 1) = 0.625i - 3
+    //     i == 8 -> x[8] = 0 exactly, and `0 > 0` is false, so the else arm: 3 - 1 = 2
+    //     printed x1000.
+    condbody(x, y, o, N);
+    k = 0;
+    while k < N { print((o[k] * 1000.0) as i32); k = k + 1; }
+
+    // (8) if-converted triangle: max(x[i], 0) = max(0.25i - 2, 0), printed x1000.
+    clamp0(x, o, N);
+    k = 0;
+    while k < N { print((o[k] * 1000.0) as i32); k = k + 1; }
+
+    // (9) ALIASED: x is both input and output. x[i] = 1.5*(0.25i - 2) + (0.125i + 1) = 0.5i - 2,
+    //     printed x1000 — and only correct if the vector loop declined at runtime.
+    saxpy_while(1.5, x, y, x, N);
+    k = 0;
+    while k < N { print((x[k] * 1000.0) as i32); k = k + 1; }
+
+    free(od); free(xd); free(oi); free(xi); free(c); free(o); free(y); free(x);
+    return 0;
+}

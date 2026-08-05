@@ -1,0 +1,149 @@
+module gblock_a
+
+// STRUCTURE TAX, variant (a): the RECOGNIZER DIALECT.
+//
+// One pre-norm transformer block (RMSNorm -> RoPE -> causal MHA -> RMSNorm -> SwiGLU MLP), written
+// in exactly the shapes `wukong_mir_build`'s recognizers match: flat `[f32; N]` arrays with
+// compile-time-constant extents, `for i in 0..CONST` loops, the row-offset/column-index norm form
+// (`x[r*D+i] * inv * g[i]`, literal `/ D.0`, inline literal eps), the NT-layout projection nest
+// (`s += a[i*K+p] * w[j*K+p]`), the fused bias+activation epilogue (`c[i*N+j] = b[j] + s`), and
+// per-head contiguous gathers so the attention GEMMs see dense [S,HD] operands.
+//
+// Variants (b)-(e) below compute the IDENTICAL arithmetic in the identical order; only the spelling
+// changes. Any timing spread between them is therefore pure structure tax, not different math.
+//
+// The dollar-delimited dimension tokens are substituted by `crates/wukong_xbench/src/general.rs`
+// before compilation; the substituted source is written to the xbench temp dir, so
+// `wukongc --emit=mir -O2 <file>` reproduces the dispatch census the harness prints.
+
+fn kbench(
+    x: [f32; $SD$],
+    g1: [f32; $D$], g2: [f32; $D$],
+    wq: [f32; $DD$], wk: [f32; $DD$], wv: [f32; $DD$], wo: [f32; $DD$],
+    w1: [f32; $FD$], w3: [f32; $FD$], w2: [f32; $DF$],
+    b1: [f32; $F$],
+    rc: [f32; $SH2$], rs: [f32; $SH2$],
+    mut nrm: [f32; $SD$],
+    mut q: [f32; $SD$], mut k: [f32; $SD$], mut v: [f32; $SD$],
+    mut sc: [f32; $SS$],
+    mut qh: [f32; $SHD$], mut kh: [f32; $SHD$], mut vt: [f32; $SHD$], mut ah: [f32; $SHD$],
+    mut ctx: [f32; $SD$],
+    mut h: [f32; $SD$],
+    mut f1: [f32; $SF$], mut f3: [f32; $SF$],
+    mut out: [f32; $SD$],
+) {
+    // ---- 1. RMSNorm(x) * g1 -> nrm  (batched affine norm form) ----
+    for i in 0..$SD$ { nrm[i] = x[i]; }
+    for r in 0..$S$ {
+        let mut s: f32 = 0.0;
+        for i in 0..$D$ { s = s + nrm[r*$D$+i] * nrm[r*$D$+i]; }
+        let inv: f32 = rsqrt(s / $D$.0 + 0.00001);
+        for i in 0..$D$ { nrm[r*$D$+i] = nrm[r*$D$+i] * inv * g1[i]; }
+    }
+
+    // ---- 2. Q/K/V projections, NT layout (nn.Linear) ----
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i*$D$+p] * wq[j*$D$+p]; }
+        q[i*$D$+j] = s;
+    } }
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i*$D$+p] * wk[j*$D$+p]; }
+        k[i*$D$+j] = s;
+    } }
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i*$D$+p] * wv[j*$D$+p]; }
+        v[i*$D$+j] = s;
+    } }
+
+    // ---- 3. RoPE (rotate-half) on q and k, per head ----
+    for r in 0..$S$ {
+        for hh in 0..$H$ {
+            for t in 0..$HD2$ {
+                let cc: f32 = rc[r*$HD2$+t];
+                let ss: f32 = rs[r*$HD2$+t];
+                let q0: f32 = q[r*$D$ + hh*$HD$ + t];
+                let q1: f32 = q[r*$D$ + hh*$HD$ + t + $HD2$];
+                q[r*$D$ + hh*$HD$ + t] = q0*cc - q1*ss;
+                q[r*$D$ + hh*$HD$ + t + $HD2$] = q0*ss + q1*cc;
+                let k0: f32 = k[r*$D$ + hh*$HD$ + t];
+                let k1: f32 = k[r*$D$ + hh*$HD$ + t + $HD2$];
+                k[r*$D$ + hh*$HD$ + t] = k0*cc - k1*ss;
+                k[r*$D$ + hh*$HD$ + t + $HD2$] = k0*ss + k1*cc;
+            }
+        }
+    }
+
+    // ---- 4. Causal multi-head attention ----
+    // Contiguous per-head gathers so each GEMM sees a dense [S,HD] / [HD,S] operand.
+    for hh in 0..$H$ {
+        for i in 0..$S$ { for p in 0..$HD$ { qh[i*$HD$+p] = q[i*$D$ + hh*$HD$ + p]; } }
+        for i in 0..$S$ { for p in 0..$HD$ { kh[i*$HD$+p] = k[i*$D$ + hh*$HD$ + p]; } }
+        for j in 0..$HD$ { for p in 0..$S$ { vt[j*$S$+p] = v[p*$D$ + hh*$HD$ + j]; } }
+        for i in 0..$S$ { for j in 0..$S$ {
+            let mut s: f32 = 0.0;
+            for p in 0..$HD$ { s = s + qh[i*$HD$+p] * kh[j*$HD$+p]; }
+            sc[i*$S$+j] = $SCALE$ * s;
+        } }
+        for i in 0..$S$ { for j in 0..$S$ { if j > i { sc[i*$S$+j] = 0.0 - 1.0e30; } } }
+        for r in 0..$S$ {
+            let mut m: f32 = sc[r*$S$];
+            for i in 0..$S$ { m = fmax(m, sc[r*$S$+i]); }
+            for i in 0..$S$ { sc[r*$S$+i] = exp(sc[r*$S$+i] - m); }
+            let mut sm: f32 = 0.0;
+            for i in 0..$S$ { sm = sm + sc[r*$S$+i]; }
+            let inv: f32 = 1.0 / sm;
+            for i in 0..$S$ { sc[r*$S$+i] = sc[r*$S$+i] * inv; }
+        }
+        for i in 0..$S$ { for j in 0..$HD$ {
+            let mut s: f32 = 0.0;
+            for p in 0..$S$ { s = s + sc[i*$S$+p] * vt[j*$S$+p]; }
+            ah[i*$HD$+j] = s;
+        } }
+        for i in 0..$S$ { for j in 0..$HD$ { ctx[i*$D$ + hh*$HD$ + j] = ah[i*$HD$+j]; } }
+    }
+
+    // ---- 5. Output projection + residual ----
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + ctx[i*$D$+p] * wo[j*$D$+p]; }
+        h[i*$D$+j] = s;
+    } }
+    for i in 0..$SD$ { h[i] = x[i] + h[i]; }
+
+    // ---- 6. RMSNorm(h) * g2 -> nrm ----
+    for i in 0..$SD$ { nrm[i] = h[i]; }
+    for r in 0..$S$ {
+        let mut s: f32 = 0.0;
+        for i in 0..$D$ { s = s + nrm[r*$D$+i] * nrm[r*$D$+i]; }
+        let inv: f32 = rsqrt(s / $D$.0 + 0.00001);
+        for i in 0..$D$ { nrm[r*$D$+i] = nrm[r*$D$+i] * inv * g2[i]; }
+    }
+
+    // ---- 7. SwiGLU MLP: gate = silu(nrm.W1' + b1), up = nrm.W3', f1 = gate*up ----
+    for i in 0..$S$ { for j in 0..$F$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i*$D$+p] * w1[j*$D$+p]; }
+        f1[i*$F$+j] = b1[j] + s;
+    } }
+    // The activation as its OWN loop: that is the shape `wukong_sgemm_nt_epi` fuses. Writing it
+    // inside the store (`f1[..] = silu(b1[j] + s)`) is arithmetically identical and is what a real
+    // engineer writes — and it declines the recognizer outright. That is variant (b).
+    for i in 0..$S$ { for j in 0..$F$ { f1[i*$F$+j] = silu(f1[i*$F$+j]); } }
+    for i in 0..$S$ { for j in 0..$F$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$D$ { s = s + nrm[i*$D$+p] * w3[j*$D$+p]; }
+        f3[i*$F$+j] = s;
+    } }
+    for i in 0..$SF$ { f1[i] = f1[i] * f3[i]; }
+
+    // ---- 8. Down projection + residual ----
+    for i in 0..$S$ { for j in 0..$D$ {
+        let mut s: f32 = 0.0;
+        for p in 0..$F$ { s = s + f1[i*$F$+p] * w2[j*$F$+p]; }
+        out[i*$D$+j] = s;
+    } }
+    for i in 0..$SD$ { out[i] = h[i] + out[i]; }
+}

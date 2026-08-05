@@ -1,0 +1,102 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 15
+// EXPECT-OUT: 19
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 99
+// EXPECT-OUT: 5
+module tests.run.alias_slice_params
+
+// Aliasing hazards for `wukong_opt::alias`. Every value below is derived from the SCALAR semantics
+// of the loop by hand, never read back from the compiler: an optimizer that wrongly assumed two
+// pointer parameters are distinct storage would produce a *self-consistent* wrong answer that
+// interp==native and -O0==-O2 both agree on, so those gates cannot see it. These EXPECT-OUT lines
+// are the only thing that can.
+//
+// All arithmetic is on small integers, exact in f32, so the expected values are exact.
+
+// Reads `src[i]` and writes `dst[i]` at the same index: aliasing is invisible here, but it is the
+// simplest shape a "distinct params do not alias" assumption would be applied to.
+fn scale_into(src: []f32, mut dst: []f32, n: i64, k: f32) {
+    let mut i: i64 = 0i64;
+    while i < n {
+        dst[i] = src[i] * k;
+        i = i + 1i64;
+    }
+}
+
+// Reads `dst[i - 1]` *after* it was written, so the answer genuinely differs when `src` and `dst`
+// are the same buffer. Hoisting or reordering the `dst` load past the `dst` store — which a
+// no-alias assumption would license — changes the result.
+fn running(src: []f32, mut dst: []f32, n: i64) {
+    let mut i: i64 = 1i64;
+    while i < n {
+        dst[i] = src[i] + dst[i - 1i64];
+        i = i + 1i64;
+    }
+}
+
+// A loop that may trip zero times over a caller-owned buffer. Its loop-invariant loads (the slice
+// header's `data` and `len`) must NOT be speculated into the preheader: whether that pointer is
+// dereferenceable is the caller's business, and here the caller passes n = 0.
+fn first_or(s: []f32, n: i64, dflt: f32) -> f32 {
+    let mut out: f32 = dflt;
+    let mut i: i64 = 0i64;
+    while i < n {
+        out = s[i];
+        i = n;
+    }
+    return out;
+}
+
+fn main() -> i32 {
+    // --- same buffer passed as both parameters, elementwise ---
+    // a = 1,2,3,4  ->  a = 2,4,6,8
+    let mut a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut sa: []f32 = a;
+    scale_into(sa, sa, 4i64, 2.0);
+    for j in 0..4i64 { print(sa[j] as i32); }
+
+    // --- same buffer, loop-carried through memory ---
+    // b = 1,2,3,4  ->  b[1]=2+1=3, b[2]=3+3=6, b[3]=4+6=10  ->  1,3,6,10
+    let mut b: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut sb: []f32 = b;
+    running(sb, sb, 4i64);
+    for j in 0..4i64 { print(sb[j] as i32); }
+
+    // --- distinct buffers, same function: a different (also exact) answer ---
+    // c = 1,2,3,4 ; d = 10,0,0,0  ->  d[1]=2+10=12, d[2]=3+12=15, d[3]=4+15=19
+    let mut c: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut d: [f32; 4] = [10.0, 0.0, 0.0, 0.0];
+    let mut sc: []f32 = c;
+    let mut sd: []f32 = d;
+    running(sc, sd, 4i64);
+    for j in 0..4i64 { print(sd[j] as i32); }
+
+    // --- zero-trip loop over a caller-owned buffer: the default comes back, no read happens ---
+    print(first_or(sc, 0i64, 7.0) as i32);   // 7
+    // the same call on an empty view of a heap buffer
+    let mut h: []f32 = alloc_f32(0i64);
+    print(first_or(h, 0i64, 7.0) as i32);    // 7
+    free(h);
+
+    // --- a write through one alias is visible through the other ---
+    sa[2] = 99.0;
+    print(a[2] as i32);                      // 99
+    // ... and the backing array and the slice keep agreeing after a whole-slice pass
+    scale_into(sd, sd, 4i64, 0.0);
+    d[1] = 5.0;
+    print(sd[1] as i32);                     // 5
+    return 0;
+}

@@ -14,11 +14,13 @@
 //! that keeps a per-slot stack of the reaching definition. Reads become the reaching value, writes
 //! update it, and each CFG edge is given the arguments its destination's phis expect.
 //!
-//! Only integer and float slots are promoted. A slot read before any write on some path becomes a
-//! zero constant of its type, materialized once per type at the top of the entry block, which is what
-//! the interpreter's zero-initialized memory would have yielded. Pointer/array/vector slots stay in
-//! memory: they are rare as scalars and have no such natural zero, so promoting them would mean
-//! synthesizing a typed "undefined" value.
+//! Integer, float and pointer slots are promoted. An integer/float slot read before any write on
+//! some path becomes a zero constant of its type, materialized once per type at the top of the entry
+//! block, which is what the interpreter's zero-initialized memory would have yielded. A pointer slot
+//! has no such natural zero, so only the definitely-initialized subset is promoted
+//! ([`initialized_ptr_slots`]) — which is exactly the case that matters, since `mir_build` gives every
+//! pointer-typed parameter (`*T`, `&T`, `Tensor[…]`) an `alloca ptr` + `store` in the entry block and
+//! then re-`load`s the base pointer at *every* element access. Array and vector slots stay in memory.
 
 use std::collections::{BTreeMap, BTreeSet};
 use crate::fxhash::{FxHashMap, FxHashSet};
@@ -44,7 +46,18 @@ impl Pass for Mem2Reg {
             cfg::prune_unreachable(f);
             cache.invalidate();
         }
-        let promotable = find_promotable(f);
+        let mut promotable = find_promotable(f);
+        // A pointer slot additionally has to be provably written before it is read — see
+        // `initialized_ptr_slots`. That test needs dominance frontiers, so only pay for them when
+        // some candidate is actually a pointer (`promote` would compute them anyway if we proceed,
+        // and the cache hands back the same result).
+        if promotable.values().any(|ty| matches!(ty, MirType::Ptr)) {
+            let init = {
+                let (df, _) = cache.df_and_children(f);
+                initialized_ptr_slots(f, &promotable, df)
+            };
+            promotable.retain(|slot, ty| !matches!(ty, MirType::Ptr) || init.contains(slot));
+        }
         if promotable.is_empty() {
             return pruned;
         }
@@ -53,10 +66,11 @@ impl Pass for Mem2Reg {
     }
 }
 
-/// A slot type is promotable to a register if it is a scalar integer or float. Pointers, arrays,
-/// and vectors are left in memory (so we never need a typed "undef" for a read-before-write).
+/// A slot type is promotable to a register if it is a scalar integer or float. Arrays and vectors
+/// are left in memory. Pointers are handled too, but only for the definitely-initialized subset —
+/// see [`initialized_ptr_slots`] for why they need the extra condition.
 fn is_promotable_ty(ty: &MirType) -> bool {
-    ty.is_int() || ty.is_float()
+    ty.is_int() || ty.is_float() || matches!(ty, MirType::Ptr)
 }
 
 /// Find allocas whose pointer is used *only* as the address of `load`/`store`. Returns a map from
@@ -77,17 +91,29 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
     }
 
     // Any appearance other than `load <slot>` / `store _, <slot>` means the address escapes.
+    // A load or store whose *type* disagrees with the slot's own is a type-punned access: the value
+    // that flows through the promoted register would then have the wrong MIR type, which the
+    // verifier rejects (and, unverified, is a silent reinterpret). Leave those in memory.
     let mut bad: FxHashSet<u32> = FxHashSet::default();
     for b in &f.blocks {
         for inst in &b.insts {
             match &inst.op {
                 // The pointer operand of a load is fine; a load has no other operands.
-                Op::Load(_, _) => {}
+                Op::Load(p, ty) => {
+                    if cand.get(&p.0).is_some_and(|slot| slot != ty) {
+                        bad.insert(p.0);
+                    }
+                }
                 // The pointer operand of a store is fine, but the stored *value* being the slot
                 // pointer means the address escapes.
-                Op::Store { value, .. } => {
+                Op::Store { ptr, value } => {
                     if cand.contains_key(&value.0) {
                         bad.insert(value.0);
+                    }
+                    if let Some(slot) = cand.get(&ptr.0) {
+                        if f.value_types.get(value.0 as usize) != Some(slot) {
+                            bad.insert(ptr.0);
+                        }
                     }
                 }
                 other => each_op_use(other, &mut |v| {
@@ -107,6 +133,81 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
         cand.remove(&x);
     }
     cand
+}
+
+/// The pointer slots that are provably **written before they are read**.
+///
+/// A read-before-write slot is promoted to a zero constant of the slot's type — what the
+/// interpreter's zero-initialized memory would have yielded. There is no such constant for a
+/// pointer: `inttoptr 0` is a genuine null on the native backend but a *valid, addressable* slot in
+/// the interpreter (interp address 0 is a real address — the standing cross-cutting landmine), so
+/// synthesizing one would trade a stack slot for an interp-vs-native divergence. Rather than reason
+/// about undef we simply refuse any pointer slot that could be read first.
+///
+/// A slot qualifies when the **first access to it inside its own alloca's block `B` is a store**,
+/// and `B` is either the entry block or has an empty dominance frontier. Why that is sufficient:
+///
+/// * SSA dominance makes `B` dominate every block that mentions the slot at all (a use must be
+///   dominated by the `alloca` that defines it), and a block is straight-line, so every access
+///   outside `B` happens after all of `B` — hence after the store.
+/// * `DF(B) = ∅` means the set `S` of blocks `B` dominates is closed under *both* successors (a
+///   successor of a dominated block is dominated, else it would be in `DF(B)`) and predecessors (a
+///   predecessor outside `S` would give a path to a dominated block that bypasses `B`). So the
+///   iterated dominance frontier of the store blocks, *and every predecessor of every block that
+///   receives a phi*, lie inside `S` — which is exactly the set of program points at which the
+///   renamer asks for a reaching definition. The stack is therefore never empty.
+/// * The entry block is admitted directly: it dominates everything, so the same argument holds even
+///   when a back edge puts the entry itself in its own frontier.
+///
+/// This admits the case the pass exists for — `mir_build` gives every pointer-typed parameter
+/// (`*T`, `&T`, and every `Tensor[…]`) an `alloca ptr` immediately followed by `store <param>` in
+/// the entry block — and, after `-O2` inlining has spliced a callee's entry block into the middle of
+/// a caller block, that callee's pointer parameters too. It excludes a pointer whose `alloca` and
+/// initializing store are separated by a branch (`mir_build` hoists a local's `alloca` to the entry
+/// block but emits its store at the `let`, so `let p = &mut a;` after a loop keeps its slot).
+///
+/// One pass per phase classifies every candidate at once — a per-slot scan would be
+/// `O(slots × block length)`, and the entry block holds one `alloca` per local of the whole function.
+fn initialized_ptr_slots(
+    f: &Function,
+    cand: &BTreeMap<u32, MirType>,
+    df: &[Vec<u32>],
+) -> FxHashSet<u32> {
+    // Phase 1: each pointer candidate's home block (where its `alloca` is).
+    let mut home: FxHashMap<u32, u32> = FxHashMap::default();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let (Some(r), Op::Alloca(_)) = (inst.result, &inst.op) {
+                if matches!(cand.get(&r.0), Some(MirType::Ptr)) {
+                    home.insert(r.0, b.id.0);
+                }
+            }
+        }
+    }
+    // Phase 2: was the first access inside the home block a store? (Accesses in any other block are
+    // dominated by the home block, so they cannot come first.)
+    let mut first_is_store: FxHashMap<u32, bool> = FxHashMap::default();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            match &inst.op {
+                Op::Store { ptr, .. } if home.get(&ptr.0) == Some(&b.id.0) => {
+                    first_is_store.entry(ptr.0).or_insert(true);
+                }
+                Op::Load(p, _) if home.get(&p.0) == Some(&b.id.0) => {
+                    first_is_store.entry(p.0).or_insert(false);
+                }
+                _ => {}
+            }
+        }
+    }
+    first_is_store
+        .into_iter()
+        .filter(|&(slot, stored)| {
+            let b = home[&slot];
+            stored && (b == f.entry.0 || df[b as usize].is_empty())
+        })
+        .map(|(slot, _)| slot)
+        .collect()
 }
 
 fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut CfgAnalyses) {
@@ -285,6 +386,13 @@ impl Rename<'_> {
             return *top;
         }
         let ty = self.promotable[&var].clone();
+        // `initialized_ptr_slots` only admits a pointer slot whose first access in its own alloca's
+        // block is a store, so its reaching definition is dominated by that store and this
+        // read-before-write path is unreachable for it. There is no `const.ptr 0` to fall back on.
+        debug_assert!(
+            !matches!(ty, MirType::Ptr),
+            "pointer slot v{var} reached the read-before-write path; initialized_ptr_slots is wrong"
+        );
         if let Some(z) = self.zero_for.get(&ty) {
             return *z;
         }

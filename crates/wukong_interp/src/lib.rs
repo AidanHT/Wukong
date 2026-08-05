@@ -1012,6 +1012,26 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let s = reg(regs, *v);
                 self.push_vec(vec![s; n])
             }
+            // One lane out of a vector, by constant index — the inverse of `Splat`, and the only
+            // way back to scalar form. The lane count comes from the *operand's* type, not the
+            // result's (the result is the lane type). Both the index and the vector-ness of the
+            // operand are checked by the MIR verifier, so a bad index here is a lowering bug, not
+            // a program error; `vec_lanes` still reports it rather than panicking.
+            Op::ExtractLane(v, k) => {
+                let n = match func.value_type(*v) {
+                    MirType::Vec(_, n) => *n as usize,
+                    other => {
+                        return Err(format!(
+                            "extractlane operand is {}, not a vector",
+                            other.display()
+                        ))
+                    }
+                };
+                let lanes = self.vec_lanes(reg(regs, *v), n)?;
+                *lanes
+                    .get(*k as usize)
+                    .ok_or("extractlane index out of range")?
+            }
             // Fused multiply-add `a*b + c`, single-rounded via `mul_add` so it stays bit-identical
             // to the native `fma`. Lane-wise for vectors, each lane rounded to its lane type.
             Op::Fma(a, b, c) => {

@@ -174,7 +174,7 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 | Enums       | C-style `enum E { A = 10, B }` (variant = its `i32` discriminant) **and data-carrying** `V(i32)` / `V { f: T }` variants | ✅ |
 | Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, indexed load/store, iteration, array→slice unsizing | ✅ |
 | SIMD vectors| `f32x4`/`i32x4`, generic `vec[T, N]` — the type **parses and type-checks** (a non-scalar element is `E0302`, a lane/element mismatch at a call is `E0401`), but no vector value can be constructed in source (`f32x4::load(p)` is `C0001`) and float-vector arithmetic is an internal error, so nothing uses it. SIMD ships through the **automatic** 128-bit/256-bit loop vectorizer, which needs no vector type in source. | 🔵 |
-| Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. Whole-tensor arithmetic (`a + b`) is `E0401` — operate elementwise. A `.col_major`/`.strided`/`.tiled(…)` layout type-checks but cannot be indexed (`C0001`). | ✅ |
+| Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. Whole-tensor arithmetic (`a + b`) is `E0401` — operate elementwise. A `.col_major`/`.strided`/`.tiled(…)` layout type-checks but cannot be indexed (`C0001`). | ✅ |
 
 `&x` and `&mut x` have type `*T` and `*mut T`. A `&T`/`&mut T` **parameter** accepts them
 (`fn deref(p: &i32) -> i32 { return *p; }` with `deref(&x)`), but the two spellings are distinct types
@@ -446,7 +446,11 @@ deterministic multicore reduction kernel that reaches aggregate memory bandwidth
 C), with a result independent of core count (✅) — provided the data is **`f32`** and the loop is a
 **half-open, unit-step** range. A `step k` or `..=` range declines to the ordinary (correct, but
 single-threaded) scalar loop with no diagnostic (`tests/run/for_step_gemm.wk`), and that
-half-open/unit-step precondition holds for every recognized kernel. Element type is handled case by
+half-open/unit-step precondition holds for every recognized kernel. What does *not* matter is how the
+index is spelled: a row base hoisted into a local (`let ib = i*K;` then `a[ib + p]`) and a dimension
+written as a bare module `const` are normalized back to the canonical `a[i*K + p]` form before
+recognition (`wukong_mir_build::canon`), so ordinary refactoring does not silently cost you the
+kernel. Element type is handled case by
 case rather than being an f32-only gate: a `bf16`/`f16` array read through the explicit widening cast —
 `s = s + (x[k] as f32)` — dispatches to the multicore low-precision reduction kernels
 (`tests/run/parallel_reduce_lowp.wk`), while the *uncast* spelling `s = s + x[k]` stays a scalar loop

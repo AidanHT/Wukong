@@ -88,6 +88,37 @@ fields (`version.workspace = true`, …); it becomes a member automatically
 a leaf binary nothing depends on (`wukong_bench`, `wukong_xbench` and `wukongc` are intentionally
 absent), then add only downward edges.
 
+## Adding or editing a benchmark peer
+
+`crates/wukong_xbench` generates a C, a C++ and a Rust peer for every kernel and compiles them at
+runtime. **A weakened peer breaks nothing observable** — the suite still runs, the cross-language
+check still passes (a slow kernel is not a wrong kernel), and the only symptom is that Wukong's
+published multiple goes up. That failure mode is not hypothetical: a 2026-08-04 audit found four
+systematic peer defects that had inflated published figures by up to 63×. So:
+
+1. **`__restrict__` on every pointer parameter** whose buffer is genuinely distinct from the others
+   at the call site. If one may legitimately alias, leave it off *and* say why at the call site.
+2. **Natural loop order.** The innermost loop must walk memory with unit stride wherever the
+   algorithm allows. Column-outer traversals of a row-major matrix are the classic strawman.
+3. **The same algorithmic opportunity Wukong's kernel has.** If Wukong dispatches a cache-blocked
+   kernel, the peer is blocked. If Wukong's kernel reassociates a float reduction, a `C(fast)`
+   [`-ffast-math`] column must exist *and be printed*, not merely computed.
+4. Ask the question the whole exercise turns on: **is this how a competent C/C++/Rust programmer
+   would write it?** If the answer needs a caveat, the caveat belongs in `BENCHMARKS.md`.
+5. **Cross-check the peer's output**, not just its time — otherwise a peer can get "faster" by not
+   doing the work.
+
+Four tests in `crates/wukong_xbench/src/main.rs` enforce (1) and (2) mechanically
+(`every_generated_c_kernel_declares_restrict`, `column_family_peers_stay_row_outer`,
+`matmul_tn_peer_stays_kij`, `transpose_peer_stays_cache_blocked`); the rest is review.
+
+**Measuring a peer change: use the harness's compilation model.** A standalone probe that puts the
+kernel and its caller in one translation unit over `static` arrays lets gcc's interprocedural alias
+analysis prove non-overlap by itself, so `restrict` measures as a no-op. The harness compiles each
+peer to a **shared library**. Put the kernel in its own TU with heap buffers, or the probe answers a
+different question — measured: the direct-convolution kernel reads 0.42 vs 0.47 ms (`restrict`
+"hurts") in one TU, and 1.99 vs 0.40 ms (`restrict` is worth 5×) in its own.
+
 ## Adding a diagnostic
 
 Pick the next free code in the range for the stage that emits it: `E00xx` generic/internal, `E01xx`
@@ -139,6 +170,19 @@ after every pass that ran and panics naming the culprit, so run the tests in a d
 Add a test asserting both an effect (e.g. instruction-count reduction) and that results are
 unchanged. The opt-level differential test (`crates/wukongc/tests/run.rs`) will also exercise it.
 
+Two transforms deliberately sit **outside** the fixpoint, in `optimize` itself: `inline_program`
+before it (it needs whole-program information) and `unroll_program` after it (it needs the canonical
+two-block loop the fixpoint produces, and re-running it on its own output would unroll the same loop
+every sweep). If you write a pass like that, give it a way to recognize what it already did, and
+measure its compile-time cost — `cargo run --release -p wukong_bench -- compile-time` reports each
+stage's in-process share, and a whole-program pass that rebuilds a dominator tree per function will
+show up there immediately.
+
+**Never trade exactness for speed in a pass.** Reassociating float arithmetic — the classic
+multiple-accumulator reduction unroll — computes a different number, which breaks both the
+interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`. `wukong_opt::unroll` unrolls without
+reassociating for exactly this reason, and takes the smaller win.
+
 ## Adding a language feature
 
 Prefer to land it end to end: parse → type/shape-check → lower → run via the interpreter, with a
@@ -188,7 +232,14 @@ Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primit
    `Op` reads; miss one and the passes silently corrupt SSA.
 8. `crates/wukong_opt/src/cse.rs` — a `pure_key` arm if the op is cacheable (include *every*
    parameter in the key), and `safe_to_hoist` in `crates/wukong_opt/src/licm.rs` (default `false` if
-   it can trap or write memory).
+   it can trap or write memory). If the op **produces or consumes a pointer**, also
+   `crates/wukong_opt/src/alias.rs`: a new pointer-producing op must get a `Prov` (default
+   `Unknown`), and a new *writer* must be classified in `AliasInfo::may_clobber` — an op that writes
+   memory and is not listed as a writer is an unsound no-alias answer, i.e. a miscompile. That match
+   is **exhaustive with no `_` arm on purpose**, so the compiler stops you rather than letting the
+   omission pass silently; keep it that way. The escape scan needs no such care in the unsafe
+   direction — its fallback arm marks *every* operand as escaping, so a new op is conservative by
+   default there; add an arm only to buy back precision for a pure *addressing* use.
 9. `crates/wukong_codegen_gpu/src/lower.rs` — `lower_inst` **and** `lower_vec_inst`, plus
    `op_operands` in `src/fusion.rs` (these live behind `--features gpu`, so only
    `cargo check --features gpu --all-targets` sees them); and `crates/wukong_autodiff/src/lib.rs` —

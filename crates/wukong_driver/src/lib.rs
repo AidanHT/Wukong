@@ -1330,6 +1330,31 @@ mod grad_cli_tests {
     }
 
     #[test]
+    fn raw_pointer_parameter_grad() {
+        // A loss whose buffers are raw `*mut f32` parameters rather than `[f32; N]` arrays.
+        //
+        // Until `mem2reg` promoted pointer slots this could not be differentiated at all: the
+        // parameter's base pointer reached autodiff as `load ptr <slot>`, and `Vjp::canon` refused
+        // it — `--emit=grad` reported "cannot route gradient for load pointer v31 (not a parameter
+        // or a one-level gep of a parameter)". With the slot promoted, the base pointer *is* the
+        // parameter value, so every access is a one-level gep off a parameter and the gradient
+        // routes. `--emit=grad` forces `-O1`, so the promotion is always in effect here.
+        //
+        // loss = sum_i (w_i * x_i)^2  ->  dL/dw_i = 2 w_i x_i^2, dL/dx_i = 2 w_i^2 x_i.
+        let src = "module m\nfn loss(w: *mut f32, x: *mut f32, mut out:[f32;1]) -> f32 {\n\
+                   let a: f32 = w[0]*x[0]; let b: f32 = w[1]*x[1]; let c: f32 = w[2]*x[2];\n\
+                   let l: f32 = a*a + b*b + c*c; out[0] = l; return l; }";
+        let w = [0.5f32, -1.25, 0.75];
+        let x = [1.5f32, 0.25, -2.0];
+        let inputs = vec![w.to_vec(), x.to_vec(), vec![0.0]];
+        let g = gate(src, "loss", &[0, 1], &inputs, &[3, 3, 1], 2, 1e-2, 3e-2, 2e-3);
+        let dw: Vec<f64> = (0..3).map(|i| (2.0 * w[i] * x[i] * x[i]) as f64).collect();
+        let dx: Vec<f64> = (0..3).map(|i| (2.0 * w[i] * w[i] * x[i]) as f64).collect();
+        assert_close(&g[0], &dw, "dL/dw = 2 w x^2");
+        assert_close(&g[1], &dx, "dL/dx = 2 w^2 x");
+    }
+
+    #[test]
     fn bilinear_two_input_grad() {
         // loss = a * b^2  ->  dL/da = b^2, dL/db = 2ab.
         let src = "module m\nfn loss(a:[f32;1], b:[f32;1], mut out:[f32;1]) -> f32 {\n\

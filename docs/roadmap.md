@@ -183,7 +183,16 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Constant-shape tensors** `Tensor[f32, R, C]`: multi-dimensional indexing `a[i, j]` lowers to a
   row-major GEP (the shape-typed surface), so elementwise tensor kernels and tensor matmuls execute
   on both backends (`tests/run/tensor_*.wk`) — and a matmul written in tensor notation dispatches to
-  the tuned GEMM kernel (see below).
+  the tuned GEMM kernel (see below). **The shape-typed spelling costs nothing**: a statically-shaped
+  contiguous tensor is normalized to its flat row-major index (`a[i, j]` → `a[i*C + j]`) before
+  lowering and binds as the buffer it is, so it reaches every kernel recognizer and the
+  autovectorizer exactly as `[f32; R*C]` does — the two spellings compile to **byte-identical MIR**
+  (`crates/wukongc/tests/tensor_parity.rs` pins this for 2-D elementwise, matmul and a non-square
+  rank-3 nest). `tests/run/transformer_block_tensor.wk` is a whole pre-norm transformer block in
+  tensor notation with the same GEMM and fused-norm dispatch as its hand-flattened twin. The one
+  structural difference that remains: a rank-2 tensor cannot be swept by a single flat index (that
+  is the shape check working), so a whole-buffer elementwise pass over one is written as a nest and
+  vectorizes per row rather than as a single stream.
 - **Symbolic-generic tensor shapes** `fn f<M, N>(a: Tensor[f32, M, N])` **execute** — the capstone of
   the shape-safety story: a shape-generic tensor function *proves* its shapes at compile time (the
   dims are rigid generics in the body, so no shape-lie; see the shape-checking limitation note below)
@@ -209,7 +218,12 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   ~3–3.6× single-thread (~110–120 GFLOP/s ≈ 90% of one P-core's roofline) and up to ~18× parallel on `C = A·B` (~19–26× single-core / up to ~104× parallel on `nn.Linear`), the lead
   growing with size. Dimensions may be compile-time literals **or runtime values** (function
   params/locals): the recognizer checks strides symbolically, so a general matmul function dispatches
-  to the kernel, not just fixed-size benchmark kernels. The two factors may even be the **same array**
+  to the kernel, not just fixed-size benchmark kernels. Dimensions may also be **module `const`s used
+  directly** (`const D: i64 = 768;` … `a[i*D + k]`), and a row base **hoisted into a local**
+  (`let ib = i*K;` … `a[ib + k]`) still dispatches: a pre-lowering canonicalization
+  (`wukong_mir_build::canon`, `docs/internals.md`) folds an integer const and forward-substitutes a
+  pure integer index local before the recognizers run, so recognition no longer turns on how the
+  index happens to be spelled. The two factors may even be the **same array**
   (a Gram matrix `A·Aᵀ`, or self-attention `Q·Kᵀ` sharing a buffer) — both sides are read-only. The
   interpreter calls the identical kernel (marshalling its memory), so the two stay bit-exact. The
   **transposed-A weight-gradient** form `C = Aᵀ·B` (`dW = dYᵀ·X`, A stored `[k,m]` with the
@@ -233,16 +247,24 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Matrix transpose → cache-blocked kernel**: the nest `for i { for j { dst[j*R+i] = src[i*C+j] } }`
   dispatches to a `B=32` cache-blocked `wukong_transpose_f32[_parallel]`. The naive transpose writes
   `dst` with stride `R` (a cache miss per element for large `R`) and gcc/rustc do not loop-tile it at
-  `-O3`, so the blocked kernel wins ~1.5× single-core / ~9–14× `@parallel` on this memory-bound layout
-  op (attention score / weight-layout transposes). A permutation, so bit-exact (`tests/run/transpose_f32.wk`).
+  `-O3`. Against a peer that is ALSO 32×32 blocked (which is what a competent C programmer writes,
+  and what the xbench peer does since 2026-08-04) the blocked kernel is a **single-core tie**
+  (1.00–1.03×); the win is the `@parallel` form, ~4.8–7.1× vs 1-thread C and ~1.0–1.1× vs an all-core
+  OpenMP peer running the same blocked nest. This is a memory-bound layout op (attention score /
+  weight-layout transposes). A permutation, so bit-exact (`tests/run/transpose_f32.wk`).
   **bf16/f16** transposes dispatch to the same blocked kernel at 16-bit width (`wukong_transpose_u16`, one
   kernel for both — a transpose moves the raw bits) for the half-precision KV/attention layouts (`transpose_bf16.wk`).
 - **Column reduction → SIMD colsum kernel**: the column-outer nest `for j { for i { s += x[i*N+j] }; out[j]=s }`
   (the bias gradient `db = Σ_batch dY`, batch sum, reduce-along-axis-0) dispatches to
   `wukong_colsum_f32[_parallel]`, which streams `x` row-major and accumulates eight columns at a time into
-  a cache-resident `out[]`. The naive form strides `x` down the rows *and* — verified on the emitted assembly —
-  gcc/rustc leave it fully scalar (no `vaddps`), so the kernel wins ~29–47× single-core / ~52–55× `@parallel`.
-  Each column sums in `i`-ascending order, so it is bit-exact (`tests/run/colsum.wk`). The **max**/**min**/
+  a cache-resident `out[]`. Each column sums in `i`-ascending order, so it is bit-exact
+  (`tests/run/colsum.wk`). **This family is a measured LOSS, not a win** (corrected 2026-08-04): the
+  ~29–47× single-core figure previously published here was measured against a C peer written
+  column-outer, the worst loop order for a row-major axis-0 reduction. Against the natural row-outer
+  nest `for i { for j { out[j] += x[i*N+j] } }`, which gcc auto-vectorizes, the kernel is
+  **a tie at best and 1.8× slower at worst** (15 of 16 measured rows are losses; the >L3 shape is a
+  consistent ~1.65× loss across two rounds), and `@parallel` only ties single-threaded C. The
+  recognizer fires correctly — the gap is in the kernel, and closing it is open work. The **max**/**min**/
   **abs-max** down the same axis (`out[j] = max/min_i x[i,j]`, `max_i |x[i,j]|` — per-channel quant stats,
   axis-0 max/min pooling, and the symmetric int8-quant scale `amax_j`) dispatch to
   `wukong_col{max,min,maxabs}_f32[_parallel]` (first-row seed + `_mm256_max_ps`/`_mm256_min_ps` fold, abs
@@ -330,8 +352,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   MIR that the native backend rejected and the interpreter ran lossily (`tests/run/int_math.wk`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Wukong
-  runs a 3×3 conv **~6–7× faster** than idiomatic hand-written direct convolution in C. See
-  `tests/run/conv_im2col.wk`.
+  runs a 3×3 conv **~1.55× faster** than a hand-written direct convolution in C — and 1.12× *slower*
+  than the same nest at `-ffast-math`. See `tests/run/conv_im2col.wk`. *(Corrected 2026-08-04: the
+  previous ~6–7× was measured against a peer whose buffers carried no `restrict`, which forced gcc to
+  reload the accumulation operands per output pixel and cost it 4.3×.)*
 - **Operator fusion**: adjacent same-range elementwise loops (e.g. a linear map then ReLU) fuse into
   one loop when the combined body is dependence-safe; CSE then forwards the intermediate through
   registers rather than memory.
@@ -378,10 +402,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   not flow-sensitive. Verify with `wukongc --emit=mir -O2 f.wk` and look for a `_parallel` symbol or a
   `wukong$par$` region.
 - Intrinsics `print`/`println`/`assert`.
-- The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining** of
-  leaf functions, **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
+- The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
+  bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
+  **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
   with block merging, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
-  forwarding, DSE, and **loop-invariant code motion**. Guarded by an `-O0`-vs-`-O{1,2,3}` differential
+  forwarding, DSE, **loop-invariant code motion**, and **partial loop unrolling** (4×, with a
+  wrap-safe guard and a remainder loop; it never reassociates, so a float reduction keeps its exact
+  serial accumulate — measured 28% on an integer reduction, 10% on an elementwise store loop, 4% on a
+  float reduction). Guarded by an `-O0`-vs-`-O{1,2,3}` differential
   test plus two layers of MIR verification: a per-pass verify-each that names the offending pass,
   `#[cfg(debug_assertions)]` so it runs in tests and CI but is compiled out of a release build; and a
   whole-program verify in the driver before **every** backend entry — `--run`, `--emit=llvm-ir`,
@@ -474,7 +502,7 @@ megakernel stores pointer values homed in the shared frame **unconditionally** r
 `tid==0`-guarded — a frame pointer slot is uniform across the SPMD threads, and the old guard left
 threads ≠ 0 loading a zero-initialized slot and dereferencing null in non-recognized scalar loops
 (the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus standing is printed by the gates
-themselves, over every fixture in `tests/run` (332 today): `lower::tests::run_corpus_matches_interp_oracle`
+themselves, over every fixture in `tests/run` (333 today): `lower::tests::run_corpus_matches_interp_oracle`
 sweeps each program at `-O0` and `-O3`, requires zero mismatches and zero device faults and non-zero
 coverage, and reports the rest as honest `UNSUPPORTED:` skips; `megakernel::tests::mega_corpus_matches_oracle`
 does the same over the megakernel-eligible subset, counting (program, opt-level) configs and treating a
@@ -510,6 +538,14 @@ naming the construct. One known gap is documented rather than fixed: when a loss
 buffer with a scalar load instead of through another recognized kernel, that kernel's output adjoint is
 never seeded. Both `--emit=grad` and `--train` force `-O1` or higher, since the transform needs
 single-block SSA (mem2reg + simplify-cfg).
+
+A loss whose buffers are **raw `*T` / `*mut T` parameters** now differentiates. It previously could
+not: the front end gives a pointer parameter an `alloca ptr` + `store`, so its base reached autodiff
+as `load ptr <slot>` and `Vjp::canon` refused to route through a load whose result is a pointer
+(*"cannot route gradient for load pointer … (not a parameter or a one-level gep of a parameter)"*).
+`mem2reg` now promotes that slot, so the base pointer *is* the parameter value and every access is a
+one-level gep off a parameter (`raw_pointer_parameter_grad`, finite-difference-gated). `--train` still
+declines on such a loss — a raw pointer carries no extent, so the trainer cannot size its buffers.
 
 ## Checked but not yet executed
 
@@ -580,7 +616,25 @@ single-block SSA (mem2reg + simplify-cfg).
   threshold an out-of-line 256-bit reduction call would lose to the inlined 128-bit path, so small or
   runtime-unknown *reduction* trips stay 128-bit + 4× unrolling; there compute-bound kernels use 2×
   the FMA ports they could, but the vectorized **transcendentals still beat scalar `libm` ~2.5–3×**.
-  The loop vectorizer assumes distinct array parameters do not alias.
+  The AST loop vectorizer assumes distinct array parameters do not alias. **That assumption is
+  informal and unchecked, and it is not the language's rule** — nothing rejects `f(a, a)`, and there
+  is no `restrict`/`&mut` annotation to carry the promise. The MIR alias analysis
+  (`wukong_opt::alias`, see `docs/internals.md`) deliberately does *not* adopt it: `may_alias` answers
+  "may alias" for two distinct pointer parameters, and `tests/run/alias_slice_params.wk` pins a
+  program whose answer depends on it. Making the promise real is a **language** decision — an opt-in
+  parameter annotation, or a rule that a `mut` aggregate parameter may not alias another parameter —
+  not something an analysis can derive. Until then the analysis exploits only what *is* guaranteed:
+  distinct stack slots, a local slot versus a parameter, non-escaping slots versus everything, and
+  disjoint constant offsets.
+  An attempt to turn the assumption into an actual wrong answer did **not** succeed, and the negative
+  result is recorded so the next person does not repeat it: `fn f(src: []f32, mut dst: []f32)` doing
+  `dst[i] = src[i-1] + 1.0` — a cascade when the caller passes one buffer twice, and a different
+  answer if lanes are widened — returns the correct scalar values at `-O0`/`-O2` on both backends,
+  because the AST vectorizer **declines slice-parameter loops outright** (`--emit=mir -O2` shows no
+  `<N x f32>` for either that loop or the safe same-index `dst[i] = src[i] * 2.0`, with a constant
+  4096 trip count). So the assumption is currently unreachable through `[]T` parameters rather than
+  proven harmless — it is *not* evidence that adopting a no-alias rule would be safe, and a fixed-size
+  array parameter or a future MIR vectorizer may well reach it.
 - Array *length* in a type may be an integer literal or a top-level `const` (resolved through
   const-to-const chains; `tests/run/const_array_length.wk`). It may also be **arithmetic over those** —
   `[i32; 2 + 2]`, or a `const N: i32 = 2 + 2` used as a length — because sema's `eval_usize` and
@@ -641,8 +695,23 @@ single-block SSA (mem2reg + simplify-cfg).
   buffer, classic UB like C (and an optimization level can even change the garbage observed). An
   out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
   `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
-- `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
-  stay in memory (the interpreter and `cse`/`dse` handle those directly).
+- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot qualifies only when
+  it is provably written before it is read: the first access inside its own `alloca`'s block must be
+  a store, and that block must be the entry block or have an empty dominance frontier. That covers
+  every pointer-typed *parameter* (`*T`, `&T`, and every `Tensor[…]`, all of which lower to one MIR
+  `ptr`) — the case that matters, since the front end otherwise re-loads the base pointer from its
+  stack slot at every element access — including after `-O2` inlining has spliced a callee's entry
+  block into the middle of a caller block. A pointer local whose `alloca` and initializing store are
+  separated by a branch keeps its slot: promoting it would need a typed "undefined" pointer for the
+  read-before-write path, and there is no sound one (`inttoptr 0` is a genuine null natively but a
+  *valid, addressable* slot in the interpreter). Arrays, vectors, address-taken locals of any type,
+  and any slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse`
+  handle those directly).
+- A **`[]T` slice parameter still re-loads its data pointer at every element access.** A slice is a
+  16-byte `{ data, len }` fat pointer passed *by address*, so the base comes from
+  `load ptr (gep <param>, 0)` — a load out of caller-owned memory, not out of a local slot — and
+  `mem2reg` has nothing to promote. Removing it needs loop-invariant load motion (or a `noalias`
+  fact about the fat pointer), not slot promotion; `licm` does not hoist loads today.
 - **String literals live in a read-only static-data section** (`.rodata`), referenced by address via
   `Op::GlobalAddr` and deduped by content (one blob per unique literal). So **returning or threading a
   `*u8`** that points at a literal created inside a callee is valid — the pointer outlives the frame,

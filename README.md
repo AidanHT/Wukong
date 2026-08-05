@@ -40,12 +40,16 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   MKL-1c across sizes, at or above parity at 2048³/4096³**. (Disclosure: threaded MKL itself swings
   ~1.4–2× with this laptop's power state, so ratios are same-run only and reported as ranges; the
   residual mid-size gap is parallel-grain scaling, honestly open);
-- **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
-  over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
-  column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
-  **RoPE** rotary embedding **~29–54×** (up to **~156× parallel**), **strided column reductions**
-  (bias-grad / per-channel quant stats) **~29–50×**, and the training-backward kernels
-  (activation/softmax/LayerNorm-RMSNorm backward, cross-entropy) **~3–13×**;
+- **dispatches the whole transformer/training kernel surface** to tuned microkernels: the
+  **weight-gradient GEMM** `dW=Aᵀ·B` (training backward) **~2.6–9.2× single / ~3.1–13.9× parallel**,
+  the **fused FFN** `silu(A·Bᵀ)` **~24–26×**, **RoPE** rotary embedding **~29–54×** (up to **~156×
+  parallel**), and the training-backward kernels (activation/softmax/LayerNorm-RMSNorm backward,
+  cross-entropy) **~3–13×**. *(Corrected 2026-08-04. The weight-gradient figure previously read "up
+  to ~128× single / ~445× parallel"; that was measured against a C peer written `ijk` with **both**
+  operands read column-strided, not the natural `kij` nest. **Strided column reductions**, previously
+  listed here at ~29–50×, are now measured as **a tie at best and a 1.8× loss** against a peer written row-outer,
+  and have been removed from this list. See the [peer-strength
+  correction](BENCHMARKS.md#-peer-strength-correction--2026-08-04).)*;
 - **wins the transcendental/activation family ~4.7–11.5× vs C** (**~28× under `@parallel`**) — the
   cleanest compute-bound win — and stands near Intel oneMKL VML, the hand-tuned
   vector-math SOTA: same-run across thermal states, **tanh 2.7–2.9× FASTER than VML**, with
@@ -61,7 +65,9 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   hyperbolic/Poincaré-embedding inverse trio) to a **256-bit AVX2 ≈1-ULP poly kernel**, where gcc/rustc
   call scalar `libm` and **cannot vectorize a loop containing the call**;
 - **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form)
-  **~1.9–6.6×** and **convolution** (im2col + GEMM) **~6–7×**;
+  **~1.9–6.6×**; **convolution** (im2col + GEMM) is **~1.55×**, and a slight loss (1.12×) against the
+  same direct-convolution C at `-ffast-math` *(corrected 2026-08-04: the previous ~6–7× was measured
+  against a peer whose buffers were not `restrict`-qualified, which cost gcc 4.3× on that kernel)*;
 - **runs a full 12-layer GPT-2-class transformer end-to-end** (d=768, 12 heads, causal attention,
   GELU MLP — ordinary Wukong source through the real pipeline, gated bit-exact against the
   interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~19–21× idiomatic C** and
@@ -130,7 +136,8 @@ Where Wukong is built to win for the ML/DL niche:
   **reductions** to SIMD, contracts `x + y*z` to a **fused multiply-add**, **fuses** adjacent
   elementwise loops, and **auto-parallelizes** `@parallel` loops across cores — things a
   general-purpose C compiler won't do to naively-written source. Underneath, an SSA optimizer
-  (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM) removes ~42% of IR ops on the benchmark kernels
+  (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM, loop unrolling) removes ~42% of IR ops on the
+  benchmark kernels
   (~48–54% on the heavy transformer/GEMM kernels). Op-graph fusion across tensor ops is still planned
   **as a CPU MIR pass**; on the GPU it exists today — `wukong_codegen_gpu`'s fusion planner classifies
   the recognized op graph and `--backend=gpu-native` compiles an eligible whole program into a single
@@ -233,7 +240,7 @@ Wukong IR (MIR)         one block-parameter SSA IR; mir_build emits it scalar-an
    │                    there is no second level (`--emit=mir-high` means MIR *before* the
    │                    optimizer, not a different IR level)
    │  optimization passes (mem2reg → SSA, const-fold, CSE, DSE, DCE, LICM, simplify-cfg;
-   │                       inlining; op-graph fusion across tensor ops is planned on the CPU path;
+   │                       inlining; partial loop unrolling (-O2, never reassociating); op-graph fusion across tensor ops is planned on the CPU path;
    │                       the GPU backend has it — see below)
    ▼
 MIR
