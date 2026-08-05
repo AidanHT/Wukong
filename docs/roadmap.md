@@ -223,7 +223,12 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   (`let ib = i*K;` … `a[ib + k]`) still dispatches: a pre-lowering canonicalization
   (`wukong_mir_build::canon`, `docs/internals.md`) folds an integer const and forward-substitutes a
   pure integer index local before the recognizers run, so recognition no longer turns on how the
-  index happens to be spelled. The two factors may even be the **same array**
+  index happens to be spelled. An operand may also be a **struct field** — `l.wq[j*D + p]`, the way a
+  real model groups its weights — and not just a bare local or parameter: a field's base pointer is
+  resolved through the same `kernel_base_ptr` path as any other operand, so the projection GEMMs, the
+  fused `bias[j] + s` epilogue and the affine norms' `gamma[i]`/`beta[i]` all dispatch from a struct
+  exactly as they do from flat parameters (`tests/run/struct_field_kernel_base.wk`). The two factors
+  may even be the **same array**
   (a Gram matrix `A·Aᵀ`, or self-attention `Q·Kᵀ` sharing a buffer) — both sides are read-only. The
   interpreter calls the identical kernel (marshalling its memory), so the two stay bit-exact. The
   **transposed-A weight-gradient** form `C = Aᵀ·B` (`dW = dYᵀ·X`, A stored `[k,m]` with the

@@ -480,6 +480,19 @@ the MIR slot shape, which cannot distinguish `[]T` from a tuple, a 16-byte struc
 `[u8; 16]`. That is what makes `[]T` slices legal operands across the whole recognized-kernel family
 (the only way to hold a runtime-sized weight blob).
 
+An operand may also live in a **struct field** — `l.wq[j*D + p]`, how a real model groups its
+weights. Recognizers name their operands by a bare `Symbol`, so `lower_program` interns a synthetic
+`"<local>.<field>"` name (a text no identifier can equal) for every `local.field[…]` in the module,
+and `FnLowerer` records each struct local/parameter's *buffer* fields — their addresses inside the
+struct's byte buffer — as it binds them. `kernel_base_ptr` consults that table when the plain scope
+lookup misses, then applies the identical rule above, so a slice field yields its data pointer and a
+fixed-array field its storage address. The table is deliberately **not** in the scope chain: a
+synthetic name is invisible to every non-kernel path, which therefore declines instead of mistaking
+a field's address for its data. A record is revalidated against the current binding of its base
+name, so an inner `let l: *mut Layer` that shadows the struct cannot resolve to the outer one's
+field. Nested (`l.inner.w`), tuple-field (`t.0`) and through-a-pointer projections are not recorded
+and lower scalar.
+
 The kernel itself (`wukong_runtime::gemm`) is a classic BLIS-style GEMM: a **6×16 register tile**
 (12 live `__m256` accumulators, 12 FMAs per K-step), `MC/KC/NC` **cache blocking**, and **packed**
 A/B panels streamed with unit stride — true **256-bit AVX2 + FMA** (the width Cranelift's IR cannot
@@ -1088,6 +1101,19 @@ Slice-ness is keyed off the **sema** type, recorded by `bind_slice` at every bin
 the MIR slot shape, which cannot distinguish `[]T` from a tuple, a 16-byte struct or a user's
 `[u8; 16]`. That is what makes `[]T` slices legal operands across the whole recognized-kernel family
 (the only way to hold a runtime-sized weight blob).
+
+An operand may also live in a **struct field** — `l.wq[j*D + p]`, how a real model groups its
+weights. Recognizers name their operands by a bare `Symbol`, so `lower_program` interns a synthetic
+`"<local>.<field>"` name (a text no identifier can equal) for every `local.field[…]` in the module,
+and `FnLowerer` records each struct local/parameter's *buffer* fields — their addresses inside the
+struct's byte buffer — as it binds them. `kernel_base_ptr` consults that table when the plain scope
+lookup misses, then applies the identical rule above, so a slice field yields its data pointer and a
+fixed-array field its storage address. The table is deliberately **not** in the scope chain: a
+synthetic name is invisible to every non-kernel path, which therefore declines instead of mistaking
+a field's address for its data. A record is revalidated against the current binding of its base
+name, so an inner `let l: *mut Layer` that shadows the struct cannot resolve to the outer one's
+field. Nested (`l.inner.w`), tuple-field (`t.0`) and through-a-pointer projections are not recorded
+and lower scalar.
 
 The kernel itself (`wukong_runtime::gemm`) is a classic BLIS-style GEMM: a **6×16 register tile**
 (12 live `__m256` accumulators, 12 FMAs per K-step), `MC/KC/NC` **cache blocking**, and **packed**
@@ -1727,6 +1753,19 @@ Slice-ness is keyed off the **sema** type, recorded by `bind_slice` at every bin
 the MIR slot shape, which cannot distinguish `[]T` from a tuple, a 16-byte struct or a user's
 `[u8; 16]`. That is what makes `[]T` slices legal operands across the whole recognized-kernel family
 (the only way to hold a runtime-sized weight blob).
+
+An operand may also live in a **struct field** — `l.wq[j*D + p]`, how a real model groups its
+weights. Recognizers name their operands by a bare `Symbol`, so `lower_program` interns a synthetic
+`"<local>.<field>"` name (a text no identifier can equal) for every `local.field[…]` in the module,
+and `FnLowerer` records each struct local/parameter's *buffer* fields — their addresses inside the
+struct's byte buffer — as it binds them. `kernel_base_ptr` consults that table when the plain scope
+lookup misses, then applies the identical rule above, so a slice field yields its data pointer and a
+fixed-array field its storage address. The table is deliberately **not** in the scope chain: a
+synthetic name is invisible to every non-kernel path, which therefore declines instead of mistaking
+a field's address for its data. A record is revalidated against the current binding of its base
+name, so an inner `let l: *mut Layer` that shadows the struct cannot resolve to the outer one's
+field. Nested (`l.inner.w`), tuple-field (`t.0`) and through-a-pointer projections are not recorded
+and lower scalar.
 
 The kernel itself (`wukong_runtime::gemm`) is a classic BLIS-style GEMM: a **6×16 register tile**
 (12 live `__m256` accumulators, 12 FMAs per K-step), `MC/KC/NC` **cache blocking**, and **packed**

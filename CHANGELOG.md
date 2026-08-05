@@ -5,6 +5,38 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Recognizers — a weight held in a struct field dispatches like any other buffer
+Every kernel recognizer named its buffer operands by a bare `Symbol`, extracted with `single_path`.
+A weight reached through a struct field — `l.wq[j*D + p]`, how every real model groups its
+parameters — is an `ExprKind::Field`, so the extraction returned nothing and the *whole nest*
+declined: no kernel at all, on both backends, at every `-O` level. In `wukong_xbench`'s structure-tax
+benchmark, one pre-norm transformer block written with its ten weights in a `struct Layer`
+dispatched **7** kernels where the arithmetically identical block over flat parameters dispatched
+**16** — six projection GEMMs, the fused-bias SwiGLU gate and both affine RMSNorms lost purely to the
+spelling of their weight operand.
+- **A struct-field buffer base now resolves through `kernel_base_ptr`, exactly like a bare local.**
+  `lower_program` interns a synthetic `"<local>.<field>"` name for every `local.field[…]` in the
+  module (a text no identifier can equal — `.` is not an identifier character), and `FnLowerer`
+  records each struct local/parameter's *buffer* fields (slice / array / tensor / pointer) as it
+  binds them. A `[]T` field is recorded as a slice, so the kernel receives its **data** pointer and
+  not the 16-byte fat pointer; a fixed `[T; N]` field's address *is* its storage and is passed
+  as-is.
+- **Fail-closed by construction.** The synthetic names live outside the scope chain, so any path
+  that did not go through `kernel_base_ptr` simply does not resolve them and declines. Five operand
+  extraction points were widened (the two GEMM operand matchers, the fused-bias base, the affine
+  norm's gamma/beta) and every consumer of each routes through the shared resolver. A record is
+  revalidated against the current binding of its base name, so an inner `let l: *mut Layer` that
+  shadows the struct can never resolve to the outer one's field.
+- Result: the struct spelling's dispatch census is now **byte-identical to the flat spelling's** —
+  the same 16 call sites, symbol for symbol — and its output joins the flat, helper-factored and
+  shape-typed spellings in a single bit-identical class (it was previously the only spelling outside
+  one). Guarded by `tests/run/struct_field_kernel_base.wk` (every output lane printed, values
+  hand-derived from the scalar loops) and `tests/run/struct_field_base_shadowed.wk`. Dispatch census
+  over all 363 existing `tests/run` + `examples` programs: identical, 0 lost, 0 gained.
+- Still declining, unchanged and scalar: a nested projection `l.inner.w[…]`, a tuple field `t.0[…]`,
+  a field of a struct reached through a pointer, and a struct captured into a mid-function
+  `@parallel` region.
+
 ### Performance — the shape-typed surface stops costing anything
 `Tensor[f32, M, N]` was the language's slowest data type. Every kernel recognizer and the whole
 autovectorizer match a **single-index** `ExprKind::Index`, so the idiomatic multi-index access
