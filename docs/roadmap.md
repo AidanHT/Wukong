@@ -626,6 +626,15 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   not something an analysis can derive. Until then the analysis exploits only what *is* guaranteed:
   distinct stack slots, a local slot versus a parameter, non-escaping slots versus everything, and
   disjoint constant offsets.
+  An attempt to turn the assumption into an actual wrong answer did **not** succeed, and the negative
+  result is recorded so the next person does not repeat it: `fn f(src: []f32, mut dst: []f32)` doing
+  `dst[i] = src[i-1] + 1.0` — a cascade when the caller passes one buffer twice, and a different
+  answer if lanes are widened — returns the correct scalar values at `-O0`/`-O2` on both backends,
+  because the AST vectorizer **declines slice-parameter loops outright** (`--emit=mir -O2` shows no
+  `<N x f32>` for either that loop or the safe same-index `dst[i] = src[i] * 2.0`, with a constant
+  4096 trip count). So the assumption is currently unreachable through `[]T` parameters rather than
+  proven harmless — it is *not* evidence that adopting a no-alias rule would be safe, and a fixed-size
+  array parameter or a future MIR vectorizer may well reach it.
 - Array *length* in a type may be an integer literal or a top-level `const` (resolved through
   const-to-const chains; `tests/run/const_array_length.wk`). It may also be **arithmetic over those** —
   `[i32; 2 + 2]`, or a `const N: i32 = 2 + 2` used as a length — because sema's `eval_usize` and
