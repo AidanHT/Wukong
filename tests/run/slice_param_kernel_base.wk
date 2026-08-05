@@ -1,0 +1,58 @@
+// RUN: --run
+// A recognized kernel whose buffer operands are `[]T` slice FUNCTION PARAMETERS must receive the
+// slices' DATA pointers, not the addresses of their 16-byte fat-pointer buffers.
+//
+// `lower_matmul_fn` (the whole-function matmul wrapper) bound its params with plain `bind` and typed
+// a slice slot via `param_slot_ty` → `mir_ty` → `Ptr`. That spilled the incoming pointer into an
+// `alloca ptr`, so the single `Load` in `kernel_base_ptr` read back the fat pointer's own ADDRESS and
+// handed it to `wukong_sgemm_nt` as the data base. The kernel then read the 16-byte header
+// (data pointer + length) as f32 elements: this program printed `0 0 0 0 0 0 0 0` on BOTH backends at
+// EVERY -O level, and segfaulted natively once `recognizer-canon` widened which spellings match.
+//
+// Recognized kernels are gate-blind — they fire identically on interp and native at every -O level —
+// so no differential or opt-invariance gate can see this. Only a fixture that prints EVERY lane with
+// values derived from the SCALAR semantics of the loop can. The expected values below are computed by
+// hand, never recorded from compiler output:
+//   A = [[1,2,3],[4,5,6]]                        (a[i] = i+1)
+//   W = [[-1,-0.5,0],[0.5,1,1.5],[2,2.5,3],[3.5,4,4.5]]   (w[i] = i*0.5 - 1)
+//   C[i][j] = sum_p A[i][p] * W[j][p]            (an NT matmul: W is read row-wise)
+//   row 0: 1*-1+2*-0.5+3*0 = -2 | 0.5+2+4.5 = 7    | 2+5+9 = 16      | 3.5+8+13.5 = 25
+//   row 1: -4-2.5+0 = -6.5      | 2+5+9 = 16       | 8+12.5+18 = 38.5 | 14+20+27 = 61
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 16
+// EXPECT-OUT: 25
+// EXPECT-OUT: -6.5
+// EXPECT-OUT: 16
+// EXPECT-OUT: 38.5
+// EXPECT-OUT: 61
+
+// C[m,n] = A[m,kk] * W[n,kk]^T over slices with RUNTIME dims — the whole body is the nest, which is
+// what routes this through `lower_matmul_fn` rather than the statement-level recognizer.
+fn linear(a: []f32, w: []f32, mut c: []f32, m: i64, n: i64, kk: i64) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut s: f32 = 0.0;
+            for p in 0..kk { s = s + a[i*kk+p] * w[j*kk+p]; }
+            c[i*n+j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 6] = [0.0; 6];   // m = 2, kk = 3
+    let mut w: [f32; 12] = [0.0; 12]; // n = 4, kk = 3
+    let mut c: [f32; 8] = [0.0; 8];   // m = 2, n = 4
+    for i in 0..6 { a[i] = (i as f32) + 1.0; }
+    for i in 0..12 { w[i] = ((i as f32) * 0.5) - 1.0; }
+
+    let sa: []f32 = a;
+    let sw: []f32 = w;
+    let sc: []f32 = c;
+    linear(sa, sw, sc, 2, 4, 3);
+
+    // Every lane, never a reduction: a partially-correct buffer passes a sum.
+    for i in 0..8 { print(c[i]); }
+    return 0;
+}

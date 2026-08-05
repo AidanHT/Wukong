@@ -1846,7 +1846,11 @@ fn lower_parallel(
                 },
             );
             let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
-            fl.bind(p.name.sym, base, mty);
+            // A `[]T` param arrives in the env as its fat-pointer address (the wrapper stores the
+            // raw incoming parameter), so it binds as the fat-pointer buffer and is recorded as a
+            // slice — same reasoning as the tensor case above, and what lets `kernel_base_ptr`
+            // load the data pointer for a kernel dispatched inside the outlined body.
+            fl.bind_slice(p.name.sym, base, mty, matches!(pty, Ty::Slice(_)));
         }
         // The index variable's source type (the range's element type) drives the loop so the
         // body's index arithmetic matches sema; the i64 runtime bounds are coerced into it.
@@ -19265,8 +19269,19 @@ fn tensor_buffer_mir(ty: &Ty) -> Option<(MirType, u32)> {
 /// this is what stops a tensor parameter being spilled to a stack slot and reloaded per element.
 /// The **call ABI is unaffected** — `param_abi_ty` maps `Array(..)` straight back to `Ptr`.
 fn param_slot_ty(ty: &Ty) -> MirType {
+    // A `[]T` slice's slot *is* its 16-byte fat-pointer buffer, exactly as the registry-aware
+    // `mir_ty_of` types it. `mir_ty` alone would say `Ptr`, which spills the incoming pointer into
+    // an `alloca ptr`; the single `Load` that reads it back then yields the fat pointer's own
+    // ADDRESS, and `kernel_base_ptr` — which loads exactly once — hands that to the kernel as the
+    // data base. The kernel reads the 16-byte header as elements and the program prints zeros on
+    // both backends at every `-O` level (see LANDMINE 1 in this crate's CLAUDE.md). Scalar
+    // indexing is unaffected either way: `place_base_ptr` recovers the fat-pointer address under
+    // both bindings, which is why the defect was visible only through a recognized kernel.
     match tensor_buffer_mir(ty) {
         Some((elem, n)) => MirType::Array(Box::new(elem), n),
+        None if matches!(ty, Ty::Slice(_)) => {
+            MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32)
+        }
         None => mir_ty(ty),
     }
 }
@@ -22637,17 +22652,21 @@ fn lower_matmul_fn(
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
         // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
-        // into every caller that inlined this wrapper).
+        // into every caller that inlined this wrapper). A `[]T` slice binds as its fat-pointer
+        // buffer for the same reason, and must go through `bind_slice` so `kernel_base_ptr` knows
+        // to load the data pointer out of it — this wrapper's whole body IS a kernel call, so
+        // binding with plain `bind` handed `wukong_sgemm_nt` the fat pointer itself.
+        let is_slice = matches!(pty, Ty::Slice(_));
         let mty = param_slot_ty(pty);
         if matches!(mty, MirType::Array(..)) {
-            fl.bind(p.name.sym, val, mty);
+            fl.bind_slice(p.name.sym, val, mty, is_slice);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {
                 ptr: slot,
                 value: val,
             });
-            fl.bind(p.name.sym, slot, mty);
+            fl.bind_slice(p.name.sym, slot, mty, is_slice);
         }
     }
     if !fl.emit_sgemm(nest, parallel) {
@@ -25538,17 +25557,20 @@ fn lower_i8matmul_fn(
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
         // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
-        // into every caller that inlined this wrapper).
+        // into every caller that inlined this wrapper). A `[]T` slice binds as its fat-pointer
+        // buffer for the same reason, and must go through `bind_slice` so `kernel_base_ptr` knows
+        // to load the data pointer out of it — the int8 twin of the `lower_matmul_fn` defect.
+        let is_slice = matches!(pty, Ty::Slice(_));
         let mty = param_slot_ty(pty);
         if matches!(mty, MirType::Array(..)) {
-            fl.bind(p.name.sym, val, mty);
+            fl.bind_slice(p.name.sym, val, mty, is_slice);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {
                 ptr: slot,
                 value: val,
             });
-            fl.bind(p.name.sym, slot, mty);
+            fl.bind_slice(p.name.sym, slot, mty, is_slice);
         }
     }
     if !fl.emit_i8gemm(nest, parallel) {
