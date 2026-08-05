@@ -809,6 +809,13 @@ impl<'a> FnTranslator<'a> {
                 let x = self.val(*v);
                 self.builder.ins().splat(vec_ty, x)
             }
+            // One lane of a vector, by constant index: one shuffle, and free for lane 0. This is
+            // how the loop vectorizer keeps a float reduction's accumulate serial without a stack
+            // round-trip. The MIR verifier has already checked the index is in range.
+            Op::ExtractLane(v, k) => {
+                let x = self.val(*v);
+                self.builder.ins().extractlane(x, *k as u8)
+            }
             // Fused multiply-add: Cranelift `fma(a, b, c)` is `a*b + c` with one rounding, lowering
             // to a hardware `vfmadd` (scalar or 128-bit vector) on FMA3 hosts.
             Op::Fma(a, b, c) => {
