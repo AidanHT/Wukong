@@ -485,6 +485,16 @@ fn kbench(x: [f32; {sd}], g: [f32; {d}], b: [f32; {d}], mut out: [f32; {sd}]) {{
 /// The same 12-layer block + final LayerNorm as one competent C translation unit. Same loop
 /// structure, same per-head slice extraction, same scratch (passed in), tanh-approx GELU with
 /// Wukong's constants. Exported as `kbench` (block) and `kfinal` (final LayerNorm).
+///
+/// **`__restrict__` on every pointer** (added 2026-08-05). The 2026-08-04 peer audit put the
+/// qualifier on all 43 kernel peers in `main.rs` and its regression test scans that file only — so
+/// the *model* peer, the flagship end-to-end row, kept the exact defect the audit was about: 24
+/// unqualified pointer parameters, plus the `linear_nt` / `layernorm_affine` helpers. gcc therefore
+/// had to assume `out` might alias `in`/`w` and could not vectorize or reorder the GEMM, the slice
+/// extraction or the elementwise passes, while Wukong's tensor parameters carry non-overlap in the
+/// type system — a no-alias compiler measured against a may-alias one, in Wukong's favour.
+/// The qualifier is TRUE here: `run_forward` passes the two ping-pong activation buffers, one
+/// distinct `Vec` per scratch field, and per-layer weight `Vec`s — no two arguments ever overlap.
 fn c_model(cfg: Cfg) -> String {
     let (s, d, h, dff, hd) = (cfg.s, cfg.d, cfg.h, cfg.dff, cfg.hd());
     let scale = 1.0 / (hd as f64).sqrt();
@@ -497,7 +507,7 @@ fn c_model(cfg: Cfg) -> String {
 #define HD {hd}
 #define SCALE {scale}f
 
-static void layernorm_affine(float* t, const float* g, const float* b) {{
+static void layernorm_affine(float* __restrict__ t, const float* __restrict__ g, const float* __restrict__ b) {{
   for (long r = 0; r < S; r++) {{
     float sm = 0.0f;
     for (long i = 0; i < D; i++) sm += t[r*D+i];
@@ -510,7 +520,7 @@ static void layernorm_affine(float* t, const float* g, const float* b) {{
 }}
 
 /* nn.Linear: out[M,N] = in[M,K] . w[N,K]^T (contiguous dot over K for both operands) */
-static void linear_nt(const float* in, const float* w, float* out, long m, long kk, long n) {{
+static void linear_nt(const float* __restrict__ in, const float* __restrict__ w, float* __restrict__ out, long m, long kk, long n) {{
   for (long i = 0; i < m; i++)
     for (long j = 0; j < n; j++) {{
       float acc = 0.0f;
@@ -520,15 +530,15 @@ static void linear_nt(const float* in, const float* w, float* out, long m, long 
 }}
 
 __declspec(dllexport) void kbench(
-    const float* x,
-    const float* ln1g, const float* ln1b,
-    const float* wq, const float* wk, const float* wv, const float* wo,
-    const float* ln2g, const float* ln2b,
-    const float* w1, const float* w2,
-    float* nrm, float* q, float* k, float* v,
-    float* qh, float* kh, float* vt,
-    float* scores, float* ah, float* attn, float* a, float* ff1,
-    float* out) {{
+    const float* __restrict__ x,
+    const float* __restrict__ ln1g, const float* __restrict__ ln1b,
+    const float* __restrict__ wq, const float* __restrict__ wk, const float* __restrict__ wv, const float* __restrict__ wo,
+    const float* __restrict__ ln2g, const float* __restrict__ ln2b,
+    const float* __restrict__ w1, const float* __restrict__ w2,
+    float* __restrict__ nrm, float* __restrict__ q, float* __restrict__ k, float* __restrict__ v,
+    float* __restrict__ qh, float* __restrict__ kh, float* __restrict__ vt,
+    float* __restrict__ scores, float* __restrict__ ah, float* __restrict__ attn, float* __restrict__ a, float* __restrict__ ff1,
+    float* __restrict__ out) {{
   /* 1. LayerNorm1(x) -> nrm */
   for (long i = 0; i < S*D; i++) nrm[i] = x[i];
   layernorm_affine(nrm, ln1g, ln1b);
@@ -587,7 +597,7 @@ __declspec(dllexport) void kbench(
   for (long i = 0; i < S*D; i++) out[i] = a[i] + out[i];
 }}
 
-__declspec(dllexport) void kfinal(const float* x, const float* g, const float* b, float* out) {{
+__declspec(dllexport) void kfinal(const float* __restrict__ x, const float* __restrict__ g, const float* __restrict__ b, float* __restrict__ out) {{
   for (long i = 0; i < S*D; i++) out[i] = x[i];
   layernorm_affine(out, g, b);
 }}
