@@ -816,6 +816,33 @@ impl<'a> FnTranslator<'a> {
                 let x = self.val(*v);
                 self.builder.ins().extractlane(x, *k as u8)
             }
+            // The lane-index ramp, as a constant-pool vector. Cranelift has no `iota`, and it does
+            // not need one: the value is a compile-time constant, so it becomes one `vconst` (a
+            // rip-relative 16-byte load the loop's preheader hoists) rather than any per-iteration
+            // work. `ConstantData` is a flat little-endian byte image of the whole register, which
+            // is exactly how the x64 backend reads it back, so lane `k` occupies bytes
+            // `[k*w, (k+1)*w)` with its own little-endian encoding — and every lane index here is
+            // below 16, so only the lowest byte of a lane is ever non-zero.
+            Op::Iota(ty) => {
+                // The fallback mirrors `ConstInt`'s: `lower_inst` has no error channel, and a type
+                // `cl_type` cannot render is malformed MIR the verifier rejects before any backend
+                // runs (`wukong_driver::verify_or_ice`).
+                let vec_ty = cl_type(ty, self.ptr_ty).unwrap_or(types::I32X4);
+                let lanes = vec_ty.lane_count() as usize;
+                let width = vec_ty.lane_bits() as usize / 8;
+                let mut bytes = vec![0u8; lanes * width];
+                for (k, chunk) in bytes.chunks_mut(width).enumerate() {
+                    chunk[..8.min(width)]
+                        .copy_from_slice(&(k as u64).to_le_bytes()[..8.min(width)]);
+                }
+                let handle = self
+                    .builder
+                    .func
+                    .dfg
+                    .constants
+                    .insert(cranelift_codegen::ir::ConstantData::from(bytes.as_slice()));
+                self.builder.ins().vconst(vec_ty, handle)
+            }
             // Fused multiply-add: Cranelift `fma(a, b, c)` is `a*b + c` with one rounding, lowering
             // to a hardware `vfmadd` (scalar or 128-bit vector) on FMA3 hosts.
             Op::Fma(a, b, c) => {

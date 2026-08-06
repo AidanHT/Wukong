@@ -376,7 +376,8 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
         | Op::ConstFloat(..)
         | Op::Alloca(..)
         | Op::FuncAddr(..)
-        | Op::GlobalAddr(..) => {}
+        | Op::GlobalAddr(..)
+        | Op::Iota(..) => {}
     }
 }
 
@@ -451,7 +452,8 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
         | Op::ConstFloat(..)
         | Op::Alloca(..)
         | Op::FuncAddr(..)
-        | Op::GlobalAddr(..) => {}
+        | Op::GlobalAddr(..)
+        | Op::Iota(..) => {}
     }
 }
 

@@ -343,6 +343,18 @@ impl Emitter<'_> {
                 let vty = self.ty(*v);
                 format!("{res}extractelement {vty} {}, i32 {k}", self.operand(*v))
             }
+            // The lane-index ramp is a constant, and LLVM writes a non-uniform vector constant
+            // inline — so it is spelled as an `add` of that literal to a zero vector, which is the
+            // shortest way to give it a name in a text path that emits one instruction per MIR op.
+            Op::Iota(ty) => {
+                let vty = self.ty(inst.result.expect("iota has a result"));
+                let (lane, n) = match ty {
+                    MirType::Vec(l, n) => (llvm_ty(l), *n),
+                    other => (llvm_ty(other), 1),
+                };
+                let items: Vec<String> = (0..n).map(|k| format!("{lane} {k}")).collect();
+                format!("{res}add {vty} zeroinitializer, <{}>", items.join(", "))
+            }
             Op::Fma(a, b, c) => {
                 // `a*b + c`. Emitted as a `contract`-flagged mul/add pair so llc fuses it into a
                 // hardware FMA under `-ffp-contract=fast` — no module-level intrinsic `declare`

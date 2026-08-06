@@ -1032,6 +1032,19 @@ impl<'a, 'k> Interp<'a, 'k> {
                     .get(*k as usize)
                     .ok_or("extractlane index out of range")?
             }
+            // The lane-index ramp `<0, 1, .., n-1>`. The lane values are stored untruncated (an
+            // `i128` per lane, exactly as `Op::ConstInt` does) — every consumer of a narrow integer
+            // lane masks to its own width, and `n` is at most 16, so no lane can exceed any lane
+            // type this op accepts.
+            Op::Iota(ty) => {
+                let n = match ty {
+                    MirType::Vec(_, n) => *n as usize,
+                    other => {
+                        return Err(format!("iota type is {}, not a vector", other.display()))
+                    }
+                };
+                self.push_vec((0..n).map(|k| Value::Int(k as i128)).collect())
+            }
             // Fused multiply-add `a*b + c`, single-rounded via `mul_add` so it stays bit-identical
             // to the native `fma`. Lane-wise for vectors, each lane rounded to its lane type.
             Op::Fma(a, b, c) => {

@@ -695,6 +695,29 @@ impl Verifier<'_> {
                     }
                 }
             }
+            // The lane ramp. Its type is carried on the op *and* is the result type, so the two are
+            // checked against each other: a mismatch would have the interpreter build one lane count
+            // and the backend read another. Integer lanes only — a float ramp has no use and would
+            // need a float-literal constant pool entry in the Cranelift path.
+            Op::Iota(ty) => {
+                if let Some(res) = self.result_ty(result) {
+                    if res != *ty {
+                        self.err(format!(
+                            "iota {} must yield {}, got {}",
+                            ty.display(),
+                            ty.display(),
+                            res.display()
+                        ));
+                    }
+                }
+                match ty {
+                    MirType::Vec(lane, n) if lane.is_int() && **lane != MirType::I1 && *n > 0 => {}
+                    _ => self.err(format!(
+                        "iota must be a vector of integer lanes, got {}",
+                        ty.display()
+                    )),
+                }
+            }
         }
     }
 
