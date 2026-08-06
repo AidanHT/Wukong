@@ -1,0 +1,384 @@
+module tests.run.vectorized_iv_as_value
+
+// The loop vectorizer's **lane ramp**: a body that reads its induction variable as a *value* rather
+// than as an address.
+//
+// Splatting the counter is the wrong answer and a quiet one -- lane `k` of a widened group is scalar
+// iteration `i + k` and must see `i + k`, not `i`, so a splat writes the group's first counter into
+// all `W` lanes and every lane but the first is wrong. `wukong_opt::vectorize` used to decline such a
+// loop outright ("the induction variable is used for something other than addressing"); it now
+// widens it as `splat(i) + iota` (`wukong_mir::Op::Iota`), which makes an integer compare against the
+// counter a per-lane **mask** instead of one scalar bool.
+//
+// Every lane of every output is printed, including the ones past `n` that keep their sentinel, and
+// every expected value below is derived from the scalar semantics of the loop -- `x[j] = j + 1`, so
+// `o[i]` is `(i+1)*2` off the target and `(i+1)*8` on it -- never recorded from compiler output. A
+// reduction is a single integer sum, exact in f32, so its expected value does not depend on the fold
+// order (`vectorized_edge_values.wk` is where the fold order itself is pinned).
+//
+// What each case is for:
+//
+//  * `a_onehot` is the classification-loss shape (`if c == target`) that motivated the ramp, run with
+//    the target in the FIRST vector group, in the LAST full group, in the SCALAR EPILOGUE, and
+//    nowhere at all. `n = 23 = 5*4 + 3`, so three lanes always come from the epilogue and the vector
+//    and scalar spellings have to agree about where the target is.
+//  * `b_ramp` casts the counter to f32 (`sitofp` of the ramp, a same-width lane conversion).
+//  * `c_index` stores the counter itself: the ramp as a store *value*, with the store's pointer still
+//    the ordinary uniform address.
+//  * `d_masked_sum` puts a lane mask (`i < t`) in front of a float reduction, the fused shape a loss
+//    takes: the mask must select per lane while the accumulate stays serial.
+//  * `e_offset` starts the counter at 3, so the ramp's base is not zero and the guard's `n_vec`
+//    arithmetic has to start the vector loop from the right place.
+//  * `g_wide` is the same one-hot at `<2 x f64>` / `i64` lanes, because the ramp is only sound when
+//    its lane count matches the width the loop's data runs at.
+//
+// `while` is used throughout so no `mir_build` recognizer intercepts a loop before the optimizer
+// sees it.
+
+// RUN: --run
+// EXPECT-EXIT: 0
+// -- a_onehot, target 3 (first vector group, lane 3)
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 32
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+// EXPECT-OUT: 32
+// EXPECT-OUT: 34
+// EXPECT-OUT: 36
+// EXPECT-OUT: 38
+// EXPECT-OUT: 40
+// EXPECT-OUT: 42
+// EXPECT-OUT: 44
+// EXPECT-OUT: 46
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// -- a_onehot, target 17 (last full vector group, lane 1)
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+// EXPECT-OUT: 32
+// EXPECT-OUT: 34
+// EXPECT-OUT: 144
+// EXPECT-OUT: 38
+// EXPECT-OUT: 40
+// EXPECT-OUT: 42
+// EXPECT-OUT: 44
+// EXPECT-OUT: 46
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// -- a_onehot, target 21 (the scalar epilogue)
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+// EXPECT-OUT: 32
+// EXPECT-OUT: 34
+// EXPECT-OUT: 36
+// EXPECT-OUT: 38
+// EXPECT-OUT: 40
+// EXPECT-OUT: 42
+// EXPECT-OUT: 176
+// EXPECT-OUT: 46
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// -- a_onehot, target 99 (no lane matches)
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+// EXPECT-OUT: 32
+// EXPECT-OUT: 34
+// EXPECT-OUT: 36
+// EXPECT-OUT: 38
+// EXPECT-OUT: 40
+// EXPECT-OUT: 42
+// EXPECT-OUT: 44
+// EXPECT-OUT: 46
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// -- b_ramp: 4*((i as f32)*0.25 + 1.0) == i + 4; sentinel -0.25 prints as -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 25
+// EXPECT-OUT: 26
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// -- c_index: o[i] = i
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// -- d_masked_sum: (1..t) - (t+1..23), for t = 9, 0, 23
+// EXPECT-OUT: -186
+// EXPECT-OUT: -276
+// EXPECT-OUT: 276
+// -- e_offset, counter starts at 3, target 14
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 120
+// EXPECT-OUT: 32
+// EXPECT-OUT: 34
+// EXPECT-OUT: 36
+// EXPECT-OUT: 38
+// EXPECT-OUT: 40
+// EXPECT-OUT: 42
+// EXPECT-OUT: 44
+// EXPECT-OUT: 46
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// -- g_wide: the same one-hot at <2 x f64> lanes, target 17
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+// EXPECT-OUT: 32
+// EXPECT-OUT: 34
+// EXPECT-OUT: 144
+// EXPECT-OUT: 38
+// EXPECT-OUT: 40
+// EXPECT-OUT: 42
+// EXPECT-OUT: 44
+// EXPECT-OUT: 46
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+// EXPECT-OUT: -777
+
+const N: i32 = 23;
+const NL: i64 = 23;
+const CAP: i64 = 26;
+
+/// The classification-loss shape: one lane of the group carries the target's weight.
+fn a_onehot(x: []f32, mut o: []f32, t: i32, n: i32) {
+    let mut i: i32 = 0;
+    while i < n {
+        let q: f32 = if i == t { 8.0 } else { 2.0 };
+        o[i] = x[i] * q;
+        i = i + 1;
+    }
+}
+
+/// The counter as a float: `sitofp` of the ramp.
+fn b_ramp(mut o: []f32, n: i32) {
+    let mut i: i32 = 0;
+    while i < n {
+        o[i] = (i as f32) * 0.25 + 1.0;
+        i = i + 1;
+    }
+}
+
+/// The counter stored as data: the ramp is the store's *value*, its pointer stays uniform.
+fn c_index(mut o: []i32, n: i32) {
+    let mut i: i32 = 0;
+    while i < n {
+        o[i] = i;
+        i = i + 1;
+    }
+}
+
+/// A lane mask in front of a float reduction.
+fn d_masked_sum(x: []f32, t: i32, n: i32) -> f32 {
+    let mut s: f32 = 0.0;
+    let mut i: i32 = 0;
+    while i < n {
+        let w: f32 = if i < t { 1.0 } else { -1.0 };
+        s = s + x[i] * w;
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The same one-hot from a non-zero start, so the ramp's base is not the loop's first element.
+fn e_offset(x: []f32, mut o: []f32, t: i32, n: i32) {
+    let mut i: i32 = 3;
+    while i < n {
+        let q: f32 = if i == t { 8.0 } else { 2.0 };
+        o[i] = x[i] * q;
+        i = i + 1;
+    }
+}
+
+/// The one-hot at `<2 x f64>` lanes over an `i64` counter.
+fn g_wide(x: []f64, mut o: []f64, t: i64, n: i64) {
+    // Named rather than inline, because a bare float literal in an `if` arm is inferred `f32`
+    // before the `let`'s annotation reaches it; these two are still loop-invariant uniforms that
+    // the widened body splats under the lane mask.
+    let hi: f64 = 8.0;
+    let lo: f64 = 2.0;
+    let mut i: i64 = 0;
+    while i < n {
+        let q: f64 = if i == t { hi } else { lo };
+        o[i] = x[i] * q;
+        i = i + 1;
+    }
+}
+
+fn setf(mut p: []f32, v: f32) {
+    let mut k: i64 = 0;
+    while k < CAP { p[k] = v; k = k + 1; }
+}
+fn showf(p: []f32) {
+    let mut k: i64 = 0;
+    while k < CAP { print(p[k] as i32); k = k + 1; }
+}
+fn showf4(p: []f32) {
+    let mut k: i64 = 0;
+    while k < CAP { print((p[k] * 4.0) as i32); k = k + 1; }
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(CAP);
+    let mut o: []f32 = alloc_f32(CAP);
+    let mut q: []i32 = alloc_i32(CAP);
+    let mut xd: []f64 = alloc_f64(CAP);
+    let mut od: []f64 = alloc_f64(CAP);
+
+    let mut j: i64 = 0;
+    while j < CAP {
+        x[j] = (j as f32) + 1.0;
+        xd[j] = (j as f64) + 1.0;
+        j = j + 1;
+    }
+
+    setf(o, -777.0); a_onehot(x, o, 3, N);  showf(o);
+    setf(o, -777.0); a_onehot(x, o, 17, N); showf(o);
+    setf(o, -777.0); a_onehot(x, o, 21, N); showf(o);
+    setf(o, -777.0); a_onehot(x, o, 99, N); showf(o);
+
+    setf(o, -0.25);  b_ramp(o, N);          showf4(o);
+
+    j = 0;
+    while j < CAP { q[j] = -777; j = j + 1; }
+    c_index(q, N);
+    j = 0;
+    while j < CAP { print(q[j]); j = j + 1; }
+
+    print(d_masked_sum(x, 9, N) as i32);
+    print(d_masked_sum(x, 0, N) as i32);
+    print(d_masked_sum(x, 23, N) as i32);
+
+    setf(o, -777.0); e_offset(x, o, 14, N); showf(o);
+
+    j = 0;
+    while j < CAP { od[j] = -777.0; j = j + 1; }
+    g_wide(xd, od, 17, NL);
+    j = 0;
+    while j < CAP { print(od[j] as i32); j = j + 1; }
+
+    free(od); free(xd); free(q); free(o); free(x);
+    return 0;
+}

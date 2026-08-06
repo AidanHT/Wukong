@@ -91,13 +91,16 @@
 //!
 //! ```text
 //!   general_loss_focal.wk (R=8192 C=1024)         general_scan_s6.wk (T=2048 D=256 N=16)
-//!   8 lines total:                                5 lines total:
+//!   4 lines total, no declines:                   5 lines total:
 //!     x1 WIDEN bb13 w=4 lin=42 guards=1 reds=1      x1 WIDEN bb10 w=4 lin=53 guards=3 reds=1
 //!     x1 WIDEN bb16 w=4 lin=8  guards=0 reds=0      x1 WIDEN bb1  w=4 lin=3  guards=0 reds=0
-//!     x1 WIDEN bb25 w=4 lin=12 guards=1 reds=0      x3 declined bb16: induction step is not 1
-//!     x5 declined bb19: the induction variable
-//!        is used for something other than addressing
+//!     x1 WIDEN bb19 w=4 lin=63 guards=2 reds=2      x3 declined bb16: induction step is not 1
+//!     x1 WIDEN bb25 w=4 lin=12 guards=1 reds=0
 //! ```
+//!
+//! `bb19` is the loss's fused forward+backward pass, and it is the one the **lane ramp** unlocked:
+//! it reads its counter as a *value* (`if c == target`), which used to be a flat decline. See
+//! [`IvRamp`].
 //!
 //! Quote it **with the repeat counts** or say explicitly that you have collapsed them. A
 //! de-duplicated paste reads like a per-loop verdict list, which is a different (and much stronger)
@@ -333,6 +336,48 @@ struct VecPlan {
     /// May two guarded bases be *equal* (rather than disjoint)? Only when every guarded access
     /// sits at the same constant offset from its base, so an equal pair is at distance 0.
     guard_allows_equal: bool,
+    /// Where the body reads the induction variable as a **value** rather than as an address.
+    ramp: IvRamp,
+}
+
+/// The induction variable's second, lane-varying face.
+///
+/// The IV is normally [`Wide::Uniform`]: one scalar for the whole group, because the only thing it
+/// does is address memory and a vector load at `base + i` covers `i .. i+W-1` on its own. A body
+/// that reads it as a *value* — `if c == target`, `(i as f32)`, `o[i] = i` — needs the opposite:
+/// lane `k` must see `i + k`, the counter scalar iteration `i + k` would have had. That vector is
+/// `splat(i) + iota` (the step is 1, enforced by [`iv_verdict`]), and `iota` is exactly why
+/// [`wukong_mir::Op::Iota`] exists — no expression over splatted scalars is lane-varying.
+///
+/// The two faces coexist. The *same* `v533` is a `gep` index (uniform) and a compare operand
+/// (ramp) in the same body, so the role is decided per instruction, not per value:
+/// [`classify_iv_uses`] records which steps of the flattened body read it as a value, and
+/// [`emit_body`] swaps the map entry for exactly those steps.
+///
+/// Only the induction variable itself gets a ramp. A value *derived* from it (`i + 1`, `i * 2`,
+/// `sext i`) used as a value is still declined: its ramp would be the same arithmetic over
+/// `ramp(i)`, which is expressible for `add`/`sub`/`mul` but not for the `shl` and `sext` the same
+/// closure admits (a MIR vector shift takes a per-lane amount Cranelift cannot lower, and a
+/// widening cast changes the lane count), and getting one of those right and the other wrong is
+/// worse than declining both.
+#[derive(Clone, Debug)]
+struct IvRamp {
+    /// The induction variable's `ValueId` in the *original* loop.
+    iv: ValueId,
+    /// Its integer type; the ramp is `Vec(ty, W)`.
+    ty: MirType,
+    /// Indices into [`VecPlan::lin`] whose instruction reads `iv` in a value role.
+    value_use: FxHashSet<usize>,
+}
+
+impl IvRamp {
+    /// Does step `at` of the flattened body read `v` as a lane-varying value?
+    fn reads_as_value(&self, at: usize, v: ValueId) -> bool {
+        v == self.iv && self.value_use.contains(&at)
+    }
+    fn needed(&self) -> bool {
+        !self.value_use.is_empty()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -560,15 +605,22 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if !carried_values_are_handled(l, iv.param_index) {
         return Err("a carried value is neither the primary IV, a reduction nor invariant");
     }
-    if !index_values_only_address(f, &lin, iv.value) {
-        return Err("the induction variable is used for something other than addressing");
-    }
+    let iv_value_use = classify_iv_uses(f, &lin, iv.value)
+        .ok_or("the induction variable is used for something other than addressing")?;
     if !invariant_loads_are_safe(l) {
         return Err("an invariant data load in a loop that also writes memory");
     }
 
     // ---- width, from the memory the loop touches ----------------------------------------------
     let w = pick_width(l).ok_or("no single lane width for the loop's accesses")?;
+    // A lane ramp only makes sense at the width the rest of the body runs at: lane `k` of the ramp
+    // has to be the induction variable of the same scalar iteration lane `k` of every other vector
+    // in the group belongs to. An `i64` counter over `f32` data would want a 4-lane ramp of 8-byte
+    // lanes, which is 256 bits — past what the backend legalizes (see [`VEC_BYTES`]) and, more to
+    // the point, a different group size from the data.
+    if !iv_value_use.is_empty() && lanes_of(&iv_ty) != Some(w) {
+        return Err("the induction variable is read as a value at a width its lanes cannot hold");
+    }
 
     // ---- trip count ---------------------------------------------------------------------------
     let trip = match &l.trip {
@@ -591,8 +643,13 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     };
 
     // ---- per-instruction plan -----------------------------------------------------------------
+    let ramp = IvRamp {
+        iv: iv.value,
+        ty: iv_ty.clone(),
+        value_use: iv_value_use,
+    };
     let (plans, vector_ty, reductions) =
-        plan_body(f, l, &lin, w).ok_or("an instruction in the body cannot be widened")?;
+        plan_body(f, l, &lin, w, &ramp).ok_or("an instruction in the body cannot be widened")?;
 
     // ---- runtime alias guard ------------------------------------------------------------------
     let (guards, guard_elem, guard_allows_equal) =
@@ -613,6 +670,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         guards,
         guard_elem,
         guard_allows_equal,
+        ramp,
     })
 }
 
@@ -900,18 +958,18 @@ fn carried_values_are_handled(l: &NaturalLoop, primary_param: usize) -> bool {
     })
 }
 
-/// A value that moves with the induction variable may only be used to *address* memory.
+/// Split every use of a value that moves with the induction variable into an **address** role and a
+/// **value** role, and decline the loop unless each one is handled.
 ///
 /// This is the invariant that makes [`Wide::Uniform`] mean what it says. The induction variable is
 /// the same in every lane only when it is a `gep` index: the vector load at `base + i` covers
 /// elements `i .. i+W-1` on its own, so lane `k` reads exactly what scalar iteration `i+k` read.
-/// Used anywhere else — `(i as f32)`, `o[i] = i * 2`, `x[i] + i` — it is *not* uniform, and
-/// splatting it writes the group's first value into all `W` lanes. That was a real miscompile
-/// during development: an initializer loop `x[i] = (i as f32) * 0.25` produced four copies of every
-/// fourth element and interp and native agreed on the wrong answer, so only the `-O0` vs `-O2` gate
-/// caught it.
+/// Used as a *value* it is not uniform, and splatting it writes the group's first counter into all
+/// `W` lanes. That was a real miscompile during development: an initializer loop
+/// `x[i] = (i as f32) * 0.25` produced four copies of every fourth element and interp and native
+/// agreed on the wrong answer, so only the `-O0` vs `-O2` gate caught it.
 ///
-/// The set is grown as a transitive closure rather than read off
+/// The address set is grown as a transitive closure rather than read off
 /// [`crate::loop_info::NaturalLoop::derived`], because `derived` only records *integer* results: a
 /// `sitofp` of the induction variable is exactly the dangerous case and would not appear in it.
 /// Address arithmetic (`add`/`sub`/`mul`/`shl`/`sext`/`neg`, and `gep` itself) may consume an index
@@ -919,12 +977,27 @@ fn carried_values_are_handled(l: &NaturalLoop, primary_param: usize) -> bool {
 /// terminates at a `gep` index, a load/store pointer, or the latch's branch arguments (where the
 /// only index value is the induction variable's own increment, which [`emit_body`] replaces with a
 /// step of `W`).
-fn index_values_only_address(f: &Function, lin: &[LinInst], iv: ValueId) -> bool {
+///
+/// A value-role use is no longer fatal: it is answered by a lane ramp ([`IvRamp`]), and the returned
+/// set names the steps of `lin` that need one. Three things keep that narrow enough to be obviously
+/// sound:
+///
+/// * **Only the induction variable itself.** An instruction whose index-set operands include
+///   anything other than `iv` is still declined — a ramp for `i + 1` or `sext i` is a different
+///   (and in the `sext` case inexpressible) construction. See [`IvRamp`].
+/// * **Never a pointer or a memory address.** `gep`, a load's pointer and a store's pointer are
+///   address roles by construction, and the induction variable is an integer, so it can never *be*
+///   one of them. The only value-role memory case is a store whose stored *value* is the counter.
+/// * **Never a synthesized if-conversion step.** The two `select`s [`linearize_region`] builds keep
+///   today's flat rejection; widening them over a ramp is expressible but buys nothing measured, and
+///   an unexercised path here is a miscompile waiting for a program to write it.
+fn classify_iv_uses(f: &Function, lin: &[LinInst], iv: ValueId) -> Option<FxHashSet<usize>> {
     let mut index: FxHashSet<u32> = FxHashSet::default();
     index.insert(iv.0);
+    let mut value_use: FxHashSet<usize> = FxHashSet::default();
     // The header parameters other than the IV are not index values: `carried_values_are_handled`
     // has already restricted them to reductions and pass-through invariants.
-    for step in lin {
+    for (at, step) in lin.iter().enumerate() {
         // A synthesized `select` never takes an index value: `linearize_region` only ever merges a
         // latch parameter or two stored *values*, and a lane-varying stored value is rejected
         // separately. Check it rather than assume it.
@@ -940,7 +1013,7 @@ fn index_values_only_address(f: &Function, lin: &[LinInst], iv: ValueId) -> bool
                     || index.contains(&then_val.0)
                     || index.contains(&else_val.0)
                 {
-                    return false;
+                    return None;
                 }
                 continue;
             }
@@ -954,7 +1027,7 @@ fn index_values_only_address(f: &Function, lin: &[LinInst], iv: ValueId) -> bool
                     || index.contains(&then_arg.0)
                     || index.contains(&else_arg.0)
                 {
-                    return false;
+                    return None;
                 }
                 continue;
             }
@@ -972,28 +1045,94 @@ fn index_values_only_address(f: &Function, lin: &[LinInst], iv: ValueId) -> bool
         // from a lane-varying index is itself lane-varying, but the *value* a lane-varying address
         // loads is not — it is the ordinary vector element, and treating it as an index would
         // reject every loop body that does arithmetic on what it read.
-        let (ok, propagates) = match &inst.op {
-            Op::Gep { .. } => (true, true),
+        let role = match &inst.op {
+            Op::Gep { .. } => Role::Address { propagates: true },
             Op::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl, ..)
             | Op::Cast(CastKind::SExt, ..)
-            | Op::Neg(_) => (true, true),
-            // Only the *pointer* may be lane-varying; a lane-varying stored value would be splatted.
-            Op::Load(p, _) => (index.contains(&p.0), false),
+            | Op::Neg(_) => Role::Address { propagates: true },
+            Op::Load(p, _) if index.contains(&p.0) => Role::Address { propagates: false },
+            Op::Load(..) => Role::Reject,
+            // A store reads its pointer in an address role and its value in a value role, so the
+            // two are judged separately: the address must be the loop's index (a store at a
+            // uniform address would have every lane write the same place), and the stored value
+            // may be the counter itself — `o[i] = i` — through the ramp.
             Op::Store { ptr, value } => {
-                (index.contains(&ptr.0) && !index.contains(&value.0), false)
+                if !index.contains(&ptr.0) {
+                    Role::Reject
+                } else if !index.contains(&value.0) {
+                    Role::Address { propagates: false }
+                } else if *value == iv {
+                    Role::Value
+                } else {
+                    Role::Reject
+                }
             }
-            _ => (false, false),
+            _ => Role::Value,
         };
-        if !ok {
-            return false;
-        }
-        if propagates {
-            if let Some(r) = inst.result {
-                index.insert(r.0);
+        match role {
+            Role::Reject => return None,
+            Role::Address { propagates } => {
+                if propagates {
+                    if let Some(r) = inst.result {
+                        index.insert(r.0);
+                    }
+                }
+            }
+            Role::Value => {
+                // Every index-set operand has to be the induction variable itself (a `Store`'s
+                // pointer excepted — it was just checked as an address), and the result, if any, is
+                // deliberately NOT added to `index`: it is lane-varying data from here on, and
+                // `plan_body`'s ordinary vector dataflow owns it.
+                let store_ptr = match &inst.op {
+                    Op::Store { ptr, .. } => Some(*ptr),
+                    _ => None,
+                };
+                let mut only_iv = true;
+                each_op_use(&inst.op, &mut |u| {
+                    if index.contains(&u.0) && u != iv && Some(u) != store_ptr {
+                        only_iv = false;
+                    }
+                });
+                if !only_iv || !ramp_consumable(&inst.op) {
+                    return None;
+                }
+                value_use.insert(at);
             }
         }
     }
-    true
+    Some(value_use)
+}
+
+/// How one instruction reads the values that move with the induction variable.
+enum Role {
+    /// Purely to address memory; the operands stay scalar. `propagates` marks the ops whose result
+    /// is itself an address value and joins the closure.
+    Address { propagates: bool },
+    /// As a lane-varying value; the induction variable operand becomes the lane ramp.
+    Value,
+    /// Neither, so the loop cannot be widened.
+    Reject,
+}
+
+/// May this operation read the induction variable as one lane-varying vector operand?
+///
+/// The list is the ops [`plan_body`] knows how to widen, minus the ones whose operands are
+/// addresses. It is a filter, not a promise: `plan_body` still has to accept the widened form (an
+/// integer divide, an `i8` multiply and every shift are refused there by [`bin_widenable`], and a
+/// lane-width-changing cast by [`cast_widenable`]), so anything this lets through and that cannot
+/// actually be widened comes back as a plain decline rather than bad MIR.
+fn ramp_consumable(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Bin(..)
+            | Op::Cmp(..)
+            | Op::Select(..)
+            | Op::Neg(_)
+            | Op::Not(_)
+            | Op::Cast(..)
+            | Op::Fma(..)
+            | Op::Store { .. }
+    )
 }
 
 /// A load at a loop-invariant address executes once per *group* in the vector body but once per
@@ -1048,6 +1187,7 @@ fn plan_body(
     l: &NaturalLoop,
     lin: &[LinInst],
     w: u32,
+    ramp: &IvRamp,
 ) -> Option<(Vec<Plan>, FxHashMap<u32, MirType>, Vec<RedPlan>)> {
     let access_at: FxHashMap<(u32, usize), &MemAccess> = l
         .accesses
@@ -1120,8 +1260,18 @@ fn plan_body(
     let mut vector_ty: FxHashMap<u32, MirType> = FxHashMap::default();
     let mut plans: Vec<Plan> = Vec::with_capacity(lin.len());
     let is_vec = |m: &FxHashMap<u32, MirType>, v: ValueId| m.contains_key(&v.0);
+    // The lane type an operand contributes *at this step*, or `None` when it is uniform. The
+    // induction variable is the one value whose answer depends on where it is read — uniform as an
+    // address, a `W`-lane ramp as a value — so this takes the step index and `is_vec` does not.
+    let lane_at = |m: &FxHashMap<u32, MirType>, at: usize, v: ValueId| -> Option<MirType> {
+        match m.get(&v.0) {
+            Some(t) => Some(t.clone()),
+            None if ramp.reads_as_value(at, v) => Some(ramp.ty.clone()),
+            None => None,
+        }
+    };
 
-    for step in lin {
+    for (at, step) in lin.iter().enumerate() {
         // A synthesized step (an if-converted store or merge) reads values the arms computed and,
         // for a merge, defines the latch parameter the rest of the body reads.
         let (block, i, inst) = match step {
@@ -1207,7 +1357,7 @@ fn plan_body(
         }
         let mut operand_is_vec = false;
         each_op_use(&inst.op, &mut |u| {
-            if is_vec(&vector_ty, u) {
+            if lane_at(&vector_ty, at, u).is_some() {
                 operand_is_vec = true;
             }
         });
@@ -1268,11 +1418,14 @@ fn plan_body(
                 if !operand_is_vec {
                     Plan::Scalar
                 } else {
-                    // The operand lane type decides the mask width, not the `i1` result type.
+                    // The operand lane type decides the mask width, not the `i1` result type. Both
+                    // operands of a `Cmp` share one MIR type, so which vector operand answers is
+                    // immaterial — including when it is the induction variable's ramp, which is
+                    // how `if c == target` becomes a per-lane mask instead of one scalar bool.
                     let mut lane: Option<MirType> = None;
                     each_op_use(&inst.op, &mut |u| {
-                        if let Some(t) = vector_ty.get(&u.0) {
-                            lane = Some(t.clone());
+                        if let Some(t) = lane_at(&vector_ty, at, u) {
+                            lane = Some(t);
                         }
                     });
                     let lane = lane?;
@@ -1331,7 +1484,7 @@ fn plan_body(
                 } else {
                     // A widening or narrowing cast changes the lane count, which would split or
                     // merge groups. Only same-width lane conversions are one-for-one.
-                    let from = vector_ty.get(&v.0)?;
+                    let from = &lane_at(&vector_ty, at, *v)?;
                     if lane_bytes(from) != lane_bytes(to)
                         || lanes_of(to)? != w
                         || !cast_widenable(*kind, to)
@@ -1950,7 +2103,36 @@ fn emit_body(
         map.insert(hp.0, Wide::Uniform(vh_params[i]));
     }
 
+    // The lane ramp, when the body reads the induction variable as a value: `splat(i) + iota`, so
+    // lane `k` holds `i + k` — the counter scalar iteration `i + k` would have had. The step is 1
+    // (`iv_verdict`), and MIR `Add` wraps exactly as the scalar `i + 1` chain does, so the two agree
+    // even across an integer overflow. The `iota` is a constant with no operands, so LICM lifts it
+    // into the guard and only the `splat` and the `add` remain per group.
+    //
+    // Emitted once, before the body, and mapped in and out per instruction below: the *same*
+    // induction variable is a `gep` index (uniform) and a compare operand (ramp) in the same block,
+    // and the plan says which role each step is.
+    let iv_scalar = vh_params[p.iv_index];
+    let ramp = p.ramp.needed().then(|| {
+        let vt = vec_of(&p.ramp.ty, p.w);
+        let iota = e.push(vb, vt.clone(), Op::Iota(vt.clone()));
+        let base = e.push(vb, vt.clone(), Op::Splat(iv_scalar));
+        e.push(vb, vt, Op::Bin(BinOp::Add, base, iota))
+    });
+
     for (i, step) in p.lin.iter().enumerate() {
+        // Give the induction variable its lane-varying face for exactly the steps that read it as a
+        // value, and its scalar one everywhere else, so the address arithmetic around them stays
+        // scalar. Set at the top of every iteration rather than restored at the bottom: the body
+        // below leaves through half a dozen `continue`s and one missed restore would splat the
+        // group's first counter into all `W` lanes.
+        if ramp.is_some() {
+            let face = match (ramp, p.ramp.value_use.contains(&i)) {
+                (Some(r), true) => Wide::Vector(r),
+                _ => Wide::Uniform(iv_scalar),
+            };
+            map.insert(p.ramp.iv.0, face);
+        }
         // The two synthesized steps of if-conversion. Both are lane-wise `select`s: one feeds a
         // single store that stands in for the two arms' stores, the other defines the latch
         // parameter the arms were merging into.
@@ -2073,6 +2255,13 @@ fn emit_body(
                 map.insert(r.0, Wide::Vector(nv));
             }
         }
+    }
+
+    // Past the body the induction variable is scalar again: the reduction folds and the back-edge
+    // arguments below both read it (or values it feeds) through `resolve_uniform`, and the
+    // induction variable's own back-edge argument is the `+ W` step.
+    if ramp.is_some() {
+        map.insert(p.ramp.iv.0, Wide::Uniform(iv_scalar));
     }
 
     // The accumulates, after every load and store of the group has happened. Moving them here is
@@ -2788,14 +2977,113 @@ mod tests {
         assert!(!is_widened(src, "k"), "a gather must stay scalar");
     }
 
-    /// The induction variable is uniform across a group only as an *address*. Used as a value it
-    /// is `i + k` in lane `k`, and splatting it writes the group's first index into all lanes.
+    /// The induction variable is uniform across a group only as an *address*. Used as a value it is
+    /// `i + k` in lane `k`, so the widened body reads it through the lane ramp `splat(i) + iota` —
+    /// and that ramp is only expressible when its lane count is the group size the rest of the body
+    /// runs at. An `i64` counter over `f32` data would need four 8-byte lanes, i.e. a 256-bit
+    /// vector, so it is declined rather than splatted.
     #[test]
-    fn an_induction_variable_used_as_a_value_is_declined() {
+    fn a_counter_whose_lanes_do_not_match_the_data_width_is_declined() {
         let src = "fn k(mut o: []f32, n: i64) { let mut i: i64 = 0; \
                    while i < n { o[i] = (i as f32) * 0.25; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "`i` as a value must stay scalar");
+        assert!(
+            !is_widened(src, "k"),
+            "an i64 counter over f32 data has no 4-lane ramp"
+        );
+    }
+
+    /// The same loop at matching lane widths: an `i32` counter over `f32` data widens, and the
+    /// ramp — not a splat — is what makes lane `k` see `i + k`.
+    #[test]
+    fn a_counter_read_as_a_value_is_widened_through_a_lane_ramp() {
+        let src = "fn k(mut o: []f32, n: i32) { let mut i: i32 = 0; \
+                   while i < n { o[i] = (i as f32) * 0.25; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(!vs.is_empty(), "an i32 counter over f32 data was not widened");
+        let (program, mut interner) = optimized(src, 2);
+        let sym = interner.intern("k");
+        let f = program.function(sym).expect("no fn k");
+        let iota: Vec<&MirType> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match &i.op {
+                Op::Iota(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            iota,
+            vec![&vec_of(&MirType::I32, 4)],
+            "expected exactly one <4 x i32> lane ramp"
+        );
+    }
+
+    /// An integer compare against the counter has to become a **lane mask**, not one scalar bool:
+    /// the `i == target` of a classification loss selects a different value in one lane of the
+    /// group. Asserted on the widened `Cmp`'s operand type, which is what decides the mask width.
+    #[test]
+    fn a_compare_against_the_counter_becomes_a_lane_mask() {
+        let src = "fn k(x: []f32, mut o: []f32, t: i32, n: i32) { let mut i: i32 = 0; \
+                   while i < n { let q: f32 = if i == t { 8.0 } else { 2.0 }; \
+                   o[i] = x[i] * q; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (program, mut interner) = optimized(src, 2);
+        let sym = interner.intern("k");
+        let f = program.function(sym).expect("no fn k");
+        let masks = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| match &i.op {
+                Op::Cmp(_, a, _) => f.value_type(*a) == &vec_of(&MirType::I32, 4),
+                _ => false,
+            })
+            .count();
+        assert_eq!(masks, 1, "expected one <4 x i32> lane-mask compare");
+        scalar_and_vector_agree(
+            "fn k(x: []f32, mut o: []f32, t: i32, n: i32) { let mut i: i32 = 0; \
+             while i < n { let q: f32 = if i == t { 8.0 } else { 2.0 }; \
+             o[i] = x[i] * q; i = i + 1; } } \
+             fn main() -> i32 { let mut x: []f32 = alloc_f32(23); let mut o: []f32 = alloc_f32(23); \
+             let mut j: i64 = 0; while j < 23 { x[j] = (j as f32) + 1.0; o[j] = -777.0; j = j + 1; } \
+             k(x, o, 17, 23); \
+             j = 0; while j < 23 { print(o[j] as i32); j = j + 1; } \
+             free(o); free(x); return 0; }",
+        );
+    }
+
+    /// The counter stored as *data* rather than used as an address: the store's pointer stays
+    /// uniform and its value becomes the ramp.
+    #[test]
+    fn storing_the_counter_itself_is_widened() {
+        let src = "fn k(mut o: []i32, n: i32) { let mut i: i32 = 0; \
+                   while i < n { o[i] = i; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(is_widened(src, "k"), "`o[i] = i` was not widened");
+        scalar_and_vector_agree(
+            "fn k(mut o: []i32, n: i32) { let mut i: i32 = 0; \
+             while i < n { o[i] = i; i = i + 1; } } \
+             fn main() -> i32 { let mut o: []i32 = alloc_i32(23); \
+             let mut j: i64 = 0; while j < 23 { o[j] = -777; j = j + 1; } \
+             k(o, 23); \
+             j = 0; while j < 23 { print(o[j]); j = j + 1; } free(o); return 0; }",
+        );
+    }
+
+    /// Only the counter itself gets a ramp. A value *derived* from it and then read as a value is
+    /// still declined — see [`IvRamp`] for why the derived construction is not attempted.
+    #[test]
+    fn a_derived_index_read_as_a_value_is_declined() {
+        let src = "fn k(mut o: []f32, n: i32) { let mut i: i32 = 0; \
+                   while i < n { let j: i32 = i + 1; o[i] = (j as f32) * 0.25; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "k"),
+            "a derived index used as a value must stay scalar"
+        );
     }
 
     /// Stride 2 is a strided access, not a contiguous vector load.
