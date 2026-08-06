@@ -51,12 +51,16 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   and have been removed from this list. See the [peer-strength
   correction](BENCHMARKS.md#-peer-strength-correction--2026-08-04).)*;
 - **wins the transcendental/activation family ~4.7–11.5× vs C** (**~28× under `@parallel`**) — the
-  cleanest compute-bound win — and stands near Intel oneMKL VML, the hand-tuned
-  vector-math SOTA: same-run across thermal states, **tanh 2.7–2.9× FASTER than VML**, with
-  **exp 1.23–1.45× and log ~1.25× slower** after 8-bucket in-register-LUT rewrites of both cores
-  (exp ~1.3 ULP, log ≤6.9e-7 rel — exhaustively swept; the residual gap is algorithmic — VML's
-  cheaper core — and the earlier single-session "exp 1.05× faster / log 1.14×" readings did not
-  reproduce across states, so the range is the honest claim). Wukong dispatches a pure
+  cleanest compute-bound win — and is now **ahead of Intel oneMKL VML**, the hand-tuned vector-math
+  SOTA, on all three ops measured, in **both** of this laptop's power states: same-run, one process,
+  ABBA-interleaved, best-of-30, MKL at one thread — **tanh 4.08–4.66×**, **log 1.17–1.46×** and
+  **exp 1.01–1.25× faster** (≈2× at n = 2²³, where Wukong's non-temporal store regime also engages).
+  The exp/log gap this replaces (1.20–1.49× and 1.05–1.28× *slower*) had been recorded as
+  algorithmic; it was actually the dispatch calling its 8-lane kernel through a function pointer,
+  which without crate-wide AVX means the `__m256` crosses the call through memory. Inlining it is
+  worth 1.12–1.75× and is **bit-identical on all 2³² f32** — accuracy stays exp ≤2 ULP (1.625e-7
+  rel) and log ≤12 ULP (6.924e-7 rel), both re-verified exhaustively rather than sampled. Wukong
+  dispatches a pure
   `out[i]=f(x[i])` loop for **35** functions
   (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/`silu`/
   `softplus`/`softsign`/`logsigmoid`/`mish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf` plus the

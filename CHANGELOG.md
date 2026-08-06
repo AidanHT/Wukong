@@ -5,6 +5,55 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Performance — the vmath exp/log loss vs oneMKL VML was the dispatch, not the polynomial (2026-08-06)
+The last documented single-core loss to an industry library ("exp 1.23–1.45× and log ~1.25× slower
+than VML; residual is algorithmic — VML has a cheaper ~0.5-ULP core") was **not** algorithmic. The
+AVX2 elementwise dispatch selected its 8-lane kernel once with `vmath8_for(op)` and then called that
+**function pointer** every 8 lanes. That pointer comes from a runtime 36-arm `match`, so LLVM cannot
+fold it, and the crate is built without crate-wide AVX — so a 256-bit vector cannot cross a real call
+boundary in a register and goes through memory. The emitted inner loop (reproduced standalone with
+`rustc -O --emit asm` on a faithful 4-arm copy of the dispatch shape; a 1-arm copy devirtualizes and
+proves nothing) was: load 8 lanes, `vmovaps %ymm0, 64(%rsp)` to spill the argument, load the hidden
+return-slot and argument pointers into `rcx`/`rdx`, `vzeroupper`, `callq *%r12`, `vmovaps 32(%rsp),
+%ymm0` to reload — and, because the callee owns its registers, the polynomial's `_mm256_set1_ps`
+constants had to be rematerialized on every vector instead of living in ymm across the loop.
+Four *arithmetic* attempts had already been spent on this gap (8-bucket in-register LUTs, Estrin
+scheduling, the ×4/×6 ILP unroll, and a bit-identical `ldexp` exp tail that measured a 10–15% loss
+and was reverted); none of them could see it, because none of them was in the loop that was slow.
+- **The op dispatch is now monomorphic** in both the one-input (`wukong_vmath_f32`) and two-input
+  (`wukong_vmath2_f32`) elementwise kernels: one `match` outside the loop, each arm instantiating the
+  shared loop body with its kernel inlined, and both the arm list and the `vmath8_for` /
+  `vmath2_8_for` tables generated from a single `with_vmath8_table!` / `with_vmath2_8_table!` so they
+  cannot desync. `WUKONG_VMATH_FNPTR=1` restores the old spelling in the same binary as the A/B
+  kill-switch.
+- **Nothing about the arithmetic changed**, and that is proven rather than asserted:
+  `vmath_exp_log_exhaustive_ulp` runs **all 2³² f32 bit patterns** through exp and log and requires
+  monomorphized lane == function-pointer lane == scalar twin, bit-for-bit — NaNs of every payload,
+  ±0, ±∞, subnormals and the negative-garbage bands included. The two per-kernel gates
+  (`vmath{,2}_monomorphized_dispatch_matches_the_function_pointer_path`) cover every declared op code
+  at every length class and in both store regimes.
+- **Measured** (`vmath_exp_log_vs_vml`, all arms in one process, ABBA-interleaved, best-of-30 minima,
+  MKL pinned to 1 thread, n = 2¹²…2²³, in **both** of this laptop's power states — battery at 32–35%
+  and AC at 14%): the internal monomorphized-vs-function-pointer ratio — power-independent, same
+  code, same bits — is **1.12–1.75× faster** (typically ~1.4×; the 1.12 is exp at 2²³, where the pass
+  is memory-bound). Against VML: exp goes from 1.20–1.49× slower to **1.01–1.25× faster** (1.97–2.13×
+  at 2²³, where Wukong's non-temporal store regime also engages), log from 1.05–1.28× slower to
+  **1.17–1.46× faster**, tanh from 2.56–3.20× to **4.08–4.66×** faster. A fourth arm times the real
+  exported `wukong_vmath_f32` and tracks whichever spelling is selected, so the twins are not
+  flattering models. The two-input kernel measures **1.09–1.48×** (`vmath2_mono_vs_fnptr`, internal
+  A/B only — VML has no `silu'`/`gelu'`/SwiGLU-gate entry to peer against).
+- **Accuracy re-swept exhaustively**, not sampled: exp max 1.625e-7 relative / ≤2 ULP over all
+  2,237,579,431 f32 in [−87, 88.376]; log max 6.924e-7 / ≤12 ULP over all 2,130,706,432 positive
+  normal f32 (12 ULP and 6.9e-7 are the same figure — the peak sits at x ≈ 1.0157 where ln x ≈ 0.0156).
+  Both bars are now asserted at the measured value. The whole exp-composed family (tanh, sigmoid,
+  silu, gelu, elu, softplus, mish, selu, erf, the hyperbolics, fused softmax and the GEMM activation
+  epilogue) inherits the speedup through `exp8`/`log8` unchanged.
+- Cost: `libwukong_runtime.rlib` grows 2.82 → 3.03 MiB (+7.4%) for the one-input change and its
+  release build 18.1 → 20.5 s. Dispatch census over all 351 `tests/run/*.wk` + 17 `examples/*.wk` is
+  byte-identical — this is a runtime-library change with no compile-time surface. **Not** changed:
+  the bf16/f16-input dispatchers still go through the function-pointer table; they are bandwidth-bound
+  and 36 more monomorphizations each is a code-size trade that was not measured.
+
 ### Benchmark honesty — three defects an adversarial verifier found and proved
 No compiler behaviour changes; all three are in `wukong_xbench` (plus the measurement docs). Two of
 them make Wukong look **worse**, which is the point.

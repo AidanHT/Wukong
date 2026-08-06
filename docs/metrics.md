@@ -62,15 +62,25 @@ Current standing (recorded):
   physics-ties at L3-resident sizes (relu, biasadd, hadamard); reductions/norms/scans/column
   family 1.4–107× vs scalar-left-by-gcc patterns — but note these are IEEE-serial C baselines
   (see G5 fairness work: a `-ffast-math` C column normalizes the reassociation share).
-- *Transcendentals*: 4.7–12× scalar libm; vs MKL VML the 8-bucket `vpermps`-LUT rewrites
-  (2026-07-08) hold **tanh 2.7–2.9× FASTER**, while the honest 2026-07-09 re-measure puts
-  **exp at 1.23–1.45× slower and log ~1.25× slower across thermal states** (the recorded
-  "exp 1.05× faster / log 1.14× faster" did not reproduce — those were single cool-session
-  readings; ranges are the honest form). A bit-identical ldexp restructure of the exp tail
-  was built, exhaustively verified, measured a ~10–15% LOSS in both thermal states
-  (port-rebalancing cannot beat a clock throttle that slows all ports), and **reverted** —
-  the residual exp/log gap is algorithmic (VML's cheaper core), documented, and stable.
-  Composites inherit the wins: log2 9.9×, log1p 7.7× vs C.
+- *Transcendentals*: 4.7–12× scalar libm; vs MKL VML the standing is now **exp 1.01–1.25×
+  faster (≈2× at n = 2²³), log 1.17–1.46× faster, tanh 4.08–4.66× faster** (2026-08-06,
+  one process, ABBA-interleaved, best-of-30, MKL at 1 thread, **both power states**).
+  **The four-year-old "the residual is algorithmic" reading was wrong**, and it is worth
+  recording why the instrument did not catch it: every lever tried against this gap —
+  8-bucket `vpermps` LUTs (2026-07-08, which did close a real ~1.7–2× loss), Estrin
+  scheduling, the ×4/×6 ILP unroll, and a bit-identical `ldexp` exp tail that measured a
+  ~10–15% loss and was **reverted** — was a change to the *polynomial*, while the cost was
+  in the *dispatch*: the loop called its 8-lane kernel through a function pointer, and the
+  Windows x64 ABI passes `__m256` in memory, so every 8 lanes paid a spill / indirect call /
+  reload and lost the poly constants out of registers. Monomorphizing that dispatch is
+  bit-identical on all 2³² f32 and worth **1.12–1.75×** on its own — a power-independent
+  internal ratio (`WUKONG_VMATH_FNPTR=1` measures the old spelling in the same binary). The
+  two-input kernel (`wukong_vmath2_f32` — activation backward, SwiGLU/GeGLU gates, pow),
+  which spilled **two** `__m256` per call, took the same fix for **1.09–1.48×**.
+  Accuracy exhaustively re-swept: exp 1.625e-7 / ≤2 ULP over 2.24e9 values, log 6.924e-7 /
+  ≤12 ULP over every positive normal f32. Composites inherit the wins: log2 9.9×, log1p 7.7× vs C.
+  *Lesson for the instrument*: a "residual is algorithmic" verdict needs a same-binary A/B
+  against the alternative *structure*, not only against alternative math.
 
 **M2. End-to-end model performance.** A compiler is judged on composed graphs, not op zoos:
 fusion, no round-trips, layer-stack throughput. GPT-2-class `.wk` models exist and dispatch
@@ -175,10 +185,11 @@ tail (C-tile prefetch, 2048³ now at/above MKL-1c parity, see M1), the 256³ del
 (now engaged at ~94–110% of MKL-all under the dynamic-claiming default), the serving goodput ceiling
 (Bcap=256, 85.6× + honest static peer), the S=128 model regime (1.5–1.9× behind eager at campaign
 start → now 1.07–1.43× AHEAD of *compiled* torch, see M2), and the honest-instrument holes (f32-out cuBLAS peer column; exp/log/model ranges
-re-based on multi-state measurement). Measured-and-bounded rather than closed: GPU long-S
-attention (warp specialization built; wins only 4–6% @S=4096 — structural SFU bound), 4096³
-GEMM (v2cs +2.7%; ~80% of the honest peer, residual is SASS-level), exp/log vs VML
-(algorithmic; the ldexp lever was built, measured a loss both thermal states, reverted).
+re-based on multi-state measurement), and **exp/log vs VML, which this list called
+"measured-and-bounded, algorithmic" until 2026-08-06 and which turned out to be a
+function-pointer dispatch boundary — now 1.01–1.39× ahead of VML** (see M1). Measured-and-bounded
+rather than closed: GPU long-S attention (warp specialization built; wins only 4–6% @S=4096 —
+structural SFU bound), 4096³ GEMM (v2cs +2.7%; ~80% of the honest peer, residual is SASS-level).
 Remaining, ranked:
 
 1. Multicore parallel-GEMM grain — the head-loop region + dynamic block-claiming landed (model
