@@ -169,6 +169,13 @@ cargo run -p wukong_xbench --release      # CC=gcc by default; set CC to overrid
 > transpose peer carries no bounds checks; and the `restrict`-qualified pointers that the harness
 > deliberately aliases (`bench_norm_batched` passes `x` for the unused `y`; `bench_row_losses`
 > entropy passes `p` twice) are both read-only, so no `restrict` contract is violated.
+>
+> One more, because the inconsistency looks like a defect and is not: **23 of the C peer flag sets
+> omit `-ffp-contract=fast` and 16 pass it, and it makes no difference.** gcc invoked without a
+> `-std=` flag is in GNU mode, where the default already *is* `fast`. Verified on
+> `out[i] = x[i] + y[i]*2.5f`, own TU: `-O3 -march=native` emits `vfmadd`, adding
+> `-ffp-contract=fast` emits `vfmadd`, and only `-ffp-contract=off` suppresses it. So no family is
+> compiled without FMA while Wukong fuses; the two spellings are equivalent and only the text differs.
 
 ## Test machine & toolchains
 
