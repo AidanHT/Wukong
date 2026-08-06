@@ -35,6 +35,45 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `sitofp` of the ramp; `o[i] = i`; a lane mask in front of a float reduction; a counter starting at
   3; and the same one-hot at `<2 x f64>`/`i64` lanes — with expected values derived by hand from the
   scalar semantics.
+### Recognizers: the natural spelling of a transformer block now dispatches
+Four widenings, all in `wukong_mir_build`. Each closes a case where a program that computes exactly
+what a recognized one computes lost its kernel to *spelling* alone. Nothing was narrowed: the
+path-keyed dispatch census over `tests/run` + `examples` is 0 LOST throughout, 835 → 848 sites.
+
+- **An activation written INTO the matmul store.** `c[i*N+j] = silu(bias[j] + s)` — the way an FFN is
+  actually written — used to decline the whole GEMM, because the store value is a `Call` and neither
+  the α peel (which wants a `Mul`) nor the bias peel (which wants an `Add`) matched. `peel_epi_act`
+  now peels `fmax(_,0)` / `gelu` / `silu` off the store first and `MatmulNest` carries the code, so it
+  fuses into one `wukong_sgemm_nt_epi` — **one** kernel call and one pass over C, where the
+  separate-loop spelling needs a GEMM plus a `wukong_vmath_f32`.
+- **A residual read from another buffer, folded into the store.** `c[i*N+j] = x[i*N+j] + s` with
+  `x != c` matched neither the plain matmul (`c = s`) nor the in-place residual (`c = c + s`). It now
+  lowers to `wukong_sgemm_nt` + a flat `wukong_velem_f32` sweep — the same pair, and the same bits, as
+  the factored `for i { c[i] = x[i] + c[i]; }` spelling.
+- **A dual-store projection.** `c[i*N+j] = s; d[i*N+j] = d[i*N+j] * s` in one body — the SwiGLU
+  up-projection multiplied into its gate — made the inner body four statements where every matmul
+  matcher wants three. It now lowers to `wukong_sgemm_nt` + `wukong_velem_f32` (Hadamard).
+- **An accumulator seed declared early** (`wukong_mir_build::canon`). Several recognizers match a
+  window of consecutive statements by position; putting `let mut s = 0.0;` one statement above where
+  the canonical softmax puts it split the window and dispatched nothing. A `let mut x = <literal>;` is
+  now sunk to the first statement that *assigns* it. Restricted to `mut`-and-assigned deliberately:
+  sinking an immutable constant lands it between two statements and cost `i8_linear_dequant.wk` its
+  fused `wukong_i8gemm_nt_deq`, which only the census saw.
+
+Every one of the four declines rather than guesses on any shape its kernel cannot represent (an α
+alongside a fused activation, a non-NT or transposed-A nest, a batch offset, or a second output
+buffer overlapping a GEMM operand), and the two-kernel forms resolve every pointer and dimension
+before emitting the GEMM so a late bail can never leave a half-lowered nest.
+
+Effect on `wukong-xbench general`'s structure-tax benchmark — one transformer block written five
+arithmetically identical ways. The monolithic natural spelling went from **7 dispatched call sites to
+15**: `wukong_norm_affine_f32` ×2, `wukong_norm_f32`, `wukong_sgemm_nt` ×7, `wukong_sgemm_nt_alpha`,
+`wukong_sgemm_nt_epi`, `wukong_velem_f32` ×3 — the recognizer-dialect spelling's 16 minus the one
+`wukong_vmath_f32` it no longer needs, since its activation rides the GEMM epilogue. No scalar GEMM
+remains in it, and it is now bit-identical to the other four spellings. Program 0's two fragility
+probes, `epilogue: in the store` and `residual: in the store`, went from dispatching NOTHING to
+dispatching the same kernels as their own-loop twins. Timings from that suite are **not** reported
+here: the machine was on battery and changed power state mid-run.
 
 ### Benchmark honesty — three defects an adversarial verifier found and proved
 No compiler behaviour changes; all three are in `wukong_xbench` (plus the measurement docs). Two of
