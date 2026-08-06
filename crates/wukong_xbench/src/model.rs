@@ -1431,6 +1431,26 @@ pub(crate) fn power_status_line() -> String {
     "power: n/a".to_string()
 }
 
+/// The power STATE alone — `AC+CHARGING` / `AC+full` / `AC` / `BATTERY` / `unknown` — with the
+/// battery percentage stripped out.
+///
+/// [`power_status_line`] embeds the charge percentage, so comparing two of its strings fires on every
+/// 1% of battery drain. That is exactly what happened: a run of the general suite printed
+/// `! POWER STATE CHANGED DURING THE RUN` between `BATTERY (48%)` and `BATTERY (47%)` while the state
+/// had not changed at all. A change-detector that cries wolf on every run is a change-detector a
+/// reader learns to scroll past, which defeats the point of having one. Sample THIS for the
+/// comparison and print [`power_status_line`] for the human.
+pub(crate) fn power_state_key() -> String {
+    let line = power_status_line();
+    // The line is "power: <STATE>[ (pct)][ — commentary]"; the state is the first token after the
+    // prefix, and the percentage always arrives parenthesized after it.
+    let body = line.strip_prefix("power: ").unwrap_or(&line);
+    body.split([' ', '(', '—'])
+        .find(|t| !t.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// Concatenate f32 slices into one little-endian binary file — the exact bytes the generated
 /// Python reads back with `torch.frombuffer(dtype=torch.float32)`.
 fn dump_f32_le(path: &Path, parts: &[&[f32]]) -> std::io::Result<()> {

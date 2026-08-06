@@ -58,9 +58,18 @@
 //! * **An f64 scalar reference, checked on EVERY lane.** Never a reduction — a partially-correct
 //!   buffer passes a sum. The interpreter cannot be the oracle at this size (its `Value` enum costs
 //!   ~24 bytes per f32 element), so the oracle is an f64 recomputation in this file.
-//! * **Round-local timings.** Absolute GFLOP/s and %-of-roofline swing ~3x with this laptop's power
-//!   and thermal state; only the same-run adjacent ratios are reportable. The power state is printed
-//!   before AND after.
+//! * **Round-interleaved timings, ratios formed WITHIN a round.** Absolute GFLOP/s swings ~3x with
+//!   this laptop's power and thermal state, so only same-run adjacent ratios are reportable — and
+//!   "adjacent" has to be enforced, not hoped for. Every column of a section is built first and
+//!   timed once per ROUND in a rotating, direction-alternating order ([`crate::round_order`]); the
+//!   ratio is formed inside each round and reported as the MEDIAN across rounds with the range the
+//!   rounds spanned. A ratio whose rounds disagree by more than [`crate::spread_limit`] prints as
+//!   INCONCLUSIVE instead of as a number, and a power-state change anywhere in the section replaces
+//!   every ratio in it with NON-REPORTABLE.
+//! * **A `C(twin)` CONTROL.** The identical C source through the identical compiler at the identical
+//!   flags, in a second DLL — a column with no language content in it at all, whose ratio against
+//!   `C` therefore has expected value 1.00. What it reads away from 1.00 is this run's own floor,
+//!   and when the control itself fails the spread gate the section says so and claims nothing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -303,26 +312,26 @@ unsafe fn call_block(f: BlockFn, bufs: &mut Bufs) {
 // Timing
 // ---------------------------------------------------------------------------------------------
 
-/// A single measured run: best-observed time, the compile time that produced it, and the output
-/// buffer as it stood after the last call.
-struct Measure {
-    compile: Duration,
-    ns_per_call: f64,
-    out: Vec<f32>,
-}
-
-/// Symmetric warm-up, then best-of-N minima. Identical protocol for Wukong and every peer — the
-/// only comparison this laptop supports is a same-run adjacent A/B of two best-observed times.
+/// ONE round-local sample of one column: a single warm-up call, then the minimum of [`SAMPLES`]
+/// calls. The minimum, not the mean: on a machine with an OS, background work can only ever make a
+/// sample slower.
 ///
-/// A block forward at the default size is tens of milliseconds, so this is the "already above the
-/// sampling target" path: two warm-ups, then the minimum of `N_SAMPLES` single calls. The minimum,
-/// not the mean: on a machine with an OS, background work can only ever make a sample slower.
-fn time_ns(mut run: impl FnMut()) -> f64 {
-    const N_SAMPLES: usize = 7;
-    run();
+/// Deliberately short, and deliberately not the old two-warm-ups-plus-best-of-7. Every sample taken
+/// inside one visit is drawn from the same instant of the machine's clock and thermal state, so
+/// piling samples into a visit tightens the estimate of *this instant's* speed while saying nothing
+/// about the drift between visits — which is the entire problem on this laptop. The dispersion this
+/// module reports therefore comes from repeating the ROUND (see [`Rounds`]), and the per-visit
+/// budget is spent on rounds instead. Total calls per column is `rounds * (1 + SAMPLES)`, which at
+/// the default 6 rounds is 24, against the 9 the single-visit protocol used.
+const SAMPLES: usize = 3;
+
+fn time_round(mut run: impl FnMut()) -> f64 {
+    // One warm-up: the column last ran a whole round ago and every other column has evicted its
+    // working set since, so without this the first timed call would charge one column's cache
+    // refill to it and not to the others.
     run();
     let mut best = f64::INFINITY;
-    for _ in 0..N_SAMPLES {
+    for _ in 0..SAMPLES {
         let t = Instant::now();
         run();
         let e = t.elapsed().as_secs_f64() * 1e9;
@@ -331,6 +340,200 @@ fn time_ns(mut run: impl FnMut()) -> f64 {
         }
     }
     best
+}
+
+// ---------------------------------------------------------------------------------------------
+// The round-interleaved measurement core, shared by all three programs
+// ---------------------------------------------------------------------------------------------
+
+/// Every column's per-round timing, plus what the machine was doing during each round.
+///
+/// A section builds ALL its columns first (compiling and loading is not timed and must not sit
+/// between two timed columns), then hands them here. Column `i` is timed once per round; the visit
+/// order rotates and alternates direction so no column keeps a slot — see [`crate::round_order`].
+struct Rounds {
+    /// How many rounds were run. Not derived from a vector length: `power` deliberately carries one
+    /// MORE entry than there are rounds.
+    rounds: usize,
+    /// `ns[column][round]` — the round-local minimum for that column in that round.
+    ns: Vec<Vec<f64>>,
+    /// The power STATE (percentage stripped) sampled at the top of every round AND once more after
+    /// the last one — `rounds + 1` entries. The closing sample is what makes the detector cover the
+    /// whole section: without it a state change during the final round would go unseen, and the
+    /// final round is where a long section is most likely to run the battery over a threshold.
+    power: Vec<String>,
+    /// The short FMA clock probe at the top of every round, GFLOP/s. A RELATIVE trace across rounds,
+    /// never a roofline — see [`crate::clock_probe_gflops`].
+    clock: Vec<f64>,
+}
+
+impl Rounds {
+    /// Time `n` columns over `rounds` rounds. `visit(i, r)` takes exactly one round-local sample of
+    /// column `i` in round `r` and returns its ns; the caller is responsible for snapshotting that
+    /// column's output buffer on round 0, because only it knows which buffer that is.
+    fn run(n: usize, rounds: usize, mut visit: impl FnMut(usize, usize) -> f64) -> Rounds {
+        let mut ns = vec![vec![f64::NAN; rounds]; n];
+        let mut power = Vec::with_capacity(rounds + 1);
+        let mut clock = Vec::with_capacity(rounds);
+        for r in 0..rounds {
+            power.push(crate::model::power_state_key());
+            clock.push(crate::clock_probe_gflops());
+            for &i in &crate::round_order(n, r) {
+                ns[i][r] = visit(i, r);
+            }
+        }
+        power.push(crate::model::power_state_key());
+        Rounds {
+            rounds,
+            ns,
+            power,
+            clock,
+        }
+    }
+
+    /// Best observed time for a column across all rounds — the point estimate for the ms column.
+    fn best(&self, i: usize) -> f64 {
+        self.ns[i].iter().copied().fold(f64::INFINITY, f64::min)
+    }
+
+    /// Did the machine stay in one power state for the whole section? When it did not, every ratio
+    /// in the section is replaced by `NON-REPORTABLE` rather than merely flagged: the three states
+    /// (battery / AC+charging / AC+full) are three different machines, and a ratio whose two columns
+    /// were measured on different machines is not a ratio.
+    fn reportable(&self) -> bool {
+        self.power.windows(2).all(|w| w[0] == w[1])
+    }
+
+    /// The per-round ratio `column(num) / column(den)` as a median plus the range the rounds spanned.
+    fn ratio(&self, num: usize, den: usize) -> Option<crate::RatioStat> {
+        crate::RatioStat::over_rounds(&self.ns[num], &self.ns[den])
+    }
+
+    /// How far the short FMA clock probe moved across the rounds, as a factor ≥ 1. This is the
+    /// drift the ratios had to survive, measured rather than assumed.
+    fn clock_spread(&self) -> f64 {
+        let live: Vec<f64> = self.clock.iter().copied().filter(|c| *c > 0.0).collect();
+        if live.len() < 2 {
+            return 1.0;
+        }
+        let lo = live.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = live.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        hi / lo
+    }
+}
+
+/// Whatever must stay alive for a built column to remain callable. Held for the whole section: with
+/// round interleaving every column has to be loaded before ANY of them is timed, so nothing is
+/// dropped until the last round is done.
+// Both payloads are write-only by design: the fn pointer taken at build time is what gets called,
+// and these exist solely so the JIT module stays mapped and the DLL stays loaded until the last
+// round. Dropping either early would leave a live `Col::f` pointing at unmapped memory.
+#[allow(dead_code)]
+enum Keep {
+    Jit(wukong_codegen_cranelift::JitModuleHandle),
+    Dll(libloading::Library),
+}
+
+/// The `vs C` cell for column `i`: the word `reference` in C's own row (a row reading "1.00x faster
+/// than itself" is noise), a round-formed [`crate::RatioStat`] everywhere else.
+fn vs_c_cell(i: usize, c_ix: Option<usize>, rr: &Rounds, reportable: bool) -> String {
+    if Some(i) == c_ix {
+        return "reference".to_string();
+    }
+    crate::fmt_ratio_stat(c_ix.and_then(|c| rr.ratio(c, i)), reportable)
+}
+
+/// The warning that has to sit under every round-interleaved table. The `ms` column is a best-of-
+/// rounds minimum and the ratio column is a median of per-round ratios, so they are NOT consistent
+/// with each other by construction — and they must not be, because two columns' minima can fall in
+/// different rounds and their quotient is then exactly the cross-round artifact this whole protocol
+/// exists to remove. Say so where the numbers are, not in a doc comment nobody reads.
+const DIVIDE_WARNING: &str =
+    "  Do NOT divide two ms entries: their minima can come from DIFFERENT rounds, and that\n\
+     \x20 quotient is precisely the cross-round artifact this protocol removes. The ratio column\n\
+     \x20 is formed inside single rounds and is the only comparison here; the ms column is\n\
+     \x20 ROUND-LOCAL context.";
+
+/// The control ratio `C / C(twin)`, the run's own measured floor. `None` when either column failed
+/// to build, in which case the run genuinely has no floor and [`print_instrument`] says so.
+fn twin_ratio(labels: &[String], rr: &Rounds) -> Option<crate::RatioStat> {
+    let c = ix_of(labels, "C")?;
+    let t = ix_of(labels, "C(twin)")?;
+    rr.ratio(c, t)
+}
+
+/// The block every round-interleaved section prints under its table: the protocol, what the
+/// machine's clock did across the rounds, and the run's own measured floor.
+///
+/// `twin` is the `C(twin)` control's ratio against `C` — identical source, identical compiler,
+/// identical flags — so its expected value is 1.00 with no language content, and what it reads away
+/// from 1.00 is the instrument rather than a language. See [`PEER_SPECS`] for what that does and does
+/// not bound.
+fn print_instrument(rr: &Rounds, twin: Option<crate::RatioStat>, per_round_calls: usize) {
+    let rounds = rr.rounds;
+    println!(
+        "  PROTOCOL: {rounds} rounds; every column timed once per round in a rotating,\n\
+         \x20   direction-alternating order (1 warm-up + best of {SAMPLES} calls per visit,\n\
+         \x20   {per_round_calls} calls per column in total). Each ratio is formed WITHIN a round;\n\
+         \x20   the cell shows the median across rounds and [min-max] of the per-round ratios.\n\
+         \x20   A ratio whose rounds disagree by more than {:.2}x prints INCONCLUSIVE, not a number\n\
+         \x20   — its [min-max] is still shown, so a range lying entirely on one side of 1.00 still\n\
+         \x20   tells you the DIRECTION; what the run failed to establish is the SIZE.",
+        crate::spread_limit()
+    );
+    if rr.clock_spread() > 1.0 {
+        println!(
+            "  CLOCK TRACE across the rounds (short FMA probe, RELATIVE only — not the roofline):\n\
+             \x20   {} GF/s — spread {:.2}x. This is the drift the ratios above had to survive.\n\
+             \x20   It is EVIDENCE, not a correction: normalizing a per-round ratio by it cancels\n\
+             \x20   exactly (both columns ran under that same clock), and normalizing the ms column\n\
+             \x20   by it was measured to make the ms column WORSE. See `clock_probe_gflops`.",
+            rr.clock
+                .iter()
+                .map(|c| format!("{c:.0}"))
+                .collect::<Vec<_>>()
+                .join(" -> "),
+            rr.clock_spread(),
+        );
+    }
+    match twin {
+        Some(t) => println!(
+            "  FLOOR (measured, this run): C(twin) is a CONTROL — the IDENTICAL C source through the\n\
+             \x20   IDENTICAL compiler at the IDENTICAL flags, in a second DLL — so its ratio against C\n\
+             \x20   has expected value 1.00 and no language content. It read {:.3}x (rounds\n\
+             \x20   {:.3}-{:.3}, spread {:.3}x). Any \"vs C++\"/\"vs Rust\" figure in this table that is\n\
+             \x20   closer to 1.00 than that is not distinguishable from the instrument.",
+            t.med,
+            t.lo,
+            t.hi,
+            t.spread(),
+        ),
+        None => println!("  FLOOR: C(twin) control unavailable — this run has no measured floor."),
+    }
+    // The control is the run's self-check, so it gets the same test as everything else. When a
+    // column that CANNOT differ from `C` nevertheless fails the spread gate, the failure is the
+    // instrument's, and no cross-language reading from this section should be carried anywhere —
+    // including into a summary that only quotes the rows which happened to pass.
+    if let Some(t) = twin {
+        if !t.conclusive() {
+            println!(
+                "  !!! THE CONTROL ITSELF FAILED ({:.3}x spread against a true value of 1.00).\n\
+                 \x20   This section did not measure anything cross-language: a column that cannot\n\
+                 \x20   differ from C moved more than the limit, so any row here that did pass the\n\
+                 \x20   limit passed it by luck. Re-run on AC+full, idle, and compare."
+                ,
+                t.spread()
+            );
+        }
+    }
+    if !rr.reportable() {
+        println!(
+            "  !!! POWER STATE CHANGED DURING THIS SECTION ({}). Every ratio above reads\n\
+             \x20   NON-REPORTABLE: the three power states are three different machines, and a\n\
+             \x20   ratio whose columns were measured on different machines is not a ratio.",
+            rr.power.join(" -> ")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -449,24 +652,22 @@ fn census_line(census: &[(String, usize)]) -> String {
     format!("{total} call site(s): {body}")
 }
 
-fn bench_wukong_block(src: &str, label: &str, bufs: &mut Bufs) -> Option<(Measure, Vec<(String, usize)>)> {
+/// Build one Wukong column of the structure-tax table. Build ONLY — nothing is timed here, because
+/// round interleaving requires every column to exist before any of them is measured, and a JIT
+/// compile sitting between two timed columns is exactly the kind of gap the drift hides in.
+fn build_wukong_col(src: &str, label: &str, note: &str) -> Option<Col<BlockFn>> {
     let blk = compile_block(src, label, N_IN + N_SCRATCH)?;
     // SAFETY: `block_abi_ok` just proved the lowered `kbench` is 27 pointers -> void, which is
-    // exactly `BlockFn`; `blk.handle` is kept alive until after the last call.
+    // exactly `BlockFn`; the handle is moved into `Keep` and outlives every call.
     let f: BlockFn = unsafe { std::mem::transmute(blk.ptr) };
-    bufs.scr[OUT_IX].iter_mut().for_each(|v| *v = 0.0);
-    let ns = time_ns(|| unsafe { call_block(f, bufs) });
-    let out = bufs.scr[OUT_IX].clone();
-    let census = blk.census.clone();
-    drop(blk.handle);
-    Some((
-        Measure {
-            compile: blk.compile,
-            ns_per_call: ns,
-            out,
-        },
-        census,
-    ))
+    Some(Col {
+        label: label.to_string(),
+        note: note.to_string(),
+        census: census_line(&blk.census),
+        compile: blk.compile,
+        f,
+        _keep: Keep::Jit(blk.handle),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -521,36 +722,150 @@ fn load_peer(
     }
 }
 
-/// Compile a peer source and time it through the identical protocol as the Wukong variants.
-/// Obeys the same one-live-pointer law: the output pointer is derived inside [`call_block`].
-fn bench_peer(
+/// Compile a peer source, load it and pull out its `kbench` as `F`. Build ONLY — see
+/// [`build_wukong_col`] for why nothing is timed at build time any more. One helper for all three
+/// programs' ABIs, so no program can drift into a different loading path than another.
+///
+/// # Safety
+/// `F` must be exactly the `extern "C"` signature the peer's `kbench` was written with. Every caller
+/// passes the same `BlockFn`/`LossFn`/`ScanFn` the Wukong side is arity-checked against by
+/// [`block_abi_ok`].
+unsafe fn peer_col<F: Copy>(
     ext: &str,
     src: &str,
     dir: &Path,
     name: &str,
     compiler: &str,
     args: &[&str],
-    bufs: &mut Bufs,
-) -> Option<Measure> {
+) -> Option<(F, libloading::Library, Duration)> {
     let (lib, compile) = load_peer(ext, src, dir, name, compiler, args)?;
-    unsafe {
-        let sym: libloading::Symbol<BlockFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("general: symbol kbench in {name}.{ext}: {e}");
-                return None;
-            }
-        };
-        let f: BlockFn = *sym;
-        bufs.scr[OUT_IX].iter_mut().for_each(|v| *v = 0.0);
-        let ns = time_ns(|| call_block(f, bufs));
-        let out = bufs.scr[OUT_IX].clone();
-        Some(Measure {
-            compile,
-            ns_per_call: ns,
-            out,
-        })
+    let f: F = match lib.get::<F>(b"kbench\0") {
+        Ok(s) => *s,
+        Err(e) => {
+            eprintln!("general: symbol kbench in {name}.{ext}: {e}");
+            return None;
+        }
+    };
+    Some((f, lib, compile))
+}
+
+/// The five peer columns every program in this module carries, in build order.
+///
+/// `C(twin)` is the IDENTICAL C source through the IDENTICAL compiler at the IDENTICAL flags,
+/// written to a second DLL. It is a CONTROL, not a peer: it changes no other column's flags and
+/// takes nothing away from anyone. What it measures is everything that separates two columns
+/// *except* the language — timing noise, scheduling, thermal drift between two slots of the same
+/// round, and code/data placement luck (the two DLLs are separate images and can land on different
+/// alignments). Its ratio against `C` therefore has an expected value of 1.00 and no language
+/// content whatsoever, so whatever it reads away from 1.00 bounds from below what any *other*
+/// column's departure from 1.00 has to beat before it means anything.
+///
+/// Note the honest limit of the control: it bounds the confounds it shares with the real columns.
+/// It cannot bound a confound unique to one language's column (a peer that happens to alias
+/// differently, say). It is a floor on believability, never a certificate.
+const RUSTC_ARGS: [&str; 3] = ["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"];
+const HONEST_FLAGS: [&str; 4] = ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
+const FASTM_FLAGS: [&str; 5] = [
+    "-O3",
+    "-march=native",
+    "-ffp-contract=fast",
+    "-ffast-math",
+    "-shared",
+];
+
+/// `(label, extension, compiler-selector, flags, dll-name-suffix)` for the peer columns. The
+/// selector is resolved by the caller because `cc`/`cxx` arrive as parameters.
+enum PeerCc {
+    Cc,
+    Cxx,
+    Rustc,
+}
+
+struct PeerSpec {
+    label: &'static str,
+    ext: &'static str,
+    cc: PeerCc,
+    args: &'static [&'static str],
+    /// Distinguishes the two columns built from the identical C source at identical flags.
+    suffix: &'static str,
+}
+
+const PEER_SPECS: [PeerSpec; 5] = [
+    PeerSpec { label: "C", ext: "c", cc: PeerCc::Cc, args: &HONEST_FLAGS, suffix: "" },
+    PeerSpec { label: "C(twin)", ext: "c", cc: PeerCc::Cc, args: &HONEST_FLAGS, suffix: "_twin" },
+    PeerSpec { label: "C(fast)", ext: "c", cc: PeerCc::Cc, args: &FASTM_FLAGS, suffix: "_fast" },
+    PeerSpec { label: "C++", ext: "cpp", cc: PeerCc::Cxx, args: &HONEST_FLAGS, suffix: "" },
+    PeerSpec { label: "Rust", ext: "rs", cc: PeerCc::Rustc, args: &RUSTC_ARGS, suffix: "" },
+];
+
+impl PeerSpec {
+    fn compiler<'a>(&self, cc: &'a str, cxx: &'a str) -> &'a str {
+        match self.cc {
+            PeerCc::Cc => cc,
+            PeerCc::Cxx => cxx,
+            PeerCc::Rustc => "rustc",
+        }
     }
+    /// The C source for the C/C++/C(fast)/C(twin) columns, the Rust source for the Rust column.
+    fn source<'a>(&self, c_src: &'a str, rs_src: &'a str) -> &'a str {
+        match self.cc {
+            PeerCc::Rustc => rs_src,
+            _ => c_src,
+        }
+    }
+    fn note(&self) -> &'static str {
+        if self.suffix == "_twin" {
+            "CONTROL: identical source+compiler+flags as C — the run's own floor"
+        } else {
+            "peer, written once, competently"
+        }
+    }
+}
+
+/// Build every peer column for one program, in [`PEER_SPECS`] order. `stem` is the DLL-name stem
+/// (`general_block` / `general_loss` / `general_scan`); the spec's suffix is what keeps `C` and
+/// `C(twin)` in two separate images. Build ONLY — see [`build_wukong_col`].
+///
+/// One helper for all three programs, so no program can drift into a different peer set, a
+/// different flag set or a different loading path than another.
+///
+/// # Safety
+/// `F` must be exactly the `extern "C"` signature the program's peer `kbench` is declared with.
+unsafe fn build_peer_cols<F: Copy>(
+    stem: &str,
+    c_src: &str,
+    rs_src: &str,
+    dir: &Path,
+    cc: &str,
+    cxx: &str,
+) -> Vec<Col<F>> {
+    let mut out = Vec::new();
+    for spec in &PEER_SPECS {
+        let name = format!("{stem}{}", spec.suffix);
+        // SAFETY: forwarded from this function's own contract.
+        let built = unsafe {
+            peer_col::<F>(
+                spec.ext,
+                spec.source(c_src, rs_src),
+                dir,
+                &name,
+                spec.compiler(cc, cxx),
+                spec.args,
+            )
+        };
+        match built {
+            Some((f, lib, compile)) => out.push(Col {
+                label: spec.label.to_string(),
+                note: spec.note().to_string(),
+                census: "-".to_string(),
+                compile,
+                f,
+                _keep: Keep::Dll(lib),
+            }),
+            None => println!("  ! {} peer unavailable — column dropped", spec.label),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -798,15 +1113,27 @@ const VARIANTS: [(&str, &str, &str); 5] = [
 const PEER_C: &str = include_str!("../wk/general/peer_block.c");
 const PEER_RS: &str = include_str!("../wk/general/peer_block.rs");
 
-/// A finished row of the headline table.
-struct Row {
-    label: &'static str,
-    note: &'static str,
-    ns: f64,
+/// One built, callable column of a round-interleaved table — a Wukong spelling or a peer, held in
+/// ONE type so the round schedule cannot tell them apart and cannot favour either. `F` is the
+/// program's `extern "C"` ABI: [`BlockFn`], [`LossFn`] or [`ScanFn`].
+struct Col<F> {
+    label: String,
+    note: String,
     census: String,
-    dev: f64,
-    dev_at: usize,
     compile: Duration,
+    f: F,
+    /// The JIT module or DLL that keeps `f` callable, held until the last round is done.
+    _keep: Keep,
+}
+
+/// The column labels, in build order — what [`Rounds`] indices mean.
+fn labels_of<F>(cols: &[Col<F>]) -> Vec<String> {
+    cols.iter().map(|c| c.label.clone()).collect()
+}
+
+/// Position of a column by label.
+fn ix_of(labels: &[String], name: &str) -> Option<usize> {
+    labels.iter().position(|l| l == name)
 }
 
 /// Entry point: every program in the general-code suite, in priority order.
@@ -842,8 +1169,7 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
         m.flops() / 1e6,
         total_bytes(m) as f64 / (1024.0 * 1024.0),
     );
-    let power_before = crate::model::power_status_line();
-    println!("  {power_before}");
+    println!("  {}", crate::model::power_status_line());
     println!();
 
     let mut bufs = Bufs::new(m);
@@ -857,125 +1183,97 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
         reference.len()
     );
 
-    // ---- the five Wukong spellings ----
-    let mut rows: Vec<Row> = Vec::new();
-    let mut outs: Vec<(&str, Vec<f32>)> = Vec::new();
+    // ---- PHASE 1: BUILD every column. Nothing is timed here. ----
+    // Until 2026-08-06 this section timed all five Wukong spellings to completion and only then
+    // built and timed the peers, one language after another. Two consequences, both systematic and
+    // neither visible in the output: any drift across the section was charged to whichever column
+    // ran last (always Rust), and the Wukong columns always got the earliest, coolest slots — a bias
+    // in Wukong's own favour, in Wukong's own benchmark. Building everything first and putting all
+    // ten columns into ONE rotating round schedule removes both.
+    let mut cols: Vec<Col<BlockFn>> = Vec::new();
     for (label, src, note) in VARIANTS {
         let text = subst(src, m);
         // Dump the exact compiled source so `wukongc --emit=mir -O2 <file>` reproduces the census.
-        let path = dir.join(format!("general_block_{label}.wk"));
-        let _ = std::fs::write(&path, &text);
-        let Some((mm, census)) = bench_wukong_block(&text, label, &mut bufs) else {
-            println!("  ! {label}: did not compile — row dropped");
-            continue;
-        };
-        let (dev, at) = max_rel_vs_ref(&mm.out, &reference);
-        rows.push(Row {
-            label,
-            note,
-            ns: mm.ns_per_call,
-            census: census_line(&census),
-            dev,
-            dev_at: at,
-            compile: mm.compile,
-        });
-        outs.push((label, mm.out));
-    }
-
-    // ---- the peers ----
-    let c_src = subst(PEER_C, m);
-    let rs_src = subst(PEER_RS, m);
-    let honest = &["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
-    let fastm = &[
-        "-O3",
-        "-march=native",
-        "-ffp-contract=fast",
-        "-ffast-math",
-        "-shared",
-    ];
-    let peers: Vec<(&'static str, Option<Measure>)> = vec![
-        (
-            "C (gcc -O3, IEEE order)",
-            bench_peer("c", &c_src, dir, "general_block", cc, honest, &mut bufs),
-        ),
-        (
-            "C(fast) (gcc -ffast-math)",
-            bench_peer(
-                "c",
-                &c_src,
-                dir,
-                "general_block_fast",
-                cc,
-                fastm,
-                &mut bufs,
-            ),
-        ),
-        (
-            "C++ (g++ -O3, IEEE order)",
-            bench_peer("cpp", &c_src, dir, "general_block", cxx, honest, &mut bufs),
-        ),
-        (
-            "Rust (rustc -O, IEEE order)",
-            bench_peer(
-                "rs",
-                &rs_src,
-                dir,
-                "general_block",
-                "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
-                &mut bufs,
-            ),
-        ),
-    ];
-
-    // ---- report ----
-    println!();
-    println!("  {:<14} {:>10} {:>9} {:>11}  {}", "variant", "ms/fwd", "GF/s*", "vs C", "spelling");
-    println!("  {}", "-".repeat(92));
-    let c_ns = peers
-        .iter()
-        .find(|(l, _)| l.starts_with("C ("))
-        .and_then(|(_, mm)| mm.as_ref())
-        .map(|mm| mm.ns_per_call);
-    for r in &rows {
-        println!(
-            "  {:<14} {:>10.2} {:>9.1} {:>11}  {}",
-            r.label,
-            r.ns / 1e6,
-            m.flops() / r.ns,
-            match c_ns {
-                Some(c) => fmt_ratio(c / r.ns),
-                None => "-".to_string(),
-            },
-            r.note,
-        );
-    }
-    println!("  {}", "-".repeat(92));
-    for (label, mm) in &peers {
-        match mm {
-            Some(mm) => println!(
-                "  {:<14} {:>10.2} {:>9.1} {:>11}  peer, written once, competently",
-                peer_short(label),
-                mm.ns_per_call / 1e6,
-                m.flops() / mm.ns_per_call,
-                match c_ns {
-                    Some(c) => fmt_ratio(c / mm.ns_per_call),
-                    None => "-".to_string(),
-                },
-            ),
-            None => println!("  {:<14} {:>10}  (unavailable)", peer_short(label), "-"),
+        let _ = std::fs::write(dir.join(format!("general_block_{label}.wk")), &text);
+        match build_wukong_col(&text, label, note) {
+            Some(c) => cols.push(c),
+            None => println!("  ! {label}: did not compile — row dropped"),
         }
     }
+    let n_wuk = cols.len();
+
+    let c_src = subst(PEER_C, m);
+    let rs_src = subst(PEER_RS, m);
+    // SAFETY: every peer source in this program declares `kbench` with the 27-pointer block ABI,
+    // which is exactly `BlockFn`; the Wukong side is checked against the same arity by
+    // `block_abi_ok`.
+    cols.extend(unsafe {
+        build_peer_cols::<BlockFn>("general_block", &c_src, &rs_src, dir, cc, cxx)
+    });
+    if cols.is_empty() {
+        println!("  ! no column built — section skipped");
+        return;
+    }
+    let labels = labels_of(&cols);
+
+    // ---- PHASE 2: ROUNDS. Every column once per round, rotating and alternating direction. ----
+    let rounds = crate::gen_rounds();
+    let mut outs: Vec<Vec<f32>> = vec![Vec::new(); cols.len()];
+    let rr = Rounds::run(cols.len(), rounds, |i, r| {
+        let f = cols[i].f;
+        bufs.scr[OUT_IX].iter_mut().for_each(|v| *v = 0.0);
+        // SAFETY: `f` came from `build_wukong_col` (arity-checked) or `peer_col` over a source that
+        // declares the 27-pointer ABI; `bufs` was built by `Bufs::new(m)`, the same `m` every column
+        // was compiled for. The one-live-pointer law is obeyed inside `call_block`.
+        let ns = time_round(|| unsafe { call_block(f, &mut bufs) });
+        if r == 0 {
+            // The peers and the JIT are deterministic, so one snapshot is the whole story; taking it
+            // on round 0 also keeps the later rounds pure timing.
+            outs[i] = bufs.scr[OUT_IX].clone();
+        }
+        ns
+    });
+
+    // ---- PHASE 3: report ----
+    let c_ix = ix_of(&labels, "C");
+    let reportable = rr.reportable();
+
+    println!();
     println!(
-        "  * GF/s is ROUND-LOCAL: this laptop's clock swings ~3x with power and thermal state.\n\
-           Only the same-run ratios in this table are reportable; the absolute column is context."
+        "  {:<14} {:>10} {:>9}  {:<28}  {}",
+        "variant", "ms/fwd", "GF/s*", "vs C (median [min-max])", "spelling"
     );
+    let rule = "-".repeat(110);
+    println!("  {rule}");
+    for (i, col) in cols.iter().enumerate() {
+        if i == n_wuk {
+            println!("  {rule}");
+        }
+        let best = rr.best(i);
+        println!(
+            "  {:<14} {:>10.2} {:>9.1}  {:<28}  {}",
+            col.label,
+            best / 1e6,
+            m.flops() / best,
+            vs_c_cell(i, c_ix, &rr, reportable),
+            col.note,
+        );
+    }
+    println!(
+        "  * ms/fwd is the best of all {rounds} rounds; GF/s is derived from it. This laptop's clock\n\
+         \x20   swings ~3x with power and thermal state, so no absolute figure here is reportable."
+    );
+    println!("{DIVIDE_WARNING}");
+    println!();
+    print_instrument(&rr, twin_ratio(&labels, &rr), rounds * (1 + SAMPLES));
+    println!();
+    print_round_trace(&labels, &rr);
 
     // ---- dispatch census ----
     println!();
     println!("  DISPATCH CENSUS (= wukongc --emit=mir -O2 <src> | grep -oE 'wukong_[a-z0-9_]+')");
-    for r in &rows {
-        println!("    {:<14} {}", r.label, r.census);
+    for col in cols.iter().take(n_wuk) {
+        println!("    {:<14} {}", col.label, col.census);
     }
     println!(
         "    sources written to {} — rerun the grep against the real binary to confirm.",
@@ -985,34 +1283,21 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     // ---- correctness ----
     println!();
     println!("  CORRECTNESS vs the f64 scalar reference (worst of all {} lanes)", reference.len());
-    for r in &rows {
-        println!(
-            "    {:<14} max rel dev {:.3e} at lane {}",
-            r.label, r.dev, r.dev_at
-        );
+    for (i, col) in cols.iter().enumerate() {
+        let (dev, at) = max_rel_vs_ref(&outs[i], &reference);
+        println!("    {:<14} max rel dev {dev:.3e} at lane {at}", col.label);
     }
-    for (label, mm) in &peers {
-        if let Some(mm) = mm {
-            let (dev, at) = max_rel_vs_ref(&mm.out, &reference);
-            println!(
-                "    {:<14} max rel dev {:.3e} at lane {}",
-                peer_short(label),
-                dev,
-                at
-            );
-        }
-    }
-    if let Some((_, base)) = outs.iter().find(|(l, _)| *l == "b-natural") {
+    if let Some(base_ix) = ix_of(&labels, "b-natural") {
         println!();
         println!("  AGREEMENT between spellings (vs b-natural, the fully-scalar one)");
-        for (label, o) in &outs {
-            if *label == "b-natural" {
+        for (i, col) in cols.iter().enumerate().take(n_wuk) {
+            if i == base_ix {
                 continue;
             }
-            let (dev, same) = max_rel_pair(o, base);
+            let (dev, same) = max_rel_pair(&outs[i], &outs[base_ix]);
             println!(
                 "    {:<14} {}",
-                label,
+                col.label,
                 if same {
                     "bit-identical".to_string()
                 } else {
@@ -1024,13 +1309,13 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
         // exactly which pairs the compiler treated as the same program. Two variants land in one
         // class iff every one of their lanes agrees to the bit.
         let mut classes: Vec<Vec<&str>> = Vec::new();
-        for (label, o) in &outs {
+        for i in 0..n_wuk {
             match classes.iter_mut().find(|c| {
-                let rep = outs.iter().find(|(l, _)| l == &c[0]).unwrap();
-                rep.1.iter().zip(o.iter()).all(|(a, b)| a.to_bits() == b.to_bits())
+                let rep = cols.iter().position(|x| x.label == c[0]).unwrap();
+                outs[rep].iter().zip(outs[i].iter()).all(|(a, b)| a.to_bits() == b.to_bits())
             }) {
-                Some(c) => c.push(label),
-                None => classes.push(vec![label]),
+                Some(c) => c.push(&cols[i].label),
+                None => classes.push(vec![&cols[i].label]),
             }
         }
         println!(
@@ -1044,57 +1329,104 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     }
 
     // ---- the headline ----
+    //
+    // Per-round max/min over the five spellings re-selects which columns are the extremes every
+    // round, and an extreme-value statistic is noisier than a fixed pair — so the alternative was
+    // measured before settling here: pinning the pair by its best-of-rounds ranking and forming
+    // THAT ratio per round gave round-to-round spreads of 2.39x / 2.61x / 2.71x / 2.99x against this
+    // estimator's 2.23x / 2.26x / 2.77x / 1.46x on the same four runs. Fixing the pair is no better
+    // and mostly worse, so the instability is the machine, not the estimator. Do not "fix" it.
+    //
+    // The structure tax is a WUKONG-INTERNAL ratio, so it is computed the same round-local way as
+    // every other ratio here: within each round, the slowest spelling over the fastest. It is
+    // subject to the same INCONCLUSIVE rule and the same power invalidation — being internal buys it
+    // no exemption, because the five spellings have very different compute/memory mixes (b-natural
+    // is scalar where a-recognizer is a dispatched AVX2 kernel) and a clock change is therefore not
+    // a common factor that cancels.
+    //
+    // That is not a hypothetical, and it qualifies the project's "Wukong-internal ratios ARE usable"
+    // rule. Four runs of the old harness published a structure tax of 6.15x / 8.33x / 7.64x / 7.79x;
+    // the same four programs under this protocol found the per-round tax moving 3.5x-11.0x WITHIN a
+    // single run. The tax is comfortably real (every round of every run exceeded 3.4x) but the
+    // two-decimal figure was not, and it is an internal ratio. "Internal" buys immunity from a
+    // uniform clock scaling, not from a clock change that hits a scalar loop and a dispatched AVX2
+    // kernel differently.
     println!();
-    if !rows.is_empty() {
-        let fastest = rows.iter().min_by(|a, b| a.ns.total_cmp(&b.ns)).unwrap();
-        let slowest = rows.iter().max_by(|a, b| a.ns.total_cmp(&b.ns)).unwrap();
-        let (fast, slow) = (fastest.ns, slowest.ns);
-        println!(
-            "  ==> STRUCTURE TAX: {:.2}x spread across five spellings of ONE block\n      \
-             (fastest {} at {:.2} ms, slowest {} at {:.2} ms).",
-            slow / fast,
-            fastest.label,
-            fast / 1e6,
-            slowest.label,
-            slow / 1e6,
-        );
-        if let Some(c) = c_ns {
-            println!(
-                "      For scale, gcc compiles ONE source; its spread across these spellings is 1.0\n      \
-                 by construction. C is at {:.2} ms.",
-                c / 1e6
-            );
+    if n_wuk > 0 {
+        let per_round_max: Vec<f64> = (0..rounds)
+            .map(|r| (0..n_wuk).map(|i| rr.ns[i][r]).fold(f64::NEG_INFINITY, f64::max))
+            .collect();
+        let per_round_min: Vec<f64> = (0..rounds)
+            .map(|r| (0..n_wuk).map(|i| rr.ns[i][r]).fold(f64::INFINITY, f64::min))
+            .collect();
+        let tax = crate::RatioStat::over_rounds(&per_round_max, &per_round_min);
+        let fastest = (0..n_wuk).min_by(|&a, &b| rr.best(a).total_cmp(&rr.best(b))).unwrap();
+        let slowest = (0..n_wuk).max_by(|&a, &b| rr.best(a).total_cmp(&rr.best(b))).unwrap();
+        match tax {
+            Some(t) if reportable && t.conclusive() => println!(
+                "  ==> STRUCTURE TAX: {:.2}x spread across five spellings of ONE block\n      \
+                 (per-round spread {:.2}-{:.2} over {rounds} rounds; fastest {} at {:.2} ms,\n      \
+                 slowest {} at {:.2} ms). gcc compiles ONE source; its spread here is 1.0 by\n      \
+                 construction.",
+                t.med,
+                t.lo,
+                t.hi,
+                cols[fastest].label,
+                rr.best(fastest) / 1e6,
+                cols[slowest].label,
+                rr.best(slowest) / 1e6,
+            ),
+            Some(t) => println!(
+                "  ==> STRUCTURE TAX: {} — per-round spread {:.2}-{:.2} over {rounds} rounds\n      \
+                 (fastest {}, slowest {}).",
+                if reportable { "INCONCLUSIVE" } else { "NON-REPORTABLE (power state changed)" },
+                t.lo,
+                t.hi,
+                cols[fastest].label,
+                cols[slowest].label,
+            ),
+            None => println!("  ==> STRUCTURE TAX: not measurable (a round produced no timing)."),
         }
     }
     println!();
     println!(
         "  compile time: {}",
-        rows.iter()
-            .map(|r| format!("{} {:.0}ms", r.label, r.compile.as_secs_f64() * 1e3))
+        cols.iter()
+            .take(n_wuk)
+            .map(|c| format!("{} {:.0}ms", c.label, c.compile.as_secs_f64() * 1e3))
             .collect::<Vec<_>>()
             .join(", ")
     );
+    println!("  {}", crate::model::power_status_line());
+}
 
-    let power_after = crate::model::power_status_line();
-    println!("  {power_after}");
-    if power_after != power_before {
-        println!(
-            "  ! POWER STATE CHANGED DURING THE RUN — these numbers are NOT comparable across rows."
-        );
+/// The raw per-round timings for every column, so the whole table above can be re-derived — and
+/// disagreed with — from the printed log rather than taken on trust. Cheap: `columns x rounds`
+/// numbers.
+fn print_round_trace(labels: &[String], rr: &Rounds) {
+    println!("  PER-ROUND ns (raw; every number above is derived from this table)");
+    print!("    {:<14}", "round");
+    for r in 0..rr.rounds {
+        print!(" {:>10}", r + 1);
     }
-}
-
-fn fmt_ratio(r: f64) -> String {
-    if r >= 1.0 {
-        format!("{r:.2}x faster")
-    } else {
-        format!("{:.2}x slower", 1.0 / r)
+    println!();
+    for (i, label) in labels.iter().enumerate() {
+        print!("    {label:<14}");
+        for r in 0..rr.rounds {
+            print!(" {:>10.3}", rr.ns[i][r] / 1e6);
+        }
+        println!();
     }
+    println!(
+        "    (ms per call; power state sampled {} times, before each round and after the last: {})",
+        rr.power.len(),
+        rr.power.join(", ")
+    );
 }
 
-fn peer_short(label: &str) -> &str {
-    label.split(' ').next().unwrap_or(label)
-}
+// `fmt_ratio` (a bare "N.NNx faster" with no dispersion) and `peer_short` are gone: every ratio in
+// this module is now a `crate::RatioStat` rendered by `crate::fmt_ratio_stat`, which cannot print a
+// point estimate without the range its rounds spanned, and every column carries its own short label.
 
 fn total_bytes(m: Dims) -> usize {
     let hd = m.hd();
@@ -1305,8 +1637,7 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
         m.c,
         bytes as f64 / (1024.0 * 1024.0),
     );
-    let power_before = crate::model::power_status_line();
-    println!("  {power_before}");
+    println!("  {}", crate::model::power_status_line());
 
     let mut b = LossBufs::new(m);
     let t = Instant::now();
@@ -1318,144 +1649,111 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
         ref_loss.len()
     );
 
-    // ---- Wukong ----
+    // ---- PHASE 1: BUILD every column. Nothing is timed here. ----
+    // Until 2026-08-06 this section timed Wukong to completion, then built and timed the peers.
+    // Building sat between timed columns and section-wide drift was charged to whoever ran last;
+    // the two-pass alternation added at 17ab8d0 removed the *ordering* bias but still could not
+    // report how far the two passes had disagreed. Everything is built first now and all six
+    // columns go into ONE rotating round schedule, so every ratio is formed inside a single round.
+    let mut cols: Vec<Col<LossFn>> = Vec::new();
     let wk_src = subst_loss(LOSS_WK, m);
     let path = dir.join("general_loss_focal.wk");
     let _ = std::fs::write(&path, &wk_src);
-    let mut rows: Vec<(String, f64, String, f64, usize, f64)> = Vec::new();
-    if let Some(blk) = compile_block(&wk_src, "loss", LOSS_PARAMS) {
-        // SAFETY: `block_abi_ok` proved the lowered `kbench` is 6 pointers -> void = `LossFn`;
-        // the handle outlives the last call.
-        let f: LossFn = unsafe { std::mem::transmute(blk.ptr) };
-        b.dz.iter_mut().for_each(|v| *v = 0.0);
-        let ns = time_ns(|| unsafe { call_loss(f, &mut b) });
-        let (dev, at) = max_rel_vs_ref(&b.dz, &ref_dz);
-        let (ldev, _) = max_rel_vs_ref(&b.loss, &ref_loss);
-        rows.push((
-            "Wukong".to_string(),
-            ns,
-            census_line(&blk.census),
-            dev,
-            at,
-            ldev,
-        ));
-        drop(blk.handle);
-    } else {
-        println!("  ! Wukong loss did not compile — row dropped");
+    match compile_block(&wk_src, "loss", LOSS_PARAMS) {
+        Some(blk) => {
+            // SAFETY: `block_abi_ok` proved the lowered `kbench` is 6 pointers -> void = `LossFn`;
+            // the handle is moved into `Keep` and outlives every call.
+            let f: LossFn = unsafe { std::mem::transmute(blk.ptr) };
+            cols.push(Col {
+                label: "Wukong".to_string(),
+                note: "the .wk source, through the real pipeline".to_string(),
+                census: census_line(&blk.census),
+                compile: blk.compile,
+                f,
+                _keep: Keep::Jit(blk.handle),
+            });
+        }
+        None => println!("  ! Wukong loss did not compile — row dropped"),
     }
+    let n_wuk = cols.len();
 
-    // ---- peers ----
     let c_src = subst_loss(LOSS_C, m);
     let rs_src = subst_loss(LOSS_RS, m);
-    let honest = &["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
-    let fastm = &[
-        "-O3",
-        "-march=native",
-        "-ffp-contract=fast",
-        "-ffast-math",
-        "-shared",
-    ];
-    let peers: [(&str, &str, &str, &str, &[&str]); 4] = [
-        ("C", "c", &c_src, cc, honest),
-        ("C(fast)", "c", &c_src, cc, fastm),
-        ("C++", "cpp", &c_src, cxx, honest),
-        (
-            "Rust",
-            "rs",
-            &rs_src,
-            "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
-        ),
-    ];
-    // Load EVERY peer before timing ANY of them, then time them in alternating order — forward
-    // pass, then reverse pass — keeping each peer's own minimum. `time_ns` already does a
-    // symmetric warm-up plus best-of-7, but running all of one peer's samples before any of the
-    // next's charges slow thermal/clock drift across the section to whichever peer is timed last.
-    // Here that was always Rust, and C++ always sat third — a fixed-order bias in a section whose
-    // C++ and Rust columns are published. Alternating gives every peer both an early and a late
-    // slot, so drift cancels instead of accumulating against one language. Same reasoning as the
-    // A-B-B-A pairing `bench_c_cpp*` uses in main.rs; this is its N-peer form.
-    let mut loaded: Vec<(String, libloading::Library, LossFn)> = Vec::new();
-    for (label, ext, src, compiler, args) in peers {
-        let name = format!("general_loss_{}", label.replace(['(', ')'], "_"));
-        let Some((lib, _)) = load_peer(ext, src, dir, &name, compiler, args) else {
-            println!("  ! {label} loss peer unavailable — row dropped");
-            continue;
-        };
-        let f: LossFn = unsafe {
-            match lib.get::<LossFn>(b"kbench\0") {
-                Ok(s) => *s,
-                Err(e) => {
-                    println!("  ! {label}: symbol kbench: {e}");
-                    continue;
-                }
-            }
-        };
-        loaded.push((label.to_string(), lib, f));
+    // SAFETY: every loss peer declares `kbench` with the 6-pointer loss ABI, which is exactly
+    // `LossFn`; the Wukong side is arity-checked against `LOSS_PARAMS` by `block_abi_ok`.
+    cols.extend(unsafe { build_peer_cols::<LossFn>("general_loss", &c_src, &rs_src, dir, cc, cxx) });
+    if cols.is_empty() {
+        println!("  ! no column built — section skipped");
+        return;
     }
-    let mut best = vec![f64::INFINITY; loaded.len()];
-    // (dz deviation, its lane, loss deviation) — recorded once; the peers are deterministic, so
-    // the extra timing passes cannot change them.
-    let mut dev_of = vec![(0.0f64, 0usize, 0.0f64); loaded.len()];
-    for pass in 0..2usize {
-        for step in 0..loaded.len() {
-            let i = if pass == 0 {
-                step
-            } else {
-                loaded.len() - 1 - step
-            };
-            let f = loaded[i].2;
-            b.dz.iter_mut().for_each(|v| *v = 0.0);
-            let ns = time_ns(|| unsafe { call_loss(f, &mut b) });
-            if ns < best[i] {
-                best[i] = ns;
-            }
-            if pass == 0 {
-                let (dev, at) = max_rel_vs_ref(&b.dz, &ref_dz);
-                let (ldev, _) = max_rel_vs_ref(&b.loss, &ref_loss);
-                dev_of[i] = (dev, at, ldev);
-            }
+    let labels = labels_of(&cols);
+
+    // ---- PHASE 2: ROUNDS ----
+    let rounds = crate::gen_rounds();
+    // (dz deviation, its lane, loss deviation) — recorded on round 0; every column here is
+    // deterministic, so the later rounds cannot change them.
+    let mut devs = vec![(0.0f64, 0usize, 0.0f64); cols.len()];
+    let rr = Rounds::run(cols.len(), rounds, |i, r| {
+        let f = cols[i].f;
+        b.dz.iter_mut().for_each(|v| *v = 0.0);
+        // SAFETY: `f` is the 6-pointer `kbench` of column `i`; `b` was built by `LossBufs::new(m)`,
+        // the same `m` every column was compiled for.
+        let ns = time_round(|| unsafe { call_loss(f, &mut b) });
+        if r == 0 {
+            let (dev, at) = max_rel_vs_ref(&b.dz, &ref_dz);
+            let (ldev, _) = max_rel_vs_ref(&b.loss, &ref_loss);
+            devs[i] = (dev, at, ldev);
         }
-    }
-    for (i, (label, _lib, _f)) in loaded.iter().enumerate() {
-        let (dev, at, ldev) = dev_of[i];
-        rows.push((label.clone(), best[i], "-".to_string(), dev, at, ldev));
-    }
+        ns
+    });
+
+    // ---- PHASE 3: report ----
+    let c_ix = ix_of(&labels, "C");
+    let reportable = rr.reportable();
 
     println!();
-    println!("  {:<10} {:>10} {:>12} {:>13}", "impl", "ms/call", "Melem/s", "vs C");
-    println!("  {}", "-".repeat(52));
-    let c_ns = rows.iter().find(|r| r.0 == "C").map(|r| r.1);
-    for (label, ns, _, _, _, _) in &rows {
+    println!(
+        "  {:<10} {:>10} {:>12}  {:<28}  {}",
+        "impl", "ms/call", "Melem/s", "vs C (median [min-max])", "what"
+    );
+    let rule = "-".repeat(100);
+    println!("  {rule}");
+    for (i, col) in cols.iter().enumerate() {
+        if i == n_wuk {
+            println!("  {rule}");
+        }
+        let best = rr.best(i);
         println!(
-            "  {:<10} {:>10.2} {:>12.1} {:>13}",
-            label,
-            ns / 1e6,
-            (m.r * m.c) as f64 / ns * 1e3,
-            match c_ns {
-                Some(c) => fmt_ratio(c / ns),
-                None => "-".to_string(),
-            }
+            "  {:<10} {:>10.2} {:>12.1}  {:<28}  {}",
+            col.label,
+            best / 1e6,
+            (m.r * m.c) as f64 / best * 1e3,
+            vs_c_cell(i, c_ix, &rr, reportable),
+            col.note,
         );
     }
+    println!("  ms/call is the best of all {rounds} rounds and is ROUND-LOCAL context.");
+    println!("{DIVIDE_WARNING}");
+    println!();
+    print_instrument(&rr, twin_ratio(&labels, &rr), rounds * (1 + SAMPLES));
+    println!();
+    print_round_trace(&labels, &rr);
     println!();
     println!("  DISPATCH CENSUS");
-    for (label, _, census, _, _, _) in &rows {
-        if census != "-" {
-            println!("    {label:<10} {census}");
-        }
+    for col in cols.iter().take(n_wuk) {
+        println!("    {:<10} {}", col.label, col.census);
     }
     println!("    source written to {}", path.display());
     println!();
     println!("  CORRECTNESS vs the f64 reference (worst of ALL gradient lanes, and of all losses)");
-    for (label, _, _, dev, at, ldev) in &rows {
-        println!("    {label:<10} dz max rel {dev:.3e} at lane {at}; loss max rel {ldev:.3e}");
+    for (i, col) in cols.iter().enumerate() {
+        let (dev, at, ldev) = devs[i];
+        println!(
+            "    {:<10} dz max rel {dev:.3e} at lane {at}; loss max rel {ldev:.3e}",
+            col.label
+        );
     }
-    let power_after = crate::model::power_status_line();
-    println!("  {power_after}");
-    if power_after != power_before {
-        println!("  ! POWER STATE CHANGED DURING THE RUN — rows are not comparable.");
-    }
+    println!("  {}", crate::model::power_status_line());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1814,8 +2112,7 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
          recognizer per state-space variant.",
         m.t, m.d, m.n
     );
-    let power_before = crate::model::power_status_line();
-    println!("  {power_before}");
+    println!("  {}", crate::model::power_status_line());
 
     let mut b = ScanBufs::new(m);
     let t0 = Instant::now();
@@ -1826,124 +2123,99 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
         reference.len()
     );
 
-    let mut rows: Vec<(String, f64, String, f64, usize)> = Vec::new();
+    // ---- PHASE 1: BUILD every column. Nothing is timed here. ----
+    let mut cols: Vec<Col<ScanFn>> = Vec::new();
     let wk_src = subst_scan(SCAN_WK, m);
     let path = dir.join("general_scan_s6.wk");
     let _ = std::fs::write(&path, &wk_src);
-    if let Some(blk) = compile_block(&wk_src, "scan", SCAN_PARAMS) {
-        // SAFETY: `block_abi_ok` proved the lowered `kbench` is 8 pointers -> void = `ScanFn`.
-        let f: ScanFn = unsafe { std::mem::transmute(blk.ptr) };
-        b.y.iter_mut().for_each(|v| *v = 0.0);
-        let ns = time_ns(|| unsafe { call_scan(f, &mut b) });
-        let (dev, at) = max_rel_vs_ref(&b.y, &reference);
-        rows.push(("Wukong".into(), ns, census_line(&blk.census), dev, at));
-        drop(blk.handle);
-    } else {
-        println!("  ! Wukong scan did not compile — row dropped");
+    match compile_block(&wk_src, "scan", SCAN_PARAMS) {
+        Some(blk) => {
+            // SAFETY: `block_abi_ok` proved the lowered `kbench` is 8 pointers -> void = `ScanFn`;
+            // the handle is moved into `Keep` and outlives every call.
+            let f: ScanFn = unsafe { std::mem::transmute(blk.ptr) };
+            cols.push(Col {
+                label: "Wukong".to_string(),
+                note: "the .wk source, through the real pipeline".to_string(),
+                census: census_line(&blk.census),
+                compile: blk.compile,
+                f,
+                _keep: Keep::Jit(blk.handle),
+            });
+        }
+        None => println!("  ! Wukong scan did not compile — row dropped"),
     }
+    let n_wuk = cols.len();
 
     let c_src = subst_scan(SCAN_C, m);
     let rs_src = subst_scan(SCAN_RS, m);
-    let honest = &["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
-    let fastm = &[
-        "-O3",
-        "-march=native",
-        "-ffp-contract=fast",
-        "-ffast-math",
-        "-shared",
-    ];
-    let peers: [(&str, &str, &str, &str, &[&str]); 4] = [
-        ("C", "c", &c_src, cc, honest),
-        ("C(fast)", "c", &c_src, cc, fastm),
-        ("C++", "cpp", &c_src, cxx, honest),
-        (
-            "Rust",
-            "rs",
-            &rs_src,
-            "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
-        ),
-    ];
-    // Load every peer before timing any of them, then alternate the timing order across two
-    // passes and keep each peer's minimum — see the identical treatment in the loss section above
-    // for why a fixed order silently charges section-wide drift to whichever peer goes last.
-    let mut loaded: Vec<(String, libloading::Library, ScanFn)> = Vec::new();
-    for (label, ext, src, compiler, args) in peers {
-        let name = format!("general_scan_{}", label.replace(['(', ')'], "_"));
-        let Some((lib, _)) = load_peer(ext, src, dir, &name, compiler, args) else {
-            println!("  ! {label} scan peer unavailable — row dropped");
-            continue;
-        };
-        let f: ScanFn = unsafe {
-            match lib.get::<ScanFn>(b"kbench\0") {
-                Ok(s) => *s,
-                Err(e) => {
-                    println!("  ! {label}: symbol kbench: {e}");
-                    continue;
-                }
-            }
-        };
-        loaded.push((label.to_string(), lib, f));
+    // SAFETY: every scan peer declares `kbench` with the 8-pointer scan ABI, which is exactly
+    // `ScanFn`; the Wukong side is arity-checked against `SCAN_PARAMS` by `block_abi_ok`.
+    cols.extend(unsafe { build_peer_cols::<ScanFn>("general_scan", &c_src, &rs_src, dir, cc, cxx) });
+    if cols.is_empty() {
+        println!("  ! no column built — section skipped");
+        return;
     }
-    let mut best = vec![f64::INFINITY; loaded.len()];
-    let mut dev_of = vec![(0.0f64, 0usize); loaded.len()];
-    for pass in 0..2usize {
-        for step in 0..loaded.len() {
-            let i = if pass == 0 {
-                step
-            } else {
-                loaded.len() - 1 - step
-            };
-            let f = loaded[i].2;
-            b.y.iter_mut().for_each(|v| *v = 0.0);
-            let ns = time_ns(|| unsafe { call_scan(f, &mut b) });
-            if ns < best[i] {
-                best[i] = ns;
-            }
-            if pass == 0 {
-                dev_of[i] = max_rel_vs_ref(&b.y, &reference);
-            }
+    let labels = labels_of(&cols);
+
+    // ---- PHASE 2: ROUNDS ----
+    let rounds = crate::gen_rounds();
+    let mut devs = vec![(0.0f64, 0usize); cols.len()];
+    let rr = Rounds::run(cols.len(), rounds, |i, r| {
+        let f = cols[i].f;
+        b.y.iter_mut().for_each(|v| *v = 0.0);
+        // SAFETY: `f` is the 8-pointer `kbench` of column `i`; `b` was built by `ScanBufs::new(m)`,
+        // the same `m` every column was compiled for.
+        let ns = time_round(|| unsafe { call_scan(f, &mut b) });
+        if r == 0 {
+            devs[i] = max_rel_vs_ref(&b.y, &reference);
         }
-    }
-    for (i, (label, _lib, _f)) in loaded.iter().enumerate() {
-        let (dev, at) = dev_of[i];
-        rows.push((label.clone(), best[i], "-".into(), dev, at));
-    }
+        ns
+    });
+
+    // ---- PHASE 3: report ----
+    let c_ix = ix_of(&labels, "C");
+    let reportable = rr.reportable();
 
     println!();
-    println!("  {:<10} {:>10} {:>12} {:>13}", "impl", "ms/call", "Mstate/s", "vs C");
-    println!("  {}", "-".repeat(52));
-    let c_ns = rows.iter().find(|r| r.0 == "C").map(|r| r.1);
-    for (label, ns, _, _, _) in &rows {
+    println!(
+        "  {:<10} {:>10} {:>12}  {:<28}  {}",
+        "impl", "ms/call", "Mstate/s", "vs C (median [min-max])", "what"
+    );
+    let rule = "-".repeat(100);
+    println!("  {rule}");
+    for (i, col) in cols.iter().enumerate() {
+        if i == n_wuk {
+            println!("  {rule}");
+        }
+        let best = rr.best(i);
         println!(
-            "  {:<10} {:>10.2} {:>12.1} {:>13}",
-            label,
-            ns / 1e6,
-            (m.t * m.d * m.n) as f64 / ns * 1e3,
-            match c_ns {
-                Some(c) => fmt_ratio(c / ns),
-                None => "-".to_string(),
-            }
+            "  {:<10} {:>10.2} {:>12.1}  {:<28}  {}",
+            col.label,
+            best / 1e6,
+            (m.t * m.d * m.n) as f64 / best * 1e3,
+            vs_c_cell(i, c_ix, &rr, reportable),
+            col.note,
         );
     }
+    println!("  ms/call is the best of all {rounds} rounds and is ROUND-LOCAL context.");
+    println!("{DIVIDE_WARNING}");
+    println!();
+    print_instrument(&rr, twin_ratio(&labels, &rr), rounds * (1 + SAMPLES));
+    println!();
+    print_round_trace(&labels, &rr);
     println!();
     println!("  DISPATCH CENSUS");
-    for (label, _, census, _, _) in &rows {
-        if census != "-" {
-            println!("    {label:<10} {census}");
-        }
+    for col in cols.iter().take(n_wuk) {
+        println!("    {:<10} {}", col.label, col.census);
     }
     println!("    source written to {}", path.display());
     println!();
     println!("  CORRECTNESS vs the f64 reference (worst of all {} lanes)", reference.len());
-    for (label, _, _, dev, at) in &rows {
-        println!("    {label:<10} max rel {dev:.3e} at lane {at}");
+    for (i, col) in cols.iter().enumerate() {
+        let (dev, at) = devs[i];
+        println!("    {:<10} max rel {dev:.3e} at lane {at}", col.label);
     }
-    let power_after = crate::model::power_status_line();
-    println!("  {power_after}");
-    if power_after != power_before {
-        println!("  ! POWER STATE CHANGED DURING THE RUN — rows are not comparable.");
-    }
+    println!("  {}", crate::model::power_status_line());
 }
 
 #[cfg(test)]
