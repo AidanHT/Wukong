@@ -2335,6 +2335,31 @@ fn rust_linear_bf16(ns: usize) -> String {
     )
 }
 
+/// The shapes [`bench_transpose`] sweeps, as `(rows, cols, aliasing_stride)`.
+///
+/// **Both regimes are measured on purpose, and they do NOT give the same answer.** Until 2026-08-05
+/// this bench ran `ns in [1024, 2048]` and nothing else — two power-of-two squares — and the ~5–7×
+/// multiple it printed was published as *the* transpose result. It is not. A transpose reads one
+/// matrix row-major and writes the other column-major, so the peer's write stream steps by the
+/// destination row stride; when that stride in BYTES is a large power of two, consecutive writes map
+/// onto the same handful of L1 sets and the blocked C peer thrashes on set conflicts. Wukong's
+/// `wukong_transpose_f32` moves 32×32 tiles through registers and is much less exposed, so the
+/// power-of-two shapes flatter it for a reason that is a property of the SIZE, not of the compiler.
+/// Measured on this box the same kernel pair goes from ~5–7× at 1024²/2048² down to ~1.4× at 1000²
+/// and 1031² — so the honest general number is the small one, and the old sweep could not see it.
+///
+/// `false` marks the general regime: 1000² (stride 4000 B), 1031² (prime) and the rectangular
+/// 1100×950 (different read and write strides, neither a power of two). The power-of-two shapes are
+/// kept — the aliasing regime is real and worth reporting — but they are labelled, geomeaned
+/// separately, and the summary says in words which number generalizes.
+const TRANSPOSE_SHAPES: &[(usize, usize, bool)] = &[
+    (1024, 1024, true),
+    (2048, 2048, true),
+    (1000, 1000, false),
+    (1031, 1031, false),
+    (1100, 950, false),
+];
+
 /// Matrix transpose `dst = srcᵀ` — the memory-bound layout op (attention score transposes, weight
 /// layout conversions). Wukong folds the `dst[j*R+i] = src[i*C+j]` nest to the cache-blocked
 /// `wukong_transpose_f32`; the C/Rust peers are **also** 32×32 cache-blocked (see [`c_transpose`]),
@@ -2342,12 +2367,19 @@ fn rust_linear_bf16(ns: usize) -> String {
 /// not blocked-vs-unblocked. gcc still does not loop-tile a transpose *by itself*, which is why the
 /// blocking has to be written out; the point is that a competent programmer writes it.
 /// The kernels carry an unused middle pointer so they share the `(src, _, dst)` `KernelFn` ABI and the
-/// f32 harness. Square shapes large enough to spill L2 (where the cache pattern dominates), reported as
-/// GB/s (`2·N²·4` bytes moved per call: read `src` + write `dst`). Transpose is a permutation, so the
+/// f32 harness. Shapes large enough to spill L2 (where the cache pattern dominates), reported as
+/// GB/s (`2·R·C·4` bytes moved per call: read `src` + write `dst`). Transpose is a permutation, so the
 /// cross-language check is **bit-exact** (no float reassociation — a stronger bar than the GEMM gate).
+///
+/// The sweep covers BOTH stride regimes — see [`TRANSPOSE_SHAPES`] — and closes with a summary that
+/// geomeans them apart and names the general one, because reporting only the power-of-two rows is
+/// reporting the size at which the peer is worst.
 fn bench_transpose(cc: &str, dir: &Path) {
-    for ns in [1024usize, 2048] {
-        let n2 = ns * ns;
+    // (single-core ratio vs blocked C, @parallel ratio vs blocked C), split by regime.
+    let (mut alias_1c, mut gen_1c): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    let (mut alias_par, mut gen_par): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    for &(rows, cols, aliasing) in TRANSPOSE_SHAPES {
+        let n2 = rows * cols;
         let src: Vec<f32> = (0..n2).map(|i| (i % 1000) as f32 * 0.5 - 250.0).collect();
         let dummy = vec![0.0f32; n2];
         let mut dst = vec![0.0f32; n2];
@@ -2358,12 +2390,19 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 .map(|x| format!("{:.1}", bytes / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== transpose (dst = srcᵀ) {ns}x{ns} (GB/s, higher is better) ===");
-        let wuk = bench_wukong(&wk_transpose(ns, false), &mut dst, sp, yp);
-        let wk_par = bench_wukong(&wk_transpose(ns, true), &mut dst, sp, yp);
+        let regime = if aliasing {
+            "power-of-two stride - FAVOURABLE regime, does NOT generalize"
+        } else {
+            "general stride"
+        };
+        println!(
+            "=== transpose (dst = srcᵀ) {rows}x{cols} [{regime}] (GB/s, higher is better) ==="
+        );
+        let wuk = bench_wukong(&wk_transpose(rows, cols, false), &mut dst, sp, yp);
+        let wk_par = bench_wukong(&wk_transpose(rows, cols, true), &mut dst, sp, yp);
         let (cm, cm_cpp) = bench_c_cpp(
             "transpose",
-            &c_transpose(ns),
+            &c_transpose(rows, cols),
             dir,
             cc,
             &["-O3", "-march=native", "-shared"],
@@ -2373,7 +2412,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs",
-            &rust_transpose(ns),
+            &rust_transpose(rows, cols),
             dir,
             "transpose",
             "rustc",
@@ -2387,7 +2426,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
             .and_then(|_| {
                 bench_external(
                     "c",
-                    &c_transpose_omp(ns),
+                    &c_transpose_omp(rows, cols),
                     dir,
                     "transpose_omp",
                     cc,
@@ -2414,7 +2453,9 @@ fn bench_transpose(cc: &str, dir: &Path) {
         );
         // Transpose is a permutation — exact, so the full-buffer cross-check is bit equality.
         // BOTH peers are checked: a peer whose spelling changed (blocked, sliced) could in principle
-        // get "faster" by not doing the work, and an unchecked column would never say so.
+        // get "faster" by not doing the work, and an unchecked column would never say so. This is
+        // also what makes the non-square shape safe: a peer that muddled `rows`/`cols` would produce
+        // a different buffer, not a faster one.
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             if m.out != c2.out {
                 println!("  ! transpose output mismatch vs C");
@@ -2432,27 +2473,69 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
+            if aliasing { alias_1c.push(r) } else { gen_1c.push(r) }
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
+            if aliasing { alias_par.push(r) } else { gen_par.push(r) }
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &wuk, &wk_par, &comp);
         println!();
     }
+    transpose_regime_summary(&alias_1c, &gen_1c, &alias_par, &gen_par);
+}
+
+/// Close the transpose section by geomeaning the two stride regimes SEPARATELY and saying, in the
+/// output itself, which one is the general result.
+///
+/// Printing one pooled number over `[1024², 2048², 1000², 1031², 1100×950]` would hide the split
+/// just as effectively as sweeping only the power-of-two shapes did — a reader who takes the
+/// headline away needs the caveat attached to it, not filed in a doc comment.
+fn transpose_regime_summary(alias_1c: &[f64], gen_1c: &[f64], alias_par: &[f64], gen_par: &[f64]) {
+    if alias_1c.is_empty() && gen_1c.is_empty() {
+        return;
+    }
+    println!("=== transpose REGIME SUMMARY (vs the 32x32-blocked C peer, geomean of ratios) ===");
+    let row = |label: &str, xs: &[f64]| {
+        if xs.is_empty() {
+            return;
+        }
+        let g = geomean(xs);
+        println!(
+            "  {:<44} {:>6.2}x {} ({} shape{})",
+            label,
+            if g >= 1.0 { g } else { 1.0 / g },
+            if g >= 1.0 { "faster" } else { "slower" },
+            xs.len(),
+            if xs.len() == 1 { "" } else { "s" }
+        );
+    };
+    row("single-core, power-of-two stride", alias_1c);
+    row("single-core, general stride  <- THE RESULT", gen_1c);
+    row("@parallel,   power-of-two stride", alias_par);
+    row("@parallel,   general stride  <- THE RESULT", gen_par);
+    println!(
+        "  ! The power-of-two rows are NOT the general case. A row stride that is a large power of\n\
+         \x20   two maps the peer's column-major write stream onto a few L1 sets, which penalizes the\n\
+         \x20   PEER for the size rather than rewarding Wukong for the codegen. Quote the general-stride\n\
+         \x20   line; the power-of-two line is the best case, and is labelled as such above."
+    );
+    println!();
 }
 
 /// Wukong transpose kernel: the idiomatic `dst[j*R+i] = src[i*C+j]` nest the `mir_build` recognizer
 /// folds to one `wukong_transpose_f32[_parallel]` call. `y` is an unused param so the signature
-/// matches the `(src, _, dst)` 3-pointer harness ABI.
-fn wk_transpose(ns: usize, parallel: bool) -> String {
+/// matches the `(src, _, dst)` 3-pointer harness ABI. `rows`/`cols` are the SOURCE shape, so the
+/// destination is `[cols, rows]` and the two strides differ on a non-square shape.
+fn wk_transpose(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
-    let n2 = ns * ns;
+    let n2 = rows * cols;
     format!(
         "module bench\n{attr}fn kbench(src: [f32; {n2}], y: [f32; {n2}], mut dst: [f32; {n2}]) {{\n\
-         \x20   for i in 0..{ns} {{\n\
-         \x20       for j in 0..{ns} {{ dst[j * {ns} + i] = src[i * {ns} + j]; }}\n\
+         \x20   for i in 0..{rows} {{\n\
+         \x20       for j in 0..{cols} {{ dst[j * {rows} + i] = src[i * {cols} + j]; }}\n\
          \x20   }}\n}}\n"
     )
 }
@@ -2464,39 +2547,68 @@ fn wk_transpose(ns: usize, parallel: bool) -> String {
 /// bench's own commentary named that as the reason Wukong won, which makes it a peer defect, not a
 /// compiler win. Measured standalone at `-O3 -march=native`, 2048², kernels in their own TU:
 /// **29.51 ms naive → 24.31 ms naive + `restrict` → 14.09 ms 32×32-blocked + `restrict`, a 2.09×
-/// total handicap**. `NS` is 1024/2048 here, both multiples of 32, so the blocked nest needs no
-/// remainder handling.
-fn c_transpose(ns: usize) -> String {
+/// total handicap**.
+///
+/// Since 2026-08-05 the sweep also covers shapes that are NOT multiples of the tile
+/// ([`TRANSPOSE_SHAPES`]), so the nest carries edge handling. It is written as a **full-tile fast
+/// path plus an edge case**, not as a clamped bound on every tile, precisely so the interior nest
+/// gcc compiles is still the constant-trip-count `for (i=ii;i<ii+TB;i++)` it saw before this change:
+/// a clamped bound would have made the tile trip count opaque and could have quietly slowed the peer
+/// at 1024²/2048², which would have made Wukong look better at exactly the sizes this change exists
+/// to put in context.
+fn c_transpose(rows: usize, cols: usize) -> String {
     format!(
-        "#define NS {ns}\n#define TB 32\n\
+        "#define NR {rows}\n#define NC {cols}\n#define TB 32\n\
          __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
-         \x20 for (long ii=0;ii<NS;ii+=TB) for (long jj=0;jj<NS;jj+=TB)\n\
-         \x20   for (long i=ii;i<ii+TB;i++)\n\
-         \x20     for (long j=jj;j<jj+TB;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+         \x20 for (long ii=0;ii<NR;ii+=TB) for (long jj=0;jj<NC;jj+=TB) {{\n\
+         \x20   if (ii+TB<=NR && jj+TB<=NC) {{\n\
+         \x20     for (long i=ii;i<ii+TB;i++)\n\
+         \x20       for (long j=jj;j<jj+TB;j++) dst[j*NR+i] = src[i*NC+j];\n\
+         \x20   }} else {{\n\
+         \x20     long i1 = ii+TB<NR?ii+TB:NR, j1 = jj+TB<NC?jj+TB:NC;\n\
+         \x20     for (long i=ii;i<i1;i++)\n\
+         \x20       for (long j=jj;j<j1;j++) dst[j*NR+i] = src[i*NC+j];\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
     )
 }
 
 /// The OpenMP twin of [`c_transpose`]: blocked tile rows across cores. A permutation, so it stays exact.
-fn c_transpose_omp(ns: usize) -> String {
+fn c_transpose_omp(rows: usize, cols: usize) -> String {
     format!(
-        "#define NS {ns}\n#define TB 32\n\
+        "#define NR {rows}\n#define NC {cols}\n#define TB 32\n\
          __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
          #pragma omp parallel for\n\
-         \x20 for (long ii=0;ii<NS;ii+=TB) for (long jj=0;jj<NS;jj+=TB)\n\
-         \x20   for (long i=ii;i<ii+TB;i++)\n\
-         \x20     for (long j=jj;j<jj+TB;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+         \x20 for (long ii=0;ii<NR;ii+=TB) for (long jj=0;jj<NC;jj+=TB) {{\n\
+         \x20   if (ii+TB<=NR && jj+TB<=NC) {{\n\
+         \x20     for (long i=ii;i<ii+TB;i++)\n\
+         \x20       for (long j=jj;j<jj+TB;j++) dst[j*NR+i] = src[i*NC+j];\n\
+         \x20   }} else {{\n\
+         \x20     long i1 = ii+TB<NR?ii+TB:NR, j1 = jj+TB<NC?jj+TB:NC;\n\
+         \x20     for (long i=ii;i<i1;i++)\n\
+         \x20       for (long j=jj;j<j1;j++) dst[j*NR+i] = src[i*NC+j];\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
     )
 }
 
-fn rust_transpose(ns: usize) -> String {
+/// The Rust transpose peer — the same blocked algorithm and the same full-tile/edge split as
+/// [`c_transpose`], so the two peer languages stay comparable to each other as well as to Wukong.
+fn rust_transpose(rows: usize, cols: usize) -> String {
     format!(
-        "const NS: usize = {ns};\nconst TB: usize = 32;\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
-         \x20 let s = core::slice::from_raw_parts(src, NS*NS);\n\
-         \x20 let d = core::slice::from_raw_parts_mut(dst, NS*NS);\n\
-         \x20 for ii in (0..NS).step_by(TB) {{ for jj in (0..NS).step_by(TB) {{\n\
-         \x20   for i in ii..ii+TB {{ for j in jj..jj+TB {{ d[j*NS+i] = s[i*NS+j]; }} }} }} }}\n}}\n"
+        "const NR: usize = {rows};\nconst NC: usize = {cols};\nconst TB: usize = 32;\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
+         \x20 let s = core::slice::from_raw_parts(src, NR*NC);\n\
+         \x20 let d = core::slice::from_raw_parts_mut(dst, NR*NC);\n\
+         \x20 for ii in (0..NR).step_by(TB) {{ for jj in (0..NC).step_by(TB) {{\n\
+         \x20   if ii+TB<=NR && jj+TB<=NC {{\n\
+         \x20     for i in ii..ii+TB {{ for j in jj..jj+TB {{ d[j*NR+i] = s[i*NC+j]; }} }}\n\
+         \x20   }} else {{\n\
+         \x20     let i1 = if ii+TB<NR {{ ii+TB }} else {{ NR }};\n\
+         \x20     let j1 = if jj+TB<NC {{ jj+TB }} else {{ NC }};\n\
+         \x20     for i in ii..i1 {{ for j in jj..j1 {{ d[j*NR+i] = s[i*NC+j]; }} }}\n\
+         \x20   }} }} }}\n}}\n"
     )
 }
 
@@ -8817,19 +8929,72 @@ mod tests {
     }
 
     /// Wukong dispatches a cache-blocked transpose; the peer must be blocked too, or the bench
-    /// measures loop tiling rather than codegen.
+    /// measures loop tiling rather than codegen. The interior nest must also keep its
+    /// **constant-trip-count** tile body (the full-tile fast path), because an always-clamped bound
+    /// would slow the peer at the tile-aligned sizes and inflate Wukong there.
     #[test]
     fn transpose_peer_stays_cache_blocked() {
-        for ns in [1024usize, 2048] {
-            let s = c_transpose(ns);
-            assert!(s.contains("#define TB 32"), "c_transpose lost its blocking:\n{s}");
+        for &(r, c, _) in TRANSPOSE_SHAPES {
+            for (which, s) in [("c_transpose", c_transpose(r, c)), ("omp", c_transpose_omp(r, c))] {
+                assert!(s.contains("#define TB 32"), "{which} lost its blocking:\n{s}");
+                assert!(
+                    s.contains("for (long ii=0;ii<NR;ii+=TB) for (long jj=0;jj<NC;jj+=TB)"),
+                    "{which} is back to the naive un-tiled nest:\n{s}"
+                );
+                assert!(
+                    s.contains("if (ii+TB<=NR && jj+TB<=NC)")
+                        && s.contains("for (long i=ii;i<ii+TB;i++)"),
+                    "{which} lost its constant-trip-count full-tile fast path — an always-clamped \
+                     tile bound handicaps the peer at the tile-aligned sizes:\n{s}"
+                );
+            }
+            assert!(c_transpose_omp(r, c).contains("#pragma omp parallel for"));
+            // The Rust peer must run the same algorithm or the third column is not comparable.
+            let rs = rust_transpose(r, c);
+            assert!(rs.contains("const TB: usize = 32;") && rs.contains("if ii+TB<=NR && jj+TB<=NC"));
+        }
+    }
+
+    /// **The transpose sweep must measure both stride regimes.** Until 2026-08-05 it ran
+    /// `[1024, 2048]` and nothing else — two power-of-two squares, the shapes at which a
+    /// column-major write stream aliases in L1 and the blocked C peer is worst. The ~5–7× that
+    /// produced was published as the transpose result; at 1000²/1031² the same kernel pair measures
+    /// ~1.4×. Sweeping only the favourable sizes is not a benchmark of the compiler, so this pins
+    /// that the general regime is present, is the majority of the sweep, includes a non-square
+    /// shape, and that the favourable regime is still there to be reported beside it.
+    #[test]
+    fn transpose_sweep_covers_both_stride_regimes() {
+        let alias: Vec<_> = TRANSPOSE_SHAPES.iter().filter(|s| s.2).collect();
+        let general: Vec<_> = TRANSPOSE_SHAPES.iter().filter(|s| !s.2).collect();
+        assert!(!alias.is_empty(), "the power-of-two regime must still be reported");
+        assert!(
+            general.len() >= 3 && general.len() > alias.len(),
+            "the general (non-power-of-two) regime must dominate the sweep, got {} general vs {} \
+             aliasing — reporting mostly power-of-two shapes measures the size, not the compiler",
+            general.len(),
+            alias.len()
+        );
+        // The `aliasing` flag has to mean what it says, or the split is decorative.
+        for &&(r, c, aliasing) in &alias {
             assert!(
-                s.contains("for (long ii=0;ii<NS;ii+=TB)"),
-                "c_transpose is back to the naive un-tiled nest:\n{s}"
+                r.is_power_of_two() && c.is_power_of_two(),
+                "{r}x{c} is flagged aliasing={aliasing} but its strides are not powers of two"
             );
-            assert_eq!(ns % 32, 0, "the blocked transpose peer needs NS % 32 == 0");
-            // The OpenMP twin must stay the same algorithm, or the C(omp) column is not comparable.
-            assert!(c_transpose_omp(ns).contains("for (long ii=0;ii<NS;ii+=TB)"));
+        }
+        for &&(r, c, _) in &general {
+            assert!(
+                !r.is_power_of_two() && !c.is_power_of_two(),
+                "{r}x{c} is flagged as the general regime but a stride is a power of two"
+            );
+        }
+        assert!(
+            general.iter().any(|s| s.0 != s.1),
+            "the general regime needs a non-square shape: a square transpose reads and writes at \
+             the SAME stride, so it cannot show a rectangular layout conversion"
+        );
+        // Every shape must still spill L2 (~2 MiB/core here), or the bench measures cache residency.
+        for &&(r, c, _) in TRANSPOSE_SHAPES.iter().collect::<Vec<_>>().iter() {
+            assert!(2 * r * c * 4 >= 4 << 20, "{r}x{c} moves under 4 MiB — too small to be L2-bound");
         }
     }
 
