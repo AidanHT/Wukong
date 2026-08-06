@@ -1439,6 +1439,22 @@ fn cast_widenable(k: CastKind, to: &MirType) -> bool {
 /// same-object pair whose index expressions differ when one of them writes, so such a loop never
 /// reaches here. That is a distant invariant, so it is also re-checked locally below rather than
 /// assumed — the check costs nothing and cannot fire on a loop the old code accepted.
+///
+/// Given that, the split is not merely safe but strictly *more precise* than grouping by base:
+/// each group's range is an exact cover of what that group touches (every member shares `terms` and
+/// differs only by a constant in `[lo, hi]`), the union of a base's groups covers everything the
+/// base touches, and testing each range separately against a written group accepts exactly the
+/// cases where the base really does not overlap it — where the hull `[min, max)` would have had to
+/// reject. The only pair a split leaves untested is one *within* a base, and that pair is either
+/// read/read (never a dependence at any width) or refused outright three lines below. Nothing here
+/// weakens `guard_allows_equal` either: distance-0 acceptance still demands that **every** group
+/// have `lo == hi` and share one `lo` and one `terms`, which a split base can never satisfy.
+///
+/// The end-to-end evidence is `tests/run/vectorized_split_base_guard.wk`, which aliases the read
+/// base with the output through a pointer the optimizer cannot fold, calls the loop once with
+/// overlapping and once with disjoint windows, and prints every lane of both buffers against
+/// hand-derived expectations. Deleting the `Select` on `emit_alias_checks`'s result makes it fail 7
+/// of its 96 lines.
 fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, MirType, bool)> {
     // A symbolic addend is only usable in the guard if it is available there, and the guard sits in
     // front of the header. `AffineExpr` deliberately also accepts a value *defined inside* the loop
@@ -2373,10 +2389,33 @@ mod tests {
     /// `-O0` (the scalar loop the front end emitted) and `-O2` (the vector loop plus its epilogue)
     /// must print the same bytes and exit the same way. That is the whole correctness story of the
     /// pass, run inside the unit tests so a failure names the case rather than a corpus file.
+    ///
+    /// It also **refuses a vacuous differential**. A caller writes a `main` that exercises some
+    /// shape, but the `-O2` program it actually gets is not the one it wrote: `-O2` inlines first,
+    /// and inlining can dissolve the very property the case is about. Passing one buffer twice
+    /// (`k(w, w, ..)`) makes the two parameters the *same SSA value* after the splice, so
+    /// `loop_info::dependence` sees one object at two different indices, reports `Carried`, and
+    /// declines the loop outright — no vector code, no guard, and a comparison of two identical
+    /// scalar programs that passes no matter what this pass does. That is exactly what happened to
+    /// `two_symbolic_offsets_on_one_base_are_guarded_separately`. Asserting that *something* is
+    /// vector-typed at `-O2` is the cheap check that keeps a differential honest; a case that needs
+    /// more (which loop widened, how wide) asserts that itself.
     fn scalar_and_vector_agree(src: &str) {
         let mut outs = Vec::new();
         for level in [0u8, 2u8] {
             let (program, mut interner) = optimized(src, level);
+            if level == 2 {
+                let widened: usize = program
+                    .funcs
+                    .iter()
+                    .map(|f| f.value_types.iter().filter(|t| t.is_vector()).count())
+                    .sum();
+                assert!(
+                    widened > 0,
+                    "vacuous differential: nothing is vector-typed at -O2, so this compares two \
+                     scalar programs and proves nothing about the vectorizer"
+                );
+            }
             let main = interner.intern("main");
             let (code, bytes) = wukong_interp::run_with_output(&program, main, &interner)
                 .unwrap_or_else(|e| panic!("-O{level}: {e}"));
@@ -2972,12 +3011,30 @@ mod tests {
     /// `MemDep::Carried` by `loop_info::dependence` and never reaches `plan_guards` — and
     /// `plan_guards` re-checks it locally anyway. So this widens, and the two proofs that it may
     /// are below: the guard is built, and it still computes the scalar answer when the caller
-    /// aliases `w` with an output at an overlapping offset.
+    /// aliases the read base with an output at an overlapping offset.
     ///
     /// (An earlier version of this test asserted the *refusal*, which was this pass's behaviour
     /// before the grouping key changed. Refusing is safe but is a missed optimization, not a
     /// correctness requirement, so the assertion was inverted and backed with a differential run
     /// rather than deleted.)
+    ///
+    /// WRITING THE DIFFERENTIAL IS THE HARD PART, and the first attempt was **vacuous**: it called
+    /// `k(w, w, b, 3, 9, 13)`, and at `-O2` inlining runs first, so the two parameters became one
+    /// SSA value, `dependence` reported `Carried` for one object at two indices, the loop was
+    /// declined, and the run compared two identical scalar programs. `WUKONG_VEC_TRACE=1` on that
+    /// source prints no `WIDEN` at all. Three things are therefore needed at once:
+    ///
+    /// * the two pointers must be **distinct SSA values that alias at run time** — hence `pick`,
+    ///   whose selector comes out of the heap so nothing can fold it;
+    /// * the offsets must stay **symbolic** past inlining — hence reading `p`/`q`/`t` out of the
+    ///   buffer too, since inlined integer literals fold into one group's constant window and turn
+    ///   the case back into `two_constant_offsets_on_one_base_are_still_guardable`;
+    /// * the store offset `t` must be **ahead of** the read offset `p`, so that overlap actually
+    ///   changes the answer. `g[i] = w[p+i]` with `g == w` and `p > 0` reads ahead of the write and
+    ///   the scalar and vector answers coincide, which would make the run undiscriminating.
+    ///
+    /// The full lane-by-lane version, with hand-derived expectations and both the overlapping and
+    /// the disjoint call, is `tests/run/vectorized_split_base_guard.wk`.
     #[test]
     fn two_symbolic_offsets_on_one_base_are_guarded_separately() {
         let src = "fn k(w: []f32, mut g: []f32, mut b: []f32, p: i64, q: i64, d: i64) { \
@@ -2987,20 +3044,50 @@ mod tests {
             is_widened(src, "k"),
             "two symbolic read offsets on one base are two ranges and must still be guardable"
         );
-        // The same kernel with `w` and `g` the *same* buffer and `p` chosen so the windows overlap:
-        // the guard has to fail and the scalar loop has to do the work. Every lane is printed, so a
-        // partially-correct buffer cannot pass.
-        scalar_and_vector_agree(
-            "fn k(w: []f32, mut g: []f32, mut b: []f32, p: i64, q: i64, d: i64) { \
-             for i in 0..d { g[i] = w[p + i]; b[i] = w[q + i]; } } \
-             fn main() -> i32 { \
-               let mut w: []f32 = alloc_f32(32); let mut b: []f32 = alloc_f32(32); \
-               for i in 0..32 { w[i] = (i as f32) * 0.25; b[i] = 0.0; } \
-               k(w, w, b, 3, 9, 13); \
-               for i in 0..32 { print((w[i] * 100.0) as i32); } \
-               for i in 0..32 { print((b[i] * 100.0) as i32); } \
-               free(w); free(b); return 0; }",
+        // `w` read at two symbolic offsets, written at a third through an alias the optimizer
+        // cannot see through. `t = 2`, `p = 0`, `d = 13`: the write window [w+2, w+15) overlaps the
+        // read window [w+0, w+13) — and so do the two the guard actually tests, which cover the
+        // vector part only, [w+2, w+14) and [w+0, w+12). So the guard must fail and the scalar loop
+        // must do the work —
+        // and because the write is AHEAD of the read, the answer it produces (0,1,0,1,… propagated
+        // two apart) is one the vector loop cannot produce. Every lane is printed.
+        let diff = "fn k(w: []f32, mut g: []f32, mut b: []f32, p: i64, q: i64, t: i64, d: i64) { \
+                    for i in 0..d { g[t + i] = w[p + i]; b[i] = w[q + i]; } } \
+                    fn pick(x: []f32, y: []f32, s: i64) -> []f32 { \
+                      if s > 0 { return x; } return y; } \
+                    fn fill(mut a: []f32, n: i64) { for i in 0..n { a[i] = (i as f32); } } \
+                    fn main() -> i32 { \
+                      let mut w: []f32 = alloc_f32(64); \
+                      let mut z: []f32 = alloc_f32(64); \
+                      let mut b: []f32 = alloc_f32(64); \
+                      fill(w, 64); fill(z, 64); fill(b, 64); \
+                      let s: i64 = w[1] as i64; \
+                      let p: i64 = w[0] as i64; \
+                      let q: i64 = w[40] as i64; \
+                      let t: i64 = w[2] as i64; \
+                      let d: i64 = w[13] as i64; \
+                      let mut g: []f32 = pick(w, z, s); \
+                      k(w, g, b, p, q, t, d); \
+                      for i in 0..64 { print(w[i] as i32); } \
+                      for i in 0..64 { print(b[i] as i32); } \
+                      free(w); free(z); free(b); return 0; }";
+        // `k` is inlined, so the widened loop lives in `main`. Two vector LOADS is the gather's own
+        // signature: the three `fill` loops use their induction variable as a value and are
+        // declined, and the two print loops contain a call, so nothing else in `main` can widen.
+        let (program, mut interner) = optimized(diff, 2);
+        let main_sym = interner.intern("main");
+        let m = program.function(main_sym).expect("no fn main");
+        let vec_loads = m
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(&i.op, Op::Load(_, t) if t.is_vector()))
+            .count();
+        assert_eq!(
+            vec_loads, 2,
+            "the two-symbolic-offset gather did not widen inside the inlined `main`"
         );
+        scalar_and_vector_agree(diff);
     }
 
     /// The case that is genuinely refused: a base *written* at one symbolic offset and touched at
