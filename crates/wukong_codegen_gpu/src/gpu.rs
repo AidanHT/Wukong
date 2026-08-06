@@ -15,6 +15,114 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
+/// **The device the backend is generating code for**, probed exactly once when the [`Gpu`] is built.
+///
+/// Before this existed the compiler knew *nothing* about its device: no compute capability, no
+/// shared-memory limits, no VRAM size — the arch was a hardcoded `sm_89` string in 67 PTX headers and
+/// the SM count fell back to a silent `.unwrap_or(20)` (the 4050's, i.e. a wrong-but-plausible answer
+/// on any other card). Everything arch-dependent — header emission, capability gating, SMEM budgets,
+/// cache keys — reads this descriptor instead of a literal.
+///
+/// Every field comes from a driver query; there are **no defaults**. A probe that fails aborts `Gpu`
+/// construction with an error naming the exact driver call, because a made-up device fact is worse
+/// than no device: it silently miscompiles or mis-tunes for hardware that is not there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuTarget {
+    /// `cuDeviceGetName`, e.g. "NVIDIA GeForce RTX 4050 Laptop GPU".
+    pub name: String,
+    /// `COMPUTE_CAPABILITY_MAJOR` — 8 for Ampere/Ada, 9 for Hopper.
+    pub cc_major: i32,
+    /// `COMPUTE_CAPABILITY_MINOR` — the `sm_<major><minor>` tail (Ada = 9, A100 = 0, H100 = 0).
+    pub cc_minor: i32,
+    /// `MULTIPROCESSOR_COUNT` — 20 on this 4050, 108 on A100, 132 on H100.
+    pub sm_count: i32,
+    /// `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`, **bytes** — the ceiling reachable via
+    /// `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`, far above the 48 KiB *static* per-block
+    /// limit the generators currently assume.
+    pub smem_per_block_optin: usize,
+    /// `MAX_SHARED_MEMORY_PER_MULTIPROCESSOR`, **bytes** — the occupancy denominator (how many CTAs
+    /// of a given SMEM footprint co-reside).
+    pub smem_per_sm: usize,
+    /// `L2_CACHE_SIZE`, **bytes** — the honest denominator for GEMM-cliff raster tuning.
+    pub l2_bytes: usize,
+    /// `cuDeviceTotalMem`, **bytes** — total VRAM (not free VRAM; that needs a current context).
+    pub total_mem: usize,
+    /// `cuDriverGetVersion`, e.g. 12090 for 12.9.
+    pub driver_version: i32,
+}
+
+impl GpuTarget {
+    /// Probe device `ordinal`'s identity. **Every failure is loud and names the driver call**, so an
+    /// unqueryable attribute can never degrade into a plausible-looking constant.
+    ///
+    /// Device-level throughout (`cuDeviceGet` / `cuDeviceGetAttribute` / `cuDeviceTotalMem` /
+    /// `cuDriverGetVersion` need no *current* context, only `cuInit`), so it is safe to call right
+    /// after the context is retained without binding it to this thread.
+    fn probe(ordinal: i32) -> Result<Self, String> {
+        let mut dev: sys::CUdevice = 0;
+        unsafe { sys::cuDeviceGet(&mut dev, ordinal).result() }
+            .map_err(|e| format!("cuDeviceGet(ordinal {ordinal}) failed: {e:?}"))?;
+
+        // One closure so every attribute failure reports the attribute that could not be read.
+        let attr = |a: sys::CUdevice_attribute, what: &str| -> Result<i32, String> {
+            let mut v: i32 = 0;
+            unsafe { sys::cuDeviceGetAttribute(&mut v, a, dev).result() }
+                .map_err(|e| format!("cuDeviceGetAttribute({what}) failed: {e:?}"))?;
+            Ok(v)
+        };
+        // A negative/zero size would silently underflow a `usize` budget downstream — reject it here.
+        let bytes = |v: i32, what: &str| -> Result<usize, String> {
+            usize::try_from(v).map_err(|_| format!("cuDeviceGetAttribute({what}) returned {v} bytes"))
+        };
+
+        let name = {
+            const BUF: usize = 256;
+            let mut buf = [0u8; BUF];
+            unsafe { sys::cuDeviceGetName(buf.as_mut_ptr() as *mut _, BUF as _, dev).result() }
+                .map_err(|e| format!("cuDeviceGetName failed: {e:?}"))?;
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(BUF);
+            String::from_utf8_lossy(&buf[..end]).into_owned()
+        };
+
+        use sys::CUdevice_attribute as A;
+        let cc_major = attr(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, "COMPUTE_CAPABILITY_MAJOR")?;
+        let cc_minor = attr(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, "COMPUTE_CAPABILITY_MINOR")?;
+        let sm_count = attr(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, "MULTIPROCESSOR_COUNT")?;
+        let smem_optin = attr(
+            A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            "MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
+        )?;
+        let smem_sm = attr(
+            A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+            "MAX_SHARED_MEMORY_PER_MULTIPROCESSOR",
+        )?;
+        let l2 = attr(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, "L2_CACHE_SIZE")?;
+
+        let mut total_mem: usize = 0;
+        unsafe { sys::cuDeviceTotalMem_v2(&mut total_mem, dev).result() }
+            .map_err(|e| format!("cuDeviceTotalMem failed: {e:?}"))?;
+
+        let mut driver_version: i32 = 0;
+        unsafe { sys::cuDriverGetVersion(&mut driver_version).result() }
+            .map_err(|e| format!("cuDriverGetVersion failed: {e:?}"))?;
+
+        if sm_count <= 0 {
+            return Err(format!("MULTIPROCESSOR_COUNT reported {sm_count} SMs"));
+        }
+        Ok(Self {
+            name,
+            cc_major,
+            cc_minor,
+            sm_count,
+            smem_per_block_optin: bytes(smem_optin, "MAX_SHARED_MEMORY_PER_BLOCK_OPTIN")?,
+            smem_per_sm: bytes(smem_sm, "MAX_SHARED_MEMORY_PER_MULTIPROCESSOR")?,
+            l2_bytes: bytes(l2, "L2_CACHE_SIZE")?,
+            total_mem,
+            driver_version,
+        })
+    }
+}
+
 /// A live CUDA device + stream + a cache of JIT-loaded PTX modules (keyed by a stable string).
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
@@ -22,25 +130,35 @@ pub struct Gpu {
     modules: HashMap<&'static str, Arc<CudaModule>>,
     /// Installed driver version — part of the on-disk cubin cache key (a cubin is driver-ABI specific).
     driver_tag: i32,
+    /// The probed device identity — see [`GpuTarget`]. Queried once, here, and never re-queried.
+    target: GpuTarget,
 }
 
 impl Gpu {
-    fn new() -> Result<Self, DriverError> {
-        let ctx = CudaContext::new(0)?;
+    /// Retain the primary context on device 0 and probe its [`GpuTarget`]. A failed probe is a failed
+    /// construction (the error names the driver call) — never a defaulted device fact.
+    fn new() -> Result<Self, String> {
+        let ctx = CudaContext::new(0).map_err(|e| format!("CudaContext::new(0) failed: {e:?}"))?;
         let stream = ctx.default_stream();
+        let target = GpuTarget::probe(0)?;
         Ok(Self {
             ctx,
             stream,
             modules: HashMap::new(),
             driver_tag: crate::cubin::driver_version(),
+            target,
         })
+    }
+
+    /// The device this `Gpu` is bound to — arch, SM count, SMEM ceilings, VRAM. Probed once at
+    /// construction; every arch-dependent decision should read it instead of a literal.
+    pub fn target(&self) -> &GpuTarget {
+        &self.target
     }
 
     /// Human-readable device name, e.g. "NVIDIA GeForce RTX 4050 Laptop GPU".
     pub fn device_name(&self) -> String {
-        self.ctx
-            .name()
-            .unwrap_or_else(|_| "<unknown CUDA device>".into())
+        self.target.name.clone()
     }
 
     /// Load `ptx` once under `key`, caching the module in-process, and return the named entry
@@ -104,20 +222,21 @@ impl Gpu {
         Some(val)
     }
 
-    /// Number of streaming multiprocessors (falls back to a plausible 20 if unqueryable) — used to size
-    /// a grid that saturates the device for memory-bound (grid-stride) kernels.
+    /// Number of streaming multiprocessors — used to size a grid that saturates the device for
+    /// memory-bound (grid-stride) kernels. Reads the [`GpuTarget`] probed at construction; it used to
+    /// re-query per call and **fall back to a silent `20`** (this 4050's count) on failure, which is a
+    /// wrong-but-plausible answer on every other card. An unqueryable SM count now fails `Gpu::new`.
     pub fn sm_count(&self) -> i32 {
-        self.device_attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
-            .unwrap_or(20)
+        self.target.sm_count
     }
 
-    /// **L2 cache size, bytes** (`0` if unqueryable) — the honest denominator for the GEMM-cliff raster
-    /// tuning. At 4096³ the GEMM is HBM-bound, so the threadblock-rasterization band is sized to keep the
-    /// co-scheduled CTAs' A/B footprint inside L2; the optimal band width keys off the *measured* L2, not
-    /// a hard-coded guess (the cliff comments have carried both 24 MB and 12 MB — this settles it).
+    /// **L2 cache size, bytes** — the honest denominator for the GEMM-cliff raster tuning. At 4096³ the
+    /// GEMM is HBM-bound, so the threadblock-rasterization band is sized to keep the co-scheduled CTAs'
+    /// A/B footprint inside L2; the optimal band width keys off the *measured* L2, not a hard-coded
+    /// guess (the cliff comments have carried both 24 MB and 12 MB — this settles it). Reads the
+    /// [`GpuTarget`]; the old `.unwrap_or(0)` could hand a divisor of zero to a future consumer.
     pub fn l2_cache_size(&self) -> i32 {
-        self.device_attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
-            .unwrap_or(0)
+        self.target.l2_bytes as i32
     }
 
     /// **Theoretical peak HBM bandwidth, GB/s** — the honest M9 denominator. Uses the exact formula
@@ -139,7 +258,8 @@ static GPU: OnceLock<Mutex<Option<Gpu>>> = OnceLock::new();
 /// Why `Gpu::new` failed, recorded the first time [`gpu`] is consulted. `Gpu::new().ok()` used to
 /// discard the `DriverError` outright, so every skip line reported "no CUDA device reachable" even
 /// when the real cause was an OOM, an exclusive-mode device, a driver/runtime mismatch, or an empty
-/// `CUDA_VISIBLE_DEVICES` — misattributing a broken box as a machine that simply has no GPU.
+/// `CUDA_VISIBLE_DEVICES` — misattributing a broken box as a machine that simply has no GPU. It now
+/// also carries a failed [`GpuTarget`] probe, naming the driver call that would not answer.
 static GPU_INIT_ERR: OnceLock<String> = OnceLock::new();
 
 /// Build the process-wide GPU, recording the driver's error if it fails.
@@ -147,7 +267,7 @@ fn init_gpu() -> Option<Gpu> {
     match Gpu::new() {
         Ok(g) => Some(g),
         Err(e) => {
-            let _ = GPU_INIT_ERR.set(format!("{e:?}"));
+            let _ = GPU_INIT_ERR.set(e);
             None
         }
     }
@@ -233,7 +353,7 @@ pub fn reset_gpu() -> bool {
         }
         Err(e) => {
             eprintln!(
-                "[wukong_codegen_gpu] CUDA device UNRECOVERABLE after kernel fault: {e:?} \
+                "[wukong_codegen_gpu] CUDA device UNRECOVERABLE after kernel fault: {e} \
                  (sticky process-level error; primary-ctx reset did not clear it — restart the \
                  process to use the GPU again)"
             );
@@ -4877,6 +4997,102 @@ mod tests {
                 eprintln!("[skip] {name}: GPU unavailable: {why}");
             }
         }
+    }
+
+    /// **The device-identity gate.** [`GpuTarget`] is probed once at `Gpu` construction and is the
+    /// single source of every arch-dependent decision downstream (PTX headers, capability gating,
+    /// SMEM budgets, cache keys), so a field that silently reports a default would mis-target the
+    /// whole backend. This asserts only **architecture-independent sanity ranges** — deliberately
+    /// *not* this 4050's values, because the point of the descriptor is that it is correct on a card
+    /// nobody here has seen. It also prints the full descriptor so a run on any new device records
+    /// what was probed.
+    #[test]
+    fn gpu_target_is_probed_and_sane() {
+        with_gpu("gpu_target", |g| {
+            let t = g.target().clone();
+            println!(
+                "GpuTarget {{\n  name: {:?}\n  cc: {}.{} (sm_{}{})\n  sm_count: {}\n  \
+                 smem_per_block_optin: {} B ({:.1} KiB)\n  smem_per_sm: {} B ({:.1} KiB)\n  \
+                 l2_bytes: {} B ({:.2} MiB)\n  total_mem: {} B ({:.2} GiB)\n  driver_version: {}\n}}",
+                t.name,
+                t.cc_major,
+                t.cc_minor,
+                t.cc_major,
+                t.cc_minor,
+                t.sm_count,
+                t.smem_per_block_optin,
+                t.smem_per_block_optin as f64 / 1024.0,
+                t.smem_per_sm,
+                t.smem_per_sm as f64 / 1024.0,
+                t.l2_bytes,
+                t.l2_bytes as f64 / (1024.0 * 1024.0),
+                t.total_mem,
+                t.total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+                t.driver_version,
+            );
+
+            assert!(!t.name.trim().is_empty(), "device name is empty");
+            // Pascal (6.x) is the oldest arch this codebase could plausibly meet; 12 is headroom.
+            assert!(
+                (6..=12).contains(&t.cc_major),
+                "cc_major {} outside 6..=12 — probe is wrong, not the device",
+                t.cc_major
+            );
+            assert!(
+                (0..=9).contains(&t.cc_minor),
+                "cc_minor {} is not a single digit",
+                t.cc_minor
+            );
+            assert!(
+                (1..=1024).contains(&t.sm_count),
+                "sm_count {} outside 1..=1024",
+                t.sm_count
+            );
+            // The 48 KiB *static* per-block limit is the floor every CUDA arch since Kepler clears;
+            // the opt-in ceiling is what makes >48 KiB pipelines expressible at all.
+            const STATIC_FLOOR: usize = 48 * 1024;
+            assert!(
+                t.smem_per_block_optin >= STATIC_FLOOR,
+                "smem_per_block_optin {} < the 48 KiB static floor",
+                t.smem_per_block_optin
+            );
+            assert!(
+                t.smem_per_sm >= STATIC_FLOOR,
+                "smem_per_sm {} < the 48 KiB static per-block floor",
+                t.smem_per_sm
+            );
+            assert!(t.l2_bytes > 0, "l2_bytes is 0 — the old .unwrap_or(0) default");
+            assert!(
+                t.total_mem > (1usize << 30),
+                "total_mem {} B is under 1 GiB",
+                t.total_mem
+            );
+            assert!(
+                t.driver_version > 0,
+                "driver_version {} is not a real version",
+                t.driver_version
+            );
+
+            // The legacy accessors must be the descriptor, not an independent re-query.
+            assert_eq!(g.sm_count(), t.sm_count, "sm_count() diverged from the target");
+            assert_eq!(
+                g.l2_cache_size() as usize,
+                t.l2_bytes,
+                "l2_cache_size() diverged from the target"
+            );
+            assert_eq!(g.device_name(), t.name, "device_name() diverged from the target");
+            // Probed once: a second read is the same object, not a fresh driver round-trip.
+            assert_eq!(g.target(), &t, "target() is not stable across calls");
+            eprintln!(
+                "[gate] GpuTarget probed: {} sm_{}{} | {} SMs | optin SMEM {:.0} KiB | L2 {:.2} MiB \u{2713}",
+                t.name,
+                t.cc_major,
+                t.cc_minor,
+                t.sm_count,
+                t.smem_per_block_optin as f64 / 1024.0,
+                t.l2_bytes as f64 / (1024.0 * 1024.0),
+            );
+        });
     }
 
     /// **§3A P3 — a sweep that cannot find its peer must fail LOUDLY, never skip silently and report
