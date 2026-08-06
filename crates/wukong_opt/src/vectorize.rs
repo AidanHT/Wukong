@@ -77,6 +77,32 @@
 //! (`wukong_interp`'s `Op::Load` arm) but its **vector** load gathers slots verbatim. Widening a
 //! half-precision load would therefore drop a rounding the scalar path performs — a silent
 //! interp-vs-native divergence, the worst possible outcome. [`lane_bytes`] refuses them.
+//!
+//! # Reading `WUKONG_VEC_TRACE=1`
+//!
+//! Setting it makes [`pick`] print one line per decision to stderr. **The stream is not one line
+//! per loop.** This pass is a [`Pass`], the pass manager re-runs the whole list until no pass
+//! reports a change, and `pick` re-walks *every* loop of the function on each of those iterations —
+//! so a loop that is declined is re-declined, with the identical message, once per fixpoint
+//! iteration after the one that widened something. A `WIDEN` line appears once (the header goes
+//! into [`Vectorize::done`]); a `declined` line appears as many times as the fixpoint ran.
+//!
+//! Measured on this tree, the two `wukong_xbench` general programs at their default dimensions:
+//!
+//! ```text
+//!   general_loss_focal.wk (R=8192 C=1024)         general_scan_s6.wk (T=2048 D=256 N=16)
+//!   8 lines total:                                5 lines total:
+//!     x1 WIDEN bb13 w=4 lin=42 guards=1 reds=1      x1 WIDEN bb10 w=4 lin=53 guards=3 reds=1
+//!     x1 WIDEN bb16 w=4 lin=8  guards=0 reds=0      x1 WIDEN bb1  w=4 lin=3  guards=0 reds=0
+//!     x1 WIDEN bb25 w=4 lin=12 guards=1 reds=0      x3 declined bb16: induction step is not 1
+//!     x5 declined bb19: the induction variable
+//!        is used for something other than addressing
+//! ```
+//!
+//! Quote it **with the repeat counts** or say explicitly that you have collapsed them. A
+//! de-duplicated paste reads like a per-loop verdict list, which is a different (and much stronger)
+//! claim than what the tool actually reports, and it hides the one thing the repetition does tell
+//! you: how many times the fixpoint went round.
 
 use wukong_mir::{
     BasicBlock, BinOp, BlockId, CastKind, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId,
@@ -338,16 +364,28 @@ struct RedPlan {
 }
 
 /// One pair of bases the vector loop is only legal over if they are equal or disjoint.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GuardPair {
     a: GuardBase,
     b: GuardBase,
 }
 
-/// A base pointer, plus the smallest and largest constant element offset the loop applies to it.
-#[derive(Clone, Copy, Debug)]
+/// A base pointer, plus the element-offset window the loop applies to it: a loop-invariant
+/// symbolic part shared by every access in the group, and the smallest and largest constant on top
+/// of it.
+///
+/// The symbolic part is what makes an inner loop over a *row* guardable. `x[r*C + j]` for
+/// `j in 0..C` touches `[x + r*C, x + r*C + C)`, and `r*C` is a value, not a constant; a guard that
+/// could only express a constant offset had to decline every row-wise inner loop in the corpus.
+#[derive(Clone, Debug)]
 struct GuardBase {
     base: MemBase,
+    /// `(value, multiplier)` addends of the index that do not move with the induction variable —
+    /// the row base `r*C` of an `a[r*C + c]` inner loop being the one that matters — exactly as
+    /// [`crate::loop_info::AffineExpr::terms`] spells them. Empty for a flat `a[i + k]`. Every
+    /// value here is defined **outside** the loop and its multiplier fits the induction variable's
+    /// type (both checked in [`plan_guards`]), so the guard block can re-materialize the offset.
+    terms: Vec<(ValueId, i64)>,
     lo: i64,
     hi: i64,
 }
@@ -367,6 +405,9 @@ struct GuardBase {
 /// `MemDep::Carried`, so a loop whose memory was never analyzed cannot be widened by accident —
 /// and because both early filters call the same code `plan_loop` does.
 fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<VecPlan> {
+    // `WUKONG_VEC_TRACE=1` prints one line per decision. Note that this whole function re-runs on
+    // every fixpoint iteration of the pass manager, so a DECLINE repeats once per iteration while a
+    // WIDEN appears once — see the module docs before quoting the stream anywhere.
     let trace = std::env::var_os("WUKONG_VEC_TRACE").is_some();
     let decline = |header: u32, why: &str| {
         if trace {
@@ -404,7 +445,19 @@ fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<
         loop_info::analyze_one(f, forest, idx, loop_info::Stages::Memory);
         let l = forest.get(id);
         match plan_loop(f, l) {
-            Ok(p) => return Some(p),
+            Ok(p) => {
+                if trace {
+                    eprintln!(
+                        "vectorize: WIDEN bb{} w={} lin={} guards={} reds={}",
+                        p.header.0,
+                        p.w,
+                        p.lin.len(),
+                        p.guards.len(),
+                        p.reductions.len()
+                    );
+                }
+                return Some(p);
+            }
             Err(why) => decline(l.header.0, why),
         }
     }
@@ -1119,14 +1172,17 @@ fn plan_body(
                     }
                 }
                 let ty = f.value_type(*param).clone();
-                let any_vec = is_vec(&vector_ty, *then_arg) || is_vec(&vector_ty, *else_arg);
-                if any_vec {
-                    if !is_vec(&vector_ty, *cond) || lanes_of(&ty)? != w {
+                // The merged parameter is lane-varying when the mask is, or when either arm is —
+                // and in both cases the condition has to be a real lane mask, since a uniform `i1`
+                // cannot blend. Two *uniform* arms under a lane mask are still lane-varying
+                // (`emit_body` splats each and selects), which is exactly the shape a label-
+                // smoothing `if c == t { qt } else { qo }` takes after if-conversion.
+                let vec_cond = is_vec(&vector_ty, *cond);
+                if vec_cond || is_vec(&vector_ty, *then_arg) || is_vec(&vector_ty, *else_arg) {
+                    if !vec_cond || lanes_of(&ty)? != w {
                         return None;
                     }
                     vector_ty.insert(param.0, ty);
-                } else if is_vec(&vector_ty, *cond) {
-                    return None; // a lane mask selecting between two uniforms is not a value
                 }
                 available.insert(param.0);
                 plans.push(Plan::Merge);
@@ -1227,14 +1283,26 @@ fn plan_body(
                     Plan::Widen
                 }
             }
-            Op::Select(c, a, b) => {
+            Op::Select(c, ..) => {
                 if !operand_is_vec {
                     Plan::Scalar
                 } else {
                     // A uniform `i1` condition cannot select between vectors: the mask has to be a
                     // per-lane all-ones/all-zeros vector, which only a vector compare produces.
-                    if !is_vec(&vector_ty, *c) || !is_vec(&vector_ty, *a) || !is_vec(&vector_ty, *b)
-                    {
+                    //
+                    // The *arms*, by contrast, need not already be vectors. `select(mask, k1, k2)`
+                    // with two loop-invariant operands is a perfectly ordinary lane-varying value —
+                    // `widen_op` splats whichever arm is not already a vector, through `to_vector`,
+                    // exactly as it does for a partly-uniform `Bin`/`Fma`/`Cmp` — and
+                    // `select(mask, splat(a), splat(b))` computes in each lane what the scalar loop
+                    // computed. Requiring both arms to be vectors declined a whole family of
+                    // bodies: a `relu` is `fmax(x[i], 0.0)`, i.e. `select(x[i] > 0, x[i], 0.0)`,
+                    // whose `else` arm is a literal, and every table-driven transcendental the
+                    // front end inlines picks its coefficients with `select(x > hi, hi_const, x)`
+                    // and `select(bit, table_a, table_b)` over f32 literals — so the first widened
+                    // compare in the body ran straight into an arm that was a constant, and one
+                    // such `select` made the entire loop unwidenable.
+                    if !is_vec(&vector_ty, *c) {
                         return None;
                     }
                     let ty = f.value_type(inst.result?).clone();
@@ -1378,72 +1446,173 @@ fn cast_widenable(k: CastKind, to: &MirType) -> bool {
 ///
 /// [`crate::loop_info::MemDep::IndependentIfBasesDisjoint`] states the obligation: every pair of
 /// bases the analysis could not relate, where at least one is written, must at runtime be either
-/// the same pointer (distance 0) or non-overlapping. A guarded access has to sit at a constant
-/// offset from its base (`1·iv + k`) so the range it touches is expressible as two `gep`s.
+/// the same pointer (distance 0) or non-overlapping. A guarded access has to sit at an offset from
+/// its base that the guard block can *recompute*, so the range it touches is expressible as two
+/// `gep`s: `1·iv + Σ invariant + k`. See [`GuardBase`] for why the invariant part matters as much
+/// as the constant one.
+///
+/// The invariant part is the whole reason this is not just "a constant offset". The single most
+/// common shape in this language is a 2-D row-major inner loop, `a[r*C + c]` for `c in 0..C`, whose
+/// index decomposes to `1·c + (r*C)` — one loop-invariant term, never a constant. Requiring an
+/// empty term list declined every such loop, which is to say every row-wise softmax, every row
+/// reduction, and both hot loops of a fused per-row loss.
+///
+/// The unit of grouping is therefore **`(base, invariant part)`, not `base`** — one buffer read at
+/// two different row offsets in the same body (`g[i] = w[ga + i]; b[i] = w[gb + i];`, the LayerNorm
+/// γ/β gather of a transformer block) contributes two ranges, and each one is a plain `[lo, hi)` the
+/// guard can compute. Grouping by base alone forced those two into one range with no expressible
+/// offset, and declined the loop.
+///
+/// Splitting one base across two groups is only sound because two such groups can only ever both be
+/// **loads**: `loop_info::dependence` reports [`crate::loop_info::MemDep::Carried`] for any
+/// same-object pair whose index expressions differ when one of them writes, so such a loop never
+/// reaches here. That is a distant invariant, so it is also re-checked locally below rather than
+/// assumed — the check costs nothing and cannot fire on a loop the old code accepted.
+///
+/// Given that, the split is not merely safe but strictly *more precise* than grouping by base:
+/// each group's range is an exact cover of what that group touches (every member shares `terms` and
+/// differs only by a constant in `[lo, hi]`), the union of a base's groups covers everything the
+/// base touches, and testing each range separately against a written group accepts exactly the
+/// cases where the base really does not overlap it — where the hull `[min, max)` would have had to
+/// reject. The only pair a split leaves untested is one *within* a base, and that pair is either
+/// read/read (never a dependence at any width) or refused outright three lines below. Nothing here
+/// weakens `guard_allows_equal` either: distance-0 acceptance still demands that **every** group
+/// have `lo == hi` and share one `lo` and one `terms`, which a split base can never satisfy.
+///
+/// The end-to-end evidence is `tests/run/vectorized_split_base_guard.wk`, which aliases the read
+/// base with the output through a pointer the optimizer cannot fold, calls the loop once with
+/// overlapping and once with disjoint windows, and prints every lane of both buffers against
+/// hand-derived expectations. Deleting the `Select` on `emit_alias_checks`'s result makes it fail 7
+/// of its 96 lines.
 fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, MirType, bool)> {
-    // Group the affine accesses by base, tracking the offset range and whether any is a store.
-    let mut bases: Vec<(GuardBase, bool, MirType)> = Vec::new();
+    // A symbolic addend is only usable in the guard if it is available there, and the guard sits in
+    // front of the header. `AffineExpr` deliberately also accepts a value *defined inside* the loop
+    // whose operands are all invariant (`loop_info::value_invariant` — that is what keeps the
+    // analysis independent of whether LICM has run), so "invariant" is not enough: such a value is
+    // defined below the guard and reading it there is a use its definition does not dominate.
+    let inside: FxHashSet<u32> = l
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            let blk = &f.blocks[b.0 as usize];
+            blk.params
+                .iter()
+                .map(|p| p.0)
+                .chain(blk.insts.iter().filter_map(|i| i.result.map(|r| r.0)))
+        })
+        .collect();
+    // Every index the guard rebuilds is arithmetic on the induction variable, so each symbolic
+    // addend has to *be* that type. It usually is; the exception is a `sext`, which the affine
+    // decomposition looks through (`Op::Cast(SExt, ..)`), leaving a narrower value behind.
+    let iv_ty = l.primary()?.ty.clone();
+    // The unit-stride requirement is stated here rather than inherited from `pick_width`, which has
+    // already imposed it on every affine access: the range arithmetic below assumes it outright.
+    let usable_terms = |ix: &crate::loop_info::AffineExpr| {
+        ix.coeff.as_const() == Some(1)
+            && ix.terms.iter().all(|(v, m)| {
+                !inside.contains(&v.0) && *f.value_type(*v) == iv_ty && fits_in(&iv_ty, *m)
+            })
+    };
+
+    // Group the affine accesses by `(base, invariant offset)`, tracking the constant offset window
+    // and whether any access in the group is a store. `usable` is per group rather than per access
+    // because `lo`/`hi` only bound the touched range for accesses that share the symbolic part —
+    // which, with the symbolic part in the key, every member of a group does.
+    struct Group {
+        g: GuardBase,
+        stored: bool,
+        elem: MirType,
+        usable: bool,
+    }
+    let mut bases: Vec<Group> = Vec::new();
     for a in &l.accesses {
         let AddrForm::Affine { base, index, elem } = &a.addr else {
             continue;
         };
         let is_store = a.kind == AccessKind::Store;
-        match bases.iter_mut().find(|(g, _, _)| g.base.same_object(*base)) {
-            Some((g, st, e)) => {
-                if e != elem {
+        match bases
+            .iter_mut()
+            .find(|gr| gr.g.base.same_object(*base) && gr.g.terms == index.terms)
+        {
+            Some(gr) => {
+                if gr.elem != *elem {
                     return None;
                 }
-                g.lo = g.lo.min(index.konst);
-                g.hi = g.hi.max(index.konst);
-                *st |= is_store;
+                gr.usable &= usable_terms(index);
+                gr.g.lo = gr.g.lo.min(index.konst);
+                gr.g.hi = gr.g.hi.max(index.konst);
+                gr.stored |= is_store;
             }
-            None => bases.push((
-                GuardBase {
+            None => bases.push(Group {
+                usable: usable_terms(index),
+                g: GuardBase {
                     base: *base,
+                    terms: index.terms.clone(),
                     lo: index.konst,
                     hi: index.konst,
                 },
-                is_store,
-                elem.clone(),
-            )),
+                stored: is_store,
+                elem: elem.clone(),
+            }),
         }
     }
     let elem = bases
         .first()
-        .map(|(_, _, e)| e.clone())
+        .map(|gr| gr.elem.clone())
         .unwrap_or(MirType::I8);
-    let uniform_offset = bases.iter().all(|(g, _, _)| g.lo == g.hi)
-        && bases.windows(2).all(|p| p[0].0.lo == p[1].0.lo);
+    // Conservative, and only ever *adds* an accepted case at runtime: two ranges may be reported
+    // "equal, therefore at distance 0" only when every group touches a single offset and all of
+    // them share it, symbolic part included.
+    let uniform_offset = bases.iter().all(|gr| gr.g.lo == gr.g.hi)
+        && bases
+            .windows(2)
+            .all(|p| p[0].g.lo == p[1].g.lo && p[0].g.terms == p[1].g.terms);
 
     let mut guards = Vec::new();
     for i in 0..bases.len() {
         for j in i + 1..bases.len() {
-            let (ga, sa, _) = &bases[i];
-            let (gb, sb, _) = &bases[j];
-            if !sa && !sb {
+            let (ga, gb) = (&bases[i], &bases[j]);
+            if !ga.stored && !gb.stored {
                 continue; // read/read is never a dependence
             }
-            if distinct_alloca_pair(f, ga.base, gb.base) {
-                continue;
-            }
-            // The whole loop's index must be `1·iv + k` for the touched range to be two `gep`s.
-            if !offsets_are_constant(l, ga.base) || !offsets_are_constant(l, gb.base) {
+            // Two groups on ONE object: their symbolic parts differ (equal ones share a group), and
+            // `lo`/`hi` say nothing about the distance between two different symbolic offsets, so
+            // there is no range test to emit. This is the local restatement of the invariant the
+            // doc comment leans on — `loop_info::dependence` already reports `Carried` here, so it
+            // is belt and braces rather than a live path.
+            if ga.g.base.same_object(gb.g.base) {
                 return None;
             }
-            guards.push(GuardPair { a: *ga, b: *gb });
+            if distinct_alloca_pair(f, ga.g.base, gb.g.base) {
+                continue;
+            }
+            // The whole group's index must be `1·iv + invariants + k` for the touched range to be
+            // two `gep`s the guard can build.
+            if !ga.usable || !gb.usable {
+                return None;
+            }
+            guards.push(GuardPair {
+                a: ga.g.clone(),
+                b: gb.g.clone(),
+            });
         }
     }
     Some((guards, elem, uniform_offset))
 }
 
-/// Does every access on this base use an index of the form `1·iv + constant`?
-fn offsets_are_constant(l: &NaturalLoop, base: MemBase) -> bool {
-    l.accesses.iter().all(|a| match &a.addr {
-        AddrForm::Affine { base: b, index, .. } if b.same_object(base) => {
-            index.terms.is_empty() && index.coeff.as_const() == Some(1)
-        }
-        _ => true,
-    })
+/// Is `k` representable in this integer type? The guard materializes a symbolic addend's
+/// multiplier as a constant of the induction variable's type, and a multiplier that does not fit
+/// would silently become a different number. `AffineExpr::scale` accumulates multipliers in `i64`
+/// (`checked_mul`), so a nested `a[(x*K1)*K2 + i]` really can leave one that overflows an `i32`
+/// induction variable's type.
+fn fits_in(ty: &MirType, k: i64) -> bool {
+    match ty {
+        MirType::I8 => i8::try_from(k).is_ok(),
+        MirType::I16 => i16::try_from(k).is_ok(),
+        MirType::I32 => i32::try_from(k).is_ok(),
+        MirType::I64 => true,
+        _ => false,
+    }
 }
 
 fn distinct_alloca_pair(f: &Function, a: MemBase, b: MemBase) -> bool {
@@ -1658,8 +1827,8 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
     let mut acc: Option<ValueId> = None;
     let mut ptr_cache: FxHashMap<u32, ValueId> = FxHashMap::default();
     for g in &p.guards {
-        let (alo, ahi) = range_of(e, p, guard, g.a, start, end, &mut ptr_cache);
-        let (blo, bhi) = range_of(e, p, guard, g.b, start, end, &mut ptr_cache);
+        let (alo, ahi) = range_of(e, p, guard, &g.a, start, end, &mut ptr_cache);
+        let (blo, bhi) = range_of(e, p, guard, &g.b, start, end, &mut ptr_cache);
         // a_end <= b_start
         let a_before = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Ule, ahi, blo));
         let b_before = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Ule, bhi, alo));
@@ -1676,13 +1845,19 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
     acc
 }
 
-/// The half-open address range `[base + start + lo, base + end + hi)` this base touches, as two
-/// integers.
+/// The half-open address range `[base + start + lo + Σt, base + end + hi + Σt)` this base touches,
+/// as two integers.
+///
+/// `Σt` is the loop-invariant symbolic part of the index — the `r*C` of a row-wise `x[r*C + j]`. It
+/// is rebuilt here rather than read out of the loop body because the guard runs *before* the body,
+/// and [`plan_guards`] has already proved every value it names is defined outside the loop, is
+/// typed like the induction variable, and has a multiplier that fits that type — so it may simply
+/// be re-added.
 fn range_of(
     e: &mut Emit<'_>,
     p: &VecPlan,
     guard: BlockId,
-    g: GuardBase,
+    g: &GuardBase,
     start: ValueId,
     end: ValueId,
     cache: &mut FxHashMap<u32, ValueId>,
@@ -1700,12 +1875,21 @@ fn range_of(
         },
     };
     let off = |e: &mut Emit<'_>, at: ValueId, k: i64| -> ValueId {
-        let idx = if k == 0 {
+        let mut idx = if k == 0 {
             at
         } else {
             let c = e.int(guard, &p.iv_ty, k);
             e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, at, c))
         };
+        for &(v, mult) in &g.terms {
+            let addend = if mult == 1 {
+                v
+            } else {
+                let m = e.int(guard, &p.iv_ty, mult);
+                e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Mul, v, m))
+            };
+            idx = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, idx, addend));
+        }
         let ptr = e.push(
             guard,
             MirType::Ptr,
@@ -2045,6 +2229,10 @@ fn red_binop(k: RedKind) -> BinOp {
         RedKind::Xor => BinOp::Xor,
         RedKind::FAdd => BinOp::FAdd,
         RedKind::FMul => BinOp::FMul,
+        // Never reassociable, so it only ever reaches the serial fold, which re-emits the combine
+        // with the accumulator on the left exactly as the scalar loop had it.
+        RedKind::Sub => BinOp::Sub,
+        RedKind::FSub => BinOp::FSub,
         // `plan_body` only ever records the operators above; min/max reductions are spelled with a
         // `select` and are classified `Recurrence` by the analysis, so they never reach here.
         other => unreachable!("{} is not a binary-combine reduction", other.name()),
@@ -2230,10 +2418,33 @@ mod tests {
     /// `-O0` (the scalar loop the front end emitted) and `-O2` (the vector loop plus its epilogue)
     /// must print the same bytes and exit the same way. That is the whole correctness story of the
     /// pass, run inside the unit tests so a failure names the case rather than a corpus file.
+    ///
+    /// It also **refuses a vacuous differential**. A caller writes a `main` that exercises some
+    /// shape, but the `-O2` program it actually gets is not the one it wrote: `-O2` inlines first,
+    /// and inlining can dissolve the very property the case is about. Passing one buffer twice
+    /// (`k(w, w, ..)`) makes the two parameters the *same SSA value* after the splice, so
+    /// `loop_info::dependence` sees one object at two different indices, reports `Carried`, and
+    /// declines the loop outright — no vector code, no guard, and a comparison of two identical
+    /// scalar programs that passes no matter what this pass does. That is exactly what happened to
+    /// `two_symbolic_offsets_on_one_base_are_guarded_separately`. Asserting that *something* is
+    /// vector-typed at `-O2` is the cheap check that keeps a differential honest; a case that needs
+    /// more (which loop widened, how wide) asserts that itself.
     fn scalar_and_vector_agree(src: &str) {
         let mut outs = Vec::new();
         for level in [0u8, 2u8] {
             let (program, mut interner) = optimized(src, level);
+            if level == 2 {
+                let widened: usize = program
+                    .funcs
+                    .iter()
+                    .map(|f| f.value_types.iter().filter(|t| t.is_vector()).count())
+                    .sum();
+                assert!(
+                    widened > 0,
+                    "vacuous differential: nothing is vector-typed at -O2, so this compares two \
+                     scalar programs and proves nothing about the vectorizer"
+                );
+            }
             let main = interner.intern("main");
             let (code, bytes) = wukong_interp::run_with_output(&program, main, &interner)
                 .unwrap_or_else(|e| panic!("-O{level}: {e}"));
@@ -2321,6 +2532,144 @@ mod tests {
             }
         }
         assert!(checked > 0, "saxpy was not widened at all");
+    }
+
+    /// A temporary declared inside a **nested** body and never read after the loop is still
+    /// loop-carried: one alloca per local in the entry block, promoted by mem2reg into a block
+    /// parameter at the inner header *and* one at the outer header, because the outer header is in
+    /// the inner one's iterated dominance frontier. Those two feed each other — the outer latch
+    /// passes the inner parameter out, the inner preheader passes the outer parameter back in — so
+    /// a use *count* calls both live and `simplify-phis` removed neither. `loop_info` then
+    /// classified the inner one `Carried::Recurrence`, and this pass refused the loop for carrying
+    /// a dependence. One dead `let` in a nested body was enough.
+    ///
+    /// The indexes here are deliberately 1-D, so this case turns on the parameter cycle alone and
+    /// not on the alias guard's invariant-offset support.
+    #[test]
+    fn a_dead_temporary_in_a_nested_body_does_not_block_widening() {
+        let src = "fn k(x: []f32, mut o: []f32, r: i64, n: i64) { \
+                   let mut a: i64 = 0; \
+                   while a < r { \
+                     let mut j: i64 = 0; \
+                     while j < n { let t: f32 = x[j] * 3.0; o[j] = t + 1.0; j = j + 1; } \
+                     a = a + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            is_widened(src, "k"),
+            "a nested body with a dead temporary was not widened"
+        );
+    }
+
+    /// A 2-D row-major inner loop: `o[b + j]` for `j in 0..c` with the row base `b` computed in the
+    /// enclosing loop. Its index is `1·j + b`, an affine expression with one loop-INVARIANT term,
+    /// and the runtime alias guard could only express `1·iv + constant` — so this shape, which is
+    /// what a row softmax, a row reduction and every fused per-row loss are made of, was declined
+    /// with "the runtime alias check cannot be expressed" whatever else it did.
+    #[test]
+    fn a_two_dimensional_row_loop_is_widened() {
+        let src = "fn k(x: []f32, mut o: []f32, r: i64, c: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < r { \
+                     let b: i64 = i * c; \
+                     let mut j: i64 = 0; \
+                     while j < c { o[b + j] = x[b + j] * 2.0 + 1.0; j = j + 1; } \
+                     i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(is_widened(src, "k"), "a 2-D row loop was not widened");
+    }
+
+    /// One buffer read at two *different* invariant row offsets in one body — the LayerNorm γ/β
+    /// gather of a transformer block, `g[i] = w[ga + i]; b[i] = w[gb + i];`. Grouping the alias
+    /// guard's ranges by base alone forced those two reads into one range with no expressible
+    /// offset; they are two ranges, and both are ordinary.
+    #[test]
+    fn one_base_read_at_two_row_offsets_is_widened() {
+        let src = "fn k(w: []f32, mut g: []f32, mut b: []f32, ga: i64, gb: i64, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { g[i] = w[ga + i]; b[i] = w[gb + i]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(is_widened(src, "k"), "a two-offset gather was not widened");
+    }
+
+    /// `select(lane mask, uniform, uniform)`. A relu is the smallest spelling of it —
+    /// `fmax(x[i], 0.0)` lowers to `select(x[i] > 0, x[i], 0.0)`, whose `else` arm is a literal —
+    /// and the planner used to demand that *both* arms already be vectors, which no literal is.
+    /// The same check refused every inlined `exp`/`log`, whose range reduction is a chain of
+    /// `select(bit, table_a, table_b)` over f32 constants.
+    #[test]
+    fn a_select_with_a_uniform_arm_is_widened() {
+        let relu = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                    while i < n { o[i] = fmax(x[i], 0.0); i = i + 1; } } \
+                    fn main() -> i32 { return 0; }";
+        assert!(is_widened(relu, "k"), "relu was not widened");
+        // Both arms uniform, under a mask derived from the data: the if-converted latch parameter.
+        let step = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                    while i < n { let g: f32 = if x[i] > 0.0 { 1.5 } else { -0.5 }; \
+                      o[i] = g; i = i + 1; } } \
+                    fn main() -> i32 { return 0; }";
+        assert!(is_widened(step, "k"), "a two-constant merge was not widened");
+        scalar_and_vector_agree(
+            "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+             while i < n { let g: f32 = if x[i] > 0.0 { 1.5 } else { -0.5 }; \
+               o[i] = fmax(g, x[i]); i = i + 1; } } \
+             fn main() -> i32 { let mut a: []f32 = alloc_f32(11); let mut b: []f32 = alloc_f32(11); \
+               let mut i: i64 = 0; while i < 11 { a[i] = (i as f32) - 5.0; i = i + 1; } \
+               k(a, b, 11); i = 0; \
+               while i < 11 { print((b[i] * 2.0) as i32); i = i + 1; } \
+               free(a); free(b); return 0; }",
+        );
+    }
+
+    /// `acc = acc - x[i]` is an accumulate with a FIXED operand order, and it is how a loss is
+    /// spelled — `lr = lr - alpha*q*(1-p)^2*log p`. It is never reassociable (`((a-x)-y)` is
+    /// `a - (x+y)`, so lane-parallel partials would need a different combining operator and a
+    /// different identity), so it takes the serial fold, and the fold has to keep the accumulator
+    /// on the LEFT. Putting it on the right turns `-sum` into something unrelated, which the
+    /// `-O0` vs `-O2` comparison catches.
+    #[test]
+    fn a_subtract_accumulate_is_a_reduction() {
+        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = s - x[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(is_widened(src, "k"), "a subtract accumulate was not widened");
+        scalar_and_vector_agree(
+            "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+             while i < n { s = s - x[i] * 2.0; i = i + 1; } return s; } \
+             fn main() -> i32 { let mut a: []f32 = alloc_f32(11); let mut i: i64 = 0; \
+               while i < 11 { a[i] = (i as f32) * 0.5 + 1.0; i = i + 1; } \
+               print((k(a, 11) * 2.0) as i32); free(a); return 0; }",
+        );
+    }
+
+    /// `acc = x[i] - acc` is NOT an accumulate: it negates the whole history every iteration, so
+    /// the iterations cannot be grouped at all. It has to stay a `Carried::Recurrence`.
+    #[test]
+    fn a_reversed_subtract_is_not_a_reduction() {
+        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = x[i] - s; i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "k"),
+            "`x[i] - acc` must not widen as a reduction"
+        );
+    }
+
+    /// An inline transcendental in the body. `exp` expands to a bit-trick range reduction — a
+    /// `bitcast` to the integer lane type, integer `and`/`sub`/`mul`, `cmp` and a `select` table
+    /// over f32 literals, then a `bitcast` back — and every one of those has to widen for the loop
+    /// to widen at all. This is the shape a custom loss is made of, and it is checked here
+    /// structurally (an integer-lane vector must appear, which only the bit trick produces).
+    #[test]
+    fn an_inline_transcendental_body_is_widened() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = exp(x[i]); i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(!vs.is_empty(), "an exp loop was not widened");
+        assert!(
+            vs.iter().any(|(l, n)| *l == MirType::I32 && *n == 4),
+            "the exp bit trick did not widen: {vs:?}"
+        );
     }
 
     /// `f32 -> i32` widens (Cranelift lowers `fcvt_to_sint_sat.i32x4`); `f64 -> i64` must not,
@@ -2631,6 +2980,239 @@ mod tests {
             is_widened(alone, "k"),
             "the loop is widened; the guard is what rejects, at runtime"
         );
+        scalar_and_vector_agree(src);
+    }
+
+    // ---- symbolic row offsets in the alias guard ---------------------------------------------
+
+    /// The inner loop of a row-wise 2-D access. `r*c` is a *value*, not a constant, so the range
+    /// this loop touches on `x` is `[x + r*c, x + r*c + c)` — and a guard that could only express
+    /// a constant offset had to decline the whole shape. That is the single most common inner loop
+    /// in the corpus (every `for j in 0..C { .. a[i*C + j] .. }`), so declining it declined most of
+    /// the ML code this pass exists for.
+    #[test]
+    fn an_inner_loop_over_a_row_is_widened() {
+        let src = "fn k(x: []f32, mut o: []f32, r: i64, c: i64) { \
+                   let b: i64 = r * c; \
+                   for j in 0..c { o[b + j] = x[b + j] * 2.0 + 1.0; } } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(!vs.is_empty(), "a row-wise inner loop was not widened");
+        assert!(vs.iter().all(|(l, n)| *l == MirType::F32 && *n == 4), "{vs:?}");
+    }
+
+    /// …and the guard it gets is a real one: passing the same buffer for `x` and `o` at *different*
+    /// rows still has to compute the scalar answer. Every lane is printed, so a partially-correct
+    /// buffer cannot pass.
+    #[test]
+    fn a_row_wise_loop_aliasing_itself_computes_the_scalar_answer() {
+        let src = "fn k(x: []f32, mut o: []f32, r: i64, c: i64) { \
+                   let b: i64 = r * c; \
+                   for j in 0..c { o[b + j] = x[b + j] * 2.0 + 1.0; } } \
+                   fn main() -> i32 { \
+                     let mut x: []f32 = alloc_f32(24); \
+                     for i in 0..24 { x[i] = (i as f32) * 0.5; } \
+                     k(x, x, 1, 11); \
+                     for i in 0..24 { print((x[i] * 10.0) as i32); } \
+                     free(x); return 0; }";
+        scalar_and_vector_agree(src);
+    }
+
+    /// A base read at two different *constant* offsets keeps working. This is the shape the guard
+    /// already handled (`lo`/`hi` bound the window), and the symbolic generalization must not
+    /// disturb it.
+    #[test]
+    fn two_constant_offsets_on_one_base_are_still_guardable() {
+        let src = "fn k(w: []f32, mut g: []f32, mut b: []f32, d: i64) { \
+                   for i in 0..d { g[i] = w[64 + i]; b[i] = w[128 + i]; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(is_widened(src, "k"), "the two-constant-offset copy was not widened");
+    }
+
+    /// Two READS on one base at offsets that differ *symbolically* are two separate ranges, not one
+    /// unexpressible one — this is the LayerNorm γ/β gather, `g[i] = w[ga + i]; b[i] = w[gb + i];`.
+    /// `lo`/`hi` bound the constant part only, so the two windows genuinely are not one range;
+    /// the answer is to make the grouping key `(base, invariant part)` rather than `base`, which
+    /// gives each read its own plain `[lo, hi)` and pairs each of them against the two stores.
+    ///
+    /// Splitting one base is only sound because the two groups can only ever both be *loads*: a
+    /// same-object pair whose index expressions differ, where one writes, is reported
+    /// `MemDep::Carried` by `loop_info::dependence` and never reaches `plan_guards` — and
+    /// `plan_guards` re-checks it locally anyway. So this widens, and the two proofs that it may
+    /// are below: the guard is built, and it still computes the scalar answer when the caller
+    /// aliases the read base with an output at an overlapping offset.
+    ///
+    /// (An earlier version of this test asserted the *refusal*, which was this pass's behaviour
+    /// before the grouping key changed. Refusing is safe but is a missed optimization, not a
+    /// correctness requirement, so the assertion was inverted and backed with a differential run
+    /// rather than deleted.)
+    ///
+    /// WRITING THE DIFFERENTIAL IS THE HARD PART, and the first attempt was **vacuous**: it called
+    /// `k(w, w, b, 3, 9, 13)`, and at `-O2` inlining runs first, so the two parameters became one
+    /// SSA value, `dependence` reported `Carried` for one object at two indices, the loop was
+    /// declined, and the run compared two identical scalar programs. `WUKONG_VEC_TRACE=1` on that
+    /// source prints no `WIDEN` at all. Three things are therefore needed at once:
+    ///
+    /// * the two pointers must be **distinct SSA values that alias at run time** — hence `pick`,
+    ///   whose selector comes out of the heap so nothing can fold it;
+    /// * the offsets must stay **symbolic** past inlining — hence reading `p`/`q`/`t` out of the
+    ///   buffer too, since inlined integer literals fold into one group's constant window and turn
+    ///   the case back into `two_constant_offsets_on_one_base_are_still_guardable`;
+    /// * the store offset `t` must be **ahead of** the read offset `p`, so that overlap actually
+    ///   changes the answer. `g[i] = w[p+i]` with `g == w` and `p > 0` reads ahead of the write and
+    ///   the scalar and vector answers coincide, which would make the run undiscriminating.
+    ///
+    /// The full lane-by-lane version, with hand-derived expectations and both the overlapping and
+    /// the disjoint call, is `tests/run/vectorized_split_base_guard.wk`.
+    #[test]
+    fn two_symbolic_offsets_on_one_base_are_guarded_separately() {
+        let src = "fn k(w: []f32, mut g: []f32, mut b: []f32, p: i64, q: i64, d: i64) { \
+                   for i in 0..d { g[i] = w[p + i]; b[i] = w[q + i]; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            is_widened(src, "k"),
+            "two symbolic read offsets on one base are two ranges and must still be guardable"
+        );
+        // `w` read at two symbolic offsets, written at a third through an alias the optimizer
+        // cannot see through. `t = 2`, `p = 0`, `d = 13`: the write window [w+2, w+15) overlaps the
+        // read window [w+0, w+13) — and so do the two the guard actually tests, which cover the
+        // vector part only, [w+2, w+14) and [w+0, w+12). So the guard must fail and the scalar loop
+        // must do the work —
+        // and because the write is AHEAD of the read, the answer it produces (0,1,0,1,… propagated
+        // two apart) is one the vector loop cannot produce. Every lane is printed.
+        let diff = "fn k(w: []f32, mut g: []f32, mut b: []f32, p: i64, q: i64, t: i64, d: i64) { \
+                    for i in 0..d { g[t + i] = w[p + i]; b[i] = w[q + i]; } } \
+                    fn pick(x: []f32, y: []f32, s: i64) -> []f32 { \
+                      if s > 0 { return x; } return y; } \
+                    fn fill(mut a: []f32, n: i64) { for i in 0..n { a[i] = (i as f32); } } \
+                    fn main() -> i32 { \
+                      let mut w: []f32 = alloc_f32(64); \
+                      let mut z: []f32 = alloc_f32(64); \
+                      let mut b: []f32 = alloc_f32(64); \
+                      fill(w, 64); fill(z, 64); fill(b, 64); \
+                      let s: i64 = w[1] as i64; \
+                      let p: i64 = w[0] as i64; \
+                      let q: i64 = w[40] as i64; \
+                      let t: i64 = w[2] as i64; \
+                      let d: i64 = w[13] as i64; \
+                      let mut g: []f32 = pick(w, z, s); \
+                      k(w, g, b, p, q, t, d); \
+                      for i in 0..64 { print(w[i] as i32); } \
+                      for i in 0..64 { print(b[i] as i32); } \
+                      free(w); free(z); free(b); return 0; }";
+        // `k` is inlined, so the widened loop lives in `main`. Two vector LOADS is the gather's own
+        // signature: the three `fill` loops use their induction variable as a value and are
+        // declined, and the two print loops contain a call, so nothing else in `main` can widen.
+        let (program, mut interner) = optimized(diff, 2);
+        let main_sym = interner.intern("main");
+        let m = program.function(main_sym).expect("no fn main");
+        let vec_loads = m
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(&i.op, Op::Load(_, t) if t.is_vector()))
+            .count();
+        assert_eq!(
+            vec_loads, 2,
+            "the two-symbolic-offset gather did not widen inside the inlined `main`"
+        );
+        scalar_and_vector_agree(diff);
+    }
+
+    /// The case that is genuinely refused: a base *written* at one symbolic offset and touched at
+    /// another. `lo`/`hi` say nothing about the distance between two different symbolic offsets, so
+    /// the two windows cannot be collapsed and a store makes them a real dependence. (`loop_info`
+    /// already declines this one step earlier, with "two accesses to one object at a non-zero
+    /// distance"; this pins the outcome, whichever stage produces it.)
+    #[test]
+    fn one_base_written_at_two_symbolic_offsets_is_refused() {
+        let src = "fn k(mut w: []f32, x: []f32, p: i64, q: i64, d: i64) { \
+                   for i in 0..d { w[p + i] = x[i]; w[q + i] = x[i] * 2.0; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "k"),
+            "a store at one symbolic offset and a store at another must not be widened"
+        );
+    }
+
+    /// Two row-wise loops side by side both widen. A single symbolic-offset loop proves the guard
+    /// can be *built*; two prove that building one does not disturb the other's.
+    #[test]
+    fn two_row_wise_loops_are_both_widened() {
+        let src = "fn k(x: []f32, mut o: []f32, mut p: []f32, r: i64, c: i64) { \
+                   let b: i64 = r * c; \
+                   for j in 0..c { o[b + j] = x[b + j] * 2.0 + 1.0; } \
+                   for j in 0..c { p[b + j] = x[b + j] * 3.0 + 1.0; } } \
+                   fn main() -> i32 { return 0; }";
+        let (program, mut interner) = optimized(src, 2);
+        let sym = interner.intern("k");
+        let f = program.function(sym).expect("no fn k");
+        let vec_loads = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(&i.op, Op::Load(_, t) if t.is_vector()))
+            .count();
+        assert_eq!(vec_loads, 2, "both loops must be widened, one vector load each");
+    }
+
+    // ---- a lane mask selecting between uniform arms -------------------------------------------
+
+    /// `select(mask, a, b)` with both arms loop-invariant is still lane-varying, and `widen_op`
+    /// splats them exactly as it does a `Bin` operand. Requiring both arms to be vectors declined
+    /// every table-driven transcendental the front end inlines — `exp` picks its 2^k coefficients
+    /// with a chain of exactly such selects, so one of them made the whole loop unwidenable.
+    ///
+    /// The assertion is on the *shape*, not just on "something was widened": the widened body must
+    /// contain a vector `Select` whose arms are `Splat`s, which is the case that used to be
+    /// refused.
+    #[test]
+    fn a_lane_mask_selects_between_two_splatted_uniform_arms() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
+                   for i in 0..n { o[i] = exp(x[i] * 0.25); } } \
+                   fn main() -> i32 { return 0; }";
+        let (program, mut interner) = optimized(src, 2);
+        let sym = interner.intern("k");
+        let f = program.function(sym).expect("no fn k");
+        let splats: FxHashSet<u32> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i.op, Op::Splat(_)))
+            .filter_map(|i| i.result.map(|r| r.0))
+            .collect();
+        let uniform_armed = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| i.result.is_some_and(|r| f.value_type(r).is_vector()))
+            .any(|i| match &i.op {
+                Op::Select(_, a, b) => splats.contains(&a.0) && splats.contains(&b.0),
+                _ => false,
+            });
+        assert!(
+            uniform_armed,
+            "no vector select over two splatted uniforms: the exp table was not widened"
+        );
+    }
+
+    /// The transcendental case end to end: `exp` inlines to a masked coefficient table, a bitcast
+    /// and integer arithmetic, and every lane must equal what the scalar loop produced.
+    #[test]
+    fn an_inlined_exp_loop_widens_and_agrees_with_the_scalar_loop() {
+        let alone = "fn k(x: []f32, mut o: []f32, n: i64) { \
+                     for i in 0..n { o[i] = exp(x[i] * 0.25); } } \
+                     fn main() -> i32 { return 0; }";
+        assert!(is_widened(alone, "k"), "an inlined exp loop was not widened");
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
+                   for i in 0..n { o[i] = exp(x[i] * 0.25); } } \
+                   fn main() -> i32 { \
+                     let mut x: []f32 = alloc_f32(23); \
+                     let mut o: []f32 = alloc_f32(23); \
+                     for i in 0..23 { x[i] = (i as f32) - 11.0; } \
+                     k(x, o, 23); \
+                     for i in 0..23 { print((o[i] * 1000.0) as i32); } \
+                     free(x); free(o); return 0; }";
         scalar_and_vector_agree(src);
     }
 }

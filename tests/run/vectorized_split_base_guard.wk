@@ -1,0 +1,218 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+module tests.run.vectorized_split_base_guard
+
+// The runtime alias guard `wukong_opt::vectorize` emits when ONE base is read at TWO different
+// SYMBOLIC offsets — `g[t+i] = w[p+i]; b[i] = w[q+i];`. That is the LayerNorm gamma/beta gather of a
+// transformer block, and it is the one place two merged optimizer branches asserted OPPOSITE things:
+// one grouped guarded ranges by `base` and refused the shape outright, the other groups them by
+// `(base, invariant part)` and guards each window separately. This fixture is the evidence that the
+// second is right, on a real program through the real pipeline.
+//
+// WHY THIS IS A REAL DIFFERENTIAL. `vectorize` runs only at `-O2`, so `-O0` output IS the unwidened
+// scalar answer and `optimization_is_observationally_invariant` is a genuine two-sided comparison for
+// this pass (unlike a `mir_build` recognizer, which fires at every level and is gate-blind). The
+// EXPECT-OUT lines below are the third side: they are derived BY HAND from the scalar semantics of
+// the loop, never recorded from compiler output, so an answer both levels agree on but that is wrong
+// still fails.
+//
+// WHAT MAKES THE SHAPE HARD TO EXERCISE — every one of these was needed, and dropping any one makes
+// the test vacuous rather than failing:
+//
+//  1. `-O2` INLINES FIRST. Handing the same slice to two parameters (`gather2(w, w, ..)`) makes them
+//     the SAME SSA value after the splice, `loop_info::dependence` then sees one object at two
+//     different indices, reports `Carried`, and the loop is declined with no vector code at all.
+//     `pick` keeps the two pointers distinct SSA values that are the same POINTER at run time, which
+//     is the only thing the runtime guard can be asked about.
+//  2. THE OFFSETS MUST STAY SYMBOLIC. An inlined integer literal folds into a group's constant
+//     `[lo, hi]` window, which merges the two reads back into one group and tests the *constant*
+//     path instead. `p`, `q`, `t`, `d` and `pick`'s selector are therefore read out of the heap
+//     buffer, which nothing in the optimizer folds.
+//  3. THE WRITE MUST BE AHEAD OF THE READ. With `g[i] = w[p+i]` and `p > 0` each iteration reads an
+//     element no earlier iteration has written, so the scalar and the (illegal) vector answers
+//     coincide and the run proves nothing. `g[t+i] = w[p+i]` with `t > p` is the propagating
+//     `a[i+2] = a[i]` copy, whose scalar answer no 4-lane vector loop can produce.
+//
+// HOW TO RE-CHECK BY HAND (the loop is widened, and the guard is what stops it):
+//     WUKONG_VEC_TRACE=1 wukongc --emit=mir -O2 tests/run/vectorized_split_base_guard.wk
+//         -> vectorize: WIDEN bb.. w=4 lin=12 guards=5 reds=0     (twice, one per call site)
+//     wukongc --emit=mir -O2 tests/run/vectorized_split_base_guard.wk | grep '<4 x f32>'
+// The five guarded pairs are (w@p, g@t), (w@p, b), (g@t, w@q), (g@t, b), (w@q, b). The sixth pair,
+// (w@p, w@q), is READ/READ on one object and is deliberately NOT guarded — that omission is the
+// whole content of the `(base, invariant part)` split, and the second call below is where the two
+// read windows genuinely do overlap each other while the guard still (correctly) lets the vector
+// loop run.
+//
+// VALUES. `w[i] = i` and `b[i] = i` exactly (all integers below 2^24, exact in f32), printed back as
+// `i32`, so every expectation is an exact integer and no rounding question arises.
+
+fn gather2(w: []f32, mut g: []f32, mut b: []f32, p: i64, q: i64, t: i64, d: i64) {
+    for i in 0..d {
+        g[t + i] = w[p + i];
+        b[i] = w[q + i];
+    }
+}
+
+// Returns `x` or `y` depending on a value the optimizer cannot fold, so the caller gets a pointer it
+// cannot prove equal to either — and which is in fact equal to `x`.
+fn pick(x: []f32, y: []f32, s: i64) -> []f32 {
+    if s > 0 {
+        return x;
+    }
+    return y;
+}
+
+fn fill(mut a: []f32, n: i64) {
+    for i in 0..n {
+        a[i] = (i as f32);
+    }
+}
+
+fn main() -> i32 {
+    let mut w: []f32 = alloc_f32(24i64);
+    let mut z: []f32 = alloc_f32(24i64);
+    let mut b: []f32 = alloc_f32(24i64);
+    fill(w, 24i64);
+    fill(z, 24i64);
+    fill(b, 24i64);
+
+    // Read every parameter out of the (still pristine) buffer so none of them is a constant.
+    let s: i64 = w[1] as i64;    // 1  -> `pick` returns `w`: `g` ALIASES `w`
+    let p0: i64 = w[0] as i64;   // 0
+    let q: i64 = w[14] as i64;   // 14
+    let t0: i64 = w[2] as i64;   // 2
+    let d: i64 = w[9] as i64;    // 9  = two 4-lane groups + a 1-element scalar tail
+    let p1: i64 = w[10] as i64;  // 10
+    let t1: i64 = w[0] as i64;   // 0
+    let g: []f32 = pick(w, z, s);
+
+    // ---- call 1: the windows OVERLAP, so the guard must reject and the scalar loop must run ----
+    // writes w[2 .. 11), reads w[0 .. 9) and w[14 .. 23).  w[2+i] = w[i] propagates w[0], w[1]:
+    //   i=0: w[2]=w[0]=0   i=1: w[3]=w[1]=1   i=2: w[4]=w[2]=0 (already rewritten)  ...
+    // so w[0..11) = 0,1,0,1,0,1,0,1,0,1,0 and w[11..24) is untouched.
+    // A 4-lane vector loop reads four ORIGINAL elements at a time and would print
+    // 0,1,0,1,2,3,2,3,6,7,6 instead — which is what this fixture fails with if the guard is dropped.
+    gather2(w, g, b, p0, q, t0, d);
+    for i in 0..24i64 {
+        print(w[i] as i32);
+    }
+    // b[i] = w[14+i] for i in 0..9, read from the untouched tail: 14..22, then b's own fill 9..23.
+    for i in 0..24i64 {
+        print(b[i] as i32);
+    }
+
+    // ---- call 2: the windows are DISJOINT even though `g` still aliases `w` ----
+    // writes w[0 .. 9), reads w[10 .. 19) and w[14 .. 23). The two READ windows overlap each other,
+    // which is exactly the pair the split leaves unguarded, and the guard correctly lets the vector
+    // loop run. Every read is of an element no store touches, so the answer is the plain copy.
+    fill(w, 24i64);
+    fill(b, 24i64);
+    gather2(w, g, b, p1, q, t1, d);
+    for i in 0..24i64 {
+        print(w[i] as i32);   // 10..18, then 9..23
+    }
+    for i in 0..24i64 {
+        print(b[i] as i32);   // 14..22, then 9..23
+    }
+
+    free(w);
+    free(z);
+    free(b);
+    return 0;
+}

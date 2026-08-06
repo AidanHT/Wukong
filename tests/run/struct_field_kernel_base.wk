@@ -1,0 +1,103 @@
+// RUN: --run
+// A recognized kernel whose buffer operand lives in a STRUCT FIELD must resolve its base pointer
+// through the same path a bare local takes — and a `[]T` field must yield its DATA pointer, not the
+// address of its 16-byte fat pointer.
+//
+// Before `buffer_base`, every recognizer read its operand base with `single_path`, which sees only a
+// bare identifier. A weight reached as `l.w[j*K+p]` — how every real model groups its parameters —
+// was an `ExprKind::Field`, so the whole nest declined: the structure-tax transformer block written
+// with its weights in a struct dispatched 7 kernels where the identical block over bare params
+// dispatched 16, on both backends at every -O level.
+//
+// Recognized kernels are GATE-BLIND (they fire identically on interp and native at every -O), so no
+// differential or opt-invariance gate can see either the decline or a wrong base pointer. Only a
+// fixture that prints EVERY lane can. The expected values below are computed BY HAND from the SCALAR
+// semantics of the loops, never recorded from compiler output.
+//
+// Part A — fused-bias NT projection (`wukong_sgemm_nt_epi`), weight AND bias both `[]f32` STRUCT
+// FIELDS, over a struct PARAMETER:
+//   x = [[1,2,3],[4,5,6]]            (x[i] = i+1, M=2, K=3)
+//   w = [[1,2,3],[4,5,6],[7,8,9],[10,11,12]]   (w[i] = i+1, N=4, K=3)
+//   b = [1,2,3,4]                    (b[j] = j+1)
+//   y[i][j] = b[j] + sum_p x[i][p]*w[j][p]
+//   row 0: 1+ (1+4+9)=14      -> 15 | 2+ (4+10+18)=32   -> 34
+//          3+ (7+16+27)=50    -> 53 | 4+ (10+22+36)=68  -> 72
+//   row 1: 1+ (4+10+18)=32    -> 33 | 2+ (16+25+36)=77  -> 79
+//          3+ (28+40+54)=122  -> 125| 4+ (40+55+72)=167 -> 171
+//
+// Part B — batched affine RMSNorm (`wukong_norm_affine_f32`), gamma a FIXED-ARRAY `[f32; 4]` struct
+// field (whose slot IS its storage — no fat-pointer load) over a struct LOCAL:
+//   z = [[2,2,2,2],[4,0,0,0]], g = [1,2,3,4]
+//   both rows: sum of squares = 16, /4 = 4, inv = rsqrt(4 + 0.00001) = 0.4999993750…
+//   row 0: z[i] = 2*inv*g[i]  = 0.99999875, 1.9999975, 2.99999625, 3.999995
+//   row 1: z[0] = 4*inv*g[0]  = 1.9999975 ; z[1..3] = 0*inv*g[i] = 0
+//   printed as round(z*1000) as i32 -> 1000 2000 3000 4000 / 2000 0 0 0
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 15
+// EXPECT-OUT: 34
+// EXPECT-OUT: 53
+// EXPECT-OUT: 72
+// EXPECT-OUT: 33
+// EXPECT-OUT: 79
+// EXPECT-OUT: 125
+// EXPECT-OUT: 171
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+module tests.run.struct_field_kernel_base
+
+struct Layer {
+    w: []f32,    // [N=4, K=3] weight, NT layout — a SLICE field (fat pointer inside the struct)
+    b: []f32,    // [N=4] per-column bias — a SLICE field
+    g: [f32; 4], // per-column RMSNorm gamma — a FIXED-ARRAY field (its address IS its storage)
+}
+
+// The struct arrives as a PARAMETER here: `lower_fn`'s parameter binding is what has to record the
+// field bases. The nest is exactly the one a bare-local spelling dispatches.
+fn project(l: Layer, x: [f32; 6], mut y: [f32; 8]) {
+    for i in 0..2 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for p in 0..3 { s = s + x[i*3+p] * l.w[j*3+p]; }
+            y[i*4+j] = l.b[j] + s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut w: [f32; 12] = [0.0; 12];
+    for i in 0..12 { w[i] = (i as f32) + 1.0; }
+    let mut b: [f32; 4] = [0.0; 4];
+    for i in 0..4 { b[i] = (i as f32) + 1.0; }
+    let mut x: [f32; 6] = [0.0; 6];
+    for i in 0..6 { x[i] = (i as f32) + 1.0; }
+
+    let sw: []f32 = w;
+    let sb: []f32 = b;
+    let mut g: [f32; 4] = [0.0; 4];
+    for i in 0..4 { g[i] = (i as f32) + 1.0; }
+    // The struct LOCAL: `StmtKind::Let`'s binding is the second site that must record field bases.
+    let l: Layer = Layer { w: sw, b: sb, g: g };
+
+    let mut y: [f32; 8] = [0.0; 8];
+    project(l, x, y);
+    // Every lane, never a reduction — a partially-correct buffer passes a sum.
+    for i in 0..8 { print(y[i]); }
+
+    let mut z: [f32; 8] = [0.0; 8];
+    z[0]=2.0; z[1]=2.0; z[2]=2.0; z[3]=2.0;
+    z[4]=4.0; z[5]=0.0; z[6]=0.0; z[7]=0.0;
+    for r in 0..2 {
+        let mut s: f32 = 0.0;
+        for i in 0..4 { s = s + z[r*4+i] * z[r*4+i]; }
+        let inv: f32 = rsqrt(s / 4.0 + 0.00001);
+        for i in 0..4 { z[r*4+i] = z[r*4+i] * inv * l.g[i]; }
+    }
+    for i in 0..8 { print(round(z[i] * 1000.0) as i32); }
+    return 0;
+}
