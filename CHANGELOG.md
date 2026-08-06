@@ -5,6 +5,37 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Loop vectorizer: a lane ramp for a counter read as a value
+- **`wukong_opt::vectorize` no longer declines a loop whose body reads its induction variable as a
+  *value*.** It used to say `the induction variable is used for something other than addressing` and
+  leave the loop scalar, which is not an exotic shape — it is what a classification loss is
+  (`if c == target { qt } else { qo }`). The decline was correct rather than merely conservative: the
+  counter is uniform across a group only as a `gep` index, and splatting it writes the group's FIRST
+  counter into all `W` lanes, a silent wrong answer on both backends.
+  The widened body now reads it through the **lane ramp** `splat(i) + iota`, so lane `k` sees the
+  counter scalar iteration `i + k` had, and an integer compare against it becomes a per-lane **mask**
+  the existing `select` path blends. Over `tests/run` + `examples`, `--emit=mir -O2` goes from 531 to
+  619 `WIDEN` decisions and that decline drops from 221 (file, loop) pairs to 64.
+  Deliberately narrow: only the counter itself gets a ramp (a derived `i + 1` or `sext i` read as a
+  value is still declined), the ramp's lane count must equal the group width the loop's data runs at
+  (an `i64` counter over `f32` data is declined), a store's pointer stays an address while its value
+  may be the ramp (`o[i] = i` widens), and the two `select`s if-conversion synthesizes keep their
+  flat rejection.
+- **New MIR op `Op::Iota(MirType)`** — the lane-index ramp `<0, 1, .., n-1>`, no operands, pure and
+  constant. It exists because no expression over splatted scalars is lane-varying, so a non-uniform
+  vector needs one non-uniform source and MIR had none. The interpreter materializes the lanes, the
+  Cranelift backend emits one `vconst`, the textual-LLVM emitter writes the vector literal, and the
+  GPU MIR→PTX path declines it as `UNSUPPORTED` exactly as it already declines `Splat`/`ExtractLane`.
+  LICM hoists it to the preheader and CSE numbers it by type, so it costs nothing per iteration.
+- **`WUKONG_NO_IV_RAMP=1`** restores the old decline, so the "what did the ramp buy" A/B is
+  same-binary and same-run (the reason `WUKONG_NO_VECTORIZE` exists). It is strictly a narrowing
+  switch: every loop it turns off is one the pass declined before the ramp existed.
+- **New gate** `tests/run/vectorized_iv_as_value.wk` prints every lane of six kernels — one-hot
+  select with the target in the first group, the last full group, the scalar epilogue and nowhere;
+  `sitofp` of the ramp; `o[i] = i`; a lane mask in front of a float reduction; a counter starting at
+  3; and the same one-hot at `<2 x f64>`/`i64` lanes — with expected values derived by hand from the
+  scalar semantics.
+
 ### Benchmark honesty — three defects an adversarial verifier found and proved
 No compiler behaviour changes; all three are in `wukong_xbench` (plus the measurement docs). Two of
 them make Wukong look **worse**, which is the point.
