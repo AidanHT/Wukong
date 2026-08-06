@@ -51,16 +51,22 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   and have been removed from this list. See the [peer-strength
   correction](BENCHMARKS.md#-peer-strength-correction--2026-08-04).)*;
 - **wins the transcendental/activation family ~4.7–11.5× vs C** (**~28× under `@parallel`**) — the
-  cleanest compute-bound win — and has now **caught Intel oneMKL VML**, the hand-tuned vector-math
-  SOTA: same-run, one process, ABBA-interleaved, best-of-30, MKL at one thread, three rounds across
-  both of this laptop's power states — **tanh 4.08–4.66× faster** and **log 1.17–1.46× faster** at
-  every size, and **exp 1.08–1.25× faster at 2¹²/2²⁰, a tie at 2¹⁶, ≈2× at 2²³** (where Wukong's
-  non-temporal store regime also engages). exp is quoted as a tie where it measures as one.
-  The exp/log gap this replaces (1.20–1.49× and 1.05–1.28× *slower*) had been recorded as
-  algorithmic; it was actually the dispatch calling its 8-lane kernel through a function pointer,
-  which without crate-wide AVX means the `__m256` crosses the call through memory. Inlining it is
-  worth 1.12–1.75× and is **bit-identical on all 2³² f32** — accuracy stays exp ≤2 ULP (1.625e-7
-  rel) and log ≤12 ULP (6.924e-7 rel), both re-verified exhaustively rather than sampled. Wukong
+  cleanest compute-bound win. Against **Intel oneMKL VML**, the hand-tuned vector-math SOTA, the
+  honest standing is narrower than this file claimed on 2026-08-06 and the "caught VML" line is
+  **retracted**: at *matched accuracy* (VML's `VML_LA` mode, which measures 2 ULP for exp and 4 ULP
+  for log on the timed band — exactly where Wukong measures 2 and 4) **exp and log are a tie**, exp
+  reading 1.09–1.20× *slower* and log between 1.09× slower and 1.07× faster at n = 2¹⁶ and 2²⁰,
+  over five same-run best-of-40 ABBA rounds. Only at n = 2²³, where Wukong's non-temporal store
+  regime engages, does either clear this machine's ~1.4× noise floor. **tanh is the real win at
+  2.85–3.24× vs VML's fastest mode** — with the disclosure that Wukong's tanh is 44 ULP against
+  VML's ≤1 ULP, so it trades accuracy for speed. Comparisons against VML's *default* HA mode
+  (~0.5 ULP) flatter Wukong and are not quoted as wins.
+  What **is** solid is the same-binary engineering: the exp/log gap once recorded as algorithmic was
+  the dispatch calling its 8-lane kernel through a function pointer, which without crate-wide AVX
+  means the `__m256` crosses the call through memory. Inlining it is worth **1.20–1.78×** with a
+  `WUKONG_VMATH_FNPTR=1` kill-switch and is **bit-identical on all 2³² f32** — accuracy stays exp
+  ≤2 ULP (1.625e-7 rel) and log ≤12 ULP (6.924e-7 rel), both re-verified exhaustively rather than
+  sampled. Wukong
   dispatches a pure
   `out[i]=f(x[i])` loop for **35** functions
   (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/`silu`/

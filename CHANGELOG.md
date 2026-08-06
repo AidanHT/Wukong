@@ -102,19 +102,17 @@ and was reverted); none of them could see it, because none of them was in the lo
   ±0, ±∞, subnormals and the negative-garbage bands included. The two per-kernel gates
   (`vmath{,2}_monomorphized_dispatch_matches_the_function_pointer_path`) cover every declared op code
   at every length class and in both store regimes.
-- **Measured** (`vmath_exp_log_vs_vml`, all arms in one process, ABBA-interleaved, best-of-30 minima,
-  MKL pinned to 1 thread, n = 2¹²…2²³, in **both** of this laptop's power states — battery at 32–35%
-  and AC at 14%): the internal monomorphized-vs-function-pointer ratio — power-independent, same
-  code, same bits — is **1.12–1.75× faster** (typically ~1.4×; the 1.12 is exp at 2²³, where the pass
-  is memory-bound). Against VML: log goes from 1.05–1.28× slower to **1.17–1.46× faster** at every
-  size and tanh from 2.56–3.20× to **4.08–4.66×**. exp is the honest one — it goes from 1.20–1.49×
-  slower to **1.08–1.25× faster at 2¹² and 2²⁰, a TIE at 2¹⁶** (four readings spanning 1.008× slower
-  to 1.053× faster; quoted as parity, not a win) and **1.97–2.13× at 2²³**, where the non-temporal
-  store regime also engages. What is unambiguous at every exp size is the delta from the old
-  spelling, measured in the same process. A fourth arm times the real
-  exported `wukong_vmath_f32` and tracks whichever spelling is selected, so the twins are not
-  flattering models. The two-input kernel measures **1.09–1.48×** (`vmath2_mono_vs_fnptr`, internal
-  A/B only — VML has no `silu'`/`gelu'`/SwiGLU-gate entry to peer against).
+- **Measured** (`vmath_exp_log_vs_vml`, all arms in one process, ABBA-interleaved, best-of-30 and
+  best-of-40 minima over three rounds, MKL pinned to 1 thread, n = 2¹²…2²³, in **both** of this
+  laptop's power states — battery at 32–35%, AC at 14% and AC at 28%): the internal
+  monomorphized-vs-function-pointer ratio — power-independent, same code, same bits — is
+  **1.12–1.75× faster** (typically ~1.4×; the 1.12 is exp at 2²³, where the pass is memory-bound).
+  A fourth arm times the real exported `wukong_vmath_f32` and tracks whichever spelling is selected,
+  so the twins are not flattering models. The two-input kernel measures **1.09–1.48×**
+  (`vmath2_mono_vs_fnptr`, internal A/B only — VML has no `silu'`/`gelu'`/SwiGLU-gate entry to peer
+  against). The vs-VML figures first published here — log 1.17–1.46× faster, exp 1.08–1.25× faster
+  at 2¹²/2²⁰ — **are retracted by the entry below**, which was measured the same day against an
+  accuracy-matched peer.
 - **Accuracy re-swept exhaustively**, not sampled: exp max 1.625e-7 relative / ≤2 ULP over all
   2,237,579,431 f32 in [−87, 88.376]; log max 6.924e-7 / ≤12 ULP over all 2,130,706,432 positive
   normal f32 (12 ULP and 6.9e-7 are the same figure — the peak sits at x ≈ 1.0157 where ln x ≈ 0.0156).
@@ -126,6 +124,47 @@ and was reverted); none of them could see it, because none of them was in the lo
   byte-identical — this is a runtime-library change with no compile-time surface. **Not** changed:
   the bf16/f16-input dispatchers still go through the function-pointer table; they are bandwidth-bound
   and 36 more monomorphizations each is a code-size trade that was not measured.
+
+### Benchmark honesty — the vmath "faster than VML" headline is retracted; at matched accuracy it is a tie (2026-08-06)
+No kernel changed and no accuracy bar moved. The entry above kept its engineering and lost its
+headline: the ratios it published were measured against **oneMKL VML in its default HA mode**, which
+runs at ~0.5 ULP, while Wukong ships a ≤2 ULP exp and a ≤12 ULP log. A faster-but-less-accurate
+kernel is not straightforwardly faster, that mismatch existed only in a source comment, and it is
+what turned this row from a loss into a win.
+- **The probe now runs an accuracy-matched peer.** `vmath_exp_log_vs_vml` resolves `vmlSetMode` /
+  `vmlGetMode` out of `mkl_rt` and times VML in **LA** and **EP** as well as HA, preserving the mode
+  word's non-accuracy bits so the arms differ in accuracy alone, checking the readback so a mode that
+  did not take cannot be printed under its label, and measuring **every arm's max relative error and
+  max ULP against a f64 reference on the very data it timed**. On the timed band VML-LA measures 2
+  ULP for exp and 4 ULP for log — exactly where Wukong measures 2 and 4. The mode word this box loads
+  at, `0x1a02` = `VML_ERRMODE_DEFAULT | VML_HA`, independently confirms the accuracy constants.
+- **Against that matched peer, exp and log are a TIE.** Five same-run best-of-40 ABBA rounds in one
+  process, AC+charging 68–76%, nothing else running: exp **1.09–1.20× slower** at 2¹⁶ and 2²⁰, log
+  between **1.09× slower and 1.07× faster**. Only at n = 2²³ does either clear the floor (exp
+  1.37–1.54×, log 1.48–1.66×), and that is Wukong's non-temporal store regime, not its core.
+  **RETRACTED**: "exp 1.08–1.25× faster at 2¹²/2²⁰" and "log 1.17–1.46× faster at every size".
+- **tanh keeps its win and gains a disclosure**: **2.85–3.24× vs VML's fastest mode** (3.93–4.91× vs
+  HA), well clear of any noise floor — but Wukong's tanh measures **44 ULP / 3.5e-6 relative against
+  VML's ≤1 ULP in every mode**, so it buys speed with accuracy.
+- **The n = 2¹² row is withdrawn as an artefact of the clock.** The probe now *measures* the smallest
+  non-zero interval `Instant` can report (100 ns here) and prints `TIMER-QUANTIZED` when the fastest
+  arm is under 100 ticks. At 16 KiB/array every arm's best-of-40 minimum is 0.5–1.4 µs — 5 to 14
+  ticks — which is why that row's ratios came out as exact small fractions (1.000, 8/7, 3/2, 8/5).
+- **Two control columns whose true ratio is exactly 1.000** now print every run: the shipped entry
+  against the `mono` twin it dispatches to, and VML-HA against a second, identical VML-HA arm. They
+  read 1.06–1.23× at 2²⁰ and, in one round at 2¹⁶ **with no power-state change and nothing else
+  running, 2.303×** — the same function timed at 27.4 µs and 11.9 µs, in a round whose `mono vs
+  fnptr` inverted to 1.60× *slower*. That round is excluded from every range above, and it is why
+  nothing under ~1.4× is published from this instrument. It is the in-crate twin of `wukong_xbench`'s
+  C(twin) column, which once read a byte-identical binary as 1.31× faster than itself. Ratios below
+  the wider of 1.4× and the run's own control spread are now printed as `TIE`.
+- **Two documentation errors fixed.** `docs/metrics.md` called the superseded "the residual is
+  algorithmic" reading *four-year-old*; per the commit bodies it dates from 2026-07-09 — about a
+  month. The changelog entry above described best-of-30 in both power states, while the round that
+  produced its numbers was three rounds at best-of-30 **and** best-of-40 across two states.
+- **Still open, and now measured rather than asserted**: VML's LA exp/log core is a shade ahead of
+  ours at n ≤ 2²⁰. `wukong-xbench`'s own VML peer (which prints much larger ratios) runs
+  in default HA mode as well and has **not** been re-measured against LA.
 
 ### Benchmark honesty — three defects an adversarial verifier found and proved
 No compiler behaviour changes; all three are in `wukong_xbench` (plus the measurement docs). Two of

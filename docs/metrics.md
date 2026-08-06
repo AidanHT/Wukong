@@ -62,28 +62,45 @@ Current standing (recorded):
   physics-ties at L3-resident sizes (relu, biasadd, hadamard); reductions/norms/scans/column
   family 1.4–107× vs scalar-left-by-gcc patterns — but note these are IEEE-serial C baselines
   (see G5 fairness work: a `-ffast-math` C column normalizes the reassociation share).
-- *Transcendentals*: 4.7–12× scalar libm; vs MKL VML the standing is now **log 1.17–1.46×
-  faster and tanh 4.08–4.66× faster at every size, exp 1.08–1.25× faster at 2¹²/2²⁰ but a
-  TIE at 2¹⁶ and ≈2× at 2²³** (2026-08-06, one process, ABBA-interleaved, best-of-30,
-  MKL at 1 thread, three rounds across **both power states**). exp is reported as a tie
-  where it measures as one; what is unambiguous at every exp size is that the old spelling
-  measures 1.20–1.49× slower than VML in the same process.
-  **The four-year-old "the residual is algorithmic" reading was wrong**, and it is worth
-  recording why the instrument did not catch it: every lever tried against this gap —
-  8-bucket `vpermps` LUTs (2026-07-08, which did close a real ~1.7–2× loss), Estrin
-  scheduling, the ×4/×6 ILP unroll, and a bit-identical `ldexp` exp tail that measured a
-  ~10–15% loss and was **reverted** — was a change to the *polynomial*, while the cost was
-  in the *dispatch*: the loop called its 8-lane kernel through a function pointer, and the
-  Windows x64 ABI passes `__m256` in memory, so every 8 lanes paid a spill / indirect call /
-  reload and lost the poly constants out of registers. Monomorphizing that dispatch is
-  bit-identical on all 2³² f32 and worth **1.12–1.75×** on its own — a power-independent
-  internal ratio (`WUKONG_VMATH_FNPTR=1` measures the old spelling in the same binary). The
+- *Transcendentals*: 4.7–12× scalar libm. **vs MKL VML the honest standing is a TIE for exp
+  and log, and the 2026-08-06 "log 1.17–1.46× / exp 1.08–1.25× faster" reading is retracted.**
+  Re-measured the same day against an **accuracy-matched** peer — VML run through
+  `vmlSetMode(VML_LA)`, which the probe measures at 2 ULP for exp and 4 ULP for log on the
+  timed band, exactly where Wukong measures 2 and 4 — five same-run best-of-40 ABBA rounds in
+  one process (AC+charging 68–76%, nothing else running) read **exp 1.09–1.20× SLOWER at 2¹⁶
+  and 2²⁰** and **log between 1.09× slower and 1.07× faster**. Only at n = 2²³ does either
+  clear the floor (exp 1.37–1.54×, log 1.48–1.66×), and that is Wukong's non-temporal store
+  regime rather than its core. The earlier numbers were against VML's **default HA mode at
+  ~0.5 ULP** — a strictly more accurate peer, so not a like-for-like comparison, and the
+  mismatch was disclosed only in a source comment. **tanh is the one real win: 2.85–3.24× vs
+  VML's fastest mode** (3.93–4.91× vs HA), bought with accuracy — Wukong's tanh is 44 ULP /
+  3.5e-6 relative against VML's ≤1 ULP in every mode. The n = 2¹² row is withdrawn outright:
+  at 16 KiB/array every arm's best-of-40 minimum is 0.5–1.4 µs against a **measured** 100 ns
+  `Instant` granularity, so its "ratios" were ratios of 5-to-14 clock ticks and came out as
+  exact small fractions.
+  **The 2026-07-09 "the residual is algorithmic" reading was wrong** (it stood about a month,
+  not longer), and it is worth recording why the instrument did not catch it: every lever
+  tried against this gap — 8-bucket `vpermps` LUTs (2026-07-08, which did close a real
+  ~1.7–2× loss), Estrin scheduling, the ×4/×6 ILP unroll, and a bit-identical `ldexp` exp
+  tail that measured a ~10–15% loss and was **reverted** — was a change to the *polynomial*,
+  while the cost was in the *dispatch*: the loop called its 8-lane kernel through a function
+  pointer, and the Windows x64 ABI passes `__m256` in memory, so every 8 lanes paid a spill /
+  indirect call / reload and lost the poly constants out of registers. Monomorphizing that
+  dispatch is bit-identical on all 2³² f32 and worth **1.20–1.78×** on its own — the
+  power-independent internal ratio (`WUKONG_VMATH_FNPTR=1` measures the old spelling in the
+  same binary), and the only figure in this bullet that is not a cross-library ratio. The
   two-input kernel (`wukong_vmath2_f32` — activation backward, SwiGLU/GeGLU gates, pow),
   which spilled **two** `__m256` per call, took the same fix for **1.09–1.48×**.
-  Accuracy exhaustively re-swept: exp 1.625e-7 / ≤2 ULP over 2.24e9 values, log 6.924e-7 /
-  ≤12 ULP over every positive normal f32. Composites inherit the wins: log2 9.9×, log1p 7.7× vs C.
-  *Lesson for the instrument*: a "residual is algorithmic" verdict needs a same-binary A/B
-  against the alternative *structure*, not only against alternative math.
+  Accuracy exhaustively re-swept and unmoved: exp 1.625e-7 / ≤2 ULP over 2.24e9 values, log
+  6.924e-7 / ≤12 ULP over every positive normal f32. Composites inherit the wins: log2 9.9×,
+  log1p 7.7× vs C.
+  *Three lessons for the instrument*: (a) a "residual is algorithmic" verdict needs a
+  same-binary A/B against the alternative *structure*, not only against alternative math;
+  (b) a vs-library ratio is only a claim if the library is in a **matched accuracy mode** —
+  ours flipped from "win" to "tie" the moment the peer stopped being asked for 0.5 ULP;
+  (c) every vs-library probe should carry a control column whose true ratio is 1.000. Ours
+  now does — two of them — and they read **1.06–1.23× at 2²⁰ and once 2.303× at 2¹⁶** on
+  identical code, with no power-state change. Nothing under ~1.4× survives that.
 
 **M2. End-to-end model performance.** A compiler is judged on composed graphs, not op zoos:
 fusion, no round-trips, layer-stack throughput. GPT-2-class `.wk` models exist and dispatch
@@ -188,12 +205,13 @@ tail (C-tile prefetch, 2048³ now at/above MKL-1c parity, see M1), the 256³ del
 (now engaged at ~94–110% of MKL-all under the dynamic-claiming default), the serving goodput ceiling
 (Bcap=256, 85.6× + honest static peer), the S=128 model regime (1.5–1.9× behind eager at campaign
 start → now 1.07–1.43× AHEAD of *compiled* torch, see M2), and the honest-instrument holes (f32-out cuBLAS peer column; exp/log/model ranges
-re-based on multi-state measurement), and **exp/log vs VML, which this list called
-"measured-and-bounded, algorithmic" until 2026-08-06 and which turned out to be a
-function-pointer dispatch boundary — log now ahead of VML at every size, exp at parity
-or ahead** (see M1). Measured-and-bounded
+re-based on multi-state measurement). Measured-and-bounded
 rather than closed: GPU long-S attention (warp specialization built; wins only 4–6% @S=4096 —
-structural SFU bound), 4096³ GEMM (v2cs +2.7%; ~80% of the honest peer, residual is SASS-level).
+structural SFU bound), 4096³ GEMM (v2cs +2.7%; ~80% of the honest peer, residual is SASS-level),
+and **exp/log vs VML** — this list called it "algorithmic" until 2026-08-06, when it turned out to
+be a function-pointer dispatch boundary worth 1.20–1.78×; but the follow-up accuracy-matched
+measurement the same day put exp and log at a **TIE** with VML's `VML_LA` core rather than ahead of
+it, so the gap is *smaller and now measured*, not closed (see M1).
 Remaining, ranked:
 
 1. Multicore parallel-GEMM grain — the head-loop region + dynamic block-claiming landed (model
