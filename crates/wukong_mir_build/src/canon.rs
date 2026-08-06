@@ -47,6 +47,49 @@
 //! Substituting into a nested `let` initializer is not allowed (that is not index position), so a
 //! *chain* of bases (`let d = 16; let ib = i*d; … a[ib + p]`) needs one round per link: the pass is
 //! a fixpoint, and each round strictly removes at least one `let`.
+//!
+//! # The second rewrite: sinking a constant `let` to its first use
+//!
+//! The other way a spelling loses its kernel has nothing to do with index arithmetic. Several
+//! recognizers match a *window* of consecutive statements — the softmax window is seven, the
+//! log-softmax six, the cross-entropy forward four plus a store — and they index that window by
+//! position. Declaring an accumulator early, which is how a great many people write C-influenced
+//! code, splits the window in half:
+//!
+//! ```text
+//!   let mut m = x[0];                        let mut m = x[0];
+//!   for i { m = fmax(m, x[i]); }             for i { m = fmax(m, x[i]); }
+//!   let mut s = 0.0;                <->      for i { x[i] = exp(x[i] - m); }
+//!   for i { x[i] = exp(x[i] - m); }          let mut s = 0.0;
+//!   for i { s = s + x[i]; }                  for i { s = s + x[i]; }
+//! ```
+//!
+//! The two programs are the same program — the left column just declares `s` one statement early —
+//! and yet the left one dispatched no kernel at all while the right one dispatched
+//! `wukong_norm_f32`.
+//!
+//! So a `let mut x = <literal>;` is **moved down** to sit immediately before the first statement
+//! that mentions `x` at all. The conditions are as narrow as they can be:
+//!
+//! * the initializer is a bare literal (optionally negated), so its value cannot depend on anything
+//!   the skipped statements do, and evaluating it later is neither a side effect nor a trap;
+//! * every statement it moves past mentions `x` nowhere — not as a read, not as an assignment
+//!   target, not as a `&`-take, and not as a re-declaration. Nothing in between can therefore
+//!   observe either the binding or the shadowing it performs;
+//! * the binding is `mut` and its first use ASSIGNS it, which confines the rewrite to an
+//!   *accumulator seed* — the one thing that genuinely belongs next to the loop that folds into it;
+//! * it never moves out of its own block, so it is still executed exactly as often as before.
+//!
+//! The `mut`-and-assigned narrowing is not cosmetic. Moving a `let` always lands it *between* two
+//! statements, and the block-level fusions (`try_fuse_matmul_epilogue`,
+//! `try_fuse_i8matmul_dequant_epilogue`, `try_fuse_run`, …) match ADJACENT pairs. Sinking an
+//! immutable constant — `let scale_a: f32 = 0.5;`, read only by a dequant epilogue — down past the
+//! int8 GEMM that preceded that epilogue split the pair and cost
+//! `tests/run/i8_linear_dequant.wk` its fused `wukong_i8gemm_nt_deq`. An immutable binding is a
+//! value definition; it stays where the author wrote it.
+//!
+//! The rewrite is idempotent (a second run finds the `let` already adjacent to its first use), which
+//! is what keeps the fixpoint from spinning.
 
 use wukong_ast::{
     Block, Expr, ExprKind, ForIter, ItemKind, Module, PatKind, Pattern, Stmt, StmtKind, UnOp,
@@ -247,6 +290,9 @@ fn block_admits_any(b: &Block, sema: &SemaResult) -> bool {
             }
         }
     }
+    if first_sink(b).is_some() {
+        return true;
+    }
     b.stmts.iter().any(|s| stmt_admits_any(s, sema))
         || b.tail.as_deref().is_some_and(|t| expr_admits_any(t, sema))
 }
@@ -371,6 +417,7 @@ fn canon_block(b: &mut Block, sema: &SemaResult) -> bool {
         }
         i += 1;
     }
+    changed |= sink_lets(b);
     for s in &mut b.stmts {
         changed |= canon_stmt(s, sema);
     }
@@ -378,6 +425,112 @@ fn canon_block(b: &mut Block, sema: &SemaResult) -> bool {
         changed |= canon_expr(t, sema);
     }
     changed
+}
+
+// ---- sinking a constant `let` to its first use -------------------------------------------------
+
+/// Where the `let` at `b.stmts[i]` would sink to, if it may sink at all: the index of the first
+/// later statement that mentions its name, when that is more than one step away (otherwise it is
+/// already adjacent to its first use and there is nothing to do). Pure.
+///
+/// The `let` is only ever moved *down*, to a statement that already mentions it, so it never leaves
+/// its block and never changes how often it runs.
+fn sink_target_at(b: &Block, i: usize) -> Option<usize> {
+    // A `let mut <ident> = <literal>;` with no statement attributes (moving it would move them).
+    //
+    // Two narrowings, and both are load-bearing. A literal initializer is the soundness argument for
+    // the value half: it reads no memory, calls nothing and cannot trap, so evaluating it later
+    // yields the very same value. And `mut` plus "the first use ASSIGNS it" (below) is what confines
+    // the rewrite to an *accumulator seed* — a binding whose whole purpose is to be folded into by
+    // the loop that follows it, and which therefore belongs next to that loop.
+    //
+    // An immutable constant is a value DEFINITION and must stay where the author put it. Moving one
+    // is not free: it lands between two statements, and the block-level fusions match ADJACENT
+    // statement pairs. Sinking `let scale_a: f32 = 0.5;` (read only by a dequant epilogue) down past
+    // the int8 GEMM it follows split that pair and cost `tests/run/i8_linear_dequant.wk` its fused
+    // `wukong_i8gemm_nt_deq`, replacing it with the unfused `wukong_i8gemm_nt` — caught only by the
+    // dispatch census, since recognizers are gate-blind.
+    let s = b.stmts.get(i)?;
+    let StmtKind::Let {
+        pat:
+            Pattern {
+                kind: PatKind::Ident(x),
+                ..
+            },
+        mutable: true,
+        init: Some(e),
+        ..
+    } = &s.kind
+    else {
+        return None;
+    };
+    if !s.attrs.is_empty() || !is_literal_init(e) {
+        return None;
+    }
+    // The first later statement that mentions `x` in ANY way; nothing before it can observe the
+    // binding, so the move is invisible to it.
+    let first_use = b.stmts[i + 1..].iter().position(|t| stmt_touches(t, *x))? + i + 1;
+    if first_use == i + 1 {
+        return None; // already adjacent
+    }
+    // That first use must ASSIGN `x` — i.e. it is the accumulating loop, not merely a reader. A
+    // binding that is only read is not a seed, and moving it buys nothing.
+    let mut facts = RegionFacts::default();
+    scan_stmt(&b.stmts[first_use], &mut facts);
+    facts.assigned.contains(x).then_some(first_use)
+}
+
+/// The first sinkable `let` in this block — the read-only feasibility probe that decides whether the
+/// module is worth cloning at all.
+fn first_sink(b: &Block) -> Option<(usize, usize)> {
+    (0..b.stmts.len()).find_map(|i| sink_target_at(b, i).map(|j| (i, j)))
+}
+
+/// Sink the constant `let`s of one block down to their first uses. Returns whether anything moved.
+///
+/// ONE left-to-right scan: `i` only ever increases, so this visits each slot once and terminates
+/// however the moves interleave. A statement that shifts into a slot already passed is therefore not
+/// re-examined in this pass — `canonicalize_module`'s bounded fixpoint gives it another round, and
+/// a missed sink is only a missed dispatch, never a wrong program. The rewrite is idempotent: a
+/// moved `let` now sits immediately before its first use, so `sink_target_at` declines it.
+fn sink_lets(b: &mut Block) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < b.stmts.len() {
+        if let Some(first_use) = sink_target_at(b, i) {
+            let s = b.stmts.remove(i);
+            // Removing at `i < first_use` shifts the first-use statement down to `first_use - 1`;
+            // inserting there places the `let` immediately before it.
+            b.stmts.insert(first_use - 1, s);
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// A bare literal, or a negated numeric one (`let mut lo: f32 = -1.0e30;`).
+fn is_literal_init(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Char(_) => true,
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => matches!(expr.kind, ExprKind::Int(_) | ExprKind::Float(_)),
+        _ => false,
+    }
+}
+
+/// Does `s` mention `x` in any way at all — read, assignment target, `&`-take, or a re-declaration
+/// that would shadow it? Conservative in both halves: `crate::stmt_mentions` answers `true` for any
+/// expression kind it does not model, and `scan_stmt` collects every binding pattern in the
+/// statement (which `stmt_mentions`, looking only at initializers and iteration expressions, does
+/// not see). A statement this returns `false` for cannot observe the binding, so moving the `let`
+/// past it is invisible.
+fn stmt_touches(s: &Stmt, x: Symbol) -> bool {
+    let mut facts = RegionFacts::default();
+    scan_stmt(s, &mut facts);
+    facts.declared.contains(&x) || crate::stmt_mentions(s, x)
 }
 
 fn canon_stmt(s: &mut Stmt, sema: &SemaResult) -> bool {

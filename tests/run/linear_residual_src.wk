@@ -1,0 +1,89 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: 22
+// EXPECT-OUT: 33
+// EXPECT-OUT: 43
+// EXPECT-OUT: 54
+// EXPECT-OUT: 67
+// EXPECT-OUT: 11
+// EXPECT-OUT: 22
+// EXPECT-OUT: 33
+// EXPECT-OUT: 43
+// EXPECT-OUT: 54
+// EXPECT-OUT: 67
+module tests.run.linear_residual_src
+
+// The transformer skip connection written OUT OF PLACE, with the residual folded into the matmul
+// store: `h[i*N+j] = x[i*N+j] + s`, where the residual source `x` is a DIFFERENT array from the
+// destination `h`. `linear_residual.wk` covers the in-place case (`c = c + s`), which fuses into one
+// beta = 1 `wukong_sgemm_nt_epi`; there is no single kernel for a cross-buffer residual (nt_epi's
+// beta reads the OUTPUT back), so before this was recognized the whole GEMM fell to a scalar nest.
+// It now lowers to the same two kernels the factored spelling dispatches — `wukong_sgemm_nt` then a
+// flat `wukong_velem_f32` sweep computing `h = x + h`.
+//
+// A = [[1,2],[3,4]] (2x2), W = [[1,0],[0,1],[1,1]] (3x2, read NT as w[j*2+k]), so A·Wᵀ is
+//   row0: [1*1+2*0, 1*0+2*1, 1*1+2*1] = [1, 2, 3]
+//   row1: [3*1+4*0, 3*0+4*1, 3*1+4*1] = [3, 4, 7]
+// x = [[10,20,30],[40,50,60]], so h = x + A·Wᵀ is
+//   row0: [11, 22, 33]
+//   row1: [43, 54, 67]
+// `h` is pre-filled with 99 by the caller: the GEMM must run with beta = 0 (it overwrites `h`, and
+// the residual arrives only from `x`). Were beta 1 the first lane would print 110, not 11. All six
+// lanes are printed; every value is the scalar semantics of the loop, derived by hand above.
+fn proj(a: [f32; 4], w: [f32; 6], x: [f32; 6], mut h: [f32; 6]) {
+    for i in 0..2 {
+        for j in 0..3 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + a[i * 2 + k] * w[j * 2 + k];
+            }
+            h[i * 3 + j] = x[i * 3 + j] + s;
+        }
+    }
+}
+
+// The same nest over `[]f32` SLICE parameters with runtime dims. A slice slot holds a 16-byte fat
+// pointer, so every buffer operand — the residual source `x` included — must be resolved through
+// `kernel_base_ptr`, which loads the data word. Handing the kernel the fat pointer instead is
+// LANDMINE 1 in `wukong_mir_build`'s CLAUDE.md: the program would print zeros on both backends at
+// every -O (2857dc7). Same six hand-derived lanes, so the two halves cross-check each other.
+fn proj_slice(a: []f32, w: []f32, x: []f32, mut h: []f32, m: i64, n: i64, kk: i64) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut s: f32 = 0.0;
+            for p in 0..kk {
+                s = s + a[i * kk + p] * w[j * kk + p];
+            }
+            h[i * n + j] = x[i * n + j] + s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let w: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let x: [f32; 6] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let mut h: [f32; 6] = [99.0; 6];
+    proj(a, w, x, h);
+    print(h[0] as i32);
+    print(h[1] as i32);
+    print(h[2] as i32);
+    print(h[3] as i32);
+    print(h[4] as i32);
+    print(h[5] as i32);
+
+    let mut h2: [f32; 6] = [99.0; 6];
+    let sa: []f32 = a;
+    let sw: []f32 = w;
+    let sx: []f32 = x;
+    let sh: []f32 = h2;
+    proj_slice(sa, sw, sx, sh, 2, 3, 2);
+    print(h2[0] as i32);
+    print(h2[1] as i32);
+    print(h2[2] as i32);
+    print(h2[3] as i32);
+    print(h2[4] as i32);
+    print(h2[5] as i32);
+    return 0;
+}

@@ -479,6 +479,24 @@ lowers the *whole nest* to a single call: `wukong_sgemm` (`C = A·B`), `wukong_s
 operands to the corresponding `wukong_sgemm_{bf16,f16}_nt*` / `wukong_i8gemm_nt` members of the same
 family. `C = Aᵀ·Bᵀ` has no kernel, so it declines.
 
+The store itself does not have to be the bare `c[i*N+j] = s`. Three shapes an engineer writes
+naturally — with the follow-up work folded *into* the store instead of trailing as its own loop —
+are peeled apart by the recognizer and lower to exactly what the factored spelling lowers to:
+
+| store | lowers to |
+|---|---|
+| `c[i*N+j] = act(bias[j] + s)`, or the bias-free `act(s)` | one `wukong_sgemm_nt_epi` carrying that act code |
+| `c[i*N+j] = x[i*N+j] + s`, `x` a *different* array | `wukong_sgemm_nt` (β = 0) + a flat `wukong_velem_f32` residual sweep |
+| `c[i*N+j] = s;` **and** `d[i*N+j] = d[i*N+j] * s` in the same body | `wukong_sgemm_nt` + `wukong_velem_f32` (Hadamard) |
+
+The last two are two-kernel lowerings, and they are bit-identical to the split source because the
+matmul store writes exactly `s` and an f32 store/load round-trip is exact. All three are NT-only,
+offset-free and mutually exclusive with a peeled α (`wukong_sgemm_nt_epi` pins its `alpha` to 1.0),
+and the two-kernel forms additionally require the second buffer to be distinct from `a`, `b` and `c`
+— the split writes all of C before any of D, so an overlap would be a different program. The
+*in-place* residual `c[i*N+j] = act(c[i*N+j] + s + bias[j])` stays the strictly better single-call
+form: one `wukong_sgemm_nt_epi` with β = 1.
+
 Each buffer operand is resolved through the shared `kernel_base_ptr`: a fixed `[T; N]` array's slot *is*
 its storage and is passed as-is, while a `Tensor[..]`/pointer operand and a `[]T` slice both keep their
 base in the slot and are loaded first (a slice's data pointer is the first word of its fat pointer).
@@ -1108,6 +1126,24 @@ lowers the *whole nest* to a single call: `wukong_sgemm` (`C = A·B`), `wukong_s
 operands to the corresponding `wukong_sgemm_{bf16,f16}_nt*` / `wukong_i8gemm_nt` members of the same
 family. `C = Aᵀ·Bᵀ` has no kernel, so it declines.
 
+The store itself does not have to be the bare `c[i*N+j] = s`. Three shapes an engineer writes
+naturally — with the follow-up work folded *into* the store instead of trailing as its own loop —
+are peeled apart by the recognizer and lower to exactly what the factored spelling lowers to:
+
+| store | lowers to |
+|---|---|
+| `c[i*N+j] = act(bias[j] + s)`, or the bias-free `act(s)` | one `wukong_sgemm_nt_epi` carrying that act code |
+| `c[i*N+j] = x[i*N+j] + s`, `x` a *different* array | `wukong_sgemm_nt` (β = 0) + a flat `wukong_velem_f32` residual sweep |
+| `c[i*N+j] = s;` **and** `d[i*N+j] = d[i*N+j] * s` in the same body | `wukong_sgemm_nt` + `wukong_velem_f32` (Hadamard) |
+
+The last two are two-kernel lowerings, and they are bit-identical to the split source because the
+matmul store writes exactly `s` and an f32 store/load round-trip is exact. All three are NT-only,
+offset-free and mutually exclusive with a peeled α (`wukong_sgemm_nt_epi` pins its `alpha` to 1.0),
+and the two-kernel forms additionally require the second buffer to be distinct from `a`, `b` and `c`
+— the split writes all of C before any of D, so an overlap would be a different program. The
+*in-place* residual `c[i*N+j] = act(c[i*N+j] + s + bias[j])` stays the strictly better single-call
+form: one `wukong_sgemm_nt_epi` with β = 1.
+
 Each buffer operand is resolved through the shared `kernel_base_ptr`: a fixed `[T; N]` array's slot *is*
 its storage and is passed as-is, while a `Tensor[..]`/pointer operand and a `[]T` slice both keep their
 base in the slot and are loaded first (a slice's data pointer is the first word of its fat pointer).
@@ -1728,8 +1764,20 @@ top of `lower_program`, before anything else looks at the tree:
   plain integer literal is inlined at its uses. This is exactly what `FnLowerer`'s `Path` arm already
   does at lowering time — the def map records a const's type, not its value — so the emitted MIR is
   unchanged and only the recognizers, which run earlier, see a difference.
+- **Accumulator-seed sinking.** Several recognizers match a *window* of consecutive statements and
+  index it by position — softmax is seven statements, log-softmax six, the cross-entropy forward
+  four plus a store. Declaring the sum accumulator one statement early splits the window, and the
+  whole row-op then dispatches nothing. So a `let mut x = <literal>;` is moved **down** to sit
+  immediately before the first statement that mentions `x`, provided that statement *assigns* it.
+  The initializer must be a bare literal (it reads no memory, calls nothing, cannot trap), every
+  statement it passes must mention the name nowhere at all — not read, written, `&`-taken or
+  re-declared — and it never leaves its block, so it still runs exactly as often.
+  The `mut`-and-assigned condition confines the rewrite to an accumulator seed and is load-bearing:
+  a move always lands *between* two statements, and the block-level fusions match adjacent pairs, so
+  sinking an immutable constant between an int8 GEMM and its dequant epilogue cost that pair its
+  fused `wukong_i8gemm_nt_deq`. An immutable binding is a value definition and stays put.
 
-Both rewrites are value-identical at *every node*, which is what lets the moved subtree keep its
+All three rewrites are value-identical at *every node*, which is what lets the moved subtree keep its
 `NodeId`s: `sema.types` answers for it exactly as before, and `SemaResult::defs` is keyed by name
 rather than by `NodeId`, so a duplicated id is read-only aliasing and never a collision. No new sema
 entries are minted.
@@ -1766,6 +1814,24 @@ lowers the *whole nest* to a single call: `wukong_sgemm` (`C = A·B`), `wukong_s
 `wukong_sgemm_nt_alpha`, a fused `act(x·Wᵀ + bias)` epilogue to `wukong_sgemm_nt_epi`, and bf16/f16/int8
 operands to the corresponding `wukong_sgemm_{bf16,f16}_nt*` / `wukong_i8gemm_nt` members of the same
 family. `C = Aᵀ·Bᵀ` has no kernel, so it declines.
+
+The store itself does not have to be the bare `c[i*N+j] = s`. Three shapes an engineer writes
+naturally — with the follow-up work folded *into* the store instead of trailing as its own loop —
+are peeled apart by the recognizer and lower to exactly what the factored spelling lowers to:
+
+| store | lowers to |
+|---|---|
+| `c[i*N+j] = act(bias[j] + s)`, or the bias-free `act(s)` | one `wukong_sgemm_nt_epi` carrying that act code |
+| `c[i*N+j] = x[i*N+j] + s`, `x` a *different* array | `wukong_sgemm_nt` (β = 0) + a flat `wukong_velem_f32` residual sweep |
+| `c[i*N+j] = s;` **and** `d[i*N+j] = d[i*N+j] * s` in the same body | `wukong_sgemm_nt` + `wukong_velem_f32` (Hadamard) |
+
+The last two are two-kernel lowerings, and they are bit-identical to the split source because the
+matmul store writes exactly `s` and an f32 store/load round-trip is exact. All three are NT-only,
+offset-free and mutually exclusive with a peeled α (`wukong_sgemm_nt_epi` pins its `alpha` to 1.0),
+and the two-kernel forms additionally require the second buffer to be distinct from `a`, `b` and `c`
+— the split writes all of C before any of D, so an overlap would be a different program. The
+*in-place* residual `c[i*N+j] = act(c[i*N+j] + s + bias[j])` stays the strictly better single-call
+form: one `wukong_sgemm_nt_epi` with β = 1.
 
 Each buffer operand is resolved through the shared `kernel_base_ptr`: a fixed `[T; N]` array's slot *is*
 its storage and is passed as-is, while a `Tensor[..]`/pointer operand and a `[]T` slice both keep their

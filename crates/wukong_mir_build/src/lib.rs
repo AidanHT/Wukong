@@ -8144,24 +8144,35 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
-        // Fused per-column bias `C = A·Bᵀ + bias[j]` in a single store (the GPT-2 projection
-        // `q = x·Wᵀ + b`, its bias a runtime-offset slice of a shared weight blob). Routes to the fused
-        // epilogue kernel `wukong_sgemm_nt_epi` (beta from the nest, act = identity); the bias base is
-        // GEP'd by its invariant offset exactly like a/b/c above. NT only (the epilogue kernel form) —
-        // any other shape (or a coexisting α) declines to the scalar nest, which computes `bias + s`
-        // correctly. Bit-identical to the unfused GEMM-then-bias the interpreter marshals as the oracle.
-        if let Some((bias_base, bias_off)) = &nest.bias {
+        // Fused per-column bias `C = A·Bᵀ + bias[j]` and/or an activation written into the store
+        // (`C = act(A·Bᵀ [+ bias[j]])` — the GPT-2 projection `q = x·Wᵀ + b`, the LLaMA SwiGLU gate
+        // `silu(x·W1ᵀ + b1)`). Routes to the fused epilogue kernel `wukong_sgemm_nt_epi` (beta from the
+        // nest, act from the nest); the bias base is GEP'd by its invariant offset exactly like a/b/c
+        // above. NT only (the epilogue kernel is `gemm_dispatch(.., transposed = true)`) — any other
+        // shape (or a coexisting α, which the kernel has no parameter for) declines to the scalar nest,
+        // which computes `act(bias + s)` correctly. Bit-identical to the unfused GEMM → bias →
+        // activation the interpreter marshals as the oracle.
+        if nest.bias.is_some() || nest.act != EPI_ACT_IDENTITY {
             if !(nest.transposed && !nest.transposed_a) || nest.alpha.is_some() {
                 return false;
             }
-            let Some(bias_p) = self.kernel_base_ptr(*bias_base) else {
-                return false;
+            // An absent bias is a null pointer built as an integer `0` (a `Ptr`-typed `ConstInt` is
+            // invalid MIR): the kernel checks `bias.is_null()` — the same convention `emit_sgemm_epi`
+            // and the affine-norm null params use.
+            let bias_p = match &nest.bias {
+                Some((bias_base, bias_off)) => {
+                    let Some(bias_p) = self.kernel_base_ptr(*bias_base) else {
+                        return false;
+                    };
+                    self.offset_base(bias_p, bias_off)
+                }
+                None => self
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
             };
-            let bias_p = self.offset_base(bias_p, bias_off);
-            let act_v = self.builder.build(
-                MirType::I64,
-                Op::ConstInt(EPI_ACT_IDENTITY as i128, MirType::I64),
-            );
+            let act_v = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(nest.act as i128, MirType::I64));
             let func = if parallel {
                 self.gemm.nt_epi_par
             } else {
@@ -8958,10 +8969,16 @@ impl FnLowerer<'_> {
         // instead of `50 100 250 300`, and `c[i*2+j] = bq[j] + s` printed the same instead of
         // `1100 2200 1500 2600`. Declining is free: `emit_sgemm` folds α into `wukong_sgemm_nt_alpha`
         // and the bias into its own `nt_epi` call, and the epilogue loop then lowers as its own pass.
+        //
+        // An activation peeled off the *store* (`c[i*N+j] = silu(s)`) declines for the same reason: the
+        // `act` this function forwards comes from the epilogue LOOP, so a store act would be silently
+        // dropped, and two stacked activations are not one epilogue in any case. `emit_sgemm` fuses the
+        // store act on its own, and the epilogue loop then lowers as a separate vmath pass.
         if !nest.transposed
             || nest.transposed_a
             || nest.alpha.is_some()
             || nest.bias.is_some()
+            || nest.act != EPI_ACT_IDENTITY
             || !nest.a_off.is_empty()
             || !nest.b_off.is_empty()
             || !nest.c_off.is_empty()
@@ -8986,7 +9003,15 @@ impl FnLowerer<'_> {
         // row-major — so it cannot honour a peeled scale, a peeled store bias, or a transposed A, and
         // must refuse them rather than emit a call that silently drops them. Its two callers are
         // independent (`try_fuse_matmul_epilogue`, `match_matmul_residual`).
-        if nest.transposed_a || nest.alpha.is_some() || nest.bias.is_some() {
+        //
+        // `nest.act` is refused for the identical reason: the `act` argument is the caller's (from the
+        // epilogue loop / the residual store), so a second activation carried on the nest itself would
+        // be dropped without trace.
+        if nest.transposed_a
+            || nest.alpha.is_some()
+            || nest.bias.is_some()
+            || nest.act != EPI_ACT_IDENTITY
+        {
             return false;
         }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
@@ -9029,6 +9054,153 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![a, b, c, m, k, n, beta, bias_ptr, act_v],
+        });
+        true
+    }
+
+    /// Emit the TWO-kernel lowering of a cross-buffer residual projection (`c[i,j] = x[i,j] + dot`,
+    /// `x != c`): `wukong_sgemm_nt(a, b, c, m, k, n, beta = 0)` then
+    /// `wukong_velem_f32(x, c, c, m*n, 1.0, 1.0, 0.0, VE_ID|VE_USE_Y)` — exactly the pair the factored
+    /// spelling (`… c[i*N+j] = s; }` then `for i { c[i] = x[i] + c[i]; }`) already dispatches, so it is
+    /// bit-identical to it: one GEMM dot per element, then one f32 add.
+    ///
+    /// **Every operand and dimension is resolved BEFORE the GEMM is emitted.** A late failure between
+    /// the two calls would leave a beta = 0 GEMM that silently dropped the residual — a wrong answer
+    /// no differential gate can see, since recognizers fire identically on both backends. Bails
+    /// (false) with nothing emitted instead, and the caller lowers the scalar nest.
+    fn emit_sgemm_residual_src(&mut self, nest: &MatmulNest<'_>, x: Symbol) -> bool {
+        // The matcher pins these, but the emitter is the last line of defence: this routine emits a
+        // plain unscaled/unbiased NT product, so anything else must never reach the call.
+        if !nest.transposed
+            || nest.transposed_a
+            || nest.alpha.is_some()
+            || nest.bias.is_some()
+            || nest.act != EPI_ACT_IDENTITY
+            || !nest.a_off.is_empty()
+            || !nest.b_off.is_empty()
+            || !nest.c_off.is_empty()
+        {
+            return false;
+        }
+        // Buffer operands go through `kernel_base_ptr` (never a raw `lookup`): a `[]T` slice keeps a
+        // 16-byte fat pointer in its slot, so the kernel needs the loaded DATA pointer — LANDMINE 1.
+        let Some([a, b, c, xp]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c, x]) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        ) else {
+            return false;
+        };
+        let beta = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        let gemm = if self.parallel_fn {
+            self.gemm.nt_par
+        } else {
+            self.gemm.nt
+        };
+        self.builder.build_void(Op::Call {
+            func: gemm,
+            args: vec![a, b, c, m, k, n, beta],
+        });
+        // The residual sweep over the flat `[0, M*N)` region the GEMM just wrote (`sc == n`, checked
+        // by the matcher, is what makes that region contiguous and exactly the nest's footprint).
+        let len = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, m, n));
+        let one = self
+            .builder
+            .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32));
+        let zero = self
+            .builder
+            .build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));
+        let op = self.builder.build(
+            MirType::I64,
+            Op::ConstInt((VE_ID | VE_USE_Y) as i128, MirType::I64),
+        );
+        let velem = if self.parallel_fn {
+            self.gemm.velem_par
+        } else {
+            self.gemm.velem
+        };
+        self.builder.build_void(Op::Call {
+            func: velem,
+            args: vec![xp, c, c, len, one, one, zero, op],
+        });
+        true
+    }
+
+    /// Emit the TWO-kernel lowering of a dual-store projection (`c[i,j] = s; d[i,j] = d[i,j] op s`):
+    /// `wukong_sgemm_nt(a, b, c, m, k, n, beta = 0)` then
+    /// `wukong_velem_f32(d, c, d, m*n, 1.0, 1.0, 0.0, velem_op)` — the same pair the factored
+    /// spelling (the matmul, then `for i { d[i] = d[i] op c[i]; }`) dispatches. Sound because the
+    /// first store writes exactly `s` and an f32 store/load round-trip is exact, so `s == c[i,j]`.
+    ///
+    /// Like `emit_sgemm_residual_src`, every operand and dimension is resolved BEFORE anything is
+    /// emitted: a bail between the two calls would leave a GEMM whose second output never happened,
+    /// and recognizers are gate-blind.
+    fn emit_sgemm_dual_store(
+        &mut self,
+        nest: &MatmulNest<'_>,
+        d: Symbol,
+        velem_op: i64,
+    ) -> bool {
+        if !nest.transposed
+            || nest.transposed_a
+            || nest.alpha.is_some()
+            || nest.bias.is_some()
+            || nest.act != EPI_ACT_IDENTITY
+            || !nest.a_off.is_empty()
+            || !nest.b_off.is_empty()
+            || !nest.c_off.is_empty()
+        {
+            return false;
+        }
+        // Buffer operands through `kernel_base_ptr` — LANDMINE 1 (a `[]T` slice slot holds a fat
+        // pointer, and the kernel needs the loaded data word).
+        let Some([a, b, c, dp]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c, d]) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        ) else {
+            return false;
+        };
+        let beta = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        let gemm = if self.parallel_fn {
+            self.gemm.nt_par
+        } else {
+            self.gemm.nt
+        };
+        self.builder.build_void(Op::Call {
+            func: gemm,
+            args: vec![a, b, c, m, k, n, beta],
+        });
+        let len = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, m, n));
+        let one = self
+            .builder
+            .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32));
+        let zero = self
+            .builder
+            .build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));
+        // `VE_HADAMARD` is its own compute mode and ignores a/b/c; the additive form reads them as
+        // `1.0·d + 1.0·c + 0.0`. Passing the same three either way keeps one emission path.
+        let op = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(velem_op as i128, MirType::I64));
+        let velem = if self.parallel_fn {
+            self.gemm.velem_par
+        } else {
+            self.gemm.velem
+        };
+        self.builder.build_void(Op::Call {
+            func: velem,
+            args: vec![dp, c, dp, len, one, one, zero, op],
         });
         true
     }
@@ -10435,6 +10607,32 @@ impl FnLowerer<'_> {
             match_matmul_residual(pat, iter, body, self.sema, self.interner)
         {
             if self.emit_sgemm_epi(&nest, bias, act) {
+                return;
+            }
+        }
+        // The CROSS-buffer residual projection `c[i*N+j] = x[i*N+j] + dot` with `x != c` — the
+        // out-of-place skip connection `h = x + attn·Woᵀ` written with the residual folded into the
+        // store. There is no single kernel for it (nt_epi's beta reads the OUTPUT back), so it lowers
+        // to the same two kernels the factored spelling dispatches: `wukong_sgemm_nt` then a flat
+        // `wukong_velem_f32` residual sweep. Tried after the in-place form, which is strictly better
+        // (one kernel) and which this arm declines by requiring `x != c`.
+        if let Some((nest, x)) =
+            match_matmul_residual_src(pat, iter, body, self.sema, self.interner)
+        {
+            if self.emit_sgemm_residual_src(&nest, x) {
+                return;
+            }
+        }
+        // The DUAL-STORE projection `c[i*N+j] = s; d[i*N+j] = d[i*N+j] op s` — the SwiGLU
+        // up-projection computed and multiplied into the gate in one pass. The extra store makes the
+        // inner body four statements where every matmul matcher wants three, so without this the
+        // whole GEMM is scalar. Lowers to `wukong_sgemm_nt` + `wukong_velem_f32`, the same pair the
+        // factored spelling dispatches. Structurally disjoint from every arm above (they all require
+        // a three-statement inner body).
+        if let Some((nest, d, op)) =
+            match_matmul_dual_store(pat, iter, body, self.sema, self.interner)
+        {
+            if self.emit_sgemm_dual_store(&nest, d, op) {
                 return;
             }
         }
@@ -20193,9 +20391,18 @@ struct MatmulNest<'a> {
     /// (the GPT-2 projection `q = x·Wᵀ + b`, the bias itself a runtime-offset slice of a shared weight
     /// blob — `w[base + REL_BQ + j]`). The offset terms are invariant in the matmul's `(i,j,k)`, so
     /// `emit_sgemm` GEPs the bias base by their sum and routes to the fused epilogue kernel
-    /// `wukong_sgemm_nt_epi` (beta from the nest, act = identity). `None` for an unbiased matmul; only
+    /// `wukong_sgemm_nt_epi` (beta from the nest, act from `act`). `None` for an unbiased matmul; only
     /// the `ijk` dot-product form (NT) populates it, and it is mutually exclusive with `alpha`.
     bias: Option<(Symbol, Vec<&'a Expr>)>,
+    /// An activation peeled off the store **itself** — `c[i,j] = silu(bias[j] + s)`, or the bias-free
+    /// `c[i,j] = silu(s)` — the SwiGLU/GELU FFN written the way an engineer actually writes it, with
+    /// the activation inside the store rather than as a separate follow-up loop. `EPI_ACT_IDENTITY`
+    /// when the store carries none. Only the `ijk` dot-product form populates it; `emit_sgemm` routes
+    /// any non-identity act (with or without a bias) to `wukong_sgemm_nt_epi`, whose epilogue applies
+    /// the identical scalar activation (`wukong_runtime::vmath::{gelu1,silu1}`, `relu`), so the fused
+    /// result equals the unfused `matmul → [bias →] activation`. Mutually exclusive with `alpha` (the
+    /// epilogue kernel has no α parameter) and NT-only (it is `gemm_dispatch(.., transposed = true)`).
+    act: u32,
 }
 
 /// A loop-invariant α scale peeled off a matmul store `c[i,j] = alpha·s`: either a runtime f32 symbol
@@ -21194,6 +21401,43 @@ fn unshadowed_intrinsic(
     math_intrinsic(interner.resolve(name))
 }
 
+/// Peel one fused-epilogue activation off `e`, returning `(inner, act_code)` — `fmax(inner, 0.0)` in
+/// either operand order (ReLU), `gelu(inner)`, `silu(inner)`, else `(e, EPI_ACT_IDENTITY)`.
+///
+/// The free-standing twin of [`FnLowerer::peel_dequant_act`], in the `EPI_ACT_*` vocabulary the GEMM
+/// epilogue kernel speaks. It is what lets the matmul recognizer accept the activation written
+/// **into the store** (`c[i*N+j] = silu(b[j] + s)`) rather than only as a separate follow-up loop:
+/// the two spellings are the same arithmetic, and the fused kernel applies the identical scalar
+/// activation, so both reach one `wukong_sgemm_nt_epi`. Uses `unshadowed_intrinsic`, so a program
+/// that defines its own `fn silu(..)` keeps its own function (never the builtin) — the rule every
+/// activation peeler in this crate obeys.
+fn peel_epi_act<'a>(e: &'a Expr, interner: &Interner, sema: &SemaResult) -> (&'a Expr, u32) {
+    let ExprKind::Call { callee, args, .. } = &e.kind else {
+        return (e, EPI_ACT_IDENTITY);
+    };
+    if args.len() == 2
+        && matches!(
+            unshadowed_intrinsic(callee, interner, sema),
+            Some(MathIntrinsic::Fmax)
+        )
+    {
+        if is_float_zero(&args[1], interner) {
+            return (&args[0], EPI_ACT_RELU);
+        }
+        if is_float_zero(&args[0], interner) {
+            return (&args[1], EPI_ACT_RELU);
+        }
+    }
+    if args.len() == 1 {
+        match unshadowed_intrinsic(callee, interner, sema) {
+            Some(MathIntrinsic::Gelu) => return (&args[0], EPI_ACT_GELU),
+            Some(MathIntrinsic::Silu) => return (&args[0], EPI_ACT_SILU),
+            _ => {}
+        }
+    }
+    (e, EPI_ACT_IDENTITY)
+}
+
 /// Match the epilogue RHS over the matmul output `C[i*N+j]`: bare `C+bias` (identity), `fmax(_, 0)`
 /// (ReLU), or a `gelu(_)` / `silu(_)` activation call (the transformer FFN `act(x·Wᵀ [+ bias])`
 /// shape). Bias is **optional for the activation forms** — the bias-free `silu(x·Wᵀ)` is the
@@ -22073,6 +22317,15 @@ fn match_matmul_ijk<'a>(
     // the fused-bias form `bias[<invariant offset> + j] + s` (the GPT-2 projection `q = x·Wᵀ + b`, its
     // bias a runtime-offset slice of a shared weight blob). Bias and α are disjoint store shapes; a
     // fused bias routes to `wukong_sgemm_nt_epi` in `emit_sgemm`.
+    //
+    // An activation written **into the store** — `c[i,j] = silu(bias[j] + s)`, or the bias-free
+    // `c[i,j] = silu(s)` — is peeled off first and rides the same epilogue kernel. That spelling is
+    // the natural one (a real FFN is written with the activation in the store, not as a separate
+    // follow-up loop) and used to decline the whole nest: `silu(..)` is a `Call`, which is neither the
+    // `Mul` `match_store_scale` wants nor the `Add` `match_bias_dot_store` wants, so BOTH failed and
+    // the entire GEMM fell to a scalar nest. Peeling is strictly additive — a `Call` never matched
+    // either shape before.
+    let (cv, act) = peel_epi_act(cv, interner, sema);
     let (alpha, bias) = match match_store_scale(cv, s_sym, &[row, jvar, kvar], sema, interner) {
         Some(a) => (a, None),
         None => (
@@ -22086,6 +22339,13 @@ fn match_matmul_ijk<'a>(
             )?),
         ),
     };
+    // DECLINE: `wukong_sgemm_nt_epi` has no α parameter (its `Epilogue::alpha` is pinned to 1.0), so
+    // `c[i,j] = silu(alpha·s)` cannot be fused — accepting it would silently drop the scale. Decline
+    // here rather than in the emitter so the nest can still fall through to a sibling recognizer, and
+    // ultimately to the scalar loop, which computes the scale correctly.
+    if act != EPI_ACT_IDENTITY && alpha.is_some() {
+        return None;
+    }
     // The output store `c[i*N + j (+ off)] = …` or the shape-typed `c[i, j] = …` (sema-aware).
     let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
     // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
@@ -22127,6 +22387,7 @@ fn match_matmul_ijk<'a>(
         c_off,
         alpha,
         bias,
+        act,
     })
 }
 
@@ -22275,6 +22536,9 @@ fn match_matmul_ijk_memacc<'a>(
         b_off,
         c_off,
         alpha: None,
+        // The memory-accumulator store is the bare `c[i,j] = c[i,j] + a·b`; there is nothing wrapping
+        // it to peel, so this form never carries a fused activation.
+        act: EPI_ACT_IDENTITY,
         bias: None,
     })
 }
@@ -22476,8 +22740,433 @@ fn match_matmul_residual<'a>(
         c_off,
         alpha: None, // the residual epilogue kernel carries no α scale
         bias: None,  // the residual store's per-column bias rides the beta=1 epilogue, not this field
+        // Likewise the residual store's activation: it is returned alongside the nest and handed to
+        // `emit_sgemm_epi` as its `act` argument, so carrying it here too would be a second, dropped
+        // copy (`emit_sgemm_epi` refuses a non-identity `nest.act` for exactly that reason).
+        act: EPI_ACT_IDENTITY,
     };
     Some((nest, bias, act))
+}
+
+/// Recognize the **cross-buffer residual projection** — the `ijk` `nn.Linear` nest whose store adds a
+/// residual read from a *different* buffer than the one it writes:
+///
+/// ```text
+/// for i in 0..M { for j in 0..N {
+///   let mut s: f32 = 0.0;
+///   for k in 0..K { s = s + a[i*K+k] * b[j*K+k]; }
+///   c[i*N+j] = x[i*N+j] + s;            // x is NOT c — the out-of-place skip connection
+/// } }
+/// ```
+///
+/// This is the transformer block's `h = x + attn·Woᵀ` written the way an engineer writes it, with the
+/// residual folded into the store instead of trailing as its own `for i { h[i] = x[i] + h[i]; }` loop.
+/// [`match_matmul_residual`] handles only the in-place case (`x == c`, which maps to one `nt_epi` with
+/// beta = 1); when the residual source is a *different* array there is no single kernel for it, and
+/// the whole nest used to fall to a scalar loop — the store is neither `c = s` nor `c = c + s`.
+///
+/// It lowers to the SAME TWO kernels the factored spelling dispatches — `wukong_sgemm_nt` writing `c`,
+/// then `wukong_velem_f32` computing `c = x + c` over the `M*N` contiguous elements — so the result is
+/// bit-identical to the split source (one GEMM dot, then one f32 add per element).
+///
+/// Tight by construction, mirroring [`match_matmul_residual`]: **NT only, normal A, no batch offsets
+/// on any operand** (the velem pass covers the flat `[0, M*N)` region, which is exactly what the nest
+/// writes because `sc == n`), the store value is exactly `x[i*N+j] + s` in either addend order with no
+/// bias and no activation (`wukong_velem_f32` computes `a·x + b·y + c`, not `act(...)` over a bias),
+/// and `x != c` (that case is the in-place form above). `x` may alias `a` or `b`: neither is ever
+/// written, so the split reads them exactly as the fused loop did. Returns `(nest, residual_source)`.
+fn match_matmul_residual_src<'a>(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &'a Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(MatmulNest<'a>, Symbol)> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    // j body: [ let s = 0.0; for k {...}; c[i*N+j] = x[i*N+j] + s ].
+    if jbody.tail.is_some() || jbody.stmts.len() != 3 {
+        return None;
+    }
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (ks, ke) = range_bounds(kiter)?;
+    if as_int_lit(ks, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_dim(ke, interner)?;
+    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
+    // NT, normal A, offset-free: the emitted pair is `wukong_sgemm_nt` over the plain 2-D `A·Bᵀ`
+    // followed by one flat `wukong_velem_f32` sweep. A batched (offset) or TN nest would need the
+    // residual pass to follow the same base shift, which this arm deliberately does not model — it
+    // falls back to the scalar nest, which is correct.
+    if !transposed || transposed_a || !a_off.is_empty() || !b_off.is_empty() {
+        return None;
+    }
+    // The store: c[i*N+j] = x[i*N+j] + s (either addend order).
+    let StmtKind::Assign {
+        target: ct,
+        op: ast::AssignOp::Assign,
+        value: cv,
+    } = &jbody.stmts[2].kind
+    else {
+        return None;
+    };
+    let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
+    if sa != kdim || sb != kdim || sc != n || !c_off.is_empty() {
+        return None;
+    }
+    // The residual addend must be a matmul-shaped read of the SAME [M,N] element, from another array.
+    let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs,
+        rhs,
+    } = &cv.kind
+    else {
+        return None;
+    };
+    let res_expr = if single_path(lhs) == Some(s_sym) {
+        rhs
+    } else if single_path(rhs) == Some(s_sym) {
+        lhs
+    } else {
+        return None;
+    };
+    let (x_sym, sx, x_off) = match_operand_row_col_off(res_expr, row, jvar, sema, interner)?;
+    if sx != n || !x_off.is_empty() {
+        return None;
+    }
+    // `x == c` is the in-place residual [`match_matmul_residual`] already fuses into one beta = 1
+    // `nt_epi`; declining it here keeps that (strictly better) single-kernel form.
+    if x_sym == cbase {
+        return None;
+    }
+    // An input aliasing the OUTPUT is a hazard (the blocked kernel writes C in a different order than
+    // the scalar nest reads it). `x` aliasing `a`/`b` is not: nothing writes them.
+    if a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    if !is_f32_expr(res_expr, sema) {
+        return None;
+    }
+    let nest = MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        beta: 0, // the GEMM overwrites C; the residual is added by the following velem sweep
+        transposed,
+        transposed_a,
+        a_off,
+        b_off,
+        c_off,
+        alpha: None,
+        bias: None,
+        act: EPI_ACT_IDENTITY,
+    };
+    Some((nest, x_sym))
+}
+
+/// Recognize the **dual-store** `ijk` `nn.Linear` nest — one whose inner body stores the dot *and*
+/// folds it into a second output in the same iteration:
+///
+/// ```text
+/// for i in 0..M { for j in 0..N {
+///   let mut s: f32 = 0.0;
+///   for k in 0..K { s = s + a[i*K+k] * b[j*K+k]; }
+///   c[i*N+j] = s;                    // the plain matmul store
+///   d[i*N+j] = d[i*N+j] * s;         // …and the gate product, in the same loop
+/// } }
+/// ```
+///
+/// This is the SwiGLU MLP's up-projection as everyone writes it: `up = x·W3ᵀ` computed and multiplied
+/// into the already-activated gate in one pass. The extra store makes the inner body four statements
+/// where every matmul matcher demands exactly three, so the entire GEMM fell to a scalar nest.
+///
+/// Because the first store writes exactly `s` — and an f32 store/load round-trip is exact — the second
+/// store's `s` IS `c[i*N+j]`, so the nest is equivalent to `C = A·Bᵀ` followed by the elementwise
+/// `D = D op C` over the same `M*N` region. That is precisely the factored spelling, and it lowers to
+/// the same two kernels: `wukong_sgemm_nt` then `wukong_velem_f32` (`VE_HADAMARD` for `*`,
+/// `VE_ID|VE_USE_Y` for `+`, both bit-exact against the scalar op).
+///
+/// Tight by construction: **NT only, normal A, offset-free**, the first store is the plain `c = s`
+/// (an α or a bias there would make `c[i,j] != s` and the split would be wrong), the second store
+/// reads `d[i*N+j]` and `s` exactly once each with the same `i*N+j` shape and stride `N`, and `d` is
+/// distinct from `a`, `b` and `c` — the split writes all of `C` before any of `D`, so an overlap with
+/// a GEMM operand would change what the later iterations read. Returns `(nest, d, velem_op)`.
+fn match_matmul_dual_store<'a>(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &'a Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(MatmulNest<'a>, Symbol, i64)> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    // j body: [ let s = 0.0; for k {...}; c[i*N+j] = s; d[i*N+j] = d[i*N+j] op s ].
+    if jbody.tail.is_some() || jbody.stmts.len() != 4 {
+        return None;
+    }
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (ks, ke) = range_bounds(kiter)?;
+    if as_int_lit(ks, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_dim(ke, interner)?;
+    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
+    if !transposed || transposed_a || !a_off.is_empty() || !b_off.is_empty() {
+        return None;
+    }
+    // Store 1: the plain `c[i*N+j] = s`. Anything else (an α, a bias, an activation) breaks the
+    // identity `c[i,j] == s` the second store's split relies on.
+    let StmtKind::Assign {
+        target: ct,
+        op: ast::AssignOp::Assign,
+        value: cv,
+    } = &jbody.stmts[2].kind
+    else {
+        return None;
+    };
+    if single_path(cv) != Some(s_sym) {
+        return None;
+    }
+    let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
+    if sa != kdim || sb != kdim || sc != n || !c_off.is_empty() {
+        return None;
+    }
+    // Store 2: `d[i*N+j] = d[i*N+j] op s` (either operand order; `op` is `*` or `+`, both
+    // commutative and both exactly expressible by `wukong_velem_f32`).
+    let StmtKind::Assign {
+        target: dt,
+        op: dop,
+        value: dv,
+    } = &jbody.stmts[3].kind
+    else {
+        return None;
+    };
+    let (dbase, sd, d_off) = match_operand_row_col_off(dt, row, jvar, sema, interner)?;
+    if sd != n || !d_off.is_empty() {
+        return None;
+    }
+    // `VE_HADAMARD` alone already implies the kernel reads `y`, but the statement-level velem
+    // recognizer (`try_velem_for` → `match_velem_binary`) emits `VE_HADAMARD | VE_USE_Y` for the very
+    // same product, and this arm's whole claim is that the folded spelling lowers to what the
+    // factored one lowers to. Setting the redundant bit makes the two calls byte-identical rather
+    // than merely equivalent (they differed only as `const.i64 512` vs `const.i64 768`).
+    let velem_op = match dop {
+        // `d[i,j] *= s` / `d[i,j] += s` — the compound form, whose value is just the RHS.
+        ast::AssignOp::Mul if single_path(dv) == Some(s_sym) => VE_HADAMARD | VE_USE_Y,
+        ast::AssignOp::Add if single_path(dv) == Some(s_sym) => VE_ID | VE_USE_Y,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: bop,
+                lhs,
+                rhs,
+            } = &dv.kind
+            else {
+                return None;
+            };
+            // Exactly one side is `d[i*N+j]` (the same element the target names) and the other is `s`.
+            let d_then_s = is_same_dn_elem(lhs, dbase, row, jvar, n, sema, interner)
+                && single_path(rhs) == Some(s_sym);
+            let s_then_d = single_path(lhs) == Some(s_sym)
+                && is_same_dn_elem(rhs, dbase, row, jvar, n, sema, interner);
+            if !d_then_s && !s_then_d {
+                return None;
+            }
+            match bop {
+                ast::BinOp::Mul => VE_HADAMARD | VE_USE_Y,
+                ast::BinOp::Add => VE_ID | VE_USE_Y,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(dv, sema) {
+        return None;
+    }
+    // The split writes ALL of C before ANY of D, so `d` overlapping a GEMM operand or the GEMM's own
+    // output would change what later iterations read. Symbol distinctness is the same standard the
+    // rest of the GEMM family holds itself to.
+    if a_sym == cbase || b_sym == cbase || dbase == cbase || dbase == a_sym || dbase == b_sym {
+        return None;
+    }
+    let nest = MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        beta: 0,
+        transposed,
+        transposed_a,
+        a_off,
+        b_off,
+        c_off,
+        alpha: None,
+        bias: None,
+        act: EPI_ACT_IDENTITY,
+    };
+    Some((nest, dbase, velem_op))
+}
+
+/// Is `e` the element `d[row*N + col]` of the array `d` — the same element a dual-store nest's second
+/// store writes? Both the flat and the shape-typed 2-index spellings, via `match_operand_row_col_off`.
+fn is_same_dn_elem(
+    e: &Expr,
+    d: Symbol,
+    row: Symbol,
+    col: Symbol,
+    n: Dim,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> bool {
+    match match_operand_row_col_off(e, row, col, sema, interner) {
+        Some((base, stride, off)) => base == d && stride == n && off.is_empty(),
+        None => false,
+    }
 }
 
 /// Recognize the canonical f32 matmul nest rooted at `for row in 0..M { … }`. See [`MatmulNest`].
@@ -22634,9 +23323,11 @@ fn match_matmul<'a>(
         a_off: Vec::new(),
         b_off: Vec::new(),
         c_off: Vec::new(),
-        // The `ikj` accumulate store is `c[i,j] += aik·b[k,j]`, not `c[i,j] = alpha·s` — no α peel.
+        // The `ikj` accumulate store is `c[i,j] += aik·b[k,j]`, not `c[i,j] = alpha·s` — no α peel,
+        // and nothing wraps the store, so no activation either.
         alpha: None,
         bias: None,
+        act: EPI_ACT_IDENTITY,
     })
 }
 
