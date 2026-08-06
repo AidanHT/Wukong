@@ -1855,6 +1855,13 @@ column pairs with `C`, never with `C(fast)`.
 
 ## GPU backend (NVIDIA RTX 4050 Laptop, `sm_89`)
 
+> **⚠ Device scope (2026-08-06):** every figure in this section was measured on an **NVIDIA RTX 4050
+> Laptop GPU** (`sm_89`, 20 SMs, 6 GB, ~192 GB/s) under **Windows/WDDM**, with the peers available on
+> that box (notably: PyTorch in **eager** mode — Triton does not install on Windows — and no CUDA
+> toolkit). These are properties of that instrument; **do not extrapolate them to datacenter parts.**
+> The datacenter retarget, including re-measurement against stronger peers (`torch.compile`, CUTLASS,
+> FlashAttention), is tracked in `GPU_RETARGET_PLAN.md`.
+
 Wukong has a **GPU backend** (`wukong_codegen_gpu`, behind `--features gpu`). Being a compiler, it
 **emits PTX text** and **driver-JIT-loads it via `cudarc`** (`cuModuleLoadData` — the NVIDIA driver's
 built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA toolkit** is needed to build or run, only the
