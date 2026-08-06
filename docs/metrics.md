@@ -7,6 +7,14 @@ It is the north star for optimization work: a change that doesn't move one of th
 `BENCHMARKS.md` and `prompts/results/*`; absolute GFLOP/s are deliberately absent (this
 hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-roofline are stable).
 
+> **Device scope (2026-08-06):** every GPU figure in this document (they appear under M1, M2, M4, M7
+> and the improvement targets) was measured on an **NVIDIA RTX 4050 Laptop GPU** (`sm_89`, 20 SMs,
+> 6 GB, ~192 GB/s) under **Windows/WDDM**, with the peers available on that box (notably: PyTorch in
+> **eager** mode — Triton does not install on Windows — and no CUDA toolkit). These are properties of
+> that instrument; **do not extrapolate them to datacenter parts.** The datacenter retarget,
+> including re-measurement against stronger peers (`torch.compile`, CUTLASS, FlashAttention), is
+> tracked in `GPU_RETARGET_PLAN.md`.
+
 ## Who the metrics serve
 
 Three real users: (a) **kernel authors** writing custom ops, (b) **model authors** composing,
