@@ -3675,6 +3675,44 @@ mod tests {
     #[allow(dead_code)]
     type VmlUnaryFn = unsafe extern "C" fn(i64, *const f32, *mut f32);
 
+    /// `vmlSetMode(newmode) -> oldmode` and `vmlGetMode()`, oneMKL's global VML accuracy control.
+    ///
+    /// This exists so the peer can be run in an **accuracy-matched** mode. Quoting a ratio against
+    /// VML's default HA (~0.5 ULP) while shipping a ≤2 ULP exp and a ≤12 ULP log is not a
+    /// like-for-like comparison, and a faster-but-less-accurate kernel is not straightforwardly
+    /// faster. LA and EP are the modes whose accuracy is in Wukong's own band.
+    #[allow(dead_code)]
+    type VmlSetModeFn = unsafe extern "C" fn(u32) -> u32;
+    #[allow(dead_code)]
+    type VmlGetModeFn = unsafe extern "C" fn() -> u32;
+
+    /// `mkl_vml_defines.h` accuracy bits. These are **not** taken on trust: every mode arm's error
+    /// is measured against a f64 reference on the very data it was timed on and printed beside its
+    /// ratio, so a wrong constant here can only cost a column, never produce a wrong claim.
+    #[allow(dead_code)]
+    const VML_LA: u32 = 0x0000_0001;
+    #[allow(dead_code)]
+    const VML_HA: u32 = 0x0000_0002;
+    #[allow(dead_code)]
+    const VML_EP: u32 = 0x0000_0003;
+    #[allow(dead_code)]
+    const VML_ACCURACY_MASK: u32 = 0x0000_000f;
+
+    /// The ratio band inside which this laptop cannot tell two implementations apart, and inside
+    /// which this repo therefore does not publish a winner.
+    ///
+    /// It is not a guess. Two independent controls set it: (1) the `wukong_xbench` C(twin) column —
+    /// byte-identical C source, same compiler, same flags, second DLL, so its ratio against C has
+    /// expected value exactly 1.00 — landed inside a 1.10× band in only 3 of 15 sections, with
+    /// observed spreads to 1.689×, and in one round read a byte-identical binary as "1.31× faster
+    /// than C"; and (2) a verifier measured a **1.64× swing on this very exp-vs-VML ratio with zero
+    /// code change**, purely because a `cargo check` overlapped the round. The instrument below also
+    /// carries its own controls (`entry` vs `mono`, and VML-HA against a second VML-HA arm), both of
+    /// which have expected value 1.000 and are printed every run — so the floor is re-observed, not
+    /// just asserted, on every measurement.
+    #[allow(dead_code)]
+    const NOISE_FLOOR: f64 = 1.4;
+
     /// Locate `mkl_rt*.dll` — `WUKONG_MKL_DLL` override, then the standard conda layouts.
     #[allow(dead_code)]
     fn mkl_dll_path() -> Option<std::path::PathBuf> {
@@ -3711,6 +3749,17 @@ mod tests {
     #[allow(dead_code)]
     #[cfg(windows)]
     fn vml() -> Option<(VmlUnaryFn, VmlUnaryFn, VmlUnaryFn)> {
+        vml_full().map(|(e, l, t, _)| (e, l, t))
+    }
+
+    /// As `vml`, plus `(vmlSetMode, vmlGetMode)` when the DLL exports them — the accuracy-mode
+    /// control. `None` for the pair means only VML's default mode can be timed, which the probe
+    /// then says out loud instead of silently quoting an accuracy-mismatched peer.
+    #[allow(dead_code)]
+    #[cfg(windows)]
+    #[allow(clippy::type_complexity)]
+    fn vml_full(
+    ) -> Option<(VmlUnaryFn, VmlUnaryFn, VmlUnaryFn, Option<(VmlSetModeFn, VmlGetModeFn)>)> {
         use libloading::os::windows::{Library as WinLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
         let path = mkl_dll_path()?;
         // SAFETY: loading a system DLL; ALTERED_SEARCH_PATH lets it resolve its own siblings.
@@ -3719,6 +3768,8 @@ mod tests {
         let lib: libloading::Library = lib.into();
         // SAFETY: the three symbols carry MKL's documented ILP64 VML signature; the by-value
         // `MKL_Set_Num_Threads` (never the lowercase Fortran by-reference twin) takes an i32.
+        // `vmlSetMode`/`vmlGetMode` are the C spellings (`MKL_UINT` in, `MKL_UINT` out); the
+        // Fortran twins take their argument by reference and are deliberately NOT accepted here.
         let out = unsafe {
             let e = *lib.get::<VmlUnaryFn>(b"vsExp\0").ok()?;
             let l = *lib.get::<VmlUnaryFn>(b"vsLn\0").ok()?;
@@ -3726,15 +3777,30 @@ mod tests {
             if let Ok(set) = lib.get::<unsafe extern "C" fn(i32)>(b"MKL_Set_Num_Threads\0") {
                 set(1);
             }
-            (e, l, t)
+            let mode = match (
+                lib.get::<VmlSetModeFn>(b"vmlSetMode\0"),
+                lib.get::<VmlGetModeFn>(b"vmlGetMode\0"),
+            ) {
+                (Ok(s), Ok(g)) => Some((*s, *g)),
+                _ => None,
+            };
+            (e, l, t, mode)
         };
         eprintln!("  oneMKL VML peer: {}", path.display());
+        if let Some((_, get)) = out.3 {
+            // SAFETY: `vmlGetMode` takes no arguments and returns the mode word.
+            eprintln!("  VML mode control: vmlSetMode/vmlGetMode present (mode {:#x} at load)", unsafe {
+                get()
+            });
+        } else {
+            eprintln!("  VML mode control: ABSENT — only the default (HA) mode can be timed");
+        }
         std::mem::forget(lib);
         Some(out)
     }
 
     /// exp/log/tanh: the **monomorphized** dispatch vs the `WUKONG_VMATH_FNPTR=1` function-pointer
-    /// dispatch vs oneMKL VML — all three in one process, interleaved **A B B A** per round so a
+    /// dispatch vs oneMKL VML — all arms in one process, interleaved **A B B A** per round so a
     /// clock ramp between arms cancels, best-of-`rounds` minima, ratios only (this laptop's absolute
     /// throughput swings ~2-3× with power state, so an absolute figure is not reportable).
     ///
@@ -3742,9 +3808,25 @@ mod tests {
     /// only difference being whether the 8-lane kernel is inlined or reached through a Windows-ABI
     /// indirect call that spills the `__m256` argument and result through memory.
     ///
+    /// Three things this probe will not let a caller quote without seeing:
+    /// - **two control columns whose true ratio is exactly 1.000** — the shipped entry against the
+    ///   `mono` twin it dispatches to, and VML-HA against a second, identical VML-HA arm. They are
+    ///   this run's own measured noise floor, in the spirit of `wukong_xbench`'s C(twin) column
+    ///   (which once read a byte-identical binary as "1.31× faster than C").
+    /// - **the accuracy of every arm**, max relative error and max ULP against a f64 reference on the
+    ///   very data that was timed. VML's default is HA at ~0.5 ULP; Wukong's exp is ≤2 ULP and its
+    ///   log ≤12 ULP, so the default-mode column is *not* accuracy-matched and is labelled as such.
+    /// - **VML in LA and EP mode**, which is the accuracy-matched peer where the DLL exports
+    ///   `vmlSetMode`. That, not HA, is the honest column for a "faster than VML" claim.
+    ///
+    /// Anything inside the wider of `NOISE_FLOOR` and the run's own control spread is printed as
+    /// `TIE`, in both directions, and a size whose fastest arm lasts fewer than 100 clock ticks is
+    /// stamped `TIMER-QUANTIZED` — the granularity is measured, not assumed.
+    ///
     /// Run: `cargo test -p wukong_runtime --release vmath_exp_log_vs_vml -- --ignored --nocapture`
     /// Env: `WUKONG_MKL_DLL=<mkl_rt.dll>`, `VMATH_VML_N=<elements>` (default 1<<20, xbench's size),
-    /// `VMATH_VML_ROUNDS=<n>` (default 40).
+    /// `VMATH_VML_ROUNDS=<n>` (default 40), `VMATH_VML_MODES=ha[,la,ep]` (default `ha,la,ep`; set it
+    /// to `ha` to reproduce the 2026-08-06 four-arm buffer rotation exactly).
     #[cfg(all(target_arch = "x86_64", windows))]
     #[test]
     #[ignore = "vs-library measurement; run explicitly in --release"]
@@ -3767,32 +3849,114 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(40);
-        let peer = vml();
+        // Smallest non-zero interval `Instant` can report, measured rather than assumed. A ratio of
+        // two arms that each last only a handful of these is a ratio of small integers — which is
+        // exactly what the 2¹² row of this sweep turned out to be, and why it is not quotable.
+        let granularity = {
+            let mut best = f64::MAX;
+            for _ in 0..64 {
+                let t0 = Instant::now();
+                loop {
+                    let d = t0.elapsed().as_secs_f64();
+                    if d > 0.0 {
+                        best = best.min(d);
+                        break;
+                    }
+                }
+            }
+            best
+        };
+        let modes_req = std::env::var("VMATH_VML_MODES").unwrap_or_else(|_| "ha,la,ep".into());
+        let (want_la, want_ep) = (modes_req.contains("la"), modes_req.contains("ep"));
+        let full = vml_full();
+        let peer = full.map(|(e, l, t, _)| (e, l, t));
+        let modectl = full.and_then(|(_, _, _, m)| m);
+        // LA/EP are only timed when the mode word can actually be set — otherwise every "mode" arm
+        // would be HA under a different label, which is exactly the kind of column this probe exists
+        // to stop. `mode_arm(k)` is Some only for a mode that is both requested and reachable.
+        let mode_arm = |k: usize| -> Option<(u32, &'static str)> {
+            match k {
+                0 => Some((VML_HA, "HA")),
+                1 if want_la && modectl.is_some() => Some((VML_LA, "LA")),
+                2 if want_ep && modectl.is_some() => Some((VML_EP, "EP")),
+                _ => None,
+            }
+        };
+        // Setting the mode is done OUTSIDE every timed region; the call itself is never measured.
+        //
+        // Only the accuracy nibble is touched. The mode word also carries VML's error-handling bits
+        // (this box loads at `0x1a02` = `VML_ERRMODE_DEFAULT | VML_HA`, which is incidentally an
+        // independent confirmation of the accuracy constants above), and writing a bare `VML_LA`
+        // would clear them — making the LA arm differ from the HA arm in more than accuracy.
+        let set_mode = |m: u32| {
+            if let Some((set, get)) = modectl {
+                // SAFETY: `vmlSetMode` takes the mode word by value and returns the previous one;
+                // `vmlGetMode` takes nothing. Both are the C spellings resolved in `vml_full`.
+                unsafe {
+                    let cur = get();
+                    set((cur & !VML_ACCURACY_MASK) | (m & VML_ACCURACY_MASK));
+                    get() & VML_ACCURACY_MASK
+                }
+            } else {
+                VML_HA
+            }
+        };
+        // A mode that silently does not take would print an HA column under an LA label, so the
+        // readback is checked before anything is timed.
+        for k in 0..3 {
+            if let Some((m, label)) = mode_arm(k) {
+                let got = set_mode(m);
+                assert_eq!(got, m, "VML mode {label} did not take — readback {got:#x}");
+            }
+        }
         // Inputs in the domain of all three ops: exp over a wide finite band, log/tanh over x > 0.
         let xs: Vec<f32> = (0..n).map(|i| 0.017 + (i % 4093) as f32 * 0.0031).collect();
         let mut a = vec![0.0f32; n];
         let mut b = vec![0.0f32; n];
         let mut c = vec![0.0f32; n];
         let mut e = vec![0.0f32; n];
+        // The peer-side twin control (`c2`) and the two accuracy-matched mode arms.
+        let mut c2 = vec![0.0f32; n];
+        let mut la = vec![0.0f32; n];
+        let mut ep = vec![0.0f32; n];
         eprintln!(
             "vmath vs oneMKL VML — n = {n} f32 ({} KiB/array), best of {rounds} rounds, ABBA \
-             interleaved, 1 thread; shipped entry = {}",
+             interleaved, 1 thread; shipped entry = {}; noise floor {NOISE_FLOOR:.2}x; clock \
+             granularity {:.0} ns",
             n * 4 / 1024,
-            if vmath_fnptr() { "fnptr (WUKONG_VMATH_FNPTR=1)" } else { "mono" }
+            if vmath_fnptr() { "fnptr (WUKONG_VMATH_FNPTR=1)" } else { "mono" },
+            granularity * 1e9
         );
-        for (op, name, vf) in [
-            (VM_EXP, "exp", peer.map(|p| p.0)),
-            (VM_LOG, "log", peer.map(|p| p.1)),
-            (VM_TANH, "tanh", peer.map(|p| p.2)),
+        // Relative error and ULP distance of a whole arm against a f64 reference, on the timed data.
+        // Same metric the exhaustive sweep uses: ULPs are counted against `want as f32`, the
+        // correctly-rounded f32 result. This is what makes "faster" and "as accurate" separable
+        // claims instead of one word.
+        let acc_of = |got: &[f32], reference: &dyn Fn(f64) -> f64| -> (f64, i64) {
+            let (mut wrel, mut wulp) = (0.0f64, 0i64);
+            for (i, &g) in got.iter().enumerate() {
+                let want = reference(f64::from(xs[i]));
+                let ulps = (i64::from(g.to_bits()) - i64::from((want as f32).to_bits())).abs();
+                let rel = if want == 0.0 { 0.0 } else { ((f64::from(g) - want) / want).abs() };
+                wrel = wrel.max(rel);
+                wulp = wulp.max(ulps);
+            }
+            (wrel, wulp)
+        };
+        for (op, name, vf, reference) in [
+            (VM_EXP, "exp", peer.map(|p| p.0), &f64::exp as &dyn Fn(f64) -> f64),
+            (VM_LOG, "log", peer.map(|p| p.1), &f64::ln as &dyn Fn(f64) -> f64),
+            (VM_TANH, "tanh", peer.map(|p| p.2), &f64::tanh as &dyn Fn(f64) -> f64),
         ] {
-            let (mut t_mono, mut t_fn, mut t_vml, mut t_ent) =
-                (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+            let (mut t_mono, mut t_fn, mut t_ent) = (f64::MAX, f64::MAX, f64::MAX);
+            // [HA, HA-twin, LA, EP] — index 1 is the peer-side control, not a fourth mode.
+            let mut t_vml = [f64::MAX; 4];
             let time = |f: &mut dyn FnMut()| -> f64 {
                 let t0 = Instant::now();
                 f();
                 t0.elapsed().as_secs_f64()
             };
-            // Warm up every arm (page-in, branch predictors, MKL's first-call dispatch).
+            // Warm up every arm (page-in, branch predictors, MKL's first-call dispatch — which is
+            // per-mode, so each mode gets its own warm-up).
             for _ in 0..3 {
                 // SAFETY: avx2+fma detected above; every buffer is exactly n f32 long.
                 unsafe {
@@ -3801,15 +3965,29 @@ mod tests {
                     wukong_vmath_f32(xs.as_ptr(), e.as_mut_ptr(), n as i64, op);
                 }
                 if let Some(f) = vf {
-                    // SAFETY: VML's ILP64 unary contract; buffers are n f32 long.
-                    unsafe { f(n as i64, xs.as_ptr(), c.as_mut_ptr()) };
+                    for k in 0..3 {
+                        if let Some((m, _)) = mode_arm(k) {
+                            set_mode(m);
+                            let dst = match k {
+                                0 => c.as_mut_ptr(),
+                                1 => la.as_mut_ptr(),
+                                _ => ep.as_mut_ptr(),
+                            };
+                            // SAFETY: VML's ILP64 unary contract; buffers are n f32 long.
+                            unsafe { f(n as i64, xs.as_ptr(), dst) };
+                        }
+                    }
+                    set_mode(VML_HA);
+                    // SAFETY: as above; `c2` is the HA twin's own buffer.
+                    unsafe { f(n as i64, xs.as_ptr(), c2.as_mut_ptr()) };
                 }
             }
             for _ in 0..rounds {
-                // A B C D (D C B A) — each arm runs twice per round in mirrored order, so a monotone
-                // clock drift inside a round biases neither arm.
+                // A B C .. (.. C B A) — each arm runs twice per round in mirrored order, so a
+                // monotone clock drift inside a round biases neither arm.
                 for order in [false, true] {
-                    let arms: [u8; 4] = if order { [0, 1, 2, 3] } else { [3, 2, 1, 0] };
+                    let arms: [u8; 7] =
+                        if order { [0, 1, 2, 3, 4, 5, 6] } else { [6, 5, 4, 3, 2, 1, 0] };
                     for arm in arms {
                         match arm {
                             // SAFETY: avx2+fma detected above; buffers are n f32 long.
@@ -3826,8 +4004,9 @@ mod tests {
                                 });
                                 t_fn = t_fn.min(d);
                             }
-                            // The real exported entry — the one a compiled `.wk` program calls. Its
-                            // arm anchors the two twins to what actually ships.
+                            // The real exported entry — the one a compiled `.wk` program calls. It
+                            // dispatches to whichever twin ships, so entry-vs-mono is a CONTROL
+                            // column: same code, same bits, true ratio exactly 1.000.
                             // SAFETY: buffers are n f32 long; n > 0.
                             2 => {
                                 let d = time(&mut || unsafe {
@@ -3835,14 +4014,25 @@ mod tests {
                                 });
                                 t_ent = t_ent.min(d);
                             }
+                            // 3 = VML HA, 4 = VML HA twin (control), 5 = VML LA, 6 = VML EP.
                             _ => {
-                                if let Some(f) = vf {
-                                    // SAFETY: VML's ILP64 unary contract; buffers are n f32 long.
-                                    let d = time(&mut || unsafe {
-                                        f(n as i64, xs.as_ptr(), c.as_mut_ptr());
-                                    });
-                                    t_vml = t_vml.min(d);
-                                }
+                                let k = usize::from(arm) - 3;
+                                let Some(f) = vf else { continue };
+                                let m = match k {
+                                    1 => Some((VML_HA, "HA")), // the twin runs in HA, like arm 3
+                                    _ => mode_arm(if k == 0 { 0 } else { k - 1 }),
+                                };
+                                let Some((m, _)) = m else { continue };
+                                let dst = match k {
+                                    0 => c.as_mut_ptr(),
+                                    1 => c2.as_mut_ptr(),
+                                    2 => la.as_mut_ptr(),
+                                    _ => ep.as_mut_ptr(),
+                                };
+                                set_mode(m);
+                                // SAFETY: VML's ILP64 unary contract; buffers are n f32 long.
+                                let d = time(&mut || unsafe { f(n as i64, xs.as_ptr(), dst) });
+                                t_vml[k] = t_vml[k].min(d);
                             }
                         }
                     }
@@ -3859,11 +4049,45 @@ mod tests {
             // `dir` reads "ours vs theirs", so the entry-vs-mono ratio is t_mono/t_ent: > 1 means the
             // entry finished sooner. Writing it the other way round labels a slower entry "faster".
             let (w4, r4) = dir(t_mono / t_ent);
+            let (arel, aulp) = acc_of(&a, reference);
+            // Absolute minima, in µs, purely as a diagnostic: they are what makes the timer's own
+            // granularity visible. `Instant` resolves to ~100 ns here, so an arm whose minimum is a
+            // couple of µs is being counted in single-digit ticks and its RATIOS come out as small
+            // exact fractions (8/7, 3/2, 5/4 …). That is an artefact of the clock, not a measurement
+            // of the kernel, and it is why the smallest size in this sweep is not quotable.
+            let us = |t: f64| t * 1e6;
+            let fastest = [t_mono, t_fn, t_ent].into_iter().chain(t_vml).fold(f64::MAX, f64::min);
+            eprintln!(
+                "  {name:<5} TIMING        : best-of-{rounds} minima (µs) mono {:.2} fnptr {:.2} \
+                 entry {:.2} | VML HA {:.2} HA' {:.2} LA {:.2} EP {:.2}{}",
+                us(t_mono),
+                us(t_fn),
+                us(t_ent),
+                us(t_vml[0]),
+                us(t_vml[1]),
+                us(t_vml[2]),
+                us(t_vml[3]),
+                // Under ~100 ticks the quantization step alone is >1%, and by 10 ticks the ratios
+                // are small exact fractions. Fired, this line disqualifies the whole size.
+                if fastest / granularity < 100.0 {
+                    format!(
+                        "   *** TIMER-QUANTIZED: fastest arm is {:.0} clock ticks — ratios at this \
+                         size are ratios of small integers, NOT of kernels ***",
+                        fastest / granularity
+                    )
+                } else {
+                    String::new()
+                }
+            );
             eprintln!(
                 "  {name:<5} mono vs fnptr : {r1:.3}x {w1} (inlined kernel vs indirect call); \
-                 shipped entry {r4:.3}x {w4} than mono"
+                 wukong accuracy max rel {arel:.3e} / {aulp} ULP"
             );
-            if t_vml.is_finite() {
+            eprintln!(
+                "  {name:<5} CONTROL       : shipped entry vs mono {r4:.3}x {w4} \
+                 (SAME CODE — true ratio 1.000; this is the run's own noise floor)"
+            );
+            if t_vml[0].is_finite() {
                 // Cross-check the peer computes the same function before quoting its time.
                 let (mut worst, mut at) = (0.0f32, 0usize);
                 for i in 0..n {
@@ -3874,13 +4098,52 @@ mod tests {
                     }
                 }
                 assert!(worst < 1e-3, "{name}: VML disagrees at [{at}] (rel {worst:.1e})");
-                let (w2, r2) = dir(t_vml / t_mono);
-                let (w3, r3) = dir(t_vml / t_fn);
-                let (w5, r5) = dir(t_vml / t_ent);
-                eprintln!(
-                    "  {name:<5} vs oneMKL VML : entry {r5:.3}x {w5} | mono {r2:.3}x {w2} | \
-                     fnptr {r3:.3}x {w3} (peer max rel {worst:.1e})"
-                );
+                let mut control_worst = r4;
+                if t_vml[1].is_finite() {
+                    let (wt, rt) = dir(t_vml[1] / t_vml[0]);
+                    control_worst = control_worst.max(rt);
+                    eprintln!(
+                        "  {name:<5} CONTROL       : VML-HA twin vs VML-HA  {rt:.3}x {wt} \
+                         (SAME LIBRARY, SAME MODE — true ratio 1.000)"
+                    );
+                }
+                // The band inside which nothing is publishable: the wider of this machine's standing
+                // noise floor and what THIS run's own two identical-code controls actually spread.
+                let floor = NOISE_FLOOR.max(control_worst);
+                if control_worst > 1.05 {
+                    eprintln!(
+                        "  {name:<5} CONTROL       : worst identical-code ratio this run \
+                         {control_worst:.3}x — nothing at or below it is a difference"
+                    );
+                }
+                // Every ratio this laptop cannot resolve is printed as a TIE, in both directions.
+                let tag = |r: f64| if r < floor { "  [TIE — at/below the noise floor]" } else { "" };
+                // (timing slot, mode-arm index, buffer) — slot 1 is the twin control, reported above.
+                for (idx, mk, buf) in [(0usize, 0usize, &c), (2, 1, &la), (3, 2, &ep)] {
+                    let Some((_, label)) = mode_arm(mk) else { continue };
+                    if !t_vml[idx].is_finite() {
+                        continue;
+                    }
+                    let (prel, pulp) = acc_of(buf, reference);
+                    let (w2, r2) = dir(t_vml[idx] / t_mono);
+                    let (w3, r3) = dir(t_vml[idx] / t_fn);
+                    // The comparison is like-for-like only in the middle band. A peer that is more
+                    // accurate is doing more work, so beating it proves nothing; a peer that is far
+                    // LESS accurate (VML EP lands at ~1.5e-4, four orders out) is doing less, so
+                    // losing to it proves nothing either. Both are named, neither is quietly dropped.
+                    let matched = if pulp < aulp {
+                        "NOT accuracy-matched — peer is MORE accurate"
+                    } else if pulp > aulp * 4 + 4 {
+                        "NOT accuracy-matched — peer is LESS accurate"
+                    } else {
+                        "accuracy-matched"
+                    };
+                    eprintln!(
+                        "  {name:<5} vs VML {label:<2}      : mono {r2:.3}x {w2}{} | fnptr {r3:.3}x {w3} \
+                         | peer max rel {prel:.3e} / {pulp} ULP vs ours {arel:.3e} / {aulp} ULP — {matched}",
+                        tag(r2)
+                    );
+                }
             }
         }
     }
