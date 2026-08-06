@@ -6964,17 +6964,15 @@ fn time_peer4(
 ) -> Option<Measure> {
     // SAFETY: the generated `kbench` is `(const float*, const float*, const float*, float*)`.
     let f: KernelFn4 = unsafe { peer_kbench(lib)? };
-    {
-        out.iter_mut().for_each(|v| *v = 0.0);
-        let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| unsafe { f(p0, p1, p2, op) });
-        let snapshot = out.to_vec();
-        Some(Measure {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
-    }
+    out.iter_mut().for_each(|v| *v = 0.0);
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(p0, p1, p2, op) });
+    let snapshot = out.to_vec();
+    Some(Measure {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
 }
 
 /// The int8 twin of [`bench_wukong`]: JIT the int8 GEMM kernel and time it through the `(u8, i8,
@@ -7239,16 +7237,14 @@ fn time_peer_halfout(
 ) -> Option<MeasureHalfOut> {
     // SAFETY: the generated `kbench` takes and returns `unsigned short*` (bf16 stored bits).
     let f: HalfOutKernelFn = unsafe { peer_kbench(lib)? };
-    {
-        let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| unsafe { f(xp, yp, op) });
-        let snapshot: Vec<f32> = out.iter().map(|&b| widen_bf16(b)).collect();
-        Some(MeasureHalfOut {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
-    }
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot: Vec<f32> = out.iter().map(|&b| widen_bf16(b)).collect();
+    Some(MeasureHalfOut {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
 }
 
 /// Best-of-many-batches timing: warm up, grow the batch until ~50 ms, then take the fastest of many
