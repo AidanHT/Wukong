@@ -269,7 +269,9 @@ fn cpp_checked(label: &str, c: &Option<Measure>, cpp: Option<Measure>) -> Option
 /// columns makes it structurally impossible for a family to print a "vs C" ratio with no C++ number
 /// behind it: there is deliberately no `bench_c_only`.
 ///
-/// The C++ column runs immediately after the C column so the two land in the same thermal group.
+/// Both columns are built first and then timed **A B B A**, each keeping its own fastest sample —
+/// see [`abba_min`] for why the old `let c = …; let cpp = …;` was a systematic bias against the C++
+/// column and not merely noise.
 #[allow(clippy::too_many_arguments)]
 fn bench_c_cpp(
     label: &str,
@@ -281,8 +283,9 @@ fn bench_c_cpp(
     xp: *const f32,
     yp: *const f32,
 ) -> (Option<Measure>, Option<Measure>) {
-    let c = bench_external("c", c_src, dir, label, cc, args, out, xp, yp);
-    let cpp = bench_external("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, xp, yp);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| time_peer(lib, compile, &mut *out, xp, yp));
     let cpp = cpp_checked(label, &c, cpp);
     (c, cpp)
 }
@@ -300,8 +303,10 @@ fn bench_c_cpp4(
     p1: *const f32,
     p2: *const f32,
 ) -> (Option<Measure>, Option<Measure>) {
-    let c = bench_external4("c", c_src, dir, label, cc, args, out, p0, p1, p2);
-    let cpp = bench_external4("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, p0, p1, p2);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) =
+        abba_min(&cl, &pl, |lib, compile| time_peer4(lib, compile, &mut *out, p0, p1, p2));
     let cpp = cpp_checked(label, &c, cpp);
     (c, cpp)
 }
@@ -319,8 +324,9 @@ fn bench_c_cpp_i8(
     ap: *const u8,
     bp: *const i8,
 ) -> (Option<MeasureI8>, Option<MeasureI8>) {
-    let c = bench_external_i8("c", c_src, dir, label, cc, args, out, ap, bp);
-    let cpp = bench_external_i8("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, ap, bp);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| time_peer_i8(lib, compile, &mut *out, ap, bp));
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) if cm.out != p.out => {
             println!("  ! {label}: C++ (g++) disagrees with C (gcc) on the i32 output — C++ column dropped");
@@ -344,8 +350,10 @@ fn bench_c_cpp_bf16(
     xp: *const u16,
     yp: *const u16,
 ) -> (Option<MeasureBf16>, Option<MeasureBf16>) {
-    let c = bench_external_bf16("c", c_src, dir, label, cc, args, out, xp, yp);
-    let cpp = bench_external_bf16("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, xp, yp);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) =
+        abba_min(&cl, &pl, |lib, compile| time_peer_bf16(lib, compile, &mut *out, xp, yp));
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) => {
             let rel = ((cm.out - p.out).abs() / cm.out.abs().max(1e-6)) as f64;
@@ -374,8 +382,10 @@ fn bench_c_cpp_halfout(
     xp: *const u16,
     yp: *const u16,
 ) -> (Option<MeasureHalfOut>, Option<MeasureHalfOut>) {
-    let c = bench_external_halfout("c", c_src, dir, label, cc, args, out, xp, yp);
-    let cpp = bench_external_halfout("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, xp, yp);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) =
+        abba_min(&cl, &pl, |lib, compile| time_peer_halfout(lib, compile, &mut *out, xp, yp));
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) => {
             let (rel, at) = max_rel_err(&cm.out, &p.out);
@@ -6678,20 +6688,27 @@ fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> O
     })
 }
 
-/// Compile a C/Rust source to a shared library with `compiler args…` (timed), load it, and bench.
-/// Derives the kernel's output pointer from `out` — see the one-live-pointer law on [`bench_wukong`].
-#[allow(clippy::too_many_arguments)]
-fn bench_external(
+/// A built-and-loaded peer library, plus the wall time its compiler process took.
+///
+/// The `Library` must outlive every call through the symbol taken out of it, which is why this is
+/// carried around as a value rather than a path: dropping it unloads the DLL.
+type PeerLib = (Duration, libloading::Library);
+
+/// Compile `src` to a shared library with `compiler args…` (timed) and LOAD it — everything
+/// `bench_external*` does EXCEPT running the kernel.
+///
+/// Split out on 2026-08-05 so the `bench_c_cpp*` pair helpers can build both peers first and then
+/// interleave only the *timed* regions (see [`abba_min`]). Building both up front also means no
+/// compiler process spawn — the noisiest thing this harness does, it loads every core — lands
+/// between two timed regions that are about to be compared.
+fn build_peer(
     ext: &str,
     src: &str,
     dir: &Path,
     name: &str,
     compiler: &str,
     args: &[&str],
-    out: &mut [f32],
-    xp: *const f32,
-    yp: *const f32,
-) -> Option<Measure> {
+) -> Option<PeerLib> {
     // Sanitize the kernel name for use as a filename: rustc derives the crate name from the source
     // file stem and rejects characters like `@` (e.g. `saxpy@parallel`).
     let safe: String = name
@@ -6728,33 +6745,135 @@ fn bench_external(
             return None;
         }
     }
-
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<KernelFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: KernelFn = *sym;
-        out.iter_mut().for_each(|v| *v = 0.0);
-        let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(xp, yp, op));
-        let snapshot = out.to_vec();
-        Some(Measure {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
+    // SAFETY: loading a library this process just produced from its own generated source. The
+    // caller keeps the returned `Library` alive for as long as it calls through it.
+    match unsafe { libloading::Library::new(&dll) } {
+        Ok(l) => Some((compile, l)),
+        Err(e) => {
+            eprintln!("load {}: {e}", dll.display());
+            None
+        }
     }
+}
+
+/// Fetch the `kbench` entry point out of a loaded peer library.
+///
+/// # Safety
+/// `F` must be the fn-pointer type matching the generated kernel's real ABI. The five generators
+/// each pass their own (`KernelFn`, `KernelFn4`, `I8KernelFn`, `Bf16KernelFn`, `HalfOutKernelFn`),
+/// exactly as the pre-split `bench_external*` bodies did.
+unsafe fn peer_kbench<F: Copy>(lib: &libloading::Library) -> Option<F> {
+    match lib.get::<F>(b"kbench\0") {
+        Ok(s) => Some(*s),
+        Err(e) => {
+            eprintln!("symbol kbench in a peer library: {e}");
+            None
+        }
+    }
+}
+
+/// The one thing [`abba_min`] needs from a measurement: how long a call took.
+trait Timed {
+    fn ns(&self) -> f64;
+}
+impl Timed for Measure {
+    fn ns(&self) -> f64 {
+        self.ns_per_call
+    }
+}
+impl Timed for MeasureI8 {
+    fn ns(&self) -> f64 {
+        self.ns_per_call
+    }
+}
+impl Timed for MeasureBf16 {
+    fn ns(&self) -> f64 {
+        self.ns_per_call
+    }
+}
+impl Timed for MeasureHalfOut {
+    fn ns(&self) -> f64 {
+        self.ns_per_call
+    }
+}
+
+/// Keep the faster of two samples of the SAME column (the harness's minimum-is-the-estimate rule,
+/// already used inside [`time_ns`] across its 14 blocks).
+fn faster<M: Timed>(x: Option<M>, y: Option<M>) -> Option<M> {
+    match (x, y) {
+        (Some(p), Some(q)) => Some(if q.ns() < p.ns() { q } else { p }),
+        (p, q) => p.or(q),
+    }
+}
+
+/// Time two already-built peers **A B B A** and keep each column's own fastest sample.
+///
+/// **This exists to remove a systematic bias, not to add samples.** Every `bench_c_cpp*` pair used
+/// to read `let c = …; let cpp = …;` — the C++ peer ALWAYS second — so any within-pair drift
+/// (clock ramp, thermal, a hybrid-scheduler migration between a P and an E core) landed on the C++
+/// column every single time, in every family, and biased the published "vs C++" ratio specifically
+/// rather than adding noise that averages out. Measured directly, by making the second slot compile
+/// the IDENTICAL C source with the IDENTICAL compiler so any difference is pure position: the
+/// second slot came out slower on 6 of 7 rows, by +0.1% to +0.4% on `transpose` but by **+5.0% and
+/// +17.3%** on the two `colsum` rows. A 17% positional penalty is larger than most of the
+/// language-vs-language differences this bench reports.
+///
+/// A B B A gives each column one early and one late slot, so a monotone drift over the pair cancels
+/// to first order in the difference; taking each column's own minimum then follows the same
+/// least-interfered-sample rule [`time_ns`] already applies within a column. The cost is that each
+/// peer is timed twice — deliberate, since the alternative (flipping which column goes first) only
+/// balances the bias across the suite in aggregate and leaves every individual printed row still
+/// carrying an unbalanced order.
+fn abba_min<M: Timed>(
+    a: &Option<PeerLib>,
+    b: &Option<PeerLib>,
+    mut time: impl FnMut(&libloading::Library, Duration) -> Option<M>,
+) -> (Option<M>, Option<M>) {
+    let a1 = a.as_ref().and_then(|(c, l)| time(l, *c));
+    let b1 = b.as_ref().and_then(|(c, l)| time(l, *c));
+    let b2 = b.as_ref().and_then(|(c, l)| time(l, *c));
+    let a2 = a.as_ref().and_then(|(c, l)| time(l, *c));
+    (faster(a1, a2), faster(b1, b2))
+}
+
+/// Time an already-loaded 3-pointer peer. Derives the kernel's output pointer from `out` — see the
+/// one-live-pointer law on [`bench_wukong`].
+fn time_peer(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+) -> Option<Measure> {
+    // SAFETY: the generated C/Rust `kbench` is `(const float*, const float*, float*) -> void`.
+    let f: KernelFn = unsafe { peer_kbench(lib)? };
+    out.iter_mut().for_each(|v| *v = 0.0);
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot = out.to_vec();
+    Some(Measure {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
+}
+
+/// Compile a C/Rust source to a shared library with `compiler args…` (timed), load it, and bench.
+/// Derives the kernel's output pointer from `out` — see the one-live-pointer law on [`bench_wukong`].
+#[allow(clippy::too_many_arguments)]
+fn bench_external(
+    ext: &str,
+    src: &str,
+    dir: &Path,
+    name: &str,
+    compiler: &str,
+    args: &[&str],
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+) -> Option<Measure> {
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer(&lib, compile, out, xp, yp)
 }
 
 /// A 4-pointer kernel ABI `(p0, p1, p2: *const, op: *mut)` — for kernels that read three input buffers
@@ -6830,59 +6949,25 @@ fn bench_external4(
     p1: *const f32,
     p2: *const f32,
 ) -> Option<Measure> {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let src_path = dir.join(format!("{safe}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
-    if std::fs::write(&src_path, src).is_err() {
-        return None;
-    }
-    let t = Instant::now();
-    let status = Command::new(compiler)
-        .args(args)
-        .arg("-o")
-        .arg(&dll)
-        .arg(&src_path)
-        .status();
-    let compile = t.elapsed();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("{compiler} failed to compile {name}.{ext}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("could not run `{compiler}` (skipping)");
-            return None;
-        }
-    }
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<KernelFn4> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: KernelFn4 = *sym;
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer4(&lib, compile, out, p0, p1, p2)
+}
+
+/// Time an already-loaded 4-pointer peer (the [`abba_min`] half of [`bench_external4`]).
+fn time_peer4(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [f32],
+    p0: *const f32,
+    p1: *const f32,
+    p2: *const f32,
+) -> Option<Measure> {
+    // SAFETY: the generated `kbench` is `(const float*, const float*, const float*, float*)`.
+    let f: KernelFn4 = unsafe { peer_kbench(lib)? };
+    {
         out.iter_mut().for_each(|v| *v = 0.0);
         let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(p0, p1, p2, op));
+        let ns = time_ns(|| unsafe { f(p0, p1, p2, op) });
         let snapshot = out.to_vec();
         Some(Measure {
             compile,
@@ -6955,67 +7040,29 @@ fn bench_external_i8(
     ap: *const u8,
     bp: *const i8,
 ) -> Option<MeasureI8> {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let src_path = dir.join(format!("{safe}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
-    if std::fs::write(&src_path, src).is_err() {
-        return None;
-    }
-    let t = Instant::now();
-    let status = Command::new(compiler)
-        .args(args)
-        .arg("-o")
-        .arg(&dll)
-        .arg(&src_path)
-        .status();
-    let compile = t.elapsed();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("{compiler} failed to compile {name}.{ext}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("could not run `{compiler}` (skipping)");
-            return None;
-        }
-    }
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer_i8(&lib, compile, out, ap, bp)
+}
 
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<I8KernelFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: I8KernelFn = *sym;
-        out.iter_mut().for_each(|v| *v = 0);
-        let cp = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(ap, bp, cp));
-        let snapshot = out.to_vec();
-        Some(MeasureI8 {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
-    }
+/// Time an already-loaded int8 peer (the [`abba_min`] half of [`bench_external_i8`]).
+fn time_peer_i8(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [i32],
+    ap: *const u8,
+    bp: *const i8,
+) -> Option<MeasureI8> {
+    // SAFETY: the generated `kbench` is `(const unsigned char*, const signed char*, int*)`.
+    let f: I8KernelFn = unsafe { peer_kbench(lib)? };
+    out.iter_mut().for_each(|v| *v = 0);
+    let cp = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(ap, bp, cp) });
+    let snapshot = out.to_vec();
+    Some(MeasureI8 {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
 }
 
 /// The bf16 twin of [`bench_wukong_i8`]: JIT-compile a Wukong bf16 reduction and time it. `out` is a
@@ -7086,67 +7133,29 @@ fn bench_external_bf16(
     xp: *const u16,
     yp: *const u16,
 ) -> Option<MeasureBf16> {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let src_path = dir.join(format!("{safe}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
-    if std::fs::write(&src_path, src).is_err() {
-        return None;
-    }
-    let t = Instant::now();
-    let status = Command::new(compiler)
-        .args(args)
-        .arg("-o")
-        .arg(&dll)
-        .arg(&src_path)
-        .status();
-    let compile = t.elapsed();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("{compiler} failed to compile {name}.{ext}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("could not run `{compiler}` (skipping)");
-            return None;
-        }
-    }
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer_bf16(&lib, compile, out, xp, yp)
+}
 
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<Bf16KernelFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: Bf16KernelFn = *sym;
-        out[0] = 0.0;
-        let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(xp, yp, op));
-        let snapshot = out[0];
-        Some(MeasureBf16 {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
-    }
+/// Time an already-loaded bf16-reduction peer (the [`abba_min`] half of [`bench_external_bf16`]).
+fn time_peer_bf16(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [f32],
+    xp: *const u16,
+    yp: *const u16,
+) -> Option<MeasureBf16> {
+    // SAFETY: the generated `kbench` is `(const unsigned short*, const unsigned short*, float*)`.
+    let f: Bf16KernelFn = unsafe { peer_kbench(lib)? };
+    out[0] = 0.0;
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot = out[0];
+    Some(MeasureBf16 {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
 }
 
 /// The all-half twin of [`bench_wukong_bf16`]: JIT a Wukong kernel with the `(x, y, out)` all-`u16`
@@ -7216,59 +7225,23 @@ fn bench_external_halfout(
     xp: *const u16,
     yp: *const u16,
 ) -> Option<MeasureHalfOut> {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let src_path = dir.join(format!("{safe}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
-    if std::fs::write(&src_path, src).is_err() {
-        return None;
-    }
-    let t = Instant::now();
-    let status = Command::new(compiler)
-        .args(args)
-        .arg("-o")
-        .arg(&dll)
-        .arg(&src_path)
-        .status();
-    let compile = t.elapsed();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("{compiler} failed to compile {name}.{ext}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("could not run `{compiler}` (skipping)");
-            return None;
-        }
-    }
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer_halfout(&lib, compile, out, xp, yp)
+}
 
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<HalfOutKernelFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: HalfOutKernelFn = *sym;
+/// Time an already-loaded all-half peer (the [`abba_min`] half of [`bench_external_halfout`]).
+fn time_peer_halfout(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [u16],
+    xp: *const u16,
+    yp: *const u16,
+) -> Option<MeasureHalfOut> {
+    // SAFETY: the generated `kbench` takes and returns `unsigned short*` (bf16 stored bits).
+    let f: HalfOutKernelFn = unsafe { peer_kbench(lib)? };
+    {
         let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(xp, yp, op));
+        let ns = time_ns(|| unsafe { f(xp, yp, op) });
         let snapshot: Vec<f32> = out.iter().map(|&b| widen_bf16(b)).collect();
         Some(MeasureHalfOut {
             compile,
@@ -8712,12 +8685,18 @@ mod tests {
     /// make by assertion — "g++ and gcc share a backend, so the C ratios stand for C++" — which no
     /// benchmark run could falsify because ~37 of the ~40 families measured no C++ at all.
     ///
-    /// The rule, scanned out of this file's own text: a `bench_external*` call whose first argument
-    /// is `"c"` is allowed only (a) inside the pair helpers and the relaxed-FP helpers themselves,
-    /// or (b) when the peer's name marks it as one of the deliberately C-only *extra* columns —
-    /// `…_fast` (the `-ffast-math` reassociation column) and `…_omp` (the OpenMP column). Those two
-    /// are normalizations of the C baseline, not a second language, so they have no C++ twin by
-    /// design. Anything else is a family that has quietly reverted to a C-only comparison.
+    /// The rule, scanned out of this file's own text: a `bench_external*` or `build_peer` call whose
+    /// first argument is `"c"` is allowed only (a) inside the pair helpers and the relaxed-FP helpers
+    /// themselves, or (b) when the peer's name marks it as one of the deliberately C-only *extra*
+    /// columns — `…_fast` (the `-ffast-math` reassociation column) and `…_omp` (the OpenMP column).
+    /// Those two are normalizations of the C baseline, not a second language, so they have no C++
+    /// twin by design. Anything else is a family that has quietly reverted to a C-only comparison.
+    ///
+    /// `build_peer` is scanned as well as `bench_external*` because the ABBA change split the
+    /// compile-and-load step out of the timing step: a family that wanted a bare C column would now
+    /// most naturally reach for `build_peer("c", …)`, and a guard that only knew the old entry point
+    /// would go quietly blind to exactly the thing it exists to catch. Both take the ext first and
+    /// the peer name fourth, so one scan covers them.
     ///
     /// **This guard was VACUOUS until 2026-08-05 and is only here on the second attempt.** The old
     /// scan needle was the CONTIGUOUS string `bench_external` + `("c",`, which requires the `"c"`
@@ -8776,55 +8755,58 @@ mod tests {
             fns.iter().rev().find(|(o, _)| *o <= pos).map(|(_, n)| *n).unwrap_or("<top level>")
         };
         let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-        // Split so the base name is not present contiguously in the text being scanned. (Belt and
+        // Split so the base names are not present contiguously in the text being scanned. (Belt and
         // braces — the `#[cfg(test)]` cut above already excludes this module.)
-        let base = concat!("bench_", "external");
+        let bases = [concat!("bench_", "external"), concat!("build_", "peer")];
         let (mut defs, mut calls, mut c_ext, mut exempt) = (0usize, 0usize, 0usize, Vec::new());
         let mut unpaired: Vec<String> = Vec::new();
-        let mut pos = 0usize;
-        while let Some(i) = scan[pos..].find(base) {
-            let abs = pos + i;
-            pos = abs + base.len();
-            // Not the tail of a longer identifier.
-            if abs > 0 && ident(scan.as_bytes()[abs - 1]) {
-                continue;
+        for base in bases {
+            let mut pos = 0usize;
+            while let Some(i) = scan[pos..].find(base) {
+                let abs = pos + i;
+                pos = abs + base.len();
+                // Not the tail of a longer identifier.
+                if abs > 0 && ident(scan.as_bytes()[abs - 1]) {
+                    continue;
+                }
+                // Consume the ABI suffix (`4` / `_i8` / `_bf16` / `_halfout` / anything added
+                // later), then any whitespace, and require the `(` of a call.
+                let mut j = pos;
+                while j < scan.len() && ident(scan.as_bytes()[j]) {
+                    j += 1;
+                }
+                let name = &scan[abs..j];
+                let lp = j + scan[j..].len() - scan[j..].trim_start().len();
+                if scan.as_bytes().get(lp) != Some(&b'(') {
+                    continue; // a doc-comment mention or a bare fn-item reference, not a call
+                }
+                if scan[..abs].ends_with("fn ") {
+                    defs += 1;
+                    continue;
+                }
+                calls += 1;
+                let line = scan[..abs].matches('\n').count() + 1;
+                let args = split_call_args(scan, lp)
+                    .unwrap_or_else(|| panic!("{name} at line {line}: argument list never closes"));
+                if args.first().copied() != Some("\"c\"") {
+                    continue; // the C++ / Rust / MKL columns
+                }
+                c_ext += 1;
+                let f = owner(abs);
+                if HELPERS.contains(&f) {
+                    continue;
+                }
+                // The peer name is the 4th argument of BOTH families; `_fast` / `_omp` mark the
+                // C-only extra columns.
+                let peer = *args.get(3).unwrap_or_else(|| {
+                    panic!("{name} at line {line}: fewer than 4 arguments — has the ABI changed?")
+                });
+                if peer.contains("_fast") || peer.contains("_omp") {
+                    exempt.push(format!("  line {line}: {f} -> {peer}"));
+                    continue;
+                }
+                unpaired.push(format!("  line {line}: {f} -> {name}(\"c\", …, {peer}, …)"));
             }
-            // Consume the ABI suffix (`4` / `_i8` / `_bf16` / `_halfout` / anything added later),
-            // then any whitespace, and require the `(` of a call.
-            let mut j = pos;
-            while j < scan.len() && ident(scan.as_bytes()[j]) {
-                j += 1;
-            }
-            let name = &scan[abs..j];
-            let lp = j + scan[j..].len() - scan[j..].trim_start().len();
-            if scan.as_bytes().get(lp) != Some(&b'(') {
-                continue; // a doc-comment mention or a bare fn-item reference, not a call
-            }
-            if scan[..abs].ends_with("fn ") {
-                defs += 1;
-                continue;
-            }
-            calls += 1;
-            let line = scan[..abs].matches('\n').count() + 1;
-            let args = split_call_args(scan, lp)
-                .unwrap_or_else(|| panic!("{name} at line {line}: argument list never closes"));
-            if args.first().copied() != Some("\"c\"") {
-                continue; // the C++ / Rust / MKL columns
-            }
-            c_ext += 1;
-            let f = owner(abs);
-            if HELPERS.contains(&f) {
-                continue;
-            }
-            // The peer name is the 4th argument; `_fast` / `_omp` mark the C-only extra columns.
-            let peer = *args.get(3).unwrap_or_else(|| {
-                panic!("{name} at line {line}: fewer than 4 arguments — has the ABI changed?")
-            });
-            if peer.contains("_fast") || peer.contains("_omp") {
-                exempt.push(format!("  line {line}: {f} -> {peer}"));
-                continue;
-            }
-            unpaired.push(format!("  line {line}: {f} -> {name}(\"c\", …, {peer}, …)"));
         }
         assert!(
             unpaired.is_empty(),
@@ -8832,10 +8814,14 @@ mod tests {
             unpaired.join("\n")
         );
         // Floors, so that renaming/deleting the things being scanned cannot make the assertion
-        // above pass by finding nothing. 5 definitions, 60 calls, 16 of them C-ext and 8 of those
-        // exempt (5 `_omp` + 3 `_fast`) at the time of writing.
-        assert_eq!(defs, 5, "expected the 5 bench_external* ABI families, found {defs}");
-        assert!(calls >= 55, "only {calls} bench_external* call sites — did the scan stop matching?");
+        // above pass by finding nothing. 6 definitions (5 `bench_external*` ABI families plus
+        // `build_peer`), 65 calls, 16 of them C-ext and 8 of those exempt (5 `_omp` + 3 `_fast`)
+        // at the time of writing.
+        assert_eq!(
+            defs, 6,
+            "expected the 5 bench_external* ABI families plus build_peer, found {defs} definitions"
+        );
+        assert!(calls >= 58, "only {calls} peer call sites — did the scan stop matching?");
         assert!(c_ext >= 14, "only {c_ext} C-ext call sites — is the first argument still the ext?");
         assert!(
             exempt.len() >= 6,
