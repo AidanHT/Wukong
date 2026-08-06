@@ -51,10 +51,11 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   and have been removed from this list. See the [peer-strength
   correction](BENCHMARKS.md#-peer-strength-correction--2026-08-04).)*;
 - **wins the transcendental/activation family ~4.7–11.5× vs C** (**~28× under `@parallel`**) — the
-  cleanest compute-bound win — and is now **ahead of Intel oneMKL VML**, the hand-tuned vector-math
-  SOTA, on all three ops measured, in **both** of this laptop's power states: same-run, one process,
-  ABBA-interleaved, best-of-30, MKL at one thread — **tanh 4.08–4.66×**, **log 1.17–1.46×** and
-  **exp 1.01–1.25× faster** (≈2× at n = 2²³, where Wukong's non-temporal store regime also engages).
+  cleanest compute-bound win — and has now **caught Intel oneMKL VML**, the hand-tuned vector-math
+  SOTA: same-run, one process, ABBA-interleaved, best-of-30, MKL at one thread, three rounds across
+  both of this laptop's power states — **tanh 4.08–4.66× faster** and **log 1.17–1.46× faster** at
+  every size, and **exp 1.08–1.25× faster at 2¹²/2²⁰, a tie at 2¹⁶, ≈2× at 2²³** (where Wukong's
+  non-temporal store regime also engages). exp is quoted as a tie where it measures as one.
   The exp/log gap this replaces (1.20–1.49× and 1.05–1.28× *slower*) had been recorded as
   algorithmic; it was actually the dispatch calling its 8-lane kernel through a function pointer,
   which without crate-wide AVX means the `__m256` crosses the call through memory. Inlining it is

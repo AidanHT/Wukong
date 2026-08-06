@@ -62,9 +62,12 @@ Current standing (recorded):
   physics-ties at L3-resident sizes (relu, biasadd, hadamard); reductions/norms/scans/column
   family 1.4–107× vs scalar-left-by-gcc patterns — but note these are IEEE-serial C baselines
   (see G5 fairness work: a `-ffast-math` C column normalizes the reassociation share).
-- *Transcendentals*: 4.7–12× scalar libm; vs MKL VML the standing is now **exp 1.01–1.25×
-  faster (≈2× at n = 2²³), log 1.17–1.46× faster, tanh 4.08–4.66× faster** (2026-08-06,
-  one process, ABBA-interleaved, best-of-30, MKL at 1 thread, **both power states**).
+- *Transcendentals*: 4.7–12× scalar libm; vs MKL VML the standing is now **log 1.17–1.46×
+  faster and tanh 4.08–4.66× faster at every size, exp 1.08–1.25× faster at 2¹²/2²⁰ but a
+  TIE at 2¹⁶ and ≈2× at 2²³** (2026-08-06, one process, ABBA-interleaved, best-of-30,
+  MKL at 1 thread, three rounds across **both power states**). exp is reported as a tie
+  where it measures as one; what is unambiguous at every exp size is that the old spelling
+  measures 1.20–1.49× slower than VML in the same process.
   **The four-year-old "the residual is algorithmic" reading was wrong**, and it is worth
   recording why the instrument did not catch it: every lever tried against this gap —
   8-bucket `vpermps` LUTs (2026-07-08, which did close a real ~1.7–2× loss), Estrin
@@ -187,7 +190,8 @@ tail (C-tile prefetch, 2048³ now at/above MKL-1c parity, see M1), the 256³ del
 start → now 1.07–1.43× AHEAD of *compiled* torch, see M2), and the honest-instrument holes (f32-out cuBLAS peer column; exp/log/model ranges
 re-based on multi-state measurement), and **exp/log vs VML, which this list called
 "measured-and-bounded, algorithmic" until 2026-08-06 and which turned out to be a
-function-pointer dispatch boundary — now 1.01–1.39× ahead of VML** (see M1). Measured-and-bounded
+function-pointer dispatch boundary — log now ahead of VML at every size, exp at parity
+or ahead** (see M1). Measured-and-bounded
 rather than closed: GPU long-S attention (warp specialization built; wins only 4–6% @S=4096 —
 structural SFU bound), 4096³ GEMM (v2cs +2.7%; ~80% of the honest peer, residual is SASS-level).
 Remaining, ranked:

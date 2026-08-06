@@ -36,9 +36,12 @@ and was reverted); none of them could see it, because none of them was in the lo
   MKL pinned to 1 thread, n = 2¹²…2²³, in **both** of this laptop's power states — battery at 32–35%
   and AC at 14%): the internal monomorphized-vs-function-pointer ratio — power-independent, same
   code, same bits — is **1.12–1.75× faster** (typically ~1.4×; the 1.12 is exp at 2²³, where the pass
-  is memory-bound). Against VML: exp goes from 1.20–1.49× slower to **1.01–1.25× faster** (1.97–2.13×
-  at 2²³, where Wukong's non-temporal store regime also engages), log from 1.05–1.28× slower to
-  **1.17–1.46× faster**, tanh from 2.56–3.20× to **4.08–4.66×** faster. A fourth arm times the real
+  is memory-bound). Against VML: log goes from 1.05–1.28× slower to **1.17–1.46× faster** at every
+  size and tanh from 2.56–3.20× to **4.08–4.66×**. exp is the honest one — it goes from 1.20–1.49×
+  slower to **1.08–1.25× faster at 2¹² and 2²⁰, a TIE at 2¹⁶** (four readings spanning 1.008× slower
+  to 1.053× faster; quoted as parity, not a win) and **1.97–2.13× at 2²³**, where the non-temporal
+  store regime also engages. What is unambiguous at every exp size is the delta from the old
+  spelling, measured in the same process. A fourth arm times the real
   exported `wukong_vmath_f32` and tracks whichever spelling is selected, so the twins are not
   flattering models. The two-input kernel measures **1.09–1.48×** (`vmath2_mono_vs_fnptr`, internal
   A/B only — VML has no `silu'`/`gelu'`/SwiGLU-gate entry to peer against).
