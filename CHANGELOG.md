@@ -140,8 +140,9 @@ what turned this row from a loss into a win.
   at, `0x1a02` = `VML_ERRMODE_DEFAULT | VML_HA`, independently confirms the accuracy constants.
 - **Against that matched peer, exp and log are a TIE.** Five same-run best-of-40 ABBA rounds in one
   process, AC+charging 68–76%, nothing else running: exp **1.09–1.20× slower** at 2¹⁶ and 2²⁰, log
-  between **1.09× slower and 1.07× faster**. Only at n = 2²³ does either clear the floor (exp
-  1.37–1.54×, log 1.48–1.66×), and that is Wukong's non-temporal store regime, not its core.
+  between **1.09× slower and 1.07× faster**. Only at n = 2²³ does either come near the floor, and
+  even there only log clears it (1.48–1.66×) while exp straddles it (1.37–1.54×) — and that is
+  Wukong's non-temporal store regime, not its core.
   **RETRACTED**: "exp 1.08–1.25× faster at 2¹²/2²⁰" and "log 1.17–1.46× faster at every size".
 - **tanh keeps its win and gains a disclosure**: **2.85–3.24× vs VML's fastest mode** (3.93–4.91× vs
   HA), well clear of any noise floor — but Wukong's tanh measures **44 ULP / 3.5e-6 relative against

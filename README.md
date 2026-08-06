@@ -57,7 +57,8 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   for log on the timed band — exactly where Wukong measures 2 and 4) **exp and log are a tie**, exp
   reading 1.09–1.20× *slower* and log between 1.09× slower and 1.07× faster at n = 2¹⁶ and 2²⁰,
   over five same-run best-of-40 ABBA rounds. Only at n = 2²³, where Wukong's non-temporal store
-  regime engages, does either clear this machine's ~1.4× noise floor. **tanh is the real win at
+  regime engages, does either come near this machine's ~1.4× noise floor — and there only log
+  clears it (1.48–1.66×), exp straddling it at 1.37–1.54×. **tanh is the real win at
   2.85–3.24× vs VML's fastest mode** — with the disclosure that Wukong's tanh is 44 ULP against
   VML's ≤1 ULP, so it trades accuracy for speed. Comparisons against VML's *default* HA mode
   (~0.5 ULP) flatter Wukong and are not quoted as wins.

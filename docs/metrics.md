@@ -69,8 +69,8 @@ Current standing (recorded):
   timed band, exactly where Wukong measures 2 and 4 — five same-run best-of-40 ABBA rounds in
   one process (AC+charging 68–76%, nothing else running) read **exp 1.09–1.20× SLOWER at 2¹⁶
   and 2²⁰** and **log between 1.09× slower and 1.07× faster**. Only at n = 2²³ does either
-  clear the floor (exp 1.37–1.54×, log 1.48–1.66×), and that is Wukong's non-temporal store
-  regime rather than its core. The earlier numbers were against VML's **default HA mode at
+  come near the floor, and even there only log clears it (1.48–1.66×) while exp straddles it
+  (1.37–1.54×) — and that is Wukong's non-temporal store regime rather than its core. The earlier numbers were against VML's **default HA mode at
   ~0.5 ULP** — a strictly more accurate peer, so not a like-for-like comparison, and the
   mismatch was disclosed only in a source comment. **tanh is the one real win: 2.85–3.24× vs
   VML's fastest mode** (3.93–4.91× vs HA), bought with accuracy — Wukong's tanh is 44 ULP /
