@@ -7683,9 +7683,26 @@ fn measure_fma_roofline() -> f64 {
     0.0
 }
 
+/// The sustained roofline: warm ≥400 ms, then best of 8 × 40M-iteration blocks. The arguments are
+/// spelled out here rather than baked into [`fma_probe_avx2`] because [`clock_probe_gflops`] runs the
+/// IDENTICAL loop at a much shorter setting, and the two must not drift apart.
+///
+/// # Safety
+/// Requires AVX2 + FMA; [`measure_fma_roofline`] is the checked entry point.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn fma_roofline_avx2() -> f64 {
+    fma_probe_avx2(400, 40_000_000, 8)
+}
+
+/// The FMA probe loop, parameterized by warm-up wall time, iterations per timed block and block
+/// count. GFLOP/s = best block.
+///
+/// # Safety
+/// Requires AVX2 + FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fma_probe_avx2(warm_ms: u64, iters: u64, samples: usize) -> f64 {
     use std::arch::x86_64::*;
     let a = _mm256_set1_ps(1.000_000_1);
     let b = _mm256_set1_ps(0.999_999_9);
@@ -7710,18 +7727,19 @@ unsafe fn fma_roofline_avx2() -> f64 {
     // far too short: the chip boosts over ~100-400 ms from a cold idle start, so the roofline would be
     // measured throttled and then read *below* the warm GEMM that runs minutes later — making
     // "% of roofline" exceed 100% (an obvious honesty bug). Warm for ≥400 ms of wall time instead.
+    // (The per-round clock trace passes a much shorter `warm_ms` on purpose — it is sampled between
+    // rounds of an already-hot section and only has to read the clock, not ramp it.)
     {
         let t = Instant::now();
         let mut warm = 0f32;
-        while t.elapsed() < Duration::from_millis(400) {
+        while t.elapsed() < Duration::from_millis(warm_ms) {
             warm += run(2_000_000);
         }
         std::hint::black_box(warm);
     }
-    let iters = 40_000_000u64;
     let mut best = f64::INFINITY;
     let mut sink = 0f32;
-    for _ in 0..8 {
+    for _ in 0..samples {
         let t = Instant::now();
         sink += run(iters);
         let e = t.elapsed().as_secs_f64();
@@ -7737,6 +7755,458 @@ unsafe fn fma_roofline_avx2() -> f64 {
 fn geomean(xs: &[f64]) -> f64 {
     let s: f64 = xs.iter().map(|x| x.ln()).sum();
     (s / xs.len() as f64).exp()
+}
+
+// ----------------------------------------------------------------------------------------------
+// ROUND-INTERLEAVED MEASUREMENT
+//
+// WHAT THIS IS AND IS NOT. Two things here are established, one thing that was claimed for it is
+// NOT, and the difference matters more than either.
+//
+// ESTABLISHED 1 — A BIAS FIX. `bench_structure_tax` used to time all five Wukong spellings to
+// completion and only then build and time the peers, one language after another, each exactly once,
+// in a FIXED order. C therefore always held the first and coolest peer slot and Rust always held the
+// last, so any drift across the section was charged to Rust and the Wukong columns always got the
+// earliest slots — in Wukong's own benchmark. That is a systematic, reproducible error in the
+// method, not noise: the harness published "C++ 1.89x slower than C" on byte-identical numeric
+// bodies from position alone. (The loss and scan sections had already been given a forward/reverse
+// two-pass at 17ab8d0; the structure tax had not.) Timing every column once per round in a rotating,
+// direction-alternating order fixes it by construction, and forming each ratio INSIDE a round means
+// no ratio is ever a quotient of two different instants of the machine's clock.
+//
+// ESTABLISHED 2 — A MEASURED NOISE FLOOR. `C(twin)` is the identical C source through the identical
+// compiler at the identical flags in a second DLL. Its ratio against `C` has expected value exactly
+// 1.00 and contains no language content whatsoever, so what it reads away from 1.00 is the
+// instrument. It is the most valuable thing in this module. In one validation run it read C 75.20 ms
+// against C(twin) 57.60 ms — the pre-2026-08-06 estimator would have published A BYTE-IDENTICAL
+// BINARY as "1.31x faster than C". Every cross-language cell is now classified against that floor:
+// a range that overlaps what the control did reads BELOW FLOOR and carries no number.
+//
+// NOT ESTABLISHED — THE VARIANCE HEADLINE, WHICH IS RETRACTED. The commit that introduced this
+// protocol (ec08db2, branch bench/noise-resistant-ratios) claimed the run-to-run spread of the
+// published `vs C` ratio fell from median 1.451x / worst 3.764x to median 1.142x / worst 1.404x. IT
+// DOES NOT REPLICATE. An adversarial re-run of the general suite EIGHT times with both binaries
+// interleaved, on AC+CHARGING, measured OLD median 1.195x / worst 2.876x against NEW median 1.270x /
+// worst 1.869x — the MEDIAN GOT WORSE. Do not restate the retracted claim.
+//
+// ESTABLISHED 3 — AND THE REASON THE MEDIAN MOVED AT ALL WAS NEITHER PROTOCOL. It was the Windows
+// scheduler walking a long single-threaded section down a hybrid P/E core topology, and once the
+// timing thread is pinned it goes away — see `general`'s CPU PINNING section for the A/B. That is
+// the largest confound this suite has ever had and it was invisible to both protocols. Measured,
+// same binary, kill switch only, three interleaved runs per arm (battery):
+//
+//     ROUND PROTOCOL, unpinned    median 1.085x   worst 1.823x
+//     ROUND PROTOCOL, pinned      median 1.035x   worst 1.076x
+//     OLD PROTOCOL,   unpinned    median 1.170x   worst 1.271x
+//     OLD PROTOCOL,   pinned      median 1.055x   worst 1.103x
+//
+// Read that honestly: PINNING is the big lever and it helps BOTH protocols. What the round protocol
+// adds on top of a pinned machine is real but small (1.055 -> 1.035 median, 1.103 -> 1.076 worst),
+// and a separate interleaved pair measured 1.068x/1.176x for ec08db2's exact protocol against
+// 1.028x/1.127x for this one. The round protocol's case rests on the bias fix and the control, not on
+// a variance headline.
+//
+// The per-visit budget ec08db2 cut (2 warm-ups + best-of-7 -> 1 + best-of-3) is restored, but for a
+// measured reason that is NOT the one it was blamed for: on a pinned machine it does not move the
+// published ratio's spread at all (1.049x/1.094x restored against 1.041x/1.092x cut). What it moves
+// is the run's own NOISE FLOOR — the control's per-round spread, 7 of 9 sections inside the 1.10
+// limit against 2 of 9 — and the floor is the gate that decides what may be printed. See
+// `general::time_round`. The default round count is cut 6 -> 4 to pay for it.
+//
+// AND THE PROTOCOL STILL SHIFTS THE LEVEL, NOT ONLY THE ORDER — the residual, after pinning, is in
+// the block section only, and it is the difference between timing a column right after a gcc pause
+// and timing continuously. See `general::time_round`. Read `ms` columns only against other `ms`
+// columns from the same run.
+//
+// WHAT THE WHOLE THING BUYS, END TO END, MEASURED IN THE STATE THE VERIFIER USED. Six general runs,
+// 2026-08-06, AC+CHARGING 68%->72% (charging caps ALL-CORE only; every column in this suite is
+// single-threaded, and it is pinned, so the cap does not bind — but the LEVELS are not comparable to
+// an AC+full run and no level here is reportable). ec08db2's binary and this one INTERLEAVED, three
+// runs each, order ship / pred / pred / ship / ship / pred:
+//
+//                                     ec08db2      SHIPPED
+//     cells resolved to a SIZE          0 of 57     19 of 57
+//     sections whose CONTROL failed     9 of 9       3 of 9
+//     control per-round spread       1.702x med   1.049x med   (worst 2.169x -> 1.503x)
+//     run-to-run spread of `vs C`    1.276x med   1.056x med   (worst 1.633x -> 1.285x)
+//
+// The 1.276x replicates the verifier's 1.270x for this protocol almost exactly, which is the
+// strongest evidence available that the comparison itself is sound. It is a THREE-change A/B (pin,
+// per-visit budget, round count), so read it with the decomposition above rather than instead of it:
+// the battery A/Bs attribute the published-ratio spread almost entirely to the PIN and the control's
+// spread — the floor — largely to the restored BUDGET. Nothing here says anything about any language.
+// ----------------------------------------------------------------------------------------------
+
+/// The order to visit `n` columns in on round `r`.
+///
+/// Rounds come in PAIRS: round `2k` visits the columns rotated left by `k`, round `2k+1` visits that
+/// exact list reversed. Every column therefore sits at position `p` in the forward round and at
+/// `n-1-p` in the reverse one, so after each complete pair every column's positions sum to exactly
+/// `n-1` — the position balance is exact, not statistical. At `n = 2` this reproduces the A B / B A
+/// of [`abba_min`] literally; this is its N-column form. The rotation across pairs additionally moves
+/// which column *leads* a round, since the leader is the one that pays for whatever ran between
+/// rounds (the clock probe, the round's power sample).
+///
+/// Use an EVEN number of rounds — see [`gen_rounds`], which enforces it — or the last unpaired round
+/// reintroduces exactly the positional bias this removes.
+fn round_order(n: usize, round: usize) -> Vec<usize> {
+    let shift = round / 2;
+    let mut ord: Vec<usize> = (0..n).map(|p| (shift + p) % n.max(1)).collect();
+    if round % 2 == 1 {
+        ord.reverse();
+    }
+    ord
+}
+
+/// Number of rounds for the round-interleaved sections, from `XBENCH_ROUNDS` (default 4), rounded UP
+/// to an even number so [`round_order`]'s position balance is exact, and floored at 2 (a single
+/// round has no dispersion to report and is exactly the protocol this replaces).
+///
+/// The default was 6 when the protocol landed and is 4 now. Rounds and per-visit samples are two
+/// different axes and the budget has to be split between them: rounds buy protection from drift
+/// BETWEEN visits, per-visit samples buy a good estimate of the speed AT a visit. ec08db2 spent
+/// almost everything on rounds (6 rounds x [1 warm + best-of-3]) and the resulting per-visit estimate
+/// was measurably worse than the protocol it replaced on the block section's 4-5 ms columns. Total
+/// calls per column is `rounds * (warmups + samples)`; at 4 x (2 + 7) that is 36, against 6 x (1 + 3)
+/// = 24 and the old single-visit protocol's 9. Reduce the ROUND COUNT, never the per-visit budget, if
+/// a section becomes too slow.
+fn gen_rounds() -> usize {
+    parse_rounds(std::env::var("XBENCH_ROUNDS").ok().as_deref())
+}
+
+/// The pure half of [`gen_rounds`], so the even/floored contract is testable without a test having
+/// to mutate a process-global env var underneath every other test in the binary.
+fn parse_rounds(v: Option<&str>) -> usize {
+    let r = v.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(4);
+    let r = r.max(2);
+    r + (r % 2)
+}
+
+/// Untimed warm-up calls at the start of every visit to a column (`XBENCH_WARMUPS`, default 2).
+///
+/// Two, not one, and this is the number ec08db2 cut. A column last ran a whole round ago and every
+/// other column has walked the same buffers since, so the first call after the gap pays a cache
+/// refill and the second pays branch-predictor and (for the JIT columns) page-fault warm-up. Charging
+/// either to the timed minimum is charging the schedule to the column.
+fn gen_warmups() -> usize {
+    parse_budget(std::env::var("XBENCH_WARMUPS").ok().as_deref(), 2, 0)
+}
+
+/// Timed calls per visit; the visit's sample is their MINIMUM (`XBENCH_SAMPLES`, default 7).
+///
+/// Seven is not arbitrary — it is what the pre-round protocol used, and the measured reason to
+/// restore it is in the module header: at best-of-3 the block section's Wukong columns roughly
+/// doubled their run-to-run spread. The minimum of a sample is a biased-low estimator whose bias
+/// shrinks with the sample size, so cutting 7 to 3 does not merely widen the estimate, it moves it,
+/// and it moves it by different amounts for a 4 ms column and a 70 ms one.
+fn gen_samples() -> usize {
+    parse_budget(std::env::var("XBENCH_SAMPLES").ok().as_deref(), 7, 1)
+}
+
+/// The pure half of [`gen_warmups`] / [`gen_samples`]. A garbage or out-of-range override falls back
+/// to the default rather than to `lo`: `XBENCH_SAMPLES=0` would leave a visit with no timed call and
+/// a `NaN` in the round table, and a `NaN` propagates into a dropped `RatioStat`, which reads exactly
+/// like "this row was not measurable" rather than like "you typed a zero".
+fn parse_budget(v: Option<&str>, dflt: usize, lo: usize) -> usize {
+    v.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= lo && n <= 1000)
+        .unwrap_or(dflt)
+}
+
+/// Median of a sample. Even-length samples take the mean of the two middle order statistics.
+/// The median, not the mean, is the point estimate for a per-round ratio: one round that collided
+/// with a background task is a large outlier in one direction only, and a mean would carry it.
+fn median(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+    let mut v = xs.to_vec();
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
+
+/// A ratio between two columns, measured ROUND BY ROUND: the median across rounds and the range the
+/// rounds spanned.
+///
+/// There is deliberately no constructor that yields a point estimate without its dispersion, and no
+/// accessor that hands out `med` without `spread`. On this machine a lone ratio is not a measurement,
+/// and the type is shaped so a caller cannot accidentally print one as if it were.
+#[derive(Clone, Copy, Debug)]
+struct RatioStat {
+    /// Median of the per-round ratios — the point estimate.
+    med: f64,
+    /// Smallest per-round ratio observed.
+    lo: f64,
+    /// Largest per-round ratio observed.
+    hi: f64,
+    /// How many rounds went into it.
+    rounds: usize,
+}
+
+impl RatioStat {
+    /// Per-round `num[r] / den[r]`, i.e. "how many times faster than `den` is `num`'s column" when
+    /// both are times and `num` is the reference. Both slices must be the same length (one entry per
+    /// round) and every entry finite and positive; anything else returns `None` rather than a
+    /// plausible-looking number, because a dropped or failed round must not silently shrink the
+    /// spread this type exists to report.
+    fn over_rounds(num: &[f64], den: &[f64]) -> Option<RatioStat> {
+        if num.len() != den.len() || num.is_empty() {
+            return None;
+        }
+        let mut rs = Vec::with_capacity(num.len());
+        for (&a, &b) in num.iter().zip(den) {
+            if !(a.is_finite() && b.is_finite()) || a <= 0.0 || b <= 0.0 {
+                return None;
+            }
+            rs.push(a / b);
+        }
+        let lo = rs.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = rs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        Some(RatioStat {
+            med: median(&rs),
+            lo,
+            hi,
+            rounds: rs.len(),
+        })
+    }
+
+    /// How far the rounds disagreed, as a factor ≥ 1.
+    fn spread(&self) -> f64 {
+        self.hi / self.lo
+    }
+
+    /// Do the rounds agree closely enough for this ratio to be quoted as a number?
+    fn conclusive(&self) -> bool {
+        self.rounds >= 2 && self.spread() <= spread_limit()
+    }
+}
+
+/// The spread above which a round-interleaved ratio is printed as INCONCLUSIVE instead of as a
+/// number. `XBENCH_SPREAD_LIMIT` overrides it.
+///
+/// 1.10 is a floor on the *claims* this harness makes. It is deliberately NOT a description of the
+/// machine, and how far the machine is from meeting it depends entirely on the confounds that have
+/// been removed. Measured on 2026-08-06, `C(twin)` CONTROL — identical C source, identical compiler,
+/// identical flags, a ratio with no language content in it whatever, true value 1.00 — over 9
+/// section-runs per configuration, each pair of configurations INTERLEAVED with each other rather
+/// than run in blocks:
+///
+/// | power | configuration | control per-round spread | inside 1.10 | control median off 1.00 |
+/// |---|---|---|---|---|
+/// | battery | as ec08db2 shipped it (unpinned, 6 x [1+3]) | median 1.290x, worst 1.509x | 0 of 9 | 3.3% typical, 7.5% worst |
+/// | battery | pinned, 4 x [2 + best-of-7] (SHIPPED) | median 1.075x, worst 1.543x | 6 of 9 | 0.5% typical, 2.2% worst |
+/// | AC+charging | as ec08db2 shipped it | median 1.702x, worst 2.169x | 0 of 9 | 9.9% typical, 27.3% worst |
+/// | AC+charging | SHIPPED | median 1.049x, worst 1.503x | 6 of 9 | 1.9% typical, 4.3% worst |
+///
+/// The ec08db2 rows are why the harness went nearly silent: a control that fails in 9 sections of 9
+/// leaves nothing to say, and on AC it was reading a byte-identical pair of DLLs 27% apart. The
+/// SHIPPED rows are why it can speak again — in the same AC+charging set, 19 of 57 cross-language
+/// cells resolved to a size against 0 of 57. The limit did not move; the instrument did. Loosening
+/// the limit to make rows pass would invert its purpose.
+///
+/// Deliberately NOT adaptive. Widening the limit when a run is noisy would let exactly the worst runs
+/// publish the most.
+///
+/// NOTE THE DIVISION OF LABOUR, because this limit alone is NOT enough and was never meant to be.
+/// It is a gate on DISPERSION: it asks whether the rounds agreed. It cannot ask whether the effect is
+/// bigger than the instrument, so a small-but-steady 1.03x sails through it — precisely the reading
+/// `C(twin)` exists to catch. [`floor_factor`] is the gate on SIZE, measured per run from the
+/// control, and [`verdict`] applies them in order: below the floor, nothing is printed at all,
+/// whatever the spread.
+fn spread_limit() -> f64 {
+    parse_spread_limit(std::env::var("XBENCH_SPREAD_LIMIT").ok().as_deref())
+}
+
+/// The pure half of [`spread_limit`] — see [`parse_rounds`] for why the split exists. An override
+/// that is not a factor strictly greater than 1 falls back to the default rather than disabling the
+/// check: `XBENCH_SPREAD_LIMIT=99` is a visible, deliberate act, whereas a typo silently accepting
+/// every ratio would be exactly the failure this module is here to prevent.
+fn parse_spread_limit(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|&x| x > 1.0)
+        .unwrap_or(1.10)
+}
+
+/// This run's own measured resolution, as a factor ≥ 1, from the `C(twin)` control.
+///
+/// The control's true value is exactly 1.00, so the largest departure from 1.00 it produced in
+/// EITHER direction — `max(hi, 1/lo)` — is the smallest effect this run could not have manufactured
+/// out of nothing. Taken symmetrically on purpose: the two DLLs are separate images and can land on
+/// different alignments, so a control interval is not guaranteed to straddle 1.00, and a one-sided
+/// band would then classify "no difference at all" as a resolved difference on the other side.
+///
+/// This is a FLOOR, never a certificate. It bounds the confounds the control SHARES with the real
+/// columns (timing, scheduling, thermal drift between two slots of one round, image placement). It
+/// cannot bound a confound unique to one language's column.
+fn floor_factor(twin: RatioStat) -> f64 {
+    twin.hi.max(1.0 / twin.lo).max(1.0)
+}
+
+/// What a run was able to say about one ratio, decided by the two gates in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    /// The whole per-round range lies outside the noise floor AND the rounds agree within
+    /// [`spread_limit`]: direction and size both hold.
+    Sized,
+    /// The whole range lies outside the floor but the rounds disagree by more than the limit: the
+    /// DIRECTION holds and the range is a bound, but the run did not pin the size.
+    DirectionOnly,
+    /// The range overlaps what a byte-identical control column did. Nothing at all: this machine in
+    /// this state cannot resolve a difference this small.
+    BelowFloor,
+}
+
+/// Classify a ratio against the run's own floor. With no control column there is no floor, and the
+/// spread gate alone decides — which is strictly weaker, because a tight spread around a tiny effect
+/// passes it. That is exactly the failure `C(twin)` was added to catch, so a run without a control
+/// says so out loud rather than quietly reverting to the old behaviour.
+fn verdict(s: RatioStat, floor: Option<f64>) -> Verdict {
+    let resolved = match floor {
+        Some(f) => s.lo > f || s.hi < 1.0 / f,
+        None => true,
+    };
+    if !resolved {
+        Verdict::BelowFloor
+    } else if s.conclusive() {
+        Verdict::Sized
+    } else {
+        Verdict::DirectionOnly
+    }
+}
+
+/// Render a [`RatioStat`] as a table cell: its verdict against this run's floor, and always the range
+/// the rounds spanned.
+///
+/// `reportable` is the power-state verdict for the section. When the state changed mid-section the
+/// cell reads `NON-REPORTABLE` and carries NO number: a reader who scrolls past a warning line still
+/// cannot come away with a figure, which is the whole difference between warning and invalidating.
+///
+/// `floor` is [`floor_factor`] of the `C(twin)` control, or `None` when the run has no control. The
+/// point of printing `BELOW FLOOR` rather than a blank is that a reader should come away knowing the
+/// INSTRUMENT'S RESOLUTION, not just that a cell was empty: a run where everything reads BELOW FLOOR
+/// has measured its own resolution and reported it, which is a result.
+fn fmt_ratio_stat(s: Option<RatioStat>, floor: Option<f64>, reportable: bool) -> String {
+    let Some(s) = s else {
+        return "-".to_string();
+    };
+    if !reportable {
+        return "NON-REPORTABLE".to_string();
+    }
+    // Direction words are chosen from the range, not the median, in the two cases where the range is
+    // all that holds: `lo > f` means every round read faster, `hi < 1/f` every round read slower.
+    match verdict(s, floor) {
+        Verdict::BelowFloor => format!("BELOW FLOOR [{:.2}-{:.2}]", s.lo, s.hi),
+        Verdict::DirectionOnly if s.lo > 1.0 => {
+            format!("FASTER, size ? [{:.2}-{:.2}]", s.lo, s.hi)
+        }
+        Verdict::DirectionOnly if s.hi < 1.0 => {
+            format!("SLOWER, size ? [{:.2}-{:.2}]", 1.0 / s.hi, 1.0 / s.lo)
+        }
+        // No floor to clear and a range straddling 1.00: the run established neither size nor
+        // direction. (Unreachable when a control exists — a straddling range always overlaps the
+        // floor — so this arm is the no-control fallback.)
+        Verdict::DirectionOnly => format!("INCONCLUSIVE [{:.2}-{:.2}]", s.lo, s.hi),
+        Verdict::Sized if s.med >= 1.0 => format!("{:.2}x faster [{:.2}-{:.2}]", s.med, s.lo, s.hi),
+        // Inverting the ratio inverts AND swaps the ends of the interval.
+        Verdict::Sized => format!(
+            "{:.2}x slower [{:.2}-{:.2}]",
+            1.0 / s.med,
+            1.0 / s.hi,
+            1.0 / s.lo
+        ),
+    }
+}
+
+/// The legend that must sit under every round-interleaved table, so the cell vocabulary above is not
+/// something a reader has to guess at. `floor` is [`floor_factor`] of this run's control.
+fn ratio_legend(floor: Option<f64>) -> String {
+    let head = match floor {
+        Some(f) => format!(
+            "  NOISE FLOOR, MEASURED THIS RUN: {f:.2}x. A byte-identical control column (C(twin):\n\
+             \x20   same source, same compiler, same flags, second DLL, true ratio exactly 1.00) moved\n\
+             \x20   by that much. Nothing smaller than it is resolvable on this machine in this state,\n\
+             \x20   whatever it looks like."
+        ),
+        None => "  NOISE FLOOR: no control column in this run — the floor is UNKNOWN and every cell\n\
+                 \x20   below is only as good as the spread gate, which a tiny-but-steady effect passes."
+            .to_string(),
+    };
+    format!(
+        "{head}\n  \
+         vs C legend — \"1.90x slower [1.87-1.94]\": median of the per-round ratios and the range\n\
+         \x20   the rounds spanned; printed only when the whole range clears the floor AND the rounds\n\
+         \x20   agree within {:.2}x. \"FASTER/SLOWER, size ?\": every round cleared the floor in that\n\
+         \x20   direction, so the direction holds and the range is a bound, but this run did not pin\n\
+         \x20   the size. \"BELOW FLOOR\": the range overlaps what the control did — not resolvable.\n\
+         \x20   \"NON-REPORTABLE\": the power state changed inside the section.",
+        spread_limit()
+    )
+}
+
+/// A SHORT same-protocol AVX2-FMA probe, sampled once per round as a relative clock trace.
+///
+/// This is NOT [`measure_fma_roofline`] and must never be quoted as a roofline: it warms for ~20 ms
+/// and times ~8 ms blocks, so it reads the short-burst turbo clock rather than the sustained one.
+/// Its only job is to answer "did this machine's clock move between round 1 and round R", in the same
+/// units every round, so a reader can see the drift the ratios had to survive. Returns 0.0 without
+/// AVX2/FMA.
+///
+/// It does NOT normalize anything. That was evaluated rather than assumed, on the raw per-round data
+/// of three general runs (2026-08-06, battery) — the evaluation is `bench/noise-resistant-ratios`'
+/// (ec08db2), carried over here rather than repeated, and it is a NEGATIVE result about a rejected
+/// alternative, so nothing below depends on it:
+///
+/// * On the published RATIO it is a mathematical no-op. Scaling both columns of a per-round ratio by
+///   that round's probe cancels: checked over all 57 (row, section, run) ratios, the normalized and
+///   un-normalized per-round ratios agreed to 1e-12 in 57 of 57 cases.
+/// * On the ABSOLUTE ms column — where a normaliser could in principle have helped — it makes things
+///   strictly WORSE. Round-to-round spread of `ms` across 66 (column, section, run) triples: raw
+///   median 1.266x / worst 3.447x, against 2.173x / 6.264x after scaling by the same round's probe.
+///   It reduced the spread in 9 of 66 cases. A 20 ms-warmed probe reads short-burst turbo and is
+///   simply noisier than the 15-second column it would be correcting, so it injects more variance
+///   than it removes.
+///
+/// So the probe survives ONLY as a printed drift trace — evidence of what the ratios had to survive.
+/// Do not promote it to a normaliser without redoing that measurement; on this data it fails.
+///
+/// AND IT IS OFF BY DEFAULT, because a probe that perturbs what it observes is worse than no probe.
+/// It is a saturating AVX2-FMA burn loop that runs immediately before the first timed column of every
+/// round: it heats the core, pulls the package into its AVX power license, and hands the round's
+/// leading column a chip in a different state from the one the trailing column gets.
+///
+/// Measured, same binary, kill switch only, two interleaved runs per arm (2026-08-06, battery,
+/// pinned) — DIRECTIONAL ONLY at n=2 per arm, but both directions point the same way and neither
+/// favours keeping it on:
+///
+/// * it lowers the level it is supposed to be observing — block C best-of-rounds 120.3 / 114.6 ms
+///   with the probe on against 144.7 / 148.8 ms with it off, i.e. the burn loop pre-boosts the core
+///   the next column is then timed on;
+/// * and it WIDENS the `C(twin)` control, whose true value is 1.00: per-round spread median 1.112x /
+///   worst 1.416x with the probe on against 1.095x / 1.152x with it off.
+///
+/// `XBENCH_CLOCK_PROBE=1` turns it back on. Keep it opt-in: the honest per-round drift trace is the
+/// raw ns table the sections already print, which costs nothing and perturbs nothing.
+fn clock_probe_enabled() -> bool {
+    matches!(
+        std::env::var("XBENCH_CLOCK_PROBE").ok().as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+fn clock_probe_gflops() -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if clock_probe_enabled() && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+        {
+            return unsafe { fma_probe_avx2(20, 4_000_000, 3) };
+        }
+    }
+    0.0
 }
 
 fn kernels() -> Vec<Kernel> {
@@ -9147,5 +9617,322 @@ mod tests {
         let xs = [0.5, 2.0, 4.0, 0.25];
         let inv: Vec<f64> = xs.iter().map(|x| 1.0 / x).collect();
         assert!((geomean(&xs) * geomean(&inv) - 1.0).abs() < 1e-12);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // The round-interleaved protocol. These are the properties the general suite's defensibility
+    // actually rests on, and every one of them is a pure function of its input — so unlike the
+    // measurements themselves they can be proved by `cargo test` on any machine in any power state.
+    // ------------------------------------------------------------------------------------------
+
+    /// The load-bearing property of [`round_order`]: over each PAIR of rounds every column's two
+    /// positions sum to exactly `n-1`. That is what makes the schedule unbiased by construction
+    /// rather than on average — no column can be systematically early (cool, uncontended) or
+    /// systematically late.
+    #[test]
+    fn round_order_balances_positions_exactly_over_each_pair() {
+        for n in 1..=12usize {
+            for pair in 0..5usize {
+                let fwd = round_order(n, 2 * pair);
+                let rev = round_order(n, 2 * pair + 1);
+                let mut pos = vec![0usize; n];
+                for (p, &col) in fwd.iter().enumerate() {
+                    pos[col] += p;
+                }
+                for (p, &col) in rev.iter().enumerate() {
+                    pos[col] += p;
+                }
+                assert!(
+                    pos.iter().all(|&s| s == n - 1),
+                    "n={n} pair={pair}: position sums {pos:?} are not all {}",
+                    n - 1
+                );
+            }
+        }
+    }
+
+    /// Every round must visit every column exactly once. A schedule that dropped or repeated a
+    /// column would leave a NaN in `Rounds::ns` (or double-count one), and the dispersion this
+    /// whole design exists to report would be computed over the wrong sample.
+    #[test]
+    fn round_order_is_a_permutation() {
+        for n in 1..=12usize {
+            for r in 0..24usize {
+                let mut ord = round_order(n, r);
+                assert_eq!(ord.len(), n, "n={n} r={r}: wrong length");
+                ord.sort_unstable();
+                assert!(
+                    ord.iter().copied().eq(0..n),
+                    "n={n} r={r}: not a permutation ({ord:?})"
+                );
+            }
+        }
+    }
+
+    /// At two columns the schedule must degenerate to literally A B / B A — the same A-B-B-A
+    /// pairing `abba_min` uses for the peer pairs elsewhere in this file. If these two ever
+    /// disagreed, the file would contain two different definitions of "unbiased order".
+    #[test]
+    fn round_order_at_two_columns_is_abba() {
+        assert_eq!(round_order(2, 0), vec![0, 1]);
+        assert_eq!(round_order(2, 1), vec![1, 0]);
+    }
+
+    /// [`gen_rounds`] must always hand back an EVEN count of at least 2: `round_order`'s balance
+    /// holds per pair, so an odd number of rounds reintroduces exactly the positional bias the
+    /// rotation removes.
+    #[test]
+    fn gen_rounds_is_even_and_at_least_two() {
+        for (set, want) in [
+            (None, 4usize),
+            (Some("1"), 2),
+            (Some("2"), 2),
+            (Some("3"), 4),
+            (Some(" 7 "), 8),
+            (Some("garbage"), 4),
+            (Some(""), 4),
+        ] {
+            let r = parse_rounds(set);
+            assert_eq!(r, want, "XBENCH_ROUNDS={set:?}");
+            assert!(r >= 2 && r % 2 == 0, "XBENCH_ROUNDS={set:?} gave {r}");
+        }
+        // And the live reader must agree with the pure one under the ambient environment.
+        assert_eq!(
+            gen_rounds(),
+            parse_rounds(std::env::var("XBENCH_ROUNDS").ok().as_deref())
+        );
+    }
+
+    /// The per-visit budget is the thing ec08db2 cut and this branch restored, so its default is
+    /// pinned: 2 warm-ups + best-of-7, the pre-round protocol's budget, NOT 1 + 3.
+    ///
+    /// It is pinned as a REGRESSION guard, not as a preference. Rounds and per-visit samples trade
+    /// off against each other and a future measurement may well move the split — but it must move it
+    /// deliberately, with this test's expectations edited in the same commit, rather than by someone
+    /// shaving the visit to make a suite finish sooner.
+    #[test]
+    fn per_visit_budget_defaults_to_two_warmups_and_best_of_seven() {
+        assert_eq!(parse_budget(None, 2, 0), 2, "warm-up default");
+        assert_eq!(parse_budget(None, 7, 1), 7, "sample default");
+        // A zero sample count would leave a visit with no timed call at all, so it must fall back to
+        // the default rather than be honoured.
+        assert_eq!(parse_budget(Some("0"), 7, 1), 7);
+        // ...while zero WARM-UPS is a legitimate (if unwise) experiment and is honoured.
+        assert_eq!(parse_budget(Some("0"), 2, 0), 0);
+        for bad in ["garbage", "", "-1", "1e9", "100000"] {
+            assert_eq!(parse_budget(Some(bad), 7, 1), 7, "XBENCH_SAMPLES={bad:?}");
+        }
+        assert_eq!(parse_budget(Some(" 9 "), 7, 1), 9);
+        // The live readers must agree with the pure one under the ambient environment.
+        assert_eq!(
+            gen_samples(),
+            parse_budget(std::env::var("XBENCH_SAMPLES").ok().as_deref(), 7, 1)
+        );
+        assert_eq!(
+            gen_warmups(),
+            parse_budget(std::env::var("XBENCH_WARMUPS").ok().as_deref(), 2, 0)
+        );
+    }
+
+    /// The clock probe must stay OPT-IN. It is a saturating AVX2-FMA loop that runs immediately
+    /// before the first timed column of every round, so leaving it on by default would have every
+    /// round's measurement preceded by a burst of self-inflicted heat.
+    #[test]
+    fn the_clock_probe_is_off_unless_asked_for() {
+        // Whatever the ambient environment says, the reader and the probe must agree — a probe that
+        // ran while `clock_probe_enabled()` was false would be invisible perturbation.
+        let on = clock_probe_enabled();
+        assert_eq!(
+            on,
+            matches!(
+                std::env::var("XBENCH_CLOCK_PROBE").ok().as_deref(),
+                Some("1") | Some("on") | Some("true")
+            )
+        );
+        if !on {
+            assert_eq!(clock_probe_gflops(), 0.0, "the probe ran while disabled");
+        }
+    }
+
+    #[test]
+    fn median_is_the_middle_order_statistic() {
+        assert!(median(&[3.0, 1.0, 2.0]) == 2.0);
+        assert!(median(&[4.0, 1.0, 3.0, 2.0]) == 2.5);
+        assert!(median(&[7.0]) == 7.0);
+        assert!(median(&[]).is_nan());
+        // The reason it is the median and not the mean: one round that collided with a background
+        // task must not move the point estimate.
+        assert!(median(&[1.0, 1.0, 1.0, 1.0, 100.0]) == 1.0);
+    }
+
+    /// A ratio must be formed round by round, not from the two columns' aggregates. This is the
+    /// whole point: under a clock that drifts, per-round ratios stay put while a ratio of
+    /// separately-aggregated columns does not.
+    #[test]
+    fn ratio_is_formed_within_each_round() {
+        // Two columns whose TRUE relation is a constant 2x, measured while the machine slows down
+        // by 3x across the rounds.
+        let drift = [1.0, 1.6, 2.2, 3.0];
+        let a: Vec<f64> = drift.iter().map(|d| 100.0 * d).collect();
+        let b: Vec<f64> = drift.iter().map(|d| 50.0 * d).collect();
+        let s = RatioStat::over_rounds(&a, &b).unwrap();
+        assert!((s.med - 2.0).abs() < 1e-12, "median {}", s.med);
+        assert!((s.spread() - 1.0).abs() < 1e-12, "spread {}", s.spread());
+        assert!(s.conclusive());
+    }
+
+    /// A dropped or non-finite round must NOT silently shrink the spread — that would turn a
+    /// failed measurement into a confident one, the exact failure mode this type exists to prevent.
+    #[test]
+    fn ratio_refuses_bad_samples() {
+        assert!(RatioStat::over_rounds(&[1.0, 2.0], &[1.0]).is_none());
+        assert!(RatioStat::over_rounds(&[], &[]).is_none());
+        assert!(RatioStat::over_rounds(&[1.0, f64::NAN], &[1.0, 1.0]).is_none());
+        assert!(RatioStat::over_rounds(&[1.0, 0.0], &[1.0, 1.0]).is_none());
+        assert!(RatioStat::over_rounds(&[1.0, -1.0], &[1.0, 1.0]).is_none());
+        assert!(RatioStat::over_rounds(&[1.0, 1.0], &[1.0, f64::INFINITY]).is_none());
+    }
+
+    /// Rounds that disagree by more than [`spread_limit`] must NOT print a number — a reader must
+    /// not be able to quote a figure the run did not establish. Both fixtures are built FROM the
+    /// active limit so the test states the contract rather than a hard-coded pair of numbers that an
+    /// `XBENCH_SPREAD_LIMIT` override would falsify.
+    #[test]
+    fn wide_spread_never_prints_a_size() {
+        let limit = spread_limit();
+        // Per-round ratios wandering by strictly more than the limit, well clear of a 1.05x floor so
+        // the DIRECTION survives and only the size is withheld.
+        let wide = RatioStat::over_rounds(&[100.0, 100.0 * limit * 1.5], &[50.0, 50.0]).unwrap();
+        assert!(!wide.conclusive(), "spread {} was accepted", wide.spread());
+        let text = fmt_ratio_stat(Some(wide), Some(1.05), true);
+        assert!(text.starts_with("FASTER, size ?"), "{text}");
+        assert!(!text.contains('x'), "a size survived a wide spread: {text}");
+        // ...and one wandering by strictly less must still be quoted, or the gate is vacuous.
+        let inside = 1.0 + (limit - 1.0) * 0.5;
+        let tight = RatioStat::over_rounds(&[100.0, 100.0 * inside], &[50.0, 50.0]).unwrap();
+        assert!(tight.conclusive(), "spread {} was rejected", tight.spread());
+        assert!(fmt_ratio_stat(Some(tight), Some(1.05), true).contains("x faster"));
+        // The SLOWER direction-only cell inverts its interval the same way the sized one does: the
+        // printed pair must read low-to-high in "times slower", not the raw ratios.
+        let slow = RatioStat::over_rounds(&[50.0, 50.0 / (limit * 1.5)], &[100.0, 100.0]).unwrap();
+        let text = fmt_ratio_stat(Some(slow), Some(1.05), true);
+        assert!(text.starts_with("SLOWER, size ?"), "{text}");
+        let lo: f64 = text[text.find('[').unwrap() + 1..text.rfind('-').unwrap()]
+            .parse()
+            .unwrap();
+        let hi: f64 = text[text.rfind('-').unwrap() + 1..text.find(']').unwrap()]
+            .parse()
+            .unwrap();
+        assert!(lo <= hi, "{text}: interval is inverted");
+        assert!((lo - 2.0).abs() < 0.01, "{text}: expected 2.00x slower at the near end");
+    }
+
+    /// THE `C(twin)` CONTRACT. A ratio smaller than what a byte-identical control column managed
+    /// must print NO number and NO direction, however tightly its rounds agreed.
+    ///
+    /// This is the failure that motivated the whole control: a spread gate alone accepts a steady
+    /// 1.03x, and a steady 1.03x on this machine is placement luck. The fixture is the real one — in
+    /// a validation run the control read C 75.20 ms against C(twin) 57.60 ms, so the old estimator
+    /// would have published a byte-identical binary as "1.31x faster than C".
+    #[test]
+    fn an_effect_below_the_control_prints_nothing_however_tight() {
+        // Four rounds of a rock-steady 1.03x — spread 1.00, so the dispersion gate passes it.
+        let steady = RatioStat::over_rounds(&[103.0; 4], &[100.0; 4]).unwrap();
+        assert!(steady.conclusive(), "the fixture must clear the spread gate");
+        let text = fmt_ratio_stat(Some(steady), Some(1.31), true);
+        assert!(text.starts_with("BELOW FLOOR"), "{text}");
+        assert!(!text.contains("faster") && !text.contains("slower"), "{text}");
+        assert_eq!(verdict(steady, Some(1.31)), Verdict::BelowFloor);
+        // The same reading against a run whose control behaved is a real result.
+        assert_eq!(verdict(steady, Some(1.01)), Verdict::Sized);
+        // And the floor is symmetric: a 1.03x SLOWER reading is refused by the same floor, which a
+        // one-sided band taken straight off a control interval that does not straddle 1.00 would not
+        // have done.
+        let slow = RatioStat::over_rounds(&[100.0; 4], &[103.0; 4]).unwrap();
+        assert_eq!(verdict(slow, Some(1.31)), Verdict::BelowFloor);
+        // `floor_factor` takes the larger departure in either direction, and never reports < 1.
+        let one_sided = RatioStat::over_rounds(&[105.0, 120.0], &[100.0, 100.0]).unwrap();
+        assert!((floor_factor(one_sided) - 1.20).abs() < 1e-12);
+        let below = RatioStat::over_rounds(&[80.0, 90.0], &[100.0, 100.0]).unwrap();
+        assert!((floor_factor(below) - 1.25).abs() < 1e-12);
+        assert!(floor_factor(RatioStat::over_rounds(&[1.0], &[1.0]).unwrap()) >= 1.0);
+    }
+
+    /// A run with NO control has no floor, and must say so rather than quietly reverting to the
+    /// weaker spread-only behaviour without telling anyone.
+    #[test]
+    fn a_run_without_a_control_declares_its_floor_unknown() {
+        let legend = ratio_legend(None);
+        assert!(legend.contains("UNKNOWN"), "{legend}");
+        assert!(ratio_legend(Some(1.42)).contains("1.42x"));
+        // ...and without a floor the small steady effect is no longer refused, which is precisely
+        // why the legend has to shout.
+        let steady = RatioStat::over_rounds(&[103.0; 4], &[100.0; 4]).unwrap();
+        assert_eq!(verdict(steady, None), Verdict::Sized);
+    }
+
+    /// A power-state change must REPLACE every number, not annotate it. A warning line can be
+    /// scrolled past; `NON-REPORTABLE` in the cell cannot.
+    #[test]
+    fn power_change_removes_the_number_entirely() {
+        let s = RatioStat::over_rounds(&[200.0, 200.0], &[100.0, 100.0]).unwrap();
+        assert!(s.conclusive());
+        assert_eq!(
+            fmt_ratio_stat(Some(s), Some(1.05), true),
+            "2.00x faster [2.00-2.00]"
+        );
+        let bad = fmt_ratio_stat(Some(s), Some(1.05), false);
+        assert_eq!(bad, "NON-REPORTABLE");
+        assert!(!bad.contains('2'), "a digit survived invalidation: {bad}");
+    }
+
+    /// Inverting a ratio must invert AND swap the ends of its interval, or a "slower" row would
+    /// advertise a range that does not contain its own point estimate.
+    #[test]
+    fn slower_direction_inverts_the_interval_correctly() {
+        // Per-round ratios both well below 1 ("slower"), disagreeing by strictly less than the limit
+        // so the cell renders as a number rather than as a bare direction.
+        let f = 1.0 + (spread_limit() - 1.0) * 0.5;
+        let s = RatioStat::over_rounds(&[50.0, 50.0 / f], &[100.0, 100.0]).unwrap();
+        assert!(s.med < 1.0);
+        assert!(s.conclusive());
+        let text = fmt_ratio_stat(Some(s), Some(1.05), true);
+        assert!(text.contains("slower"), "{text}");
+        let lo: f64 = text[text.find('[').unwrap() + 1..text.find('-').unwrap()]
+            .parse()
+            .unwrap();
+        let hi: f64 = text[text.find('-').unwrap() + 1..text.find(']').unwrap()]
+            .parse()
+            .unwrap();
+        assert!(lo <= hi, "{text}: interval is inverted");
+        let point: f64 = text[..text.find('x').unwrap()].parse().unwrap();
+        assert!(lo <= point && point <= hi, "{text}: point outside its own range");
+    }
+
+    /// `spread_limit` must stay a strict factor > 1: a limit of 1.0 or below would make every
+    /// ratio inconclusive, and a typo must fall back to the default rather than silently disable
+    /// the check.
+    #[test]
+    fn spread_limit_rejects_degenerate_overrides() {
+        for (set, want) in [
+            (None, 1.10f64),
+            (Some("1.25"), 1.25),
+            (Some("1.0"), 1.10),
+            (Some("0.5"), 1.10),
+            (Some("-3"), 1.10),
+            (Some("nonsense"), 1.10),
+        ] {
+            let got = parse_spread_limit(set);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "XBENCH_SPREAD_LIMIT={set:?} gave {got}"
+            );
+            assert!(got > 1.0, "XBENCH_SPREAD_LIMIT={set:?} gave a limit <= 1");
+        }
+        assert!(
+            (spread_limit() - parse_spread_limit(std::env::var("XBENCH_SPREAD_LIMIT").ok().as_deref()))
+                .abs()
+                < 1e-12
+        );
     }
 }
