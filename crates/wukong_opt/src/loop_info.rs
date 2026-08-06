@@ -611,6 +611,11 @@ pub enum RedKind {
     Xor,
     FAdd,
     FMul,
+    /// `acc = acc - x`, integer. The accumulator is always the LEFT operand — `x - acc` is not a
+    /// reduction, it is a recurrence that negates its own history.
+    Sub,
+    /// `acc = acc - x`, float.
+    FSub,
     SMax,
     SMin,
     UMax,
@@ -636,10 +641,19 @@ impl RedKind {
     /// `max(max(1, NaN), 0) = max(NaN, 0) = 0`, folding right gives
     /// `max(1, max(NaN, 0)) = max(1, 0) = 1`. Different answers, so lane-wise partial maxima may
     /// not be recombined in a different order than the source loop takes them.
+    /// Subtraction is **never** reassociable, at any element type. `((a - x) - y)` is
+    /// `a - (x + y)`, not `a - (x - y)`, so lane-parallel partials would need a *different*
+    /// operator to combine them and a different identity to start from. Its accumulate stays
+    /// serial, which for the float case is what it would have been anyway.
     pub fn reassociable(self) -> bool {
         !matches!(
             self,
-            RedKind::FAdd | RedKind::FMul | RedKind::FMax | RedKind::FMin
+            RedKind::FAdd
+                | RedKind::FMul
+                | RedKind::FMax
+                | RedKind::FMin
+                | RedKind::Sub
+                | RedKind::FSub
         )
     }
 
@@ -652,6 +666,8 @@ impl RedKind {
             RedKind::Xor => "xor",
             RedKind::FAdd => "fadd",
             RedKind::FMul => "fmul",
+            RedKind::Sub => "sub",
+            RedKind::FSub => "fsub",
             RedKind::SMax => "smax",
             RedKind::SMin => "smin",
             RedKind::UMax => "umax",
@@ -1563,11 +1579,18 @@ fn collect_accesses(
 /// The reduction operator a combining instruction implements, given that one operand is the
 /// accumulator `p`. Returns `(kind, the other operand, fma factors)`.
 ///
-/// Only *associative-shaped* combines are recognized — `acc ⊕ x` where `⊕` is one of the operators
-/// [`RedKind`] names. Whether the partials may then be reassociated is a separate question that
-/// [`RedKind::reassociable`] answers; a float `add` is a reduction here and is still not
-/// reassociable. Subtraction is deliberately absent: `acc - x` has no [`RedKind`], and inventing
-/// one by negating `x` would be a transform, not an analysis.
+/// A combine is `acc ⊕ x` where `⊕` is one of the operators [`RedKind`] names and `acc` is used
+/// nowhere else in the loop. Whether the partials may then be reassociated is a separate question
+/// that [`RedKind::reassociable`] answers; a float `add` is a reduction here and is still not
+/// reassociable.
+///
+/// **Subtraction is included, and only with the accumulator on the LEFT.** `acc = acc - x` is an
+/// accumulator like any other: it has a fixed operand order, its partials may not be reassociated,
+/// and a consumer folds it serially in index order — the same treatment a float `add` already gets.
+/// `x - acc` is a different thing entirely (it negates the whole history every iteration) and stays
+/// a `Recurrence`. This matters because a negated accumulate is how a loss is spelled:
+/// `lr = lr - alpha*q*(1-p)^2*log p` in a focal loss, `e = e - t[i]*log(y[i])` in a cross-entropy.
+/// Refusing it made the entire enclosing loop unvectorizable, transcendental and all.
 fn combine_kind(
     ctx: &LoopCtx<'_>,
     p: ValueId,
@@ -1575,6 +1598,18 @@ fn combine_kind(
 ) -> Option<(RedKind, Option<ValueId>, Option<(ValueId, ValueId)>)> {
     match ctx.op_of(next)? {
         Op::Bin(b, a, c) => {
+            // `acc - x` only; `x - acc` is not an accumulate.
+            if matches!(b, BinOp::Sub | BinOp::FSub) {
+                if *a != p || *c == p {
+                    return None;
+                }
+                let kind = if matches!(b, BinOp::Sub) {
+                    RedKind::Sub
+                } else {
+                    RedKind::FSub
+                };
+                return Some((kind, Some(*c), None));
+            }
             let other = if *a == p && *c != p {
                 *c
             } else if *c == p && *a != p {

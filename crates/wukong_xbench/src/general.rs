@@ -1367,6 +1367,15 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
         ),
     ];
+    // Load EVERY peer before timing ANY of them, then time them in alternating order — forward
+    // pass, then reverse pass — keeping each peer's own minimum. `time_ns` already does a
+    // symmetric warm-up plus best-of-7, but running all of one peer's samples before any of the
+    // next's charges slow thermal/clock drift across the section to whichever peer is timed last.
+    // Here that was always Rust, and C++ always sat third — a fixed-order bias in a section whose
+    // C++ and Rust columns are published. Alternating gives every peer both an early and a late
+    // slot, so drift cancels instead of accumulating against one language. Same reasoning as the
+    // A-B-B-A pairing `bench_c_cpp*` uses in main.rs; this is its N-peer form.
+    let mut loaded: Vec<(String, libloading::Library, LossFn)> = Vec::new();
     for (label, ext, src, compiler, args) in peers {
         let name = format!("general_loss_{}", label.replace(['(', ')'], "_"));
         let Some((lib, _)) = load_peer(ext, src, dir, &name, compiler, args) else {
@@ -1382,11 +1391,35 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
                 }
             }
         };
-        b.dz.iter_mut().for_each(|v| *v = 0.0);
-        let ns = time_ns(|| unsafe { call_loss(f, &mut b) });
-        let (dev, at) = max_rel_vs_ref(&b.dz, &ref_dz);
-        let (ldev, _) = max_rel_vs_ref(&b.loss, &ref_loss);
-        rows.push((label.to_string(), ns, "-".to_string(), dev, at, ldev));
+        loaded.push((label.to_string(), lib, f));
+    }
+    let mut best = vec![f64::INFINITY; loaded.len()];
+    // (dz deviation, its lane, loss deviation) — recorded once; the peers are deterministic, so
+    // the extra timing passes cannot change them.
+    let mut dev_of = vec![(0.0f64, 0usize, 0.0f64); loaded.len()];
+    for pass in 0..2usize {
+        for step in 0..loaded.len() {
+            let i = if pass == 0 {
+                step
+            } else {
+                loaded.len() - 1 - step
+            };
+            let f = loaded[i].2;
+            b.dz.iter_mut().for_each(|v| *v = 0.0);
+            let ns = time_ns(|| unsafe { call_loss(f, &mut b) });
+            if ns < best[i] {
+                best[i] = ns;
+            }
+            if pass == 0 {
+                let (dev, at) = max_rel_vs_ref(&b.dz, &ref_dz);
+                let (ldev, _) = max_rel_vs_ref(&b.loss, &ref_loss);
+                dev_of[i] = (dev, at, ldev);
+            }
+        }
+    }
+    for (i, (label, _lib, _f)) in loaded.iter().enumerate() {
+        let (dev, at, ldev) = dev_of[i];
+        rows.push((label.clone(), best[i], "-".to_string(), dev, at, ldev));
     }
 
     println!();
@@ -1831,6 +1864,10 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
         ),
     ];
+    // Load every peer before timing any of them, then alternate the timing order across two
+    // passes and keep each peer's minimum — see the identical treatment in the loss section above
+    // for why a fixed order silently charges section-wide drift to whichever peer goes last.
+    let mut loaded: Vec<(String, libloading::Library, ScanFn)> = Vec::new();
     for (label, ext, src, compiler, args) in peers {
         let name = format!("general_scan_{}", label.replace(['(', ')'], "_"));
         let Some((lib, _)) = load_peer(ext, src, dir, &name, compiler, args) else {
@@ -1846,10 +1883,31 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
                 }
             }
         };
-        b.y.iter_mut().for_each(|v| *v = 0.0);
-        let ns = time_ns(|| unsafe { call_scan(f, &mut b) });
-        let (dev, at) = max_rel_vs_ref(&b.y, &reference);
-        rows.push((label.into(), ns, "-".into(), dev, at));
+        loaded.push((label.to_string(), lib, f));
+    }
+    let mut best = vec![f64::INFINITY; loaded.len()];
+    let mut dev_of = vec![(0.0f64, 0usize); loaded.len()];
+    for pass in 0..2usize {
+        for step in 0..loaded.len() {
+            let i = if pass == 0 {
+                step
+            } else {
+                loaded.len() - 1 - step
+            };
+            let f = loaded[i].2;
+            b.y.iter_mut().for_each(|v| *v = 0.0);
+            let ns = time_ns(|| unsafe { call_scan(f, &mut b) });
+            if ns < best[i] {
+                best[i] = ns;
+            }
+            if pass == 0 {
+                dev_of[i] = max_rel_vs_ref(&b.y, &reference);
+            }
+        }
+    }
+    for (i, (label, _lib, _f)) in loaded.iter().enumerate() {
+        let (dev, at) = dev_of[i];
+        rows.push((label.clone(), best[i], "-".into(), dev, at));
     }
 
     println!();
