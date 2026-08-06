@@ -53,3 +53,34 @@ jobs:
         # Release build so the heavy kernels run quickly; the harness exits non-zero if any program
         # that lowers cleanly disagrees between -O0 and -O3, so this also guards optimizer soundness.
         run: cargo run -p wukong_bench --release -- tests/run examples bench/kernels
+
+  # `cargo test --workspace` above NEVER builds the `gpu` feature, so every line of
+  # `crates/wukong_codegen_gpu` (and the `gpu`-gated arms of `wukong_driver`/`wukongc`) was invisible
+  # to CI: the whole crate could fail to compile and the `test` job would still be green. This job
+  # closes that hole. Type-check only — no GPU tests are run and no device is needed, because
+  # `cudarc` is built with `dynamic-loading` (it dlopens `nvcuda.dll`/`libcuda.so` at *run* time), so
+  # building the feature needs no CUDA toolkit on the runner. Mirrors the second half of the local
+  # two-command gate documented in CLAUDE.md.
+  gpu-check:
+    name: gpu type-check (no device)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Distinct `-gpu` suffix: this job's `target/` holds a different feature-resolution graph
+          # (cudarc + friends) than the `test` job's, so sharing a key would make the two thrash
+          # each other's cache on every run.
+          key: ${{ runner.os }}-cargo-gpu-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: GPU type-check
+        run: cargo check --features gpu --all-targets
