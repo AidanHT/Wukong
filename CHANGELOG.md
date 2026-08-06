@@ -5,6 +5,55 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Benchmark honesty — three defects an adversarial verifier found and proved
+No compiler behaviour changes; all three are in `wukong_xbench` (plus the measurement docs). Two of
+them make Wukong look **worse**, which is the point.
+- **The C/C++ pairing guard was vacuous.** `every_c_column_is_paired_with_a_cpp_column` exists to
+  make it impossible for a family to print a "vs C" ratio with no C++ column behind it. Its scan
+  needle was the CONTIGUOUS string `bench_external` + `("c",`, which matches only when the ext
+  literal is on the same LINE as the opening paren — one occurrence in 8,733 lines, and that one on
+  the exemption list, because rustfmt puts `"c",` on its own line everywhere else. It could not match
+  `bench_external4(`/`_i8(`/`_bf16(`/`_halfout(` at all. The `unpaired` vector was unconditionally
+  empty and the `_fast`/`_omp` exemption branch had never once executed. Falsified directly: a
+  `bench_c_cpp` call reverted to a C-only `bench_external` plus `let cm_cpp = None;` compiled and the
+  test still said `ok`. The scan is now whitespace-insensitive, suffix-aware, covers `build_peer` as
+  well, and parses the real top-level argument list instead of a fixed text window; four floors stop
+  it passing by finding nothing. Falsified again after the rewrite, three ways, each confirmed to
+  FAIL and then reverted.
+- **The transpose benchmark measured only the regime it wins in.** The sweep was `ns in [1024, 2048]`
+  — two power-of-two squares. A transpose writes column-major, so the peer's write stream steps by
+  the destination row stride, and when that stride in bytes is a large power of two the writes land
+  on a few L1 sets and the blocked C peer thrashes. Same run, adjacent columns: the peer moves
+  2.4 GB/s at 1024² and 18.9 GB/s at 1000² — an **8× swing in the PEER for a 2.4% change in shape**,
+  collapsing the published ratio from 7.43× to 1.51×. The sweep now also runs 1000², 1031² (prime)
+  and the rectangular 1100×950, labels each row's regime in its header, and closes with a REGIME
+  SUMMARY that geomeans the two apart and marks the general-stride line as the result (6.56× vs
+  **1.46×** single-core on the battery-state round used to develop the change). The power-of-two
+  shapes are kept and reported beside it, never as it. The peers' new tile edge handling is a
+  full-tile fast path plus an else-branch — never a clamped bound — so gcc still compiles the
+  constant-trip-count tile body at the aligned sizes (verified standalone, ABAB best-of-20:
+  new/old = 1.004–1.011, output bit-identical).
+- **The C++ column was always timed second.** Every one of the ~44 `bench_c_cpp*` pair sites read
+  `let c = …; let cpp = …;`, so every within-pair drift — clock ramp, thermal, a hybrid-scheduler
+  P↔E migration — was charged to C++ in every family. That is a systematic bias in the published
+  "vs C++" ratio, not noise: the order was the same on every repetition, so repeating the suite could
+  not cancel it. Probed by putting the identical C source through the identical compiler in the
+  second slot, the second slot was slower on **6 of 7 rows, by up to +17%**. `bench_external*` is
+  split into `build_peer` (compile + load) and `time_peer*` (zero, time, snapshot); both peers are
+  now built before either is timed — so no compiler spawn sits between two timed regions about to be
+  compared — and then timed **A B B A**, each column keeping its own fastest sample. Each column gets
+  one early and one late slot, so a monotone drift cancels in the ratio, and the per-column minimum
+  is the rule `time_ns` already applies across its 14 blocks.
+- `BENCHMARKS.md`: **withdrew** "a first smoke run already shows rows where the C and C++ columns
+  differ by well more than a few percent" — an empirical claim published with no numbers, from a run
+  its own commit declared non-reportable, and taken before the ordering bias above was known. The
+  transpose rows there and in `docs/roadmap.md` are flagged **power-of-two-only and unverified**:
+  they no longer reproduce on the current tree, in the same direction both before and after this
+  change (so the sweep change is not the cause), and no corrected figure is published because every
+  run available was battery-state.
+- Dispatch census over all 367 `tests/run` + `examples` programs, base vs branch: **367 identical,
+  0 lost, 0 gained** — as expected for a change that touches no compiler crate.
+
 ### Recognizers — a weight held in a struct field dispatches like any other buffer
 Every kernel recognizer named its buffer operands by a bare `Symbol`, extracted with `single_path`.
 A weight reached through a struct field — `l.wq[j*D + p]`, how every real model groups its
