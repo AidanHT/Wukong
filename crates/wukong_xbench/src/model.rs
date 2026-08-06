@@ -611,14 +611,26 @@ __declspec(dllexport) void kfinal(const float* __restrict__ x, const float* __re
 /// "vs C, C++, and Rust" framing had no Rust behind its most-cited number.
 ///
 /// Written the way a competent Rust programmer writes a numeric kernel over foreign buffers: the raw
-/// pointers are turned into **slices** once at the top (`from_raw_parts`), which is both the idiomatic
-/// spelling AND the one that gives LLVM `noalias` — the exact property `__restrict__` gives the C peer,
-/// so the two languages get the same aliasing information rather than Rust being silently handicapped
-/// by raw-pointer may-alias semantics. The inner loops index a pre-sliced ROW (`&a[i*k..i*k+k]`), so
+/// pointers are turned into **slices** and handed to `kbody` **as parameters**, which is both the
+/// idiomatic spelling AND the one that gives LLVM `noalias` — the exact property `__restrict__` gives
+/// the C peer, so the two languages get the same aliasing information rather than Rust being silently
+/// handicapped by raw-pointer may-alias semantics. The inner loops index a pre-sliced ROW (`&a[i*k..i*k+k]`), so
 /// the bounds check is provably redundant and LLVM removes it instead of paying it per element. Same
 /// loop structure, same per-head slice extraction, same caller-provided scratch, same tanh-approx GELU
 /// constants, same strictly-sequential f32 accumulation as the C peer (`acc += …`, not `.sum()` over a
 /// reassociable iterator) — so the comparison is the toolchain, not the algorithm.
+///
+/// **LANDMINE, corrected 2026-08-06.** This doc comment used to say the `noalias` came from
+/// `from_raw_parts` *at the top of `kbench`*. It does not. rustc attaches `noalias` to function
+/// **parameters**; a slice built as a local inside the `extern "C"` entry point grants nothing.
+/// Measured on a `saxpy` body at `-Copt-level=3 -Ctarget-cpu=native`: slices-as-locals emits asm
+/// byte-identical to bare raw pointers (108 lines, 4 basic blocks — a runtime overlap test plus a
+/// scalar fallback loop) and its LLVM-IR contains no `llvm.experimental.noalias.scope.decl` at all,
+/// while the same body behind a slice-parameter `fn` emits 56 lines, 1 block, zero scalar FP and the
+/// full `!alias.scope`/`!noalias` metadata. So the previous spelling gave the C peer `__restrict__`
+/// and this peer nothing over the whole inline attention block — the two helper calls
+/// (`layernorm_affine`, `linear_nt`) were the only parts that ever got it. The body is now `kbody`,
+/// taking all 24 buffers as slice parameters; `kbench` only converts and calls. No loop text moved.
 fn rust_model(cfg: Cfg) -> String {
     let (s, d, h, dff, hd) = (cfg.s, cfg.d, cfg.h, cfg.dff, cfg.hd());
     let scale = 1.0 / (hd as f64).sqrt();
@@ -663,6 +675,13 @@ fn linear_nt(inp: &[f32], w: &[f32], out: &mut [f32], m: usize, kk: usize, n: us
     }}
 }}
 
+/* The C-ABI entry point. Its ONLY job is to turn the 24 pointers into 24 slice PARAMETERS of
+   `kbody` — the spelling that actually carries `noalias` into LLVM, i.e. the Rust equivalent of the
+   `__restrict__` on `c_model`'s 24 pointers. Building the slices here and looping here would give
+   this column no aliasing information at all (see the LANDMINE on `rust_model`).
+
+   The peers are built without `--edition`, i.e. edition 2015, where a `use core::…` needs an
+   `extern crate`; a fully-qualified path expression does not. */
 #[no_mangle]
 pub unsafe extern \"C\" fn kbench(
     px: *const f32,
@@ -675,21 +694,32 @@ pub unsafe extern \"C\" fn kbench(
     pscores: *mut f32, pah: *mut f32, pattn: *mut f32, pa: *mut f32, pff1: *mut f32,
     pout: *mut f32,
 ) {{
-    /* The peers are built without `--edition`, i.e. edition 2015, where a `use core::…` needs an
-       `extern crate`; a fully-qualified path expression does not. Same spelling as every other Rust
-       peer in this suite (see `rust_colsum` in main.rs). */
-    let x = rp(px, S * D);
-    let (ln1g, ln1b) = (rp(pln1g, D), rp(pln1b, D));
-    let (wq, wk, wv, wo) = (rp(pwq, D * D), rp(pwk, D * D), rp(pwv, D * D), rp(pwo, D * D));
-    let (ln2g, ln2b) = (rp(pln2g, D), rp(pln2b, D));
-    let (w1, w2) = (rp(pw1, DFF * D), rp(pw2, D * DFF));
-    let nrm = rmp(pnrm, S * D);
-    let (q, k, v) = (rmp(pq, S * D), rmp(pk, S * D), rmp(pv, S * D));
-    let (qh, kh, vt) = (rmp(pqh, S * HD), rmp(pkh, S * HD), rmp(pvt, HD * S));
-    let (scores, ah) = (rmp(pscores, S * S), rmp(pah, S * HD));
-    let (attn, a, ff1) = (rmp(pattn, S * D), rmp(pa, S * D), rmp(pff1, S * DFF));
-    let out = rmp(pout, S * D);
+    kbody(
+        rp(px, S * D),
+        rp(pln1g, D), rp(pln1b, D),
+        rp(pwq, D * D), rp(pwk, D * D), rp(pwv, D * D), rp(pwo, D * D),
+        rp(pln2g, D), rp(pln2b, D),
+        rp(pw1, DFF * D), rp(pw2, D * DFF),
+        rmp(pnrm, S * D), rmp(pq, S * D), rmp(pk, S * D), rmp(pv, S * D),
+        rmp(pqh, S * HD), rmp(pkh, S * HD), rmp(pvt, HD * S),
+        rmp(pscores, S * S), rmp(pah, S * HD), rmp(pattn, S * D), rmp(pa, S * D),
+        rmp(pff1, S * DFF),
+        rmp(pout, S * D),
+    )
+}}
 
+#[inline(always)]
+fn kbody(
+    x: &[f32],
+    ln1g: &[f32], ln1b: &[f32],
+    wq: &[f32], wk: &[f32], wv: &[f32], wo: &[f32],
+    ln2g: &[f32], ln2b: &[f32],
+    w1: &[f32], w2: &[f32],
+    nrm: &mut [f32], q: &mut [f32], k: &mut [f32], v: &mut [f32],
+    qh: &mut [f32], kh: &mut [f32], vt: &mut [f32],
+    scores: &mut [f32], ah: &mut [f32], attn: &mut [f32], a: &mut [f32], ff1: &mut [f32],
+    out: &mut [f32],
+) {{
     /* 1. LayerNorm1(x) -> nrm */
     nrm.copy_from_slice(x);
     layernorm_affine(nrm, ln1g, ln1b);
@@ -2994,6 +3024,46 @@ mod tests {
         assert!(
             src.contains("HuggingFace"),
             "the fused-projection asymmetry lost its in-script disclosure"
+        );
+    }
+
+    /// **The Rust peer must get the same aliasing information `c_model` gets from `__restrict__`.**
+    ///
+    /// rustc emits LLVM `noalias` on reference *parameters* only. A slice built as a local inside
+    /// the `extern "C"` entry grants nothing — measured on a `saxpy` body, that spelling compiles to
+    /// asm byte-identical to bare raw pointers (108 lines, 4 blocks, a runtime overlap test and a
+    /// scalar fallback loop) with no `noalias` metadata in the IR, while the same body behind a
+    /// slice-parameter `fn` is 56 lines, 1 block, zero scalar FP. `rust_model` carried the local
+    /// spelling and a doc comment claiming it granted `noalias`; only the two helper calls
+    /// (`layernorm_affine`, `linear_nt`) ever did. The whole body is `kbody` now.
+    ///
+    /// Isolated effect on this peer, `S=128 D=768 H=12 DFF=3072`, same flags, `--emit=asm`:
+    /// 2132 → 1705 lines, 286 → 384 `ymm` uses, **1013 → 567 scalar-FP ops**, 67 → 57 blocks; and
+    /// the two spellings agree **bit-for-bit on all 98304 output lanes** (checked by running both in
+    /// one process over identical buffers), because no loop text moved.
+    #[test]
+    fn rust_model_peer_takes_its_buffers_as_slice_parameters() {
+        let src = rust_model(Cfg { s: 16, d: 64, h: 4, dff: 256 });
+        assert!(
+            src.contains("fn kbody("),
+            "rust_model lost its `kbody` shim — its 24 buffers must cross a fn boundary as slices, \
+             which is the only spelling that gives LLVM `noalias` (c_model's `__restrict__`)"
+        );
+        let entry = src
+            .find("pub unsafe extern \"C\" fn kbench(")
+            .expect("rust_model must export kbench");
+        let body = &src[entry..];
+        let open = body.find(") {").expect("kbench must open a body") + 3;
+        let close = open + body[open..].find("\n}").expect("kbench must close its body");
+        let entry_body = &body[open..close];
+        assert!(
+            entry_body.contains("kbody("),
+            "rust_model's `kbench` must delegate to `kbody`"
+        );
+        assert!(
+            !entry_body.contains("for "),
+            "rust_model's `kbench` runs loops over slices it built as LOCALS — that grants no \
+             aliasing information at all. Body was:\n{entry_body}"
         );
     }
 
