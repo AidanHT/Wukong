@@ -9058,6 +9058,79 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit the TWO-kernel lowering of a cross-buffer residual projection (`c[i,j] = x[i,j] + dot`,
+    /// `x != c`): `wukong_sgemm_nt(a, b, c, m, k, n, beta = 0)` then
+    /// `wukong_velem_f32(x, c, c, m*n, 1.0, 1.0, 0.0, VE_ID|VE_USE_Y)` — exactly the pair the factored
+    /// spelling (`… c[i*N+j] = s; }` then `for i { c[i] = x[i] + c[i]; }`) already dispatches, so it is
+    /// bit-identical to it: one GEMM dot per element, then one f32 add.
+    ///
+    /// **Every operand and dimension is resolved BEFORE the GEMM is emitted.** A late failure between
+    /// the two calls would leave a beta = 0 GEMM that silently dropped the residual — a wrong answer
+    /// no differential gate can see, since recognizers fire identically on both backends. Bails
+    /// (false) with nothing emitted instead, and the caller lowers the scalar nest.
+    fn emit_sgemm_residual_src(&mut self, nest: &MatmulNest<'_>, x: Symbol) -> bool {
+        // The matcher pins these, but the emitter is the last line of defence: this routine emits a
+        // plain unscaled/unbiased NT product, so anything else must never reach the call.
+        if !nest.transposed
+            || nest.transposed_a
+            || nest.alpha.is_some()
+            || nest.bias.is_some()
+            || nest.act != EPI_ACT_IDENTITY
+            || !nest.a_off.is_empty()
+            || !nest.b_off.is_empty()
+            || !nest.c_off.is_empty()
+        {
+            return false;
+        }
+        // Buffer operands go through `kernel_base_ptr` (never a raw `lookup`): a `[]T` slice keeps a
+        // 16-byte fat pointer in its slot, so the kernel needs the loaded DATA pointer — LANDMINE 1.
+        let Some([a, b, c, xp]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c, x]) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        ) else {
+            return false;
+        };
+        let beta = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        let gemm = if self.parallel_fn {
+            self.gemm.nt_par
+        } else {
+            self.gemm.nt
+        };
+        self.builder.build_void(Op::Call {
+            func: gemm,
+            args: vec![a, b, c, m, k, n, beta],
+        });
+        // The residual sweep over the flat `[0, M*N)` region the GEMM just wrote (`sc == n`, checked
+        // by the matcher, is what makes that region contiguous and exactly the nest's footprint).
+        let len = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, m, n));
+        let one = self
+            .builder
+            .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32));
+        let zero = self
+            .builder
+            .build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));
+        let op = self.builder.build(
+            MirType::I64,
+            Op::ConstInt((VE_ID | VE_USE_Y) as i128, MirType::I64),
+        );
+        let velem = if self.parallel_fn {
+            self.gemm.velem_par
+        } else {
+            self.gemm.velem
+        };
+        self.builder.build_void(Op::Call {
+            func: velem,
+            args: vec![xp, c, c, len, one, one, zero, op],
+        });
+        true
+    }
+
     /// Fuse a recognized int8 GEMM immediately followed by its per-channel dequant epilogue into one
     /// `wukong_i8gemm_nt_deq` call (`out = act((A·Bᵀ as f32)·scale_a·scale_b [+ bias])`). The i32
     /// accumulator never reaches memory — the kernel dequants each output tile in registers straight
@@ -10460,6 +10533,19 @@ impl FnLowerer<'_> {
             match_matmul_residual(pat, iter, body, self.sema, self.interner)
         {
             if self.emit_sgemm_epi(&nest, bias, act) {
+                return;
+            }
+        }
+        // The CROSS-buffer residual projection `c[i*N+j] = x[i*N+j] + dot` with `x != c` — the
+        // out-of-place skip connection `h = x + attn·Woᵀ` written with the residual folded into the
+        // store. There is no single kernel for it (nt_epi's beta reads the OUTPUT back), so it lowers
+        // to the same two kernels the factored spelling dispatches: `wukong_sgemm_nt` then a flat
+        // `wukong_velem_f32` residual sweep. Tried after the in-place form, which is strictly better
+        // (one kernel) and which this arm declines by requiring `x != c`.
+        if let Some((nest, x)) =
+            match_matmul_residual_src(pat, iter, body, self.sema, self.interner)
+        {
+            if self.emit_sgemm_residual_src(&nest, x) {
                 return;
             }
         }
@@ -22573,6 +22659,196 @@ fn match_matmul_residual<'a>(
         act: EPI_ACT_IDENTITY,
     };
     Some((nest, bias, act))
+}
+
+/// Recognize the **cross-buffer residual projection** — the `ijk` `nn.Linear` nest whose store adds a
+/// residual read from a *different* buffer than the one it writes:
+///
+/// ```text
+/// for i in 0..M { for j in 0..N {
+///   let mut s: f32 = 0.0;
+///   for k in 0..K { s = s + a[i*K+k] * b[j*K+k]; }
+///   c[i*N+j] = x[i*N+j] + s;            // x is NOT c — the out-of-place skip connection
+/// } }
+/// ```
+///
+/// This is the transformer block's `h = x + attn·Woᵀ` written the way an engineer writes it, with the
+/// residual folded into the store instead of trailing as its own `for i { h[i] = x[i] + h[i]; }` loop.
+/// [`match_matmul_residual`] handles only the in-place case (`x == c`, which maps to one `nt_epi` with
+/// beta = 1); when the residual source is a *different* array there is no single kernel for it, and
+/// the whole nest used to fall to a scalar loop — the store is neither `c = s` nor `c = c + s`.
+///
+/// It lowers to the SAME TWO kernels the factored spelling dispatches — `wukong_sgemm_nt` writing `c`,
+/// then `wukong_velem_f32` computing `c = x + c` over the `M*N` contiguous elements — so the result is
+/// bit-identical to the split source (one GEMM dot, then one f32 add per element).
+///
+/// Tight by construction, mirroring [`match_matmul_residual`]: **NT only, normal A, no batch offsets
+/// on any operand** (the velem pass covers the flat `[0, M*N)` region, which is exactly what the nest
+/// writes because `sc == n`), the store value is exactly `x[i*N+j] + s` in either addend order with no
+/// bias and no activation (`wukong_velem_f32` computes `a·x + b·y + c`, not `act(...)` over a bias),
+/// and `x != c` (that case is the in-place form above). `x` may alias `a` or `b`: neither is ever
+/// written, so the split reads them exactly as the fused loop did. Returns `(nest, residual_source)`.
+fn match_matmul_residual_src<'a>(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &'a Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(MatmulNest<'a>, Symbol)> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    // j body: [ let s = 0.0; for k {...}; c[i*N+j] = x[i*N+j] + s ].
+    if jbody.tail.is_some() || jbody.stmts.len() != 3 {
+        return None;
+    }
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (ks, ke) = range_bounds(kiter)?;
+    if as_int_lit(ks, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_dim(ke, interner)?;
+    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
+    // NT, normal A, offset-free: the emitted pair is `wukong_sgemm_nt` over the plain 2-D `A·Bᵀ`
+    // followed by one flat `wukong_velem_f32` sweep. A batched (offset) or TN nest would need the
+    // residual pass to follow the same base shift, which this arm deliberately does not model — it
+    // falls back to the scalar nest, which is correct.
+    if !transposed || transposed_a || !a_off.is_empty() || !b_off.is_empty() {
+        return None;
+    }
+    // The store: c[i*N+j] = x[i*N+j] + s (either addend order).
+    let StmtKind::Assign {
+        target: ct,
+        op: ast::AssignOp::Assign,
+        value: cv,
+    } = &jbody.stmts[2].kind
+    else {
+        return None;
+    };
+    let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
+    if sa != kdim || sb != kdim || sc != n || !c_off.is_empty() {
+        return None;
+    }
+    // The residual addend must be a matmul-shaped read of the SAME [M,N] element, from another array.
+    let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs,
+        rhs,
+    } = &cv.kind
+    else {
+        return None;
+    };
+    let res_expr = if single_path(lhs) == Some(s_sym) {
+        rhs
+    } else if single_path(rhs) == Some(s_sym) {
+        lhs
+    } else {
+        return None;
+    };
+    let (x_sym, sx, x_off) = match_operand_row_col_off(res_expr, row, jvar, sema, interner)?;
+    if sx != n || !x_off.is_empty() {
+        return None;
+    }
+    // `x == c` is the in-place residual [`match_matmul_residual`] already fuses into one beta = 1
+    // `nt_epi`; declining it here keeps that (strictly better) single-kernel form.
+    if x_sym == cbase {
+        return None;
+    }
+    // An input aliasing the OUTPUT is a hazard (the blocked kernel writes C in a different order than
+    // the scalar nest reads it). `x` aliasing `a`/`b` is not: nothing writes them.
+    if a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    if !is_f32_expr(res_expr, sema) {
+        return None;
+    }
+    let nest = MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        beta: 0, // the GEMM overwrites C; the residual is added by the following velem sweep
+        transposed,
+        transposed_a,
+        a_off,
+        b_off,
+        c_off,
+        alpha: None,
+        bias: None,
+        act: EPI_ACT_IDENTITY,
+    };
+    Some((nest, x_sym))
 }
 
 /// Recognize the canonical f32 matmul nest rooted at `for row in 0..M { … }`. See [`MatmulNest`].
