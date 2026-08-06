@@ -223,7 +223,13 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   (`let ib = i*K;` … `a[ib + k]`) still dispatches: a pre-lowering canonicalization
   (`wukong_mir_build::canon`, `docs/internals.md`) folds an integer const and forward-substitutes a
   pure integer index local before the recognizers run, so recognition no longer turns on how the
-  index happens to be spelled. An operand may also be a **struct field** — `l.wq[j*D + p]`, the way a
+  index happens to be spelled. Nor does it turn on whether the follow-up work is written **into the
+  store** or as its own loop: `c[i*N+j] = act(bias[j] + s)` (and the bias-free `act(s)`) fuses to one
+  `wukong_sgemm_nt_epi`; a residual read from *another* array, `c[i*N+j] = x[i*N+j] + s`, and a second
+  store in the same body, `c[i*N+j] = s; d[i*N+j] = d[i*N+j] * s` (the SwiGLU up-projection folded
+  into its gate), each lower to the same `wukong_sgemm_nt` + `wukong_velem_f32` pair the two-loop
+  spelling dispatches — bit-identical to it, since the matmul store writes exactly `s`
+  (`tests/run/linear_{silu_store,bias_relu_store,residual_src,dual_store}.wk`). An operand may also be a **struct field** — `l.wq[j*D + p]`, the way a
   real model groups its weights — and not just a bare local or parameter: a field's base pointer is
   resolved through the same `kernel_base_ptr` path as any other operand, so the projection GEMMs, the
   fused `bias[j] + s` epilogue and the affine norms' `gamma[i]`/`beta[i]` all dispatch from a struct

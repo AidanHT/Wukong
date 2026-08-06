@@ -450,7 +450,13 @@ half-open/unit-step precondition holds for every recognized kernel. What does *n
 index is spelled: a row base hoisted into a local (`let ib = i*K;` then `a[ib + p]`) and a dimension
 written as a bare module `const` are normalized back to the canonical `a[i*K + p]` form before
 recognition (`wukong_mir_build::canon`), so ordinary refactoring does not silently cost you the
-kernel. Element type is handled case by
+kernel. The same pass moves a `let mut acc = 0.0;` down to the loop that accumulates into it, so
+declaring an accumulator a statement or two early does not break the multi-statement windows that
+softmax / log-softmax / cross-entropy match. Nor does folding the follow-up work **into** a matmul
+store rather than writing it as its own loop: `c[i*N+j] = silu(bias[j] + s)` fuses to one
+`wukong_sgemm_nt_epi`, `c[i*N+j] = x[i*N+j] + s` (a residual from another array) and a second store
+`d[i*N+j] = d[i*N+j] * s` alongside `c[i*N+j] = s` (the SwiGLU up-projection) each lower to the same
+GEMM + `wukong_velem_f32` pair the two-loop spelling does. Element type is handled case by
 case rather than being an f32-only gate: a `bf16`/`f16` array read through the explicit widening cast —
 `s = s + (x[k] as f32)` — dispatches to the multicore low-precision reduction kernels
 (`tests/run/parallel_reduce_lowp.wk`), while the *uncast* spelling `s = s + x[k]` stays a scalar loop

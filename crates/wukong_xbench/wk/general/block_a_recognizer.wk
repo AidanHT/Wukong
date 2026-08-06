@@ -128,9 +128,10 @@ fn kbench(
         for p in 0..$D$ { s = s + nrm[i*$D$+p] * w1[j*$D$+p]; }
         f1[i*$F$+j] = b1[j] + s;
     } }
-    // The activation as its OWN loop: that is the shape `wukong_sgemm_nt_epi` fuses. Writing it
-    // inside the store (`f1[..] = silu(b1[j] + s)`) is arithmetically identical and is what a real
-    // engineer writes — and it declines the recognizer outright. That is variant (b).
+    // The activation as its OWN loop. Variant (b) writes the same activation INSIDE the store
+    // (`f1[..] = silu(b1[j] + s)`); both now fuse into one `wukong_sgemm_nt_epi`, so (b) reaches the
+    // same arithmetic in one kernel call FEWER than this spelling (no separate `wukong_vmath_f32`
+    // pass over f1). This loop is kept as the explicit two-step form the epilogue fusion matches.
     for i in 0..$S$ { for j in 0..$F$ { f1[i*$F$+j] = silu(f1[i*$F$+j]); } }
     for i in 0..$S$ { for j in 0..$F$ {
         let mut s: f32 = 0.0;
