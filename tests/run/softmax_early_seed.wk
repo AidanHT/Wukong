@@ -1,0 +1,83 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 643
+// EXPECT-OUT: 87
+// EXPECT-OUT: 236
+// EXPECT-OUT: 32
+// EXPECT-OUT: 643
+// EXPECT-OUT: 87
+// EXPECT-OUT: 236
+// EXPECT-OUT: 32
+module tests.run.softmax_early_seed
+
+// A stable softmax whose sum accumulator is DECLARED EARLY — `let mut s: f32 = 0.0;` sits one
+// statement above where the canonical spelling puts it, ahead of the exp pass instead of after it.
+// That is the same program (nothing between the declaration and the sum loop mentions `s`), but the
+// softmax recognizer matches a WINDOW of seven consecutive statements by position, so the early
+// declaration split the window and the whole thing dispatched no kernel at all: three separate
+// scalar/vector passes over the row instead of one `wukong_norm_f32`.
+//
+// `wukong_mir_build::canon` now sinks a `let mut <ident> = <literal>;` down to the first statement
+// that mentions it, when that statement ASSIGNS it — an accumulator seed belongs next to the loop
+// that folds into it. Both spellings below therefore dispatch `wukong_norm_f32` and must agree
+// lane for lane.
+//
+// Hand-derived from the scalar semantics, x = [3, 1, 2, 0]:
+//   m = 3;  e = [exp(0), exp(-2), exp(-1), exp(-3)]
+//         = [1, 0.1353352832, 0.3678794412, 0.0497870684]
+//   s = 1.5530017928;  inv = 1/s = 0.6439142600
+//   out = [0.6439142600, 0.0871443167, 0.2368828175, 0.0320586043]
+// Printed as (out*1000) as i32 (truncating): 643 / 87 / 236 / 32, twice.
+fn softmax_early(mut x: [f32; 4]) {
+    let mut m: f32 = x[0];
+    for i in 0..4 {
+        m = fmax(m, x[i]);
+    }
+    let mut s: f32 = 0.0;
+    for i in 0..4 {
+        x[i] = exp(x[i] - m);
+    }
+    for i in 0..4 {
+        s = s + x[i];
+    }
+    let inv: f32 = 1.0 / s;
+    for i in 0..4 {
+        x[i] = x[i] * inv;
+    }
+}
+
+// The canonical order, for reference: identical arithmetic, `let mut s` one statement later.
+fn softmax_canonical(mut x: [f32; 4]) {
+    let mut m: f32 = x[0];
+    for i in 0..4 {
+        m = fmax(m, x[i]);
+    }
+    for i in 0..4 {
+        x[i] = exp(x[i] - m);
+    }
+    let mut s: f32 = 0.0;
+    for i in 0..4 {
+        s = s + x[i];
+    }
+    let inv: f32 = 1.0 / s;
+    for i in 0..4 {
+        x[i] = x[i] * inv;
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 4] = [3.0, 1.0, 2.0, 0.0];
+    softmax_early(a);
+    print((a[0] * 1000.0) as i32);
+    print((a[1] * 1000.0) as i32);
+    print((a[2] * 1000.0) as i32);
+    print((a[3] * 1000.0) as i32);
+
+    let mut b: [f32; 4] = [3.0, 1.0, 2.0, 0.0];
+    softmax_canonical(b);
+    print((b[0] * 1000.0) as i32);
+    print((b[1] * 1000.0) as i32);
+    print((b[2] * 1000.0) as i32);
+    print((b[3] * 1000.0) as i32);
+    return 0;
+}
