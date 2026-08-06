@@ -2010,6 +2010,57 @@ mod tests {
         }
     }
 
+    /// **Each Rust peer must hand its buffers to a `fn` as SLICE PARAMETERS.**
+    ///
+    /// The C peers here declare every buffer `__restrict__`. rustc emits LLVM `noalias` only on
+    /// *reference parameters* — never on a raw pointer, and (measured, not assumed) never on a slice
+    /// built as a LOCAL inside the `extern "C"` entry point: that spelling compiles to asm
+    /// byte-identical to bare raw pointers and its IR carries no `noalias` metadata at all. So
+    /// without a shim the C column gets non-overlap information the Rust column does not, and the
+    /// Rust peer is silently the weaker one.
+    ///
+    /// The rule this pins: `kbench` builds the slices and calls `kbody`; the loops live in `kbody`,
+    /// whose parameters are `&[f32]` / `&mut [f32]`. Falsified by deleting the `kbody` indirection
+    /// from `peer_scan.rs` — the test then fails on the `for ` needle.
+    #[test]
+    fn rust_peers_take_their_buffers_as_slice_parameters() {
+        for (name, src) in [
+            ("peer_block.rs", PEER_RS),
+            ("peer_loss.rs", LOSS_RS),
+            ("peer_scan.rs", SCAN_RS),
+        ] {
+            assert!(
+                src.contains("unsafe fn kbody("),
+                "{name}: no `kbody` shim — the loops must live behind slice PARAMETERS, which is \
+                 the only spelling rustc turns into LLVM `noalias` (the C twin's `__restrict__`)"
+            );
+            assert!(
+                src.contains("&mut [f32]") && src.contains("&[f32]"),
+                "{name}: `kbody` must take slices, not raw pointers"
+            );
+            let entry = src
+                .find("pub unsafe extern \"C\" fn kbench(")
+                .unwrap_or_else(|| panic!("{name}: no `kbench` entry point"));
+            let after = &src[entry..];
+            let body_start = after.find(") {").expect("kbench must open a body") + 3;
+            let body_end = body_start
+                + after[body_start..]
+                    .find("\n}")
+                    .expect("kbench must close its body");
+            let entry_body = &after[body_start..body_end];
+            assert!(
+                entry_body.contains("kbody("),
+                "{name}: `kbench` must delegate to `kbody`"
+            );
+            assert!(
+                !entry_body.contains("for "),
+                "{name}: `kbench` still runs a loop over slices it built as LOCALS. That grants no \
+                 aliasing information — move the loop into `kbody` and pass the slices in. Body was:\
+                 \n{entry_body}"
+            );
+        }
+    }
+
     /// Every ablation probe must reach optimized MIR — a probe that failed to compile would print
     /// "no dispatches" and read exactly like a recognizer decline, which is the opposite claim.
     #[test]
