@@ -158,10 +158,17 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
-and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 20 variants: constants
+and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 22 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
-(`Alloca`/`Load`/`Store`/`Gep`), `Call`, the float/SIMD primitives (`Splat`/`Fma`/`Sqrt`/`Round`), the
-address-of ops (`FuncAddr`, `GlobalAddr`), and `VecKernelCall`. Every op produces exactly one result
+(`Alloca`/`Load`/`Store`/`Gep`), `Call`, the float/SIMD primitives
+(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the address-of ops (`FuncAddr`, `GlobalAddr`),
+and `VecKernelCall`. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
+reads one lane back out (the only way from vector to scalar form, and what keeps a widened float
+reduction's accumulate serial), and `Iota` is the lane-index ramp `<0, 1, .., n-1>` — the one
+non-uniform vector *source*, since every other op is lane-wise and so any expression over splatted
+scalars is the same in every lane. The loop vectorizer needs it to widen a body that reads its
+induction variable as a value rather than as an address: lane `k` is scalar iteration `i + k`, so
+`if c == target` widens to `cmp.eq(splat(i) + iota, splat(target))`, a per-lane mask. Every op produces exactly one result
 except `Store` (never), `Call` (void callees such as `print`) and an elementwise `VecKernelCall`. A
 string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
 bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
@@ -796,10 +803,17 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
-and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 20 variants: constants
+and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 22 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
-(`Alloca`/`Load`/`Store`/`Gep`), `Call`, the float/SIMD primitives (`Splat`/`Fma`/`Sqrt`/`Round`), the
-address-of ops (`FuncAddr`, `GlobalAddr`), and `VecKernelCall`. Every op produces exactly one result
+(`Alloca`/`Load`/`Store`/`Gep`), `Call`, the float/SIMD primitives
+(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the address-of ops (`FuncAddr`, `GlobalAddr`),
+and `VecKernelCall`. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
+reads one lane back out (the only way from vector to scalar form, and what keeps a widened float
+reduction's accumulate serial), and `Iota` is the lane-index ramp `<0, 1, .., n-1>` — the one
+non-uniform vector *source*, since every other op is lane-wise and so any expression over splatted
+scalars is the same in every lane. The loop vectorizer needs it to widen a body that reads its
+induction variable as a value rather than as an address: lane `k` is scalar iteration `i + k`, so
+`if c == target` widens to `cmp.eq(splat(i) + iota, splat(target))`, a per-lane mask. Every op produces exactly one result
 except `Store` (never), `Call` (void callees such as `print`) and an elementwise `VecKernelCall`. A
 string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
 bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
@@ -1418,10 +1432,17 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
-and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 20 variants: constants
+and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 22 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
-(`Alloca`/`Load`/`Store`/`Gep`), `Call`, the float/SIMD primitives (`Splat`/`Fma`/`Sqrt`/`Round`), the
-address-of ops (`FuncAddr`, `GlobalAddr`), and `VecKernelCall`. Every op produces exactly one result
+(`Alloca`/`Load`/`Store`/`Gep`), `Call`, the float/SIMD primitives
+(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the address-of ops (`FuncAddr`, `GlobalAddr`),
+and `VecKernelCall`. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
+reads one lane back out (the only way from vector to scalar form, and what keeps a widened float
+reduction's accumulate serial), and `Iota` is the lane-index ramp `<0, 1, .., n-1>` — the one
+non-uniform vector *source*, since every other op is lane-wise and so any expression over splatted
+scalars is the same in every lane. The loop vectorizer needs it to widen a body that reads its
+induction variable as a value rather than as an address: lane `k` is scalar iteration `i + k`, so
+`if c == target` widens to `cmp.eq(splat(i) + iota, splat(target))`, a per-lane mask. Every op produces exactly one result
 except `Store` (never), `Call` (void callees such as `print`) and an elementwise `VecKernelCall`. A
 string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
 bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
