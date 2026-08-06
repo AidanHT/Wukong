@@ -1,0 +1,46 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 731
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2857
+// EXPECT-OUT: 1761
+module tests.run.linear_silu_store
+
+// The LLaMA/Mistral SwiGLU gate written the natural way: the bias-add and the SiLU both live INSIDE
+// the matmul store, `f[i*N+j] = silu(b[j] + s)`, not in a separate follow-up loop. Fuses to one
+// `wukong_sgemm_nt_epi(.., bias, act = SILU)`.
+//
+// x = [[1,2],[3,4]], W = I (so s = x·Wᵀ = x = [[1,2],[3,4]]), b = [0, -2]:
+//   pre-activation row0: [1+0, 2-2] = [1, 0]
+//   pre-activation row1: [3+0, 4-2] = [3, 2]
+// silu(z) = z·sigmoid(z) = z/(1+e^-z):
+//   silu(1) = 1/(1+0.3678794) = 0.7310586
+//   silu(0) = 0
+//   silu(3) = 3/(1+0.0497871) = 2.8577223
+//   silu(2) = 2/(1+0.1353353) = 1.7615942
+// Printed as (out*1000) as i32 (truncating): 731 / 0 / 2857 / 1761. Every lane is printed and every
+// value is hand-derived from the scalar definition of SiLU, not recorded from compiler output.
+fn gate(x: [f32; 4], w: [f32; 4], b: [f32; 2], mut f: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + x[i * 2 + k] * w[j * 2 + k];
+            }
+            f[i * 2 + j] = silu(b[j] + s);
+        }
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let w: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let b: [f32; 2] = [0.0, -2.0];
+    let mut f: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    gate(x, w, b, f);
+    print((f[0] * 1000.0) as i32);
+    print((f[1] * 1000.0) as i32);
+    print((f[2] * 1000.0) as i32);
+    print((f[3] * 1000.0) as i32);
+    return 0;
+}

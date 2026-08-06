@@ -8144,24 +8144,35 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
-        // Fused per-column bias `C = A·Bᵀ + bias[j]` in a single store (the GPT-2 projection
-        // `q = x·Wᵀ + b`, its bias a runtime-offset slice of a shared weight blob). Routes to the fused
-        // epilogue kernel `wukong_sgemm_nt_epi` (beta from the nest, act = identity); the bias base is
-        // GEP'd by its invariant offset exactly like a/b/c above. NT only (the epilogue kernel form) —
-        // any other shape (or a coexisting α) declines to the scalar nest, which computes `bias + s`
-        // correctly. Bit-identical to the unfused GEMM-then-bias the interpreter marshals as the oracle.
-        if let Some((bias_base, bias_off)) = &nest.bias {
+        // Fused per-column bias `C = A·Bᵀ + bias[j]` and/or an activation written into the store
+        // (`C = act(A·Bᵀ [+ bias[j]])` — the GPT-2 projection `q = x·Wᵀ + b`, the LLaMA SwiGLU gate
+        // `silu(x·W1ᵀ + b1)`). Routes to the fused epilogue kernel `wukong_sgemm_nt_epi` (beta from the
+        // nest, act from the nest); the bias base is GEP'd by its invariant offset exactly like a/b/c
+        // above. NT only (the epilogue kernel is `gemm_dispatch(.., transposed = true)`) — any other
+        // shape (or a coexisting α, which the kernel has no parameter for) declines to the scalar nest,
+        // which computes `act(bias + s)` correctly. Bit-identical to the unfused GEMM → bias →
+        // activation the interpreter marshals as the oracle.
+        if nest.bias.is_some() || nest.act != EPI_ACT_IDENTITY {
             if !(nest.transposed && !nest.transposed_a) || nest.alpha.is_some() {
                 return false;
             }
-            let Some(bias_p) = self.kernel_base_ptr(*bias_base) else {
-                return false;
+            // An absent bias is a null pointer built as an integer `0` (a `Ptr`-typed `ConstInt` is
+            // invalid MIR): the kernel checks `bias.is_null()` — the same convention `emit_sgemm_epi`
+            // and the affine-norm null params use.
+            let bias_p = match &nest.bias {
+                Some((bias_base, bias_off)) => {
+                    let Some(bias_p) = self.kernel_base_ptr(*bias_base) else {
+                        return false;
+                    };
+                    self.offset_base(bias_p, bias_off)
+                }
+                None => self
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
             };
-            let bias_p = self.offset_base(bias_p, bias_off);
-            let act_v = self.builder.build(
-                MirType::I64,
-                Op::ConstInt(EPI_ACT_IDENTITY as i128, MirType::I64),
-            );
+            let act_v = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(nest.act as i128, MirType::I64));
             let func = if parallel {
                 self.gemm.nt_epi_par
             } else {
@@ -8958,10 +8969,16 @@ impl FnLowerer<'_> {
         // instead of `50 100 250 300`, and `c[i*2+j] = bq[j] + s` printed the same instead of
         // `1100 2200 1500 2600`. Declining is free: `emit_sgemm` folds α into `wukong_sgemm_nt_alpha`
         // and the bias into its own `nt_epi` call, and the epilogue loop then lowers as its own pass.
+        //
+        // An activation peeled off the *store* (`c[i*N+j] = silu(s)`) declines for the same reason: the
+        // `act` this function forwards comes from the epilogue LOOP, so a store act would be silently
+        // dropped, and two stacked activations are not one epilogue in any case. `emit_sgemm` fuses the
+        // store act on its own, and the epilogue loop then lowers as a separate vmath pass.
         if !nest.transposed
             || nest.transposed_a
             || nest.alpha.is_some()
             || nest.bias.is_some()
+            || nest.act != EPI_ACT_IDENTITY
             || !nest.a_off.is_empty()
             || !nest.b_off.is_empty()
             || !nest.c_off.is_empty()
@@ -8986,7 +9003,15 @@ impl FnLowerer<'_> {
         // row-major — so it cannot honour a peeled scale, a peeled store bias, or a transposed A, and
         // must refuse them rather than emit a call that silently drops them. Its two callers are
         // independent (`try_fuse_matmul_epilogue`, `match_matmul_residual`).
-        if nest.transposed_a || nest.alpha.is_some() || nest.bias.is_some() {
+        //
+        // `nest.act` is refused for the identical reason: the `act` argument is the caller's (from the
+        // epilogue loop / the residual store), so a second activation carried on the nest itself would
+        // be dropped without trace.
+        if nest.transposed_a
+            || nest.alpha.is_some()
+            || nest.bias.is_some()
+            || nest.act != EPI_ACT_IDENTITY
+        {
             return false;
         }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
@@ -20193,9 +20218,18 @@ struct MatmulNest<'a> {
     /// (the GPT-2 projection `q = x·Wᵀ + b`, the bias itself a runtime-offset slice of a shared weight
     /// blob — `w[base + REL_BQ + j]`). The offset terms are invariant in the matmul's `(i,j,k)`, so
     /// `emit_sgemm` GEPs the bias base by their sum and routes to the fused epilogue kernel
-    /// `wukong_sgemm_nt_epi` (beta from the nest, act = identity). `None` for an unbiased matmul; only
+    /// `wukong_sgemm_nt_epi` (beta from the nest, act from `act`). `None` for an unbiased matmul; only
     /// the `ijk` dot-product form (NT) populates it, and it is mutually exclusive with `alpha`.
     bias: Option<(Symbol, Vec<&'a Expr>)>,
+    /// An activation peeled off the store **itself** — `c[i,j] = silu(bias[j] + s)`, or the bias-free
+    /// `c[i,j] = silu(s)` — the SwiGLU/GELU FFN written the way an engineer actually writes it, with
+    /// the activation inside the store rather than as a separate follow-up loop. `EPI_ACT_IDENTITY`
+    /// when the store carries none. Only the `ijk` dot-product form populates it; `emit_sgemm` routes
+    /// any non-identity act (with or without a bias) to `wukong_sgemm_nt_epi`, whose epilogue applies
+    /// the identical scalar activation (`wukong_runtime::vmath::{gelu1,silu1}`, `relu`), so the fused
+    /// result equals the unfused `matmul → [bias →] activation`. Mutually exclusive with `alpha` (the
+    /// epilogue kernel has no α parameter) and NT-only (it is `gemm_dispatch(.., transposed = true)`).
+    act: u32,
 }
 
 /// A loop-invariant α scale peeled off a matmul store `c[i,j] = alpha·s`: either a runtime f32 symbol
@@ -21194,6 +21228,43 @@ fn unshadowed_intrinsic(
     math_intrinsic(interner.resolve(name))
 }
 
+/// Peel one fused-epilogue activation off `e`, returning `(inner, act_code)` — `fmax(inner, 0.0)` in
+/// either operand order (ReLU), `gelu(inner)`, `silu(inner)`, else `(e, EPI_ACT_IDENTITY)`.
+///
+/// The free-standing twin of [`FnLowerer::peel_dequant_act`], in the `EPI_ACT_*` vocabulary the GEMM
+/// epilogue kernel speaks. It is what lets the matmul recognizer accept the activation written
+/// **into the store** (`c[i*N+j] = silu(b[j] + s)`) rather than only as a separate follow-up loop:
+/// the two spellings are the same arithmetic, and the fused kernel applies the identical scalar
+/// activation, so both reach one `wukong_sgemm_nt_epi`. Uses `unshadowed_intrinsic`, so a program
+/// that defines its own `fn silu(..)` keeps its own function (never the builtin) — the rule every
+/// activation peeler in this crate obeys.
+fn peel_epi_act<'a>(e: &'a Expr, interner: &Interner, sema: &SemaResult) -> (&'a Expr, u32) {
+    let ExprKind::Call { callee, args, .. } = &e.kind else {
+        return (e, EPI_ACT_IDENTITY);
+    };
+    if args.len() == 2
+        && matches!(
+            unshadowed_intrinsic(callee, interner, sema),
+            Some(MathIntrinsic::Fmax)
+        )
+    {
+        if is_float_zero(&args[1], interner) {
+            return (&args[0], EPI_ACT_RELU);
+        }
+        if is_float_zero(&args[0], interner) {
+            return (&args[1], EPI_ACT_RELU);
+        }
+    }
+    if args.len() == 1 {
+        match unshadowed_intrinsic(callee, interner, sema) {
+            Some(MathIntrinsic::Gelu) => return (&args[0], EPI_ACT_GELU),
+            Some(MathIntrinsic::Silu) => return (&args[0], EPI_ACT_SILU),
+            _ => {}
+        }
+    }
+    (e, EPI_ACT_IDENTITY)
+}
+
 /// Match the epilogue RHS over the matmul output `C[i*N+j]`: bare `C+bias` (identity), `fmax(_, 0)`
 /// (ReLU), or a `gelu(_)` / `silu(_)` activation call (the transformer FFN `act(x·Wᵀ [+ bias])`
 /// shape). Bias is **optional for the activation forms** — the bias-free `silu(x·Wᵀ)` is the
@@ -22073,6 +22144,15 @@ fn match_matmul_ijk<'a>(
     // the fused-bias form `bias[<invariant offset> + j] + s` (the GPT-2 projection `q = x·Wᵀ + b`, its
     // bias a runtime-offset slice of a shared weight blob). Bias and α are disjoint store shapes; a
     // fused bias routes to `wukong_sgemm_nt_epi` in `emit_sgemm`.
+    //
+    // An activation written **into the store** — `c[i,j] = silu(bias[j] + s)`, or the bias-free
+    // `c[i,j] = silu(s)` — is peeled off first and rides the same epilogue kernel. That spelling is
+    // the natural one (a real FFN is written with the activation in the store, not as a separate
+    // follow-up loop) and used to decline the whole nest: `silu(..)` is a `Call`, which is neither the
+    // `Mul` `match_store_scale` wants nor the `Add` `match_bias_dot_store` wants, so BOTH failed and
+    // the entire GEMM fell to a scalar nest. Peeling is strictly additive — a `Call` never matched
+    // either shape before.
+    let (cv, act) = peel_epi_act(cv, interner, sema);
     let (alpha, bias) = match match_store_scale(cv, s_sym, &[row, jvar, kvar], sema, interner) {
         Some(a) => (a, None),
         None => (
@@ -22086,6 +22166,13 @@ fn match_matmul_ijk<'a>(
             )?),
         ),
     };
+    // DECLINE: `wukong_sgemm_nt_epi` has no α parameter (its `Epilogue::alpha` is pinned to 1.0), so
+    // `c[i,j] = silu(alpha·s)` cannot be fused — accepting it would silently drop the scale. Decline
+    // here rather than in the emitter so the nest can still fall through to a sibling recognizer, and
+    // ultimately to the scalar loop, which computes the scale correctly.
+    if act != EPI_ACT_IDENTITY && alpha.is_some() {
+        return None;
+    }
     // The output store `c[i*N + j (+ off)] = …` or the shape-typed `c[i, j] = …` (sema-aware).
     let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
     // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
@@ -22127,6 +22214,7 @@ fn match_matmul_ijk<'a>(
         c_off,
         alpha,
         bias,
+        act,
     })
 }
 
@@ -22275,6 +22363,9 @@ fn match_matmul_ijk_memacc<'a>(
         b_off,
         c_off,
         alpha: None,
+        // The memory-accumulator store is the bare `c[i,j] = c[i,j] + a·b`; there is nothing wrapping
+        // it to peel, so this form never carries a fused activation.
+        act: EPI_ACT_IDENTITY,
         bias: None,
     })
 }
@@ -22476,6 +22567,10 @@ fn match_matmul_residual<'a>(
         c_off,
         alpha: None, // the residual epilogue kernel carries no α scale
         bias: None,  // the residual store's per-column bias rides the beta=1 epilogue, not this field
+        // Likewise the residual store's activation: it is returned alongside the nest and handed to
+        // `emit_sgemm_epi` as its `act` argument, so carrying it here too would be a second, dropped
+        // copy (`emit_sgemm_epi` refuses a non-identity `nest.act` for exactly that reason).
+        act: EPI_ACT_IDENTITY,
     };
     Some((nest, bias, act))
 }
@@ -22634,9 +22729,11 @@ fn match_matmul<'a>(
         a_off: Vec::new(),
         b_off: Vec::new(),
         c_off: Vec::new(),
-        // The `ikj` accumulate store is `c[i,j] += aik·b[k,j]`, not `c[i,j] = alpha·s` — no α peel.
+        // The `ikj` accumulate store is `c[i,j] += aik·b[k,j]`, not `c[i,j] = alpha·s` — no α peel,
+        // and nothing wraps the store, so no activation either.
         alpha: None,
         bias: None,
+        act: EPI_ACT_IDENTITY,
     })
 }
 
