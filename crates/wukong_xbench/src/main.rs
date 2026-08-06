@@ -165,6 +165,14 @@ fn max_rel_err(a: &[f32], b: &[f32]) -> (f64, usize) {
 /// recognized kernels do. The plain C column keeps the honest default flags (see the fairness notes
 /// in BENCHMARKS.md — withholding `-ffast-math` inflates the reduction-bearing rows); this column is
 /// the reassociation-normalized comparison, printed alongside, never replacing, the plain-C ratio.
+///
+/// NOTE (checked 2026-08-06, because the inconsistency looks like a defect): 23 of the honest-flags
+/// C call sites in this file spell `["-O3", "-march=native", "-shared"]` and 16 spell
+/// `["-O3", "-march=native", "-ffp-contract=fast", "-shared"]`, and **the two are equivalent**. gcc
+/// invoked without a `-std=` flag is in GNU mode, whose `-ffp-contract` default already is `fast`.
+/// Verified on `out[i] = x[i] + y[i]*2.5f` in its own TU: `-O3 -march=native` emits `vfmadd`, adding
+/// `-ffp-contract=fast` emits `vfmadd`, `-ffp-contract=off` emits none. No family is silently denied
+/// the FMA that Wukong fuses.
 const C_FAST_FLAGS: &[&str] = &["-O3", "-march=native", "-ffast-math", "-shared"];
 
 /// LOOSE cross-check for the relaxed-FP peers (C(fast) / C(omp)). `-ffast-math` and OpenMP-partitioned
@@ -1586,12 +1594,16 @@ fn c_matmul_tn(ns: usize) -> String {
     )
 }
 
+/// The Rust weight-gradient peer. Same `kij` nest as [`c_matmul_tn`], and the slices are taken
+/// **as function parameters** (see the LANDMINE on [`rust_kernel`]) so this column gets the same
+/// `noalias` its C twin gets from `__restrict__` — the defect whose isolated cost on this very
+/// family was measured at 8.7× for the C peer. Building the slices inside `kbench` (the previous
+/// spelling) grants no aliasing information at all.
 fn rust_matmul_tn(ns: usize) -> String {
     format!(
-        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
-         \x20 let a = core::slice::from_raw_parts(a, NS*NS);\n\
-         \x20 let b = core::slice::from_raw_parts(b, NS*NS);\n\
-         \x20 let c = core::slice::from_raw_parts_mut(c, NS*NS);\n\
+        "const NS: usize = {ns};\n\
+         #[inline(always)]\n\
+         fn kbody(a: &[f32], b: &[f32], c: &mut [f32]) {{\n\
          \x20 for v in c.iter_mut() {{ *v = 0.0; }}\n\
          \x20 for k in 0..NS {{\n\
          \x20   let brow = &b[k*NS..k*NS+NS];\n\
@@ -1600,7 +1612,10 @@ fn rust_matmul_tn(ns: usize) -> String {
          \x20     let crow = &mut c[i*NS..i*NS+NS];\n\
          \x20     for (cv, &bv) in crow.iter_mut().zip(brow) {{ *cv += aki*bv; }}\n\
          \x20   }}\n\
-         \x20 }}\n}}\n"
+         \x20 }}\n}}\n\
+         #[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
+         \x20 kbody(core::slice::from_raw_parts(a, NS*NS), core::slice::from_raw_parts(b, NS*NS), \
+         core::slice::from_raw_parts_mut(c, NS*NS))\n}}\n"
     )
 }
 
@@ -2606,11 +2621,12 @@ fn c_transpose_omp(rows: usize, cols: usize) -> String {
 
 /// The Rust transpose peer — the same blocked algorithm and the same full-tile/edge split as
 /// [`c_transpose`], so the two peer languages stay comparable to each other as well as to Wukong.
+/// The slices are function parameters, not locals, so this column carries `noalias` like its C
+/// twin's `__restrict__` (see the LANDMINE on [`rust_kernel`]).
 fn rust_transpose(rows: usize, cols: usize) -> String {
     format!(
-        "const NR: usize = {rows};\nconst NC: usize = {cols};\nconst TB: usize = 32;\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
-         \x20 let s = core::slice::from_raw_parts(src, NR*NC);\n\
-         \x20 let d = core::slice::from_raw_parts_mut(dst, NR*NC);\n\
+        "const NR: usize = {rows};\nconst NC: usize = {cols};\nconst TB: usize = 32;\n\
+         #[inline(always)]\nfn kbody(s: &[f32], d: &mut [f32]) {{\n\
          \x20 for ii in (0..NR).step_by(TB) {{ for jj in (0..NC).step_by(TB) {{\n\
          \x20   if ii+TB<=NR && jj+TB<=NC {{\n\
          \x20     for i in ii..ii+TB {{ for j in jj..jj+TB {{ d[j*NR+i] = s[i*NC+j]; }} }}\n\
@@ -2618,7 +2634,9 @@ fn rust_transpose(rows: usize, cols: usize) -> String {
          \x20     let i1 = if ii+TB<NR {{ ii+TB }} else {{ NR }};\n\
          \x20     let j1 = if jj+TB<NC {{ jj+TB }} else {{ NC }};\n\
          \x20     for i in ii..i1 {{ for j in jj..j1 {{ d[j*NR+i] = s[i*NC+j]; }} }}\n\
-         \x20   }} }} }}\n}}\n"
+         \x20   }} }} }}\n}}\n\
+         #[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
+         \x20 kbody(core::slice::from_raw_parts(src, NR*NC), core::slice::from_raw_parts_mut(dst, NR*NC))\n}}\n"
     )
 }
 
@@ -2783,11 +2801,12 @@ fn c_colsum_omp(m: usize, n: usize) -> String {
 
 fn rust_colsum(m: usize, n: usize) -> String {
     format!(
-        "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
-         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+        "const M: usize = {m};\nconst N: usize = {n};\n\
+         #[inline(always)]\nfn kbody(xs: &[f32], os: &mut [f32]) {{\n\
          \x20 for o in os.iter_mut() {{ *o = 0.0; }}\n\
-         \x20 for i in 0..M {{ let row = &xs[i*N..i*N+N]; for (o, &v) in os.iter_mut().zip(row) {{ *o += v; }} }}\n}}\n"
+         \x20 for i in 0..M {{ let row = &xs[i*N..i*N+N]; for (o, &v) in os.iter_mut().zip(row) {{ *o += v; }} }}\n}}\n\
+         #[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
+         \x20 kbody(core::slice::from_raw_parts(x, M*N), core::slice::from_raw_parts_mut(out, N))\n}}\n"
     )
 }
 
@@ -3220,12 +3239,13 @@ fn rust_colmax(m: usize, n: usize, op: u8) -> String {
     let cmp = if op == 1 { "<" } else { ">" };
     let (lo, hi) = if op == 2 { ("(", ").abs()") } else { ("", "") };
     format!(
-        "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
-         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+        "const M: usize = {m};\nconst N: usize = {n};\n\
+         #[inline(always)]\nfn kbody(xs: &[f32], os: &mut [f32]) {{\n\
          \x20 for (o, &v) in os.iter_mut().zip(&xs[0..N]) {{ *o = {lo}v{hi}; }}\n\
          \x20 for i in 1..M {{ let row = &xs[i*N..i*N+N];\n\
-         \x20   for (o, &r) in os.iter_mut().zip(row) {{ let s=*o; let v={lo}r{hi}; *o = if s{cmp}v {{s}} else {{v}}; }} }}\n}}\n"
+         \x20   for (o, &r) in os.iter_mut().zip(row) {{ let s=*o; let v={lo}r{hi}; *o = if s{cmp}v {{s}} else {{v}}; }} }}\n}}\n\
+         #[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
+         \x20 kbody(core::slice::from_raw_parts(x, M*N), core::slice::from_raw_parts_mut(out, N))\n}}\n"
     )
 }
 
@@ -3404,17 +3424,24 @@ fn c_colarg(rows: usize, cols: usize, is_max: bool) -> String {
     )
 }
 
+/// The Rust column-arg peer. Two fixes over the first row-outer rewrite, both of which cost the peer
+/// time its C twin never paid:
+///   * the running-best scratch was a **heap `vec![0.0f32; C]` allocated inside the timed kernel**,
+///     and zero-filled before being overwritten by the seed loop. `c_colarg`'s twin is `float bv[C]`,
+///     a stack array with no allocator call and no pre-fill. It is a fixed-size stack array here now.
+///   * the slices were built inside `kbench`, which grants no `noalias` (see [`rust_kernel`]).
 fn rust_colarg(rows: usize, cols: usize, is_max: bool) -> String {
     let cmp = if is_max { ">" } else { "<" };
     format!(
-        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
-         pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut i32) {{\n\
-         \x20 let xs = core::slice::from_raw_parts(x, R*C);\n\
-         \x20 let os = core::slice::from_raw_parts_mut(out, C);\n\
-         \x20 let mut bv = vec![0.0f32; C];\n\
+        "const R: usize = {rows};\nconst C: usize = {cols};\n\
+         #[inline(always)]\nfn kbody(xs: &[f32], os: &mut [i32]) {{\n\
+         \x20 let mut bv = [0.0f32; C];\n\
          \x20 for j in 0..C {{ bv[j]=xs[j]; os[j]=0; }}\n\
          \x20 for i in 1..R {{ let row = &xs[i*C..i*C+C];\n\
-         \x20   for j in 0..C {{ let v=row[j]; if v {cmp} bv[j] {{ bv[j]=v; os[j]=i as i32; }} }} }}\n}}\n"
+         \x20   for j in 0..C {{ let v=row[j]; if v {cmp} bv[j] {{ bv[j]=v; os[j]=i as i32; }} }} }}\n}}\n\
+         #[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut i32) {{\n\
+         \x20 kbody(core::slice::from_raw_parts(x, R*C), core::slice::from_raw_parts_mut(out, C))\n}}\n"
     )
 }
 
@@ -3573,8 +3600,15 @@ fn rust_lrscan(rows: usize, cols: usize) -> String {
 /// step, also EMA). The carried `h` is a true loop-carried dependency, so gcc/rustc cannot auto-vectorize
 /// the inner time loop (like cumsum) and emit **one serial mul+add chain** per row — latency-bound, a few
 /// GB/s. Wukong's kernel **interleaves 4 independent rows**, keeping four chains in flight to fill the
-/// idle ports: a genuine single-core WIN (~1.6–1.9×), since gcc/rustc may not legally re-order an f32
-/// recurrence across rows. `@parallel` maps independent row chunks across cores on top (~5–8×). GB/s =
+/// idle ports: a genuine single-core WIN (~1.6–1.9×).
+///
+/// PEER-FAIRNESS NOTE (corrected 2026-08-06). This used to justify that win by saying "gcc/rustc may
+/// not legally re-order an f32 recurrence across rows". That is **false**: the rows are independent,
+/// so unroll-and-jam across `r` is perfectly legal and changes no value — gcc and rustc simply do not
+/// do it here. The honest statement is that the peer is the *idiomatic* spelling and neither
+/// toolchain finds the row interleave on its own, not that it is forbidden from finding it. What IS
+/// illegal without `-ffast-math` is re-ordering *within* a row, which is why the peer's inner time
+/// loop stays one serial chain. `@parallel` maps independent row chunks across cores on top (~5–8×). GB/s =
 /// `3·R·C·4` (read `a` + read `b` + write `out`). The recurrence is sequential within a row (no
 /// reassociation) and the kernel does plain mul+add (two roundings) where gcc may fuse to one `fma`, so
 /// the cross-check is a ~1-ULP magnitude-normalized tolerance like cumsum.
@@ -4152,12 +4186,13 @@ fn rust_colstat(m: usize, n: usize, op: u8) -> String {
         _ => ("*o += r*r;", "(s / M as f32).sqrt()"),
     };
     format!(
-        "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 let xs = core::slice::from_raw_parts(x, M*N);\n\
-         \x20 let os = core::slice::from_raw_parts_mut(out, N);\n\
+        "const M: usize = {m};\nconst N: usize = {n};\n\
+         #[inline(always)]\nfn kbody(xs: &[f32], os: &mut [f32]) {{\n\
          \x20 for o in os.iter_mut() {{ *o = 0.0; }}\n\
          \x20 for i in 0..M {{ let row = &xs[i*N..i*N+N]; for (o, &r) in os.iter_mut().zip(row) {{ {fold} }} }}\n\
-         \x20 for o in os.iter_mut() {{ let s = *o; *o = {fin}; }}\n}}\n"
+         \x20 for o in os.iter_mut() {{ let s = *o; *o = {fin}; }}\n}}\n\
+         #[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
+         \x20 kbody(core::slice::from_raw_parts(x, M*N), core::slice::from_raw_parts_mut(out, N))\n}}\n"
     )
 }
 
@@ -8380,10 +8415,48 @@ fn c_kernel_rw(body: &str) -> String {
     format!("#include <math.h>\n#define N {N}\n__declspec(dllexport) void kbench(const float* __restrict__ x, float* __restrict__ y, float* __restrict__ out) {{\n  {body}\n}}\n")
 }
 
+/// The Rust twin of [`c_kernel`] — **including its aliasing information**.
+///
+/// The C peers have declared every pointer parameter `__restrict__` since the 2026-08-04 audit. The
+/// Rust peers were still taking bare `*const f32` / `*mut f32`, which carries **no** aliasing
+/// information at all: rustc emits `noalias` on *reference* parameters, never on raw pointers, so
+/// every Rust peer in this file was compiled under may-alias assumptions while its C twin was not.
+/// Verified directly on the `saxpy` body at `-Copt-level=3 -Ctarget-cpu=native`:
+///
+/// | spelling | asm |
+/// |---|---|
+/// | raw pointers | 108 lines, **4 blocks** — a runtime `\|out-x\|<128 \|\| \|out-y\|<128` overlap test and a fully scalar `vaddss` fallback loop beside the vector one |
+/// | slices threaded through a `fn` boundary | 56 lines, **1 block**, zero scalar FP |
+///
+/// LANDMINE: `let x = core::slice::from_raw_parts(x, N);` **at the top of `kbench` does not do it.**
+/// That spelling was measured to emit byte-identical code to the raw-pointer one (108 lines, 4
+/// blocks) and its LLVM-IR carries no `llvm.experimental.noalias.scope.decl` at all, because rustc
+/// attaches `noalias` to function *parameters*. The slices must cross a **function boundary**; the
+/// `#[inline(always)]` shim below is what turns them into `!alias.scope`/`!noalias` metadata that
+/// survives inlining. Several peers in this file (`rust_colsum`, `rust_transpose`, `rust_model`, …)
+/// built slices at the top of `kbench` and were documented as getting `noalias` from it; they did
+/// not, and are routed through shims now.
+///
+/// The kernel `{body}` text is **unchanged** by the shim — it still indexes through `x`/`y`/`out`
+/// raw pointers, so no bounds check appears and no accumulation order moves. Only the aliasing facts
+/// change, which is exactly what `__restrict__` does for the C column.
+///
+/// `y` is `&mut` because the harness derives `yp` with `as_mut_ptr` and the `fused_linear_relu` row
+/// streams its intermediate through it (its C twin is [`c_kernel_rw`], `float* __restrict__ y`).
+/// `#[allow(unused_variables)]`: some kernels (relu, poly) don't read `y`; the fixed `(x,y,out)` ABI
+/// keeps the param, so silence the warning rather than clutter the benchmark output.
 fn rust_kernel(body: &str) -> String {
-    // `#[allow(unused_variables)]`: some kernels (relu, poly) don't read `y`; the fixed `(x,y,out)`
-    // ABI keeps the param, so silence the warning rather than clutter the benchmark output.
-    format!("#[allow(dead_code)]\nconst N: usize = {N};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
+    format!(
+        "#[allow(dead_code)]\nconst N: usize = {N};\n\
+         #[inline(always)]\n#[allow(unused_variables)]\n\
+         unsafe fn kbody(xs: &[f32], ys: &mut [f32], os: &mut [f32]) {{\n  \
+         let (x, y, out) = (xs.as_ptr(), ys.as_mut_ptr(), os.as_mut_ptr());\n  {body}\n}}\n\
+         #[no_mangle]\n#[allow(unused_variables)]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  \
+         kbody(core::slice::from_raw_parts(x, N), \
+         core::slice::from_raw_parts_mut(y as *mut f32, N), \
+         core::slice::from_raw_parts_mut(out, N))\n}}\n"
+    )
 }
 
 /// Render a C kernel source as **C++** for the g++ peer column. C is a subset of C++, so the numeric
@@ -8405,8 +8478,20 @@ fn wk_kernel_n(n: usize, body: &str) -> String {
 fn c_kernel_n(n: usize, body: &str) -> String {
     format!("#include <math.h>\n#define N {n}\n__declspec(dllexport) void kbench(const float* __restrict__ x, const float* __restrict__ y, float* __restrict__ out) {{\n  {body}\n}}\n")
 }
+/// [`rust_kernel`]'s parameterized twin, with the same `noalias` shim. `y` stays `&[f32]` here (not
+/// `&mut` as in [`rust_kernel`]) because the streaming bench derives `yp` with `as_ptr()` — building
+/// a `&mut` from a shared-provenance pointer would be UB even though no streaming body writes `y`.
 fn rust_kernel_n(n: usize, body: &str) -> String {
-    format!("const N: usize = {n};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
+    format!(
+        "const N: usize = {n};\n\
+         #[inline(always)]\n#[allow(unused_variables)]\n\
+         unsafe fn kbody(xs: &[f32], ys: &[f32], os: &mut [f32]) {{\n  \
+         let (x, y, out) = (xs.as_ptr(), ys.as_ptr(), os.as_mut_ptr());\n  {body}\n}}\n\
+         #[no_mangle]\n#[allow(unused_variables)]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  \
+         kbody(core::slice::from_raw_parts(x, N), core::slice::from_raw_parts(y, N), \
+         core::slice::from_raw_parts_mut(out, N))\n}}\n"
+    )
 }
 
 /// Regression guards for the pure decision functions this file's peer columns and correctness
@@ -8558,6 +8643,78 @@ mod tests {
     //      a `C(fast)` [-ffast-math] column exists AND is printed.
     //   4. Ask the question the whole exercise turns on: *is this how a competent C programmer
     //      would write it?* If the answer needs a caveat, the caveat belongs in BENCHMARKS.md.
+    //   5. The RUST peer gets the same aliasing information: its buffers reach the loops as slice
+    //      PARAMETERS of a `kbody` fn (guarded below). `__restrict__` on the C side and raw pointers
+    //      on the Rust side is not a language difference, it is a peer defect.
+
+    /// **The Rust half of rule 1.** `__restrict__` on every C peer buys nothing for fairness if the
+    /// Rust peer computing the same thing is compiled under may-alias assumptions — and it was.
+    /// rustc emits LLVM `noalias` on *reference parameters only*: never on a raw pointer, and
+    /// (measured, not assumed) never on a slice built as a LOCAL inside the `extern "C"` entry.
+    ///
+    /// Evidence, `saxpy` body, rustc 1.94.1 `-Copt-level=3 -Ctarget-cpu=native`, `--emit=asm`:
+    ///
+    /// | spelling | asm lines | basic blocks | scalar-FP ops |
+    /// |---|---|---|---|
+    /// | `*out.add(i) = …` raw pointers | 108 | 4 | 32 |
+    /// | `from_raw_parts` **inside** `kbench`, loop inside `kbench` | 108 | 4 | 32 |
+    /// | slices passed to a `fn` taking `&[f32]`/`&mut [f32]` | **56** | **1** | **0** |
+    ///
+    /// The first two are byte-identical (a runtime `|out-x| < 128` overlap test plus a scalar
+    /// fallback loop); only the third carries `llvm.experimental.noalias.scope.decl` in the IR.
+    ///
+    /// So the shim is the fix: `kbench` converts the pointers and calls `kbody`, whose parameters
+    /// are slices; `kbody` may immediately take `.as_ptr()` back, which keeps every kernel body's
+    /// loop text — and therefore its accumulation order — byte-for-byte what it was.
+    ///
+    /// This test pins the generators that carry the shim today. It is deliberately a **named list**
+    /// rather than a textual scan of the whole file: the remaining ~30 Rust peers are still raw
+    /// pointers, so a blanket scan could only be satisfied by converting all of them at once, and
+    /// the measured effect on their shapes was inside this machine's noise. Add a generator here
+    /// when you convert it.
+    #[test]
+    fn converted_rust_peers_take_their_buffers_as_slice_parameters() {
+        let cases: Vec<(&str, String)> = vec![
+            ("rust_kernel", rust_kernel("for i in 0..N { *out.add(i)= *x.add(i); }")),
+            ("rust_kernel_n", rust_kernel_n(64, "for i in 0..N { *out.add(i)= *x.add(i); }")),
+            ("rust_matmul_tn", rust_matmul_tn(32)),
+            ("rust_transpose", rust_transpose(64, 32)),
+            ("rust_colsum", rust_colsum(64, 32)),
+            ("rust_colmax", rust_colmax(64, 32, 0)),
+            ("rust_colarg", rust_colarg(64, 32, true)),
+            ("rust_colstat", rust_colstat(64, 32, 3)),
+        ];
+        for (name, src) in &cases {
+            assert!(
+                src.contains("fn kbody("),
+                "{name}: no `kbody` shim — its buffers never cross a fn boundary as slices, so this \
+                 peer is compiled may-alias while its C twin has __restrict__"
+            );
+            let entry = src
+                .find("pub unsafe extern \"C\" fn kbench(")
+                .unwrap_or_else(|| panic!("{name}: no `kbench` entry point"));
+            let body = &src[entry..];
+            let open = body.find(") {").expect("kbench must open a body") + 3;
+            assert!(
+                body[open..].contains("kbody("),
+                "{name}: `kbench` must delegate to `kbody`"
+            );
+            assert!(
+                !body[open..].contains("for "),
+                "{name}: `kbench` still runs a loop directly. Slices built as locals grant NO \
+                 aliasing information (verified: byte-identical asm to raw pointers) — move the \
+                 loop behind `kbody`'s slice parameters."
+            );
+        }
+        // The scratch vector `rust_colarg` needs is a stack array, not a heap allocation inside the
+        // timed kernel: `c_colarg`'s twin is `float bv[C]` and pays neither the allocator call nor
+        // the zero-fill that `vec![0.0f32; C]` does.
+        let arg = rust_colarg(64, 32, true);
+        assert!(
+            !arg.contains("vec!"),
+            "rust_colarg allocates inside the timed kernel; its C twin does not"
+        );
+    }
 
     /// EVERY generated C kernel must declare its pointer parameters `__restrict__`. Scanned out of
     /// the crate's own source text rather than from a hand-kept list, so a NEW peer generator added
