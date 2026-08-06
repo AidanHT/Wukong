@@ -165,6 +165,14 @@ fn max_rel_err(a: &[f32], b: &[f32]) -> (f64, usize) {
 /// recognized kernels do. The plain C column keeps the honest default flags (see the fairness notes
 /// in BENCHMARKS.md — withholding `-ffast-math` inflates the reduction-bearing rows); this column is
 /// the reassociation-normalized comparison, printed alongside, never replacing, the plain-C ratio.
+///
+/// NOTE (checked 2026-08-06, because the inconsistency looks like a defect): 23 of the honest-flags
+/// C call sites in this file spell `["-O3", "-march=native", "-shared"]` and 16 spell
+/// `["-O3", "-march=native", "-ffp-contract=fast", "-shared"]`, and **the two are equivalent**. gcc
+/// invoked without a `-std=` flag is in GNU mode, whose `-ffp-contract` default already is `fast`.
+/// Verified on `out[i] = x[i] + y[i]*2.5f` in its own TU: `-O3 -march=native` emits `vfmadd`, adding
+/// `-ffp-contract=fast` emits `vfmadd`, `-ffp-contract=off` emits none. No family is silently denied
+/// the FMA that Wukong fuses.
 const C_FAST_FLAGS: &[&str] = &["-O3", "-march=native", "-ffast-math", "-shared"];
 
 /// LOOSE cross-check for the relaxed-FP peers (C(fast) / C(omp)). `-ffast-math` and OpenMP-partitioned
