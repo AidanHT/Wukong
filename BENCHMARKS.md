@@ -110,6 +110,66 @@ cargo run -p wukong_xbench --release      # CC=gcc by default; set CC to overrid
 > and the guard now scans `model.rs` too, matches `static` helpers, accepts multi-line parameter lists
 > and asserts a floor of four prototypes found in that file so its half cannot pass vacuously.
 
+> ## ⚠ Follow-up correction — 2026-08-06: the RUST peers never got defect #1 either
+>
+> Defect #1 was fixed for C and C++ and never for Rust. The Rust peers computing the identical kernels
+> take bare `*const f32` / `*mut f32`, and **rustc emits LLVM `noalias` on reference parameters only —
+> never on a raw pointer.** So every "vs Rust" figure in this document was measured with the C column
+> compiled under proven non-overlap and the Rust column under may-alias, on the same programs, in the
+> same table.
+>
+> The spelling several peers already used does not fix it. `rust_colsum`, `rust_transpose`,
+> `rust_matmul_tn` and `rust_model` built slices with `from_raw_parts` **at the top of `kbench`**, and
+> this document (and `rust_model`'s doc comment) said that gave them `noalias`. Measured, saxpy body,
+> rustc 1.94.1 `-C opt-level=3 -C target-cpu=native`, `--emit=asm`:
+>
+> | spelling | asm lines | basic blocks | scalar-FP ops |
+> |---|---|---|---|
+> | raw pointers | 108 | 4 | 32 |
+> | `from_raw_parts` inside `kbench` | 108 | 4 | 32 |
+> | slices as parameters of a `fn` | **56** | **1** | **0** |
+>
+> The first two are **byte-identical** asm (a runtime overlap test plus a scalar fallback loop beside
+> the vector one); only the third carries `noalias` metadata in the IR.
+>
+> Fixed for the peers where it changes codegen, by a `kbody` shim that leaves every kernel loop's text
+> byte-for-byte unchanged (proved: old and new run in one process over identical buffers and agree on
+> **every** lane — `peer_block` 0/65536 differing bits, `peer_scan` 0/131072, `peer_loss` 0/1048576,
+> `rust_model` 0/98304). Also fixed: `rust_colarg` allocated a heap `vec![0.0f32; C]` **inside the
+> timed kernel** where `c_colarg` uses a stack `float bv[C]`.
+>
+> **Which figures this invalidates.** Only the **Rust** columns, and only where the codegen moved.
+>
+> | family | status |
+> |---|---|
+> | every elementwise / transcendental / reduction row built from `rust_kernel` (~35 rows), the 4 streaming rows, `fused_linear_relu` | **Rust column NEEDS RE-MEASUREMENT** — `fused_linear_relu` lost its entire scalar fallback (49 → 0 scalar-FP ops), saxpy 108 → 56 asm lines |
+> | transpose, colargmax/colargmin | **Rust column NEEDS RE-MEASUREMENT** |
+> | end-to-end model (12-layer stack) — Rust column | **NEEDS RE-MEASUREMENT** (1013 → 567 scalar-FP ops) |
+> | general-code section — Rust column, all three programs | **NEEDS RE-MEASUREMENT** (S6 scan 150 → 32 scalar-FP ops; structure-tax block 750 → 369) |
+> | colsum, colmax/colmin/colmaxabs, colmean/sumsq/L2/RMS, matmul_tn — Rust column | **unaffected**: the shim produced byte-identical asm (`Compare-Object` on the `.s`: 0 differing lines) |
+> | every **C**, **C++**, **C(fast)**, **C(omp)**, MKL, matrixmultiply and PyTorch column | **unaffected** — no C or C++ peer changed |
+>
+> The direction is known (the Rust peers get faster, so Wukong's Rust ratios get worse); the magnitude
+> is not, because this machine was on battery / flapping AC throughout and the four kernels timed
+> directly moved 0.95–1.07× in *both* directions, which is the noise floor, not a measurement.
+>
+> ~30 Rust peers are still raw pointers. They were left alone deliberately: on their shapes the alias
+> check is hoisted out of the loop and the vector path still runs, so the codegen difference is a
+> constant, and converting them would be churn with no measured effect. The rule and the evidence are
+> recorded in the peer checklist in `crates/wukong_xbench/src/main.rs`; three regression guards pin the
+> peers that were converted.
+>
+> **Also audited this round and found CLEAN** (recorded so the next audit does not redo it): every C
+> peer's innermost loop already walks memory with unit stride (all ~45 checked by hand); `gcc
+> -march=native` resolves to `alderlake` with AVX2+FMA and no AVX-512, and `rustc -C target-cpu=native`
+> to `meteorlake` with the same `avx2`+`fma` target features, so neither toolchain is handed a wider
+> ISA than Wukong's AVX2 kernels; `c_model`'s `linear_nt` takes its dimensions as runtime arguments,
+> but gcc's IPA-CP specializes it — a dimension-templated twin measures 0.96–1.04× against it, i.e.
+> nothing; the Rust int8 GEMM peer emits `vpmaddwd` and carries no overflow checks; the blocked Rust
+> transpose peer carries no bounds checks; and the `restrict`-qualified pointers that the harness
+> deliberately aliases (`bench_norm_batched` passes `x` for the unused `y`; `bench_row_losses`
+> entropy passes `p` twice) are both read-only, so no `restrict` contract is violated.
+
 ## Test machine & toolchains
 
 - Windows 11, Intel Core Ultra 7 155H (Meteor Lake: 6 P-cores + 8 E-cores + 2 LP-E, 22 threads),
@@ -559,6 +619,20 @@ within the session's run-to-run noise.
   C++ mode, so the g++ column inherits it. Every call site in `wukong_xbench` passes three (or four)
   genuinely distinct allocations, which is what makes the qualifier true rather than merely fast; the
   one bench that passed an aliasing filler pointer was fixed in the same commit.
+- **Aliasing, Rust half — the Rust peer's buffers reach its loops as slice PARAMETERS** (added
+  2026-08-06). `__restrict__` on the C peer buys nothing for fairness if the Rust peer computing the
+  same kernel is compiled may-alias, and it was: rustc emits LLVM `noalias` on *reference parameters*
+  only, never on a raw pointer, and — verified against the emitted asm and IR, not assumed — never on
+  a slice built as a **local** inside the `extern "C"` entry point either. Both of those compile to
+  byte-identical code: a runtime overlap test plus a scalar fallback loop beside the vector one. The
+  fixed peers therefore convert in `kbench` and run the loops in a `kbody` whose parameters are
+  `&[f32]` / `&mut [f32]`, which leaves the loop text — and so the accumulation order and the output
+  bits — unchanged. `converted_rust_peers_take_their_buffers_as_slice_parameters` (main.rs),
+  `rust_peers_take_their_buffers_as_slice_parameters` (general.rs) and
+  `rust_model_peer_takes_its_buffers_as_slice_parameters` (model.rs) pin it. **~30 Rust peers are
+  still raw pointers**, disclosed rather than hidden: on their shapes the alias check hoists out of
+  the loop and the vector path still runs, and the four timed directly moved 0.95–1.07× in both
+  directions, which is this machine's noise floor.
 - **Peer loop order — the peer must walk memory the way a competent programmer would** (audited
   2026-08-04). Four peers failed this and were rewritten: the column reductions (column-outer → row-
   outer), the column argmax (column-outer → row-outer with a running-best vector), the weight-gradient
@@ -718,9 +792,11 @@ reassociate + vectorize the dot products — the strongest flags-only C). Since 
 also runs a **C++(g++)** column — the identical translation unit through the other GCC front end at
 the same flags, so the "C++ tracks C" claim is measured here too — and a **Rust** column
 (`rustc -C opt-level=3 -C target-cpu=native`), the same block written as one cdylib, which this row
-never had at all. The Rust peer slices its foreign pointers once (`from_raw_parts`), which is both the
-idiomatic spelling and the one that gives LLVM the `noalias` that `__restrict__` gives the C peer — so
-the two are given the same aliasing information rather than Rust being silently handicapped. The
+never had at all. The Rust peer hands its foreign pointers to the body as **slice parameters**, which
+is both the idiomatic spelling and the one that gives LLVM the `noalias` that `__restrict__` gives the
+C peer — so the two are given the same aliasing information rather than Rust being silently
+handicapped. (Until 2026-08-06 this sentence said the `from_raw_parts` call *at the top of `kbench`*
+did it. It does not — see the 2026-08-06 correction below.) The
 naive-dot forward is tens of seconds per call at S=512, so all three are skipped there by default
 (`XBENCH_MODEL_NAIVE` forces them), the same rule as the ≥2048³ naive matmuls.
 
@@ -986,6 +1062,20 @@ im2col+GEMM route is a **1.55× win at honest flags and a slight loss once the p
 — it is not the 6–7× this document claimed. What remains true is the structural point: Wukong gets
 whatever conv performance it has *for free* through the existing matmul dispatch
 (`tests/run/conv_im2col.wk`), with no conv-specific kernel.
+
+> **Is "Wukong im2col+GEMM vs C direct" an unfair algorithm asymmetry? Measured 2026-08-06: no.**
+> The `.wk` program spells im2col by hand, so the choice is the program's, not the compiler's — which
+> makes the obvious objection that the C peer should be allowed the same algorithm. It was written and
+> timed. gcc 14.2, own translation unit, `__restrict__`, best-of-9 ABBA, the same
+> Cin=16/20²/64@18²/3×3 shape: the im2col+GEMM C spelling produces **bit-identical output** (0 of
+> 20736 lanes differ in bits — the `p = ic·K² + ky·K + kx` accumulation order is the same order the
+> direct nest walks `(ic, ky, kx)`) and is only **1.06× faster** than the direct nest at
+> `-O3 -march=native -ffp-contract=fast`, because its GEMM inner loop is the same IEEE-serial f32
+> reduction gcc will not vectorize. At `-ffast-math` the ranking **reverses**: the direct nest is
+> **1.60× faster** than im2col+GEMM. So the peer as written is the better of the two spellings for the
+> `C(fast)` column and within 6% for the plain one, and swapping it would weaken the `C(fast)` bar.
+> The peer stands. (Battery, so those two ratios are same-run adjacent C-vs-C only, not comparable to
+> any Wukong number.)
 
 ### Transcendentals / activations — Wukong dispatches to a 256-bit AVX2 kernel; C calls scalar `libm`
 
@@ -1556,8 +1646,16 @@ loop-carried, so gcc `-O3 -march=native` and rustc emit **one serial `mul`+`add`
 `wukong_lrscan_f32` scans **4 rows interleaved**, keeping four chains in flight to fill the ports the
 single chain leaves idle (plain `mul`+`add`, deliberately *not* `f32::mul_add` — on a build without the
 `fma` target feature the latter lowers to a libm `fmaf` **call** that re-serializes the chain and erases
-the ILP: measured `mul_add` 0.8× vs C, plain `mul`+`add` 1.8×). gcc/rustc may not legally re-order an f32
-recurrence across rows without `-ffast-math`, so this 4-way ILP is a genuine **single-core win**:
+the ILP: measured `mul_add` 0.8× vs C, plain `mul`+`add` 1.8×). This 4-way ILP is a genuine
+**single-core win**:
+
+> **Corrected 2026-08-06.** This paragraph used to justify the win with "gcc/rustc may not legally
+> re-order an f32 recurrence across rows without `-ffast-math`". That is **false and the claim is
+> withdrawn**: the rows are independent, so unroll-and-jam across `r` changes no value and is legal at
+> any flags — gcc and rustc simply do not find it here. What is illegal without `-ffast-math` is
+> re-ordering *within* a row, which is why the peer's inner time loop stays one serial chain. The
+> measured ratios below are unaffected; only the reason given for them was wrong. The peer itself is
+> the idiomatic spelling and was not changed.
 
 | scan | 1024×1024 | 4096×1024 | cross-check |
 |------|-----------|-----------|-------------|
