@@ -205,6 +205,26 @@ pub enum Op {
     /// Pure and side-effect-free. The interpreter indexes its lane arena; the Cranelift backend
     /// emits `extractlane`; the textual-LLVM emitter emits `extractelement`.
     ExtractLane(ValueId, u32),
+    /// The lane-index ramp of a SIMD vector: the result is the `Vec(int_lane, n)` named by the
+    /// operand type and lane `k` holds the integer `k`. No operands; pure, constant, and
+    /// side-effect-free.
+    ///
+    /// It exists because a vector whose lanes differ cannot be *built* out of the other vector ops.
+    /// [`Op::Splat`] makes every lane the same and every arithmetic op is lane-wise, so any
+    /// expression over splatted scalars is uniform across lanes — a non-uniform vector needs one
+    /// non-uniform source, and this is it.
+    ///
+    /// The job it exists for is the loop vectorizer's **lane ramp**. A loop body that reads its
+    /// induction variable as a *value* rather than as an address (`if c == target`, `(i as f32)`)
+    /// cannot splat it: lane `k` of the widened group is scalar iteration `i + k` and must see
+    /// `i + k`, not `i`. With a unit step that vector is exactly `splat(i) + iota`, so an integer
+    /// induction variable compared against a target yields a per-lane mask instead of one scalar
+    /// bool.
+    ///
+    /// The interpreter materializes the lanes directly; the Cranelift backend emits a `vconst` from
+    /// the constant pool; the textual-LLVM emitter emits the vector literal. The GPU MIR→PTX path
+    /// declines it, exactly as it declines every other vectorized-MIR op.
+    Iota(MirType),
     /// Fused multiply-add: `a * b + c` with a *single* rounding. The front-end contracts a float
     /// `x + y*z` into this; it is faster (one instruction) and more accurate than separate
     /// `FMul`+`FAdd`. All three operands and the result share one float type (scalar or `Vec`).

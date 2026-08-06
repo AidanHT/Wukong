@@ -221,6 +221,7 @@ fn safe_to_hoist(f: &Function, op: &Op, alias: &AliasInfo, mem: &LoopMem) -> boo
         | Op::GlobalAddr(..)
         | Op::Splat(..)
         | Op::ExtractLane(..)
+        | Op::Iota(..)
         | Op::Fma(..)
         | Op::Sqrt(..)
         | Op::Round(..) => true,

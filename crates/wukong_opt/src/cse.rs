@@ -131,6 +131,9 @@ enum Key {
     GlobalAddr(u32),
     Splat(u32),
     ExtractLane(u32, u32),
+    /// Keyed by the whole vector type: `iota <4 x i32>` and `iota <2 x i64>` are different
+    /// constants, and only the type distinguishes them (the op has no operands).
+    Iota(MirType),
     Fma(u32, u32, u32),
     Sqrt(u32),
     Round(u8, u32),
@@ -253,6 +256,7 @@ fn pure_key(op: &Op, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
         Op::GlobalAddr(s) => Key::GlobalAddr(s.0),
         Op::Splat(a) => Key::Splat(m(*a)),
         Op::ExtractLane(a, k) => Key::ExtractLane(m(*a), *k),
+        Op::Iota(ty) => Key::Iota(ty.clone()),
         Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
         Op::Sqrt(a) => Key::Sqrt(m(*a)),
         Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
