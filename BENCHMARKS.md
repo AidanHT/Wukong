@@ -31,7 +31,11 @@ every "vs C" ratio.
 > compiler in the second slot, the second slot came out slower on 6 of 7 probe rows, by up to +17%.
 > (That magnitude was measured in a battery-state run and is not itself a reportable figure; the
 > existence and the consistent direction of the effect are what withdraw the claim.) The pair is now
-> timed **A B B A** with each column keeping its own fastest sample, so a future round can answer the
+> timed **A B B A** with each column keeping its own fastest sample. The `general` suite carries four
+> peers rather than a pair (C, C(fast), C++, Rust) and had the same defect in its own form — it timed
+> them in a fixed order with C++ third and Rust last — so it now loads every peer before timing any of
+> them and alternates the order across a forward and a reverse pass, keeping each peer's minimum.
+> With both fixed, a future round can answer the
 > question — this one could not, and should not have been quoted as if it had.
 
 Two **additional C peer columns** normalize the two disclosed baseline asymmetries (see Fairness
