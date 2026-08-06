@@ -1751,6 +1751,36 @@ correctness gate can see the difference either. `cargo run -p wukong_xbench --re
 the suite that can. It prints the dispatch census for every program it times, and checks every lane
 against an f64 scalar reference.
 
+> ## ⚠ Every table in this section is SUPERSEDED — 2026-08-06
+>
+> Both its columns have moved out from under it, and neither correction is available here.
+>
+> **The census columns are stale.** The recognizer widenings in `CHANGELOG.md` (activation fused into
+> a matmul store, cross-buffer residual, dual-store projection, sunk accumulator seed, struct-field
+> buffer bases) landed after these tables were written. The suite's own census now reports
+> (a) 16 sites, (b) **15**, (c) **15**, (d) **16**, (e) 13 — where the tables below say (b)
+> *nothing*, (c) 3, (d) 7, (e) 9 — and the fragility probes `epilogue: in the store`,
+> `residual: in the store` and `gemm: row base hoisted` now dispatch where the table says **nothing**.
+> Run the suite and read its `DISPATCH CENSUS` block; do not read the tables below for census facts.
+>
+> **The timing columns were produced by an instrument with no control in it.** The general suite now
+> carries a `C(twin)` **control column** — the identical C source through the identical compiler at
+> the identical flags in a second DLL, so its ratio against `C` has expected value exactly 1.00 and no
+> language content — and it reports every run's own measured floor. There was none when these tables
+> were taken. The first time one was carried, on this machine still unpinned, it moved **1.05×–1.69×**
+> across 15 sections and in one case read a byte-identical binary as *1.31× faster than C*. The
+> dominant cause was the Windows scheduler walking the single-threaded timing thread down this hybrid
+> P/E laptop's core classes mid-run, and that is also what drove the *"spread across the five
+> spellings: 41–50×"* headline: with the thread pinned and the control passing, that headline reads
+> **below the run's own noise floor** in all three AC runs of 2026-08-06 (and in 7 of 9 battery runs).
+> The five spellings now sit in one pack. Two things changed at once and this branch did not separate
+> them — the recognizers genuinely widened (the census above) *and* the instrument stopped
+> manufacturing spread — so read the collapse of that headline as "the suite can no longer show a
+> structure tax here", not as a quantified compiler win.
+>
+> **No replacement figures are published.** Every run available was battery or AC+charging, and a
+> level from either is not comparable to an AC+full one. Re-measure on AC+full and idle.
+
 **Recognizer fragility** (census only — nothing timed, so this table holds in any power state). Each
 pair computes bit-identical results and differs by one edit:
 

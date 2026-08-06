@@ -5,6 +5,90 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Benchmark instrument — a byte-identical control column, a bias fix, and one retraction
+`wukong_xbench`'s opt-in `general` suite only. No kernel, no peer source and no compiler crate is
+touched — `wukong_xbench` is a leaf binary crate nothing depends on, so `wukongc` is byte-identical
+and no program's dispatch set can move. That makes the dispatch census a **non-regression argument
+and nothing more**; it is not independent evidence for anything below.
+
+- **A `C(twin)` CONTROL COLUMN — every run now measures its own noise floor.** The identical C
+  source, through the identical compiler, at the identical flags, into a second DLL. Its ratio
+  against `C` has expected value exactly 1.00 and contains no language content, so what it reads away
+  from 1.00 is the *instrument*. In one validation run it read C **75.20 ms** against C(twin)
+  **57.60 ms**: the previous estimator would have published **a byte-identical binary as "1.31×
+  faster than C"**. Every cross-language cell is now classified against it — a per-round range that
+  overlaps what the control did prints `BELOW FLOOR` and carries **no number**, however tightly its
+  rounds agreed, because a tight spread around a tiny effect is exactly what the control exists to
+  refuse. The floor is printed as a figure (`NOISE FLOOR, MEASURED THIS RUN: 1.03x`), so a run that
+  resolves nothing has still reported its own resolution rather than leaving blanks. When the control
+  fails its own spread gate the section says so and claims no size.
+- **A real positional bias, fixed.** `bench_structure_tax` timed all five Wukong spellings to
+  completion and only then built and timed the peers, one language after another, each exactly once,
+  in a fixed order — so C always held the first and coolest peer slot and Rust always held the last,
+  and the Wukong columns always got the earliest slots, in Wukong's own benchmark. (The loss and scan
+  sections had been given a forward/reverse two-pass at `17ab8d0`; this one had not.) Every column of
+  every section is now **built first**, then timed **once per round** in a rotating,
+  direction-alternating order whose position balance is *exact* over each pair of rounds, and each
+  ratio is formed **inside** a round and reported as the median with the `[min-max]` the rounds
+  spanned — never as the quotient of two minima drawn from different instants of the machine's clock.
+- **The timing thread is pinned to one core, and that is the largest confound this suite ever had.**
+  This laptop is a hybrid Core Ultra 7 155H (6 P-cores, 8 E-cores, 2 LP E-cores, three performance
+  classes) and every program in the section is single-threaded, so Windows walks a long timing thread
+  down the classes mid-run. Measured, same binary, kill switch only (`XBENCH_PIN=off`): unpinned, the
+  C column degraded **81 → 174 ms monotonically inside one run** while the 4–5 ms Wukong columns in
+  the same rounds did not move, and the zero-difference control read a **2.12× spread**; pinned, the
+  same section held 75 → 71 ms and the control read ~1.05×. Applied identically to every column, so
+  it carries no language content — and the control is what validates it rather than an assertion. A
+  `PinGuard` restores the previous affinity on the way out, because a leaked one-core mask would cap
+  every later multicore row and read as a performance finding. A pinned figure is single-core only.
+- **RETRACTED: the "run-to-run variance fell from median 1.451× to 1.142×" claim.** It was made for
+  the round protocol on branch `bench/noise-resistant-ratios` and **it does not replicate.** An
+  adversarial re-run with both binaries interleaved measured the old protocol at median 1.195× /
+  worst 2.876× against the new at **1.270× / 1.869×** — the median got *worse*; only the tail
+  improved. What this work establishes is a **bias fix** and a **noise-floor control**, plus the
+  scheduler finding above. It is not a median variance reduction, and no doc or comment states one.
+- **The per-visit budget is back to 2 warm-ups + best-of-7** (it had been cut to 1 + best-of-3), and
+  the default round count is cut 6 → 4 to pay for it. The reason is measured and is *not* the one the
+  cut was blamed for: on a pinned machine the budget does not move the published ratio's spread at
+  all (1.049×/1.094× restored against 1.041×/1.092× cut), but it does tighten **the run's own noise
+  floor** — the control's per-round spread landed inside the 1.10 limit in 7 of 9 sections against 2
+  of 9 — and the floor is the gate that decides what may be printed at all.
+- **The `ms` column's LEVEL is protocol-dependent, and the table says so where the numbers are.**
+  Pinned, same machine, same day, the block section's C peer read 92–103 ms under the old protocol
+  and 105–155 ms under this one. It is not the extra calls (a run cut to 8 calls per column — *fewer*
+  than the old protocol's 9 — sits in the same band); it is that this protocol builds every column
+  before timing any, where the old one compiled and timed each peer in turn and the core re-boosted
+  across each `gcc` pause. The two sections that already built first show no offset (1.01×). Read
+  `ms` only against other `ms` from the same run.
+- **The power-change detector separates STATE from DRAIN instead of losing one of them.** A state
+  change (battery / AC+charging / AC+full — three different machines) replaces every ratio in the
+  section with `NON-REPORTABLE` **in the cell**, not with a warning line a reader can scroll past.
+  Battery drain while the state holds no longer voids the section, but it is still sampled every
+  round and **printed** (`! BATTERY MOVED 71% -> 70% inside this section`), so stripping the
+  percentage from the invalidation key is not a loss of sensitivity.
+- **The per-round AVX2-FMA clock probe is off by default** (`XBENCH_CLOCK_PROBE=1`); it used to run
+  every round unconditionally. It was measured to perturb what it observes — a saturating burn loop
+  immediately before a timed round pre-boosts the core (block C 120/115 ms with it on against
+  145/149 ms off) and *widens* the zero-difference control (1.112×/1.416× on against 1.095×/1.152×
+  off). Using it as a *normalizer* had already been evaluated and rejected on
+  `bench/noise-resistant-ratios` (carried over, not re-measured here): on the published ratio it
+  cancels exactly, and on the `ms` column it makes the spread strictly worse. It survives only as an
+  opt-in printed drift trace; the honest always-on one is the raw per-round table.
+- **`BENCHMARKS.md`'s general-code tables are flagged as superseded** — they predate both the
+  recognizer widenings above (which change the *census* column outright) and this instrument work.
+  No replacement figures are published: every run available was battery or AC+charging.
+
+What it adds up to, measured in the state the adversarial verifier used. Six `general` runs,
+2026-08-06, AC+charging 68%→72%, the predecessor binary and this one **interleaved** three each
+(ship/pred/pred/ship/ship/pred), power checked before and after every run. Cells resolved to a size:
+**0 of 57 → 19 of 57**. Sections whose control failed: **9 of 9 → 3 of 9**. Control per-round spread:
+median **1.702× → 1.049×**. Run-to-run spread of the published `vs C` ratio: median **1.276× →
+1.056×** — and the 1.276× replicates the verifier's independently measured 1.270× for that protocol,
+which is the best evidence available that the comparison itself is sound. It is a three-change A/B
+(pin, per-visit budget, round count); the battery A/Bs above attribute the ratio spread mostly to the
+pin and the control spread mostly to the budget. **No cross-language figure is published from any of
+it** — every number here is about the instrument.
+
 ### Loop vectorizer: a lane ramp for a counter read as a value
 - **`wukong_opt::vectorize` no longer declines a loop whose body reads its induction variable as a
   *value*.** It used to say `the induction variable is used for something other than addressing` and
