@@ -1461,6 +1461,54 @@ pub(crate) fn power_status_line() -> String {
     "power: n/a".to_string()
 }
 
+/// The power STATE — `AC+CHARGING` / `AC+full` / `AC` / `BATTERY` / `unknown`, percentage stripped —
+/// AND the battery charge, from ONE sample of the OS.
+///
+/// [`power_status_line`] embeds the charge percentage, so comparing two of its strings fires on every
+/// 1% of battery drain. That is exactly what happened: a run of the general suite printed
+/// `! POWER STATE CHANGED DURING THE RUN` between `BATTERY (48%)` and `BATTERY (47%)` while the state
+/// had not changed at all. A change-detector that cries wolf on every run is a change-detector a
+/// reader learns to scroll past, which defeats the point of having one.
+///
+/// **THE STATE IS THE INVALIDATION KEY; IT IS NOT THE WHOLE DETECTOR.** Stripping the percentage out
+/// of the key does lose sensitivity to drain, and drain is a real confound — a laptop that crosses a
+/// low-battery threshold throttles without changing `ac_line_status`. So the percentage is not
+/// discarded, it is returned beside the key: the round-interleaved sections record both every round,
+/// and a section whose charge moved while its state did not prints the drain explicitly beside its
+/// ratios. The split is deliberate — a STATE change invalidates every number in the section, a DRAIN
+/// is disclosed and left to the reader, because the three states are three different machines while
+/// 5% of battery is a matter of degree.
+///
+/// The two halves are a split detector, not two detectors, so they must describe the same instant:
+/// asking twice could pair a state read from before an adapter event with a charge read from after
+/// it. There is therefore exactly one entry point, and it renders [`power_status_line`] once.
+pub(crate) fn power_sample() -> (String, Option<u32>) {
+    let line = power_status_line();
+    (state_key_of(&line), pct_of(&line))
+}
+
+/// The KEY half of [`power_sample`], separated so the contract is testable without a machine that can
+/// be unplugged mid-test — the whole point of the key is what it does and does NOT treat as a change,
+/// and that has to be pinned rather than reasoned about.
+///
+/// The line is `"power: <STATE>[ (pct)][ — commentary]"`; the state is the first token after the
+/// prefix, and the percentage always arrives parenthesized after it.
+fn state_key_of(line: &str) -> String {
+    let body = line.strip_prefix("power: ").unwrap_or(line);
+    body.split([' ', '(', '—'])
+        .find(|t| !t.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// The CHARGE half of [`power_sample`]: the battery percentage, or `None` when the line carries none
+/// (a desktop, or `power: unknown`, or an out-of-range reading the renderer wrote as `?%`).
+fn pct_of(line: &str) -> Option<u32> {
+    let open = line.find('(')?;
+    let pct = line[open + 1..].find('%')? + open + 1;
+    line[open + 1..pct].trim().parse::<u32>().ok()
+}
+
 /// Concatenate f32 slices into one little-endian binary file — the exact bytes the generated
 /// Python reads back with `torch.frombuffer(dtype=torch.float32)`.
 fn dump_f32_le(path: &Path, parts: &[&[f32]]) -> std::io::Result<()> {
@@ -2862,6 +2910,66 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE POWER DETECTOR'S SPLIT CONTRACT, over every line [`power_status_line`] can render.
+    ///
+    /// The key must fire on a STATE change and must NOT fire on drain within a state — that is the
+    /// whole reason the percentage was moved out of it — and the percentage must still be RECOVERABLE
+    /// beside it, because a key that merely lost the drain would be a loosened detector rather than a
+    /// split one. Both halves are asserted here so neither can be dropped without a red test.
+    #[test]
+    fn the_power_key_ignores_drain_but_never_a_state_change() {
+        let cap = "power: AC+CHARGING (68%) — ALL-CORE CAPPED (~25%): single-core numbers are fine, \
+                   every multicore row below is DIRECTIONAL ONLY";
+        let full = "power: AC+full (68%) — REPORTABLE";
+        let batt = "power: BATTERY (71%) — NON-REPORTABLE: single-core noisy, all-core meaningless \
+                    (2-4x slow); not comparable to AC runs";
+        let batt2 = "power: BATTERY (70%) — NON-REPORTABLE: single-core noisy, all-core meaningless \
+                     (2-4x slow); not comparable to AC runs";
+        let desk = "power: AC (desktop, no battery) — REPORTABLE";
+
+        assert_eq!(state_key_of(cap), "AC+CHARGING");
+        assert_eq!(state_key_of(full), "AC+full");
+        assert_eq!(state_key_of(batt), "BATTERY");
+        assert_eq!(state_key_of(desk), "AC");
+        assert_eq!(state_key_of("power: unknown"), "unknown");
+        assert_eq!(state_key_of("power: n/a"), "n/a");
+
+        // Drain inside one state is NOT a state change...
+        assert_eq!(state_key_of(batt), state_key_of(batt2));
+        // ...but it is still visible, which is what stops the split being a pure loss.
+        assert_eq!(pct_of(batt), Some(71));
+        assert_eq!(pct_of(batt2), Some(70));
+        assert_ne!(pct_of(batt), pct_of(batt2));
+
+        // The three states are three different machines and must never collide, including the two
+        // that differ only after the "AC" prefix.
+        for (a, b) in [(cap, full), (cap, batt), (full, batt), (full, desk), (cap, desk)] {
+            assert_ne!(state_key_of(a), state_key_of(b), "{a}\nvs\n{b}");
+        }
+
+        // A line with no charge in it yields no percentage rather than a plausible-looking zero —
+        // the desktop line's own parenthesis must not be mistaken for one.
+        assert_eq!(pct_of(desk), None);
+        assert_eq!(pct_of("power: unknown"), None);
+        assert_eq!(pct_of(cap), Some(68));
+        // `?%` is what the renderer emits when the OS reports an out-of-range charge.
+        assert_eq!(pct_of("power: BATTERY (?%) — NON-REPORTABLE"), None);
+
+        // And whatever state this machine is actually in, the live sampler must hand back a key with
+        // no charge left in it, from a known set. Asserted as a PROPERTY rather than against a second
+        // OS query: this laptop's adapter is known to flap, and a test that re-queried would race it.
+        let (k, p) = power_sample();
+        assert!(
+            ["AC+CHARGING", "AC+full", "AC", "BATTERY", "unknown", "n/a"].contains(&k.as_str()),
+            "power_sample produced an unknown key {k:?}"
+        );
+        assert!(
+            !k.contains('%') && !k.contains('(') && !k.contains(' '),
+            "the invalidation key still carries a charge or commentary: {k:?}"
+        );
+        assert!(p.map_or(true, |v| v <= 100), "charge out of range: {p:?}");
+    }
 
     /// A cross-check that inspected no elements must never report agreement. The old closure
     /// `zip`ped the two buffers, so an EMPTY or truncated peer output folded to `max|Δ| = 0` and
