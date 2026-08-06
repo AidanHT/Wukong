@@ -29,6 +29,13 @@
 //! gcc/g++/rustc's spread across five such spellings is ~1.0 — they all lower to the same loops.
 //! Wukong's spread IS the benchmark.
 //!
+//! Variant (b) is the one that has moved. It began at 7 dispatched call sites against (a)'s 16 and
+//! was ~6x slower than the other four; it now dispatches 15 — (a)'s multiset minus the one
+//! `wukong_vmath_f32`, which (b) does not need because its activation rides the GEMM epilogue — and
+//! sits inside the pack. **Do not "fix" (b) by rewriting it into the dialect.** It is the only
+//! spelling here written with no regard for the recognizers, and rewriting it would delete the
+//! measurement instead of the tax.
+//!
 //! # Program 2: FUSED CUSTOM LOSS
 //!
 //! Focal loss (gamma = 2) with label smoothing and per-class weights, forward AND a hand-written
@@ -1004,7 +1011,13 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     }
     if let Some((_, base)) = outs.iter().find(|(l, _)| *l == "b-natural") {
         println!();
-        println!("  AGREEMENT between spellings (vs b-natural, the fully-scalar one)");
+        // b-natural is the *reference* spelling here only in the sense that it is the one written
+        // without any regard for the recognizers. It is NOT "the fully-scalar one" any more — since
+        // the store-fused epilogue / cross-buffer residual / dual-store arms landed it dispatches 15
+        // kernels of its own. The independent oracle is the f64 recomputation above, checked on every
+        // lane; this block only reports whether the five spellings agree with each other.
+        println!("  AGREEMENT between spellings (vs b-natural, the one written with no regard for");
+        println!("  the recognizers; the independent oracle is the f64 reference above)");
         for (label, o) in &outs {
             if *label == "b-natural" {
                 continue;

@@ -10,10 +10,21 @@ module gblock_b
 //   2. the activation written into the store (`f1[..] = silu(b1[j] + s)`) instead of as a
 //      separate follow-up loop;
 //   3. the residual added at the store (`h[..] = x[..] + s`) instead of as a separate vector add;
-//   4. the norm reading its input directly instead of copy-then-normalize-in-place.
+//   4. the norm reading its input directly instead of copy-then-normalize-in-place;
+//   5. the sum accumulator of the causal softmax declared above the exp pass rather than below it;
+//   6. the SwiGLU up-projection multiplied into the gate in the SAME loop that computes it.
 //
-// None of these changes a single floating-point result. Every one of them is invisible to
-// `wukong_mir_build`'s recognizers, which match on syntactic index shapes.
+// None of these changes a single floating-point result. Every one of them USED to be invisible to
+// `wukong_mir_build`'s recognizers, which match on syntactic index shapes and on windows of
+// consecutive statements — this spelling dispatched 7 kernels against variant (a)'s 16, leaving four
+// GEMMs, a softmax and every elementwise pass on the scalar path.
+//
+// It now dispatches 15: variant (a)'s multiset minus the one `wukong_vmath_f32`, which this spelling
+// does not need because its activation is fused into the `wukong_sgemm_nt_epi` writeback. The five
+// changes that closed it are the index-base substitution and the accumulator-seed sink in
+// `wukong_mir_build::canon`, plus the store-fused activation, the cross-buffer residual and the
+// dual-store arms of the matmul recognizer. Keep this file written the natural way: it is the
+// benchmark's only measurement of what an unaware spelling costs.
 
 fn kbench(
     x: [f32; $SD$],
