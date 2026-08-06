@@ -8545,6 +8545,56 @@ mod tests {
         assert!(seen >= 40, "only {seen} C kbench signatures found — did the peer generators move?");
     }
 
+    /// Split an `f(…)` argument list into its TOP-LEVEL arguments.
+    ///
+    /// `src[open]` must be the `(` that opens the list. Nesting of `()`/`[]`/`{}` is tracked and
+    /// string / char literals are skipped, so neither the comma inside `&["-O3", "-shared"]` nor the
+    /// one inside `&format!("{}_omp", k.name)` is mistaken for an argument separator, and a `)`
+    /// inside a nested call (`&c_rmsnorm_bwd(r, c)`) does not end the list. Returns `None` if the
+    /// list never closes. Byte-indexed, which is safe because every delimiter it splits on is ASCII
+    /// and the multi-byte text in this file lives inside string literals it skips wholesale.
+    fn split_call_args(src: &str, open: usize) -> Option<Vec<&str>> {
+        let b = src.as_bytes();
+        assert_eq!(b[open], b'(');
+        let (mut depth, mut start, mut i) = (0i32, open + 1, open);
+        let mut args: Vec<&str> = Vec::new();
+        while i < b.len() {
+            match b[i] {
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                // `'x'` / `'\n'` is a char literal; a lone `'` is a lifetime, so just step over it.
+                b'\'' => {
+                    if i + 2 < b.len() && b[i + 2] == b'\'' {
+                        i += 2;
+                    } else if i + 3 < b.len() && b[i + 1] == b'\\' && b[i + 3] == b'\'' {
+                        i += 3;
+                    }
+                }
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        args.push(&src[start..i]);
+                        return Some(
+                            args.into_iter().map(str::trim).filter(|a| !a.is_empty()).collect(),
+                        );
+                    }
+                }
+                b',' if depth == 1 => {
+                    args.push(&src[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// **Every honest-flags C column must come from a `bench_c_cpp*` pair**, so the C++ column
     /// cannot go missing from a family. This is the guard behind the claim `BENCHMARKS.md` used to
     /// make by assertion — "g++ and gcc share a backend, so the C ratios stand for C++" — which no
@@ -8556,12 +8606,40 @@ mod tests {
     /// `…_fast` (the `-ffast-math` reassociation column) and `…_omp` (the OpenMP column). Those two
     /// are normalizations of the C baseline, not a second language, so they have no C++ twin by
     /// design. Anything else is a family that has quietly reverted to a C-only comparison.
+    ///
+    /// **This guard was VACUOUS until 2026-08-05 and is only here on the second attempt.** The old
+    /// scan needle was the CONTIGUOUS string `bench_external` + `("c",`, which requires the `"c"`
+    /// literal to sit on the same LINE as the opening paren. That spelling occurs exactly ONCE in
+    /// this ~8,700-line file — inside `bench_c_cpp` itself, which is on the exemption list — while
+    /// all fifteen other C-ext call sites use the rustfmt-produced multi-line spelling with `"c",`
+    /// on the next line. It could not match `bench_external4(` / `_i8(` / `_bf16(` / `_halfout(` at
+    /// all, since `bench_external` + `(` is not a substring of `bench_external4(`. The `unpaired`
+    /// vector was therefore unconditionally empty and the `_fast`/`_omp` branch had never once
+    /// executed. Falsified directly: reverting `bench_matmul_tn`'s `bench_c_cpp` call to a
+    /// multi-line C-only `bench_external` plus `let cm_cpp: Option<Measure> = None;` compiled and
+    /// the old test still reported `ok`. The scan below is therefore **whitespace-insensitive**, is
+    /// **suffix-aware**, and reads the peer name out of the parsed argument list rather than out of
+    /// a fixed-width text window (the window could not reach `"rmsnorm_bwd_fast"` either, because
+    /// the nested `&c_rmsnorm_bwd(r, c)` closes the window's first `)` before the name).
+    ///
+    /// Falsify it again after touching it. A guard nobody has falsified is not a guard.
     #[test]
     fn every_c_column_is_paired_with_a_cpp_column() {
         const SRC: &str = include_str!("main.rs");
-        // Helpers that legitimately hold a bare C-ext `bench_external` call: the pair helpers
-        // (which add the C++ column themselves) and the relaxed-FP column helpers. Spelled without
-        // the literal needle, so this list does not match itself.
+        // Scan only the NON-TEST half of the file. Every real call site lives there, and the cut
+        // makes the needles below unable to match this test's own source text — which is what the
+        // old version was contorting its needle to avoid, at the cost of matching almost nothing.
+        let marker = concat!("#[cfg", "(test)]");
+        let end = SRC.find(marker).expect("main.rs must contain a #[cfg(test)] module");
+        assert!(
+            end > SRC.len() / 2,
+            "the {marker} marker was found at byte {end} of {} — the scan region is not the body \
+             of the file, and a stray early occurrence would hide every call site after it",
+            SRC.len()
+        );
+        let scan = &SRC[..end];
+        // Helpers that legitimately hold a bare C-ext `bench_external*` call: the pair helpers
+        // (which add the C++ column themselves) and the relaxed-FP column helpers.
         const HELPERS: &[&str] = &[
             "bench_c_cpp",
             "bench_c_cpp4",
@@ -8575,7 +8653,7 @@ mod tests {
         // (byte offset, name) of every top-level `fn …` so an occurrence can be attributed.
         let mut fns: Vec<(usize, &str)> = Vec::new();
         let mut at = 0usize;
-        for line in SRC.split_inclusive('\n') {
+        for line in scan.split_inclusive('\n') {
             if let Some(r) = line.strip_prefix("fn ") {
                 let n = r.split(['(', '<', ' ']).next().unwrap_or("");
                 fns.push((at, n));
@@ -8583,41 +8661,78 @@ mod tests {
             at += line.len();
         }
         let owner = |pos: usize| -> &str {
-            fns.iter()
-                .rev()
-                .find(|(o, _)| *o <= pos)
-                .map(|(_, n)| *n)
-                .unwrap_or("<top level>")
+            fns.iter().rev().find(|(o, _)| *o <= pos).map(|(_, n)| *n).unwrap_or("<top level>")
         };
-        // Split so the needle is not present contiguously in the text being scanned.
-        let needle = concat!("bench_external", "(\"c\",");
-        let mut unpaired = Vec::new();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        // Split so the base name is not present contiguously in the text being scanned. (Belt and
+        // braces — the `#[cfg(test)]` cut above already excludes this module.)
+        let base = concat!("bench_", "external");
+        let (mut defs, mut calls, mut c_ext, mut exempt) = (0usize, 0usize, 0usize, Vec::new());
+        let mut unpaired: Vec<String> = Vec::new();
         let mut pos = 0usize;
-        while let Some(i) = SRC[pos..].find(needle) {
+        while let Some(i) = scan[pos..].find(base) {
             let abs = pos + i;
-            pos = abs + needle.len();
+            pos = abs + base.len();
+            // Not the tail of a longer identifier.
+            if abs > 0 && ident(scan.as_bytes()[abs - 1]) {
+                continue;
+            }
+            // Consume the ABI suffix (`4` / `_i8` / `_bf16` / `_halfout` / anything added later),
+            // then any whitespace, and require the `(` of a call.
+            let mut j = pos;
+            while j < scan.len() && ident(scan.as_bytes()[j]) {
+                j += 1;
+            }
+            let name = &scan[abs..j];
+            let lp = j + scan[j..].len() - scan[j..].trim_start().len();
+            if scan.as_bytes().get(lp) != Some(&b'(') {
+                continue; // a doc-comment mention or a bare fn-item reference, not a call
+            }
+            if scan[..abs].ends_with("fn ") {
+                defs += 1;
+                continue;
+            }
+            calls += 1;
+            let line = scan[..abs].matches('\n').count() + 1;
+            let args = split_call_args(scan, lp)
+                .unwrap_or_else(|| panic!("{name} at line {line}: argument list never closes"));
+            if args.first().copied() != Some("\"c\"") {
+                continue; // the C++ / Rust / MKL columns
+            }
+            c_ext += 1;
             let f = owner(abs);
             if HELPERS.contains(&f) {
                 continue;
             }
-            // The name argument is the 4th; `_fast` / `_omp` mark the C-only extra columns.
-            let window = &SRC[abs..(abs + 400).min(SRC.len())];
-            let head = &window[..window.find(')').unwrap_or(window.len())];
-            if head.contains("_fast") || head.contains("_omp") {
+            // The peer name is the 4th argument; `_fast` / `_omp` mark the C-only extra columns.
+            let peer = *args.get(3).unwrap_or_else(|| {
+                panic!("{name} at line {line}: fewer than 4 arguments — has the ABI changed?")
+            });
+            if peer.contains("_fast") || peer.contains("_omp") {
+                exempt.push(format!("  line {line}: {f} -> {peer}"));
                 continue;
             }
-            unpaired.push((f, head.replace('\n', " ")));
+            unpaired.push(format!("  line {line}: {f} -> {name}(\"c\", …, {peer}, …)"));
         }
         assert!(
             unpaired.is_empty(),
             "these benches take a C column WITHOUT a C++ twin — use bench_c_cpp*(…) instead:\n{}",
-            unpaired
-                .iter()
-                .map(|(f, h)| format!("  {f}: {h}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            unpaired.join("\n")
         );
-        // …and a floor, so deleting every pair call cannot make the assertion above pass vacuously.
+        // Floors, so that renaming/deleting the things being scanned cannot make the assertion
+        // above pass by finding nothing. 5 definitions, 60 calls, 16 of them C-ext and 8 of those
+        // exempt (5 `_omp` + 3 `_fast`) at the time of writing.
+        assert_eq!(defs, 5, "expected the 5 bench_external* ABI families, found {defs}");
+        assert!(calls >= 55, "only {calls} bench_external* call sites — did the scan stop matching?");
+        assert!(c_ext >= 14, "only {c_ext} C-ext call sites — is the first argument still the ext?");
+        assert!(
+            exempt.len() >= 6,
+            "only {} C-only extra columns recognized, so the `_fast`/`_omp` exemption is close to \
+             dead code and the guard is close to vacuous again — found:\n{}",
+            exempt.len(),
+            exempt.join("\n")
+        );
+        // …and a floor on the pairs themselves, so deleting every pair call is loud too.
         let pairs = SRC.matches(concat!("bench_c_cpp", "(")).count()
             + SRC.matches(concat!("bench_c_cpp", "4(")).count()
             + SRC.matches(concat!("bench_c_cpp", "_i8(")).count()
