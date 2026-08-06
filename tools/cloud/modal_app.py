@@ -61,7 +61,12 @@ WK_GPU = os.environ.get("WK_GPU", "L40S")
 today's PTX runs unmodified (GPU_RETARGET_PLAN.md §3). Start there, not on an A100."""
 
 WK_TIMEOUT = int(os.environ.get("WK_TIMEOUT", "3600"))
-WK_CUDA_TAG = os.environ.get("WK_CUDA_TAG", "12.8.1-cudnn-devel-ubuntu22.04")
+WK_CUDA_TAG = os.environ.get("WK_CUDA_TAG", "12.9.2-cudnn-devel-ubuntu22.04")
+# 12.9 is the deliberate ceiling, not an oversight: cudarc 0.16.6 has no CUDA-13 bindings (its
+# feature list and dlopen candidates stop at the .so.12 line), the nvidia-*-cu12 pip wheels end at
+# 12.9.x, and torch 2.13.0+cu129 is the newest CUDA-12 build — so 12.9.2 aligns the image toolkit
+# with every peer the harness compiles against it. Both this tag and the previous 12.8.1 were
+# live-verified on Docker Hub 2026-08-06.
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 REMOTE_SRC = "/wukong"
