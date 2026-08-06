@@ -834,6 +834,21 @@ fn main() {
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" },
                 );
+                // NOT ACCURACY-MATCHED, and the row must say so. `vs_exp`/`vs_ln`/`vs_tanh` run in
+                // VML's DEFAULT mode, which is VML_HA at ~0.5 ULP, while Wukong ships ≤2 ULP exp,
+                // ≤12 ULP log and 44 ULP tanh. A faster-but-less-accurate kernel is not
+                // straightforwardly faster. `wukong_runtime`'s own `vmath_exp_log_vs_vml` probe
+                // re-runs the peer through `vmlSetMode(VML_LA)` — measured at 2 ULP exp / 4 ULP log,
+                // where Wukong measures 2 and 4 — and at that matched accuracy exp and log come out
+                // a TIE (2026-08-06). This row has NOT been re-measured that way, and it also times
+                // each arm in its own tight rep-block rather than rotating them, so it is a
+                // different cache regime as well. Treat it as an upper bound, not a standing.
+                println!(
+                    "     (VML here runs in its DEFAULT ~0.5-ULP HA mode — NOT accuracy-matched \
+                     against Wukong's ≤2 ULP exp / ≤12 ULP log / 44 ULP tanh. At matched accuracy \
+                     (VML_LA) the in-crate probe reads exp and log as a TIE. Upper bound, not a \
+                     standing.)"
+                );
             }
         }
         let is_par = k.name.contains("@parallel");
