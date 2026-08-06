@@ -991,7 +991,14 @@ fn carried_values_are_handled(l: &NaturalLoop, primary_param: usize) -> bool {
 /// * **Never a synthesized if-conversion step.** The two `select`s [`linearize_region`] builds keep
 ///   today's flat rejection; widening them over a ramp is expressible but buys nothing measured, and
 ///   an unexercised path here is a miscompile waiting for a program to write it.
+///
+/// `WUKONG_NO_IV_RAMP=1` restores the flat decline, for the same reason
+/// [`Vectorize::run_function`]'s `WUKONG_NO_VECTORIZE` exists: the only honest A/B on this machine
+/// is same-run and adjacent, so the two arms of "what did the ramp buy" have to be one binary. It
+/// is strictly a *narrowing* switch — a loop it turns off is one this pass declined before the ramp
+/// existed — so no program can compute a different answer under it.
 fn classify_iv_uses(f: &Function, lin: &[LinInst], iv: ValueId) -> Option<FxHashSet<usize>> {
+    let no_ramp = std::env::var_os("WUKONG_NO_IV_RAMP").is_some();
     let mut index: FxHashSet<u32> = FxHashSet::default();
     index.insert(iv.0);
     let mut value_use: FxHashSet<usize> = FxHashSet::default();
@@ -1093,7 +1100,7 @@ fn classify_iv_uses(f: &Function, lin: &[LinInst], iv: ValueId) -> Option<FxHash
                         only_iv = false;
                     }
                 });
-                if !only_iv || !ramp_consumable(&inst.op) {
+                if no_ramp || !only_iv || !ramp_consumable(&inst.op) {
                     return None;
                 }
                 value_use.insert(at);
