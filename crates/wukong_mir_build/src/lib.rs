@@ -23089,9 +23089,14 @@ fn match_matmul_dual_store<'a>(
     if sd != n || !d_off.is_empty() {
         return None;
     }
+    // `VE_HADAMARD` alone already implies the kernel reads `y`, but the statement-level velem
+    // recognizer (`try_velem_for` → `match_velem_binary`) emits `VE_HADAMARD | VE_USE_Y` for the very
+    // same product, and this arm's whole claim is that the folded spelling lowers to what the
+    // factored one lowers to. Setting the redundant bit makes the two calls byte-identical rather
+    // than merely equivalent (they differed only as `const.i64 512` vs `const.i64 768`).
     let velem_op = match dop {
         // `d[i,j] *= s` / `d[i,j] += s` — the compound form, whose value is just the RHS.
-        ast::AssignOp::Mul if single_path(dv) == Some(s_sym) => VE_HADAMARD,
+        ast::AssignOp::Mul if single_path(dv) == Some(s_sym) => VE_HADAMARD | VE_USE_Y,
         ast::AssignOp::Add if single_path(dv) == Some(s_sym) => VE_ID | VE_USE_Y,
         ast::AssignOp::Assign => {
             let ExprKind::Binary {
@@ -23111,7 +23116,7 @@ fn match_matmul_dual_store<'a>(
                 return None;
             }
             match bop {
-                ast::BinOp::Mul => VE_HADAMARD,
+                ast::BinOp::Mul => VE_HADAMARD | VE_USE_Y,
                 ast::BinOp::Add => VE_ID | VE_USE_Y,
                 _ => return None,
             }
