@@ -269,7 +269,9 @@ fn cpp_checked(label: &str, c: &Option<Measure>, cpp: Option<Measure>) -> Option
 /// columns makes it structurally impossible for a family to print a "vs C" ratio with no C++ number
 /// behind it: there is deliberately no `bench_c_only`.
 ///
-/// The C++ column runs immediately after the C column so the two land in the same thermal group.
+/// Both columns are built first and then timed **A B B A**, each keeping its own fastest sample —
+/// see [`abba_min`] for why the old `let c = …; let cpp = …;` was a systematic bias against the C++
+/// column and not merely noise.
 #[allow(clippy::too_many_arguments)]
 fn bench_c_cpp(
     label: &str,
@@ -281,8 +283,9 @@ fn bench_c_cpp(
     xp: *const f32,
     yp: *const f32,
 ) -> (Option<Measure>, Option<Measure>) {
-    let c = bench_external("c", c_src, dir, label, cc, args, out, xp, yp);
-    let cpp = bench_external("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, xp, yp);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| time_peer(lib, compile, &mut *out, xp, yp));
     let cpp = cpp_checked(label, &c, cpp);
     (c, cpp)
 }
@@ -300,8 +303,10 @@ fn bench_c_cpp4(
     p1: *const f32,
     p2: *const f32,
 ) -> (Option<Measure>, Option<Measure>) {
-    let c = bench_external4("c", c_src, dir, label, cc, args, out, p0, p1, p2);
-    let cpp = bench_external4("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, p0, p1, p2);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) =
+        abba_min(&cl, &pl, |lib, compile| time_peer4(lib, compile, &mut *out, p0, p1, p2));
     let cpp = cpp_checked(label, &c, cpp);
     (c, cpp)
 }
@@ -319,8 +324,9 @@ fn bench_c_cpp_i8(
     ap: *const u8,
     bp: *const i8,
 ) -> (Option<MeasureI8>, Option<MeasureI8>) {
-    let c = bench_external_i8("c", c_src, dir, label, cc, args, out, ap, bp);
-    let cpp = bench_external_i8("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, ap, bp);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| time_peer_i8(lib, compile, &mut *out, ap, bp));
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) if cm.out != p.out => {
             println!("  ! {label}: C++ (g++) disagrees with C (gcc) on the i32 output — C++ column dropped");
@@ -344,8 +350,10 @@ fn bench_c_cpp_bf16(
     xp: *const u16,
     yp: *const u16,
 ) -> (Option<MeasureBf16>, Option<MeasureBf16>) {
-    let c = bench_external_bf16("c", c_src, dir, label, cc, args, out, xp, yp);
-    let cpp = bench_external_bf16("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, xp, yp);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) =
+        abba_min(&cl, &pl, |lib, compile| time_peer_bf16(lib, compile, &mut *out, xp, yp));
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) => {
             let rel = ((cm.out - p.out).abs() / cm.out.abs().max(1e-6)) as f64;
@@ -374,8 +382,10 @@ fn bench_c_cpp_halfout(
     xp: *const u16,
     yp: *const u16,
 ) -> (Option<MeasureHalfOut>, Option<MeasureHalfOut>) {
-    let c = bench_external_halfout("c", c_src, dir, label, cc, args, out, xp, yp);
-    let cpp = bench_external_halfout("cpp", &cpp_from_c(c_src), dir, label, cxx(), args, out, xp, yp);
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    let (c, cpp) =
+        abba_min(&cl, &pl, |lib, compile| time_peer_halfout(lib, compile, &mut *out, xp, yp));
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) => {
             let (rel, at) = max_rel_err(&cm.out, &p.out);
@@ -2335,6 +2345,31 @@ fn rust_linear_bf16(ns: usize) -> String {
     )
 }
 
+/// The shapes [`bench_transpose`] sweeps, as `(rows, cols, aliasing_stride)`.
+///
+/// **Both regimes are measured on purpose, and they do NOT give the same answer.** Until 2026-08-05
+/// this bench ran `ns in [1024, 2048]` and nothing else — two power-of-two squares — and the ~5–7×
+/// multiple it printed was published as *the* transpose result. It is not. A transpose reads one
+/// matrix row-major and writes the other column-major, so the peer's write stream steps by the
+/// destination row stride; when that stride in BYTES is a large power of two, consecutive writes map
+/// onto the same handful of L1 sets and the blocked C peer thrashes on set conflicts. Wukong's
+/// `wukong_transpose_f32` moves 32×32 tiles through registers and is much less exposed, so the
+/// power-of-two shapes flatter it for a reason that is a property of the SIZE, not of the compiler.
+/// Measured on this box the same kernel pair goes from ~5–7× at 1024²/2048² down to ~1.4× at 1000²
+/// and 1031² — so the honest general number is the small one, and the old sweep could not see it.
+///
+/// `false` marks the general regime: 1000² (stride 4000 B), 1031² (prime) and the rectangular
+/// 1100×950 (different read and write strides, neither a power of two). The power-of-two shapes are
+/// kept — the aliasing regime is real and worth reporting — but they are labelled, geomeaned
+/// separately, and the summary says in words which number generalizes.
+const TRANSPOSE_SHAPES: &[(usize, usize, bool)] = &[
+    (1024, 1024, true),
+    (2048, 2048, true),
+    (1000, 1000, false),
+    (1031, 1031, false),
+    (1100, 950, false),
+];
+
 /// Matrix transpose `dst = srcᵀ` — the memory-bound layout op (attention score transposes, weight
 /// layout conversions). Wukong folds the `dst[j*R+i] = src[i*C+j]` nest to the cache-blocked
 /// `wukong_transpose_f32`; the C/Rust peers are **also** 32×32 cache-blocked (see [`c_transpose`]),
@@ -2342,12 +2377,19 @@ fn rust_linear_bf16(ns: usize) -> String {
 /// not blocked-vs-unblocked. gcc still does not loop-tile a transpose *by itself*, which is why the
 /// blocking has to be written out; the point is that a competent programmer writes it.
 /// The kernels carry an unused middle pointer so they share the `(src, _, dst)` `KernelFn` ABI and the
-/// f32 harness. Square shapes large enough to spill L2 (where the cache pattern dominates), reported as
-/// GB/s (`2·N²·4` bytes moved per call: read `src` + write `dst`). Transpose is a permutation, so the
+/// f32 harness. Shapes large enough to spill L2 (where the cache pattern dominates), reported as
+/// GB/s (`2·R·C·4` bytes moved per call: read `src` + write `dst`). Transpose is a permutation, so the
 /// cross-language check is **bit-exact** (no float reassociation — a stronger bar than the GEMM gate).
+///
+/// The sweep covers BOTH stride regimes — see [`TRANSPOSE_SHAPES`] — and closes with a summary that
+/// geomeans them apart and names the general one, because reporting only the power-of-two rows is
+/// reporting the size at which the peer is worst.
 fn bench_transpose(cc: &str, dir: &Path) {
-    for ns in [1024usize, 2048] {
-        let n2 = ns * ns;
+    // (single-core ratio vs blocked C, @parallel ratio vs blocked C), split by regime.
+    let (mut alias_1c, mut gen_1c): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    let (mut alias_par, mut gen_par): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    for &(rows, cols, aliasing) in TRANSPOSE_SHAPES {
+        let n2 = rows * cols;
         let src: Vec<f32> = (0..n2).map(|i| (i % 1000) as f32 * 0.5 - 250.0).collect();
         let dummy = vec![0.0f32; n2];
         let mut dst = vec![0.0f32; n2];
@@ -2358,12 +2400,19 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 .map(|x| format!("{:.1}", bytes / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== transpose (dst = srcᵀ) {ns}x{ns} (GB/s, higher is better) ===");
-        let wuk = bench_wukong(&wk_transpose(ns, false), &mut dst, sp, yp);
-        let wk_par = bench_wukong(&wk_transpose(ns, true), &mut dst, sp, yp);
+        let regime = if aliasing {
+            "power-of-two stride - FAVOURABLE regime, does NOT generalize"
+        } else {
+            "general stride"
+        };
+        println!(
+            "=== transpose (dst = srcᵀ) {rows}x{cols} [{regime}] (GB/s, higher is better) ==="
+        );
+        let wuk = bench_wukong(&wk_transpose(rows, cols, false), &mut dst, sp, yp);
+        let wk_par = bench_wukong(&wk_transpose(rows, cols, true), &mut dst, sp, yp);
         let (cm, cm_cpp) = bench_c_cpp(
             "transpose",
-            &c_transpose(ns),
+            &c_transpose(rows, cols),
             dir,
             cc,
             &["-O3", "-march=native", "-shared"],
@@ -2373,7 +2422,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs",
-            &rust_transpose(ns),
+            &rust_transpose(rows, cols),
             dir,
             "transpose",
             "rustc",
@@ -2387,7 +2436,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
             .and_then(|_| {
                 bench_external(
                     "c",
-                    &c_transpose_omp(ns),
+                    &c_transpose_omp(rows, cols),
                     dir,
                     "transpose_omp",
                     cc,
@@ -2414,7 +2463,9 @@ fn bench_transpose(cc: &str, dir: &Path) {
         );
         // Transpose is a permutation — exact, so the full-buffer cross-check is bit equality.
         // BOTH peers are checked: a peer whose spelling changed (blocked, sliced) could in principle
-        // get "faster" by not doing the work, and an unchecked column would never say so.
+        // get "faster" by not doing the work, and an unchecked column would never say so. This is
+        // also what makes the non-square shape safe: a peer that muddled `rows`/`cols` would produce
+        // a different buffer, not a faster one.
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             if m.out != c2.out {
                 println!("  ! transpose output mismatch vs C");
@@ -2432,27 +2483,69 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
+            if aliasing { alias_1c.push(r) } else { gen_1c.push(r) }
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
+            if aliasing { alias_par.push(r) } else { gen_par.push(r) }
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &wuk, &wk_par, &comp);
         println!();
     }
+    transpose_regime_summary(&alias_1c, &gen_1c, &alias_par, &gen_par);
+}
+
+/// Close the transpose section by geomeaning the two stride regimes SEPARATELY and saying, in the
+/// output itself, which one is the general result.
+///
+/// Printing one pooled number over `[1024², 2048², 1000², 1031², 1100×950]` would hide the split
+/// just as effectively as sweeping only the power-of-two shapes did — a reader who takes the
+/// headline away needs the caveat attached to it, not filed in a doc comment.
+fn transpose_regime_summary(alias_1c: &[f64], gen_1c: &[f64], alias_par: &[f64], gen_par: &[f64]) {
+    if alias_1c.is_empty() && gen_1c.is_empty() {
+        return;
+    }
+    println!("=== transpose REGIME SUMMARY (vs the 32x32-blocked C peer, geomean of ratios) ===");
+    let row = |label: &str, xs: &[f64]| {
+        if xs.is_empty() {
+            return;
+        }
+        let g = geomean(xs);
+        println!(
+            "  {:<44} {:>6.2}x {} ({} shape{})",
+            label,
+            if g >= 1.0 { g } else { 1.0 / g },
+            if g >= 1.0 { "faster" } else { "slower" },
+            xs.len(),
+            if xs.len() == 1 { "" } else { "s" }
+        );
+    };
+    row("single-core, power-of-two stride", alias_1c);
+    row("single-core, general stride  <- THE RESULT", gen_1c);
+    row("@parallel,   power-of-two stride", alias_par);
+    row("@parallel,   general stride  <- THE RESULT", gen_par);
+    println!(
+        "  ! The power-of-two rows are NOT the general case. A row stride that is a large power of\n\
+         \x20   two maps the peer's column-major write stream onto a few L1 sets, which penalizes the\n\
+         \x20   PEER for the size rather than rewarding Wukong for the codegen. Quote the general-stride\n\
+         \x20   line; the power-of-two line is the best case, and is labelled as such above."
+    );
+    println!();
 }
 
 /// Wukong transpose kernel: the idiomatic `dst[j*R+i] = src[i*C+j]` nest the `mir_build` recognizer
 /// folds to one `wukong_transpose_f32[_parallel]` call. `y` is an unused param so the signature
-/// matches the `(src, _, dst)` 3-pointer harness ABI.
-fn wk_transpose(ns: usize, parallel: bool) -> String {
+/// matches the `(src, _, dst)` 3-pointer harness ABI. `rows`/`cols` are the SOURCE shape, so the
+/// destination is `[cols, rows]` and the two strides differ on a non-square shape.
+fn wk_transpose(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
-    let n2 = ns * ns;
+    let n2 = rows * cols;
     format!(
         "module bench\n{attr}fn kbench(src: [f32; {n2}], y: [f32; {n2}], mut dst: [f32; {n2}]) {{\n\
-         \x20   for i in 0..{ns} {{\n\
-         \x20       for j in 0..{ns} {{ dst[j * {ns} + i] = src[i * {ns} + j]; }}\n\
+         \x20   for i in 0..{rows} {{\n\
+         \x20       for j in 0..{cols} {{ dst[j * {rows} + i] = src[i * {cols} + j]; }}\n\
          \x20   }}\n}}\n"
     )
 }
@@ -2464,39 +2557,68 @@ fn wk_transpose(ns: usize, parallel: bool) -> String {
 /// bench's own commentary named that as the reason Wukong won, which makes it a peer defect, not a
 /// compiler win. Measured standalone at `-O3 -march=native`, 2048², kernels in their own TU:
 /// **29.51 ms naive → 24.31 ms naive + `restrict` → 14.09 ms 32×32-blocked + `restrict`, a 2.09×
-/// total handicap**. `NS` is 1024/2048 here, both multiples of 32, so the blocked nest needs no
-/// remainder handling.
-fn c_transpose(ns: usize) -> String {
+/// total handicap**.
+///
+/// Since 2026-08-05 the sweep also covers shapes that are NOT multiples of the tile
+/// ([`TRANSPOSE_SHAPES`]), so the nest carries edge handling. It is written as a **full-tile fast
+/// path plus an edge case**, not as a clamped bound on every tile, precisely so the interior nest
+/// gcc compiles is still the constant-trip-count `for (i=ii;i<ii+TB;i++)` it saw before this change:
+/// a clamped bound would have made the tile trip count opaque and could have quietly slowed the peer
+/// at 1024²/2048², which would have made Wukong look better at exactly the sizes this change exists
+/// to put in context.
+fn c_transpose(rows: usize, cols: usize) -> String {
     format!(
-        "#define NS {ns}\n#define TB 32\n\
+        "#define NR {rows}\n#define NC {cols}\n#define TB 32\n\
          __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
-         \x20 for (long ii=0;ii<NS;ii+=TB) for (long jj=0;jj<NS;jj+=TB)\n\
-         \x20   for (long i=ii;i<ii+TB;i++)\n\
-         \x20     for (long j=jj;j<jj+TB;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+         \x20 for (long ii=0;ii<NR;ii+=TB) for (long jj=0;jj<NC;jj+=TB) {{\n\
+         \x20   if (ii+TB<=NR && jj+TB<=NC) {{\n\
+         \x20     for (long i=ii;i<ii+TB;i++)\n\
+         \x20       for (long j=jj;j<jj+TB;j++) dst[j*NR+i] = src[i*NC+j];\n\
+         \x20   }} else {{\n\
+         \x20     long i1 = ii+TB<NR?ii+TB:NR, j1 = jj+TB<NC?jj+TB:NC;\n\
+         \x20     for (long i=ii;i<i1;i++)\n\
+         \x20       for (long j=jj;j<j1;j++) dst[j*NR+i] = src[i*NC+j];\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
     )
 }
 
 /// The OpenMP twin of [`c_transpose`]: blocked tile rows across cores. A permutation, so it stays exact.
-fn c_transpose_omp(ns: usize) -> String {
+fn c_transpose_omp(rows: usize, cols: usize) -> String {
     format!(
-        "#define NS {ns}\n#define TB 32\n\
+        "#define NR {rows}\n#define NC {cols}\n#define TB 32\n\
          __declspec(dllexport) void kbench(const float* __restrict__ src, const float* __restrict__ y, float* __restrict__ dst){{\n\
          \x20 (void)y;\n\
          #pragma omp parallel for\n\
-         \x20 for (long ii=0;ii<NS;ii+=TB) for (long jj=0;jj<NS;jj+=TB)\n\
-         \x20   for (long i=ii;i<ii+TB;i++)\n\
-         \x20     for (long j=jj;j<jj+TB;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+         \x20 for (long ii=0;ii<NR;ii+=TB) for (long jj=0;jj<NC;jj+=TB) {{\n\
+         \x20   if (ii+TB<=NR && jj+TB<=NC) {{\n\
+         \x20     for (long i=ii;i<ii+TB;i++)\n\
+         \x20       for (long j=jj;j<jj+TB;j++) dst[j*NR+i] = src[i*NC+j];\n\
+         \x20   }} else {{\n\
+         \x20     long i1 = ii+TB<NR?ii+TB:NR, j1 = jj+TB<NC?jj+TB:NC;\n\
+         \x20     for (long i=ii;i<i1;i++)\n\
+         \x20       for (long j=jj;j<j1;j++) dst[j*NR+i] = src[i*NC+j];\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
     )
 }
 
-fn rust_transpose(ns: usize) -> String {
+/// The Rust transpose peer — the same blocked algorithm and the same full-tile/edge split as
+/// [`c_transpose`], so the two peer languages stay comparable to each other as well as to Wukong.
+fn rust_transpose(rows: usize, cols: usize) -> String {
     format!(
-        "const NS: usize = {ns};\nconst TB: usize = 32;\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
-         \x20 let s = core::slice::from_raw_parts(src, NS*NS);\n\
-         \x20 let d = core::slice::from_raw_parts_mut(dst, NS*NS);\n\
-         \x20 for ii in (0..NS).step_by(TB) {{ for jj in (0..NS).step_by(TB) {{\n\
-         \x20   for i in ii..ii+TB {{ for j in jj..jj+TB {{ d[j*NS+i] = s[i*NS+j]; }} }} }} }}\n}}\n"
+        "const NR: usize = {rows};\nconst NC: usize = {cols};\nconst TB: usize = 32;\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
+         \x20 let s = core::slice::from_raw_parts(src, NR*NC);\n\
+         \x20 let d = core::slice::from_raw_parts_mut(dst, NR*NC);\n\
+         \x20 for ii in (0..NR).step_by(TB) {{ for jj in (0..NC).step_by(TB) {{\n\
+         \x20   if ii+TB<=NR && jj+TB<=NC {{\n\
+         \x20     for i in ii..ii+TB {{ for j in jj..jj+TB {{ d[j*NR+i] = s[i*NC+j]; }} }}\n\
+         \x20   }} else {{\n\
+         \x20     let i1 = if ii+TB<NR {{ ii+TB }} else {{ NR }};\n\
+         \x20     let j1 = if jj+TB<NC {{ jj+TB }} else {{ NC }};\n\
+         \x20     for i in ii..i1 {{ for j in jj..j1 {{ d[j*NR+i] = s[i*NC+j]; }} }}\n\
+         \x20   }} }} }}\n}}\n"
     )
 }
 
@@ -6566,20 +6688,27 @@ fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> O
     })
 }
 
-/// Compile a C/Rust source to a shared library with `compiler args…` (timed), load it, and bench.
-/// Derives the kernel's output pointer from `out` — see the one-live-pointer law on [`bench_wukong`].
-#[allow(clippy::too_many_arguments)]
-fn bench_external(
+/// A built-and-loaded peer library, plus the wall time its compiler process took.
+///
+/// The `Library` must outlive every call through the symbol taken out of it, which is why this is
+/// carried around as a value rather than a path: dropping it unloads the DLL.
+type PeerLib = (Duration, libloading::Library);
+
+/// Compile `src` to a shared library with `compiler args…` (timed) and LOAD it — everything
+/// `bench_external*` does EXCEPT running the kernel.
+///
+/// Split out on 2026-08-05 so the `bench_c_cpp*` pair helpers can build both peers first and then
+/// interleave only the *timed* regions (see [`abba_min`]). Building both up front also means no
+/// compiler process spawn — the noisiest thing this harness does, it loads every core — lands
+/// between two timed regions that are about to be compared.
+fn build_peer(
     ext: &str,
     src: &str,
     dir: &Path,
     name: &str,
     compiler: &str,
     args: &[&str],
-    out: &mut [f32],
-    xp: *const f32,
-    yp: *const f32,
-) -> Option<Measure> {
+) -> Option<PeerLib> {
     // Sanitize the kernel name for use as a filename: rustc derives the crate name from the source
     // file stem and rejects characters like `@` (e.g. `saxpy@parallel`).
     let safe: String = name
@@ -6616,33 +6745,135 @@ fn bench_external(
             return None;
         }
     }
-
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<KernelFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: KernelFn = *sym;
-        out.iter_mut().for_each(|v| *v = 0.0);
-        let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(xp, yp, op));
-        let snapshot = out.to_vec();
-        Some(Measure {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
+    // SAFETY: loading a library this process just produced from its own generated source. The
+    // caller keeps the returned `Library` alive for as long as it calls through it.
+    match unsafe { libloading::Library::new(&dll) } {
+        Ok(l) => Some((compile, l)),
+        Err(e) => {
+            eprintln!("load {}: {e}", dll.display());
+            None
+        }
     }
+}
+
+/// Fetch the `kbench` entry point out of a loaded peer library.
+///
+/// # Safety
+/// `F` must be the fn-pointer type matching the generated kernel's real ABI. The five generators
+/// each pass their own (`KernelFn`, `KernelFn4`, `I8KernelFn`, `Bf16KernelFn`, `HalfOutKernelFn`),
+/// exactly as the pre-split `bench_external*` bodies did.
+unsafe fn peer_kbench<F: Copy>(lib: &libloading::Library) -> Option<F> {
+    match lib.get::<F>(b"kbench\0") {
+        Ok(s) => Some(*s),
+        Err(e) => {
+            eprintln!("symbol kbench in a peer library: {e}");
+            None
+        }
+    }
+}
+
+/// The one thing [`abba_min`] needs from a measurement: how long a call took.
+trait Timed {
+    fn ns(&self) -> f64;
+}
+impl Timed for Measure {
+    fn ns(&self) -> f64 {
+        self.ns_per_call
+    }
+}
+impl Timed for MeasureI8 {
+    fn ns(&self) -> f64 {
+        self.ns_per_call
+    }
+}
+impl Timed for MeasureBf16 {
+    fn ns(&self) -> f64 {
+        self.ns_per_call
+    }
+}
+impl Timed for MeasureHalfOut {
+    fn ns(&self) -> f64 {
+        self.ns_per_call
+    }
+}
+
+/// Keep the faster of two samples of the SAME column (the harness's minimum-is-the-estimate rule,
+/// already used inside [`time_ns`] across its 14 blocks).
+fn faster<M: Timed>(x: Option<M>, y: Option<M>) -> Option<M> {
+    match (x, y) {
+        (Some(p), Some(q)) => Some(if q.ns() < p.ns() { q } else { p }),
+        (p, q) => p.or(q),
+    }
+}
+
+/// Time two already-built peers **A B B A** and keep each column's own fastest sample.
+///
+/// **This exists to remove a systematic bias, not to add samples.** Every `bench_c_cpp*` pair used
+/// to read `let c = …; let cpp = …;` — the C++ peer ALWAYS second — so any within-pair drift
+/// (clock ramp, thermal, a hybrid-scheduler migration between a P and an E core) landed on the C++
+/// column every single time, in every family, and biased the published "vs C++" ratio specifically
+/// rather than adding noise that averages out. Measured directly, by making the second slot compile
+/// the IDENTICAL C source with the IDENTICAL compiler so any difference is pure position: the
+/// second slot came out slower on 6 of 7 rows, by +0.1% to +0.4% on `transpose` but by **+5.0% and
+/// +17.3%** on the two `colsum` rows. A 17% positional penalty is larger than most of the
+/// language-vs-language differences this bench reports.
+///
+/// A B B A gives each column one early and one late slot, so a monotone drift over the pair cancels
+/// to first order in the difference; taking each column's own minimum then follows the same
+/// least-interfered-sample rule [`time_ns`] already applies within a column. The cost is that each
+/// peer is timed twice — deliberate, since the alternative (flipping which column goes first) only
+/// balances the bias across the suite in aggregate and leaves every individual printed row still
+/// carrying an unbalanced order.
+fn abba_min<M: Timed>(
+    a: &Option<PeerLib>,
+    b: &Option<PeerLib>,
+    mut time: impl FnMut(&libloading::Library, Duration) -> Option<M>,
+) -> (Option<M>, Option<M>) {
+    let a1 = a.as_ref().and_then(|(c, l)| time(l, *c));
+    let b1 = b.as_ref().and_then(|(c, l)| time(l, *c));
+    let b2 = b.as_ref().and_then(|(c, l)| time(l, *c));
+    let a2 = a.as_ref().and_then(|(c, l)| time(l, *c));
+    (faster(a1, a2), faster(b1, b2))
+}
+
+/// Time an already-loaded 3-pointer peer. Derives the kernel's output pointer from `out` — see the
+/// one-live-pointer law on [`bench_wukong`].
+fn time_peer(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+) -> Option<Measure> {
+    // SAFETY: the generated C/Rust `kbench` is `(const float*, const float*, float*) -> void`.
+    let f: KernelFn = unsafe { peer_kbench(lib)? };
+    out.iter_mut().for_each(|v| *v = 0.0);
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot = out.to_vec();
+    Some(Measure {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
+}
+
+/// Compile a C/Rust source to a shared library with `compiler args…` (timed), load it, and bench.
+/// Derives the kernel's output pointer from `out` — see the one-live-pointer law on [`bench_wukong`].
+#[allow(clippy::too_many_arguments)]
+fn bench_external(
+    ext: &str,
+    src: &str,
+    dir: &Path,
+    name: &str,
+    compiler: &str,
+    args: &[&str],
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+) -> Option<Measure> {
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer(&lib, compile, out, xp, yp)
 }
 
 /// A 4-pointer kernel ABI `(p0, p1, p2: *const, op: *mut)` — for kernels that read three input buffers
@@ -6718,66 +6949,30 @@ fn bench_external4(
     p1: *const f32,
     p2: *const f32,
 ) -> Option<Measure> {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let src_path = dir.join(format!("{safe}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
-    if std::fs::write(&src_path, src).is_err() {
-        return None;
-    }
-    let t = Instant::now();
-    let status = Command::new(compiler)
-        .args(args)
-        .arg("-o")
-        .arg(&dll)
-        .arg(&src_path)
-        .status();
-    let compile = t.elapsed();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("{compiler} failed to compile {name}.{ext}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("could not run `{compiler}` (skipping)");
-            return None;
-        }
-    }
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<KernelFn4> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: KernelFn4 = *sym;
-        out.iter_mut().for_each(|v| *v = 0.0);
-        let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(p0, p1, p2, op));
-        let snapshot = out.to_vec();
-        Some(Measure {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
-    }
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer4(&lib, compile, out, p0, p1, p2)
+}
+
+/// Time an already-loaded 4-pointer peer (the [`abba_min`] half of [`bench_external4`]).
+fn time_peer4(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [f32],
+    p0: *const f32,
+    p1: *const f32,
+    p2: *const f32,
+) -> Option<Measure> {
+    // SAFETY: the generated `kbench` is `(const float*, const float*, const float*, float*)`.
+    let f: KernelFn4 = unsafe { peer_kbench(lib)? };
+    out.iter_mut().for_each(|v| *v = 0.0);
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(p0, p1, p2, op) });
+    let snapshot = out.to_vec();
+    Some(Measure {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
 }
 
 /// The int8 twin of [`bench_wukong`]: JIT the int8 GEMM kernel and time it through the `(u8, i8,
@@ -6843,67 +7038,29 @@ fn bench_external_i8(
     ap: *const u8,
     bp: *const i8,
 ) -> Option<MeasureI8> {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let src_path = dir.join(format!("{safe}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
-    if std::fs::write(&src_path, src).is_err() {
-        return None;
-    }
-    let t = Instant::now();
-    let status = Command::new(compiler)
-        .args(args)
-        .arg("-o")
-        .arg(&dll)
-        .arg(&src_path)
-        .status();
-    let compile = t.elapsed();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("{compiler} failed to compile {name}.{ext}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("could not run `{compiler}` (skipping)");
-            return None;
-        }
-    }
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer_i8(&lib, compile, out, ap, bp)
+}
 
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<I8KernelFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: I8KernelFn = *sym;
-        out.iter_mut().for_each(|v| *v = 0);
-        let cp = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(ap, bp, cp));
-        let snapshot = out.to_vec();
-        Some(MeasureI8 {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
-    }
+/// Time an already-loaded int8 peer (the [`abba_min`] half of [`bench_external_i8`]).
+fn time_peer_i8(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [i32],
+    ap: *const u8,
+    bp: *const i8,
+) -> Option<MeasureI8> {
+    // SAFETY: the generated `kbench` is `(const unsigned char*, const signed char*, int*)`.
+    let f: I8KernelFn = unsafe { peer_kbench(lib)? };
+    out.iter_mut().for_each(|v| *v = 0);
+    let cp = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(ap, bp, cp) });
+    let snapshot = out.to_vec();
+    Some(MeasureI8 {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
 }
 
 /// The bf16 twin of [`bench_wukong_i8`]: JIT-compile a Wukong bf16 reduction and time it. `out` is a
@@ -6974,67 +7131,29 @@ fn bench_external_bf16(
     xp: *const u16,
     yp: *const u16,
 ) -> Option<MeasureBf16> {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let src_path = dir.join(format!("{safe}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
-    if std::fs::write(&src_path, src).is_err() {
-        return None;
-    }
-    let t = Instant::now();
-    let status = Command::new(compiler)
-        .args(args)
-        .arg("-o")
-        .arg(&dll)
-        .arg(&src_path)
-        .status();
-    let compile = t.elapsed();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("{compiler} failed to compile {name}.{ext}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("could not run `{compiler}` (skipping)");
-            return None;
-        }
-    }
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer_bf16(&lib, compile, out, xp, yp)
+}
 
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<Bf16KernelFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: Bf16KernelFn = *sym;
-        out[0] = 0.0;
-        let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(xp, yp, op));
-        let snapshot = out[0];
-        Some(MeasureBf16 {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
-    }
+/// Time an already-loaded bf16-reduction peer (the [`abba_min`] half of [`bench_external_bf16`]).
+fn time_peer_bf16(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [f32],
+    xp: *const u16,
+    yp: *const u16,
+) -> Option<MeasureBf16> {
+    // SAFETY: the generated `kbench` is `(const unsigned short*, const unsigned short*, float*)`.
+    let f: Bf16KernelFn = unsafe { peer_kbench(lib)? };
+    out[0] = 0.0;
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot = out[0];
+    Some(MeasureBf16 {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
 }
 
 /// The all-half twin of [`bench_wukong_bf16`]: JIT a Wukong kernel with the `(x, y, out)` all-`u16`
@@ -7104,66 +7223,28 @@ fn bench_external_halfout(
     xp: *const u16,
     yp: *const u16,
 ) -> Option<MeasureHalfOut> {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let src_path = dir.join(format!("{safe}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
-    if std::fs::write(&src_path, src).is_err() {
-        return None;
-    }
-    let t = Instant::now();
-    let status = Command::new(compiler)
-        .args(args)
-        .arg("-o")
-        .arg(&dll)
-        .arg(&src_path)
-        .status();
-    let compile = t.elapsed();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("{compiler} failed to compile {name}.{ext}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("could not run `{compiler}` (skipping)");
-            return None;
-        }
-    }
+    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
+    time_peer_halfout(&lib, compile, out, xp, yp)
+}
 
-    unsafe {
-        let lib = match libloading::Library::new(&dll) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("load {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let sym: libloading::Symbol<HalfOutKernelFn> = match lib.get(b"kbench\0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("symbol kbench in {}: {e}", dll.display());
-                return None;
-            }
-        };
-        let f: HalfOutKernelFn = *sym;
-        let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-        let ns = time_ns(|| f(xp, yp, op));
-        let snapshot: Vec<f32> = out.iter().map(|&b| widen_bf16(b)).collect();
-        Some(MeasureHalfOut {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
-        })
-    }
+/// Time an already-loaded all-half peer (the [`abba_min`] half of [`bench_external_halfout`]).
+fn time_peer_halfout(
+    lib: &libloading::Library,
+    compile: Duration,
+    out: &mut [u16],
+    xp: *const u16,
+    yp: *const u16,
+) -> Option<MeasureHalfOut> {
+    // SAFETY: the generated `kbench` takes and returns `unsigned short*` (bf16 stored bits).
+    let f: HalfOutKernelFn = unsafe { peer_kbench(lib)? };
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot: Vec<f32> = out.iter().map(|&b| widen_bf16(b)).collect();
+    Some(MeasureHalfOut {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
 }
 
 /// Best-of-many-batches timing: warm up, grow the batch until ~50 ms, then take the fastest of many
@@ -8545,23 +8626,107 @@ mod tests {
         assert!(seen >= 40, "only {seen} C kbench signatures found — did the peer generators move?");
     }
 
+    /// Split an `f(…)` argument list into its TOP-LEVEL arguments.
+    ///
+    /// `src[open]` must be the `(` that opens the list. Nesting of `()`/`[]`/`{}` is tracked and
+    /// string / char literals are skipped, so neither the comma inside `&["-O3", "-shared"]` nor the
+    /// one inside `&format!("{}_omp", k.name)` is mistaken for an argument separator, and a `)`
+    /// inside a nested call (`&c_rmsnorm_bwd(r, c)`) does not end the list. Returns `None` if the
+    /// list never closes. Byte-indexed, which is safe because every delimiter it splits on is ASCII
+    /// and the multi-byte text in this file lives inside string literals it skips wholesale.
+    fn split_call_args(src: &str, open: usize) -> Option<Vec<&str>> {
+        let b = src.as_bytes();
+        assert_eq!(b[open], b'(');
+        let (mut depth, mut start, mut i) = (0i32, open + 1, open);
+        let mut args: Vec<&str> = Vec::new();
+        while i < b.len() {
+            match b[i] {
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                // `'x'` / `'\n'` is a char literal; a lone `'` is a lifetime, so just step over it.
+                b'\'' => {
+                    if i + 2 < b.len() && b[i + 2] == b'\'' {
+                        i += 2;
+                    } else if i + 3 < b.len() && b[i + 1] == b'\\' && b[i + 3] == b'\'' {
+                        i += 3;
+                    }
+                }
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        args.push(&src[start..i]);
+                        return Some(
+                            args.into_iter().map(str::trim).filter(|a| !a.is_empty()).collect(),
+                        );
+                    }
+                }
+                b',' if depth == 1 => {
+                    args.push(&src[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// **Every honest-flags C column must come from a `bench_c_cpp*` pair**, so the C++ column
     /// cannot go missing from a family. This is the guard behind the claim `BENCHMARKS.md` used to
     /// make by assertion — "g++ and gcc share a backend, so the C ratios stand for C++" — which no
     /// benchmark run could falsify because ~37 of the ~40 families measured no C++ at all.
     ///
-    /// The rule, scanned out of this file's own text: a `bench_external*` call whose first argument
-    /// is `"c"` is allowed only (a) inside the pair helpers and the relaxed-FP helpers themselves,
-    /// or (b) when the peer's name marks it as one of the deliberately C-only *extra* columns —
-    /// `…_fast` (the `-ffast-math` reassociation column) and `…_omp` (the OpenMP column). Those two
-    /// are normalizations of the C baseline, not a second language, so they have no C++ twin by
-    /// design. Anything else is a family that has quietly reverted to a C-only comparison.
+    /// The rule, scanned out of this file's own text: a `bench_external*` or `build_peer` call whose
+    /// first argument is `"c"` is allowed only (a) inside the pair helpers and the relaxed-FP helpers
+    /// themselves, or (b) when the peer's name marks it as one of the deliberately C-only *extra*
+    /// columns — `…_fast` (the `-ffast-math` reassociation column) and `…_omp` (the OpenMP column).
+    /// Those two are normalizations of the C baseline, not a second language, so they have no C++
+    /// twin by design. Anything else is a family that has quietly reverted to a C-only comparison.
+    ///
+    /// `build_peer` is scanned as well as `bench_external*` because the ABBA change split the
+    /// compile-and-load step out of the timing step: a family that wanted a bare C column would now
+    /// most naturally reach for `build_peer("c", …)`, and a guard that only knew the old entry point
+    /// would go quietly blind to exactly the thing it exists to catch. Both take the ext first and
+    /// the peer name fourth, so one scan covers them.
+    ///
+    /// **This guard was VACUOUS until 2026-08-05 and is only here on the second attempt.** The old
+    /// scan needle was the CONTIGUOUS string `bench_external` + `("c",`, which requires the `"c"`
+    /// literal to sit on the same LINE as the opening paren. That spelling occurs exactly ONCE in
+    /// this ~8,700-line file — inside `bench_c_cpp` itself, which is on the exemption list — while
+    /// all fifteen other C-ext call sites use the rustfmt-produced multi-line spelling with `"c",`
+    /// on the next line. It could not match `bench_external4(` / `_i8(` / `_bf16(` / `_halfout(` at
+    /// all, since `bench_external` + `(` is not a substring of `bench_external4(`. The `unpaired`
+    /// vector was therefore unconditionally empty and the `_fast`/`_omp` branch had never once
+    /// executed. Falsified directly: reverting `bench_matmul_tn`'s `bench_c_cpp` call to a
+    /// multi-line C-only `bench_external` plus `let cm_cpp: Option<Measure> = None;` compiled and
+    /// the old test still reported `ok`. The scan below is therefore **whitespace-insensitive**, is
+    /// **suffix-aware**, and reads the peer name out of the parsed argument list rather than out of
+    /// a fixed-width text window (the window could not reach `"rmsnorm_bwd_fast"` either, because
+    /// the nested `&c_rmsnorm_bwd(r, c)` closes the window's first `)` before the name).
+    ///
+    /// Falsify it again after touching it. A guard nobody has falsified is not a guard.
     #[test]
     fn every_c_column_is_paired_with_a_cpp_column() {
         const SRC: &str = include_str!("main.rs");
-        // Helpers that legitimately hold a bare C-ext `bench_external` call: the pair helpers
-        // (which add the C++ column themselves) and the relaxed-FP column helpers. Spelled without
-        // the literal needle, so this list does not match itself.
+        // Scan only the NON-TEST half of the file. Every real call site lives there, and the cut
+        // makes the needles below unable to match this test's own source text — which is what the
+        // old version was contorting its needle to avoid, at the cost of matching almost nothing.
+        let marker = concat!("#[cfg", "(test)]");
+        let end = SRC.find(marker).expect("main.rs must contain a #[cfg(test)] module");
+        assert!(
+            end > SRC.len() / 2,
+            "the {marker} marker was found at byte {end} of {} — the scan region is not the body \
+             of the file, and a stray early occurrence would hide every call site after it",
+            SRC.len()
+        );
+        let scan = &SRC[..end];
+        // Helpers that legitimately hold a bare C-ext `bench_external*` call: the pair helpers
+        // (which add the C++ column themselves) and the relaxed-FP column helpers.
         const HELPERS: &[&str] = &[
             "bench_c_cpp",
             "bench_c_cpp4",
@@ -8575,7 +8740,7 @@ mod tests {
         // (byte offset, name) of every top-level `fn …` so an occurrence can be attributed.
         let mut fns: Vec<(usize, &str)> = Vec::new();
         let mut at = 0usize;
-        for line in SRC.split_inclusive('\n') {
+        for line in scan.split_inclusive('\n') {
             if let Some(r) = line.strip_prefix("fn ") {
                 let n = r.split(['(', '<', ' ']).next().unwrap_or("");
                 fns.push((at, n));
@@ -8583,41 +8748,85 @@ mod tests {
             at += line.len();
         }
         let owner = |pos: usize| -> &str {
-            fns.iter()
-                .rev()
-                .find(|(o, _)| *o <= pos)
-                .map(|(_, n)| *n)
-                .unwrap_or("<top level>")
+            fns.iter().rev().find(|(o, _)| *o <= pos).map(|(_, n)| *n).unwrap_or("<top level>")
         };
-        // Split so the needle is not present contiguously in the text being scanned.
-        let needle = concat!("bench_external", "(\"c\",");
-        let mut unpaired = Vec::new();
-        let mut pos = 0usize;
-        while let Some(i) = SRC[pos..].find(needle) {
-            let abs = pos + i;
-            pos = abs + needle.len();
-            let f = owner(abs);
-            if HELPERS.contains(&f) {
-                continue;
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        // Split so the base names are not present contiguously in the text being scanned. (Belt and
+        // braces — the `#[cfg(test)]` cut above already excludes this module.)
+        let bases = [concat!("bench_", "external"), concat!("build_", "peer")];
+        let (mut defs, mut calls, mut c_ext, mut exempt) = (0usize, 0usize, 0usize, Vec::new());
+        let mut unpaired: Vec<String> = Vec::new();
+        for base in bases {
+            let mut pos = 0usize;
+            while let Some(i) = scan[pos..].find(base) {
+                let abs = pos + i;
+                pos = abs + base.len();
+                // Not the tail of a longer identifier.
+                if abs > 0 && ident(scan.as_bytes()[abs - 1]) {
+                    continue;
+                }
+                // Consume the ABI suffix (`4` / `_i8` / `_bf16` / `_halfout` / anything added
+                // later), then any whitespace, and require the `(` of a call.
+                let mut j = pos;
+                while j < scan.len() && ident(scan.as_bytes()[j]) {
+                    j += 1;
+                }
+                let name = &scan[abs..j];
+                let lp = j + scan[j..].len() - scan[j..].trim_start().len();
+                if scan.as_bytes().get(lp) != Some(&b'(') {
+                    continue; // a doc-comment mention or a bare fn-item reference, not a call
+                }
+                if scan[..abs].ends_with("fn ") {
+                    defs += 1;
+                    continue;
+                }
+                calls += 1;
+                let line = scan[..abs].matches('\n').count() + 1;
+                let args = split_call_args(scan, lp)
+                    .unwrap_or_else(|| panic!("{name} at line {line}: argument list never closes"));
+                if args.first().copied() != Some("\"c\"") {
+                    continue; // the C++ / Rust / MKL columns
+                }
+                c_ext += 1;
+                let f = owner(abs);
+                if HELPERS.contains(&f) {
+                    continue;
+                }
+                // The peer name is the 4th argument of BOTH families; `_fast` / `_omp` mark the
+                // C-only extra columns.
+                let peer = *args.get(3).unwrap_or_else(|| {
+                    panic!("{name} at line {line}: fewer than 4 arguments — has the ABI changed?")
+                });
+                if peer.contains("_fast") || peer.contains("_omp") {
+                    exempt.push(format!("  line {line}: {f} -> {peer}"));
+                    continue;
+                }
+                unpaired.push(format!("  line {line}: {f} -> {name}(\"c\", …, {peer}, …)"));
             }
-            // The name argument is the 4th; `_fast` / `_omp` mark the C-only extra columns.
-            let window = &SRC[abs..(abs + 400).min(SRC.len())];
-            let head = &window[..window.find(')').unwrap_or(window.len())];
-            if head.contains("_fast") || head.contains("_omp") {
-                continue;
-            }
-            unpaired.push((f, head.replace('\n', " ")));
         }
         assert!(
             unpaired.is_empty(),
             "these benches take a C column WITHOUT a C++ twin — use bench_c_cpp*(…) instead:\n{}",
-            unpaired
-                .iter()
-                .map(|(f, h)| format!("  {f}: {h}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            unpaired.join("\n")
         );
-        // …and a floor, so deleting every pair call cannot make the assertion above pass vacuously.
+        // Floors, so that renaming/deleting the things being scanned cannot make the assertion
+        // above pass by finding nothing. 6 definitions (5 `bench_external*` ABI families plus
+        // `build_peer`), 65 calls, 16 of them C-ext and 8 of those exempt (5 `_omp` + 3 `_fast`)
+        // at the time of writing.
+        assert_eq!(
+            defs, 6,
+            "expected the 5 bench_external* ABI families plus build_peer, found {defs} definitions"
+        );
+        assert!(calls >= 58, "only {calls} peer call sites — did the scan stop matching?");
+        assert!(c_ext >= 14, "only {c_ext} C-ext call sites — is the first argument still the ext?");
+        assert!(
+            exempt.len() >= 6,
+            "only {} C-only extra columns recognized, so the `_fast`/`_omp` exemption is close to \
+             dead code and the guard is close to vacuous again — found:\n{}",
+            exempt.len(),
+            exempt.join("\n")
+        );
+        // …and a floor on the pairs themselves, so deleting every pair call is loud too.
         let pairs = SRC.matches(concat!("bench_c_cpp", "(")).count()
             + SRC.matches(concat!("bench_c_cpp", "4(")).count()
             + SRC.matches(concat!("bench_c_cpp", "_i8(")).count()
@@ -8702,19 +8911,72 @@ mod tests {
     }
 
     /// Wukong dispatches a cache-blocked transpose; the peer must be blocked too, or the bench
-    /// measures loop tiling rather than codegen.
+    /// measures loop tiling rather than codegen. The interior nest must also keep its
+    /// **constant-trip-count** tile body (the full-tile fast path), because an always-clamped bound
+    /// would slow the peer at the tile-aligned sizes and inflate Wukong there.
     #[test]
     fn transpose_peer_stays_cache_blocked() {
-        for ns in [1024usize, 2048] {
-            let s = c_transpose(ns);
-            assert!(s.contains("#define TB 32"), "c_transpose lost its blocking:\n{s}");
+        for &(r, c, _) in TRANSPOSE_SHAPES {
+            for (which, s) in [("c_transpose", c_transpose(r, c)), ("omp", c_transpose_omp(r, c))] {
+                assert!(s.contains("#define TB 32"), "{which} lost its blocking:\n{s}");
+                assert!(
+                    s.contains("for (long ii=0;ii<NR;ii+=TB) for (long jj=0;jj<NC;jj+=TB)"),
+                    "{which} is back to the naive un-tiled nest:\n{s}"
+                );
+                assert!(
+                    s.contains("if (ii+TB<=NR && jj+TB<=NC)")
+                        && s.contains("for (long i=ii;i<ii+TB;i++)"),
+                    "{which} lost its constant-trip-count full-tile fast path — an always-clamped \
+                     tile bound handicaps the peer at the tile-aligned sizes:\n{s}"
+                );
+            }
+            assert!(c_transpose_omp(r, c).contains("#pragma omp parallel for"));
+            // The Rust peer must run the same algorithm or the third column is not comparable.
+            let rs = rust_transpose(r, c);
+            assert!(rs.contains("const TB: usize = 32;") && rs.contains("if ii+TB<=NR && jj+TB<=NC"));
+        }
+    }
+
+    /// **The transpose sweep must measure both stride regimes.** Until 2026-08-05 it ran
+    /// `[1024, 2048]` and nothing else — two power-of-two squares, the shapes at which a
+    /// column-major write stream aliases in L1 and the blocked C peer is worst. The ~5–7× that
+    /// produced was published as the transpose result; at 1000²/1031² the same kernel pair measures
+    /// ~1.4×. Sweeping only the favourable sizes is not a benchmark of the compiler, so this pins
+    /// that the general regime is present, is the majority of the sweep, includes a non-square
+    /// shape, and that the favourable regime is still there to be reported beside it.
+    #[test]
+    fn transpose_sweep_covers_both_stride_regimes() {
+        let alias: Vec<_> = TRANSPOSE_SHAPES.iter().filter(|s| s.2).collect();
+        let general: Vec<_> = TRANSPOSE_SHAPES.iter().filter(|s| !s.2).collect();
+        assert!(!alias.is_empty(), "the power-of-two regime must still be reported");
+        assert!(
+            general.len() >= 3 && general.len() > alias.len(),
+            "the general (non-power-of-two) regime must dominate the sweep, got {} general vs {} \
+             aliasing — reporting mostly power-of-two shapes measures the size, not the compiler",
+            general.len(),
+            alias.len()
+        );
+        // The `aliasing` flag has to mean what it says, or the split is decorative.
+        for &&(r, c, aliasing) in &alias {
             assert!(
-                s.contains("for (long ii=0;ii<NS;ii+=TB)"),
-                "c_transpose is back to the naive un-tiled nest:\n{s}"
+                r.is_power_of_two() && c.is_power_of_two(),
+                "{r}x{c} is flagged aliasing={aliasing} but its strides are not powers of two"
             );
-            assert_eq!(ns % 32, 0, "the blocked transpose peer needs NS % 32 == 0");
-            // The OpenMP twin must stay the same algorithm, or the C(omp) column is not comparable.
-            assert!(c_transpose_omp(ns).contains("for (long ii=0;ii<NS;ii+=TB)"));
+        }
+        for &&(r, c, _) in &general {
+            assert!(
+                !r.is_power_of_two() && !c.is_power_of_two(),
+                "{r}x{c} is flagged as the general regime but a stride is a power of two"
+            );
+        }
+        assert!(
+            general.iter().any(|s| s.0 != s.1),
+            "the general regime needs a non-square shape: a square transpose reads and writes at \
+             the SAME stride, so it cannot show a rectangular layout conversion"
+        );
+        // Every shape must still spill L2 (~2 MiB/core here), or the bench measures cache residency.
+        for &&(r, c, _) in TRANSPOSE_SHAPES.iter().collect::<Vec<_>>().iter() {
+            assert!(2 * r * c * 4 >= 4 << 20, "{r}x{c} moves under 4 MiB — too small to be L2-bound");
         }
     }
 
