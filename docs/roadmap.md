@@ -253,9 +253,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   dispatches to a `B=32` cache-blocked `wukong_transpose_f32[_parallel]`. The naive transpose writes
   `dst` with stride `R` (a cache miss per element for large `R`) and gcc/rustc do not loop-tile it at
   `-O3`. Against a peer that is ALSO 32×32 blocked (which is what a competent C programmer writes,
-  and what the xbench peer does since 2026-08-04) the blocked kernel is a **single-core tie**
-  (1.00–1.03×); the win is the `@parallel` form, ~4.8–7.1× vs 1-thread C and ~1.0–1.1× vs an all-core
-  OpenMP peer running the same blocked nest. This is a memory-bound layout op (attention score /
+  and what the xbench peer does since 2026-08-04) the blocked kernel was published as a **single-core
+  tie** (1.00–1.03×), with the win in the `@parallel` form, ~4.8–7.1× vs 1-thread C and ~1.0–1.1× vs
+  an all-core OpenMP peer running the same blocked nest. **⚠ Both figures are unverified as of
+  2026-08-05:** they were measured only at 1024²/2048², power-of-two strides at which the peer's
+  column-major write stream aliases in L1 — a property of the size, not of anyone's codegen — and
+  they no longer reproduce on the current tree. `wukong_xbench` now sweeps 1000², 1031² and 1100×950
+  alongside them and reports the two regimes separately; the numbers here await a fresh AC+full-power
+  round. See BENCHMARKS.md "Matrix transpose". This is a memory-bound layout op (attention score /
   weight-layout transposes). A permutation, so bit-exact (`tests/run/transpose_f32.wk`).
   **bf16/f16** transposes dispatch to the same blocked kernel at 16-bit width (`wukong_transpose_u16`, one
   kernel for both — a transpose moves the raw bits) for the half-precision KV/attention layouts (`transpose_bf16.wk`).

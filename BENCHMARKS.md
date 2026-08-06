@@ -18,9 +18,21 @@ every "vs C" ratio.
 > falsify it. `wukong_xbench` now measures the column everywhere (`bench_c_cpp`, which returns the C
 > and C++ columns as an inseparable pair, plus the `every_c_column_is_paired_with_a_cpp_column`
 > regression test). **Any "vs C++" figure below still covers only the three sections that always had
-> the column; the rest await a full AC+full-power round.** A first smoke run already shows rows where
-> the C and C++ columns differ by well more than "a few percent", so the assertion should be treated
-> as unproven rather than as a shortcut.
+> the column; the rest await a full AC+full-power round.** The assertion should be treated as
+> **unproven** — not as disproven, and not as a shortcut.
+>
+> **Withdrawn 2026-08-05: "a first smoke run already shows rows where the C and C++ columns differ by
+> well more than a few percent".** That sentence stood here as an empirical claim sourced from a run
+> this document's own commit declared non-reportable, and it is withdrawn on two counts. First, it
+> cannot be checked: no numbers were published with it. Second, the run behind it could not have
+> separated a real front-end difference from the harness's own **ordering bias** — until 2026-08-05
+> every `bench_c_cpp*` pair timed the C++ peer *second*, always, so any within-pair drift was charged
+> to C++ in every family. Measured directly by putting the identical C source through the identical
+> compiler in the second slot, the second slot came out slower on 6 of 7 probe rows, by up to +17%.
+> (That magnitude was measured in a battery-state run and is not itself a reportable figure; the
+> existence and the consistent direction of the effect are what withdraw the claim.) The pair is now
+> timed **A B B A** with each column keeping its own fastest sample, so a future round can answer the
+> question — this one could not, and should not have been quoted as if it had.
 
 Two **additional C peer columns** normalize the two disclosed baseline asymmetries (see Fairness
 notes): **C(fast)** — the same C source recompiled `-O3 -march=native -ffast-math`, so gcc may
@@ -248,7 +260,7 @@ tolerance for the reassociated-float ones).
 | **TN weight-gradient** (`dW=dYᵀ·X`) | **~2.6–9.2×** | ~3.1–13.9× | transpose-prepass + the tiled kernel, vs the natural `kij` nest gcc vectorizes but does not tile *(corrected 2026-08-04: was ~128×/~445× against a peer that read both operands column-strided)* |
 | **int8 `nn.Linear`** (`vpdpbusd`) | ~1.5–2.5× | ~4.6–14.7× | 2×4 register tile halves B traffic (vs gcc's own `vpdpbusd`) |
 | **Column reductions** (sum/max/min/absmax/mean/L2/RMS) | **tie → 1.8× SLOWER** | ~1.0–1.4× | *nothing* — gcc auto-vectorizes the natural row-outer nest and matches or beats the kernel. The old ~29–50× was the peer's column-outer loop order *(corrected 2026-08-04)* |
-| **Transpose** (f32) | ≈tie (1.00–1.03×) | ~4.8–7.1× | *nothing single-core* once the peer is blocked too; `@parallel` adds cross-core bandwidth *(corrected 2026-08-04: was ~1.5× against an unblocked peer)* |
+| **Transpose** (f32) | ≈tie (1.00–1.03×) — **⚠ unverified, and power-of-two shapes only** | ~4.8–7.1× — same caveat | *nothing single-core* once the peer is blocked too; `@parallel` adds cross-core bandwidth *(corrected 2026-08-04: was ~1.5× against an unblocked peer)*. **2026-08-05: these figures come from a sweep that only ever ran 1024²/2048², the stride regime that penalizes the peer; and they no longer reproduce on the current tree. See "Matrix transpose" below — both need a fresh AC round over both regimes.** |
 | **Fused norms** (softmax/LN/RMS) | ~1.9–6.6× | memory-bound | single-pass fusion + 256-bit `exp`; their float reductions stay sequential |
 | **Reductions** (dot / ssd) | ~2.6–2.9× | ~8–26× | lane accumulators; their reduction is a serial `vaddss` chain |
 | **Activations** (35-op `vmath`) | ~2–11.5× | ~28× | hand-AVX2 256-bit transcendentals vs scalar libm |
@@ -452,7 +464,7 @@ published value.
 | colargmax | 4096×1024 | ~~4.10×~~ | 2.47× slower | 2.46× slower | 1.7× |
 | colargmin | 1024×1024 | ~~2.69×~~ | 1.68× slower | 1.86× slower | 1.6× |
 | colargmin | 4096×1024 | ~~3.48×~~ | 1.71× slower | 1.98× slower | 2.0× |
-| transpose | 2048×2048 | ~~2.20×~~ | 1.00× (tie) | — | 2.2× |
+| transpose | 2048×2048 | ~~2.20×~~ | 1.00× (tie) **⚠ pow2-only, unverified** | — | 2.2× |
 
 The `@parallel` column for these collapses too: colsum/colmax/colmin/colmaxabs/colstat move from
 +16× … +55× down to between 2.0× *slower* and 1.4× faster, i.e. **all-core Wukong roughly ties
@@ -467,8 +479,8 @@ single-threaded C** on the column-reduction family.
 | matmul_tn | 1024³ | ~~120.34×~~ | **5.28×** (9.16× rd 2) | 5.38× | 22.8× |
 | matmul_tn `@parallel` | 1024³ | ~~436.23×~~ | **13.90×** | 14.16× | 31.4× |
 | conv2d 3×3 | Cin16 20² → 64@18² | ~~5.90×~~ | **1.55×** | **1.12× slower** | 3.8× |
-| transpose | 1024×1024 | ~~1.48×~~ | 1.03× (tie) | — | 1.4× |
-| transpose `@parallel` | 2048² | ~~14.83×~~ | 7.05× (1.12× vs C(omp)) | — | 2.1× |
+| transpose | 1024×1024 | ~~1.48×~~ | 1.03× (tie) **⚠ pow2-only, unverified** | — | 1.4× |
+| transpose `@parallel` | 2048² | ~~14.83×~~ | 7.05× (1.12× vs C(omp)) **⚠ pow2-only, unverified** | — | 2.1× |
 | rowargmax | 1024×1024 | ~~3.35×~~ | 2.45× | 1.92× | 1.4× |
 | rowargmin | 4096×1024 | ~~3.45×~~ | 2.29× | 2.08× | 1.5× |
 | gemv | 4096×4096 | ~~3.57×~~ | 3.16× | **1.09× slower** | 1.1× |
@@ -584,6 +596,23 @@ within the session's run-to-run noise.
   serial twin); if the probe fails the columns are skipped with a note. The parallel-GEMM peers in
   matmul/linear/transpose/colsum are measured inside the all-core thermal group *before* `Wuk(par)`,
   so any residual heat lands on Wukong, never the peer.
+- **The C and C++ columns are timed A B B A, each keeping its own fastest sample (2026-08-05).**
+  Ordering within a pair used to be fixed — `let c = …; let cpp = …;` at every one of the ~44 pair
+  call sites — so the C++ peer was *always* second and every within-pair drift (clock ramp, thermal,
+  a hybrid-scheduler P↔E migration) was charged to C++ in every family. That is a systematic bias in
+  the published "vs C++" ratio, not noise: repeating the suite cannot cancel it, because the order is
+  the same every time. Probed by putting the identical C source through the identical compiler in the
+  second slot, the second slot was slower on 6 of 7 rows, by up to +17%. Both peers are now built
+  first (so no compiler process spawn — the noisiest thing the harness does — sits between two timed
+  regions about to be compared) and then timed A, B, B, A: each column gets one early and one late
+  slot, so a monotone drift contributes equally to both minima and cancels in the ratio. Taking each
+  column's minimum is the rule `time_ns` already applies across its 14 blocks, one level up. The
+  cost, paid deliberately, is that each peer is timed twice.
+- **The transpose sweep covers both stride regimes (2026-08-05).** Sweeping only power-of-two shapes
+  measured the size at which the peer's column-major write stream aliases in L1, not the codegen; the
+  sweep now includes 1000², 1031² and 1100×950, labels each row's regime and geomeans them apart.
+  Same rule as the peer-spelling corrections: if a shape family flatters us, it is reported *beside*
+  the general case, never *as* it.
 - **Matmul dispatch is the value proposition, stated plainly.** The C/Rust columns are the *naive
   nest a programmer writes*; Wukong's compiler optimizes it the way a tensor compiler should. The
   win **grows with size** precisely because tiling/packing matters more as the data stops fitting in
@@ -1248,7 +1277,7 @@ line per element — so this compounds the bf16 widen win with the transpose-pre
 weight-gradient GEMM already documents (`~42–445×` idiomatic C there). `tests/run/matmul_{bf16,f16}_tn.wk`;
 the runtime twin pins both precisions == the f32 TN kernel on the widened operands, serial == parallel.
 
-### Matrix transpose — a tie once the peer is blocked too
+### Matrix transpose — ⚠ published as a tie, now unverified and regime-limited
 
 `dst = srcᵀ` is the memory-bound layout op behind attention score transposes and weight-layout
 conversions. Wukong folds the nest to the `B=32` cache-blocked **`wukong_transpose_f32`**, which
@@ -1265,7 +1294,26 @@ cross-language check is **bit-exact** — a stronger bar than the GEMM tolerance
 > **29.51 ms naive → 24.31 ms naive + `restrict` → 14.09 ms 32×32-blocked + `restrict` — a 2.09×
 > total handicap.**
 
-Measured with the blocked peer (2026-08-04, same-run adjacent, AC+charging — all-core directional):
+> **⚠ Both rows below are power-of-two shapes, and that is a biased sample (2026-08-05).** Until
+> 2026-08-05 `bench_transpose` swept `ns in [1024, 2048]` and nothing else. A transpose reads one
+> matrix row-major and writes the other column-major, so the peer's write stream steps by the
+> destination row stride; when that stride in bytes is a large power of two, consecutive writes map
+> onto a few L1 sets and the blocked C peer thrashes on set conflicts. Wukong's tile-mover is much
+> less exposed. **That is a property of the SIZE, not of anyone's codegen** — and it was the only
+> regime this benchmark ever measured. The harness now also sweeps 1000², 1031² (prime) and the
+> rectangular 1100×950, labels each row's regime, and closes the section with a summary that geomeans
+> the two regimes apart and names the general-stride one as the result. Whatever these two rows are
+> re-measured to be, they are the favourable case and must not be quoted as the transpose result.
+>
+> **⚠ These two rows are also stale against the current tree.** Re-running the section on
+> `integration/wave2-opt-merge` puts single-core well above the "tie" recorded here, in the same
+> direction at both sizes and both before and after the 2026-08-05 sweep change (so it is not caused
+> by that change). No corrected number is published here because every run available on 2026-08-05
+> was battery-state and therefore non-reportable. **Treat the single-core row as unverified pending a
+> fresh AC+full-power round**, and re-measure both regimes when one is possible.
+
+Measured with the blocked peer (2026-08-04, same-run adjacent, AC+charging — all-core directional;
+**power-of-two strides only — see the warnings above**):
 
 | size  | 1-core vs C | `@parallel` vs C | `@parallel` vs C(omp) | was (1-core / `@parallel`) |
 |-------|-------------|------------------|------------------------|-----------------------------|
@@ -2359,7 +2407,7 @@ every one of these was previously published as a win):
   1.8× slower** than gcc on the natural row-outer nest — 15 of the 16 measured rows are losses, and
   the >L3 4096×1024 shape is a consistent ~1.65× loss across two independent rounds. Was ~29–50×.
 - **Column argmax/argmin** (axis-0): between a **tie and 2.5× slower** (round 1: 1.49–2.47× slower on all four rows; round 2: 1.05× faster to 1.74× slower). Was ~2.7–5.3×.
-- **f32 transpose, single core:** a **tie** (1.00–1.17× across two rounds) once the peer is blocked too. Was ~1.5×.
+- **f32 transpose, single core:** a **tie** (1.00–1.17× across two rounds) once the peer is blocked too. Was ~1.5×. **⚠ 2026-08-05: both rounds were power-of-two shapes only — the regime that penalizes the peer — and neither reproduces on the current tree. Unverified pending a fresh AC round over both regimes; see "Matrix transpose".**
   (`@parallel` still wins 4.8–7.1× vs 1-thread C, ~1.0–1.1× vs all-core OpenMP.)
 - **bf16 reductions vs `C(fast)`:** **1.1–1.8× slower**. The plain-C multiple (~4–7.6×) is entirely
   the withheld `-ffast-math`.
