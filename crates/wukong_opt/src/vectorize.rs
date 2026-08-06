@@ -77,6 +77,32 @@
 //! (`wukong_interp`'s `Op::Load` arm) but its **vector** load gathers slots verbatim. Widening a
 //! half-precision load would therefore drop a rounding the scalar path performs — a silent
 //! interp-vs-native divergence, the worst possible outcome. [`lane_bytes`] refuses them.
+//!
+//! # Reading `WUKONG_VEC_TRACE=1`
+//!
+//! Setting it makes [`pick`] print one line per decision to stderr. **The stream is not one line
+//! per loop.** This pass is a [`Pass`], the pass manager re-runs the whole list until no pass
+//! reports a change, and `pick` re-walks *every* loop of the function on each of those iterations —
+//! so a loop that is declined is re-declined, with the identical message, once per fixpoint
+//! iteration after the one that widened something. A `WIDEN` line appears once (the header goes
+//! into [`Vectorize::done`]); a `declined` line appears as many times as the fixpoint ran.
+//!
+//! Measured on this tree, the two `wukong_xbench` general programs at their default dimensions:
+//!
+//! ```text
+//!   general_loss_focal.wk (R=8192 C=1024)         general_scan_s6.wk (T=2048 D=256 N=16)
+//!   8 lines total:                                5 lines total:
+//!     x1 WIDEN bb13 w=4 lin=42 guards=1 reds=1      x1 WIDEN bb10 w=4 lin=53 guards=3 reds=1
+//!     x1 WIDEN bb16 w=4 lin=8  guards=0 reds=0      x1 WIDEN bb1  w=4 lin=3  guards=0 reds=0
+//!     x1 WIDEN bb25 w=4 lin=12 guards=1 reds=0      x3 declined bb16: induction step is not 1
+//!     x5 declined bb19: the induction variable
+//!        is used for something other than addressing
+//! ```
+//!
+//! Quote it **with the repeat counts** or say explicitly that you have collapsed them. A
+//! de-duplicated paste reads like a per-loop verdict list, which is a different (and much stronger)
+//! claim than what the tool actually reports, and it hides the one thing the repetition does tell
+//! you: how many times the fixpoint went round.
 
 use wukong_mir::{
     BasicBlock, BinOp, BlockId, CastKind, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId,
@@ -379,6 +405,9 @@ struct GuardBase {
 /// `MemDep::Carried`, so a loop whose memory was never analyzed cannot be widened by accident —
 /// and because both early filters call the same code `plan_loop` does.
 fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<VecPlan> {
+    // `WUKONG_VEC_TRACE=1` prints one line per decision. Note that this whole function re-runs on
+    // every fixpoint iteration of the pass manager, so a DECLINE repeats once per iteration while a
+    // WIDEN appears once — see the module docs before quoting the stream anywhere.
     let trace = std::env::var_os("WUKONG_VEC_TRACE").is_some();
     let decline = |header: u32, why: &str| {
         if trace {
