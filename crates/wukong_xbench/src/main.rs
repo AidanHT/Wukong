@@ -3592,8 +3592,15 @@ fn rust_lrscan(rows: usize, cols: usize) -> String {
 /// step, also EMA). The carried `h` is a true loop-carried dependency, so gcc/rustc cannot auto-vectorize
 /// the inner time loop (like cumsum) and emit **one serial mul+add chain** per row — latency-bound, a few
 /// GB/s. Wukong's kernel **interleaves 4 independent rows**, keeping four chains in flight to fill the
-/// idle ports: a genuine single-core WIN (~1.6–1.9×), since gcc/rustc may not legally re-order an f32
-/// recurrence across rows. `@parallel` maps independent row chunks across cores on top (~5–8×). GB/s =
+/// idle ports: a genuine single-core WIN (~1.6–1.9×).
+///
+/// PEER-FAIRNESS NOTE (corrected 2026-08-06). This used to justify that win by saying "gcc/rustc may
+/// not legally re-order an f32 recurrence across rows". That is **false**: the rows are independent,
+/// so unroll-and-jam across `r` is perfectly legal and changes no value — gcc and rustc simply do not
+/// do it here. The honest statement is that the peer is the *idiomatic* spelling and neither
+/// toolchain finds the row interleave on its own, not that it is forbidden from finding it. What IS
+/// illegal without `-ffast-math` is re-ordering *within* a row, which is why the peer's inner time
+/// loop stays one serial chain. `@parallel` maps independent row chunks across cores on top (~5–8×). GB/s =
 /// `3·R·C·4` (read `a` + read `b` + write `out`). The recurrence is sequential within a row (no
 /// reassociation) and the kernel does plain mul+add (two roundings) where gcc may fuse to one `fma`, so
 /// the cross-check is a ~1-ULP magnitude-normalized tolerance like cumsum.
