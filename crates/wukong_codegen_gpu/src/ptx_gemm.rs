@@ -7,7 +7,12 @@
 //! per K-step (BK=16); the inner product reads them from shared into registers and issues 16 FMAs
 //! per K. Out-of-range threads load zeros and skip the C store, so ragged M/N/K work. Two entries:
 //! `gemm_nt_rb` (`C = A·Bᵀ`, nn.Linear) and `gemm_nn_rb` (`C = A·B`).
+//!
+//! Instruction mix: plain f32 FMAs, `.shared` staging and `bar.sync` — nothing above the Ampere ISA,
+//! so the module is tagged at the [`crate::ptx_target::HDR_SM80`] floor and driver-JITs on every part
+//! from A100 up, not just on the Ada box it was developed on.
 
+use crate::ptx_target::HDR_SM80;
 use std::sync::OnceLock;
 
 const BM: u32 = 64; // C tile rows per block
@@ -143,7 +148,7 @@ fn entry(name: &str, transposed: bool, tag: &str) -> String {
 pub fn gemm_rb_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(HDR_SM80);
         m += &entry("gemm_nt_rb", true, "nt");
         m += &entry("gemm_nn_rb", false, "nn");
         m
@@ -177,5 +182,19 @@ mod tests {
             );
         }
         assert_eq!(ptx.matches(".visible .entry ").count(), 2);
+    }
+
+    /// Retarget gate (GPU_RETARGET_PLAN.md §5, Phase 2): this module's instruction mix is Ampere-legal,
+    /// so it must carry the `sm_80` FLOOR header, never the development box's `sm_89`. PTX is only
+    /// forward-compatible — an `sm_89`-tagged module loads on zero A100s — and the tag is invisible to
+    /// every gate that runs on this Ada card, so nothing but this assert keeps the floor.
+    #[test]
+    fn gemm_rb_module_opens_at_the_sm80_floor() {
+        let ptx = gemm_rb_ptx();
+        assert!(ptx.starts_with(HDR_SM80), "gemm_rb must open with ptx_target::HDR_SM80");
+        assert!(
+            !ptx.contains(crate::ptx_target::TARGET_SM89),
+            "gemm_rb emits no Ada-only instruction, so it must not be tagged sm_89"
+        );
     }
 }
