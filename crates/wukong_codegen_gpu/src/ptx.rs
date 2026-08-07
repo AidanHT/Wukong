@@ -3,15 +3,19 @@
 //!
 //! These are the GPU analogue of the AVX2 microkernels in `wukong_runtime`: each recognized op
 //! (saxpy, elementwise, reduction, GEMM, …) gets a kernel the host launches over device buffers.
-//! Target is `sm_89` (Ada / RTX 4050). This file holds the deliberately simple *base* kernels; the
-//! register-blocked and tensor-core GEMMs live in the `ptx_gemm` / `ptx_wmma` / `ptx_fp8` / `ptx_int8`
-//! / `ptx_int4` siblings, and the fused norms in `ptx_norm`.
+//! Every kernel here is plain f32 / `cvt` / `.shared` code with no instruction above the Ampere ISA,
+//! so each module is tagged with the [`crate::ptx_target::HDR_SM80`] floor — the LOWEST target its
+//! mix is legal on, which driver-JITs on Ampere and every later part. The device's own architecture
+//! (`Gpu::target()`) belongs at the dispatch, peer-arch and cubin-key seams, never in the tag. This
+//! file holds the deliberately simple *base* kernels; the register-blocked and tensor-core GEMMs live
+//! in the `ptx_gemm` / `ptx_wmma` / `ptx_fp8` / `ptx_int8` / `ptx_int4` siblings, and the fused norms
+//! in `ptx_norm`.
 
 /// `y[i] = a*x[i] + y[i]` (the canonical Phase-0 spike). `a` is fused via `fma.rn` so a CPU
 /// reference using `f32::mul_add` matches bit-for-bit.
 pub const SAXPY: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry saxpy(
@@ -58,7 +62,7 @@ DONE:
 /// `out[i] = x[i] + y[i]` — exact IEEE add, matches a CPU reference bit-for-bit.
 pub const VADD: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry vadd(
@@ -110,7 +114,7 @@ DONE:
 /// `dst` is N×f16 (2 bytes/elem); one thread per element, grid-stride not needed (host sizes the grid).
 pub const CAST_F32_F16: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry cast_f32_f16(
@@ -170,7 +174,7 @@ DONE:
 /// forward kernel a plain cast and the inverse a plain copy. Gated by `head_transpose_round_trips`.
 pub const HEAD_TRANSPOSE_PTX: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry cast_transpose_qkv(
@@ -295,7 +299,7 @@ DONE:
 /// pass (`2·len` floats moved).
 pub const COPY_V4: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry copy_v4(
@@ -367,6 +371,7 @@ DONE:
 }
 "#;
 
+use crate::ptx_target::HDR_SM80;
 use std::sync::OnceLock;
 
 /// `0f` + the IEEE-754 f32 hex of `x` — a PTX f32 immediate (`mov.f32 %f, 0f3F800000`). Built from
@@ -428,7 +433,7 @@ DONE:
             )
         };
 
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(HDR_SM80);
 
         // relu(x) = max(x, 0)
         m += &entry(
@@ -482,7 +487,7 @@ DONE:
 /// `BLOCK` must stay 256 (the `sdata[1024]` static shared array and the unrolled tree assume it).
 pub const REDUCE: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry reduce_sum(
@@ -722,7 +727,7 @@ END:
 /// the C store, so ragged M/N/K are handled. `A,B,C` are f32; `fma.rn` accumulation.
 pub const GEMM: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry gemm_nt(
@@ -971,6 +976,36 @@ mod tests {
             if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
                 panic!("{what}: PTX must be pure ASCII (the driver rejects the module) -- line {}: {line}", i + 1);
             }
+        }
+    }
+
+    /// Retarget gate (GPU_RETARGET_PLAN.md §5, Phase 2): every base family must open with the `sm_80`
+    /// FLOOR header from `ptx_target`, never the development box's `sm_89`. These modules are plain
+    /// f32/`cvt`/`.shared` code with nothing above the Ampere ISA, and PTX is forward-compatible only
+    /// — an `sm_89` tag buys nothing and fails `cuModuleLoadData` on every A100, while being invisible
+    /// to every device gate in this crate (an Ada card loads either tag happily). The consts here are
+    /// literal PTX text, so this assert is what actually ties them to `ptx_target::HDR_SM80`.
+    #[test]
+    fn every_dispatched_ptx_family_opens_at_the_sm80_floor() {
+        let modules: [(&str, &str); 8] = [
+            ("SAXPY", SAXPY),
+            ("VADD", VADD),
+            ("COPY_V4", COPY_V4),
+            ("CAST_F32_F16", CAST_F32_F16),
+            ("HEAD_TRANSPOSE_PTX", HEAD_TRANSPOSE_PTX),
+            ("REDUCE", REDUCE),
+            ("GEMM", GEMM),
+            ("vmath_ptx", vmath_ptx()),
+        ];
+        for (what, ptx) in modules {
+            assert!(
+                ptx.trim_start().starts_with(HDR_SM80),
+                "{what}: must open with ptx_target::HDR_SM80 (the family's lowest legal target)"
+            );
+            assert!(
+                !ptx.contains(crate::ptx_target::TARGET_SM89),
+                "{what}: emits no Ada-only instruction, so it must not be tagged sm_89"
+            );
         }
     }
 
