@@ -5,14 +5,20 @@
 //! are 8-bit operands in the same `m16n8k32` geometry) — so this module mirrors [`crate::ptx_fp8`] tile
 //! for tile, swapping the `mma` type to `.s32.u8.s8.s32` and the accumulators from f32 to **s32**.
 //!
-//! **Target floor: `sm_80`** ([`crate::ptx_target::HDR_SM80_V84`]). This family shares fp8's tile
-//! *geometry* but none of its Ada-only *instructions*: the full emitted set is `mma.sync.m16n8k32` with
-//! `.u8`/`.s8` operands, `ldmatrix.sync.aligned.m8n8.x2/x4.shared.b16`, and
+//! **Module floor: `.version 7.8` / `.target sm_80`** ([`crate::ptx_target::HDR_SM80`]). This family
+//! shares fp8's tile *geometry* but none of its Ada-only *instructions*: the full emitted set is
+//! `mma.sync.m16n8k32` with `.u8`/`.s8` operands, `ldmatrix.sync.aligned.m8n8.x2/x4.shared.b16`, and
 //! `cp.async.cg.shared.global` / `commit_group` / `wait_group` — every one of them Ampere-legal
 //! (PTX ISA: 8-bit integer `m16n8k32` MMA is `sm_80`+). These modules were tagged `sm_89` only because
 //! that was the development card's own arch — a tag that loads on **zero** A100s while buying nothing.
-//! The `.version` stays **8.4** (a driver/ISA-vintage requirement, orthogonal to the arch floor); only
-//! the target floats down.
+//!
+//! The `.version` is the **driver** floor the way `.target` is the *device* floor, and it was likewise
+//! over-declared: `.version 8.4` makes `cuModuleLoadData` demand driver **r550+**, while the ceiling
+//! instruction in every module this file emits is `mma.sync.aligned.m16n8k32...u8.s8` = **PTX ISA 7.0**
+//! (`ldmatrix` 6.5, `cp.async` 7.0, and the `.extern .shared` window is launch-time state, not an ISA
+//! feature). Target fleets run r535/r545, so the whole family sits at **7.8** — nothing it emits needs
+//! more, and every byte above the ceiling is a load failure on the exact parts this retarget exists to
+//! reach. Both floors are now the LOWEST the instruction mix is legal on.
 //!
 //! **Semantics** match Wukong's CPU int8 GEMM (the AVX-VNNI `vpdpbusd` quantized `nn.Linear`):
 //! **`u8` activations × `i8` weights → `i32`**, `C = A·Bᵀ`. The integer accumulate is associative and
@@ -21,7 +27,7 @@
 //! wraps mod 2³², which is exactly what the CPU reference (wrapping `i32` adds) computes.
 
 use crate::gpu::{smem_mode_for, SmemMode, DSMEM_DECL, DSMEM_SYM, STATIC_SMEM_CAP};
-use crate::ptx_target::{HDR_SM80, HDR_SM80_V84};
+use crate::ptx_target::HDR_SM80;
 
 /// One `mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32` tile: A is `16×32` **u8** row-major, B is
 /// `32×8` **i8** column-major (the `.row.col` operand layout), D = A·B is `16×8` **i32** row-major. One
@@ -30,9 +36,9 @@ use crate::ptx_target::{HDR_SM80, HDR_SM80_V84};
 /// same address math as [`crate::ptx_fp8::FP8_TILE`] — only the `mma` type and accumulator/store width
 /// differ (s32, but s32 and f32 are both 4 bytes, so even the store strides are unchanged).
 ///
-/// A `const` cannot interpolate [`HDR_SM80_V84`], so the header is spelled literally here and pinned
+/// A `const` cannot interpolate [`HDR_SM80`], so the header is spelled literally here and pinned
 /// against the constant by `tests::int8_ptx_is_ascii_and_structural`.
-pub const INT8_TILE: &str = r#".version 8.4
+pub const INT8_TILE: &str = r#".version 7.8
 .target sm_80
 .address_size 64
 
@@ -111,7 +117,7 @@ pub fn int8_gemm_mt_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
         let (tm, tn) = (INT8_TM, INT8_TN);
-        let mut s = format!("{HDR_SM80_V84}\n");
+        let mut s = format!("{HDR_SM80}\n");
         s += ".visible .entry int8_gemm_nt_mt(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{\n";
         s += "    .reg .pred %p;\n";
         s += "    .reg .b32 %M,%N,%K,%lane,%grp,%tg4,%tg2,%row0,%col0,%k,%tmp;\n";
@@ -313,7 +319,7 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
 
         // The fused-dequant variant takes an extra `scale[N]` (f32) per-output-channel scale param.
         let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
-        let mut s = format!("{HDR_SM80_V84}\n");
+        let mut s = format!("{HDR_SM80}\n");
         s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
         s += &format!("    .shared .align 16 .b8 smemA[{}];\n", 2 * tile_bytes);
         s += &format!("    .shared .align 16 .b8 smemB[{}];\n", 2 * tile_bytes);
@@ -490,7 +496,8 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
 /// requires M%bm==0, N%bn==0, K%64==0, bm%(16·wm)==0, bn%(8·wn)==0, (bm/wm)%8==(bn/wn)%8==0, `bm·bk`
 /// and `bn·bk` powers of two (the XOR buffer toggle) and each a multiple of `threads·16` (128-bit
 /// cp.async staging), and `stages·(bm+bn)·bk` ≤ the caller's `smem_budget` (48 KiB here — the ISA's
-/// static cap — so this shim's PTX is the historical text to the byte). Every *tile-shape* condition is asserted in
+/// static cap — so this shim's body is the historical text to the byte, under the floated `.version
+/// 7.8` header). Every *tile-shape* condition is asserted in
 /// [`gen_int8_smdb_swz_impl`], so an untileable tile config panics at generation rather than staging
 /// a partial slab; the M/N/K divisibility is asserted only when `static_dims` bakes the dims in — on
 /// the dynamic-dims entries (the default, and the only ones split-K uses) M/N/K are runtime
@@ -507,11 +514,11 @@ fn gen_int8_smdb_swz(
     static_dims: Option<(usize, usize, usize)>,
     raster: usize,
 ) -> String {
-    // The shipped 2-stage double-buffer — every existing caller routes here, byte-identical to before the
-    // `stages` generalization (the `_impl` `stages==2` branch contains the verbatim XOR-toggle path).
-    // The 48 KiB budget is the PTX ISA's static cap, so every shipped kernel stays on the static
-    // emission path and its PTX text is unchanged to the byte.
-    gen_int8_smdb_swz_impl(name, bm, bn, wm, wn, dequant, splitk, static_dims, raster, 2, STATIC_SMEM_CAP, HDR_SM80_V84)
+    // The shipped 2-stage double-buffer — every existing caller routes here, its BODY byte-identical to
+    // before the `stages` generalization (the `_impl` `stages==2` branch contains the verbatim
+    // XOR-toggle path); only the module header floated 8.4 -> 7.8. The 48 KiB budget is the PTX ISA's
+    // static cap, so every shipped kernel stays on the static emission path.
+    gen_int8_smdb_swz_impl(name, bm, bn, wm, wn, dequant, splitk, static_dims, raster, 2, STATIC_SMEM_CAP)
 }
 
 /// `stages`-deep generalization of [`gen_int8_smdb_swz`]: `stages==2` is the original XOR double-buffer
@@ -524,8 +531,8 @@ fn gen_int8_smdb_swz(
 ///
 /// **`smem_budget` (bytes) is the ceiling this kernel may spend, and it also selects the emission form**
 /// ([`crate::gpu::smem_mode_for`]): at or below the PTX ISA's 48 KiB static cap the `.shared` arrays are
-/// declared exactly as they always were — **byte-identical PTX**, so every shipped entry (and its warm
-/// cubin) is untouched — and beyond it the two rings are carved out of ONE module-scope
+/// declared exactly as they always were — **byte-identical bodies**, so every shipped entry's kernel is
+/// untouched — and beyond it the two rings are carved out of ONE module-scope
 /// [`crate::gpu::DSMEM_DECL`] window at constant offsets (A at 0, B at `stages·bm·bk`). Generators stay
 /// pure text functions: the budget is *passed in* by the dispatch layer from `Gpu::smem_budget()`, never
 /// probed here, so the whole stage grid is enumerable off-device and an A100/H100 budget is testable on
@@ -544,14 +551,15 @@ fn gen_int8_smdb_swz_impl(
     raster: usize,
     stages: usize,
     smem_budget: usize,
-    // The module header ([`crate::ptx_target`]). Shipped entries keep `HDR_SM80_V84` so their PTX text
-    // is unchanged; NEW modules take `HDR_SM80` (`.version 7.8`). The `.version` is a **driver**
-    // requirement, not an ISA one: 8.4 makes `cuModuleLoadData` demand r550+, while this family's whole
-    // instruction mix (`mma.sync.m16n8k32.u8.s8` = PTX 7.0, `ldmatrix` 6.5, `cp.async` 7.0, and the
-    // `.extern .shared` window — verified loading under 7.8) needs nothing past 7.0. Cloud fleets run
-    // r535+, so an unnecessary 8.4 is a portability hole for exactly the parts this work targets.
-    hdr: &str,
 ) -> String {
+    // ONE header for the whole family ([`HDR_SM80`] = `.version 7.8` / `.target sm_80`) — there is no
+    // per-entry header parameter any more, because there is no longer a second header to pass. The
+    // `.version` is a **driver** requirement, not an ISA one: 8.4 makes `cuModuleLoadData` demand
+    // r550+, while this family's whole instruction mix (`mma.sync.m16n8k32.u8.s8` = PTX 7.0, `ldmatrix`
+    // 6.5, `cp.async` 7.0, and the `.extern .shared` window — launch-time state, not an ISA feature)
+    // needs nothing past 7.0. Cloud fleets run r535+, so an unnecessary 8.4 is a portability hole for
+    // exactly the parts this work targets.
+    let hdr = HDR_SM80;
     let bk = 64usize; // u8 K-slab: nc = bk/16 = 4 chunks/row (reuses the fp16 nc=4 swizzle phase), 2 k32 steps
     let threads = wm * wn * 32;
     let tm = bm / (16 * wm); // 16-row A subtiles per warp
@@ -1014,7 +1022,7 @@ pub fn int8_gemm_swz_tile_stage_ptx(
         format!("int8_swz_{bm}x{bn}_w{wm}x{wn}_s{stages}")
     };
     let ptx = gen_int8_smdb_swz_impl(
-        &name, bm, bn, wm, wn, false, false, None, raster, stages, smem_budget, HDR_SM80,
+        &name, bm, bn, wm, wn, false, false, None, raster, stages, smem_budget,
     );
     (name, ptx, smem_mode_for(stages * (bm + bn) * 64))
 }
@@ -1053,7 +1061,7 @@ pub fn int8_gemm_w64_swz_ptx() -> &'static str {
 /// **Bit-exact** mod 2³² (a deeper prefetch ring only reorders staging; the i32 mma arithmetic is identical).
 pub fn int8_gemm_w64_swz_s3_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz_impl("int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0, 3, STATIC_SMEM_CAP, HDR_SM80_V84)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz_impl("int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0, 3, STATIC_SMEM_CAP)).as_str()
 }
 
 /// One row of the **int8 variable-stage grid** — the family's `(tile, warps, depth)` point, its stable
@@ -1130,7 +1138,7 @@ pub const INT8_STAGE_VARIANTS: &[Int8StageCfg] = &[
 /// dispatcher's `applicable()`, never in a silently-clamped launch.
 pub fn int8_stage_ptx(v: &Int8StageCfg, smem_budget: usize) -> (String, SmemMode) {
     let ptx = gen_int8_smdb_swz_impl(
-        v.name, v.bm, v.bn, v.wm, v.wn, false, false, None, 0, v.stages, smem_budget, HDR_SM80,
+        v.name, v.bm, v.bn, v.wm, v.wn, false, false, None, 0, v.stages, smem_budget,
     );
     (ptx, v.smem_mode())
 }
@@ -1161,7 +1169,7 @@ pub fn int8_gemm_w64_swz_deq_ptx() -> &'static str {
 pub fn int8_gemm_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
-        HDR_SM80_V84.to_string()
+        HDR_SM80.to_string()
             + (r#"
 .visible .entry int8_gemm_nt(
     .param .u32 pM,
@@ -1302,7 +1310,7 @@ fn gen_int8_smdb_ms(
     let wn_shift = wn.trailing_zeros();
 
     let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
-    let mut s = format!("{HDR_SM80_V84}\n");
+    let mut s = format!("{HDR_SM80}\n");
     s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
     s += &format!("    .shared .align 16 .b8 smemA[{ring}];\n");
     s += &format!("    .shared .align 16 .b8 smemB[{ring}];\n");
@@ -1566,8 +1574,16 @@ mod tests {
                 "{entry}: must carry the int8 family floor {TARGET_SM80}"
             );
             assert!(
-                ptx.starts_with(HDR_SM80_V84),
-                "{entry}: must open with the routed HDR_SM80_V84 header"
+                ptx.starts_with(HDR_SM80),
+                "{entry}: must open with the routed HDR_SM80 header (.version 7.8 / .target sm_80)"
+            );
+            // The DRIVER floor, the twin of the target floor above: `.version 8.4` makes
+            // `cuModuleLoadData` demand r550+, and the ceiling instruction here is
+            // `mma.sync.aligned.m16n8k32...u8.s8` = PTX ISA 7.0 (ldmatrix 6.5, cp.async 7.0). Target
+            // fleets run r535/r545, so an 8.4 tag on this mix is a pure load failure, bought nothing.
+            assert!(
+                !ptx.contains(".version 8.4"),
+                "{entry}: `.version 8.4` demands driver r550+; nothing this family emits is above ISA 7.0"
             );
             assert!(
                 !ptx.contains("sm_89"),
@@ -1637,20 +1653,25 @@ mod tests {
     /// machine this box cannot test on — one non-ASCII byte in a `format!` is a `ptxas fatal` at
     /// `cuModuleLoadData`, and no local device gate would ever see it.
     ///
-    /// They are pinned at [`HDR_SM80`] (**`.version 7.8`**), not the `8.4` the shipped int8 entries carry.
-    /// The `.version` is a **driver** requirement, not an instruction-set one: 8.4 makes the JIT demand
-    /// r550+, while this family needs nothing past PTX ISA 7.0 (`mma.sync.m16n8k32.u8.s8` 7.0, `ldmatrix`
-    /// 6.5, `cp.async` 7.0) — and the `.extern .shared` window itself loads fine under 7.8, since dynamic
-    /// SMEM is launch-time state rather than an ISA feature. Cloud fleets run r535+, so an unnecessary
-    /// 8.4 would refuse to load on the very parts this work exists to reach.
+    /// They are pinned at [`HDR_SM80`] (**`.version 7.8`**) — as, since the 8.4 float, is every other
+    /// module this file emits. The `.version` is a **driver** requirement, not an instruction-set one:
+    /// 8.4 makes the JIT demand r550+, while this family needs nothing past PTX ISA 7.0
+    /// (`mma.sync.m16n8k32.u8.s8` 7.0, `ldmatrix` 6.5, `cp.async` 7.0) — and the `.extern .shared`
+    /// window itself loads fine under 7.8, since dynamic SMEM is launch-time state rather than an ISA
+    /// feature. Cloud fleets run r535+, so an unnecessary 8.4 would refuse to load on the very parts
+    /// this work exists to reach.
     #[test]
     fn int8_stage_modules_are_ascii_at_the_portable_floor() {
         for (entry, ptx) in stage_modules() {
             assert!(ptx.is_ascii(), "{entry}: PTX must be ASCII");
             assert!(
                 ptx.starts_with(HDR_SM80),
-                "{entry}: a NEW int8 module must open at .version 7.8 / sm_80 — 8.4 needs driver r550+ \
+                "{entry}: an int8 module must open at .version 7.8 / sm_80 — 8.4 needs driver r550+ \
                  for no instruction this family emits"
+            );
+            assert!(
+                !ptx.contains(".version 8.4"),
+                "{entry}: `.version 8.4` demands driver r550+; this family's ceiling is ISA 7.0"
             );
             assert!(!ptx.contains("sm_89"), "{entry}: no Ada-only instruction here");
             assert!(ptx.contains(&format!(".visible .entry {entry}(")), "{entry}: entry missing");
@@ -1667,9 +1688,9 @@ mod tests {
     /// budget parameter and an extern-window arm changes *nothing* about the kernels this card already
     /// runs. A behavioural A/B could only sample that; this proves it: generate the grid's s2 and s3
     /// rows, rename the entry back, and demand string equality with `int8_gemm_w64_swz_ptx()` /
-    /// `int8_gemm_w64_swz_s3_ptx()`. The shipped functions themselves are untouched (still `.version
-    /// 8.4`), so their on-disk cubins stay warm; the grid rows differ *only* in the deliberate `.version`
-    /// floor — asserted here as the sole difference, so a body change cannot hide behind it.
+    /// `int8_gemm_w64_swz_s3_ptx()`. Both sides now open at the same [`HDR_SM80`] floor (the `.version`
+    /// float moved the shipped entries down to 7.8 too), so the header is stripped from each and the
+    /// **entire body** must match to the byte — the entry symbol is the only licensed difference.
     #[test]
     fn int8_stage_grid_s2_s3_are_the_shipped_kernels() {
         for (grid, shipped_name, shipped) in [
@@ -1680,7 +1701,7 @@ mod tests {
             let (ptx, mode) = int8_stage_ptx(v, ADA_OPTIN_BUDGET);
             assert_eq!(mode, SmemMode::Static, "{grid} is {} B — must stay on the static path", v.smem_bytes());
             let body = ptx.strip_prefix(HDR_SM80).expect("grid rows open at the 7.8 floor");
-            let shipped_body = shipped.strip_prefix(HDR_SM80_V84).expect("shipped entries are 8.4");
+            let shipped_body = shipped.strip_prefix(HDR_SM80).expect("shipped entries open at 7.8 too");
             assert_eq!(
                 body.replace(grid, shipped_name),
                 shipped_body,
