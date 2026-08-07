@@ -80,7 +80,12 @@ fn build_and_run_exe(
     src: &Path,
     stem: &str,
 ) -> Result<(Option<i32>, String), String> {
-    let exe = tmp.join(format!("{stem}.exe"));
+    // `<stem>` plus the *host's* executable suffix — `.exe` on Windows, empty on unix — matching what
+    // `wukong_driver::emit_native` names an unqualified `--emit=exe` output. Hardcoding `.exe` here
+    // happened to work on Linux (we pass `-o`, so the driver writes exactly this path) but named the
+    // ELF file a lie, and the gate would have stopped mirroring the driver the moment it stopped
+    // passing `-o`.
+    let exe = tmp.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
     let _ = std::fs::remove_file(&exe);
     let emit = Command::new(env!("CARGO_BIN_EXE_wukongc"))
         .current_dir(tmp) // the `.o` / `_shim.rs` / `_rt.c` intermediates land here

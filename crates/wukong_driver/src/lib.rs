@@ -400,11 +400,14 @@ fn run_on_gpu(
             let mut accel = gpu_accel::GpuAccel::new(g);
             wukong_interp::run_with_output_accel(program, entry, interner, &mut accel)
         }
-        None => Err(
+        // The driver library's file name is per-OS (`nvcuda.dll` on Windows, `libcuda.so.1` on
+        // Linux); it comes from `wukong_codegen_gpu`'s one table so this message and the
+        // `--backend=gpu-native` twin in `lower.rs` cannot drift apart.
+        None => Err(format!(
             "`--backend=gpu` requires a CUDA device, but none was reachable (the driver \
-                     dlopens `nvcuda.dll`; check the NVIDIA driver is installed)"
-                .into(),
-        ),
+             dlopens `{}`; check the NVIDIA driver is installed)",
+            wukong_codegen_gpu::baselines::cuda_driver_lib_name()
+        )),
     }
 }
 
@@ -555,10 +558,14 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         return exit::OK;
     }
 
+    // The default executable name is `<stem>` plus the host's executable suffix: `.exe` on Windows,
+    // **nothing** on unix, where `foo.exe` would be a lie about the file's format and would not be
+    // what any adjacent tooling (or the user) looks for. `std::env::consts::EXE_SUFFIX` is the
+    // platform's own answer, so the Windows spelling is unchanged, byte for byte.
     let out = opts
         .output
         .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{stem}.exe")));
+        .unwrap_or_else(|| PathBuf::from(format!("{stem}{}", std::env::consts::EXE_SUFFIX)));
 
     // The generated link inputs are compiler intermediates, not user artifacts — keep them out of
     // the directory the user invoked us in (see [`ScratchDir`]).
