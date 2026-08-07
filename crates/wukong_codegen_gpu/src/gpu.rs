@@ -52,6 +52,17 @@ pub struct GpuTarget {
 }
 
 impl GpuTarget {
+    /// `(cc_major, cc_minor)` — orderable, so a capability floor is a plain `>=` comparison
+    /// (`(8,9) >= (8,0)` and `(9,0) >= (8,9)`, which is exactly the arch ordering CUDA guarantees).
+    pub fn cc(&self) -> (i32, i32) {
+        (self.cc_major, self.cc_minor)
+    }
+
+    /// Does this device meet compute-capability floor `min`?
+    pub fn supports(&self, min: (i32, i32)) -> bool {
+        self.cc() >= min
+    }
+
     /// Probe device `ordinal`'s identity. **Every failure is loud and names the driver call**, so an
     /// unqueryable attribute can never degrade into a plausible-looking constant.
     ///
@@ -123,6 +134,69 @@ impl GpuTarget {
     }
 }
 
+/// **The minimum compute capability the fp8 kernel families need.** `mma.sync…e4m3/e5m2` and the
+/// packed `cvt.rn.satfinite.e{4m3,5m2}x2.f32` converters exist nowhere below Ada — an A100 (cc 8.0)
+/// cannot run them at all, not slowly: the instructions are absent from its ISA.
+pub const FP8_MIN_CC: (i32, i32) = (8, 9);
+
+/// A GPU call's failure — either the driver said no, or **this device cannot run this kernel family
+/// at all**.
+///
+/// The second arm is the thing `DriverError` cannot express and the reason this type exists. A
+/// capability decline is not an error in the "something went wrong" sense: it is a fact about the
+/// hardware, decided *before* any PTX is generated or loaded, and the caller is expected to have a
+/// documented alternative (bf16/int8 for fp8). Squeezing it into a `DriverError` would either
+/// fabricate a CUDA status code or — far worse — invite a silent fallback that quietly computes in a
+/// different dtype than the caller asked for.
+#[derive(Debug)]
+pub enum GpuError {
+    /// The CUDA driver rejected a call.
+    Driver(DriverError),
+    /// The device lacks a capability the kernel requires; the string names the capability, the
+    /// requirement and what was actually probed (see [`capability_decline`]).
+    Unsupported(String),
+}
+
+impl From<DriverError> for GpuError {
+    fn from(e: DriverError) -> Self {
+        GpuError::Driver(e)
+    }
+}
+
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuError::Driver(e) => write!(f, "{e:?}"),
+            GpuError::Unsupported(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for GpuError {}
+
+impl GpuError {
+    /// The decline message iff this is a capability decline — the discriminator a gate uses to route
+    /// a *capability* skip (a third category, distinct from "no device" and "no peer").
+    pub fn unsupported(&self) -> Option<&str> {
+        match self {
+            GpuError::Unsupported(m) => Some(m),
+            GpuError::Driver(_) => None,
+        }
+    }
+}
+
+/// The one-line capability-decline message, e.g.
+/// `"gemm_nt_fp8: fp8 requires cc>=8.9, device is 8.0 (NVIDIA A100-SXM4-40GB)"`.
+///
+/// A free function, not a `format!` at each call site, so the wording is identical everywhere and can
+/// be asserted by a test with no device attached.
+pub fn capability_decline(what: &str, cap: &str, min: (i32, i32), have: (i32, i32), device: &str) -> String {
+    format!(
+        "{what}: {cap} requires cc>={}.{}, device is {}.{} ({device})",
+        min.0, min.1, have.0, have.1
+    )
+}
+
 /// A live CUDA device + stream + a cache of JIT-loaded PTX modules (keyed by a stable string).
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
@@ -184,6 +258,39 @@ impl Gpu {
     /// (see `autotune`). The DEVICE's architecture, like [`Gpu::compute_arch`], never a family floor.
     pub fn sm_arch(&self) -> String {
         crate::ptx_target::sm_arch(self.target.cc_major, self.target.cc_minor)
+    }
+
+    /// Can this device run the **fp8** kernel families at all? (cc >= 8.9 — see [`FP8_MIN_CC`].)
+    pub fn supports_fp8(&self) -> bool {
+        self.target.supports(FP8_MIN_CC)
+    }
+
+    /// **The capability precondition.** `Ok(())` iff the device meets floor `min`; otherwise a
+    /// [`GpuError::Unsupported`] naming the capability, the floor and what was probed.
+    ///
+    /// Call this as the FIRST statement of a launch wrapper — before any PTX is generated, before any
+    /// module is loaded, before any host-side conversion — so a card that cannot run the family
+    /// declines instantly and identically, instead of failing somewhere inside `cuModuleLoadData`
+    /// with a JIT error that names an instruction rather than the missing capability.
+    pub fn require_cap(&self, what: &str, cap: &str, min: (i32, i32)) -> Result<(), GpuError> {
+        if self.target.supports(min) {
+            return Ok(());
+        }
+        Err(GpuError::Unsupported(capability_decline(
+            what,
+            cap,
+            min,
+            self.target.cc(),
+            &self.target.name,
+        )))
+    }
+
+    /// [`Gpu::require_cap`] for fp8: **never** silently substitutes another dtype. The bf16 / int8
+    /// paths are the documented alternative on a pre-Ada card, but choosing them is the CALLER's
+    /// decision — a launcher that quietly computed in bf16 because fp8 was unavailable would return
+    /// numerically different results under the same function name.
+    pub fn require_fp8(&self, what: &str) -> Result<(), GpuError> {
+        self.require_cap(what, "fp8", FP8_MIN_CC)
     }
 
     /// Load `ptx` once under `key`, caching the module in-process, and return the named entry
@@ -3821,7 +3928,8 @@ impl ResidentModelF16 {
 /// is `16×32` row-major, `b_col` is `32×8` **column-major** (the `.col` operand), both arrive as f32
 /// and are rounded to E4M3 on the host; `D` is `16×8` f32 (the mixed-precision accumulate). Validates
 /// the manual fragment layout — the core a full fp8 GEMM would tile over.
-pub fn fp8_tile(g: &mut Gpu, a: &[f32], b_col: &[f32]) -> Result<Vec<f32>, DriverError> {
+pub fn fp8_tile(g: &mut Gpu, a: &[f32], b_col: &[f32]) -> Result<Vec<f32>, GpuError> {
+    g.require_fp8("fp8_tile")?;
     assert_eq!(a.len(), 16 * 32, "A must be 16×32");
     assert_eq!(b_col.len(), 32 * 8, "B must be 32×8 (column-major)");
     let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
@@ -3841,7 +3949,7 @@ pub fn fp8_tile(g: &mut Gpu, a: &[f32], b_col: &[f32]) -> Result<Vec<f32>, Drive
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&a_d).arg(&b_d).arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// Full **fp8 (E4M3) tensor-core `C = A·Bᵀ`** (nn.Linear): `A` (m×k) and `B` (n×k) arrive as f32 and
@@ -3855,7 +3963,8 @@ pub fn gemm_nt_fp8(
     m: usize,
     k: usize,
     n: usize,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
+    g.require_fp8("gemm_nt_fp8")?;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
@@ -3907,7 +4016,7 @@ pub fn gemm_nt_fp8(
         .arg(&b_d)
         .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// **W4A16 weight-only int4 decode** `C = A·dequant(W)ᵀ` (the LLM-decode workhorse). `A` (`[M,K]`)
@@ -4250,10 +4359,11 @@ pub fn gemm_nt_fp8_pipe(
     m: usize,
     k: usize,
     n: usize,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::{
         f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS,
     };
+    g.require_fp8("gemm_nt_fp8_pipe")?;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     // Warp-tile dispatch (the transferred int8 lever; `quant_fp8_warp_tile_sweep`, perf/gpu-quant-2).
@@ -4292,7 +4402,7 @@ pub fn gemm_nt_fp8_pipe(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// `C = act(A·Bᵀ + bias)` (fp8 E4M3 in, f32 out) fused into the pipelined fp8 workhorse store epilogue —
@@ -4310,8 +4420,9 @@ fn gemm_nt_fp8_pipe_fused_bias(
     k: usize,
     n: usize,
     entry: &'static str,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS};
+    g.require_fp8(entry)?;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
@@ -4335,23 +4446,23 @@ fn gemm_nt_fp8_pipe_fused_bias(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// `C = A·Bᵀ + bias` fused, fp8 inputs (affine Linear) — see [`gemm_nt_fp8_pipe_fused_bias`].
-pub fn gemm_nt_fp8_mma_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_mma_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias")
 }
 /// `C = relu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_mma_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_relu")
 }
 /// `C = silu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_mma_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_silu")
 }
 /// `C = gelu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_gelu")
 }
 
@@ -4368,8 +4479,9 @@ pub fn gemm_nt_fp8_mma_bias_residual(
     m: usize,
     k: usize,
     n: usize,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS};
+    g.require_fp8("gemm_nt_fp8_mma_bias_residual")?;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
@@ -4395,7 +4507,7 @@ pub fn gemm_nt_fp8_mma_bias_residual(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// `out = act(x·Wgᵀ [+bg]) ⊙ (x·Wuᵀ [+bu])` — the fused **SwiGLU/GeGLU** FFN gate on the fp8 dual-B
@@ -4415,8 +4527,9 @@ fn gemm_nt_fp8_gate(
     k: usize,
     n: usize,
     entry: &'static str,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::f32_to_e4m3;
+    g.require_fp8(entry)?;
     assert_eq!(x.len(), m * k);
     assert_eq!(wg.len(), n * k);
     assert_eq!(wu.len(), n * k);
@@ -4448,16 +4561,16 @@ fn gemm_nt_fp8_gate(
     } else {
         unsafe { bld.launch(cfg)? };
     }
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// Fused **SwiGLU** FFN gate (fp8 E4M3 — the fastest fused inference gate): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
-pub fn gemm_nt_fp8_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_silu")
 }
 
 /// Fused **GeGLU** FFN gate (fp8 E4M3): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
-pub fn gemm_nt_fp8_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_gelu")
 }
 
@@ -4821,8 +4934,9 @@ pub fn gemm_nt_fp8_bwd(
     m: usize,
     k: usize,
     n: usize,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::{FP8_TM, FP8_TN};
+    g.require_fp8("gemm_nt_fp8_bwd")?;
     assert_eq!(dy.len(), m * k);
     assert_eq!(w.len(), n * k);
     assert!(
@@ -4846,7 +4960,7 @@ pub fn gemm_nt_fp8_bwd(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// **Per-tensor `amax`** = `maxᵢ |x[i]|` on-device — the delayed-scaling calibration statistic for fp8
@@ -4889,7 +5003,12 @@ pub fn quantize_scaled_fp8(
     x: &[f32],
     recip: f32,
     e5m2: bool,
-) -> Result<Vec<u8>, DriverError> {
+) -> Result<Vec<u8>, GpuError> {
+    // The hardware `cvt.rn.satfinite.e{5m2,4m3}x2.f32` converters are Ada-and-later, exactly like
+    // the fp8 mma itself, so the device quantize carries the same capability floor. (`amax_f32`
+    // deliberately does NOT: it is plain f32 max-abs -- the delayed-scaling statistic an A100 still
+    // needs, and the plan splits it out precisely so it survives there.)
+    g.require_fp8("quantize_scaled_fp8")?;
     let n = x.len();
     assert!(n % 2 == 0, "device fp8 quantize needs an even element count");
     if n == 0 {
@@ -4914,7 +5033,7 @@ pub fn quantize_scaled_fp8(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&nn).arg(&x_d).arg(&mut o_d).arg(&recip);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&o_d)
+    Ok(g.stream.memcpy_dtov(&o_d)?)
 }
 
 #[cfg(test)]
@@ -4930,7 +5049,7 @@ mod tests {
     fn fp8_device_quantize_within_ulp() {
         use crate::ptx_fp8::e4m3_to_f32;
         use crate::ptx_fp8_train::{delayed_scale_recip, e5m2_to_f32, E4M3_MAX, E5M2_MAX};
-        with_gpu("fp8_device_quantize", |g| {
+        with_fp8("fp8_device_quantize", |g| {
             let mut rng = crate::diff::Rng::new(0xF8D);
             let x = rng.vec(4096, -100.0, 100.0);
             let amax = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
@@ -4977,7 +5096,7 @@ mod tests {
     fn fp8_bwd_gemm_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
         use crate::ptx_fp8_train::{e5m2_to_f32, f32_to_e5m2};
-        with_gpu("fp8_bwd_gemm", |g| {
+        with_fp8("fp8_bwd_gemm", |g| {
             let mut rng = crate::diff::Rng::new(0xB17D);
             for (m, k, n) in [(32usize, 64usize, 32usize), (64, 96, 64), (96, 128, 32)] {
                 let dy = rng.vec(m * k, -1.0, 1.0);
@@ -5022,6 +5141,179 @@ mod tests {
                 eprintln!("[skip] {name}: GPU unavailable: {why}");
             }
         }
+    }
+
+    /// **The THIRD skip category: a capability skip.**
+    ///
+    /// A gate can fail to run for three distinct reasons, and conflating them hides bugs:
+    ///   1. *no device* — [`with_gpu`] handles it; `WUKONG_GPU_REQUIRED=1` escalates to a failure.
+    ///   2. *no peer* — `peer_gate`; `WUKONG_PEER_REQUIRED=1` escalates.
+    ///   3. *this device cannot run this kernel family at all* — here. Skipping the fp8 suite on an
+    ///      A100 is the CORRECT outcome; skipping it on this Ada card would be a bug in the gate, and
+    ///      exactly the "green having tested nothing" failure the other two guard against.
+    ///
+    /// So the decision is delegated to the **production** check ([`Gpu::require_cap`], the same call
+    /// the launchers make), and a skip on a device that *does* meet the floor is escalated through
+    /// `skip_or_fail` — a failure under `WUKONG_GPU_REQUIRED=1`.
+    fn with_cap(name: &str, cap: &str, min: (i32, i32), body: impl FnOnce(&mut Gpu)) {
+        with_gpu(name, |g| {
+            let have = g.target().cc();
+            match g.require_cap(name, cap, min) {
+                Ok(()) => body(g),
+                Err(e) => {
+                    let why = e.to_string();
+                    if have >= min {
+                        crate::diff::skip_or_fail(
+                            name,
+                            &format!(
+                                "the {cap} capability gate declined ({why}) although the device is \
+                                 cc {}.{} >= {}.{} — the GATE is wrong, not the hardware",
+                                have.0, have.1, min.0, min.1
+                            ),
+                        );
+                    }
+                    eprintln!("[skip:capability] {why}");
+                }
+            }
+        });
+    }
+
+    /// [`with_cap`] for fp8 (cc >= 8.9): every fp8 device gate runs through this, so the whole family
+    /// skips loudly-and-correctly on a pre-Ada card instead of `unwrap`ping a capability decline.
+    fn with_fp8(name: &str, body: impl FnOnce(&mut Gpu)) {
+        with_cap(name, "fp8", FP8_MIN_CC, body);
+    }
+
+    /// A synthetic [`GpuTarget`] for capability arms that CANNOT be reached from this laptop. The
+    /// A100 branch of every fp8 decision is the whole point of the gate and would otherwise be
+    /// completely untested until someone rents one; the ordering logic it rests on
+    /// ([`GpuTarget::supports`]) is pure, so a fabricated descriptor tests it honestly. Only the
+    /// fields the capability logic reads are meaningful; the rest are plausible filler.
+    fn fake_target(name: &str, cc: (i32, i32)) -> GpuTarget {
+        GpuTarget {
+            name: name.to_string(),
+            cc_major: cc.0,
+            cc_minor: cc.1,
+            sm_count: 108,
+            smem_per_block_optin: 166912,
+            smem_per_sm: 167936,
+            l2_bytes: 41943040,
+            total_mem: 42949672960,
+            driver_version: 12090,
+        }
+    }
+
+    /// **The fp8 capability gate.** fp8 `mma.sync` and the packed `cvt.rn.satfinite.e{4m3,5m2}x2`
+    /// converters exist nowhere below Ada, so on an A100 the fp8 launchers must decline *before* they
+    /// generate PTX or load a module — loudly, naming the capability, and **never** by quietly
+    /// computing in bf16 (that would return different numbers under the same function name; choosing
+    /// the bf16/int8 alternative is the caller's documented decision).
+    ///
+    /// Three properties:
+    ///   * the decline wording is fixed and names capability + floor + probed cc, so a gate can
+    ///     recognise a capability skip and a reader can act on it;
+    ///   * [`GpuTarget::supports`] orders compute capabilities correctly — tested against SYNTHETIC
+    ///     descriptors, the only honest way to exercise the A100/H100 arms from an Ada laptop;
+    ///   * on the real device the gate agrees with the probe, and on THIS card (cc 8.9) it must NOT
+    ///     decline: a capability skip here would be a bug, which is why `with_fp8` escalates one.
+    #[test]
+    fn fp8_capability_gate_declines_below_ada() {
+        // Ordering: the arms this box cannot reach.
+        let a100 = fake_target("NVIDIA A100-SXM4-40GB", (8, 0));
+        let h100 = fake_target("NVIDIA H100 80GB HBM3", (9, 0));
+        let ada = fake_target("NVIDIA GeForce RTX 4050 Laptop GPU", (8, 9));
+        let ampere_consumer = fake_target("NVIDIA GeForce RTX 3090", (8, 6));
+        assert!(!a100.supports(FP8_MIN_CC), "A100 (cc 8.0) has no fp8 tensor cores");
+        assert!(!ampere_consumer.supports(FP8_MIN_CC), "GA102 (cc 8.6) has no fp8 tensor cores");
+        assert!(ada.supports(FP8_MIN_CC), "Ada (cc 8.9) is the fp8 floor");
+        assert!(h100.supports(FP8_MIN_CC), "Hopper (cc 9.0) is above the floor — 9.0 > 8.9");
+        assert!(fake_target("sm_120", (12, 0)).supports(FP8_MIN_CC));
+
+        // The message a capability skip carries.
+        assert_eq!(
+            capability_decline("gemm_nt_fp8", "fp8", FP8_MIN_CC, a100.cc(), &a100.name),
+            "gemm_nt_fp8: fp8 requires cc>=8.9, device is 8.0 (NVIDIA A100-SXM4-40GB)"
+        );
+
+        // And on the real device: probe, gate and launcher must agree.
+        with_gpu("fp8_capability", |g| {
+            let cc = g.target().cc();
+            assert_eq!(
+                g.supports_fp8(),
+                cc >= FP8_MIN_CC,
+                "supports_fp8() disagrees with the probed cc {}.{}",
+                cc.0,
+                cc.1
+            );
+            if g.supports_fp8() {
+                g.require_fp8("probe").expect("a cc>=8.9 device must not decline fp8");
+                // ... and a real launcher must reach the device rather than decline.
+                let a: Vec<f32> = (0..16 * 32).map(|i| ((i % 5) as f32) - 2.0).collect();
+                let b: Vec<f32> = (0..32 * 8).map(|i| ((i % 3) as f32) - 1.0).collect();
+                assert!(
+                    fp8_tile(g, &a, &b).is_ok(),
+                    "fp8_tile declined on a device that supports fp8"
+                );
+                eprintln!(
+                    "[gate] fp8 capability: cc {}.{} >= 8.9 -> fp8 dispatch ENABLED, no decline \u{2713}",
+                    cc.0, cc.1
+                );
+            } else {
+                // The pre-Ada path, if this ever runs on one: a capability decline, not a driver error.
+                let a = vec![0f32; 16 * 32];
+                let b = vec![0f32; 32 * 8];
+                let e = fp8_tile(g, &a, &b).expect_err("a pre-Ada device must decline fp8");
+                let msg = e
+                    .unsupported()
+                    .expect("the decline must be a CAPABILITY error, not a driver error");
+                assert!(msg.contains("fp8 requires cc>=8.9"), "decline must name the capability: {msg}");
+                eprintln!("[gate] fp8 capability: {msg} \u{2713}");
+            }
+        });
+    }
+
+    /// **Every fp8 launcher that loads a module must gate first.** The capability check is only worth
+    /// anything if a *new* fp8 entry point cannot forget it — a launcher that generates PTX and calls
+    /// `cuModuleLoadData` on an A100 fails with a JIT error naming an instruction, not the missing
+    /// capability, and does so after the host-side conversion work.
+    ///
+    /// So this scans this file's own source (`include_str!`, compile-time — no I/O, no path
+    /// assumptions): every **top-level** `fn` whose name mentions fp8 and which loads a module must
+    /// contain `require_fp8(`. Wrappers that merely delegate to another fp8 launcher load nothing and
+    /// are exempt (the callee gates). Test/bench fns are indented, so the column-0 anchor skips them.
+    #[test]
+    fn every_fp8_launcher_requires_the_capability() {
+        let src = include_str!("gpu.rs");
+        let mut checked = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let sig = line.strip_prefix("pub fn ").or_else(|| line.strip_prefix("fn "));
+            let Some(sig) = sig else { continue };
+            let name = sig.split('(').next().unwrap_or("");
+            if !name.contains("fp8") {
+                continue;
+            }
+            // The item body: from here to the next column-0 `}`.
+            let body: String = src
+                .lines()
+                .skip(i)
+                .take_while(|l| !l.starts_with('}'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let loads = body.contains("g.function(") || body.contains("load_module(");
+            if loads {
+                assert!(
+                    body.contains("require_fp8("),
+                    "fp8 launcher `{name}` loads a module without a capability gate — on a pre-Ada \
+                     card it would fail inside the PTX JIT instead of declining"
+                );
+                checked.push(name.to_string());
+            }
+        }
+        assert!(
+            checked.len() >= 8,
+            "expected the known fp8 launcher set to be scanned, found only {checked:?}"
+        );
+        eprintln!("[gate] {} fp8 launchers are capability-gated: {checked:?} \u{2713}", checked.len());
     }
 
     /// **The device-identity gate.** [`GpuTarget`] is probed once at `Gpu` construction and is the
@@ -6592,7 +6884,7 @@ mod tests {
     #[test]
     fn fp8_swiglu_gate_match_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_swiglu_gate", |g| {
+        with_fp8("fp8_swiglu_gate", |g| {
             let mut rng = crate::diff::Rng::new(0xF8_5A_7E);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             let silu = |x: f32| x / (1.0 + (-x).exp());
@@ -11092,7 +11384,7 @@ mod tests {
     #[test]
     fn fp8_tensorcore_tile_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_tile", |g| {
+        with_fp8("fp8_tile", |g| {
             // Asymmetric, e4m3-exact integer data — a layout bug can't hide (all-ones would).
             let a: Vec<f32> = (0..16 * 32)
                 .map(|t| {
@@ -11132,7 +11424,7 @@ mod tests {
     #[test]
     fn fp8_gemm_matches_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_gemm", |g| {
+        with_fp8("fp8_gemm", |g| {
             let mut rng = crate::diff::Rng::new(0x00F8);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             // e4m3 products are exact in f32 (4 sig bits × 4 = 8 ≤ 23), so vs an e4m3-rounded-input
@@ -11161,7 +11453,7 @@ mod tests {
     #[test]
     fn fp8_pipe_matches_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_pipe", |g| {
+        with_fp8("fp8_pipe", |g| {
             let mut rng = crate::diff::Rng::new(0xF8B1);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             for (m, k, n) in [(128usize, 64usize, 128usize), (128, 128, 128), (256, 256, 256), (128, 192, 384)] {
@@ -11186,7 +11478,7 @@ mod tests {
     #[test]
     fn fp8_pipe_regime_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_pipe_regime", |g| {
+        with_fp8("fp8_pipe_regime", |g| {
             let mut rng = crate::diff::Rng::new(0xF8D3);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             // (m, k, n): two 128∤M → m64 (bm=64); 1024 → w64_s3 (bm=128, M≤2048); 2304/2560 → w64 (bm=128).
@@ -11224,7 +11516,7 @@ mod tests {
     #[test]
     fn fp8_mma_bias_match_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_mma_bias", |g| {
+        with_fp8("fp8_mma_bias", |g| {
             let mut rng = crate::diff::Rng::new(0xF8B2);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             let silu = |x: f32| x / (1.0 + (-x).exp());
@@ -11295,7 +11587,7 @@ mod tests {
     #[test]
     fn fp8_mma_bias_residual_match_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_mma_bias_residual", |g| {
+        with_fp8("fp8_mma_bias_residual", |g| {
             let mut rng = crate::diff::Rng::new(0xF8B3);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 192, 384)] {
@@ -11497,7 +11789,7 @@ mod tests {
     fn fp8_pipe_vs_peers() {
         use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS, FP8_TM, FP8_TN};
         use half::f16;
-        with_gpu("fp8_pipe_vs_peers", |g| {
+        with_fp8("fp8_pipe_vs_peers", |g| {
             let mut rng = crate::diff::Rng::new(0xF8FE);
             // Clock warmup (peak-vs-peak; absolutes swing ~7× with boost on this part).
             let wa = rng.vec(2048 * 2048, -1.0, 1.0);
@@ -11624,7 +11916,7 @@ mod tests {
         use crate::ptx_fp8::{
             f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS, FP8_TM, FP8_TN,
         };
-        with_gpu("fp8_vs_cublaslt", |g| {
+        with_fp8("fp8_vs_cublaslt", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("fp8_vs_cublaslt_pct");
                 eprintln!("[skip] fp8_vs_cublaslt: cuBLASLt not loadable.\n{}", peer_env_hint());
@@ -11707,7 +11999,7 @@ mod tests {
             cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3,
         };
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
-        with_gpu("fp8_pipe_sweep", |g| {
+        with_fp8("fp8_pipe_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("fp8_pipe_config_sweep_vs_cublaslt");
                 eprintln!("[skip] fp8_pipe_config_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
@@ -11777,7 +12069,7 @@ mod tests {
     #[ignore = "throughput A/B; run explicitly (GPU; no DLLs needed)"]
     fn fp8_pipe_m64_vs_default_ab() {
         use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS};
-        with_gpu("fp8_m64_ab", |g| {
+        with_fp8("fp8_m64_ab", |g| {
             let mut rng = crate::diff::Rng::new(0xF8DA);
             let wa = rng.vec(2048 * 2048, -1.0, 1.0);
             let wb = rng.vec(2048 * 2048, -1.0, 1.0);
@@ -16087,7 +16379,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn quant_fp8_warp_tile_sweep() {
         use crate::baselines::{cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3};
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
-        with_gpu("quant_fp8_warp_tile_sweep", |g| {
+        with_fp8("quant_fp8_warp_tile_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("quant_fp8_warp_tile_sweep");
                 eprintln!("[skip] quant_fp8_warp_tile_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
