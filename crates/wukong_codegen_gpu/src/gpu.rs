@@ -139,6 +139,71 @@ impl GpuTarget {
 /// cannot run them at all, not slowly: the instructions are absent from its ISA.
 pub const FP8_MIN_CC: (i32, i32) = (8, 9);
 
+/// **The PTX ISA's static `.shared` ceiling — 48 KiB, on every target and every device.**
+///
+/// PTX §5.1.7 caps a *statically declared* `.shared` allocation at 48 KiB regardless of what the part
+/// can actually address (this Ada laptop: 99 KiB opt-in; A100: 163; H100: 227). Verified in both
+/// directions on the metal: a 60 KiB `.shared` array is refused by the JIT with
+/// `ptxas error: Entry function '…' uses too much shared data (0xf000 bytes, 0xc000 max)`, while the
+/// same 60 KiB reached through an `.extern` window + `cuFuncSetAttribute` runs. So this constant is not
+/// a policy knob — it is the boundary between the two *emission* forms ([`smem_mode_for`]).
+pub const STATIC_SMEM_CAP: usize = 48 * 1024;
+
+/// The single module-scope dynamic-SMEM window symbol every generated kernel carves its slabs out of.
+///
+/// **Two module-scope `.extern .shared` arrays ALIAS** (measured: both resolve to the window base), so
+/// a kernel cannot have "one extern for A and one for B" — it has ONE window and per-slab **constant**
+/// offsets (A at 0, B at `stages·tile_a`, …). Address it through the symbol, never as a literal 0: the
+/// window starts *after* whatever statics the entry also declares (measured: 3072 with 3 KiB of statics).
+pub const DSMEM_SYM: &str = "wk_dsmem";
+
+/// The module-scope declaration of [`DSMEM_SYM`]. **Module scope is mandatory** — the identical line
+/// inside an `.entry` body is rejected by the driver JIT with `CUDA_ERROR_INVALID_PTX`. Needs no new
+/// `.version`/`.target`: dynamic SMEM is launch-time state, not an ISA feature (verified under the
+/// tree's own `.version 7.8` / `sm_80` headers).
+pub const DSMEM_DECL: &str = ".extern .shared .align 16 .b8 wk_dsmem[];\n";
+
+/// **How a generated kernel's shared memory is declared, and therefore how it must be launched.**
+///
+/// Returned by every stage-parameterized generator so the launch wrapper never re-derives the size.
+/// LANDMINE: `LaunchConfig::shared_mem_bytes` is memory allocated *in addition to* the entry's statics,
+/// so a [`SmemMode::Static`] kernel must be launched with **0** — passing its static size again would
+/// allocate the tile twice and silently halve residency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmemMode {
+    /// Today's `.shared .align 16 .b8 …[N]` declarations inside the entry; launch with `shared_mem_bytes: 0`.
+    Static,
+    /// One module-scope [`DSMEM_DECL`] window of `N` bytes; the entry must be loaded through
+    /// [`Gpu::function_dyn`] and launched through [`dyn_launch_cfg`] with the same `N`.
+    Dynamic(u32),
+}
+
+impl SmemMode {
+    /// The byte count to pass to [`dyn_launch_cfg`] / `LaunchConfig::shared_mem_bytes` — `0` for
+    /// [`SmemMode::Static`] (see the landmine above), the window size for [`SmemMode::Dynamic`].
+    pub const fn launch_bytes(self) -> usize {
+        match self {
+            SmemMode::Static => 0,
+            SmemMode::Dynamic(n) => n as usize,
+        }
+    }
+    pub const fn is_dynamic(self) -> bool {
+        matches!(self, SmemMode::Dynamic(_))
+    }
+}
+
+/// **The emission rule** (D6 §5.2): at or below the 48 KiB static ISA cap a generator keeps today's
+/// static `.shared` declarations — **byte-identical PTX**, so the shipped kernels, their cubin-cache
+/// warmth and their measured behaviour are untouched — and only beyond it switches to the `.extern`
+/// window. One rule, one place, so int8 and f16 cannot disagree about where the boundary is.
+pub const fn smem_mode_for(bytes: usize) -> SmemMode {
+    if bytes <= STATIC_SMEM_CAP {
+        SmemMode::Static
+    } else {
+        SmemMode::Dynamic(bytes as u32)
+    }
+}
+
 /// A [`LaunchConfig`] carrying a **dynamic** shared-memory window of `dyn_smem` bytes.
 ///
 /// Every launch in this crate passes `shared_mem_bytes: 0` because every kernel declares its SMEM
@@ -407,6 +472,31 @@ impl Gpu {
             self.dyn_smem.insert(slot, dyn_smem);
         }
         Ok(f)
+    }
+
+    /// **Load an entry whose SMEM form the generator decided** — the one call a stage-parameterized
+    /// kernel needs. Returns the function *and the byte count its launch must carry*, so the caller
+    /// never re-derives a size the generator already computed (`dyn_launch_cfg(grid, block, bytes)`).
+    ///
+    /// [`SmemMode::Static`] ⇒ plain [`Gpu::function`] and **0** launch bytes (the static tile is already
+    /// reserved by the entry; passing its size again would allocate it twice). [`SmemMode::Dynamic`] ⇒
+    /// [`Gpu::function_dyn`], which opts the entry in and asserts the request against this device's
+    /// ceiling. The `key` rule is unchanged and is *sharper* here: the cache never re-examines PTX on a
+    /// hit, so two stage/mode variants under one key would silently share the first one's kernel **and**
+    /// its SMEM ceiling — every variant's key and entry name must embed (tile, warps, stages, mode).
+    pub fn function_smem(
+        &mut self,
+        key: &'static str,
+        ptx: &str,
+        name: &str,
+        mode: SmemMode,
+    ) -> Result<(CudaFunction, usize), DriverError> {
+        match mode {
+            SmemMode::Static => Ok((self.function(key, ptx, name)?, 0)),
+            SmemMode::Dynamic(n) => {
+                Ok((self.function_dyn(key, ptx, name, n as usize)?, n as usize))
+            }
+        }
     }
 
     /// Load a module for `ptx`, preferring a cached cubin over a fresh JIT. Warm path: a previously
@@ -1568,6 +1658,66 @@ pub(crate) fn gemm_nt_f16_cliff(
     };
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ` via a named [`PIPE_DEEP_VARIANTS`](crate::ptx_wmma::PIPE_DEEP_VARIANTS) kernel — the
+/// **variable-stage** f16 pipeline, half of whose rows live in dynamic shared memory (rings deeper than
+/// the PTX ISA's 48 KiB static cap can express at this tile).
+///
+/// The SMEM form comes from the config, not from this function: `function_smem` loads the entry the way
+/// its [`SmemMode`] says (plain load + 0 launch bytes for a static row; `cuFuncSetAttribute` opt-in +
+/// the window size for a dynamic one) and hands back the byte count the launch must carry. Declines
+/// loudly — never silently downshifts to a shallower ring — when the row does not fit this device's
+/// opt-in ceiling. Numerically identical to every other f16 GEMM here (f32 accumulate); tolerance-gated.
+pub fn gemm_nt_f16_deep(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    v: &crate::ptx_wmma::CliffCfg,
+) -> Result<Vec<f32>, GpuError> {
+    use crate::ptx_wmma::gemm_deep_ptx;
+    use half::f16;
+    assert_eq!(a.len(), m * k, "A must be m×k");
+    assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
+    assert!(
+        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        "{} requires M%{}==0, N%{}==0, K%{}==0",
+        v.name, v.bm, v.bn, v.bk
+    );
+    if v.smem_bytes() > g.smem_budget() {
+        // A capability fact about the hardware, decided before any PTX is loaded — not a driver error,
+        // and above all not a silent fall-back to a shallower ring the caller did not ask for.
+        return Err(GpuError::Unsupported(format!(
+            "f16 deep pipeline `{}`: needs {} B of shared memory per block, but {} reports a {} B \
+             opt-in ceiling (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+            v.name,
+            v.smem_bytes(),
+            g.target.name,
+            g.smem_budget()
+        )));
+    }
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    // One key for the one deep module; the ENTRY name carries (tile, stages) and the SMEM ceiling is
+    // tracked per (key, entry), so no two depths can inherit each other's window.
+    let (f, dyn_bytes) = g.function_smem("gemm_deep", gemm_deep_ptx(), v.name, v.smem_mode())?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    // r16-rasterized ⇒ a 1-D grid of (M/bm)·(N/bn) blocks.
+    let cfg = dyn_launch_cfg(
+        (((m / v.bm) * (n / v.bn)) as u32, 1, 1),
+        (v.threads() as u32, 1, 1),
+        dyn_bytes,
+    );
+    unsafe { bld.launch(cfg)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// The fp16 `mma.sync` workhorse config (`mma_nt_f16_128_bk32_s2_r16`) — the fastest large-GEMM base, and
@@ -12985,6 +13135,132 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **THE f16 DEEP-PIPELINE GATE — `mma.sync` rings past the 48 KiB static wall.**
+    ///
+    /// Three of the five [`PIPE_DEEP_VARIANTS`](crate::ptx_wmma::PIPE_DEEP_VARIANTS) rows (s4 = 64 KiB,
+    /// s5 = 80 KiB, 128×256 s3 = 72 KiB) **cannot be declared statically on any device** — the 48 KiB cap
+    /// is a PTX ISA rule about static `.shared`, not a device fact — so they exist only through the
+    /// module-scope `.extern .shared` window plus `cuFuncSetAttribute`. This runs them, on the metal.
+    ///
+    /// Two oracles, because a float kernel has no bit-exact one:
+    ///   * the **f16-rounded f64 reference** at the crate's fp16 GEMM tolerance (abs 1e-2, rel 2e-3) —
+    ///     the independent check, so a wrong kernel cannot pass by agreeing with a wrong sibling;
+    ///   * the **shipped 2-stage row** (`deep_swz_128_s2`, byte-identical to `cliff_swz_s2`) at the same
+    ///     tolerance — the regression check. A deeper ring only reorders *when* each K-slab is staged;
+    ///     the mma sequence and the f32 accumulation ORDER per output are identical, so in practice the
+    ///     depths agree far more tightly than the oracle bound, and the observed max_abs is printed.
+    ///
+    /// Shapes are the ring's K-corners per depth — one K-tile (the prologue stages slabs past the end of
+    /// A/B and must guard every one of them), exactly `stages-1` K-tiles (prologue fills the ring, the
+    /// main loop never prefetches), a wrap, and several wraps — plus a multi-band raster shape
+    /// (`tiles_n = 17 > raster = 16`), the arm every small test shape leaves dead. A row past this
+    /// device's opt-in ceiling is a **capability skip**, never a silent pass.
+    #[test]
+    fn gemm_deep_matches_reference_within_tol() {
+        use crate::ptx_wmma::PIPE_DEEP_VARIANTS;
+        use half::f16;
+        with_gpu("gemm_deep", |g| {
+            let budget = g.smem_budget();
+            eprintln!(
+                "f16 deep pipeline on {} — opt-in SMEM budget {budget} B ({} KiB); static ISA cap {} KiB",
+                g.device_name(),
+                budget / 1024,
+                STATIC_SMEM_CAP / 1024
+            );
+            let base = crate::ptx_wmma::deep_variant("deep_swz_128_s2");
+            let mut rng = crate::diff::Rng::new(0x0DEE_9176);
+            let mut ran = 0usize;
+            for v in PIPE_DEEP_VARIANTS {
+                if v.smem_bytes() > budget {
+                    eprintln!(
+                        "[skip:capability] {}: {} B > this device's opt-in ceiling {budget} B",
+                        v.name,
+                        v.smem_bytes()
+                    );
+                    continue;
+                }
+                // The occupancy the depth actually buys/costs on THIS card — a device fact, printed as
+                // context for why this part's verdict on depth is not the datacenter's. Not a timing.
+                let occ = {
+                    let (f, dyn_bytes) = g
+                        .function_smem("gemm_deep", crate::ptx_wmma::gemm_deep_ptx(), v.name, v.smem_mode())
+                        .unwrap();
+                    assert_eq!(dyn_bytes, v.smem_mode().launch_bytes());
+                    f.occupancy_max_active_blocks_per_multiprocessor(v.threads() as u32, dyn_bytes, None)
+                        .unwrap_or(0)
+                };
+                eprintln!(
+                    "  {:<20} {}x{} s{} SMEM {:>5} B ({:>2} KiB) {:<8} occupancy={} CTA/SM",
+                    v.name,
+                    v.bm,
+                    v.bn,
+                    v.stages,
+                    v.smem_bytes(),
+                    v.smem_bytes() / 1024,
+                    if v.smem_mode().is_dynamic() { "DYNAMIC" } else { "static" },
+                    occ
+                );
+                let mut shapes = vec![
+                    (v.bm, v.bk, v.bn),                          // 1 CTA, 1 K-tile — full prologue guard
+                    (v.bm, v.bk * (v.stages - 1), v.bn),         // prologue exactly fills the ring
+                    (2 * v.bm, v.bk * v.stages, 2 * v.bn),       // 4 CTAs, first ring wrap
+                    (v.bm, v.bk * (v.stages + 3), 2 * v.bn),     // several wraps, rectangular
+                    (v.bm, v.bk, (v.raster + 1) * v.bn),         // tiles_n = 17 > raster = 16
+                ];
+                shapes.dedup();
+                for (m, k, n) in shapes {
+                    let a = rng.vec(m * k, -1.0, 1.0);
+                    let b = rng.vec(n * k, -1.0, 1.0);
+                    let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                    let c = gemm_nt_f16_deep(g, &a, &b, m, k, n, v).unwrap();
+                    let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
+                    // …and against the shipped 2-stage row at the same shape (the regression oracle).
+                    let (peer_max, peer_note) = if m % base.bm == 0 && n % base.bn == 0 && k % base.bk == 0 {
+                        let c2 = gemm_nt_f16_deep(g, &a, &b, m, k, n, base).unwrap();
+                        crate::diff::assert_close(&format!("{} vs s2 {m}x{k}x{n}", v.name), &c, &c2, 1e-2, 2e-3);
+                        (c.iter().zip(&c2).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max), "")
+                    } else {
+                        (f32::NAN, " (s2 does not tile this shape)")
+                    };
+                    eprintln!(
+                        "    {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e} | vs s2 max_abs={:.2e}{peer_note}",
+                        s.max_abs, s.max_rel, peer_max
+                    );
+                    ran += 1;
+                }
+            }
+            assert!(ran >= 10, "the deep grid must actually have run (only {ran} shapes)");
+            eprintln!(
+                "[gate] f16 deep pipeline: {ran} K-corner shapes across s2..s5 + the 128x256 tile, every one \
+                 within fp16 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the >48 KiB rows \
+                 ran out of the dynamic SMEM window ✓"
+            );
+        });
+    }
+
+    /// **A deep row that does not fit the device declines LOUDLY** — it never silently runs a shallower
+    /// ring or a truncated window. The launch path asserts the request against
+    /// `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` *at the seam*, because the driver's own rejection
+    /// (`CUDA_ERROR_INVALID_VALUE` at launch) names neither the kernel nor the ceiling. Probed with a
+    /// fabricated over-budget config so the check fires on every card, however large its carveout.
+    #[test]
+    fn gemm_deep_declines_over_budget_instead_of_downshifting() {
+        use crate::ptx_wmma::{deep_variant, CliffCfg};
+        with_gpu("gemm_deep_decline", |g| {
+            let budget = g.smem_budget();
+            // 32 stages at 128x128 bk32 = 512 KiB — past every part's opt-in ceiling (H100's is 227 KiB).
+            let over = CliffCfg { name: "deep_swz_128_s2", stages: 32, ..*deep_variant("deep_swz_128_s2") };
+            assert!(over.smem_bytes() > budget, "the probe config must exceed the device ceiling");
+            let a = vec![0f32; 128 * 32];
+            let b = vec![0f32; 128 * 32];
+            let err = gemm_nt_f16_deep(g, &a, &b, 128, 32, 128, &over).unwrap_err();
+            let msg = err.unsupported().expect("an over-budget row must be a CAPABILITY decline");
+            assert!(msg.contains("shared memory"), "the decline must name what was refused: {msg}");
+            assert!(msg.contains(&budget.to_string()), "the decline must name the ceiling: {msg}");
+            eprintln!("[gate] over-budget deep row declined: {msg}");
+        });
+    }
+
     /// **Correctness gate for the dispatched w22 swizzle workhorses** (`mma_nt_{f16,bf16}_128_bk32_s2_r16_
     /// w22swz`, the GEMM-cliff win `gemm_nt_{f16,bf16}` route ≥48 MB to). Small shapes never reach the ≥48 MB
     /// arm, so this loads the production kernels by name and checks `C = A·Bᵀ` vs the {f16,bf16}-rounded f64
@@ -16405,6 +16681,170 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 assert_eq!(c3, rf, "w64_s3 {m}x{k}x{n} != i32 oracle (element-wise)");
                 assert_eq!(c3, c2, "w64_s3 {m}x{k}x{n} != w64 2-stage (element-wise)");
                 eprintln!("int8 w64_s3 {m}x{k}x{n}: 3-stage == 2-stage == i32 oracle ✓ ({} elems)", m * n);
+            }
+        });
+    }
+
+    /// **THE STAGE-GRID GATE — int8 `w64` at s2..s5, half of it living in dynamic shared memory.**
+    ///
+    /// This is the payoff of the dynamic-SMEM plumbing and the one thing that transfers 100% to the
+    /// datacenter parts: s4 (64 KiB) and s5 (80 KiB) **cannot be declared statically on any device** —
+    /// the 48 KiB cap is a PTX ISA rule, not a device fact — so they exist only through the module-scope
+    /// `.extern .shared` window + `cuFuncSetAttribute`. They are exercised here, on the metal, at $0.
+    ///
+    /// int8 accumulates exactly mod 2³², so the gate is **element-wise `==`** against *two* oracles: the
+    /// wrapping-`i32` CPU reference (the real one) and the shipped 2-stage kernel (the regression one).
+    /// A deeper ring only reorders *when* each K-slab is staged; every `mma` and every accumulator is
+    /// byte-for-byte the 2-stage kernel's, so anything but equality is a bug — no tolerance to hide in.
+    ///
+    /// The shapes are the **K-corners of the ring**, per depth, which is where the two ways a
+    /// variable-depth `cp.async` pipeline goes wrong actually show:
+    ///   * `K = 64` — a single K-tile, *shorter than the prologue*: slabs 1..stages-2 are staged at
+    ///     absolute K columns past the end of A and B and must be guarded, while their `commit_group`
+    ///     must NOT be (the `wait_group stages-1` count is positional). An off-by-one here consumes an
+    ///     in-flight slab and silently returns wrong C, only at particular K.
+    ///   * `K = (stages-1)·64` — the prologue exactly fills the ring; the main loop never prefetches.
+    ///   * `K = stages·64` — the first ring **wrap**. The 2-stage kernel toggles buffers by XOR, which
+    ///     only cycles two; every deeper ring must use add+wrap, and mixing the two corrupts stage ≥ 3.
+    ///   * `K = (stages+2)·64` — several wraps, so a cursor that drifts by one tile per lap is caught.
+    /// Each K is run at a different rectangular CTA grid so multi-CTA tile ownership is covered too.
+    ///
+    /// Occupancy is *printed*, not asserted: it is a device fact (`cuOccupancyMaxActiveBlocksPerMultiprocessor`)
+    /// that explains why this card's verdict on depth is not the datacenter's. No timing is taken here.
+    /// A variant past this device's opt-in ceiling is a **capability skip**, never a silent pass. Skips
+    /// without a GPU.
+    #[test]
+    fn quant_int8_stage_grid_matches_reference() {
+        use crate::ptx_int8::{int8_stage_ptx, INT8_STAGE_VARIANTS};
+        with_gpu("quant_int8_stage_grid", |g| {
+            let budget = g.smem_budget();
+            eprintln!(
+                "int8 stage grid on {} — opt-in SMEM budget {budget} B ({} KiB); the static ISA cap is {} KiB",
+                g.device_name(),
+                budget / 1024,
+                STATIC_SMEM_CAP / 1024
+            );
+            // The shipped 2-stage kernel: the regression oracle every depth must also equal.
+            let f_ship = g
+                .function("int8_gemm_nt_w64_swz", crate::ptx_int8::int8_gemm_w64_swz_ptx(), "int8_gemm_nt_w64_swz")
+                .unwrap();
+            let mut rng = crate::diff::Rng::new(0x5A31);
+            let mut ran = 0usize;
+            for v in INT8_STAGE_VARIANTS {
+                if v.smem_bytes() > budget {
+                    // A real capability limit (a Turing-class 64 KiB opt-in cannot express s5), not a
+                    // silent green: `WUKONG_GPU_REQUIRED` still sees the device, so say why loudly.
+                    eprintln!(
+                        "[skip:capability] {}: {} B > this device's opt-in ceiling {budget} B",
+                        v.name,
+                        v.smem_bytes()
+                    );
+                    continue;
+                }
+                let (ptx, mode) = int8_stage_ptx(v, budget);
+                assert_eq!(mode, v.smem_mode(), "{}: generator and table disagree on the SMEM form", v.name);
+                // ONE call for both forms: static ⇒ plain load + 0 launch bytes; dynamic ⇒ the opt-in.
+                // The key is the variant name, so no two depths can share a module (or an SMEM ceiling).
+                let (f, dyn_bytes) = g.function_smem(v.name, &ptx, v.name, mode).unwrap();
+                assert_eq!(dyn_bytes, mode.launch_bytes());
+                let occ = f
+                    .occupancy_max_active_blocks_per_multiprocessor(v.threads() as u32, dyn_bytes, None)
+                    .unwrap_or(0);
+                eprintln!(
+                    "  {:<16} s{} SMEM {:>5} B ({:>2} KiB) {:<8} launch_bytes={:<6} occupancy={} CTA/SM",
+                    v.name,
+                    v.stages,
+                    v.smem_bytes(),
+                    v.smem_bytes() / 1024,
+                    if mode.is_dynamic() { "DYNAMIC" } else { "static" },
+                    dyn_bytes,
+                    occ
+                );
+                // K-corners of this depth's ring (deduped), each at its own rectangular CTA grid.
+                let mut ks = vec![64usize, v.min_k(), v.stages * 64, (v.stages + 2) * 64];
+                ks.sort_unstable();
+                ks.dedup();
+                let grids = [(128usize, 128usize), (256, 128), (128, 256), (256, 256)];
+                for (i, k) in ks.iter().copied().enumerate() {
+                    let (m, n) = grids[i % grids.len()];
+                    let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                    let want = ref_nt_int8(&a_u8, &b, m, k, n);
+                    let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                    let b_d = g.stream.memcpy_stod(&b).unwrap();
+                    let dims = (m as u32, n as u32, k as u32);
+                    let grid = ((n / v.bn) as u32, (m / v.bm) as u32, 1);
+                    let block = (v.threads() as u32, 1, 1);
+                    let run = |g: &mut Gpu, f: &_, bytes: usize| -> Vec<i32> {
+                        let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                        let mut bld = g.stream.launch_builder(f);
+                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        unsafe { bld.launch(dyn_launch_cfg(grid, block, bytes)).unwrap() };
+                        g.stream.memcpy_dtov(&cc).unwrap()
+                    };
+                    let got = run(g, &f, dyn_bytes);
+                    assert_eq!(got, want, "{} {m}x{k}x{n}: != the i32 oracle (element-wise)", v.name);
+                    let ship = run(g, &f_ship, 0);
+                    assert_eq!(got, ship, "{} {m}x{k}x{n}: != the shipped 2-stage kernel", v.name);
+                    ran += 1;
+                }
+            }
+            assert!(ran >= 8, "the stage grid must actually have run (only {ran} shapes)");
+            eprintln!(
+                "[gate] int8 stage grid s2..s5: {ran} K-corner shapes, every one == the i32 oracle AND == the \
+                 shipped 2-stage kernel, element-wise; s4/s5 ran out of the dynamic SMEM window (>48 KiB static) ✓"
+            );
+        });
+    }
+
+    /// **The big-tile × depth point: CUTLASS's SM80 int8 shape (256×128, 64×64 warp tile) at 3 stages.**
+    /// 3·(256+128)·64 = **72 KiB** — a config that simply *cannot exist* under the static cap, which is
+    /// why the 4050 could only ever test that shape at 2 stages (and measured it a loss: 1 CTA/SM starves
+    /// 20 SMs). On A100/H100 it is the predicted int8 winner, so the PTX has to be proven correct here.
+    /// Bit-exact against the i32 oracle, at the ring's K-corners. Skips (capability) below a 72 KiB opt-in.
+    #[test]
+    fn quant_int8_bigtile_stage3_matches_reference() {
+        use crate::ptx_int8::int8_gemm_swz_tile_stage_ptx;
+        with_gpu("quant_int8_bigtile_s3", |g| {
+            let budget = g.smem_budget();
+            let mut rng = crate::diff::Rng::new(0x5A32);
+            // (bm, bn, wm, wn): the two CUTLASS SM80 int8 shape-class orientations, 8 warps, 64×64 warp tile.
+            for (bm, bn, wm, wn) in [(256usize, 128usize, 4usize, 2usize), (128, 256, 2, 4)] {
+                let bytes = 3 * (bm + bn) * 64;
+                if bytes > budget {
+                    eprintln!("[skip:capability] int8 {bm}x{bn} s3: {bytes} B > opt-in ceiling {budget} B");
+                    continue;
+                }
+                let (name, ptx, mode) = int8_gemm_swz_tile_stage_ptx(bm, bn, wm, wn, 0, 3, budget);
+                assert_eq!(mode, SmemMode::Dynamic(bytes as u32), "{name}: 72 KiB must be dynamic");
+                // An owned per-shape module: load it directly rather than fabricate a `&'static str` key.
+                let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
+                let f = module.load_function(name.as_str()).unwrap();
+                let _ = g.ctx.bind_to_thread();
+                f.set_attribute(
+                    sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    bytes as i32,
+                )
+                .unwrap();
+                let occ = f
+                    .occupancy_max_active_blocks_per_multiprocessor((wm * wn * 32) as u32, bytes, None)
+                    .unwrap_or(0);
+                eprintln!("  {name}: SMEM {bytes} B ({} KiB) DYNAMIC, occupancy={occ} CTA/SM", bytes / 1024);
+                for k in [64usize, 128, 192, 320] {
+                    let (m, n) = (bm, bn);
+                    let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                    let want = ref_nt_int8(&a_u8, &b, m, k, n);
+                    let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                    let b_d = g.stream.memcpy_stod(&b).unwrap();
+                    let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut cc);
+                    unsafe {
+                        bld.launch(dyn_launch_cfg((1, 1, 1), ((wm * wn * 32) as u32, 1, 1), bytes)).unwrap()
+                    };
+                    assert_eq!(g.stream.memcpy_dtov(&cc).unwrap(), want, "{name} {m}x{k}x{n} != i32 oracle");
+                }
+                eprintln!("[gate] {name}: bit-exact at 4 K-corners out of a {bytes}-B dynamic window ✓");
             }
         });
     }
