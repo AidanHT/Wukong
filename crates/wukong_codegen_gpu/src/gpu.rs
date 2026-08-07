@@ -5540,48 +5540,460 @@ mod tests {
         });
     }
 
-    /// **Every fp8 launcher that loads a module must gate first.** The capability check is only worth
-    /// anything if a *new* fp8 entry point cannot forget it — a launcher that generates PTX and calls
-    /// `cuModuleLoadData` on an A100 fails with a JIT error naming an instruction, not the missing
-    /// capability, and does so after the host-side conversion work.
-    ///
-    /// So this scans this file's own source (`include_str!`, compile-time — no I/O, no path
-    /// assumptions): every **top-level** `fn` whose name mentions fp8 and which loads a module must
-    /// contain `require_fp8(`. Wrappers that merely delegate to another fp8 launcher load nothing and
-    /// are exempt (the callee gates). Test/bench fns are indented, so the column-0 anchor skips them.
+    /// **Every `src/*.rs` in this crate, paired with its name — the corpus the source-scanning laws
+    /// read.** `include_str!` is compile-time: no I/O, no path assumptions, and the bytes scanned are
+    /// exactly the bytes that were compiled. Kept honest by [`crate_source_list_is_complete`], which
+    /// reads the directory and demands agreement — a new module cannot join the crate and quietly sit
+    /// outside every law that scans source.
+    const CRATE_SOURCES: &[(&str, &str)] = &[
+        ("autotune.rs", include_str!("autotune.rs")),
+        ("baselines.rs", include_str!("baselines.rs")),
+        ("cubin.rs", include_str!("cubin.rs")),
+        ("diff.rs", include_str!("diff.rs")),
+        ("fusion.rs", include_str!("fusion.rs")),
+        ("gpu.rs", include_str!("gpu.rs")),
+        ("graph.rs", include_str!("graph.rs")),
+        ("lib.rs", include_str!("lib.rs")),
+        ("lower.rs", include_str!("lower.rs")),
+        ("megakernel.rs", include_str!("megakernel.rs")),
+        ("paged_attention.rs", include_str!("paged_attention.rs")),
+        ("paged_kv.rs", include_str!("paged_kv.rs")),
+        ("pool.rs", include_str!("pool.rs")),
+        ("ptx.rs", include_str!("ptx.rs")),
+        ("ptx_autodiff_bwd.rs", include_str!("ptx_autodiff_bwd.rs")),
+        ("ptx_conv.rs", include_str!("ptx_conv.rs")),
+        ("ptx_flash.rs", include_str!("ptx_flash.rs")),
+        ("ptx_fp8.rs", include_str!("ptx_fp8.rs")),
+        ("ptx_fp8_train.rs", include_str!("ptx_fp8_train.rs")),
+        ("ptx_gemm.rs", include_str!("ptx_gemm.rs")),
+        ("ptx_int4.rs", include_str!("ptx_int4.rs")),
+        ("ptx_int8.rs", include_str!("ptx_int8.rs")),
+        ("ptx_norm.rs", include_str!("ptx_norm.rs")),
+        ("ptx_optim.rs", include_str!("ptx_optim.rs")),
+        ("ptx_target.rs", include_str!("ptx_target.rs")),
+        ("ptx_winograd.rs", include_str!("ptx_winograd.rs")),
+        ("ptx_wmma.rs", include_str!("ptx_wmma.rs")),
+        ("serving.rs", include_str!("serving.rs")),
+        ("train_resident.rs", include_str!("train_resident.rs")),
+    ];
+
+    /// **[`CRATE_SOURCES`] must list every `src/*.rs`.** A source-scanning law is only as wide as its
+    /// corpus, and an `include_str!` table is exactly the kind of list that rots the day someone adds a
+    /// module. `CARGO_MANIFEST_DIR` is set by cargo for every build of this crate; if the directory is
+    /// somehow unreadable (a vendored/packaged build), the check reports a skip rather than a failure —
+    /// the table itself is still compile-time correct, only its *completeness* goes unproven.
     #[test]
-    fn every_fp8_launcher_requires_the_capability() {
-        let src = include_str!("gpu.rs");
-        let mut checked = Vec::new();
-        for (i, line) in src.lines().enumerate() {
-            let sig = line.strip_prefix("pub fn ").or_else(|| line.strip_prefix("fn "));
-            let Some(sig) = sig else { continue };
-            let name = sig.split('(').next().unwrap_or("");
-            if !name.contains("fp8") {
+    fn crate_source_list_is_complete() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("[skip] {} unreadable — CRATE_SOURCES completeness unproven", dir.display());
+            return;
+        };
+        let mut on_disk: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".rs"))
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = CRATE_SOURCES.iter().map(|(n, _)| n.to_string()).collect();
+        listed.sort();
+        assert_eq!(
+            on_disk, listed,
+            "CRATE_SOURCES is stale — add the new src/*.rs here or every source law is blind to it"
+        );
+    }
+
+    /// A crate source reduced to **scannable code**: `r#"..."#` raw strings (the PTX bodies) blanked,
+    /// `//` comment lines dropped, and the `#[cfg(test)]` module cut off.
+    ///
+    /// Each removal earns its place. A PTX body contains column-0 `}` and would end an item early; a
+    /// comment naming `ptx_fp8::fp8_pipe_entry` is prose, not a call (and, symmetrically, a commented-out
+    /// `require_fp8(` must not satisfy a law); and a test module legitimately loads fp8 modules behind
+    /// `with_fp8`. Every file in this crate has at most one `#[cfg(test)]`, at column 0, last —
+    /// asserted, so the cut cannot silently swallow real code.
+    fn scannable_source(name: &str, src: &str) -> String {
+        assert!(
+            src.matches("\n#[cfg(test)]").count() <= 1,
+            "{name}: more than one column-0 #[cfg(test)] — the test-module cut is no longer sound"
+        );
+        // 1. blank raw strings (they are PTX text, never Rust items).
+        let mut code = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(i) = rest.find("r#\"") {
+            code.push_str(&rest[..i]);
+            code.push_str("\"\"");
+            let after = &rest[i + 3..];
+            rest = match after.find("\"#") {
+                Some(e) => &after[e + 2..],
+                None => "",
+            };
+        }
+        code.push_str(rest);
+        // 2. cut the test module.
+        if let Some(i) = code.find("\n#[cfg(test)]") {
+            code.truncate(i);
+        }
+        // 3. drop comment lines.
+        code.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every `fn` in scannable code (any visibility, any nesting), as `(name, body)`. A body runs from
+    /// the signature line to the first `}` at the signature's own indentation — exact for rustfmt'd
+    /// Rust once raw strings are blanked, and it reaches `impl` methods that a column-0 anchor misses.
+    fn scanned_fns(src: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            let indent = line.len() - t.len();
+            let Some(sig) = ["pub fn ", "pub(crate) fn ", "fn ", "pub async fn ", "async fn "]
+                .iter()
+                .find_map(|p| t.strip_prefix(p))
+            else {
                 continue;
+            };
+            let name = sig.split(['(', '<']).next().unwrap_or("").trim().to_string();
+            let close = format!("{}}}", " ".repeat(indent));
+            let mut body = String::new();
+            for (j, l) in lines[i..].iter().enumerate() {
+                body.push_str(l);
+                body.push('\n');
+                if j > 0 && *l == close.as_str() {
+                    break;
+                }
             }
-            // The item body: from here to the next column-0 `}`.
-            let body: String = src
-                .lines()
-                .skip(i)
-                .take_while(|l| !l.starts_with('}'))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let loads = body.contains("g.function(") || body.contains("load_module(");
-            if loads {
-                assert!(
-                    body.contains("require_fp8("),
-                    "fp8 launcher `{name}` loads a module without a capability gate — on a pre-Ada \
-                     card it would fail inside the PTX JIT instead of declining"
-                );
-                checked.push(name.to_string());
+            out.push((name, body));
+        }
+        out
+    }
+
+    /// The fp8 PTX-generator symbols a body names: every identifier reached through `ptx_fp8::` or
+    /// `ptx_fp8_train::`, including the `::{A, B, C}` import-group form (which may span lines).
+    fn fp8_surface_refs(body: &str) -> Vec<String> {
+        let mut refs = Vec::new();
+        for pat in ["ptx_fp8::", "ptx_fp8_train::"] {
+            let mut rest = body;
+            while let Some(i) = rest.find(pat) {
+                let after = &rest[i + pat.len()..];
+                if let Some(tail) = after.strip_prefix('{') {
+                    let group = &tail[..tail.find('}').unwrap_or(tail.len())];
+                    refs.extend(
+                        group.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                    );
+                } else {
+                    let sym: String =
+                        after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if !sym.is_empty() {
+                        refs.push(sym);
+                    }
+                }
+                rest = after;
             }
         }
-        assert!(
-            checked.len() >= 8,
-            "expected the known fp8 launcher set to be scanned, found only {checked:?}"
+        refs
+    }
+
+    /// **Every function that reaches the fp8 generator surface and loads a module must gate first —
+    /// crate-wide, keyed on the PTX symbol, not on the function's name.**
+    ///
+    /// fp8 `mma.sync` and the packed `cvt.rn.satfinite.e{4m3,5m2}x2` converters exist nowhere below
+    /// Ada. A launcher that skips [`Gpu::require_fp8`] does not fail cleanly on an A100: it does the
+    /// host-side f32→fp8 conversion, generates PTX, and dies inside `cuModuleLoadData` with a JIT error
+    /// naming an *instruction*, which tells the caller nothing about the missing capability.
+    ///
+    /// The law this replaces had three demonstrated holes, each of which let a real launcher through:
+    ///   * **name-keyed** (`name.contains("fp8")`) — V1 planted `gemm_nt_e4m3_probe`, which loads
+    ///     `ptx_fp8::FP8_TILE` with no gate, and the law stayed green because the name says `e4m3`;
+    ///   * **single-file** (`include_str!("gpu.rs")`) — a launcher in `train_resident.rs`,
+    ///     `serving.rs`, `autotune.rs` or `baselines.rs` was never scanned at all;
+    ///   * **receiver-keyed** (`g.function(` / `load_module(`) — the same load through any other
+    ///     binding (`gpu.function(`, `dev.function_smem(`) read as "loads nothing", so the whole
+    ///     requirement silently switched off.
+    ///
+    /// So: scan every [`CRATE_SOURCES`] file, take every `fn` at any nesting outside the test module,
+    /// and if its body names an fp8 generator symbol **and** performs any module load, require a
+    /// `require_fp8(`/`require_cap(` at a byte offset *before* the first load. Wrappers that delegate to
+    /// a gated launcher load nothing and are exempt by construction — the callee gates.
+    ///
+    /// `AMAX_PTX` is the one exempt symbol: it is the delayed-scaling amax reduction, plain `max.f32`
+    /// with no fp8 instruction anywhere in it, floored at `.version 7.8`/`sm_80` by its own gate in
+    /// `ptx_fp8_train` precisely so it keeps running on the pre-Ada parts. Gating it on cc>=8.9 would
+    /// be the mirror-image bug of the one this law exists to prevent.
+    #[test]
+    fn every_fp8_module_load_is_capability_gated() {
+        /// PTX-emitting fp8 symbols that are NOT an fp8 capability requirement. See the doc above.
+        const EXEMPT: &[&str] = &["AMAX_PTX"];
+        /// Module loads, receiver-agnostic: any binding, any of `Gpu`'s load entry points, and the raw
+        /// driver call the debug helpers use.
+        const LOAD_VERBS: &[&str] = &[
+            ".function(",
+            ".function_dyn(",
+            ".function_smem(",
+            "load_module",
+            "load_function(",
+            "cuModuleLoadData",
+        ];
+        const GATES: &[&str] = &["require_fp8(", "require_cap("];
+
+        // A bare `FP8_TILE` after a file-scope `use crate::ptx_fp8::...` would carry no `ptx_fp8::` in
+        // the function body and so escape the scan. Only the fp8 files themselves may import that way.
+        for (name, src) in CRATE_SOURCES {
+            if name.starts_with("ptx_fp8") {
+                continue;
+            }
+            assert!(
+                !src.contains("\nuse crate::ptx_fp8"),
+                "{name}: file-scope fp8 import — the symbol-keyed scan is per-FUNCTION, so move it \
+                 into the function body or this law goes blind to that file"
+            );
+        }
+
+        let mut checked: Vec<String> = Vec::new();
+        for (file, src) in CRATE_SOURCES {
+            let code = scannable_source(file, src);
+            for (name, body) in scanned_fns(&code) {
+                let refs = fp8_surface_refs(&body);
+                if refs.is_empty() || refs.iter().all(|r| EXEMPT.contains(&r.as_str())) {
+                    continue;
+                }
+                let Some(load_at) = LOAD_VERBS.iter().filter_map(|v| body.find(v)).min() else {
+                    continue; // delegating wrapper: it loads nothing, the callee gates
+                };
+                let gate_at = GATES.iter().filter_map(|g| body.find(g)).min();
+                assert!(
+                    gate_at.is_some_and(|at| at < load_at),
+                    "{file}::{name} reaches the fp8 generator surface {refs:?} and loads a module \
+                     without a preceding capability gate — on a pre-Ada card it would fail inside \
+                     the PTX JIT (naming an instruction) instead of declining (naming fp8)"
+                );
+                checked.push(format!("{file}::{name}"));
+            }
+        }
+
+        // EXACT, not a floor: `>= 8` never tightened, so a launcher could be deleted or slip out of
+        // the scan unnoticed. Adding or removing an fp8 launcher is a deliberate act — update this
+        // number in the same commit, and read the printed list to confirm it is the set you meant.
+        // (The cuBLASLt fp8 peer `baselines::cublaslt_gemm_nt_fp8_e4m3` is deliberately NOT here: it
+        // rounds on the host and loads no PTX module at all, so there is no module load to precede.)
+        const EXPECTED_LAUNCHERS: usize = 8;
+        assert_eq!(
+            checked.len(),
+            EXPECTED_LAUNCHERS,
+            "the gated fp8 launcher set changed; update EXPECTED_LAUNCHERS deliberately: {checked:#?}"
         );
         eprintln!("[gate] {} fp8 launchers are capability-gated: {checked:?} \u{2713}", checked.len());
+    }
+
+    /// **Every PTX module this crate emits without a device and without a MIR program**, as
+    /// `(what, ptx)`. Zero-argument generators and literal consts are taken whole; a parameterized
+    /// generator contributes one representative shape, lifted from the shape its own family gate
+    /// already uses (so an illegal config cannot make this list panic).
+    ///
+    /// **Not reachable here:** `lower::emit_ptx` / `emit_mega_ptx` / `fusion` / `megakernel` build
+    /// their module from a `Program`, so they are not enumerable from a `&str`-only list — `lower.rs`
+    /// carries the same `.version` law over its own output (`!ptx.contains(".version 8.4")`, asserted
+    /// per `--emit` at every `-O`), and `baselines.rs` carries it over the NVRTC peers.
+    fn device_free_modules() -> Vec<(String, String)> {
+        use crate::{
+            ptx, ptx_autodiff_bwd as bwd, ptx_conv as conv, ptx_fp8 as fp8, ptx_fp8_train as fp8t,
+            ptx_gemm, ptx_int4 as int4, ptx_int8 as int8, ptx_norm, ptx_optim as optim,
+            ptx_winograd as wino, ptx_wmma as wmma,
+        };
+        let (c, h, w, k, r, s) = (64usize, 28usize, 28usize, 64usize, 3usize, 3usize);
+        let (wc, wh, ww, wk, wm) = (64usize, 14usize, 14usize, 64usize, 2usize);
+        let (_, _, nt) = wino::wino_ntiles(wh, ww, wm);
+        let mut v: Vec<(String, String)> = vec![
+            // ptx.rs — the offload core.
+            ("ptx::SAXPY", ptx::SAXPY.to_string()),
+            ("ptx::VADD", ptx::VADD.to_string()),
+            ("ptx::CAST_F32_F16", ptx::CAST_F32_F16.to_string()),
+            ("ptx::HEAD_TRANSPOSE_PTX", ptx::HEAD_TRANSPOSE_PTX.to_string()),
+            ("ptx::COPY_V4", ptx::COPY_V4.to_string()),
+            ("ptx::REDUCE", ptx::REDUCE.to_string()),
+            ("ptx::GEMM", ptx::GEMM.to_string()),
+            ("ptx::vmath_ptx", ptx::vmath_ptx().to_string()),
+            // f32/f16/bf16 GEMM, norms, flash.
+            ("ptx_gemm::gemm_rb_ptx", ptx_gemm::gemm_rb_ptx().to_string()),
+            ("ptx_norm::norm_ptx", ptx_norm::norm_ptx().to_string()),
+            ("ptx_flash::flash_ptx", crate::ptx_flash::flash_ptx().to_string()),
+            ("wmma::gemm_deep_ptx", wmma::gemm_deep_ptx().to_string()),
+            ("wmma::gemm_cliff_ptx", wmma::gemm_cliff_ptx().to_string()),
+            ("wmma::wmma_f16_ptx", wmma::wmma_f16_ptx().to_string()),
+            ("wmma::wmma_bf16_ptx", wmma::wmma_bf16_ptx().to_string()),
+            ("wmma::roofline_f16_ptx", wmma::roofline_f16_ptx().to_string()),
+            ("wmma::wmma_f16_sm_static_ptx", wmma::wmma_f16_sm_static_ptx(256, 256, 256, false)),
+            ("wmma::wmma_f16_sm_static_ptx/128", wmma::wmma_f16_sm_static_ptx(256, 256, 256, true)),
+            // training: optimizers and backward.
+            ("optim::ADAMW_STEP_PTX", optim::ADAMW_STEP_PTX.to_string()),
+            ("optim::SGD_STEP_PTX", optim::SGD_STEP_PTX.to_string()),
+            ("bwd::TRANSPOSE_F32_PTX", bwd::TRANSPOSE_F32_PTX.to_string()),
+            ("bwd::TRANSPOSE_CAST_F32_F16_PTX", bwd::TRANSPOSE_CAST_F32_F16_PTX.to_string()),
+            ("bwd::ACT_BWD_PTX", bwd::ACT_BWD_PTX.to_string()),
+            ("bwd::TRAIN_ELEM_PTX", bwd::TRAIN_ELEM_PTX.to_string()),
+            ("bwd::norm_bwd_ptx", bwd::norm_bwd_ptx().to_string()),
+            ("bwd::train_gemm_ptx", bwd::train_gemm_ptx().to_string()),
+            // conv + winograd.
+            ("conv::CONV2D", conv::CONV2D.to_string()),
+            ("conv::conv2d_ptx", conv::conv2d_ptx(c, h, w, k, r, s)),
+            ("conv::conv_wmma_ptx", conv::conv_wmma_ptx(c, h, w, k, r, s)),
+            ("conv::conv_wmma_strided_ptx", conv::conv_wmma_strided_ptx(c, h, w, k, r, s, 2)),
+            ("conv::conv_wmma_pad_ptx", conv::conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1)),
+            ("conv::conv_wmma_db_ptx", conv::conv_wmma_db_ptx(c, h, w, k, r, s)),
+            (
+                "conv::conv_wmma_epi_ptx",
+                conv::conv_wmma_epi_ptx(c, h, w, k, r, s, crate::ptx_wmma::Act::Relu, true),
+            ),
+            ("conv::conv_wmma_splitk_ptx", conv::conv_wmma_splitk_ptx(c, h, w, k, r, s, 2)),
+            ("conv::conv_wmma_db_splitk_ptx", conv::conv_wmma_db_splitk_ptx(c, h, w, k, r, s, 2)),
+            (
+                "conv::conv_wmma_pad_splitk_ptx",
+                conv::conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, 2),
+            ),
+            ("conv::conv_splitk_reduce_ptx", conv::conv_splitk_reduce_ptx(k * 676, 2)),
+            ("conv::bias_relu_ptx", conv::bias_relu_ptx(k, 676)),
+            ("conv::pad_nchw_copy_ptx", conv::pad_nchw_copy_ptx(c, h, w, 1)),
+            ("wino::wino_filter_xform_ptx", wino::wino_filter_xform_ptx(wc, wk, wm)),
+            ("wino::wino_input_xform_ptx", wino::wino_input_xform_ptx(wc, wh, ww, wm)),
+            ("wino::wino_output_xform_ptx", wino::wino_output_xform_ptx(wk, wh, ww, wm)),
+            ("wino::wino_bgemm_ptx", wino::wino_bgemm_ptx(wc, nt, wk)),
+            // quantized: int4, int8.
+            ("int4::w4a16_ptx", int4::w4a16_ptx().to_string()),
+            ("int4::w4a16_splitk_ptx", int4::w4a16_splitk_ptx().to_string()),
+            ("int4::w4a16_static_ptx", int4::w4a16_static_ptx(256, 256, 256, false)),
+            ("int8::INT8_TILE", int8::INT8_TILE.to_string()),
+            ("int8::int8_gemm_ptx", int8::int8_gemm_ptx().to_string()),
+            ("int8::int8_gemm_mt_ptx", int8::int8_gemm_mt_ptx().to_string()),
+            ("int8::int8_gemm_smdb_ptx", int8::int8_gemm_smdb_ptx().to_string()),
+            ("int8::int8_gemm_smdb_deq_ptx", int8::int8_gemm_smdb_deq_ptx().to_string()),
+            ("int8::int8_gemm_smdb128_ptx", int8::int8_gemm_smdb128_ptx().to_string()),
+            ("int8::int8_gemm_smdb_s3_ptx", int8::int8_gemm_smdb_s3_ptx().to_string()),
+            ("int8::int8_gemm_smdb_s4_ptx", int8::int8_gemm_smdb_s4_ptx().to_string()),
+            ("int8::int8_gemm_smdb128_s3_ptx", int8::int8_gemm_smdb128_s3_ptx().to_string()),
+            ("int8::int8_gemm_smdb128_s4_ptx", int8::int8_gemm_smdb128_s4_ptx().to_string()),
+            ("int8::int8_gemm_smdb_swz_ptx", int8::int8_gemm_smdb_swz_ptx().to_string()),
+            ("int8::int8_gemm_smdb_swz_splitk_ptx", int8::int8_gemm_smdb_swz_splitk_ptx().to_string()),
+            ("int8::int8_gemm_smdb_swz_deq_ptx", int8::int8_gemm_smdb_swz_deq_ptx().to_string()),
+            ("int8::int8_gemm_smdb128_swz_ptx", int8::int8_gemm_smdb128_swz_ptx().to_string()),
+            ("int8::int8_gemm_w64_swz_ptx", int8::int8_gemm_w64_swz_ptx().to_string()),
+            ("int8::int8_gemm_w64_swz_s3_ptx", int8::int8_gemm_w64_swz_s3_ptx().to_string()),
+            ("int8::int8_gemm_w64_swz_r8_ptx", int8::int8_gemm_w64_swz_r8_ptx().to_string()),
+            ("int8::int8_gemm_w64_swz_deq_ptx", int8::int8_gemm_w64_swz_deq_ptx().to_string()),
+            ("int8::int8_gemm_smdb_swz_static_ptx", int8::int8_gemm_smdb_swz_static_ptx(256, 256, 256, false)),
+            ("int8::int8_gemm_smdb_swz_raster_ptx", int8::int8_gemm_smdb_swz_raster_ptx(false, 8)),
+            // fp8 (the licensed 8.4 / sm_89 family) and its sm_80-floored amax companion.
+            ("fp8::FP8_TILE", fp8::FP8_TILE.to_string()),
+            ("fp8::fp8_gemm_ptx", fp8::fp8_gemm_ptx().to_string()),
+            ("fp8::fp8_gemm_mt_ptx", fp8::fp8_gemm_mt_ptx().to_string()),
+            ("fp8::fp8_pipe_ptx", fp8::fp8_pipe_ptx().to_string()),
+            ("fp8::fp8_pipe_w64_ptx", fp8::fp8_pipe_w64_ptx().to_string()),
+            ("fp8::fp8_pipe_w64_s3_ptx", fp8::fp8_pipe_w64_s3_ptx().to_string()),
+            ("fp8::fp8_pipe_cfg_ptx", fp8::fp8_pipe_cfg_ptx(128, 128, 64, 2, 4, 2, 16)),
+            ("fp8t::AMAX_PTX", fp8t::AMAX_PTX.to_string()),
+            ("fp8t::fp8_bwd_gemm_ptx", fp8t::fp8_bwd_gemm_ptx().to_string()),
+            ("fp8t::fp8_e5m2_gemm_ptx", fp8t::fp8_e5m2_gemm_ptx().to_string()),
+            ("fp8t::quantize_scaled_e4m3_ptx", fp8t::quantize_scaled_e4m3_ptx().to_string()),
+            ("fp8t::quantize_scaled_e5m2_ptx", fp8t::quantize_scaled_e5m2_ptx().to_string()),
+            // paged KV serving.
+            ("paged::paged_attn_decode_ptx", crate::paged_attention::paged_attn_decode_ptx(128)),
+            (
+                "paged::paged_attn_decode_int8_ptx",
+                crate::paged_attention::paged_attn_decode_int8_ptx(128),
+            ),
+            ("paged::kv_append_ptx", crate::paged_attention::kv_append_ptx()),
+            ("paged::kv_append_int8_ptx", crate::paged_attention::kv_append_int8_ptx()),
+        ]
+        .into_iter()
+        .map(|(n, p)| (n.to_string(), p))
+        .collect();
+        // The int8 variable-stage grid (including the two dynamic-SMEM depths) at this card's budget.
+        for cfg in int8::INT8_STAGE_VARIANTS {
+            v.push((format!("int8::stage/{}", cfg.name), int8::int8_stage_ptx(cfg, 101 * 1024).0));
+        }
+        for (bm, bn, wm2, wn2) in [(256usize, 128usize, 4usize, 2usize), (128, 256, 2, 4)] {
+            let (name, ptx) = int8::int8_gemm_swz_tile_ptx(bm, bn, wm2, wn2, 0);
+            v.push((format!("int8::swz_tile/{name}"), ptx));
+        }
+        v
+    }
+
+    /// **The durable `.version` law: a module may declare an r550+ driver floor only if it emits an
+    /// instruction that needs one.** This is the gate that catches the NEXT over-declaration at
+    /// authorship, rather than on an A100 six months later.
+    ///
+    /// `.version` is a *driver* floor exactly as `.target` is a *device* floor, and `cuModuleLoadData`
+    /// enforces it: `.version 7.8` loads on r520+, `.version 8.4` demands **r550+** and fails on the
+    /// r535/r545 fleets this retarget exists to reach. Both the int8 family and the amax reduction had
+    /// inherited an 8.4 they never earned — nothing about the instruction mix, only about what the file
+    /// happened to be written with. Per-family header gates cannot see that class of bug: they pin
+    /// whatever constant the family currently uses, so an over-declaring family passes its own gate.
+    ///
+    /// So the law is stated over the **instruction mix** instead. If a module's text contains none of
+    /// `wgmma`, `stmatrix`, `elect.sync`, `cp.async.bulk`, `tcgen05`, `clusterlaunchcontrol` (the
+    /// Hopper/Blackwell-era instructions introduced above ISA 7.8) and no fp8 `mma` (`e4m3`/`e5m2`,
+    /// PTX ISA 8.1+), then everything it emits is ISA ≤ 7.8 and its header **must** say `.version 7.8`.
+    /// A new family that genuinely needs a higher `.version` names one of those instructions and is
+    /// licensed automatically; a family that does not, cannot quietly ask for a newer driver.
+    ///
+    /// **Coverage** ([`device_free_modules`]): every literal PTX const and every zero-argument
+    /// generator the crate exposes, plus one representative shape of each parameterized generator —
+    /// 88 modules across ptx, gemm, wmma, norm, flash, conv, winograd, optim, autodiff-bwd, int4, int8
+    /// (including the variable-stage grid and both dynamic-SMEM depths), fp8, fp8-train and paged KV.
+    /// Not covered here, because they need a MIR `Program` rather than a shape: `lower::emit_ptx` /
+    /// `emit_mega_ptx` / `fusion` / `megakernel`, which carry the identical `.version 8.4` negative in
+    /// `lower.rs` over their own output, and the NVRTC peers, which carry it in `baselines.rs`.
+    #[test]
+    fn no_module_declares_a_driver_floor_its_instructions_do_not_need() {
+        /// Instructions introduced above PTX ISA 7.8 — the only thing that licenses a higher
+        /// `.version`. (Hopper/Blackwell async + warp-group MMA, and the fp8 mma operand types.)
+        const ABOVE_78: &[&str] = &[
+            "wgmma",
+            "stmatrix",
+            "elect.sync",
+            "cp.async.bulk",
+            "tcgen05",
+            "clusterlaunchcontrol",
+            "e4m3",
+            "e5m2",
+        ];
+        let mods = device_free_modules();
+        let mut floored = 0usize;
+        let mut licensed: Vec<String> = Vec::new();
+        for (what, ptx) in &mods {
+            let head = ptx.trim_start();
+            let version = head
+                .lines()
+                .next()
+                .and_then(|l| l.strip_prefix(".version "))
+                .unwrap_or_else(|| panic!("{what}: module does not open with a `.version` directive"));
+            match ABOVE_78.iter().find(|i| ptx.contains(**i)) {
+                Some(instr) => licensed.push(format!("{what} (.version {version}, needs `{instr}`)")),
+                None => {
+                    assert_eq!(
+                        version, "7.8",
+                        "{what}: declares `.version {version}` while emitting nothing above PTX ISA \
+                         7.8 — 8.4 makes cuModuleLoadData demand driver r550+, so this module simply \
+                         will not load on the r535/r545 fleets. Float it to 7.8 (ptx_target::HDR_SM80), \
+                         or add the instruction that earns the higher floor to ABOVE_78."
+                    );
+                    floored += 1;
+                }
+            }
+        }
+        // EXACT, so a module leaving the enumeration is as loud as one arriving. Update deliberately.
+        const EXPECTED_MODULES: usize = 88;
+        assert_eq!(
+            mods.len(),
+            EXPECTED_MODULES,
+            "the device-free module set changed; update EXPECTED_MODULES deliberately"
+        );
+        eprintln!(
+            "[gate] .version law: {floored}/{} modules floored at 7.8; {} licensed above it: {licensed:?} \u{2713}",
+            mods.len(),
+            licensed.len()
+        );
     }
 
     /// **The device-identity gate.** [`GpuTarget`] is probed once at `Gpu` construction and is the
