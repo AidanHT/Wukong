@@ -23,9 +23,11 @@
 //! Ada, so those modules keep the genuine [`crate::ptx_target::HDR_SM89_V84`] floor. But [`AMAX_PTX`]
 //! is **plain f32** — a grid-strided `ld.global.f32` / `abs.f32` / `max.f32` / `st.global.f32` loop
 //! with no fp8 instruction anywhere in it — and it was tagged `sm_89` only by association with its
-//! siblings. It is retagged to the `sm_80` floor so the amax calibration statistic (which an fp8
-//! training step needs *before* any fp8 kernel runs, and which is useful on its own as a per-tensor
-//! max-abs reduction) still loads on Ampere. Same module, same file, two different floors.
+//! siblings. It carries the full [`crate::ptx_target::HDR_SM80`] floor — `sm_80` **and** `.version
+//! 7.8` — so the amax calibration statistic (which an fp8 training step needs *before* any fp8 kernel
+//! runs, and which is useful on its own as a per-tensor max-abs reduction) loads on Ampere *and* on
+//! the pre-r550 drivers that refuse a `.version 8.4` module. Same file, two different floors, on both
+//! the target axis and the version axis.
 
 use crate::ptx_fp8::{FP8_TM, FP8_TN};
 use crate::ptx_target::HDR_SM89_V84;
@@ -216,14 +218,21 @@ pub const E5M2_MAX: f32 = 57344.0;
 /// run-to-run-identical result. `amax` is the calibration statistic for delayed scaling: the scale that
 /// maps a tensor's largest magnitude onto the fp8 max so the fp8 range is fully used.
 ///
-/// **Floor `sm_80`, unlike every other module in this file.** The body below is plain f32 — grid-stride
-/// index math, `ld.global.f32`, `abs.f32`, `max.f32`, `st.global.f32` — with **no fp8 instruction**: no
-/// `mma`, no `cvt.rn.satfinite.e{4m3,5m2}x2`, no `cp.async`, no `ldmatrix`. Nothing in it needs Ada, so
-/// pinning it to its fp8 siblings' `sm_89` would have made an Ampere-legal reduction unloadable on
-/// Ampere. A `const` cannot interpolate `ptx_target::HDR_SM80_V84`, so the header is spelled literally
-/// and pinned against the constant by `tests::fp8_train_floors_are_split_by_instruction_mix`, which also
-/// re-checks the fp8-free instruction mix that earns the lower floor.
-pub const AMAX_PTX: &str = r#".version 8.4
+/// **Floor `sm_80` at `.version 7.8`, unlike every other module in this file.** The body below is plain
+/// f32 — grid-stride index math, `ld.global.f32`, `abs.f32`, `max.f32`, `st.global.f32` — with **no fp8
+/// instruction**: no `mma`, no `cvt.rn.satfinite.e{4m3,5m2}x2`, no `cp.async`, no `ldmatrix`. Nothing in
+/// it needs Ada, so pinning it to its fp8 siblings' `sm_89` would have made an Ampere-legal reduction
+/// unloadable on Ampere.
+///
+/// The **`.version` is a second, independent portability axis** and it was over-declared the same way
+/// the target was. `.version 8.4` is refused by `cuModuleLoadData` on any driver below r550, and the
+/// cloud fleets this retarget exists for run r535/r545 — so an `sm_80` module that declares 8.4 is
+/// *still* unloadable there, for no gain: every instruction above predates ISA 7.0 (they are 3.x-era
+/// scalar ops), so the module is legal at `.version 7.8`, the crate's Ampere-floor version.
+/// A `const` cannot interpolate `ptx_target::HDR_SM80`, so the header is spelled literally and pinned
+/// against the constant by `tests::fp8_train_floors_are_split_by_instruction_mix`, which also re-checks
+/// the fp8-free instruction mix that earns the lower floor.
+pub const AMAX_PTX: &str = r#".version 7.8
 .target sm_80
 .address_size 64
 
@@ -366,7 +375,7 @@ pub fn quantize_scaled_e4m3_ptx() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ptx_target::{HDR_SM80_V84, TARGET_SM80, TARGET_SM89};
+    use crate::ptx_target::{HDR_SM80, TARGET_SM80, TARGET_SM89};
 
     /// Assert one generated module is pure ASCII, naming the offending line *and the offending
     /// character* if not. A single non-ASCII byte anywhere in a PTX string is a `ptxas fatal`; on the
@@ -457,9 +466,16 @@ mod tests {
             );
         }
 
-        assert!(AMAX_PTX.starts_with(HDR_SM80_V84), "AMAX_PTX: must open with HDR_SM80_V84");
+        assert!(AMAX_PTX.starts_with(HDR_SM80), "AMAX_PTX: must open with HDR_SM80 (.version 7.8)");
         assert!(AMAX_PTX.contains(TARGET_SM80), "AMAX_PTX: plain f32 reduction, floor is sm_80");
         assert!(!AMAX_PTX.contains("sm_89"), "AMAX_PTX: must not be pinned to Ada");
+        // The `.version` axis is checked separately from the `.target` axis because a half-done
+        // conversion (target floated to sm_80, `.version` left at 8.4) still fails to load on the
+        // r535/r545 drivers this retarget targets -- `.version 8.4` demands r550+.
+        assert!(
+            !AMAX_PTX.contains(".version 8.4"),
+            "AMAX_PTX: `.version 8.4` demands driver r550+; this body needs nothing above ISA 7.0"
+        );
         // The evidence for the lower floor: no fp8 type token, no MMA, and none of the other
         // arch-raising instruction families. Only plain-f32 global loads, `abs`, `max` and a store.
         for banned in [

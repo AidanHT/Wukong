@@ -53,6 +53,13 @@
 //! `sm_80` is the LOWEST legal target — and PTX is forward-compatible only: an `sm_80` module
 //! driver-JITs on every later part, an `sm_89` one loads on zero A100s. `megakernel.rs` emits no
 //! header of its own, so these two `push_str` calls are the single floor for all gpu-native output.
+//!
+//! The header's `.version 7.8` is the **second** floor, on an independent axis: `.version` is a
+//! *driver* requirement the way `.target` is a *device* one, and `cuModuleLoadData` refuses a
+//! `.version 8.4` module on any driver below r550 (observed cloud fleets run r535/r545). The mix
+//! above needs nothing above ISA 7.0, so both floors are the crate's Ampere default. Both are pinned
+//! by `tests::gpu_native_modules_open_at_the_sm80_floor` — a device-free gate, because the corpus
+//! gate below runs on this box's Ada card, where either over-declaration would JIT perfectly.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -3969,6 +3976,73 @@ mod tests {
         let k = ptx_vmath_lowp("mrt_vmath_bf16", "bf16").expect("bf16 vmath kernel");
         assert!(k.contains("cvt.f32.bf16"), "spliced kernel lost its bf16 input widen");
         assert!(k.is_ascii(), "PTX must stay ASCII");
+    }
+
+    /// **The gpu-native floor gate** — the one this crate did not have. Every other PTX family pins
+    /// its module header in a device-free test (`ptx_fp8_train::fp8_train_floors_are_split_by_...`,
+    /// `baselines::int8_dequant_chain_peer_ptx_is_floored_and_ascii`, the `ptx*` family gates); the
+    /// general MIR->PTX path — the only backend that emits a module for an *arbitrary* program, and
+    /// therefore the one whose floor governs the most output — referenced
+    /// [`crate::ptx_target::HDR_SM80`] at both `push_str` sites with nothing asserting it.
+    ///
+    /// Both over-declarations are invisible to every other gate in this crate, because both JIT fine
+    /// on the Ada card the corpus gate runs on:
+    ///   * `.target sm_89` loads on **zero** A100s — PTX is forward-compatible only;
+    ///   * `.version 8.4` is refused by `cuModuleLoadData` on any driver **below r550**, and the
+    ///     cloud fleets this retarget exists for run r535/r545. The version is an independent
+    ///     portability axis from the target, so it is asserted independently.
+    ///
+    /// Both emitters are gated: [`emit_ptx`] and [`emit_mega_ptx`] only build text (the device is
+    /// touched later, by `jit_run*`), so this is pure-CPU and fires on any `--features gpu` build.
+    /// Swept at `-O0` and `-O3` because the two levels present different MIR to the emitters.
+    #[test]
+    fn gpu_native_modules_open_at_the_sm80_floor() {
+        use crate::ptx_target::{HDR_SM80, TARGET_SM80, TARGET_SM89};
+
+        // A parameterless `main` (the megakernel entry requires no params) with a loop, integer
+        // arithmetic and a print — enough MIR that both emitters walk their real emission tables.
+        const SRC: &str = r#"module gate
+
+fn main() -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 8 {
+        s = s + i * 2;
+        i = i + 1;
+    }
+    print(s);
+    return 0;
+}
+"#;
+
+        for opt in [0u8, 3u8] {
+            let (program, mut interner) =
+                build(SRC, opt).expect("the floor probe program must compile");
+            let entry = interner.intern("main");
+            let modules = [
+                ("emit_ptx", emit_ptx(&program, entry, &interner)),
+                ("emit_mega_ptx", emit_mega_ptx(&program, entry, &interner)),
+            ];
+            for (what, res) in modules {
+                let ptx = res.unwrap_or_else(|e| panic!("{what}@O{opt}: lowering failed: {e}"));
+                assert!(
+                    ptx.starts_with(HDR_SM80),
+                    "{what}@O{opt}: must open with HDR_SM80 (`.version 7.8` / `.target sm_80`), got: {:?}",
+                    ptx.lines().take(3).collect::<Vec<_>>()
+                );
+                assert!(ptx.contains(TARGET_SM80), "{what}@O{opt}: lost the sm_80 floor");
+                assert!(
+                    !ptx.contains(TARGET_SM89),
+                    "{what}@O{opt}: `{TARGET_SM89}` loads on zero A100s and nothing here needs Ada"
+                );
+                assert!(
+                    !ptx.contains(".version 8.4"),
+                    "{what}@O{opt}: `.version 8.4` demands driver r550+; this instruction mix \
+                     (generic scalar PTX, `bar.sync`, `red.f32`, one `atom.global.add`) needs \
+                     nothing above ISA 7.0"
+                );
+            }
+        }
     }
 
     /// The comparator the corpus gate is built on, pinned against the real divergence it used to

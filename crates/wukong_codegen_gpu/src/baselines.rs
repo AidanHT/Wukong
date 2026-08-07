@@ -2245,7 +2245,15 @@ pub fn time_cudnn_conv2d(
 /// `.target` is a *compatibility floor*: the driver JIT still compiles this to SASS for whatever
 /// device is current, so the floor costs the peer nothing and buys it every part from Ampere up.
 /// Tagged `sm_89` it would fail to load on an A100 and silently delete the int8-chain peer from the
-/// scoreboard on the exact datacenter parts this retarget targets. `.version 8.4` is kept.
+/// scoreboard on the exact datacenter parts this retarget targets.
+///
+/// **`.version 7.8`, not 8.4 — the same over-declaration on the other axis.** A module's `.version` is
+/// a *driver* floor the way `.target` is a *device* floor: `cuModuleLoadData` refuses `.version 8.4`
+/// on any driver below r550, and the cloud fleets this retarget aims at run r535/r545. Since the
+/// instruction list above tops out around ISA 3.x, declaring 8.4 bought nothing and cost the peer the
+/// same silent deletion from the scoreboard that `sm_89` would have — just triggered by the host's
+/// driver rather than by its card. Both floors are now the crate's Ampere default,
+/// [`crate::ptx_target::HDR_SM80`].
 const INT8_DEQUANT_CHAIN_BODY: &str = r#".visible .entry int8_dequant_chain(
     .param .u64 pIn,
     .param .u64 pScale,
@@ -2292,9 +2300,10 @@ END:
 }
 "#;
 
-/// [`INT8_DEQUANT_CHAIN_BODY`] under the shared `sm_80` floor header — the module the driver JITs.
+/// [`INT8_DEQUANT_CHAIN_BODY`] under the shared `sm_80` / `.version 7.8` floor header — the module the
+/// driver JITs.
 fn int8_dequant_chain_ptx() -> String {
-    format!("{}{INT8_DEQUANT_CHAIN_BODY}", crate::ptx_target::HDR_SM80_V84)
+    format!("{}{INT8_DEQUANT_CHAIN_BODY}", crate::ptx_target::HDR_SM80)
 }
 
 /// Time the **cuBLAS int8 GEMM + dequant chain**: `iters` resident pairs of (`cublasGemmEx` i32 →
@@ -2710,16 +2719,25 @@ mod tests {
         eprintln!("[gate] NVRTC peers compile with {want} for {} ✓", t.name);
     }
 
-    /// The one hand-written peer PTX must sit at the shared `sm_80` floor and stay pure ASCII — a
-    /// `.target sm_89` here loads on ZERO A100s (PTX is forward-, never backward-compatible), and one
-    /// non-ASCII byte is a `ptxas fatal` at `cuModuleLoadData`.
+    /// The one hand-written peer PTX must sit at the shared `sm_80` / `.version 7.8` floor and stay
+    /// pure ASCII — a `.target sm_89` here loads on ZERO A100s (PTX is forward-, never
+    /// backward-compatible), a `.version 8.4` loads on ZERO pre-r550 drivers (and the observed cloud
+    /// fleets run r535/r545), and one non-ASCII byte is a `ptxas fatal` at `cuModuleLoadData`. Both
+    /// floors are asserted, because floating only the target leaves the peer just as undeployable.
     #[test]
     fn int8_dequant_chain_peer_ptx_is_floored_and_ascii() {
         let ptx = super::int8_dequant_chain_ptx();
         assert!(ptx.is_ascii(), "peer PTX must be pure ASCII");
-        assert!(ptx.starts_with(crate::ptx_target::HDR_SM80_V84), "peer PTX must open with the sm_80 v8.4 header");
+        assert!(
+            ptx.starts_with(crate::ptx_target::HDR_SM80),
+            "peer PTX must open with the sm_80 v7.8 header"
+        );
         assert!(ptx.contains(crate::ptx_target::TARGET_SM80));
         assert!(!ptx.contains(crate::ptx_target::TARGET_SM89), "this kernel needs no Ada instruction");
+        assert!(
+            !ptx.contains(".version 8.4"),
+            "`.version 8.4` demands driver r550+; this kernel needs nothing above ISA 7.0"
+        );
         assert!(ptx.contains(".visible .entry int8_dequant_chain("), "the header must not have eaten the body");
     }
 
