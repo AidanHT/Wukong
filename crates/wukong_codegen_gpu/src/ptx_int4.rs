@@ -28,10 +28,19 @@
 //! weight exactly; every f16x2 intermediate `1024+u`, `1024+Z`, and their difference is exact in fp16);
 //! the host [`quantize_weight_symmetric`] / [`quantize_weight_asymmetric`] produce the packed layout the
 //! kernel consumes.
+//!
+//! **Target floor: `sm_80`** ([`crate::ptx_target::HDR_SM80`], which *is* this file's existing
+//! `.version 7.8` at the Ampere floor). Nothing here is Ada-only: the unpack is `lop3.b32` (`sm_50`+)
+//! plus `sub/mul.rn.f16x2` (`sm_53`+), and the math is `wmma.{load,mma,store}...m16n16k16.f32`
+//! (`sm_70`+) with plain `ld/st`-staged SMEM (this family uses no `cp.async` at all). The former
+//! `sm_89` tag was the development card's own arch, and it made the module fail to load on every
+//! Ampere part for no gain.
 
 use std::sync::OnceLock;
 
 use half::f16;
+
+use crate::ptx_target::HDR_SM80;
 
 /// Default group size along K (per-group scale/zero-point granularity). 128 is the GPTQ/AWQ default;
 /// it is a multiple of the 16-wide WMMA K-step, so a `wmma` K-tile never straddles two groups (one
@@ -508,7 +517,7 @@ pub const W4_THREADS: usize = W4_WARPS_M * W4_WARPS_N * 32;
 pub fn w4a16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(HDR_SM80);
         m += &entry_w4a16("gemm_nt_w4a16", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false, None, false);
         m += &entry_w4a16("gemm_nt_w4a16_z", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, true, None, false);
         m
@@ -582,7 +591,7 @@ REND:
 pub fn w4a16_splitk_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(HDR_SM80);
         m += &entry_w4a16("gemm_nt_w4a16_sk", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false, None, true);
         m += W4A16_SPLITK_REDUCE;
         m
@@ -598,7 +607,7 @@ pub fn w4a16_splitk_ptx() -> &'static str {
 /// driver JIT + the persistent cubin cache (M10) make the per-shape compile a one-time, cached cost.
 pub fn w4a16_static_ptx(m: usize, n: usize, k: usize, zero_point: bool) -> String {
     let name = if zero_point { "gemm_nt_w4a16_static_z" } else { "gemm_nt_w4a16_static" };
-    let mut s = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+    let mut s = String::from(HDR_SM80);
     s += &entry_w4a16(name, W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, zero_point, Some((m, n, k)), false);
     s
 }
@@ -611,6 +620,7 @@ pub fn w4a16_static_entry(zero_point: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ptx_target::TARGET_SM80;
 
     /// Host quant→dequant must be self-consistent and faithful: the symmetric reconstruction stays
     /// within one quantization step of the original, and the packed/scale shapes are exactly the
@@ -687,9 +697,18 @@ mod tests {
     }
 
     /// The generated PTX must be **pure ASCII** (a single non-ASCII byte is a `ptxas fatal` on this
-    /// box) and contain both entry points.
+    /// box), contain both entry points, and carry the family's **`sm_80` floor** — the `lop3` unpack
+    /// and the `m16n16k16` `wmma` are Ampere-legal, so tagging Ada would lock the module out of every
+    /// A100 for nothing. PTX is forward-compatible only, so the floor must be the lowest legal arch.
     #[test]
     fn w4a16_ptx_is_ascii_and_complete() {
+        for (label, ptx) in
+            [("w4a16", w4a16_ptx().to_string()), ("w4a16_splitk", w4a16_splitk_ptx().to_string())]
+        {
+            assert!(ptx.starts_with(HDR_SM80), "{label}: must open with the routed HDR_SM80 header");
+            assert!(ptx.contains(TARGET_SM80), "{label}: must carry the int4 floor {TARGET_SM80}");
+            assert!(!ptx.contains("sm_89"), "{label}: nothing here is Ada-only");
+        }
         let ptx = w4a16_ptx();
         assert!(ptx.is_ascii(), "PTX must be ASCII");
         assert!(ptx.contains(".visible .entry gemm_nt_w4a16("));
@@ -700,6 +719,7 @@ mod tests {
         // from params) so ptxas can strength-reduce — e.g. K=4096 appears as an immediate.
         let st = w4a16_static_ptx(64, 4096, 4096, false);
         assert!(st.is_ascii(), "static PTX must be ASCII");
+        assert!(st.starts_with(HDR_SM80), "static PTX must open with the routed HDR_SM80 header");
         assert!(st.contains(".visible .entry gemm_nt_w4a16_static("));
         assert!(st.contains("mov.u32 %K,4096;"), "static kernel must bake K as a constant");
     }

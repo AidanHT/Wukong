@@ -16,8 +16,19 @@
 //! both sides identically* — the only residual error is the kernel's f32 accumulation order, so the
 //! tolerance is the ordinary `c·√K·ε_f32` GEMM bound (tight, **not** an fp8-slack fudge): E5M2's coarse
 //! 2-bit mantissa shows up when the caller quantizes a real f32 gradient, not in this GEMM gate.
+//!
+//! **Target floors — this file has TWO, and the split is the point.** The E5M2/E4M3 GEMMs
+//! ([`gen_fp8_mt_typed`]) issue `mma.sync.m16n8k32...e5m2.e4m3.f32` and the quantizers
+//! ([`gen_quantize_scaled`]) issue `cvt.rn.satfinite.e5m2x2.f32`; neither instruction exists below
+//! Ada, so those modules keep the genuine [`crate::ptx_target::HDR_SM89_V84`] floor. But [`AMAX_PTX`]
+//! is **plain f32** — a grid-strided `ld.global.f32` / `abs.f32` / `max.f32` / `st.global.f32` loop
+//! with no fp8 instruction anywhere in it — and it was tagged `sm_89` only by association with its
+//! siblings. It is retagged to the `sm_80` floor so the amax calibration statistic (which an fp8
+//! training step needs *before* any fp8 kernel runs, and which is useful on its own as a per-tensor
+//! max-abs reduction) still loads on Ampere. Same module, same file, two different floors.
 
 use crate::ptx_fp8::{FP8_TM, FP8_TN};
+use crate::ptx_target::HDR_SM89_V84;
 
 /// OCP **E5M2** (1 sign, 5 exp bias 15, 2 mantissa; max normal 57344) round-to-nearest-even from `f32`,
 /// returning the 8 stored bits — the wider-range backward-gradient format. Saturates `|x|` to the max
@@ -97,7 +108,8 @@ pub fn e5m2_to_f32(b: u8) -> f32 {
 /// row-major (= `K×N` col-major for the `.col` operand). Requires M%(16·TM)==0, N%(8·TN)==0, K%32==0.
 fn gen_fp8_mt_typed(entry: &str, atype: &str, btype: &str) -> String {
     let (tm, tn) = (FP8_TM, FP8_TN);
-    let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+    // Genuine Ada floor: the `mma` emitted below takes e5m2/e4m3 operands.
+    let mut s = format!("{HDR_SM89_V84}\n");
     s += &format!(".visible .entry {entry}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n");
     s += "    .reg .pred %p;\n";
     s += "    .reg .b32 %M,%N,%K,%lane,%grp,%tg4,%tg2,%row0,%col0,%k,%tmp;\n";
@@ -203,8 +215,16 @@ pub const E5M2_MAX: f32 = 57344.0;
 /// atomics — M12): the per-thread partition and the associative-and-commutative `max` give a
 /// run-to-run-identical result. `amax` is the calibration statistic for delayed scaling: the scale that
 /// maps a tensor's largest magnitude onto the fp8 max so the fp8 range is fully used.
+///
+/// **Floor `sm_80`, unlike every other module in this file.** The body below is plain f32 — grid-stride
+/// index math, `ld.global.f32`, `abs.f32`, `max.f32`, `st.global.f32` — with **no fp8 instruction**: no
+/// `mma`, no `cvt.rn.satfinite.e{4m3,5m2}x2`, no `cp.async`, no `ldmatrix`. Nothing in it needs Ada, so
+/// pinning it to its fp8 siblings' `sm_89` would have made an Ampere-legal reduction unloadable on
+/// Ampere. A `const` cannot interpolate `ptx_target::HDR_SM80_V84`, so the header is spelled literally
+/// and pinned against the constant by `tests::fp8_train_floors_are_split_by_instruction_mix`, which also
+/// re-checks the fp8-free instruction mix that earns the lower floor.
 pub const AMAX_PTX: &str = r#".version 8.4
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry amax_f32(
@@ -278,11 +298,10 @@ pub fn quantize_e4m3_scaled(x: f32, recip: f32) -> u8 {
 /// pair of fp8 bytes). Keeps the whole fp8 quantization on-GPU (no host round-trip) — the residency the
 /// fp8 training step needs. Grid-strided over `N/2` pairs; requires N even. Entry `{entry}`.
 fn gen_quantize_scaled(entry: &str, fmt: &str) -> String {
+    // Genuine Ada floor: `cvt.rn.satfinite.e4m3x2/e5m2x2.f32` is Ada's hardware packed-fp8 converter.
+    let hdr = HDR_SM89_V84;
     format!(
-        r#".version 8.4
-.target sm_89
-.address_size 64
-
+        r#"{hdr}
 .visible .entry {entry}(
     .param .u32 pN,
     .param .u64 pX,
@@ -347,6 +366,7 @@ pub fn quantize_scaled_e4m3_ptx() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ptx_target::{HDR_SM80_V84, TARGET_SM80, TARGET_SM89};
 
     /// Assert one generated module is pure ASCII, naming the offending line *and the offending
     /// character* if not. A single non-ASCII byte anywhere in a PTX string is a `ptxas fatal`; on the
@@ -410,6 +430,45 @@ mod tests {
                 &format!("gen_quantize_scaled({entry},{fmt})"),
                 &gen_quantize_scaled(entry, fmt),
             );
+        }
+    }
+
+    /// **The two floors of this file must not collapse into one.** The GEMMs and the quantizers issue
+    /// instructions that exist nowhere below Ada (`mma...e5m2.e4m3.f32`, `cvt.rn.satfinite.e*x2.f32`),
+    /// so they are pinned to `sm_89`; `AMAX_PTX` issues none of them and is pinned to `sm_80` so the
+    /// calibration reduction keeps loading on Ampere. Floating amax by association with its siblings
+    /// (or dragging it back up) is a silent portability regression on a card this box cannot test, so
+    /// the split is asserted both ways here — including an *instruction-level* check that the amax body
+    /// really is fp8-free, which is the whole justification for its lower floor. Pure-CPU.
+    #[test]
+    fn fp8_train_floors_are_split_by_instruction_mix() {
+        for (what, ptx) in [
+            ("fp8_bwd_gemm_ptx", fp8_bwd_gemm_ptx().to_string()),
+            ("fp8_e5m2_gemm_ptx", fp8_e5m2_gemm_ptx().to_string()),
+            ("quantize_scaled_e5m2_ptx", quantize_scaled_e5m2_ptx().to_string()),
+            ("quantize_scaled_e4m3_ptx", quantize_scaled_e4m3_ptx().to_string()),
+        ] {
+            assert!(ptx.starts_with(HDR_SM89_V84), "{what}: must open with HDR_SM89_V84");
+            assert!(ptx.contains(TARGET_SM89), "{what}: Ada is its true floor");
+            // ...and it must be true: an Ada-only token has to be present to earn that floor.
+            assert!(
+                ptx.contains("e4m3") || ptx.contains("e5m2"),
+                "{what}: claims the sm_89 floor but emits no fp8 instruction"
+            );
+        }
+
+        assert!(AMAX_PTX.starts_with(HDR_SM80_V84), "AMAX_PTX: must open with HDR_SM80_V84");
+        assert!(AMAX_PTX.contains(TARGET_SM80), "AMAX_PTX: plain f32 reduction, floor is sm_80");
+        assert!(!AMAX_PTX.contains("sm_89"), "AMAX_PTX: must not be pinned to Ada");
+        // The evidence for the lower floor: no fp8 type token, no MMA, and none of the other
+        // arch-raising instruction families. Only plain-f32 global loads, `abs`, `max` and a store.
+        for banned in [
+            "e4m3", "e5m2", "mma", "ldmatrix", "cp.async", "satfinite", "wgmma", "mbarrier",
+        ] {
+            assert!(!AMAX_PTX.contains(banned), "AMAX_PTX: unexpected `{banned}` -- re-check its floor");
+        }
+        for required in ["ld.global.f32", "abs.f32", "max.f32", "st.global.f32"] {
+            assert!(AMAX_PTX.contains(required), "AMAX_PTX: lost `{required}`");
         }
     }
 
