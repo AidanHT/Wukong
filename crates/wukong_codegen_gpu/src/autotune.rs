@@ -23,10 +23,12 @@
 //! accumulation.
 //!
 //! The cache is a tiny hand-rolled text file (no serde dependency): one line per entry,
-//! `<dtype> <m> <n> <k> = <config> <gflops>`, where `<dtype>` is `int8` or `w4a16`. `<config>` is a
+//! `<dtype> <device> <m> <n> <k> = <config> <gflops>`, where `<dtype>` is `int8` or `w4a16` and
+//! `<device>` is [`crate::gpu::Gpu::device_tag`] (`sm_89x20` — arch + SM count). `<config>` is a
 //! candidate token understood by [`launch_int8_tuned`] / [`launch_w4a16_tuned`]. It outlives the
-//! candidate set, so a hit is *validated* (`int8_token_usable` / `w4a16_token_usable`) before it is
-//! trusted — an unknown or mis-tiling token is a miss and re-tunes.
+//! candidate set *and* the machine, so a hit is trusted only when it is **applicable at this shape**
+//! (`int8_token_usable` / `w4a16_token_usable`) **and keyed to this device** — an unknown token, a
+//! mis-tiling one, or one measured on another card is a miss and re-tunes.
 
 use crate::gpu::Gpu;
 use cudarc::driver::{CudaFunction, CudaSlice, DriverError, LaunchConfig, PushKernelArg};
@@ -225,8 +227,18 @@ pub struct CacheEntry {
     pub gflops: f64,
 }
 
-/// On-disk per-shape autotune cache. Keyed by `"<dtype> <m> <n> <k>"`; serialized as one
+/// On-disk per-shape autotune cache. Keyed by `"<dtype> <device> <m> <n> <k>"`; serialized as one
 /// `<key> = <config> <gflops>` line each (no serde dependency).
+///
+/// **`<device>` is part of the key, not decoration** ([`crate::gpu::Gpu::device_tag`], e.g.
+/// `sm_89x20`). A tuned config is a verdict about one machine — the search's own axes (split-K
+/// factor, CTA/warp tile) are decided by how a grid fills the SMs — so replaying a 4050's winners on
+/// an A100 is not a stale hit, it is a *wrong* hit that no validation downstream could detect: the
+/// token names a real candidate, it tiles the shape, it launches, it returns correct numbers. It is
+/// simply the wrong kernel, silently. Keying by device makes that a miss and a re-tune.
+///
+/// A cache file written before the device joined the key has 4-token keys, which [`Self::from_text`]
+/// rejects — so an old cache is a clean re-tune, never a cross-device trust.
 #[derive(Clone, Debug, Default)]
 pub struct AutotuneCache {
     map: BTreeMap<String, CacheEntry>,
@@ -237,28 +249,28 @@ impl AutotuneCache {
         Self { map: BTreeMap::new() }
     }
 
-    fn int8_key(m: usize, n: usize, k: usize) -> String {
-        format!("int8 {m} {n} {k}")
+    fn int8_key(dev: &str, m: usize, n: usize, k: usize) -> String {
+        format!("int8 {dev} {m} {n} {k}")
     }
 
-    pub fn get_int8(&self, m: usize, n: usize, k: usize) -> Option<&CacheEntry> {
-        self.map.get(&Self::int8_key(m, n, k))
+    pub fn get_int8(&self, dev: &str, m: usize, n: usize, k: usize) -> Option<&CacheEntry> {
+        self.map.get(&Self::int8_key(dev, m, n, k))
     }
 
-    pub fn insert_int8(&mut self, m: usize, n: usize, k: usize, entry: CacheEntry) {
-        self.map.insert(Self::int8_key(m, n, k), entry);
+    pub fn insert_int8(&mut self, dev: &str, m: usize, n: usize, k: usize, entry: CacheEntry) {
+        self.map.insert(Self::int8_key(dev, m, n, k), entry);
     }
 
-    fn w4a16_key(m: usize, n: usize, k: usize) -> String {
-        format!("w4a16 {m} {n} {k}")
+    fn w4a16_key(dev: &str, m: usize, n: usize, k: usize) -> String {
+        format!("w4a16 {dev} {m} {n} {k}")
     }
 
-    pub fn get_w4a16(&self, m: usize, n: usize, k: usize) -> Option<&CacheEntry> {
-        self.map.get(&Self::w4a16_key(m, n, k))
+    pub fn get_w4a16(&self, dev: &str, m: usize, n: usize, k: usize) -> Option<&CacheEntry> {
+        self.map.get(&Self::w4a16_key(dev, m, n, k))
     }
 
-    pub fn insert_w4a16(&mut self, m: usize, n: usize, k: usize, entry: CacheEntry) {
-        self.map.insert(Self::w4a16_key(m, n, k), entry);
+    pub fn insert_w4a16(&mut self, dev: &str, m: usize, n: usize, k: usize, entry: CacheEntry) {
+        self.map.insert(Self::w4a16_key(dev, m, n, k), entry);
     }
 
     pub fn len(&self) -> usize {
@@ -271,7 +283,8 @@ impl AutotuneCache {
 
     /// Serialize to the line-oriented text format.
     pub fn to_text(&self) -> String {
-        let mut s = String::from("# wukong autotune cache: <dtype> <m> <n> <k> = <config> <gflops>\n");
+        let mut s =
+            String::from("# wukong autotune cache: <dtype> <device> <m> <n> <k> = <config> <gflops>\n");
         for (key, e) in &self.map {
             s += &format!("{key} = {} {:.1}\n", e.config, e.gflops);
         }
@@ -280,6 +293,10 @@ impl AutotuneCache {
 
     /// Parse the text format. Malformed lines (and `#` comments / blanks) are skipped, so a partially
     /// corrupt cache degrades to "fewer entries" rather than an error — the autotuner just re-tunes them.
+    ///
+    /// **A pre-device-key cache (4-token keys) is dropped entirely by that rule**, which is the wanted
+    /// behaviour: those entries carry no record of which card produced them, so the only safe reading
+    /// is "unknown provenance" → re-tune.
     pub fn from_text(text: &str) -> Self {
         let mut map = BTreeMap::new();
         for line in text.lines() {
@@ -289,8 +306,8 @@ impl AutotuneCache {
             }
             let Some((key, val)) = line.split_once('=') else { continue };
             let key = key.trim();
-            // key must be `<dtype> <m> <n> <k>` (4 tokens); val must be `<config> <gflops>`.
-            if key.split_whitespace().count() != 4 {
+            // key must be `<dtype> <device> <m> <n> <k>` (5 tokens); val must be `<config> <gflops>`.
+            if key.split_whitespace().count() != 5 {
                 continue;
             }
             let mut vt = val.split_whitespace();
@@ -310,7 +327,10 @@ impl AutotuneCache {
     }
 }
 
-/// Is `token` a candidate this build knows *and* one that tiles `m×n×k` exactly? The cache is a
+/// Is `token` a candidate this build knows *and* one that tiles `m×n×k` exactly? **A hit counts only
+/// if it is applicable at this shape AND was measured on this device** — the device half is enforced by
+/// the key itself ([`AutotuneCache`]), so a foreign-card entry never reaches this predicate; what
+/// follows guards the rest. The cache is a
 /// hand-editable text file that survives across builds (the module header documents its format and
 /// `from_text` is deliberately corruption-tolerant), so a hit can name a token from an older candidate
 /// set, or a candidate that does not fit the shape it is keyed by. Neither may reach a launch: an
@@ -331,13 +351,14 @@ pub fn tune_int8_cached(
     n: usize,
     k: usize,
 ) -> Result<String, DriverError> {
-    if let Some(e) = cache.get_int8(m, n, k) {
+    let dev = g.device_tag();
+    if let Some(e) = cache.get_int8(&dev, m, n, k) {
         if int8_token_usable(&e.config, m, n, k) {
             return Ok(e.config.clone());
         }
     }
     let r = tune_int8_gemm(g, m, n, k)?;
-    cache.insert_int8(m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
+    cache.insert_int8(&dev, m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
     Ok(r.best)
 }
 
@@ -381,7 +402,7 @@ pub fn revalidate_int8(
     n: usize,
     k: usize,
 ) -> Result<Option<Regression>, DriverError> {
-    let Some(e) = cache.get_int8(m, n, k) else { return Ok(None) };
+    let Some(e) = cache.get_int8(&g.device_tag(), m, n, k) else { return Ok(None) };
     let r = tune_int8_gemm(g, m, n, k)?;
     let cached_secs = r.ranked.iter().find(|x| x.name == e.config).map(|x| x.secs);
     Ok(match cached_secs {
@@ -573,13 +594,14 @@ pub fn tune_w4a16_cached(
     k: usize,
     n: usize,
 ) -> Result<String, DriverError> {
-    if let Some(e) = cache.get_w4a16(m, n, k) {
+    let dev = g.device_tag();
+    if let Some(e) = cache.get_w4a16(&dev, m, n, k) {
         if w4a16_token_usable(&e.config, k) {
             return Ok(e.config.clone());
         }
     }
     let r = tune_w4a16_gemm(g, qw, m, k, n)?;
-    cache.insert_w4a16(m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
+    cache.insert_w4a16(&dev, m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
     Ok(r.best)
 }
 
@@ -628,21 +650,62 @@ mod tests {
     /// fewer entries, never an error).
     #[test]
     fn cache_text_roundtrip() {
+        let dev = "sm_89x20";
         let mut c = AutotuneCache::new();
-        c.insert_int8(1024, 1024, 1024, CacheEntry { config: "swz64".into(), gflops: 12345.6 });
-        c.insert_int8(64, 128, 8192, CacheEntry { config: "swz64_sk8".into(), gflops: 6948.0 });
-        c.insert_int8(4096, 4096, 4096, CacheEntry { config: "swz128".into(), gflops: 50570.0 });
+        c.insert_int8(dev, 1024, 1024, 1024, CacheEntry { config: "swz64".into(), gflops: 12345.6 });
+        c.insert_int8(dev, 64, 128, 8192, CacheEntry { config: "swz64_sk8".into(), gflops: 6948.0 });
+        c.insert_int8(dev, 4096, 4096, 4096, CacheEntry { config: "swz128".into(), gflops: 50570.0 });
         let back = AutotuneCache::from_text(&c.to_text());
         assert_eq!(back.len(), 3);
-        assert_eq!(back.get_int8(1024, 1024, 1024).unwrap().config, "swz64");
-        assert_eq!(back.get_int8(64, 128, 8192).unwrap().config, "swz64_sk8");
-        assert_eq!(back.get_int8(4096, 4096, 4096).unwrap().config, "swz128");
+        assert_eq!(back.get_int8(dev, 1024, 1024, 1024).unwrap().config, "swz64");
+        assert_eq!(back.get_int8(dev, 64, 128, 8192).unwrap().config, "swz64_sk8");
+        assert_eq!(back.get_int8(dev, 4096, 4096, 4096).unwrap().config, "swz128");
         // tolerant parsing: junk lines are dropped, valid ones survive.
         let parsed = AutotuneCache::from_text(
-            "# header\n\nint8 256 256 256 = swz64 999.9\ngarbage line\nint8 1 2 = bad\n",
+            "# header\n\nint8 sm_89x20 256 256 256 = swz64 999.9\ngarbage line\nint8 1 2 = bad\n",
         );
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed.get_int8(256, 256, 256).unwrap().config, "swz64");
+        assert_eq!(parsed.get_int8(dev, 256, 256, 256).unwrap().config, "swz64");
+    }
+
+    /// **A tuned config is a verdict about one MACHINE (no GPU).** The cache outlives the process, the
+    /// candidate set *and* the card: on a metered cloud instance the natural move is to carry the file
+    /// along, and a 4050-tuned winner replayed on an A100 is the one stale-hit class no downstream
+    /// validation can catch - the token names a real candidate, it tiles the shape, it launches, it
+    /// returns correct numbers, it is simply the wrong kernel (the tuned axes, split-K factor and
+    /// CTA/warp tile, are chosen by how a grid fills the SMs). So the device is part of the key:
+    ///   * a lookup with another device tag MISSES (-> re-tune), and
+    ///   * a cache file written before the device joined the key (4-token) is dropped wholesale,
+    ///     because those entries record no provenance at all.
+    #[test]
+    fn a_cache_from_another_device_is_a_miss_not_a_wrong_hit() {
+        let (laptop, a100) = ("sm_89x20", "sm_80x108");
+        let mut c = AutotuneCache::new();
+        c.insert_int8(laptop, 4096, 4096, 4096, CacheEntry { config: "swz128".into(), gflops: 50570.0 });
+        c.insert_w4a16(laptop, 64, 256, 1024, CacheEntry { config: "w4a16_sk4".into(), gflops: 900.0 });
+        assert_eq!(c.get_int8(laptop, 4096, 4096, 4096).unwrap().config, "swz128");
+        assert!(c.get_int8(a100, 4096, 4096, 4096).is_none(), "an A100 must not inherit a 4050 tune");
+        assert!(c.get_w4a16(a100, 64, 256, 1024).is_none(), "w4a16 split-K is SM-count-sensitive");
+        // The same shape tuned on both cards coexists - the key is (dtype, device, shape).
+        c.insert_int8(a100, 4096, 4096, 4096, CacheEntry { config: "w64_r8".into(), gflops: 1.0 });
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.get_int8(laptop, 4096, 4096, 4096).unwrap().config, "swz128");
+        assert_eq!(c.get_int8(a100, 4096, 4096, 4096).unwrap().config, "w64_r8");
+        // A cache written before this change parses to nothing: unknown provenance => clean re-tune.
+        let legacy = "# wukong autotune cache: <dtype> <m> <n> <k> = <config> <gflops>\n\
+                      int8 4096 4096 4096 = swz128 50570.0\n\
+                      w4a16 64 256 1024 = w4a16_sk4 900.0\n";
+        assert_eq!(
+            AutotuneCache::from_text(legacy).len(),
+            0,
+            "a device-less cache must be re-tuned, never trusted on an unknown card"
+        );
+        // The tag itself must stay a single whitespace-free token, or the 5-token key parse breaks.
+        for tag in [laptop, a100, "sm_90x132", "sm_120x24"] {
+            let mut one = AutotuneCache::new();
+            one.insert_int8(tag, 256, 256, 256, CacheEntry { config: "swz64".into(), gflops: 1.0 });
+            assert_eq!(AutotuneCache::from_text(&one.to_text()).len(), 1, "tag {tag} broke the key");
+        }
     }
 
     /// **A cache hit must be re-validated against the shape it is used at (no GPU).** The cache is a
@@ -668,8 +731,8 @@ mod tests {
         assert!(int8_token_usable("smdb64", 256, 256, 96), "BK=32 kernel accepts K=96");
         assert!(!int8_token_usable("swz64_sk8", 256, 256, 256), "sk=8 needs K%512==0");
         // A parsed cache entry is only trusted through the same predicate.
-        let c = AutotuneCache::from_text("int8 192 256 256 = smdb128 999.9\n");
-        let e = c.get_int8(192, 256, 256).expect("entry parses");
+        let c = AutotuneCache::from_text("int8 sm_89x20 192 256 256 = smdb128 999.9\n");
+        let e = c.get_int8("sm_89x20", 192, 256, 256).expect("entry parses");
         assert_eq!(e.config, "smdb128");
         assert!(!int8_token_usable(&e.config, 192, 256, 256), "a parsed hit is still re-validated");
         // W4A16: the split count must divide K by GROUP_SIZE·sk, and be one this build searches.
@@ -688,21 +751,22 @@ mod tests {
     /// CRLF before), would never have been caught.
     #[test]
     fn cache_save_load_roundtrip_through_a_file() {
+        let dev = "sm_89x20";
         let mut c = AutotuneCache::new();
-        c.insert_int8(1024, 1024, 1024, CacheEntry { config: "swz64".into(), gflops: 12345.6 });
-        c.insert_w4a16(64, 256, 1024, CacheEntry { config: "w4a16_sk4".into(), gflops: 900.0 });
+        c.insert_int8(dev, 1024, 1024, 1024, CacheEntry { config: "swz64".into(), gflops: 12345.6 });
+        c.insert_w4a16(dev, 64, 256, 1024, CacheEntry { config: "w4a16_sk4".into(), gflops: 900.0 });
         let path = std::env::temp_dir().join(format!("wukong_autotune_{}.txt", std::process::id()));
         c.save(&path).expect("save");
         let back = AutotuneCache::load(&path).expect("load");
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.len(), c.len());
-        assert_eq!(back.get_int8(1024, 1024, 1024).unwrap().config, "swz64");
-        assert_eq!(back.get_w4a16(64, 256, 1024).unwrap().config, "w4a16_sk4");
+        assert_eq!(back.get_int8(dev, 1024, 1024, 1024).unwrap().config, "swz64");
+        assert_eq!(back.get_w4a16(dev, 64, 256, 1024).unwrap().config, "w4a16_sk4");
         // CRLF (what a Windows editor writes) must parse identically to LF.
         let crlf = c.to_text().replace('\n', "\r\n");
         let from_crlf = AutotuneCache::from_text(&crlf);
         assert_eq!(from_crlf.len(), c.len(), "CRLF cache must parse");
-        assert_eq!(from_crlf.get_int8(1024, 1024, 1024).unwrap().config, "swz64");
+        assert_eq!(from_crlf.get_int8(dev, 1024, 1024, 1024).unwrap().config, "swz64");
         // A path that cannot be written must surface an error, not be silently dropped.
         assert!(c.save(std::env::temp_dir().join("wukong_no_such_dir_xyz").join("c.txt")).is_err());
     }
@@ -757,8 +821,15 @@ mod tests {
         let _ = tune_int8_cached(g, &mut cache, 256, 256, 256).unwrap();
         assert_eq!(cache.len(), before, "a cached shape must not grow the cache");
         // round-trip the populated cache through text and confirm a known entry survives.
+        let dev = g.device_tag();
         let reloaded = AutotuneCache::from_text(&cache.to_text());
-        assert_eq!(reloaded.get_int8(64, 128, 8192).map(|e| e.config.clone()), cache.get_int8(64, 128, 8192).map(|e| e.config.clone()));
+        assert_eq!(
+            reloaded.get_int8(&dev, 64, 128, 8192).map(|e| e.config.clone()),
+            cache.get_int8(&dev, 64, 128, 8192).map(|e| e.config.clone())
+        );
+        // The entries are keyed to THIS device, and no other device tag can read them.
+        assert!(cache.get_int8("sm_80x108", 256, 256, 256).is_none(), "an A100 lookup must miss");
+        eprintln!("[autotune] cache keyed to device `{dev}`");
         // Revalidate the freshly-tuned shape. Immediately after caching this usually confirms the cached
         // config (no regression), BUT 64×128×8192 is a thin-M split-K shape where several candidates sit
         // within measurement noise — under a throttled/contended clock the re-tune can transiently flag a
@@ -808,11 +879,13 @@ mod tests {
             eprintln!("[autotune] w4a16 {m}x{n}x{k}: best = {} ({:.0} GFLOP/s); max_abs={:.1e}", r.best, r.ranked[0].gflops, s.max_abs);
         }
         assert_eq!(cache.len(), 2, "both tuned w4a16 shapes should be cached");
+        let dev = g.device_tag();
         let reloaded = AutotuneCache::from_text(&cache.to_text());
         assert_eq!(
-            reloaded.get_w4a16(64, 256, 1024).map(|e| e.config.clone()),
-            cache.get_w4a16(64, 256, 1024).map(|e| e.config.clone())
+            reloaded.get_w4a16(&dev, 64, 256, 1024).map(|e| e.config.clone()),
+            cache.get_w4a16(&dev, 64, 256, 1024).map(|e| e.config.clone())
         );
+        assert!(cache.get_w4a16("sm_80x108", 64, 256, 1024).is_none(), "an A100 lookup must miss");
         eprintln!("[gate] autotune w4a16: search tolerance-checked + tuned launch correct + cache round-trip ✓");
     }
 }
