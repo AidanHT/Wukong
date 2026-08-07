@@ -1,7 +1,13 @@
-//! Tensor-core GEMM via `wmma` PTX — the FLOP/s headline. On Ada (`sm_89`) the 4th-gen tensor cores
-//! do bf16/fp16 multiplies with **f32 accumulate** (the standard mixed-precision contract), at many
-//! times the f32 CUDA-core rate. This is where low precision stops being a footprint trick and buys
-//! real throughput.
+//! Tensor-core GEMM via `wmma` PTX — the FLOP/s headline. On Ada's 4th-gen tensor cores (the box
+//! these were developed on) bf16/fp16 multiplies run with **f32 accumulate** (the standard
+//! mixed-precision contract), at many times the f32 CUDA-core rate. This is where low precision stops
+//! being a footprint trick and buys real throughput.
+//!
+//! **Target floor.** Every instruction these generators emit — `wmma.load/mma.m16n16k16`,
+//! `mma.sync.m16n8k16`, `ldmatrix`, `cp.async`, `lop3` — is defined by the PTX ISA at `sm_80`
+//! (including the legacy 8×`.b32` f16 fragment spelling below), and no fp8 converter appears here.
+//! So every module in this file is tagged with the [`crate::ptx_target::HDR_SM80`] floor, which
+//! driver-JITs on Ampere and every later part; tagging it at the Ada arch would load on zero A100s.
 //!
 //! Each warp computes a `(16·tm)×(16·tn)` block of C as a `tm×tn` grid of `m16n16k16` WMMA tiles,
 //! accumulating over K. The key optimization over one-tile-per-warp is **fragment reuse**: per
@@ -14,6 +20,7 @@
 //! are f32. f16·f16→f32 and bf16·bf16→f32 are exact per product, so the only deviation from an f64
 //! reference is the f32 accumulation order (tolerance-gated).
 
+use crate::ptx_target::HDR_SM80;
 use std::sync::OnceLock;
 
 /// Comma-joined `{%p0,%p1,...}` register vector for a WMMA fragment.
@@ -276,7 +283,7 @@ pub fn pipe_variant(name: &str) -> &'static PipeCfg {
 /// **GEMM-cliff experiment candidates** (branch `perf/gpu-gemm-cliff-2`). A self-contained family of
 /// large-GEMM workhorse variants — all 128×128 / BK=32 / r16 raster `mma.sync.m16n8k16`, varying only the
 /// SMEM layout (8-padded vs no-pad XOR-swizzle), the cp.async pipeline **depth** (`stages`), and the
-/// **launch-bounds** (`min_ctas` ⇒ `.minnctapersm`). The research existence-proof (sm_89, 4096³ → 100% of
+/// **launch-bounds** (`min_ctas` ⇒ `.minnctapersm`). The research existence-proof (on Ada, 4096³ → 100% of
 /// cuBLAS) attributes the climb past ~74% to warp-tile ILP + swizzle + a **3-stage** pipeline (CUTLASS's
 /// SM80 floor is 3; the production workhorse is at 2). The no-pad swizzle is what frees the SMEM for s3
 /// (s2 padded = 40 KiB, s3 padded = 60 KiB > the 48 KiB static cap; s3 no-pad = 48 KiB exactly). All are
@@ -352,7 +359,7 @@ pub const CLIFF_VARIANTS: &[CliffCfg] = &[
 pub fn gemm_cliff_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(HDR_SM80);
         for v in CLIFF_VARIANTS {
             m += &entry_mma_pipe(
                 v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false,
@@ -2000,7 +2007,7 @@ fn roofline_entry() -> String {
 /// (`wmma_nt_f16_sm128_static`) per `use_128`. Returns an owned per-shape module (the caller caches it
 /// under a shape-keyed key / raw-loads it). Identical codegen to the dynamic `_sm` kernel ⇒ **bit-exact**.
 pub fn wmma_f16_sm_static_ptx(m: usize, n: usize, k: usize, use_128: bool) -> String {
-    let mut s = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+    let mut s = String::from(HDR_SM80);
     if use_128 {
         s += &entry_smem("wmma_nt_f16_sm128_static", "f16", SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N, Some((m, n, k)));
     } else {
@@ -2024,7 +2031,7 @@ pub fn wmma_f16_sm_static_entry(use_128: bool) -> &'static str {
 pub fn wmma_f16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(HDR_SM80);
         m += &entry("wmma_nt_f16", "f16", 1, 1);
         m += &entry("wmma_nt_f16_mt", "f16", TM_TILES, TN_TILES);
         m += &entry_smem("wmma_nt_f16_sm", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, None);
@@ -2277,7 +2284,7 @@ pub fn wmma_f16_ptx() -> &'static str {
 pub fn wmma_bf16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(HDR_SM80);
         m += &entry("wmma_nt_bf16", "bf16", 1, 1);
         m += &entry("wmma_nt_bf16_mt", "bf16", TM_TILES, TN_TILES);
         // bf16 large-GEMM workhorse (mma.sync + padded conflict-free SMEM + r16 raster) — the cliff fix
@@ -2404,7 +2411,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
 pub fn roofline_f16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(HDR_SM80);
         m += &roofline_entry();
         m
     })
@@ -2540,6 +2547,32 @@ mod tests {
             sorted.sort_unstable();
             sorted.dedup();
             assert_eq!(sorted.len(), names.len(), "{what}: duplicate .visible .entry name");
+        }
+    }
+
+    /// Retarget gate (GPU_RETARGET_PLAN.md §5, Phase 2): every tensor-core module here must open with
+    /// the `sm_80` FLOOR header, never the development box's `sm_89`. `wmma.*.m16n16k16`,
+    /// `mma.sync.m16n8k16`, `ldmatrix` and `cp.async` are all Ampere-ISA instructions, and PTX is
+    /// forward-compatible only — an `sm_89` tag on an Ampere-legal module is a pure loss that fails
+    /// `cuModuleLoadData` on every A100 while being completely invisible to the device gates below,
+    /// which run on an Ada card that accepts either tag.
+    #[test]
+    fn every_tensor_core_module_opens_at_the_sm80_floor() {
+        let statics = [wmma_f16_sm_static_ptx(128, 128, 128, false), wmma_f16_sm_static_ptx(128, 128, 128, true)];
+        let modules: [(&str, &str); 6] = [
+            ("wmma_f16_ptx", wmma_f16_ptx()),
+            ("wmma_bf16_ptx", wmma_bf16_ptx()),
+            ("gemm_cliff_ptx", gemm_cliff_ptx()),
+            ("roofline_f16_ptx", roofline_f16_ptx()),
+            ("wmma_f16_sm_static_ptx(64)", &statics[0]),
+            ("wmma_f16_sm_static_ptx(128)", &statics[1]),
+        ];
+        for (what, ptx) in modules {
+            assert!(ptx.starts_with(HDR_SM80), "{what}: must open with ptx_target::HDR_SM80");
+            assert!(
+                !ptx.contains(crate::ptx_target::TARGET_SM89),
+                "{what}: emits no Ada-only instruction, so it must not be tagged sm_89"
+            );
         }
     }
 
