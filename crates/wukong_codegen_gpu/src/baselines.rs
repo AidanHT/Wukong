@@ -137,6 +137,34 @@ pub fn peer_env_hint() -> &'static str {
     }
 }
 
+/// NVRTC options that compile a peer **for the device it is about to run on**.
+///
+/// Every peer here is an *honest bar*, and `--gpu-architecture` is the single option that decides
+/// what the peer is allowed to be: NVRTC picks instructions from it (`__expf`'s SFU form, `dp4a`,
+/// the `mma`/`wmma` families, the async-copy intrinsics), so compiling a peer for anything below the
+/// device deliberately hands Wukong a handicapped opponent. These sites used to say
+/// `arch: Some("compute_89")`, i.e. "compile every peer for a laptop Ada part" — on an A100 that
+/// under-configures the peer (NVRTC would emit no Ada-only instruction the A100 lacks, but it also
+/// silently declines every Ampere-and-later choice keyed off a >= 8.9 arch), and on an sm_120 part it
+/// is a straight capability loss. The arch is therefore read from the probed [`Gpu::target`].
+///
+/// Note the asymmetry with the *module* headers ([`crate::ptx_target`]): a PTX module is tagged with
+/// its family FLOOR because PTX is forward-compatible and the driver JIT still emits SASS for the
+/// real device. A peer's NVRTC arch is the opposite case — it is a source-language capability
+/// switch, not a compatibility tag, so it tracks the device exactly.
+///
+/// `CompileOptions::arch` is `Option<&'static str>` and the arch is only known at runtime, so the
+/// flag goes through `options` — the exact string `arch` itself expands to (`cudarc`'s
+/// `CompileOptions::build`), so this is the same NVRTC command line, not an approximation.
+fn peer_compile_opts(g: &Gpu) -> CompileOptions {
+    let t = g.target();
+    let arch = crate::ptx_target::compute_arch(t.cc_major, t.cc_minor);
+    CompileOptions {
+        options: vec![format!("--gpu-architecture={arch}")],
+        ..Default::default()
+    }
+}
+
 /// Probe whether the NVRTC + cuBLAS DLLs are loadable in this process, **without** letting a missing
 /// DLL abort the run: `cudarc`'s lazy loader `panic!`s if no candidate library is found, so we drive
 /// the first real call to each library under `catch_unwind` and treat a panic (or any error) as "not
@@ -202,14 +230,10 @@ extern "C" __global__ void naive_gemm_nt(int M, int N, int K,
 }
 "#;
 
-/// Compile the naive CUDA-C GEMM with NVRTC (targeting this box's `sm_89`) and load it. Returned as a
-/// loaded module so callers can launch it many times for timing without recompiling.
+/// Compile the naive CUDA-C GEMM with NVRTC (targeting the probed device — see [`peer_compile_opts`])
+/// and load it. Returned as a loaded module so callers can launch it many times without recompiling.
 fn nvrtc_naive_gemm_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
-    let opts = CompileOptions {
-        arch: Some("compute_89"),
-        ..Default::default()
-    };
-    let ptx = compile_ptx_with_opts(NAIVE_GEMM_NT_CUDA, opts)?;
+    let ptx = compile_ptx_with_opts(NAIVE_GEMM_NT_CUDA, peer_compile_opts(g))?;
     Ok(g.ctx.load_module(ptx)?)
 }
 
@@ -318,11 +342,7 @@ extern "C" __global__ void naive_attn(int H, int S, int D, float scale,
 "#;
 
 fn nvrtc_naive_attn_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
-    let opts = CompileOptions {
-        arch: Some("compute_89"),
-        ..Default::default()
-    };
-    let ptx = compile_ptx_with_opts(NAIVE_ATTN_CUDA, opts)?;
+    let ptx = compile_ptx_with_opts(NAIVE_ATTN_CUDA, peer_compile_opts(g))?;
     Ok(g.ctx.load_module(ptx)?)
 }
 
@@ -1238,8 +1258,7 @@ extern "C" __global__ void naive_w4a16(int M, int N, int K, int group,
 "#;
 
 fn nvrtc_naive_w4a16_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
-    let opts = CompileOptions { arch: Some("compute_89"), ..Default::default() };
-    let ptx = compile_ptx_with_opts(NAIVE_W4A16_CUDA, opts)?;
+    let ptx = compile_ptx_with_opts(NAIVE_W4A16_CUDA, peer_compile_opts(g))?;
     Ok(g.ctx.load_module(ptx)?)
 }
 
@@ -1339,11 +1358,7 @@ extern "C" __global__ void naive_conv(int C, int H, int W, int K, int R, int S, 
 "#;
 
 fn nvrtc_naive_conv_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
-    let opts = CompileOptions {
-        arch: Some("compute_89"),
-        ..Default::default()
-    };
-    let ptx = compile_ptx_with_opts(NAIVE_CONV_CUDA, opts)?;
+    let ptx = compile_ptx_with_opts(NAIVE_CONV_CUDA, peer_compile_opts(g))?;
     Ok(g.ctx.load_module(ptx)?)
 }
 
@@ -1487,12 +1502,12 @@ extern "C" __global__ void dp4a_gemm_nt_int8(int M, int N, int K,
 }
 "#;
 
+/// The int8 peers are the sharpest case for compiling at the device arch: `dp4a` is an sm_61+
+/// instruction the peer writes as inline PTX, but NVRTC still validates it against the compile arch,
+/// and the whole point of this peer family is that it is the *best* thing a programmer gets without
+/// a library — which is arch-dependent.
 fn nvrtc_int8_module(g: &Gpu, src: &str) -> Result<Arc<CudaModule>, PeerError> {
-    let opts = CompileOptions {
-        arch: Some("compute_89"),
-        ..Default::default()
-    };
-    let ptx = compile_ptx_with_opts(src, opts)?;
+    let ptx = compile_ptx_with_opts(src, peer_compile_opts(g))?;
     Ok(g.ctx.load_module(ptx)?)
 }
 
@@ -1991,7 +2006,8 @@ pub fn cublaslt_available() -> bool {
 // with per-shape autotuning, the bar Wukong's conv must close on. We drive the **legacy** forward API
 // through cudarc's safe `cudnn` module (`ConvForward` over `cudnnConvolutionForward`), letting
 // `cudnnGetConvolutionForwardAlgorithm_v7` (the autotuner heuristic) pick the algorithm — exactly the
-// "cuDNN chooses its best engine" comparison. To engage the tensor cores on Ada (sm_89) we feed cuDNN
+// "cuDNN chooses its best engine" comparison. To engage the tensor cores (Ada sm_89 on this box, and
+// every tensor-core part since Volta the same way) we feed cuDNN
 // its fast path: **NHWC fp16** inputs, f32 accumulate, `CUDNN_TENSOR_OP_MATH`. Wukong stores NCHW, so
 // X/W are transposed to NHWC/KRSC **once** at setup (outside the timed loop) and cuDNN's NHWC output is
 // transposed back to `[K,P,Q]` for the same f64 cross-check Wukong's own conv faces. The chosen algo
@@ -2220,10 +2236,17 @@ pub fn time_cudnn_conv2d(
 /// needs no per-element integer remainder and `scale[c]` / the i32 row stream coalesce. A fair, fast
 /// dequant — the second kernel a cuBLAS int8 pipeline launches, re-reading the whole M×N i32 from HBM and
 /// writing M×N f32 (the HBM round-trip + launch Wukong's fused epilogue removes).
-const INT8_DEQUANT_CHAIN_PTX: &str = r#".version 8.4
-.target sm_89
-.address_size 64
-.visible .entry int8_dequant_chain(
+///
+/// **Floored to `sm_80`, not compiled for the device** — the one hand-written PTX module in this file,
+/// and the opposite call to [`peer_compile_opts`] above, on evidence: its whole instruction set is
+/// `mov`/`mad.lo.s32`/`setp`/`mul.wide.u32`/`ld.global`/`cvt.rn.f32.s32`/`mul.f32`/`st.global`/`bra`
+/// — pre-Volta-generic, nothing Ada-only, no shared memory, no `mma`, no `cp.async`. Unlike NVRTC's
+/// `--gpu-architecture` (a source-language capability switch, so peers take the device), a PTX
+/// `.target` is a *compatibility floor*: the driver JIT still compiles this to SASS for whatever
+/// device is current, so the floor costs the peer nothing and buys it every part from Ampere up.
+/// Tagged `sm_89` it would fail to load on an A100 and silently delete the int8-chain peer from the
+/// scoreboard on the exact datacenter parts this retarget targets. `.version 8.4` is kept.
+const INT8_DEQUANT_CHAIN_BODY: &str = r#".visible .entry int8_dequant_chain(
     .param .u64 pIn,
     .param .u64 pScale,
     .param .u64 pOut,
@@ -2269,6 +2292,11 @@ END:
 }
 "#;
 
+/// [`INT8_DEQUANT_CHAIN_BODY`] under the shared `sm_80` floor header — the module the driver JITs.
+fn int8_dequant_chain_ptx() -> String {
+    format!("{}{INT8_DEQUANT_CHAIN_BODY}", crate::ptx_target::HDR_SM80_V84)
+}
+
 /// Time the **cuBLAS int8 GEMM + dequant chain**: `iters` resident pairs of (`cublasGemmEx` i32 →
 /// `int8_dequant_chain` i32→f32), one warm-up, one trailing sync. Returns **seconds per pair** — the
 /// honest peer for Wukong's single fused `int8_gemm_nt_*_deq`. A/B/scale are dummy (timing is
@@ -2286,7 +2314,7 @@ pub fn time_cublas_int8_gemm_dequant_chain(
     let mut ci_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
     let scale_d = g.stream.memcpy_stod(&vec![1.0f32 / 127.0; n])?;
     let mut cf_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
-    let module = g.ctx.load_module(INT8_DEQUANT_CHAIN_PTX.into())?;
+    let module = g.ctx.load_module(int8_dequant_chain_ptx().into())?;
     let deq = module.load_function("int8_dequant_chain")?;
     let stream = g.stream.clone();
     let (mm, nn) = (m as u32, n as u32);
@@ -2319,7 +2347,8 @@ pub fn time_cublas_int8_gemm_dequant_chain(
 // fMHA), driven as a subprocess. THE bar the M5 milestone actually requires: a genuinely *fused*
 // FlashAttention-class kernel, NOT the pre-FlashAttention unfused cuBLAS chain ([`cublas_attn_chain`]).
 //
-// Why a subprocess: a real fused FA-class kernel exists for Ada sm_89 but is reachable here only from
+// Why a subprocess: a real fused FA-class kernel exists for the device (Ada sm_89 here, and for every
+// datacenter part) but is reachable here only from
 // Python (NVRTC has no headers, so `nvcuda::wmma`/CUTLASS/FlashAttention won't compile as an in-process
 // peer). The peer script `tools/fa2_sdpa_peer.py` forces each fused SDPA backend in turn over the SAME
 // f16 Q/K/V bytes Wukong's flash runs, CUDA-event-times it (so Python's per-call dispatch overhead is
@@ -2657,6 +2686,43 @@ pub fn fa2_sdpa_peer_rope(
 
 #[cfg(test)]
 mod tests {
+    /// **A peer must be compiled for the device it races on** (§2.2 / Phase 2 step 5).
+    ///
+    /// Every NVRTC peer here used to pass `arch: Some("compute_89")`, so on any part that is not a
+    /// laptop Ada the bar was compiled for the wrong machine — an under-configured opponent, which is
+    /// exactly the dishonest comparison this module exists to forbid. This pins the flag to the
+    /// probed [`crate::gpu::GpuTarget`]: it is a *device* test, because the whole claim is about what
+    /// the real device reports, and a constant would pass it on this box for the wrong reason.
+    #[test]
+    fn peers_compile_for_the_probed_device() {
+        let mut guard = crate::gpu::gpu();
+        let Some(g) = guard.as_mut() else {
+            let why = crate::gpu::init_error().unwrap_or("no CUDA device reachable");
+            assert!(!crate::gpu::gpu_required(), "WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}");
+            eprintln!("[skip] peers_compile_for_the_probed_device: GPU unavailable: {why}");
+            return;
+        };
+        let t = g.target();
+        let want = format!("--gpu-architecture=compute_{}{}", t.cc_major, t.cc_minor);
+        let opts = super::peer_compile_opts(g);
+        assert!(opts.arch.is_none(), "the static `arch` field must stay empty: the flag is runtime-built");
+        assert_eq!(opts.options, vec![want.clone()], "peer NVRTC arch != the probed device");
+        eprintln!("[gate] NVRTC peers compile with {want} for {} ✓", t.name);
+    }
+
+    /// The one hand-written peer PTX must sit at the shared `sm_80` floor and stay pure ASCII — a
+    /// `.target sm_89` here loads on ZERO A100s (PTX is forward-, never backward-compatible), and one
+    /// non-ASCII byte is a `ptxas fatal` at `cuModuleLoadData`.
+    #[test]
+    fn int8_dequant_chain_peer_ptx_is_floored_and_ascii() {
+        let ptx = super::int8_dequant_chain_ptx();
+        assert!(ptx.is_ascii(), "peer PTX must be pure ASCII");
+        assert!(ptx.starts_with(crate::ptx_target::HDR_SM80_V84), "peer PTX must open with the sm_80 v8.4 header");
+        assert!(ptx.contains(crate::ptx_target::TARGET_SM80));
+        assert!(!ptx.contains(crate::ptx_target::TARGET_SM89), "this kernel needs no Ada instruction");
+        assert!(ptx.contains(".visible .entry int8_dequant_chain("), "the header must not have eaten the body");
+    }
+
     /// **The peer chain's attention must be the *same kernel* the Wukong layer runs** (device-free).
     ///
     /// `CublasChainLayer`'s whole claim is that attention is common to both stacks, so the printed
