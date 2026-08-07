@@ -52,6 +52,17 @@ pub struct GpuTarget {
 }
 
 impl GpuTarget {
+    /// `(cc_major, cc_minor)` — orderable, so a capability floor is a plain `>=` comparison
+    /// (`(8,9) >= (8,0)` and `(9,0) >= (8,9)`, which is exactly the arch ordering CUDA guarantees).
+    pub fn cc(&self) -> (i32, i32) {
+        (self.cc_major, self.cc_minor)
+    }
+
+    /// Does this device meet compute-capability floor `min`?
+    pub fn supports(&self, min: (i32, i32)) -> bool {
+        self.cc() >= min
+    }
+
     /// Probe device `ordinal`'s identity. **Every failure is loud and names the driver call**, so an
     /// unqueryable attribute can never degrade into a plausible-looking constant.
     ///
@@ -123,11 +134,98 @@ impl GpuTarget {
     }
 }
 
+/// **The minimum compute capability the fp8 kernel families need.** `mma.sync…e4m3/e5m2` and the
+/// packed `cvt.rn.satfinite.e{4m3,5m2}x2.f32` converters exist nowhere below Ada — an A100 (cc 8.0)
+/// cannot run them at all, not slowly: the instructions are absent from its ISA.
+pub const FP8_MIN_CC: (i32, i32) = (8, 9);
+
+/// A [`LaunchConfig`] carrying a **dynamic** shared-memory window of `dyn_smem` bytes.
+///
+/// Every launch in this crate passes `shared_mem_bytes: 0` because every kernel declares its SMEM
+/// statically (and is therefore capped at the PTX ISA's 48 KiB). A kernel whose `.shared` is an
+/// `.extern` window instead gets its size *here*, at launch — and only up to the ceiling its entry was
+/// opted into by [`Gpu::function_dyn`].
+pub fn dyn_launch_cfg(
+    grid_dim: (u32, u32, u32),
+    block_dim: (u32, u32, u32),
+    dyn_smem: usize,
+) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim,
+        block_dim,
+        shared_mem_bytes: u32::try_from(dyn_smem)
+            .expect("dynamic SMEM byte count must fit in u32 (the driver's own type)"),
+    }
+}
+
+/// A GPU call's failure — either the driver said no, or **this device cannot run this kernel family
+/// at all**.
+///
+/// The second arm is the thing `DriverError` cannot express and the reason this type exists. A
+/// capability decline is not an error in the "something went wrong" sense: it is a fact about the
+/// hardware, decided *before* any PTX is generated or loaded, and the caller is expected to have a
+/// documented alternative (bf16/int8 for fp8). Squeezing it into a `DriverError` would either
+/// fabricate a CUDA status code or — far worse — invite a silent fallback that quietly computes in a
+/// different dtype than the caller asked for.
+#[derive(Debug)]
+pub enum GpuError {
+    /// The CUDA driver rejected a call.
+    Driver(DriverError),
+    /// The device lacks a capability the kernel requires; the string names the capability, the
+    /// requirement and what was actually probed (see [`capability_decline`]).
+    Unsupported(String),
+}
+
+impl From<DriverError> for GpuError {
+    fn from(e: DriverError) -> Self {
+        GpuError::Driver(e)
+    }
+}
+
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuError::Driver(e) => write!(f, "{e:?}"),
+            GpuError::Unsupported(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for GpuError {}
+
+impl GpuError {
+    /// The decline message iff this is a capability decline — the discriminator a gate uses to route
+    /// a *capability* skip (a third category, distinct from "no device" and "no peer").
+    pub fn unsupported(&self) -> Option<&str> {
+        match self {
+            GpuError::Unsupported(m) => Some(m),
+            GpuError::Driver(_) => None,
+        }
+    }
+}
+
+/// The one-line capability-decline message, e.g.
+/// `"gemm_nt_fp8: fp8 requires cc>=8.9, device is 8.0 (NVIDIA A100-SXM4-40GB)"`.
+///
+/// A free function, not a `format!` at each call site, so the wording is identical everywhere and can
+/// be asserted by a test with no device attached.
+pub fn capability_decline(what: &str, cap: &str, min: (i32, i32), have: (i32, i32), device: &str) -> String {
+    format!(
+        "{what}: {cap} requires cc>={}.{}, device is {}.{} ({device})",
+        min.0, min.1, have.0, have.1
+    )
+}
+
 /// A live CUDA device + stream + a cache of JIT-loaded PTX modules (keyed by a stable string).
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
+    /// The largest **dynamic** shared-memory ceiling already opted into per `(module key, entry name)`.
+    /// `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` is a property of the loaded `CUfunction`, so
+    /// it survives every later `load_function` for that entry: it is set once at load and re-set only
+    /// if a later caller needs a strictly larger window. See [`Gpu::function_dyn`].
+    dyn_smem: HashMap<(&'static str, String), usize>,
     /// Installed driver version — part of the on-disk cubin cache key (a cubin is driver-ABI specific).
     driver_tag: i32,
     /// The probed device identity — see [`GpuTarget`]. Queried once, here, and never re-queried.
@@ -145,6 +243,7 @@ impl Gpu {
             ctx,
             stream,
             modules: HashMap::new(),
+            dyn_smem: HashMap::new(),
             driver_tag: crate::cubin::driver_version(),
             target,
         })
@@ -159,6 +258,76 @@ impl Gpu {
     /// Human-readable device name, e.g. "NVIDIA GeForce RTX 4050 Laptop GPU".
     pub fn device_name(&self) -> String {
         self.target.name.clone()
+    }
+
+    /// The device's **`compute_XX`** spelling for NVRTC's `--gpu-architecture`.
+    ///
+    /// This is the DEVICE's architecture, deliberately **not** a PTX family floor: our own PTX modules
+    /// are tagged with the lowest target their instruction mix is legal on (see [`crate::ptx_target`])
+    /// so they forward-JIT everywhere, but a peer kernel compiled *here, now* is compiled for the card
+    /// the round actually runs on. It used to be the literal `"compute_89"`.
+    ///
+    /// `cudarc::nvrtc::CompileOptions::arch` is `Option<&'static str>`, so the probed spelling is
+    /// interned in a process-wide `OnceLock`. A process talks to exactly one device (ordinal 0, one
+    /// primary context, one [`Gpu`] singleton), so first-writer-wins names the same device every later
+    /// caller would have asked for.
+    pub fn compute_arch(&self) -> &'static str {
+        static ARCH: OnceLock<String> = OnceLock::new();
+        ARCH.get_or_init(|| {
+            crate::ptx_target::compute_arch(self.target.cc_major, self.target.cc_minor)
+        })
+        .as_str()
+    }
+
+    /// The device's **`sm_XX`** spelling — the ptxas `-arch` flag and the device half of a cache key
+    /// (see `autotune`). The DEVICE's architecture, like [`Gpu::compute_arch`], never a family floor.
+    pub fn sm_arch(&self) -> String {
+        crate::ptx_target::sm_arch(self.target.cc_major, self.target.cc_minor)
+    }
+
+    /// **The device half of a persistent cache key** — `"sm_89x20"`: this device's arch and its SM
+    /// count, one whitespace-free token so it drops into a hand-editable text key.
+    ///
+    /// The arch alone is not enough identity. A tuned config is a verdict about a *machine*: the
+    /// autotuner's own axes (split-K factor, CTA/warp tile) are chosen by how a grid fills the SMs, so
+    /// an RTX 4090 (`sm_89`, 128 SMs) must not inherit an RTX 4050's (`sm_89`, 20 SMs) winners even
+    /// though the ISA is identical. Arch + SM count separates every part this project targets
+    /// (4050 `sm_89x20`, A100 `sm_80x108`, H100 `sm_90x132`).
+    pub fn device_tag(&self) -> String {
+        format!("{}x{}", self.sm_arch(), self.target.sm_count)
+    }
+
+    /// Can this device run the **fp8** kernel families at all? (cc >= 8.9 — see [`FP8_MIN_CC`].)
+    pub fn supports_fp8(&self) -> bool {
+        self.target.supports(FP8_MIN_CC)
+    }
+
+    /// **The capability precondition.** `Ok(())` iff the device meets floor `min`; otherwise a
+    /// [`GpuError::Unsupported`] naming the capability, the floor and what was probed.
+    ///
+    /// Call this as the FIRST statement of a launch wrapper — before any PTX is generated, before any
+    /// module is loaded, before any host-side conversion — so a card that cannot run the family
+    /// declines instantly and identically, instead of failing somewhere inside `cuModuleLoadData`
+    /// with a JIT error that names an instruction rather than the missing capability.
+    pub fn require_cap(&self, what: &str, cap: &str, min: (i32, i32)) -> Result<(), GpuError> {
+        if self.target.supports(min) {
+            return Ok(());
+        }
+        Err(GpuError::Unsupported(capability_decline(
+            what,
+            cap,
+            min,
+            self.target.cc(),
+            &self.target.name,
+        )))
+    }
+
+    /// [`Gpu::require_cap`] for fp8: **never** silently substitutes another dtype. The bf16 / int8
+    /// paths are the documented alternative on a pre-Ada card, but choosing them is the CALLER's
+    /// decision — a launcher that quietly computed in bf16 because fp8 was unavailable would return
+    /// numerically different results under the same function name.
+    pub fn require_fp8(&self, what: &str) -> Result<(), GpuError> {
+        self.require_cap(what, "fp8", FP8_MIN_CC)
     }
 
     /// Load `ptx` once under `key`, caching the module in-process, and return the named entry
@@ -181,6 +350,63 @@ impl Gpu {
             self.modules.insert(key, module);
         }
         self.modules[key].load_function(name)
+    }
+
+    /// **The most shared memory one block may use on this device**, bytes — `MAX_SHARED_MEMORY_PER_
+    /// BLOCK_OPTIN`, reachable *only* through the dynamic window ([`Gpu::function_dyn`]).
+    ///
+    /// The 48 KiB every generator in this crate assumes is a **PTX ISA rule about STATIC `.shared`**
+    /// (PTX §5.1.7), not a device fact: it is the same 48 KiB on a card with 99 KiB (this Ada part),
+    /// 164 KiB (A100) or 228 KiB (H100) of opt-in carveout. Retagging a module lifts nothing; only an
+    /// `.extern .shared` window plus `cuFuncSetAttribute` does.
+    pub fn smem_budget(&self) -> usize {
+        self.target.smem_per_block_optin
+    }
+
+    /// [`Gpu::function`], plus opting this entry into a **dynamic shared-memory window** of `dyn_smem`
+    /// bytes (`cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)`).
+    ///
+    /// The attribute is a ceiling on what a launch may request; the launch itself must then pass the
+    /// byte count in `LaunchConfig::shared_mem_bytes` ([`dyn_launch_cfg`] builds that config). Without
+    /// the opt-in, any launch above 48 KiB is rejected with `CUDA_ERROR_INVALID_VALUE` — which is what
+    /// `dynamic_smem_window_exceeds_the_static_48_kib_ceiling` proves in both directions.
+    ///
+    /// It is set **once per (module key, entry)**: the attribute lives on the loaded `CUfunction`, so
+    /// every later `load_function` for that entry already has it. A later, larger request raises it;
+    /// a smaller one is a no-op (the ceiling already covers it).
+    ///
+    /// **The module-cache rule is unchanged and still applies** ([`Gpu::function`]): the cache keys on
+    /// `key` alone and never re-examines `ptx`, so a distinct generated variant needs a distinct key —
+    /// here doubly so, since two variants sharing a key would also share one SMEM ceiling.
+    pub fn function_dyn(
+        &mut self,
+        key: &'static str,
+        ptx: &str,
+        name: &str,
+        dyn_smem: usize,
+    ) -> Result<CudaFunction, DriverError> {
+        // A launch-seam precondition, asserted at the seam: an over-budget request is a generator bug,
+        // and the driver's own rejection would name neither the budget nor the kernel.
+        assert!(
+            dyn_smem <= self.smem_budget(),
+            "{name}: dynamic SMEM request {dyn_smem} B exceeds the device ceiling {} B \
+             (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN on {})",
+            self.smem_budget(),
+            self.target.name
+        );
+        let f = self.function(key, ptx, name)?;
+        let slot = (key, name.to_string());
+        if self.dyn_smem.get(&slot).copied().unwrap_or(0) < dyn_smem {
+            // `cuFuncSetAttribute` needs a context current on THIS thread (cudarc binds inside
+            // load_module/launch, but not here), and libtest runs these on many threads.
+            let _ = self.ctx.bind_to_thread();
+            f.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                dyn_smem as i32,
+            )?;
+            self.dyn_smem.insert(slot, dyn_smem);
+        }
+        Ok(f)
     }
 
     /// Load a module for `ptx`, preferring a cached cubin over a fresh JIT. Warm path: a previously
@@ -677,6 +903,26 @@ pub fn gemm_nn(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **The f16 GEMM regime boundaries, in bytes of fp16 A+B working set, derived from the device's L2.**
+///
+/// The two thresholds [`gemm_nt_f16`] dispatches on were the literals `16 MiB` and `48 MiB` — tuned on
+/// this 4050 and meaningless on any other card, while the probed `l2_bytes` sat unused by dispatch (its
+/// only consumer was a bench print). They are not arbitrary sizes: the boundaries are where the A+B
+/// footprint stops fitting L2 (`≈ ⅔·L2`, the point where C and the raster band still leave room) and
+/// where it is comfortably HBM-bound (`2·L2`), which is why the *shape* of the rule ports and the
+/// *numbers* do not.
+///
+/// On this device the derivation is **exactly** the old pair — 24 MiB L2: `25165824·2/3 = 16777216`
+/// (16 MiB) and `25165824·2 = 50331648` (48 MiB) — so the 4050 dispatch census is unchanged, which
+/// `f16_regime_thresholds_reproduce_the_4050_literals` machine-checks. (A 1.33×/4× reading of the same
+/// bands assumes a 12 MiB L2; the probe settles it at 24 MiB. Evaluate `·2/3` in that order — `/3·2`
+/// truncates first and gives a different edge whenever `l2_bytes % 3 == 2`.)
+///
+/// Returns `(l2_resident_ceiling, hbm_bound_floor)`.
+pub fn f16_regime_thresholds(l2_bytes: usize) -> (usize, usize) {
+    (l2_bytes * 2 / 3, l2_bytes * 2)
+}
+
 /// Pick the WMMA entry + launch config: the fragment-reuse multi-tile kernel (`<base>_mt`, one warp
 /// per WARP_M×WARP_N block) when M and N are multiples of the warp tile, else the single-16×16-tile
 /// kernel (`<base>`, any 16-multiple). One warp (32 threads) per block either way.
@@ -725,7 +971,8 @@ pub fn gemm_nt_f16(
     );
     // Regime-aware dispatch among the multi-stage `cp.async` pipeline kernels (all numerically identical;
     // winners picked by `gemm_pipe_sweep`, same-run vs cuBLAS at full clock). The binding constraint flips
-    // with the A+B working set vs the 24 MB L2 (see `PIPE_VARIANTS`):
+    // with the A+B working set vs the device's L2 (24 MB here, probed -- see
+    // `f16_regime_thresholds`; `PIPE_VARIANTS`):
     //   • L2-resident: a DEEP BK=16 pipeline wins (latency is low; depth keeps the tensor cores fed) —
     //     `pipe_64_s6` ≤1024³ (~90% of cuBLAS), `pipe_128_s4` ~2048³ (~94%).
     //   • Larger (≥ ~2048³, A+B ≳ L2): the `mma.sync.m16n8k16` kernel with conflict-free padded SMEM and
@@ -734,24 +981,27 @@ pub fn gemm_nt_f16(
     // Anything not matching a pipeline variant's divisibility falls through to the older SMEM kernels.
     // RESOLVED (perf/gpu-gemm-4096, swept 2026-07-09): of the CLIFF_VARIANTS re-tune candidates
     // (3-stage pipeline, L2-keyed raster bands, forced launch-bounds, vectorized epilogues) only the
-    // `_v2cs` epilogue beat the swz base, and only at ≥48 MB — it is dispatched by the first arm
+    // `_v2cs` epilogue beat the swz base, and only at ≥2·L2 (48 MB here) — it is dispatched by the first arm
     // below; everything else measured a loss at both 2048³ and 4096³ and stays bench-only.
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
-    if ws_bytes >= 48 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
-        // **Largest regime (A+B ≥ 48 MB, ~4096³ up): the `_v2cs` epilogue variant** — the same swz
+    // The band edges are multiples of the PROBED L2 (see `f16_regime_thresholds`), not the 16/48 MiB
+    // literals they replace — on this 24 MiB-L2 card they evaluate to exactly those literals.
+    let (l2_resident_max, hbm_bound_min) = f16_regime_thresholds(g.target().l2_bytes);
+    if ws_bytes >= hbm_bound_min && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+        // **Largest regime (A+B ≥ 2·L2 = 48 MB here, ~4096³ up): the `_v2cs` epilogue variant** — the same swz
         // s2 body as the w24 workhorse below, with C written as paired-column `st.global.cs.v2.f32`
         // (half the store count + the evict-first streaming hint keeps the one-shot C out of the
         // raster band's L2 working set). `gemm_cliff_ab` (round-robin best-of-10, 2026-07-09):
         // 1.027× the s2 base at 4096³ = 76.8% / 80.4% of the f16-/f32-out cuBLAS peers. At 2048³
         // every cliff variant LOSES to the plain swz base (v2cs 0.75× — C is L2-scale there and
-        // the .cs hint forfeits reuse), so this arm keys strictly on the ≥48 MB working set and
+        // the .cs hint forfeits reuse), so this arm keys strictly on the ≥2·L2 working set and
         // the [16, 48) MB band below keeps the plain swz w24.
         return gemm_nt_f16_cliff(g, a, b, m, k, n, "cliff_swz_s2_v2cs");
     }
-    if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+    if ws_bytes >= l2_resident_max && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
         let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
-        // **Large regime (A+B ≥ 16 MB, ≥2048³):** the no-pad `ldmatrix`+XOR-swizzle **w24** workhorse is the
+        // **Large regime (A+B ≥ ⅔·L2 = 16 MB here, ≥2048³):** the no-pad `ldmatrix`+XOR-swizzle **w24** workhorse is the
         // robust same-run winner — it beats the padded hand-placed base **1.23× @2048³ (87.4% vs 70.9% of
         // cuBLAS) and 1.13× @4096³**. The mechanism is the *fragment load*, not occupancy: the swz path loads
         // each mma operand with one warp-cooperative hardware `ldmatrix` (conflict-free via the no-pad XOR
@@ -3796,7 +4046,8 @@ impl ResidentModelF16 {
 /// is `16×32` row-major, `b_col` is `32×8` **column-major** (the `.col` operand), both arrive as f32
 /// and are rounded to E4M3 on the host; `D` is `16×8` f32 (the mixed-precision accumulate). Validates
 /// the manual fragment layout — the core a full fp8 GEMM would tile over.
-pub fn fp8_tile(g: &mut Gpu, a: &[f32], b_col: &[f32]) -> Result<Vec<f32>, DriverError> {
+pub fn fp8_tile(g: &mut Gpu, a: &[f32], b_col: &[f32]) -> Result<Vec<f32>, GpuError> {
+    g.require_fp8("fp8_tile")?;
     assert_eq!(a.len(), 16 * 32, "A must be 16×32");
     assert_eq!(b_col.len(), 32 * 8, "B must be 32×8 (column-major)");
     let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
@@ -3816,7 +4067,7 @@ pub fn fp8_tile(g: &mut Gpu, a: &[f32], b_col: &[f32]) -> Result<Vec<f32>, Drive
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&a_d).arg(&b_d).arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// Full **fp8 (E4M3) tensor-core `C = A·Bᵀ`** (nn.Linear): `A` (m×k) and `B` (n×k) arrive as f32 and
@@ -3830,7 +4081,8 @@ pub fn gemm_nt_fp8(
     m: usize,
     k: usize,
     n: usize,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
+    g.require_fp8("gemm_nt_fp8")?;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
@@ -3882,7 +4134,7 @@ pub fn gemm_nt_fp8(
         .arg(&b_d)
         .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// **W4A16 weight-only int4 decode** `C = A·dequant(W)ᵀ` (the LLM-decode workhorse). `A` (`[M,K]`)
@@ -4225,10 +4477,11 @@ pub fn gemm_nt_fp8_pipe(
     m: usize,
     k: usize,
     n: usize,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::{
         f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS,
     };
+    g.require_fp8("gemm_nt_fp8_pipe")?;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     // Warp-tile dispatch (the transferred int8 lever; `quant_fp8_warp_tile_sweep`, perf/gpu-quant-2).
@@ -4267,7 +4520,7 @@ pub fn gemm_nt_fp8_pipe(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// `C = act(A·Bᵀ + bias)` (fp8 E4M3 in, f32 out) fused into the pipelined fp8 workhorse store epilogue —
@@ -4285,8 +4538,9 @@ fn gemm_nt_fp8_pipe_fused_bias(
     k: usize,
     n: usize,
     entry: &'static str,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS};
+    g.require_fp8(entry)?;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
@@ -4310,23 +4564,23 @@ fn gemm_nt_fp8_pipe_fused_bias(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// `C = A·Bᵀ + bias` fused, fp8 inputs (affine Linear) — see [`gemm_nt_fp8_pipe_fused_bias`].
-pub fn gemm_nt_fp8_mma_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_mma_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias")
 }
 /// `C = relu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_mma_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_relu")
 }
 /// `C = silu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_mma_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_silu")
 }
 /// `C = gelu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_gelu")
 }
 
@@ -4343,8 +4597,9 @@ pub fn gemm_nt_fp8_mma_bias_residual(
     m: usize,
     k: usize,
     n: usize,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS};
+    g.require_fp8("gemm_nt_fp8_mma_bias_residual")?;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
@@ -4370,7 +4625,7 @@ pub fn gemm_nt_fp8_mma_bias_residual(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// `out = act(x·Wgᵀ [+bg]) ⊙ (x·Wuᵀ [+bu])` — the fused **SwiGLU/GeGLU** FFN gate on the fp8 dual-B
@@ -4390,8 +4645,9 @@ fn gemm_nt_fp8_gate(
     k: usize,
     n: usize,
     entry: &'static str,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::f32_to_e4m3;
+    g.require_fp8(entry)?;
     assert_eq!(x.len(), m * k);
     assert_eq!(wg.len(), n * k);
     assert_eq!(wu.len(), n * k);
@@ -4423,16 +4679,16 @@ fn gemm_nt_fp8_gate(
     } else {
         unsafe { bld.launch(cfg)? };
     }
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// Fused **SwiGLU** FFN gate (fp8 E4M3 — the fastest fused inference gate): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
-pub fn gemm_nt_fp8_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_silu")
 }
 
 /// Fused **GeGLU** FFN gate (fp8 E4M3): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
-pub fn gemm_nt_fp8_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_fp8_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_gelu")
 }
 
@@ -4796,8 +5052,9 @@ pub fn gemm_nt_fp8_bwd(
     m: usize,
     k: usize,
     n: usize,
-) -> Result<Vec<f32>, DriverError> {
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_fp8::{FP8_TM, FP8_TN};
+    g.require_fp8("gemm_nt_fp8_bwd")?;
     assert_eq!(dy.len(), m * k);
     assert_eq!(w.len(), n * k);
     assert!(
@@ -4821,7 +5078,7 @@ pub fn gemm_nt_fp8_bwd(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&c_d)
+    Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// **Per-tensor `amax`** = `maxᵢ |x[i]|` on-device — the delayed-scaling calibration statistic for fp8
@@ -4864,7 +5121,12 @@ pub fn quantize_scaled_fp8(
     x: &[f32],
     recip: f32,
     e5m2: bool,
-) -> Result<Vec<u8>, DriverError> {
+) -> Result<Vec<u8>, GpuError> {
+    // The hardware `cvt.rn.satfinite.e{5m2,4m3}x2.f32` converters are Ada-and-later, exactly like
+    // the fp8 mma itself, so the device quantize carries the same capability floor. (`amax_f32`
+    // deliberately does NOT: it is plain f32 max-abs -- the delayed-scaling statistic an A100 still
+    // needs, and the plan splits it out precisely so it survives there.)
+    g.require_fp8("quantize_scaled_fp8")?;
     let n = x.len();
     assert!(n % 2 == 0, "device fp8 quantize needs an even element count");
     if n == 0 {
@@ -4889,7 +5151,7 @@ pub fn quantize_scaled_fp8(
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&nn).arg(&x_d).arg(&mut o_d).arg(&recip);
     unsafe { bld.launch(cfg)? };
-    g.stream.memcpy_dtov(&o_d)
+    Ok(g.stream.memcpy_dtov(&o_d)?)
 }
 
 #[cfg(test)]
@@ -4905,7 +5167,7 @@ mod tests {
     fn fp8_device_quantize_within_ulp() {
         use crate::ptx_fp8::e4m3_to_f32;
         use crate::ptx_fp8_train::{delayed_scale_recip, e5m2_to_f32, E4M3_MAX, E5M2_MAX};
-        with_gpu("fp8_device_quantize", |g| {
+        with_fp8("fp8_device_quantize", |g| {
             let mut rng = crate::diff::Rng::new(0xF8D);
             let x = rng.vec(4096, -100.0, 100.0);
             let amax = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
@@ -4952,7 +5214,7 @@ mod tests {
     fn fp8_bwd_gemm_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
         use crate::ptx_fp8_train::{e5m2_to_f32, f32_to_e5m2};
-        with_gpu("fp8_bwd_gemm", |g| {
+        with_fp8("fp8_bwd_gemm", |g| {
             let mut rng = crate::diff::Rng::new(0xB17D);
             for (m, k, n) in [(32usize, 64usize, 32usize), (64, 96, 64), (96, 128, 32)] {
                 let dy = rng.vec(m * k, -1.0, 1.0);
@@ -4997,6 +5259,179 @@ mod tests {
                 eprintln!("[skip] {name}: GPU unavailable: {why}");
             }
         }
+    }
+
+    /// **The THIRD skip category: a capability skip.**
+    ///
+    /// A gate can fail to run for three distinct reasons, and conflating them hides bugs:
+    ///   1. *no device* — [`with_gpu`] handles it; `WUKONG_GPU_REQUIRED=1` escalates to a failure.
+    ///   2. *no peer* — `peer_gate`; `WUKONG_PEER_REQUIRED=1` escalates.
+    ///   3. *this device cannot run this kernel family at all* — here. Skipping the fp8 suite on an
+    ///      A100 is the CORRECT outcome; skipping it on this Ada card would be a bug in the gate, and
+    ///      exactly the "green having tested nothing" failure the other two guard against.
+    ///
+    /// So the decision is delegated to the **production** check ([`Gpu::require_cap`], the same call
+    /// the launchers make), and a skip on a device that *does* meet the floor is escalated through
+    /// `skip_or_fail` — a failure under `WUKONG_GPU_REQUIRED=1`.
+    fn with_cap(name: &str, cap: &str, min: (i32, i32), body: impl FnOnce(&mut Gpu)) {
+        with_gpu(name, |g| {
+            let have = g.target().cc();
+            match g.require_cap(name, cap, min) {
+                Ok(()) => body(g),
+                Err(e) => {
+                    let why = e.to_string();
+                    if have >= min {
+                        crate::diff::skip_or_fail(
+                            name,
+                            &format!(
+                                "the {cap} capability gate declined ({why}) although the device is \
+                                 cc {}.{} >= {}.{} — the GATE is wrong, not the hardware",
+                                have.0, have.1, min.0, min.1
+                            ),
+                        );
+                    }
+                    eprintln!("[skip:capability] {why}");
+                }
+            }
+        });
+    }
+
+    /// [`with_cap`] for fp8 (cc >= 8.9): every fp8 device gate runs through this, so the whole family
+    /// skips loudly-and-correctly on a pre-Ada card instead of `unwrap`ping a capability decline.
+    fn with_fp8(name: &str, body: impl FnOnce(&mut Gpu)) {
+        with_cap(name, "fp8", FP8_MIN_CC, body);
+    }
+
+    /// A synthetic [`GpuTarget`] for capability arms that CANNOT be reached from this laptop. The
+    /// A100 branch of every fp8 decision is the whole point of the gate and would otherwise be
+    /// completely untested until someone rents one; the ordering logic it rests on
+    /// ([`GpuTarget::supports`]) is pure, so a fabricated descriptor tests it honestly. Only the
+    /// fields the capability logic reads are meaningful; the rest are plausible filler.
+    fn fake_target(name: &str, cc: (i32, i32)) -> GpuTarget {
+        GpuTarget {
+            name: name.to_string(),
+            cc_major: cc.0,
+            cc_minor: cc.1,
+            sm_count: 108,
+            smem_per_block_optin: 166912,
+            smem_per_sm: 167936,
+            l2_bytes: 41943040,
+            total_mem: 42949672960,
+            driver_version: 12090,
+        }
+    }
+
+    /// **The fp8 capability gate.** fp8 `mma.sync` and the packed `cvt.rn.satfinite.e{4m3,5m2}x2`
+    /// converters exist nowhere below Ada, so on an A100 the fp8 launchers must decline *before* they
+    /// generate PTX or load a module — loudly, naming the capability, and **never** by quietly
+    /// computing in bf16 (that would return different numbers under the same function name; choosing
+    /// the bf16/int8 alternative is the caller's documented decision).
+    ///
+    /// Three properties:
+    ///   * the decline wording is fixed and names capability + floor + probed cc, so a gate can
+    ///     recognise a capability skip and a reader can act on it;
+    ///   * [`GpuTarget::supports`] orders compute capabilities correctly — tested against SYNTHETIC
+    ///     descriptors, the only honest way to exercise the A100/H100 arms from an Ada laptop;
+    ///   * on the real device the gate agrees with the probe, and on THIS card (cc 8.9) it must NOT
+    ///     decline: a capability skip here would be a bug, which is why `with_fp8` escalates one.
+    #[test]
+    fn fp8_capability_gate_declines_below_ada() {
+        // Ordering: the arms this box cannot reach.
+        let a100 = fake_target("NVIDIA A100-SXM4-40GB", (8, 0));
+        let h100 = fake_target("NVIDIA H100 80GB HBM3", (9, 0));
+        let ada = fake_target("NVIDIA GeForce RTX 4050 Laptop GPU", (8, 9));
+        let ampere_consumer = fake_target("NVIDIA GeForce RTX 3090", (8, 6));
+        assert!(!a100.supports(FP8_MIN_CC), "A100 (cc 8.0) has no fp8 tensor cores");
+        assert!(!ampere_consumer.supports(FP8_MIN_CC), "GA102 (cc 8.6) has no fp8 tensor cores");
+        assert!(ada.supports(FP8_MIN_CC), "Ada (cc 8.9) is the fp8 floor");
+        assert!(h100.supports(FP8_MIN_CC), "Hopper (cc 9.0) is above the floor — 9.0 > 8.9");
+        assert!(fake_target("sm_120", (12, 0)).supports(FP8_MIN_CC));
+
+        // The message a capability skip carries.
+        assert_eq!(
+            capability_decline("gemm_nt_fp8", "fp8", FP8_MIN_CC, a100.cc(), &a100.name),
+            "gemm_nt_fp8: fp8 requires cc>=8.9, device is 8.0 (NVIDIA A100-SXM4-40GB)"
+        );
+
+        // And on the real device: probe, gate and launcher must agree.
+        with_gpu("fp8_capability", |g| {
+            let cc = g.target().cc();
+            assert_eq!(
+                g.supports_fp8(),
+                cc >= FP8_MIN_CC,
+                "supports_fp8() disagrees with the probed cc {}.{}",
+                cc.0,
+                cc.1
+            );
+            if g.supports_fp8() {
+                g.require_fp8("probe").expect("a cc>=8.9 device must not decline fp8");
+                // ... and a real launcher must reach the device rather than decline.
+                let a: Vec<f32> = (0..16 * 32).map(|i| ((i % 5) as f32) - 2.0).collect();
+                let b: Vec<f32> = (0..32 * 8).map(|i| ((i % 3) as f32) - 1.0).collect();
+                assert!(
+                    fp8_tile(g, &a, &b).is_ok(),
+                    "fp8_tile declined on a device that supports fp8"
+                );
+                eprintln!(
+                    "[gate] fp8 capability: cc {}.{} >= 8.9 -> fp8 dispatch ENABLED, no decline \u{2713}",
+                    cc.0, cc.1
+                );
+            } else {
+                // The pre-Ada path, if this ever runs on one: a capability decline, not a driver error.
+                let a = vec![0f32; 16 * 32];
+                let b = vec![0f32; 32 * 8];
+                let e = fp8_tile(g, &a, &b).expect_err("a pre-Ada device must decline fp8");
+                let msg = e
+                    .unsupported()
+                    .expect("the decline must be a CAPABILITY error, not a driver error");
+                assert!(msg.contains("fp8 requires cc>=8.9"), "decline must name the capability: {msg}");
+                eprintln!("[gate] fp8 capability: {msg} \u{2713}");
+            }
+        });
+    }
+
+    /// **Every fp8 launcher that loads a module must gate first.** The capability check is only worth
+    /// anything if a *new* fp8 entry point cannot forget it — a launcher that generates PTX and calls
+    /// `cuModuleLoadData` on an A100 fails with a JIT error naming an instruction, not the missing
+    /// capability, and does so after the host-side conversion work.
+    ///
+    /// So this scans this file's own source (`include_str!`, compile-time — no I/O, no path
+    /// assumptions): every **top-level** `fn` whose name mentions fp8 and which loads a module must
+    /// contain `require_fp8(`. Wrappers that merely delegate to another fp8 launcher load nothing and
+    /// are exempt (the callee gates). Test/bench fns are indented, so the column-0 anchor skips them.
+    #[test]
+    fn every_fp8_launcher_requires_the_capability() {
+        let src = include_str!("gpu.rs");
+        let mut checked = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let sig = line.strip_prefix("pub fn ").or_else(|| line.strip_prefix("fn "));
+            let Some(sig) = sig else { continue };
+            let name = sig.split('(').next().unwrap_or("");
+            if !name.contains("fp8") {
+                continue;
+            }
+            // The item body: from here to the next column-0 `}`.
+            let body: String = src
+                .lines()
+                .skip(i)
+                .take_while(|l| !l.starts_with('}'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let loads = body.contains("g.function(") || body.contains("load_module(");
+            if loads {
+                assert!(
+                    body.contains("require_fp8("),
+                    "fp8 launcher `{name}` loads a module without a capability gate — on a pre-Ada \
+                     card it would fail inside the PTX JIT instead of declining"
+                );
+                checked.push(name.to_string());
+            }
+        }
+        assert!(
+            checked.len() >= 8,
+            "expected the known fp8 launcher set to be scanned, found only {checked:?}"
+        );
+        eprintln!("[gate] {} fp8 launchers are capability-gated: {checked:?} \u{2713}", checked.len());
     }
 
     /// **The device-identity gate.** [`GpuTarget`] is probed once at `Gpu` construction and is the
@@ -5081,6 +5516,20 @@ mod tests {
                 "l2_cache_size() diverged from the target"
             );
             assert_eq!(g.device_name(), t.name, "device_name() diverged from the target");
+            // The **device**-arch flag spellings (NVRTC `--gpu-architecture`, ptxas `-arch`, cache
+            // keys) must be derived from the probed capability, never a `compute_89`/`sm_89` literal
+            // and never a PTX family floor (which is a property of a module's instruction mix, not of
+            // the card — see `crate::ptx_target`).
+            assert_eq!(
+                g.compute_arch(),
+                crate::ptx_target::compute_arch(t.cc_major, t.cc_minor),
+                "compute_arch() is not the probed device"
+            );
+            assert_eq!(
+                g.sm_arch(),
+                crate::ptx_target::sm_arch(t.cc_major, t.cc_minor),
+                "sm_arch() is not the probed device"
+            );
             // Probed once: a second read is the same object, not a fresh driver round-trip.
             assert_eq!(g.target(), &t, "target() is not stable across calls");
             eprintln!(
@@ -5092,6 +5541,174 @@ mod tests {
                 t.smem_per_block_optin as f64 / 1024.0,
                 t.l2_bytes as f64 / (1024.0 * 1024.0),
             );
+        });
+    }
+
+    /// **Dynamic shared memory, end to end: a block really can use more than 48 KiB.**
+    ///
+    /// The 48 KiB every generator in this crate assumes is a PTX ISA rule about *static* `.shared`,
+    /// not a device fact — and it is the reason the f16/int8 pipelines stop at 2 stages while CUTLASS's
+    /// SM80 floor is 3. This card has a **99 KiB opt-in carveout** the codebase has never touched
+    /// (`ptx_conv.rs`: "no opt-in to the larger Ada banks"). The host plumbing for it is proven here,
+    /// on the laptop, before any generator is parameterized — and it is the same plumbing that reaches
+    /// A100's 164 KiB and H100's 228 KiB.
+    ///
+    /// The kernel is a self-contained `.extern .shared` window (tagged at the **sm_80 floor**, so the
+    /// proof holds on Ampere too): every thread strides the whole window writing `3i+1`, syncs, then
+    /// reads back a slot near the FAR END and stores it to global. A window that is not really that
+    /// large cannot pass — the stores would land outside it.
+    ///
+    /// Both directions are asserted, because a one-directional test would pass even if
+    /// `function_dyn` did nothing:
+    ///   * **with** `function_dyn` + `dyn_launch_cfg`: the launch succeeds and every lane is exact;
+    ///   * **without** the opt-in (the same PTX under a second module key, so a fresh `CUfunction`
+    ///     with no attribute set), the identical launch is REJECTED by the driver.
+    #[test]
+    fn dynamic_smem_window_exceeds_the_static_48_kib_ceiling() {
+        /// 64 KiB — comfortably above the 48 KiB static ISA ceiling, and within the opt-in carveout of
+        /// every part this project targets (Turing 64 KiB, Ada 99 KiB, A100 164 KiB, H100 228 KiB).
+        const WANT: usize = 64 * 1024;
+        const THREADS: u32 = 256;
+        let slots = WANT / 4; // u32 slots in the window
+        // `.extern .shared` = the dynamic window; its size comes from the launch, not the declaration.
+        let body = format!(
+            ".extern .shared .align 16 .b8 dsmem[];\n\
+.visible .entry dyn_smem_probe(.param .u32 pn, .param .u64 pout)\n{{\n\
+    .reg .pred %p0;\n\
+    .reg .b32 %n,%tix,%nt,%i,%v,%sp,%ad;\n\
+    .reg .b64 %out,%off,%gp;\n\
+    ld.param.u32 %n,[pn];\n    ld.param.u64 %out,[pout];\n\
+    cvta.to.global.u64 %out,%out;\n\
+    mov.u32 %tix,%tid.x;\n    mov.u32 %nt,%ntid.x;\n    mov.u32 %sp,dsmem;\n\
+    mov.u32 %i,%tix;\n\
+L_FILL:\n\
+    setp.ge.u32 %p0,%i,%n;\n    @%p0 bra E_FILL;\n\
+    mul.lo.u32 %v,%i,3;\n    add.u32 %v,%v,1;\n\
+    shl.b32 %ad,%i,2;\n    add.u32 %ad,%ad,%sp;\n    st.shared.u32 [%ad],%v;\n\
+    add.u32 %i,%i,%nt;\n    bra L_FILL;\n\
+E_FILL:\n\
+    bar.sync 0;\n\
+    sub.u32 %i,%n,1;\n    sub.u32 %i,%i,%tix;\n\
+    shl.b32 %ad,%i,2;\n    add.u32 %ad,%ad,%sp;\n    ld.shared.u32 %v,[%ad];\n\
+    mul.wide.u32 %off,%tix,4;\n    add.s64 %gp,%out,%off;\n    st.global.u32 [%gp],%v;\n\
+    ret;\n}}\n"
+        );
+        let ptx = format!("{}{}", crate::ptx_target::HDR_SM80, body);
+        assert!(ptx.is_ascii(), "PTX must be pure ASCII (one non-ASCII char is a ptxas fatal)");
+        assert!(ptx.contains(crate::ptx_target::TARGET_SM80), "the probe must sit at the sm_80 floor");
+
+        with_gpu("dyn_smem", |g| {
+            let budget = g.smem_budget();
+            if budget < WANT {
+                // A legitimate capability skip: a pre-Volta-era carveout cannot express this at all.
+                eprintln!(
+                    "[skip:capability] dyn_smem: opt-in SMEM budget {budget} B < the {WANT} B window"
+                );
+                return;
+            }
+            let n = slots as u32;
+            let mut out_d = g.stream.alloc_zeros::<u32>(THREADS as usize).unwrap();
+            let cfg = dyn_launch_cfg((1, 1, 1), (THREADS, 1, 1), WANT);
+            assert_eq!(cfg.shared_mem_bytes as usize, WANT, "the launch must carry the window size");
+
+            // (1) With the opt-in: must launch and be exact at the far end of the window.
+            let f = g.function_dyn("dyn_smem_probe", &ptx, "dyn_smem_probe", WANT).unwrap();
+            {
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&n).arg(&mut out_d);
+                unsafe { bld.launch(cfg).unwrap() };
+            }
+            g.stream.synchronize().unwrap();
+            let got = g.stream.memcpy_dtov(&out_d).unwrap();
+            for t in 0..THREADS as usize {
+                let slot = slots - 1 - t; // the top of the 64 KiB window
+                let want = (slot as u32) * 3 + 1;
+                assert_eq!(
+                    got[t], want,
+                    "lane {t} read slot {slot} (byte offset {}) of the dynamic window as {} — the \
+                     window is not really {WANT} B",
+                    slot * 4,
+                    got[t]
+                );
+            }
+
+            // (2) Without the opt-in: the SAME launch must be refused. This is what proves step (1)
+            //     was bought by `cuFuncSetAttribute` and not by some default.
+            let f_plain = g.function("dyn_smem_probe_noattr", &ptx, "dyn_smem_probe").unwrap();
+            let refused = {
+                let mut bld = g.stream.launch_builder(&f_plain);
+                bld.arg(&n).arg(&mut out_d);
+                unsafe { bld.launch(cfg) }
+            };
+            assert!(
+                refused.is_err(),
+                "a {WANT} B dynamic launch WITHOUT MAX_DYNAMIC_SHARED_SIZE_BYTES must be rejected — \
+                 if the driver allows it, `function_dyn` is not what makes the window legal"
+            );
+            eprintln!(
+                "[gate] dynamic SMEM: requested {WANT} B ({} KiB) > the 48 KiB static ceiling, launch OK \
+                 and exact at slot {} (device opt-in budget {budget} B / {:.0} KiB); the same launch \
+                 without the opt-in was refused: {:?} \u{2713}",
+                WANT / 1024,
+                slots - 1,
+                budget as f64 / 1024.0,
+                refused.unwrap_err()
+            );
+        });
+    }
+
+    /// **The L2-derived f16 regime thresholds must be byte-identical to the literals they replaced.**
+    ///
+    /// `gemm_nt_f16` used to branch on the constants `16 MiB` and `48 MiB` — a 4050 tuning verdict
+    /// frozen into the dispatcher, while the probed `l2_bytes` was dead code for dispatch. Deriving
+    /// them from L2 is only a *retarget* if it changes nothing on the card they were tuned on: any
+    /// drift is a silent perf regression on this box, invisible to every correctness gate (all the
+    /// regimes compute the same math). So the identity is pinned here, with the probe's own number:
+    ///
+    ///   25165824 · 2 / 3 = 16777216 = 16 MiB   (the L2-resident ceiling)
+    ///   25165824 · 2     = 50331648 = 48 MiB   (the HBM-bound floor)
+    ///
+    /// The literal `L2_RTX_4050` is deliberately spelled out rather than read from the device: this
+    /// gate must keep asserting the 4050's arithmetic when it runs on an A100, where the *derivation*
+    /// is what ports. The device half then confirms the probe still reports that L2 here.
+    #[test]
+    fn f16_regime_thresholds_reproduce_the_4050_literals() {
+        /// `L2_CACHE_SIZE` as probed on this RTX 4050 Laptop GPU — 24 MiB (the census settled the
+        /// 24-vs-12 MB confusion the cliff comments carried).
+        const L2_RTX_4050: usize = 25_165_824;
+        let (lo, hi) = f16_regime_thresholds(L2_RTX_4050);
+        assert_eq!(lo, 16 * 1024 * 1024, "the L2-resident ceiling drifted off the old 16 MiB literal");
+        assert_eq!(hi, 48 * 1024 * 1024, "the HBM-bound floor drifted off the old 48 MiB literal");
+        assert_eq!((lo, hi), (16_777_216, 50_331_648));
+        // Evaluation order: `·2/3`, not `/3·2`. Both agree here (24 MiB is a multiple of 3) and on the
+        // A100/H100 L2s, but they diverge whenever `l2 % 3 == 2` — so the order is pinned, not lucky.
+        assert_eq!(lo, L2_RTX_4050 * 2 / 3);
+        assert_eq!(f16_regime_thresholds(8).0, 5, "`*2/3` rounds down from 5.33");
+        assert_eq!(8 / 3 * 2, 4, "`/3*2` would truncate first — a different, lower band edge");
+        // The shape ports: a 40 MiB A100 L2 and a 50 MiB H100 L2 scale, they do not inherit 16/48 MiB.
+        assert_eq!(f16_regime_thresholds(40 * 1024 * 1024), (27_962_026, 83_886_080));
+        assert!(f16_regime_thresholds(50 * 1024 * 1024).0 > lo);
+
+        with_gpu("f16_regime_thresholds", |g| {
+            let l2 = g.target().l2_bytes;
+            let (dlo, dhi) = f16_regime_thresholds(l2);
+            eprintln!(
+                "[gate] f16 regime bands from probed L2 {} B ({:.2} MiB): [{}, {}) B = [{:.0}, {:.0}) MiB \u{2713}",
+                l2,
+                l2 as f64 / (1024.0 * 1024.0),
+                dlo,
+                dhi,
+                dlo as f64 / (1024.0 * 1024.0),
+                dhi as f64 / (1024.0 * 1024.0),
+            );
+            if l2 == L2_RTX_4050 {
+                assert_eq!(
+                    (dlo, dhi),
+                    (16 * 1024 * 1024, 48 * 1024 * 1024),
+                    "on the tuned card the derived bands MUST equal the retired literals"
+                );
+            }
+            assert!(dlo < dhi, "the regime bands must be ordered");
         });
     }
 
@@ -6553,7 +7170,7 @@ mod tests {
     #[test]
     fn fp8_swiglu_gate_match_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_swiglu_gate", |g| {
+        with_fp8("fp8_swiglu_gate", |g| {
             let mut rng = crate::diff::Rng::new(0xF8_5A_7E);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             let silu = |x: f32| x / (1.0 + (-x).exp());
@@ -7072,8 +7689,10 @@ mod tests {
     #[test]
     fn mma_m16n8k16_layout_verifies() {
         use half::f16;
-        const MMA_TEST_PTX: &str = "\
-.version 7.8\n.target sm_89\n.address_size 64\n\
+        // `mma.sync.m16n8k16.f32.f16.f16.f32` is Ampere-legal, so the module is tagged at the
+        // **sm_80 family floor** (`crate::ptx_target::HDR_SM80`), not at this device's `sm_89`: PTX is
+        // forward-compatible only, and a module tagged sm_89 loads on zero A100s.
+        const MMA_TEST_BODY: &str = "\
 .visible .entry mma_test(.param .u64 pA, .param .u64 pB, .param .u64 pC)\n{\n\
     .reg .b32 %lane,%grp,%tg,%tg2,%r,%c;\n\
     .reg .b32 %a0,%a1,%a2,%a3,%b0,%b1;\n\
@@ -7093,6 +7712,7 @@ mod tests {
     mul.lo.s32 %r,%grp,8;\n    add.s32 %r,%r,%tg2;\n    mul.wide.u32 %off,%r,4;\n    add.s64 %p,%C,%off;\n    st.global.f32 [%p],%d0;\n    st.global.f32 [%p+4],%d1;\n\
     add.s32 %r,%grp,8;\n    mul.lo.s32 %r,%r,8;\n    add.s32 %r,%r,%tg2;\n    mul.wide.u32 %off,%r,4;\n    add.s64 %p,%C,%off;\n    st.global.f32 [%p],%d2;\n    st.global.f32 [%p+4],%d3;\n\
     ret;\n}\n";
+        let mma_test_ptx = format!("{}{}", crate::ptx_target::HDR_SM80, MMA_TEST_BODY);
         with_gpu("mma_test", |g| {
             // A 16×16 row-major; B 16×8 stored col-major (b_mem[n*16+k] = B[k][n]); small ints (f16-exact).
             let mut a = vec![0f32; 16 * 16];
@@ -7112,7 +7732,7 @@ mod tests {
             let a_d = g.stream.memcpy_stod(&a16).unwrap();
             let b_d = g.stream.memcpy_stod(&b16).unwrap();
             let mut c_d = g.stream.alloc_zeros::<f32>(16 * 8).unwrap();
-            let f = g.function("mma_test", MMA_TEST_PTX, "mma_test").unwrap();
+            let f = g.function("mma_test", &mma_test_ptx, "mma_test").unwrap();
             let cfg = LaunchConfig {
                 grid_dim: (1, 1, 1),
                 block_dim: (32, 1, 1),
@@ -11050,7 +11670,7 @@ mod tests {
     #[test]
     fn fp8_tensorcore_tile_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_tile", |g| {
+        with_fp8("fp8_tile", |g| {
             // Asymmetric, e4m3-exact integer data — a layout bug can't hide (all-ones would).
             let a: Vec<f32> = (0..16 * 32)
                 .map(|t| {
@@ -11090,7 +11710,7 @@ mod tests {
     #[test]
     fn fp8_gemm_matches_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_gemm", |g| {
+        with_fp8("fp8_gemm", |g| {
             let mut rng = crate::diff::Rng::new(0x00F8);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             // e4m3 products are exact in f32 (4 sig bits × 4 = 8 ≤ 23), so vs an e4m3-rounded-input
@@ -11119,7 +11739,7 @@ mod tests {
     #[test]
     fn fp8_pipe_matches_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_pipe", |g| {
+        with_fp8("fp8_pipe", |g| {
             let mut rng = crate::diff::Rng::new(0xF8B1);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             for (m, k, n) in [(128usize, 64usize, 128usize), (128, 128, 128), (256, 256, 256), (128, 192, 384)] {
@@ -11144,7 +11764,7 @@ mod tests {
     #[test]
     fn fp8_pipe_regime_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_pipe_regime", |g| {
+        with_fp8("fp8_pipe_regime", |g| {
             let mut rng = crate::diff::Rng::new(0xF8D3);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             // (m, k, n): two 128∤M → m64 (bm=64); 1024 → w64_s3 (bm=128, M≤2048); 2304/2560 → w64 (bm=128).
@@ -11182,7 +11802,7 @@ mod tests {
     #[test]
     fn fp8_mma_bias_match_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_mma_bias", |g| {
+        with_fp8("fp8_mma_bias", |g| {
             let mut rng = crate::diff::Rng::new(0xF8B2);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             let silu = |x: f32| x / (1.0 + (-x).exp());
@@ -11253,7 +11873,7 @@ mod tests {
     #[test]
     fn fp8_mma_bias_residual_match_reference_within_tol() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
-        with_gpu("fp8_mma_bias_residual", |g| {
+        with_fp8("fp8_mma_bias_residual", |g| {
             let mut rng = crate::diff::Rng::new(0xF8B3);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
             for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 192, 384)] {
@@ -11455,7 +12075,7 @@ mod tests {
     fn fp8_pipe_vs_peers() {
         use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS, FP8_TM, FP8_TN};
         use half::f16;
-        with_gpu("fp8_pipe_vs_peers", |g| {
+        with_fp8("fp8_pipe_vs_peers", |g| {
             let mut rng = crate::diff::Rng::new(0xF8FE);
             // Clock warmup (peak-vs-peak; absolutes swing ~7× with boost on this part).
             let wa = rng.vec(2048 * 2048, -1.0, 1.0);
@@ -11582,7 +12202,7 @@ mod tests {
         use crate::ptx_fp8::{
             f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS, FP8_TM, FP8_TN,
         };
-        with_gpu("fp8_vs_cublaslt", |g| {
+        with_fp8("fp8_vs_cublaslt", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("fp8_vs_cublaslt_pct");
                 eprintln!("[skip] fp8_vs_cublaslt: cuBLASLt not loadable.\n{}", peer_env_hint());
@@ -11665,7 +12285,7 @@ mod tests {
             cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3,
         };
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
-        with_gpu("fp8_pipe_sweep", |g| {
+        with_fp8("fp8_pipe_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("fp8_pipe_config_sweep_vs_cublaslt");
                 eprintln!("[skip] fp8_pipe_config_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
@@ -11735,7 +12355,7 @@ mod tests {
     #[ignore = "throughput A/B; run explicitly (GPU; no DLLs needed)"]
     fn fp8_pipe_m64_vs_default_ab() {
         use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS};
-        with_gpu("fp8_m64_ab", |g| {
+        with_fp8("fp8_m64_ab", |g| {
             let mut rng = crate::diff::Rng::new(0xF8DA);
             let wa = rng.vec(2048 * 2048, -1.0, 1.0);
             let wb = rng.vec(2048 * 2048, -1.0, 1.0);
@@ -12074,8 +12694,11 @@ mod tests {
                 eprintln!("[skip] nvrtc_wmma_probe: NVRTC not loadable.");
                 return;
             }
-            let opts = || CompileOptions {
-                arch: Some("compute_89"),
+            // The DEVICE's arch (probed), not a hardcoded `compute_89`: a peer is compiled for the card
+            // the round runs on. `&'static str` (interned in `Gpu::compute_arch`) is what NVRTC wants.
+            let arch = g.compute_arch();
+            let opts = move || CompileOptions {
+                arch: Some(arch),
                 ..Default::default()
             };
             // (1) Does NVRTC bundle cuda_fp16.h? (expected yes — sanity for the header mechanism.)
@@ -12568,6 +13191,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 return;
             }
             eprintln!("device: {} | ptxas: {ptxas}", g.device_name());
+            // ptxas compiles the cubin for THIS device (probed), not a hardcoded `sm_89` — an offline
+            // cubin is arch-specific, so a literal would silently target the wrong card.
+            let sm_arch = g.sm_arch();
             let v = CLIFF_VARIANTS.iter().find(|v| v.name == "cliff_swz_s2").unwrap();
             let ptx = gemm_cliff_ptx();
             // Offline-compile the module with a few ptxas flag sets → cubin → driver-load.
@@ -12584,7 +13210,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             for (tag, flags) in flagsets {
                 let cubin_path = dir.join(format!("wukong_cliff_{pid}_{tag}.cubin"));
                 let out = std::process::Command::new(&ptxas)
-                    .arg("-arch=sm_89")
+                    .arg(format!("-arch={sm_arch}"))
                     .args(*flags)
                     .arg("-o")
                     .arg(&cubin_path)
@@ -16039,7 +16665,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn quant_fp8_warp_tile_sweep() {
         use crate::baselines::{cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3};
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
-        with_gpu("quant_fp8_warp_tile_sweep", |g| {
+        with_fp8("quant_fp8_warp_tile_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("quant_fp8_warp_tile_sweep");
                 eprintln!("[skip] quant_fp8_warp_tile_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
