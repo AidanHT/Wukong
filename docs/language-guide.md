@@ -678,8 +678,9 @@ wukongc [OPTIONS] <input.wk>
 --train-seed=<n>      seed for the deterministic buffer initialization      (default: 0x5EED1234)
 -O0|-O1|-O2|-O3       optimization level (default: -O0; -O3 currently runs the -O2 pipeline)
 -o <path>             write the artifact to <path> — only with --emit=obj or --emit=exe (default:
-                      <stem>.o / <stem>.exe). Rejected with --run and with every other stage,
-                      which print their artifact on stdout — redirect instead.
+                      <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
+                      on unix). Rejected with --run and with every other stage, which print their
+                      artifact on stdout — redirect instead.
 --error-format=<f>    human | json   (default: human)
 --explain <CODE>      print an extended explanation for an error code
 --color=<when>        auto | always | never   (default: auto — colour when stderr is a terminal)
