@@ -18,15 +18,15 @@
 //! Deliberately **un-gated** (pure strings, no `cudarc`): the un-gated `paged_attention`
 //! generators route through it, and these gates run in a plain, toolchain-free `cargo test`.
 
-/// `.version 7.8` at the `sm_80` floor — the default header for every Ampere-legal family.
+/// `.version 7.8` at the `sm_80` floor — the header for every Ampere-legal family, which since the
+/// int8 `.version` float is **every** family but fp8. There is deliberately no `8.4`-at-`sm_80`
+/// constant: an ISA-7.0 instruction mix has no business demanding an r550+ driver, and a documented
+/// constant for that pair is an invitation to declare it again.
 pub const HDR_SM80: &str = ".version 7.8\n.target sm_80\n.address_size 64\n";
 
-/// `.version 8.4` at the `sm_80` floor — for families that keep an 8.4-era `.version` but emit no
-/// Ada-only instruction (the int8/int4 families today). When routing a site, keep the file's
-/// current `.version`; only the target floor changes.
-pub const HDR_SM80_V84: &str = ".version 8.4\n.target sm_80\n.address_size 64\n";
-
-/// `.version 8.4` at the `sm_89` floor — the fp8 families.
+/// `.version 8.4` at the `sm_89` floor — the fp8 families, and the only place either 8.4 or sm_89 is
+/// earned: the `e4m3`/`e5m2` `mma` and the packed `cvt.rn.satfinite.*x2` converters exist nowhere
+/// below Ada, and their PTX-ISA introduction is past 7.8.
 pub const HDR_SM89_V84: &str = ".version 8.4\n.target sm_89\n.address_size 64\n";
 
 /// Bare target directives, for containment asserts in tests and for generators that interpolate a
@@ -36,6 +36,12 @@ pub const TARGET_SM89: &str = ".target sm_89";
 
 /// A header from explicit parts, for the odd module whose (version, target) pair is not one of the
 /// shipped constants. Prefer the constants — they are the grep point for "what floors exist".
+///
+/// **Justify the `version` you pass, not just the `target`.** `.version` is a *driver* floor exactly
+/// as `.target` is a *device* floor, and `cuModuleLoadData` enforces it: `.version 7.8` needs r520+,
+/// `.version 8.4` needs **r550+** — so an 8.4 tag refuses to load on the r535/r545 fleets this
+/// retarget targets, for nothing, unless the module actually emits an instruction introduced above
+/// ISA 7.8. Pass the LOWEST `.version` its instruction mix is legal on, the same rule `.target` obeys.
 pub fn header(version: &str, target: &str) -> String {
     format!(".version {version}\n.target {target}\n.address_size 64\n")
 }
@@ -57,17 +63,34 @@ mod tests {
 
     #[test]
     fn headers_are_ascii_well_formed_and_agree_with_the_builder() {
-        for h in [HDR_SM80, HDR_SM80_V84, HDR_SM89_V84] {
+        for h in [HDR_SM80, HDR_SM89_V84] {
             assert!(h.is_ascii(), "PTX header must be pure ASCII");
             assert!(h.starts_with(".version "));
             assert!(h.ends_with("\n.address_size 64\n"));
         }
         assert!(HDR_SM80.contains(TARGET_SM80));
-        assert!(HDR_SM80_V84.contains(TARGET_SM80));
         assert!(HDR_SM89_V84.contains(TARGET_SM89));
         assert_eq!(header("7.8", "sm_80"), HDR_SM80);
-        assert_eq!(header("8.4", "sm_80"), HDR_SM80_V84);
         assert_eq!(header("8.4", "sm_89"), HDR_SM89_V84);
+    }
+
+    /// **`.version 8.4` is spelled in exactly one shipped constant, and it is the `sm_89` one.** The
+    /// removed `HDR_SM80_V84` was an ISA-7.0 instruction mix (int8/int4: `mma.sync.m16n8k32.u8.s8`,
+    /// `ldmatrix`, `cp.async`) tagged with a header that makes `cuModuleLoadData` demand driver r550+ —
+    /// a pure load failure on the r535/r545 fleets, bought nothing. It is gone; only fp8, whose
+    /// `e4m3`/`e5m2` `mma` genuinely postdates 7.8, keeps an 8.4. A future `8.4`-at-an-Ampere-floor
+    /// constant would reintroduce the hole silently, so the pairing is pinned here.
+    #[test]
+    fn only_the_ada_floor_declares_the_r550_driver_version() {
+        for h in [HDR_SM80, HDR_SM89_V84] {
+            if h.contains(".version 8.4") {
+                assert!(
+                    h.contains(TARGET_SM89),
+                    "`.version 8.4` demands driver r550+; only the fp8/Ada floor earns it: {h:?}"
+                );
+            }
+        }
+        assert!(HDR_SM80.starts_with(".version 7.8"), "the Ampere floor stays at the r520+ driver");
     }
 
     #[test]
