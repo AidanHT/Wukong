@@ -317,8 +317,8 @@ unsafe fn call_block(f: BlockFn, bufs: &mut Bufs) {
     let i: Vec<*const f32> = bufs.inp.iter().map(|v| v.as_ptr()).collect();
     let o: Vec<*mut f32> = bufs.scr.iter_mut().map(|v| v.as_mut_ptr()).collect();
     f(
-        i[0], i[1], i[2], i[3], i[4], i[5], i[6], i[7], i[8], i[9], i[10], i[11], i[12], o[0], o[1],
-        o[2], o[3], o[4], o[5], o[6], o[7], o[8], o[9], o[10], o[11], o[12], o[13],
+        i[0], i[1], i[2], i[3], i[4], i[5], i[6], i[7], i[8], i[9], i[10], i[11], i[12], o[0],
+        o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8], o[9], o[10], o[11], o[12], o[13],
     );
 }
 
@@ -552,7 +552,9 @@ fn pin_for_section() -> PinGuard {
             PinGuard(Some(prev))
         }
         None => {
-            println!("  CPU PINNING: requested mask {mask:#x} was REFUSED by the OS — running unpinned.");
+            println!(
+                "  CPU PINNING: requested mask {mask:#x} was REFUSED by the OS — running unpinned."
+            );
             PinGuard(None)
         }
     }
@@ -902,7 +904,10 @@ fn kernel_census(mir: &str) -> Vec<(String, usize)> {
             .unwrap_or(rest.len());
         *counts.entry(&rest[..end]).or_insert(0) += 1;
     }
-    counts.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    counts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
 }
 
 fn census_line(census: &[(String, usize)]) -> String {
@@ -958,7 +963,13 @@ fn load_peer(
 ) -> Option<(libloading::Library, Duration)> {
     let safe: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let src_path = dir.join(format!("{safe}.{ext}"));
     let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
@@ -1035,7 +1046,11 @@ unsafe fn peer_col<F: Copy>(
 /// Note the honest limit of the control: it bounds the confounds it shares with the real columns.
 /// It cannot bound a confound unique to one language's column (a peer that happens to alias
 /// differently, say). It is a floor on believability, never a certificate.
-const RUSTC_ARGS: [&str; 3] = ["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"];
+const RUSTC_ARGS: [&str; 3] = [
+    "-Copt-level=3",
+    "-Ctarget-cpu=native",
+    "--crate-type=cdylib",
+];
 const HONEST_FLAGS: [&str; 4] = ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
 const FASTM_FLAGS: [&str; 5] = [
     "-O3",
@@ -1063,11 +1078,41 @@ struct PeerSpec {
 }
 
 const PEER_SPECS: [PeerSpec; 5] = [
-    PeerSpec { label: "C", ext: "c", cc: PeerCc::Cc, args: &HONEST_FLAGS, suffix: "" },
-    PeerSpec { label: "C(twin)", ext: "c", cc: PeerCc::Cc, args: &HONEST_FLAGS, suffix: "_twin" },
-    PeerSpec { label: "C(fast)", ext: "c", cc: PeerCc::Cc, args: &FASTM_FLAGS, suffix: "_fast" },
-    PeerSpec { label: "C++", ext: "cpp", cc: PeerCc::Cxx, args: &HONEST_FLAGS, suffix: "" },
-    PeerSpec { label: "Rust", ext: "rs", cc: PeerCc::Rustc, args: &RUSTC_ARGS, suffix: "" },
+    PeerSpec {
+        label: "C",
+        ext: "c",
+        cc: PeerCc::Cc,
+        args: &HONEST_FLAGS,
+        suffix: "",
+    },
+    PeerSpec {
+        label: "C(twin)",
+        ext: "c",
+        cc: PeerCc::Cc,
+        args: &HONEST_FLAGS,
+        suffix: "_twin",
+    },
+    PeerSpec {
+        label: "C(fast)",
+        ext: "c",
+        cc: PeerCc::Cc,
+        args: &FASTM_FLAGS,
+        suffix: "_fast",
+    },
+    PeerSpec {
+        label: "C++",
+        ext: "cpp",
+        cc: PeerCc::Cxx,
+        args: &HONEST_FLAGS,
+        suffix: "",
+    },
+    PeerSpec {
+        label: "Rust",
+        ext: "rs",
+        cc: PeerCc::Rustc,
+        args: &RUSTC_ARGS,
+        suffix: "",
+    },
 ];
 
 impl PeerSpec {
@@ -1571,7 +1616,10 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
 
     // ---- correctness ----
     println!();
-    println!("  CORRECTNESS vs the f64 scalar reference (worst of all {} lanes)", reference.len());
+    println!(
+        "  CORRECTNESS vs the f64 scalar reference (worst of all {} lanes)",
+        reference.len()
+    );
     for (i, col) in cols.iter().enumerate() {
         let (dev, at) = max_rel_vs_ref(&outs[i], &reference);
         println!("    {:<14} max rel dev {dev:.3e} at lane {at}", col.label);
@@ -1607,7 +1655,10 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
         for i in 0..n_wuk {
             match classes.iter_mut().find(|c| {
                 let rep = cols.iter().position(|x| x.label == c[0]).unwrap();
-                outs[rep].iter().zip(outs[i].iter()).all(|(a, b)| a.to_bits() == b.to_bits())
+                outs[rep]
+                    .iter()
+                    .zip(outs[i].iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
             }) {
                 Some(c) => c.push(&cols[i].label),
                 None => classes.push(vec![&cols[i].label]),
@@ -1653,14 +1704,26 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     println!();
     if n_wuk > 0 {
         let per_round_max: Vec<f64> = (0..rounds)
-            .map(|r| (0..n_wuk).map(|i| rr.ns[i][r]).fold(f64::NEG_INFINITY, f64::max))
+            .map(|r| {
+                (0..n_wuk)
+                    .map(|i| rr.ns[i][r])
+                    .fold(f64::NEG_INFINITY, f64::max)
+            })
             .collect();
         let per_round_min: Vec<f64> = (0..rounds)
-            .map(|r| (0..n_wuk).map(|i| rr.ns[i][r]).fold(f64::INFINITY, f64::min))
+            .map(|r| {
+                (0..n_wuk)
+                    .map(|i| rr.ns[i][r])
+                    .fold(f64::INFINITY, f64::min)
+            })
             .collect();
         let tax = crate::RatioStat::over_rounds(&per_round_max, &per_round_min);
-        let fastest = (0..n_wuk).min_by(|&a, &b| rr.best(a).total_cmp(&rr.best(b))).unwrap();
-        let slowest = (0..n_wuk).max_by(|&a, &b| rr.best(a).total_cmp(&rr.best(b))).unwrap();
+        let fastest = (0..n_wuk)
+            .min_by(|&a, &b| rr.best(a).total_cmp(&rr.best(b)))
+            .unwrap();
+        let slowest = (0..n_wuk)
+            .max_by(|&a, &b| rr.best(a).total_cmp(&rr.best(b)))
+            .unwrap();
         // The `C(twin)` floor applies here too. It is a property of the INSTRUMENT, not of the C
         // language, so an internal Wukong-vs-Wukong ratio has to clear it just the same: if two
         // byte-identical binaries can read 1.3x apart in this run, so can two spellings.
@@ -1831,14 +1894,8 @@ fn subst_loss(src: &str, m: LossDims) -> String {
 }
 
 /// `kbench(z, alpha, tgt, p, loss, dz)`.
-type LossFn = unsafe extern "C" fn(
-    *const f32,
-    *const f32,
-    *const i32,
-    *mut f32,
-    *mut f32,
-    *mut f32,
-);
+type LossFn =
+    unsafe extern "C" fn(*const f32, *const f32, *const i32, *mut f32, *mut f32, *mut f32);
 
 const LOSS_PARAMS: usize = 6;
 
@@ -1867,10 +1924,14 @@ impl LossBufs {
         // subtraction and the 1/p term in the gradient are both exercised) and narrow enough that
         // no p underflows to a denormal, which would make the f64 reference and the f32 kernels
         // disagree about something that is not the compiler's doing.
-        let z: Vec<f32> = (0..m.r * m.c).map(|_| (unit(next()) * 6.0 - 3.0) as f32).collect();
+        let z: Vec<f32> = (0..m.r * m.c)
+            .map(|_| (unit(next()) * 6.0 - 3.0) as f32)
+            .collect();
         // Class weights around 1, the usual imbalance correction.
         let alpha: Vec<f32> = (0..m.c).map(|_| (0.5 + unit(next())) as f32).collect();
-        let tgt: Vec<i32> = (0..m.r).map(|_| (unit(next()) * m.c as f64) as i32 % m.c as i32).collect();
+        let tgt: Vec<i32> = (0..m.r)
+            .map(|_| (unit(next()) * m.c as f64) as i32 % m.c as i32)
+            .collect();
         LossBufs {
             z,
             alpha,
@@ -2010,7 +2071,9 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
     let rs_src = subst_loss(LOSS_RS, m);
     // SAFETY: every loss peer declares `kbench` with the 6-pointer loss ABI, which is exactly
     // `LossFn`; the Wukong side is arity-checked against `LOSS_PARAMS` by `block_abi_ok`.
-    cols.extend(unsafe { build_peer_cols::<LossFn>("general_loss", &c_src, &rs_src, dir, cc, cxx) });
+    cols.extend(unsafe {
+        build_peer_cols::<LossFn>("general_loss", &c_src, &rs_src, dir, cc, cxx)
+    });
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
         return;
@@ -2366,13 +2429,21 @@ impl ScanBufs {
             z ^= z >> 31;
             (z >> 11) as f64 / (1u64 << 53) as f64
         };
-        let x = (0..m.t * m.d).map(|_| (next() * 2.0 - 1.0) as f32).collect();
-        let dt = (0..m.t * m.d).map(|_| (0.01 + 0.09 * next()) as f32).collect();
+        let x = (0..m.t * m.d)
+            .map(|_| (next() * 2.0 - 1.0) as f32)
+            .collect();
+        let dt = (0..m.t * m.d)
+            .map(|_| (0.01 + 0.09 * next()) as f32)
+            .collect();
         let a = (0..m.d * m.n)
             .map(|i| -(0.5 + (i % m.n) as f64 + 0.25 * next()) as f32)
             .collect();
-        let bmat = (0..m.t * m.n).map(|_| (next() * 2.0 - 1.0) as f32).collect();
-        let cmat = (0..m.t * m.n).map(|_| (next() * 2.0 - 1.0) as f32).collect();
+        let bmat = (0..m.t * m.n)
+            .map(|_| (next() * 2.0 - 1.0) as f32)
+            .collect();
+        let cmat = (0..m.t * m.n)
+            .map(|_| (next() * 2.0 - 1.0) as f32)
+            .collect();
         let dskip = (0..m.d).map(|_| (0.5 + next()) as f32).collect();
         ScanBufs {
             x,
@@ -2481,7 +2552,9 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
     let rs_src = subst_scan(SCAN_RS, m);
     // SAFETY: every scan peer declares `kbench` with the 8-pointer scan ABI, which is exactly
     // `ScanFn`; the Wukong side is arity-checked against `SCAN_PARAMS` by `block_abi_ok`.
-    cols.extend(unsafe { build_peer_cols::<ScanFn>("general_scan", &c_src, &rs_src, dir, cc, cxx) });
+    cols.extend(unsafe {
+        build_peer_cols::<ScanFn>("general_scan", &c_src, &rs_src, dir, cc, cxx)
+    });
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
         return;
@@ -2543,7 +2616,10 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
     }
     println!("    source written to {}", path.display());
     println!();
-    println!("  CORRECTNESS vs the f64 reference (worst of all {} lanes)", reference.len());
+    println!(
+        "  CORRECTNESS vs the f64 reference (worst of all {} lanes)",
+        reference.len()
+    );
     for (i, col) in cols.iter().enumerate() {
         let (dev, at) = devs[i];
         println!("    {:<10} max rel {dev:.3e} at lane {at}", col.label);
@@ -2676,7 +2752,10 @@ mod tests {
             );
         }
         // And the live reader must agree with the pure one under the ambient environment.
-        assert_eq!(pin_mask(), parse_pin(std::env::var("XBENCH_PIN").ok().as_deref()));
+        assert_eq!(
+            pin_mask(),
+            parse_pin(std::env::var("XBENCH_PIN").ok().as_deref())
+        );
     }
 
     /// A pin must be UNDONE. `bench_general` runs inside one process with the rest of the suite, and
@@ -2695,7 +2774,10 @@ mod tests {
         // After the guard, setting a fresh mask must report the FULL mask as the previous one, i.e.
         // the guard put it back rather than leaving us on CPU 0.
         let after = set_thread_affinity(!0usize).expect("affinity readable");
-        assert!(after.count_ones() > 1, "still pinned to one CPU after the guard: {after:#x}");
+        assert!(
+            after.count_ones() > 1,
+            "still pinned to one CPU after the guard: {after:#x}"
+        );
         let _ = set_thread_affinity(before);
     }
 
@@ -2741,7 +2823,10 @@ mod tests {
         let y = reference_scan_f64(m, &b);
         assert_eq!(y.len(), m.t * m.d);
         assert!(y.iter().all(|v| v.is_finite()), "the recurrence diverged");
-        assert!(y.iter().any(|v| v.abs() > 1.0e-6), "the state never became live");
+        assert!(
+            y.iter().any(|v| v.abs() > 1.0e-6),
+            "the state never became live"
+        );
         // Every decay must be a genuine contraction, or the state is not a state.
         for (i, &a) in b.a.iter().enumerate() {
             assert!(a < 0.0, "A[{i}] = {a} is not negative");
@@ -2759,7 +2844,10 @@ mod tests {
             eps: 0.125,
         };
         let total = m.qt() + m.qo() * (m.c - 1) as f32;
-        assert!((total - 1.0).abs() < 1.0e-6, "targets sum to {total}, not 1");
+        assert!(
+            (total - 1.0).abs() < 1.0e-6,
+            "targets sum to {total}, not 1"
+        );
         for v in [m.qt(), m.qo()] {
             let text = v.to_string();
             assert!(!text.contains('e'), "{text} uses scientific notation");
@@ -2799,7 +2887,11 @@ mod tests {
             let sig_end = sig_start + src[sig_start..].find(") {").expect("signature end");
             let sig = &src[sig_start..sig_end];
             let n = sig.matches(':').count();
-            assert_eq!(n, N_IN + N_SCRATCH, "{label} declares {n} kbench parameters");
+            assert_eq!(
+                n,
+                N_IN + N_SCRATCH,
+                "{label} declares {n} kbench parameters"
+            );
         }
     }
 
@@ -2814,8 +2906,8 @@ mod tests {
             f: 16,
         };
         let b = Bufs::new(m);
-        let live: usize =
-            b.inp.iter().map(|v| v.len()).sum::<usize>() + b.scr.iter().map(|v| v.len()).sum::<usize>();
+        let live: usize = b.inp.iter().map(|v| v.len()).sum::<usize>()
+            + b.scr.iter().map(|v| v.len()).sum::<usize>();
         assert_eq!(live * 4, total_bytes(m));
     }
 
@@ -2836,6 +2928,9 @@ mod tests {
             r.iter().any(|v| v.abs() > 1.0e-6),
             "reference is all ~zero — the oracle would be vacuous"
         );
-        assert!(r.iter().all(|v| v.is_finite()), "reference has non-finite lanes");
+        assert!(
+            r.iter().all(|v| v.is_finite()),
+            "reference has non-finite lanes"
+        );
     }
 }

@@ -36,10 +36,10 @@ pub use gevm::{wukong_sgevm_f32, wukong_sgevm_f32_parallel};
 mod vmath;
 pub use vmath::{
     wukong_vmath2_f32, wukong_vmath_bf16, wukong_vmath_f16, wukong_vmath_f32,
-    wukong_vmath_f32_parallel, VM_ACOS,
-    VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH, VM_CBRT, VM_COS, VM_COSH, VM_ERF, VM_EXP,
-    VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU, VM_LOG, VM_LOG10, VM_LOG1P, VM_LOG2, VM_LOGSIGMOID,
-    VM_RELU, VM_SIGMOID, VM_SILU, VM_SIN, VM_SINH, VM_SOFTSIGN, VM_TAN, VM_TANH,
+    wukong_vmath_f32_parallel, VM_ACOS, VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH, VM_CBRT,
+    VM_COS, VM_COSH, VM_ERF, VM_EXP, VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU, VM_LOG, VM_LOG10,
+    VM_LOG1P, VM_LOG2, VM_LOGSIGMOID, VM_RELU, VM_SIGMOID, VM_SILU, VM_SIN, VM_SINH, VM_SOFTSIGN,
+    VM_TAN, VM_TANH,
 };
 
 mod velem;
@@ -76,9 +76,9 @@ mod lowp;
 pub use lowp::{
     wukong_axpby_bf16, wukong_axpby_bf16_out, wukong_axpby_f16, wukong_axpby_f16_out,
     wukong_dot_bf16, wukong_dot_bf16_parallel, wukong_dot_f16, wukong_dot_f16_parallel,
-    wukong_reduce_bf16, wukong_reduce_bf16_parallel, wukong_reduce_f16,
-    wukong_reduce_f16_parallel, wukong_sum_bf16, wukong_sum_bf16_parallel, wukong_sum_f16,
-    wukong_sum_f16_parallel, wukong_vmath_bf16_out, wukong_vmath_f16_out,
+    wukong_reduce_bf16, wukong_reduce_bf16_parallel, wukong_reduce_f16, wukong_reduce_f16_parallel,
+    wukong_sum_bf16, wukong_sum_bf16_parallel, wukong_sum_f16, wukong_sum_f16_parallel,
+    wukong_vmath_bf16_out, wukong_vmath_f16_out,
 };
 
 mod transpose;
@@ -91,9 +91,9 @@ mod colreduce;
 pub use colreduce::{
     wukong_coll2_f32, wukong_coll2_f32_parallel, wukong_colmax_f32, wukong_colmax_f32_parallel,
     wukong_colmaxabs_f32, wukong_colmaxabs_f32_parallel, wukong_colmean_f32,
-    wukong_colmean_f32_parallel, wukong_colmin_f32, wukong_colmin_f32_parallel,
-    wukong_colrms_f32, wukong_colrms_f32_parallel, wukong_colsum_f32, wukong_colsum_f32_parallel,
-    wukong_colsumsq_f32, wukong_colsumsq_f32_parallel,
+    wukong_colmean_f32_parallel, wukong_colmin_f32, wukong_colmin_f32_parallel, wukong_colrms_f32,
+    wukong_colrms_f32_parallel, wukong_colsum_f32, wukong_colsum_f32_parallel, wukong_colsumsq_f32,
+    wukong_colsumsq_f32_parallel,
 };
 
 mod softmax_bwd;
@@ -521,7 +521,9 @@ pub unsafe extern "C" fn wukong_parallel_for(
             (0..workers).into_par_iter().for_each(|_| loop {
                 // Relaxed suffices: the counter only hands out unique granules; the fork-join's
                 // join publishes every write the body made.
-                let c = claims_ref.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let c = claims_ref
+                    .0
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if c >= ntasks {
                     break;
                 }
@@ -674,7 +676,11 @@ macro_rules! rt_file_io {
             };
             // `min(len, avail)` clamped at zero — the interpreter's exact expression, so a
             // non-positive `len` reads nothing on an openable path instead of casting negative.
-            let n = if len <= 0 { 0 } else { (len as usize).min(avail) };
+            let n = if len <= 0 {
+                0
+            } else {
+                (len as usize).min(avail)
+            };
             if n == 0 {
                 return 0;
             }
@@ -747,7 +753,10 @@ rt_file_io!(wukong_rt_read_u8, wukong_rt_write_u8, u8);
 #[no_mangle]
 pub extern "C" fn wukong_now_ns() -> i64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as i64
 }
 
 #[cfg(test)]
@@ -906,7 +915,10 @@ mod tests {
     fn rt_alloc_degenerate_counts_are_null_and_free_ignores_null() {
         assert!(wukong_rt_alloc(0, 4, 0).is_null());
         assert!(wukong_rt_alloc(-5, 8, 1).is_null());
-        assert!(wukong_rt_alloc(i64::MAX, i64::MAX, 0).is_null(), "overflow must yield null");
+        assert!(
+            wukong_rt_alloc(i64::MAX, i64::MAX, 0).is_null(),
+            "overflow must yield null"
+        );
         wukong_rt_free(std::ptr::null_mut()); // must be a no-op, not a crash
     }
 
@@ -966,9 +978,19 @@ mod tests {
         let mut a = Arena::with_capacity(64);
         let live = a.alloc(16, 8).unwrap();
         assert_eq!(live, 0);
-        assert!(a.alloc(16, 0).is_none(), "align 0 must not alias the live region");
-        assert!(a.alloc(16, 3).is_none(), "a non-power-of-two align has no valid mask");
-        assert_eq!(a.used(), 16, "a rejected request must not move the bump pointer");
+        assert!(
+            a.alloc(16, 0).is_none(),
+            "align 0 must not alias the live region"
+        );
+        assert!(
+            a.alloc(16, 3).is_none(),
+            "a non-power-of-two align has no valid mask"
+        );
+        assert_eq!(
+            a.used(),
+            16,
+            "a rejected request must not move the bump pointer"
+        );
         // The valid alignments still behave.
         assert_eq!(a.alloc(8, 16).unwrap(), 16);
     }
@@ -1032,7 +1054,12 @@ mod tests {
         static CTR: AtomicU64 = AtomicU64::new(0);
         let id = CTR.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("wukong_io_{}_{}_{}.bin", tag, std::process::id(), id));
+        p.push(format!(
+            "wukong_io_{}_{}_{}.bin",
+            tag,
+            std::process::id(),
+            id
+        ));
         p
     }
 
@@ -1126,7 +1153,10 @@ mod tests {
         let path = io_tmp("le");
         let cp = cpath(&path);
         let src = [0x0102_0304i32, -1];
-        assert_eq!(wukong_rt_write_i32(cp.as_ptr() as *const u8, src.as_ptr(), 2), 2);
+        assert_eq!(
+            wukong_rt_write_i32(cp.as_ptr() as *const u8, src.as_ptr(), 2),
+            2
+        );
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(raw, vec![0x04, 0x03, 0x02, 0x01, 0xff, 0xff, 0xff, 0xff]);
         std::fs::remove_file(&path).ok();
@@ -1229,7 +1259,11 @@ mod tests {
         assert_eq!(wukong_rt_write_i32(ptr, [1i32, 2, 3].as_ptr(), 3), 3);
         let empty: [i32; 0] = [];
         assert_eq!(wukong_rt_write_i32(ptr, empty.as_ptr(), 0), 0);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "file must be truncated");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "file must be truncated"
+        );
         std::fs::remove_file(&path).ok();
     }
 }

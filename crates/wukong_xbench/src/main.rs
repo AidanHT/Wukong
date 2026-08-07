@@ -181,7 +181,11 @@ const C_FAST_FLAGS: &[&str] = &["-O3", "-march=native", "-ffast-math", "-shared"
 /// (and prints the mismatch) when the peer's output is unusable; the caller then drops the column
 /// rather than failing the bench.
 fn relaxed_peer_ok(label: &str, peer: &str, wuk: &Measure, p: &Measure) -> bool {
-    let maxabs = wuk.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+    let maxabs = wuk
+        .out
+        .iter()
+        .fold(0.0f32, |a, &v| a.max(v.abs()))
+        .max(1e-6);
     let maxerr = wuk
         .out
         .iter()
@@ -252,7 +256,11 @@ fn cpp_checked(label: &str, c: &Option<Measure>, cpp: Option<Measure>) -> Option
     let p = cpp?;
     let Some(cm) = c else { return Some(p) };
     let bitwise_same = cm.out.len() == p.out.len()
-        && cm.out.iter().zip(&p.out).all(|(a, b)| a.to_bits() == b.to_bits());
+        && cm
+            .out
+            .iter()
+            .zip(&p.out)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
     if bitwise_same {
         return Some(p);
     }
@@ -293,7 +301,9 @@ fn bench_c_cpp(
 ) -> (Option<Measure>, Option<Measure>) {
     let cl = build_peer("c", c_src, dir, label, cc, args);
     let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
-    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| time_peer(lib, compile, &mut *out, xp, yp));
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| {
+        time_peer(lib, compile, &mut *out, xp, yp)
+    });
     let cpp = cpp_checked(label, &c, cpp);
     (c, cpp)
 }
@@ -313,8 +323,9 @@ fn bench_c_cpp4(
 ) -> (Option<Measure>, Option<Measure>) {
     let cl = build_peer("c", c_src, dir, label, cc, args);
     let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
-    let (c, cpp) =
-        abba_min(&cl, &pl, |lib, compile| time_peer4(lib, compile, &mut *out, p0, p1, p2));
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| {
+        time_peer4(lib, compile, &mut *out, p0, p1, p2)
+    });
     let cpp = cpp_checked(label, &c, cpp);
     (c, cpp)
 }
@@ -334,7 +345,9 @@ fn bench_c_cpp_i8(
 ) -> (Option<MeasureI8>, Option<MeasureI8>) {
     let cl = build_peer("c", c_src, dir, label, cc, args);
     let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
-    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| time_peer_i8(lib, compile, &mut *out, ap, bp));
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| {
+        time_peer_i8(lib, compile, &mut *out, ap, bp)
+    });
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) if cm.out != p.out => {
             println!("  ! {label}: C++ (g++) disagrees with C (gcc) on the i32 output — C++ column dropped");
@@ -360,8 +373,9 @@ fn bench_c_cpp_bf16(
 ) -> (Option<MeasureBf16>, Option<MeasureBf16>) {
     let cl = build_peer("c", c_src, dir, label, cc, args);
     let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
-    let (c, cpp) =
-        abba_min(&cl, &pl, |lib, compile| time_peer_bf16(lib, compile, &mut *out, xp, yp));
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| {
+        time_peer_bf16(lib, compile, &mut *out, xp, yp)
+    });
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) => {
             let rel = ((cm.out - p.out).abs() / cm.out.abs().max(1e-6)) as f64;
@@ -392,8 +406,9 @@ fn bench_c_cpp_halfout(
 ) -> (Option<MeasureHalfOut>, Option<MeasureHalfOut>) {
     let cl = build_peer("c", c_src, dir, label, cc, args);
     let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
-    let (c, cpp) =
-        abba_min(&cl, &pl, |lib, compile| time_peer_halfout(lib, compile, &mut *out, xp, yp));
+    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| {
+        time_peer_halfout(lib, compile, &mut *out, xp, yp)
+    });
     let cpp = cpp.and_then(|p| match &c {
         Some(cm) => {
             let (rel, at) = max_rel_err(&cm.out, &p.out);
@@ -574,7 +589,8 @@ fn report_cpp_ratio(wuk: &Option<Measure>, wk_par: &Option<Measure>, p: &Option<
 fn is_reduction_kernel(name: &str) -> bool {
     matches!(
         name,
-        "dot" | "ssd"
+        "dot"
+            | "ssd"
             | "argmax"
             | "dot@parallel"
             | "ssd@parallel"
@@ -767,7 +783,11 @@ fn main() {
             &dir,
             k.name,
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut out,
             xp,
             yp,
@@ -1156,7 +1176,11 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
             dir,
             "linear_rect",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut c,
             ap,
             bp,
@@ -1164,14 +1188,31 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
         // The reassociation-normalized C column: the inner K-dot is an IEEE-serial float reduction at
         // honest flags, and Wukong's tiled kernel accumulates it in a blocked (reassociated) order —
         // the same disclosure the square GEMM sections carry.
-        let cfast = bench_c_fast("linear_rect", &c_linear_rect(m, k, n), dir, cc, &wuk, &mut c, ap, bp);
+        let cfast = bench_c_fast(
+            "linear_rect",
+            &c_linear_rect(m, k, n),
+            dir,
+            cc,
+            &wuk,
+            &mut c,
+            ap,
+            bp,
+        );
         let mkl_all = mkl()
             .map(|api| api.max_threads)
             .and_then(|t| bench_mm_mkl_rect(m, k, n, true, t, &a, &b, &mut c));
         let wk_par = bench_wukong(&wk_linear_rect(m, k, n, true), &mut c, ap, bp);
         println!(
             "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            "", "Wuk(1c)", "Wuk(par)", "MKL(1c)", "MKL(all)", "C(gcc)", "C++(g++)", "C(fast)", "Rust"
+            "",
+            "Wuk(1c)",
+            "Wuk(par)",
+            "MKL(1c)",
+            "MKL(all)",
+            "C(gcc)",
+            "C++(g++)",
+            "C(fast)",
+            "Rust"
         );
         println!(
             "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
@@ -1299,7 +1340,11 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
             dir,
             "matmul",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut c,
             ap,
             bp,
@@ -1334,7 +1379,10 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
                     bp,
                 )
             })
-            .filter(|p| wuk.as_ref().is_some_and(|m| relaxed_peer_ok("matmul", "C(omp)", m, p)))
+            .filter(|p| {
+                wuk.as_ref()
+                    .is_some_and(|m| relaxed_peer_ok("matmul", "C(omp)", m, p))
+            })
     } else {
         None
     };
@@ -1342,7 +1390,17 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
 
     println!(
         "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "", "Wuk(1c)", "Wuk(par)", "MKL(1c)", "MKL(all)", "tuned(mm)", "C(gcc)", "C++(g++)", "C(fast)", "C(omp)", "Rust"
+        "",
+        "Wuk(1c)",
+        "Wuk(par)",
+        "MKL(1c)",
+        "MKL(all)",
+        "tuned(mm)",
+        "C(gcc)",
+        "C++(g++)",
+        "C(fast)",
+        "C(omp)",
+        "Rust"
     );
     println!(
         "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
@@ -1500,7 +1558,11 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             dir,
             "matmul_tn",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut c,
             ap,
             bp,
@@ -1653,7 +1715,9 @@ fn bench_gemv(cc: &str, dir: &Path) {
                 .map(|mm| format!("{:.1}", bytes / mm.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== gemv (y[i] = Sum_j A[i,j]*x[j]) {m}x{n} (A-stream GB/s, higher is better) ===");
+        println!(
+            "=== gemv (y[i] = Sum_j A[i,j]*x[j]) {m}x{n} (A-stream GB/s, higher is better) ==="
+        );
         let wuk = bench_wukong(&wk_gemv(m, n, false), &mut y, ap, xp);
         let wk_par = bench_wukong(&wk_gemv(m, n, true), &mut y, ap, xp);
         let (cm, cm_cpp) = bench_c_cpp(
@@ -1667,8 +1731,19 @@ fn bench_gemv(cc: &str, dir: &Path) {
             xp,
         );
         let rm = bench_external(
-            "rs", &rust_gemv(m, n), dir, "gemv", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut y, ap, xp,
+            "rs",
+            &rust_gemv(m, n),
+            dir,
+            "gemv",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut y,
+            ap,
+            xp,
         );
         // Reassociation-normalized peer. Wukong's `wukong_sgemv` folds each row across four 8-wide
         // accumulators — it REASSOCIATES the dot — so a plain-flags C column that must keep the sum
@@ -1681,12 +1756,22 @@ fn bench_gemv(cc: &str, dir: &Path) {
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cm_cpp), gbps(&cfast), gbps(&rm)
+            "GB/s",
+            gbps(&wuk),
+            gbps(&wk_par),
+            gbps(&cm),
+            gbps(&cm_cpp),
+            gbps(&cfast),
+            gbps(&rm)
         );
         // The 8-wide row dot reassociates → magnitude-normalized tolerance (max|Δ| / max|C|), not a
         // pointwise ratio (mean-zero inputs put outputs near 0). Same basis as the reduction cross-checks.
         if let (Some(a2), Some(c2)) = (&wuk, &cm) {
-            let maxabs = c2.out.iter().fold(0.0f32, |mx, &v| mx.max(v.abs())).max(1e-6);
+            let maxabs = c2
+                .out
+                .iter()
+                .fold(0.0f32, |mx, &v| mx.max(v.abs()))
+                .max(1e-6);
             let maxerr = a2
                 .out
                 .iter()
@@ -1763,7 +1848,9 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
                 .map(|x| format!("{:.1}", flops / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== scaled_gemm (scores = (Q·Kᵀ)·scale) S={s} D={d} (GFLOP/s, higher is better) ===");
+        println!(
+            "=== scaled_gemm (scores = (Q·Kᵀ)·scale) S={s} D={d} (GFLOP/s, higher is better) ==="
+        );
         let wuk = bench_wukong(&wk_scaled_scores(s, d, false), &mut out, qp, kp);
         let wk_par = bench_wukong(&wk_scaled_scores(s, d, true), &mut out, qp, kp);
         // Unscaled QKᵀ (plain nt) — same tuned kernel without the α; the ratio isolates the α cost.
@@ -1779,19 +1866,45 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
             kp,
         );
         let rm = bench_external(
-            "rs", &rust_scaled_scores(s, d), dir, "scaled_gemm", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, qp, kp,
+            "rs",
+            &rust_scaled_scores(s, d),
+            dir,
+            "scaled_gemm",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut out,
+            qp,
+            kp,
         );
         // Reassociation-normalized peer: the D-long score dot is a float reduction Wukong's blocked
         // GEMM accumulates out of order, so C is given the same freedom in this column.
-        let cfast = bench_c_fast("scaled_gemm", &c_scaled_scores(s, d), dir, cc, &wuk, &mut out, qp, kp);
+        let cfast = bench_c_fast(
+            "scaled_gemm",
+            &c_scaled_scores(s, d),
+            dir,
+            cc,
+            &wuk,
+            &mut out,
+            qp,
+            kp,
+        );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "GFLOP/s", gflops(&wuk), gflops(&wk_par), gflops(&cm), gflops(&cm_cpp), gflops(&cfast), gflops(&rm)
+            "GFLOP/s",
+            gflops(&wuk),
+            gflops(&wk_par),
+            gflops(&cm),
+            gflops(&cm_cpp),
+            gflops(&cfast),
+            gflops(&rm)
         );
         // The D-long score dot reassociates (FMA + blocked accumulation vs C's naive scalar order), and
         // the small mixed-sign Q/K put some scores near 0 → a pointwise relative check divides by ~0 and
@@ -1799,7 +1912,11 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
         // the same basis as gemv and the reduction cross-checks. The bit-exact gate is the runtime f64
         // reference + interp==native unit test; this is only a sanity ceiling.
         if let (Some(a2), Some(c2)) = (&wuk, &cm) {
-            let maxabs = c2.out.iter().fold(0.0f32, |mx, &v| mx.max(v.abs())).max(1e-6);
+            let maxabs = c2
+                .out
+                .iter()
+                .fold(0.0f32, |mx, &v| mx.max(v.abs()))
+                .max(1e-6);
             let maxerr = a2
                 .out
                 .iter()
@@ -1827,7 +1944,9 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
         if let (Some(ms), Some(mn)) = (&wuk, &wk_noscale) {
             // >1 ⇒ the α costs time; ~1.0 ⇒ the scale is free (folded into the writeback).
             let r = ms.ns_per_call / mn.ns_per_call;
-            println!("  -> α overhead vs unscaled QKᵀ (same kernel): {r:.3}x (≈1.0 ⇒ the scale is free)");
+            println!(
+                "  -> α overhead vs unscaled QKᵀ (same kernel): {r:.3}x (≈1.0 ⇒ the scale is free)"
+            );
         }
         println!();
     }
@@ -1921,7 +2040,11 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
             dir,
             "linear",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut c,
             ap,
             bp,
@@ -1948,11 +2071,24 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
                     bp,
                 )
             })
-            .filter(|p| wuk.as_ref().is_some_and(|m| relaxed_peer_ok("linear", "C(omp)", m, p)));
+            .filter(|p| {
+                wuk.as_ref()
+                    .is_some_and(|m| relaxed_peer_ok("linear", "C(omp)", m, p))
+            });
         let wk_par = bench_wukong(&wk_linear(ns, true), &mut c, ap, bp);
         println!(
             "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            "", "Wuk(1c)", "Wuk(par)", "MKL(1c)", "MKL(all)", "tuned(mm)", "C(gcc)", "C++(g++)", "C(fast)", "C(omp)", "Rust"
+            "",
+            "Wuk(1c)",
+            "Wuk(par)",
+            "MKL(1c)",
+            "MKL(all)",
+            "tuned(mm)",
+            "C(gcc)",
+            "C++(g++)",
+            "C(fast)",
+            "C(omp)",
+            "Rust"
         );
         println!(
             "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
@@ -1980,7 +2116,12 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
-        report_relaxed_ratio("C(omp) [-fopenmp -ffast-math, all cores]", &wuk, &wk_par, &comp);
+        report_relaxed_ratio(
+            "C(omp) [-fopenmp -ffast-math, all cores]",
+            &wuk,
+            &wk_par,
+            &comp,
+        );
         println!();
     }
 }
@@ -2121,7 +2262,11 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
             dir,
             "ffn",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut c,
             ap,
             bp,
@@ -2279,7 +2424,11 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
             dir,
             "linear_bf16",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut c,
             ap,
             bp,
@@ -2287,7 +2436,16 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
         // Reassociation-normalized peer: the K-long f32 accumulation is a float reduction, and
         // Wukong's widen-prepass + tuned GEMM accumulates it blocked. Validity-checked at the loose
         // 1e-2 bar on c[0], the same sanity guard the plain column uses.
-        let cfast = bench_bf16_fast("linear_bf16", &c_linear_bf16(ns), dir, cc, &wuk, &mut c, ap, bp);
+        let cfast = bench_bf16_fast(
+            "linear_bf16",
+            &c_linear_bf16(ns),
+            dir,
+            cc,
+            &wuk,
+            &mut c,
+            ap,
+            bp,
+        );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -2456,7 +2614,11 @@ fn bench_transpose(cc: &str, dir: &Path) {
             dir,
             "transpose",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut dst,
             sp,
             yp,
@@ -2476,7 +2638,10 @@ fn bench_transpose(cc: &str, dir: &Path) {
                     yp,
                 )
             })
-            .filter(|p| wuk.as_ref().is_some_and(|m| relaxed_peer_ok("transpose", "C(omp)", m, p)));
+            .filter(|p| {
+                wuk.as_ref()
+                    .is_some_and(|m| relaxed_peer_ok("transpose", "C(omp)", m, p))
+            });
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(omp)", "Rust"
@@ -2513,12 +2678,20 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
-            if aliasing { alias_1c.push(r) } else { gen_1c.push(r) }
+            if aliasing {
+                alias_1c.push(r)
+            } else {
+                gen_1c.push(r)
+            }
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
-            if aliasing { alias_par.push(r) } else { gen_par.push(r) }
+            if aliasing {
+                alias_par.push(r)
+            } else {
+                gen_par.push(r)
+            }
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &wuk, &wk_par, &comp);
@@ -2704,7 +2877,11 @@ fn bench_colsum(cc: &str, dir: &Path) {
             dir,
             "colsum",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut out,
             xp,
             yp,
@@ -2726,7 +2903,10 @@ fn bench_colsum(cc: &str, dir: &Path) {
                     yp,
                 )
             })
-            .filter(|p| wuk.as_ref().is_some_and(|mm| relaxed_peer_ok("colsum", "C(omp)", mm, p)));
+            .filter(|p| {
+                wuk.as_ref()
+                    .is_some_and(|mm| relaxed_peer_ok("colsum", "C(omp)", mm, p))
+            });
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "C(omp)", "Rust"
@@ -2767,7 +2947,12 @@ fn bench_colsum(cc: &str, dir: &Path) {
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
-        report_relaxed_ratio("C(omp) [-fopenmp -ffast-math, all cores]", &wuk, &wk_par, &comp);
+        report_relaxed_ratio(
+            "C(omp) [-fopenmp -ffast-math, all cores]",
+            &wuk,
+            &wk_par,
+            &comp,
+        );
         println!();
     }
 }
@@ -2862,7 +3047,11 @@ fn bench_biasadd(cc: &str, dir: &Path) {
             dir,
             "biasadd",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut out,
             xp,
             bp,
@@ -2938,16 +3127,26 @@ fn rust_biasadd(r: usize, c: usize) -> String {
 /// cross-check is bit-exact. Sizes past L3 so the streaming-store advantage is exercised.
 fn bench_dequant(cc: &str, dir: &Path) {
     let ext_flags_c = ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
-    let ext_flags_rs = ["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"];
+    let ext_flags_rs = [
+        "-Copt-level=3",
+        "-Ctarget-cpu=native",
+        "--crate-type=cdylib",
+    ];
 
     // --- 1-D dequant: out[j] = (q[j] as f32)·scale, for i32 and i8 inputs -------------------------
     for (ty, in_bytes, is_i8) in [("i32", 4usize, false), ("i8", 1usize, true)] {
         let n = 1usize << 23; // 8M elements: f32 output = 32 MiB ≫ L3, so NT stores engage.
-        // A varied signed int fill (both signs, magnitudes past the i8 boundary for i32).
-        let qi32: Vec<i32> = (0..n).map(|i| (((i as i64 * 1103515245 + 12345) >> 9) as i32) % 4096 - 2048).collect();
+                              // A varied signed int fill (both signs, magnitudes past the i8 boundary for i32).
+        let qi32: Vec<i32> = (0..n)
+            .map(|i| (((i as i64 * 1103515245 + 12345) >> 9) as i32) % 4096 - 2048)
+            .collect();
         let qi8: Vec<i8> = (0..n).map(|i| ((i * 37 + 5) % 251) as i64 as i8).collect();
         let mut out = vec![0.0f32; n];
-        let qp = if is_i8 { qi8.as_ptr() as *const f32 } else { qi32.as_ptr() as *const f32 };
+        let qp = if is_i8 {
+            qi8.as_ptr() as *const f32
+        } else {
+            qi32.as_ptr() as *const f32
+        };
         // A REAL, distinct filler for the unused middle pointer. It used to be `out.as_ptr()`, which
         // aliased the output buffer the kernel writes — harmless while the C peer never dereferenced
         // it, but a latent `restrict` violation the moment the peer's parameters carry `__restrict__`
@@ -2975,9 +3174,30 @@ fn bench_dequant(cc: &str, dir: &Path) {
             qp,
             dummy,
         );
-        let rm = bench_external("rs", &rust_dequant_1d(n, is_i8), dir, "dequant1d", "rustc", &ext_flags_rs, &mut out, qp, dummy);
-        println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust");
-        println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cpp), gbps(&rm));
+        let rm = bench_external(
+            "rs",
+            &rust_dequant_1d(n, is_i8),
+            dir,
+            "dequant1d",
+            "rustc",
+            &ext_flags_rs,
+            &mut out,
+            qp,
+            dummy,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&wuk),
+            gbps(&wk_par),
+            gbps(&cm),
+            gbps(&cpp),
+            gbps(&rm)
+        );
         dequant_check(&wuk, &cm, "C");
         dequant_ratio(&wuk, &wk_par, &cm, &cpp, &rm);
         println!();
@@ -2987,11 +3207,17 @@ fn bench_dequant(cc: &str, dir: &Path) {
     for (ty, in_bytes, is_i8) in [("i32", 4usize, false), ("i8", 1usize, true)] {
         let (r, c) = (8192usize, 1024usize); // 8M elements, 32 MiB f32 out ≫ L3
         let rc = r * c;
-        let qi32: Vec<i32> = (0..rc).map(|i| (((i as i64 * 22695477 + 1) >> 7) as i32) % 4096 - 2048).collect();
+        let qi32: Vec<i32> = (0..rc)
+            .map(|i| (((i as i64 * 22695477 + 1) >> 7) as i32) % 4096 - 2048)
+            .collect();
         let qi8: Vec<i8> = (0..rc).map(|i| ((i * 29 + 7) % 251) as i64 as i8).collect();
         let scale: Vec<f32> = (0..c).map(|j| (j % 7) as f32 * 0.003 + 0.002).collect();
         let mut out = vec![0.0f32; rc];
-        let qp = if is_i8 { qi8.as_ptr() as *const f32 } else { qi32.as_ptr() as *const f32 };
+        let qp = if is_i8 {
+            qi8.as_ptr() as *const f32
+        } else {
+            qi32.as_ptr() as *const f32
+        };
         let sp = scale.as_ptr();
         let bytes = (in_bytes + 4) as f64 * rc as f64; // scale[C] is negligible
         let gbps = |v: &Option<Measure>| {
@@ -3012,9 +3238,30 @@ fn bench_dequant(cc: &str, dir: &Path) {
             qp,
             sp,
         );
-        let rm = bench_external("rs", &rust_dequant_perchan(r, c, is_i8), dir, "dequantpc", "rustc", &ext_flags_rs, &mut out, qp, sp);
-        println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust");
-        println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cpp), gbps(&rm));
+        let rm = bench_external(
+            "rs",
+            &rust_dequant_perchan(r, c, is_i8),
+            dir,
+            "dequantpc",
+            "rustc",
+            &ext_flags_rs,
+            &mut out,
+            qp,
+            sp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&wuk),
+            gbps(&wk_par),
+            gbps(&cm),
+            gbps(&cpp),
+            gbps(&rm)
+        );
         dequant_check(&wuk, &cm, "C");
         dequant_ratio(&wuk, &wk_par, &cm, &cpp, &rm);
         println!();
@@ -3026,8 +3273,16 @@ fn bench_dequant(cc: &str, dir: &Path) {
 fn dequant_check(wuk: &Option<Measure>, peer: &Option<Measure>, lang: &str) {
     if let (Some(m), Some(p)) = (wuk, peer) {
         if m.out != p.out {
-            let at = m.out.iter().zip(&p.out).position(|(x, y)| x != y).unwrap_or(0);
-            println!("  ! dequant output mismatch vs {lang} at [{at}]: {} vs {}", m.out[at], p.out[at]);
+            let at = m
+                .out
+                .iter()
+                .zip(&p.out)
+                .position(|(x, y)| x != y)
+                .unwrap_or(0);
+            println!(
+                "  ! dequant output mismatch vs {lang} at [{at}]: {} vs {}",
+                m.out[at], p.out[at]
+            );
         }
     }
 }
@@ -3042,15 +3297,27 @@ fn dequant_ratio(
 ) {
     if let (Some(m), Some(c)) = (wuk, cm) {
         let r = c.ns_per_call / m.ns_per_call;
-        println!("  -> Wukong single-core is {:.2}x {} than C (gcc -O3 -march=native)", if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+        println!(
+            "  -> Wukong single-core is {:.2}x {} than C (gcc -O3 -march=native)",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
     }
     if let (Some(m), Some(cpp)) = (wuk, cpp) {
         let r = cpp.ns_per_call / m.ns_per_call;
-        println!("  -> Wukong single-core is {:.2}x {} than C++ (g++)", if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+        println!(
+            "  -> Wukong single-core is {:.2}x {} than C++ (g++)",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
     }
     if let (Some(m), Some(rm)) = (wuk, rm) {
         let r = rm.ns_per_call / m.ns_per_call;
-        println!("  -> Wukong single-core is {:.2}x {} than Rust (rustc -Copt-level=3)", if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+        println!(
+            "  -> Wukong single-core is {:.2}x {} than Rust (rustc -Copt-level=3)",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
     }
     if let (Some(mp), Some(c)) = (wk_par, cm) {
         let r = c.ns_per_call / mp.ns_per_call;
@@ -3167,7 +3434,11 @@ fn bench_colmax(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
                 &mut out,
                 xp,
                 yp,
@@ -3317,7 +3588,9 @@ fn bench_rowarg(cc: &str, dir: &Path) {
     for (is_max, label) in [(true, "rowargmax"), (false, "rowargmin")] {
         for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
             let n = rows * cols;
-            let x: Vec<f32> = (0..n).map(|i| ((i * 31 + 7) % 101) as f32 * 0.5 - 25.0).collect();
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 31 + 7) % 101) as f32 * 0.5 - 25.0)
+                .collect();
             let dummy = vec![0.0f32; n];
             let mut out = vec![0.0f32; rows];
             let (xp, yp) = (x.as_ptr(), dummy.as_ptr());
@@ -3328,7 +3601,9 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             let sym = if is_max { "argmax" } else { "argmin" };
-            println!("=== {label} (out[r] = {sym}_j x[r,j]) {rows}x{cols} (GB/s, higher is better) ===");
+            println!(
+                "=== {label} (out[r] = {sym}_j x[r,j]) {rows}x{cols} (GB/s, higher is better) ==="
+            );
             let wuk = bench_wukong(&wk_rowarg(rows, cols, is_max, false), &mut out, xp, yp);
             let wk_par = bench_wukong(&wk_rowarg(rows, cols, is_max, true), &mut out, xp, yp);
             let (cm, cm_cpp) = bench_c_cpp(
@@ -3347,14 +3622,26 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
                 &mut out,
                 xp,
                 yp,
             );
             // Reassociation-normalized peer (exact-index-checked, see `bench_c_fast_idx`).
-            let cfast =
-                bench_c_fast_idx(label, &c_rowarg(rows, cols, is_max), dir, cc, &wuk, &mut out, xp, yp);
+            let cfast = bench_c_fast_idx(
+                label,
+                &c_rowarg(rows, cols, is_max),
+                dir,
+                cc,
+                &wuk,
+                &mut out,
+                xp,
+                yp,
+            );
             println!(
                 "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -3469,7 +3756,9 @@ fn bench_colarg(cc: &str, dir: &Path) {
     for (is_max, label) in [(true, "colargmax"), (false, "colargmin")] {
         for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
             let n = rows * cols;
-            let x: Vec<f32> = (0..n).map(|i| ((i * 37 + 11) % 103) as f32 * 0.5 - 25.0).collect();
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 37 + 11) % 103) as f32 * 0.5 - 25.0)
+                .collect();
             let dummy = vec![0.0f32; n];
             let mut out = vec![0.0f32; cols];
             let (xp, yp) = (x.as_ptr(), dummy.as_ptr());
@@ -3480,7 +3769,9 @@ fn bench_colarg(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             let sym = if is_max { "argmax" } else { "argmin" };
-            println!("=== {label} (out[j] = {sym}_i x[i,j]) {rows}x{cols} (GB/s, higher is better) ===");
+            println!(
+                "=== {label} (out[j] = {sym}_i x[i,j]) {rows}x{cols} (GB/s, higher is better) ==="
+            );
             let wuk = bench_wukong(&wk_colarg(rows, cols, is_max, false), &mut out, xp, yp);
             let wk_par = bench_wukong(&wk_colarg(rows, cols, is_max, true), &mut out, xp, yp);
             let (cm, cm_cpp) = bench_c_cpp(
@@ -3499,14 +3790,26 @@ fn bench_colarg(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
                 &mut out,
                 xp,
                 yp,
             );
             // Reassociation-normalized peer (exact-index-checked, see `bench_c_fast_idx`).
-            let cfast =
-                bench_c_fast_idx(label, &c_colarg(rows, cols, is_max), dir, cc, &wuk, &mut out, xp, yp);
+            let cfast = bench_c_fast_idx(
+                label,
+                &c_colarg(rows, cols, is_max),
+                dir,
+                cc,
+                &wuk,
+                &mut out,
+                xp,
+                yp,
+            );
             println!(
                 "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -3632,8 +3935,12 @@ fn bench_lrscan(cc: &str, dir: &Path) {
         let n = rows * cols;
         // `a` (the gate) bounded in (−1, 1) so the recurrence is a contraction and `h` stays finite;
         // `b` (the input drive) small. Deterministic, no RNG.
-        let a: Vec<f32> = (0..n).map(|i| ((i * 13 + 5) % 19) as f32 * 0.1 - 0.9).collect();
-        let b: Vec<f32> = (0..n).map(|i| ((i * 7 + 3) % 11) as f32 * 0.2 - 1.0).collect();
+        let a: Vec<f32> = (0..n)
+            .map(|i| ((i * 13 + 5) % 19) as f32 * 0.1 - 0.9)
+            .collect();
+        let b: Vec<f32> = (0..n)
+            .map(|i| ((i * 7 + 3) % 11) as f32 * 0.2 - 1.0)
+            .collect();
         let mut out = vec![0.0f32; n];
         let (ap, bp) = (a.as_ptr(), b.as_ptr());
         let bytes = n as f64 * 4.0 * 3.0; // read a + read b + write out
@@ -3663,7 +3970,11 @@ fn bench_lrscan(cc: &str, dir: &Path) {
             dir,
             "lrscan",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut out,
             ap,
             bp,
@@ -3763,7 +4074,9 @@ fn bench_cumprod(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== cumprod (out[r,i] = Prod_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ===");
+        println!(
+            "=== cumprod (out[r,i] = Prod_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ==="
+        );
         let wuk = bench_wukong(&wk_cumprod(rows, cols, false), &mut out, xp, yp);
         let wk_par = bench_wukong(&wk_cumprod(rows, cols, true), &mut out, xp, yp);
         let (cm, cm_cpp) = bench_c_cpp(
@@ -3782,7 +4095,11 @@ fn bench_cumprod(cc: &str, dir: &Path) {
             dir,
             "cumprod",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut out,
             xp,
             yp,
@@ -3836,7 +4153,9 @@ fn bench_cumprod(cc: &str, dir: &Path) {
 fn bench_cumsum(cc: &str, dir: &Path) {
     for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
         let n = rows * cols;
-        let x: Vec<f32> = (0..n).map(|i| ((i * 31 + 7) % 101) as f32 * 0.01 - 0.5).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i * 31 + 7) % 101) as f32 * 0.01 - 0.5)
+            .collect();
         let dummy = vec![0.0f32; n];
         let mut out = vec![0.0f32; n];
         let (xp, yp) = (x.as_ptr(), dummy.as_ptr());
@@ -3846,7 +4165,9 @@ fn bench_cumsum(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== cumsum (out[r,i] = Sum_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ===");
+        println!(
+            "=== cumsum (out[r,i] = Sum_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ==="
+        );
         let wuk = bench_wukong(&wk_cumsum(rows, cols, false), &mut out, xp, yp);
         let wk_par = bench_wukong(&wk_cumsum(rows, cols, true), &mut out, xp, yp);
         let (cm, cm_cpp) = bench_c_cpp(
@@ -3865,7 +4186,11 @@ fn bench_cumsum(cc: &str, dir: &Path) {
             dir,
             "cumsum",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut out,
             xp,
             yp,
@@ -3876,7 +4201,16 @@ fn bench_cumsum(cc: &str, dir: &Path) {
         // order — is not the like-for-like peer. This is the rule the file applies to `dot`/`ssd`;
         // `cumsum` is the one scan that also needs it (cumprod / cummax / cummin / lrscan stay
         // bit-exact in Wukong, so their plain-flags column already IS like-for-like).
-        let cfast = bench_c_fast("cumsum", &c_cumsum(rows, cols), dir, cc, &wuk, &mut out, xp, yp);
+        let cfast = bench_c_fast(
+            "cumsum",
+            &c_cumsum(rows, cols),
+            dir,
+            cc,
+            &wuk,
+            &mut out,
+            xp,
+            yp,
+        );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -3967,7 +4301,9 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
     for (is_max, label) in [(true, "cummax"), (false, "cummin")] {
         for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
             let n = rows * cols;
-            let x: Vec<f32> = (0..n).map(|i| ((i * 47 + 13) % 101) as f32 * 0.5 - 25.0).collect();
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 47 + 13) % 101) as f32 * 0.5 - 25.0)
+                .collect();
             let dummy = vec![0.0f32; n];
             let mut out = vec![0.0f32; n];
             let (xp, yp) = (x.as_ptr(), dummy.as_ptr());
@@ -3997,7 +4333,11 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
                 &mut out,
                 xp,
                 yp,
@@ -4076,11 +4416,7 @@ fn bench_colstat(cc: &str, dir: &Path) {
                     .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                     .unwrap_or_else(|| "n/a".into())
             };
-            let desc = if opc == 0 {
-                "x[i,j]"
-            } else {
-                "x[i,j]²"
-            };
+            let desc = if opc == 0 { "x[i,j]" } else { "x[i,j]²" };
             println!("=== {label} (out[j] = {sym}_i {desc}) {m}x{n} (GB/s, higher is better) ===");
             let wuk = bench_wukong(&wk_colstat(m, n, false, opc), &mut out, xp, yp);
             let wk_par = bench_wukong(&wk_colstat(m, n, true, opc), &mut out, xp, yp);
@@ -4100,13 +4436,26 @@ fn bench_colstat(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
                 &mut out,
                 xp,
                 yp,
             );
             // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided fold.
-            let cfast = bench_c_fast(label, &c_colstat(m, n, opc), dir, cc, &wuk, &mut out, xp, yp);
+            let cfast = bench_c_fast(
+                label,
+                &c_colstat(m, n, opc),
+                dir,
+                cc,
+                &wuk,
+                &mut out,
+                xp,
+                yp,
+            );
             println!(
                 "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -4163,7 +4512,10 @@ fn wk_colstat(m: usize, n: usize, parallel: bool, op: u8) -> String {
         0 => (format!("s = s + {prod};"), format!("s / {m}.0")),
         1 => (format!("s = s + {prod} * {prod};"), "s".to_string()),
         2 => (format!("s = s + {prod} * {prod};"), "sqrt(s)".to_string()),
-        _ => (format!("s = s + {prod} * {prod};"), format!("sqrt(s / {m}.0)")),
+        _ => (
+            format!("s = s + {prod} * {prod};"),
+            format!("sqrt(s / {m}.0)"),
+        ),
     };
     format!(
         "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], mut out: [f32; {n}]) {{\n\
@@ -4181,7 +4533,10 @@ fn c_colstat(m: usize, n: usize, op: u8) -> String {
         0 => ("out[j] += x[i*N+j];", "s / (float)M"),
         1 => ("{ float v=x[i*N+j]; out[j] += v*v; }", "s"),
         2 => ("{ float v=x[i*N+j]; out[j] += v*v; }", "sqrtf(s)"),
-        _ => ("{ float v=x[i*N+j]; out[j] += v*v; }", "sqrtf(s / (float)M)"),
+        _ => (
+            "{ float v=x[i*N+j]; out[j] += v*v; }",
+            "sqrtf(s / (float)M)",
+        ),
     };
     format!(
         "#include <math.h>\n#define M {m}\n#define N {n}\n\
@@ -4253,13 +4608,26 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
             dir,
             "softmax_bwd",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut dx,
             yp,
             dyp,
         );
         // Reassociation-normalized peer: -ffast-math lets gcc reassociate the per-row dot.
-        let cfast = bench_c_fast("softmax_bwd", &c_softmax_bwd(r, c), dir, cc, &wuk, &mut dx, yp, dyp);
+        let cfast = bench_c_fast(
+            "softmax_bwd",
+            &c_softmax_bwd(r, c),
+            dir,
+            cc,
+            &wuk,
+            &mut dx,
+            yp,
+            dyp,
+        );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -4352,7 +4720,9 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
     for (r, c) in [(1024usize, 1024usize), (4096, 512)] {
         let n = r * c;
         // Well-conditioned: x ~ O(1) (non-zero mean-square), a small grad, gamma ~ 1.
-        let x: Vec<f32> = (0..n).map(|i| ((i % 19) as f32 - 9.0) * 0.1 + 0.3).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.1 + 0.3)
+            .collect();
         let dy: Vec<f32> = (0..n).map(|i| (i % 13) as f32 * 0.1 - 0.6).collect();
         let gamma: Vec<f32> = (0..c).map(|i| (i % 11) as f32 * 0.05 + 0.7).collect();
         let mut dx = vec![0.0f32; n];
@@ -4378,26 +4748,59 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
             gp,
         );
         let rm = bench_external4(
-            "rs", &rust_rmsnorm_bwd(r, c), dir, "rmsnorm_bwd", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp,
+            "rs",
+            &rust_rmsnorm_bwd(r, c),
+            dir,
+            "rmsnorm_bwd",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut dx,
+            xp,
+            dyp,
+            gp,
         );
         // Reassociation-normalized peer: -ffast-math lets gcc reassociate the two per-row reductions.
         let cfast = bench_external4(
-            "c", &c_rmsnorm_bwd(r, c), dir, "rmsnorm_bwd_fast", cc,
-            C_FAST_FLAGS, &mut dx, xp, dyp, gp,
+            "c",
+            &c_rmsnorm_bwd(r, c),
+            dir,
+            "rmsnorm_bwd_fast",
+            cc,
+            C_FAST_FLAGS,
+            &mut dx,
+            xp,
+            dyp,
+            gp,
         )
-        .filter(|cf| wuk.as_ref().is_some_and(|m| relaxed_peer_ok("rmsnorm_bwd", "C(fast)", m, cf)));
+        .filter(|cf| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("rmsnorm_bwd", "C(fast)", m, cf))
+        });
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cm_cpp), gbps(&cfast), gbps(&rm)
+            "GB/s",
+            gbps(&wuk),
+            gbps(&wk_par),
+            gbps(&cm),
+            gbps(&cm_cpp),
+            gbps(&cfast),
+            gbps(&rm)
         );
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
-            let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            let maxerr = m
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
                 println!("  ! rmsnorm_bwd mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
@@ -4474,7 +4877,9 @@ fn rust_rmsnorm_bwd(rows: usize, cols: usize) -> String {
 fn bench_layernorm_bwd(cc: &str, dir: &Path) {
     for (r, c) in [(1024usize, 1024usize), (4096, 512)] {
         let n = r * c;
-        let x: Vec<f32> = (0..n).map(|i| ((i % 19) as f32 - 9.0) * 0.1 + 0.3).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.1 + 0.3)
+            .collect();
         let dy: Vec<f32> = (0..n).map(|i| (i % 13) as f32 * 0.1 - 0.6).collect();
         let gamma: Vec<f32> = (0..c).map(|i| (i % 11) as f32 * 0.05 + 0.7).collect();
         let mut dx = vec![0.0f32; n];
@@ -4500,16 +4905,48 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
             gp,
         );
         let rm = bench_external4(
-            "rs", &rust_layernorm_bwd(r, c), dir, "layernorm_bwd", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp,
+            "rs",
+            &rust_layernorm_bwd(r, c),
+            dir,
+            "layernorm_bwd",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut dx,
+            xp,
+            dyp,
+            gp,
         );
         // Reassociation-normalized peer: -ffast-math lets gcc reassociate the four per-row reductions.
         let cfast = bench_external4(
-            "c", &c_layernorm_bwd(r, c), dir, "layernorm_bwd_fast", cc,
-            C_FAST_FLAGS, &mut dx, xp, dyp, gp,
+            "c",
+            &c_layernorm_bwd(r, c),
+            dir,
+            "layernorm_bwd_fast",
+            cc,
+            C_FAST_FLAGS,
+            &mut dx,
+            xp,
+            dyp,
+            gp,
         )
-        .filter(|cf| wuk.as_ref().is_some_and(|m| relaxed_peer_ok("layernorm_bwd", "C(fast)", m, cf)));
-        report_ratio("layernorm_bwd", &wuk, &wk_par, &cm, &cm_cpp, &rm, &cfast, &gbps);
+        .filter(|cf| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("layernorm_bwd", "C(fast)", m, cf))
+        });
+        report_ratio(
+            "layernorm_bwd",
+            &wuk,
+            &wk_par,
+            &cm,
+            &cm_cpp,
+            &rm,
+            &cfast,
+            &gbps,
+        );
     }
 }
 
@@ -4597,8 +5034,19 @@ fn bench_xent(cc: &str, dir: &Path) {
             tp,
         );
         let rm = bench_external(
-            "rs", &rust_xent(r, c), dir, "xent", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut loss, xp, tp,
+            "rs",
+            &rust_xent(r, c),
+            dir,
+            "xent",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut loss,
+            xp,
+            tp,
         );
         // Reassociation-normalized peer: -ffast-math on the row-max + Σexp reductions.
         let cfast = bench_c_fast("xent", &c_xent(r, c), dir, cc, &wuk, &mut loss, xp, tp);
@@ -4608,11 +5056,21 @@ fn bench_xent(cc: &str, dir: &Path) {
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cm_cpp), gbps(&cfast), gbps(&rm)
+            "GB/s",
+            gbps(&wuk),
+            gbps(&wk_par),
+            gbps(&cm),
+            gbps(&cm_cpp),
+            gbps(&cfast),
+            gbps(&rm)
         );
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
-            let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            let maxerr = m
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
                 println!("  ! xent mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
@@ -4714,8 +5172,19 @@ fn bench_rope(cc: &str, dir: &Path) {
             fp,
         );
         let rm = bench_external(
-            "rs", &rust_rope(rows, half), dir, "rope", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, xp, fp,
+            "rs",
+            &rust_rope(rows, half),
+            dir,
+            "rope",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut out,
+            xp,
+            fp,
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
@@ -4723,11 +5192,20 @@ fn bench_rope(cc: &str, dir: &Path) {
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "GB/s", gbps(&wuk), gbps(&wk_par), gbps(&cm), gbps(&cm_cpp), gbps(&rm)
+            "GB/s",
+            gbps(&wuk),
+            gbps(&wk_par),
+            gbps(&cm),
+            gbps(&cm_cpp),
+            gbps(&rm)
         );
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
-            let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            let maxerr = m
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
                 println!("  ! rope mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
@@ -4827,14 +5305,34 @@ fn bench_xent_bwd(cc: &str, dir: &Path) {
             tp,
         );
         let rm = bench_external(
-            "rs", &rust_xent_bwd(r, c), dir, "xent_bwd", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, tp,
+            "rs",
+            &rust_xent_bwd(r, c),
+            dir,
+            "xent_bwd",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut dx,
+            xp,
+            tp,
         );
         // Reassociation-normalized peer: the per-row `max` and `Σexp` are float reductions Wukong
         // folds 8 lanes wide, so the plain-flags C column is the strictly-in-order one. (`rope`,
         // `rope_bwd`, `gate` and `act_backward` deliberately pass `&None` here — they are pure
         // elementwise maps with no reduction, so `-ffast-math` normalizes nothing for them.)
-        let cfast = bench_c_fast("xent_bwd", &c_xent_bwd(r, c), dir, cc, &wuk, &mut dx, xp, tp);
+        let cfast = bench_c_fast(
+            "xent_bwd",
+            &c_xent_bwd(r, c),
+            dir,
+            cc,
+            &wuk,
+            &mut dx,
+            xp,
+            tp,
+        );
         report_ratio("xent_bwd", &wuk, &wk_par, &cm, &cm_cpp, &rm, &cfast, &gbps);
     }
 }
@@ -4889,7 +5387,9 @@ fn bench_rope_bwd(cc: &str, dir: &Path) {
         let d = 2 * half;
         let n = rows * d;
         let g: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.25).collect();
-        let inv_freq: Vec<f32> = (0..half).map(|k| 10000f32.powf(-(k as f32) / half as f32)).collect();
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|k| 10000f32.powf(-(k as f32) / half as f32))
+            .collect();
         let mut dx = vec![0.0f32; n];
         let (gp, fp) = (g.as_ptr(), inv_freq.as_ptr());
         let bytes = (2.0 * n as f64 + half as f64) * 4.0;
@@ -4912,8 +5412,19 @@ fn bench_rope_bwd(cc: &str, dir: &Path) {
             fp,
         );
         let rm = bench_external(
-            "rs", &rust_rope_bwd(rows, half), dir, "rope_bwd", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, gp, fp,
+            "rs",
+            &rust_rope_bwd(rows, half),
+            dir,
+            "rope_bwd",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut dx,
+            gp,
+            fp,
         );
         report_ratio("rope_bwd", &wuk, &wk_par, &cm, &cm_cpp, &rm, &None, &gbps);
     }
@@ -4979,7 +5490,9 @@ fn bench_gate(cc: &str, dir: &Path) {
 }
 
 fn bench_gate_n(cc: &str, dir: &Path, n: usize) {
-    let a: Vec<f32> = (0..n).map(|i| (i as f32 - (n / 2) as f32) * (12.0 / n as f32)).collect();
+    let a: Vec<f32> = (0..n)
+        .map(|i| (i as f32 - (n / 2) as f32) * (12.0 / n as f32))
+        .collect();
     let b: Vec<f32> = (0..n).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
     let mut out = vec![0.0f32; n];
     let (ap, bp) = (a.as_ptr(), b.as_ptr());
@@ -5007,8 +5520,19 @@ fn bench_gate_n(cc: &str, dir: &Path, n: usize) {
             bp,
         );
         let rm = bench_external(
-            "rs", &rust_gate(n, act), dir, "gate", "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, ap, bp,
+            "rs",
+            &rust_gate(n, act),
+            dir,
+            "gate",
+            "rustc",
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
+            &mut out,
+            ap,
+            bp,
         );
         report_ratio("gate", &wuk, &wk_par, &cm, &cm_cpp, &rm, &None, &gbps);
     }
@@ -5115,8 +5639,19 @@ fn bench_row_losses(cc: &str, dir: &Path) {
                 p1,
             );
             let rm = bench_external(
-                "rs", &src_r, dir, label, "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, p0, p1,
+                "rs",
+                &src_r,
+                dir,
+                label,
+                "rustc",
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
+                &mut out,
+                p0,
+                p1,
             );
             // Reassociation-normalized peer: the per-row logf/expf reductions under -ffast-math.
             let cfast = bench_c_fast(label, &src_c, dir, cc, &wuk, &mut out, p0, p1);
@@ -5210,7 +5745,12 @@ fn report_ratio(
     );
     let mut vals = format!(
         "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
-        "GB/s", gbps(wuk), gbps(wk_par), gbps(cm), gbps(cppm), gbps(rm)
+        "GB/s",
+        gbps(wuk),
+        gbps(wk_par),
+        gbps(cm),
+        gbps(cppm),
+        gbps(rm)
     );
     if has_fast {
         hdr.push_str(&format!(" {:>11}", "C(fast)"));
@@ -5220,7 +5760,11 @@ fn report_ratio(
     println!("{vals}");
     if let (Some(m), Some(c2)) = (wuk, cm) {
         let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
-        let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+        let maxerr = m
+            .out
+            .iter()
+            .zip(&c2.out)
+            .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
         let rel = (maxerr / maxabs) as f64;
         if rel > 1e-3 {
             println!("  ! {label} mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
@@ -5300,7 +5844,11 @@ fn bench_act_backward_n(cc: &str, dir: &Path, n: usize) {
             dir,
             "act_backward",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut dx,
             xp,
             dyp,
@@ -5368,8 +5916,10 @@ fn c_act_backward(n: usize, op: &str) -> String {
         "tanh" => "float t=tanhf(v); float g=1.0f-t*t;",
         "elu" => "float g = v>0.0f ? 1.0f : expf(v);",
         "softplus" => "float g=1.0f/(1.0f+expf(-v));",
-        _ => "float c0=0.7978845608f,c1=0.044715f; float u=tanhf(c0*(v+c1*v*v*v)); \
-              float g=0.5f*(1.0f+u)+0.5f*v*(1.0f-u*u)*c0*(1.0f+3.0f*c1*v*v);",
+        _ => {
+            "float c0=0.7978845608f,c1=0.044715f; float u=tanhf(c0*(v+c1*v*v*v)); \
+              float g=0.5f*(1.0f+u)+0.5f*v*(1.0f-u*u)*c0*(1.0f+3.0f*c1*v*v);"
+        }
     };
     format!(
         "#include <math.h>\n#define N {n}\n\
@@ -5385,8 +5935,10 @@ fn rust_act_backward(n: usize, op: &str) -> String {
         "tanh" => "let t=v.tanh(); let g=1.0f32-t*t;",
         "elu" => "let g=if v>0.0 {1.0f32} else {v.exp()};",
         "softplus" => "let g=1.0f32/(1.0+(-v).exp());",
-        _ => "let (c0,c1)=(0.7978845608f32,0.044715f32); let u=(c0*(v+c1*v*v*v)).tanh(); \
-              let g=0.5*(1.0+u)+0.5*v*(1.0-u*u)*c0*(1.0+3.0*c1*v*v);",
+        _ => {
+            "let (c0,c1)=(0.7978845608f32,0.044715f32); let u=(c0*(v+c1*v*v*v)).tanh(); \
+              let g=0.5*(1.0+u)+0.5*v*(1.0-u*u)*c0*(1.0+3.0*c1*v*v);"
+        }
     };
     format!(
         "const N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, dy:*const f32, dx:*mut f32) {{\n\
@@ -5440,7 +5992,11 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
             dir,
             "i8gemm",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut c,
             ap,
             bp,
@@ -5476,7 +6032,12 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
         // Integer arithmetic → exact equality is the correct cross-language bar. Every available
         // result must match the single-core Wukong reference exactly; a mismatch is a real bug.
         if let Some(m) = &wuk {
-            for (lang, other) in [("Wuk(par)", &wk_par), ("C", &cm), ("C++", &cm_cpp), ("Rust", &rm)] {
+            for (lang, other) in [
+                ("Wuk(par)", &wk_par),
+                ("C", &cm),
+                ("C++", &cm_cpp),
+                ("Rust", &rm),
+            ] {
                 if let Some(o) = other {
                     if o.out != m.out {
                         let at = m
@@ -5625,7 +6186,11 @@ fn bench_bf16(cc: &str, dir: &Path) {
                 dir,
                 "bf16",
                 "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
                 &mut o,
                 xp,
                 yp,
@@ -5791,7 +6356,11 @@ fn bench_axpby_half_out(cc: &str, dir: &Path) {
         dir,
         "axpbyhalf",
         "rustc",
-        &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+        &[
+            "-Copt-level=3",
+            "-Ctarget-cpu=native",
+            "--crate-type=cdylib",
+        ],
         &mut oh,
         xp,
         yp,
@@ -5950,14 +6519,27 @@ fn bench_conv(cc: &str, dir: &Path) {
         dir,
         "conv",
         "rustc",
-        &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+        &[
+            "-Copt-level=3",
+            "-Ctarget-cpu=native",
+            "--crate-type=cdylib",
+        ],
         &mut output,
         ip,
         wp,
     );
     // Reassociation-normalized peer: the direct convolution's `Cin·K·K`-long accumulation is a float
     // reduction, and Wukong's im2col+GEMM path accumulates it in a blocked (reassociated) order.
-    let cfast = bench_c_fast("conv", &c_conv(cin, h, cout, k), dir, cc, &wuk, &mut output, ip, wp);
+    let cfast = bench_c_fast(
+        "conv",
+        &c_conv(cin, h, cout, k),
+        dir,
+        cc,
+        &wuk,
+        &mut output,
+        ip,
+        wp,
+    );
     println!(
         "  {:<18} {:>14} {:>14} {:>14} {:>14} {:>14}",
         "", "Wuk im2col+GEMM", "C (direct)", "C++ (direct)", "C(fast) direct", "Rust (direct)"
@@ -6072,7 +6654,15 @@ fn bench_norm(cc: &str, dir: &Path) {
         );
         println!(
             "  {:<16} {:>12} {:>12} {:>12} {:>12} {:>12} {:>16} {:>16} {:>16}",
-            "", "Wukong", "C (gcc)", "C++ (g++)", "C(fast)", "Rust", "Wuk vs C", "vs C++", "vs C(fast)"
+            "",
+            "Wukong",
+            "C (gcc)",
+            "C++ (g++)",
+            "C(fast)",
+            "Rust",
+            "Wuk vs C",
+            "vs C++",
+            "vs C(fast)"
         );
         for op in [
             "softmax",
@@ -6100,15 +6690,27 @@ fn bench_norm(cc: &str, dir: &Path) {
                 dir,
                 &format!("norm_{op}"),
                 "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
                 &mut out,
                 xp,
                 yp,
             );
             // Reassociation-normalized peer: with -ffast-math gcc may reassociate the norm's
             // reductions (and vectorize expf via its own fast paths). Loose-checked inside.
-            let cfast =
-                bench_c_fast(&format!("norm_{op}"), &c_norm(cols, op), dir, cc, &wuk, &mut out, xp, yp);
+            let cfast = bench_c_fast(
+                &format!("norm_{op}"),
+                &c_norm(cols, op),
+                dir,
+                cc,
+                &wuk,
+                &mut out,
+                xp,
+                yp,
+            );
             let ns = |m: &Option<Measure>| {
                 m.as_ref()
                     .map(|x| format!("{:.0}", x.ns_per_call))
@@ -6344,7 +6946,15 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
         );
         println!(
             "  {:<18} {:>12} {:>12} {:>12} {:>12} {:>12} {:>16} {:>16} {:>16}",
-            "", "Wukong", "C (gcc)", "C++ (g++)", "C(fast)", "Rust", "Wuk vs C", "vs C++", "vs C(fast)"
+            "",
+            "Wukong",
+            "C (gcc)",
+            "C++ (g++)",
+            "C(fast)",
+            "Rust",
+            "Wuk vs C",
+            "vs C++",
+            "vs C(fast)"
         );
         for op in ["rmsnorm", "layernorm", "softmax"] {
             // C/Rust baselines are single-threaded per-row norms — the same for both Wukong rows
@@ -6365,7 +6975,11 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                 dir,
                 "bnorm",
                 "rustc",
-                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &[
+                    "-Copt-level=3",
+                    "-Ctarget-cpu=native",
+                    "--crate-type=cdylib",
+                ],
                 &mut out,
                 xp,
                 yp,
@@ -6386,12 +7000,7 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
             let mut cfast: Option<Measure> = None;
             for (suffix, par) in [("", false), ("@parallel", true)] {
                 let label = format!("{op}{suffix}");
-                let wuk = bench_wukong(
-                    &wk_norm_batched(rows, cols, op, par),
-                    &mut out,
-                    xp,
-                    yp,
-                );
+                let wuk = bench_wukong(&wk_norm_batched(rows, cols, op, par), &mut out, xp, yp);
                 if !par {
                     cfast = cfast_raw.take().filter(|cf| {
                         wuk.as_ref()
@@ -7448,7 +8057,13 @@ fn mkl_dll_path() -> Option<PathBuf> {
         bases.push(PathBuf::from(prefix).join("Library").join("bin"));
     }
     if let Ok(home) = std::env::var("USERPROFILE") {
-        for name in ["Anaconda3", "anaconda3", "miniconda3", "Miniconda3", "miniforge3"] {
+        for name in [
+            "Anaconda3",
+            "anaconda3",
+            "miniconda3",
+            "Miniconda3",
+            "miniforge3",
+        ] {
             bases.push(PathBuf::from(&home).join(name).join("Library").join("bin"));
         }
     }
@@ -7479,8 +8094,12 @@ fn mkl() -> Option<&'static MklApi> {
             // Fortran *by-reference* binding (`const int*`); calling it by value dereferences the
             // thread count as a pointer and segfaults — use `MKL_Set_Num_Threads` (by value).
             let sgemm = *lib.get::<CblasSgemmFn>(b"cblas_sgemm_64\0").ok()?;
-            let set_threads = *lib.get::<MklSetNumThreadsFn>(b"MKL_Set_Num_Threads\0").ok()?;
-            let get_max = *lib.get::<MklGetMaxThreadsFn>(b"MKL_Get_Max_Threads\0").ok()?;
+            let set_threads = *lib
+                .get::<MklSetNumThreadsFn>(b"MKL_Set_Num_Threads\0")
+                .ok()?;
+            let get_max = *lib
+                .get::<MklGetMaxThreadsFn>(b"MKL_Get_Max_Threads\0")
+                .ok()?;
             // VML transcendentals are optional (older MKL builds, or a stripped redist, may omit them).
             let vml = |sym: &[u8]| lib.get::<VmlUnaryFn>(sym).ok().map(|s| *s);
             let vs_exp = vml(b"vsExp\0");
@@ -8216,7 +8835,9 @@ fn clock_probe_enabled() -> bool {
 fn clock_probe_gflops() -> f64 {
     #[cfg(target_arch = "x86_64")]
     {
-        if clock_probe_enabled() && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+        if clock_probe_enabled()
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
         {
             return unsafe { fma_probe_avx2(20, 4_000_000, 3) };
         }
@@ -8827,7 +9448,11 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
             dir,
             &format!("stream_{name}"),
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             &mut out,
             xp,
             yp,
@@ -8952,7 +9577,10 @@ fn rust_kernel(body: &str) -> String {
 /// to the same code), and g++ shares gcc's middle/back-end — so this measures whether the C++ toolchain
 /// beats Wukong (it does not), proving the "beat C++" claim instead of assuming it.
 fn cpp_from_c(c_src: &str) -> String {
-    c_src.replace("__declspec(dllexport)", "extern \"C\" __declspec(dllexport)")
+    c_src.replace(
+        "__declspec(dllexport)",
+        "extern \"C\" __declspec(dllexport)",
+    )
 }
 
 // Parameterized kernel builders (an explicit element count `n`) — used by the large-tensor streaming
@@ -9044,7 +9672,10 @@ mod tests {
             "argmax@parallel",
         ] {
             assert!(names.contains(&n), "`{n}` is no longer a kernel row");
-            assert!(is_reduction_kernel(n), "`{n}` dropped out of is_reduction_kernel");
+            assert!(
+                is_reduction_kernel(n),
+                "`{n}` dropped out of is_reduction_kernel"
+            );
         }
         for n in [
             "saxpy@parallel",
@@ -9058,7 +9689,10 @@ mod tests {
             "argmax@parallel",
         ] {
             assert!(names.contains(&n), "`{n}` is no longer a kernel row");
-            assert!(c_omp_source(n).is_some(), "`{n}` dropped out of c_omp_source");
+            assert!(
+                c_omp_source(n).is_some(),
+                "`{n}` dropped out of c_omp_source"
+            );
         }
     }
 
@@ -9075,15 +9709,16 @@ mod tests {
         );
         // NaN vs finite is a divergence, not a skip (this used to return 0.0 = "bit-exact").
         let (rel, at) = max_rel_err(&[1.0, f32::NAN, 3.0], &[1.0, 0.42, 3.0]);
-        assert!(rel.is_infinite(), "NaN vs finite must not read as bit-exact");
+        assert!(
+            rel.is_infinite(),
+            "NaN vs finite must not read as bit-exact"
+        );
         assert_eq!(at, 1);
         assert!(max_rel_err(&[0.42], &[f32::NAN]).0.is_infinite());
         // +Inf vs -Inf makes `rel` NaN, which must not be silently skipped either.
-        assert!(
-            max_rel_err(&[f32::INFINITY], &[f32::NEG_INFINITY])
-                .0
-                .is_infinite()
-        );
+        assert!(max_rel_err(&[f32::INFINITY], &[f32::NEG_INFINITY])
+            .0
+            .is_infinite());
         // A real relative difference, magnitude-normalized.
         let (rel, at) = max_rel_err(&[100.0, 1.0], &[100.0, 1.5]);
         assert_eq!(at, 1);
@@ -9160,8 +9795,14 @@ mod tests {
     #[test]
     fn converted_rust_peers_take_their_buffers_as_slice_parameters() {
         let cases: Vec<(&str, String)> = vec![
-            ("rust_kernel", rust_kernel("for i in 0..N { *out.add(i)= *x.add(i); }")),
-            ("rust_kernel_n", rust_kernel_n(64, "for i in 0..N { *out.add(i)= *x.add(i); }")),
+            (
+                "rust_kernel",
+                rust_kernel("for i in 0..N { *out.add(i)= *x.add(i); }"),
+            ),
+            (
+                "rust_kernel_n",
+                rust_kernel_n(64, "for i in 0..N { *out.add(i)= *x.add(i); }"),
+            ),
             ("rust_matmul_tn", rust_matmul_tn(32)),
             ("rust_transpose", rust_transpose(64, 32)),
             ("rust_colsum", rust_colsum(64, 32)),
@@ -9265,7 +9906,10 @@ mod tests {
         );
         // A floor, so that deleting or renaming the peer generators cannot make this pass vacuously
         // with zero matches. 43 signatures at the time of writing.
-        assert!(seen >= 40, "only {seen} C kbench signatures found — did the peer generators move?");
+        assert!(
+            seen >= 40,
+            "only {seen} C kbench signatures found — did the peer generators move?"
+        );
     }
 
     /// Split an `f(…)` argument list into its TOP-LEVEL arguments.
@@ -9303,7 +9947,10 @@ mod tests {
                     if depth == 0 {
                         args.push(&src[start..i]);
                         return Some(
-                            args.into_iter().map(str::trim).filter(|a| !a.is_empty()).collect(),
+                            args.into_iter()
+                                .map(str::trim)
+                                .filter(|a| !a.is_empty())
+                                .collect(),
                         );
                     }
                 }
@@ -9359,7 +10006,9 @@ mod tests {
         // makes the needles below unable to match this test's own source text — which is what the
         // old version was contorting its needle to avoid, at the cost of matching almost nothing.
         let marker = concat!("#[cfg", "(test)]");
-        let end = SRC.find(marker).expect("main.rs must contain a #[cfg(test)] module");
+        let end = SRC
+            .find(marker)
+            .expect("main.rs must contain a #[cfg(test)] module");
         assert!(
             end > SRC.len() / 2,
             "the {marker} marker was found at byte {end} of {} — the scan region is not the body \
@@ -9390,7 +10039,11 @@ mod tests {
             at += line.len();
         }
         let owner = |pos: usize| -> &str {
-            fns.iter().rev().find(|(o, _)| *o <= pos).map(|(_, n)| *n).unwrap_or("<top level>")
+            fns.iter()
+                .rev()
+                .find(|(o, _)| *o <= pos)
+                .map(|(_, n)| *n)
+                .unwrap_or("<top level>")
         };
         let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
         // Split so the base names are not present contiguously in the text being scanned. (Belt and
@@ -9459,8 +10112,14 @@ mod tests {
             defs, 6,
             "expected the 5 bench_external* ABI families plus build_peer, found {defs} definitions"
         );
-        assert!(calls >= 58, "only {calls} peer call sites — did the scan stop matching?");
-        assert!(c_ext >= 14, "only {c_ext} C-ext call sites — is the first argument still the ext?");
+        assert!(
+            calls >= 58,
+            "only {calls} peer call sites — did the scan stop matching?"
+        );
+        assert!(
+            c_ext >= 14,
+            "only {c_ext} C-ext call sites — is the first argument still the ext?"
+        );
         assert!(
             exempt.len() >= 6,
             "only {} C-only extra columns recognized, so the `_fast`/`_omp` exemption is close to \
@@ -9474,7 +10133,10 @@ mod tests {
             + SRC.matches(concat!("bench_c_cpp", "_i8(")).count()
             + SRC.matches(concat!("bench_c_cpp", "_bf16(")).count()
             + SRC.matches(concat!("bench_c_cpp", "_halfout(")).count();
-        assert!(pairs >= 35, "only {pairs} C/C++ pair call sites — did a family lose its peers?");
+        assert!(
+            pairs >= 35,
+            "only {pairs} C/C++ pair call sites — did a family lose its peers?"
+        );
     }
 
     /// The C++ render must keep the numeric body byte-for-byte and only unmangle the export, or the
@@ -9530,7 +10192,10 @@ mod tests {
                 s.contains("for (long i=1;i<R;i++) for (long j=0;j<C;j++)"),
                 "c_colarg(is_max={is_max}) regressed to a column-outer scan:\n{s}"
             );
-            assert!(s.contains("float bv[C];"), "c_colarg lost its running-best vector:\n{s}");
+            assert!(
+                s.contains("float bv[C];"),
+                "c_colarg lost its running-best vector:\n{s}"
+            );
         }
     }
 
@@ -9541,7 +10206,10 @@ mod tests {
         let s = c_matmul_tn(64);
         let k = s.find("for (long k=").expect("no k loop in c_matmul_tn");
         let i = s.find("for (long i=").expect("no i loop in c_matmul_tn");
-        assert!(k < i, "c_matmul_tn regressed to an i-outer (ijk) nest:\n{s}");
+        assert!(
+            k < i,
+            "c_matmul_tn regressed to an i-outer (ijk) nest:\n{s}"
+        );
         assert!(
             s.contains("float aki=a[k*NS+i];"),
             "c_matmul_tn no longer hoists the A element out of the inner loop:\n{s}"
@@ -9559,8 +10227,14 @@ mod tests {
     #[test]
     fn transpose_peer_stays_cache_blocked() {
         for &(r, c, _) in TRANSPOSE_SHAPES {
-            for (which, s) in [("c_transpose", c_transpose(r, c)), ("omp", c_transpose_omp(r, c))] {
-                assert!(s.contains("#define TB 32"), "{which} lost its blocking:\n{s}");
+            for (which, s) in [
+                ("c_transpose", c_transpose(r, c)),
+                ("omp", c_transpose_omp(r, c)),
+            ] {
+                assert!(
+                    s.contains("#define TB 32"),
+                    "{which} lost its blocking:\n{s}"
+                );
                 assert!(
                     s.contains("for (long ii=0;ii<NR;ii+=TB) for (long jj=0;jj<NC;jj+=TB)"),
                     "{which} is back to the naive un-tiled nest:\n{s}"
@@ -9575,7 +10249,9 @@ mod tests {
             assert!(c_transpose_omp(r, c).contains("#pragma omp parallel for"));
             // The Rust peer must run the same algorithm or the third column is not comparable.
             let rs = rust_transpose(r, c);
-            assert!(rs.contains("const TB: usize = 32;") && rs.contains("if ii+TB<=NR && jj+TB<=NC"));
+            assert!(
+                rs.contains("const TB: usize = 32;") && rs.contains("if ii+TB<=NR && jj+TB<=NC")
+            );
         }
     }
 
@@ -9590,7 +10266,10 @@ mod tests {
     fn transpose_sweep_covers_both_stride_regimes() {
         let alias: Vec<_> = TRANSPOSE_SHAPES.iter().filter(|s| s.2).collect();
         let general: Vec<_> = TRANSPOSE_SHAPES.iter().filter(|s| !s.2).collect();
-        assert!(!alias.is_empty(), "the power-of-two regime must still be reported");
+        assert!(
+            !alias.is_empty(),
+            "the power-of-two regime must still be reported"
+        );
         assert!(
             general.len() >= 3 && general.len() > alias.len(),
             "the general (non-power-of-two) regime must dominate the sweep, got {} general vs {} \
@@ -9618,7 +10297,10 @@ mod tests {
         );
         // Every shape must still spill L2 (~2 MiB/core here), or the bench measures cache residency.
         for &&(r, c, _) in TRANSPOSE_SHAPES.iter().collect::<Vec<_>>().iter() {
-            assert!(2 * r * c * 4 >= 4 << 20, "{r}x{c} moves under 4 MiB — too small to be L2-bound");
+            assert!(
+                2 * r * c * 4 >= 4 << 20,
+                "{r}x{c} moves under 4 MiB — too small to be L2-bound"
+            );
         }
     }
 
@@ -9839,7 +10521,10 @@ mod tests {
             .parse()
             .unwrap();
         assert!(lo <= hi, "{text}: interval is inverted");
-        assert!((lo - 2.0).abs() < 0.01, "{text}: expected 2.00x slower at the near end");
+        assert!(
+            (lo - 2.0).abs() < 0.01,
+            "{text}: expected 2.00x slower at the near end"
+        );
     }
 
     /// THE `C(twin)` CONTRACT. A ratio smaller than what a byte-identical control column managed
@@ -9853,10 +10538,16 @@ mod tests {
     fn an_effect_below_the_control_prints_nothing_however_tight() {
         // Four rounds of a rock-steady 1.03x — spread 1.00, so the dispersion gate passes it.
         let steady = RatioStat::over_rounds(&[103.0; 4], &[100.0; 4]).unwrap();
-        assert!(steady.conclusive(), "the fixture must clear the spread gate");
+        assert!(
+            steady.conclusive(),
+            "the fixture must clear the spread gate"
+        );
         let text = fmt_ratio_stat(Some(steady), Some(1.31), true);
         assert!(text.starts_with("BELOW FLOOR"), "{text}");
-        assert!(!text.contains("faster") && !text.contains("slower"), "{text}");
+        assert!(
+            !text.contains("faster") && !text.contains("slower"),
+            "{text}"
+        );
         assert_eq!(verdict(steady, Some(1.31)), Verdict::BelowFloor);
         // The same reading against a run whose control behaved is a real result.
         assert_eq!(verdict(steady, Some(1.01)), Verdict::Sized);
@@ -9921,7 +10612,10 @@ mod tests {
             .unwrap();
         assert!(lo <= hi, "{text}: interval is inverted");
         let point: f64 = text[..text.find('x').unwrap()].parse().unwrap();
-        assert!(lo <= point && point <= hi, "{text}: point outside its own range");
+        assert!(
+            lo <= point && point <= hi,
+            "{text}: point outside its own range"
+        );
     }
 
     /// `spread_limit` must stay a strict factor > 1: a limit of 1.0 or below would make every
@@ -9945,8 +10639,9 @@ mod tests {
             assert!(got > 1.0, "XBENCH_SPREAD_LIMIT={set:?} gave a limit <= 1");
         }
         assert!(
-            (spread_limit() - parse_spread_limit(std::env::var("XBENCH_SPREAD_LIMIT").ok().as_deref()))
-                .abs()
+            (spread_limit()
+                - parse_spread_limit(std::env::var("XBENCH_SPREAD_LIMIT").ok().as_deref()))
+            .abs()
                 < 1e-12
         );
     }

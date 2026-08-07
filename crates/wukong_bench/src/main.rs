@@ -161,7 +161,8 @@ fn main() {
                 speedup_n += 1;
                 match floor {
                     Some(fl) if r.t_interp > fl => {
-                        let net = (r.t_interp - fl).as_secs_f64() / r.t_native.as_secs_f64().max(1e-12);
+                        let net =
+                            (r.t_interp - fl).as_secs_f64() / r.t_native.as_secs_f64().max(1e-12);
                         log_net_sum += net.ln();
                         net_n += 1;
                     }
@@ -425,11 +426,7 @@ fn interp_call_floor() -> Option<Duration> {
 ///
 /// NOTE: every rep pays one 512 MiB worker-thread spawn+join inside `wukong_interp::run` — see
 /// [`interp_call_floor`], which measures it and which the report prints alongside this column.
-fn time_run(
-    p: &wukong_mir::Program,
-    entry: wukong_span::Symbol,
-    interner: &Interner,
-) -> Duration {
+fn time_run(p: &wukong_mir::Program, entry: wukong_span::Symbol, interner: &Interner) -> Duration {
     for _ in 0..2 {
         let _ = wukong_interp::run(p, entry, interner); // warm up
     }

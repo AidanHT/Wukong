@@ -339,7 +339,9 @@ mod tests {
     /// Deterministic, non-RNG input with both signs and duplicates (the `% 101` band repeats values, so
     /// ties are exercised) so the running max/min are non-trivial.
     fn fill(n: usize) -> Vec<f32> {
-        (0..n).map(|i| ((i * 47 + 13) % 101) as f32 - 50.0).collect()
+        (0..n)
+            .map(|i| ((i * 47 + 13) % 101) as f32 - 50.0)
+            .collect()
     }
 
     /// Independent naive left-to-right inclusive running extremum, per row (the cross-check reference).
@@ -428,9 +430,19 @@ mod tests {
             let mut p_min = vec![0.0f32; rows * cols];
             unsafe {
                 wukong_cummax_f32(x.as_ptr(), s_max.as_mut_ptr(), rows as i64, cols as i64);
-                wukong_cummax_f32_parallel(x.as_ptr(), p_max.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummax_f32_parallel(
+                    x.as_ptr(),
+                    p_max.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
                 wukong_cummin_f32(x.as_ptr(), s_min.as_mut_ptr(), rows as i64, cols as i64);
-                wukong_cummin_f32_parallel(x.as_ptr(), p_min.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummin_f32_parallel(
+                    x.as_ptr(),
+                    p_min.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
             }
             assert_eq!(s_max, p_max, "cummax serial != parallel {rows}x{cols}");
             assert_eq!(s_min, p_min, "cummin serial != parallel {rows}x{cols}");
@@ -471,9 +483,19 @@ mod tests {
             let mut p_min = vec![0.0f32; rows * cols];
             unsafe {
                 wukong_cummax_f32(x.as_ptr(), s_max.as_mut_ptr(), rows as i64, cols as i64);
-                wukong_cummax_f32_parallel(x.as_ptr(), p_max.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummax_f32_parallel(
+                    x.as_ptr(),
+                    p_max.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
                 wukong_cummin_f32(x.as_ptr(), s_min.as_mut_ptr(), rows as i64, cols as i64);
-                wukong_cummin_f32_parallel(x.as_ptr(), p_min.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_cummin_f32_parallel(
+                    x.as_ptr(),
+                    p_min.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
             }
             assert_eq!(
                 bits(&s_max),
@@ -545,8 +567,12 @@ mod tests {
             vec![nan; 20],
             vec![-inf; 12],
             vec![inf; 12],
-            vec![inf, -inf, 0.0, -0.0, inf, -inf, 3.0, -3.0, inf, 1.0, -0.0, 0.0],
-            vec![-inf, nan, inf, nan, 2.0, -inf, inf, 5.0, nan, -0.0, 0.0, 7.0, nan, 1.0],
+            vec![
+                inf, -inf, 0.0, -0.0, inf, -inf, 3.0, -3.0, inf, 1.0, -0.0, 0.0,
+            ],
+            vec![
+                -inf, nan, inf, nan, 2.0, -inf, inf, 5.0, nan, -0.0, 0.0, 7.0, nan, 1.0,
+            ],
         ];
         for x in &cases {
             let cols = x.len();
@@ -588,7 +614,10 @@ mod tests {
             wukong_cummin_f32(asc.as_ptr(), min_asc.as_mut_ptr(), 1, 8);
         }
         assert_eq!(max_asc, asc, "cummax of ascending ramp = the ramp");
-        assert_eq!(min_asc, [1.0f32; 8], "cummin of ascending ramp = first repeated");
+        assert_eq!(
+            min_asc, [1.0f32; 8],
+            "cummin of ascending ramp = first repeated"
+        );
 
         // descending ramp 8..=1
         let desc: [f32; 8] = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
@@ -598,7 +627,10 @@ mod tests {
             wukong_cummax_f32(desc.as_ptr(), max_desc.as_mut_ptr(), 1, 8);
             wukong_cummin_f32(desc.as_ptr(), min_desc.as_mut_ptr(), 1, 8);
         }
-        assert_eq!(max_desc, [8.0f32; 8], "cummax of descending ramp = first repeated");
+        assert_eq!(
+            max_desc, [8.0f32; 8],
+            "cummax of descending ramp = first repeated"
+        );
         assert_eq!(min_desc, desc, "cummin of descending ramp = the ramp");
 
         // a mixed pattern with distinct values + a duplicate to catch a lane-misroute the monotone
@@ -610,7 +642,15 @@ mod tests {
             wukong_cummax_f32(mixed.as_ptr(), max_mx.as_mut_ptr(), 1, 8);
             wukong_cummin_f32(mixed.as_ptr(), min_mx.as_mut_ptr(), 1, 8);
         }
-        assert_eq!(max_mx, [3.0, 3.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0], "cummax mixed");
-        assert_eq!(min_mx, [3.0, 1.0, 1.0, 1.0, -4.0, -4.0, -4.0, -4.0], "cummin mixed");
+        assert_eq!(
+            max_mx,
+            [3.0, 3.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0],
+            "cummax mixed"
+        );
+        assert_eq!(
+            min_mx,
+            [3.0, 1.0, 1.0, 1.0, -4.0, -4.0, -4.0, -4.0],
+            "cummin mixed"
+        );
     }
 }

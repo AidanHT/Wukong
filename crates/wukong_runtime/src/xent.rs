@@ -42,9 +42,9 @@
 //! per-row max and Σexp reassociate across lanes — the documented reassociated-reduction exception:
 //! every backend runs this same kernel, so they agree.
 
-use crate::vmath::{exp1, log1};
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
+use crate::vmath::{exp1, log1};
 use rayon::prelude::*;
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
@@ -104,8 +104,8 @@ unsafe fn xent_row_scalar(x: *const f32, target: usize, n: usize) -> f32 {
         *smj += exp1(*x.add(t + j) - m);
     }
     let lse = m + log1(hsum8(sm)); // log-sum-exp; ONE scalar log — same op/bits as log-softmax's `off`.
-    // 3) loss = lse − x[target] (a single scalar gather load, identical in the AVX2 path). An
-    // out-of-range label has no logit to gather, so the loss is NaN instead of a read past the row.
+                                   // 3) loss = lse − x[target] (a single scalar gather load, identical in the AVX2 path). An
+                                   // out-of-range label has no logit to gather, so the loss is NaN instead of a read past the row.
     if target < n {
         lse - *x.add(target)
     } else {
@@ -164,8 +164,8 @@ unsafe fn xent_row_avx2(x: *const f32, target: usize, n: usize) -> f32 {
         *smj += exp1(*x.add(i + j) - m);
     }
     let lse = m + log1(hsum8(sm)); // same scalar log on the same sum bits as the scalar twin.
-    // 3) loss = lse − x[target] — the same single scalar load, and the same out-of-range guard, as
-    // the scalar twin.
+                                   // 3) loss = lse − x[target] — the same single scalar load, and the same out-of-range guard, as
+                                   // the scalar twin.
     if target < n {
         lse - *x.add(target)
     } else {
@@ -415,7 +415,13 @@ mod tests {
                 let tg = [t as i32];
                 let mut got = [0.0f32; 1];
                 unsafe {
-                    wukong_xent_fwd_f32(buf.as_ptr(), tg.as_ptr(), got.as_mut_ptr(), 1, cols as i64);
+                    wukong_xent_fwd_f32(
+                        buf.as_ptr(),
+                        tg.as_ptr(),
+                        got.as_mut_ptr(),
+                        1,
+                        cols as i64,
+                    );
                 }
                 assert!(
                     got[0].is_nan(),

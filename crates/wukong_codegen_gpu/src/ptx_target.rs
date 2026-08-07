@@ -90,7 +90,10 @@ mod tests {
                 );
             }
         }
-        assert!(HDR_SM80.starts_with(".version 7.8"), "the Ampere floor stays at the r520+ driver");
+        assert!(
+            HDR_SM80.starts_with(".version 7.8"),
+            "the Ampere floor stays at the r520+ driver"
+        );
     }
 
     #[test]

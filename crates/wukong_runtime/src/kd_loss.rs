@@ -43,9 +43,9 @@
 //! per-row max, Σexp and the final q-weighted sum reassociate across lanes — the documented
 //! reassociated-reduction exception: every backend runs this same kernel, so they agree.
 
-use crate::vmath::{exp1, log1};
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
+use crate::vmath::{exp1, log1};
 use rayon::prelude::*;
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
@@ -108,8 +108,8 @@ unsafe fn kd_loss_row_scalar(x: *const f32, q: *const f32, n: usize) -> f32 {
         *smj += exp1(*x.add(t + j) - m);
     }
     let lse = m + log1(hsum8(sm)); // log-sum-exp; ONE scalar log — same op/bits as xent's `lse`.
-    // 3) out = Σ q·(lse − x) — a second 8-lane reduction with the same hsum8. Per lane:
-    //    acc = q·lse + (−q·x)  via  q.mul_add(lse, -(q*x))  — the exact op order the AVX2 path uses.
+                                   // 3) out = Σ q·(lse − x) — a second 8-lane reduction with the same hsum8. Per lane:
+                                   //    acc = q·lse + (−q·x)  via  q.mul_add(lse, -(q*x))  — the exact op order the AVX2 path uses.
     let mut acc = [0.0f32; 8];
     for s in 0..nb {
         let b = s * 8;
@@ -169,8 +169,8 @@ unsafe fn kd_loss_row_avx2(x: *const f32, q: *const f32, n: usize) -> f32 {
         *smj += exp1(*x.add(i + j) - m);
     }
     let lse = m + log1(hsum8(sm)); // same scalar log on the same sum bits as the scalar twin.
-    // 3) out = Σ q·(lse − x): one accumulator, lane `j` folds elements ≡ j (mod 8). Per lane the op
-    //    is fmadd(q, lse, -(q*x)) == the scalar twin's q.mul_add(lse, -(q*x)).
+                                   // 3) out = Σ q·(lse − x): one accumulator, lane `j` folds elements ≡ j (mod 8). Per lane the op
+                                   //    is fmadd(q, lse, -(q*x)) == the scalar twin's q.mul_add(lse, -(q*x)).
     let lsev = _mm256_set1_ps(lse);
     let zero = _mm256_setzero_ps();
     let mut av = _mm256_setzero_ps();

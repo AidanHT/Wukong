@@ -160,15 +160,17 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     .map(|s| s.parse::<usize>())
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| {
-                        format!("--grad-wrt expects comma-separated parameter indices, got `{list}`")
+                        format!(
+                            "--grad-wrt expects comma-separated parameter indices, got `{list}`"
+                        )
                     })?;
             }
             "--train" => opts.grad.train = true,
             _ if arg.starts_with("--train-steps=") => {
                 let v = &arg["--train-steps=".len()..];
-                opts.grad.train_steps = v
-                    .parse()
-                    .map_err(|_| format!("--train-steps expects a non-negative integer, got `{v}`"))?;
+                opts.grad.train_steps = v.parse().map_err(|_| {
+                    format!("--train-steps expects a non-negative integer, got `{v}`")
+                })?;
             }
             _ if arg.starts_with("--train-lr=") => {
                 let v = &arg["--train-lr=".len()..];

@@ -46,19 +46,23 @@ fn time_pair<S: FnMut(), P: FnMut()>(
 }
 
 fn main() {
-    println!("threads: rayon={} physical={}", rayon::current_num_threads(), num_cpus::get_physical());
+    println!(
+        "threads: rayon={} physical={}",
+        rayon::current_num_threads(),
+        num_cpus::get_physical()
+    );
     println!(
         "{:<22} {:>10} {:>10} {:>8}",
         "shape (MxKxN)", "ser GF/s", "par GF/s", "scaling"
     );
     // (M, K, N): the transformer GEMMs at S=128 and S=512, plus reference squares.
     let shapes: &[(usize, usize, usize)] = &[
-        (128, 768, 768),   // S=128 qkv / attn-out proj
-        (128, 768, 3072),  // S=128 ffn up
-        (128, 3072, 768),  // S=128 ffn down
-        (512, 768, 768),   // S=512 qkv / attn-out proj
-        (512, 768, 3072),  // S=512 ffn up
-        (512, 3072, 768),  // S=512 ffn down
+        (128, 768, 768),  // S=128 qkv / attn-out proj
+        (128, 768, 3072), // S=128 ffn up
+        (128, 3072, 768), // S=128 ffn down
+        (512, 768, 768),  // S=512 qkv / attn-out proj
+        (512, 768, 3072), // S=512 ffn up
+        (512, 3072, 768), // S=512 ffn down
         (256, 256, 256),
         (512, 512, 512),
         (1024, 1024, 1024),
@@ -71,17 +75,33 @@ fn main() {
         // Bigger GEMMs get fewer reps so each measurement is ~a few ms.
         let reps = (200_000_000 / (m * k * n).max(1)).clamp(2, 200) as u32;
         // Capture as usize so the serial and parallel closures can coexist (both touch `c`).
-        let (ap, bp, cp) = (a.as_ptr() as usize, b.as_ptr() as usize, c.as_mut_ptr() as usize);
+        let (ap, bp, cp) = (
+            a.as_ptr() as usize,
+            b.as_ptr() as usize,
+            c.as_mut_ptr() as usize,
+        );
         let (mi, ki, ni) = (m as i64, k as i64, n as i64);
         let (ser, par, scaling) = time_pair(
             || unsafe {
                 wukong_runtime::wukong_sgemm_nt(
-                    ap as *const f32, bp as *const f32, cp as *mut f32, mi, ki, ni, 0,
+                    ap as *const f32,
+                    bp as *const f32,
+                    cp as *mut f32,
+                    mi,
+                    ki,
+                    ni,
+                    0,
                 )
             },
             || unsafe {
                 wukong_runtime::wukong_sgemm_nt_parallel(
-                    ap as *const f32, bp as *const f32, cp as *mut f32, mi, ki, ni, 0,
+                    ap as *const f32,
+                    bp as *const f32,
+                    cp as *mut f32,
+                    mi,
+                    ki,
+                    ni,
+                    0,
                 )
             },
             25,

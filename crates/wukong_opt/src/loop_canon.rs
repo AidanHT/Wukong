@@ -77,7 +77,9 @@ impl Pass for LoopCanon {
         // steady state is "nothing to do", where this costs exactly one analysis.
         for _ in 0..MAX_REWRITES {
             let forest = analyze(f, cache);
-            let Some(action) = pick(f, &forest) else { break };
+            let Some(action) = pick(f, &forest) else {
+                break;
+            };
             match action {
                 Action::Preheader(id) => insert_preheader(f, forest.get(id)),
                 Action::Latch(id) => insert_latch(f, forest.get(id)),
@@ -525,13 +527,13 @@ mod tests {
         //   bb1(p) -> bb2 | bb3 ; bb2 -> bb1(p+1) ; bb3 -> bb1(p+2) | bb4
         let mut f = build(
             vec![
-                MirType::I1,   // v0 cond
-                MirType::I32,  // v1 zero
-                MirType::I32,  // v2 one
-                MirType::I32,  // v3 header param
-                MirType::I32,  // v4 = p + 1
-                MirType::I32,  // v5 = p + 2
-                MirType::I32,  // v6 two
+                MirType::I1,  // v0 cond
+                MirType::I32, // v1 zero
+                MirType::I32, // v2 one
+                MirType::I32, // v3 header param
+                MirType::I32, // v4 = p + 1
+                MirType::I32, // v5 = p + 2
+                MirType::I32, // v6 two
             ],
             vec![
                 (
@@ -650,7 +652,10 @@ mod tests {
             while_after, brk_after,
             "the two spellings must converge: while {while_after:?} vs break {brk_after:?}"
         );
-        assert_eq!(while_before, while_after, "the `while` form is already canonical");
+        assert_eq!(
+            while_before, while_after,
+            "the `while` form is already canonical"
+        );
     }
 
     /// `(predicate, does the true arm stay in the loop)` for the loop's single exit test.
@@ -661,12 +666,12 @@ mod tests {
             let inside: FxHashSet<u32> = l.blocks.iter().map(|b| b.0).collect();
             for &(from, _) in &l.exits {
                 let blk = &f.blocks[from.0 as usize];
-                if let Terminator::CondBr {
-                    cond, then_blk, ..
-                } = &blk.term
-                {
-                    if let Some(Op::Cmp(p, ..)) =
-                        blk.insts.iter().find(|i| i.result == Some(*cond)).map(|i| &i.op)
+                if let Terminator::CondBr { cond, then_blk, .. } = &blk.term {
+                    if let Some(Op::Cmp(p, ..)) = blk
+                        .insts
+                        .iter()
+                        .find(|i| i.result == Some(*cond))
+                        .map(|i| &i.op)
                     {
                         out.push((p.name().to_string(), inside.contains(&then_blk.0)));
                     }
@@ -680,7 +685,8 @@ mod tests {
     fn a_multiply_used_exit_condition_is_left_alone() {
         // The compare feeds the branch *and* a stored value, so negating it in place would flip the
         // stored bool too. The pass must decline rather than rewrite.
-        let src = "fn k(mut o: [i32; 64], n: i32) -> i32 { let mut i: i32 = 0; let mut last: i32 = 0; \
+        let src =
+            "fn k(mut o: [i32; 64], n: i32) -> i32 { let mut i: i32 = 0; let mut last: i32 = 0; \
                    loop { let done: bool = i >= n; last = done as i32; if done { break; } \
                           o[i] = i; i = i + 1; } return last; } \
                    fn main() -> i32 { return 0; }";
@@ -702,7 +708,11 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(preds(&before), preds(&f), "a multiply-used compare must not be negated");
+        assert_eq!(
+            preds(&before),
+            preds(&f),
+            "a multiply-used compare must not be negated"
+        );
     }
 
     #[test]
@@ -744,7 +754,10 @@ mod tests {
 
     // ---- hand-built CFG helpers ----
 
-    fn build(value_types: Vec<MirType>, blocks: Vec<(Vec<u32>, Vec<Inst>, Terminator)>) -> Function {
+    fn build(
+        value_types: Vec<MirType>,
+        blocks: Vec<(Vec<u32>, Vec<Inst>, Terminator)>,
+    ) -> Function {
         let mut interner = Interner::new();
         Function {
             name: interner.intern("t"),

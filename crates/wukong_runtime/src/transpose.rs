@@ -263,7 +263,12 @@ unsafe fn transpose_parallel<T: Copy + Send + Sync>(
 /// # Safety
 /// `src` valid for `rows*cols`, `dst` for `cols*rows` f32, non-overlapping.
 #[no_mangle]
-pub unsafe extern "C" fn wukong_transpose_f32(src: *const f32, dst: *mut f32, rows: i64, cols: i64) {
+pub unsafe extern "C" fn wukong_transpose_f32(
+    src: *const f32,
+    dst: *mut f32,
+    rows: i64,
+    cols: i64,
+) {
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -318,7 +323,12 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
 /// # Safety
 /// `src` valid for `rows*cols`, `dst` for `cols*rows` `u16`, non-overlapping.
 #[no_mangle]
-pub unsafe extern "C" fn wukong_transpose_u16(src: *const u16, dst: *mut u16, rows: i64, cols: i64) {
+pub unsafe extern "C" fn wukong_transpose_u16(
+    src: *const u16,
+    dst: *mut u16,
+    rows: i64,
+    cols: i64,
+) {
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -383,7 +393,12 @@ mod tests {
             let mut got_par = vec![0.0f32; r * c];
             unsafe {
                 wukong_transpose_f32(src.as_ptr(), got.as_mut_ptr(), r as i64, c as i64);
-                wukong_transpose_f32_parallel(src.as_ptr(), got_par.as_mut_ptr(), r as i64, c as i64);
+                wukong_transpose_f32_parallel(
+                    src.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    r as i64,
+                    c as i64,
+                );
             }
             assert_eq!(got, want, "transpose {r}x{c} vs naive");
             assert_eq!(got, got_par, "transpose serial vs parallel {r}x{c}");
@@ -416,7 +431,12 @@ mod tests {
             let mut got_par = vec![0u16; r * c];
             unsafe {
                 wukong_transpose_u16(src.as_ptr(), got.as_mut_ptr(), r as i64, c as i64);
-                wukong_transpose_u16_parallel(src.as_ptr(), got_par.as_mut_ptr(), r as i64, c as i64);
+                wukong_transpose_u16_parallel(
+                    src.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    r as i64,
+                    c as i64,
+                );
             }
             assert_eq!(got, want, "u16 transpose {r}x{c} vs naive");
             assert_eq!(got, got_par, "u16 transpose serial vs parallel {r}x{c}");

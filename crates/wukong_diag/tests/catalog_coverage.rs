@@ -91,7 +91,11 @@ fn emitted_codes() -> BTreeMap<String, String> {
     for path in &files {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let src = String::from_utf8_lossy(&bytes);
-        let rel = path.strip_prefix(&root).unwrap_or(path).display().to_string();
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
         for (code, line) in codes_in(&src) {
             seen.entry(code).or_insert_with(|| format!("{rel}:{line}"));
         }

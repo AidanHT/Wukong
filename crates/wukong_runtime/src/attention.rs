@@ -180,11 +180,8 @@ unsafe fn attention_avx2(
                 let mut sv = _mm256_setzero_ps();
                 let mut t = 0;
                 while t < dv {
-                    sv = _mm256_fmadd_ps(
-                        _mm256_loadu_ps(qi.add(t)),
-                        _mm256_loadu_ps(kj.add(t)),
-                        sv,
-                    );
+                    sv =
+                        _mm256_fmadd_ps(_mm256_loadu_ps(qi.add(t)), _mm256_loadu_ps(kj.add(t)), sv);
                     t += 8;
                 }
                 let mut x = hsum256(sv);
@@ -204,7 +201,10 @@ unsafe fn attention_avx2(
                 let mut t = 0;
                 while t < dv {
                     let a = _mm256_mul_ps(_mm256_loadu_ps(accp.add(t)), corrv);
-                    _mm256_storeu_ps(accp.add(t), _mm256_fmadd_ps(pv, _mm256_loadu_ps(vj.add(t)), a));
+                    _mm256_storeu_ps(
+                        accp.add(t),
+                        _mm256_fmadd_ps(pv, _mm256_loadu_ps(vj.add(t)), a),
+                    );
                     t += 8;
                 }
                 while t < d {

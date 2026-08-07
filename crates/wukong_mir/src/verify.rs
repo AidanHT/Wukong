@@ -370,7 +370,10 @@ impl Verifier<'_> {
         // `Store` never produces a result; `Call` may be void (e.g. the `print` intrinsic) or
         // value-producing; `VecKernelCall` is void when elementwise and f32 when a reduction (checked
         // against the recipe below). Every other op must produce exactly one result.
-        let must_produce = !matches!(op, Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. });
+        let must_produce = !matches!(
+            op,
+            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. }
+        );
         if must_produce && result.is_none() {
             self.err(format!("operation {op:?} must produce a result value"));
         }
@@ -880,10 +883,7 @@ mod tests {
         b.ret(None);
         // The function registered no kernels, so `#0` refers to nothing.
         let errs = verify_function(&b.finish());
-        assert!(
-            errs.iter().any(|e| e.contains("out of range")),
-            "{errs:?}"
-        );
+        assert!(errs.iter().any(|e| e.contains("out of range")), "{errs:?}");
     }
 
     // ---- rules the verifier already enforced but that nothing pinned ----

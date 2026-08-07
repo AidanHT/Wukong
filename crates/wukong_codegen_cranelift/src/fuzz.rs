@@ -738,20 +738,45 @@ fn vmath_kernels_match_f64_reference() {
             Regime::Normal,
             1e-4,
         ),
-        ("mish", |v| {
-            let sp = v.max(0.0) + (1.0 + (-v.abs()).exp()).ln();
-            v * sp.tanh()
-        }, Regime::Normal, 1e-4),
-        ("selu", |v| {
-            let (lam, alpha) = (1.050_700_987_355_480_5_f64, 1.673_263_242_354_377_3_f64);
-            lam * if v > 0.0 { v } else { alpha * (v.exp() - 1.0) }
-        }, Regime::Normal, 1e-4),
+        (
+            "mish",
+            |v| {
+                let sp = v.max(0.0) + (1.0 + (-v.abs()).exp()).ln();
+                v * sp.tanh()
+            },
+            Regime::Normal,
+            1e-4,
+        ),
+        (
+            "selu",
+            |v| {
+                let (lam, alpha) = (1.050_700_987_355_480_5_f64, 1.673_263_242_354_377_3_f64);
+                lam * if v > 0.0 { v } else { alpha * (v.exp() - 1.0) }
+            },
+            Regime::Normal,
+            1e-4,
+        ),
         ("softsign", |v| v / (1.0 + v.abs()), Regime::Normal, 1e-4),
         // logsigmoid(x) = ln σ(x) = −softplus(−x) = −(max(−x,0) + ln(1 + e^−|x|)).
-        ("logsigmoid", |v| -((-v).max(0.0) + (1.0 + (-v.abs()).exp()).ln()), Regime::Normal, 1e-4),
+        (
+            "logsigmoid",
+            |v| -((-v).max(0.0) + (1.0 + (-v.abs()).exp()).ln()),
+            Regime::Normal,
+            1e-4,
+        ),
         // hardsigmoid / hardswish are piecewise-linear clamps — exact bar f32 rounding.
-        ("hardsigmoid", |v| (v + 3.0).clamp(0.0, 6.0) / 6.0, Regime::Normal, 1e-4),
-        ("hardswish", |v| v * ((v + 3.0).clamp(0.0, 6.0) / 6.0), Regime::Normal, 1e-4),
+        (
+            "hardsigmoid",
+            |v| (v + 3.0).clamp(0.0, 6.0) / 6.0,
+            Regime::Normal,
+            1e-4,
+        ),
+        (
+            "hardswish",
+            |v| v * ((v + 3.0).clamp(0.0, 6.0) / 6.0),
+            Regime::Normal,
+            1e-4,
+        ),
         // --- Trig / inverse-trig (Cephes ≈1 ULP; |x|>1 → NaN want is skipped by the loop) -----
         ("sin", |v| v.sin(), Regime::Normal, 1e-4),
         ("cos", |v| v.cos(), Regime::Normal, 1e-4),
@@ -775,17 +800,26 @@ fn vmath_kernels_match_f64_reference() {
         // erf: Abramowitz–Stegun 7.1.26 high-precision f64 reference (std f64 has no erf). Its own
         // ≈1.5e-7 absolute error dominates near the x=0 zero, so the bound is 1e-3 (still catches
         // any gross kernel error; the full-buffer fuzzer gates interp==native exactly).
-        ("erf", |v| {
-            let (a1, a2, a3, a4, a5, p) = (
-                0.254_829_592_f64, -0.284_496_736_f64, 1.421_413_741_f64,
-                -1.453_152_027_f64, 1.061_405_429_f64, 0.327_591_1_f64,
-            );
-            let sign = if v >= 0.0 { 1.0 } else { -1.0 };
-            let x = v.abs();
-            let t = 1.0 / (1.0 + p * x);
-            let y = 1.0 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) * (-x * x).exp();
-            sign * y
-        }, Regime::Normal, 1e-3),
+        (
+            "erf",
+            |v| {
+                let (a1, a2, a3, a4, a5, p) = (
+                    0.254_829_592_f64,
+                    -0.284_496_736_f64,
+                    1.421_413_741_f64,
+                    -1.453_152_027_f64,
+                    1.061_405_429_f64,
+                    0.327_591_1_f64,
+                );
+                let sign = if v >= 0.0 { 1.0 } else { -1.0 };
+                let x = v.abs();
+                let t = 1.0 / (1.0 + p * x);
+                let y = 1.0 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) * (-x * x).exp();
+                sign * y
+            },
+            Regime::Normal,
+            1e-3,
+        ),
         ("cbrt", |v| v.cbrt(), Regime::Normal, 1e-4),
         // tan (pole at π/2 ∈ [−2,2)), tanhshrink and elu (catastrophic cancellation near 0) are
         // intentionally omitted — their relative error is unbounded by construction, not by a kernel

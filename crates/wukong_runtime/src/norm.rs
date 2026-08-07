@@ -27,9 +27,9 @@
 //! same `[f32; 8]` the scalar twin builds and calls the *same* combine — so the AVX2 kernel and the
 //! scalar fallback agree bit-for-bit too (pinned by a unit test across partial-chunk / tail sizes).
 
-use crate::vmath::{exp1, log1};
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
+use crate::vmath::{exp1, log1};
 use rayon::prelude::*;
 
 // Norm op codes (shared with the recognizer in `wukong_mir_build`).
@@ -157,7 +157,7 @@ unsafe fn logsoftmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
         *smj += exp1(*x.add(t + j) - m);
     }
     let off = m + log1(hsum8(sm)); // m + log-sum-exp; ONE scalar log — the bit-exact pivot.
-    // 3) out[i] = (x[i] - m) - ls == x[i] - off.
+                                   // 3) out[i] = (x[i] - m) - ls == x[i] - off.
     for i in 0..n {
         *out.add(i) = *x.add(i) - off;
     }
@@ -1127,7 +1127,14 @@ mod tests {
         // log-softmax — reuse `mx` and `den` (= Σ exp(x-mx)) from the softmax block; ls = log(den).
         let mut lsm = vec![0.0f32; n];
         unsafe {
-            wukong_norm_f32(x.as_ptr(), lsm.as_mut_ptr(), 1, n as i64, 0, NORM_LOGSOFTMAX);
+            wukong_norm_f32(
+                x.as_ptr(),
+                lsm.as_mut_ptr(),
+                1,
+                n as i64,
+                0,
+                NORM_LOGSOFTMAX,
+            );
         }
         let ls = den.ln();
         for i in 0..n {
@@ -1138,7 +1145,10 @@ mod tests {
                 lsm[i]
             );
             // exp(log-softmax) must equal softmax — the two are consistent.
-            assert!(((lsm[i] as f64).exp() - sm[i] as f64).abs() < 1e-4, "exp(logsoftmax)!=softmax i={i}");
+            assert!(
+                ((lsm[i] as f64).exp() - sm[i] as f64).abs() < 1e-4,
+                "exp(logsoftmax)!=softmax i={i}"
+            );
         }
 
         // layernorm

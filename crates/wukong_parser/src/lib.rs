@@ -587,7 +587,13 @@ impl<'a> Parser<'a> {
             }
             self.bump();
             let ty = self.parse_type();
-            e = self.finish_expr(e.span, ExprKind::Cast { expr: Box::new(e), ty });
+            e = self.finish_expr(
+                e.span,
+                ExprKind::Cast {
+                    expr: Box::new(e),
+                    ty,
+                },
+            );
         }
         e
     }
@@ -652,7 +658,10 @@ impl<'a> Parser<'a> {
             // in `parse_cast`; the `_ => break` arm below builds nothing, so it is not charged. No
             // restore is needed here: the sole caller `parse_prefix` snapshots and restores
             // `self.depth` around us.
-            if matches!(self.kind(), T::LParen | T::LBracket | T::Dot | T::ColonColon) {
+            if matches!(
+                self.kind(),
+                T::LParen | T::LBracket | T::Dot | T::ColonColon
+            ) {
                 self.depth += 1;
                 if self.depth > Self::MAX_DEPTH {
                     let sp = self.span();
@@ -1364,11 +1373,7 @@ impl<'a> Parser<'a> {
         self.bump(); // while
         let cond = self.parse_cond();
         let body = self.parse_block();
-        StmtKind::While {
-            label,
-            cond,
-            body,
-        }
+        StmtKind::While { label, cond, body }
     }
 
     fn parse_for(&mut self, label: Option<Ident>) -> StmtKind {
@@ -1618,7 +1623,10 @@ impl<'a> Parser<'a> {
                     self.error(
                         start,
                         "E0206",
-                        format!("expected an integer after `-`, found {}", self.kind().describe()),
+                        format!(
+                            "expected an integer after `-`, found {}",
+                            self.kind().describe()
+                        ),
                     );
                     PatKind::Wildcard
                 }
@@ -1976,7 +1984,10 @@ mod tests {
     /// used to parse as a 0-element tensor and `vec[f32, 4294967304]` as `f32x8`.
     #[test]
     fn radix_and_out_of_range_extents() {
-        assert_eq!(ty("Tensor[f32, 0x10, 0b101, 0o17]"), "Tensor[f32, 16, 5, 15]");
+        assert_eq!(
+            ty("Tensor[f32, 0x10, 0b101, 0o17]"),
+            "Tensor[f32, 16, 5, 15]"
+        );
         assert_eq!(ty("Tensor[f32, 1_000, 16usize]"), "Tensor[f32, 1000, 16]");
         assert_eq!(ty("vec[f32, 0x8]"), "f32x8");
 
@@ -2047,19 +2058,28 @@ mod tests {
                 let chain = format!("1{}", "+1".repeat(5000));
                 let mut i = Interner::new();
                 let (_e, d) = parse_expr_str(&chain, SourceId(0), &mut i);
-                assert!(has_e0209(&d), "long `+` chain should report E0209, got {d:?}");
+                assert!(
+                    has_e0209(&d),
+                    "long `+` chain should report E0209, got {d:?}"
+                );
 
                 // Case 1: 4000 nested parentheses (recursive descent).
                 let parens = format!("{}1{}", "(".repeat(4000), ")".repeat(4000));
                 let mut i = Interner::new();
                 let (_e, d) = parse_expr_str(&parens, SourceId(0), &mut i);
-                assert!(has_e0209(&d), "nested parens should report E0209, got {d:?}");
+                assert!(
+                    has_e0209(&d),
+                    "nested parens should report E0209, got {d:?}"
+                );
 
                 // Case 2: 4000 nested array types (recursive `parse_type`).
                 let ty = format!("{}i32{}", "[".repeat(4000), "; 1]".repeat(4000));
                 let mut i = Interner::new();
                 let (_t, d) = parse_type_str(&ty, SourceId(0), &mut i);
-                assert!(has_e0209(&d), "nested array type should report E0209, got {d:?}");
+                assert!(
+                    has_e0209(&d),
+                    "nested array type should report E0209, got {d:?}"
+                );
 
                 // A single clean diagnostic, not a cascade: the parens case reports E0209 once.
                 let parens = format!("{}1{}", "(".repeat(4000), ")".repeat(4000));
@@ -2105,7 +2125,10 @@ mod tests {
                 // A realistic postfix chain stays far under the limit.
                 let mut i = Interner::new();
                 let (_e, d) = parse_expr_str("a.b.c[0].d(1).e", SourceId(0), &mut i);
-                assert!(d.is_empty(), "short postfix chain must parse cleanly: {d:?}");
+                assert!(
+                    d.is_empty(),
+                    "short postfix chain must parse cleanly: {d:?}"
+                );
             })
             .expect("spawn parser thread")
             .join()
@@ -2129,19 +2152,28 @@ mod tests {
                 let blocks = format!("{}0{}", "{".repeat(n), "}".repeat(n));
                 let mut i = Interner::new();
                 let (_e, d) = parse_expr_str(&blocks, SourceId(0), &mut i);
-                assert!(has_e0209(&d), "nested blocks should report E0209, got {d:?}");
+                assert!(
+                    has_e0209(&d),
+                    "nested blocks should report E0209, got {d:?}"
+                );
 
                 // A long `if … else if … else if …` chain (direct `parse_if` recursion).
                 let elifs = format!("{}{{ 0 }}", "if true { 0 } else ".repeat(n));
                 let mut i = Interner::new();
                 let (_e, d) = parse_expr_str(&elifs, SourceId(0), &mut i);
-                assert!(has_e0209(&d), "deep else-if chain should report E0209, got {d:?}");
+                assert!(
+                    has_e0209(&d),
+                    "deep else-if chain should report E0209, got {d:?}"
+                );
 
                 // A `match` whose arm body is another `match`, nested deep.
                 let matches = format!("{}0{}", "match 0 { _ => ".repeat(n), " }".repeat(n));
                 let mut i = Interner::new();
                 let (_e, d) = parse_expr_str(&matches, SourceId(0), &mut i);
-                assert!(has_e0209(&d), "nested match arms should report E0209, got {d:?}");
+                assert!(
+                    has_e0209(&d),
+                    "nested match arms should report E0209, got {d:?}"
+                );
 
                 // Nested loop bodies `while … { while … { … } }` (statement form, via parse_module).
                 let whiles = format!(
@@ -2151,7 +2183,10 @@ mod tests {
                 );
                 let mut i = Interner::new();
                 let (_m, d) = parse_module(&whiles, SourceId(0), &mut i);
-                assert!(has_e0209(&d), "nested loop bodies should report E0209, got {d:?}");
+                assert!(
+                    has_e0209(&d),
+                    "nested loop bodies should report E0209, got {d:?}"
+                );
             })
             .expect("spawn parser thread")
             .join()
@@ -2171,35 +2206,53 @@ mod tests {
         let parens = format!("{}1{}", "(".repeat(50), ")".repeat(50));
         let mut i = Interner::new();
         let (_e, d) = parse_expr_str(&parens, SourceId(0), &mut i);
-        assert!(d.is_empty(), "50-deep parens should parse cleanly, got {d:?}");
+        assert!(
+            d.is_empty(),
+            "50-deep parens should parse cleanly, got {d:?}"
+        );
 
         // A 16-deep array type.
         let ty = format!("{}i32{}", "[".repeat(16), "; 1]".repeat(16));
         let mut i = Interner::new();
         let (_t, d) = parse_type_str(&ty, SourceId(0), &mut i);
-        assert!(d.is_empty(), "16-deep array type should parse cleanly, got {d:?}");
+        assert!(
+            d.is_empty(),
+            "16-deep array type should parse cleanly, got {d:?}"
+        );
 
         // 64-deep blocks, a 64-arm-deep else-if chain, a 64-deep match nest, and 64-deep loop
         // bodies all sit far under the limit — the new structural guards must not reject them.
         let blocks = format!("{}0{}", "{".repeat(64), "}".repeat(64));
         let mut i = Interner::new();
         let (_e, d) = parse_expr_str(&blocks, SourceId(0), &mut i);
-        assert!(d.is_empty(), "64-deep blocks should parse cleanly, got {d:?}");
+        assert!(
+            d.is_empty(),
+            "64-deep blocks should parse cleanly, got {d:?}"
+        );
 
         let elifs = format!("{}{{ 0 }}", "if true { 0 } else ".repeat(64));
         let mut i = Interner::new();
         let (_e, d) = parse_expr_str(&elifs, SourceId(0), &mut i);
-        assert!(d.is_empty(), "64-deep else-if chain should parse cleanly, got {d:?}");
+        assert!(
+            d.is_empty(),
+            "64-deep else-if chain should parse cleanly, got {d:?}"
+        );
 
         let matches = format!("{}0{}", "match 0 { _ => ".repeat(64), " }".repeat(64));
         let mut i = Interner::new();
         let (_e, d) = parse_expr_str(&matches, SourceId(0), &mut i);
-        assert!(d.is_empty(), "64-deep match nest should parse cleanly, got {d:?}");
+        assert!(
+            d.is_empty(),
+            "64-deep match nest should parse cleanly, got {d:?}"
+        );
 
         // A wide-but-shallow block (many sequential statements) must not accumulate depth.
         let wide = format!("{{ {} 0 }}", "let x = 1; ".repeat(500));
         let mut i = Interner::new();
         let (_e, d) = parse_expr_str(&wide, SourceId(0), &mut i);
-        assert!(d.is_empty(), "wide shallow block should parse cleanly, got {d:?}");
+        assert!(
+            d.is_empty(),
+            "wide shallow block should parse cleanly, got {d:?}"
+        );
     }
 }

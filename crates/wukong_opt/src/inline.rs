@@ -158,7 +158,8 @@ pub fn inline_program(program: &mut Program) -> bool {
         for &ci in comp {
             let ci = ci as usize;
             let original_size = func_insts(&program.funcs[ci]);
-            let size_cap = GROWTH_LIMIT.min(original_size.saturating_mul(GROWTH_FACTOR).max(BASE_LIMIT));
+            let size_cap =
+                GROWTH_LIMIT.min(original_size.saturating_mul(GROWTH_FACTOR).max(BASE_LIMIT));
             // Which of the caller's blocks sit inside a loop; extended in place as we splice.
             let mut in_loop = loop_blocks(&program.funcs[ci]);
             let mut splices = 0u32;

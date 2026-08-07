@@ -166,9 +166,31 @@ impl MlpTrainer {
     /// Forward: `H_pre = X·W1ᵀ`, `H = relu(H_pre)`, `Y = H·W2ᵀ` — all resident.
     pub fn forward(&mut self, g: &mut Gpu) -> Result<(), DriverError> {
         let (b, i, h, o) = (self.b, self.i, self.h, self.o);
-        gemm_dispatch(self.prec, g, false, true, &self.x, &self.w1, &mut self.h_pre, b, h, i)?;
+        gemm_dispatch(
+            self.prec,
+            g,
+            false,
+            true,
+            &self.x,
+            &self.w1,
+            &mut self.h_pre,
+            b,
+            h,
+            i,
+        )?;
         relu_fwd_device(g, &self.h_pre, &mut self.hact, b * h)?;
-        gemm_dispatch(self.prec, g, false, true, &self.hact, &self.w2, &mut self.y, b, o, h)?;
+        gemm_dispatch(
+            self.prec,
+            g,
+            false,
+            true,
+            &self.hact,
+            &self.w2,
+            &mut self.y,
+            b,
+            o,
+            h,
+        )?;
         Ok(())
     }
 
@@ -181,7 +203,18 @@ impl MlpTrainer {
     /// matrix (see [`crate::ptx_autodiff_bwd::attention_backward`]).
     pub fn recompute_activations(&mut self, g: &mut Gpu) -> Result<(), DriverError> {
         let (b, i, h) = (self.b, self.i, self.h);
-        gemm_dispatch(self.prec, g, false, true, &self.x, &self.w1, &mut self.h_pre, b, h, i)?;
+        gemm_dispatch(
+            self.prec,
+            g,
+            false,
+            true,
+            &self.x,
+            &self.w1,
+            &mut self.h_pre,
+            b,
+            h,
+            i,
+        )?;
         relu_fwd_device(g, &self.h_pre, &mut self.hact, b * h)?;
         Ok(())
     }
@@ -193,13 +226,54 @@ impl MlpTrainer {
         let (b, i, h, o) = (self.b, self.i, self.h, self.o);
         mse_grad_device(g, &self.y, &self.target, &mut self.dy, b * o, scale)?;
         // dW2[O×H] = dYᵀ[O×B]·H[B×H]
-        gemm_dispatch(self.prec, g, true, false, &self.dy, &self.hact, &mut self.dw2, o, h, b)?;
+        gemm_dispatch(
+            self.prec,
+            g,
+            true,
+            false,
+            &self.dy,
+            &self.hact,
+            &mut self.dw2,
+            o,
+            h,
+            b,
+        )?;
         // dH[B×H] = dY[B×O]·W2[O×H]
-        gemm_dispatch(self.prec, g, false, false, &self.dy, &self.w2, &mut self.dh, b, h, o)?;
+        gemm_dispatch(
+            self.prec,
+            g,
+            false,
+            false,
+            &self.dy,
+            &self.w2,
+            &mut self.dh,
+            b,
+            h,
+            o,
+        )?;
         // dH_pre = dH ⊙ relu'(H_pre)
-        act_bwd_device(g, VM_RELU, &self.dh, &self.h_pre, &self.hact, &mut self.dh_pre, b * h)?;
+        act_bwd_device(
+            g,
+            VM_RELU,
+            &self.dh,
+            &self.h_pre,
+            &self.hact,
+            &mut self.dh_pre,
+            b * h,
+        )?;
         // dW1[H×I] = dH_preᵀ[H×B]·X[B×I]
-        gemm_dispatch(self.prec, g, true, false, &self.dh_pre, &self.x, &mut self.dw1, h, i, b)?;
+        gemm_dispatch(
+            self.prec,
+            g,
+            true,
+            false,
+            &self.dh_pre,
+            &self.x,
+            &mut self.dw1,
+            h,
+            i,
+            b,
+        )?;
         Ok(())
     }
 
@@ -216,8 +290,24 @@ impl MlpTrainer {
         hpv[hp::BC2] = 1.0 - (cfg.beta2 as f64).powi(t) as f32;
         let hp_d = g.stream.memcpy_stod(&hpv)?;
         let (n1, n2) = (self.h * self.i, self.o * self.h);
-        adamw_step_device(g, &mut self.w1, &self.dw1, &mut self.m1, &mut self.v1, &hp_d, n1)?;
-        adamw_step_device(g, &mut self.w2, &self.dw2, &mut self.m2, &mut self.v2, &hp_d, n2)?;
+        adamw_step_device(
+            g,
+            &mut self.w1,
+            &self.dw1,
+            &mut self.m1,
+            &mut self.v1,
+            &hp_d,
+            n1,
+        )?;
+        adamw_step_device(
+            g,
+            &mut self.w2,
+            &self.dw2,
+            &mut self.m2,
+            &mut self.v2,
+            &hp_d,
+            n2,
+        )?;
         Ok(())
     }
 
@@ -233,16 +323,28 @@ impl MlpTrainer {
     /// One resident step (fwd + bwd + fused AdamW) with a **pre-uploaded** hp device buffer — pure
     /// kernel chain, no per-step host traffic. The throughput-measurement entry (the `bc` bias
     /// corrections are baked into `hp_d`; for a fixed-cadence timing loop they barely move).
-    pub fn step_devhp(
-        &mut self,
-        g: &mut Gpu,
-        hp_d: &CudaSlice<f32>,
-    ) -> Result<(), DriverError> {
+    pub fn step_devhp(&mut self, g: &mut Gpu, hp_d: &CudaSlice<f32>) -> Result<(), DriverError> {
         self.forward(g)?;
         self.backward(g, 2.0)?;
         let (n1, n2) = (self.h * self.i, self.o * self.h);
-        adamw_step_device(g, &mut self.w1, &self.dw1, &mut self.m1, &mut self.v1, hp_d, n1)?;
-        adamw_step_device(g, &mut self.w2, &self.dw2, &mut self.m2, &mut self.v2, hp_d, n2)?;
+        adamw_step_device(
+            g,
+            &mut self.w1,
+            &self.dw1,
+            &mut self.m1,
+            &mut self.v1,
+            hp_d,
+            n1,
+        )?;
+        adamw_step_device(
+            g,
+            &mut self.w2,
+            &self.dw2,
+            &mut self.m2,
+            &mut self.v2,
+            hp_d,
+            n2,
+        )?;
         Ok(())
     }
 
@@ -258,12 +360,18 @@ impl MlpTrainer {
 
     /// Read the parameter gradients back to the host (`dW1`, `dW2`) — the gradient gate.
     pub fn grads_host(&self, g: &Gpu) -> Result<(Vec<f32>, Vec<f32>), DriverError> {
-        Ok((g.stream.memcpy_dtov(&self.dw1)?, g.stream.memcpy_dtov(&self.dw2)?))
+        Ok((
+            g.stream.memcpy_dtov(&self.dw1)?,
+            g.stream.memcpy_dtov(&self.dw2)?,
+        ))
     }
 
     /// Read the current weights back to the host (`W1`, `W2`).
     pub fn weights_host(&self, g: &Gpu) -> Result<(Vec<f32>, Vec<f32>), DriverError> {
-        Ok((g.stream.memcpy_dtov(&self.w1)?, g.stream.memcpy_dtov(&self.w2)?))
+        Ok((
+            g.stream.memcpy_dtov(&self.w1)?,
+            g.stream.memcpy_dtov(&self.w2)?,
+        ))
     }
 }
 
@@ -463,7 +571,10 @@ mod tests {
             }
             eprintln!("resident MLP (f16): loss {l0:.4e} -> {prev:.4e} over 200 AdamW steps");
             // Looser than the f32 gate (0.2): f16 rounding floors how far the loss can fall.
-            assert!(prev < l0 * 0.5, "f16 loss did not fall enough: {l0:.3e} -> {prev:.3e}");
+            assert!(
+                prev < l0 * 0.5,
+                "f16 loss did not fall enough: {l0:.3e} -> {prev:.3e}"
+            );
         });
     }
 
@@ -553,8 +664,13 @@ mod tests {
                 }
                 prev = cur;
             }
-            eprintln!("resident MLP: loss {l0:.4e} -> {prev:.4e} over 300 AdamW steps ({worse} up-blips)");
-            assert!(prev < l0 * 0.2, "loss did not fall enough: {l0:.3e} -> {prev:.3e}");
+            eprintln!(
+                "resident MLP: loss {l0:.4e} -> {prev:.4e} over 300 AdamW steps ({worse} up-blips)"
+            );
+            assert!(
+                prev < l0 * 0.2,
+                "loss did not fall enough: {l0:.3e} -> {prev:.3e}"
+            );
             assert!(worse < 15, "too many loss increases ({worse}) — unstable");
         });
     }
@@ -678,7 +794,10 @@ mod tests {
                 );
                 // Regression floor (clock-invariant ratio): the reg-blocked routing measures ~32-35%;
                 // a revert to the naive kernel drops to ~7-10%. 20% catches that without flakiness.
-                assert!(pct >= 20.0, "training GEMM regressed to {pct:.1}% of cuBLAS (expected >=20%)");
+                assert!(
+                    pct >= 20.0,
+                    "training GEMM regressed to {pct:.1}% of cuBLAS (expected >=20%)"
+                );
             }
         });
     }
@@ -888,8 +1007,28 @@ mod tests {
         mse_grad_device(g, &tr.y, &tr.target, &mut tr.dy, b * o, 2.0).unwrap();
         cublas_gemm_rm_narrow(blas, g, true, false, &tr.dy, &tr.hact, &mut tr.dw2, o, h, b);
         cublas_gemm_rm_narrow(blas, g, false, false, &tr.dy, &tr.w2, &mut tr.dh, b, h, o);
-        act_bwd_device(g, VM_RELU, &tr.dh, &tr.h_pre, &tr.hact, &mut tr.dh_pre, b * h).unwrap();
-        cublas_gemm_rm_narrow(blas, g, true, false, &tr.dh_pre, &tr.x, &mut tr.dw1, h, i, b);
+        act_bwd_device(
+            g,
+            VM_RELU,
+            &tr.dh,
+            &tr.h_pre,
+            &tr.hact,
+            &mut tr.dh_pre,
+            b * h,
+        )
+        .unwrap();
+        cublas_gemm_rm_narrow(
+            blas,
+            g,
+            true,
+            false,
+            &tr.dh_pre,
+            &tr.x,
+            &mut tr.dw1,
+            h,
+            i,
+            b,
+        );
         adamw_step_device(g, &mut tr.w1, &tr.dw1, &mut tr.m1, &mut tr.v1, hp_d, h * i).unwrap();
         adamw_step_device(g, &mut tr.w2, &tr.dw2, &mut tr.m2, &mut tr.v2, hp_d, o * h).unwrap();
     }
@@ -917,10 +1056,19 @@ mod tests {
                 cublas_gemm_rm_narrow(&blas, g, ta, tb, &a_d, &b_d, &mut c_d, m, n, k);
                 let got = g.stream.memcpy_dtov(&c_d).unwrap();
                 let want = gemm_f16(g, ta, tb, &a, &bb, m, n, k).unwrap();
-                assert_close(&format!("eager cuBLAS cfg ta={ta} tb={tb}"), &got, &want, 5e-2, 1e-2);
+                assert_close(
+                    &format!("eager cuBLAS cfg ta={ta} tb={tb}"),
+                    &got,
+                    &want,
+                    5e-2,
+                    1e-2,
+                );
             }
             // (2) Timing: fused (Wukong WMMA) vs eager (cuBLAS), compute-bound then launch-bound.
-            for &(b, i, h, o) in &[(512usize, 768usize, 3072usize, 768usize), (64, 768, 3072, 768)] {
+            for &(b, i, h, o) in &[
+                (512usize, 768usize, 3072usize, 768usize),
+                (64, 768, 3072, 768),
+            ] {
                 let mut rng = Rng::new(0x57A1 ^ b as u64);
                 let w1 = rng.vec(h * i, -0.02, 0.02);
                 let w2 = rng.vec(o * h, -0.02, 0.02);
@@ -968,8 +1116,8 @@ mod tests {
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
                 let ratio = se / sf; // >1 ⇒ fused (Wukong) is faster
-                // ±10% is within the measured run-to-run swing on this box (contention-noisy clocks),
-                // so call that band parity rather than flip "win"/"trail" on noise (the honesty law).
+                                     // ±10% is within the measured run-to-run swing on this box (contention-noisy clocks),
+                                     // so call that band parity rather than flip "win"/"trail" on noise (the honesty law).
                 let verdict = if ratio >= 1.10 {
                     "Wukong wins"
                 } else if ratio <= 0.90 {

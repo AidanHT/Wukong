@@ -1020,13 +1020,25 @@ mod tests {
             ("COPY_V4", COPY_V4, &["copy_v4"]),
             ("CAST_F32_F16", CAST_F32_F16, &["cast_f32_f16"]),
             // gpu::reduce selects one of these three from the RED_* op code.
-            ("REDUCE", REDUCE, &["reduce_sum", "reduce_dot", "reduce_max"]),
+            (
+                "REDUCE",
+                REDUCE,
+                &["reduce_sum", "reduce_dot", "reduce_max"],
+            ),
             ("GEMM", GEMM, &["gemm_nt", "gemm_nn"]),
             // gpu::vmath_entry maps the six supported VM_* op codes onto these.
-            ("vmath_ptx", vmath_ptx(), &["relu", "exp", "sigmoid", "tanh", "silu", "gelu"]),
+            (
+                "vmath_ptx",
+                vmath_ptx(),
+                &["relu", "exp", "sigmoid", "tanh", "silu", "gelu"],
+            ),
         ];
         for (what, ptx, names) in families {
-            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "{what}: unbalanced braces");
+            assert_eq!(
+                ptx.matches('{').count(),
+                ptx.matches('}').count(),
+                "{what}: unbalanced braces"
+            );
             for n in names {
                 assert_eq!(
                     ptx.matches(&format!(".visible .entry {n}(")).count(),

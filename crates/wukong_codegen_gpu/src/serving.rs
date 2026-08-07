@@ -102,7 +102,12 @@ impl DecodeLayer {
     /// default, bit-exact path). `cfg` is the cache geometry; `dff` the FFN inner dim. Requires
     /// `D % 64 == 0`, `Dff % 64 == 0`, `Bcap % 64 == 0` (the 64×64 WMMA tile), and
     /// `head_dim ∈ {64, 128}` (the generated paged-attn kernels).
-    pub fn new(g: &mut Gpu, w: &TransformerWeights, cfg: KvConfig, dff: usize) -> Result<Self, DriverError> {
+    pub fn new(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        cfg: KvConfig,
+        dff: usize,
+    ) -> Result<Self, DriverError> {
         Self::new_with_dtype(g, w, cfg, dff, KvDtype::F16)
     }
 
@@ -117,9 +122,18 @@ impl DecodeLayer {
         dtype: KvDtype,
     ) -> Result<Self, DriverError> {
         let d = cfg.heads * cfg.head_dim;
-        assert!(d % 64 == 0 && dff % 64 == 0, "D and Dff must be multiples of 64 (WMMA tile)");
-        assert!(cfg.num_slots % 64 == 0, "Bcap (num_slots) must be a multiple of 64 (WMMA M tile)");
-        assert!(matches!(cfg.head_dim, 64 | 128), "head_dim must be 64 or 128 (generated paged-attn kernels)");
+        assert!(
+            d % 64 == 0 && dff % 64 == 0,
+            "D and Dff must be multiples of 64 (WMMA tile)"
+        );
+        assert!(
+            cfg.num_slots % 64 == 0,
+            "Bcap (num_slots) must be a multiple of 64 (WMMA M tile)"
+        );
+        assert!(
+            matches!(cfg.head_dim, 64 | 128),
+            "head_dim must be 64 or 128 (generated paged-attn kernels)"
+        );
         for (name, wt, len) in [
             ("wq", w.wq, d * d),
             ("wk", w.wk, d * d),
@@ -144,7 +158,11 @@ impl DecodeLayer {
                     _ => unreachable!(),
                 };
                 (
-                    g.function(attn_key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY)?,
+                    g.function(
+                        attn_key,
+                        &paged_attn_decode_ptx(cfg.head_dim),
+                        PAGED_ATTN_ENTRY,
+                    )?,
                     g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)?,
                 )
             }
@@ -155,8 +173,16 @@ impl DecodeLayer {
                     _ => unreachable!(),
                 };
                 (
-                    g.function(attn_key, &paged_attn_decode_int8_ptx(cfg.head_dim), PAGED_ATTN_INT8_ENTRY)?,
-                    g.function("kv_append_int8", &kv_append_int8_ptx(), KV_APPEND_INT8_ENTRY)?,
+                    g.function(
+                        attn_key,
+                        &paged_attn_decode_int8_ptx(cfg.head_dim),
+                        PAGED_ATTN_INT8_ENTRY,
+                    )?,
+                    g.function(
+                        "kv_append_int8",
+                        &kv_append_int8_ptx(),
+                        KV_APPEND_INT8_ENTRY,
+                    )?,
                 )
             }
         };
@@ -209,13 +235,24 @@ impl DecodeLayer {
         layer: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
-        assert_eq!(self.dtype, kv.dtype(), "cache storage dtype must match the layer's kernels");
+        assert_eq!(
+            self.dtype,
+            kv.dtype(),
+            "cache storage dtype must match the layer's kernels"
+        );
         let (bcap, d, dff, eps) = (self.bcap(), self.d(), self.dff, self.eps);
         debug_assert_eq!(x_d.len(), bcap * d);
         debug_assert_eq!(out.len(), bcap * d);
-        let norm_cfg = LaunchConfig { grid_dim: (bcap as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let norm_cfg = LaunchConfig {
+            grid_dim: (bcap as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
-        let norm = |pool: &mut DevicePool, src: &CudaSlice<f32>, rows: usize| -> Result<PoolBuf<f32>, DriverError> {
+        let norm = |pool: &mut DevicePool,
+                    src: &CudaSlice<f32>,
+                    rows: usize|
+         -> Result<PoolBuf<f32>, DriverError> {
             let mut o = pool.alloc::<f32>(rows * d)?;
             let (r, c) = (rows as u32, d as u32);
             let mut b = stream.launch_builder(&self.f_norm);
@@ -223,7 +260,10 @@ impl DecodeLayer {
             unsafe { b.launch(norm_cfg)? };
             Ok(o)
         };
-        let cast = |pool: &mut DevicePool, src: &CudaSlice<f32>, n: usize| -> Result<PoolBuf<f16>, DriverError> {
+        let cast = |pool: &mut DevicePool,
+                    src: &CudaSlice<f32>,
+                    n: usize|
+         -> Result<PoolBuf<f16>, DriverError> {
             let mut dst = pool.alloc::<f16>(n)?;
             let nn = n as u32;
             let mut b = stream.launch_builder(&self.f_cast);
@@ -231,7 +271,14 @@ impl DecodeLayer {
             unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
             Ok(dst)
         };
-        let gemm16 = |pool: &mut DevicePool, f: &CudaFunction, a: &CudaSlice<f16>, b: &CudaSlice<f16>, m: usize, k: usize, n: usize| -> Result<PoolBuf<f32>, DriverError> {
+        let gemm16 = |pool: &mut DevicePool,
+                      f: &CudaFunction,
+                      a: &CudaSlice<f16>,
+                      b: &CudaSlice<f16>,
+                      m: usize,
+                      k: usize,
+                      n: usize|
+         -> Result<PoolBuf<f32>, DriverError> {
             let mut c = pool.alloc::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(f);
@@ -239,11 +286,24 @@ impl DecodeLayer {
             unsafe { bld.launch(wmma_sm_cfg(m, n))? };
             Ok(c)
         };
-        let resid_gemm = |pool: &mut DevicePool, a: &CudaSlice<f16>, b: &CudaSlice<f16>, residual: &CudaSlice<f32>, m: usize, k: usize, n: usize| -> Result<PoolBuf<f32>, DriverError> {
+        let resid_gemm = |pool: &mut DevicePool,
+                          a: &CudaSlice<f16>,
+                          b: &CudaSlice<f16>,
+                          residual: &CudaSlice<f32>,
+                          m: usize,
+                          k: usize,
+                          n: usize|
+         -> Result<PoolBuf<f32>, DriverError> {
             let mut c = pool.alloc::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(&self.f_resid);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut *c).arg(residual);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(a)
+                .arg(b)
+                .arg(&mut *c)
+                .arg(residual);
             unsafe { bld.launch(wmma_sm_cfg(m, n))? };
             Ok(c)
         };
@@ -261,12 +321,73 @@ impl DecodeLayer {
         let mut attn = pool.alloc::<f32>(bcap * d)?;
         match kv {
             KvStorage::F16 { k: kc, v: vc } => {
-                launch_kv_append(stream, &self.f_append, &k, &v, kc, vc, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
-                launch_paged_attn_decode(stream, &self.f_attn, &q, kc, vc, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
+                launch_kv_append(
+                    stream,
+                    &self.f_append,
+                    &k,
+                    &v,
+                    kc,
+                    vc,
+                    bt_d,
+                    wpos_d,
+                    active_d,
+                    &self.cfg,
+                    layer,
+                    bcap,
+                )?;
+                launch_paged_attn_decode(
+                    stream,
+                    &self.f_attn,
+                    &q,
+                    kc,
+                    vc,
+                    &mut attn,
+                    bt_d,
+                    cl_d,
+                    &self.cfg,
+                    layer,
+                    bcap,
+                    self.scale,
+                )?;
             }
-            KvStorage::Int8 { k: kc, v: vc, ksc, vsc } => {
-                launch_kv_append_int8(stream, &self.f_append, &k, &v, kc, vc, ksc, vsc, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
-                launch_paged_attn_decode_int8(stream, &self.f_attn, &q, kc, vc, ksc, vsc, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
+            KvStorage::Int8 {
+                k: kc,
+                v: vc,
+                ksc,
+                vsc,
+            } => {
+                launch_kv_append_int8(
+                    stream,
+                    &self.f_append,
+                    &k,
+                    &v,
+                    kc,
+                    vc,
+                    ksc,
+                    vsc,
+                    bt_d,
+                    wpos_d,
+                    active_d,
+                    &self.cfg,
+                    layer,
+                    bcap,
+                )?;
+                launch_paged_attn_decode_int8(
+                    stream,
+                    &self.f_attn,
+                    &q,
+                    kc,
+                    vc,
+                    ksc,
+                    vsc,
+                    &mut attn,
+                    bt_d,
+                    cl_d,
+                    &self.cfg,
+                    layer,
+                    bcap,
+                    self.scale,
+                )?;
             }
         }
         let attn_16 = cast(pool, &attn, bcap * d)?;
@@ -280,7 +401,13 @@ impl DecodeLayer {
         {
             let (mm, nn, kk) = (bcap as u32, d as u32, dff as u32);
             let mut bld = stream.launch_builder(&self.f_resid);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(&*f1_16).arg(&self.w2).arg(&mut *out).arg(&*x1);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(&*f1_16)
+                .arg(&self.w2)
+                .arg(&mut *out)
+                .arg(&*x1);
             unsafe { bld.launch(wmma_sm_cfg(bcap, d))? };
         }
         Ok(())
@@ -362,7 +489,11 @@ impl DecodeModel {
         dtype: KvDtype,
     ) -> Result<Self, DriverError> {
         assert!(!weights.is_empty(), "model needs at least one layer");
-        assert_eq!(weights.len(), cfg.layers, "cfg.layers must equal the number of weight sets");
+        assert_eq!(
+            weights.len(),
+            cfg.layers,
+            "cfg.layers must equal the number of weight sets"
+        );
         let d = cfg.heads * cfg.head_dim;
         let mut layers = Vec::with_capacity(weights.len());
         for w in weights {
@@ -370,12 +501,28 @@ impl DecodeModel {
         }
         let cache = PagedKvCache::new_with_dtype(g.stream.clone(), cfg, dtype)?;
         let pool = DevicePool::new(g.stream.clone(), pool_bytes)?;
-        let bt_d = g.stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
+        let bt_d = g
+            .stream
+            .alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
         let cl_d = g.stream.alloc_zeros::<u32>(cfg.num_slots)?;
         let wpos_d = g.stream.alloc_zeros::<u32>(cfg.num_slots)?;
         let active_d = g.stream.memcpy_stod(&vec![1u32; cfg.num_slots])?;
-        let bufs = [g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?, g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?];
-        Ok(Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, cfg, uploaded_epoch: None })
+        let bufs = [
+            g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?,
+            g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?,
+        ];
+        Ok(Self {
+            layers,
+            cache,
+            pool,
+            bt_d,
+            cl_d,
+            wpos_d,
+            active_d,
+            bufs,
+            cfg,
+            uploaded_epoch: None,
+        })
     }
 
     /// Advance **every** slot by one token: append a cache position per slot (host), upload the block
@@ -403,34 +550,74 @@ impl DecodeModel {
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
         // Disjoint field borrows (the launchers need &mut cache storage + &mut pool + & metadata at once).
-        let Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, .. } = self;
+        let Self {
+            layers,
+            cache,
+            pool,
+            bt_d,
+            cl_d,
+            wpos_d,
+            active_d,
+            bufs,
+            ..
+        } = self;
         let n = layers.len();
         let kv = cache.storage_mut();
         if n == 1 {
             pool.reset();
-            return layers[0].forward_step_on(stream, pool, kv, x_d, bt_d, cl_d, wpos_d, active_d, 0, out);
+            return layers[0]
+                .forward_step_on(stream, pool, kv, x_d, bt_d, cl_d, wpos_d, active_d, 0, out);
         }
         pool.reset();
-        layers[0].forward_step_on(stream, pool, kv, x_d, bt_d, cl_d, wpos_d, active_d, 0, &mut bufs[0])?;
+        layers[0].forward_step_on(
+            stream,
+            pool,
+            kv,
+            x_d,
+            bt_d,
+            cl_d,
+            wpos_d,
+            active_d,
+            0,
+            &mut bufs[0],
+        )?;
         let mut cur = 0usize; // layer i-1's output lives in bufs[cur]
         for (i, layer) in layers.iter().enumerate().take(n - 1).skip(1) {
             pool.reset();
             let (a, b) = bufs.split_at_mut(1);
-            let (src, dst) = if cur == 0 { (&a[0], &mut b[0]) } else { (&b[0], &mut a[0]) };
+            let (src, dst) = if cur == 0 {
+                (&a[0], &mut b[0])
+            } else {
+                (&b[0], &mut a[0])
+            };
             layer.forward_step_on(stream, pool, kv, src, bt_d, cl_d, wpos_d, active_d, i, dst)?;
             cur = 1 - cur;
         }
         pool.reset();
         // Last layer reads the current buffer, writes the caller's `out`.
         let src = &bufs[cur];
-        layers[n - 1].forward_step_on(stream, pool, kv, src, bt_d, cl_d, wpos_d, active_d, n - 1, out)
+        layers[n - 1].forward_step_on(
+            stream,
+            pool,
+            kv,
+            src,
+            bt_d,
+            cl_d,
+            wpos_d,
+            active_d,
+            n - 1,
+            out,
+        )
     }
 
     /// Upload the current host block table / context lengths / write positions to the device metadata
     /// buffers **without** running the layers — the host half of [`step_on`](Self::step_on), exposed so
     /// a graph can capture only the launch half ([`run_layers_on`](Self::run_layers_on)). Returns the
     /// per-slot write positions it appended.
-    pub fn advance_and_upload(&mut self, stream: &Arc<CudaStream>) -> Result<Vec<u32>, DriverError> {
+    pub fn advance_and_upload(
+        &mut self,
+        stream: &Arc<CudaStream>,
+    ) -> Result<Vec<u32>, DriverError> {
         let active = vec![true; self.cfg.num_slots];
         self.advance_and_upload_masked(stream, &active)
     }
@@ -512,7 +699,11 @@ impl DecodeModel {
         active: &[u32],
     ) -> Result<(), DriverError> {
         let bcap = self.cfg.num_slots;
-        assert_eq!(table.len(), bcap * self.cfg.max_blocks_per_seq, "flat block table must be [Bcap, max_blocks_per_seq]");
+        assert_eq!(
+            table.len(),
+            bcap * self.cfg.max_blocks_per_seq,
+            "flat block table must be [Bcap, max_blocks_per_seq]"
+        );
         assert_eq!(cl.len(), bcap, "context lengths must be one per slot");
         assert_eq!(wpos.len(), bcap, "write positions must be one per slot");
         assert_eq!(active.len(), bcap, "active mask must be one per slot");
@@ -608,7 +799,10 @@ impl Scheduler {
     /// goodput bench measures continuous batching against — identical kernels and step machinery,
     /// admission only when the previous batch has fully drained.
     pub fn new_static(model: DecodeModel) -> Self {
-        Self { static_batching: true, ..Self::new(model) }
+        Self {
+            static_batching: true,
+            ..Self::new(model)
+        }
     }
 
     /// Queue a request for admission.
@@ -692,7 +886,10 @@ impl Scheduler {
             else {
                 break; // nothing in the window fits → leave the queue intact
             };
-            let req = self.waiting.remove(pick).expect("position() index is in range");
+            let req = self
+                .waiting
+                .remove(pick)
+                .expect("position() index is in range");
             // Prefill: bulk-reserve the prompt's cache positions (≥1 so the slot owns a block; the
             // attention/append kernels then see a non-empty, non-padding row).
             self.model
@@ -703,7 +900,9 @@ impl Scheduler {
             // `gen_len.max(1)`: the same normalization `prompt_len` gets just above. A `remaining` of 0
             // would go negative on this sequence's first `retire_finished` — panicking in a debug build
             // and wrapping to `usize::MAX` in a release one, pinning the slot and its blocks forever.
-            self.slots[slot] = Some(Inflight { remaining: req.gen_len.max(1) });
+            self.slots[slot] = Some(Inflight {
+                remaining: req.gen_len.max(1),
+            });
             self.admitted += 1;
             n += 1;
         }
@@ -764,7 +963,11 @@ impl Scheduler {
             (xp as u64, op as u64)
         };
         if let Some((graph, gx, go)) = &self.graph {
-            assert_eq!((*gx, *go), (xp, op), "step_graphed: x_d/out must be the buffers the graph was captured with");
+            assert_eq!(
+                (*gx, *go),
+                (xp, op),
+                "step_graphed: x_d/out must be the buffers the graph was captured with"
+            );
             graph.launch()?;
         } else {
             // Warmup executes this step eagerly (idempotent kernels: re-running would rewrite the
@@ -927,7 +1130,15 @@ mod tests {
             let wpos = [5usize, 0, 16, 31, 3, 20, 12, 47]; // write positions across block boundaries
             let max_bps = wpos.iter().copied().max().unwrap().div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 4;
-            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: 1,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut mgr = BlockManager::new(num_blocks, bsz, bcap, max_bps);
             for b in 0..bcap {
                 mgr.reserve(b, wpos[b] + 1).unwrap(); // ensure position wpos[b] has a block
@@ -943,8 +1154,14 @@ mod tests {
             let wpos_u: Vec<u32> = wpos.iter().map(|&p| p as u32).collect();
             let wpos_d = g.stream.memcpy_stod(&wpos_u).unwrap();
             let active_d = g.stream.memcpy_stod(&vec![1u32; bcap]).unwrap(); // all slots active
-            let func = g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY).unwrap();
-            launch_kv_append(&g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &bt_d, &wpos_d, &active_d, &cfg, 0, bcap).unwrap();
+            let func = g
+                .function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)
+                .unwrap();
+            launch_kv_append(
+                &g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &bt_d, &wpos_d, &active_d,
+                &cfg, 0, bcap,
+            )
+            .unwrap();
             g.stream.synchronize().unwrap();
             let kh = g.stream.memcpy_dtov(&k_d).unwrap();
             let vh = g.stream.memcpy_dtov(&v_d).unwrap();
@@ -954,8 +1171,16 @@ mod tests {
                     for dh in 0..hd {
                         let idx = cfg.elem_offset(0, phys, off, h, dh);
                         let src = (h * hd + dh) + b * d;
-                        assert_eq!(kh[idx].to_f32(), f16r(knew[src]), "K append slot {b} h{h} dh{dh}");
-                        assert_eq!(vh[idx].to_f32(), f16r(vnew[src]), "V append slot {b} h{h} dh{dh}");
+                        assert_eq!(
+                            kh[idx].to_f32(),
+                            f16r(knew[src]),
+                            "K append slot {b} h{h} dh{dh}"
+                        );
+                        assert_eq!(
+                            vh[idx].to_f32(),
+                            f16r(vnew[src]),
+                            "V append slot {b} h{h} dh{dh}"
+                        );
                     }
                 }
             }
@@ -965,7 +1190,12 @@ mod tests {
 
     /// Build `n` independent layers' weights (owned) + a `TransformerWeights` view per layer.
     #[allow(clippy::type_complexity)]
-    fn layer_weights(rng: &mut crate::diff::Rng, n: usize, d: usize, dff: usize) -> Vec<[Vec<f32>; 6]> {
+    fn layer_weights(
+        rng: &mut crate::diff::Rng,
+        n: usize,
+        d: usize,
+        dff: usize,
+    ) -> Vec<[Vec<f32>; 6]> {
         (0..n)
             .map(|_| {
                 [
@@ -982,7 +1212,14 @@ mod tests {
     fn weights_view(wdata: &[[Vec<f32>; 6]]) -> Vec<TransformerWeights<'_>> {
         wdata
             .iter()
-            .map(|wl| TransformerWeights { wq: &wl[0], wk: &wl[1], wv: &wl[2], wo: &wl[3], w1: &wl[4], w2: &wl[5] })
+            .map(|wl| TransformerWeights {
+                wq: &wl[0],
+                wk: &wl[1],
+                wv: &wl[2],
+                wo: &wl[3],
+                w1: &wl[4],
+                w2: &wl[5],
+            })
             .collect()
     }
 
@@ -1004,8 +1241,16 @@ mod tests {
         let mut kh = vec![f16::from_f32(0.0); cfg.slab_elems()];
         let mut vh = vec![f16::from_f32(0.0); cfg.slab_elems()];
         for b in 0..ctx0.len() {
-            let pk: Vec<f32> = rng.vec(ctx0[b] * d, -1.0, 1.0).iter().map(|&x| f16r(x)).collect();
-            let pv: Vec<f32> = rng.vec(ctx0[b] * d, -1.0, 1.0).iter().map(|&x| f16r(x)).collect();
+            let pk: Vec<f32> = rng
+                .vec(ctx0[b] * d, -1.0, 1.0)
+                .iter()
+                .map(|&x| f16r(x))
+                .collect();
+            let pv: Vec<f32> = rng
+                .vec(ctx0[b] * d, -1.0, 1.0)
+                .iter()
+                .map(|&x| f16r(x))
+                .collect();
             if ctx0[b] > 0 {
                 model.cache_mut().manager().reserve(b, ctx0[b]).unwrap();
             }
@@ -1040,7 +1285,15 @@ mod tests {
             let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 13) % 81).collect(); // ragged incl. 0
             let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 8;
-            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: 1,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut rng = crate::diff::Rng::new(0x5723);
             let wdata = layer_weights(&mut rng, 1, d, dff);
             let weights = weights_view(&wdata);
@@ -1052,7 +1305,17 @@ mod tests {
             model.step_on(&g.stream.clone(), &x_d, &mut out_d).unwrap();
             g.stream.synchronize().unwrap();
             let got = g.stream.memcpy_dtov(&out_d).unwrap();
-            let refv = ref_decode_step(&x, &weights[0], &past_k, &past_v, &ctx0, heads, hd, dff, 1e-5);
+            let refv = ref_decode_step(
+                &x,
+                &weights[0],
+                &past_k,
+                &past_v,
+                &ctx0,
+                heads,
+                hd,
+                dff,
+                1e-5,
+            );
             let s = crate::diff::assert_close("decode_step", &got, &refv, 5e-2, 5e-2);
             eprintln!(
                 "decode step vs f64 ref: max_abs={:.2e} max_rel={:.2e} (Bcap={bcap}, heads={heads}, hd={hd}, Dff={dff}, ragged ctx 0..80)",
@@ -1103,8 +1366,16 @@ mod tests {
                 }
             }
             // Dequantized effective past ([t, heads, hd] row-major ⇒ scale index = i / hd).
-            past_k.push((0..ctx0[b] * d).map(|i| kqi[i] as f32 * ksi[i / hd]).collect());
-            past_v.push((0..ctx0[b] * d).map(|i| vqi[i] as f32 * vsi[i / hd]).collect());
+            past_k.push(
+                (0..ctx0[b] * d)
+                    .map(|i| kqi[i] as f32 * ksi[i / hd])
+                    .collect(),
+            );
+            past_v.push(
+                (0..ctx0[b] * d)
+                    .map(|i| vqi[i] as f32 * vsi[i / hd])
+                    .collect(),
+            );
         }
         match model.cache_mut().storage_mut() {
             KvStorage::Int8 { k, v, ksc, vsc } => {
@@ -1131,7 +1402,15 @@ mod tests {
             let wpos = [5usize, 0, 16, 31, 0, 3, 20, 0]; // across block boundaries
             let max_bps = wpos.iter().copied().max().unwrap().div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 4;
-            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: 1,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut mgr = BlockManager::new(num_blocks, bsz, bcap, max_bps);
             for b in 0..bcap {
                 if active[b] {
@@ -1152,10 +1431,16 @@ mod tests {
             let wpos_d = g.stream.memcpy_stod(&wpos_u).unwrap();
             let act_u: Vec<u32> = active.iter().map(|&a| a as u32).collect();
             let act_d = g.stream.memcpy_stod(&act_u).unwrap();
-            let func = g.function("kv_append_int8", &kv_append_int8_ptx(), KV_APPEND_INT8_ENTRY).unwrap();
+            let func = g
+                .function(
+                    "kv_append_int8",
+                    &kv_append_int8_ptx(),
+                    KV_APPEND_INT8_ENTRY,
+                )
+                .unwrap();
             launch_kv_append_int8(
-                &g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &mut ksc_d, &mut vsc_d, &bt_d, &wpos_d,
-                &act_d, &cfg, 0, bcap,
+                &g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &mut ksc_d, &mut vsc_d,
+                &bt_d, &wpos_d, &act_d, &cfg, 0, bcap,
             )
             .unwrap();
             g.stream.synchronize().unwrap();
@@ -1167,7 +1452,12 @@ mod tests {
             let quant = |row: &[f32]| -> (Vec<i8>, f32) {
                 let amax = row.iter().fold(0f32, |m, &x| m.max(x.abs()));
                 let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                (row.iter().map(|&x| (x / scale).round_ties_even().clamp(-127.0, 127.0) as i8).collect(), scale)
+                (
+                    row.iter()
+                        .map(|&x| (x / scale).round_ties_even().clamp(-127.0, 127.0) as i8)
+                        .collect(),
+                    scale,
+                )
             };
             let mut exp_k = vec![0i8; cfg.slab_elems()];
             let mut exp_v = vec![0i8; cfg.slab_elems()];
@@ -1190,12 +1480,23 @@ mod tests {
                 }
             }
             for i in 0..cfg.slab_elems() {
-                assert_eq!(kh[i], exp_k[i], "int8 K slab elem {i} (inactive leak or quant mismatch?)");
+                assert_eq!(
+                    kh[i], exp_k[i],
+                    "int8 K slab elem {i} (inactive leak or quant mismatch?)"
+                );
                 assert_eq!(vh[i], exp_v[i], "int8 V slab elem {i}");
             }
             for i in 0..cfg.scale_slab_elems() {
-                assert_eq!(ksch[i].to_bits(), exp_ks[i].to_bits(), "K scale {i} not bit-equal");
-                assert_eq!(vsch[i].to_bits(), exp_vs[i].to_bits(), "V scale {i} not bit-equal");
+                assert_eq!(
+                    ksch[i].to_bits(),
+                    exp_ks[i].to_bits(),
+                    "K scale {i} not bit-equal"
+                );
+                assert_eq!(
+                    vsch[i].to_bits(),
+                    exp_vs[i].to_bits(),
+                    "V scale {i} not bit-equal"
+                );
             }
             let written = active.iter().filter(|&&a| a).count();
             eprintln!(
@@ -1218,12 +1519,21 @@ mod tests {
             let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 13) % 81).collect(); // ragged incl. 0
             let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 8;
-            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: 1,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut rng = crate::diff::Rng::new(0x1D8A);
             let wdata = layer_weights(&mut rng, 1, d, dff);
             let weights = weights_view(&wdata);
             let mut model =
-                DecodeModel::new_with_dtype(g, &weights, cfg, dff, 64 * 1024 * 1024, KvDtype::Int8).unwrap();
+                DecodeModel::new_with_dtype(g, &weights, cfg, dff, 64 * 1024 * 1024, KvDtype::Int8)
+                    .unwrap();
             let (past_k, past_v) = populate_one_layer_int8(g, &mut model, &ctx0, heads, hd, 0x9876);
             let x = rng.vec(bcap * d, -1.0, 1.0);
             let x_d = g.stream.memcpy_stod(&x).unwrap();
@@ -1237,8 +1547,18 @@ mod tests {
                 let (q, sc) = quantize_kv_int8(row, 1, heads, hd);
                 (0..row.len()).map(|i| q[i] as f32 * sc[i / hd]).collect()
             };
-            let refv =
-                ref_decode_step_with(&x, &weights[0], &past_k, &past_v, &ctx0, heads, hd, dff, 1e-5, &int8_round);
+            let refv = ref_decode_step_with(
+                &x,
+                &weights[0],
+                &past_k,
+                &past_v,
+                &ctx0,
+                heads,
+                hd,
+                dff,
+                1e-5,
+                &int8_round,
+            );
             let s = crate::diff::assert_close("decode_step_int8", &got, &refv, 5e-2, 5e-2);
             let (i8b, f16b) = (model.cache().footprint_bytes(), cfg.kv_bytes(2));
             assert!(i8b < f16b, "int8 cache must be smaller than f16");
@@ -1261,12 +1581,21 @@ mod tests {
     #[test]
     fn serving_decode_step_invariant_to_block_layout() {
         with_gpu("serving_decode_step_invariant_to_block_layout", |g| {
-            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 4usize);
+            let (heads, hd, dff, bsz, bcap, depth) =
+                (4usize, 64usize, 256usize, 16usize, 64usize, 4usize);
             let d = heads * hd;
             let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 11) % 67).collect();
             let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 8;
-            let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: depth,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut rng = crate::diff::Rng::new(0x9001);
             let wdata = layer_weights(&mut rng, depth, d, dff);
             let weights = weights_view(&wdata);
@@ -1277,7 +1606,11 @@ mod tests {
             let run = |g: &mut Gpu, ascending: bool| -> (Vec<f32>, Vec<u32>) {
                 let mut model = DecodeModel::new(g, &weights, cfg, dff, 128 * 1024 * 1024).unwrap();
                 // Reserve in the chosen slot order ⇒ different physical block ids per sequence.
-                let order: Vec<usize> = if ascending { (0..bcap).collect() } else { (0..bcap).rev().collect() };
+                let order: Vec<usize> = if ascending {
+                    (0..bcap).collect()
+                } else {
+                    (0..bcap).rev().collect()
+                };
                 for &b in &order {
                     if ctx0[b] > 0 {
                         model.cache_mut().manager().reserve(b, ctx0[b]).unwrap();
@@ -1289,8 +1622,16 @@ mod tests {
                 for layer in 0..depth {
                     let mut lrng = crate::diff::Rng::new(0xAB00 + layer as u64);
                     for b in 0..bcap {
-                        let pk: Vec<f32> = lrng.vec(ctx0[b] * d, -1.0, 1.0).iter().map(|&x| f16r(x)).collect();
-                        let pv: Vec<f32> = lrng.vec(ctx0[b] * d, -1.0, 1.0).iter().map(|&x| f16r(x)).collect();
+                        let pk: Vec<f32> = lrng
+                            .vec(ctx0[b] * d, -1.0, 1.0)
+                            .iter()
+                            .map(|&x| f16r(x))
+                            .collect();
+                        let pv: Vec<f32> = lrng
+                            .vec(ctx0[b] * d, -1.0, 1.0)
+                            .iter()
+                            .map(|&x| f16r(x))
+                            .collect();
                         for t in 0..ctx0[b] {
                             let (phys, off) = model.cache_mut().manager_ref().locate(b, t);
                             for h in 0..heads {
@@ -1321,7 +1662,11 @@ mod tests {
             assert_ne!(table_a, table_b, "the two layouts must physically differ");
             assert_eq!(out_a.len(), out_b.len());
             for i in 0..out_a.len() {
-                assert_eq!(out_a[i].to_bits(), out_b[i].to_bits(), "decode step diverged across block layouts at {i}");
+                assert_eq!(
+                    out_a[i].to_bits(),
+                    out_b[i].to_bits(),
+                    "decode step diverged across block layouts at {i}"
+                );
             }
             eprintln!("{depth}-layer decode step BIT-IDENTICAL across 2 physical block layouts (Bcap={bcap}) — paging invisible end-to-end");
         });
@@ -1391,8 +1736,16 @@ mod tests {
         for layer in 0..cfg.layers {
             let mut lrng = crate::diff::Rng::new(seed + layer as u64);
             for b in 0..cfg.num_slots {
-                let pk: Vec<f32> = lrng.vec(ctx0[b] * d, -1.0, 1.0).iter().map(|&x| f16r(x)).collect();
-                let pv: Vec<f32> = lrng.vec(ctx0[b] * d, -1.0, 1.0).iter().map(|&x| f16r(x)).collect();
+                let pk: Vec<f32> = lrng
+                    .vec(ctx0[b] * d, -1.0, 1.0)
+                    .iter()
+                    .map(|&x| f16r(x))
+                    .collect();
+                let pv: Vec<f32> = lrng
+                    .vec(ctx0[b] * d, -1.0, 1.0)
+                    .iter()
+                    .map(|&x| f16r(x))
+                    .collect();
                 for t in 0..ctx0[b] {
                     let (phys, off) = model.cache_mut().manager_ref().locate(b, t);
                     for h in 0..cfg.heads {
@@ -1426,7 +1779,15 @@ mod tests {
         let ctx0: Vec<usize> = (0..bcap).map(|b| 32 + (b * 7) % 64).collect();
         let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
         let num_blocks = bcap * max_bps + 8;
-        let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+        let cfg = KvConfig {
+            layers: depth,
+            heads,
+            head_dim: hd,
+            block_size: bsz,
+            num_blocks,
+            num_slots: bcap,
+            max_blocks_per_seq: max_bps,
+        };
         (cfg, dff, ctx0, heads * hd, bcap)
     }
 
@@ -1444,13 +1805,16 @@ mod tests {
                 let mut rng = crate::diff::Rng::new(0xC0F0);
                 let wdata = layer_weights(&mut rng, depth, d, dff);
                 let weights = weights_view(&wdata);
-                let mut model = primed_model(g, &weights, cfg, dff, &ctx0, 64 * 1024 * 1024, 0xC0DE);
+                let mut model =
+                    primed_model(g, &weights, cfg, dff, &ctx0, 64 * 1024 * 1024, 0xC0DE);
                 let x = rng.vec(bcap * d, -1.0, 1.0);
                 let x_d = g.stream.memcpy_stod(&x).unwrap();
 
                 // Eager reference on the default stream.
                 let mut out_e = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
-                model.run_layers_on(&g.stream.clone(), &x_d, &mut out_e).unwrap();
+                model
+                    .run_layers_on(&g.stream.clone(), &x_d, &mut out_e)
+                    .unwrap();
                 g.stream.synchronize().unwrap();
                 let ref_host = g.stream.memcpy_dtov(&out_e).unwrap();
 
@@ -1472,8 +1836,16 @@ mod tests {
 
                 assert_eq!(g1.len(), ref_host.len());
                 for i in 0..ref_host.len() {
-                    assert_eq!(g1[i].to_bits(), ref_host[i].to_bits(), "graphed != eager at {i}");
-                    assert_eq!(g1[i].to_bits(), g2[i].to_bits(), "graph replay non-deterministic at {i}");
+                    assert_eq!(
+                        g1[i].to_bits(),
+                        ref_host[i].to_bits(),
+                        "graphed != eager at {i}"
+                    );
+                    assert_eq!(
+                        g1[i].to_bits(),
+                        g2[i].to_bits(),
+                        "graph replay non-deterministic at {i}"
+                    );
                 }
                 eprintln!(
                     "{depth}-layer decode step graphed==eager bit-identical & deterministic (Bcap={bcap} D={d} Dff={dff}); \
@@ -1500,7 +1872,8 @@ mod tests {
                     let mut rng = crate::diff::Rng::new(0x7000 + depth as u64);
                     let wdata = layer_weights(&mut rng, depth, d, dff);
                     let weights = weights_view(&wdata);
-                    let mut model = primed_model(g, &weights, cfg, dff, &ctx0, 128 * 1024 * 1024, 0xBEE5);
+                    let mut model =
+                        primed_model(g, &weights, cfg, dff, &ctx0, 128 * 1024 * 1024, 0xBEE5);
                     let x = rng.vec(bcap * d, -1.0, 1.0);
                     let x_d = g.stream.memcpy_stod(&x).unwrap();
 
@@ -1554,7 +1927,15 @@ mod tests {
             let wpos = [3usize, 0, 7, 16, 0, 0, 20, 0];
             let max_bps = wpos.iter().copied().max().unwrap().div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 4;
-            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: 1,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut mgr = BlockManager::new(num_blocks, bsz, bcap, max_bps);
             for b in 0..bcap {
                 if active[b] {
@@ -1573,8 +1954,14 @@ mod tests {
             let wpos_d = g.stream.memcpy_stod(&wpos_u).unwrap();
             let act_u: Vec<u32> = active.iter().map(|&a| a as u32).collect();
             let act_d = g.stream.memcpy_stod(&act_u).unwrap();
-            let func = g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY).unwrap();
-            launch_kv_append(&g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &bt_d, &wpos_d, &act_d, &cfg, 0, bcap).unwrap();
+            let func = g
+                .function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)
+                .unwrap();
+            launch_kv_append(
+                &g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &bt_d, &wpos_d, &act_d,
+                &cfg, 0, bcap,
+            )
+            .unwrap();
             g.stream.synchronize().unwrap();
             let kh = g.stream.memcpy_dtov(&k_d).unwrap();
             // Exact slab expectation: zeros everywhere except each active slot's written channels.
@@ -1586,12 +1973,17 @@ mod tests {
                 let (phys, off) = mgr.locate(b, wpos[b]);
                 for h in 0..heads {
                     for dh in 0..hd {
-                        expect[cfg.elem_offset(0, phys, off, h, dh)] = f16r(knew[(h * hd + dh) + b * d]);
+                        expect[cfg.elem_offset(0, phys, off, h, dh)] =
+                            f16r(knew[(h * hd + dh) + b * d]);
                     }
                 }
             }
             for i in 0..cfg.slab_elems() {
-                assert_eq!(kh[i].to_f32(), expect[i], "slab elem {i} (inactive-row leak?)");
+                assert_eq!(
+                    kh[i].to_f32(),
+                    expect[i],
+                    "slab elem {i} (inactive-row leak?)"
+                );
             }
             let written = active.iter().filter(|&&a| a).count();
             eprintln!("kv_append mask: {written}/{bcap} active slots written; every inactive row skipped (block 0 intact)");
@@ -1611,7 +2003,15 @@ mod tests {
             let l0 = 37usize; // slot 0's prefilled context length
             let max_bps = (l0 + 80).div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 8;
-            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: 1,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut rng = crate::diff::Rng::new(0x4242);
             let wdata = layer_weights(&mut rng, 1, d, dff);
             let weights = weights_view(&wdata);
@@ -1622,14 +2022,20 @@ mod tests {
                 let mut model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
                 let _ = populate_one_layer(g, &mut model, ctx0, heads, hd, 0xABCD);
                 let mut out = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
-                model.advance_and_upload_masked(&g.stream.clone(), active).unwrap();
-                model.run_layers_on(&g.stream.clone(), &x_d, &mut out).unwrap();
+                model
+                    .advance_and_upload_masked(&g.stream.clone(), active)
+                    .unwrap();
+                model
+                    .run_layers_on(&g.stream.clone(), &x_d, &mut out)
+                    .unwrap();
                 g.stream.synchronize().unwrap();
                 g.stream.memcpy_dtov(&out).unwrap()
             };
 
             // (a) co-batched: every slot active with its own (slot-0-shared) context.
-            let ctx_co: Vec<usize> = (0..bcap).map(|b| if b == 0 { l0 } else { 8 + (b * 5) % 72 }).collect();
+            let ctx_co: Vec<usize> = (0..bcap)
+                .map(|b| if b == 0 { l0 } else { 8 + (b * 5) % 72 })
+                .collect();
             let out_co = run(g, &ctx_co, &vec![true; bcap]);
             // (b) alone: only slot 0 active; others free + masked.
             let mut ctx_alone = vec![0usize; bcap];
@@ -1639,7 +2045,11 @@ mod tests {
             let out_alone = run(g, &ctx_alone, &act_alone);
 
             for i in 0..d {
-                assert_eq!(out_co[i].to_bits(), out_alone[i].to_bits(), "slot 0 dim {i}: co-batched != alone");
+                assert_eq!(
+                    out_co[i].to_bits(),
+                    out_alone[i].to_bits(),
+                    "slot 0 dim {i}: co-batched != alone"
+                );
             }
             eprintln!("slot-0 decode output bit-identical: co-batched (64 active) == alone (1 active) — batch composition is invisible");
         });
@@ -1652,19 +2062,32 @@ mod tests {
     #[test]
     fn serving_scheduler_drains_and_conserves_blocks() {
         with_gpu("serving_scheduler_drains_and_conserves_blocks", |g| {
-            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 2usize);
+            let (heads, hd, dff, bsz, bcap, depth) =
+                (4usize, 64usize, 256usize, 16usize, 64usize, 2usize);
             let d = heads * hd;
             let max_bps = (40usize + 24).div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 32;
-            let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: depth,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut rng = crate::diff::Rng::new(0x77AA);
             let wdata = layer_weights(&mut rng, depth, d, dff);
             let weights = weights_view(&wdata);
             let x = rng.vec(bcap * d, -1.0, 1.0);
 
             const NREQ: usize = 240;
-            let reqs: Vec<Request> =
-                (0..NREQ).map(|i| Request { prompt_len: 1 + (i * 7) % 40, gen_len: 1 + (i * 5) % 24 }).collect();
+            let reqs: Vec<Request> = (0..NREQ)
+                .map(|i| Request {
+                    prompt_len: 1 + (i * 7) % 40,
+                    gen_len: 1 + (i * 5) % 24,
+                })
+                .collect();
             let total_gen: usize = reqs.iter().map(|r| r.gen_len).sum();
 
             let drive = |g: &mut Gpu| -> (usize, usize, usize, usize, Vec<usize>) {
@@ -1685,13 +2108,22 @@ mod tests {
                     assert!(steps < 100_000, "scheduler failed to drain (liveness)");
                 }
                 g.stream.synchronize().unwrap();
-                (sched.completed(), sched.emitted(), sched.free_blocks(), init_free, trace)
+                (
+                    sched.completed(),
+                    sched.emitted(),
+                    sched.free_blocks(),
+                    init_free,
+                    trace,
+                )
             };
 
             let (completed, emitted, free_end, init_free, trace1) = drive(g);
             assert_eq!(completed, NREQ, "every request completes");
             assert_eq!(emitted, total_gen, "useful tokens == Σ gen_len");
-            assert_eq!(free_end, init_free, "all KV blocks returned to the pool (no leak)");
+            assert_eq!(
+                free_end, init_free,
+                "all KV blocks returned to the pool (no leak)"
+            );
             let peak = trace1.iter().copied().max().unwrap();
             let (_, _, _, _, trace2) = drive(g);
             assert_eq!(trace1, trace2, "scheduler schedule is deterministic");
@@ -1714,18 +2146,31 @@ mod tests {
     fn serving_scheduler_graph_matches_eager() {
         with_gpu("serving_scheduler_graph_matches_eager", |g| {
             with_event_tracking_disabled(g, |g| {
-                let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 2usize);
+                let (heads, hd, dff, bsz, bcap, depth) =
+                    (4usize, 64usize, 256usize, 16usize, 64usize, 2usize);
                 let d = heads * hd;
                 let max_bps = (40usize + 24).div_ceil(bsz) + 2;
                 let num_blocks = bcap * max_bps + 32;
-                let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+                let cfg = KvConfig {
+                    layers: depth,
+                    heads,
+                    head_dim: hd,
+                    block_size: bsz,
+                    num_blocks,
+                    num_slots: bcap,
+                    max_blocks_per_seq: max_bps,
+                };
                 let mut rng = crate::diff::Rng::new(0x6A6A);
                 let wdata = layer_weights(&mut rng, depth, d, dff);
                 let weights = weights_view(&wdata);
                 let x = rng.vec(bcap * d, -1.0, 1.0);
                 const NREQ: usize = 96;
-                let reqs: Vec<Request> =
-                    (0..NREQ).map(|i| Request { prompt_len: 1 + (i * 7) % 40, gen_len: 1 + (i * 5) % 24 }).collect();
+                let reqs: Vec<Request> = (0..NREQ)
+                    .map(|i| Request {
+                        prompt_len: 1 + (i * 7) % 40,
+                        gen_len: 1 + (i * 5) % 24,
+                    })
+                    .collect();
 
                 // FNV-1a over the output bits: digest equality at every step == bit-equality.
                 let digest = |v: &[f32]| -> u64 {
@@ -1738,7 +2183,9 @@ mod tests {
                     h
                 };
                 // Drive a full drain; per-step (active, out-digest) trace + accounting.
-                let drive = |g: &mut Gpu, graphed: bool| -> (Vec<(usize, u64)>, usize, usize, usize, usize) {
+                let drive = |g: &mut Gpu,
+                             graphed: bool|
+                 -> (Vec<(usize, u64)>, usize, usize, usize, usize) {
                     let model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
                     let init_free = model.cache().manager_ref().free_blocks();
                     let mut sched = Scheduler::new(model);
@@ -1749,7 +2196,11 @@ mod tests {
                     // default. Retire the construction-time NULL-stream work (weight upload, slab
                     // zeroing) first — a non-blocking stream does not implicitly wait on it.
                     g.stream.synchronize().unwrap();
-                    let stream = if graphed { g.ctx.new_stream().unwrap() } else { g.stream.clone() };
+                    let stream = if graphed {
+                        g.ctx.new_stream().unwrap()
+                    } else {
+                        g.stream.clone()
+                    };
                     let x_d = stream.memcpy_stod(&x).unwrap();
                     let mut out = stream.alloc_zeros::<f32>(bcap * d).unwrap();
                     let mut trace = Vec::new();
@@ -1762,9 +2213,18 @@ mod tests {
                         stream.synchronize().unwrap();
                         let bits = stream.memcpy_dtov(&out).unwrap();
                         trace.push((n, digest(&bits)));
-                        assert!(trace.len() < 100_000, "scheduler failed to drain (liveness)");
+                        assert!(
+                            trace.len() < 100_000,
+                            "scheduler failed to drain (liveness)"
+                        );
                     }
-                    (trace, sched.completed(), sched.emitted(), sched.free_blocks(), init_free)
+                    (
+                        trace,
+                        sched.completed(),
+                        sched.emitted(),
+                        sched.free_blocks(),
+                        init_free,
+                    )
                 };
 
                 let (trace_e, comp_e, emit_e, free_e, init_e) = drive(g, false);
@@ -1777,7 +2237,10 @@ mod tests {
                 assert_eq!(trace_e.len(), trace_g.len(), "step counts diverge");
                 for (i, (e, gr)) in trace_e.iter().zip(&trace_g).enumerate() {
                     assert_eq!(e.0, gr.0, "active count diverges at step {i}");
-                    assert_eq!(e.1, gr.1, "decode output diverges at step {i} (graphed != eager)");
+                    assert_eq!(
+                        e.1, gr.1,
+                        "decode output diverges at step {i} (graphed != eager)"
+                    );
                 }
                 eprintln!(
                     "scheduler drain graph-driven == eager: {} steps, {NREQ} reqs, {emit_e} tokens — \
@@ -1799,7 +2262,8 @@ mod tests {
     #[test]
     fn serving_scheduler_retires_zero_gen_len_request() {
         with_gpu("serving_scheduler_retires_zero_gen_len_request", |g| {
-            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 128usize, 16usize, 64usize, 1usize);
+            let (heads, hd, dff, bsz, bcap, depth) =
+                (4usize, 64usize, 128usize, 16usize, 64usize, 1usize);
             let d = heads * hd;
             let cfg = KvConfig {
                 layers: depth,
@@ -1817,20 +2281,33 @@ mod tests {
             let model = DecodeModel::new(g, &weights, cfg, dff, 32 * 1024 * 1024).unwrap();
             let init_free = model.cache().manager_ref().free_blocks();
             let mut sched = Scheduler::new(model);
-            sched.enqueue(Request { prompt_len: 8, gen_len: 0 });
+            sched.enqueue(Request {
+                prompt_len: 8,
+                gen_len: 0,
+            });
             let x_d = g.stream.memcpy_stod(&x).unwrap();
             let mut out = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
             let mut steps = 0usize;
             while !sched.is_idle() {
                 sched.step(&g.stream.clone(), &x_d, &mut out).unwrap();
                 steps += 1;
-                assert!(steps <= 4, "gen_len==0 never retired: `remaining` underflowed and pinned the slot");
+                assert!(
+                    steps <= 4,
+                    "gen_len==0 never retired: `remaining` underflowed and pinned the slot"
+                );
             }
             g.stream.synchronize().unwrap();
-            assert_eq!(steps, 1, "a gen_len==0 request emits its one floored token and retires the same step");
+            assert_eq!(
+                steps, 1,
+                "a gen_len==0 request emits its one floored token and retires the same step"
+            );
             assert_eq!(sched.completed(), 1, "the request completes");
             assert_eq!(sched.emitted(), 1, "gen_len is floored at one token");
-            assert_eq!(sched.free_blocks(), init_free, "the retired slot's KV blocks return to the pool");
+            assert_eq!(
+                sched.free_blocks(),
+                init_free,
+                "the retired slot's KV blocks return to the pool"
+            );
             eprintln!(
                 "gen_len==0 request retired in 1 step, blocks conserved {init_free}->{} (no `remaining` underflow)",
                 sched.free_blocks()
@@ -1849,7 +2326,8 @@ mod tests {
     #[test]
     fn serving_failed_advance_leaves_allocator_unchanged() {
         with_gpu("serving_failed_advance_leaves_allocator_unchanged", |g| {
-            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 128usize, 16usize, 64usize, 1usize);
+            let (heads, hd, dff, bsz, bcap, depth) =
+                (4usize, 64usize, 128usize, 16usize, 64usize, 1usize);
             let d = heads * hd;
             // max_blocks_per_seq = 2 ⇒ a sequence tops out at 32 cached tokens; the pool itself is
             // roomy, so the only way to fail is the per-sequence table-width cap.
@@ -1870,17 +2348,26 @@ mod tests {
             model.cache_mut().manager().reserve(0, 5).unwrap();
             model.cache_mut().manager().reserve(1, 5).unwrap();
             model.cache_mut().manager().reserve(3, 32).unwrap();
-            let before: Vec<usize> = (0..bcap).map(|b| model.cache().manager_ref().context_len(b)).collect();
+            let before: Vec<usize> = (0..bcap)
+                .map(|b| model.cache().manager_ref().context_len(b))
+                .collect();
             let free_before = model.cache().manager_ref().free_blocks();
             let epoch_before = model.cache().manager_ref().layout_epoch();
 
             let stream = g.stream.clone();
             assert!(
-                model.advance_and_upload_masked(&stream, &vec![true; bcap]).is_err(),
+                model
+                    .advance_and_upload_masked(&stream, &vec![true; bcap])
+                    .is_err(),
                 "slot 3 is at its max_blocks_per_seq cap ⇒ the advance must fail"
             );
-            let after: Vec<usize> = (0..bcap).map(|b| model.cache().manager_ref().context_len(b)).collect();
-            assert_eq!(before, after, "a failed advance must not advance any slot's context length");
+            let after: Vec<usize> = (0..bcap)
+                .map(|b| model.cache().manager_ref().context_len(b))
+                .collect();
+            assert_eq!(
+                before, after,
+                "a failed advance must not advance any slot's context length"
+            );
             assert_eq!(
                 free_before,
                 model.cache().manager_ref().free_blocks(),
@@ -1898,7 +2385,11 @@ mod tests {
             stream.synchronize().unwrap();
             for b in 0..bcap {
                 let want = before[b] + usize::from(b != 3);
-                assert_eq!(model.cache().manager_ref().context_len(b), want, "slot {b} advance");
+                assert_eq!(
+                    model.cache().manager_ref().context_len(b),
+                    want,
+                    "slot {b} advance"
+                );
             }
             eprintln!(
                 "failed decode advance is atomic: ctx lengths, free blocks ({free_before}) and layout epoch \
@@ -1915,18 +2406,31 @@ mod tests {
     #[test]
     fn serving_static_batching_admits_only_when_drained() {
         with_gpu("serving_static_batching_admits_only_when_drained", |g| {
-            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 1usize);
+            let (heads, hd, dff, bsz, bcap, depth) =
+                (4usize, 64usize, 256usize, 16usize, 64usize, 1usize);
             let d = heads * hd;
             let max_bps = (40usize + 24).div_ceil(bsz) + 2;
             let num_blocks = bcap * max_bps + 32;
-            let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let cfg = KvConfig {
+                layers: depth,
+                heads,
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
             let mut rng = crate::diff::Rng::new(0x57A7);
             let wdata = layer_weights(&mut rng, depth, d, dff);
             let weights = weights_view(&wdata);
             let x = rng.vec(bcap * d, -1.0, 1.0);
             const NREQ: usize = 96;
-            let reqs: Vec<Request> =
-                (0..NREQ).map(|i| Request { prompt_len: 1 + (i * 7) % 40, gen_len: 1 + (i * 5) % 24 }).collect();
+            let reqs: Vec<Request> = (0..NREQ)
+                .map(|i| Request {
+                    prompt_len: 1 + (i * 7) % 40,
+                    gen_len: 1 + (i * 5) % 24,
+                })
+                .collect();
             let total_gen: usize = reqs.iter().map(|r| r.gen_len).sum();
 
             let model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
@@ -1943,19 +2447,32 @@ mod tests {
             while !sched.is_idle() {
                 sched.step(&g.stream.clone(), &x_d, &mut out).unwrap();
                 if sched.admitted() > prev_admitted {
-                    assert_eq!(prev_active_after, 0, "static batching refilled a slot mid-flight");
+                    assert_eq!(
+                        prev_active_after, 0,
+                        "static batching refilled a slot mid-flight"
+                    );
                     prev_admitted = sched.admitted();
                     batches += 1;
                 }
                 prev_active_after = sched.num_active();
                 steps += 1;
-                assert!(steps < 100_000, "static scheduler failed to drain (liveness)");
+                assert!(
+                    steps < 100_000,
+                    "static scheduler failed to drain (liveness)"
+                );
             }
             g.stream.synchronize().unwrap();
             assert_eq!(sched.completed(), NREQ, "every request completes");
             assert_eq!(sched.emitted(), total_gen, "useful tokens == Σ gen_len");
-            assert_eq!(sched.free_blocks(), init_free, "all KV blocks returned to the pool");
-            assert!(batches >= NREQ / bcap, "at least ceil(NREQ/Bcap) admission waves");
+            assert_eq!(
+                sched.free_blocks(),
+                init_free,
+                "all KV blocks returned to the pool"
+            );
+            assert!(
+                batches >= NREQ / bcap,
+                "at least ceil(NREQ/Bcap) admission waves"
+            );
             eprintln!(
                 "static batching drained {NREQ} reqs in {steps} steps across {batches} full-drain batches — \
                  zero mid-flight refills (the honest peer policy holds)"
@@ -2014,11 +2531,14 @@ mod tests {
                     /// Steer the shared graph to `fill` active slots: slots < fill carry their ragged
                     /// context (+1 for the appended token), the rest read as empty and masked.
                     fn set_fill(&mut self, fill: usize) {
-                        let cl: Vec<u32> =
-                            (0..self.bcap).map(|b| if b < fill { self.ctx0[b] as u32 + 1 } else { 0 }).collect();
+                        let cl: Vec<u32> = (0..self.bcap)
+                            .map(|b| if b < fill { self.ctx0[b] as u32 + 1 } else { 0 })
+                            .collect();
                         let wpos: Vec<u32> = self.ctx0.iter().map(|&c| c as u32).collect();
                         let act: Vec<u32> = (0..self.bcap).map(|b| (b < fill) as u32).collect();
-                        self.model.upload_metadata(&self.cap, &self.table, &cl, &wpos, &act).unwrap();
+                        self.model
+                            .upload_metadata(&self.cap, &self.table, &cl, &wpos, &act)
+                            .unwrap();
                     }
                 }
                 let mut held: Vec<HeldB> = Vec::new();
@@ -2040,14 +2560,19 @@ mod tests {
                         let cl: Vec<u32> = ctx0.iter().map(|&c| c as u32 + 1).collect();
                         let wpos: Vec<u32> = ctx0.iter().map(|&c| c as u32).collect();
                         let act = vec![1u32; bcap];
-                        model.upload_metadata(&cap, &table, &cl, &wpos, &act).unwrap();
+                        model
+                            .upload_metadata(&cap, &table, &cl, &wpos, &act)
+                            .unwrap();
                     }
                     // Retire the NULL-stream construction work (weights, slabs, x) before the
                     // dedicated stream reads it — no implicit NULL-stream ordering here.
                     g.stream.synchronize().unwrap();
                     model.run_layers_on(&cap, &x_d, &mut out_c).unwrap();
                     cap.synchronize().unwrap();
-                    let graph = crate::graph::Graph::capture(cap.clone(), || model.run_layers_on(&cap, &x_d, &mut out_c)).unwrap();
+                    let graph = crate::graph::Graph::capture(cap.clone(), || {
+                        model.run_layers_on(&cap, &x_d, &mut out_c)
+                    })
+                    .unwrap();
                     eprintln!(
                         "  Bcap={bcap:3}: KV slabs {:6.1} MiB (budget {:.1} GiB) | pool {} MiB | ctx 32..95",
                         kv as f64 / (1 << 20) as f64,
@@ -2056,7 +2581,18 @@ mod tests {
                     );
                     let fills = vec![1usize, bcap / 4, bcap / 2, bcap];
                     let n_fills = fills.len();
-                    held.push(HeldB { bcap, cap, graph, model, _x: x_d, _out: out_c, table, ctx0, fills, best: vec![f64::MAX; n_fills] });
+                    held.push(HeldB {
+                        bcap,
+                        cap,
+                        graph,
+                        model,
+                        _x: x_d,
+                        _out: out_c,
+                        table,
+                        ctx0,
+                        fills,
+                        best: vec![f64::MAX; n_fills],
+                    });
                 }
 
                 // Global warmup on the largest point to lock the boost clock high before any timing.
@@ -2154,12 +2690,20 @@ mod tests {
                     let (cfg, dff, _, d, _) = graph_cfg_at(depth, bcap);
                     let nreq = 3 * bcap;
                     let reqs: Vec<Request> = (0..nreq)
-                        .map(|i| Request { prompt_len: 8 + (i * 11) % 56, gen_len: 8 + (i * 13) % 56 })
+                        .map(|i| Request {
+                            prompt_len: 8 + (i * 11) % 56,
+                            gen_len: 8 + (i * 13) % 56,
+                        })
                         .collect();
                     let mut drain = |static_batching: bool| -> (f64, usize, usize) {
-                        let model = DecodeModel::new(g, &weights, cfg, dff, 48 * 1024 * 1024 * (bcap / 64)).unwrap();
-                        let mut sched =
-                            if static_batching { Scheduler::new_static(model) } else { Scheduler::new(model) };
+                        let model =
+                            DecodeModel::new(g, &weights, cfg, dff, 48 * 1024 * 1024 * (bcap / 64))
+                                .unwrap();
+                        let mut sched = if static_batching {
+                            Scheduler::new_static(model)
+                        } else {
+                            Scheduler::new(model)
+                        };
                         for &r in &reqs {
                             sched.enqueue(r);
                         }
@@ -2214,14 +2758,32 @@ mod tests {
 
     /// Run the tuned WMMA f16 GEMM `C[m,n] = A[m,k]·B[n,k]ᵀ` (the projection kernel TP would split),
     /// f16 inputs / f32 output. Calls — does not modify — `wmma_nt_f16_sm_db`.
-    fn wmma_gemm_nt(g: &mut Gpu, a16: &[f16], b16: &[f16], m: usize, n: usize, k: usize) -> Vec<f32> {
+    fn wmma_gemm_nt(
+        g: &mut Gpu,
+        a16: &[f16],
+        b16: &[f16],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
         let a_d = g.stream.memcpy_stod(a16).unwrap();
         let b_d = g.stream.memcpy_stod(b16).unwrap();
         let mut c_d = g.stream.alloc_zeros::<f32>(m * n).unwrap();
-        let func = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db").unwrap();
+        let func = g
+            .function(
+                "wmma_f16",
+                crate::ptx_wmma::wmma_f16_ptx(),
+                "wmma_nt_f16_sm_db",
+            )
+            .unwrap();
         let (mm, nn, kk) = (m as u32, n as u32, k as u32);
         let mut b = g.stream.launch_builder(&func);
-        b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+        b.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&a_d)
+            .arg(&b_d)
+            .arg(&mut c_d);
         unsafe { b.launch(wmma_sm_cfg(m, n)).unwrap() };
         g.stream.synchronize().unwrap();
         g.stream.memcpy_dtov(&c_d).unwrap()
@@ -2238,8 +2800,16 @@ mod tests {
         with_gpu("tp_column_parallel_gemm_split_is_bit_exact", |g| {
             let (m, n, k) = (64usize, 256usize, 256usize); // N%128==0 ⇒ N/2 a multiple of the 64 tile
             let mut rng = crate::diff::Rng::new(0x701);
-            let a: Vec<f16> = rng.vec(m * k, -1.0, 1.0).iter().map(|&x| f16::from_f32(x)).collect();
-            let b: Vec<f16> = rng.vec(n * k, -1.0, 1.0).iter().map(|&x| f16::from_f32(x)).collect();
+            let a: Vec<f16> = rng
+                .vec(m * k, -1.0, 1.0)
+                .iter()
+                .map(|&x| f16::from_f32(x))
+                .collect();
+            let b: Vec<f16> = rng
+                .vec(n * k, -1.0, 1.0)
+                .iter()
+                .map(|&x| f16::from_f32(x))
+                .collect();
             let full = wmma_gemm_nt(g, &a, &b, m, n, k);
             // Two "GPUs", each owning N/2 output columns (B rows): C_g = A · B_g^T, no comm.
             let nh = n / 2;
@@ -2253,7 +2823,11 @@ mod tests {
                 }
             }
             for i in 0..m * n {
-                assert_eq!(part[i].to_bits(), full[i].to_bits(), "column-parallel split != unsplit at {i}");
+                assert_eq!(
+                    part[i].to_bits(),
+                    full[i].to_bits(),
+                    "column-parallel split != unsplit at {i}"
+                );
             }
             eprintln!("TP column-parallel ({m}×{n}×{k}, split N {n}→2×{nh}): concat == unsplit BIT-IDENTICAL (no all-reduce needed)");
         });
@@ -2270,8 +2844,16 @@ mod tests {
         with_gpu("tp_row_parallel_gemm_allreduce_matches", |g| {
             let (m, n, k) = (64usize, 256usize, 256usize); // K/2 a multiple of the 16-wide K tile
             let mut rng = crate::diff::Rng::new(0x702);
-            let a: Vec<f16> = rng.vec(m * k, -1.0, 1.0).iter().map(|&x| f16::from_f32(x)).collect();
-            let b: Vec<f16> = rng.vec(n * k, -1.0, 1.0).iter().map(|&x| f16::from_f32(x)).collect();
+            let a: Vec<f16> = rng
+                .vec(m * k, -1.0, 1.0)
+                .iter()
+                .map(|&x| f16::from_f32(x))
+                .collect();
+            let b: Vec<f16> = rng
+                .vec(n * k, -1.0, 1.0)
+                .iter()
+                .map(|&x| f16::from_f32(x))
+                .collect();
             let full = wmma_gemm_nt(g, &a, &b, m, n, k);
             // Each "GPU" owns a K-shard of both operands and computes a full-[M,N] partial.
             let kh = k / 2;

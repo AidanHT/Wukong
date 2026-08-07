@@ -474,7 +474,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(names.contains(&"main".to_string()), "lost `main`: {names:?}");
+        assert!(
+            names.contains(&"main".to_string()),
+            "lost `main`: {names:?}"
+        );
         assert!(
             names.contains(&"helper".to_string()),
             "lost `helper`: {names:?}"

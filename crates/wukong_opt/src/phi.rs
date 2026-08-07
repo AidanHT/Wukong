@@ -359,6 +359,9 @@ mod tests {
             .flat_map(|b| b.params.iter())
             .filter(|p| *f.value_type(**p) == MirType::F32)
             .count();
-        assert!(f32_params >= 1, "the recurrence's carried value was dropped");
+        assert!(
+            f32_params >= 1,
+            "the recurrence's carried value was dropped"
+        );
     }
 }

@@ -95,21 +95,93 @@ fn int8_candidates() -> Vec<Int8Cand> {
         int8_gemm_smdb128_ptx, int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_ptx,
         int8_gemm_smdb_swz_ptx, int8_gemm_smdb_swz_splitk_ptx, int8_gemm_w64_swz_ptx,
         int8_gemm_w64_swz_r8_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_STAGE_VARIANTS,
-        INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128, INT8_W64_BM, INT8_W64_BN,
-        INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+        INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, INT8_WARPS_M,
+        INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
     };
     let w64 = INT8_WARPS_M * INT8_WARPS_N;
     let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
     let ww64 = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
     let mut v = vec![
-        Int8Cand { name: "smdb64", src: Int8Src::Fixed(int8_gemm_smdb_ptx), entry: "int8_gemm_nt_smdb", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 32, raster: 0, smem: 0, min_k: 0 },
-        Int8Cand { name: "smdb128", src: Int8Src::Fixed(int8_gemm_smdb128_ptx), entry: "int8_gemm_nt_smdb128", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 32, raster: 0, smem: 0, min_k: 0 },
-        Int8Cand { name: "swz64", src: Int8Src::Fixed(int8_gemm_smdb_swz_ptx), entry: "int8_gemm_nt_smdb_swz", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 64, raster: 0, smem: 0, min_k: 0 },
-        Int8Cand { name: "swz128", src: Int8Src::Fixed(int8_gemm_smdb128_swz_ptx), entry: "int8_gemm_nt_smdb128_swz", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 64, raster: 0, smem: 0, min_k: 0 },
+        Int8Cand {
+            name: "smdb64",
+            src: Int8Src::Fixed(int8_gemm_smdb_ptx),
+            entry: "int8_gemm_nt_smdb",
+            bm: INT8_BM,
+            bn: INT8_BN,
+            warps: w64,
+            sk: 1,
+            k_mult: 32,
+            raster: 0,
+            smem: 0,
+            min_k: 0,
+        },
+        Int8Cand {
+            name: "smdb128",
+            src: Int8Src::Fixed(int8_gemm_smdb128_ptx),
+            entry: "int8_gemm_nt_smdb128",
+            bm: INT8_BM128,
+            bn: INT8_BN128,
+            warps: w128,
+            sk: 1,
+            k_mult: 32,
+            raster: 0,
+            smem: 0,
+            min_k: 0,
+        },
+        Int8Cand {
+            name: "swz64",
+            src: Int8Src::Fixed(int8_gemm_smdb_swz_ptx),
+            entry: "int8_gemm_nt_smdb_swz",
+            bm: INT8_BM,
+            bn: INT8_BN,
+            warps: w64,
+            sk: 1,
+            k_mult: 64,
+            raster: 0,
+            smem: 0,
+            min_k: 0,
+        },
+        Int8Cand {
+            name: "swz128",
+            src: Int8Src::Fixed(int8_gemm_smdb128_swz_ptx),
+            entry: "int8_gemm_nt_smdb128_swz",
+            bm: INT8_BM128,
+            bn: INT8_BN128,
+            warps: w128,
+            sk: 1,
+            k_mult: 64,
+            raster: 0,
+            smem: 0,
+            min_k: 0,
+        },
         // The 64×64-warp-tile workhorse (128×128 CTA, 4 warps) — the perf/gpu-quant-2 winner (~1.2–1.3×
         // the 8-warp swz128 same-run; 2048³→92%, +raster8→99.6% of cuBLAS) — and its rasterized sibling.
-        Int8Cand { name: "w64", src: Int8Src::Fixed(int8_gemm_w64_swz_ptx), entry: "int8_gemm_nt_w64_swz", bm: INT8_W64_BM, bn: INT8_W64_BN, warps: ww64, sk: 1, k_mult: 64, raster: 0, smem: 0, min_k: 0 },
-        Int8Cand { name: "w64_r8", src: Int8Src::Fixed(int8_gemm_w64_swz_r8_ptx), entry: "int8_gemm_nt_w64_swz_r8", bm: INT8_W64_BM, bn: INT8_W64_BN, warps: ww64, sk: 1, k_mult: 64, raster: 8 , smem: 0, min_k: 0 },
+        Int8Cand {
+            name: "w64",
+            src: Int8Src::Fixed(int8_gemm_w64_swz_ptx),
+            entry: "int8_gemm_nt_w64_swz",
+            bm: INT8_W64_BM,
+            bn: INT8_W64_BN,
+            warps: ww64,
+            sk: 1,
+            k_mult: 64,
+            raster: 0,
+            smem: 0,
+            min_k: 0,
+        },
+        Int8Cand {
+            name: "w64_r8",
+            src: Int8Src::Fixed(int8_gemm_w64_swz_r8_ptx),
+            entry: "int8_gemm_nt_w64_swz_r8",
+            bm: INT8_W64_BM,
+            bn: INT8_W64_BN,
+            warps: ww64,
+            sk: 1,
+            k_mult: 64,
+            raster: 8,
+            smem: 0,
+            min_k: 0,
+        },
     ];
     // **The variable-stage rows** (`INT8_STAGE_VARIANTS`, same 128×128 CTA / 64×64 warp tile as `w64`,
     // deeper `cp.async` ring). s2 is byte-identical to `w64` above, so it is skipped rather than timed
@@ -120,7 +192,11 @@ fn int8_candidates() -> Vec<Int8Cand> {
     // heuristic, should decide: the cache is device-keyed, so each part gets its own verdict.
     for cfg in INT8_STAGE_VARIANTS.iter().filter(|c| c.stages > 2) {
         v.push(Int8Cand {
-            name: match cfg.stages { 3 => "w64_s3", 4 => "w64_s4", _ => "w64_s5" },
+            name: match cfg.stages {
+                3 => "w64_s3",
+                4 => "w64_s4",
+                _ => "w64_s5",
+            },
             src: Int8Src::Stage(cfg),
             entry: cfg.name,
             bm: cfg.bm,
@@ -136,7 +212,11 @@ fn int8_candidates() -> Vec<Int8Cand> {
     // split-K variants of the 64×64 swz kernel (one entry, gridDim.z = sk; thin-M / small-N lever).
     for sk in [2usize, 4, 8] {
         v.push(Int8Cand {
-            name: match sk { 2 => "swz64_sk2", 4 => "swz64_sk4", _ => "swz64_sk8" },
+            name: match sk {
+                2 => "swz64_sk2",
+                4 => "swz64_sk4",
+                _ => "swz64_sk8",
+            },
             src: Int8Src::Fixed(int8_gemm_smdb_swz_splitk_ptx),
             entry: "int8_gemm_nt_smdb_swz_sk",
             bm: INT8_BM,
@@ -261,10 +341,17 @@ pub struct TuneResult {
 /// **bit-exact cross-check** (all int8 kernels must agree byte-for-byte — a disagreement panics rather
 /// than silently caching a wrong "winner"), then times each best-of-N. Returns the ranking, fastest
 /// first. Panics if no candidate fits the shape (needs at least M%64==0, N%64==0, K%32==0).
-pub fn tune_int8_gemm(g: &mut Gpu, m: usize, n: usize, k: usize) -> Result<TuneResult, DriverError> {
+pub fn tune_int8_gemm(
+    g: &mut Gpu,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<TuneResult, DriverError> {
     let budget = g.smem_budget();
-    let cands: Vec<Int8Cand> =
-        int8_candidates().into_iter().filter(|c| applicable(c, m, n, k, budget)).collect();
+    let cands: Vec<Int8Cand> = int8_candidates()
+        .into_iter()
+        .filter(|c| applicable(c, m, n, k, budget))
+        .collect();
     assert!(
         !cands.is_empty(),
         "autotune: no int8 GEMM candidate fits {m}x{n}x{k} (need M%64==0, N%64==0, K%32==0)"
@@ -285,7 +372,12 @@ pub fn tune_int8_gemm(g: &mut Gpu, m: usize, n: usize, k: usize) -> Result<TuneR
         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n])?; // split-K needs a zeroed C
         {
             let mut bld = g.stream.launch_builder(&f);
-            bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+            bld.arg(&dims.0)
+                .arg(&dims.1)
+                .arg(&dims.2)
+                .arg(&a_d)
+                .arg(&b_d)
+                .arg(&mut cc);
             unsafe { bld.launch(cfg)? };
         }
         let out = g.stream.memcpy_dtov(&cc)?;
@@ -299,10 +391,17 @@ pub fn tune_int8_gemm(g: &mut Gpu, m: usize, n: usize, k: usize) -> Result<TuneR
         }
         let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
         let secs = best_secs(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 6, 50);
-        ranked.push(Ranked { name: c.name.to_string(), secs, gflops: flop / secs / 1e9 });
+        ranked.push(Ranked {
+            name: c.name.to_string(),
+            secs,
+            gflops: flop / secs / 1e9,
+        });
     }
     ranked.sort_by(|x, y| x.secs.partial_cmp(&y.secs).unwrap());
-    Ok(TuneResult { best: ranked[0].name.clone(), ranked })
+    Ok(TuneResult {
+        best: ranked[0].name.clone(),
+        ranked,
+    })
 }
 
 /// A cached winner for one (op, shape, dtype) key: the config token + the GFLOP/s it hit when tuned
@@ -332,7 +431,9 @@ pub struct AutotuneCache {
 
 impl AutotuneCache {
     pub fn new() -> Self {
-        Self { map: BTreeMap::new() }
+        Self {
+            map: BTreeMap::new(),
+        }
     }
 
     fn int8_key(dev: &str, m: usize, n: usize, k: usize) -> String {
@@ -369,8 +470,9 @@ impl AutotuneCache {
 
     /// Serialize to the line-oriented text format.
     pub fn to_text(&self) -> String {
-        let mut s =
-            String::from("# wukong autotune cache: <dtype> <device> <m> <n> <k> = <config> <gflops>\n");
+        let mut s = String::from(
+            "# wukong autotune cache: <dtype> <device> <m> <n> <k> = <config> <gflops>\n",
+        );
         for (key, e) in &self.map {
             s += &format!("{key} = {} {:.1}\n", e.config, e.gflops);
         }
@@ -390,16 +492,26 @@ impl AutotuneCache {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((key, val)) = line.split_once('=') else { continue };
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
             let key = key.trim();
             // key must be `<dtype> <device> <m> <n> <k>` (5 tokens); val must be `<config> <gflops>`.
             if key.split_whitespace().count() != 5 {
                 continue;
             }
             let mut vt = val.split_whitespace();
-            let (Some(config), Some(gf)) = (vt.next(), vt.next()) else { continue };
+            let (Some(config), Some(gf)) = (vt.next(), vt.next()) else {
+                continue;
+            };
             let gflops = gf.parse::<f64>().unwrap_or(0.0);
-            map.insert(key.to_string(), CacheEntry { config: config.to_string(), gflops });
+            map.insert(
+                key.to_string(),
+                CacheEntry {
+                    config: config.to_string(),
+                    gflops,
+                },
+            );
         }
         Self { map }
     }
@@ -423,7 +535,9 @@ impl AutotuneCache {
 /// unknown token used to `panic!` and a mis-tiled one used to launch a truncated grid, returning `Ok`
 /// with part of C left at its pre-fill. Both are treated as a cache miss and re-tuned.
 fn int8_token_usable(token: &str, m: usize, n: usize, k: usize, budget: usize) -> bool {
-    int8_candidates().iter().any(|c| c.name == token && applicable(c, m, n, k, budget))
+    int8_candidates()
+        .iter()
+        .any(|c| c.name == token && applicable(c, m, n, k, budget))
 }
 
 /// Look up the tuned config for `m×n×k`, tuning + caching it on a miss. Returns the config token.
@@ -444,7 +558,16 @@ pub fn tune_int8_cached(
         }
     }
     let r = tune_int8_gemm(g, m, n, k)?;
-    cache.insert_int8(&dev, m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
+    cache.insert_int8(
+        &dev,
+        m,
+        n,
+        k,
+        CacheEntry {
+            config: r.best.clone(),
+            gflops: r.ranked[0].gflops,
+        },
+    );
     Ok(r.best)
 }
 
@@ -488,7 +611,9 @@ pub fn revalidate_int8(
     n: usize,
     k: usize,
 ) -> Result<Option<Regression>, DriverError> {
-    let Some(e) = cache.get_int8(&g.device_tag(), m, n, k) else { return Ok(None) };
+    let Some(e) = cache.get_int8(&g.device_tag(), m, n, k) else {
+        return Ok(None);
+    };
     let r = tune_int8_gemm(g, m, n, k)?;
     let cached_secs = r.ranked.iter().find(|x| x.name == e.config).map(|x| x.secs);
     Ok(match cached_secs {
@@ -527,7 +652,12 @@ pub fn launch_int8_tuned(
     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?; // split-K accumulates → C must start zeroed
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -551,7 +681,10 @@ fn w4a16_token(sk: usize) -> String {
 
 /// Parse a W4A16 config token to its split count (`"w4a16"` → 1, `"w4a16_skN"` → N).
 fn w4a16_sk_of(token: &str) -> usize {
-    token.strip_prefix("w4a16_sk").and_then(|s| s.parse().ok()).unwrap_or(1)
+    token
+        .strip_prefix("w4a16_sk")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
 }
 
 /// Is `token` a split count this build searches *and* one the shape's `k` divides? Same reasoning as
@@ -582,30 +715,60 @@ pub fn tune_w4a16_gemm(
     assert_eq!(qw.n, n);
     assert_eq!(qw.k, k);
     assert_eq!(qw.group, GROUP_SIZE);
-    assert!(qw.zeros.is_none(), "w4a16 autotune is the symmetric split-K path");
+    assert!(
+        qw.zeros.is_none(),
+        "w4a16 autotune is the symmetric split-K path"
+    );
     assert!(
         m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
         "w4a16 tune needs M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
     );
-    let a: Vec<f16> = (0..m * k).map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 8.0)).collect();
+    let a: Vec<f16> = (0..m * k)
+        .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 8.0))
+        .collect();
     let a_d = g.stream.memcpy_stod(&a)?;
     let bq_d = g.stream.memcpy_stod(&qw.packed)?;
     let scl_d = g.stream.memcpy_stod(&qw.scales)?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let flop = 2.0 * m as f64 * n as f64 * k as f64;
     let f_base = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16")?;
-    let f_sk = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "gemm_nt_w4a16_sk")?;
-    let f_red = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "w4a16_splitk_reduce")?;
-    let cfg1 = LaunchConfig { grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1), block_dim: (W4_THREADS as u32, 1, 1), shared_mem_bytes: 0 };
-    let rcfg = LaunchConfig { grid_dim: (256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let f_sk = g.function(
+        "w4a16_sk",
+        crate::ptx_int4::w4a16_splitk_ptx(),
+        "gemm_nt_w4a16_sk",
+    )?;
+    let f_red = g.function(
+        "w4a16_sk",
+        crate::ptx_int4::w4a16_splitk_ptx(),
+        "w4a16_splitk_reduce",
+    )?;
+    let cfg1 = LaunchConfig {
+        grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
+        block_dim: (W4_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let rcfg = LaunchConfig {
+        grid_dim: (256, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let mut reference: Option<Vec<f32>> = None;
     let mut ranked: Vec<Ranked> = Vec::new();
-    for &sk in W4A16_SK_CANDS.iter().filter(|&&sk| k % (sk * GROUP_SIZE) == 0) {
+    for &sk in W4A16_SK_CANDS
+        .iter()
+        .filter(|&&sk| k % (sk * GROUP_SIZE) == 0)
+    {
         let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
         let (out, secs) = if sk == 1 {
             {
                 let mut b = g.stream.launch_builder(&f_base);
-                b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+                b.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&a_d)
+                    .arg(&bq_d)
+                    .arg(&scl_d)
+                    .arg(&mut c_d);
                 unsafe { b.launch(cfg1)? };
             }
             let out = g.stream.memcpy_dtov(&c_d)?;
@@ -614,7 +777,13 @@ pub fn tune_w4a16_gemm(
                 let t0 = Instant::now();
                 for _ in 0..50 {
                     let mut b = g.stream.launch_builder(&f_base);
-                    b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+                    b.arg(&mm)
+                        .arg(&nn)
+                        .arg(&kk)
+                        .arg(&a_d)
+                        .arg(&bq_d)
+                        .arg(&scl_d)
+                        .arg(&mut c_d);
                     unsafe { b.launch(cfg1)? };
                 }
                 g.stream.synchronize().unwrap();
@@ -623,11 +792,21 @@ pub fn tune_w4a16_gemm(
             (out, s)
         } else {
             let mut part_d = g.stream.memcpy_stod(&vec![0f32; sk * m * n])?;
-            let cfg_sk = LaunchConfig { grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, sk as u32), block_dim: (W4_THREADS as u32, 1, 1), shared_mem_bytes: 0 };
+            let cfg_sk = LaunchConfig {
+                grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, sk as u32),
+                block_dim: (W4_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
             let (mnp, skk) = ((m * n) as u32, sk as u32);
             {
                 let mut b = g.stream.launch_builder(&f_sk);
-                b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut part_d);
+                b.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&a_d)
+                    .arg(&bq_d)
+                    .arg(&scl_d)
+                    .arg(&mut part_d);
                 unsafe { b.launch(cfg_sk)? };
             }
             {
@@ -642,7 +821,13 @@ pub fn tune_w4a16_gemm(
                 for _ in 0..50 {
                     {
                         let mut b = g.stream.launch_builder(&f_sk);
-                        b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut part_d);
+                        b.arg(&mm)
+                            .arg(&nn)
+                            .arg(&kk)
+                            .arg(&a_d)
+                            .arg(&bq_d)
+                            .arg(&scl_d)
+                            .arg(&mut part_d);
                         unsafe { b.launch(cfg_sk)? };
                     }
                     {
@@ -660,14 +845,24 @@ pub fn tune_w4a16_gemm(
         match &reference {
             None => reference = Some(out),
             Some(r) => {
-                let bad = out.iter().zip(r).any(|(&x, &y)| (x - y).abs() > 1e-2 + 2e-3 * y.abs());
+                let bad = out
+                    .iter()
+                    .zip(r)
+                    .any(|(&x, &y)| (x - y).abs() > 1e-2 + 2e-3 * y.abs());
                 assert!(!bad, "autotune w4a16: sk={sk} disagrees with the un-split output beyond fp16 tolerance at {m}x{n}x{k}");
             }
         }
-        ranked.push(Ranked { name: w4a16_token(sk), secs, gflops: flop / secs / 1e9 });
+        ranked.push(Ranked {
+            name: w4a16_token(sk),
+            secs,
+            gflops: flop / secs / 1e9,
+        });
     }
     ranked.sort_by(|x, y| x.secs.partial_cmp(&y.secs).unwrap());
-    Ok(TuneResult { best: ranked[0].name.clone(), ranked })
+    Ok(TuneResult {
+        best: ranked[0].name.clone(),
+        ranked,
+    })
 }
 
 /// Look up the tuned W4A16 split count for `m×n×k`, tuning + caching on a miss. Returns the config
@@ -688,7 +883,16 @@ pub fn tune_w4a16_cached(
         }
     }
     let r = tune_w4a16_gemm(g, qw, m, k, n)?;
-    cache.insert_w4a16(&dev, m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
+    cache.insert_w4a16(
+        &dev,
+        m,
+        n,
+        k,
+        CacheEntry {
+            config: r.best.clone(),
+            gflops: r.ranked[0].gflops,
+        },
+    );
     Ok(r.best)
 }
 
@@ -739,14 +943,50 @@ mod tests {
     fn cache_text_roundtrip() {
         let dev = "sm_89x20";
         let mut c = AutotuneCache::new();
-        c.insert_int8(dev, 1024, 1024, 1024, CacheEntry { config: "swz64".into(), gflops: 12345.6 });
-        c.insert_int8(dev, 64, 128, 8192, CacheEntry { config: "swz64_sk8".into(), gflops: 6948.0 });
-        c.insert_int8(dev, 4096, 4096, 4096, CacheEntry { config: "swz128".into(), gflops: 50570.0 });
+        c.insert_int8(
+            dev,
+            1024,
+            1024,
+            1024,
+            CacheEntry {
+                config: "swz64".into(),
+                gflops: 12345.6,
+            },
+        );
+        c.insert_int8(
+            dev,
+            64,
+            128,
+            8192,
+            CacheEntry {
+                config: "swz64_sk8".into(),
+                gflops: 6948.0,
+            },
+        );
+        c.insert_int8(
+            dev,
+            4096,
+            4096,
+            4096,
+            CacheEntry {
+                config: "swz128".into(),
+                gflops: 50570.0,
+            },
+        );
         let back = AutotuneCache::from_text(&c.to_text());
         assert_eq!(back.len(), 3);
-        assert_eq!(back.get_int8(dev, 1024, 1024, 1024).unwrap().config, "swz64");
-        assert_eq!(back.get_int8(dev, 64, 128, 8192).unwrap().config, "swz64_sk8");
-        assert_eq!(back.get_int8(dev, 4096, 4096, 4096).unwrap().config, "swz128");
+        assert_eq!(
+            back.get_int8(dev, 1024, 1024, 1024).unwrap().config,
+            "swz64"
+        );
+        assert_eq!(
+            back.get_int8(dev, 64, 128, 8192).unwrap().config,
+            "swz64_sk8"
+        );
+        assert_eq!(
+            back.get_int8(dev, 4096, 4096, 4096).unwrap().config,
+            "swz128"
+        );
         // tolerant parsing: junk lines are dropped, valid ones survive.
         let parsed = AutotuneCache::from_text(
             "# header\n\nint8 sm_89x20 256 256 256 = swz64 999.9\ngarbage line\nint8 1 2 = bad\n",
@@ -768,15 +1008,54 @@ mod tests {
     fn a_cache_from_another_device_is_a_miss_not_a_wrong_hit() {
         let (laptop, a100) = ("sm_89x20", "sm_80x108");
         let mut c = AutotuneCache::new();
-        c.insert_int8(laptop, 4096, 4096, 4096, CacheEntry { config: "swz128".into(), gflops: 50570.0 });
-        c.insert_w4a16(laptop, 64, 256, 1024, CacheEntry { config: "w4a16_sk4".into(), gflops: 900.0 });
-        assert_eq!(c.get_int8(laptop, 4096, 4096, 4096).unwrap().config, "swz128");
-        assert!(c.get_int8(a100, 4096, 4096, 4096).is_none(), "an A100 must not inherit a 4050 tune");
-        assert!(c.get_w4a16(a100, 64, 256, 1024).is_none(), "w4a16 split-K is SM-count-sensitive");
+        c.insert_int8(
+            laptop,
+            4096,
+            4096,
+            4096,
+            CacheEntry {
+                config: "swz128".into(),
+                gflops: 50570.0,
+            },
+        );
+        c.insert_w4a16(
+            laptop,
+            64,
+            256,
+            1024,
+            CacheEntry {
+                config: "w4a16_sk4".into(),
+                gflops: 900.0,
+            },
+        );
+        assert_eq!(
+            c.get_int8(laptop, 4096, 4096, 4096).unwrap().config,
+            "swz128"
+        );
+        assert!(
+            c.get_int8(a100, 4096, 4096, 4096).is_none(),
+            "an A100 must not inherit a 4050 tune"
+        );
+        assert!(
+            c.get_w4a16(a100, 64, 256, 1024).is_none(),
+            "w4a16 split-K is SM-count-sensitive"
+        );
         // The same shape tuned on both cards coexists - the key is (dtype, device, shape).
-        c.insert_int8(a100, 4096, 4096, 4096, CacheEntry { config: "w64_r8".into(), gflops: 1.0 });
+        c.insert_int8(
+            a100,
+            4096,
+            4096,
+            4096,
+            CacheEntry {
+                config: "w64_r8".into(),
+                gflops: 1.0,
+            },
+        );
         assert_eq!(c.len(), 3);
-        assert_eq!(c.get_int8(laptop, 4096, 4096, 4096).unwrap().config, "swz128");
+        assert_eq!(
+            c.get_int8(laptop, 4096, 4096, 4096).unwrap().config,
+            "swz128"
+        );
         assert_eq!(c.get_int8(a100, 4096, 4096, 4096).unwrap().config, "w64_r8");
         // A cache written before this change parses to nothing: unknown provenance => clean re-tune.
         let legacy = "# wukong autotune cache: <dtype> <m> <n> <k> = <config> <gflops>\n\
@@ -790,8 +1069,21 @@ mod tests {
         // The tag itself must stay a single whitespace-free token, or the 5-token key parse breaks.
         for tag in [laptop, a100, "sm_90x132", "sm_120x24"] {
             let mut one = AutotuneCache::new();
-            one.insert_int8(tag, 256, 256, 256, CacheEntry { config: "swz64".into(), gflops: 1.0 });
-            assert_eq!(AutotuneCache::from_text(&one.to_text()).len(), 1, "tag {tag} broke the key");
+            one.insert_int8(
+                tag,
+                256,
+                256,
+                256,
+                CacheEntry {
+                    config: "swz64".into(),
+                    gflops: 1.0,
+                },
+            );
+            assert_eq!(
+                AutotuneCache::from_text(&one.to_text()).len(),
+                1,
+                "tag {tag} broke the key"
+            );
         }
     }
 
@@ -807,42 +1099,93 @@ mod tests {
     #[test]
     fn stale_cache_tokens_are_not_usable() {
         const ADA: usize = 101_376; // this card's opt-in ceiling; the shipped kernels never approach it
-        // A known token that fits its shape is usable.
+                                    // A known token that fits its shape is usable.
         assert!(int8_token_usable("smdb128", 256, 256, 256, ADA));
-        assert!(int8_token_usable("smdb64", 192, 256, 256, ADA), "64x64 tiles do divide M=192");
+        assert!(
+            int8_token_usable("smdb64", 192, 256, 256, ADA),
+            "64x64 tiles do divide M=192"
+        );
         // The two escapes above.
-        assert!(!int8_token_usable("smdb128", 192, 256, 256, ADA), "128 does not divide M=192");
-        assert!(!int8_token_usable("swz64_sk16", 256, 256, 256, ADA), "unknown candidate token");
+        assert!(
+            !int8_token_usable("smdb128", 192, 256, 256, ADA),
+            "128 does not divide M=192"
+        );
+        assert!(
+            !int8_token_usable("swz64_sk16", 256, 256, 256, ADA),
+            "unknown candidate token"
+        );
         assert!(!int8_token_usable("", 256, 256, 256, ADA));
         // K-divisibility is part of the contract too: the BK=64 swz kernels need K%64==0, split-K sk*64.
-        assert!(!int8_token_usable("swz64", 256, 256, 96, ADA), "BK=64 kernel needs K%64==0");
-        assert!(int8_token_usable("smdb64", 256, 256, 96, ADA), "BK=32 kernel accepts K=96");
-        assert!(!int8_token_usable("swz64_sk8", 256, 256, 256, ADA), "sk=8 needs K%512==0");
+        assert!(
+            !int8_token_usable("swz64", 256, 256, 96, ADA),
+            "BK=64 kernel needs K%64==0"
+        );
+        assert!(
+            int8_token_usable("smdb64", 256, 256, 96, ADA),
+            "BK=32 kernel accepts K=96"
+        );
+        assert!(
+            !int8_token_usable("swz64_sk8", 256, 256, 256, ADA),
+            "sk=8 needs K%512==0"
+        );
         // **The device budget is part of the contract now.** A deep-ring token is a real candidate on a
         // card with the carveout for it and NOT a candidate on one without — the same token, the same
         // shape, a different answer per machine. This is the class of stale hit the campaign cares about:
         // the cache travels to a rented box, and a 64 KiB ring replayed on a 64 KiB-opt-in Turing part
         // would reach `cuFuncSetAttribute` and fail there, naming neither kernel nor ceiling.
-        assert!(int8_token_usable("w64_s4", 256, 256, 256, ADA), "s4 is 64 KiB — fits a 99 KiB carveout");
-        assert!(!int8_token_usable("w64_s4", 256, 256, 256, 49_152), "s4 cannot exist under a 48 KiB ceiling");
-        assert!(int8_token_usable("w64_s3", 256, 256, 256, 49_152), "s3 is 48 KiB exactly — still static");
-        assert!(int8_token_usable("w64_s5", 256, 256, 256, 166_912), "s5 is 80 KiB — fits an A100");
-        assert!(!int8_token_usable("w64_s5", 256, 256, 256, 65_536), "s5 does not fit a 64 KiB ceiling");
+        assert!(
+            int8_token_usable("w64_s4", 256, 256, 256, ADA),
+            "s4 is 64 KiB — fits a 99 KiB carveout"
+        );
+        assert!(
+            !int8_token_usable("w64_s4", 256, 256, 256, 49_152),
+            "s4 cannot exist under a 48 KiB ceiling"
+        );
+        assert!(
+            int8_token_usable("w64_s3", 256, 256, 256, 49_152),
+            "s3 is 48 KiB exactly — still static"
+        );
+        assert!(
+            int8_token_usable("w64_s5", 256, 256, 256, 166_912),
+            "s5 is 80 KiB — fits an A100"
+        );
+        assert!(
+            !int8_token_usable("w64_s5", 256, 256, 256, 65_536),
+            "s5 does not fit a 64 KiB ceiling"
+        );
         // …and a depth whose ring cannot fill at this K is not a candidate either (correct, but waste).
-        assert!(!int8_token_usable("w64_s5", 256, 256, 192, ADA), "s5 needs K >= (5-1)*64 = 256");
-        assert!(int8_token_usable("w64_s4", 256, 256, 192, ADA), "s4 needs K >= 192");
+        assert!(
+            !int8_token_usable("w64_s5", 256, 256, 192, ADA),
+            "s5 needs K >= (5-1)*64 = 256"
+        );
+        assert!(
+            int8_token_usable("w64_s4", 256, 256, 192, ADA),
+            "s4 needs K >= 192"
+        );
         // A parsed cache entry is only trusted through the same predicate.
         let c = AutotuneCache::from_text("int8 sm_89x20 192 256 256 = smdb128 999.9\n");
         let e = c.get_int8("sm_89x20", 192, 256, 256).expect("entry parses");
         assert_eq!(e.config, "smdb128");
-        assert!(!int8_token_usable(&e.config, 192, 256, 256, ADA), "a parsed hit is still re-validated");
+        assert!(
+            !int8_token_usable(&e.config, 192, 256, 256, ADA),
+            "a parsed hit is still re-validated"
+        );
         // W4A16: the split count must divide K by GROUP_SIZE·sk, and be one this build searches.
         use crate::ptx_int4::GROUP_SIZE;
         assert!(w4a16_token_usable("w4a16", 4 * GROUP_SIZE));
         assert!(w4a16_token_usable("w4a16_sk4", 4 * GROUP_SIZE));
-        assert!(!w4a16_token_usable("w4a16_sk4", 2 * GROUP_SIZE), "sk=4 needs K%(4*group)==0");
-        assert!(!w4a16_token_usable("w4a16_sk3", 24 * GROUP_SIZE), "sk=3 is not a searched candidate");
-        assert!(!w4a16_token_usable("smdb64", 8 * GROUP_SIZE), "an int8 token is not a w4a16 token");
+        assert!(
+            !w4a16_token_usable("w4a16_sk4", 2 * GROUP_SIZE),
+            "sk=4 needs K%(4*group)==0"
+        );
+        assert!(
+            !w4a16_token_usable("w4a16_sk3", 24 * GROUP_SIZE),
+            "sk=3 is not a searched candidate"
+        );
+        assert!(
+            !w4a16_token_usable("smdb64", 8 * GROUP_SIZE),
+            "an int8 token is not a w4a16 token"
+        );
     }
 
     /// **The on-disk cache survives a real file round-trip (no GPU).** `cache_text_roundtrip` only
@@ -854,29 +1197,66 @@ mod tests {
     fn cache_save_load_roundtrip_through_a_file() {
         let dev = "sm_89x20";
         let mut c = AutotuneCache::new();
-        c.insert_int8(dev, 1024, 1024, 1024, CacheEntry { config: "swz64".into(), gflops: 12345.6 });
-        c.insert_w4a16(dev, 64, 256, 1024, CacheEntry { config: "w4a16_sk4".into(), gflops: 900.0 });
+        c.insert_int8(
+            dev,
+            1024,
+            1024,
+            1024,
+            CacheEntry {
+                config: "swz64".into(),
+                gflops: 12345.6,
+            },
+        );
+        c.insert_w4a16(
+            dev,
+            64,
+            256,
+            1024,
+            CacheEntry {
+                config: "w4a16_sk4".into(),
+                gflops: 900.0,
+            },
+        );
         let path = std::env::temp_dir().join(format!("wukong_autotune_{}.txt", std::process::id()));
         c.save(&path).expect("save");
         let back = AutotuneCache::load(&path).expect("load");
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.len(), c.len());
-        assert_eq!(back.get_int8(dev, 1024, 1024, 1024).unwrap().config, "swz64");
-        assert_eq!(back.get_w4a16(dev, 64, 256, 1024).unwrap().config, "w4a16_sk4");
+        assert_eq!(
+            back.get_int8(dev, 1024, 1024, 1024).unwrap().config,
+            "swz64"
+        );
+        assert_eq!(
+            back.get_w4a16(dev, 64, 256, 1024).unwrap().config,
+            "w4a16_sk4"
+        );
         // CRLF (what a Windows editor writes) must parse identically to LF.
         let crlf = c.to_text().replace('\n', "\r\n");
         let from_crlf = AutotuneCache::from_text(&crlf);
         assert_eq!(from_crlf.len(), c.len(), "CRLF cache must parse");
-        assert_eq!(from_crlf.get_int8(dev, 1024, 1024, 1024).unwrap().config, "swz64");
+        assert_eq!(
+            from_crlf.get_int8(dev, 1024, 1024, 1024).unwrap().config,
+            "swz64"
+        );
         // A path that cannot be written must surface an error, not be silently dropped.
-        assert!(c.save(std::env::temp_dir().join("wukong_no_such_dir_xyz").join("c.txt")).is_err());
+        assert!(c
+            .save(
+                std::env::temp_dir()
+                    .join("wukong_no_such_dir_xyz")
+                    .join("c.txt")
+            )
+            .is_err());
     }
 
     /// **Regression decision logic (no GPU).** Both directions, deterministic: a clearly-faster different
     /// config flags; the cached config still being best (or a within-threshold reshuffle) does not.
     #[test]
     fn regression_decision_both_ways() {
-        let best = Ranked { name: "swz64_sk8".into(), secs: 1.0e-4, gflops: 0.0 };
+        let best = Ranked {
+            name: "swz64_sk8".into(),
+            secs: 1.0e-4,
+            gflops: 0.0,
+        };
         // cached is 2× slower than the new best → flag.
         let r = regression_decision("smdb64", 2.0e-4, &best, 1.10);
         assert_eq!(r.unwrap().current_best, "swz64_sk8");
@@ -904,32 +1284,62 @@ mod tests {
         };
         let n_cands = int8_candidates().len();
         let mut cache = AutotuneCache::new();
-        for (m, n, k) in [(256usize, 256usize, 256usize), (64, 128, 8192), (128, 128, 256)] {
+        for (m, n, k) in [
+            (256usize, 256usize, 256usize),
+            (64, 128, 8192),
+            (128, 128, 256),
+        ] {
             let r = tune_int8_gemm(g, m, n, k).unwrap();
-            assert!(!r.ranked.is_empty(), "ranking must be non-empty for {m}x{n}x{k}");
+            assert!(
+                !r.ranked.is_empty(),
+                "ranking must be non-empty for {m}x{n}x{k}"
+            );
             assert!(r.ranked.len() <= n_cands);
-            assert!(int8_candidates().iter().any(|c| c.name == r.best), "winner `{}` must be a known candidate", r.best);
+            assert!(
+                int8_candidates().iter().any(|c| c.name == r.best),
+                "winner `{}` must be a known candidate",
+                r.best
+            );
             // tuned launch == CPU i32 oracle (the chosen kernel is bit-exact like every candidate).
             let a: Vec<u8> = (0..m * k).map(|i| (i % 251) as u8).collect();
             let b: Vec<i8> = (0..n * k).map(|i| ((i % 251) as i32 - 125) as i8).collect();
             let want = ref_nt_int8(&a, &b, m, k, n);
             let got = launch_int8_tuned(g, &mut cache, &a, &b, m, n, k).unwrap();
-            assert_eq!(got, want, "tuned int8 launch {m}x{n}x{k} must equal the i32 reference");
-            eprintln!("[autotune] {m}x{n}x{k}: best = {} ({:.0} GFLOP/s); ranked {}", r.best, r.ranked[0].gflops, r.ranked.len());
+            assert_eq!(
+                got, want,
+                "tuned int8 launch {m}x{n}x{k} must equal the i32 reference"
+            );
+            eprintln!(
+                "[autotune] {m}x{n}x{k}: best = {} ({:.0} GFLOP/s); ranked {}",
+                r.best,
+                r.ranked[0].gflops,
+                r.ranked.len()
+            );
         }
         // cache is populated; a repeat tune-or-lookup is a hit (config token stable).
         let before = cache.len();
         let _ = tune_int8_cached(g, &mut cache, 256, 256, 256).unwrap();
-        assert_eq!(cache.len(), before, "a cached shape must not grow the cache");
+        assert_eq!(
+            cache.len(),
+            before,
+            "a cached shape must not grow the cache"
+        );
         // round-trip the populated cache through text and confirm a known entry survives.
         let dev = g.device_tag();
         let reloaded = AutotuneCache::from_text(&cache.to_text());
         assert_eq!(
-            reloaded.get_int8(&dev, 64, 128, 8192).map(|e| e.config.clone()),
-            cache.get_int8(&dev, 64, 128, 8192).map(|e| e.config.clone())
+            reloaded
+                .get_int8(&dev, 64, 128, 8192)
+                .map(|e| e.config.clone()),
+            cache
+                .get_int8(&dev, 64, 128, 8192)
+                .map(|e| e.config.clone())
         );
         // The entries are keyed to THIS device, and no other device tag can read them.
-        assert!(cache.get_int8("sm_80x108", 256, 256, 256).is_none(), "an A100 lookup must miss");
+        assert!(
+            cache.get_int8("sm_80x108", 256, 256, 256).is_none(),
+            "an A100 lookup must miss"
+        );
         eprintln!("[autotune] cache keyed to device `{dev}`");
         // Revalidate the freshly-tuned shape. Immediately after caching this usually confirms the cached
         // config (no regression), BUT 64×128×8192 is a thin-M split-K shape where several candidates sit
@@ -943,7 +1353,10 @@ mod tests {
                 "revalidation must name a known candidate, got `{}`",
                 reg.current_best
             );
-            assert!(reg.speedup_available > 1.10, "a flagged regression must clear the 1.10 threshold");
+            assert!(
+                reg.speedup_available > 1.10,
+                "a flagged regression must clear the 1.10 threshold"
+            );
         }
         eprintln!("[gate] autotune int8: search bit-exact + tuned launch correct + cache round-trip + revalidation well-formed ✓");
     }
@@ -987,13 +1400,20 @@ mod tests {
             "no variable-stage candidate is applicable at {m}x{n}x{k} on a {budget} B budget — the \
              registration never took effect"
         );
-        for cfg in INT8_STAGE_VARIANTS.iter().filter(|c| c.stages > 2 && c.smem_bytes() <= budget) {
+        for cfg in INT8_STAGE_VARIANTS
+            .iter()
+            .filter(|c| c.stages > 2 && c.smem_bytes() <= budget)
+        {
             eprintln!(
                 "  candidate s{} : SMEM {:>5} B ({:>2} KiB) {:<8} min_k={}",
                 cfg.stages,
                 cfg.smem_bytes(),
                 cfg.smem_bytes() / 1024,
-                if cfg.smem_mode().is_dynamic() { "DYNAMIC" } else { "static" },
+                if cfg.smem_mode().is_dynamic() {
+                    "DYNAMIC"
+                } else {
+                    "static"
+                },
                 cfg.min_k()
             );
         }
@@ -1009,7 +1429,10 @@ mod tests {
         let a: Vec<u8> = (0..m * k).map(|i| (i % 251) as u8).collect();
         let b: Vec<i8> = (0..n * k).map(|i| ((i % 251) as i32 - 125) as i8).collect();
         let mut cache = AutotuneCache::new();
-        assert_eq!(launch_int8_tuned(g, &mut cache, &a, &b, m, n, k).unwrap(), ref_nt_int8(&a, &b, m, k, n));
+        assert_eq!(
+            launch_int8_tuned(g, &mut cache, &a, &b, m, n, k).unwrap(),
+            ref_nt_int8(&a, &b, m, k, n)
+        );
         // Order only — no numbers. This machine is contended and its depth verdict is not portable.
         let order: Vec<&str> = r.ranked.iter().map(|x| x.name.as_str()).collect();
         eprintln!(
@@ -1044,21 +1467,44 @@ mod tests {
             let w = rng.vec(n * k, -0.8, 0.8);
             let qw = quantize_weight_symmetric(&w, n, k, GROUP_SIZE);
             let r = tune_w4a16_gemm(g, &qw, m, k, n).unwrap();
-            assert!(!r.ranked.is_empty(), "w4a16 ranking must be non-empty for {m}x{n}x{k}");
-            assert!(r.best == "w4a16" || r.best.starts_with("w4a16_sk"), "best `{}` must be a w4a16 token", r.best);
+            assert!(
+                !r.ranked.is_empty(),
+                "w4a16 ranking must be non-empty for {m}x{n}x{k}"
+            );
+            assert!(
+                r.best == "w4a16" || r.best.starts_with("w4a16_sk"),
+                "best `{}` must be a w4a16 token",
+                r.best
+            );
             let want = reference_w4a16(&a, &qw, m);
             let got = launch_w4a16_tuned(g, &mut cache, &a, &qw, m, k, n).unwrap();
-            let s = crate::diff::assert_close(&format!("w4a16 tuned {m}x{n}x{k}"), &got, &want, 1e-2, 2e-3);
-            eprintln!("[autotune] w4a16 {m}x{n}x{k}: best = {} ({:.0} GFLOP/s); max_abs={:.1e}", r.best, r.ranked[0].gflops, s.max_abs);
+            let s = crate::diff::assert_close(
+                &format!("w4a16 tuned {m}x{n}x{k}"),
+                &got,
+                &want,
+                1e-2,
+                2e-3,
+            );
+            eprintln!(
+                "[autotune] w4a16 {m}x{n}x{k}: best = {} ({:.0} GFLOP/s); max_abs={:.1e}",
+                r.best, r.ranked[0].gflops, s.max_abs
+            );
         }
         assert_eq!(cache.len(), 2, "both tuned w4a16 shapes should be cached");
         let dev = g.device_tag();
         let reloaded = AutotuneCache::from_text(&cache.to_text());
         assert_eq!(
-            reloaded.get_w4a16(&dev, 64, 256, 1024).map(|e| e.config.clone()),
-            cache.get_w4a16(&dev, 64, 256, 1024).map(|e| e.config.clone())
+            reloaded
+                .get_w4a16(&dev, 64, 256, 1024)
+                .map(|e| e.config.clone()),
+            cache
+                .get_w4a16(&dev, 64, 256, 1024)
+                .map(|e| e.config.clone())
         );
-        assert!(cache.get_w4a16("sm_80x108", 64, 256, 1024).is_none(), "an A100 lookup must miss");
+        assert!(
+            cache.get_w4a16("sm_80x108", 64, 256, 1024).is_none(),
+            "an A100 lookup must miss"
+        );
         eprintln!("[gate] autotune w4a16: search tolerance-checked + tuned launch correct + cache round-trip ✓");
     }
 }

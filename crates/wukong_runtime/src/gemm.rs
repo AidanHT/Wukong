@@ -681,12 +681,27 @@ unsafe fn gemm_dispatch(
                         sgemm_avx2(a, b, c, m, k, n, beta, bt, epi)
                     }
                     (true, pool) => {
-                        let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
+                        let args = GemmArgs {
+                            a,
+                            b,
+                            c,
+                            m,
+                            k,
+                            n,
+                            beta,
+                            bt,
+                            epi,
+                        };
                         if gemm_2d() {
                             if gemm_2d_shared(macs) {
                                 sgemm_2d_shared(pool, args);
                             } else if gemm_dyn() {
-                                sgemm_2d_blocks_dyn(pool, args, gemm_steal_order(), gemm_skinny_a());
+                                sgemm_2d_blocks_dyn(
+                                    pool,
+                                    args,
+                                    gemm_steal_order(),
+                                    gemm_skinny_a(),
+                                );
                             } else {
                                 sgemm_2d_blocks(pool, args);
                             }
@@ -1025,7 +1040,19 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
-    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, crate::bf16_bits_to_f32);
+    gemm_lowp_nt_epi(
+        a,
+        b,
+        c,
+        m,
+        k,
+        n,
+        beta,
+        bias,
+        act,
+        false,
+        crate::bf16_bits_to_f32,
+    );
 }
 
 /// Multi-threaded fused-epilogue `C = act(A·Bᵀ + bias)` with `bf16` inputs.
@@ -1045,7 +1072,19 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
-    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, crate::bf16_bits_to_f32);
+    gemm_lowp_nt_epi(
+        a,
+        b,
+        c,
+        m,
+        k,
+        n,
+        beta,
+        bias,
+        act,
+        true,
+        crate::bf16_bits_to_f32,
+    );
 }
 
 /// Fused-epilogue `C = act(A·Bᵀ + bias)` with `f16` inputs, single-threaded. See [`gemm_lowp_nt_epi`].
@@ -1065,7 +1104,19 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
-    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, crate::f16_bits_to_f32);
+    gemm_lowp_nt_epi(
+        a,
+        b,
+        c,
+        m,
+        k,
+        n,
+        beta,
+        bias,
+        act,
+        false,
+        crate::f16_bits_to_f32,
+    );
 }
 
 /// Multi-threaded fused-epilogue `C = act(A·Bᵀ + bias)` with `f16` inputs.
@@ -1085,7 +1136,19 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
-    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, crate::f16_bits_to_f32);
+    gemm_lowp_nt_epi(
+        a,
+        b,
+        c,
+        m,
+        k,
+        n,
+        beta,
+        bias,
+        act,
+        true,
+        crate::f16_bits_to_f32,
+    );
 }
 
 /// `C = Aᵀ·B` with **half-precision inputs** (`bf16`/`f16`, stored as `u16`) and an **f32 accumulator**
@@ -1330,7 +1393,10 @@ struct GemmRegion {
     /// panel space, `.1` hands out C row-panel (`ip`) indices. One fresh pair per block — cheaper
     /// and simpler than resetting two shared counters, which would need its *own* barrier to order
     /// the reset against the previous phase's overshooting `fetch_add` stragglers.
-    counters: Vec<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)>,
+    counters: Vec<(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    )>,
     /// In-region phase barrier, sized to the exact broadcast width (asserted before first use).
     barrier: std::sync::Barrier,
     nworkers: usize,
@@ -1669,8 +1735,14 @@ fn select_2d_block_shape(m: usize, n: usize, target_blocks: usize) -> (usize, us
     // insertion never fires for any square (256/512/1024/2048³ each still pick their prior
     // candidate — (96, 96) yields < target blocks at every cube), so the cube standings are
     // unchanged (pinned in `select_2d_block_shape_policy`).
-    const CANDIDATES: &[(usize, usize)] =
-        &[(192, 256), (144, 192), (96, 128), (96, 96), (48, 96), (24, 48)];
+    const CANDIDATES: &[(usize, usize)] = &[
+        (192, 256),
+        (144, 192),
+        (96, 128),
+        (96, 96),
+        (48, 96),
+        (24, 48),
+    ];
     let target = target_blocks.max(1);
     // Equalize block sizes along one dim without changing its block count: `nb` is preserved
     // (round_up(ceil(d/nb), unit) ≤ bd since bd is a unit multiple with nb·bd ≥ d, and
@@ -1860,7 +1932,17 @@ unsafe fn sgemm_2d_block(
         // matrix-edge-only zero padding ⇒ byte-identical micropanels.
         pack_a(a.add(i0 * k + pc), k, bm, kc, ap);
         pack_b_block(b, k, n, pc, j0, kc, bn, bt, bp);
-        macro_kernel(bm, bn, kc, ap, bp, c.add(i0 * n + j0), n, beta_eff, block_epi);
+        macro_kernel(
+            bm,
+            bn,
+            kc,
+            ap,
+            bp,
+            c.add(i0 * n + j0),
+            n,
+            beta_eff,
+            block_epi,
+        );
         pc += kc;
     }
 }
@@ -1903,7 +1985,17 @@ unsafe fn sgemm_2d_block_shared_a(
             None
         };
         pack_b_block(b, k, n, pc, j0, kc, bn, bt, bp);
-        macro_kernel(m, bn, kc, ap_shared.add(off), bp, c.add(j0), n, beta_eff, block_epi);
+        macro_kernel(
+            m,
+            bn,
+            kc,
+            ap_shared.add(off),
+            bp,
+            c.add(j0),
+            n,
+            beta_eff,
+            block_epi,
+        );
     }
 }
 
@@ -2069,22 +2161,24 @@ unsafe fn sgemm_2d_blocks_dyn(
                 }
             } else {
                 let chunks_ref = &chunks;
-                (0..chunks_ref.len() * mpanels).into_par_iter().for_each(|u| {
-                    let (ci, ip) = (u / mpanels, u % mpanels);
-                    let (pc, kc, off) = chunks_ref[ci];
-                    // SAFETY: each (chunk, panel) granule owns a disjoint `MR·kc` destination
-                    // slice; A is read-only; buffer sized `a_rows·k` above.
-                    unsafe {
-                        pack_a_panel(
-                            (a_addr as *const f32).add(pc),
-                            k,
-                            m,
-                            kc,
-                            ip,
-                            (ap_shared_addr as *mut f32).add(off + ip * kc * MR),
-                        );
-                    }
-                });
+                (0..chunks_ref.len() * mpanels)
+                    .into_par_iter()
+                    .for_each(|u| {
+                        let (ci, ip) = (u / mpanels, u % mpanels);
+                        let (pc, kc, off) = chunks_ref[ci];
+                        // SAFETY: each (chunk, panel) granule owns a disjoint `MR·kc` destination
+                        // slice; A is read-only; buffer sized `a_rows·k` above.
+                        unsafe {
+                            pack_a_panel(
+                                (a_addr as *const f32).add(pc),
+                                k,
+                                m,
+                                kc,
+                                ip,
+                                (ap_shared_addr as *mut f32).add(off + ip * kc * MR),
+                            );
+                        }
+                    });
             }
         }
         // One claim-loop task per worker — plain fork-join tasks, NOT `broadcast`: the loop never
@@ -3030,10 +3124,16 @@ unsafe fn micro_6x16_avx512(
     beta: f32,
 ) {
     use std::arch::x86_64::*;
-    let (mut c0, mut c1, mut c2) =
-        (_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps());
-    let (mut c3, mut c4, mut c5) =
-        (_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps());
+    let (mut c0, mut c1, mut c2) = (
+        _mm512_setzero_ps(),
+        _mm512_setzero_ps(),
+        _mm512_setzero_ps(),
+    );
+    let (mut c3, mut c4, mut c5) = (
+        _mm512_setzero_ps(),
+        _mm512_setzero_ps(),
+        _mm512_setzero_ps(),
+    );
     let mut ap = ap;
     let mut bp = bp;
     // One K-step: load the 16-wide B row into a single zmm, then for each of the 6 A rows broadcast its
@@ -3110,7 +3210,10 @@ mod tests {
         assert_eq!(positive_or_unset(Some("not-a-number".to_string())), None);
         assert_eq!(positive_or_unset(None), None);
         assert_eq!(positive_or_unset(Some("1".to_string())), Some(1));
-        assert_eq!(positive_or_unset(Some("4194304".to_string())), Some(4 << 20));
+        assert_eq!(
+            positive_or_unset(Some("4194304".to_string())),
+            Some(4 << 20)
+        );
         // The invariant the `macs / min_task_macs()` use site depends on, under this process's env.
         assert!(min_task_macs() > 0, "min_task_macs is used as a divisor");
 
@@ -3283,7 +3386,11 @@ mod tests {
             SetPriorityClass(GetCurrentProcess(), 0x0000_0080); // HIGH_PRIORITY_CLASS
             SetThreadPriority(GetCurrentThread(), 15); // THREAD_PRIORITY_TIME_CRITICAL
             let affinity = SetThreadAffinityMask(GetCurrentThread(), 0x1); // logical CPU 0 (a P-core)
-            PrevSched { affinity, priority_class, thread_priority }
+            PrevSched {
+                affinity,
+                priority_class,
+                thread_priority,
+            }
         }
     }
     /// Undo [`pin_pcore`] — all three pieces, not just the affinity mask.
@@ -3315,7 +3422,11 @@ mod tests {
     }
     #[cfg(not(windows))]
     fn pin_pcore() -> PrevSched {
-        PrevSched { affinity: 0, priority_class: 0, thread_priority: THREAD_PRIORITY_ERROR_RETURN }
+        PrevSched {
+            affinity: 0,
+            priority_class: 0,
+            thread_priority: THREAD_PRIORITY_ERROR_RETURN,
+        }
     }
     #[cfg(not(windows))]
     fn restore_sched(_: PrevSched) {}
@@ -3443,9 +3554,20 @@ mod tests {
             let mut c = vec![0.0f32; n * n];
             let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
             let flops = 2.0 * (n as f64).powi(3);
-            let logical_run = || unsafe { sgemm_avx2_parallel(ap, bp, cp, n, n, n, 0.0, false, None) };
+            let logical_run =
+                || unsafe { sgemm_avx2_parallel(ap, bp, cp, n, n, n, 0.0, false, None) };
             let physical_run = || {
-                let args = GemmArgs { a: ap, b: bp, c: cp, m: n, k: n, n, beta: 0.0, bt: false, epi: None };
+                let args = GemmArgs {
+                    a: ap,
+                    b: bp,
+                    c: cp,
+                    m: n,
+                    k: n,
+                    n,
+                    beta: 0.0,
+                    bt: false,
+                    epi: None,
+                };
                 ppool.install(move || unsafe { args.run() });
             };
             for _ in 0..3 {
@@ -3496,7 +3618,15 @@ mod tests {
                 // path's supported case.
                 unsafe {
                     micro_6x16(
-                        kc, ap.as_ptr(), bp.as_ptr(), c_avx2.as_mut_ptr(), NR, beta, MR, NR, None,
+                        kc,
+                        ap.as_ptr(),
+                        bp.as_ptr(),
+                        c_avx2.as_mut_ptr(),
+                        NR,
+                        beta,
+                        MR,
+                        NR,
+                        None,
                     );
                     micro_6x16_avx512(kc, ap.as_ptr(), bp.as_ptr(), c_512.as_mut_ptr(), NR, beta);
                 }
@@ -3656,7 +3786,10 @@ mod tests {
                     0,
                 );
             }
-            assert_eq!(got, nn, "tn must equal NN on manually-transposed A ({m}x{k}x{n})");
+            assert_eq!(
+                got, nn,
+                "tn must equal NN on manually-transposed A ({m}x{k}x{n})"
+            );
             assert_eq!(got, got_par, "tn serial vs parallel ({m}x{k}x{n})");
         }
     }
@@ -3696,17 +3829,74 @@ mod tests {
             let (mi, ki, ni) = (m as i64, k as i64, n as i64);
             unsafe {
                 // Reference: the exact f32 NT kernel on the widened operands.
-                wukong_sgemm_nt(a_bf_f32.as_ptr(), b_bf_f32.as_ptr(), ref_bf.as_mut_ptr(), mi, ki, ni, 0);
-                wukong_sgemm_nt(a_h_f32.as_ptr(), b_h_f32.as_ptr(), ref_h.as_mut_ptr(), mi, ki, ni, 0);
+                wukong_sgemm_nt(
+                    a_bf_f32.as_ptr(),
+                    b_bf_f32.as_ptr(),
+                    ref_bf.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+                wukong_sgemm_nt(
+                    a_h_f32.as_ptr(),
+                    b_h_f32.as_ptr(),
+                    ref_h.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
                 // bf16 / f16 kernels on the stored half-width bits.
-                wukong_sgemm_bf16_nt(a_bf.as_ptr(), b_bf.as_ptr(), got_bf.as_mut_ptr(), mi, ki, ni, 0);
-                wukong_sgemm_bf16_nt_parallel(a_bf.as_ptr(), b_bf.as_ptr(), got_bf_par.as_mut_ptr(), mi, ki, ni, 0);
-                wukong_sgemm_f16_nt(a_h.as_ptr(), b_h.as_ptr(), got_h.as_mut_ptr(), mi, ki, ni, 0);
-                wukong_sgemm_f16_nt_parallel(a_h.as_ptr(), b_h.as_ptr(), got_h_par.as_mut_ptr(), mi, ki, ni, 0);
+                wukong_sgemm_bf16_nt(
+                    a_bf.as_ptr(),
+                    b_bf.as_ptr(),
+                    got_bf.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+                wukong_sgemm_bf16_nt_parallel(
+                    a_bf.as_ptr(),
+                    b_bf.as_ptr(),
+                    got_bf_par.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+                wukong_sgemm_f16_nt(
+                    a_h.as_ptr(),
+                    b_h.as_ptr(),
+                    got_h.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+                wukong_sgemm_f16_nt_parallel(
+                    a_h.as_ptr(),
+                    b_h.as_ptr(),
+                    got_h_par.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
             }
-            assert_eq!(got_bf, ref_bf, "bf16 nt must equal f32 nt on widened operands ({m}x{k}x{n})");
-            assert_eq!(got_bf, got_bf_par, "bf16 nt serial vs parallel ({m}x{k}x{n})");
-            assert_eq!(got_h, ref_h, "f16 nt must equal f32 nt on widened operands ({m}x{k}x{n})");
+            assert_eq!(
+                got_bf, ref_bf,
+                "bf16 nt must equal f32 nt on widened operands ({m}x{k}x{n})"
+            );
+            assert_eq!(
+                got_bf, got_bf_par,
+                "bf16 nt serial vs parallel ({m}x{k}x{n})"
+            );
+            assert_eq!(
+                got_h, ref_h,
+                "f16 nt must equal f32 nt on widened operands ({m}x{k}x{n})"
+            );
             assert_eq!(got_h, got_h_par, "f16 nt serial vs parallel ({m}x{k}x{n})");
         }
     }
@@ -3744,17 +3934,74 @@ mod tests {
             let (mi, ki, ni) = (m as i64, k as i64, n as i64);
             unsafe {
                 // Reference: the exact f32 TN kernel on the widened operands.
-                wukong_sgemm_tn(a_bf_f32.as_ptr(), b_bf_f32.as_ptr(), ref_bf.as_mut_ptr(), mi, ki, ni, 0);
-                wukong_sgemm_tn(a_h_f32.as_ptr(), b_h_f32.as_ptr(), ref_h.as_mut_ptr(), mi, ki, ni, 0);
+                wukong_sgemm_tn(
+                    a_bf_f32.as_ptr(),
+                    b_bf_f32.as_ptr(),
+                    ref_bf.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+                wukong_sgemm_tn(
+                    a_h_f32.as_ptr(),
+                    b_h_f32.as_ptr(),
+                    ref_h.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
                 // bf16 / f16 TN kernels on the stored half-width bits.
-                wukong_sgemm_bf16_tn(a_bf.as_ptr(), b_bf.as_ptr(), got_bf.as_mut_ptr(), mi, ki, ni, 0);
-                wukong_sgemm_bf16_tn_parallel(a_bf.as_ptr(), b_bf.as_ptr(), got_bf_par.as_mut_ptr(), mi, ki, ni, 0);
-                wukong_sgemm_f16_tn(a_h.as_ptr(), b_h.as_ptr(), got_h.as_mut_ptr(), mi, ki, ni, 0);
-                wukong_sgemm_f16_tn_parallel(a_h.as_ptr(), b_h.as_ptr(), got_h_par.as_mut_ptr(), mi, ki, ni, 0);
+                wukong_sgemm_bf16_tn(
+                    a_bf.as_ptr(),
+                    b_bf.as_ptr(),
+                    got_bf.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+                wukong_sgemm_bf16_tn_parallel(
+                    a_bf.as_ptr(),
+                    b_bf.as_ptr(),
+                    got_bf_par.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+                wukong_sgemm_f16_tn(
+                    a_h.as_ptr(),
+                    b_h.as_ptr(),
+                    got_h.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+                wukong_sgemm_f16_tn_parallel(
+                    a_h.as_ptr(),
+                    b_h.as_ptr(),
+                    got_h_par.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
             }
-            assert_eq!(got_bf, ref_bf, "bf16 tn must equal f32 tn on widened operands ({m}x{k}x{n})");
-            assert_eq!(got_bf, got_bf_par, "bf16 tn serial vs parallel ({m}x{k}x{n})");
-            assert_eq!(got_h, ref_h, "f16 tn must equal f32 tn on widened operands ({m}x{k}x{n})");
+            assert_eq!(
+                got_bf, ref_bf,
+                "bf16 tn must equal f32 tn on widened operands ({m}x{k}x{n})"
+            );
+            assert_eq!(
+                got_bf, got_bf_par,
+                "bf16 tn serial vs parallel ({m}x{k}x{n})"
+            );
+            assert_eq!(
+                got_h, ref_h,
+                "f16 tn must equal f32 tn on widened operands ({m}x{k}x{n})"
+            );
             assert_eq!(got_h, got_h_par, "f16 tn serial vs parallel ({m}x{k}x{n})");
         }
     }
@@ -3779,7 +4026,11 @@ mod tests {
         let (mi, ki, ni) = (m as i64, k as i64, n as i64);
         for act in 0i64..4 {
             for use_bias in [false, true] {
-                let bptr = if use_bias { bias.as_ptr() } else { std::ptr::null() };
+                let bptr = if use_bias {
+                    bias.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
                 let mut ref_bf = vec![0.0f32; m * n];
                 let mut got_bf = vec![0.0f32; m * n];
                 let mut got_bf_par = vec![0.0f32; m * n];
@@ -3788,17 +4039,83 @@ mod tests {
                 let mut got_h_par = vec![0.0f32; m * n];
                 unsafe {
                     // Reference: the f32 fused-epilogue kernel on the widened operands.
-                    wukong_sgemm_nt_epi(a_bf_f32.as_ptr(), b_bf_f32.as_ptr(), ref_bf.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
-                    wukong_sgemm_bf16_nt_epi(a_bf.as_ptr(), b_bf.as_ptr(), got_bf.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
-                    wukong_sgemm_bf16_nt_epi_parallel(a_bf.as_ptr(), b_bf.as_ptr(), got_bf_par.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
-                    wukong_sgemm_nt_epi(a_h_f32.as_ptr(), b_h_f32.as_ptr(), ref_h.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
-                    wukong_sgemm_f16_nt_epi(a_h.as_ptr(), b_h.as_ptr(), got_h.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
-                    wukong_sgemm_f16_nt_epi_parallel(a_h.as_ptr(), b_h.as_ptr(), got_h_par.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
+                    wukong_sgemm_nt_epi(
+                        a_bf_f32.as_ptr(),
+                        b_bf_f32.as_ptr(),
+                        ref_bf.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        bptr,
+                        act,
+                    );
+                    wukong_sgemm_bf16_nt_epi(
+                        a_bf.as_ptr(),
+                        b_bf.as_ptr(),
+                        got_bf.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        bptr,
+                        act,
+                    );
+                    wukong_sgemm_bf16_nt_epi_parallel(
+                        a_bf.as_ptr(),
+                        b_bf.as_ptr(),
+                        got_bf_par.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        bptr,
+                        act,
+                    );
+                    wukong_sgemm_nt_epi(
+                        a_h_f32.as_ptr(),
+                        b_h_f32.as_ptr(),
+                        ref_h.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        bptr,
+                        act,
+                    );
+                    wukong_sgemm_f16_nt_epi(
+                        a_h.as_ptr(),
+                        b_h.as_ptr(),
+                        got_h.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        bptr,
+                        act,
+                    );
+                    wukong_sgemm_f16_nt_epi_parallel(
+                        a_h.as_ptr(),
+                        b_h.as_ptr(),
+                        got_h_par.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        bptr,
+                        act,
+                    );
                 }
                 assert_eq!(got_bf, ref_bf, "bf16 nt_epi act={act} bias={use_bias}");
-                assert_eq!(got_bf, got_bf_par, "bf16 nt_epi serial vs parallel act={act} bias={use_bias}");
+                assert_eq!(
+                    got_bf, got_bf_par,
+                    "bf16 nt_epi serial vs parallel act={act} bias={use_bias}"
+                );
                 assert_eq!(got_h, ref_h, "f16 nt_epi act={act} bias={use_bias}");
-                assert_eq!(got_h, got_h_par, "f16 nt_epi serial vs parallel act={act} bias={use_bias}");
+                assert_eq!(
+                    got_h, got_h_par,
+                    "f16 nt_epi serial vs parallel act={act} bias={use_bias}"
+                );
             }
         }
     }
@@ -3887,7 +4204,10 @@ mod tests {
             return;
         }
         for &(m, k, n) in &[(520usize, 900usize, 4200usize), (214, 901, 4160)] {
-            assert!((m * k * n) as u64 >= PAR_MIN_MACS, "shape must trip the parallel gate");
+            assert!(
+                (m * k * n) as u64 >= PAR_MIN_MACS,
+                "shape must trip the parallel gate"
+            );
             assert!(n > NC, "shape must span multiple NC blocks");
             assert!(k > select_kc(k), "shape must span multiple K blocks");
             let a = fill(71, m * k);
@@ -3901,8 +4221,15 @@ mod tests {
             let mut per = vec![0.0f32; m * n];
             unsafe {
                 let args = GemmArgs {
-                    a: a.as_ptr(), b: b.as_ptr(), c: per.as_mut_ptr(),
-                    m, k, n, beta: 0.0, bt: false, epi: None,
+                    a: a.as_ptr(),
+                    b: b.as_ptr(),
+                    c: per.as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    beta: 0.0,
+                    bt: false,
+                    epi: None,
                 };
                 sgemm_persistent_region(gemm_pool(), args);
             }
@@ -3910,7 +4237,17 @@ mod tests {
             // Legacy fork-join path (what the WUKONG_GEMM_FORKJOIN=1 kill-switch routes to).
             let mut fj = vec![0.0f32; m * n];
             unsafe {
-                sgemm_avx2_parallel(a.as_ptr(), b.as_ptr(), fj.as_mut_ptr(), m, k, n, 0.0, false, None);
+                sgemm_avx2_parallel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    fj.as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    0.0,
+                    false,
+                    None,
+                );
             }
             assert_eq!(serial, fj, "fork-join != serial (m{m} k{k} n{n})");
             // Public entry: routes to whichever path the process env selected — must equal serial
@@ -3919,7 +4256,10 @@ mod tests {
             unsafe {
                 wukong_sgemm_parallel(a.as_ptr(), b.as_ptr(), public.as_mut_ptr(), mi, ki, ni, 0);
             }
-            assert_eq!(serial, public, "public parallel entry != serial (m{m} k{k} n{n})");
+            assert_eq!(
+                serial, public,
+                "public parallel entry != serial (m{m} k{k} n{n})"
+            );
         }
         // Fused-epilogue leg: bias + ReLU on the nt form, across 3 K-blocks (uneven split) and 2 NC
         // blocks, on both parallel shapes.
@@ -3929,21 +4269,49 @@ mod tests {
             let a = fill(73, m * k);
             let b = fill(74, n * k);
             let bias = fill(75, n);
-            let epi = Epilogue { bias: bias.as_ptr(), act: ACT_RELU, alpha: 1.0 };
+            let epi = Epilogue {
+                bias: bias.as_ptr(),
+                act: ACT_RELU,
+                alpha: 1.0,
+            };
             let mut serial = vec![0.0f32; m * n];
             let mut per = vec![0.0f32; m * n];
             let mut fj = vec![0.0f32; m * n];
             unsafe {
                 wukong_sgemm_nt_epi(
-                    a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
-                    m as i64, k as i64, n as i64, 0, bias.as_ptr(), ACT_RELU as i64,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    serial.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                    bias.as_ptr(),
+                    ACT_RELU as i64,
                 );
                 let args = GemmArgs {
-                    a: a.as_ptr(), b: b.as_ptr(), c: per.as_mut_ptr(),
-                    m, k, n, beta: 0.0, bt: true, epi: Some(epi),
+                    a: a.as_ptr(),
+                    b: b.as_ptr(),
+                    c: per.as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    beta: 0.0,
+                    bt: true,
+                    epi: Some(epi),
                 };
                 sgemm_persistent_region(gemm_pool(), args);
-                sgemm_avx2_parallel(a.as_ptr(), b.as_ptr(), fj.as_mut_ptr(), m, k, n, 0.0, true, Some(epi));
+                sgemm_avx2_parallel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    fj.as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    0.0,
+                    true,
+                    Some(epi),
+                );
             }
             assert_eq!(serial, per, "persistent nt+epi != serial");
             assert_eq!(serial, fj, "fork-join nt+epi != serial");
@@ -3971,10 +4339,10 @@ mod tests {
         // (m, k, n, bt combos, beta combos): the big multi-block shape runs once (bt=false,
         // beta=0); the mid shape sweeps the full bt × beta matrix; two degenerate grids.
         let shapes: &[(usize, usize, usize, &[bool], &[i64])] = &[
-            (520, 901, 4200, &[false], &[0]),          // multi-block both dims, 3 uneven K-blocks
-            (214, 901, 616, &[false, true], &[0, 1]),  // edge remainders, full bt × beta sweep
-            (100, 130, 96, &[false, true], &[0, 1]),   // single/degenerate grid
-            (13, 700, 530, &[false, true], &[0, 1]),   // skinny m: 1 row-block, several col-blocks
+            (520, 901, 4200, &[false], &[0]), // multi-block both dims, 3 uneven K-blocks
+            (214, 901, 616, &[false, true], &[0, 1]), // edge remainders, full bt × beta sweep
+            (100, 130, 96, &[false, true], &[0, 1]), // single/degenerate grid
+            (13, 700, 530, &[false, true], &[0, 1]), // skinny m: 1 row-block, several col-blocks
         ];
         for &(m, k, n, bts, betas) in shapes {
             for &bt in bts {
@@ -3987,17 +4355,43 @@ mod tests {
                     let (mi, ki, ni) = (m as i64, k as i64, n as i64);
                     unsafe {
                         if bt {
-                            wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, beta);
+                            wukong_sgemm_nt(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                serial.as_mut_ptr(),
+                                mi,
+                                ki,
+                                ni,
+                                beta,
+                            );
                         } else {
-                            wukong_sgemm(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, beta);
+                            wukong_sgemm(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                serial.as_mut_ptr(),
+                                mi,
+                                ki,
+                                ni,
+                                beta,
+                            );
                         }
                         let args = GemmArgs {
-                            a: a.as_ptr(), b: b.as_ptr(), c: got2d.as_mut_ptr(),
-                            m, k, n, beta: beta as f32, bt, epi: None,
+                            a: a.as_ptr(),
+                            b: b.as_ptr(),
+                            c: got2d.as_mut_ptr(),
+                            m,
+                            k,
+                            n,
+                            beta: beta as f32,
+                            bt,
+                            epi: None,
                         };
                         sgemm_2d_blocks(gemm_pool(), args);
                     }
-                    assert_eq!(serial, got2d, "2d != serial (m{m} k{k} n{n} bt{bt} beta{beta})");
+                    assert_eq!(
+                        serial, got2d,
+                        "2d != serial (m{m} k{k} n{n} bt{bt} beta{beta})"
+                    );
                 }
             }
         }
@@ -4012,22 +4406,46 @@ mod tests {
             let bias = fill(86, n);
             for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
                 for use_bias in [false, true] {
-                    let bias_ptr = if use_bias { bias.as_ptr() } else { std::ptr::null() };
+                    let bias_ptr = if use_bias {
+                        bias.as_ptr()
+                    } else {
+                        std::ptr::null()
+                    };
                     let mut serial = vec![0.0f32; m * n];
                     let mut got2d = vec![0.0f32; m * n];
                     unsafe {
                         wukong_sgemm_nt_epi(
-                            a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
-                            m as i64, k as i64, n as i64, 0, bias_ptr, act as i64,
+                            a.as_ptr(),
+                            b.as_ptr(),
+                            serial.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            0,
+                            bias_ptr,
+                            act as i64,
                         );
                         let args = GemmArgs {
-                            a: a.as_ptr(), b: b.as_ptr(), c: got2d.as_mut_ptr(),
-                            m, k, n, beta: 0.0, bt: true,
-                            epi: Some(Epilogue { bias: bias_ptr, act, alpha: 1.0 }),
+                            a: a.as_ptr(),
+                            b: b.as_ptr(),
+                            c: got2d.as_mut_ptr(),
+                            m,
+                            k,
+                            n,
+                            beta: 0.0,
+                            bt: true,
+                            epi: Some(Epilogue {
+                                bias: bias_ptr,
+                                act,
+                                alpha: 1.0,
+                            }),
                         };
                         sgemm_2d_blocks(gemm_pool(), args);
                     }
-                    assert_eq!(serial, got2d, "2d nt+epi != serial (act{act} bias{use_bias})");
+                    assert_eq!(
+                        serial, got2d,
+                        "2d nt+epi != serial (act{act} bias{use_bias})"
+                    );
                 }
             }
         }
@@ -4045,16 +4463,29 @@ mod tests {
             for &n in &[96usize, 128, 530, 616, 768, 1024, 3072, 4200] {
                 for &target in &[1usize, 3, 12, 48, 96] {
                     let (bm, bn) = select_2d_block_shape(m, n, target);
-                    assert!(bm >= MR && bm % MR == 0, "BM {bm} not MR-aligned (m{m} n{n} t{target})");
-                    assert!(bn >= NR && bn % NR == 0, "BN {bn} not NR-aligned (m{m} n{n} t{target})");
+                    assert!(
+                        bm >= MR && bm % MR == 0,
+                        "BM {bm} not MR-aligned (m{m} n{n} t{target})"
+                    );
+                    assert!(
+                        bn >= NR && bn % NR == 0,
+                        "BN {bn} not NR-aligned (m{m} n{n} t{target})"
+                    );
                     if m <= MC {
-                        assert_eq!(m.div_ceil(bm), 1, "skinny m must give one block row (m{m} n{n} t{target})");
+                        assert_eq!(
+                            m.div_ceil(bm),
+                            1,
+                            "skinny m must give one block row (m{m} n{n} t{target})"
+                        );
                     }
                     // Tail balance: after the rebalance, every non-edge block is full-size and the
                     // edge remainder is at least `block − unit` short of one extra block — i.e. the
                     // grid can't shrink a whole block dim further without changing the block count.
                     let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
-                    assert!(nbi * bm >= m && nbj * bn >= n, "grid must cover the matrix (m{m} n{n} t{target})");
+                    assert!(
+                        nbi * bm >= m && nbj * bn >= n,
+                        "grid must cover the matrix (m{m} n{n} t{target})"
+                    );
                     assert!(
                         (bm - MR) * nbi < m,
                         "BM {bm} not minimal for its row count (m{m} n{n} t{target})"
@@ -4124,10 +4555,17 @@ mod tests {
             let (bm, bn) = select_2d_block_shape(m, n, target);
             let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
             let order = dyn_block_order(m, n, bm, bn, nbi, nbj);
-            assert_eq!(order.len(), nbi * nbj, "not a full enumeration (m{m} n{n} t{target})");
+            assert_eq!(
+                order.len(),
+                nbi * nbj,
+                "not a full enumeration (m{m} n{n} t{target})"
+            );
             let mut seen = vec![false; nbi * nbj];
             for &t in &order {
-                assert!(!seen[t as usize], "block {t} claimed twice (m{m} n{n} t{target})");
+                assert!(
+                    !seen[t as usize],
+                    "block {t} claimed twice (m{m} n{n} t{target})"
+                );
                 seen[t as usize] = true;
             }
             let full = |t: usize| {
@@ -4169,8 +4607,8 @@ mod tests {
         }
         // (m, k, n, bt combos, beta combos) — band notes relative to SHARED_MAX_MACS = 2^26.
         let shapes: &[(usize, usize, usize, &[bool], &[i64])] = &[
-            (300, 300, 300, &[false], &[0]),          // below band; odd square, ragged both dims
-            (128, 700, 530, &[false], &[0]),          // below band; skinny M, ragged n
+            (300, 300, 300, &[false], &[0]), // below band; odd square, ragged both dims
+            (128, 700, 530, &[false], &[0]), // below band; skinny M, ragged n
             (214, 901, 616, &[false, true], &[0, 1]), // above band; edge remainders, 3 uneven K-blocks
             (128, 3072, 768, &[false, true], &[0]),   // above band; skinny FFN, long K
         ];
@@ -4184,9 +4622,25 @@ mod tests {
                     let (mi, ki, ni) = (m as i64, k as i64, n as i64);
                     unsafe {
                         if bt {
-                            wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, beta);
+                            wukong_sgemm_nt(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                serial.as_mut_ptr(),
+                                mi,
+                                ki,
+                                ni,
+                                beta,
+                            );
                         } else {
-                            wukong_sgemm(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, beta);
+                            wukong_sgemm(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                serial.as_mut_ptr(),
+                                mi,
+                                ki,
+                                ni,
+                                beta,
+                            );
                         }
                     }
                     for steal_order in [false, true] {
@@ -4194,8 +4648,15 @@ mod tests {
                             let mut got = base.clone();
                             unsafe {
                                 let args = GemmArgs {
-                                    a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
-                                    m, k, n, beta: beta as f32, bt, epi: None,
+                                    a: a.as_ptr(),
+                                    b: b.as_ptr(),
+                                    c: got.as_mut_ptr(),
+                                    m,
+                                    k,
+                                    n,
+                                    beta: beta as f32,
+                                    bt,
+                                    epi: None,
                                 };
                                 sgemm_2d_blocks_dyn(gemm_pool(), args, steal_order, skinny_a);
                             }
@@ -4225,8 +4686,15 @@ mod tests {
                         let mut got = vec![0.0f32; m * n];
                         unsafe {
                             let args = GemmArgs {
-                                a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
-                                m, k, n, beta: 0.0, bt: true, epi: Some(epi),
+                                a: a.as_ptr(),
+                                b: b.as_ptr(),
+                                c: got.as_mut_ptr(),
+                                m,
+                                k,
+                                n,
+                                beta: 0.0,
+                                bt: true,
+                                epi: Some(epi),
                             };
                             sgemm_2d_blocks_dyn(gemm_pool(), args, steal_order, skinny_a);
                         }
@@ -4241,21 +4709,47 @@ mod tests {
             let mut serial = vec![0.0f32; m * n];
             unsafe {
                 wukong_sgemm_nt_epi(
-                    a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
-                    m as i64, k as i64, n as i64, 0, bias.as_ptr(), ACT_RELU as i64,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    serial.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                    bias.as_ptr(),
+                    ACT_RELU as i64,
                 );
             }
-            run_dyn(Epilogue { bias: bias.as_ptr(), act: ACT_RELU, alpha: 1.0 }, &serial, "relu bias");
+            run_dyn(
+                Epilogue {
+                    bias: bias.as_ptr(),
+                    act: ACT_RELU,
+                    alpha: 1.0,
+                },
+                &serial,
+                "relu bias",
+            );
             // No bias: the null base must stay null through both shifts.
             let mut serial_nb = vec![0.0f32; m * n];
             unsafe {
                 wukong_sgemm_nt_epi(
-                    a.as_ptr(), b.as_ptr(), serial_nb.as_mut_ptr(),
-                    m as i64, k as i64, n as i64, 0, std::ptr::null(), ACT_SILU as i64,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    serial_nb.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                    std::ptr::null(),
+                    ACT_SILU as i64,
                 );
             }
             run_dyn(
-                Epilogue { bias: std::ptr::null(), act: ACT_SILU, alpha: 1.0 },
+                Epilogue {
+                    bias: std::ptr::null(),
+                    act: ACT_SILU,
+                    alpha: 1.0,
+                },
                 &serial_nb,
                 "silu nobias",
             );
@@ -4263,12 +4757,22 @@ mod tests {
             let mut serial_alpha = vec![0.0f32; m * n];
             unsafe {
                 wukong_sgemm_nt_alpha(
-                    a.as_ptr(), b.as_ptr(), serial_alpha.as_mut_ptr(),
-                    m as i64, k as i64, n as i64, 0, 0.125,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    serial_alpha.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                    0.125,
                 );
             }
             run_dyn(
-                Epilogue { bias: std::ptr::null(), act: ACT_IDENTITY, alpha: 0.125 },
+                Epilogue {
+                    bias: std::ptr::null(),
+                    act: ACT_IDENTITY,
+                    alpha: 0.125,
+                },
                 &serial_alpha,
                 "alpha 0.125",
             );
@@ -4301,7 +4805,15 @@ mod tests {
                 let b = fill(112, k * n);
                 let mut s = vec![0.0f32; m * n];
                 unsafe {
-                    wukong_sgemm(a.as_ptr(), b.as_ptr(), s.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+                    wukong_sgemm(
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        s.as_mut_ptr(),
+                        m as i64,
+                        k as i64,
+                        n as i64,
+                        0,
+                    );
                 }
                 (a, b, s)
             })
@@ -4318,8 +4830,15 @@ mod tests {
                     let mut got = vec![0.0f32; m * n];
                     unsafe {
                         let args = GemmArgs {
-                            a: a.as_ptr(), b: b.as_ptr(), c: got.as_mut_ptr(),
-                            m, k, n, beta: 0.0, bt: false, epi: None,
+                            a: a.as_ptr(),
+                            b: b.as_ptr(),
+                            c: got.as_mut_ptr(),
+                            m,
+                            k,
+                            n,
+                            beta: 0.0,
+                            bt: false,
+                            epi: None,
                         };
                         sgemm_2d_blocks_dyn(Some(&pool), args, steal_order, skinny_a);
                     }
@@ -4333,12 +4852,22 @@ mod tests {
             let mut st = vec![0.0f32; m * n];
             unsafe {
                 let args = GemmArgs {
-                    a: a.as_ptr(), b: b.as_ptr(), c: st.as_mut_ptr(),
-                    m, k, n, beta: 0.0, bt: false, epi: None,
+                    a: a.as_ptr(),
+                    b: b.as_ptr(),
+                    c: st.as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    beta: 0.0,
+                    bt: false,
+                    epi: None,
                 };
                 sgemm_2d_blocks(Some(&pool), args);
             }
-            assert_eq!(serial, &st, "static 2d != serial (threads {t} m{m} k{k} n{n})");
+            assert_eq!(
+                serial, &st,
+                "static 2d != serial (threads {t} m{m} k{k} n{n})"
+            );
         }
     }
 
@@ -4366,12 +4895,12 @@ mod tests {
         }
         // (m, k, n, bt combos, beta combos).
         let shapes: &[(usize, usize, usize, &[bool], &[i64])] = &[
-            (300, 300, 300, &[false], &[0]),          // odd square, nothing block-aligned
-            (512, 1024, 512, &[false], &[0]),         // k spans 3 select_kc groups (344+344+336)
-            (128, 768, 768, &[false, true], &[0]),    // skinny M: one block row (policy rule)
-            (128, 3072, 768, &[false, true], &[0]),   // skinny M, long K: 8 shared-pack rounds
-            (768, 768, 128, &[false], &[0]),          // tall: many block rows, few columns
-            (13, 700, 530, &[false, true], &[0]),     // ragged m = 13 (one 18-high block row)
+            (300, 300, 300, &[false], &[0]),  // odd square, nothing block-aligned
+            (512, 1024, 512, &[false], &[0]), // k spans 3 select_kc groups (344+344+336)
+            (128, 768, 768, &[false, true], &[0]), // skinny M: one block row (policy rule)
+            (128, 3072, 768, &[false, true], &[0]), // skinny M, long K: 8 shared-pack rounds
+            (768, 768, 128, &[false], &[0]),  // tall: many block rows, few columns
+            (13, 700, 530, &[false, true], &[0]), // ragged m = 13 (one 18-high block row)
             (214, 901, 616, &[false, true], &[0, 1]), // edge remainders, uneven K, full matrix
         ];
         for &(m, k, n, bts, betas) in shapes {
@@ -4385,17 +4914,43 @@ mod tests {
                     let (mi, ki, ni) = (m as i64, k as i64, n as i64);
                     unsafe {
                         if bt {
-                            wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, beta);
+                            wukong_sgemm_nt(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                serial.as_mut_ptr(),
+                                mi,
+                                ki,
+                                ni,
+                                beta,
+                            );
                         } else {
-                            wukong_sgemm(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, beta);
+                            wukong_sgemm(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                serial.as_mut_ptr(),
+                                mi,
+                                ki,
+                                ni,
+                                beta,
+                            );
                         }
                         let args = GemmArgs {
-                            a: a.as_ptr(), b: b.as_ptr(), c: shared.as_mut_ptr(),
-                            m, k, n, beta: beta as f32, bt, epi: None,
+                            a: a.as_ptr(),
+                            b: b.as_ptr(),
+                            c: shared.as_mut_ptr(),
+                            m,
+                            k,
+                            n,
+                            beta: beta as f32,
+                            bt,
+                            epi: None,
                         };
                         sgemm_2d_shared(gemm_pool(), args);
                     }
-                    assert_eq!(serial, shared, "2d-shared != serial (m{m} k{k} n{n} bt{bt} beta{beta})");
+                    assert_eq!(
+                        serial, shared,
+                        "2d-shared != serial (m{m} k{k} n{n} bt{bt} beta{beta})"
+                    );
                 }
             }
         }
@@ -4407,14 +4962,32 @@ mod tests {
             let b = fill(95, k * n);
             let (mut serial, mut blocks) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
             unsafe {
-                wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+                wukong_sgemm_nt(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    serial.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                );
                 let args = GemmArgs {
-                    a: a.as_ptr(), b: b.as_ptr(), c: blocks.as_mut_ptr(),
-                    m, k, n, beta: 0.0, bt: true, epi: None,
+                    a: a.as_ptr(),
+                    b: b.as_ptr(),
+                    c: blocks.as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    beta: 0.0,
+                    bt: true,
+                    epi: None,
                 };
                 sgemm_2d_blocks(gemm_pool(), args);
             }
-            assert_eq!(serial, blocks, "2d per-block (kill-switch path) != serial on the skinny grid");
+            assert_eq!(
+                serial, blocks,
+                "2d per-block (kill-switch path) != serial on the skinny grid"
+            );
         }
         // Epilogue leg: bias + every activation, plus the no-bias and α-scaled forms, on the nt
         // shape with 3 uneven K-blocks — a per-K-block epilogue bug folds the bias/activation
@@ -4430,23 +5003,45 @@ mod tests {
                 let mut shared = vec![0.0f32; m * n];
                 unsafe {
                     let args = GemmArgs {
-                        a: a.as_ptr(), b: b.as_ptr(), c: shared.as_mut_ptr(),
-                        m, k, n, beta: 0.0, bt: true, epi: Some(epi),
+                        a: a.as_ptr(),
+                        b: b.as_ptr(),
+                        c: shared.as_mut_ptr(),
+                        m,
+                        k,
+                        n,
+                        beta: 0.0,
+                        bt: true,
+                        epi: Some(epi),
                     };
                     sgemm_2d_shared(gemm_pool(), args);
                 }
-                assert_eq!(serial_ref, &shared[..], "2d-shared nt+epi != serial ({tag})");
+                assert_eq!(
+                    serial_ref,
+                    &shared[..],
+                    "2d-shared nt+epi != serial ({tag})"
+                );
             };
             for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
                 let mut serial = vec![0.0f32; m * n];
                 unsafe {
                     wukong_sgemm_nt_epi(
-                        a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
-                        m as i64, k as i64, n as i64, 0, bias.as_ptr(), act as i64,
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        serial.as_mut_ptr(),
+                        m as i64,
+                        k as i64,
+                        n as i64,
+                        0,
+                        bias.as_ptr(),
+                        act as i64,
                     );
                 }
                 run_shared(
-                    Epilogue { bias: bias.as_ptr(), act, alpha: 1.0 },
+                    Epilogue {
+                        bias: bias.as_ptr(),
+                        act,
+                        alpha: 1.0,
+                    },
                     &serial,
                     &format!("act{act} bias"),
                 );
@@ -4455,12 +5050,23 @@ mod tests {
             let mut serial = vec![0.0f32; m * n];
             unsafe {
                 wukong_sgemm_nt_epi(
-                    a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
-                    m as i64, k as i64, n as i64, 0, std::ptr::null(), ACT_RELU as i64,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    serial.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                    std::ptr::null(),
+                    ACT_RELU as i64,
                 );
             }
             run_shared(
-                Epilogue { bias: std::ptr::null(), act: ACT_RELU, alpha: 1.0 },
+                Epilogue {
+                    bias: std::ptr::null(),
+                    act: ACT_RELU,
+                    alpha: 1.0,
+                },
                 &serial,
                 "relu nobias",
             );
@@ -4468,12 +5074,22 @@ mod tests {
             let mut serial_alpha = vec![0.0f32; m * n];
             unsafe {
                 wukong_sgemm_nt_alpha(
-                    a.as_ptr(), b.as_ptr(), serial_alpha.as_mut_ptr(),
-                    m as i64, k as i64, n as i64, 0, 0.125,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    serial_alpha.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                    0.125,
                 );
             }
             run_shared(
-                Epilogue { bias: std::ptr::null(), act: ACT_IDENTITY, alpha: 0.125 },
+                Epilogue {
+                    bias: std::ptr::null(),
+                    act: ACT_IDENTITY,
+                    alpha: 0.125,
+                },
                 &serial_alpha,
                 "alpha 0.125",
             );
@@ -4632,8 +5248,7 @@ mod tests {
                     for &alpha in alphas {
                         for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
                             for use_bias in [false, true] {
-                                let no_epi =
-                                    act == ACT_IDENTITY && !use_bias && alpha == 1.0;
+                                let no_epi = act == ACT_IDENTITY && !use_bias && alpha == 1.0;
                                 let bias_ptr = if use_bias {
                                     bias.as_ptr()
                                 } else {
@@ -4642,7 +5257,11 @@ mod tests {
                                 let epi = if no_epi {
                                     None
                                 } else {
-                                    Some(Epilogue { bias: bias_ptr, act, alpha })
+                                    Some(Epilogue {
+                                        bias: bias_ptr,
+                                        act,
+                                        alpha,
+                                    })
                                 };
                                 // Reference: the beta rule, then the epilogue on the fully
                                 // reduced sum — `alpha` scales the accumulated value, then the
@@ -4726,13 +5345,35 @@ mod tests {
                 let mut got = vec![0.0f32; m * n];
                 let mut got_par = vec![0.0f32; m * n];
                 unsafe {
-                    wukong_sgemm_nt_alpha(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), mi, ki, ni, 0, alpha);
+                    wukong_sgemm_nt_alpha(
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        got.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        alpha,
+                    );
                     wukong_sgemm_nt_alpha_parallel(
-                        a.as_ptr(), b.as_ptr(), got_par.as_mut_ptr(), mi, ki, ni, 0, alpha,
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        got_par.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        alpha,
                     );
                 }
-                assert_eq!(got, want, "nt_alpha != alpha·nt (m{m} k{k} n{n} alpha{alpha})");
-                assert_eq!(got, got_par, "nt_alpha serial vs parallel (m{m} k{k} n{n} alpha{alpha})");
+                assert_eq!(
+                    got, want,
+                    "nt_alpha != alpha·nt (m{m} k{k} n{n} alpha{alpha})"
+                );
+                assert_eq!(
+                    got, got_par,
+                    "nt_alpha serial vs parallel (m{m} k{k} n{n} alpha{alpha})"
+                );
             }
             // alpha == 1.0 must be byte-identical to the plain `nt` kernel (the multiply is skipped).
             let mut plain = vec![0.0f32; m * n];
@@ -4741,7 +5382,10 @@ mod tests {
                 wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), plain.as_mut_ptr(), mi, ki, ni, 0);
                 wukong_sgemm_nt_alpha(a.as_ptr(), b.as_ptr(), a1.as_mut_ptr(), mi, ki, ni, 0, 1.0);
             }
-            assert_eq!(plain, a1, "nt_alpha(1.0) must be byte-identical to nt (m{m} k{k} n{n})");
+            assert_eq!(
+                plain, a1,
+                "nt_alpha(1.0) must be byte-identical to nt (m{m} k{k} n{n})"
+            );
         }
     }
 
@@ -4753,7 +5397,10 @@ mod tests {
     #[test]
     fn sgemm_nt_epi_parallel_matches_serial() {
         for &(m, k, n) in &[(512, 300, 512), (640, 300, 400)] {
-            assert!((m * k * n) as u64 >= PAR_MIN_MACS, "size must trip the parallel path");
+            assert!(
+                (m * k * n) as u64 >= PAR_MIN_MACS,
+                "size must trip the parallel path"
+            );
             let a = fill(21, m * k);
             let b = fill(22, n * k);
             let bias = fill(23, n);
@@ -4767,15 +5414,32 @@ mod tests {
                     let (mut serial, mut par) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
                     unsafe {
                         wukong_sgemm_nt_epi(
-                            a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
-                            m as i64, k as i64, n as i64, 0, bias_ptr, act as i64,
+                            a.as_ptr(),
+                            b.as_ptr(),
+                            serial.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            0,
+                            bias_ptr,
+                            act as i64,
                         );
                         wukong_sgemm_nt_epi_parallel(
-                            a.as_ptr(), b.as_ptr(), par.as_mut_ptr(),
-                            m as i64, k as i64, n as i64, 0, bias_ptr, act as i64,
+                            a.as_ptr(),
+                            b.as_ptr(),
+                            par.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            0,
+                            bias_ptr,
+                            act as i64,
                         );
                     }
-                    assert_eq!(serial, par, "par-fused != serial-fused (m{m} k{k} n{n} act{act} bias{use_bias})");
+                    assert_eq!(
+                        serial, par,
+                        "par-fused != serial-fused (m{m} k{k} n{n} act{act} bias{use_bias})"
+                    );
                 }
             }
         }

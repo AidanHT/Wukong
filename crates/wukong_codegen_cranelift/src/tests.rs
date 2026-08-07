@@ -170,33 +170,35 @@ fn p4_bench_reduction_256_vs_128() {
 #[test]
 fn p4_vec256_coverage_sweep() {
     let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this sweep
-    // Each body computes `o[i]` (or updates a stream in place) from streams a,b,c and scalar `k`.
+                               // Each body computes `o[i]` (or updates a stream in place) from streams a,b,c and scalar `k`.
     let bodies: &[&str] = &[
         "o[i] = a[i] + b[i] - c[i]",
         "o[i] = a[i] * b[i] * c[i]",
         "o[i] = a[i] / (b[i] + 1.0)",
         "o[i] = -a[i] + b[i] * c[i]",
         "o[i] = sqrt(a[i] * a[i] + b[i] * b[i])",
-        "o[i] = a[i] * k + b[i]",                                    // invariant scalar
-        "o[i] = if a[i] > b[i] { a[i] } else { b[i] }",              // max via blend
-        "o[i] = if a[i] > 0.0 { a[i] } else { 0.0 }",                // relu
+        "o[i] = a[i] * k + b[i]",                       // invariant scalar
+        "o[i] = if a[i] > b[i] { a[i] } else { b[i] }", // max via blend
+        "o[i] = if a[i] > 0.0 { a[i] } else { 0.0 }",   // relu
         "o[i] = if a[i] < 6.0 { if a[i] > 0.0 { a[i] } else { 0.0 } } else { 6.0 }", // relu6 (nested)
-        "o[i] = a[i] * b[i] + a[i] * c[i] - b[i] * c[i] + a[i]",     // load reuse (CSE)
-        "a[i] = a[i] * a[i] + 1.0",                                  // in-place, output=input
-        "o[i] = sqrt(a[i]) * k - b[i] / c[i] + a[i] * b[i]",         // mixed, 3 streams + scalar
+        "o[i] = a[i] * b[i] + a[i] * c[i] - b[i] * c[i] + a[i]", // load reuse (CSE)
+        "a[i] = a[i] * a[i] + 1.0",                              // in-place, output=input
+        "o[i] = sqrt(a[i]) * k - b[i] / c[i] + a[i] * b[i]",     // mixed, 3 streams + scalar
         // Repeated-operand class: one op names the same value twice, then further allocating ops
         // follow with no operand death between. That is the precondition for the emitter to release
         // one register twice and hand it to two later allocations; no body above had it, so
         // `o[i] = a[i]*a[i] + b[i]*c[i]` compiled to `a*a + c*c` while this sweep stayed green.
-        "o[i] = a[i] * a[i] + b[i] * c[i]",                          // dup, then two loads
-        "o[i] = a[i] * a[i] + b[i] * b[i] + b[i]",                   // dup, then dup
-        "o[i] = sqrt(a[i] * a[i]) + (-b[i])",                        // dup under sqrt, then neg
+        "o[i] = a[i] * a[i] + b[i] * c[i]", // dup, then two loads
+        "o[i] = a[i] * a[i] + b[i] * b[i] + b[i]", // dup, then dup
+        "o[i] = sqrt(a[i] * a[i]) + (-b[i])", // dup under sqrt, then neg
         "o[i] = a[i] * a[i] + b[i] + c[i]",
         "o[i] = a[i] + a[i] + b[i] * c[i]",
         "o[i] = a[i] * a[i] * b[i] * c[i]",
     ];
     // Trip counts around the 8-lane group boundary, its multiples, and non-multiples (tail).
-    let sizes: &[usize] = &[1, 2, 7, 8, 9, 15, 16, 17, 24, 63, 64, 65, 100, 255, 256, 257];
+    let sizes: &[usize] = &[
+        1, 2, 7, 8, 9, 15, 16, 17, 24, 63, 64, 65, 100, 255, 256, 257,
+    ];
 
     for body in bodies {
         for &n in sizes {
@@ -217,13 +219,13 @@ fn p4_vec256_coverage_sweep() {
                        print(s as i32); return ((s as i32) & 255); }}",
                     m = n.max(1),
                 );
-                let native = jit(&src, 3)
-                    .unwrap_or_else(|e| panic!("jit -O3 [{form} n={n}] `{body}`: {e}"));
+                let native =
+                    jit(&src, 3).unwrap_or_else(|e| panic!("jit -O3 [{form} n={n}] `{body}`: {e}"));
                 let oracle = interp(&src, 3)
                     .unwrap_or_else(|e| panic!("interp [{form} n={n}] `{body}`: {e}"));
                 assert_eq!(native, oracle, "native vs interp [{form} n={n}] `{body}`");
-                let o0 = jit(&src, 0)
-                    .unwrap_or_else(|e| panic!("jit -O0 [{form} n={n}] `{body}`: {e}"));
+                let o0 =
+                    jit(&src, 0).unwrap_or_else(|e| panic!("jit -O0 [{form} n={n}] `{body}`: {e}"));
                 assert_eq!(o0, native, "-O0 vs -O3 [{form} n={n}] `{body}`");
             }
         }
@@ -309,7 +311,10 @@ fn p4_kill_switch_is_result_identical() {
             std::env::remove_var("WUKONG_P4_NO_256");
 
             assert!(k256 > 0, "vacuous: no 256-bit kernel for [n={n}] `{body}`");
-            assert_eq!(k128, 0, "WUKONG_P4_NO_256=1 still built a kernel [n={n}] `{body}`");
+            assert_eq!(
+                k128, 0,
+                "WUKONG_P4_NO_256=1 still built a kernel [n={n}] `{body}`"
+            );
             assert_eq!(
                 wide, narrow,
                 "WUKONG_P4_NO_256 changed the result [n={n}] `{body}`"
@@ -405,8 +410,8 @@ fn cranelift_still_rejects_f32x8() {
 /// place; a failure means Cranelift widened and the decision should be revisited.
 #[test]
 fn p4_probe_vec256_ops() {
-    use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature, Value};
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+    use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature, Value};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_jit::{JITBuilder, JITModule};
     use cranelift_module::{Linkage, Module};
@@ -460,88 +465,144 @@ fn p4_probe_vec256_ops() {
     // (name, vty, builder). Each loads from params, applies the op, stores to params[last].
     type B = Box<dyn Fn(&mut FunctionBuilder, &[Value], types::Type)>;
     let cases: Vec<(&str, types::Type, B)> = vec![
-        ("f32x4 fadd (control)", f32x4, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let r = b.ins().fadd(va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 load+store", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            b.ins().store(MemFlags::trusted(), va, p[3], 0);
-        })),
-        ("f32x8 fadd", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let r = b.ins().fadd(va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 fsub", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let r = b.ins().fsub(va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 fmul", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let r = b.ins().fmul(va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 fdiv", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let r = b.ins().fdiv(va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 fma", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let vc = b.ins().load(vt, MemFlags::trusted(), p[2], 0);
-            let r = b.ins().fma(va, vb, vc);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 fneg", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let r = b.ins().fneg(va);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 sqrt", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let r = b.ins().sqrt(va);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 fmin/fmax", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let r = b.ins().fmax(va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 fcmp->bitselect", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let mask = b.ins().fcmp(FloatCC::GreaterThan, va, vb);
-            let r = b.ins().bitselect(mask, va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("f32x8 splat(scalar)", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let s = b.ins().load(types::F32, MemFlags::trusted(), p[0], 0);
-            let r = b.ins().splat(vt, s);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("i32x8 iadd", i32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let r = b.ins().iadd(va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
-        ("i32x8 icmp->bitselect", i32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
-            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
-            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
-            let mask = b.ins().icmp(IntCC::SignedGreaterThan, va, vb);
-            let r = b.ins().bitselect(mask, va, vb);
-            b.ins().store(MemFlags::trusted(), r, p[3], 0);
-        })),
+        (
+            "f32x4 fadd (control)",
+            f32x4,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let r = b.ins().fadd(va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 load+store",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                b.ins().store(MemFlags::trusted(), va, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 fadd",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let r = b.ins().fadd(va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 fsub",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let r = b.ins().fsub(va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 fmul",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let r = b.ins().fmul(va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 fdiv",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let r = b.ins().fdiv(va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 fma",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let vc = b.ins().load(vt, MemFlags::trusted(), p[2], 0);
+                let r = b.ins().fma(va, vb, vc);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 fneg",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let r = b.ins().fneg(va);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 sqrt",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let r = b.ins().sqrt(va);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 fmin/fmax",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let r = b.ins().fmax(va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 fcmp->bitselect",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let mask = b.ins().fcmp(FloatCC::GreaterThan, va, vb);
+                let r = b.ins().bitselect(mask, va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "f32x8 splat(scalar)",
+            f32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let s = b.ins().load(types::F32, MemFlags::trusted(), p[0], 0);
+                let r = b.ins().splat(vt, s);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "i32x8 iadd",
+            i32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let r = b.ins().iadd(va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
+        (
+            "i32x8 icmp->bitselect",
+            i32x8,
+            Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+                let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+                let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+                let mask = b.ins().icmp(IntCC::SignedGreaterThan, va, vb);
+                let r = b.ins().bitselect(mask, va, vb);
+                b.ins().store(MemFlags::trusted(), r, p[3], 0);
+            }),
+        ),
     ];
 
     println!("\n=== P4 vec256 legalization probe (Cranelift 0.124.3, AVX2/FMA host) ===");
@@ -762,7 +823,10 @@ fn differential_tuple() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "tuple native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "tuple native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -787,7 +851,10 @@ fn differential_struct() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "struct native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "struct native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -825,7 +892,10 @@ fn differential_nested_struct() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "nested-struct native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "nested-struct native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -936,7 +1006,10 @@ fn differential_mixed_branch_types() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "mixed-branch native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "mixed-branch native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -970,7 +1043,10 @@ fn differential_short_circuit() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "short-circuit native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "short-circuit native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1000,7 +1076,10 @@ fn differential_for_continue() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "for+continue native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "for+continue native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1034,7 +1113,10 @@ fn differential_labeled_loops() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "labeled-loop native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "labeled-loop native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1065,7 +1147,10 @@ fn differential_struct_across_fns() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "struct-across-fns native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "struct-across-fns native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1104,7 +1189,10 @@ fn differential_struct_assign() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "struct-assign native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "struct-assign native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1149,7 +1237,10 @@ fn differential_struct_return() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "struct-return native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "struct-return native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1190,7 +1281,10 @@ fn differential_match() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "match native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "match native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1210,15 +1304,24 @@ fn differential_radix_literals() {
         ("fn main() -> i32 { return 0xFF_FF; }", 65535),
         ("fn main() -> i32 { return 1_000 + 0x10; }", 1016),
         // hex array index and a decimal literal sanity check.
-        ("fn main() -> i32 { let a: [i32; 4] = [10,20,30,40]; return a[0x2]; }", 30),
+        (
+            "fn main() -> i32 { let a: [i32; 4] = [10,20,30,40]; return a[0x2]; }",
+            30,
+        ),
         ("fn main() -> i32 { return 1_000_000; }", 1_000_000),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "radix native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "radix literal wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "radix native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "radix literal wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1231,26 +1334,68 @@ fn differential_radix_literals() {
 #[test]
 fn differential_float_narrow_int_cast() {
     let cases = [
-        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as u8) as i32; }", 7),
-        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as i8) as i32; }", 7),
-        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as u16) as i32; }", 7),
-        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as i16) as i32; }", 7),
-        ("fn main() -> i32 { let a: f32 = 300.0;        return (a as u8) as i32; }", 255),
-        ("fn main() -> i32 { let a: f32 = 300.0;        return (a as i8) as i32; }", 127),
-        ("fn main() -> i32 { let a: f32 = 0.0 - 1.0;    return (a as u8) as i32; }", 0),
-        ("fn main() -> i32 { let a: f32 = 0.0 - 300.0;  return (a as i8) as i32; }", -128),
-        ("fn main() -> i32 { let a: f32 = 70000.0;      return (a as u16) as i32; }", 65535),
-        ("fn main() -> i32 { let a: f32 = 0.0 - 70000.0; return (a as i16) as i32; }", -32768),
-        ("fn main() -> i32 { let a: f64 = 3.9;          return (a as u8) as i32; }", 3),
+        (
+            "fn main() -> i32 { let a: f32 = 7.0;          return (a as u8) as i32; }",
+            7,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 7.0;          return (a as i8) as i32; }",
+            7,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 7.0;          return (a as u16) as i32; }",
+            7,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 7.0;          return (a as i16) as i32; }",
+            7,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 300.0;        return (a as u8) as i32; }",
+            255,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 300.0;        return (a as i8) as i32; }",
+            127,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 0.0 - 1.0;    return (a as u8) as i32; }",
+            0,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 0.0 - 300.0;  return (a as i8) as i32; }",
+            -128,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 70000.0;      return (a as u16) as i32; }",
+            65535,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 0.0 - 70000.0; return (a as i16) as i32; }",
+            -32768,
+        ),
+        (
+            "fn main() -> i32 { let a: f64 = 3.9;          return (a as u8) as i32; }",
+            3,
+        ),
         // a >= 32-bit target still uses the direct path.
-        ("fn main() -> i32 { let a: f32 = 1000000.0;    return (a as i32); }", 1_000_000),
+        (
+            "fn main() -> i32 { let a: f32 = 1000000.0;    return (a as i32); }",
+            1_000_000,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "float->narrow-int native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "float->narrow-int wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "float->narrow-int native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "float->narrow-int wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1264,19 +1409,40 @@ fn differential_float_narrow_int_cast() {
 fn differential_top_level_const() {
     let cases = [
         ("const N: i32 = 64; fn main() -> i32 { return N; }", 64),
-        ("const N: i32 = 64; fn main() -> i32 { return N * 2 + 1; }", 129),
-        ("const I: i32 = 2; fn main() -> i32 { let a: [i32; 4] = [10,20,30,40]; return a[I]; }", 30),
-        ("const A: i32 = 64; const B: i32 = A + 1; fn main() -> i32 { return B; }", 65),
-        ("const LIM: i32 = 5; fn main() -> i32 { let mut c: i32 = 0; \
-          for i in 0..LIM { c += 1; } return c; }", 5),
-        ("const PI: f32 = 3.5; fn main() -> i32 { return PI as i32; }", 3),
-        ("const BIG: i64 = 1000; fn main() -> i32 { return BIG as i32; }", 1000),
+        (
+            "const N: i32 = 64; fn main() -> i32 { return N * 2 + 1; }",
+            129,
+        ),
+        (
+            "const I: i32 = 2; fn main() -> i32 { let a: [i32; 4] = [10,20,30,40]; return a[I]; }",
+            30,
+        ),
+        (
+            "const A: i32 = 64; const B: i32 = A + 1; fn main() -> i32 { return B; }",
+            65,
+        ),
+        (
+            "const LIM: i32 = 5; fn main() -> i32 { let mut c: i32 = 0; \
+          for i in 0..LIM { c += 1; } return c; }",
+            5,
+        ),
+        (
+            "const PI: f32 = 3.5; fn main() -> i32 { return PI as i32; }",
+            3,
+        ),
+        (
+            "const BIG: i64 = 1000; fn main() -> i32 { return BIG as i32; }",
+            1000,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "const native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "const native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "const wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -1292,15 +1458,27 @@ fn differential_nested_tuple_field() {
         ("fn main() -> i32 { let t = ((1, 2), 3); return t.0.0; }", 1),
         ("fn main() -> i32 { let t = ((1, 2), 3); return t.0.1; }", 2),
         ("fn main() -> i32 { let t = (9, (7, 8)); return t.1.0; }", 7),
-        ("fn main() -> i32 { let mut t = ((1, 2), 3); t.0.0 = 50; return t.0.0 + t.0.1; }", 52),
-        ("fn main() -> i32 { let t = (((5, 6), 7), 8); return t.0.0.0; }", 5),
+        (
+            "fn main() -> i32 { let mut t = ((1, 2), 3); t.0.0 = 50; return t.0.0 + t.0.1; }",
+            52,
+        ),
+        (
+            "fn main() -> i32 { let t = (((5, 6), 7), 8); return t.0.0.0; }",
+            5,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "nested-tuple-field native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "nested-tuple-field wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "nested-tuple-field native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "nested-tuple-field wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1313,20 +1491,41 @@ fn differential_nested_tuple_field() {
 #[test]
 fn differential_enum() {
     let cases = [
-        ("enum E { A = 10, B = 20 } fn main() -> i32 { return E::B as i32; }", 20),
-        ("enum Color { Red, Green, Blue } fn main() -> i32 { return Color::Blue as i32; }", 2),
-        ("enum E { A = 5, B, C } fn main() -> i32 { return E::C as i32; }", 7),
-        ("enum E { A = 10, B = 20 } fn main() -> i32 { let x: E = E::A; return x as i32; }", 10),
-        ("enum E { A = 10, B = 20 } \
-          fn main() -> i32 { let x: E = E::B; if x == E::B { return 1; } return 0; }", 1),
-        ("enum E { A = 10, B = 20 } \
-          fn main() -> i32 { return (E::A as i32) + (E::B as i32); }", 30),
+        (
+            "enum E { A = 10, B = 20 } fn main() -> i32 { return E::B as i32; }",
+            20,
+        ),
+        (
+            "enum Color { Red, Green, Blue } fn main() -> i32 { return Color::Blue as i32; }",
+            2,
+        ),
+        (
+            "enum E { A = 5, B, C } fn main() -> i32 { return E::C as i32; }",
+            7,
+        ),
+        (
+            "enum E { A = 10, B = 20 } fn main() -> i32 { let x: E = E::A; return x as i32; }",
+            10,
+        ),
+        (
+            "enum E { A = 10, B = 20 } \
+          fn main() -> i32 { let x: E = E::B; if x == E::B { return 1; } return 0; }",
+            1,
+        ),
+        (
+            "enum E { A = 10, B = 20 } \
+          fn main() -> i32 { return (E::A as i32) + (E::B as i32); }",
+            30,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "enum native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "enum native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "enum wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -1341,19 +1540,37 @@ fn differential_enum() {
 fn differential_let_destructure() {
     let cases = [
         ("fn main() -> i32 { let (a, b) = (3, 4); return a + b; }", 7),
-        ("fn main() -> i32 { let (a, b, c) = (1, 2, 3); return a + b + c; }", 6),
-        ("fn mk() -> (i32, i32) { return (10, 20); } \
-          fn main() -> i32 { let (x, y) = mk(); return x + y; }", 30),
-        ("fn main() -> i32 { let ((a, b), c) = ((1, 2), 3); return a + b + c; }", 6),
+        (
+            "fn main() -> i32 { let (a, b, c) = (1, 2, 3); return a + b + c; }",
+            6,
+        ),
+        (
+            "fn mk() -> (i32, i32) { return (10, 20); } \
+          fn main() -> i32 { let (x, y) = mk(); return x + y; }",
+            30,
+        ),
+        (
+            "fn main() -> i32 { let ((a, b), c) = ((1, 2), 3); return a + b + c; }",
+            6,
+        ),
         ("fn main() -> i32 { let (a, _) = (5, 99); return a; }", 5),
-        ("fn main() -> i32 { let (a, b) = (10, 20); a = 30; return a + b; }", 50),
+        (
+            "fn main() -> i32 { let (a, b) = (10, 20); a = 30; return a + b; }",
+            50,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "let-destructure native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "let-destructure wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "let-destructure native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "let-destructure wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1370,7 +1587,10 @@ fn differential_int_math_intrinsics() {
         ("fn main() -> i32 { return abs(7); }", 7),
         ("fn main() -> i32 { return abs(-2147483647); }", 2147483647),
         // round/floor/ceil/trunc on integers are the identity.
-        ("fn main() -> i32 { return round(5) + floor(-9) + ceil(3) + trunc(8); }", 7),
+        (
+            "fn main() -> i32 { return round(5) + floor(-9) + ceil(3) + trunc(8); }",
+            7,
+        ),
         // sqrt promotes the int operand to f32 (16 -> 16.0 -> 4.0 -> 4).
         ("fn main() -> i32 { return sqrt(16) as i32; }", 4),
         // float abs still works (the float path is unchanged).
@@ -1380,7 +1600,10 @@ fn differential_int_math_intrinsics() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "int-math native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "int-math native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "int-math wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -1402,13 +1625,31 @@ fn differential_int_math_intrinsics() {
 #[test]
 fn differential_fmax_fmin_int() {
     let cases = [
-        ("fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmax(a, b) as i32; }", 5),
-        ("fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmin(a, b) as i32; }", 3),
-        ("fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmax(a, b) as i32; }", 2),
-        ("fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmin(a, b) as i32; }", -7),
+        (
+            "fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmax(a, b) as i32; }",
+            5,
+        ),
+        (
+            "fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmin(a, b) as i32; }",
+            3,
+        ),
+        (
+            "fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmax(a, b) as i32; }",
+            2,
+        ),
+        (
+            "fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmin(a, b) as i32; }",
+            -7,
+        ),
         // float forms unchanged (the operands were already f32).
-        ("fn main() -> i32 { let a: f32 = 5.0; let b: f32 = 3.0; return fmax(a, b) as i32; }", 5),
-        ("fn main() -> i32 { let a: f32 = 5.0; let b: f32 = 3.0; return fmin(a, b) as i32; }", 3),
+        (
+            "fn main() -> i32 { let a: f32 = 5.0; let b: f32 = 3.0; return fmax(a, b) as i32; }",
+            5,
+        ),
+        (
+            "fn main() -> i32 { let a: f32 = 5.0; let b: f32 = 3.0; return fmin(a, b) as i32; }",
+            3,
+        ),
         // an integer literal already coerced before; still does.
         ("fn main() -> i32 { return fmax(5, 3) as i32; }", 5),
     ];
@@ -1416,8 +1657,14 @@ fn differential_fmax_fmin_int() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "fmax/fmin-int native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "fmax/fmin-int wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "fmax/fmin-int native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "fmax/fmin-int wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1449,17 +1696,30 @@ fn differential_match_patterns() {
         (format!("{NAME}(Color::Green); }}"), 2),
         (format!("{NAME}(Color::Blue); }}"), 3),
         // an or-pattern nested in a tuple field.
-        ("fn main() -> i32 { return match (1, 7) { (0 | 1, y) => y, _ => 0 }; }".to_string(), 7),
+        (
+            "fn main() -> i32 { return match (1, 7) { (0 | 1, y) => y, _ => 0 }; }".to_string(),
+            7,
+        ),
         // a negative range bound, signed comparison.
-        ("fn f(n: i32) -> i32 { return match n { -5..0 => 1, 0..=5 => 2, _ => 3 }; } \
-          fn main() -> i32 { return f(-3); }".to_string(), 1),
+        (
+            "fn f(n: i32) -> i32 { return match n { -5..0 => 1, 0..=5 => 2, _ => 3 }; } \
+          fn main() -> i32 { return f(-3); }"
+                .to_string(),
+            1,
+        ),
     ];
     for (src, want) in &cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "match-patterns native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, *want, "match-patterns wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "match-patterns native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, *want,
+                "match-patterns wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1486,8 +1746,14 @@ fn differential_char_patterns() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "char-pattern native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, *want, "char-pattern wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "char-pattern native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, *want,
+                "char-pattern wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1520,8 +1786,14 @@ fn differential_tensor_1d_kernels() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "tensor-1d-kernel native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "tensor-1d-kernel wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "tensor-1d-kernel native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "tensor-1d-kernel wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1552,8 +1824,14 @@ fn differential_loop_wide_bound() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "wide-bound loop native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "wide-bound loop wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "wide-bound loop native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "wide-bound loop wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1593,9 +1871,15 @@ fn differential_vectorized_inline_transcendental() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "inline-transcendental native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "inline-transcendental native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             if want >= 0 {
-                assert_eq!(n.0, want, "inline-transcendental wrong value at -O{opt} for:\n{src}");
+                assert_eq!(
+                    n.0, want,
+                    "inline-transcendental wrong value at -O{opt} for:\n{src}"
+                );
             }
         }
     }
@@ -1628,8 +1912,14 @@ fn differential_match_exhaustiveness() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "exhaustive-match native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "exhaustive-match wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "exhaustive-match native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "exhaustive-match wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1641,22 +1931,49 @@ fn differential_match_exhaustiveness() {
 #[test]
 fn differential_cast_to_bool() {
     let cases = [
-        ("fn main() -> i32 { let x: i32 = 0; return (x as bool) as i32; }", 0),
-        ("fn main() -> i32 { let x: i32 = 2; return (x as bool) as i32; }", 1), // was 0 under truncation
-        ("fn main() -> i32 { let x: i32 = 255; return (x as bool) as i32; }", 1),
-        ("fn main() -> i32 { let x: i32 = 0 - 4; return (x as bool) as i32; }", 1), // negative is nonzero
-        ("fn main() -> i32 { let x: f32 = 0.5; return (x as bool) as i32; }", 1),
-        ("fn main() -> i32 { let x: f32 = 0.0; return (x as bool) as i32; }", 0),
+        (
+            "fn main() -> i32 { let x: i32 = 0; return (x as bool) as i32; }",
+            0,
+        ),
+        (
+            "fn main() -> i32 { let x: i32 = 2; return (x as bool) as i32; }",
+            1,
+        ), // was 0 under truncation
+        (
+            "fn main() -> i32 { let x: i32 = 255; return (x as bool) as i32; }",
+            1,
+        ),
+        (
+            "fn main() -> i32 { let x: i32 = 0 - 4; return (x as bool) as i32; }",
+            1,
+        ), // negative is nonzero
+        (
+            "fn main() -> i32 { let x: f32 = 0.5; return (x as bool) as i32; }",
+            1,
+        ),
+        (
+            "fn main() -> i32 { let x: f32 = 0.0; return (x as bool) as i32; }",
+            0,
+        ),
         // the cast now agrees with the condition path on the same value.
-        ("fn main() -> i32 { let x: i32 = 2; if (x as bool) { return 7; } else { return 0; } }", 7),
+        (
+            "fn main() -> i32 { let x: i32 = 2; if (x as bool) { return 7; } else { return 0; } }",
+            7,
+        ),
         // regression: bool -> int is unchanged.
-        ("fn main() -> i32 { let b: bool = true; return (b as i32) + 10; }", 11),
+        (
+            "fn main() -> i32 { let b: bool = true; return (b as i32) + 10; }",
+            11,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "cast-to-bool native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "cast-to-bool native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "cast-to-bool wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -1671,20 +1988,32 @@ fn differential_bitwise_not() {
         ("fn main() -> i32 { let x: i32 = 5; return ~x; }", -6),
         ("fn main() -> i32 { let x: i32 = 0; return ~x; }", -1),
         // De Morgan: ~(a & b) == (~a) | (~b).
-        ("fn main() -> i32 { let a: i32 = 12; let b: i32 = 10; \
-          if ~(a & b) == (~a) | (~b) { return 1; } else { return 0; } }", 1),
+        (
+            "fn main() -> i32 { let a: i32 = 12; let b: i32 = 10; \
+          if ~(a & b) == (~a) | (~b) { return 1; } else { return 0; } }",
+            1,
+        ),
         // width masking: ~5 as u8 = 0xFA = 250.
-        ("fn main() -> i32 { let x: u8 = 5; let y: u8 = ~x; return y as i32; }", 250),
+        (
+            "fn main() -> i32 { let x: u8 = 5; let y: u8 = ~x; return y as i32; }",
+            250,
+        ),
         // composed with arithmetic: ~3 + 10 = -4 + 10 = 6.
         ("fn main() -> i32 { let x: i32 = 3; return ~x + 10; }", 6),
         // `~` and `!` are the same op on an integer.
-        ("fn main() -> i32 { let x: i32 = 42; if ~x == !x { return 7; } else { return 0; } }", 7),
+        (
+            "fn main() -> i32 { let x: i32 = 42; if ~x == !x { return 7; } else { return 0; } }",
+            7,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "bitwise-not native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "bitwise-not native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "bitwise-not wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -1718,7 +2047,10 @@ fn differential_int_literal_widening() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "int-literal-widening native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "int-literal-widening native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(
                 String::from_utf8_lossy(&n.1),
                 want,
@@ -1755,8 +2087,14 @@ fn differential_aggregate_literal_adapt() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "aggregate-literal native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "aggregate-literal wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "aggregate-literal native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "aggregate-literal wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1788,8 +2126,14 @@ fn differential_const_array_length() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "const-array-length native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "const-array-length wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "const-array-length native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "const-array-length wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1815,7 +2159,10 @@ fn differential_char_type() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "char native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "char native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "char wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -1829,22 +2176,43 @@ fn differential_char_type() {
 fn differential_binary_const_adapt() {
     let cases = [
         // binary const adapts to i64 (was an i32-vs-i64 mismatch); -16.
-        ("fn main() -> i32 { let v: i64 = 0 - 16; return v as i32; }", -16),
+        (
+            "fn main() -> i32 { let v: i64 = 0 - 16; return v as i32; }",
+            -16,
+        ),
         // multiply + add fold, wide target: 1_000_001 / 1000 = 1000.
-        ("fn main() -> i32 { let v: i64 = 1000 * 1000 + 1; return (v / 1000) as i32; }", 1000),
+        (
+            "fn main() -> i32 { let v: i64 = 1000 * 1000 + 1; return (v / 1000) as i32; }",
+            1000,
+        ),
         // float binary adapts to f64: (1.5 - 0.5) * 10 = 10.
-        ("fn main() -> i32 { let v: f64 = 1.5 - 0.5; return (v * 10.0) as i32; }", 10),
+        (
+            "fn main() -> i32 { let v: f64 = 1.5 - 0.5; return (v * 10.0) as i32; }",
+            10,
+        ),
         // bitwise const adapts: 0xF0 | 0x0F = 255.
-        ("fn main() -> i32 { let v: i64 = 0xF0 | 0x0F; return v as i32; }", 255),
+        (
+            "fn main() -> i32 { let v: i64 = 0xF0 | 0x0F; return v as i32; }",
+            255,
+        ),
         // nested binary, all literals: 3 + 2*2 = 7.
-        ("fn main() -> i32 { let v: i64 = 3 + 2 * 2; return v as i32; }", 7),
+        (
+            "fn main() -> i32 { let v: i64 = 3 + 2 * 2; return v as i32; }",
+            7,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "binary-const-adapt native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "binary-const-adapt wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "binary-const-adapt native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "binary-const-adapt wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1870,8 +2238,14 @@ fn differential_u64_range_literal() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "u64-range-literal native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "u64-range-literal wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "u64-range-literal native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "u64-range-literal wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1911,8 +2285,14 @@ fn differential_deref_field_access() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "deref-field-access native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "deref-field-access wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "deref-field-access native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "deref-field-access wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1945,8 +2325,14 @@ fn differential_aggregate_value_merge() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "aggregate-value-merge native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "aggregate-value-merge wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "aggregate-value-merge native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "aggregate-value-merge wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -1982,7 +2368,10 @@ fn differential_tuple_match() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "tuple-match native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "tuple-match native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, *want, "tuple-match wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -2004,14 +2393,23 @@ fn differential_char_literals() {
         ("fn main() -> i32 { return '\\x41' as i32; }", 65),
         ("fn main() -> i32 { return '\\u{1F600}' as i32; }", 128512),
         ("fn main() -> i32 { let z = 'Z'; return z as i32; }", 90),
-        ("fn main() -> i32 { if 'a' < 'b' { return 1; } return 0; }", 1),
-        ("fn main() -> i32 { return ('z' as i32) - ('a' as i32); }", 25),
+        (
+            "fn main() -> i32 { if 'a' < 'b' { return 1; } return 0; }",
+            1,
+        ),
+        (
+            "fn main() -> i32 { return ('z' as i32) - ('a' as i32); }",
+            25,
+        ),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "char native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "char native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "char wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -2045,7 +2443,10 @@ fn differential_string_literals() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "string native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "string native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -2059,7 +2460,10 @@ fn differential_string_literals() {
 fn differential_return_type_coercion() {
     let cases = [
         // int literal from a wider return type (stays 0).
-        ("fn f() -> i64 { return 0; } fn main() -> i64 { return f(); }", 0i64),
+        (
+            "fn f() -> i64 { return 0; } fn main() -> i64 { return f(); }",
+            0i64,
+        ),
         // implicit tail value coerced to the return type.
         ("fn g() -> i64 { 5 } fn main() -> i64 { return g(); }", 5),
         // negative i32 literal sign-extends to i64.
@@ -2073,7 +2477,10 @@ fn differential_return_type_coercion() {
             6,
         ),
         // narrow (u8) return type.
-        ("fn b() -> u8 { return 5; } fn main() -> i64 { return b() as i64; }", 5),
+        (
+            "fn b() -> u8 { return 5; } fn main() -> i64 { return b() as i64; }",
+            5,
+        ),
         // a recursive i64 function whose base case is `return 0;` (the field pattern the hunt hit).
         (
             "fn sum(n: i32) -> i64 { if n <= 0 { return 0; } return (n as i64) + sum(n - 1); } \
@@ -2085,8 +2492,14 @@ fn differential_return_type_coercion() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "return-coercion native vs interp mismatch at -O{opt} for:\n{src}");
-            assert_eq!(n.0, want, "return-coercion wrong value at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "return-coercion native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+            assert_eq!(
+                n.0, want,
+                "return-coercion wrong value at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -2115,7 +2528,10 @@ fn differential_f32_const_fold() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "f32-fold native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "f32-fold native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "f32-fold wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -2141,7 +2557,10 @@ fn differential_int_to_f32_rounding() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "int->f32 native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "int->f32 native vs interp mismatch at -O{opt} for:\n{src}"
+            );
             assert_eq!(n.0, want, "int->f32 wrong value at -O{opt} for:\n{src}");
         }
     }
@@ -2167,7 +2586,10 @@ fn differential_pointer() {
         for opt in [0u8, 1, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "pointer native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "pointer native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -2477,7 +2899,11 @@ fn dequant_loop_lowers_to_dequant_kernel() {
             "{ty} pure dequant -> wukong_dequant_f32"
         );
     }
-    for act in ["fmax((q[j] as f32) * s, 0.0)", "gelu((q[j] as f32) * s)", "silu((q[j] as f32) * s)"] {
+    for act in [
+        "fmax((q[j] as f32) * s, 0.0)",
+        "gelu((q[j] as f32) * s)",
+        "silu((q[j] as f32) * s)",
+    ] {
         assert!(
             lowered_calls(&deq("", "i8", act), "wukong_dequant_f32"),
             "activated dequant `{act}` -> wukong_dequant_f32"
@@ -2523,7 +2949,10 @@ fn differential_dequant_mixed_parallel() {
     for opt in [0u8, 2, 3] {
         let n = jit(src, opt).expect("jit");
         let i = interp(src, opt).expect("interp");
-        assert_eq!(n, i, "mixed-parallel dequant native vs interp mismatch at -O{opt}");
+        assert_eq!(
+            n, i,
+            "mixed-parallel dequant native vs interp mismatch at -O{opt}"
+        );
     }
 }
 
@@ -2556,7 +2985,10 @@ fn differential_dequant_perchan() {
         "per-channel dequant -> wukong_dequant_perchan_f32"
     );
     assert!(
-        lowered_calls(&make("@parallel ", "i8", "V"), "wukong_dequant_perchan_f32_parallel"),
+        lowered_calls(
+            &make("@parallel ", "i8", "V"),
+            "wukong_dequant_perchan_f32_parallel"
+        ),
         "@parallel per-channel dequant -> wukong_dequant_perchan_f32_parallel"
     );
     for ty in ["i8", "u8", "i32"] {
@@ -3279,7 +3711,10 @@ fn bias_bcast_is_correct_across_sizes() {
         let src = kernel(rows, cols);
         let native = jit(&src, 3).expect("jit");
         let interp = interp(&src, 3).expect("interp");
-        assert_eq!(native, interp, "bias native vs interp mismatch at {rows}x{cols}");
+        assert_eq!(
+            native, interp,
+            "bias native vs interp mismatch at {rows}x{cols}"
+        );
         let want = (rows * (cols * (cols - 1) / 2)) as i64;
         assert_eq!(native.0, want, "wrong bias-bcast sum at {rows}x{cols}");
     }
@@ -3308,7 +3743,10 @@ fn bias_bcast_parallel_matches_interp() {
     for opt in [0u8, 3] {
         let native = jit(src, opt).expect("jit");
         let interp = interp(src, opt).expect("interp");
-        assert_eq!(native, interp, "parallel bias native vs interp mismatch at O{opt}");
+        assert_eq!(
+            native, interp,
+            "parallel bias native vs interp mismatch at O{opt}"
+        );
         // sum_k k (0..96) + 8 * sum_j j (0..12) = 4560 + 8*66 = 5088.
         assert_eq!(native.0, 5088, "wrong parallel bias sum at O{opt}");
     }
@@ -3450,7 +3888,7 @@ fn p4_reduction_f64_reference() {
 #[test]
 fn p4_reduction256_gate_and_differential() {
     let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this gate
-    // Full program: init streams a,b (deterministic, both signs), then the reduction `red`, print s.
+                               // Full program: init streams a,b (deterministic, both signs), then the reduction `red`, print s.
     let mk = |n: usize, red: &str| {
         format!(
             "fn main() -> i32 {{ let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
@@ -3777,8 +4215,16 @@ fn p4_vec256_general_matches_interp() {
             "n={n}: expected a synthesized vector kernel in the MIR"
         );
         let native = jit(&src, 3).expect("jit -O3");
-        assert_eq!(native, interp(&src, 3).expect("interp"), "n={n}: native vs interp");
-        assert_eq!(jit(&src, 0).expect("jit -O0"), native, "n={n}: native -O0 vs -O3");
+        assert_eq!(
+            native,
+            interp(&src, 3).expect("interp"),
+            "n={n}: native vs interp"
+        );
+        assert_eq!(
+            jit(&src, 0).expect("jit -O0"),
+            native,
+            "n={n}: native -O0 vs -O3"
+        );
     }
 }
 
@@ -3789,9 +4235,9 @@ fn p4_vec256_general_matches_interp() {
 #[test]
 fn p4_counting_while_normalizes_and_matches_interp() {
     let _env = p4_read_lock(); // asserts a kernel was synthesized, so the knob must stay clear
-    // `lo` lets us cover both the ran case (lo < N) and the empty case (lo == N ⇒ never runs). The
-    // counting-while body is a stream×stream product plus a third stream (`a*b + e`) — velem can't
-    // claim that shape, so it reaches the general recipe (a real `vec_kernels` entry).
+                               // `lo` lets us cover both the ran case (lo < N) and the empty case (lo == N ⇒ never runs). The
+                               // counting-while body is a stream×stream product plus a third stream (`a*b + e`) — velem can't
+                               // claim that shape, so it reaches the general recipe (a real `vec_kernels` entry).
     let prog = |n: usize, lo: usize| {
         format!(
             "fn main() -> i32 {{ \
@@ -3822,7 +4268,11 @@ fn p4_counting_while_normalizes_and_matches_interp() {
                 interp(&src, 3).expect("interp"),
                 "n={n} lo={lo}: native vs interp"
             );
-            assert_eq!(jit(&src, 0).expect("jit -O0"), native, "n={n} lo={lo}: -O0 vs -O3");
+            assert_eq!(
+                jit(&src, 0).expect("jit -O0"),
+                native,
+                "n={n} lo={lo}: -O0 vs -O3"
+            );
         }
     }
 }
@@ -3933,7 +4383,11 @@ fn tensor_matmul_is_correct() {
             for j in 0..ns {
                 let mut acc = 0.0f32;
                 for k in 0..ns {
-                    let bkj = if transposed_b { b[j * ns + k] } else { b[k * ns + j] };
+                    let bkj = if transposed_b {
+                        b[j * ns + k]
+                    } else {
+                        b[k * ns + j]
+                    };
                     acc += a[i * ns + k] * bkj;
                 }
                 sum += acc;
@@ -4038,8 +4492,15 @@ fn tensor_matmul_accumulate_form() {
             let src = kernel(ns, parallel);
             let native = jit(&src, 3).expect("jit");
             let interp = interp(&src, 3).expect("interp");
-            assert_eq!(native, interp, "tensor acc matmul native vs interp (ns={ns}, par={parallel})");
-            assert_eq!(native.0, reference(ns), "tensor acc matmul wrong (ns={ns}, par={parallel})");
+            assert_eq!(
+                native, interp,
+                "tensor acc matmul native vs interp (ns={ns}, par={parallel})"
+            );
+            assert_eq!(
+                native.0,
+                reference(ns),
+                "tensor acc matmul wrong (ns={ns}, par={parallel})"
+            );
         }
     }
 }
@@ -4073,44 +4534,68 @@ fn lowered_calls(src: &str, callee: &str) -> bool {
 #[test]
 fn parallel_row_loss_and_gather_nests_reach_their_kernels() {
     // Two rows of four so the row loop is the parallel axis and the inner reductions are per row.
-    let xent = |a: &str| format!(
-        "module p\n{a}fn f(x:[f32;8], target:[i32;2], mut loss:[f32;2]) {{ for r in 0..2 {{ \
+    let xent = |a: &str| {
+        format!(
+            "module p\n{a}fn f(x:[f32;8], target:[i32;2], mut loss:[f32;2]) {{ for r in 0..2 {{ \
          let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
          let mut s: f32 = 0.0; for i in 0..4 {{ s = s + exp(x[r*4+i] - m); }} \
-         loss[r] = m + log(s) - x[r*4+target[r]]; }} }}");
-    let lse = |a: &str| format!(
-        "module p\n{a}fn f(x:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         loss[r] = m + log(s) - x[r*4+target[r]]; }} }}"
+        )
+    };
+    let lse = |a: &str| {
+        format!(
+            "module p\n{a}fn f(x:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
          let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
          let mut s: f32 = 0.0; for i in 0..4 {{ s = s + exp(x[r*4+i] - m); }} \
-         out[r] = m + log(s); }} }}");
-    let kldiv = |a: &str| format!(
-        "module p\n{a}fn f(p:[f32;8], q:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         out[r] = m + log(s); }} }}"
+        )
+    };
+    let kldiv = |a: &str| {
+        format!(
+            "module p\n{a}fn f(p:[f32;8], q:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
          let mut s: f32 = 0.0; \
          for i in 0..4 {{ s = s + p[r*4+i] * (log(p[r*4+i]) - log(q[r*4+i])); }} \
-         out[r] = s; }} }}");
-    let entropy = |a: &str| format!(
-        "module p\n{a}fn f(p:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         out[r] = s; }} }}"
+        )
+    };
+    let entropy = |a: &str| {
+        format!(
+            "module p\n{a}fn f(p:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
          let mut s: f32 = 0.0; for i in 0..4 {{ s = s + p[r*4+i] * log(p[r*4+i]); }} \
-         out[r] = -s; }} }}");
-    let kd = |a: &str| format!(
-        "module p\n{a}fn f(x:[f32;8], q:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
+         out[r] = -s; }} }}"
+        )
+    };
+    let kd = |a: &str| {
+        format!(
+            "module p\n{a}fn f(x:[f32;8], q:[f32;8], mut out:[f32;2]) {{ for r in 0..2 {{ \
          let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
          let mut z: f32 = 0.0; for i in 0..4 {{ z = z + exp(x[r*4+i] - m); }} \
          let l: f32 = m + log(z); let mut s: f32 = 0.0; \
-         for i in 0..4 {{ s = s + q[r*4+i] * (l - x[r*4+i]); }} out[r] = s; }} }}");
-    let xbwd = |a: &str| format!(
-        "module p\n{a}fn f(x:[f32;8], target:[i32;2], mut dx:[f32;8]) {{ for r in 0..2 {{ \
+         for i in 0..4 {{ s = s + q[r*4+i] * (l - x[r*4+i]); }} out[r] = s; }} }}"
+        )
+    };
+    let xbwd = |a: &str| {
+        format!(
+            "module p\n{a}fn f(x:[f32;8], target:[i32;2], mut dx:[f32;8]) {{ for r in 0..2 {{ \
          let mut m: f32 = x[r*4]; for i in 0..4 {{ m = fmax(m, x[r*4+i]); }} \
          let mut z: f32 = 0.0; for i in 0..4 {{ z = z + exp(x[r*4+i] - m); }} \
          let invz: f32 = 1.0 / z; \
          for i in 0..4 {{ dx[r*4+i] = exp(x[r*4+i] - m) * invz; }} \
-         dx[r*4+target[r]] = dx[r*4+target[r]] - 1.0; }} }}");
-    let scatter = |a: &str| format!(
-        "module p\n{a}fn f(ids:[i32;4], grad_out:[f32;12], mut grad_w:[f32;6]) {{ \
-         for t in 0..4 {{ for d in 0..3 {{ grad_w[ids[t]*3+d] += grad_out[t*3+d]; }} }} }}");
-    let embed = |a: &str| format!(
-        "module p\n{a}fn f(ids:[i32;4], weight:[f32;12], mut out:[f32;12]) {{ \
-         for t in 0..4 {{ for d in 0..3 {{ out[t*3+d] = weight[ids[t]*3+d]; }} }} }}");
+         dx[r*4+target[r]] = dx[r*4+target[r]] - 1.0; }} }}"
+        )
+    };
+    let scatter = |a: &str| {
+        format!(
+            "module p\n{a}fn f(ids:[i32;4], grad_out:[f32;12], mut grad_w:[f32;6]) {{ \
+         for t in 0..4 {{ for d in 0..3 {{ grad_w[ids[t]*3+d] += grad_out[t*3+d]; }} }} }}"
+        )
+    };
+    let embed = |a: &str| {
+        format!(
+            "module p\n{a}fn f(ids:[i32;4], weight:[f32;12], mut out:[f32;12]) {{ \
+         for t in 0..4 {{ for d in 0..3 {{ out[t*3+d] = weight[ids[t]*3+d]; }} }} }}"
+        )
+    };
 
     let cases: &[(&str, &dyn Fn(&str) -> String)] = &[
         ("wukong_xent_fwd_f32", &xent),
@@ -4324,10 +4809,7 @@ fn ijk_dot_product_matmul_recognized() {
     let nt = "module m\nfn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
         for k in 0..8 { s = s + a[i*8+k] * b[j*8+k]; } c[i*4+j] = s; } } }";
-    assert!(
-        lowered_calls(nt, "wukong_sgemm_nt"),
-        "ijk A·Bᵀ -> sgemm_nt"
-    );
+    assert!(lowered_calls(nt, "wukong_sgemm_nt"), "ijk A·Bᵀ -> sgemm_nt");
     // C = A·B (b[k*N+j]).
     let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
@@ -5147,19 +5629,26 @@ fn serial_parallel_object_bytes_identical() {
         let serial = crate::emit_object_ex(
             &program,
             &interner,
-            crate::EmitOptions { verify: false, parallel: false },
+            crate::EmitOptions {
+                verify: false,
+                parallel: false,
+            },
         )
         .unwrap_or_else(|e| panic!("src {i} serial: {e}"))
         .0;
         let parallel = crate::emit_object_ex(
             &program,
             &interner,
-            crate::EmitOptions { verify: false, parallel: true },
+            crate::EmitOptions {
+                verify: false,
+                parallel: true,
+            },
         )
         .unwrap_or_else(|e| panic!("src {i} parallel: {e}"))
         .0;
         assert_eq!(
-            serial, parallel,
+            serial,
+            parallel,
             "src {i}: parallel per-function codegen changed the object bytes ({} vs {} bytes)",
             serial.len(),
             parallel.len()
@@ -5174,14 +5663,20 @@ fn verifier_toggle_object_bytes_identical() {
         let verified = crate::emit_object_ex(
             &program,
             &interner,
-            crate::EmitOptions { verify: true, parallel: false },
+            crate::EmitOptions {
+                verify: true,
+                parallel: false,
+            },
         )
         .unwrap_or_else(|e| panic!("src {i} verify: {e}"))
         .0;
         let unverified = crate::emit_object_ex(
             &program,
             &interner,
-            crate::EmitOptions { verify: false, parallel: false },
+            crate::EmitOptions {
+                verify: false,
+                parallel: false,
+            },
         )
         .unwrap_or_else(|e| panic!("src {i} noverify: {e}"))
         .0;
@@ -5200,7 +5695,10 @@ fn parallel_object_bytes_deterministic() {
     let first = crate::emit_object_ex(
         &program,
         &interner,
-        crate::EmitOptions { verify: false, parallel: true },
+        crate::EmitOptions {
+            verify: false,
+            parallel: true,
+        },
     )
     .unwrap()
     .0;
@@ -5208,11 +5706,17 @@ fn parallel_object_bytes_deterministic() {
         let again = crate::emit_object_ex(
             &program,
             &interner,
-            crate::EmitOptions { verify: false, parallel: true },
+            crate::EmitOptions {
+                verify: false,
+                parallel: true,
+            },
         )
         .unwrap()
         .0;
-        assert_eq!(first, again, "parallel codegen produced nondeterministic object bytes");
+        assert_eq!(
+            first, again,
+            "parallel codegen produced nondeterministic object bytes"
+        );
     }
 }
 
@@ -5253,7 +5757,10 @@ fn parallel_codegen_error_is_source_ordered() {
     let serial = crate::emit_object_ex(
         &program,
         &interner,
-        crate::EmitOptions { verify: false, parallel: false },
+        crate::EmitOptions {
+            verify: false,
+            parallel: false,
+        },
     )
     .map(|_| ())
     .expect_err("an oversized stack slot must not compile");
@@ -5265,7 +5772,10 @@ fn parallel_codegen_error_is_source_ordered() {
         let parallel = crate::emit_object_ex(
             &program,
             &interner,
-            crate::EmitOptions { verify: false, parallel: true },
+            crate::EmitOptions {
+                verify: false,
+                parallel: true,
+            },
         )
         .map(|_| ())
         .expect_err("an oversized stack slot must not compile");
@@ -5370,8 +5880,15 @@ fn backend_compile_ab() {
                 return None;
             }
             wukong_opt::optimize(&mut p, 2);
-            crate::emit_object_ex(&p, &interner, crate::EmitOptions { verify: false, parallel: false })
-                .ok()?;
+            crate::emit_object_ex(
+                &p,
+                &interner,
+                crate::EmitOptions {
+                    verify: false,
+                    parallel: false,
+                },
+            )
+            .ok()?;
             Some((p, interner))
         }));
         match outcome {
@@ -5397,9 +5914,18 @@ fn backend_compile_ab() {
         panicked
     );
 
-    let ser = crate::EmitOptions { verify: false, parallel: false };
-    let ver = crate::EmitOptions { verify: true, parallel: false };
-    let par = crate::EmitOptions { verify: false, parallel: true };
+    let ser = crate::EmitOptions {
+        verify: false,
+        parallel: false,
+    };
+    let ver = crate::EmitOptions {
+        verify: true,
+        parallel: false,
+    };
+    let par = crate::EmitOptions {
+        verify: false,
+        parallel: true,
+    };
     let emit = |p: &wukong_mir::Program, i: &Interner, o: crate::EmitOptions| {
         crate::emit_object_ex(p, i, o).unwrap()
     };

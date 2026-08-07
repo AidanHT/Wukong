@@ -304,8 +304,15 @@ mod tests {
         let mut got = vec![0i32; rows];
         let want = unsafe { rowarg_scalar(x.as_ptr(), cols, true) };
         unsafe { wukong_rowargmax_i32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64) };
-        assert_eq!(want, planted as i32, "scalar twin lost the exact column index");
-        assert_eq!(got, vec![want], "rowargmax dispatch != scalar twin past 2^24 cols");
+        assert_eq!(
+            want, planted as i32,
+            "scalar twin lost the exact column index"
+        );
+        assert_eq!(
+            got,
+            vec![want],
+            "rowargmax dispatch != scalar twin past 2^24 cols"
+        );
     }
 
     #[test]
@@ -341,7 +348,10 @@ mod tests {
                     fp(x.as_ptr(), got_par.as_mut_ptr(), rows as i64, cols as i64);
                 }
                 assert_eq!(got, want, "is_max={is_max} {rows}x{cols} vs naive");
-                assert_eq!(got, got_par, "is_max={is_max} serial vs parallel {rows}x{cols}");
+                assert_eq!(
+                    got, got_par,
+                    "is_max={is_max} serial vs parallel {rows}x{cols}"
+                );
             }
         }
     }
@@ -377,9 +387,19 @@ mod tests {
         let mut amin_p = vec![0i32; rows];
         unsafe {
             wukong_rowargmax_i32(x.as_ptr(), amax.as_mut_ptr(), rows as i64, cols as i64);
-            wukong_rowargmax_i32_parallel(x.as_ptr(), amax_p.as_mut_ptr(), rows as i64, cols as i64);
+            wukong_rowargmax_i32_parallel(
+                x.as_ptr(),
+                amax_p.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+            );
             wukong_rowargmin_i32(x.as_ptr(), amin.as_mut_ptr(), rows as i64, cols as i64);
-            wukong_rowargmin_i32_parallel(x.as_ptr(), amin_p.as_mut_ptr(), rows as i64, cols as i64);
+            wukong_rowargmin_i32_parallel(
+                x.as_ptr(),
+                amin_p.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+            );
         }
 
         // argmax: row0 all-equal → 0; row1 dup max at 2 & 5 → 2; row2 (baseline 0, min planted) → max
@@ -415,7 +435,10 @@ mod tests {
             wukong_rowargmax_i32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
             wukong_rowargmax_i32_parallel(x.as_ptr(), got_p.as_mut_ptr(), rows as i64, cols as i64);
         }
-        assert!(got.iter().all(|&v| v == 3), "every row argmax == lowest dup index 3 (serial)");
+        assert!(
+            got.iter().all(|&v| v == 3),
+            "every row argmax == lowest dup index 3 (serial)"
+        );
         assert_eq!(got, got_p, "serial == parallel across the rayon threshold");
     }
 

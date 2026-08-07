@@ -484,9 +484,9 @@ impl Sema<'_> {
                         }
                         let payload = match &v.data {
                             VariantData::Unit => VariantPayload::Unit,
-                            VariantData::Tuple(tys) => {
-                                VariantPayload::Tuple(tys.iter().map(|t| self.lower_type(t)).collect())
-                            }
+                            VariantData::Tuple(tys) => VariantPayload::Tuple(
+                                tys.iter().map(|t| self.lower_type(t)).collect(),
+                            ),
                             VariantData::Struct(fields) => VariantPayload::Struct(
                                 fields
                                     .iter()
@@ -1138,7 +1138,11 @@ impl Sema<'_> {
         for p in &f.params {
             if !seen_params.insert(p.name.sym) {
                 let nm = self.sym_str(p.name.sym).to_string();
-                self.error(p.name.span, "E0300", format!("duplicate parameter name `{nm}`"));
+                self.error(
+                    p.name.span,
+                    "E0300",
+                    format!("duplicate parameter name `{nm}`"),
+                );
             }
             let ty = self.lower_type(&p.ty);
             // A parameter without `mut` is immutable: track it so reassigning it (`p = …`) or
@@ -1520,7 +1524,10 @@ impl Sema<'_> {
                 self.error(
                     span,
                     "E0401",
-                    format!("missing field{s} {} in this struct initializer", missing.join(", ")),
+                    format!(
+                        "missing field{s} {} in this struct initializer",
+                        missing.join(", ")
+                    ),
                 );
             }
         }
@@ -1840,7 +1847,9 @@ impl Sema<'_> {
                             );
                         }
                     }
-                    ExprKind::Field { .. } | ExprKind::TupleField { .. } | ExprKind::Index { .. } => {
+                    ExprKind::Field { .. }
+                    | ExprKind::TupleField { .. }
+                    | ExprKind::Index { .. } => {
                         if let Some(root) = self.assign_root_param(target) {
                             if self.is_immutable_param(root) && self.param_is_aggregate(root) {
                                 let nm = self.sym_str(root).to_string();
@@ -1903,7 +1912,8 @@ impl Sema<'_> {
                         // backend builds a `Void` return signature and rejects the value, while the
                         // interpreter silently discards it — a backend divergence. A returned `()`
                         // or void call (type `Unit`) is fine; stay lenient on `Unknown`/`Error`.
-                        if matches!(ret, Ty::Unit) && !matches!(t, Ty::Unit | Ty::Unknown | Ty::Error)
+                        if matches!(ret, Ty::Unit)
+                            && !matches!(t, Ty::Unit | Ty::Unknown | Ty::Error)
                         {
                             self.error(
                                 e.span,
@@ -1921,7 +1931,8 @@ impl Sema<'_> {
                         // the -O0 verifier rejects it (a clean ICE) but -O2 mem2reg *panicked* on the
                         // void branch argument. Reject at the source (E0401), like the bare `return;`
                         // arm below — stay lenient on `Unknown`/`Error`.
-                        if !matches!(ret, Ty::Unit | Ty::Unknown | Ty::Error) && matches!(t, Ty::Unit)
+                        if !matches!(ret, Ty::Unit | Ty::Unknown | Ty::Error)
+                            && matches!(t, Ty::Unit)
                         {
                             self.error(
                                 e.span,
@@ -2211,7 +2222,11 @@ impl Sema<'_> {
             }
             (VariantPat::Struct(fps), VariantPayload::Struct(named)) => {
                 for fp in fps {
-                    match named.iter().find(|(n, _)| *n == fp.name).map(|(_, t)| t.clone()) {
+                    match named
+                        .iter()
+                        .find(|(n, _)| *n == fp.name)
+                        .map(|(_, t)| t.clone())
+                    {
                         Some(t) => self.bind_pattern(&fp.pat, &t),
                         None => {
                             let fname = self.sym_str(fp.name).to_string();
@@ -2239,7 +2254,9 @@ impl Sema<'_> {
                 self.error(
                     span,
                     "E0401",
-                    format!("enum variant `{qual}` is a struct variant; destructure it with `{{ .. }}`"),
+                    format!(
+                        "enum variant `{qual}` is a struct variant; destructure it with `{{ .. }}`"
+                    ),
                 );
                 self.bind_variant_fields_unknown(fields);
             }
@@ -2247,7 +2264,9 @@ impl Sema<'_> {
                 self.error(
                     span,
                     "E0401",
-                    format!("enum variant `{qual}` is a tuple variant; destructure it with `( .. )`"),
+                    format!(
+                        "enum variant `{qual}` is a tuple variant; destructure it with `( .. )`"
+                    ),
                 );
                 self.bind_variant_fields_unknown(fields);
             }
@@ -2298,7 +2317,11 @@ impl Sema<'_> {
             Some(Def {
                 kind: DefKind::Enum(vs),
                 ..
-            }) => Some(vs.iter().find(|v| v.name == vname).map(|v| v.payload.clone())),
+            }) => Some(
+                vs.iter()
+                    .find(|v| v.name == vname)
+                    .map(|v| v.payload.clone()),
+            ),
             _ => None,
         };
         let payload_opt = resolved?; // not an enum → ordinary call
@@ -2414,7 +2437,10 @@ impl Sema<'_> {
         match &e.kind {
             ExprKind::Int(s) => !has_int_suffix(self.sym_str(*s)),
             ExprKind::Float(s) => !has_float_suffix(self.sym_str(*s)),
-            ExprKind::Unary { op: UnOp::Neg, expr } => self.is_adaptable_num_literal(expr),
+            ExprKind::Unary {
+                op: UnOp::Neg,
+                expr,
+            } => self.is_adaptable_num_literal(expr),
             _ => false,
         }
     }
@@ -2476,7 +2502,10 @@ impl Sema<'_> {
             }
             (ExprKind::TupleLit(items), Ty::Tuple(tys)) => {
                 items.len() == tys.len()
-                    && items.iter().zip(tys).all(|(it, t)| self.literal_adapts(t, it))
+                    && items
+                        .iter()
+                        .zip(tys)
+                        .all(|(it, t)| self.literal_adapts(t, it))
             }
             _ => false,
         }
@@ -2781,7 +2810,10 @@ impl Sema<'_> {
                 // disagreeing). Reject them cleanly here, only for the arithmetic/bitwise/shift
                 // operators. `==`/`!=` and ordering on pointers are untouched; elementwise tensor work
                 // uses indexed scalars (`a[i] + b[i]`), and SIMD `Vector` arithmetic still lowers.
-                if matches!(op, Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr) {
+                if matches!(
+                    op,
+                    Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr
+                ) {
                     if let Some(bad) = [&l, &r]
                         .into_iter()
                         .find(|t| matches!(t, Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. }))
@@ -2810,7 +2842,10 @@ impl Sema<'_> {
                     self.error(
                         e.span,
                         "E0401",
-                        format!("arithmetic operator `{}` is not defined for `bool`", op.glyph()),
+                        format!(
+                            "arithmetic operator `{}` is not defined for `bool`",
+                            op.glyph()
+                        ),
                     );
                     return Ty::Unknown;
                 }
@@ -2957,7 +2992,9 @@ impl Sema<'_> {
                         let arith = matches!(op, Add | Sub | Mul | Div | Rem);
                         if arith && self.is_adaptable_num_literal(lhs) && self.is_generic_ty(&r) {
                             r
-                        } else if arith && self.is_adaptable_num_literal(rhs) && self.is_generic_ty(&l)
+                        } else if arith
+                            && self.is_adaptable_num_literal(rhs)
+                            && self.is_generic_ty(&l)
                         {
                             l
                         } else {
@@ -3092,7 +3129,11 @@ impl Sema<'_> {
                         Some(Def {
                             kind: DefKind::Enum(vs),
                             ..
-                        }) => Some(vs.iter().find(|v| v.name == vname).map(|v| v.payload.clone())),
+                        }) => Some(
+                            vs.iter()
+                                .find(|v| v.name == vname)
+                                .map(|v| v.payload.clone()),
+                        ),
                         _ => None,
                     };
                     if let Some(payload_opt) = vp {
@@ -3281,7 +3322,10 @@ impl Sema<'_> {
             // lenient, matching the rest of this function.
             return match scrut_ty {
                 Ty::Named(n) => {
-                    matches!(self.defs.lookup(*n).map(|d| &d.kind), Some(DefKind::Enum(_)))
+                    matches!(
+                        self.defs.lookup(*n).map(|d| &d.kind),
+                        Some(DefKind::Enum(_))
+                    )
                 }
                 Ty::Scalar(_) => true,
                 _ => false,
@@ -3555,8 +3599,9 @@ fn collect_enum_coverage(
 /// The integer value of an int-literal pattern (with its folded-in sign), or `None`.
 fn pat_int_value(p: &Pattern, interner: &Interner) -> Option<i64> {
     match &p.kind {
-        PatKind::Int { sym, neg } => parse_int_text(interner.resolve(*sym))
-            .map(|v| if *neg { v.wrapping_neg() } else { v }),
+        PatKind::Int { sym, neg } => {
+            parse_int_text(interner.resolve(*sym)).map(|v| if *neg { v.wrapping_neg() } else { v })
+        }
         _ => None,
     }
 }
@@ -3786,7 +3831,8 @@ fn int_literal_well_formed(text: &str) -> bool {
             (&body, 10)
         };
     !digits.is_empty()
-        && (i64::from_str_radix(digits, radix).is_ok() || u64::from_str_radix(digits, radix).is_ok())
+        && (i64::from_str_radix(digits, radix).is_ok()
+            || u64::from_str_radix(digits, radix).is_ok())
 }
 
 /// Whether a float literal's text parses as an `f64` after stripping the optional sign, a float type
@@ -4094,11 +4140,11 @@ mod tests {
         // and empty — because the "no arm matched" fallthrough lowers to `Unreachable`, which the
         // interpreter and native backend trap differently (a divergence). Was value-position only.
         for src in [
-            "fn f(n: i32) { match n { 0 => {}, 1 => {} } }",            // statement, unit arms
-            "fn f(n: i32) -> i32 { let x = match n {}; return x; }",    // empty match
+            "fn f(n: i32) { match n { 0 => {}, 1 => {} } }", // statement, unit arms
+            "fn f(n: i32) -> i32 { let x = match n {}; return x; }", // empty match
             "fn f(n: i32) -> i32 { return match n { 0 => 1, 1 => 2 }; }", // value (regression)
-            "enum E { A, B } fn f(e: E) { match e {} }",               // empty enum match
-            "fn f(b: bool) { match b { true => {} } }",                // bool missing a case
+            "enum E { A, B } fn f(e: E) { match e {} }",     // empty enum match
+            "fn f(b: bool) { match b { true => {} } }",      // bool missing a case
         ] {
             assert!(errors(src).contains(&"E0405"), "expected E0405 for {src:?}");
         }
@@ -4109,7 +4155,10 @@ mod tests {
             "fn f(n: i32) { match n { 0 => {}, _ => {} } }",
             "fn f(n: i32) -> i32 { return match n { 0 => 1, _ => 2 }; }",
         ] {
-            assert!(!errors(src).contains(&"E0405"), "unexpected E0405 for {src:?}");
+            assert!(
+                !errors(src).contains(&"E0405"),
+                "unexpected E0405 for {src:?}"
+            );
         }
     }
 
@@ -4139,7 +4188,10 @@ mod tests {
             "fn f() { let x = 5f32; }",
             "fn f() { let x = 9000000000; }",
         ] {
-            assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+            assert!(
+                !errors(src).contains(&"E0401"),
+                "unexpected E0401 for {src:?}"
+            );
         }
     }
 
@@ -4185,7 +4237,10 @@ mod tests {
             "fn f(a: f32, b: f32) -> bool { return a >= b; }",
             "fn f() -> bool { let x = true; let y = false; return x == y || !x; }",
         ] {
-            assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+            assert!(
+                !errors(src).contains(&"E0401"),
+                "unexpected E0401 for {src:?}"
+            );
         }
     }
 
@@ -4208,7 +4263,10 @@ mod tests {
             "fn f(a: i32, b: i32) -> bool { return a == b; }",
             "fn f(a: i32, b: i32, c: i32, d: i32) -> bool { return (a < b) == (c < d); }",
         ] {
-            assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+            assert!(
+                !errors(src).contains(&"E0401"),
+                "unexpected E0401 for {src:?}"
+            );
         }
     }
 
@@ -4229,7 +4287,10 @@ mod tests {
             "fn f() -> bool { let a = true; return !a && (a || a); }",
             "fn f() -> i32 { let a: [i32; 2] = [10, 20]; let i = 1; return a[i]; }",
         ] {
-            assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+            assert!(
+                !errors(src).contains(&"E0401"),
+                "unexpected E0401 for {src:?}"
+            );
         }
     }
 
@@ -4606,7 +4667,8 @@ mod tests {
             errors(long)
         );
         // Matching counts still adapt — including through a `const` and an enum-variant length.
-        let ok = "const N: usize = 4; fn f() { let a: [f32; N] = [0.0; 4]; let b: [i8; 2] = [7; 2]; }";
+        let ok =
+            "const N: usize = 4; fn f() { let a: [f32; N] = [0.0; 4]; let b: [i8; 2] = [7; 2]; }";
         assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
     }
 
@@ -4652,10 +4714,18 @@ mod tests {
         // `?` stays the documented escape hatch, and Var→Var forwarding is unaffected.
         let dyn_ok = "fn takes_any(a: Tensor[f32, ?]) -> f32 { return a[0]; } \
                       fn fwd<N>(a: Tensor[f32, N]) -> f32 { return takes_any(a); }";
-        assert!(errors(dyn_ok).is_empty(), "unexpected: {:?}", errors(dyn_ok));
+        assert!(
+            errors(dyn_ok).is_empty(),
+            "unexpected: {:?}",
+            errors(dyn_ok)
+        );
         let var_ok = "fn inner<P>(a: Tensor[f32, P]) -> f32 { return a[0]; } \
                       fn fwd<N>(a: Tensor[f32, N]) -> f32 { return inner(a); }";
-        assert!(errors(var_ok).is_empty(), "unexpected: {:?}", errors(var_ok));
+        assert!(
+            errors(var_ok).is_empty(),
+            "unexpected: {:?}",
+            errors(var_ok)
+        );
     }
 
     #[test]

@@ -156,8 +156,12 @@ mod tests {
     #[test]
     fn softmax_bwd_matches_reference_and_parallel() {
         for (rows, cols) in [(1, 1), (3, 7), (4, 8), (5, 16), (9, 33), (16, 100)] {
-            let y: Vec<f32> = (0..rows * cols).map(|t| ((t * 5 + 1) % 19) as f32 * 0.05).collect();
-            let dy: Vec<f32> = (0..rows * cols).map(|t| ((t * 3 + 2) % 23) as f32 * 0.1 - 1.0).collect();
+            let y: Vec<f32> = (0..rows * cols)
+                .map(|t| ((t * 5 + 1) % 19) as f32 * 0.05)
+                .collect();
+            let dy: Vec<f32> = (0..rows * cols)
+                .map(|t| ((t * 3 + 2) % 23) as f32 * 0.1 - 1.0)
+                .collect();
             // Reference: per-row s via the proven kernel, then dx = y*(dy-s).
             let mut want = vec![0.0f32; rows * cols];
             for row in 0..rows {
@@ -214,8 +218,9 @@ mod tests {
             (40, 320),
         ] {
             // Per-row-normalized y (a genuine softmax output) + sign-mixed upstream dy; deterministic.
-            let mut y: Vec<f32> =
-                (0..rows * cols).map(|i| ((i as f32) * 0.017).sin() * 0.4 + 0.6).collect();
+            let mut y: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i as f32) * 0.017).sin() * 0.4 + 0.6)
+                .collect();
             for row in 0..rows {
                 let off = row * cols;
                 let sum: f32 = (0..cols).map(|j| y[off + j]).sum();
@@ -223,8 +228,9 @@ mod tests {
                     y[off + j] /= sum;
                 }
             }
-            let dy: Vec<f32> =
-                (0..rows * cols).map(|i| ((i as f32) * 0.013 + 0.7).cos() * 1.1 - 0.2).collect();
+            let dy: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i as f32) * 0.013 + 0.7).cos() * 1.1 - 0.2)
+                .collect();
             let mut got = vec![0.0f32; rows * cols];
             let mut got_par = vec![0.0f32; rows * cols];
             unsafe {
@@ -246,7 +252,9 @@ mod tests {
             for row in 0..rows {
                 let off = row * cols;
                 // s = Σ_j y_j·dy_j accumulated in f64 — independent of the kernel's reduction.
-                let s: f64 = (0..cols).map(|j| y[off + j] as f64 * dy[off + j] as f64).sum();
+                let s: f64 = (0..cols)
+                    .map(|j| y[off + j] as f64 * dy[off + j] as f64)
+                    .sum();
                 for j in 0..cols {
                     let want = y[off + j] as f64 * (dy[off + j] as f64 - s);
                     let denom = want.abs().max(1.0);

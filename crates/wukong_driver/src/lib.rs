@@ -275,8 +275,7 @@ pub fn compile(opts: &Options) -> i32 {
     };
 
     // --- MIR construction ---
-    let (mut program, lower_diags) =
-        wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    let (mut program, lower_diags) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
     for d in &lower_diags {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }
@@ -965,7 +964,11 @@ fn run_train(
             if let (Some(&first), Some(&last)) = (traj.first(), traj.last()) {
                 out.push_str(&format!(
                     "loss {first:.6} -> {last:.6}  ({:.2}x reduction)\n",
-                    if last != 0.0 { first / last } else { f32::INFINITY }
+                    if last != 0.0 {
+                        first / last
+                    } else {
+                        f32::INFINITY
+                    }
                 ));
             }
             let _ = std::io::stdout().write_all(out.as_bytes());
@@ -1202,7 +1205,11 @@ mod grad_cli_tests {
     /// Drive the real `build_grad` path (`--grad-of`/`--grad-wrt`) and return the `{fwd, fwd_grad}`
     /// program, the forward and gradient function names, the **resolved** `wrt` list (so `[]`
     /// expands to every buffer parameter, matching the appended gradient buffers), and the interner.
-    fn grad_prog(src: &str, of: &str, wrt: &[usize]) -> (Program, Symbol, Symbol, Vec<usize>, Interner) {
+    fn grad_prog(
+        src: &str,
+        of: &str,
+        wrt: &[usize],
+    ) -> (Program, Symbol, Symbol, Vec<usize>, Interner) {
         let (program, mut interner) = compile_o1(src);
         let opts = Options {
             grad: GradOptions {
@@ -1213,8 +1220,12 @@ mod grad_cli_tests {
             ..Options::default()
         };
         let fsym = interner.intern(of);
-        let resolved =
-            grad_wrt(program.function(fsym).expect("loss fn"), wrt, opts.grad.train).expect("wrt");
+        let resolved = grad_wrt(
+            program.function(fsym).expect("loss fn"),
+            wrt,
+            opts.grad.train,
+        )
+        .expect("wrt");
         let (fwd, g) = build_grad(&program, &mut interner, &opts).expect("build_grad failed");
         let (fname, gname) = (fwd.name, g.name);
         let prog = Program {
@@ -1354,7 +1365,17 @@ mod grad_cli_tests {
         let w = [0.5f32, -1.25, 0.75];
         let x = [1.5f32, 0.25, -2.0];
         let inputs = vec![w.to_vec(), x.to_vec(), vec![0.0]];
-        let g = gate(src, "loss", &[0, 1], &inputs, &[3, 3, 1], 2, 1e-2, 3e-2, 2e-3);
+        let g = gate(
+            src,
+            "loss",
+            &[0, 1],
+            &inputs,
+            &[3, 3, 1],
+            2,
+            1e-2,
+            3e-2,
+            2e-3,
+        );
         let dw: Vec<f64> = (0..3).map(|i| (2.0 * w[i] * x[i] * x[i]) as f64).collect();
         let dx: Vec<f64> = (0..3).map(|i| (2.0 * w[i] * w[i] * x[i]) as f64).collect();
         assert_close(&g[0], &dw, "dL/dw = 2 w x^2");
@@ -1369,7 +1390,17 @@ mod grad_cli_tests {
                    out[0] = l; return l; }";
         let (a, b) = (0.7f32, 1.1f32);
         let inputs = vec![vec![a], vec![b], vec![0.0]];
-        let g = gate(src, "loss", &[0, 1], &inputs, &[1, 1, 1], 2, 1e-2, 3e-2, 1e-3);
+        let g = gate(
+            src,
+            "loss",
+            &[0, 1],
+            &inputs,
+            &[1, 1, 1],
+            2,
+            1e-2,
+            3e-2,
+            1e-3,
+        );
         assert_close(&g[0], &[(b * b) as f64], "dL/da = b^2");
         assert_close(&g[1], &[(2.0 * a * b) as f64], "dL/db = 2ab");
     }
@@ -1391,7 +1422,9 @@ mod grad_cli_tests {
     // --- Recognized-kernel tape: a real linear + MSE model, differentiated from source. -----------
 
     fn lcg(seed: &mut u64) -> f32 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (((*seed >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.8 // ~[-0.4, 0.4]
     }
     fn rand_vec(seed: &mut u64, n: usize) -> Vec<f32> {
@@ -1527,7 +1560,8 @@ mod grad_cli_tests {
 
     /// A least-squares linear regression `loss = Σ(x·wᵀ − t)²` — convex in the weights `w`, so
     /// full-batch gradient descent with a small step descends monotonically.
-    const REGRESSION_SRC: &str = "@parallel fn loss(x:[f32;12], w:[f32;8], t:[f32;6], mut out:[f32;1]) -> f32 {\n\
+    const REGRESSION_SRC: &str =
+        "@parallel fn loss(x:[f32;12], w:[f32;8], t:[f32;6], mut out:[f32;1]) -> f32 {\n\
          let mut p: [f32; 6] = [0.0; 6];\n\
          for i in 0..3 { for j in 0..2 { let mut s: f32 = 0.0;\n\
            for kk in 0..4 { s = s + x[i*4+kk] * w[j*4+kk]; }\n\
@@ -1587,13 +1621,27 @@ mod grad_cli_tests {
     #[test]
     fn train_sgd_loss_strictly_decreases() {
         // Full-batch GD on a convex least-squares objective: the loss never rises (f32 rounding slack).
-        let traj = train_traj(REGRESSION_SRC, &[1], &[12, 8, 6, 1], 120, 0.05, TrainOpt::Sgd, 0xA5A5);
+        let traj = train_traj(
+            REGRESSION_SRC,
+            &[1],
+            &[12, 8, 6, 1],
+            120,
+            0.05,
+            TrainOpt::Sgd,
+            0xA5A5,
+        );
         for w in traj.windows(2) {
             assert!(w[1] <= w[0] + 1e-6, "SGD loss rose: {} -> {}", w[0], w[1]);
         }
         let (l0, lf) = (traj[0], *traj.last().unwrap());
-        assert!(l0 > 0.05, "test setup: initial loss should be substantial, got {l0}");
-        assert!(lf < 0.3 * l0, "SGD did not reduce the loss enough: {l0} -> {lf}");
+        assert!(
+            l0 > 0.05,
+            "test setup: initial loss should be substantial, got {l0}"
+        );
+        assert!(
+            lf < 0.3 * l0,
+            "SGD did not reduce the loss enough: {l0} -> {lf}"
+        );
     }
 
     /// The documented `--grad-wrt` default ("all buffer parameters of the loss function ... for
@@ -1603,10 +1651,25 @@ mod grad_cli_tests {
     /// loss-output parameter (the last one)" unless an explicit list was supplied.
     #[test]
     fn train_default_wrt_excludes_the_loss_output() {
-        let traj = train_traj(REGRESSION_SRC, &[], &[12, 8, 6, 1], 40, 0.02, TrainOpt::Sgd, 0xA5A5);
-        assert_eq!(traj.len(), 41, "traj[i] = loss after i updates, plus a final");
+        let traj = train_traj(
+            REGRESSION_SRC,
+            &[],
+            &[12, 8, 6, 1],
+            40,
+            0.02,
+            TrainOpt::Sgd,
+            0xA5A5,
+        );
+        assert_eq!(
+            traj.len(),
+            41,
+            "traj[i] = loss after i updates, plus a final"
+        );
         let (l0, lf) = (traj[0], *traj.last().unwrap());
-        assert!(lf < l0, "the default --grad-wrt did not train: {l0} -> {lf}");
+        assert!(
+            lf < l0,
+            "the default --grad-wrt did not train: {l0} -> {lf}"
+        );
     }
 
     /// A repeated `--grad-wrt` index appends a second gradient buffer to the backward's parameter
@@ -1631,9 +1694,20 @@ mod grad_cli_tests {
     #[test]
     fn train_adamw_reduces_loss() {
         // The fused AdamW kernel drives a much larger reduction than plain SGD in the same budget.
-        let traj = train_traj(REGRESSION_SRC, &[1], &[12, 8, 6, 1], 150, 0.05, TrainOpt::AdamW, 0xA5A5);
+        let traj = train_traj(
+            REGRESSION_SRC,
+            &[1],
+            &[12, 8, 6, 1],
+            150,
+            0.05,
+            TrainOpt::AdamW,
+            0xA5A5,
+        );
         let (l0, lf) = (traj[0], *traj.last().unwrap());
-        assert!(lf.is_finite() && lf < 0.05 * l0, "AdamW did not converge: {l0} -> {lf}");
+        assert!(
+            lf.is_finite() && lf < 0.05 * l0,
+            "AdamW did not converge: {l0} -> {lf}"
+        );
     }
 
     // --- Transformer FFN block: two matmuls + activation + reduction, differentiated from source. ---
@@ -1645,7 +1719,8 @@ mod grad_cli_tests {
     #[test]
     fn transformer_ffn_block_from_source() {
         // x[M=2,K=4], W1[H=3,K=4] -> p[2,3]; a=silu(p); W2[N=2,H=3] -> y[2,2]; loss=Σy.
-        let src = "@parallel fn loss(x:[f32;8], w1:[f32;12], w2:[f32;6], mut out:[f32;1]) -> f32 {\n\
+        let src =
+            "@parallel fn loss(x:[f32;8], w1:[f32;12], w2:[f32;6], mut out:[f32;1]) -> f32 {\n\
              let mut p: [f32; 6] = [0.0; 6];\n\
              for i in 0..2 { for j in 0..3 { let mut s: f32 = 0.0;\n\
                for kk in 0..4 { s = s + x[i*4+kk] * w1[j*4+kk]; } p[i*3+j] = s; } }\n\
@@ -1659,7 +1734,10 @@ mod grad_cli_tests {
              out[0] = loss; return loss; }";
         // The composite backward must ride the fused activation kernel + the tuned GEMM (three of them).
         let mir = grad_mir(src, "loss", &[1, 2]);
-        assert!(mir.contains("wukong_vmath2_f32"), "silu backward missing\n{mir}");
+        assert!(
+            mir.contains("wukong_vmath2_f32"),
+            "silu backward missing\n{mir}"
+        );
         assert_eq!(
             mir.matches("wukong_sgemm(").count(),
             3,
@@ -1736,7 +1814,10 @@ mod verify_gate_tests {
             let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
             assert!(!md.iter().any(|d| d.is_error()), "mir_build errors");
             wukong_opt::optimize(&mut program, level);
-            assert!(!verify_or_ice(&program), "clean program failed verify at -O{level}");
+            assert!(
+                !verify_or_ice(&program),
+                "clean program failed verify at -O{level}"
+            );
         }
     }
 }
@@ -1956,7 +2037,13 @@ mod gpu_e2e_tests {
                 );
 
                 // fp16 tensor-core path → fp16 tolerance (looser than the f32 GEMM bound).
-                let s = assert_close(&format!("fused {actname} {m}x{k}x{n}"), &cg, &cc, 5e-2, 2e-2);
+                let s = assert_close(
+                    &format!("fused {actname} {m}x{k}x{n}"),
+                    &cg,
+                    &cc,
+                    5e-2,
+                    2e-2,
+                );
                 eprintln!(
                     "gpu --backend fused {actname} {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
                     accel.calls, s.max_abs, s.max_rel
@@ -2017,8 +2104,13 @@ mod gpu_e2e_tests {
                      CPU-vs-CPU"
                 );
 
-                let s =
-                    assert_close(&format!("fused bias {actname} {m}x{k}x{n}"), &cg, &cc, 5e-2, 2e-2);
+                let s = assert_close(
+                    &format!("fused bias {actname} {m}x{k}x{n}"),
+                    &cg,
+                    &cc,
+                    5e-2,
+                    2e-2,
+                );
                 eprintln!(
                     "gpu --backend fused bias {actname} {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
                     accel.calls, s.max_abs, s.max_rel
@@ -2146,7 +2238,9 @@ mod gpu_e2e_tests {
         let g = match guard.as_mut() {
             Some(g) => g,
             None => {
-                eprintln!("skip gpu_backend_declines_unimplemented_norm_ops_to_cpu: no CUDA device");
+                eprintln!(
+                    "skip gpu_backend_declines_unimplemented_norm_ops_to_cpu: no CUDA device"
+                );
                 return;
             }
         };

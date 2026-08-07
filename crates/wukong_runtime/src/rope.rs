@@ -53,7 +53,13 @@ use rayon::prelude::*;
 /// `inv_freq` valid for `half` f32; `x`, `out` valid for `2*half` f32 (`out` may alias `x` — both of a
 /// pair's inputs are read before either output is written).
 #[inline]
-unsafe fn rope_row_scalar(pos: f32, inv_freq: *const f32, x: *const f32, out: *mut f32, half: usize) {
+unsafe fn rope_row_scalar(
+    pos: f32,
+    inv_freq: *const f32,
+    x: *const f32,
+    out: *mut f32,
+    half: usize,
+) {
     for j in 0..half {
         let theta = pos * *inv_freq.add(j);
         let c = crate::vmath::sincos1(theta, true);

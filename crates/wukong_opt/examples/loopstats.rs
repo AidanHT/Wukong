@@ -169,17 +169,16 @@ fn census(path: &Path, level: u8, stats: &mut Stats) -> Result<(), String> {
                 }
             }
             // Polarity, over *every* exit edge (a `break` in the body is an exit too).
-            let inside: std::collections::HashSet<u32> =
-                l.blocks.iter().map(|b| b.0).collect();
+            let inside: std::collections::HashSet<u32> = l.blocks.iter().map(|b| b.0).collect();
             let all_on_true = !l.exits.is_empty()
-                && l.exits.iter().all(|&(from, _)| {
-                    match &f.blocks[from.0 as usize].term {
+                && l.exits
+                    .iter()
+                    .all(|&(from, _)| match &f.blocks[from.0 as usize].term {
                         wukong_mir::Terminator::CondBr {
                             then_blk, else_blk, ..
                         } => inside.contains(&then_blk.0) && !inside.contains(&else_blk.0),
                         _ => false,
-                    }
-                });
+                    });
             stats.exit_on_true += all_on_true as usize;
             let iv = l.primary();
             stats.primary_iv += iv.is_some() as usize;

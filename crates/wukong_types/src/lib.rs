@@ -500,7 +500,10 @@ mod tests {
             let size = ty.size_of().unwrap();
             for (off, f) in ty.tuple_offsets().unwrap() {
                 assert_eq!(off % f.align_of().unwrap(), 0, "field at {off}");
-                assert!(off + f.size_of().unwrap() <= size, "field at {off} overruns");
+                assert!(
+                    off + f.size_of().unwrap() <= size,
+                    "field at {off} overruns"
+                );
             }
         }
         assert!(Ty::Scalar(Scalar::I32).tuple_offsets().is_none());

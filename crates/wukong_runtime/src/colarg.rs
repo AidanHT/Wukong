@@ -141,7 +141,7 @@ unsafe fn colarg_avx2(
     let bip = best_idx.as_mut_ptr();
     for jj in 0..width {
         *bvp.add(jj) = *x.add(j0 + jj); // x[0, j0+jj]
-        // best_idx already 0.0 (row 0)
+                                        // best_idx already 0.0 (row 0)
     }
     const NB: usize = COLARG_JB / 8; // YMM lanes per tile
     let n8 = width & !7; // floor to multiple of 8
@@ -362,7 +362,9 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
     // (the same pattern as the parallel column reductions / GEMM); each task reads all rows and
     // writes a disjoint `out[]` stripe.
     let nthreads = rayon::current_num_threads().max(1);
-    let per = (c.div_ceil(nthreads)).next_multiple_of(COLARG_JB).max(COLARG_JB);
+    let per = (c.div_ceil(nthreads))
+        .next_multiple_of(COLARG_JB)
+        .max(COLARG_JB);
     let nstripes = c.div_ceil(per);
     let (x_addr, out_addr) = (x as usize, out as usize);
     (0..nstripes).into_par_iter().for_each(|s| {
@@ -370,7 +372,15 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
         let j1 = (j0 + per).min(c);
         // SAFETY: disjoint out[] stripe per task; pointers re-derived from the captured addresses.
         unsafe {
-            colarg_range(x_addr as *const f32, out_addr as *mut i32, r, c, j0, j1, is_max);
+            colarg_range(
+                x_addr as *const f32,
+                out_addr as *mut i32,
+                r,
+                c,
+                j0,
+                j1,
+                is_max,
+            );
         }
     });
 }
@@ -512,7 +522,10 @@ mod tests {
                     fp(x.as_ptr(), got_par.as_mut_ptr(), rows as i64, cols as i64);
                 }
                 assert_eq!(got, want, "is_max={is_max} {rows}x{cols} vs naive");
-                assert_eq!(got, got_par, "is_max={is_max} serial vs parallel {rows}x{cols}");
+                assert_eq!(
+                    got, got_par,
+                    "is_max={is_max} serial vs parallel {rows}x{cols}"
+                );
             }
         }
     }
@@ -562,9 +575,19 @@ mod tests {
         let mut amin_p = vec![0i32; cols];
         unsafe {
             wukong_colargmax_i32(x.as_ptr(), amax.as_mut_ptr(), rows as i64, cols as i64);
-            wukong_colargmax_i32_parallel(x.as_ptr(), amax_p.as_mut_ptr(), rows as i64, cols as i64);
+            wukong_colargmax_i32_parallel(
+                x.as_ptr(),
+                amax_p.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+            );
             wukong_colargmin_i32(x.as_ptr(), amin.as_mut_ptr(), rows as i64, cols as i64);
-            wukong_colargmin_i32_parallel(x.as_ptr(), amin_p.as_mut_ptr(), rows as i64, cols as i64);
+            wukong_colargmin_i32_parallel(
+                x.as_ptr(),
+                amin_p.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+            );
         }
 
         // argmax: col0 all-equal → 0; col1 dup max at 2 & 5 → 2; col2 (baseline 0, min planted) → max
@@ -572,7 +595,10 @@ mod tests {
         assert_eq!(amax[0], 0, "argmax all-equal column → row 0 (serial)");
         assert_eq!(amax[1], 2, "argmax dup max at rows 2 & 5 → 2 (serial)");
         assert_eq!(amax[2], 0, "argmax of min-planted column → row 0 (serial)");
-        assert_eq!(amax[jc], 2, "argmax dup max at rows 2 & 5, high column → 2 (serial)");
+        assert_eq!(
+            amax[jc], 2,
+            "argmax dup max at rows 2 & 5, high column → 2 (serial)"
+        );
         assert_eq!(amax_p, amax, "argmax lowest-row-index (parallel == serial)");
 
         // argmin: col0 all-equal → 0; col1 (baseline 0, max planted) → min 0.0 first at row 0 → 0;
@@ -580,7 +606,10 @@ mod tests {
         assert_eq!(amin[0], 0, "argmin all-equal column → row 0 (serial)");
         assert_eq!(amin[1], 0, "argmin of max-planted column → row 0 (serial)");
         assert_eq!(amin[2], 2, "argmin dup min at rows 2 & 5 → 2 (serial)");
-        assert_eq!(amin[jc], 0, "argmin of max-planted high column → row 0 (serial)");
+        assert_eq!(
+            amin[jc], 0,
+            "argmin of max-planted high column → row 0 (serial)"
+        );
         assert_eq!(amin_p, amin, "argmin lowest-row-index (parallel == serial)");
     }
 
@@ -602,8 +631,15 @@ mod tests {
             wukong_colargmax_i32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
             colarg_scalar(x.as_ptr(), want.as_mut_ptr(), rows, cols, 0, cols, true);
         }
-        assert_eq!(want, vec![(rows - 1) as i32], "scalar twin lost the exact row index");
-        assert_eq!(got, want, "colargmax dispatch != scalar twin past 2^24 rows");
+        assert_eq!(
+            want,
+            vec![(rows - 1) as i32],
+            "scalar twin lost the exact row index"
+        );
+        assert_eq!(
+            got, want,
+            "colargmax dispatch != scalar twin past 2^24 rows"
+        );
     }
 
     /// Where AVX2 is available, the vector path must equal the scalar twin EXACTLY for every column,
@@ -622,9 +658,9 @@ mod tests {
         }
         // Widths and heights straddle every edge of the COLARG_RB x COLARG_JB tile as well as the
         // 8-lane edge: below / at / just past one tile, and the 8-wide + scalar tails inside a block.
-        for &cols in
-            &[1usize, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 71, 72, 100, 127, 128, 129, 257]
-        {
+        for &cols in &[
+            1usize, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 71, 72, 100, 127, 128, 129, 257,
+        ] {
             for &rows in &[1usize, 2, 3, 4, 5, 7, 8, 9, 33, 100] {
                 let x = fill(rows, cols);
                 for is_max in [true, false] {
@@ -634,7 +670,10 @@ mod tests {
                         colarg_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, is_max);
                         colarg_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, is_max);
                     }
-                    assert_eq!(s, v, "scalar != avx2 at rows={rows} cols={cols} is_max={is_max}");
+                    assert_eq!(
+                        s, v,
+                        "scalar != avx2 at rows={rows} cols={cols} is_max={is_max}"
+                    );
                 }
             }
         }
@@ -669,9 +708,9 @@ mod tests {
         for j in 0..cols {
             for i in 0..rows {
                 x[i * cols + j] = match j % 7 {
-                    0 => i as f32,             // strictly increasing: update on every row
-                    1 => -(i as f32),          // strictly decreasing: never updates after row 0
-                    2 => 4.0,                  // constant: every compare is an exact tie
+                    0 => i as f32,    // strictly increasing: update on every row
+                    1 => -(i as f32), // strictly decreasing: never updates after row 0
+                    2 => 4.0,         // constant: every compare is an exact tie
                     3 => {
                         if i % 3 == 1 {
                             nan
@@ -709,12 +748,19 @@ mod tests {
                 colarg_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 64, cols, is_max);
             }
             assert_eq!(s, v, "early-out/NaN/±0: scalar != avx2 (is_max={is_max})");
-            assert_eq!(s, p, "early-out/NaN/±0: scalar != striped (is_max={is_max})");
+            assert_eq!(
+                s, p,
+                "early-out/NaN/±0: scalar != striped (is_max={is_max})"
+            );
             // Spot-pin the three columns whose answer is forced by the tie-break rule itself, so a
             // twin that drifted *together with* the vector path would still be caught.
             let inc = if is_max { rows as i32 - 1 } else { 0 };
             assert_eq!(v[0], inc, "increasing column (is_max={is_max})");
-            assert_eq!(v[1], rows as i32 - 1 - inc, "decreasing column (is_max={is_max})");
+            assert_eq!(
+                v[1],
+                rows as i32 - 1 - inc,
+                "decreasing column (is_max={is_max})"
+            );
             assert_eq!(v[2], 0, "constant column must keep row 0 (is_max={is_max})");
             assert_eq!(v[5], 0, "±0.0 tie must keep row 0 (is_max={is_max})");
         }

@@ -41,7 +41,12 @@ fn wk_constants() -> BTreeMap<String, i64> {
             continue;
         };
         // Strip the trailing `;` and any `// comment`.
-        let value = value.split("//").next().unwrap().trim().trim_end_matches(';');
+        let value = value
+            .split("//")
+            .next()
+            .unwrap()
+            .trim()
+            .trim_end_matches(';');
         if let Ok(v) = value.trim().parse::<i64>() {
             out.insert(name.trim().to_string(), v);
         }
@@ -85,7 +90,9 @@ fn exporter_layout() -> (BTreeMap<String, i64>, Vec<(String, String)>) {
     let body = &body[..end];
     let mut tensors = Vec::new();
     for chunk in body.split('(').skip(1) {
-        let Some(close) = chunk.find(')') else { continue };
+        let Some(close) = chunk.find(')') else {
+            continue;
+        };
         let entry = &chunk[..close];
         let Some((name, size)) = entry.split_once(',') else {
             continue;

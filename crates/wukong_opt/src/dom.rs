@@ -69,7 +69,11 @@ fn intersect(mut a: u32, mut b: u32, idom: &[u32], rpo_num: &[usize]) -> u32 {
 /// Dominance frontiers, indexed by block id, from precomputed idoms and predecessors: `df[b]` is
 /// the set of blocks where `b`'s dominance ends — exactly the blocks that may need a phi for a value
 /// defined in `b`.
-pub(crate) fn dominance_frontiers_from(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<Vec<u32>> {
+pub(crate) fn dominance_frontiers_from(
+    f: &Function,
+    idom: &[u32],
+    preds: &[Vec<u32>],
+) -> Vec<Vec<u32>> {
     let n = f.blocks.len();
     let mut df: Vec<Vec<u32>> = vec![Vec::new(); n];
     for b in 0..n as u32 {

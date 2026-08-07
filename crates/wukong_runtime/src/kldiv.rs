@@ -183,8 +183,11 @@ pub unsafe extern "C" fn wukong_kldiv_f32_parallel(
         // SAFETY: disjoint row slices; pointers re-derived from the captured addresses, valid for
         // rows*cols (p/q) and rows (out) by contract.
         unsafe {
-            *(o_addr as *mut f32).add(row) =
-                kldiv_row((p_addr as *const f32).add(off), (q_addr as *const f32).add(off), c);
+            *(o_addr as *mut f32).add(row) = kldiv_row(
+                (p_addr as *const f32).add(off),
+                (q_addr as *const f32).add(off),
+                c,
+            );
         }
     });
 }
@@ -201,7 +204,8 @@ mod tests {
             let off = r * cols;
             // Strictly positive, varied across columns and rows.
             for i in 0..cols {
-                v[off + i] = (((i as f32) * 0.13 + (r as f32) * 0.07 + phase).sin() * 0.5 + 1.0) + 0.1;
+                v[off + i] =
+                    (((i as f32) * 0.13 + (r as f32) * 0.07 + phase).sin() * 0.5 + 1.0) + 0.1;
             }
             // Normalize the row to sum 1.0 (a proper distribution).
             let s: f32 = v[off..off + cols].iter().sum();
@@ -249,7 +253,13 @@ mod tests {
             let q = fill_probs(rows, cols, 1.7);
             let mut got = vec![0.0f32; rows];
             unsafe {
-                wukong_kldiv_f32(p.as_ptr(), q.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_kldiv_f32(
+                    p.as_ptr(),
+                    q.as_ptr(),
+                    got.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
             }
             for row in 0..rows {
                 let off = row * cols;
@@ -280,7 +290,13 @@ mod tests {
             let mut s = vec![0.0f32; rows];
             let mut par = vec![0.0f32; rows];
             unsafe {
-                wukong_kldiv_f32(p.as_ptr(), q.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_kldiv_f32(
+                    p.as_ptr(),
+                    q.as_ptr(),
+                    s.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
                 wukong_kldiv_f32_parallel(
                     p.as_ptr(),
                     q.as_ptr(),
@@ -310,7 +326,13 @@ mod tests {
             let mut got = vec![0.0f32; rows];
             unsafe {
                 // q == p.
-                wukong_kldiv_f32(p.as_ptr(), p.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_kldiv_f32(
+                    p.as_ptr(),
+                    p.as_ptr(),
+                    got.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
             }
             for row in 0..rows {
                 assert!(

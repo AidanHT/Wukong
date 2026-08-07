@@ -46,7 +46,8 @@ use cudarc::driver::{sys, DriverError};
 /// buffer until `cuLinkDestroy`, so we copy it out first.
 pub fn ptx_to_cubin(ptx: &str) -> Result<Vec<u8>, DriverError> {
     // PTX is ASCII with no interior NUL; the driver wants a NUL-terminated buffer (size incl. NUL).
-    let ptx_c = CString::new(ptx).map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE))?;
+    let ptx_c =
+        CString::new(ptx).map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE))?;
     let name = CString::new("wukong_kernel").unwrap();
     unsafe {
         let mut state: sys::CUlinkState = std::ptr::null_mut();
@@ -127,12 +128,20 @@ pub fn device_sm_arch() -> String {
         }
         use sys::CUdevice_attribute as A;
         let (mut major, mut minor) = (0i32, 0i32);
-        let ok = sys::cuDeviceGetAttribute(&mut major, A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev)
+        let ok = sys::cuDeviceGetAttribute(
+            &mut major,
+            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            dev,
+        )
+        .result()
+        .is_ok()
+            && sys::cuDeviceGetAttribute(
+                &mut minor,
+                A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                dev,
+            )
             .result()
-            .is_ok()
-            && sys::cuDeviceGetAttribute(&mut minor, A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev)
-                .result()
-                .is_ok();
+            .is_ok();
         if ok {
             crate::ptx_target::sm_arch(major, minor)
         } else {
@@ -219,7 +228,8 @@ mod tests {
         }
         // The hash — not just the printed name — must cover the arch: erase the arch text from each
         // name and the remainders must STILL differ.
-        let bare = |p: &PathBuf, arch: &str| p.file_name().unwrap().to_string_lossy().replace(arch, "");
+        let bare =
+            |p: &PathBuf, arch: &str| p.file_name().unwrap().to_string_lossy().replace(arch, "");
         assert_ne!(
             bare(&a100, "sm_80"),
             bare(&ada, "sm_89"),
@@ -235,9 +245,17 @@ mod tests {
     fn cache_key_is_deterministic_and_still_covers_ptx_and_driver() {
         let ada = |ptx: &str, drv: i32| cache_path_for(ptx, drv, "sm_89");
         assert_eq!(ada(FLOORED_PTX, 12090), ada(FLOORED_PTX, 12090));
-        assert_ne!(ada(FLOORED_PTX, 12090), ada(FLOORED_PTX, 12080), "driver version must key");
+        assert_ne!(
+            ada(FLOORED_PTX, 12090),
+            ada(FLOORED_PTX, 12080),
+            "driver version must key"
+        );
         let other = FLOORED_PTX.replace("entry k()", "entry j()");
-        assert_ne!(ada(FLOORED_PTX, 12090), ada(&other, 12090), "PTX text must key");
+        assert_ne!(
+            ada(FLOORED_PTX, 12090),
+            ada(&other, 12090),
+            "PTX text must key"
+        );
     }
 
     /// **A pre-change entry must be a clean MISS, never a wrong-arch load.** The old name shape is
@@ -247,9 +265,17 @@ mod tests {
     fn a_pre_change_cache_entry_can_never_be_hit() {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         FLOORED_PTX.hash(&mut h);
-        let old = cache_dir().join(format!("drv12090-{}-{:016x}.cubin", FLOORED_PTX.len(), h.finish()));
+        let old = cache_dir().join(format!(
+            "drv12090-{}-{:016x}.cubin",
+            FLOORED_PTX.len(),
+            h.finish()
+        ));
         for arch in ["sm_80", "sm_89", "sm_90", "sm_120", UNKNOWN_ARCH] {
-            assert_ne!(cache_path_for(FLOORED_PTX, 12090, arch), old, "arch {arch} rehabilitated a stale entry");
+            assert_ne!(
+                cache_path_for(FLOORED_PTX, 12090, arch),
+                old,
+                "arch {arch} rehabilitated a stale entry"
+            );
         }
     }
 
@@ -264,7 +290,10 @@ mod tests {
             arch == UNKNOWN_ARCH || (arch.starts_with("sm_") && arch[3..].chars().all(|c| c.is_ascii_digit())),
             "device_sm_arch answered {arch:?}, which is neither a device arch nor the unknown bucket"
         );
-        assert_eq!(cache_path(FLOORED_PTX, 12090), cache_path_for(FLOORED_PTX, 12090, &arch));
+        assert_eq!(
+            cache_path(FLOORED_PTX, 12090),
+            cache_path_for(FLOORED_PTX, 12090, &arch)
+        );
     }
 
     /// **An unusable entry at the new key must degrade to the direct PTX JIT** — the promise this
@@ -278,8 +307,13 @@ mod tests {
         let mut guard = crate::gpu::gpu();
         let Some(g) = guard.as_mut() else {
             let why = crate::gpu::init_error().unwrap_or("no CUDA device reachable");
-            assert!(!crate::gpu::gpu_required(), "WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}");
-            eprintln!("[skip] a_corrupt_cache_entry_degrades_to_the_ptx_jit: GPU unavailable: {why}");
+            assert!(
+                !crate::gpu::gpu_required(),
+                "WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}"
+            );
+            eprintln!(
+                "[skip] a_corrupt_cache_entry_degrades_to_the_ptx_jit: GPU unavailable: {why}"
+            );
             return;
         };
         // A module no other test shares, so this cannot race for a cache path.
@@ -290,7 +324,10 @@ mod tests {
         let path = cache_path(&ptx, driver_version());
         write_atomic(&path, b"neither SASS nor PTX").expect("plant a corrupt cache entry");
         let f = g.function("wukong_cubin_probe", &ptx, "wukong_cubin_probe");
-        assert!(f.is_ok(), "a corrupt cache entry broke a load that plain PTX JIT would have served: {f:?}");
+        assert!(
+            f.is_ok(),
+            "a corrupt cache entry broke a load that plain PTX JIT would have served: {f:?}"
+        );
         let after = std::fs::read(&path).unwrap_or_default();
         assert!(
             after.len() > 64 && after.starts_with(b"\x7fELF"),
@@ -309,13 +346,23 @@ mod tests {
         let mut guard = crate::gpu::gpu();
         let Some(g) = guard.as_mut() else {
             let why = crate::gpu::init_error().unwrap_or("no CUDA device reachable");
-            assert!(!crate::gpu::gpu_required(), "WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}");
+            assert!(
+                !crate::gpu::gpu_required(),
+                "WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}"
+            );
             eprintln!("[skip] probed_arch_agrees_with_gpu_target: GPU unavailable: {why}");
             return;
         };
         let t = g.target();
         let want = crate::ptx_target::sm_arch(t.cc_major, t.cc_minor);
-        assert_eq!(device_sm_arch(), want, "cubin cache key arch != Gpu::target()'s arch");
-        eprintln!("[gate] cubin cache keys on the probed device arch {want} ({}) ✓", t.name);
+        assert_eq!(
+            device_sm_arch(),
+            want,
+            "cubin cache key arch != Gpu::target()'s arch"
+        );
+        eprintln!(
+            "[gate] cubin cache keys on the probed device arch {want} ({}) ✓",
+            t.name
+        );
     }
 }

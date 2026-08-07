@@ -576,7 +576,13 @@ mod tests {
         let cases: [(CastKind, i128, MirType, MirType, i128); 8] = [
             (SExt, -1, MirType::I32, MirType::I64, -1),
             (SExt, 1, MirType::I32, MirType::I64, 1),
-            (SExt, i32::MIN as i128, MirType::I32, MirType::I64, i32::MIN as i128),
+            (
+                SExt,
+                i32::MIN as i128,
+                MirType::I32,
+                MirType::I64,
+                i32::MIN as i128,
+            ),
             // `u32::MAX` is stored sign-extended as -1; zero-extending reads its own 32 bits.
             (ZExt, -1, MirType::I32, MirType::I64, u32::MAX as i128),
             (ZExt, -1, MirType::I8, MirType::I32, u8::MAX as i128),
@@ -597,7 +603,12 @@ mod tests {
         }
         // Float, pointer and representation casts are declined outright.
         for k in [FpToSi, SiToFp, FpExt, FpTrunc, Bitcast, IntToPtr, PtrToInt] {
-            assert_eq!(fold_int_cast(k, 1, &MirType::I32, &MirType::I64), None, "{}", k.name());
+            assert_eq!(
+                fold_int_cast(k, 1, &MirType::I32, &MirType::I64),
+                None,
+                "{}",
+                k.name()
+            );
         }
         // A vector operand or result would need a splatted const, which `set_const` cannot write.
         let v4 = MirType::Vec(Box::new(MirType::I32), 4);

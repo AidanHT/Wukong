@@ -58,7 +58,14 @@ pub(crate) fn load_imports(
     for item in &module.items {
         if let ItemKind::Import(imp) = &item.kind {
             load_one(
-                imp, &root_dir, sm, interner, sink, next_node, &mut loaded, &mut extra,
+                imp,
+                &root_dir,
+                sm,
+                interner,
+                sink,
+                next_node,
+                &mut loaded,
+                &mut extra,
             );
         }
     }
@@ -106,7 +113,10 @@ fn load_one(
                     file.display()
                 ))
                 .with_code("E0305")
-                .primary(imp.path.span, "this import does not resolve to a source file")
+                .primary(
+                    imp.path.span,
+                    "this import does not resolve to a source file",
+                )
                 .help(format!(
                     "`import a.b` resolves to `a/b.wk` under the root source file's directory — \
                      expected `{}`",
@@ -172,7 +182,14 @@ mod tests {
             wukong_parser::parse_module_tokens_from(&tokens, sm.source(id), &mut interner, 0);
         assert!(pd.is_empty(), "unexpected parser diags: {pd:?}");
         let mut sink = DiagnosticSink::new();
-        load_imports(&mut module, &path, &mut sm, &mut interner, &mut sink, &mut next);
+        load_imports(
+            &mut module,
+            &path,
+            &mut sm,
+            &mut interner,
+            &mut sink,
+            &mut next,
+        );
         let fns = module
             .items
             .iter()
@@ -193,7 +210,11 @@ mod tests {
     #[test]
     fn import_cycle_loads_each_file_once() {
         let (fns, sink, files) = load("cycle_a.wk");
-        assert!(!sink.has_errors(), "cycle must not be an error: {:?}", sink.diagnostics());
+        assert!(
+            !sink.has_errors(),
+            "cycle must not be an error: {:?}",
+            sink.diagnostics()
+        );
         assert_eq!(files, 2, "cycle_b's import of cycle_a must not reload it");
         assert_eq!(count(&fns, "from_a"), 1);
         assert_eq!(count(&fns, "from_b"), 1);
@@ -204,9 +225,20 @@ mod tests {
     #[test]
     fn diamond_import_dedups_by_canonical_path() {
         let (fns, sink, files) = load("diamond_root.wk");
-        assert!(!sink.has_errors(), "diamond must not be an error: {:?}", sink.diagnostics());
-        assert_eq!(files, 4, "root + b + c + d, d loaded once through two paths");
-        assert_eq!(count(&fns, "shared_leaf"), 1, "diamond leaf must be spliced exactly once");
+        assert!(
+            !sink.has_errors(),
+            "diamond must not be an error: {:?}",
+            sink.diagnostics()
+        );
+        assert_eq!(
+            files, 4,
+            "root + b + c + d, d loaded once through two paths"
+        );
+        assert_eq!(
+            count(&fns, "shared_leaf"),
+            1,
+            "diamond leaf must be spliced exactly once"
+        );
         assert_eq!(count(&fns, "from_diamond_b"), 1);
         assert_eq!(count(&fns, "from_diamond_c"), 1);
     }
@@ -215,7 +247,8 @@ mod tests {
     /// once, not once per mention).
     #[test]
     fn missing_import_is_e0305() {
-        let src = "import does.not.exist;\nimport does.not.exist;\nfn main() -> i32 { return 0; }\n";
+        let src =
+            "import does.not.exist;\nimport does.not.exist;\nfn main() -> i32 { return 0; }\n";
         let mut sm = SourceMap::new();
         // The root itself is synthetic (not on disk): the loader only needs its directory.
         let root = imports_dir().join("virtual_root.wk");
@@ -226,10 +259,21 @@ mod tests {
             wukong_parser::parse_module_tokens_from(&tokens, sm.source(id), &mut interner, 0);
         assert!(pd.is_empty(), "unexpected parser diags: {pd:?}");
         let mut sink = DiagnosticSink::new();
-        load_imports(&mut module, &root, &mut sm, &mut interner, &mut sink, &mut next);
+        load_imports(
+            &mut module,
+            &root,
+            &mut sm,
+            &mut interner,
+            &mut sink,
+            &mut next,
+        );
         assert!(sink.has_errors());
         let diags = sink.diagnostics();
-        assert_eq!(diags.len(), 1, "one E0305 per missing file, not per import: {diags:?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "one E0305 per missing file, not per import: {diags:?}"
+        );
         assert_eq!(diags[0].code, Some("E0305"));
     }
 }

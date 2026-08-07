@@ -95,10 +95,9 @@ impl LoopMem {
         for &blk in body {
             for inst in &f.blocks[blk as usize].insts {
                 match &inst.op {
-                    Op::Store { ptr, value } => mem.stores.push((
-                        *ptr,
-                        type_bytes(f.value_type(*value)).unwrap_or(u32::MAX),
-                    )),
+                    Op::Store { ptr, value } => mem
+                        .stores
+                        .push((*ptr, type_bytes(f.value_type(*value)).unwrap_or(u32::MAX))),
                     Op::Call { .. } | Op::VecKernelCall { .. } => mem.has_call = true,
                     _ => {}
                 }
@@ -382,8 +381,18 @@ mod tests {
         let mut cache = CfgAnalyses::default();
         assert!(Licm.run_function(&mut f, &mut cache));
         // The header load moved to the preheader; the element load stays (its address varies).
-        assert_eq!(loads_in(&f, 2), 1, "{}", wukong_mir::print::print_function(&f, &it));
-        assert_eq!(loads_in(&f, 0), 1, "{}", wukong_mir::print::print_function(&f, &it));
+        assert_eq!(
+            loads_in(&f, 2),
+            1,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
+        assert_eq!(
+            loads_in(&f, 0),
+            1,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
     }
 
     /// The identical loop, but the address is a *parameter*. Nothing writes it, so it is invariant —
@@ -404,7 +413,12 @@ mod tests {
         assert_eq!(loads_in(&f, 2), 2);
         let mut cache = CfgAnalyses::default();
         Licm.run_function(&mut f, &mut cache);
-        assert_eq!(loads_in(&f, 2), 2, "{}", wukong_mir::print::print_function(&f, &it));
+        assert_eq!(
+            loads_in(&f, 2),
+            2,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
     }
 
     /// A store in the loop that may alias the slot keeps its load inside.
@@ -417,13 +431,21 @@ mod tests {
             |b| b.alloca(MirType::Array(Box::new(MirType::I8), 16)),
             |b, slot| {
                 let x = b.build(MirType::I64, Op::Load(slot, MirType::I64));
-                b.build_void(Op::Store { ptr: slot, value: x });
+                b.build_void(Op::Store {
+                    ptr: slot,
+                    value: x,
+                });
             },
         );
         assert_eq!(loads_in(&f, 2), 1);
         let mut cache = CfgAnalyses::default();
         Licm.run_function(&mut f, &mut cache);
-        assert_eq!(loads_in(&f, 2), 1, "{}", wukong_mir::print::print_function(&f, &it));
+        assert_eq!(
+            loads_in(&f, 2),
+            1,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
     }
 
     /// A call in the loop is opaque, but it still cannot reach a slot this function never published.
@@ -446,7 +468,12 @@ mod tests {
         );
         let mut cache = CfgAnalyses::default();
         assert!(Licm.run_function(&mut f, &mut cache));
-        assert_eq!(loads_in(&f, 2), 0, "{}", wukong_mir::print::print_function(&f, &it));
+        assert_eq!(
+            loads_in(&f, 2),
+            0,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
 
         let mut escaped = loop_fn(
             &mut it,

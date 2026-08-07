@@ -55,9 +55,21 @@ unsafe fn gemv_row_avx2(a: *const f32, x: *const f32, n: usize) -> f32 {
     // (cache-resident) x. `_mm256_fmadd_ps(a, x, c)` == the scalar `x.mul_add`/`fmadd` lane-for-lane.
     while j + 32 <= n {
         c0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j)), _mm256_loadu_ps(x.add(j)), c0);
-        c1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j + 8)), _mm256_loadu_ps(x.add(j + 8)), c1);
-        c2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j + 16)), _mm256_loadu_ps(x.add(j + 16)), c2);
-        c3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j + 24)), _mm256_loadu_ps(x.add(j + 24)), c3);
+        c1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.add(j + 8)),
+            _mm256_loadu_ps(x.add(j + 8)),
+            c1,
+        );
+        c2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.add(j + 16)),
+            _mm256_loadu_ps(x.add(j + 16)),
+            c2,
+        );
+        c3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.add(j + 24)),
+            _mm256_loadu_ps(x.add(j + 24)),
+            c3,
+        );
         j += 32;
     }
     // Remaining full 8-blocks fold into the first accumulator.
@@ -110,13 +122,7 @@ unsafe fn gemv_row(a: *const f32, x: *const f32, n: usize) -> f32 {
 /// # Safety
 /// `a` valid for `m*n` `f32`, `x` for `n`, `y` for `m`; `y` must not overlap `a` or `x`.
 #[no_mangle]
-pub unsafe extern "C" fn wukong_sgemv(
-    a: *const f32,
-    x: *const f32,
-    y: *mut f32,
-    m: i64,
-    n: i64,
-) {
+pub unsafe extern "C" fn wukong_sgemv(a: *const f32, x: *const f32, y: *mut f32, m: i64, n: i64) {
     if m <= 0 || n <= 0 {
         return;
     }
@@ -303,7 +309,13 @@ mod tests {
             let mut got_par = vec![0.0f32; m];
             unsafe {
                 wukong_sgemv(a.as_ptr(), x.as_ptr(), got.as_mut_ptr(), m as i64, n as i64);
-                wukong_sgemv_parallel(a.as_ptr(), x.as_ptr(), got_par.as_mut_ptr(), m as i64, n as i64);
+                wukong_sgemv_parallel(
+                    a.as_ptr(),
+                    x.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    m as i64,
+                    n as i64,
+                );
             }
             let tol = 1e-3 * (n as f32).sqrt();
             for i in 0..m {
@@ -325,12 +337,25 @@ mod tests {
     /// Sizes straddle the 32/8-element unroll edges and `GEMV_PAR_MIN_ROWS`.
     #[test]
     fn sgemv_alpha_matches_scaled_plain_and_parallel() {
-        for &(m, n) in &[(1usize, 1usize), (3, 8), (7, 32), (9, 33), (128, 64), (300, 517)] {
+        for &(m, n) in &[
+            (1usize, 1usize),
+            (3, 8),
+            (7, 32),
+            (9, 33),
+            (128, 64),
+            (300, 517),
+        ] {
             let a = fill(5, m * n);
             let x = fill(6, n);
             let mut plain = vec![0.0f32; m];
             unsafe {
-                wukong_sgemv(a.as_ptr(), x.as_ptr(), plain.as_mut_ptr(), m as i64, n as i64);
+                wukong_sgemv(
+                    a.as_ptr(),
+                    x.as_ptr(),
+                    plain.as_mut_ptr(),
+                    m as i64,
+                    n as i64,
+                );
             }
             for &alpha in &[1.0f32, 0.125, -2.5] {
                 let want: Vec<f32> = plain
@@ -357,15 +382,31 @@ mod tests {
                         alpha,
                     );
                 }
-                assert_eq!(got, want, "sgemv_alpha != alpha·sgemv ({m}x{n} alpha={alpha})");
-                assert_eq!(got, got_par, "sgemv_alpha serial vs parallel ({m}x{n} alpha={alpha})");
+                assert_eq!(
+                    got, want,
+                    "sgemv_alpha != alpha·sgemv ({m}x{n} alpha={alpha})"
+                );
+                assert_eq!(
+                    got, got_par,
+                    "sgemv_alpha serial vs parallel ({m}x{n} alpha={alpha})"
+                );
             }
             // alpha == 1.0 must be byte-identical to the plain kernel.
             let mut a1 = vec![0.0f32; m];
             unsafe {
-                wukong_sgemv_alpha(a.as_ptr(), x.as_ptr(), a1.as_mut_ptr(), m as i64, n as i64, 1.0);
+                wukong_sgemv_alpha(
+                    a.as_ptr(),
+                    x.as_ptr(),
+                    a1.as_mut_ptr(),
+                    m as i64,
+                    n as i64,
+                    1.0,
+                );
             }
-            assert_eq!(plain, a1, "sgemv_alpha(1.0) must be byte-identical to sgemv ({m}x{n})");
+            assert_eq!(
+                plain, a1,
+                "sgemv_alpha(1.0) must be byte-identical to sgemv ({m}x{n})"
+            );
         }
     }
 

@@ -1333,7 +1333,8 @@ impl<'a> FnTranslator<'a> {
         }
         // KL divergence / soft-label cross-entropy: (p|x, q, out, rows, cols) — three pointers + two
         // i64, the same vmath2 shape; route by name. Void.
-        if matches!(name, RT_KLDIV | RT_KLDIV_PAR | RT_KD_LOSS | RT_KD_LOSS_PAR) && args.len() == 5 {
+        if matches!(name, RT_KLDIV | RT_KLDIV_PAR | RT_KD_LOSS | RT_KD_LOSS_PAR) && args.len() == 5
+        {
             let a = self.val(args[0]);
             let b = self.val(args[1]);
             let out = self.val(args[2]);
@@ -1452,7 +1453,9 @@ impl<'a> FnTranslator<'a> {
             let rows = self.coerce_to_i64(args[3]);
             let cols = self.coerce_to_i64(args[4]);
             let fref = self.rt_refs[name];
-            self.builder.ins().call(fref, &[x, target, loss, rows, cols]);
+            self.builder
+                .ins()
+                .call(fref, &[x, target, loss, rows, cols]);
             return None;
         }
         // Cross-entropy backward: wukong_xent_bwd_f32[_parallel](x, target, dx, rows, cols) — same
@@ -1469,7 +1472,8 @@ impl<'a> FnTranslator<'a> {
         }
         // RoPE: wukong_rope_f32[_parallel](x, inv_freq, out, rows, half) — three f32 pointers + two
         // i64, the same vmath2 shape. Void.
-        if matches!(name, RT_ROPE | RT_ROPE_PAR | RT_ROPE_BWD | RT_ROPE_BWD_PAR) && args.len() == 5 {
+        if matches!(name, RT_ROPE | RT_ROPE_PAR | RT_ROPE_BWD | RT_ROPE_BWD_PAR) && args.len() == 5
+        {
             let x = self.val(args[0]);
             let inv_freq = self.val(args[1]);
             let out = self.val(args[2]);
@@ -1621,8 +1625,10 @@ impl<'a> FnTranslator<'a> {
         // The bf16 mixed-precision reductions: wukong_dot_bf16(x, y, n) -> f32 (3 args) and
         // wukong_sum_bf16(x, n) -> f32 (2 args). bf16 storage, f32 accumulate; both return the
         // accumulated f32, so bind the call result like the sreduce kernel above.
-        if matches!(name, RT_DOT_BF16 | RT_DOT_F16 | RT_DOT_BF16_PAR | RT_DOT_F16_PAR)
-            && args.len() == 3
+        if matches!(
+            name,
+            RT_DOT_BF16 | RT_DOT_F16 | RT_DOT_BF16_PAR | RT_DOT_F16_PAR
+        ) && args.len() == 3
         {
             let x = self.val(args[0]);
             let y = self.val(args[1]);
@@ -1631,8 +1637,10 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[x, y, n]);
             return self.builder.inst_results(call).first().copied();
         }
-        if matches!(name, RT_SUM_BF16 | RT_SUM_F16 | RT_SUM_BF16_PAR | RT_SUM_F16_PAR)
-            && args.len() == 2
+        if matches!(
+            name,
+            RT_SUM_BF16 | RT_SUM_F16 | RT_SUM_BF16_PAR | RT_SUM_F16_PAR
+        ) && args.len() == 2
         {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
@@ -1764,7 +1772,9 @@ impl<'a> FnTranslator<'a> {
             let h = self.coerce_to_i64(args[4]);
             let v = self.coerce_to_i64(args[5]);
             let fref = self.rt_refs[name];
-            self.builder.ins().call(fref, &[grad_w, grad_out, ids, t, h, v]);
+            self.builder
+                .ins()
+                .call(fref, &[grad_w, grad_out, ids, t, h, v]);
             return None;
         }
         // The int8 quantized nn.Linear with fused dequant epilogue:
@@ -1810,7 +1820,9 @@ impl<'a> FnTranslator<'a> {
             let scale = self.val(args[4]);
             let op = self.coerce_to_i64(args[5]);
             let fref = self.rt_refs[name];
-            self.builder.ins().call(fref, &[q, out, rows, cols, scale, op]);
+            self.builder
+                .ins()
+                .call(fref, &[q, out, rows, cols, scale, op]);
             return None;
         }
         // Everything above dispatches a runtime kernel on (name, arity). `rt_refs` holds exactly
@@ -2171,7 +2183,10 @@ fn default_verify() -> bool {
 /// codegen (proven by the `serial_parallel_object_bytes_identical` test). Default on; the
 /// `WUKONG_PAR_CODEGEN=0` kill-switch forces serial.
 fn default_parallel() -> bool {
-    !matches!(std::env::var("WUKONG_PAR_CODEGEN").ok().as_deref(), Some("0"))
+    !matches!(
+        std::env::var("WUKONG_PAR_CODEGEN").ok().as_deref(),
+        Some("0")
+    )
 }
 
 fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
@@ -2249,7 +2264,7 @@ fn populate_module<M: Module>(
     }
     sig_gemm_epi.params.push(AbiParam::new(ptr_ty)); // bias
     sig_gemm_epi.params.push(AbiParam::new(types::I64)); // act
-    // wukong_sgemv[_parallel](a: ptr, x: ptr, y: ptr, m: i64, n: i64) — matrix-times-vector (void).
+                                                         // wukong_sgemv[_parallel](a: ptr, x: ptr, y: ptr, m: i64, n: i64) — matrix-times-vector (void).
     let mut sig_gemv = Signature::new(call_conv);
     for _ in 0..3 {
         sig_gemv.params.push(AbiParam::new(ptr_ty));
@@ -2268,7 +2283,7 @@ fn populate_module<M: Module>(
         sig_gemv_alpha.params.push(AbiParam::new(types::I64));
     }
     sig_gemv_alpha.params.push(AbiParam::new(types::F32)); // alpha
-    // wukong_sgemm_nt_alpha[_parallel](a, b, c: ptr, m, k, n, beta: i64, alpha: f32) — α-scaled Linear.
+                                                           // wukong_sgemm_nt_alpha[_parallel](a, b, c: ptr, m, k, n, beta: i64, alpha: f32) — α-scaled Linear.
     let mut sig_gemm_alpha = Signature::new(call_conv);
     for _ in 0..3 {
         sig_gemm_alpha.params.push(AbiParam::new(ptr_ty));
@@ -2277,7 +2292,7 @@ fn populate_module<M: Module>(
         sig_gemm_alpha.params.push(AbiParam::new(types::I64));
     }
     sig_gemm_alpha.params.push(AbiParam::new(types::F32)); // alpha
-    // wukong_vmath_f32(x: ptr, out: ptr, n: i64, op: i64) — vectorized elementwise transcendental.
+                                                           // wukong_vmath_f32(x: ptr, out: ptr, n: i64, op: i64) — vectorized elementwise transcendental.
     let mut sig_vmath = Signature::new(call_conv);
     sig_vmath.params.push(AbiParam::new(ptr_ty));
     sig_vmath.params.push(AbiParam::new(ptr_ty));
@@ -2895,7 +2910,11 @@ fn populate_module<M: Module>(
             .declare_function(RT_DEQUANT_PERCHAN, Linkage::Import, &sig_dequant_perchan)
             .map_err(|e| e.to_string())?,
         dequant_perchan_par: module
-            .declare_function(RT_DEQUANT_PERCHAN_PAR, Linkage::Import, &sig_dequant_perchan)
+            .declare_function(
+                RT_DEQUANT_PERCHAN_PAR,
+                Linkage::Import,
+                &sig_dequant_perchan,
+            )
             .map_err(|e| e.to_string())?,
         // Embedding lookup reuses the 3-ptr + 3-i64 void signature (the pointer element type is
         // irrelevant to the ABI — out/weight are f32*, ids is i32*).
@@ -3016,7 +3035,7 @@ fn populate_module<M: Module>(
     kernel_sig.params.push(AbiParam::new(ptr_ty)); // ptrs
     kernel_sig.params.push(AbiParam::new(ptr_ty)); // scalars
     kernel_sig.params.push(AbiParam::new(types::I64)); // n
-    // A reduction kernel returns its horizontal fold as f32; an elementwise kernel is void.
+                                                       // A reduction kernel returns its horizontal fold as f32; an elementwise kernel is void.
     let mut kernel_sig_reduce = kernel_sig.clone();
     kernel_sig_reduce.returns.push(AbiParam::new(types::F32));
     let mut kernel_ids: Vec<Vec<FuncId>> = Vec::with_capacity(program.funcs.len());
@@ -3031,7 +3050,11 @@ fn populate_module<M: Module>(
                 &kernel_sig
             };
             let id = module
-                .declare_function(&format!("__wukong_veckernel_{fi}_{ki}"), Linkage::Local, sig)
+                .declare_function(
+                    &format!("__wukong_veckernel_{fi}_{ki}"),
+                    Linkage::Local,
+                    sig,
+                )
                 .map_err(|e| e.to_string())?;
             module
                 .define_function_bytes(id, 16, &bytes, &[])
@@ -3043,11 +3066,27 @@ fn populate_module<M: Module>(
 
     if parallel && program.funcs.len() > 1 {
         define_functions_parallel(
-            module, program, interner, ptr_ty, call_conv, &rt, &ids, &data_ids, &kernel_ids,
+            module,
+            program,
+            interner,
+            ptr_ty,
+            call_conv,
+            &rt,
+            &ids,
+            &data_ids,
+            &kernel_ids,
         )?;
     } else {
         define_functions_serial(
-            module, program, interner, ptr_ty, call_conv, &rt, &ids, &data_ids, &kernel_ids,
+            module,
+            program,
+            interner,
+            ptr_ty,
+            call_conv,
+            &rt,
+            &ids,
+            &data_ids,
+            &kernel_ids,
         )?;
     }
     Ok(ids)
@@ -3317,7 +3356,10 @@ fn build_function_clif(
                 RT_SOFTMAX_BWD_PAR,
                 module.declare_func_in_func(rt.softmax_bwd_par, builder.func),
             );
-            rt_refs.insert(RT_LRSCAN, module.declare_func_in_func(rt.lrscan, builder.func));
+            rt_refs.insert(
+                RT_LRSCAN,
+                module.declare_func_in_func(rt.lrscan, builder.func),
+            );
             rt_refs.insert(
                 RT_LRSCAN_PAR,
                 module.declare_func_in_func(rt.lrscan_par, builder.func),
@@ -3372,7 +3414,10 @@ fn build_function_clif(
                 RT_LOGSUMEXP_PAR,
                 module.declare_func_in_func(rt.logsumexp_par, builder.func),
             );
-            rt_refs.insert(RT_KLDIV, module.declare_func_in_func(rt.kldiv, builder.func));
+            rt_refs.insert(
+                RT_KLDIV,
+                module.declare_func_in_func(rt.kldiv, builder.func),
+            );
             rt_refs.insert(
                 RT_KLDIV_PAR,
                 module.declare_func_in_func(rt.kldiv_par, builder.func),
@@ -3433,7 +3478,10 @@ fn build_function_clif(
                 RT_CUMSUM_PAR,
                 module.declare_func_in_func(rt.cumsum_par, builder.func),
             );
-            rt_refs.insert(RT_CUMPROD, module.declare_func_in_func(rt.cumprod, builder.func));
+            rt_refs.insert(
+                RT_CUMPROD,
+                module.declare_func_in_func(rt.cumprod, builder.func),
+            );
             rt_refs.insert(
                 RT_CUMPROD_PAR,
                 module.declare_func_in_func(rt.cumprod_par, builder.func),
@@ -3796,10 +3844,11 @@ impl Decls<'_> {
     ) -> FuncRef {
         let decl = self.d.get_function_decl(func_id);
         let signature = func.import_signature(decl.signature.clone());
-        let user_name_ref = func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName {
-            namespace: 0,
-            index: func_id.as_u32(),
-        });
+        let user_name_ref =
+            func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName {
+                namespace: 0,
+                index: func_id.as_u32(),
+            });
         let colocated = decl.linkage.is_final();
         func.import_function(cranelift_codegen::ir::ExtFuncData {
             name: cranelift_codegen::ir::ExternalName::user(user_name_ref),
@@ -3816,10 +3865,11 @@ impl Decls<'_> {
     ) -> GlobalValue {
         let decl = self.d.get_data_decl(data);
         let colocated = decl.linkage.is_final();
-        let user_name_ref = func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName {
-            namespace: 1,
-            index: data.as_u32(),
-        });
+        let user_name_ref =
+            func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName {
+                namespace: 1,
+                index: data.as_u32(),
+            });
         func.create_global_value(cranelift_codegen::ir::GlobalValueData::Symbol {
             name: cranelift_codegen::ir::ExternalName::user(user_name_ref),
             offset: cranelift_codegen::ir::immediates::Imm64::new(0),
@@ -3855,8 +3905,8 @@ fn define_functions_serial<M: Module>(
         for (fi, f) in program.funcs.iter().enumerate() {
             let mut clif = cranelift_codegen::ir::Function::new();
             build_function_clif(
-                &decls, f, fi, program, interner, ptr_ty, call_conv, rt, ids, data_ids,
-                kernel_ids, &mut fbctx, &mut clif,
+                &decls, f, fi, program, interner, ptr_ty, call_conv, rt, ids, data_ids, kernel_ids,
+                &mut fbctx, &mut clif,
             )?;
             clifs.push((ids[&f.name], clif));
         }
@@ -3906,13 +3956,29 @@ fn define_functions_parallel<M: Module>(
             .par_iter()
             .enumerate()
             .map_init(
-                || (FunctionBuilderContext::new(), cranelift_codegen::Context::new()),
+                || {
+                    (
+                        FunctionBuilderContext::new(),
+                        cranelift_codegen::Context::new(),
+                    )
+                },
                 |(fbctx, ctx), (fi, f)| -> Result<_, String> {
                     let fid = ids[&f.name];
                     ctx.clear();
                     build_function_clif(
-                        &decls, f, fi, program, interner, ptr_ty, call_conv, rt, ids, data_ids,
-                        kernel_ids, fbctx, &mut ctx.func,
+                        &decls,
+                        f,
+                        fi,
+                        program,
+                        interner,
+                        ptr_ty,
+                        call_conv,
+                        rt,
+                        ids,
+                        data_ids,
+                        kernel_ids,
+                        fbctx,
+                        &mut ctx.func,
                     )?;
                     let mut cp = cranelift_codegen::control::ControlPlane::default();
                     ctx.compile(isa, &mut cp)
@@ -4101,10 +4167,22 @@ pub fn jit_compile(
     builder.symbol(RT_READ_I64, wukong_runtime::wukong_rt_read_i64 as *const u8);
     builder.symbol(RT_READ_I8, wukong_runtime::wukong_rt_read_i8 as *const u8);
     builder.symbol(RT_READ_U8, wukong_runtime::wukong_rt_read_u8 as *const u8);
-    builder.symbol(RT_WRITE_F32, wukong_runtime::wukong_rt_write_f32 as *const u8);
-    builder.symbol(RT_WRITE_F64, wukong_runtime::wukong_rt_write_f64 as *const u8);
-    builder.symbol(RT_WRITE_I32, wukong_runtime::wukong_rt_write_i32 as *const u8);
-    builder.symbol(RT_WRITE_I64, wukong_runtime::wukong_rt_write_i64 as *const u8);
+    builder.symbol(
+        RT_WRITE_F32,
+        wukong_runtime::wukong_rt_write_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_WRITE_F64,
+        wukong_runtime::wukong_rt_write_f64 as *const u8,
+    );
+    builder.symbol(
+        RT_WRITE_I32,
+        wukong_runtime::wukong_rt_write_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_WRITE_I64,
+        wukong_runtime::wukong_rt_write_i64 as *const u8,
+    );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
@@ -4283,18 +4361,12 @@ pub fn jit_compile(
         RT_KLDIV_PAR,
         wukong_runtime::wukong_kldiv_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_ENTROPY,
-        wukong_runtime::wukong_entropy_f32 as *const u8,
-    );
+    builder.symbol(RT_ENTROPY, wukong_runtime::wukong_entropy_f32 as *const u8);
     builder.symbol(
         RT_ENTROPY_PAR,
         wukong_runtime::wukong_entropy_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_KD_LOSS,
-        wukong_runtime::wukong_kd_loss_f32 as *const u8,
-    );
+    builder.symbol(RT_KD_LOSS, wukong_runtime::wukong_kd_loss_f32 as *const u8);
     builder.symbol(
         RT_KD_LOSS_PAR,
         wukong_runtime::wukong_kd_loss_f32_parallel as *const u8,
@@ -4371,10 +4443,7 @@ pub fn jit_compile(
         RT_VMATH_BF16,
         wukong_runtime::wukong_vmath_bf16 as *const u8,
     );
-    builder.symbol(
-        RT_VMATH_F16,
-        wukong_runtime::wukong_vmath_f16 as *const u8,
-    );
+    builder.symbol(RT_VMATH_F16, wukong_runtime::wukong_vmath_f16 as *const u8);
     builder.symbol(
         RT_VMATH_BF16_OUT,
         wukong_runtime::wukong_vmath_bf16_out as *const u8,
@@ -4450,10 +4519,7 @@ pub fn jit_compile(
         RT_VELEM_PARALLEL,
         wukong_runtime::wukong_velem_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_VHORNER,
-        wukong_runtime::wukong_vhorner_f32 as *const u8,
-    );
+    builder.symbol(RT_VHORNER, wukong_runtime::wukong_vhorner_f32 as *const u8);
     builder.symbol(
         RT_BIAS_BCAST,
         wukong_runtime::wukong_bias_bcast_f32 as *const u8,
@@ -4462,10 +4528,7 @@ pub fn jit_compile(
         RT_BIAS_BCAST_PAR,
         wukong_runtime::wukong_bias_bcast_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_SREDUCE,
-        wukong_runtime::wukong_sreduce_f32 as *const u8,
-    );
+    builder.symbol(RT_SREDUCE, wukong_runtime::wukong_sreduce_f32 as *const u8);
     builder.symbol(
         RT_SREDUCE_PARALLEL,
         wukong_runtime::wukong_sreduce_f32_parallel as *const u8,
@@ -4491,10 +4554,7 @@ pub fn jit_compile(
         RT_NORM_AFFINE_PARALLEL,
         wukong_runtime::wukong_norm_affine_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_I8GEMM_NT,
-        wukong_runtime::wukong_i8gemm_nt as *const u8,
-    );
+    builder.symbol(RT_I8GEMM_NT, wukong_runtime::wukong_i8gemm_nt as *const u8);
     builder.symbol(
         RT_I8GEMM_NT_PARALLEL,
         wukong_runtime::wukong_i8gemm_nt_parallel as *const u8,
@@ -4546,10 +4606,7 @@ pub fn jit_compile(
         RT_REDUCE_BF16,
         wukong_runtime::wukong_reduce_bf16 as *const u8,
     );
-    builder.symbol(
-        RT_AXPBY_F16,
-        wukong_runtime::wukong_axpby_f16 as *const u8,
-    );
+    builder.symbol(RT_AXPBY_F16, wukong_runtime::wukong_axpby_f16 as *const u8);
     builder.symbol(RT_DOT_F16, wukong_runtime::wukong_dot_f16 as *const u8);
     builder.symbol(RT_SUM_F16, wukong_runtime::wukong_sum_f16 as *const u8);
     builder.symbol(
@@ -4676,10 +4733,22 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_READ_I64, wukong_runtime::wukong_rt_read_i64 as *const u8);
     builder.symbol(RT_READ_I8, wukong_runtime::wukong_rt_read_i8 as *const u8);
     builder.symbol(RT_READ_U8, wukong_runtime::wukong_rt_read_u8 as *const u8);
-    builder.symbol(RT_WRITE_F32, wukong_runtime::wukong_rt_write_f32 as *const u8);
-    builder.symbol(RT_WRITE_F64, wukong_runtime::wukong_rt_write_f64 as *const u8);
-    builder.symbol(RT_WRITE_I32, wukong_runtime::wukong_rt_write_i32 as *const u8);
-    builder.symbol(RT_WRITE_I64, wukong_runtime::wukong_rt_write_i64 as *const u8);
+    builder.symbol(
+        RT_WRITE_F32,
+        wukong_runtime::wukong_rt_write_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_WRITE_F64,
+        wukong_runtime::wukong_rt_write_f64 as *const u8,
+    );
+    builder.symbol(
+        RT_WRITE_I32,
+        wukong_runtime::wukong_rt_write_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_WRITE_I64,
+        wukong_runtime::wukong_rt_write_i64 as *const u8,
+    );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
@@ -4858,18 +4927,12 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_KLDIV_PAR,
         wukong_runtime::wukong_kldiv_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_ENTROPY,
-        wukong_runtime::wukong_entropy_f32 as *const u8,
-    );
+    builder.symbol(RT_ENTROPY, wukong_runtime::wukong_entropy_f32 as *const u8);
     builder.symbol(
         RT_ENTROPY_PAR,
         wukong_runtime::wukong_entropy_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_KD_LOSS,
-        wukong_runtime::wukong_kd_loss_f32 as *const u8,
-    );
+    builder.symbol(RT_KD_LOSS, wukong_runtime::wukong_kd_loss_f32 as *const u8);
     builder.symbol(
         RT_KD_LOSS_PAR,
         wukong_runtime::wukong_kd_loss_f32_parallel as *const u8,
@@ -4946,10 +5009,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_VMATH_BF16,
         wukong_runtime::wukong_vmath_bf16 as *const u8,
     );
-    builder.symbol(
-        RT_VMATH_F16,
-        wukong_runtime::wukong_vmath_f16 as *const u8,
-    );
+    builder.symbol(RT_VMATH_F16, wukong_runtime::wukong_vmath_f16 as *const u8);
     builder.symbol(
         RT_VMATH_BF16_OUT,
         wukong_runtime::wukong_vmath_bf16_out as *const u8,
@@ -5025,10 +5085,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_VELEM_PARALLEL,
         wukong_runtime::wukong_velem_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_VHORNER,
-        wukong_runtime::wukong_vhorner_f32 as *const u8,
-    );
+    builder.symbol(RT_VHORNER, wukong_runtime::wukong_vhorner_f32 as *const u8);
     builder.symbol(
         RT_BIAS_BCAST,
         wukong_runtime::wukong_bias_bcast_f32 as *const u8,
@@ -5037,10 +5094,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_BIAS_BCAST_PAR,
         wukong_runtime::wukong_bias_bcast_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_SREDUCE,
-        wukong_runtime::wukong_sreduce_f32 as *const u8,
-    );
+    builder.symbol(RT_SREDUCE, wukong_runtime::wukong_sreduce_f32 as *const u8);
     builder.symbol(
         RT_SREDUCE_PARALLEL,
         wukong_runtime::wukong_sreduce_f32_parallel as *const u8,
@@ -5066,10 +5120,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_NORM_AFFINE_PARALLEL,
         wukong_runtime::wukong_norm_affine_f32_parallel as *const u8,
     );
-    builder.symbol(
-        RT_I8GEMM_NT,
-        wukong_runtime::wukong_i8gemm_nt as *const u8,
-    );
+    builder.symbol(RT_I8GEMM_NT, wukong_runtime::wukong_i8gemm_nt as *const u8);
     builder.symbol(
         RT_I8GEMM_NT_PARALLEL,
         wukong_runtime::wukong_i8gemm_nt_parallel as *const u8,
@@ -5121,10 +5172,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_REDUCE_BF16,
         wukong_runtime::wukong_reduce_bf16 as *const u8,
     );
-    builder.symbol(
-        RT_AXPBY_F16,
-        wukong_runtime::wukong_axpby_f16 as *const u8,
-    );
+    builder.symbol(RT_AXPBY_F16, wukong_runtime::wukong_axpby_f16 as *const u8);
     builder.symbol(RT_DOT_F16, wukong_runtime::wukong_dot_f16 as *const u8);
     builder.symbol(RT_SUM_F16, wukong_runtime::wukong_sum_f16 as *const u8);
     builder.symbol(

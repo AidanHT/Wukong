@@ -388,7 +388,8 @@ mod tests {
                 for row in 0..rows {
                     let off = row * cols;
                     let g = if use_gamma { Some(&gamma[..]) } else { None };
-                    let row_ref = reference(&x[off..off + cols], &dy[off..off + cols], g, cols, EPS);
+                    let row_ref =
+                        reference(&x[off..off + cols], &dy[off..off + cols], g, cols, EPS);
                     want[off..off + cols].copy_from_slice(&row_ref);
                 }
                 let mut got = vec![0.0f32; rows * cols];

@@ -357,7 +357,8 @@ fn find_candidate(
             continue;
         }
         if let Some(c) = candidate_at(f, h, &preds, consts) {
-            let cost = f.blocks[c.header as usize].insts.len() + f.blocks[c.body as usize].insts.len();
+            let cost =
+                f.blocks[c.header as usize].insts.len() + f.blocks[c.body as usize].insts.len();
             if cost > BODY_FOR_4X {
                 continue;
             }
@@ -448,7 +449,8 @@ fn candidate_at(
     if preheader == exit || preheader == h {
         return None;
     }
-    if !matches!(&f.blocks[preheader as usize].term, Terminator::Br { target, .. } if target.0 == h) {
+    if !matches!(&f.blocks[preheader as usize].term, Terminator::Br { target, .. } if target.0 == h)
+    {
         return None;
     }
 

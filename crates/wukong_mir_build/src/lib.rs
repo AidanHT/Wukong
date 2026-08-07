@@ -25,7 +25,8 @@ mod tindex;
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use wukong_ast::{
-    self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind, VariantPat,
+    self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind,
+    VariantPat,
 };
 use wukong_diag::Diagnostic;
 use wukong_mir::{
@@ -884,8 +885,7 @@ pub fn lower_program(
     let normalized = tindex::linearize_module(module, sema, interner);
     let merged_sema = normalized.as_ref().map(|(_, extra)| {
         let mut s = sema.clone();
-        s.types
-            .extend(extra.iter().map(|(id, t)| (*id, t.clone())));
+        s.types.extend(extra.iter().map(|(id, t)| (*id, t.clone())));
         s
     });
     let module: &Module = normalized.as_ref().map(|(m, _)| m).unwrap_or(module);
@@ -1144,9 +1144,22 @@ pub fn lower_program(
                 // lose the kernel dispatch). Lower it normally with `parallel = true`; the embedded
                 // matmul recognizer in `lower_for` then emits the multicore half GEMM. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
-                if has_parallel_attr(item, interner) && lowp_matmul_fn(body, sema, interner).is_some()
+                if has_parallel_attr(item, interner)
+                    && lowp_matmul_fn(body, sema, interner).is_some()
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1165,7 +1178,19 @@ pub fn lower_program(
                             || match_gevm(pat, it, lb, p.sema, p.interner).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1174,8 +1199,21 @@ pub fn lower_program(
                 // kernel). Lower it normally with `parallel = true`; the embedded `match_transpose` in
                 // `lower_for` then emits the multicore `wukong_transpose_f32_parallel`. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
-                if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some()
+                {
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1185,7 +1223,19 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `wukong_{max,avg}pool2d_f32_parallel` (channels
                 // across cores, bit-equal to serial — channels independent, no cross-channel combine).
                 if has_parallel_attr(item, interner) && pool2d_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1194,7 +1244,19 @@ pub fn lower_program(
                 // normally with `parallel = true`; the embedded `match_colsum` then emits the multicore
                 // `wukong_colsum_f32_parallel` (disjoint column stripes, bit-equal to serial).
                 if has_parallel_attr(item, interner) && colsum_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1202,7 +1264,19 @@ pub fn lower_program(
                 // like the column reduction above. Rows are scanned per disjoint column stripe → the
                 // multicore `wukong_colarg*_i32_parallel` is bit-equal to serial.
                 if has_parallel_attr(item, interner) && colarg_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1210,8 +1284,22 @@ pub fn lower_program(
                 // (which would split the rows into scalar loops and lose the fused dot+apply kernel).
                 // The embedded `match_softmax_bwd` then emits the multicore `wukong_softmax_bwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
-                if has_parallel_attr(item, interner) && softmax_bwd_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                if has_parallel_attr(item, interner)
+                    && softmax_bwd_fn(body, sema, interner).is_some()
+                {
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1220,8 +1308,22 @@ pub fn lower_program(
                 // kernel). The embedded `match_rmsnorm_bwd` then emits the multicore
                 // `wukong_rmsnorm_bwd_f32_parallel` (rows across cores, bit-equal to serial — rows
                 // independent, each row reduces over its own `C` columns).
-                if has_parallel_attr(item, interner) && rmsnorm_bwd_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                if has_parallel_attr(item, interner)
+                    && rmsnorm_bwd_fn(body, sema, interner).is_some()
+                {
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1229,7 +1331,19 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && layernorm_bwd_fn(body, sema, interner).is_some()
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1238,13 +1352,37 @@ pub fn lower_program(
                 // kernel). The embedded `match_xent` then emits the multicore `wukong_xent_fwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && xent_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
                 // A `@parallel` whole-function cross-entropy backward: intercept before the outliner.
                 if has_parallel_attr(item, interner) && xent_bwd_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1252,13 +1390,38 @@ pub fn lower_program(
                 // the rows into scalar loops and lose the inline-sincos kernel). The embedded
                 // `match_rope` then emits the multicore `wukong_rope_f32_parallel` (rows independent).
                 if has_parallel_attr(item, interner) && rope_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
                 // A `@parallel` whole-function batched log-sum-exp: intercept before the outliner.
-                if has_parallel_attr(item, interner) && logsumexp_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                if has_parallel_attr(item, interner) && logsumexp_fn(f, body, sema, interner, gemm)
+                {
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1273,7 +1436,19 @@ pub fn lower_program(
                         p.match_kd_loss(pat, it, lb).is_some()
                     }))
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1285,7 +1460,19 @@ pub fn lower_program(
                         p.match_dequant_perchan(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1297,7 +1484,19 @@ pub fn lower_program(
                         p.match_rowarg(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1308,7 +1507,19 @@ pub fn lower_program(
                         p.match_cumsum(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1319,7 +1530,19 @@ pub fn lower_program(
                         p.match_cumprod(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1330,7 +1553,19 @@ pub fn lower_program(
                         p.match_lrscan(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1340,7 +1575,19 @@ pub fn lower_program(
                         p.match_cumminmax(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1353,7 +1600,19 @@ pub fn lower_program(
                         p.match_embedding(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1365,7 +1624,19 @@ pub fn lower_program(
                         p.match_scatter(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1374,7 +1645,19 @@ pub fn lower_program(
                 // lose the fused-epilogue kernel). Lower it normally with `parallel = true`; the
                 // embedded `match_matmul_residual` in `lower_for` then emits the multicore nt_epi.
                 if has_parallel_attr(item, interner) && matmul_residual_fn(body, sema, interner) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1387,7 +1670,19 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && is_batched_norm_fn(f, body, sema, interner, gemm)
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1400,7 +1695,19 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && is_bias_bcast_fn(f, body, sema, interner, gemm)
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
@@ -1424,12 +1731,26 @@ pub fn lower_program(
                     // A `@parallel` function that is not a single elementwise loop — e.g. a reduction
                     // (`let mut s = 0; for k { s += x[k]*y[k] }; …`). Lower it normally, but with any
                     // recognized reduction loop dispatched to the multicore reduction kernel.
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags, Some(&mut par_regions));
+                    let func = lower_fn(
+                        f,
+                        body,
+                        sema,
+                        interner,
+                        gemm,
+                        true,
+                        &no_subst,
+                        f.name.sym,
+                        &mono,
+                        &mut diags,
+                        Some(&mut par_regions),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
-                let func =
-                    lower_fn(f, body, sema, interner, gemm, false, &no_subst, f.name.sym, &mono, &mut diags, None);
+                let func = lower_fn(
+                    f, body, sema, interner, gemm, false, &no_subst, f.name.sym, &mono, &mut diags,
+                    None,
+                );
                 program.funcs.push(func);
             }
         }
@@ -1446,7 +1767,9 @@ pub fn lower_program(
         .collect();
     for (mangled, orig, subst) in &mono.instances {
         if let Some((f, body)) = fn_decls.get(orig) {
-            let func = lower_fn(f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags, None);
+            let func = lower_fn(
+                f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags, None,
+            );
             program.funcs.push(func);
         }
     }
@@ -1474,7 +1797,9 @@ fn has_parallel_attr(item: &ast::Item, interner: &Interner) -> bool {
 /// and the block is finished as `unreachable`. This is the rule the mid-function region scanner
 /// already applies (`scan_region_stmt`'s `Return`/`Break`/`Continue` arms).
 fn escapes_parallel_chunk_block(b: &Block, depth: u32) -> bool {
-    b.stmts.iter().any(|s| escapes_parallel_chunk_stmt(s, depth))
+    b.stmts
+        .iter()
+        .any(|s| escapes_parallel_chunk_stmt(s, depth))
         || b.tail
             .as_ref()
             .is_some_and(|e| escapes_parallel_chunk_expr(e, depth))
@@ -1499,7 +1824,8 @@ fn escapes_parallel_chunk_stmt(s: &Stmt, depth: u32) -> bool {
         }
         StmtKind::Expr(e) => escapes_parallel_chunk_expr(e, depth),
         StmtKind::While { cond, body, .. } => {
-            escapes_parallel_chunk_expr(cond, depth) || escapes_parallel_chunk_block(body, depth + 1)
+            escapes_parallel_chunk_expr(cond, depth)
+                || escapes_parallel_chunk_block(body, depth + 1)
         }
         StmtKind::For { iter, body, .. } => {
             let it = match iter {
@@ -1782,7 +2108,11 @@ fn lower_fn(
     // deep-copies the returned value into it. No aggregate ever rides in a register, so both backends
     // execute only pointer passing + copies they already support.
     let ret_is_agg = ty_is_aggregate(&ret_ty, sema);
-    let ret_mir = if ret_is_agg { MirType::Void } else { mir_ty(&ret_ty) };
+    let ret_mir = if ret_is_agg {
+        MirType::Void
+    } else {
+        mir_ty(&ret_ty)
+    };
 
     let mut fl = FnLowerer {
         builder: Builder::new(name, ret_mir.clone()),
@@ -2828,7 +3158,8 @@ impl FnLowerer<'_> {
         if self.enum_is_data_carrying(*sname) {
             return;
         }
-        let (Some(layout), Some(ftys)) = (self.struct_layout(*sname), self.struct_field_tys(*sname))
+        let (Some(layout), Some(ftys)) =
+            (self.struct_layout(*sname), self.struct_field_tys(*sname))
         else {
             return;
         };
@@ -2991,9 +3322,7 @@ impl FnLowerer<'_> {
                 Some(size) => MirType::Array(Box::new(MirType::I8), size as u32),
                 None => mir_ty(ty),
             },
-            Ty::Array { elem, len } => {
-                MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32)
-            }
+            Ty::Array { elem, len } => MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32),
             Ty::Tuple(_) => {
                 MirType::Array(Box::new(MirType::I8), self.ty_size(ty).unwrap_or(0) as u32)
             }
@@ -3461,10 +3790,7 @@ impl FnLowerer<'_> {
         let lv = self
             .builder
             .build(MirType::I64, Op::ConstInt(len as i128, MirType::I64));
-        self.builder.build_void(Op::Store {
-            ptr: lp,
-            value: lv,
-        });
+        self.builder.build_void(Op::Store { ptr: lp, value: lv });
     }
 
     /// Lower a call argument, applying the array→slice *unsizing* coercion when the parameter is a
@@ -3488,7 +3814,12 @@ impl FnLowerer<'_> {
 
     /// Allocate a fresh tagged-union buffer for `enum_sym::vname` and construct the variant into it,
     /// yielding the base pointer (the by-pointer aggregate convention — a value-position variant).
-    fn lower_enum_value(&mut self, enum_sym: Symbol, vname: Symbol, payload: VariantCtor) -> ValueId {
+    fn lower_enum_value(
+        &mut self,
+        enum_sym: Symbol,
+        vname: Symbol,
+        payload: VariantCtor,
+    ) -> ValueId {
         let size = self.enum_layout(enum_sym).map(|(s, _, _)| s).unwrap_or(4);
         let buf = self
             .builder
@@ -3520,7 +3851,9 @@ impl FnLowerer<'_> {
         match payload {
             VariantCtor::Unit => {}
             VariantCtor::Tuple(args) => {
-                let offsets = self.variant_field_offsets(enum_sym, vname).unwrap_or_default();
+                let offsets = self
+                    .variant_field_offsets(enum_sym, vname)
+                    .unwrap_or_default();
                 for (i, (off, fty)) in offsets.into_iter().enumerate() {
                     if let Some(arg) = args.get(i) {
                         let p = self.field_ptr(dst, off);
@@ -3591,7 +3924,13 @@ impl FnLowerer<'_> {
     /// initialized at its declared byte offset (literal field order may differ from declaration order
     /// — each value goes to its named field's offset). A field that is itself a struct/tuple/array
     /// recurses (or byte-copies) via `init_field`, so nested aggregates work.
-    fn lower_struct_init(&mut self, base: ValueId, sym: Symbol, fields: &[ast::FieldInit], span: Span) {
+    fn lower_struct_init(
+        &mut self,
+        base: ValueId,
+        sym: Symbol,
+        fields: &[ast::FieldInit],
+        span: Span,
+    ) {
         let Some(field_tys) = self.struct_field_tys(sym) else {
             self.unsupported(span, "struct with an unsized field");
             return;
@@ -3780,7 +4119,10 @@ impl FnLowerer<'_> {
             // miscompile both backends agreed on. A struct `Ty::Named` stays unsigned (never a cast
             // operand); only an `enum` discriminant is signed.
             Ty::Named(sym) => {
-                matches!(self.sema.defs.lookup(sym).map(|d| &d.kind), Some(DefKind::Enum(_)))
+                matches!(
+                    self.sema.defs.lookup(sym).map(|d| &d.kind),
+                    Some(DefKind::Enum(_))
+                )
             }
             _ => false,
         }
@@ -3871,7 +4213,8 @@ impl FnLowerer<'_> {
             }
             // LayerNorm / RMSNorm / L2-norm accept the out-of-place form `out = norm(x)` (`dst != arr`),
             // the residual-stream transformer pattern, as well as the in-place form (`dst == arr`).
-            if let Some((n, arr, dst, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i, None) {
+            if let Some((n, arr, dst, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i, None)
+            {
                 if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
                     i += n;
                     continue;
@@ -4804,7 +5147,10 @@ impl FnLowerer<'_> {
             return None;
         };
         if args.len() != 1
-            || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Exp))
+            || !matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Exp)
+            )
         {
             return None;
         }
@@ -4830,7 +5176,10 @@ impl FnLowerer<'_> {
             return None;
         };
         if args.len() == 1
-            && matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Log))
+            && matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Log)
+            )
             && single_path(&args[0]) == Some(s)
         {
             Some(name)
@@ -4937,7 +5286,10 @@ impl FnLowerer<'_> {
         let is_log_s = |x: &Expr| match &x.kind {
             ExprKind::Call { callee, args, .. } => {
                 args.len() == 1
-                    && matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Log))
+                    && matches!(
+                        self.vectorizable_intrinsic(callee),
+                        Some(MathIntrinsic::Log)
+                    )
                     && single_path(&args[0]) == Some(s)
             }
             _ => false,
@@ -5013,7 +5365,12 @@ impl FnLowerer<'_> {
     /// gate is trivial (like the transpose). The naive source has no bounds check, so the emitter passes a
     /// large `V` sentinel and the kernel's out-of-range→zero clamp never fires for in-range ids. Pure
     /// (`&self`).
-    fn match_embedding(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<EmbeddingNest> {
+    fn match_embedding(
+        &self,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &Block,
+    ) -> Option<EmbeddingNest> {
         // for t in 0..T { <single inner for> }
         let ast::PatKind::Ident(t) = &pat.kind else {
             return None;
@@ -5138,9 +5495,7 @@ impl FnLowerer<'_> {
         } else {
             return None;
         };
-        Some(ids)
-            .map(|i| (weight, i))
-            .filter(|(w, i)| w != i)
+        Some(ids).map(|i| (weight, i)).filter(|(w, i)| w != i)
     }
 
     /// Match `ids[t]` — a single-index read of an `i32` array `ids` at exactly the outer var `t` (an
@@ -5186,7 +5541,9 @@ impl FnLowerer<'_> {
         // `emit_nonoverlapping_call`, which picks the serial kernel when they may.
         match (parallel, nest.w_total) {
             (true, Some(w_total)) => {
-                let out_elems = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, t_rows, h));
+                let out_elems = self
+                    .builder
+                    .build(MirType::I64, Op::Bin(BinOp::Mul, t_rows, h));
                 let w_elems = self
                     .builder
                     .build(MirType::I64, Op::ConstInt(w_total as i128, MirType::I64));
@@ -5245,7 +5602,9 @@ impl FnLowerer<'_> {
             let bytes = me
                 .builder
                 .build(MirType::I64, Op::Bin(BinOp::Mul, elems, esize));
-            let hi = me.builder.build(MirType::I64, Op::Bin(BinOp::Add, lo, bytes));
+            let hi = me
+                .builder
+                .build(MirType::I64, Op::Bin(BinOp::Add, lo, bytes));
             (lo, hi)
         };
         let (a_lo, a_hi) = range(self, a, a_elems);
@@ -5378,7 +5737,9 @@ impl FnLowerer<'_> {
         let total = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.total as i128, MirType::I64));
-        let v = self.builder.build(MirType::I64, Op::Bin(BinOp::UDiv, total, h));
+        let v = self
+            .builder
+            .build(MirType::I64, Op::Bin(BinOp::UDiv, total, h));
         let args = vec![grad_w, grad_out, ids, t_rows, h, v];
         if parallel {
             // The parallel scatter accumulates into `grad_w` from several cores while every core reads
@@ -5420,7 +5781,10 @@ impl FnLowerer<'_> {
             return false;
         };
         if args.len() != 1
-            || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Exp))
+            || !matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Exp)
+            )
         {
             return false;
         }
@@ -5508,7 +5872,8 @@ impl FnLowerer<'_> {
             return None;
         }
         let (z, z0) = Self::let_init(&body.stmts[2])?;
-        if !matches!(&z0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0) {
+        if !matches!(&z0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
+        {
             return None;
         }
         let (v3, n3, body3) = self.as_range0_for(&body.stmts[3])?;
@@ -5540,7 +5905,8 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if !matches!(&rhs.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0) {
+        if !matches!(&rhs.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0)
+        {
             return None;
         }
         if self.match_xent_gather(lhs, dx, r, n_expr)? != target {
@@ -5565,7 +5931,12 @@ impl FnLowerer<'_> {
     /// same softmax max + Σexp prefix (shared matchers), then a per-row scalar store `out[r] = m + log(s)`.
     /// C/Rust keep the expf reduction scalar; the fused 256-bit kernel wins. Reductions reassociate (the
     /// documented exception — both backends run the kernel), so the gate holds.
-    fn match_logsumexp(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<LogsumexpNest> {
+    fn match_logsumexp(
+        &self,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &Block,
+    ) -> Option<LogsumexpNest> {
         let ast::PatKind::Ident(r) = &pat.kind else {
             return None;
         };
@@ -5610,12 +5981,7 @@ impl FnLowerer<'_> {
         if out == x {
             return None;
         }
-        Some(LogsumexpNest {
-            x,
-            out,
-            rows,
-            cols,
-        })
+        Some(LogsumexpNest { x, out, rows, cols })
     }
 
     /// Recognize a batched per-row argmax/argmin returning an **index** (the classification-head / greedy-
@@ -5688,9 +6054,7 @@ impl FnLowerer<'_> {
         let ExprKind::Index { base, indices } = &bv_init.kind else {
             return None;
         };
-        if indices.len() != 1
-            || !self.is_mul_of(&indices[0], r, je)
-            || single_path(base) != Some(x)
+        if indices.len() != 1 || !self.is_mul_of(&indices[0], r, je) || single_path(base) != Some(x)
         {
             return None;
         }
@@ -5837,13 +6201,9 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        let (_acc, x, out, cols) = self.match_cumsum_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
-        Some(CumsumNest {
-            x,
-            out,
-            rows,
-            cols,
-        })
+        let (_acc, x, out, cols) =
+            self.match_cumsum_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        Some(CumsumNest { x, out, rows, cols })
     }
 
     /// The `let acc = 0.0; for i in 0..C { acc = acc + x[<row·C>+i]; out[<row·C>+i] = acc }` pair
@@ -5938,13 +6298,9 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        let (_p, x, out, cols) = self.match_cumprod_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
-        Some(CumsumNest {
-            x,
-            out,
-            rows,
-            cols,
-        })
+        let (_p, x, out, cols) =
+            self.match_cumprod_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        Some(CumsumNest { x, out, rows, cols })
     }
 
     /// The `let p = 1.0; for i in 0..C { p = p * x[<row·C>+i]; out[<row·C>+i] = p }` pair shared by
@@ -6134,7 +6490,8 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        let (_h, a, b, out, cols) = self.match_lrscan_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        let (_h, a, b, out, cols) =
+            self.match_lrscan_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
         Some(LrscanNest {
             a,
             b,
@@ -6305,7 +6662,12 @@ impl FnLowerer<'_> {
     /// gcc/rustc keep the loop-carried `out[i]=fmax(out[i-1],x[i])` scalar; the SIMD in-lane max/min scan
     /// vectorizes it. **No reassociation** — max/min select an input value, so the kernel is *bit-exact*
     /// vs the scalar scan (unlike cumsum). `out` is f32, distinct from `x`. Pure (`&self`).
-    fn match_cumminmax(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<CumMinMaxNest> {
+    fn match_cumminmax(
+        &self,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &Block,
+    ) -> Option<CumMinMaxNest> {
         let ast::PatKind::Ident(r) = &pat.kind else {
             return None;
         };
@@ -6392,7 +6754,8 @@ impl FnLowerer<'_> {
             return None;
         };
         let out = self.index_off(ot, i, batch)?;
-        if single_path(ov) != Some(m) || scalar_of(ot, self.sema) != Some(wukong_types::Scalar::F32) {
+        if single_path(ov) != Some(m) || scalar_of(ot, self.sema) != Some(wukong_types::Scalar::F32)
+        {
             return None;
         }
         Some((x, out, is_max))
@@ -6447,11 +6810,20 @@ impl FnLowerer<'_> {
     }
 
     /// Match `log(arr[r*C+v])` → the indexed array `arr` (a single-arg `log` call over a row-major read).
-    fn match_log_index(&self, e: &Expr, v: Symbol, batch: Option<(Symbol, &Expr)>) -> Option<Symbol> {
+    fn match_log_index(
+        &self,
+        e: &Expr,
+        v: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
         let ExprKind::Call { callee, args, .. } = &e.kind else {
             return None;
         };
-        if args.len() != 1 || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Log))
+        if args.len() != 1
+            || !matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Log)
+            )
         {
             return None;
         }
@@ -6482,7 +6854,8 @@ impl FnLowerer<'_> {
             return None;
         }
         let (s, s0) = Self::let_init(&body.stmts[0])?;
-        if !matches!(&s0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0) {
+        if !matches!(&s0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
+        {
             return None;
         }
         let (iv, n_expr, b1) = self.as_range0_for(&body.stmts[1])?;
@@ -6610,12 +6983,7 @@ impl FnLowerer<'_> {
         if out == p {
             return None;
         }
-        Some(EntropyNest {
-            p,
-            out,
-            rows,
-            cols,
-        })
+        Some(EntropyNest { p, out, rows, cols })
     }
 
     /// Recognize the **batched soft-label cross-entropy** (distillation loss) `out[r] = Σ_i q[r,i]·(lse
@@ -6644,7 +7012,8 @@ impl FnLowerer<'_> {
             return None;
         }
         let (z, z0) = Self::let_init(&body.stmts[2])?;
-        if !matches!(&z0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0) {
+        if !matches!(&z0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
+        {
             return None;
         }
         let (v3, n3, body3) = self.as_range0_for(&body.stmts[3])?;
@@ -6656,7 +7025,8 @@ impl FnLowerer<'_> {
         self.match_m_plus_log(lse0, m, z)?;
         // [5] let s = 0.0;  [6] for i { s = s + q[r*C+i]*(lse - x[r*C+i]) };  [7] out[r] = s
         let (s, s0) = Self::let_init(&body.stmts[5])?;
-        if !matches!(&s0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0) {
+        if !matches!(&s0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
+        {
             return None;
         }
         let (v6, n6, body6) = self.as_range0_for(&body.stmts[6])?;
@@ -6893,7 +7263,10 @@ impl FnLowerer<'_> {
         }
         let sym = single_path(e)?;
         for st in prior.iter().rev() {
-            let StmtKind::Let { pat, init, mutable, .. } = &st.kind else {
+            let StmtKind::Let {
+                pat, init, mutable, ..
+            } = &st.kind
+            else {
                 continue;
             };
             if !matches!(&pat.kind, ast::PatKind::Ident(n) if *n == sym) {
@@ -7189,7 +7562,10 @@ impl FnLowerer<'_> {
             return None;
         };
         if args.len() != 1
-            || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Sqrt))
+            || !matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Sqrt)
+            )
         {
             return None;
         }
@@ -7244,7 +7620,15 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(
+        usize,
+        Symbol,
+        Symbol,
+        Expr,
+        i64,
+        Option<Symbol>,
+        Option<Symbol>,
+    )> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 7 {
             return None;
@@ -7312,7 +7696,15 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(
+        usize,
+        Symbol,
+        Symbol,
+        Expr,
+        i64,
+        Option<Symbol>,
+        Option<Symbol>,
+    )> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 4 {
             return None;
@@ -7327,14 +7719,14 @@ impl FnLowerer<'_> {
         let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
         // Reciprocal-multiply binding (`let inv = 1/sqrt(ms+eps)` → `x*inv`), or the textbook
         // plain-RMS divide (`let rms = sqrt(ms+eps)` → `x/rms`) — never mixed.
-        let (den, div, eps_bits) = match self.match_inv_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2])
-        {
-            Some((inv, e)) => (inv, false, e),
-            None => {
-                let (rms, e) = self.match_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2])?;
-                (rms, true, e)
-            }
-        };
+        let (den, div, eps_bits) =
+            match self.match_inv_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2]) {
+                Some((inv, e)) => (inv, false, e),
+                None => {
+                    let (rms, e) = self.match_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2])?;
+                    (rms, true, e)
+                }
+            };
         let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
         if !exprs_struct_eq(n3, n_expr) {
             return None;
@@ -7396,7 +7788,10 @@ impl FnLowerer<'_> {
             return None;
         };
         if args.len() != 1
-            || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Sqrt))
+            || !matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Sqrt)
+            )
         {
             return None;
         }
@@ -7447,7 +7842,15 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(
+        usize,
+        Symbol,
+        Symbol,
+        Expr,
+        i64,
+        Option<Symbol>,
+        Option<Symbol>,
+    )> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 4 {
             return None;
@@ -7570,13 +7973,20 @@ impl FnLowerer<'_> {
                             if self.enum_is_data_carrying(sym) {
                                 // `let x = Enum::Variant { .. }` — construct the tagged union in place.
                                 let vname = path.segments.last().unwrap().sym;
-                                self.construct_enum_into(slot, sym, vname, VariantCtor::Struct(fields));
+                                self.construct_enum_into(
+                                    slot,
+                                    sym,
+                                    vname,
+                                    VariantCtor::Struct(fields),
+                                );
                             } else {
                                 self.lower_struct_init(slot, sym, fields, e.span);
                             }
                         }
-                    } else if matches!(&e.kind, ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. })
-                    {
+                    } else if matches!(
+                        &e.kind,
+                        ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
+                    ) {
                         if let MirType::Array(elem, n) = &mty {
                             self.lower_array_init(slot, elem, *n, e);
                         }
@@ -7907,7 +8317,9 @@ impl FnLowerer<'_> {
             return false;
         }
         // Lower the bounds and run the vectorized loop over `[start, N)` with a fresh index slot.
-        let start_val = self.builder.build(ity.clone(), Op::Load(islot, ity.clone()));
+        let start_val = self
+            .builder
+            .build(ity.clone(), Op::Load(islot, ity.clone()));
         let end_ty = self.expr_mir(rhs);
         let e0 = self.lower_expr(rhs);
         let end_val = self.coerce_to(e0, &end_ty, &ity, true);
@@ -7937,8 +8349,7 @@ impl FnLowerer<'_> {
         if single_path(target) != Some(i) {
             return false;
         }
-        let is_one =
-            |e: &Expr| matches!(&e.kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 1);
+        let is_one = |e: &Expr| matches!(&e.kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 1);
         match op {
             ast::AssignOp::Add => is_one(value),
             ast::AssignOp::Assign => matches!(&value.kind,
@@ -8065,7 +8476,8 @@ impl FnLowerer<'_> {
         // the first 8 bytes of its own data matrix as a base pointer.
         let is_slice = self.slice_slots.contains(&val);
         Some(if matches!(ty, MirType::Ptr) || is_slice {
-            self.builder.build(MirType::Ptr, Op::Load(val, MirType::Ptr))
+            self.builder
+                .build(MirType::Ptr, Op::Load(val, MirType::Ptr))
         } else {
             val
         })
@@ -8315,7 +8727,8 @@ impl FnLowerer<'_> {
         let Some([w, a, out]) = self.kernel_base_ptrs([nest.w, nest.a, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let Some(alpha_v) = self.alpha_value(nest.alpha.unwrap_or(AlphaScale::Lit(1.0))) else {
@@ -8445,7 +8858,8 @@ impl FnLowerer<'_> {
         let Some([src, dst]) = self.kernel_base_ptrs([nest.src, nest.dst]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = match (parallel, nest.elem_u16) {
@@ -8469,7 +8883,8 @@ impl FnLowerer<'_> {
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = match (nest.op, parallel) {
@@ -8505,7 +8920,8 @@ impl FnLowerer<'_> {
         let Some([y, dy, dx]) = self.kernel_base_ptrs([nest.y, nest.dy, nest.dx]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8530,7 +8946,8 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let eps = self.builder.build(
@@ -8557,7 +8974,8 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let eps = self.builder.build(
@@ -8584,7 +9002,8 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8605,7 +9024,8 @@ impl FnLowerer<'_> {
         let Some([x, target, dx]) = self.kernel_base_ptrs([nest.x, nest.target, nest.dx]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8628,7 +9048,8 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let (Some(rows), Some(half)) = (self.dim_value(nest.rows), self.dim_value(nest.half)) else {
+        let (Some(rows), Some(half)) = (self.dim_value(nest.rows), self.dim_value(nest.half))
+        else {
             return false;
         };
         let func = match (nest.backward, parallel) {
@@ -8650,7 +9071,8 @@ impl FnLowerer<'_> {
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8671,7 +9093,8 @@ impl FnLowerer<'_> {
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = match (nest.is_max, parallel) {
@@ -8693,7 +9116,8 @@ impl FnLowerer<'_> {
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = match (nest.is_max, parallel) {
@@ -8715,7 +9139,8 @@ impl FnLowerer<'_> {
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8736,7 +9161,8 @@ impl FnLowerer<'_> {
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8758,7 +9184,8 @@ impl FnLowerer<'_> {
         let Some([a, b, out]) = self.kernel_base_ptrs([nest.a, nest.b, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8778,7 +9205,8 @@ impl FnLowerer<'_> {
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = match (nest.is_max, parallel) {
@@ -8799,7 +9227,8 @@ impl FnLowerer<'_> {
         let Some([p, q, out]) = self.kernel_base_ptrs([nest.p, nest.q, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8819,7 +9248,8 @@ impl FnLowerer<'_> {
         let Some([p, out]) = self.kernel_base_ptrs([nest.p, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8839,7 +9269,8 @@ impl FnLowerer<'_> {
         let Some([x, q, out]) = self.kernel_base_ptrs([nest.x, nest.q, nest.out]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         let func = if parallel {
@@ -8861,7 +9292,12 @@ impl FnLowerer<'_> {
     /// kernel widens A/B losslessly and runs the f32 `nt_epi` epilogue, so fused == the f32 fused FFN on
     /// the widened operands; in a `@parallel` function the multicore kernel runs (each C tile owned by
     /// one task → bit-identical to the serial kernel the interpreter marshals).
-    fn emit_lowp_gemm_epi(&mut self, nest: &LowpMatmulNest, bias: Option<Symbol>, act: u32) -> bool {
+    fn emit_lowp_gemm_epi(
+        &mut self,
+        nest: &LowpMatmulNest,
+        bias: Option<Symbol>,
+        act: u32,
+    ) -> bool {
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -9140,12 +9576,7 @@ impl FnLowerer<'_> {
     /// Like `emit_sgemm_residual_src`, every operand and dimension is resolved BEFORE anything is
     /// emitted: a bail between the two calls would leave a GEMM whose second output never happened,
     /// and recognizers are gate-blind.
-    fn emit_sgemm_dual_store(
-        &mut self,
-        nest: &MatmulNest<'_>,
-        d: Symbol,
-        velem_op: i64,
-    ) -> bool {
+    fn emit_sgemm_dual_store(&mut self, nest: &MatmulNest<'_>, d: Symbol, velem_op: i64) -> bool {
         if !nest.transposed
             || nest.transposed_a
             || nest.alpha.is_some()
@@ -9498,7 +9929,10 @@ impl FnLowerer<'_> {
             // folds by fmax; here the kernel abs's each element and folds by `+`.
             ExprKind::Call { callee, args, .. }
                 if args.len() == 1
-                    && matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Abs)) =>
+                    && matches!(
+                        self.vectorizable_intrinsic(callee),
+                        Some(MathIntrinsic::Abs)
+                    ) =>
             {
                 let inner = &args[0];
                 if let Some(a) = idx_base(inner) {
@@ -9609,7 +10043,13 @@ impl FnLowerer<'_> {
     /// The reconcile is guarded by `ki >= 0` so that case neither stores nor forms the address `x[-1]`.
     /// Both backends marshal the identical kernel, so the differential oracle stays exact. Returns
     /// false (fall back to the scalar loop) on any mismatch.
-    fn try_emit_argreduce(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
+    fn try_emit_argreduce(
+        &mut self,
+        pat: &Pattern,
+        start: &Expr,
+        end: &Expr,
+        body: &Block,
+    ) -> bool {
         // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
         // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
         if const_usize_expr(start, self.interner, self.sema) != Some(0) {
@@ -9683,7 +10123,9 @@ impl FnLowerer<'_> {
                 elem: MirType::F32,
             },
         );
-        let kv = self.builder.build(MirType::F32, Op::Load(kptr, MirType::F32));
+        let kv = self
+            .builder
+            .build(MirType::F32, Op::Load(kptr, MirType::F32));
         // Reconcile with the running (bv, bi): better = (kv CMP bv), the loop's own strict compare.
         let bv_cur = self
             .builder
@@ -9696,9 +10138,7 @@ impl FnLowerer<'_> {
         } else {
             CmpOp::Folt
         };
-        let better = self
-            .builder
-            .build(MirType::I1, Op::Cmp(pred, kv, bv_cur));
+        let better = self.builder.build(MirType::I1, Op::Cmp(pred, kv, bv_cur));
         let ki_bi = self.coerce_to(ki, &MirType::I64, &bi_ty, true);
         let new_bv = self
             .builder
@@ -10202,7 +10642,8 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby_narrow(body, *k) else {
+        let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby_narrow(body, *k)
+        else {
             return false;
         };
         let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
@@ -10491,7 +10932,15 @@ impl FnLowerer<'_> {
         pat: &Pattern,
         iter: &ForIter,
         body: &Block,
-    ) -> Option<(Symbol, Symbol, Expr, i64, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(
+        Symbol,
+        Symbol,
+        Expr,
+        i64,
+        i64,
+        Option<Symbol>,
+        Option<Symbol>,
+    )> {
         let ForIter::Range {
             start,
             end: Some(_),
@@ -10938,16 +11387,19 @@ impl FnLowerer<'_> {
         // widens with the counter. The `@parallel` range path already drives by the end's type.
         let sty = self.expr_mir(start);
         let ety = self.expr_mir(end);
-        let (ity, signed) = if ety.is_int() && sty.is_int() && mir_byte_size(&ety) > mir_byte_size(&sty)
-        {
-            (ety.clone(), self.signed(end))
-        } else {
-            // The counter's signedness must consider BOTH bounds (see `forces_unsigned_cmp`).
-            // Reading it off the START alone drove `for i in 0..n` with `n: u32 = 3_000_000_000`
-            // as `cmp.slt i, -1294967296`, so the loop ran zero iterations; the `u64` form was
-            // right only because its end is strictly wider and takes the branch above.
-            (sty.clone(), self.signed(start) && !self.forces_unsigned_cmp(end, &sty))
-        };
+        let (ity, signed) =
+            if ety.is_int() && sty.is_int() && mir_byte_size(&ety) > mir_byte_size(&sty) {
+                (ety.clone(), self.signed(end))
+            } else {
+                // The counter's signedness must consider BOTH bounds (see `forces_unsigned_cmp`).
+                // Reading it off the START alone drove `for i in 0..n` with `n: u32 = 3_000_000_000`
+                // as `cmp.slt i, -1294967296`, so the loop ran zero iterations; the `u64` form was
+                // right only because its end is strictly wider and takes the branch above.
+                (
+                    sty.clone(),
+                    self.signed(start) && !self.forces_unsigned_cmp(end, &sty),
+                )
+            };
 
         // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
         // `wukong_argreduce_f32` call + a branchless reconcile. Tried before the vectorizer (which
@@ -11497,8 +11949,7 @@ impl FnLowerer<'_> {
                     sc.ok = false; // indexing something that is not a runtime binding
                     return;
                 }
-                if !self.region_capture(bsym, sc)
-                    || !matches!(self.expr_ty(base), Ty::Array { .. })
+                if !self.region_capture(bsym, sc) || !matches!(self.expr_ty(base), Ty::Array { .. })
                 {
                     sc.ok = false;
                     return;
@@ -12136,7 +12587,11 @@ impl FnLowerer<'_> {
         let ExprKind::Call { callee, args, .. } = &gate.kind else {
             return None;
         };
-        if args.len() != 1 || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Sigmoid))
+        if args.len() != 1
+            || !matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Sigmoid)
+            )
         {
             return None;
         }
@@ -12319,7 +12774,9 @@ impl FnLowerer<'_> {
         let cty = self.expr_mir(cols);
         let cv = self.lower_expr(cols);
         let cv = self.coerce_to(cv, &cty, &MirType::I64, true);
-        let total = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, rv, cv));
+        let total = self
+            .builder
+            .build(MirType::I64, Op::Bin(BinOp::Mul, rv, cv));
         let zero = self
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
@@ -12356,14 +12813,26 @@ impl FnLowerer<'_> {
     /// kernel's `apply1` expects). Pure.
     fn peel_bias_act<'b>(&self, value: &'b Expr) -> Option<(&'b Expr, i64)> {
         // Bare additive form → identity.
-        if matches!(&value.kind, ExprKind::Binary { op: ast::BinOp::Add, .. }) {
+        if matches!(
+            &value.kind,
+            ExprKind::Binary {
+                op: ast::BinOp::Add,
+                ..
+            }
+        ) {
             return Some((value, BIAS_ACT_NONE));
         }
         // Transcendental activation call `f(add)`.
         if let ExprKind::Call { callee, args, .. } = &value.kind {
             if args.len() == 1 {
                 if let Some(code) = self.bias_activation_code(callee) {
-                    if matches!(&args[0].kind, ExprKind::Binary { op: ast::BinOp::Add, .. }) {
+                    if matches!(
+                        &args[0].kind,
+                        ExprKind::Binary {
+                            op: ast::BinOp::Add,
+                            ..
+                        }
+                    ) {
                         return Some((&args[0], code));
                     }
                 }
@@ -12372,7 +12841,13 @@ impl FnLowerer<'_> {
         // ReLU `if add > 0 { add } else { 0 }` — reuse the velem peel, remap VE_RELU → VMATH_RELU.
         if let Some((inner, act)) = self.peel_velem_act(value) {
             if act == VE_RELU
-                && matches!(&inner.kind, ExprKind::Binary { op: ast::BinOp::Add, .. })
+                && matches!(
+                    &inner.kind,
+                    ExprKind::Binary {
+                        op: ast::BinOp::Add,
+                        ..
+                    }
+                )
             {
                 return Some((inner, VMATH_RELU));
             }
@@ -12981,9 +13456,10 @@ impl FnLowerer<'_> {
         let x_base = self
             .kernel_base_ptr(plan.x)
             .expect("velem `x` operand validated in matcher");
-        let y_base = plan
-            .y
-            .map(|y| self.kernel_base_ptr(y).expect("velem `y` operand validated in matcher"));
+        let y_base = plan.y.map(|y| {
+            self.kernel_base_ptr(y)
+                .expect("velem `y` operand validated in matcher")
+        });
         let out_base = self
             .kernel_base_ptr(plan.out)
             .expect("velem `out` operand validated in matcher");
@@ -13057,7 +13533,11 @@ impl FnLowerer<'_> {
             return (value, DQ_ID);
         };
         // ReLU: fmax(INNER, 0.0) / fmax(0.0, INNER).
-        if args.len() == 2 && matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Fmax))
+        if args.len() == 2
+            && matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Fmax)
+            )
         {
             let is_zero = |e: &Expr| {
                 matches!(&e.kind, ExprKind::Float(t)
@@ -13323,15 +13803,14 @@ impl FnLowerer<'_> {
             return None;
         };
         // `(q[i*C+j] as f32) · scale[j]`, either factor order.
-        let (q_sym, q_elem, width, scale_sym) = if let Some((q, el, w)) =
-            self.dequant_cast_operand_batched(lhs, j, batch)
-        {
-            (q, el, w, self.perchan_scale_operand(rhs, j)?)
-        } else if let Some((q, el, w)) = self.dequant_cast_operand_batched(rhs, j, batch) {
-            (q, el, w, self.perchan_scale_operand(lhs, j)?)
-        } else {
-            return None;
-        };
+        let (q_sym, q_elem, width, scale_sym) =
+            if let Some((q, el, w)) = self.dequant_cast_operand_batched(lhs, j, batch) {
+                (q, el, w, self.perchan_scale_operand(rhs, j)?)
+            } else if let Some((q, el, w)) = self.dequant_cast_operand_batched(rhs, j, batch) {
+                (q, el, w, self.perchan_scale_operand(lhs, j)?)
+            } else {
+                return None;
+            };
         Some(DequantPerchanNest {
             out: out_sym,
             q: q_sym,
@@ -13351,7 +13830,8 @@ impl FnLowerer<'_> {
         let Some([q, out, scale]) = self.kernel_base_ptrs([nest.q, nest.out, nest.scale]) else {
             return false;
         };
-        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
+        else {
             return false;
         };
         // The GEP element type does not matter here (offset 0 — the whole matrix), but the kernel needs
@@ -14214,7 +14694,9 @@ impl FnLowerer<'_> {
                     let vi = self.rec_value(value, j, &locals, &mut r)?;
                     match &target.kind {
                         // reassign an inner temp (Horner-style `r = r*v + c`).
-                        ExprKind::Path(p) if p.is_single() && locals.contains_key(&p.first().sym) => {
+                        ExprKind::Path(p)
+                            if p.is_single() && locals.contains_key(&p.first().sym) =>
+                        {
                             locals.insert(p.first().sym, vi);
                         }
                         // store to a unit-stride array element.
@@ -14413,7 +14895,9 @@ impl FnLowerer<'_> {
         // a short/empty loop runs entirely in the scalar tail and the kernel is never entered).
         let s64 = self.coerce_to(s0, ity, &MirType::I64, true);
         let e64 = self.coerce_to(end_v, ity, &MirType::I64, true);
-        let trip = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
+        let trip = self
+            .builder
+            .build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
         let neg8 = self
             .builder
             .build(MirType::I64, Op::ConstInt(-8, MirType::I64));
@@ -14444,9 +14928,10 @@ impl FnLowerer<'_> {
         self.bind(j, jslot, ity.clone());
 
         // ptrs[k] = &base_k[start + offset_k] — one entry per stream, offset to the loop start.
-        let ptrs = self
-            .builder
-            .alloca(MirType::Array(Box::new(MirType::Ptr), recipe.streams.len() as u32));
+        let ptrs = self.builder.alloca(MirType::Array(
+            Box::new(MirType::Ptr),
+            recipe.streams.len() as u32,
+        ));
         for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
             let base = self.lookup(*base_sym).expect("stream base in scope").0;
             let idxv = self.lower_expr(idx_expr);
@@ -14821,7 +15306,9 @@ impl FnLowerer<'_> {
         // n = largest multiple of 8 ≤ trip count (0 if under 8 / negative), like the elementwise path.
         let s64 = self.coerce_to(s0, ity, &MirType::I64, true);
         let e64 = self.coerce_to(end_v, ity, &MirType::I64, true);
-        let trip = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
+        let trip = self
+            .builder
+            .build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
         let neg8 = self
             .builder
             .build(MirType::I64, Op::ConstInt(-8, MirType::I64));
@@ -14852,9 +15339,10 @@ impl FnLowerer<'_> {
 
         // ptrs[k] = &base_k[start + offset_k]; scalars[k] = the k-th invariant f32 (as the elementwise
         // emitter does).
-        let ptrs = self
-            .builder
-            .alloca(MirType::Array(Box::new(MirType::Ptr), recipe.streams.len() as u32));
+        let ptrs = self.builder.alloca(MirType::Array(
+            Box::new(MirType::Ptr),
+            recipe.streams.len() as u32,
+        ));
         for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
             let base = self.lookup(*base_sym).expect("stream base in scope").0;
             let idxv = self.lower_expr(idx_expr);
@@ -16091,8 +16579,7 @@ impl FnLowerer<'_> {
             // treats the whole `if` as diverging and emits no fallthrough `ret` carrying this dead
             // placeholder — which, mistyped as `i32` for a non-i32 return, was a -O0 MIR-verify ICE
             // while -O1+ deleted the dead block before verification (a -O0 ≠ -O{1,2,3} gate violation).
-            self.builder
-                .set_term(wukong_mir::Terminator::Unreachable);
+            self.builder.set_term(wukong_mir::Terminator::Unreachable);
             self.terminated = true;
         }
         result
@@ -16127,7 +16614,10 @@ impl FnLowerer<'_> {
                             elems.len()
                         ))
                         .with_code("E0401")
-                        .primary(init.span, "initializer length does not match the destination"),
+                        .primary(
+                            init.span,
+                            "initializer length does not match the destination",
+                        ),
                     );
                 }
                 for (i, el) in elems.iter().take(n as usize).enumerate() {
@@ -16475,7 +16965,9 @@ impl FnLowerer<'_> {
             let iv = self.lower_index_i64(ix);
             let term = match st {
                 None => iv, // innermost axis, unit stride
-                Some(s) => self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, iv, *s)),
+                Some(s) => self
+                    .builder
+                    .build(MirType::I64, Op::Bin(BinOp::Mul, iv, *s)),
             };
             flat = Some(match flat {
                 None => term,
@@ -16628,7 +17120,9 @@ impl FnLowerer<'_> {
                             .build(MirType::I8, Op::ConstInt(*b as i128, MirType::I8));
                         self.store_element(base, &elem, i as i128, v);
                     }
-                    let nul = self.builder.build(MirType::I8, Op::ConstInt(0, MirType::I8));
+                    let nul = self
+                        .builder
+                        .build(MirType::I8, Op::ConstInt(0, MirType::I8));
                     self.store_element(base, &elem, bytes.len() as i128, nul);
                     base
                 }
@@ -16738,9 +17232,7 @@ impl FnLowerer<'_> {
                 else_branch,
             } => self.lower_if_value(cond, then_branch, else_branch.as_deref(), e),
             ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms, e),
-            ExprKind::Loop { label, body } => {
-                self.lower_loop_value(label.map(|l| l.sym), body, e)
-            }
+            ExprKind::Loop { label, body } => self.lower_loop_value(label.map(|l| l.sym), body, e),
             _ => {
                 self.unsupported(e.span, "expression");
                 let t = self.expr_mir(e);
@@ -16789,7 +17281,8 @@ impl FnLowerer<'_> {
                 // Always matches: lower the body directly, then the remaining arms are unreachable.
                 self.push_scope();
                 self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
-                merge_reachable |= self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
+                merge_reachable |=
+                    self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
                 self.pop_scope();
                 handled_default = true;
                 break;
@@ -16803,8 +17296,7 @@ impl FnLowerer<'_> {
             self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
             let cond =
                 self.match_arm_cond(&arm.pat, scrut, &scrut_mir, &scrut_ty, arm.guard.as_ref());
-            self.builder
-                .cond_br(cond, body_bb, vec![], next_bb, vec![]);
+            self.builder.cond_br(cond, body_bb, vec![], next_bb, vec![]);
 
             self.builder.switch_to(body_bb);
             self.terminated = false;
@@ -16827,9 +17319,7 @@ impl FnLowerer<'_> {
         // to `merge`, so the merge param never lacks a provider.)
         if !handled_default && !self.terminated {
             match merge_param {
-                Some(_) => self
-                    .builder
-                    .set_term(wukong_mir::Terminator::Unreachable),
+                Some(_) => self.builder.set_term(wukong_mir::Terminator::Unreachable),
                 None => {
                     self.builder.br(merge, vec![]);
                     merge_reachable = true;
@@ -16855,8 +17345,7 @@ impl FnLowerer<'_> {
             // treats the whole `match` as diverging and emits no fallthrough `ret` carrying this dead
             // placeholder — which, mistyped as `i32` for a non-i32 return, was a -O0 MIR-verify ICE
             // while -O1+ deleted the dead block before verification (a -O0 ≠ -O{1,2,3} gate violation).
-            self.builder
-                .set_term(wukong_mir::Terminator::Unreachable);
+            self.builder.set_term(wukong_mir::Terminator::Unreachable);
             self.terminated = true;
         }
         result
@@ -16921,9 +17410,14 @@ impl FnLowerer<'_> {
                     if matches!(fmty, MirType::Array(..)) {
                         self.bind_slice(*name, fptr, fmty, is_slice);
                     } else {
-                        let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
+                        let val = self
+                            .builder
+                            .build(fmty.clone(), Op::Load(fptr, fmty.clone()));
                         let slot = self.builder.alloca(fmty.clone());
-                        self.builder.build_void(Op::Store { ptr: slot, value: val });
+                        self.builder.build_void(Op::Store {
+                            ptr: slot,
+                            value: val,
+                        });
                         self.bind_slice(*name, slot, fmty, is_slice);
                     }
                 }
@@ -16956,7 +17450,9 @@ impl FnLowerer<'_> {
             }
             (Some(pc), None) => pc,
             (None, Some(g)) => self.lower_bool_cond(g),
-            (None, None) => self.builder.build(MirType::I1, Op::ConstInt(1, MirType::I1)),
+            (None, None) => self
+                .builder
+                .build(MirType::I1, Op::ConstInt(1, MirType::I1)),
         }
     }
 
@@ -16980,18 +17476,30 @@ impl FnLowerer<'_> {
                     v = -v;
                 }
                 let Some(c) = self.pattern_const(v, scrut_mir, scrut_ty, pat.span) else {
-                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                    return Some(
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+                    );
                 };
-                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+                Some(
+                    self.builder
+                        .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
+                )
             }
             // A char-literal pattern compares the scrutinee (a `char` is its integer code point) to
             // the literal's decoded code point — the same equality test as an integer-literal pattern.
             ast::PatKind::Char(sym) => {
                 let v = decode_char_literal(self.interner.resolve(*sym)) as i128;
                 let Some(c) = self.pattern_const(v, scrut_mir, scrut_ty, pat.span) else {
-                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                    return Some(
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+                    );
                 };
-                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+                Some(
+                    self.builder
+                        .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
+                )
             }
             // A bool pattern's constant is `i1`, so the scrutinee must be one too: `match x { true =>
             // .. }` on an `i32` scrutinee emitted `cmp i32, i1`, which the verifier rejected with raw
@@ -17000,12 +17508,18 @@ impl FnLowerer<'_> {
             ast::PatKind::Bool(b) => {
                 if *scrut_mir != MirType::I1 {
                     self.unsupported(pat.span, "bool pattern on a non-bool scrutinee");
-                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                    return Some(
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+                    );
                 }
                 let c = self
                     .builder
                     .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
-                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+                Some(
+                    self.builder
+                        .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
+                )
             }
             // `Enum::Variant` — compare the scrutinee's discriminant to the variant's. A C-style enum
             // scrutinee *is* its i32 discriminant; a data-carrying enum scrutinee is a buffer whose
@@ -17013,7 +17527,10 @@ impl FnLowerer<'_> {
             ast::PatKind::Path(path) => {
                 let Some(disc) = self.enum_path_value(path) else {
                     self.unsupported(span, "match pattern");
-                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                    return Some(
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+                    );
                 };
                 Some(self.enum_disc_eq(scrut, scrut_mir, disc))
             }
@@ -17022,23 +17539,24 @@ impl FnLowerer<'_> {
             ast::PatKind::Variant { path, fields } => {
                 let Some(disc) = self.enum_path_value(path) else {
                     self.unsupported(span, "enum-variant pattern");
-                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                    return Some(
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+                    );
                 };
                 let mut cond = self.enum_disc_eq(scrut, scrut_mir, disc);
                 let enum_sym = path.segments[0].sym;
                 let vname = path.segments.last().unwrap().sym;
                 if let Some(fc) = self.variant_pattern_cond(scrut, enum_sym, vname, fields, span) {
-                    cond = self.builder.build(MirType::I1, Op::Bin(BinOp::And, cond, fc));
+                    cond = self
+                        .builder
+                        .build(MirType::I1, Op::Bin(BinOp::And, cond, fc));
                 }
                 Some(cond)
             }
             // A range pattern `lo..hi` / `lo..=hi`: `lo <= scrut` AND `scrut < hi` (or `<= hi`),
             // with the comparison signedness taken from the scrutinee's type.
-            ast::PatKind::Range {
-                lo,
-                hi,
-                inclusive,
-            } => {
+            ast::PatKind::Range { lo, hi, inclusive } => {
                 let signed = !matches!(scrut_ty, Ty::Scalar(s) if !s.is_signed());
                 // A bound that is not an int/char literal (the parser accepts any pattern as `hi`,
                 // so `3..LIMIT` for a `const LIMIT` parses) used to fold to a silent `0`, compiling
@@ -17048,13 +17566,19 @@ impl FnLowerer<'_> {
                     (self.pattern_int_value(lo), self.pattern_int_value(hi))
                 else {
                     self.unsupported(span, "non-literal range-pattern bound");
-                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                    return Some(
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+                    );
                 };
                 let (Some(lo_c), Some(hi_c)) = (
                     self.pattern_const(lo_v, scrut_mir, scrut_ty, lo.span),
                     self.pattern_const(hi_v, scrut_mir, scrut_ty, hi.span),
                 ) else {
-                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                    return Some(
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+                    );
                 };
                 let ge = self.builder.build(
                     MirType::I1,
@@ -17204,7 +17728,10 @@ impl FnLowerer<'_> {
         };
         let Some((ftys, offsets)) = layout else {
             self.unsupported(span, "tuple pattern");
-            return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+            return Some(
+                self.builder
+                    .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+            );
         };
         let mut acc: Option<ValueId> = None;
         for (i, sub) in subs.iter().enumerate() {
@@ -17218,7 +17745,8 @@ impl FnLowerer<'_> {
             let field_scrut = if Self::pattern_needs_ptr(sub) {
                 fptr
             } else {
-                self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()))
+                self.builder
+                    .build(fmty.clone(), Op::Load(fptr, fmty.clone()))
             };
             if let Some(c) = self.pattern_cond(sub, field_scrut, &fmty, fty, span) {
                 acc = Some(match acc {
@@ -17270,7 +17798,9 @@ impl FnLowerer<'_> {
     ) -> Vec<(u64, Ty, &'p Pattern)> {
         match fields {
             VariantPat::Tuple(subs) => {
-                let offs = self.variant_field_offsets(enum_sym, vname).unwrap_or_default();
+                let offs = self
+                    .variant_field_offsets(enum_sym, vname)
+                    .unwrap_or_default();
                 subs.iter()
                     .enumerate()
                     .filter_map(|(i, sub)| offs.get(i).map(|f| (f.0, f.1.clone(), sub)))
@@ -17314,9 +17844,14 @@ impl FnLowerer<'_> {
                     if matches!(fmty, MirType::Array(..)) {
                         self.bind_slice(*name, fptr, fmty, is_slice);
                     } else {
-                        let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
+                        let val = self
+                            .builder
+                            .build(fmty.clone(), Op::Load(fptr, fmty.clone()));
                         let slot = self.builder.alloca(fmty.clone());
-                        self.builder.build_void(Op::Store { ptr: slot, value: val });
+                        self.builder.build_void(Op::Store {
+                            ptr: slot,
+                            value: val,
+                        });
                         self.bind_slice(*name, slot, fmty, is_slice);
                     }
                 }
@@ -17353,7 +17888,8 @@ impl FnLowerer<'_> {
             let field_scrut = if Self::pattern_needs_ptr(sub) {
                 fptr
             } else {
-                self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()))
+                self.builder
+                    .build(fmty.clone(), Op::Load(fptr, fmty.clone()))
             };
             if let Some(c) = self.pattern_cond(sub, field_scrut, &fmty, &fty, sub.span) {
                 acc = Some(match acc {
@@ -17737,7 +18273,10 @@ impl FnLowerer<'_> {
         match &ga.kind {
             ast::TypeKind::Int(s) => {
                 let v = parse_int(self.interner.resolve(*s));
-                Some(self.builder.build(MirType::I64, Op::ConstInt(v, MirType::I64)))
+                Some(
+                    self.builder
+                        .build(MirType::I64, Op::ConstInt(v, MirType::I64)),
+                )
             }
             ast::TypeKind::Path(p) if p.is_single() => {
                 let (slot, ty) = self.lookup(p.first().sym)?;
@@ -18664,7 +19203,9 @@ impl FnLowerer<'_> {
     fn emit_silu_backward(&mut self, x: ValueId, dy: ValueId, rty: &MirType) -> ValueId {
         let s = self.emit_sigmoid(x, rty);
         let one = self.splat_const_f(1.0, rty);
-        let oms = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, s));
+        let oms = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, one, s));
         let xs = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, s));
         let g = self.builder.build(rty.clone(), Op::Fma(xs, oms, s)); // x·s·(1−s) + s
         self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, g))
@@ -18685,19 +19226,38 @@ impl FnLowerer<'_> {
         let t = self.builder.build(rty.clone(), Op::Fma(c1, x3, x)); // c1·x³ + x
         let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, t));
         let u = self.emit_tanh(inner, rty);
-        let onep = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, one, u));
-        let half_onep = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, half, onep)); // ½(1+u)
+        let onep = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, one, u));
+        let half_onep = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, half, onep)); // ½(1+u)
         let u2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, u, u));
-        let sech2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, u2)); // 1 − u²
+        let sech2 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, one, u2)); // 1 − u²
         let three = self.splat_const_f(3.0, rty);
-        let three_x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, three, x2));
+        let three_x2 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, three, x2));
         let di = self.builder.build(rty.clone(), Op::Fma(c1, three_x2, one)); // c1·3x² + 1
-        let dinner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, di)); // I'(x)
-        let hx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, half, x));
-        let a = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, hx, sech2));
-        let term2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, a, dinner)); // ½x(1−u²)I'
-        let gp = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, half_onep, term2));
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, gp))
+        let dinner = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, c0, di)); // I'(x)
+        let hx = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, half, x));
+        let a = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, hx, sech2));
+        let term2 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, a, dinner)); // ½x(1−u²)I'
+        let gp = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, half_onep, term2));
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, dy, gp))
     }
 
     /// `sigmoid_backward(x, dy) = dy · σ(x)·(1 − σ(x))`. Mirrors `sigmoid_bwd8`/`sigmoid_bwd_2`, so the
@@ -18705,9 +19265,14 @@ impl FnLowerer<'_> {
     fn emit_sigmoid_backward(&mut self, x: ValueId, dy: ValueId, rty: &MirType) -> ValueId {
         let s = self.emit_sigmoid(x, rty);
         let one = self.splat_const_f(1.0, rty);
-        let oms = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, s));
-        let sp = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, s, oms)); // s·(1−s)
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, sp))
+        let oms = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, one, s));
+        let sp = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, s, oms)); // s·(1−s)
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, dy, sp))
     }
 
     /// `tanh_backward(x, dy) = dy · (1 − tanh²(x))`. Mirrors `tanh_bwd8`/`tanh_bwd_2`, so the inlined
@@ -18716,8 +19281,11 @@ impl FnLowerer<'_> {
         let t = self.emit_tanh(x, rty);
         let one = self.splat_const_f(1.0, rty);
         let t2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, t, t));
-        let sech2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, t2)); // 1 − t²
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, sech2))
+        let sech2 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, one, t2)); // 1 − t²
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, dy, sech2))
     }
 
     /// `elu_backward(x, dy) = dy · (x>0 ? 1 : eˣ)` (α=1). Mirrors `elu_bwd8`/`elu_bwd_2` (the same
@@ -19455,7 +20023,9 @@ impl FnLowerer<'_> {
             .builder
             .build(ity.clone(), Op::Cast(CastKind::Bitcast, t, ity.clone()));
         let mb = self.splat_const_i(EXP_TBL_MBIAS, &ity);
-        let m = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, bits, mb));
+        let m = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, bits, mb));
 
         // r = x − n·(ln2/8), with the /8 split ln2 hi/lo pair (two fmas; n·C1 is exact).
         let neg_c1 = self.splat_const_f(-EXP_TBL_C1, fty);
@@ -19495,7 +20065,9 @@ impl FnLowerer<'_> {
             .build(fty.clone(), Op::Select(b0, consts[7], consts[6]));
         let s0123 = self.builder.build(fty.clone(), Op::Select(b1, s23, s01));
         let s4567 = self.builder.build(fty.clone(), Op::Select(b1, s67, s45));
-        let tj = self.builder.build(fty.clone(), Op::Select(b2, s4567, s0123));
+        let tj = self
+            .builder
+            .build(fty.clone(), Op::Select(b2, s4567, s0123));
 
         // e^r ≈ ((P3·r + P2)·r + 1)·r + 1 — three FMAs, mirroring the kernel op-for-op.
         let p3c = self.splat_const_f(EXP_TBL_P3, fty);
@@ -19609,9 +20181,7 @@ impl FnLowerer<'_> {
         let zero_i = self.splat_const_i(0, &ity);
         let bit_mask = |this: &mut Self, bit: i128| {
             let c = this.splat_const_i(bit, &ity);
-            let and = this
-                .builder
-                .build(ity.clone(), Op::Bin(BinOp::And, tmp, c));
+            let and = this.builder.build(ity.clone(), Op::Bin(BinOp::And, tmp, c));
             this.builder
                 .build(mty.clone(), Op::Cmp(CmpOp::Ne, and, zero_i))
         };
@@ -19637,7 +20207,8 @@ impl FnLowerer<'_> {
                 .build(fty.clone(), Op::Select(b0, consts[7], consts[6]));
             let s0123 = this.builder.build(fty.clone(), Op::Select(b1, s23, s01));
             let s4567 = this.builder.build(fty.clone(), Op::Select(b1, s67, s45));
-            this.builder.build(fty.clone(), Op::Select(b2, s4567, s0123))
+            this.builder
+                .build(fty.clone(), Op::Select(b2, s4567, s0123))
         };
         let r_j = lookup(self, &LOG_TBL_R);
         let l_j = lookup(self, &LOG_TBL_L);
@@ -19858,10 +20429,7 @@ fn mir_ty(ty: &Ty) -> MirType {
         // A tuple (and any other aggregate) is a flat byte buffer; its local *value* is the base
         // pointer (like an array), and field access GEPs to a padded byte offset. `tuple_offsets`
         // is the layout authority. Falls back to a 0-byte buffer for an unsized field (never read).
-        Ty::Tuple(_) => MirType::Array(
-            Box::new(MirType::I8),
-            ty.size_of().unwrap_or(0) as u32,
-        ),
+        Ty::Tuple(_) => MirType::Array(Box::new(MirType::I8), ty.size_of().unwrap_or(0) as u32),
         _ => MirType::I32,
     }
 }
@@ -19894,12 +20462,7 @@ fn attn_buffer_extent(t: &Ty) -> Option<Option<u64>> {
     }
 }
 
-fn const_usize_depth(
-    e: &Expr,
-    interner: &Interner,
-    sema: &SemaResult,
-    depth: u32,
-) -> Option<u32> {
+fn const_usize_depth(e: &Expr, interner: &Interner, sema: &SemaResult, depth: u32) -> Option<u32> {
     if depth > 64 {
         return None;
     }
@@ -20833,9 +21396,7 @@ fn region_access_sig(
         }
         // Inline `hh / C` / `hh % C` (literal C ≥ 2) atoms.
         if let ExprKind::Binary { op, lhs, rhs } = &atom.kind {
-            if matches!(op, ast::BinOp::Div | ast::BinOp::Rem)
-                && single_path(lhs) == Some(hh)
-            {
+            if matches!(op, ast::BinOp::Div | ast::BinOp::Rem) && single_path(lhs) == Some(hh) {
                 if let Some(c) = as_int_lit(rhs, interner) {
                     let c = c as i128;
                     if c >= 2 {
@@ -21259,7 +21820,16 @@ fn match_product_ab_off<'a>(
     jvar: Symbol,
     sema: &SemaResult,
     interner: &Interner,
-) -> Option<(Symbol, Dim, Vec<&'a Expr>, Symbol, Dim, Vec<&'a Expr>, bool, bool)> {
+) -> Option<(
+    Symbol,
+    Dim,
+    Vec<&'a Expr>,
+    Symbol,
+    Dim,
+    Vec<&'a Expr>,
+    bool,
+    bool,
+)> {
     let ExprKind::Binary {
         op: ast::BinOp::Mul,
         lhs: f1,
@@ -21395,7 +21965,10 @@ fn unshadowed_intrinsic(
         return None;
     }
     let name = p.first().sym;
-    if matches!(sema.defs.lookup(name).map(|d| &d.kind), Some(DefKind::Fn(_))) {
+    if matches!(
+        sema.defs.lookup(name).map(|d| &d.kind),
+        Some(DefKind::Fn(_))
+    ) {
         return None;
     }
     math_intrinsic(interner.resolve(name))
@@ -21584,11 +22157,7 @@ fn index_by_var(e: &Expr, var: Symbol) -> Option<Symbol> {
 /// [`match_epi_value`]'s activation detection — including the shadow test, so a user `fn gelu` is
 /// never folded into the kernel; the runtime `dequant_row` applies the identical scalar form
 /// (`vmath::{gelu1,silu1}`), so fused == unfused.
-fn peel_dequant_act<'a>(
-    e: &'a Expr,
-    interner: &Interner,
-    sema: &SemaResult,
-) -> (&'a Expr, u32) {
+fn peel_dequant_act<'a>(e: &'a Expr, interner: &Interner, sema: &SemaResult) -> (&'a Expr, u32) {
     if let ExprKind::Call { callee, args, .. } = &e.kind {
         if args.len() == 2
             && matches!(
@@ -22739,7 +23308,7 @@ fn match_matmul_residual<'a>(
         b_off,
         c_off,
         alpha: None, // the residual epilogue kernel carries no α scale
-        bias: None,  // the residual store's per-column bias rides the beta=1 epilogue, not this field
+        bias: None, // the residual store's per-column bias rides the beta=1 epilogue, not this field
         // Likewise the residual store's activation: it is returned alongside the nest and handed to
         // `emit_sgemm_epi` as its `act` argument, so carrying it here too would be a second, dropped
         // copy (`emit_sgemm_epi` refuses a non-identity `nest.act` for exactly that reason).
@@ -23099,12 +23668,7 @@ fn match_matmul_dual_store<'a>(
         ast::AssignOp::Mul if single_path(dv) == Some(s_sym) => VE_HADAMARD | VE_USE_Y,
         ast::AssignOp::Add if single_path(dv) == Some(s_sym) => VE_ID | VE_USE_Y,
         ast::AssignOp::Assign => {
-            let ExprKind::Binary {
-                op: bop,
-                lhs,
-                rhs,
-            } = &dv.kind
-            else {
+            let ExprKind::Binary { op: bop, lhs, rhs } = &dv.kind else {
                 return None;
             };
             // Exactly one side is `d[i*N+j]` (the same element the target names) and the other is `s`.
@@ -24081,7 +24645,8 @@ fn match_pool2d(
         _ => return None,
     };
     // The window data load `x[c*(H*W) + (oy*SH + dy)*W + (ox*SW + dx)]` — pin every stride to a dim.
-    let (xbase, w, sh, sw) = match_pool_window_index(vinit, cvar, oyvar, oxvar, dyvar, dxvar, interner)?;
+    let (xbase, w, sh, sw) =
+        match_pool_window_index(vinit, cvar, oyvar, oxvar, dyvar, dxvar, interner)?;
     if scalar_of(vinit, sema) != Some(wukong_types::Scalar::F32) {
         return None;
     }
@@ -24219,8 +24784,13 @@ fn match_pool_window_index(
     // The `(oy*SH + dy) * W` term (the window's top input row, scaled by the row width W). It is a
     // product of an `Add(oy*SH, dy)` and `W`; identify the row factor by it containing `oy`.
     let row_pos = terms.iter().position(|t| {
-        matches!(&t.kind, ExprKind::Binary { op: ast::BinOp::Mul, .. })
-            && pool_row_factor(t, oyvar, dyvar, interner).is_some()
+        matches!(
+            &t.kind,
+            ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                ..
+            }
+        ) && pool_row_factor(t, oyvar, dyvar, interner).is_some()
     })?;
     let (sh, w) = pool_row_factor(terms[row_pos], oyvar, dyvar, interner)?;
     terms.remove(row_pos);
@@ -24233,7 +24803,12 @@ fn match_pool_window_index(
 
 /// For a `(oy*SH + dy) * W` term (either `*` operand order, either `+` operand order), return
 /// `(SH, W)`. The row factor is the `Add` side that contains both `oy` and `dy`; `W` is the other.
-fn pool_row_factor(e: &Expr, oyvar: Symbol, dyvar: Symbol, interner: &Interner) -> Option<(Dim, Dim)> {
+fn pool_row_factor(
+    e: &Expr,
+    oyvar: Symbol,
+    dyvar: Symbol,
+    interner: &Interner,
+) -> Option<(Dim, Dim)> {
     let ExprKind::Binary {
         op: ast::BinOp::Mul,
         lhs,
@@ -24287,8 +24862,13 @@ fn match_pool_seed_index(
     terms.remove(ox_pos);
     // `(oy*SH) * W` — a product whose one factor is `oy*SH` (contains oy) and the other is W.
     let row_pos = terms.iter().position(|t| {
-        matches!(&t.kind, ExprKind::Binary { op: ast::BinOp::Mul, .. })
-            && pool_seed_row_factor(t, oyvar, interner).is_some()
+        matches!(
+            &t.kind,
+            ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                ..
+            }
+        ) && pool_seed_row_factor(t, oyvar, interner).is_some()
     })?;
     let (sh, w) = pool_seed_row_factor(terms[row_pos], oyvar, interner)?;
     terms.remove(row_pos);
@@ -24382,7 +24962,10 @@ fn classify_pool_fold(
     if let ast::AssignOp::Assign = op {
         if let ExprKind::Call { callee, args, .. } = &value.kind {
             if args.len() == 2
-                && matches!(intrinsic_callee(callee, sema, interner), Some(MathIntrinsic::Fmax))
+                && matches!(
+                    intrinsic_callee(callee, sema, interner),
+                    Some(MathIntrinsic::Fmax)
+                )
             {
                 let (a0, a1) = (single_path(&args[0]), single_path(&args[1]));
                 if (a0 == Some(acc) && a1 == Some(vvar)) || (a1 == Some(acc) && a0 == Some(vvar)) {
@@ -24749,7 +25332,12 @@ fn col_sqrt_arg<'a>(e: &'a Expr, sema: &SemaResult, interner: &Interner) -> Opti
     let ExprKind::Call { callee, args, .. } = &e.kind else {
         return None;
     };
-    if args.len() == 1 && matches!(intrinsic_callee(callee, sema, interner), Some(MathIntrinsic::Sqrt)) {
+    if args.len() == 1
+        && matches!(
+            intrinsic_callee(callee, sema, interner),
+            Some(MathIntrinsic::Sqrt)
+        )
+    {
         Some(&args[0])
     } else {
         None
@@ -24841,7 +25429,10 @@ fn intrinsic_callee(
         return None;
     }
     let name = p.first().sym;
-    if matches!(sema.defs.lookup(name).map(|d| &d.kind), Some(DefKind::Fn(_))) {
+    if matches!(
+        sema.defs.lookup(name).map(|d| &d.kind),
+        Some(DefKind::Fn(_))
+    ) {
         return None;
     }
     math_intrinsic(interner.resolve(name))
@@ -25863,7 +26454,10 @@ fn stmt_let_init(stmt: &Stmt) -> Option<(Symbol, &Expr)> {
 }
 
 /// Match `for v in 0..N { body }` returning `(v, N, body)`. Free twin of `FnLowerer::as_range0_for`.
-fn stmt_range0_for<'a>(stmt: &'a Stmt, interner: &Interner) -> Option<(Symbol, &'a Expr, &'a Block)> {
+fn stmt_range0_for<'a>(
+    stmt: &'a Stmt,
+    interner: &Interner,
+) -> Option<(Symbol, &'a Expr, &'a Block)> {
     let StmtKind::For {
         pat, iter, body, ..
     } = &stmt.kind
@@ -26067,7 +26661,8 @@ fn is_xhat(
         return false;
     };
     (is_centered_sub(lhs, x, mean, rvar, iv, cols, interner) && single_path(rhs) == Some(rstd))
-        || (is_centered_sub(rhs, x, mean, rvar, iv, cols, interner) && single_path(lhs) == Some(rstd))
+        || (is_centered_sub(rhs, x, mean, rvar, iv, cols, interner)
+            && single_path(lhs) == Some(rstd))
 }
 
 /// Recognize the **batched LayerNorm backward** (input gradient) and dispatch it to
@@ -26275,8 +26870,7 @@ fn match_layernorm_bwd(
     };
     let xm2_ok = (is_xhat(xl, x, mean, rstd, rvar, iv12, &cols, interner)
         && single_path(xr) == Some(m2))
-        || (is_xhat(xr, x, mean, rstd, rvar, iv12, &cols, interner)
-            && single_path(xl) == Some(m2));
+        || (is_xhat(xr, x, mean, rstd, rvar, iv12, &cols, interner) && single_path(xl) == Some(m2));
     if !xm2_ok {
         return None;
     }
@@ -27339,9 +27933,10 @@ fn decode_escape(chars: &mut std::str::Chars) -> u32 {
         Some('"') => '"' as u32,
         Some('0') => 0,
         // `\xHH` — up to two hex digits (the lexer consumed at most two).
-        Some('x') => chars.by_ref().take(2).fold(0u32, |v, c| {
-            c.to_digit(16).map_or(v, |d| v * 16 + d)
-        }),
+        Some('x') => chars
+            .by_ref()
+            .take(2)
+            .fold(0u32, |v, c| c.to_digit(16).map_or(v, |d| v * 16 + d)),
         // `\u{HHHH}` — the hex digits between the braces. Saturating, so an over-long escape
         // (`\u{100000000}`, ≥ 9 hex digits) clamps to an invalid code point instead of overflowing
         // the accumulator and panicking the compiler; a valid code point is ≤ 6 hex digits anyway.
@@ -27378,9 +27973,9 @@ mod tests {
     /// Does function `f` contain a call to a function named `callee`?
     fn fn_calls(f: &Function, interner: &Interner, callee: &str) -> bool {
         f.blocks.iter().any(|b| {
-            b.insts
-                .iter()
-                .any(|i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == callee))
+            b.insts.iter().any(
+                |i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == callee),
+            )
         })
     }
 
@@ -27599,7 +28194,11 @@ fn tiled(q: [f32; 64], k: [f32; 64], v: [f32; 64], mut attn: [f32; 64], mut y: [
             .iter()
             .find(|f| interner.resolve(f.name).starts_with("wukong$par$"))
             .expect("outlined region body function");
-        for kernel in ["wukong_sgemm_nt_alpha", "wukong_norm_f32", "wukong_sgemm_nt"] {
+        for kernel in [
+            "wukong_sgemm_nt_alpha",
+            "wukong_norm_f32",
+            "wukong_sgemm_nt",
+        ] {
             assert!(
                 fn_calls(outlined, &interner, kernel),
                 "the per-tile op sequence must dispatch the SERIAL {kernel} inside the region"
@@ -27763,7 +28362,11 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
             ((8.0f64 / std::f64::consts::LN_2) as f32).to_bits(),
             "SCALE"
         );
-        assert_eq!((EXP_MAGIC as f32).to_bits(), 12582912.0f32.to_bits(), "MAGIC");
+        assert_eq!(
+            (EXP_MAGIC as f32).to_bits(),
+            12582912.0f32.to_bits(),
+            "MAGIC"
+        );
         assert_eq!(
             EXP_TBL_MBIAS,
             (EXP_MAGIC as f32).to_bits() as i128 - 127 * 8,
@@ -27797,7 +28400,10 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
         let resid = ((EXP_TBL_C1 as f32 as f64) + (EXP_TBL_C2 as f32 as f64)
             - std::f64::consts::LN_2 / 8.0)
             .abs();
-        assert!(resid < 1e-12, "Cody-Waite pair drifted off ln2/8: {resid:e}");
+        assert!(
+            resid < 1e-12,
+            "Cody-Waite pair drifted off ln2/8: {resid:e}"
+        );
         // P2 = 1/2 + (√2−1)/12·h² (h = ln2/16), the Chebyshev-shifted r² coefficient; P3 = 1/6.
         let h = std::f64::consts::LN_2 / 16.0;
         let want_p2 = (0.5 + (2f64.sqrt() - 1.0) / 12.0 * h * h) as f32;
@@ -27859,7 +28465,8 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
             (1.0f32 / 8_388_608.0).to_bits(),
             "INV_2P23"
         );
-        let resid = ((EXP_C1 as f32 as f64) + (EXP_C2 as f32 as f64) - std::f64::consts::LN_2).abs();
+        let resid =
+            ((EXP_C1 as f32 as f64) + (EXP_C2 as f32 as f64) - std::f64::consts::LN_2).abs();
         assert!(resid < 1e-7, "ln2 hi/lo split drifted off ln2: {resid:e}");
     }
 

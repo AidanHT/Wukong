@@ -239,8 +239,30 @@ impl PipeCfg {
 /// `gemm_nt_f16` dispatches among these by working-set size; `gemm_pipe_sweep` re-measures them. (~72% is
 /// near the WMMA ceiling on this part; the cuBLAS-class `mma.sync`+`ldmatrix` path is the next lever.)
 pub const PIPE_VARIANTS: &[PipeCfg] = &[
-    PipeCfg { name: "wmma_nt_f16_pipe_64_s6", bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, stages: 6, raster: 0, mma: false, pad: 0 }, // 24 KiB — ≤1024³
-    PipeCfg { name: "wmma_nt_f16_pipe_128_s4", bm: 128, bn: 128, bk: 16, wm: 2, wn: 4, stages: 4, raster: 0, mma: false, pad: 0 }, // 32 KiB — ~2048³
+    PipeCfg {
+        name: "wmma_nt_f16_pipe_64_s6",
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        wm: 2,
+        wn: 2,
+        stages: 6,
+        raster: 0,
+        mma: false,
+        pad: 0,
+    }, // 24 KiB — ≤1024³
+    PipeCfg {
+        name: "wmma_nt_f16_pipe_128_s4",
+        bm: 128,
+        bn: 128,
+        bk: 16,
+        wm: 2,
+        wn: 4,
+        stages: 4,
+        raster: 0,
+        mma: false,
+        pad: 0,
+    }, // 32 KiB — ~2048³
     // Spilling champion: a 128×128 BK=32 tile with **threadblock rasterization** (r8). At 4096³ the GEMM
     // is HBM-bound (~2.7 GB of A/B reads ≫ the 134 MB minimum), so banding co-scheduled CTAs into a compact
     // L2 footprint cut effective traffic: 56% → 72% of cuBLAS (a 12-config raster sweep found the optimum
@@ -251,7 +273,18 @@ pub const PIPE_VARIANTS: &[PipeCfg] = &[
     // in the L2-resident/compute-bound regime, the r16 band maximizes L2 reuse) and 4096³ ~72–75%
     // (HBM-bound). The r16 raster beat r8 at both sizes for the mma kernel (a 6-config sweep); the smaller
     // 64-tile and 128×64 tile both lost. %128, K%32.
-    PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, mma: true, pad: 8 }, // 40 KiB
+    PipeCfg {
+        name: "mma_nt_f16_128_bk32_s2_r16",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        mma: true,
+        pad: 8,
+    }, // 40 KiB
 ];
 
 /// The bf16 large-GEMM workhorse — the bf16 twin of the f16 spilling champion `mma_nt_f16_128_bk32_s2_r16`
@@ -335,30 +368,160 @@ pub const CLIFF_VARIANTS: &[CliffCfg] = &[
     //  - `cliff_swz_w22` : no-pad swizzle, w22 (2×2) — the 4096³ warp-tile winner (3 CTAs/SM, +ILP).
     //  - `cliff_pad_w24` : padded (pad=8), w24 — byte-identical to the production `mma_nt_f16_128_bk32_s2_r16`
     //    that the 16–48 MB arm dispatches; here to settle **swz-vs-padded @2048³ same-run** (the open floor).
-    CliffCfg { name: "cliff_swz_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
-    CliffCfg { name: "cliff_swz_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
-    CliffCfg { name: "cliff_pad_w24", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: false, pad: 8, min_ctas: 0, store: Store::Scalar },
+    CliffCfg {
+        name: "cliff_swz_s2",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "cliff_swz_w22",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 2,
+        stages: 2,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "cliff_pad_w24",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        swz: false,
+        pad: 8,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
     // ---- 4096³ re-tune levers (perf/gpu-gemm-4096) — all w24, no-pad swizzle unless noted; auto-gated by
     // `gemm_cliff_matches_reference`, A/B-timed by `gemm_cliff_ab`. The central sweep picks winners. ----
     //  * **3-stage pipeline** (`_s3`): CUTLASS's SM80 floor is 3 stages; the no-pad swizzle frees the SMEM
     //    for it — s3 no-pad = 48 KiB *exactly* (s3 padded = 60 KiB > the 48 KiB static cap). More cp.async
     //    buffers deepen the prefetch window to hide the HBM latency the 4096³ GEMM is bound by.
-    CliffCfg { name: "cliff_swz_s3", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg {
+        name: "cliff_swz_s3",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 3,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
     //  * **s3 raster-band re-tune** (`_r8`/`_r32`): the rasterization window sets the co-scheduled CTAs'
     //    A/B footprint; re-tune it against the *measured* L2 at 4096³ (the r16 optimum was found at s2).
-    CliffCfg { name: "cliff_swz_s3_r8", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 8, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
-    CliffCfg { name: "cliff_swz_s3_r32", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 32, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg {
+        name: "cliff_swz_s3_r8",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 3,
+        raster: 8,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "cliff_swz_s3_r32",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 3,
+        raster: 32,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
     //  * **launch-bounds** (`_mc3`/`_mc2`): force the occupancy ptxas leaves on the table. The 128×128 tile
     //    carries 64 f32 accumulators/thread, so the JIT defaults to ~2 CTAs/SM (register-bound). `_s2_mc3`
     //    caps registers to fit 3 CTAs/SM on the 32 KiB s2 tile (may spill — that's what the A/B measures);
     //    `_s3_mc2` pins 2 CTAs/SM on the 48 KiB s3 tile (2×48 = 96 KiB ≤ the 100 KiB SM carveout).
-    CliffCfg { name: "cliff_swz_s2_mc3", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 3, store: Store::Scalar },
-    CliffCfg { name: "cliff_swz_s3_mc2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 16, swz: true, pad: 0, min_ctas: 2, store: Store::Scalar },
+    CliffCfg {
+        name: "cliff_swz_s2_mc3",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 3,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "cliff_swz_s3_mc2",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 3,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 2,
+        store: Store::Scalar,
+    },
     //  * **epilogue store vectorization** (`_v2`/`_v2cs`): fold each lane's adjacent-column D-fragment pair
     //    into one `st.global.v2.f32` (half the C-write store count); `_v2cs` adds the `.cs` streaming hint so
     //    the write-once C stream does not evict the L2-resident A/B raster band. Bit-identical to `cliff_swz_s2`.
-    CliffCfg { name: "cliff_swz_s2_v2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::V2 },
-    CliffCfg { name: "cliff_swz_s2_v2cs", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::V2Cs },
+    CliffCfg {
+        name: "cliff_swz_s2_v2",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::V2,
+    },
+    CliffCfg {
+        name: "cliff_swz_s2_v2cs",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::V2Cs,
+    },
 ];
 
 /// The SMEM budget the **deep** table is generated against: the *smallest* opt-in carveout among the
@@ -392,11 +555,76 @@ pub const DEEP_SMEM_BUDGET: usize = 101_376;
 /// (`deep_grid_s2_s3_are_the_shipped_cliff_kernels`), so they are the equivalence anchor: every deep row
 /// must agree with them, and with the f64 oracle, at the crate's fp16 tolerance.
 pub const PIPE_DEEP_VARIANTS: &[CliffCfg] = &[
-    CliffCfg { name: "deep_swz_128_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
-    CliffCfg { name: "deep_swz_128_s3", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
-    CliffCfg { name: "deep_swz_128_s4", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 4, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
-    CliffCfg { name: "deep_swz_128_s5", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 5, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
-    CliffCfg { name: "deep_swz_128x256_s3", bm: 128, bn: 256, bk: 32, wm: 2, wn: 4, stages: 3, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg {
+        name: "deep_swz_128_s2",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "deep_swz_128_s3",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 3,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "deep_swz_128_s4",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 4,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "deep_swz_128_s5",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 5,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "deep_swz_128x256_s3",
+        bm: 128,
+        bn: 256,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 3,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
 ];
 
 /// Look up a [`PIPE_DEEP_VARIANTS`] row by entry name (a wrong name is a loud panic at the call site,
@@ -423,13 +651,31 @@ pub fn gemm_deep_ptx() -> &'static str {
         let mut m = String::from(HDR_SM80);
         // Declared once, at MODULE scope (inside an entry body it is CUDA_ERROR_INVALID_PTX), and only
         // when some row actually needs it — so a hypothetical all-static table emits historical text.
-        if PIPE_DEEP_VARIANTS.iter().any(|v| v.smem_mode().is_dynamic()) {
+        if PIPE_DEEP_VARIANTS
+            .iter()
+            .any(|v| v.smem_mode().is_dynamic())
+        {
             m += DSMEM_DECL;
         }
         for v in PIPE_DEEP_VARIANTS {
             m += &entry_mma_pipe_budget(
-                v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None,
-                false, false, v.swz, v.min_ctas, v.store, DEEP_SMEM_BUDGET,
+                v.name,
+                "f16",
+                v.bm,
+                v.bn,
+                v.bk,
+                v.wm,
+                v.wn,
+                v.stages,
+                v.raster,
+                v.pad,
+                Act::None,
+                false,
+                false,
+                v.swz,
+                v.min_ctas,
+                v.store,
+                DEEP_SMEM_BUDGET,
             );
         }
         m
@@ -445,8 +691,22 @@ pub fn gemm_cliff_ptx() -> &'static str {
         let mut m = String::from(HDR_SM80);
         for v in CLIFF_VARIANTS {
             m += &entry_mma_pipe(
-                v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false,
-                false, v.swz, v.min_ctas, v.store,
+                v.name,
+                "f16",
+                v.bm,
+                v.bn,
+                v.bk,
+                v.wm,
+                v.wn,
+                v.stages,
+                v.raster,
+                v.pad,
+                Act::None,
+                false,
+                false,
+                v.swz,
+                v.min_ctas,
+                v.store,
             );
         }
         m
@@ -468,7 +728,10 @@ fn entry_smem(
     static_dims: Option<(usize, usize, usize)>,
 ) -> String {
     if let Some((m, n, k)) = static_dims {
-        assert!(m % bm == 0 && n % bn == 0 && k % SM_BK == 0, "{name}: static dims must tile the kernel");
+        assert!(
+            m % bm == 0 && n % bn == 0 && k % SM_BK == 0,
+            "{name}: static dims must tile the kernel"
+        );
     }
     let mma_ty = if ty == "f16" {
         "f32.f32".to_string()
@@ -548,7 +811,8 @@ fn entry_smem(
             s += &format!("    mov.u32 %M,{m};\n    mov.u32 %N,{n};\n    mov.u32 %K,{k};\n");
         }
         None => {
-            s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+            s +=
+                "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
         }
     }
     s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
@@ -584,7 +848,9 @@ fn entry_smem(
             *s += &format!("    mul.wide.u32 %off,%tmp,2;\n    add.s64 %gptr,{gptr},%off;\n");
             *s += "    ld.global.v4.u32 {%v0,%v1,%v2,%v3},[%gptr];\n";
             // shared dest byte = flat·2 = e·16.
-            *s += &format!("    mov.u32 %tmp,{smem};\n    shl.b32 %tmp2,%e,4;\n    add.u32 %tmp,%tmp,%tmp2;\n");
+            *s += &format!(
+                "    mov.u32 %tmp,{smem};\n    shl.b32 %tmp2,%e,4;\n    add.u32 %tmp,%tmp,%tmp2;\n"
+            );
             *s += "    st.shared.v4.u32 [%tmp],{%v0,%v1,%v2,%v3};\n";
         }
     };
@@ -595,7 +861,10 @@ fn entry_smem(
     // Each warp loads its fragments from shared (generic addr via cvta.shared) and accumulates.
     for ti in 0..tm {
         s += &format!("    mov.u32 %tmp,smemA_{name};\n");
-        s += &format!("    mul.lo.s32 %tmp2,%warpRow,{wm};\n    add.u32 %tmp2,%tmp2,{};\n", ti * 16);
+        s += &format!(
+            "    mul.lo.s32 %tmp2,%warpRow,{wm};\n    add.u32 %tmp2,%tmp2,{};\n",
+            ti * 16
+        );
         s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
         s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
         let ra = veclist(&format!("a{ti}_"), nab);
@@ -603,7 +872,10 @@ fn entry_smem(
     }
     for tj in 0..tn {
         s += &format!("    mov.u32 %tmp,smemB_{name};\n");
-        s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+        s += &format!(
+            "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+            tj * 16
+        );
         s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
         s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
         let rb = veclist(&format!("b{tj}_"), nab);
@@ -626,9 +898,15 @@ fn entry_smem(
     for ti in 0..tm {
         for tj in 0..tn {
             // row = baseRow + warpRow·wm + ti·16 ; col = baseCol + warpCol·wn + tj·16
-            s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+            s += &format!(
+                "    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n",
+                ti * 16
+            );
             s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
-            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+            s += &format!(
+                "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+                tj * 16
+            );
             s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
             s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
             let cc = veclist(&format!("c{ti}_{tj}_"), 8);
@@ -707,7 +985,10 @@ fn entry_smem_db(
     bias: bool,
     residual: bool,
 ) -> String {
-    assert_eq!(bm, bn, "the double-buffered kernel uses one buffer-offset reg for A and B");
+    assert_eq!(
+        bm, bn,
+        "the double-buffered kernel uses one buffer-offset reg for A and B"
+    );
     let mma_ty = if ty == "f16" {
         "f32.f32".to_string()
     } else {
@@ -757,13 +1038,23 @@ fn entry_smem_db(
     // The fused-bias variant takes an extra `bias[N]` (f32) param read in the store-back epilogue; the
     // residual variant takes a `residual[M,N]` (f32) param used to seed the accumulator (wmma.load.c).
     let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
-    let resid_param = if residual { ",\n    .param .u64 pResidual" } else { "" };
+    let resid_param = if residual {
+        ",\n    .param .u64 pResidual"
+    } else {
+        ""
+    };
     let mut s = String::new();
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
     );
-    s += &format!("    .shared .align 16 .b8 smemA_{name}[{}];\n", 2 * tile_bytes);
-    s += &format!("    .shared .align 16 .b8 smemB_{name}[{}];\n", 2 * tile_bytes);
+    s += &format!(
+        "    .shared .align 16 .b8 smemA_{name}[{}];\n",
+        2 * tile_bytes
+    );
+    s += &format!(
+        "    .shared .align 16 .b8 smemB_{name}[{}];\n",
+        2 * tile_bytes
+    );
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%ktn,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%ldm,%bufc,%bufp,%v0,%v1,%v2,%v3;\n";
     let mut decl_c = String::new();
@@ -776,7 +1067,10 @@ fn entry_smem_db(
     }
     // `%act0`/`%act1` are scratch for a fused transcendental epilogue (Act::Silu/Gelu); unused (and
     // dropped by ptxas) for Act::None/Relu.
-    s += &format!("    .reg .f32 {},%act0,%act1;\n", decl_c.trim_end_matches(','));
+    s += &format!(
+        "    .reg .f32 {},%act0,%act1;\n",
+        decl_c.trim_end_matches(',')
+    );
     if bias {
         // Fused-bias store-back epilogue scratch: %lane (lane id), %f (flat 0..256 elem), %grow/%gcol
         // (this element's global row/col), %scbase (this warp's SMEM scratch base), %bval/%biasv (the
@@ -820,12 +1114,19 @@ fn entry_smem_db(
         for ti in 0..tm {
             for tj in 0..tn {
                 let cc = veclist(&format!("c{ti}_{tj}_"), 8);
-                s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+                s += &format!(
+                    "    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n",
+                    ti * 16
+                );
                 s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
-                s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+                s += &format!(
+                    "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+                    tj * 16
+                );
                 s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
                 s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%Resid,%off;\n";
-                s += &format!("    wmma.load.c.sync.aligned.m16n16k16.row.f32 {cc}, [%cptr], %N;\n");
+                s +=
+                    &format!("    wmma.load.c.sync.aligned.m16n16k16.row.f32 {cc}, [%cptr], %N;\n");
             }
         }
     } else {
@@ -843,7 +1144,12 @@ fn entry_smem_db(
     // Issue cp.async copies staging the column-`%kcol` A/B tile into the buffer at byte offset `bufoff`.
     // Identical addressing to entry_smem's `stage`, but with cp.async (global→shared, no register hop)
     // and the staged column read from %kcol (so the prefetch can target the *next* tile while %kt lags).
-    let stage = |g_base: &str, gbase_ptr: &str, smem: String, bufoff: &str, chunks: usize, s: &mut String| {
+    let stage = |g_base: &str,
+                 gbase_ptr: &str,
+                 smem: String,
+                 bufoff: &str,
+                 chunks: usize,
+                 s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
                 *s += "    mov.u32 %e,%tix;\n";
@@ -860,8 +1166,22 @@ fn entry_smem_db(
 
     // Prologue: prefetch tile 0 into buffer 0 and commit it as the first async group.
     s += "    mov.u32 %kcol,0;\n";
-    stage("%baseRow", "%A", format!("smemA_{name}"), "%bufc", a_chunks, &mut s);
-    stage("%baseCol", "%B", format!("smemB_{name}"), "%bufc", b_chunks, &mut s);
+    stage(
+        "%baseRow",
+        "%A",
+        format!("smemA_{name}"),
+        "%bufc",
+        a_chunks,
+        &mut s,
+    );
+    stage(
+        "%baseCol",
+        "%B",
+        format!("smemB_{name}"),
+        "%bufc",
+        b_chunks,
+        &mut s,
+    );
     s += "    cp.async.commit_group;\n";
 
     s += "    mov.u32 %kt,0;\n";
@@ -870,15 +1190,32 @@ fn entry_smem_db(
     s += "    add.u32 %ktn,%kt,16;\n    setp.lt.u32 %pmore,%ktn,%K;\n";
     s += &format!("    @!%pmore bra LAST_{name};\n");
     s += "    mov.u32 %kcol,%ktn;\n";
-    stage("%baseRow", "%A", format!("smemA_{name}"), "%bufp", a_chunks, &mut s);
-    stage("%baseCol", "%B", format!("smemB_{name}"), "%bufp", b_chunks, &mut s);
+    stage(
+        "%baseRow",
+        "%A",
+        format!("smemA_{name}"),
+        "%bufp",
+        a_chunks,
+        &mut s,
+    );
+    stage(
+        "%baseCol",
+        "%B",
+        format!("smemB_{name}"),
+        "%bufp",
+        b_chunks,
+        &mut s,
+    );
     s += "    cp.async.commit_group;\n    cp.async.wait_group 1;\n";
     s += &format!("    bra SYNC_{name};\nLAST_{name}:\n    cp.async.wait_group 0;\nSYNC_{name}:\n");
     s += "    bar.sync 0;\n";
     // Compute the current tile from buffer `%bufc`.
     for ti in 0..tm {
         s += &format!("    mov.u32 %tmp,smemA_{name};\n    add.u32 %tmp,%tmp,%bufc;\n");
-        s += &format!("    mul.lo.s32 %tmp2,%warpRow,{wm};\n    add.u32 %tmp2,%tmp2,{};\n", ti * 16);
+        s += &format!(
+            "    mul.lo.s32 %tmp2,%warpRow,{wm};\n    add.u32 %tmp2,%tmp2,{};\n",
+            ti * 16
+        );
         s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
         s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
         let ra = veclist(&format!("a{ti}_"), nab);
@@ -886,7 +1223,10 @@ fn entry_smem_db(
     }
     for tj in 0..tn {
         s += &format!("    mov.u32 %tmp,smemB_{name};\n    add.u32 %tmp,%tmp,%bufc;\n");
-        s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+        s += &format!(
+            "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+            tj * 16
+        );
         s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
         s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
         let rb = veclist(&format!("b{tj}_"), nab);
@@ -926,9 +1266,11 @@ fn entry_smem_db(
                 // Store this 16×16 tile's accumulator to the warp's scratch (row-major, leading dim 16).
                 let cc = veclist(&format!("c{ti}_{tj}_"), 8);
                 s += "    cvt.u64.u32 %scptr,%scbase;\n    cvta.shared.u64 %scptr,%scptr;\n";
-                s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%scptr], {cc}, %ldm;\n");
+                s += &format!(
+                    "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%scptr], {cc}, %ldm;\n"
+                );
                 s += "    bar.sync 0;\n"; // tile fully written to scratch before any lane reads it
-                // Each lane owns 8 of the 256 elements: flat f = lane + u·32 ⇒ (row f/16, col f%16).
+                                          // Each lane owns 8 of the 256 elements: flat f = lane + u·32 ⇒ (row f/16, col f%16).
                 for u in 0..8 {
                     if u == 0 {
                         s += "    mov.u32 %f,%lane;\n";
@@ -953,9 +1295,15 @@ fn entry_smem_db(
     } else {
         for ti in 0..tm {
             for tj in 0..tn {
-                s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+                s += &format!(
+                    "    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n",
+                    ti * 16
+                );
                 s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
-                s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+                s += &format!(
+                    "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+                    tj * 16
+                );
                 s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
                 s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
                 // Fused epilogue: activate each accumulator register in place before storing C.
@@ -963,7 +1311,9 @@ fn entry_smem_db(
                     s += &act.epilogue(&format!("%c{ti}_{tj}_{r}"));
                 }
                 let cc = veclist(&format!("c{ti}_{tj}_"), 8);
-                s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n");
+                s += &format!(
+                    "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n"
+                );
             }
         }
     }
@@ -1007,9 +1357,15 @@ fn entry_smem_pipe(
     bias: bool,
     residual: bool,
 ) -> String {
-    assert!(stages >= 2, "the pipeline needs at least 2 stages (1 prefetch in flight)");
+    assert!(
+        stages >= 2,
+        "the pipeline needs at least 2 stages (1 prefetch in flight)"
+    );
     assert!(bk % 16 == 0, "bk must be a multiple of the WMMA k16 step");
-    assert!((bk / 8).is_power_of_two(), "bk/8 must be a power of two (shift-based staging address math)");
+    assert!(
+        (bk / 8).is_power_of_two(),
+        "bk/8 must be a power of two (shift-based staging address math)"
+    );
     assert!(
         raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()),
         "{name}: rasterization needs bm,bn powers of two (tiles_m/n via shift)"
@@ -1054,7 +1410,10 @@ fn entry_smem_pipe(
     }
     let a_chunks = bm * bk / (threads * 8);
     let b_chunks = bn * bk / (threads * 8);
-    assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk per thread");
+    assert!(
+        a_chunks >= 1 && b_chunks >= 1,
+        "{name}: tile too small for one 128-bit chunk per thread"
+    );
     let bk_chunks = bk / 8; // 8-element (128-bit) chunks per staged row
     let row_shift = bk_chunks.trailing_zeros(); // flat-chunk e → row = e >> row_shift
     let col_mask = bk_chunks - 1; //              col8 = (e & col_mask) << 3
@@ -1065,7 +1424,11 @@ fn entry_smem_pipe(
     // The fused-bias variant takes an extra `bias[N]` (f32) param read in the SMEM store-back epilogue;
     // the residual variant takes a `residual[M,N]` (f32) used to seed the accumulator via wmma.load.c.
     let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
-    let resid_param = if residual { ",\n    .param .u64 pResidual" } else { "" };
+    let resid_param = if residual {
+        ",\n    .param .u64 pResidual"
+    } else {
+        ""
+    };
     let mut s = String::new();
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
@@ -1099,7 +1462,10 @@ fn entry_smem_pipe(
     // `%act0`/`%act1` are scratch for a fused transcendental epilogue (Act::Silu/Gelu, applied in the
     // bias store-back); dropped by ptxas when unused (Act::None/Relu, or no bias).
     if bias {
-        s += &format!("    .reg .f32 {},%act0,%act1;\n", decl_c.trim_end_matches(','));
+        s += &format!(
+            "    .reg .f32 {},%act0,%act1;\n",
+            decl_c.trim_end_matches(',')
+        );
     } else {
         s += &format!("    .reg .f32 {};\n", decl_c.trim_end_matches(','));
     }
@@ -1148,12 +1514,19 @@ fn entry_smem_pipe(
         for ti in 0..tm {
             for tj in 0..tn {
                 let cc = veclist(&format!("c{ti}_{tj}_"), 8);
-                s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+                s += &format!(
+                    "    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n",
+                    ti * 16
+                );
                 s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
-                s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+                s += &format!(
+                    "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+                    tj * 16
+                );
                 s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
                 s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%Resid,%off;\n";
-                s += &format!("    wmma.load.c.sync.aligned.m16n16k16.row.f32 {cc}, [%cptr], %N;\n");
+                s +=
+                    &format!("    wmma.load.c.sync.aligned.m16n16k16.row.f32 {cc}, [%cptr], %N;\n");
             }
         }
     } else {
@@ -1170,7 +1543,12 @@ fn entry_smem_pipe(
     // `bufoff` within `smem`. Each thread copies `chunks` 128-bit (8×f16) groups: flat chunk e=tix+li·T,
     // row r=e>>row_shift, col8=(e&col_mask)<<3 (BK row-major), so SMEM dest byte = bufoff + e·16 and the
     // global element is (g_base+r)·K + kcol + col8. 16-byte aligned (every term is an 8-multiple).
-    let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+    let stage = |g_base: &str,
+                 gbase_ptr: &str,
+                 smem: &str,
+                 bufoff: &str,
+                 chunks: usize,
+                 s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
                 *s += "    mov.u32 %e,%tix;\n";
@@ -1189,30 +1567,70 @@ fn entry_smem_pipe(
     // even when guarded off for tiny K so the wait_group accounting stays uniform).
     for st in 0..(stages - 1) {
         s += &format!("    mov.u32 %kcol,{};\n", st * bk);
-        s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", st * tile_a, st * tile_b);
+        s += &format!(
+            "    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n",
+            st * tile_a,
+            st * tile_b
+        );
         s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
-        stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-        stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+        stage(
+            "%baseRow",
+            "%A",
+            &format!("smemA_{name}"),
+            "%bufwA",
+            a_chunks,
+            &mut s,
+        );
+        stage(
+            "%baseCol",
+            "%B",
+            &format!("smemB_{name}"),
+            "%bufwB",
+            b_chunks,
+            &mut s,
+        );
         s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
     }
 
     // Compute buffer starts at offset 0; the write (prefetch) buffer trails by stages-1 buffers.
     s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcB,0;\n";
-    s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", (stages - 1) * tile_a, (stages - 1) * tile_b);
+    s += &format!(
+        "    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n",
+        (stages - 1) * tile_a,
+        (stages - 1) * tile_b
+    );
     s += "    mov.u32 %kt,0;\n";
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
     // Drain the oldest in-flight group (the tile we are about to read), then the single fence.
     s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
     // Issue the prefetch for the tile (stages-1) ahead into the write buffer, if it exists; commit.
     s += &format!("    add.u32 %kcol,%kt,{};\n    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra NOPRE_{name};\n", (stages - 1) * bk);
-    stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-    stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+    stage(
+        "%baseRow",
+        "%A",
+        &format!("smemA_{name}"),
+        "%bufwA",
+        a_chunks,
+        &mut s,
+    );
+    stage(
+        "%baseCol",
+        "%B",
+        &format!("smemB_{name}"),
+        "%bufwB",
+        b_chunks,
+        &mut s,
+    );
     s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
     // Compute the current tile from buffer `%bufc`: bk/16 WMMA k-steps, fragment reuse across tm×tn.
     for ks in 0..nks {
         for ti in 0..tm {
             s += &format!("    mov.u32 %tmp,smemA_{name};\n    add.u32 %tmp,%tmp,%bufcA;\n");
-            s += &format!("    mul.lo.s32 %tmp2,%warpRow,{};\n    add.u32 %tmp2,%tmp2,{};\n", wm * bk as i64, ti * 16 * bk);
+            s += &format!(
+                "    mul.lo.s32 %tmp2,%warpRow,{};\n    add.u32 %tmp2,%tmp2,{};\n",
+                wm * bk as i64,
+                ti * 16 * bk
+            );
             s += &format!("    add.u32 %tmp2,%tmp2,{};\n    shl.b32 %tmp2,%tmp2,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ks * 16);
             s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
             let ra = veclist(&format!("a{ti}_"), nab);
@@ -1220,7 +1638,11 @@ fn entry_smem_pipe(
         }
         for tj in 0..tn {
             s += &format!("    mov.u32 %tmp,smemB_{name};\n    add.u32 %tmp,%tmp,%bufcB;\n");
-            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{};\n    add.u32 %tmp2,%tmp2,{};\n", wn * bk as i64, tj * 16 * bk);
+            s += &format!(
+                "    mul.lo.s32 %tmp2,%warpCol,{};\n    add.u32 %tmp2,%tmp2,{};\n",
+                wn * bk as i64,
+                tj * 16 * bk
+            );
             s += &format!("    add.u32 %tmp2,%tmp2,{};\n    shl.b32 %tmp2,%tmp2,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ks * 16);
             s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
             let rb = veclist(&format!("b{tj}_"), nab);
@@ -1266,9 +1688,11 @@ fn entry_smem_pipe(
                 // Store this 16×16 tile's accumulator to the warp's scratch (row-major, leading dim 16).
                 let cc = veclist(&format!("c{ti}_{tj}_"), 8);
                 s += "    cvt.u64.u32 %scptr,%scbase;\n    cvta.shared.u64 %scptr,%scptr;\n";
-                s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%scptr], {cc}, %scld;\n");
+                s += &format!(
+                    "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%scptr], {cc}, %scld;\n"
+                );
                 s += "    bar.sync 0;\n"; // tile fully written to scratch before any lane reads it
-                // Each lane owns 8 of the 256 elements: flat f = lane + u·32 ⇒ (row f/16, col f%16).
+                                          // Each lane owns 8 of the 256 elements: flat f = lane + u·32 ⇒ (row f/16, col f%16).
                 for u in 0..8 {
                     if u == 0 {
                         s += "    mov.u32 %f,%lane;\n";
@@ -1292,13 +1716,21 @@ fn entry_smem_pipe(
     } else {
         for ti in 0..tm {
             for tj in 0..tn {
-                s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+                s += &format!(
+                    "    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n",
+                    ti * 16
+                );
                 s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
-                s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+                s += &format!(
+                    "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+                    tj * 16
+                );
                 s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
                 s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
                 let cc = veclist(&format!("c{ti}_{tj}_"), 8);
-                s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n");
+                s += &format!(
+                    "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n"
+                );
             }
         }
     }
@@ -1358,8 +1790,23 @@ fn entry_mma_pipe(
     // path and its PTX is the historical text to the byte. Only the deliberately-deep variants
     // ([`PIPE_DEEP_VARIANTS`]) pass a device budget and cross into the dynamic window.
     entry_mma_pipe_budget(
-        name, ty, bm, bn, bk, warps_m, warps_n, stages, raster, pad, act, bias, residual, swz,
-        min_ctas, store, STATIC_SMEM_CAP,
+        name,
+        ty,
+        bm,
+        bn,
+        bk,
+        warps_m,
+        warps_n,
+        stages,
+        raster,
+        pad,
+        act,
+        bias,
+        residual,
+        swz,
+        min_ctas,
+        store,
+        STATIC_SMEM_CAP,
     )
 }
 
@@ -1399,9 +1846,18 @@ fn entry_mma_pipe_budget(
     smem_budget: usize,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
-    assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
-    assert!(bm % (16 * warps_m) == 0, "{name}: bm must be a multiple of 16·warps_m (m16 sub-tiles)");
-    assert!(bn % (8 * warps_n) == 0, "{name}: bn must be a multiple of 8·warps_n (n8 sub-tiles)");
+    assert!(
+        bk % 16 == 0 && (bk / 8).is_power_of_two(),
+        "bk must be a 16-multiple with bk/8 a power of two"
+    );
+    assert!(
+        bm % (16 * warps_m) == 0,
+        "{name}: bm must be a multiple of 16·warps_m (m16 sub-tiles)"
+    );
+    assert!(
+        bn % (8 * warps_n) == 0,
+        "{name}: bn must be a multiple of 8·warps_n (n8 sub-tiles)"
+    );
     assert!(
         raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()),
         "{name}: rasterization needs bm,bn powers of two"
@@ -1413,12 +1869,15 @@ fn entry_mma_pipe_budget(
     let nks = bk / 16; // k16 steps fed by one staged tile
     let wmr = bm / warps_m; // per-warp M rows (WM)
     let wnc = bn / warps_n; // per-warp N cols (WN)
-    // SMEM rows padded by `pad` f16 (`ldp` leading dim): a b32 fragment load by lane (grp,tid) hits bank
-    // (grp·ldp/2 + tid) mod 32. pad=8 ⇒ ldp/2 = (bk+8)/2 ≡ 4·(odd), so grp·(ldp/2) spans all eight
-    // multiples of 4 and the 8 grp × 4 tid = 32 lanes hit 32 distinct banks — conflict-free (vs the 4-way
-    // conflict at stride bk where grp and grp+2 alias). pad=0 keeps the conflict but a smaller footprint ⇒
-    // more CTAs/SM. Pad keeps 16-byte alignment for cp.async. K-offsets stay bk-based.
-    assert!(pad % 8 == 0, "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)");
+                            // SMEM rows padded by `pad` f16 (`ldp` leading dim): a b32 fragment load by lane (grp,tid) hits bank
+                            // (grp·ldp/2 + tid) mod 32. pad=8 ⇒ ldp/2 = (bk+8)/2 ≡ 4·(odd), so grp·(ldp/2) spans all eight
+                            // multiples of 4 and the 8 grp × 4 tid = 32 lanes hit 32 distinct banks — conflict-free (vs the 4-way
+                            // conflict at stride bk where grp and grp+2 alias). pad=0 keeps the conflict but a smaller footprint ⇒
+                            // more CTAs/SM. Pad keeps 16-byte alignment for cp.async. K-offsets stay bk-based.
+    assert!(
+        pad % 8 == 0,
+        "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)"
+    );
     // The **`swz` (ldmatrix + XOR-swizzle + no-pad)** path drops the padding (smaller footprint ⇒ more
     // CTAs/SM — 3 vs the padded 2 at this tile, the occupancy the HBM-bound 4096³ needs) and instead makes
     // both the cp.async stores and the `ldmatrix` gathers conflict-free via an XOR swizzle on the 16-byte
@@ -1429,8 +1888,14 @@ fn entry_mma_pipe_budget(
     let nc = bk / 8; // 16-byte (8×f16) chunks per SMEM row
     let nc_mask = nc - 1;
     if swz {
-        assert!(bk == 32, "{name}: the swz swizzle phase is derived for bk=32 (nc=4)");
-        assert!(wmr % 8 == 0 && wnc % 8 == 0, "{name}: swz needs warp row/col bases ≡ 0 (mod 8)");
+        assert!(
+            bk == 32,
+            "{name}: the swz swizzle phase is derived for bk=32 (nc=4)"
+        );
+        assert!(
+            wmr % 8 == 0 && wnc % 8 == 0,
+            "{name}: swz needs warp row/col bases ≡ 0 (mod 8)"
+        );
     }
     let ldp = if swz { bk } else { bk + pad }; // swz: no pad (the swizzle, not padding, gives conflict-free)
     let tile_a = bm * ldp * 2;
@@ -1448,10 +1913,16 @@ fn entry_mma_pipe_budget(
     // Sub-slab alignment inside the shared window: B starts right after the whole A ring, and every
     // `cp.async …,16` / `ldmatrix` into it assumes 16-B alignment. Loud at generation, because a
     // forgotten offset assert is the one way the swizzle/alignment risk escapes silently.
-    assert!(smem_a % 16 == 0, "{name}: B slab offset {smem_a} is not 16-B aligned");
+    assert!(
+        smem_a % 16 == 0,
+        "{name}: B slab offset {smem_a} is not 16-B aligned"
+    );
     let a_chunks = bm * bk / (threads * 8);
     let b_chunks = bn * bk / (threads * 8);
-    assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk per thread");
+    assert!(
+        a_chunks >= 1 && b_chunks >= 1,
+        "{name}: tile too small for one 128-bit chunk per thread"
+    );
     let bk_chunks = bk / 8;
     let row_shift = bk_chunks.trailing_zeros();
     let col_mask = bk_chunks - 1;
@@ -1463,7 +1934,11 @@ fn entry_mma_pipe_budget(
     // activation — `out = act(A·Bᵀ + bias) + residual`, the transformer down-proj / attention output-proj
     // sublayer output (the skip connection); fusing it folds the otherwise-separate residual-add kernel.
     let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
-    let resid_param = if residual { ",\n    .param .u64 pResid" } else { "" };
+    let resid_param = if residual {
+        ",\n    .param .u64 pResid"
+    } else {
+        ""
+    };
     let mut s = String::new();
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n"
@@ -1548,8 +2023,13 @@ fn entry_mma_pipe_budget(
     // lane decomposition: grp = lane/4 (0..7), tg = lane%4 (0..3), tg2 = 2·tg.
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += "    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
-    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
-    s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
+    s += &format!(
+        "    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n",
+        warps_n - 1
+    );
+    s += &format!(
+        "    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n"
+    );
     // Per-lane SMEM byte offset shared by A and B fragment loads: (grp·ldp + tg2)·2 (padded row stride).
     s += &format!("    mul.lo.s32 %laneoff,%grp,{ldp};\n    add.u32 %laneoff,%laneoff,%tg2;\n    shl.b32 %laneoff,%laneoff,1;\n");
     if swz {
@@ -1599,7 +2079,12 @@ fn entry_mma_pipe_budget(
 
     // `smem` is the pre-rendered ring base (the `mov`, plus the constant slab offset in the shared
     // window); the static form is the historical single `mov`, byte for byte.
-    let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+    let stage = |g_base: &str,
+                 gbase_ptr: &str,
+                 smem: &str,
+                 bufoff: &str,
+                 chunks: usize,
+                 s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
                 *s += "    mov.u32 %e,%tix;\n";
@@ -1626,14 +2111,22 @@ fn entry_mma_pipe_budget(
 
     for st in 0..(stages - 1) {
         s += &format!("    mov.u32 %kcol,{};\n", st * bk);
-        s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", st * tile_a, st * tile_b);
+        s += &format!(
+            "    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n",
+            st * tile_a,
+            st * tile_b
+        );
         s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
         stage("%baseRow", "%A", &a_base, "%bufwA", a_chunks, &mut s);
         stage("%baseCol", "%B", &b_base, "%bufwB", b_chunks, &mut s);
         s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
     }
     s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcB,0;\n";
-    s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", (stages - 1) * tile_a, (stages - 1) * tile_b);
+    s += &format!(
+        "    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n",
+        (stages - 1) * tile_a,
+        (stages - 1) * tile_b
+    );
     s += "    mov.u32 %kt,0;\n";
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
     s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
@@ -1670,7 +2163,10 @@ fn entry_mma_pipe_budget(
             s += &base_into("%aptr", &sym_a, 0);
             s += "    add.u32 %aptr,%aptr,%bufcA;\n";
             s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
-            s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
+            s += &format!(
+                "    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n",
+                ks * 32
+            );
             for mi in 0..tm {
                 let base = mi * 16 * ldp * 2; // m16-block row offset (bytes, padded stride)
                 let r8 = 8 * ldp * 2; // +8 rows
@@ -1683,11 +2179,15 @@ fn entry_mma_pipe_budget(
             s += &base_into("%bptr", &sym_b, off_b);
             s += "    add.u32 %bptr,%bptr,%bufcB;\n";
             s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
-            s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+            s += &format!(
+                "    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n",
+                ks * 32
+            );
             for ni in 0..tn {
                 let base = ni * 8 * ldp * 2; // n8-block row offset (bytes, padded stride)
                 s += &format!("    ld.shared.b32 %b{ni}_0,[%bptr+{}];\n", base);
-                s += &format!("    ld.shared.b32 %b{ni}_1,[%bptr+{}];\n", base + 16); // k+8 (not padded)
+                s += &format!("    ld.shared.b32 %b{ni}_1,[%bptr+{}];\n", base + 16);
+                // k+8 (not padded)
             }
         }
         for mi in 0..tm {
@@ -1709,7 +2209,9 @@ fn entry_mma_pipe_budget(
     // columns ⇒ contiguous in C, so `Store::V2{,Cs}` folds them into one `st.global.v2.f32` (bit-identical).
     let store_pair = |dst: &str, lo: &str, hi: &str| -> String {
         match store {
-            Store::Scalar => format!("    st.global.f32 [{dst}],{lo};\n    st.global.f32 [{dst}+4],{hi};\n"),
+            Store::Scalar => {
+                format!("    st.global.f32 [{dst}],{lo};\n    st.global.f32 [{dst}+4],{hi};\n")
+            }
             Store::V2 => format!("    st.global.v2.f32 [{dst}],{{{lo},{hi}}};\n"),
             Store::V2Cs => format!("    st.global.cs.v2.f32 [{dst}],{{{lo},{hi}}};\n"),
         }
@@ -1740,14 +2242,22 @@ fn entry_mma_pipe_budget(
                 s += "    add.s64 %cptr2,%Resid,%off;\n    ld.global.f32 %resv0,[%cptr2];\n    ld.global.f32 %resv1,[%cptr2+4];\n";
                 s += &format!("    add.f32 %d{mi}_{ni}_0,%d{mi}_{ni}_0,%resv0;\n    add.f32 %d{mi}_{ni}_1,%d{mi}_{ni}_1,%resv1;\n");
             }
-            s += &store_pair("%cptr", &format!("%d{mi}_{ni}_0"), &format!("%d{mi}_{ni}_1"));
+            s += &store_pair(
+                "%cptr",
+                &format!("%d{mi}_{ni}_0"),
+                &format!("%d{mi}_{ni}_1"),
+            );
             // row grp+8: C[(grow+8)·N+gcol] = d2, [+1] = d3 (residual scratch in the now-free %cptr).
             s += "    add.u32 %tmp,%grow,8;\n    mul.lo.s32 %tmp,%tmp,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr2,%C,%off;\n";
             if residual {
                 s += "    add.s64 %cptr,%Resid,%off;\n    ld.global.f32 %resv0,[%cptr];\n    ld.global.f32 %resv1,[%cptr+4];\n";
                 s += &format!("    add.f32 %d{mi}_{ni}_2,%d{mi}_{ni}_2,%resv0;\n    add.f32 %d{mi}_{ni}_3,%d{mi}_{ni}_3,%resv1;\n");
             }
-            s += &store_pair("%cptr2", &format!("%d{mi}_{ni}_2"), &format!("%d{mi}_{ni}_3"));
+            s += &store_pair(
+                "%cptr2",
+                &format!("%d{mi}_{ni}_2"),
+                &format!("%d{mi}_{ni}_3"),
+            );
         }
     }
     s += "    ret;\n}\n";
@@ -1790,14 +2300,26 @@ fn entry_mma_gate(
     swz: bool,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
-    assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
-    assert!(bm % (16 * warps_m) == 0, "{name}: bm must be a multiple of 16·warps_m");
-    assert!(bn % (8 * warps_n) == 0, "{name}: bn must be a multiple of 8·warps_n");
+    assert!(
+        bk % 16 == 0 && (bk / 8).is_power_of_two(),
+        "bk must be a 16-multiple with bk/8 a power of two"
+    );
+    assert!(
+        bm % (16 * warps_m) == 0,
+        "{name}: bm must be a multiple of 16·warps_m"
+    );
+    assert!(
+        bn % (8 * warps_n) == 0,
+        "{name}: bn must be a multiple of 8·warps_n"
+    );
     assert!(
         raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()),
         "{name}: rasterization needs bm,bn powers of two"
     );
-    assert!(pad % 8 == 0, "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)");
+    assert!(
+        pad % 8 == 0,
+        "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)"
+    );
     let mma_ty = format!("f32.{ty}.{ty}.f32");
     let threads = warps_m * warps_n * 32;
     let tm = bm / (16 * warps_m); // m16 sub-tiles per warp
@@ -1820,8 +2342,14 @@ fn entry_mma_gate(
     // to hide the no-pad swizzle's per-ks address arithmetic. Emitted + correctness-gated as a verified
     // alternative; **production routes to the padded base** (see `gemm_nt_f16_swiglu`).
     if swz {
-        assert!(bk == 32, "{name}: the swz swizzle phase is derived for bk=32 (nc=4)");
-        assert!(wmr % 8 == 0 && wnc % 8 == 0, "{name}: swz needs warp row/col bases ≡ 0 (mod 8)");
+        assert!(
+            bk == 32,
+            "{name}: the swz swizzle phase is derived for bk=32 (nc=4)"
+        );
+        assert!(
+            wmr % 8 == 0 && wnc % 8 == 0,
+            "{name}: swz needs warp row/col bases ≡ 0 (mod 8)"
+        );
     }
     let ldp = if swz { bk } else { bk + pad }; // swz: no pad (the swizzle, not padding, gives conflict-free)
     let tile_a = bm * ldp * 2;
@@ -1829,10 +2357,17 @@ fn entry_mma_gate(
     let smem_a = stages * tile_a;
     let smem_b = stages * tile_b;
     // Three ring buffers: A + Wg + Wu. 128×64/bk32/pad8/s2 ⇒ 20480 + 2·10240 = 40 KiB (= single-B 128×128).
-    assert!(smem_a + 2 * smem_b <= 48 * 1024, "{name}: static SMEM {} B exceeds 48 KiB", smem_a + 2 * smem_b);
+    assert!(
+        smem_a + 2 * smem_b <= 48 * 1024,
+        "{name}: static SMEM {} B exceeds 48 KiB",
+        smem_a + 2 * smem_b
+    );
     let a_chunks = bm * bk / (threads * 8);
     let b_chunks = bn * bk / (threads * 8);
-    assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk per thread");
+    assert!(
+        a_chunks >= 1 && b_chunks >= 1,
+        "{name}: tile too small for one 128-bit chunk per thread"
+    );
     let bk_chunks = bk / 8;
     let row_shift = bk_chunks.trailing_zeros();
     let col_mask = bk_chunks - 1;
@@ -1840,7 +2375,11 @@ fn entry_mma_gate(
 
     // The fused-bias variant takes per-column gate/up biases `bg[N]`,`bu[N]` (f32), added in the store
     // epilogue (the `silu(x·Wg+bg) ⊙ (x·Wu+bu)` form; biasless is the Llama-style no-bias gate).
-    let bias_param = if bias { ",\n    .param .u64 pBiasG,\n    .param .u64 pBiasU" } else { "" };
+    let bias_param = if bias {
+        ",\n    .param .u64 pBiasG,\n    .param .u64 pBiasU"
+    } else {
+        ""
+    };
     let mut s = String::new();
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pBg,\n    .param .u64 pBu,\n    .param .u64 pC{bias_param}\n)\n{{\n"
@@ -1910,8 +2449,13 @@ fn entry_mma_gate(
     }
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += "    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
-    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
-    s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
+    s += &format!(
+        "    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n",
+        warps_n - 1
+    );
+    s += &format!(
+        "    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n"
+    );
     s += &format!("    mul.lo.s32 %laneoff,%grp,{ldp};\n    add.u32 %laneoff,%laneoff,%tg2;\n    shl.b32 %laneoff,%laneoff,1;\n");
     if swz {
         // A ldmatrix.x4: row R = warpMrow + mi·16 + (lane&15); arowb = (warpMrow + (lane&15))·bk·2 (mi·16
@@ -1937,7 +2481,12 @@ fn entry_mma_gate(
     // (`bufoff + row·ldp·2 + col·2`, the layout the hand-placed b32 fragment loads read conflict-free).
     // swz: **no-pad + XOR-swizzle** (`bufoff + row·bk·2 + (chunk XOR ((row>>1)&nc_mask))·16`, the layout the
     // `ldmatrix` gathers read conflict-free). Same global read either way.
-    let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+    let stage = |g_base: &str,
+                 gbase_ptr: &str,
+                 smem: &str,
+                 bufoff: &str,
+                 chunks: usize,
+                 s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
                 *s += "    mov.u32 %e,%tix;\n";
@@ -1963,22 +2512,74 @@ fn entry_mma_gate(
     // Prologue: prefetch tiles 0..stages-2 of A, Wg, Wu (one cp.async group per K-tile).
     for st in 0..(stages - 1) {
         s += &format!("    mov.u32 %kcol,{};\n", st * bk);
-        s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n", st * tile_a, st * tile_b, st * tile_b);
+        s += &format!(
+            "    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n",
+            st * tile_a,
+            st * tile_b,
+            st * tile_b
+        );
         s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
-        stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-        stage("%baseCol", "%Bg", &format!("smemBg_{name}"), "%bufwBg", b_chunks, &mut s);
-        stage("%baseCol", "%Bu", &format!("smemBu_{name}"), "%bufwBu", b_chunks, &mut s);
+        stage(
+            "%baseRow",
+            "%A",
+            &format!("smemA_{name}"),
+            "%bufwA",
+            a_chunks,
+            &mut s,
+        );
+        stage(
+            "%baseCol",
+            "%Bg",
+            &format!("smemBg_{name}"),
+            "%bufwBg",
+            b_chunks,
+            &mut s,
+        );
+        stage(
+            "%baseCol",
+            "%Bu",
+            &format!("smemBu_{name}"),
+            "%bufwBu",
+            b_chunks,
+            &mut s,
+        );
         s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
     }
     s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcBg,0;\n    mov.u32 %bufcBu,0;\n";
-    s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n", (stages - 1) * tile_a, (stages - 1) * tile_b, (stages - 1) * tile_b);
+    s += &format!(
+        "    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n",
+        (stages - 1) * tile_a,
+        (stages - 1) * tile_b,
+        (stages - 1) * tile_b
+    );
     s += "    mov.u32 %kt,0;\n";
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
     s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
     s += &format!("    add.u32 %kcol,%kt,{};\n    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra NOPRE_{name};\n", (stages - 1) * bk);
-    stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-    stage("%baseCol", "%Bg", &format!("smemBg_{name}"), "%bufwBg", b_chunks, &mut s);
-    stage("%baseCol", "%Bu", &format!("smemBu_{name}"), "%bufwBu", b_chunks, &mut s);
+    stage(
+        "%baseRow",
+        "%A",
+        &format!("smemA_{name}"),
+        "%bufwA",
+        a_chunks,
+        &mut s,
+    );
+    stage(
+        "%baseCol",
+        "%Bg",
+        &format!("smemBg_{name}"),
+        "%bufwBg",
+        b_chunks,
+        &mut s,
+    );
+    stage(
+        "%baseCol",
+        "%Bu",
+        &format!("smemBu_{name}"),
+        "%bufwBu",
+        b_chunks,
+        &mut s,
+    );
     s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
 
     // Compute: load A fragments ONCE (smem + buffer + warp + lane + ks·16), then issue the gate `mma`s
@@ -2012,7 +2613,10 @@ fn entry_mma_gate(
         } else {
             s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
             s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
-            s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
+            s += &format!(
+                "    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n",
+                ks * 32
+            );
             for mi in 0..tm {
                 let base = mi * 16 * ldp * 2;
                 let r8 = 8 * ldp * 2;
@@ -2023,7 +2627,10 @@ fn entry_mma_gate(
             }
             s += &format!("    mov.u32 %bptr,smemBg_{name};\n    add.u32 %bptr,%bptr,%bufcBg;\n");
             s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
-            s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+            s += &format!(
+                "    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n",
+                ks * 32
+            );
             for ni in 0..tn {
                 let base = ni * 8 * ldp * 2;
                 s += &format!("    ld.shared.b32 %bg{ni}_0,[%bptr+{}];\n", base);
@@ -2031,7 +2638,10 @@ fn entry_mma_gate(
             }
             s += &format!("    mov.u32 %bptr,smemBu_{name};\n    add.u32 %bptr,%bptr,%bufcBu;\n");
             s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
-            s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+            s += &format!(
+                "    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n",
+                ks * 32
+            );
             for ni in 0..tn {
                 let base = ni * 8 * ldp * 2;
                 s += &format!("    ld.shared.b32 %bu{ni}_0,[%bptr+{}];\n", base);
@@ -2172,16 +2782,36 @@ fn roofline_entry() -> String {
 pub fn wmma_f16_sm_static_ptx(m: usize, n: usize, k: usize, use_128: bool) -> String {
     let mut s = String::from(HDR_SM80);
     if use_128 {
-        s += &entry_smem("wmma_nt_f16_sm128_static", "f16", SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N, Some((m, n, k)));
+        s += &entry_smem(
+            "wmma_nt_f16_sm128_static",
+            "f16",
+            SM128_BM,
+            SM128_BN,
+            SM128_WARPS_M,
+            SM128_WARPS_N,
+            Some((m, n, k)),
+        );
     } else {
-        s += &entry_smem("wmma_nt_f16_sm_static", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Some((m, n, k)));
+        s += &entry_smem(
+            "wmma_nt_f16_sm_static",
+            "f16",
+            SM_BM,
+            SM_BN,
+            SM_WARPS_M,
+            SM_WARPS_N,
+            Some((m, n, k)),
+        );
     }
     s
 }
 
 /// Entry name for [`wmma_f16_sm_static_ptx`] at the matching `use_128`.
 pub fn wmma_f16_sm_static_entry(use_128: bool) -> &'static str {
-    if use_128 { "wmma_nt_f16_sm128_static" } else { "wmma_nt_f16_sm_static" }
+    if use_128 {
+        "wmma_nt_f16_sm128_static"
+    } else {
+        "wmma_nt_f16_sm_static"
+    }
 }
 
 /// fp16 tensor-core GEMM module — the whole dispatched fp16 family in one module, in emission order:
@@ -2197,13 +2827,39 @@ pub fn wmma_f16_ptx() -> &'static str {
         let mut m = String::from(HDR_SM80);
         m += &entry("wmma_nt_f16", "f16", 1, 1);
         m += &entry("wmma_nt_f16_mt", "f16", TM_TILES, TN_TILES);
-        m += &entry_smem("wmma_nt_f16_sm", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, None);
+        m += &entry_smem(
+            "wmma_nt_f16_sm",
+            "f16",
+            SM_BM,
+            SM_BN,
+            SM_WARPS_M,
+            SM_WARPS_N,
+            None,
+        );
         // Single-buffered 128×128 tile (no cp.async pipeline). At L2-spilling sizes the double-buffered
         // kernels are occupancy-bound and LOSE to the un-pipelined ones (measured: _sm beats _sm_db at
         // 2048³); the big tile halves redundant inter-CTA traffic while single-buffering avoids the
         // pipeline's extra SMEM + bar.syncs — the large-GEMM candidate the clean scoreboard motivates.
-        m += &entry_smem("wmma_nt_f16_sm128", "f16", SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N, None);
-        m += &entry_smem_db("wmma_nt_f16_sm_db", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
+        m += &entry_smem(
+            "wmma_nt_f16_sm128",
+            "f16",
+            SM128_BM,
+            SM128_BN,
+            SM128_WARPS_M,
+            SM128_WARPS_N,
+            None,
+        );
+        m += &entry_smem_db(
+            "wmma_nt_f16_sm_db",
+            "f16",
+            SM_BM,
+            SM_BN,
+            SM_WARPS_M,
+            SM_WARPS_N,
+            Act::None,
+            false,
+            false,
+        );
         m += &entry_smem_db(
             "wmma_nt_f16_sm128_db",
             "f16",
@@ -2220,9 +2876,39 @@ pub fn wmma_f16_ptx() -> &'static str {
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
             m += &if v.mma {
-                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false, 0, Store::Scalar)
+                entry_mma_pipe(
+                    v.name,
+                    "f16",
+                    v.bm,
+                    v.bn,
+                    v.bk,
+                    v.wm,
+                    v.wn,
+                    v.stages,
+                    v.raster,
+                    v.pad,
+                    Act::None,
+                    false,
+                    false,
+                    false,
+                    0,
+                    Store::Scalar,
+                )
             } else {
-                entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, Act::None, false, false)
+                entry_smem_pipe(
+                    v.name,
+                    "f16",
+                    v.bm,
+                    v.bn,
+                    v.bk,
+                    v.wm,
+                    v.wn,
+                    v.stages,
+                    v.raster,
+                    Act::None,
+                    false,
+                    false,
+                )
             };
         }
         // **`ldmatrix` + XOR-swizzle + no-pad workhorse** (`_swz`) — the full CUTLASS recipe for the
@@ -2236,8 +2922,18 @@ pub fn wmma_f16_ptx() -> &'static str {
             m += &entry_mma_pipe(
                 &format!("{}_swz", wh.name),
                 "f16",
-                wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
-                Act::None, false, false, true,
+                wh.bm,
+                wh.bn,
+                wh.bk,
+                wh.wm,
+                wh.wn,
+                wh.stages,
+                wh.raster,
+                wh.pad,
+                Act::None,
+                false,
+                false,
+                true,
                 0,
                 Store::Scalar,
             );
@@ -2250,8 +2946,18 @@ pub fn wmma_f16_ptx() -> &'static str {
             m += &entry_mma_pipe(
                 &format!("{}_w22swz", wh.name),
                 "f16",
-                wh.bm, wh.bn, wh.bk, 2, 2, wh.stages, wh.raster, wh.pad,
-                Act::None, false, false, true,
+                wh.bm,
+                wh.bn,
+                wh.bk,
+                2,
+                2,
+                wh.stages,
+                wh.raster,
+                wh.pad,
+                Act::None,
+                false,
+                false,
+                true,
                 0,
                 Store::Scalar,
             );
@@ -2272,7 +2978,13 @@ pub fn wmma_f16_ptx() -> &'static str {
             m += &entry_smem_pipe(
                 &format!("{}_{suffix}", p64.name),
                 "f16",
-                p64.bm, p64.bn, p64.bk, p64.wm, p64.wn, p64.stages, p64.raster,
+                p64.bm,
+                p64.bn,
+                p64.bk,
+                p64.wm,
+                p64.wn,
+                p64.stages,
+                p64.raster,
                 act,
                 true,
                 false,
@@ -2283,7 +2995,13 @@ pub fn wmma_f16_ptx() -> &'static str {
         m += &entry_smem_pipe(
             &format!("{}_bias_residual", p64.name),
             "f16",
-            p64.bm, p64.bn, p64.bk, p64.wm, p64.wn, p64.stages, p64.raster,
+            p64.bm,
+            p64.bn,
+            p64.bk,
+            p64.wm,
+            p64.wn,
+            p64.stages,
+            p64.raster,
             Act::None,
             true,
             true,
@@ -2295,11 +3013,23 @@ pub fn wmma_f16_ptx() -> &'static str {
         // column map is known, so bias[col] is added without any SMEM scratch the WMMA path needs). Built
         // on the r16 mma champion (the fastest base): bias alone (Linear) + bias·{relu,silu,gelu} (FFN).
         let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
-        for (suffix, act) in [("bias", Act::None), ("bias_relu", Act::Relu), ("bias_silu", Act::Silu), ("bias_gelu", Act::Gelu)] {
+        for (suffix, act) in [
+            ("bias", Act::None),
+            ("bias_relu", Act::Relu),
+            ("bias_silu", Act::Silu),
+            ("bias_gelu", Act::Gelu),
+        ] {
             m += &entry_mma_pipe(
                 &format!("{}_{suffix}", wh.name),
                 "f16",
-                wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
+                wh.bm,
+                wh.bn,
+                wh.bk,
+                wh.wm,
+                wh.wn,
+                wh.stages,
+                wh.raster,
+                wh.pad,
                 act,
                 true,
                 false,
@@ -2317,7 +3047,14 @@ pub fn wmma_f16_ptx() -> &'static str {
             m += &entry_mma_pipe(
                 &format!("{}_swz_{suffix}", wh.name),
                 "f16",
-                wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, 0,
+                wh.bm,
+                wh.bn,
+                wh.bk,
+                wh.wm,
+                wh.wn,
+                wh.stages,
+                wh.raster,
+                0,
                 act,
                 true,
                 false,
@@ -2334,7 +3071,14 @@ pub fn wmma_f16_ptx() -> &'static str {
         m += &entry_mma_pipe(
             &format!("{}_bias_residual", wh.name),
             "f16",
-            wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
+            wh.bm,
+            wh.bn,
+            wh.bk,
+            wh.wm,
+            wh.wn,
+            wh.stages,
+            wh.raster,
+            wh.pad,
             Act::None,
             true,
             true,
@@ -2349,7 +3093,14 @@ pub fn wmma_f16_ptx() -> &'static str {
         m += &entry_mma_pipe(
             &format!("{}_swz_bias_residual", wh.name),
             "f16",
-            wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, 0,
+            wh.bm,
+            wh.bn,
+            wh.bk,
+            wh.wm,
+            wh.wn,
+            wh.stages,
+            wh.raster,
+            0,
             Act::None,
             true,
             true,
@@ -2369,12 +3120,40 @@ pub fn wmma_f16_ptx() -> &'static str {
             ("gate_silu_bias", Act::Silu, true),
             ("gate_gelu_bias", Act::Gelu, true),
         ] {
-            m += &entry_mma_gate(&format!("mma_nt_f16_128x64_{suffix}"), "f16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, false);
+            m += &entry_mma_gate(
+                &format!("mma_nt_f16_128x64_{suffix}"),
+                "f16",
+                128,
+                64,
+                32,
+                2,
+                4,
+                2,
+                16,
+                8,
+                act,
+                gbias,
+                false,
+            );
             // The no-pad `ldmatrix`+XOR-swizzle twin (`..._swz`), bit-identical to the padded gate. Emitted +
             // correctness-gated as a verified alternative, but **measured a wash-to-loss for this dual-B tile**
             // (the single-B GEMM-cliff swz win does NOT transfer — see `entry_mma_gate` / the same-run
             // `fused_swiglu_gate_vs_chain`), so `gemm_nt_f16_swiglu`/`_geglu` route to the PADDED base, not here.
-            m += &entry_mma_gate(&format!("mma_nt_f16_128x64_{suffix}_swz"), "f16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, true);
+            m += &entry_mma_gate(
+                &format!("mma_nt_f16_128x64_{suffix}_swz"),
+                "f16",
+                128,
+                64,
+                32,
+                2,
+                4,
+                2,
+                16,
+                8,
+                act,
+                gbias,
+                true,
+            );
         }
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
         // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
@@ -2453,22 +3232,85 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // bf16 large-GEMM workhorse (mma.sync + padded conflict-free SMEM + r16 raster) — the cliff fix
         // carried to the training precision; `gemm_nt_bf16` dispatches A+B ≳ L2 here.
         let v = PIPE_BF16;
-        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false, 0, Store::Scalar);
+        m += &entry_mma_pipe(
+            v.name,
+            "bf16",
+            v.bm,
+            v.bn,
+            v.bk,
+            v.wm,
+            v.wn,
+            v.stages,
+            v.raster,
+            v.pad,
+            Act::None,
+            false,
+            false,
+            false,
+            0,
+            Store::Scalar,
+        );
         // bf16 ldmatrix+XOR-swizzle+no-pad twin (`_swz`) — the HBM-bound-4096³ win carried to the training
         // dtype (the swz path is dtype-agnostic; `gemm_nt_bf16` regime-dispatches it for A+B ≳ 2×L2).
-        m += &entry_mma_pipe(&format!("{}_swz", v.name), "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, true, 0, Store::Scalar);
+        m += &entry_mma_pipe(
+            &format!("{}_swz", v.name),
+            "bf16",
+            v.bm,
+            v.bn,
+            v.bk,
+            v.wm,
+            v.wn,
+            v.stages,
+            v.raster,
+            v.pad,
+            Act::None,
+            false,
+            false,
+            true,
+            0,
+            Store::Scalar,
+        );
         // bf16 w22 swizzle twin: 2×2 warp grid = 32 mma/warp + 3 CTAs/SM. Emitted + correctness-gated but
         // **NOT dispatched** — like its fp16 twin, w22 only noise-ties w24 at 4096³ and loses at 2048³, so
         // `gemm_nt_bf16` routes the whole A+B ≥ 16 MB regime to the w24 `_swz` (see the gpu.rs dispatch).
-        m += &entry_mma_pipe(&format!("{}_w22swz", v.name), "bf16", v.bm, v.bn, v.bk, 2, 2, v.stages, v.raster, v.pad, Act::None, false, false, true, 0, Store::Scalar);
+        m += &entry_mma_pipe(
+            &format!("{}_w22swz", v.name),
+            "bf16",
+            v.bm,
+            v.bn,
+            v.bk,
+            2,
+            2,
+            v.stages,
+            v.raster,
+            v.pad,
+            Act::None,
+            false,
+            false,
+            true,
+            0,
+            Store::Scalar,
+        );
         // Fused-epilogue variants on the **fast bf16 mma workhorse** — the register-level `act(x·Wᵀ+bias)`
         // (bias added to the f32 accumulators via the known D-fragment column map, no SMEM scratch) carried
         // to the training dtype. The bf16 twin of the fp16 `mma_nt_f16_128_bk32_s2_r16_bias*` champions.
-        for (suffix, act) in [("bias", Act::None), ("bias_relu", Act::Relu), ("bias_silu", Act::Silu), ("bias_gelu", Act::Gelu)] {
+        for (suffix, act) in [
+            ("bias", Act::None),
+            ("bias_relu", Act::Relu),
+            ("bias_silu", Act::Silu),
+            ("bias_gelu", Act::Gelu),
+        ] {
             m += &entry_mma_pipe(
                 &format!("{}_{suffix}", v.name),
                 "bf16",
-                v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad,
+                v.bm,
+                v.bn,
+                v.bk,
+                v.wm,
+                v.wn,
+                v.stages,
+                v.raster,
+                v.pad,
                 act,
                 true,
                 false,
@@ -2482,7 +3324,14 @@ pub fn wmma_bf16_ptx() -> &'static str {
             m += &entry_mma_pipe(
                 &format!("{}_swz_{suffix}", v.name),
                 "bf16",
-                v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, 0,
+                v.bm,
+                v.bn,
+                v.bk,
+                v.wm,
+                v.wn,
+                v.stages,
+                v.raster,
+                0,
                 act,
                 true,
                 false,
@@ -2495,7 +3344,14 @@ pub fn wmma_bf16_ptx() -> &'static str {
         m += &entry_mma_pipe(
             &format!("{}_bias_residual", v.name),
             "bf16",
-            v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad,
+            v.bm,
+            v.bn,
+            v.bk,
+            v.wm,
+            v.wn,
+            v.stages,
+            v.raster,
+            v.pad,
             Act::None,
             true,
             true,
@@ -2508,7 +3364,14 @@ pub fn wmma_bf16_ptx() -> &'static str {
         m += &entry_mma_pipe(
             &format!("{}_swz_bias_residual", v.name),
             "bf16",
-            v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, 0,
+            v.bm,
+            v.bn,
+            v.bk,
+            v.wm,
+            v.wn,
+            v.stages,
+            v.raster,
+            0,
             Act::None,
             true,
             true,
@@ -2525,13 +3388,55 @@ pub fn wmma_bf16_ptx() -> &'static str {
             ("gate_silu_bias", Act::Silu, true),
             ("gate_gelu_bias", Act::Gelu, true),
         ] {
-            m += &entry_mma_gate(&format!("mma_nt_bf16_128x64_{suffix}"), "bf16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, false);
+            m += &entry_mma_gate(
+                &format!("mma_nt_bf16_128x64_{suffix}"),
+                "bf16",
+                128,
+                64,
+                32,
+                2,
+                4,
+                2,
+                16,
+                8,
+                act,
+                gbias,
+                false,
+            );
             // bf16 no-pad swizzle twin (`..._swz`), bit-identical; correctness-gated alternative. Like fp16,
             // measured a wash-to-loss for this dual-B tile, so `gemm_nt_bf16_swiglu`/`_geglu` use the padded base.
-            m += &entry_mma_gate(&format!("mma_nt_bf16_128x64_{suffix}_swz"), "bf16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, true);
+            m += &entry_mma_gate(
+                &format!("mma_nt_bf16_128x64_{suffix}_swz"),
+                "bf16",
+                128,
+                64,
+                32,
+                2,
+                4,
+                2,
+                16,
+                8,
+                act,
+                gbias,
+                true,
+            );
         }
-        m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
-        for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
+        m += &entry_smem_db(
+            "wmma_nt_bf16_sm_db",
+            "bf16",
+            SM_BM,
+            SM_BN,
+            SM_WARPS_M,
+            SM_WARPS_N,
+            Act::None,
+            false,
+            false,
+        );
+        for (suffix, act) in [
+            ("relu", Act::Relu),
+            ("silu", Act::Silu),
+            ("gelu", Act::Gelu),
+        ] {
             m += &entry_smem_db(
                 &format!("wmma_nt_bf16_sm_db_{suffix}"),
                 "bf16",
@@ -2597,7 +3502,13 @@ mod tests {
     fn split_insn(line: &str) -> (String, Vec<String>) {
         let l = line.trim().trim_end_matches(';');
         let (op, rest) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
-        (op.to_string(), rest.split(',').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect())
+        (
+            op.to_string(),
+            rest.split(',')
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .collect(),
+        )
     }
 
     /// Canonicalize an activation body so two spellings of the *same dataflow* compare equal:
@@ -2635,18 +3546,32 @@ mod tests {
     /// store, plus the register the store reads (which must be what the last instruction wrote).
     fn vmath_body(name: &str) -> Vec<String> {
         let ptx = crate::ptx::vmath_ptx();
-        let at = ptx.find(&format!(".visible .entry {name}(")).expect("entry exists");
+        let at = ptx
+            .find(&format!(".visible .entry {name}("))
+            .expect("entry exists");
         let body = &ptx[at..];
         let body = &body[..body.find("\nDONE:").expect("entry has a DONE label")];
         let start = body.find("ld.global.f32").expect("entry loads x[i]");
         let tail = &body[start..];
-        let lines: Vec<&str> = tail.lines().skip(1).map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let lines: Vec<&str> = tail
+            .lines()
+            .skip(1)
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
         let (store, act) = lines.split_last().expect("at least the store");
         let (op, ops) = split_insn(store);
-        assert_eq!(op, "st.global.f32", "{name}: the entry must end in the output store");
+        assert_eq!(
+            op, "st.global.f32",
+            "{name}: the entry must end in the output store"
+        );
         let result = ops[1].clone();
-        let (last_op, last_ops) = split_insn(act.last().expect("at least one activation instruction"));
-        assert_eq!(last_ops[0], result, "{name}: `{last_op}` must write the register the store reads");
+        let (last_op, last_ops) =
+            split_insn(act.last().expect("at least one activation instruction"));
+        assert_eq!(
+            last_ops[0], result,
+            "{name}: `{last_op}` must write the register the store reads"
+        );
         act.iter().map(|l| l.to_string()).collect()
     }
 
@@ -2661,11 +3586,19 @@ mod tests {
     /// sequence all fail here.
     #[test]
     fn fused_activation_epilogue_matches_the_standalone_vmath_kernel() {
-        for (name, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
+        for (name, act) in [
+            ("relu", Act::Relu),
+            ("silu", Act::Silu),
+            ("gelu", Act::Gelu),
+        ] {
             let standalone = vmath_body(name);
             let standalone: Vec<&str> = standalone.iter().map(|s| s.as_str()).collect();
             let fused = act.epilogue("%acc");
-            let fused: Vec<&str> = fused.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            let fused: Vec<&str> = fused
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect();
             assert_eq!(
                 canon_act_body(&standalone, "%f1"),
                 canon_act_body(&fused, "%acc"),
@@ -2673,7 +3606,11 @@ mod tests {
                  would compute a different answer depending on whether the epilogue recognizer fired"
             );
         }
-        assert_eq!(Act::None.epilogue("%acc"), "", "the plain GEMM must emit no epilogue");
+        assert_eq!(
+            Act::None.epilogue("%acc"),
+            "",
+            "the plain GEMM must emit no epilogue"
+        );
     }
 
     /// Every `.visible .entry <name>(` defined in `ptx`, in order.
@@ -2681,7 +3618,9 @@ mod tests {
         ptx.match_indices(".visible .entry ")
             .map(|(i, m)| {
                 let rest = &ptx[i + m.len()..];
-                &rest[..rest.find('(').expect("an entry declaration opens its param list")]
+                &rest[..rest
+                    .find('(')
+                    .expect("an entry declaration opens its param list")]
             })
             .collect()
     }
@@ -2699,18 +3638,32 @@ mod tests {
             ("gemm_cliff_ptx", gemm_cliff_ptx()),
             ("gemm_deep_ptx", gemm_deep_ptx()),
             ("roofline_f16_ptx", roofline_f16_ptx()),
-            ("wmma_f16_sm_static_ptx", &wmma_f16_sm_static_ptx(128, 128, 128, false)),
+            (
+                "wmma_f16_sm_static_ptx",
+                &wmma_f16_sm_static_ptx(128, 128, 128, false),
+            ),
         ];
         for (what, ptx) in modules {
             if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
-                panic!("{what}: PTX must be pure ASCII (ptxas fatal otherwise) -- line {}: {line}", i + 1);
+                panic!(
+                    "{what}: PTX must be pure ASCII (ptxas fatal otherwise) -- line {}: {line}",
+                    i + 1
+                );
             }
-            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "{what}: unbalanced braces");
+            assert_eq!(
+                ptx.matches('{').count(),
+                ptx.matches('}').count(),
+                "{what}: unbalanced braces"
+            );
             let names = entry_names(ptx);
             let mut sorted = names.clone();
             sorted.sort_unstable();
             sorted.dedup();
-            assert_eq!(sorted.len(), names.len(), "{what}: duplicate .visible .entry name");
+            assert_eq!(
+                sorted.len(),
+                names.len(),
+                "{what}: duplicate .visible .entry name"
+            );
         }
     }
 
@@ -2725,16 +3678,27 @@ mod tests {
     fn deep_grid_s2_s3_are_the_shipped_cliff_kernels() {
         let cliff = gemm_cliff_ptx();
         let entry_of = |ptx: &str, name: &str| -> String {
-            let at = ptx.find(&format!(".visible .entry {name}(")).expect("entry exists");
+            let at = ptx
+                .find(&format!(".visible .entry {name}("))
+                .expect("entry exists");
             let rest = &ptx[at..];
             // Entries are emitted back-to-back; take up to the next one (or the module end).
-            let end = rest[1..].find(".visible .entry ").map_or(rest.len(), |i| i + 1);
+            let end = rest[1..]
+                .find(".visible .entry ")
+                .map_or(rest.len(), |i| i + 1);
             rest[..end].to_string()
         };
         let deep = gemm_deep_ptx();
-        for (deep_name, cliff_name) in [("deep_swz_128_s2", "cliff_swz_s2"), ("deep_swz_128_s3", "cliff_swz_s3")] {
+        for (deep_name, cliff_name) in [
+            ("deep_swz_128_s2", "cliff_swz_s2"),
+            ("deep_swz_128_s3", "cliff_swz_s3"),
+        ] {
             let v = deep_variant(deep_name);
-            assert_eq!(v.smem_mode(), SmemMode::Static, "{deep_name} must stay on the static path");
+            assert_eq!(
+                v.smem_mode(),
+                SmemMode::Static,
+                "{deep_name} must stay on the static path"
+            );
             assert_eq!(
                 entry_of(deep, deep_name).replace(deep_name, cliff_name),
                 entry_of(cliff, cliff_name),
@@ -2759,10 +3723,17 @@ mod tests {
     #[test]
     fn deep_grid_smem_math_and_window_discipline() {
         let deep = gemm_deep_ptx();
-        assert_eq!(deep.matches(".extern .shared").count(), 1, "exactly ONE window per module");
+        assert_eq!(
+            deep.matches(".extern .shared").count(),
+            1,
+            "exactly ONE window per module"
+        );
         let decl = deep.find(".extern .shared").expect("window");
         let first_entry = deep.find(".visible .entry").expect("entry");
-        assert!(decl < first_entry, "the window must be declared at MODULE scope, before any entry");
+        assert!(
+            decl < first_entry,
+            "the window must be declared at MODULE scope, before any entry"
+        );
         let expect: [(&str, usize, bool); 5] = [
             ("deep_swz_128_s2", 32768, false),
             ("deep_swz_128_s3", 49152, false),
@@ -2774,27 +3745,53 @@ mod tests {
         for (v, (name, bytes, dynamic)) in PIPE_DEEP_VARIANTS.iter().zip(expect) {
             assert_eq!(v.name, name, "deep grid order");
             assert_eq!(v.smem_bytes(), bytes, "{name}: SMEM closed form");
-            assert_eq!(v.smem_mode().is_dynamic(), dynamic, "{name}: emission form at {bytes} B");
-            assert_eq!(v.smem_mode().launch_bytes(), if dynamic { bytes } else { 0 }, "{name}");
-            assert!(v.smem_bytes() <= DEEP_SMEM_BUDGET, "{name}: must fit the smallest target's ceiling");
+            assert_eq!(
+                v.smem_mode().is_dynamic(),
+                dynamic,
+                "{name}: emission form at {bytes} B"
+            );
+            assert_eq!(
+                v.smem_mode().launch_bytes(),
+                if dynamic { bytes } else { 0 },
+                "{name}"
+            );
+            assert!(
+                v.smem_bytes() <= DEEP_SMEM_BUDGET,
+                "{name}: must fit the smallest target's ceiling"
+            );
             let tile_a = v.bm * (v.bk + v.pad) * 2; // one A buffer of the ring
             if dynamic {
-                assert!(!deep.contains(&format!("smemA_{name}")), "{name}: no statics beside the window");
-                assert!(deep.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")), "{name}: B ring via the symbol");
+                assert!(
+                    !deep.contains(&format!("smemA_{name}")),
+                    "{name}: no statics beside the window"
+                );
+                assert!(
+                    deep.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")),
+                    "{name}: B ring via the symbol"
+                );
                 assert!(
                     deep.contains(&format!("add.u32 %bptr,%bptr,{};", v.stages * tile_a)),
                     "{name}: the B ring must start after the whole A ring"
                 );
             } else {
                 assert!(
-                    deep.contains(&format!(".shared .align 16 .b8 smemA_{name}[{}];", v.stages * tile_a)),
+                    deep.contains(&format!(
+                        ".shared .align 16 .b8 smemA_{name}[{}];",
+                        v.stages * tile_a
+                    )),
                     "{name}: static rows keep their own arrays"
                 );
             }
             // Every depth keeps `stages-2` cp.async groups in flight and guards each prologue slab.
-            assert!(deep.contains(&format!("cp.async.wait_group {};", v.stages - 2)), "{name}");
+            assert!(
+                deep.contains(&format!("cp.async.wait_group {};", v.stages - 2)),
+                "{name}"
+            );
             for st in 0..(v.stages - 1) {
-                assert!(deep.contains(&format!("PRO_{name}_{st}:")), "{name}: prologue slab {st} unguarded");
+                assert!(
+                    deep.contains(&format!("PRO_{name}_{st}:")),
+                    "{name}: prologue slab {st} unguarded"
+                );
             }
         }
     }
@@ -2807,7 +3804,10 @@ mod tests {
     /// which run on an Ada card that accepts either tag.
     #[test]
     fn every_tensor_core_module_opens_at_the_sm80_floor() {
-        let statics = [wmma_f16_sm_static_ptx(128, 128, 128, false), wmma_f16_sm_static_ptx(128, 128, 128, true)];
+        let statics = [
+            wmma_f16_sm_static_ptx(128, 128, 128, false),
+            wmma_f16_sm_static_ptx(128, 128, 128, true),
+        ];
         let modules: [(&str, &str); 7] = [
             ("wmma_f16_ptx", wmma_f16_ptx()),
             ("wmma_bf16_ptx", wmma_bf16_ptx()),
@@ -2818,7 +3818,10 @@ mod tests {
             ("wmma_f16_sm_static_ptx(128)", &statics[1]),
         ];
         for (what, ptx) in modules {
-            assert!(ptx.starts_with(HDR_SM80), "{what}: must open with ptx_target::HDR_SM80");
+            assert!(
+                ptx.starts_with(HDR_SM80),
+                "{what}: must open with ptx_target::HDR_SM80"
+            );
             assert!(
                 !ptx.contains(crate::ptx_target::TARGET_SM89),
                 "{what}: emits no Ada-only instruction, so it must not be tagged sm_89"
@@ -2842,49 +3845,117 @@ mod tests {
         // Sweep tables shared by the builder and the host (`gemm_nt_f16_pipe` / `gemm_nt_f16_cliff`
         // launch `v.name` straight from these), so a table edit must reach the module.
         for v in PIPE_VARIANTS {
-            assert!(has(f16, v.name), "PIPE_VARIANTS entry `{}` missing from wmma_f16_ptx", v.name);
+            assert!(
+                has(f16, v.name),
+                "PIPE_VARIANTS entry `{}` missing from wmma_f16_ptx",
+                v.name
+            );
         }
         for v in CLIFF_VARIANTS {
-            assert!(has(cliff, v.name), "CLIFF_VARIANTS entry `{}` missing from gemm_cliff_ptx", v.name);
+            assert!(
+                has(cliff, v.name),
+                "CLIFF_VARIANTS entry `{}` missing from gemm_cliff_ptx",
+                v.name
+            );
         }
         let deep = gemm_deep_ptx();
         for v in PIPE_DEEP_VARIANTS {
-            assert!(has(deep, v.name), "PIPE_DEEP_VARIANTS entry `{}` missing from gemm_deep_ptx", v.name);
+            assert!(
+                has(deep, v.name),
+                "PIPE_DEEP_VARIANTS entry `{}` missing from gemm_deep_ptx",
+                v.name
+            );
         }
-        assert!(has(bf16, PIPE_BF16.name), "PIPE_BF16 entry `{}` missing", PIPE_BF16.name);
+        assert!(
+            has(bf16, PIPE_BF16.name),
+            "PIPE_BF16 entry `{}` missing",
+            PIPE_BF16.name
+        );
         for use_128 in [false, true] {
             let n = wmma_f16_sm_static_entry(use_128);
             let ptx = wmma_f16_sm_static_ptx(256, 256, 256, use_128);
-            assert!(has(&ptx, n), "static-shape entry `{n}` missing from its own module");
+            assert!(
+                has(&ptx, n),
+                "static-shape entry `{n}` missing from its own module"
+            );
         }
 
         // The names gpu.rs spells as literals at its dispatch sites.
         let wh = "mma_nt_f16_128_bk32_s2_r16";
         let p64 = "wmma_nt_f16_pipe_64_s6";
         let bwh = PIPE_BF16.name;
-        for n in ["wmma_nt_f16", "wmma_nt_f16_mt", "wmma_nt_f16_sm", "wmma_nt_f16_sm128",
-                  "wmma_nt_f16_sm_db", "wmma_nt_f16_sm128_db", "wmma_nt_f16_sm_db_residual",
-                  "wmma_nt_f16_sm_db_relu", "wmma_nt_f16_sm_db_silu", "wmma_nt_f16_sm_db_gelu",
-                  "wmma_nt_f16_sm_db_bias", "wmma_nt_f16_sm_db_bias_relu",
-                  "wmma_nt_f16_sm_db_bias_silu", "wmma_nt_f16_sm_db_bias_gelu"] {
-            assert!(has(f16, n), "dispatched entry `{n}` missing from wmma_f16_ptx");
+        for n in [
+            "wmma_nt_f16",
+            "wmma_nt_f16_mt",
+            "wmma_nt_f16_sm",
+            "wmma_nt_f16_sm128",
+            "wmma_nt_f16_sm_db",
+            "wmma_nt_f16_sm128_db",
+            "wmma_nt_f16_sm_db_residual",
+            "wmma_nt_f16_sm_db_relu",
+            "wmma_nt_f16_sm_db_silu",
+            "wmma_nt_f16_sm_db_gelu",
+            "wmma_nt_f16_sm_db_bias",
+            "wmma_nt_f16_sm_db_bias_relu",
+            "wmma_nt_f16_sm_db_bias_silu",
+            "wmma_nt_f16_sm_db_bias_gelu",
+        ] {
+            assert!(
+                has(f16, n),
+                "dispatched entry `{n}` missing from wmma_f16_ptx"
+            );
         }
-        for n in ["wmma_nt_bf16", "wmma_nt_bf16_mt", "wmma_nt_bf16_sm_db", "wmma_nt_bf16_sm_db_relu",
-                  "wmma_nt_bf16_sm_db_silu", "wmma_nt_bf16_sm_db_gelu", "wmma_nt_bf16_sm_db_bias",
-                  "wmma_nt_bf16_sm_db_bias_relu", "wmma_nt_bf16_sm_db_bias_silu",
-                  "wmma_nt_bf16_sm_db_bias_gelu"] {
-            assert!(has(bf16, n), "dispatched entry `{n}` missing from wmma_bf16_ptx");
+        for n in [
+            "wmma_nt_bf16",
+            "wmma_nt_bf16_mt",
+            "wmma_nt_bf16_sm_db",
+            "wmma_nt_bf16_sm_db_relu",
+            "wmma_nt_bf16_sm_db_silu",
+            "wmma_nt_bf16_sm_db_gelu",
+            "wmma_nt_bf16_sm_db_bias",
+            "wmma_nt_bf16_sm_db_bias_relu",
+            "wmma_nt_bf16_sm_db_bias_silu",
+            "wmma_nt_bf16_sm_db_bias_gelu",
+        ] {
+            assert!(
+                has(bf16, n),
+                "dispatched entry `{n}` missing from wmma_bf16_ptx"
+            );
         }
         // The fused-epilogue families: `{base}[_swz]_bias[_act]` and `..._bias_residual`.
         for base in [wh, p64] {
-            for suffix in ["bias", "bias_relu", "bias_silu", "bias_gelu", "bias_residual"] {
-                assert!(has(f16, &format!("{base}_{suffix}")), "`{base}_{suffix}` missing");
+            for suffix in [
+                "bias",
+                "bias_relu",
+                "bias_silu",
+                "bias_gelu",
+                "bias_residual",
+            ] {
+                assert!(
+                    has(f16, &format!("{base}_{suffix}")),
+                    "`{base}_{suffix}` missing"
+                );
             }
         }
-        for suffix in ["bias", "bias_relu", "bias_silu", "bias_gelu", "bias_residual"] {
-            assert!(has(f16, &format!("{wh}_swz_{suffix}")), "`{wh}_swz_{suffix}` missing");
-            assert!(has(bf16, &format!("{bwh}_{suffix}")), "`{bwh}_{suffix}` missing");
-            assert!(has(bf16, &format!("{bwh}_swz_{suffix}")), "`{bwh}_swz_{suffix}` missing");
+        for suffix in [
+            "bias",
+            "bias_relu",
+            "bias_silu",
+            "bias_gelu",
+            "bias_residual",
+        ] {
+            assert!(
+                has(f16, &format!("{wh}_swz_{suffix}")),
+                "`{wh}_swz_{suffix}` missing"
+            );
+            assert!(
+                has(bf16, &format!("{bwh}_{suffix}")),
+                "`{bwh}_{suffix}` missing"
+            );
+            assert!(
+                has(bf16, &format!("{bwh}_swz_{suffix}")),
+                "`{bwh}_swz_{suffix}` missing"
+            );
         }
         for base in [wh, bwh] {
             let ptx = if base == wh { f16 } else { bf16 };
@@ -2895,9 +3966,21 @@ mod tests {
         // The gated-FFN (GLU-family) dual-B tiles, padded base + swizzle twin.
         for ty in ["f16", "bf16"] {
             let ptx = if ty == "f16" { f16 } else { bf16 };
-            for g in ["gate_silu", "gate_gelu", "gate_glu", "gate_silu_bias", "gate_gelu_bias"] {
-                assert!(has(ptx, &format!("mma_nt_{ty}_128x64_{g}")), "`mma_nt_{ty}_128x64_{g}` missing");
-                assert!(has(ptx, &format!("mma_nt_{ty}_128x64_{g}_swz")), "`mma_nt_{ty}_128x64_{g}_swz` missing");
+            for g in [
+                "gate_silu",
+                "gate_gelu",
+                "gate_glu",
+                "gate_silu_bias",
+                "gate_gelu_bias",
+            ] {
+                assert!(
+                    has(ptx, &format!("mma_nt_{ty}_128x64_{g}")),
+                    "`mma_nt_{ty}_128x64_{g}` missing"
+                );
+                assert!(
+                    has(ptx, &format!("mma_nt_{ty}_128x64_{g}_swz")),
+                    "`mma_nt_{ty}_128x64_{g}_swz` missing"
+                );
             }
         }
         assert!(has(roofline_f16_ptx(), "wmma_roofline_f16"));
@@ -2916,11 +3999,23 @@ mod tests {
             (SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N),
         ] {
             let threads = wm * wn * 32;
-            assert_eq!(bm * SM_BK % (threads * 8), 0, "A tile {bm}x{SM_BK} must tile {threads} threads");
-            assert_eq!(bn * SM_BK % (threads * 8), 0, "B tile {bn}x{SM_BK} must tile {threads} threads");
+            assert_eq!(
+                bm * SM_BK % (threads * 8),
+                0,
+                "A tile {bm}x{SM_BK} must tile {threads} threads"
+            );
+            assert_eq!(
+                bn * SM_BK % (threads * 8),
+                0,
+                "B tile {bn}x{SM_BK} must tile {threads} threads"
+            );
             for ty in ["f16", "bf16"] {
                 let p = entry_smem("t_sm", ty, bm, bn, wm, wn, None);
-                assert_eq!(p.matches("ld.global.v4.u32").count(), 2, "one A + one B stage per K step");
+                assert_eq!(
+                    p.matches("ld.global.v4.u32").count(),
+                    2,
+                    "one A + one B stage per K step"
+                );
                 // The double-buffered twin stages with `cp.async` (global->shared, no register hop):
                 // one 16-byte copy per chunk, prologue + steady state.
                 let d = entry_smem_db("t_db", ty, bm, bn, wm, wn, Act::None, false, false);

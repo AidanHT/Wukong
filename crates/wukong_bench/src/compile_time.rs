@@ -102,8 +102,16 @@ pub fn report(files: &[PathBuf]) {
     );
     let mut rows: Vec<(&'static str, Duration, u64)> =
         agg.iter().map(|p| (p.name, p.time, p.calls)).collect();
-    rows.push(("inline", tot_inline, if tot_inline > Duration::ZERO { 1 } else { 0 }));
-    rows.push(("unroll", tot_unroll, if tot_unroll > Duration::ZERO { 1 } else { 0 }));
+    rows.push((
+        "inline",
+        tot_inline,
+        if tot_inline > Duration::ZERO { 1 } else { 0 },
+    ));
+    rows.push((
+        "unroll",
+        tot_unroll,
+        if tot_unroll > Duration::ZERO { 1 } else { 0 },
+    ));
     rows.sort_by(|a, b| b.1.cmp(&a.1));
     for (name, time, calls) in rows {
         println!(
@@ -116,7 +124,10 @@ pub fn report(files: &[PathBuf]) {
     }
 
     if !failures.is_empty() {
-        eprintln!("\n{} program(s) failed the byte-identical self-check:", failures.len());
+        eprintln!(
+            "\n{} program(s) failed the byte-identical self-check:",
+            failures.len()
+        );
         for f in &failures {
             eprintln!("  - {f}");
         }

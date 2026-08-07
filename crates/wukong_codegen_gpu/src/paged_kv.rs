@@ -89,8 +89,16 @@ impl KvConfig {
     /// Flat element offset of `K[layer][phys_block][tok][head][dh]` (row-major), the single indexing
     /// rule the append and attention kernels both compute. `tok` is the in-block token (`0..block_size`).
     #[inline]
-    pub fn elem_offset(&self, layer: usize, phys_block: u32, tok: usize, head: usize, dh: usize) -> usize {
-        (((layer * self.num_blocks + phys_block as usize) * self.block_size + tok) * self.heads + head)
+    pub fn elem_offset(
+        &self,
+        layer: usize,
+        phys_block: u32,
+        tok: usize,
+        head: usize,
+        dh: usize,
+    ) -> usize {
+        (((layer * self.num_blocks + phys_block as usize) * self.block_size + tok) * self.heads
+            + head)
             * self.head_dim
             + dh
     }
@@ -107,7 +115,8 @@ impl KvConfig {
     /// `elem_offset(..., dh=0) / head_dim`.
     #[inline]
     pub fn scale_offset(&self, layer: usize, phys_block: u32, tok: usize, head: usize) -> usize {
-        ((layer * self.num_blocks + phys_block as usize) * self.block_size + tok) * self.heads + head
+        ((layer * self.num_blocks + phys_block as usize) * self.block_size + tok) * self.heads
+            + head
     }
 
     /// Bytes for the whole K **and** V cache at `elem_size` bytes/element (4 = f32, 2 = f16): the
@@ -225,7 +234,12 @@ impl BlockManager {
     /// New manager owning `num_blocks` physical blocks of `block_size` tokens, for `num_slots` batch
     /// slots, each able to grow to `max_blocks_per_seq` logical blocks. The free list starts full and
     /// **ascending-popped** (block 0 first) so a fresh, un-fragmented run lays sequences out contiguously.
-    pub fn new(num_blocks: usize, block_size: usize, num_slots: usize, max_blocks_per_seq: usize) -> Self {
+    pub fn new(
+        num_blocks: usize,
+        block_size: usize,
+        num_slots: usize,
+        max_blocks_per_seq: usize,
+    ) -> Self {
         assert!(block_size > 0 && num_blocks > 0 && num_slots > 0 && max_blocks_per_seq > 0);
         // Push descending so `pop()` (LIFO) hands out 0,1,2,… ascending on a fresh pool.
         let free: Vec<u32> = (0..num_blocks as u32).rev().collect();
@@ -417,8 +431,16 @@ pub enum KvDtype {
 /// slabs have the identical `[layers, num_blocks, block_size, heads, head_dim]` layout in both arms.
 #[cfg(feature = "gpu")]
 pub enum KvStorage {
-    F16 { k: CudaSlice<half::f16>, v: CudaSlice<half::f16> },
-    Int8 { k: CudaSlice<i8>, v: CudaSlice<i8>, ksc: CudaSlice<f32>, vsc: CudaSlice<f32> },
+    F16 {
+        k: CudaSlice<half::f16>,
+        v: CudaSlice<half::f16>,
+    },
+    Int8 {
+        k: CudaSlice<i8>,
+        v: CudaSlice<i8>,
+        ksc: CudaSlice<f32>,
+        vsc: CudaSlice<f32>,
+    },
 }
 
 #[cfg(feature = "gpu")]
@@ -461,8 +483,17 @@ impl PagedKvCache {
 
     /// As [`new`](Self::new) with an explicit storage dtype. `Int8` additionally allocates the two
     /// per-(token, head) f32 scale slabs (zeroed).
-    pub fn new_with_dtype(stream: Arc<CudaStream>, cfg: KvConfig, dtype: KvDtype) -> Result<Self, DriverError> {
-        let mgr = BlockManager::new(cfg.num_blocks, cfg.block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+    pub fn new_with_dtype(
+        stream: Arc<CudaStream>,
+        cfg: KvConfig,
+        dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
+        let mgr = BlockManager::new(
+            cfg.num_blocks,
+            cfg.block_size,
+            cfg.num_slots,
+            cfg.max_blocks_per_seq,
+        );
         let storage = match dtype {
             KvDtype::F16 => KvStorage::F16 {
                 k: stream.alloc_zeros::<half::f16>(cfg.slab_elems())?,
@@ -477,7 +508,14 @@ impl PagedKvCache {
         };
         let block_table_d = stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
         let ctx_len_d = stream.alloc_zeros::<u32>(cfg.num_slots)?;
-        Ok(Self { cfg, mgr, stream, storage, block_table_d, ctx_len_d })
+        Ok(Self {
+            cfg,
+            mgr,
+            stream,
+            storage,
+            block_table_d,
+            ctx_len_d,
+        })
     }
 
     /// Total device bytes the K + V storage occupies across all layers (int8 includes its scale
@@ -540,14 +578,18 @@ impl PagedKvCache {
     pub fn k_mut(&mut self) -> &mut CudaSlice<half::f16> {
         match &mut self.storage {
             KvStorage::F16 { k, .. } => k,
-            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+            KvStorage::Int8 { .. } => {
+                panic!("f16 slab accessor on an int8 cache — use storage_mut()")
+            }
         }
     }
     /// Mutable device V slab (f16 storage only).
     pub fn v_mut(&mut self) -> &mut CudaSlice<half::f16> {
         match &mut self.storage {
             KvStorage::F16 { v, .. } => v,
-            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+            KvStorage::Int8 { .. } => {
+                panic!("f16 slab accessor on an int8 cache — use storage_mut()")
+            }
         }
     }
 
@@ -558,7 +600,9 @@ impl PagedKvCache {
     pub fn slabs_mut(&mut self) -> (&mut CudaSlice<half::f16>, &mut CudaSlice<half::f16>) {
         match &mut self.storage {
             KvStorage::F16 { k, v } => (k, v),
-            KvStorage::Int8 { .. } => panic!("f16 slab accessor on an int8 cache — use storage_mut()"),
+            KvStorage::Int8 { .. } => {
+                panic!("f16 slab accessor on an int8 cache — use storage_mut()")
+            }
         }
     }
 
@@ -607,8 +651,14 @@ mod tests {
         let vs_f16 = f16b as f64 / i8b as f64;
         let vs_f32 = f32b as f64 / i8b as f64;
         // head_dim=128 ⇒ int8 = 1 + 4/128 bytes/value ⇒ ~1.94× vs f16, ~3.88× vs f32.
-        assert!(vs_f16 > 1.9 && vs_f16 < 2.0, "int8 ~half of f16 (got {vs_f16:.3}x)");
-        assert!(vs_f32 > 3.8 && vs_f32 < 4.0, "int8 ~quarter of f32 (got {vs_f32:.3}x)");
+        assert!(
+            vs_f16 > 1.9 && vs_f16 < 2.0,
+            "int8 ~half of f16 (got {vs_f16:.3}x)"
+        );
+        assert!(
+            vs_f32 > 3.8 && vs_f32 < 4.0,
+            "int8 ~quarter of f32 (got {vs_f32:.3}x)"
+        );
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
         eprintln!(
             "KV footprint (32L, 8h×128, 4096×16 blocks): f32 {:.2} GiB | f16 {:.2} GiB | int8 {:.2} GiB → {:.2}x vs f16, {:.2}x vs f32",
@@ -627,7 +677,10 @@ mod tests {
         let (layers, heads, hd, bsz) = (12, 8, 64, 16);
         for &bcap in &[64usize, 128, 256] {
             let max_ctx = KvConfig::max_ctx_within_budget(layers, heads, hd, bsz, bcap, 2, budget);
-            assert!(max_ctx >= 96, "Bcap={bcap} must fit the bench's 96-token contexts (got {max_ctx})");
+            assert!(
+                max_ctx >= 96,
+                "Bcap={bcap} must fit the bench's 96-token contexts (got {max_ctx})"
+            );
             let cfg = KvConfig::for_serving(layers, heads, hd, bsz, bcap, max_ctx);
             let bytes = cfg.assert_kv_budget(2, budget);
             eprintln!(
@@ -770,13 +823,28 @@ mod tests {
         };
         // Offset 0 is the first element; the last addressable element is slab_elems-1.
         assert_eq!(cfg.elem_offset(0, 0, 0, 0, 0), 0);
-        let last = cfg.elem_offset(cfg.layers - 1, (cfg.num_blocks - 1) as u32, cfg.block_size - 1, cfg.heads - 1, cfg.head_dim - 1);
+        let last = cfg.elem_offset(
+            cfg.layers - 1,
+            (cfg.num_blocks - 1) as u32,
+            cfg.block_size - 1,
+            cfg.heads - 1,
+            cfg.head_dim - 1,
+        );
         assert_eq!(last, cfg.slab_elems() - 1);
         // Adjacent dh elements are contiguous (row-major innermost).
-        assert_eq!(cfg.elem_offset(0, 0, 0, 0, 1) - cfg.elem_offset(0, 0, 0, 0, 0), 1);
+        assert_eq!(
+            cfg.elem_offset(0, 0, 0, 0, 1) - cfg.elem_offset(0, 0, 0, 0, 0),
+            1
+        );
         // Adjacent head steps by head_dim.
-        assert_eq!(cfg.elem_offset(0, 0, 0, 1, 0) - cfg.elem_offset(0, 0, 0, 0, 0), cfg.head_dim);
+        assert_eq!(
+            cfg.elem_offset(0, 0, 0, 1, 0) - cfg.elem_offset(0, 0, 0, 0, 0),
+            cfg.head_dim
+        );
         // Adjacent layer steps by one full plane.
-        assert_eq!(cfg.elem_offset(1, 0, 0, 0, 0) - cfg.elem_offset(0, 0, 0, 0, 0), cfg.layer_plane_elems());
+        assert_eq!(
+            cfg.elem_offset(1, 0, 0, 0, 0) - cfg.elem_offset(0, 0, 0, 0, 0),
+            cfg.layer_plane_elems()
+        );
     }
 }

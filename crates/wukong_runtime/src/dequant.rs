@@ -329,7 +329,9 @@ pub unsafe extern "C" fn wukong_dequant_f32_parallel(
     // provisioning-only: the `current_num_threads()` read below resolves `RAYON_NUM_THREADS` the same
     // way either way, so the chunk count — and with it every chunk boundary — is unchanged.
     crate::ensure_global_pool();
-    let workers = rayon::current_num_threads().max(1).min(n.div_ceil(8).max(1));
+    let workers = rayon::current_num_threads()
+        .max(1)
+        .min(n.div_ceil(8).max(1));
     // 8-aligned chunk bounds so each worker's output sub-slice starts 32-byte-aligned iff `out` is
     // (the NT prologue then peels ≤7 elements, disjointly from the previous chunk's tail).
     let chunk = n.div_ceil(workers);
@@ -445,7 +447,10 @@ unsafe fn perchan_row_avx2(
         // GELU / SiLU — compute-bound: scalar-twin per lane (bit-exact with the unfused activation).
         let mut j = 0usize;
         while j + 8 <= cols {
-            let d = _mm256_mul_ps(_mm256_cvtepi32_ps(widen8(q, j, width)), _mm256_loadu_ps(scale.add(j)));
+            let d = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(widen8(q, j, width)),
+                _mm256_loadu_ps(scale.add(j)),
+            );
             let mut t = [0f32; 8];
             _mm256_storeu_ps(t.as_mut_ptr(), d);
             for v in &mut t {
@@ -488,13 +493,26 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32(
             let nt = use_nt(rows * cols, in_bytes);
             for i in 0..rows {
                 // SAFETY: row i in bounds; features detected.
-                perchan_row_avx2(q.add(i * cols * in_bytes), out.add(i * cols), cols, scale, op, nt);
+                perchan_row_avx2(
+                    q.add(i * cols * in_bytes),
+                    out.add(i * cols),
+                    cols,
+                    scale,
+                    op,
+                    nt,
+                );
             }
             return;
         }
     }
     for i in 0..rows {
-        perchan_row_scalar(q.add(i * cols * in_bytes), out.add(i * cols), cols, scale, op);
+        perchan_row_scalar(
+            q.add(i * cols * in_bytes),
+            out.add(i * cols),
+            cols,
+            scale,
+            op,
+        );
     }
 }
 
@@ -555,7 +573,9 @@ mod tests {
     // i32 includes magnitudes past 2^24 so the `i32 → f32` rounding path (round-to-nearest-even) is
     // exercised, pinning that `_mm256_cvtepi32_ps` rounds like Rust's `as f32`.
     fn fill_i8(n: usize) -> Vec<i8> {
-        (0..n).map(|i| (((i * 53 + 7) % 256) as i32 - 128) as i8).collect()
+        (0..n)
+            .map(|i| (((i * 53 + 7) % 256) as i32 - 128) as i8)
+            .collect()
     }
     fn fill_u8(n: usize) -> Vec<u8> {
         (0..n).map(|i| ((i * 37 + 11) % 256) as u8).collect()
@@ -603,8 +623,16 @@ mod tests {
                 }
                 // Bit-exact equality (compare the raw bits so a NaN from a pathological scale still pins).
                 for i in 0..n {
-                    assert_eq!(got[i].to_bits(), want[i].to_bits(), "avx2!=scalar w={width} act={act} i={i}");
-                    assert_eq!(got_par[i].to_bits(), want[i].to_bits(), "par!=scalar w={width} act={act} i={i}");
+                    assert_eq!(
+                        got[i].to_bits(),
+                        want[i].to_bits(),
+                        "avx2!=scalar w={width} act={act} i={i}"
+                    );
+                    assert_eq!(
+                        got_par[i].to_bits(),
+                        want[i].to_bits(),
+                        "par!=scalar w={width} act={act} i={i}"
+                    );
                 }
             }
         }
@@ -621,7 +649,15 @@ mod tests {
         let qi32 = fill_i32(n);
         let scale = 0.007f32;
         let mut got = vec![0f32; n];
-        unsafe { wukong_dequant_f32(qi32.as_ptr() as *const u8, got.as_mut_ptr(), n as i64, scale, DQ_ID | DQ_I32) };
+        unsafe {
+            wukong_dequant_f32(
+                qi32.as_ptr() as *const u8,
+                got.as_mut_ptr(),
+                n as i64,
+                scale,
+                DQ_ID | DQ_I32,
+            )
+        };
         for i in 0..n {
             // Reference: widen through f32 (round-to-nearest-even, as the kernel's cvt does), then one
             // f32 multiply — the exact operation the source `(q as f32)*scale` denotes.
@@ -638,7 +674,9 @@ mod tests {
         let n = rows * cols;
         let qi8 = fill_i8(n);
         let qi32 = fill_i32(n);
-        let scale: Vec<f32> = (0..cols).map(|j| 0.002 + (j % 11) as f32 * 0.0005).collect();
+        let scale: Vec<f32> = (0..cols)
+            .map(|j| 0.002 + (j % 11) as f32 * 0.0005)
+            .collect();
         for &act in &[DQ_ID, DQ_RELU, DQ_GELU, DQ_SILU] {
             for &(width, qptr) in &[
                 (DQ_I8, qi8.as_ptr() as *const u8),
@@ -648,17 +686,47 @@ mod tests {
                 let mut want = vec![0f32; n];
                 for i in 0..rows {
                     let qrow = unsafe { qptr.add(i * cols * if width == DQ_I32 { 4 } else { 1 }) };
-                    unsafe { perchan_row_scalar(qrow, want.as_mut_ptr().add(i * cols), cols, scale.as_ptr(), op) };
+                    unsafe {
+                        perchan_row_scalar(
+                            qrow,
+                            want.as_mut_ptr().add(i * cols),
+                            cols,
+                            scale.as_ptr(),
+                            op,
+                        )
+                    };
                 }
                 let mut got = vec![0f32; n];
                 let mut got_par = vec![0f32; n];
                 unsafe {
-                    wukong_dequant_perchan_f32(qptr, got.as_mut_ptr(), rows as i64, cols as i64, scale.as_ptr(), op);
-                    wukong_dequant_perchan_f32_parallel(qptr, got_par.as_mut_ptr(), rows as i64, cols as i64, scale.as_ptr(), op);
+                    wukong_dequant_perchan_f32(
+                        qptr,
+                        got.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                        scale.as_ptr(),
+                        op,
+                    );
+                    wukong_dequant_perchan_f32_parallel(
+                        qptr,
+                        got_par.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                        scale.as_ptr(),
+                        op,
+                    );
                 }
                 for t in 0..n {
-                    assert_eq!(got[t].to_bits(), want[t].to_bits(), "perchan avx2!=scalar w={width} act={act} t={t}");
-                    assert_eq!(got_par[t].to_bits(), want[t].to_bits(), "perchan par!=scalar w={width} act={act} t={t}");
+                    assert_eq!(
+                        got[t].to_bits(),
+                        want[t].to_bits(),
+                        "perchan avx2!=scalar w={width} act={act} t={t}"
+                    );
+                    assert_eq!(
+                        got_par[t].to_bits(),
+                        want[t].to_bits(),
+                        "perchan par!=scalar w={width} act={act} t={t}"
+                    );
                 }
             }
         }
@@ -674,9 +742,21 @@ mod tests {
             let mut want = vec![0f32; n];
             unsafe {
                 if n > 0 {
-                    dequant_scalar(q.as_ptr() as *const u8, want.as_mut_ptr(), n, scale, DQ_RELU | DQ_I8);
+                    dequant_scalar(
+                        q.as_ptr() as *const u8,
+                        want.as_mut_ptr(),
+                        n,
+                        scale,
+                        DQ_RELU | DQ_I8,
+                    );
                 }
-                wukong_dequant_f32(q.as_ptr() as *const u8, got.as_mut_ptr(), n as i64, scale, DQ_RELU | DQ_I8);
+                wukong_dequant_f32(
+                    q.as_ptr() as *const u8,
+                    got.as_mut_ptr(),
+                    n as i64,
+                    scale,
+                    DQ_RELU | DQ_I8,
+                );
             }
             assert_eq!(got, want, "n={n}");
         }
