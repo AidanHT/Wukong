@@ -16,6 +16,7 @@
 //! `rg sm_89` over the backend shows exactly which families are genuinely Ada-only. The *device*
 //! side of that floor is a `cc >= (8,9)` capability gate before dispatch, in `gpu.rs` — not here.
 
+use crate::gpu::{smem_mode_for, SmemMode, DSMEM_DECL, DSMEM_SYM, STATIC_SMEM_CAP};
 use crate::ptx_target::HDR_SM89_V84;
 
 /// OCP **E4M3** (1 sign, 4 exp bias 7, 3 mantissa; max normal 448, no Inf) round-to-nearest-even from
@@ -165,6 +166,20 @@ fn fp8_veclist(prefix: &str, n: usize) -> String {
     format!("{{{}}}", regs.join(","))
 }
 
+/// `add.u32 <reg>,<reg>,<off>;` for a slab's **constant** base inside the shared dynamic window — and
+/// the **empty string** at offset 0.
+///
+/// Emitting nothing at 0 is the whole point: on the static path every ring already sits at offset 0 of
+/// its own `.shared` array, so the generated text stays byte-identical to the shipped kernels' (D6 §5.2).
+/// Only when both rings are carved out of the one `wk_dsmem` window does the B ring need its base added.
+fn fp8_slab_add(reg: &str, off: usize) -> String {
+    if off == 0 {
+        String::new()
+    } else {
+        format!("    add.u32 {reg},{reg},{off};\n")
+    }
+}
+
 /// Generate the **pipelined fp8 (E4M3) GEMM** entry — `mma.sync.m16n8k32` with a multi-stage `cp.async`
 /// SMEM pipeline, padded conflict-free fragment loads, and threadblock rasterization. Mirrors the
 /// fp16/bf16 `entry_mma_pipe` but for 1-byte e4m3 and the K=32 mma step. `C = A·Bᵀ`, A `[M,K]` / B `[N,K]`
@@ -172,10 +187,24 @@ fn fp8_veclist(prefix: &str, n: usize) -> String {
 /// requires `M%bm==0`, `N%bn==0`, `K%bk==0`, `bk%32==0` with `bk/16` a power of two (shift-based
 /// staging address math), `pad%16==0`, `bm%(16·wm)==0`, `bn%(8·wn)==0`, a **power-of-two warp grid**
 /// (`warpRow`/`warpCol` are a shift and a mask), and `bm·bk`,`bn·bk` multiples of `threads·16`
-/// (128-bit staging). Static SMEM `stages·(bm+bn)·(bk+pad)` ≤ 48 KiB. Every one of the *tile-shape*
+/// (128-bit staging). Every one of the *tile-shape*
 /// conditions is asserted below, so an illegal tile config panics at generation instead of emitting a
 /// silently wrong kernel. The `M`/`N`/`K` divisibility is the CALLER's: they are runtime kernel params
 /// (`pM`/`pN`/`pK`), not generator arguments, so nothing here can check them — the launch wrapper must.
+///
+/// **`smem_budget` (bytes) is the ceiling this entry may spend, and it also selects the emission form**
+/// ([`crate::gpu::smem_mode_for`]): at or below the PTX ISA's 48 KiB **static** cap the `.shared` arrays
+/// are declared exactly as they always were — **byte-identical bodies**, so every shipped fp8 entry is
+/// untouched — and beyond it both rings are carved out of ONE module-scope [`crate::gpu::DSMEM_DECL`]
+/// window at constant offsets (A at 0, B at `stages*bm*(bk+pad)`). The generator stays a pure text
+/// function: the budget is *passed in* by the dispatch layer from `Gpu::smem_budget()`, never probed
+/// here, so the whole stage grid is enumerable off-device and an A100/H100 budget is testable on this
+/// laptop. SMEM(stages) = `stages*(bm+bn)*(bk+pad)` — at 1 byte per e4m3 the slabs are half fp16's, which
+/// is exactly why pipeline depth is cheaper for fp8 than for any other dtype (D6 4.1, candidate 2).
+///
+/// The window itself is declared by the MODULE builder ([`fp8_stage_ptx`]), never here: module scope is
+/// mandatory, and the identical `.extern .shared` line inside an `.entry` body is `CUDA_ERROR_INVALID_PTX`.
+#[allow(clippy::too_many_arguments)]
 fn fp8_pipe_entry(
     name: &str,
     bm: usize,
@@ -189,6 +218,7 @@ fn fp8_pipe_entry(
     act: crate::ptx_wmma::Act,
     bias: bool,
     residual: bool,
+    smem_budget: usize,
 ) -> String {
     use crate::ptx_wmma::Act;
     assert!(stages >= 2 && bk % 32 == 0 && (bk / 16).is_power_of_two() && pad % 16 == 0);
@@ -216,7 +246,30 @@ fn fp8_pipe_entry(
     let ldp = bk + pad; // padded SMEM row stride (bytes; 1 byte/e4m3)
     let (tile_a, tile_b) = (bm * ldp, bn * ldp);
     let (smem_a, smem_b) = (stages * tile_a, stages * tile_b);
-    assert!(smem_a + smem_b <= 48 * 1024, "{name}: fp8 SMEM {} B exceeds 48 KiB", smem_a + smem_b);
+    // SMEM(stages) = stages*(bm+bn)*(bk+pad) — the family's closed form. The BUDGET is the ceiling; the
+    // 48 KiB PTX ISA static cap (STATIC_SMEM_CAP) decides the emission FORM, not the ceiling.
+    let mode = smem_mode_for(smem_a + smem_b);
+    assert!(
+        smem_a + smem_b <= smem_budget,
+        "{name}: fp8 SMEM {} B (stages={stages}, {bm}x{bn}, ldp={ldp}) exceeds the budget {smem_budget} B",
+        smem_a + smem_b
+    );
+    // Where each ring lives. Static: its own entry-name-qualified `.shared` array at offset 0 — the
+    // historical spelling, emitted verbatim. Dynamic: BOTH rings are windows into the single
+    // module-scope `wk_dsmem` (two module-scope externs ALIAS, measured), A at 0 and B after the A ring.
+    let (sym_a, sym_b, off_b): (String, String, usize) = if mode.is_dynamic() {
+        // Sub-slab alignment inside the single window: every `cp.async ...,16` and every
+        // `ld.shared.b32` into the B ring assumes a 16-B-aligned destination, and the window base
+        // itself is only `.align 16`. Loud at generation, because a misaligned slab offset is a
+        // silently-wrong kernel rather than a driver error (D6 risk 4).
+        assert!(
+            smem_a % 16 == 0,
+            "{name}: the B ring's window offset {smem_a} B is not 16-B aligned (cp.async ...,16 needs it)"
+        );
+        (DSMEM_SYM.to_string(), DSMEM_SYM.to_string(), smem_a)
+    } else {
+        (format!("smemA_{name}"), format!("smemB_{name}"), 0)
+    };
     let a_chunks = bm * bk / (threads * 16); // 16-byte (16×e4m3) cp.async chunks
     let b_chunks = bn * bk / (threads * 16);
     assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk/thread");
@@ -236,8 +289,12 @@ fn fp8_pipe_entry(
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
     );
-    s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
-    s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
+    // A dynamic entry declares NO static `.shared` array: it would count against the same opt-in
+    // ceiling the window is sized from, silently shrinking the window the launch may request.
+    if !mode.is_dynamic() {
+        s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
+        s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
+    }
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufcA,%bufcB,%bufwA,%bufwB,%lane,%grp,%tg,%tg4,%tg2,%laneoff,%warpMrow,%warpNcol,%aptr,%bptr,%grow,%gcol;\n";
     // Fused-epilogue scratch: %act0/%act1 for the transcendental activations, %biasv0/%biasv1 for the two
@@ -314,7 +371,13 @@ fn fp8_pipe_entry(
     // cp.async staging into the padded SMEM layout (row stride ldp bytes). 16-byte chunks = 16 e4m3:
     // flat elem = e·16, row r=e>>row_shift, col c=(e&col_mask)·16; global byte = (g_base+r)·K + kcol + c
     // (1 byte/elem), SMEM dest = bufoff + r·ldp + c.
-    let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+    let stage = |g_base: &str,
+                 gbase_ptr: &str,
+                 smem: &str,
+                 slab_off: usize,
+                 bufoff: &str,
+                 chunks: usize,
+                 s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
                 *s += "    mov.u32 %e,%tix;\n";
@@ -324,7 +387,11 @@ fn fp8_pipe_entry(
             *s += &format!("    shr.u32 %r,%e,{row_shift};\n    and.b32 %c,%e,{col_mask};\n    shl.b32 %c,%c,4;\n");
             *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
             *s += &format!("    cvt.u64.u32 %off,%tmp;\n    add.s64 %gptr,{gbase_ptr},%off;\n");
-            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n");
+            // Always through the SYMBOL, never a literal base: the dynamic window does not start at 0
+            // (it begins after whatever statics the entry declares — measured 3072 with 3 KiB of them).
+            *s += &format!("    mov.u32 %tmp,{smem};\n");
+            *s += &fp8_slab_add("%tmp", slab_off);
+            *s += &format!("    add.u32 %tmp,%tmp,{bufoff};\n");
             *s += &format!("    mul.lo.s32 %tmp2,%r,{ldp};\n    add.u32 %tmp,%tmp,%tmp2;\n    add.u32 %tmp,%tmp,%c;\n");
             *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
         }
@@ -334,8 +401,8 @@ fn fp8_pipe_entry(
         s += &format!("    mov.u32 %kcol,{};\n", st * bk);
         s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", st * tile_a, st * tile_b);
         s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
-        stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-        stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+        stage("%baseRow", "%A", &sym_a, 0, "%bufwA", a_chunks, &mut s);
+        stage("%baseCol", "%B", &sym_b, off_b, "%bufwB", b_chunks, &mut s);
         s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
     }
     s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcB,0;\n";
@@ -344,14 +411,14 @@ fn fp8_pipe_entry(
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
     s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
     s += &format!("    add.u32 %kcol,%kt,{};\n    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra NOPRE_{name};\n", (stages - 1) * bk);
-    stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-    stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+    stage("%baseRow", "%A", &sym_a, 0, "%bufwA", a_chunks, &mut s);
+    stage("%baseCol", "%B", &sym_b, off_b, "%bufwB", b_chunks, &mut s);
     s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
 
     // Compute: per k32 step, build A/B fragment base ptrs (smem + buffer + warp·ldp + laneoff + ks·32),
     // ld.shared.b32 the hand-placed fragments, issue tm·tn mma.sync m16n8k32.
     for ks in 0..nks {
-        s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
+        s += &format!("    mov.u32 %aptr,{sym_a};\n    add.u32 %aptr,%aptr,%bufcA;\n");
         s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    add.u32 %aptr,%aptr,%tmp;\n");
         s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
         for mi in 0..tm {
@@ -362,7 +429,9 @@ fn fp8_pipe_entry(
             s += &format!("    ld.shared.b32 %a{mi}_1,[%aptr+{}];\n", base + r8);
             s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
         }
-        s += &format!("    mov.u32 %bptr,smemB_{name};\n    add.u32 %bptr,%bptr,%bufcB;\n");
+        s += &format!("    mov.u32 %bptr,{sym_b};\n");
+        s += &fp8_slab_add("%bptr", off_b);
+        s += "    add.u32 %bptr,%bptr,%bufcB;\n";
         s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    add.u32 %bptr,%bptr,%tmp;\n");
         s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
         for ni in 0..tn {
@@ -464,7 +533,14 @@ fn fp8_gate_entry(
     let ldp = bk + pad; // padded SMEM row stride (bytes; 1 byte/e4m3)
     let (tile_a, tile_b) = (bm * ldp, bn * ldp);
     let (smem_a, smem_b) = (stages * tile_a, stages * tile_b);
-    assert!(smem_a + 2 * smem_b <= 48 * 1024, "{name}: fp8 gate SMEM {} B exceeds 48 KiB", smem_a + 2 * smem_b);
+    // The gated-FFN family stays entirely on the STATIC path: three rings at 128x64 is 40 KiB, well
+    // inside the ISA cap, and no deep-stage candidate in D6 4.1 targets it. Spelled through
+    // `STATIC_SMEM_CAP` so the one boundary constant is the one every fp8 generator reads.
+    assert!(
+        smem_a + 2 * smem_b <= STATIC_SMEM_CAP,
+        "{name}: fp8 gate SMEM {} B exceeds the 48 KiB static ISA cap",
+        smem_a + 2 * smem_b
+    );
     let a_chunks = bm * bk / (threads * 16);
     let b_chunks = bn * bk / (threads * 16);
     assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk/thread");
@@ -688,6 +764,7 @@ pub fn fp8_pipe_ptx() -> &'static str {
             Act::None,
             false,
             false,
+            STATIC_SMEM_CAP,
         );
         // **Small/mid-M tile** (`fp8_gemm_pipe_m64`, 64×128) — the regime-aware win the cuBLASLt-fp8
         // sweep found (`fp8_pipe_config_sweep_vs_cublaslt`): halving BM to 64 doubles the CTA count, and
@@ -709,6 +786,7 @@ pub fn fp8_pipe_ptx() -> &'static str {
             Act::None,
             false,
             false,
+            STATIC_SMEM_CAP,
         );
         // Fused-epilogue fp8 variants — the beat-cuBLAS fusion carried to the **fastest** precision (Ada
         // 2× TC rate), so `C = act(x·Wᵀ + bias)` fp8 Linear/FFN is the fastest fused inference path. The
@@ -733,6 +811,7 @@ pub fn fp8_pipe_ptx() -> &'static str {
                 act,
                 true,
                 false,
+                STATIC_SMEM_CAP,
             );
         }
         // fp8 fused bias + residual (no act) — the fastest down-proj / output-proj: out = x·Wᵀ + bias +
@@ -750,6 +829,7 @@ pub fn fp8_pipe_ptx() -> &'static str {
             Act::None,
             true,
             true,
+            STATIC_SMEM_CAP,
         );
         // Fused **gated-FFN (SwiGLU/GeGLU/GLU)** gate at the Ada 2× fp8 rate — the fastest fused inference
         // gate. `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` in one dual-B kernel (128×64, fp8 = 1 byte/elem so three
@@ -799,6 +879,10 @@ pub fn fp8_pipe_cfg_ptx(
         Act::None,
         false,
         false,
+        // The historical caller: the 48 KiB ISA cap, so every sweep config this builds stays on the
+        // static emission path and its PTX is the shipped text to the byte. The deeper rings go through
+        // [`fp8_stage_ptx`], which passes the device's opt-in budget instead.
+        STATIC_SMEM_CAP,
     );
     m
 }
@@ -825,6 +909,135 @@ pub fn fp8_pipe_w64_ptx() -> &'static str {
 pub fn fp8_pipe_w64_s3_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| fp8_pipe_cfg_ptx(FP8_PIPE_BM, FP8_PIPE_BN, 32, 2, 2, 3, FP8_PIPE_RASTER)).as_str()
+}
+
+/// One row of the **fp8 variable-stage grid** — the family's `(tile, warps, depth)` point, its stable
+/// module-cache key **and** its PTX entry name in one `&'static str`.
+///
+/// The name carries the tile *and* the stage count because [`crate::gpu::Gpu::function`] keys the module
+/// cache on the key alone and **never re-examines the PTX on a hit**: two depths under one key would
+/// silently run the first one's kernel with the second one's launch window — and, worse, inherit its
+/// `cuFuncSetAttribute` SMEM ceiling. One row = one key = one entry = one depth.
+#[derive(Clone, Copy, Debug)]
+pub struct Fp8StageCfg {
+    /// PTX entry symbol *and* module-cache key (a `&'static str`, as `Gpu::function` requires).
+    pub name: &'static str,
+    pub bm: usize,
+    pub bn: usize,
+    pub bk: usize,
+    pub wm: usize,
+    pub wn: usize,
+    pub stages: usize,
+    pub raster: usize,
+}
+
+impl Fp8StageCfg {
+    /// `stages*(bm+bn)*(bk+pad)` — the family's closed form at 1 byte per e4m3 ([`FP8_PIPE_PAD`] is the
+    /// bank-conflict pad every fp8 pipe entry uses).
+    pub const fn smem_bytes(&self) -> usize {
+        self.stages * (self.bm + self.bn) * (self.bk + FP8_PIPE_PAD)
+    }
+    pub const fn threads(&self) -> usize {
+        self.wm * self.wn * 32
+    }
+    /// Static at or below the 48 KiB ISA cap, one dynamic window beyond it — the single emission rule.
+    pub const fn smem_mode(&self) -> SmemMode {
+        smem_mode_for(self.smem_bytes())
+    }
+    /// Shortest K this depth's prologue fills exactly: the ring stages `stages-1` slabs before the main
+    /// loop, so `K = (stages-1)*bk` is the corner where the prologue fills the ring and the loop never
+    /// prefetches. Shorter K is *correct* (every prologue slab past K is guarded) but wastes the depth.
+    pub const fn min_k(&self) -> usize {
+        (self.stages - 1) * self.bk
+    }
+}
+
+/// **The fp8 deep-stage grid — `mma.sync.m16n8k32` E4M3 rings past the 48 KiB static wall.**
+///
+/// fp8 is the dtype where pipeline depth is cheapest per byte (1 B/elem, half fp16's slab) and the one
+/// whose Ada `mma.sync` programming model *is* Hopper's — so this grid is the campaign's most direct
+/// H100-fp8 evidence, and an A100 cannot run a single row of it (no fp8 ISA at cc 8.0).
+///
+/// The CTAs/SM column is **measured**, not predicted — `cuOccupancyMaxActiveBlocksPerMultiprocessor`
+/// on this 4050, printed by `fp8_deep_matches_reference_within_tol` on every run.
+///
+/// | row | tile | warps | depth | SMEM | form | CTAs/SM here (100 KiB/SM, 1 KiB reserved) |
+/// |---|---|---|---|---|---|---|
+/// | `fp8_deep_128_s2` | 128x128 | 2x2 | 2 | 40 KiB | static (== the shipped `w64`) | 2 |
+/// | `fp8_deep_128_s3` | 128x128 | 2x2 | 3 | 60 KiB | **dynamic** | 1 |
+/// | `fp8_deep_128_s4` | 128x128 | 2x2 | 4 | 80 KiB | **dynamic** | 1 |
+/// | `fp8_deep_m64_s2` | 64x128 | 2x4 | 2 | 30 KiB | static (== the shipped `_m64`) | 3 |
+/// | `fp8_deep_m64_s4` | 64x128 | 2x4 | 4 | 60 KiB | **dynamic** | 1 |
+/// | `fp8_deep_m64_s6` | 64x128 | 2x4 | 6 | 90 KiB | **dynamic** | 1 |
+///
+/// These are exactly D6 4.1's candidate 2 ("fp8 s3/s4 at 60-90 KiB"). **128x128 s5 is deliberately
+/// absent**: 5*(128+128)*80 = 102400 B, four bytes past this Ada part's 101376 B opt-in ceiling — it is
+/// not a tuning choice but a hard budget miss here, and the same generator produces it unchanged the
+/// moment an A100 (163 KiB) or H100 (227 KiB) budget is passed in.
+///
+/// The `_s2` rows are the shipped kernels under grid names — their PTX is byte-identical bar the entry
+/// symbol, which `fp8_deep_grid_s2_rows_are_the_shipped_kernels` proves — so the grid's own correctness
+/// gate covers the dispatched pair too, and they are the equivalence anchor every deeper row must match.
+///
+/// **This grid is a correctness deliverable, not a perf verdict on this card.** Every row past s2 costs
+/// occupancy here (60 KiB already pins 1 CTA/SM); the datacenter budgets are what dissolve that. What
+/// transfers 100% is the PTX: this is the exact module an H100 will run, validated on the metal at $0.
+pub const FP8_DEEP_VARIANTS: &[Fp8StageCfg] = &[
+    // 128x128 CTA on the 64x64 warp tile (wm=wn=2, 128 threads) — the measured fp8 dispatch winner.
+    Fp8StageCfg { name: "fp8_deep_128_s2", bm: 128, bn: 128, bk: FP8_PIPE_BK, wm: 2, wn: 2, stages: 2, raster: FP8_PIPE_RASTER }, // 40 KiB static
+    Fp8StageCfg { name: "fp8_deep_128_s3", bm: 128, bn: 128, bk: FP8_PIPE_BK, wm: 2, wn: 2, stages: 3, raster: FP8_PIPE_RASTER }, // 60 KiB dynamic
+    Fp8StageCfg { name: "fp8_deep_128_s4", bm: 128, bn: 128, bk: FP8_PIPE_BK, wm: 2, wn: 2, stages: 4, raster: FP8_PIPE_RASTER }, // 80 KiB dynamic
+    // 64x128 small/mid-M tile (wm=2, wn=4, 256 threads) — half the A ring, so it reaches s6 in budget.
+    Fp8StageCfg { name: "fp8_deep_m64_s2", bm: FP8_PIPE_M64_BM, bn: 128, bk: FP8_PIPE_BK, wm: FP8_PIPE_WM, wn: FP8_PIPE_WN, stages: 2, raster: FP8_PIPE_RASTER }, // 30 KiB static
+    Fp8StageCfg { name: "fp8_deep_m64_s4", bm: FP8_PIPE_M64_BM, bn: 128, bk: FP8_PIPE_BK, wm: FP8_PIPE_WM, wn: FP8_PIPE_WN, stages: 4, raster: FP8_PIPE_RASTER }, // 60 KiB dynamic
+    Fp8StageCfg { name: "fp8_deep_m64_s6", bm: FP8_PIPE_M64_BM, bn: 128, bk: FP8_PIPE_BK, wm: FP8_PIPE_WM, wn: FP8_PIPE_WN, stages: 6, raster: FP8_PIPE_RASTER }, // 90 KiB dynamic
+];
+
+/// Look up a [`FP8_DEEP_VARIANTS`] row by entry name — a wrong name is a loud panic at the call site,
+/// never a silent mis-dispatch.
+pub fn fp8_deep_variant(name: &str) -> &'static Fp8StageCfg {
+    FP8_DEEP_VARIANTS
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("unknown fp8 deep variant {name:?}"))
+}
+
+/// Generate one [`FP8_DEEP_VARIANTS`] row against `smem_budget` bytes (the running device's
+/// `Gpu::smem_budget()`, or a target's budget when enumerating off-device). Returns the module and the
+/// [`SmemMode`] its launch must honour — `Gpu::function_smem` consumes exactly this pair, so no caller
+/// re-derives a byte count the generator already knows.
+///
+/// One row, one module, one entry: the row's `name` is both the entry symbol and the module-cache key
+/// (crate hard rule 4). The emitted text does **not** depend on `smem_budget` — only on the row's own
+/// byte count, through [`crate::gpu::smem_mode_for`] — so a bigger card produces byte-identical PTX and
+/// the on-disk cubin cache stays warm across devices.
+///
+/// Panics (loudly, at generation) if the row does not fit `smem_budget`: a decline belongs in the
+/// dispatcher, ahead of any load, never in a silently-clamped launch.
+pub fn fp8_stage_ptx(v: &Fp8StageCfg, smem_budget: usize) -> (String, SmemMode) {
+    use crate::ptx_wmma::Act;
+    let mode = v.smem_mode();
+    let mut m = format!("{HDR_SM89_V84}\n");
+    if mode.is_dynamic() {
+        // MODULE SCOPE, not inside the entry — the identical line in an entry body is CUDA_ERROR_INVALID_PTX.
+        m += DSMEM_DECL;
+    }
+    m += &fp8_pipe_entry(
+        v.name,
+        v.bm,
+        v.bn,
+        v.bk,
+        v.wm,
+        v.wn,
+        v.stages,
+        v.raster,
+        FP8_PIPE_PAD,
+        Act::None,
+        false,
+        false,
+        smem_budget,
+    );
+    (m, mode)
 }
 
 /// Multi-tile per warp for fp8: `M` direction tiles (each 16 rows) and `N` direction tiles (each 8
@@ -1046,6 +1259,25 @@ KEND:
 mod tests {
     use super::*;
     use crate::ptx_target::TARGET_SM89;
+    use crate::ptx_wmma::DEEP_SMEM_BUDGET;
+
+    /// One `.visible .entry <name>(...)` lifted out of a (possibly multi-entry) module, header excluded.
+    ///
+    /// The entry terminator is the column-0 `"\n}\n"`: PTX register vectors (`{%d0,%d1,%d2,%d3}`) only
+    /// ever appear mid-line and every instruction line ends in `;`, so the closing brace of an `.entry`
+    /// is the sole occurrence of that pattern. This is what makes a byte-identity comparison possible
+    /// between a single-entry grid module and one entry of the twelve-entry shipped pipe module.
+    fn entry_text(module: &str, name: &str) -> String {
+        let start = module
+            .find(&format!(".visible .entry {name}("))
+            .unwrap_or_else(|| panic!("{name}: not declared in this module"));
+        let end = module[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{name}: entry never closes"))
+            + start
+            + 3;
+        module[start..end].to_string()
+    }
 
     /// The `.visible .entry` names `fp8_pipe_ptx()` must declare, in emission order.
     const PIPE_ENTRIES: [&str; 12] = [
@@ -1069,7 +1301,7 @@ mod tests {
     /// Pure-CPU.
     #[test]
     fn fp8_ptx_is_ascii_and_structural() {
-        let modules: Vec<(&str, String)> = vec![
+        let mut modules: Vec<(String, String)> = vec![
             ("fp8_tile", FP8_TILE.to_string()),
             ("fp8_gemm_nt", fp8_gemm_ptx().to_string()),
             ("fp8_gemm_nt_mt", fp8_gemm_mt_ptx().to_string()),
@@ -1077,7 +1309,17 @@ mod tests {
             ("fp8_gemm_pipe(w64)", fp8_pipe_w64_ptx().to_string()),
             ("fp8_gemm_pipe(w64_s3)", fp8_pipe_w64_s3_ptx().to_string()),
             ("fp8_gemm_pipe(cfg)", fp8_pipe_cfg_ptx(128, 128, 64, 2, 4, 2, 16)),
-        ];
+        ]
+        .into_iter()
+        .map(|(n, p)| (n.to_string(), p))
+        .collect();
+        // Every deep-stage row, static and dynamic alike — the `.extern` window is ASCII too, and a row
+        // that lost its Ada floor or its E4M3 mma would be a load failure on the very parts this exists
+        // to reach. Generated at the deep budget so the >48 KiB rows take the dynamic arm here.
+        for v in FP8_DEEP_VARIANTS {
+            modules.push((format!("deep/{}", v.name), fp8_stage_ptx(v, DEEP_SMEM_BUDGET).0));
+        }
+        let modules = modules;
         for (label, ptx) in &modules {
             assert!(ptx.is_ascii(), "{label}: PTX must be ASCII");
             // The fp8 floor is GENUINE, not a leftover device tag: the `e4m3` mma asserted below
@@ -1170,5 +1412,145 @@ mod tests {
     #[should_panic(expected = "warp grid must be powers of two")]
     fn pipe_rejects_a_non_power_of_two_warp_grid() {
         let _ = fp8_pipe_cfg_ptx(128, 192, 64, 2, 3, 2, 0);
+    }
+
+    /// **ZERO REGRESSION on the <=48 KiB path: the grid's `_s2` rows ARE the shipped kernels, byte for
+    /// byte below the entry symbol.** The whole budget migration rests on one promise — that adding a
+    /// budget parameter and an extern-window arm changes *nothing* about the kernels this card already
+    /// runs and whose cubins are already warm. A behavioural A/B could only sample that; this proves it.
+    ///
+    /// Both anchors are real dispatch targets: `fp8_deep_128_s2` reproduces `fp8_pipe_w64_ptx()` (the
+    /// 64x64-warp-tile entry `gemm_nt_fp8_pipe` routes 128-divisible shapes to) and `fp8_deep_m64_s2`
+    /// reproduces the `fp8_gemm_pipe_m64` entry inside the twelve-entry shipped pipe module (the 128-M
+    /// fallback). Rename the grid entry back to the shipped symbol and demand string equality.
+    #[test]
+    fn fp8_deep_grid_s2_rows_are_the_shipped_kernels() {
+        for (grid, shipped_name, shipped_module) in [
+            ("fp8_deep_128_s2", "fp8_gemm_pipe", fp8_pipe_w64_ptx().to_string()),
+            ("fp8_deep_m64_s2", "fp8_gemm_pipe_m64", fp8_pipe_ptx().to_string()),
+        ] {
+            let v = fp8_deep_variant(grid);
+            let (ptx, mode) = fp8_stage_ptx(v, DEEP_SMEM_BUDGET);
+            assert_eq!(
+                mode,
+                SmemMode::Static,
+                "{grid} is {} B — it must stay on the static path",
+                v.smem_bytes()
+            );
+            assert_eq!(
+                entry_text(&ptx, grid).replace(grid, shipped_name),
+                entry_text(&shipped_module, shipped_name),
+                "{grid}: the budget-parameterized generator no longer reproduces the shipped \
+                 `{shipped_name}` byte for byte — the <=48 KiB path is NOT allowed to move"
+            );
+        }
+    }
+
+    /// **The deep grid's SMEM arithmetic, emission form and window discipline (no GPU).** Six things a
+    /// wrong dynamic-SMEM fp8 kernel gets wrong *silently*, each checked from the generated text:
+    ///   * the closed form `stages*(bm+bn)*(bk+pad)` and the 48 KiB boundary that splits the two forms;
+    ///   * `.extern .shared` sits at **module scope** — the identical line inside an entry body is
+    ///     `CUDA_ERROR_INVALID_PTX` (measured), so its offset must precede `.visible .entry`;
+    ///   * exactly **one** window per module: two module-scope externs ALIAS (measured), so a second
+    ///     would put the B ring on top of the A ring and quietly compute garbage;
+    ///   * a dynamic entry declares **no** static `.shared` array (it would count against the same
+    ///     opt-in ceiling the window is sized from), and a static entry never names the window;
+    ///   * the B ring's window offset is the whole A ring, and is 16-B aligned (`cp.async ...,16`);
+    ///   * the ring cursor is **add+wrap at every depth**. The two-buffer XOR toggle the int8 family
+    ///     started from cycles exactly two buffers, so it would corrupt every stage past the second
+    ///     (D6 risk 2); fp8 must never grow one.
+    #[test]
+    fn fp8_deep_grid_smem_math_and_modes() {
+        // (stages, bytes, dynamic) per row, spelled out rather than recomputed — a table that agrees
+        // with the formula by construction would notice nothing if both moved together.
+        let expect: [(usize, usize, bool); 6] = [
+            (2, 40960, false),
+            (3, 61440, true),
+            (4, 81920, true),
+            (2, 30720, false),
+            (4, 61440, true),
+            (6, 92160, true),
+        ];
+        assert_eq!(FP8_DEEP_VARIANTS.len(), expect.len(), "grid length changed — update `expect`");
+        for (v, (stages, bytes, dynamic)) in FP8_DEEP_VARIANTS.iter().zip(expect) {
+            assert_eq!(v.stages, stages, "{}: grid order", v.name);
+            assert_eq!(v.smem_bytes(), bytes, "{}: SMEM closed form", v.name);
+            assert_eq!(v.smem_mode().is_dynamic(), dynamic, "{}: emission form at {bytes} B", v.name);
+            assert_eq!(
+                v.smem_mode().launch_bytes(),
+                if dynamic { bytes } else { 0 },
+                "{}: a static row must launch with 0 (its tile is already reserved)",
+                v.name
+            );
+            assert!(
+                v.smem_bytes() <= DEEP_SMEM_BUDGET,
+                "{}: {bytes} B must fit the smallest target's opt-in ceiling",
+                v.name
+            );
+            let (ptx, mode) = fp8_stage_ptx(v, DEEP_SMEM_BUDGET);
+            assert_eq!(mode, v.smem_mode(), "{}: generator and table disagree on the form", v.name);
+            assert_eq!(ptx.matches(".extern .shared").count(), usize::from(dynamic), "{}", v.name);
+            let ring_a = v.stages * v.bm * (v.bk + FP8_PIPE_PAD);
+            if dynamic {
+                let (decl, entry) = (
+                    ptx.find(".extern .shared").expect("window"),
+                    ptx.find(".visible .entry").expect("entry"),
+                );
+                assert!(decl < entry, "{}: the window must be declared at MODULE scope", v.name);
+                assert!(
+                    !ptx.contains(&format!(".shared .align 16 .b8 smemA_{}", v.name)),
+                    "{}: no statics beside the window",
+                    v.name
+                );
+                // Both rings address the one window; B starts after the whole A ring, 16-B aligned.
+                assert!(ptx.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")), "{}", v.name);
+                assert!(
+                    ptx.contains(&format!("add.u32 %bptr,%bptr,{ring_a};")),
+                    "{}: the B ring must start after the whole A ring ({ring_a} B)",
+                    v.name
+                );
+                assert_eq!(ring_a % 16, 0, "{}: window offset must be 16-B aligned", v.name);
+            } else {
+                assert!(
+                    ptx.contains(&format!(".shared .align 16 .b8 smemA_{}[{ring_a}];", v.name)),
+                    "{}",
+                    v.name
+                );
+                assert!(!ptx.contains(DSMEM_SYM), "{}: a static kernel must not touch the window", v.name);
+            }
+            // Ring cursor: add+wrap at EVERY depth. fp8 never had the XOR toggle, and must not gain one.
+            assert!(!ptx.contains("xor.b32 %bufcA"), "{}: XOR wrap is invalid past 2 buffers", v.name);
+            assert!(ptx.contains(&format!("setp.ge.u32 %pmore,%bufcA,{ring_a};")), "{}", v.name);
+            // cp.async bookkeeping: the prologue commits `stages-1` groups (one guarded staging block
+            // each, the commit deliberately OUTSIDE the guard because `wait_group` counts positionally),
+            // and the steady state keeps `stages-2` in flight.
+            assert!(ptx.contains(&format!("cp.async.wait_group {};", v.stages - 2)), "{}", v.name);
+            assert_eq!(
+                ptx.matches("setp.lt.u32 %pmore,%kcol,%K;").count(),
+                v.stages,
+                "{}: one guard per prologue slab plus the steady-state prefetch guard",
+                v.name
+            );
+            assert_eq!(
+                ptx.matches("cp.async.commit_group;").count(),
+                v.stages,
+                "{}: `stages-1` prologue commits + one per loop iteration, all outside their guards",
+                v.name
+            );
+        }
+    }
+
+    /// **An over-budget depth is a loud generation failure, never a clamped launch.** The budget is the
+    /// device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`; a kernel past it cannot run at all, and the driver's
+    /// own rejection (`CUDA_ERROR_INVALID_VALUE`, at launch) names neither the kernel nor the ceiling.
+    #[test]
+    #[should_panic(expected = "exceeds the budget")]
+    fn fp8_deep_over_budget_panics_at_generation() {
+        // 128x128 s5 = 5*(128+128)*80 = 102400 B — four bytes past this Ada part's 101376 B opt-in, and
+        // the reason the shipped grid stops at s4. It is legal on A100/H100 and this same call proves it.
+        let over =
+            Fp8StageCfg { name: "fp8_deep_probe_s5", bm: 128, bn: 128, bk: FP8_PIPE_BK, wm: 2, wn: 2, stages: 5, raster: FP8_PIPE_RASTER };
+        assert_eq!(over.smem_bytes(), 102400);
+        let _ = fp8_stage_ptx(&over, DEEP_SMEM_BUDGET);
     }
 }
