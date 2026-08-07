@@ -348,6 +348,71 @@ pub fn quantize_scaled_e4m3_ptx() -> &'static str {
 mod tests {
     use super::*;
 
+    /// Assert one generated module is pure ASCII, naming the offending line *and the offending
+    /// character* if not. A single non-ASCII byte anywhere in a PTX string is a `ptxas fatal`; on the
+    /// device path it surfaces only as an opaque `DriverError`/`CUDA_ERROR_INVALID_PTX` out of
+    /// `cuModuleLoadData`, with nothing pointing at the one character at fault.
+    fn assert_ptx_ascii(what: &str, ptx: &str) {
+        assert!(!ptx.is_empty(), "{what}: generated an empty module");
+        if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+            let bad: Vec<char> = line.chars().filter(|c| !c.is_ascii()).collect();
+            panic!(
+                "{what}: PTX line {} is not ASCII (ptxas fatal at cuModuleLoadData) -- \
+                 offending char(s) {bad:?} in: {line}",
+                i + 1
+            );
+        }
+    }
+
+    /// **The crate's PTX-is-ASCII gate for this file** — every other PTX generator family carries one
+    /// (`ptx::every_dispatched_ptx_family_is_pure_ascii`, `ptx_conv::every_conv_generator_emits_ascii_ptx`,
+    /// `ptx_flash::flash_ptx_is_pure_ascii`, ...); this one had none, so the fp8 *training* kernels were
+    /// the single unfenced family in the crate.
+    ///
+    /// The risk here is not theoretical: this file's prose is written with `×`, `→`, `·`, `⁻¹⁶`, `√`
+    /// and `≥` **immediately adjacent** to the `format!`/`writeln!` lines that build the kernels, and
+    /// the emitted PTX itself already carries inline `//` comments (`// global thread id`,
+    /// `// d[15:8]=fp8(va)`), so a one-keystroke copy of a doc line into an emitted line is the live
+    /// failure mode. A GPU-less `cargo test` never loads a module and every fp8 device test *skips*, so
+    /// such a regression lands green here and detonates only on a machine with a device — as every fp8
+    /// backward GEMM, `amax` and delayed-scaling quantize dying at once.
+    ///
+    /// Pure-CPU: these functions only build text. Both private generators are swept over their whole
+    /// parameter space (all four `mma` operand-type pairings, both packed-converter formats), not just
+    /// the configs the public wrappers happen to pin today, so a new wrapper is fenced before it exists.
+    #[test]
+    fn every_fp8_train_generator_emits_ascii_ptx() {
+        // The five modules `gpu.rs` hands to the driver JIT (`Gpu::function`).
+        assert_ptx_ascii("fp8_bwd_gemm_ptx", fp8_bwd_gemm_ptx());
+        assert_ptx_ascii("fp8_e5m2_gemm_ptx", fp8_e5m2_gemm_ptx());
+        assert_ptx_ascii("AMAX_PTX", AMAX_PTX);
+        assert_ptx_ascii("quantize_scaled_e5m2_ptx", quantize_scaled_e5m2_ptx());
+        assert_ptx_ascii("quantize_scaled_e4m3_ptx", quantize_scaled_e4m3_ptx());
+
+        // `gen_fp8_mt_typed` over every operand-type pairing it can be asked for -- the two shipped
+        // wrappers pin (e5m2,e4m3) and (e5m2,e5m2), but the type tokens are interpolated into the
+        // `mma` line, so the forward (e4m3,e4m3) and mixed (e4m3,e5m2) spellings must be gated too.
+        for atype in ["e4m3", "e5m2"] {
+            for btype in ["e4m3", "e5m2"] {
+                assert_ptx_ascii(
+                    &format!("gen_fp8_mt_typed(a={atype},b={btype})"),
+                    &gen_fp8_mt_typed(&format!("fp8_mt_{atype}_{btype}"), atype, btype),
+                );
+            }
+        }
+
+        // `gen_quantize_scaled` over both Ada packed-converter formats. The entry name is interpolated
+        // into the branch labels as well as the `.entry`, so it is swept alongside the format.
+        for (entry, fmt) in
+            [("quantize_scaled_e5m2", "e5m2x2"), ("quantize_scaled_e4m3", "e4m3x2")]
+        {
+            assert_ptx_ascii(
+                &format!("gen_quantize_scaled({entry},{fmt})"),
+                &gen_quantize_scaled(entry, fmt),
+            );
+        }
+    }
+
     /// E5M2 round-trip exactness on representable values + rounding spot-checks (no GPU needed).
     #[test]
     fn e5m2_host_roundtrip() {
