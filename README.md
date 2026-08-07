@@ -109,6 +109,13 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   int8 GEMM **~180–237× naive CUDA-C**, **95.7% of the 192 GB/s HBM peak**, and **0.76 ms cold GPU
   compile vs Triton's 30–120 s**.
 
+  > **Device scope (2026-08-06):** every GPU figure in the bullet above was measured on an **NVIDIA
+  > RTX 4050 Laptop GPU** (`sm_89`, 20 SMs, 6 GB, ~192 GB/s) under **Windows/WDDM**, with the peers
+  > available on that box (notably: PyTorch in **eager** mode — Triton does not install on Windows —
+  > and no CUDA toolkit). These are properties of that instrument; **do not extrapolate them to
+  > datacenter parts.** The datacenter retarget, including re-measurement against stronger peers
+  > (`torch.compile`, CUTLASS, FlashAttention), is tracked in `GPU_RETARGET_PLAN.md`.
+
 The domain-aware paths (GEMM, the `vmath` transcendentals, the `velem` streaming elementwise, the
 fused norms) emit **true 256-bit AVX2/FMA** via hand-written runtime microkernels — and the
 **general** loop vectorizer reaches the same width by a second route: a vectorizable f32 loop body is
