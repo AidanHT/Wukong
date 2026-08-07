@@ -1598,6 +1598,21 @@ impl<'a> FnEmit<'a> {
                 }
                 ls
             }
+            // The lane ramp `<0, 1, .., n-1>` the loop vectorizer emits for a value-carrying
+            // induction variable (`splat(i) + iota`). Every lane is a small non-negative integer, so
+            // materializing lane k as the 64-bit constant k is exact for every lane type the verifier
+            // admits (integer lanes, n <= 16) — the same values `wukong_interp` pushes untruncated
+            // and the same ones Cranelift's `vconst` pool holds. `rc_of` maps every integer type to
+            // `RC::Rd`, so `mov.b64` is the lane class every consumer of these lanes expects.
+            Op::Iota(_) => {
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(RC::Rd);
+                    self.emit(&format!("mov.b64 {d}, {i};"));
+                    ls.push(d);
+                }
+                ls
+            }
             other => return Err(format!("{UNSUPPORTED} SIMD op {other:?} not yet lowered to PTX")),
         };
         self.vlanes.insert(r.0, out);
