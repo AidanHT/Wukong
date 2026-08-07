@@ -12,7 +12,11 @@
 //!
 //! Each kernel mirrors the exact math the tape emits (`wukong_autodiff::tape`), so it is gated
 //! tolerance-/bit-equal to that op — and the tape's CPU form is finite-difference-gated, which
-//! transitively makes the device form correct. PTX is pure ASCII; target `sm_89`. The elementwise and
+//! transitively makes the device form correct. PTX is pure ASCII, and every module here is tagged at
+//! the **`sm_80` floor** ([`crate::ptx_target::HDR_SM80`]) — the instruction mix is f32 arithmetic,
+//! `cvt.rn.f16.f32`, shared memory and `wmma`/`mma.sync` fragments, all Ampere-legal, and PTX is
+//! forward-compatible only, so tagging the development device's arch would only cost us the A100.
+//! The elementwise and
 //! transpose kernels are grid-stride, so for those correctness is independent of the launch grid;
 //! the row-norm ones are one-CTA-per-row and the GEMM entries and `ptx::CAST_F32_F16` are
 //! one-thread-per-output, so those launchers must size the grid to cover the rows / the output.
@@ -39,7 +43,7 @@ const NORM_RMSNORM: i64 = 2;
 /// of the backward, the `dB` GEMM dominates.)
 pub const TRANSPOSE_F32_PTX: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry transpose_f32(
@@ -99,7 +103,7 @@ T_END:
 /// transpose and the f32→f16 narrow into a single kernel keeps the resident step's launch count down.
 pub const TRANSPOSE_CAST_F32_F16_PTX: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry transpose_cast_f32_f16(
@@ -183,7 +187,7 @@ pub fn transpose_f32(g: &mut Gpu, src: &[f32], m: usize, n: usize) -> Result<Vec
 /// f32 — bit-exact to the CPU tape loop.
 pub const ACT_BWD_PTX: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry relu_bwd(
@@ -530,7 +534,7 @@ fn rmsnorm_bwd() -> String {
 pub fn norm_bwd_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(crate::ptx_target::HDR_SM80);
         m += &softmax_bwd();
         m += &layernorm_bwd();
         m += &rmsnorm_bwd();
@@ -652,7 +656,7 @@ GEMM_END_{tag}:
 pub fn train_gemm_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        let mut m = String::from(crate::ptx_target::HDR_SM80);
         m += &gemm_entry("nn", false, false);
         m += &gemm_entry("nt", false, true);
         m += &gemm_entry("tn", true, false);
@@ -712,7 +716,7 @@ pub fn gemm_f32(
 /// the gradient of `scale/2 * sum (y-t)^2` (scale=2 reproduces the SSD loss the tape differentiates).
 pub const TRAIN_ELEM_PTX: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry relu_fwd(.param .u64 rx, .param .u64 rout, .param .u32 rn)
@@ -1324,6 +1328,34 @@ mod tests {
                 name,
                 crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
             ),
+        }
+    }
+
+    /// **Header-floor gate, device-free.** Every backward module — the four `const` literals and the
+    /// two generated ones — must carry exactly [`crate::ptx_target::HDR_SM80`]. PTX is
+    /// forward-compatible *only*: a module tagged with the development device's `sm_89` buys nothing
+    /// on Ada and fails `cuModuleLoadData` on every A100. Nothing here needs Ada (f32 arithmetic,
+    /// `cvt.rn.f16.f32`, shared memory, `wmma`/`mma.sync.m16n8k16.f16`), so the floor *is* `sm_80`.
+    /// The `const`s cannot interpolate the constant, so this assert is what keeps their copies honest.
+    #[test]
+    fn backward_ptx_headers_are_at_the_sm80_floor() {
+        let mods: [(&str, &str); 6] = [
+            ("TRANSPOSE_F32_PTX", TRANSPOSE_F32_PTX),
+            ("TRANSPOSE_CAST_F32_F16_PTX", TRANSPOSE_CAST_F32_F16_PTX),
+            ("ACT_BWD_PTX", ACT_BWD_PTX),
+            ("TRAIN_ELEM_PTX", TRAIN_ELEM_PTX),
+            ("norm_bwd_ptx", norm_bwd_ptx()),
+            ("train_gemm_ptx", train_gemm_ptx()),
+        ];
+        for (what, ptx) in mods {
+            assert!(
+                ptx.contains(crate::ptx_target::HDR_SM80),
+                "{what}: must carry ptx_target::HDR_SM80 verbatim"
+            );
+            assert!(
+                !ptx.contains(crate::ptx_target::TARGET_SM89),
+                "{what}: an Ampere-legal module must not claim the Ada floor"
+            );
         }
     }
 

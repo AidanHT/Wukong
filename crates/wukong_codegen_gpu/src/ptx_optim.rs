@@ -12,9 +12,11 @@
 //! double-rounding (the GPU's single-rounded f32 is, if anything, the more accurate of the two).
 //! Gated below against the real `build_adamw_step` MIR run on the interpreter oracle.
 //!
-//! PTX is pure ASCII (a non-ASCII byte is a `ptxas fatal`); target `sm_89` (Ada / RTX 4050). The
-//! grid-stride loop makes correctness independent of the launch grid, so one fixed kernel handles
-//! any element count.
+//! PTX is pure ASCII (a non-ASCII byte is a `ptxas fatal`); both modules are tagged at the
+//! **`sm_80` floor** ([`crate::ptx_target::HDR_SM80`]) — the instruction mix is plain f32, legal on
+//! Ampere and every later part, and PTX is forward-compatible only, so tagging the development
+//! device's arch would only cost us the A100. The grid-stride loop makes correctness independent of
+//! the launch grid, so one fixed kernel handles any element count.
 
 use crate::gpu::Gpu;
 use cudarc::driver::{CudaSlice, DriverError, LaunchConfig, PushKernelArg};
@@ -46,9 +48,12 @@ pub mod hp {
 ///
 /// `fma.rn` for the two moment updates, `div.rn`/`sqrt.rn` elsewhere — every result single-rounded
 /// f32, matching the same MIR run on the interpreter to a tight tolerance (mostly bit-exact).
+///
+/// (Header floor: this literal carries exactly [`crate::ptx_target::HDR_SM80`] — a `const` cannot
+/// interpolate the constant, so `optimizer_ptx_is_ascii` asserts the two agree byte-for-byte.)
 pub const ADAMW_STEP_PTX: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry adamw_step(
@@ -144,9 +149,12 @@ ADAMW_END:
 /// Fused **SGD** update with decoupled weight decay over `n` contiguous f32 elements (grid-stride):
 /// `w -= lr*(g + wd*w)`. Reads `hp[LR]` and `hp[WD]` from the same [`hp`] layout (the moment slots
 /// are unused). All ops correctly-rounded f32, so it is bit-exact to the same formula on the CPU.
+///
+/// (Header floor: this literal carries exactly [`crate::ptx_target::HDR_SM80`] — see
+/// [`ADAMW_STEP_PTX`].)
 pub const SGD_STEP_PTX: &str = r#"
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry sgd_step(
@@ -369,6 +377,18 @@ mod tests {
             if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
                 panic!("{what}: PTX line {} is not ASCII (ptxas fatal): {line:?}", i + 1);
             }
+            // Header floor. Both kernels are plain single-rounded f32 (`fma.rn`/`div.rn`/`sqrt.rn`)
+            // over a grid-stride loop — nothing above `sm_80` — and PTX is forward-compatible only,
+            // so the old `sm_89` tag bought nothing on Ada and made the module unloadable on every
+            // A100. A `const` cannot interpolate `HDR_SM80`, so this is the tie to the single source.
+            assert!(
+                ptx.contains(crate::ptx_target::HDR_SM80),
+                "{what}: must carry ptx_target::HDR_SM80 verbatim"
+            );
+            assert!(
+                !ptx.contains(crate::ptx_target::TARGET_SM89),
+                "{what}: an Ampere-legal module must not claim the Ada floor"
+            );
         }
         assert!(ADAMW_STEP_PTX.contains(".visible .entry adamw_step("));
         assert!(SGD_STEP_PTX.contains(".visible .entry sgd_step("));
