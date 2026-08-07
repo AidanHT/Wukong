@@ -2777,7 +2777,7 @@ mod tests {
             assert_eq!(v.smem_mode().is_dynamic(), dynamic, "{name}: emission form at {bytes} B");
             assert_eq!(v.smem_mode().launch_bytes(), if dynamic { bytes } else { 0 }, "{name}");
             assert!(v.smem_bytes() <= DEEP_SMEM_BUDGET, "{name}: must fit the smallest target's ceiling");
-            let tile_a = v.stages * v.bm * (v.bk + v.pad) * 2 / v.stages; // one A buffer
+            let tile_a = v.bm * (v.bk + v.pad) * 2; // one A buffer of the ring
             if dynamic {
                 assert!(!deep.contains(&format!("smemA_{name}")), "{name}: no statics beside the window");
                 assert!(deep.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")), "{name}: B ring via the symbol");
