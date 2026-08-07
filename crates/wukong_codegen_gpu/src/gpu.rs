@@ -809,6 +809,26 @@ pub fn gemm_nn(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **The f16 GEMM regime boundaries, in bytes of fp16 A+B working set, derived from the device's L2.**
+///
+/// The two thresholds [`gemm_nt_f16`] dispatches on were the literals `16 MiB` and `48 MiB` — tuned on
+/// this 4050 and meaningless on any other card, while the probed `l2_bytes` sat unused by dispatch (its
+/// only consumer was a bench print). They are not arbitrary sizes: the boundaries are where the A+B
+/// footprint stops fitting L2 (`≈ ⅔·L2`, the point where C and the raster band still leave room) and
+/// where it is comfortably HBM-bound (`2·L2`), which is why the *shape* of the rule ports and the
+/// *numbers* do not.
+///
+/// On this device the derivation is **exactly** the old pair — 24 MiB L2: `25165824·2/3 = 16777216`
+/// (16 MiB) and `25165824·2 = 50331648` (48 MiB) — so the 4050 dispatch census is unchanged, which
+/// `f16_regime_thresholds_reproduce_the_4050_literals` machine-checks. (A 1.33×/4× reading of the same
+/// bands assumes a 12 MiB L2; the probe settles it at 24 MiB. Evaluate `·2/3` in that order — `/3·2`
+/// truncates first and gives a different edge whenever `l2_bytes % 3 == 2`.)
+///
+/// Returns `(l2_resident_ceiling, hbm_bound_floor)`.
+pub fn f16_regime_thresholds(l2_bytes: usize) -> (usize, usize) {
+    (l2_bytes * 2 / 3, l2_bytes * 2)
+}
+
 /// Pick the WMMA entry + launch config: the fragment-reuse multi-tile kernel (`<base>_mt`, one warp
 /// per WARP_M×WARP_N block) when M and N are multiples of the warp tile, else the single-16×16-tile
 /// kernel (`<base>`, any 16-multiple). One warp (32 threads) per block either way.
@@ -857,7 +877,8 @@ pub fn gemm_nt_f16(
     );
     // Regime-aware dispatch among the multi-stage `cp.async` pipeline kernels (all numerically identical;
     // winners picked by `gemm_pipe_sweep`, same-run vs cuBLAS at full clock). The binding constraint flips
-    // with the A+B working set vs the 24 MB L2 (see `PIPE_VARIANTS`):
+    // with the A+B working set vs the device's L2 (24 MB here, probed -- see
+    // `f16_regime_thresholds`; `PIPE_VARIANTS`):
     //   • L2-resident: a DEEP BK=16 pipeline wins (latency is low; depth keeps the tensor cores fed) —
     //     `pipe_64_s6` ≤1024³ (~90% of cuBLAS), `pipe_128_s4` ~2048³ (~94%).
     //   • Larger (≥ ~2048³, A+B ≳ L2): the `mma.sync.m16n8k16` kernel with conflict-free padded SMEM and
@@ -866,24 +887,27 @@ pub fn gemm_nt_f16(
     // Anything not matching a pipeline variant's divisibility falls through to the older SMEM kernels.
     // RESOLVED (perf/gpu-gemm-4096, swept 2026-07-09): of the CLIFF_VARIANTS re-tune candidates
     // (3-stage pipeline, L2-keyed raster bands, forced launch-bounds, vectorized epilogues) only the
-    // `_v2cs` epilogue beat the swz base, and only at ≥48 MB — it is dispatched by the first arm
+    // `_v2cs` epilogue beat the swz base, and only at ≥2·L2 (48 MB here) — it is dispatched by the first arm
     // below; everything else measured a loss at both 2048³ and 4096³ and stays bench-only.
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
-    if ws_bytes >= 48 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
-        // **Largest regime (A+B ≥ 48 MB, ~4096³ up): the `_v2cs` epilogue variant** — the same swz
+    // The band edges are multiples of the PROBED L2 (see `f16_regime_thresholds`), not the 16/48 MiB
+    // literals they replace — on this 24 MiB-L2 card they evaluate to exactly those literals.
+    let (l2_resident_max, hbm_bound_min) = f16_regime_thresholds(g.target().l2_bytes);
+    if ws_bytes >= hbm_bound_min && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+        // **Largest regime (A+B ≥ 2·L2 = 48 MB here, ~4096³ up): the `_v2cs` epilogue variant** — the same swz
         // s2 body as the w24 workhorse below, with C written as paired-column `st.global.cs.v2.f32`
         // (half the store count + the evict-first streaming hint keeps the one-shot C out of the
         // raster band's L2 working set). `gemm_cliff_ab` (round-robin best-of-10, 2026-07-09):
         // 1.027× the s2 base at 4096³ = 76.8% / 80.4% of the f16-/f32-out cuBLAS peers. At 2048³
         // every cliff variant LOSES to the plain swz base (v2cs 0.75× — C is L2-scale there and
-        // the .cs hint forfeits reuse), so this arm keys strictly on the ≥48 MB working set and
+        // the .cs hint forfeits reuse), so this arm keys strictly on the ≥2·L2 working set and
         // the [16, 48) MB band below keeps the plain swz w24.
         return gemm_nt_f16_cliff(g, a, b, m, k, n, "cliff_swz_s2_v2cs");
     }
-    if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+    if ws_bytes >= l2_resident_max && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
         let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
-        // **Large regime (A+B ≥ 16 MB, ≥2048³):** the no-pad `ldmatrix`+XOR-swizzle **w24** workhorse is the
+        // **Large regime (A+B ≥ ⅔·L2 = 16 MB here, ≥2048³):** the no-pad `ldmatrix`+XOR-swizzle **w24** workhorse is the
         // robust same-run winner — it beats the padded hand-placed base **1.23× @2048³ (87.4% vs 70.9% of
         // cuBLAS) and 1.13× @4096³**. The mechanism is the *fragment load*, not occupancy: the swz path loads
         // each mma operand with one warp-cooperative hardware `ldmatrix` (conflict-free via the no-pad XOR
@@ -5423,6 +5447,61 @@ mod tests {
                 t.smem_per_block_optin as f64 / 1024.0,
                 t.l2_bytes as f64 / (1024.0 * 1024.0),
             );
+        });
+    }
+
+    /// **The L2-derived f16 regime thresholds must be byte-identical to the literals they replaced.**
+    ///
+    /// `gemm_nt_f16` used to branch on the constants `16 MiB` and `48 MiB` — a 4050 tuning verdict
+    /// frozen into the dispatcher, while the probed `l2_bytes` was dead code for dispatch. Deriving
+    /// them from L2 is only a *retarget* if it changes nothing on the card they were tuned on: any
+    /// drift is a silent perf regression on this box, invisible to every correctness gate (all the
+    /// regimes compute the same math). So the identity is pinned here, with the probe's own number:
+    ///
+    ///   25165824 · 2 / 3 = 16777216 = 16 MiB   (the L2-resident ceiling)
+    ///   25165824 · 2     = 50331648 = 48 MiB   (the HBM-bound floor)
+    ///
+    /// The literal `L2_RTX_4050` is deliberately spelled out rather than read from the device: this
+    /// gate must keep asserting the 4050's arithmetic when it runs on an A100, where the *derivation*
+    /// is what ports. The device half then confirms the probe still reports that L2 here.
+    #[test]
+    fn f16_regime_thresholds_reproduce_the_4050_literals() {
+        /// `L2_CACHE_SIZE` as probed on this RTX 4050 Laptop GPU — 24 MiB (the census settled the
+        /// 24-vs-12 MB confusion the cliff comments carried).
+        const L2_RTX_4050: usize = 25_165_824;
+        let (lo, hi) = f16_regime_thresholds(L2_RTX_4050);
+        assert_eq!(lo, 16 * 1024 * 1024, "the L2-resident ceiling drifted off the old 16 MiB literal");
+        assert_eq!(hi, 48 * 1024 * 1024, "the HBM-bound floor drifted off the old 48 MiB literal");
+        assert_eq!((lo, hi), (16_777_216, 50_331_648));
+        // Evaluation order: `·2/3`, not `/3·2`. Both agree here (24 MiB is a multiple of 3) and on the
+        // A100/H100 L2s, but they diverge whenever `l2 % 3 == 2` — so the order is pinned, not lucky.
+        assert_eq!(lo, L2_RTX_4050 * 2 / 3);
+        assert_eq!(f16_regime_thresholds(8).0, 5, "`*2/3` rounds down from 5.33");
+        assert_eq!(8 / 3 * 2, 4, "`/3*2` would truncate first — a different, lower band edge");
+        // The shape ports: a 40 MiB A100 L2 and a 50 MiB H100 L2 scale, they do not inherit 16/48 MiB.
+        assert_eq!(f16_regime_thresholds(40 * 1024 * 1024), (27_962_026, 83_886_080));
+        assert!(f16_regime_thresholds(50 * 1024 * 1024).0 > lo);
+
+        with_gpu("f16_regime_thresholds", |g| {
+            let l2 = g.target().l2_bytes;
+            let (dlo, dhi) = f16_regime_thresholds(l2);
+            eprintln!(
+                "[gate] f16 regime bands from probed L2 {} B ({:.2} MiB): [{}, {}) B = [{:.0}, {:.0}) MiB \u{2713}",
+                l2,
+                l2 as f64 / (1024.0 * 1024.0),
+                dlo,
+                dhi,
+                dlo as f64 / (1024.0 * 1024.0),
+                dhi as f64 / (1024.0 * 1024.0),
+            );
+            if l2 == L2_RTX_4050 {
+                assert_eq!(
+                    (dlo, dhi),
+                    (16 * 1024 * 1024, 48 * 1024 * 1024),
+                    "on the tuned card the derived bands MUST equal the retired literals"
+                );
+            }
+            assert!(dlo < dhi, "the regime bands must be ordered");
         });
     }
 
