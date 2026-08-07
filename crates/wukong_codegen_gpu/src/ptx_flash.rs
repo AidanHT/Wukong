@@ -2766,7 +2766,10 @@ fn entry_mma_reg_pipe_ws3(d: usize, pv_ldmatrix: bool) -> String {
 pub fn flash_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
-        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        // `sm_80` floor from the single source: this module's whole instruction mix
+        // (`mma.sync.m16n8k16.f16`, `wmma`, `ldmatrix`, `cp.async`, `shfl.sync`, `ex2.approx`) is
+        // Ampere-legal, and PTX is forward-compatible only — an `sm_89` tag would load on ZERO A100s.
+        let mut m = String::from(crate::ptx_target::HDR_SM80);
         for &d in &SUPPORTED_D {
             m += &entry_untiled(d, FLASH_WARPS);
             m += &entry_tiled(d, FLASH_TWARPS);
@@ -2862,6 +2865,24 @@ mod tests {
         if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
             panic!("flash PTX must be pure ASCII (ptxas fatal otherwise) -- line {}: {line}", i + 1);
         }
+    }
+
+    /// **Header-floor gate, device-free.** Every instruction this module emits (`mma.sync.m16n8k16`,
+    /// `wmma`, `ldmatrix`, `cp.async`, `shfl.sync`, `ex2.approx`) is Ampere-legal, so the module is
+    /// tagged at the `sm_80` floor from [`crate::ptx_target`]. PTX is forward-compatible only: the
+    /// old `sm_89` tag cost nothing on Ada and made the module unloadable on every A100.
+    #[test]
+    fn flash_ptx_is_tagged_at_the_sm80_floor() {
+        let ptx = flash_ptx();
+        assert!(
+            ptx.starts_with(crate::ptx_target::HDR_SM80),
+            "flash PTX must open with ptx_target::HDR_SM80, got: {:?}",
+            &ptx[..ptx.len().min(64)]
+        );
+        assert!(
+            !ptx.contains(crate::ptx_target::TARGET_SM89),
+            "an Ampere-legal module must not claim the Ada floor"
+        );
     }
 
     /// Structural sanity the driver would otherwise be the first to check: balanced braces and one

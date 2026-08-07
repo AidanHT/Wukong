@@ -25,8 +25,12 @@ fn strided(tag: &str, body: &str) -> String {
     )
 }
 
+/// The module header, from the single source ([`crate::ptx_target`]). This family emits only
+/// `shfl.sync` / plain f32 / SFU approximations, all legal at the **`sm_80` floor** — tagging it with
+/// the device's own arch would make the module unloadable on any *older* part (PTX is
+/// forward-compatible only).
 fn header() -> String {
-    String::from(".version 7.8\n.target sm_89\n.address_size 64\n")
+    String::from(crate::ptx_target::HDR_SM80)
 }
 
 /// Common prologue: one warp per row (block_dim=32, grid=rows). Sets `%row,%lane,%cols`, the f32
@@ -164,6 +168,23 @@ pub fn norm_ptx() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// **Header-floor gate, device-free.** The norm module must carry the `sm_80` floor from
+    /// [`crate::ptx_target`] — never the device's own arch. PTX is forward-compatible only, so an
+    /// `sm_89` tag here would fail `cuModuleLoadData` on every A100 while changing nothing on Ada.
+    #[test]
+    fn norm_module_is_tagged_at_the_sm80_floor() {
+        let ptx = super::norm_ptx();
+        assert!(
+            ptx.starts_with(crate::ptx_target::HDR_SM80),
+            "norm PTX must open with ptx_target::HDR_SM80, got: {:?}",
+            &ptx[..ptx.len().min(64)]
+        );
+        assert!(
+            !ptx.contains(crate::ptx_target::TARGET_SM89),
+            "an Ampere-legal module must not claim the Ada floor"
+        );
+    }
+
     /// Independent **f64** two-pass LayerNorm over `[rows, cols]` — the oracle, computed in a wider
     /// type and in a different order than either the CPU kernel or the GPU kernel, so it is not a
     /// circular check on either one.
