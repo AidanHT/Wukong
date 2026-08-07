@@ -7,6 +7,16 @@
 //! that proven fragment layout: [`fp8_gemm_ptx`] (one 16×8 tile per warp), [`fp8_gemm_mt_ptx`]
 //! (fragment-reuse), and [`fp8_pipe_ptx`] (the `cp.async`-pipelined workhorse plus its fused
 //! bias/activation/residual and gated-FFN entries). f32 accumulate (the mixed-precision contract).
+//!
+//! **Target floor: `sm_89`, and it is real.** Every module here issues
+//! `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`, an instruction that exists nowhere below
+//! Ada — so unlike the int8/int4 families (which share the geometry but use Ampere-legal operand
+//! types and therefore float down to `sm_80`), this file must stay tagged `sm_89`. The floor is
+//! spelled once, via [`crate::ptx_target::HDR_SM89_V84`] / [`crate::ptx_target::TARGET_SM89`], so a
+//! `rg sm_89` over the backend shows exactly which families are genuinely Ada-only. The *device*
+//! side of that floor is a `cc >= (8,9)` capability gate before dispatch, in `gpu.rs` — not here.
+
+use crate::ptx_target::HDR_SM89_V84;
 
 /// OCP **E4M3** (1 sign, 4 exp bias 7, 3 mantissa; max normal 448, no Inf) round-to-nearest-even from
 /// `f32`, returning the 8 stored bits. Exact for the e4m3-representable values the validation uses;
@@ -61,6 +71,10 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
 /// `32×8` e4m3 column-major (the `.row.col` operand layout), D = A·B is `16×8` f32 row-major. One
 /// warp; the per-lane fragment addresses below are the PTX-ISA layout for 8-bit `m16n8k32`
 /// (groupID = laneid≫2, threadID-in-group = laneid&3; A packs 4 e4m3 per .b32 register).
+///
+/// A `const` cannot interpolate [`HDR_SM89_V84`], so the header is spelled literally here and pinned
+/// against the constant by `tests::fp8_ptx_is_ascii_and_structural`. `sm_89` is the *true* floor: the
+/// `e4m3` `mma` below does not exist on Ampere.
 pub const FP8_TILE: &str = r#".version 8.4
 .target sm_89
 .address_size 64
@@ -660,7 +674,7 @@ pub fn fp8_pipe_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
         use crate::ptx_wmma::Act;
-        let mut m = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+        let mut m = format!("{HDR_SM89_V84}\n");
         m += &fp8_pipe_entry(
             "fp8_gemm_pipe",
             FP8_PIPE_BM,
@@ -771,7 +785,7 @@ pub fn fp8_pipe_cfg_ptx(
     raster: usize,
 ) -> String {
     use crate::ptx_wmma::Act;
-    let mut m = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+    let mut m = format!("{HDR_SM89_V84}\n");
     m += &fp8_pipe_entry(
         "fp8_gemm_pipe",
         bm,
@@ -827,7 +841,7 @@ pub fn fp8_gemm_mt_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
         let (tm, tn) = (FP8_TM, FP8_TN);
-        let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+        let mut s = format!("{HDR_SM89_V84}\n");
         s += ".visible .entry fp8_gemm_nt_mt(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{\n";
         s += "    .reg .pred %p;\n";
         s += "    .reg .b32 %M,%N,%K,%lane,%grp,%tg4,%tg2,%row0,%col0,%k,%tmp;\n";
@@ -926,11 +940,8 @@ pub fn fp8_gemm_mt_ptx() -> &'static str {
 pub fn fp8_gemm_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
-        String::from(
-            r#".version 8.4
-.target sm_89
-.address_size 64
-
+        HDR_SM89_V84.to_string()
+            + (r#"
 .visible .entry fp8_gemm_nt(
     .param .u32 pM,
     .param .u32 pN,
@@ -1026,8 +1037,7 @@ KEND:
     st.global.f32 [%cp+4],%d3;
     ret;
 }
-"#,
-        )
+"#)
     })
     .as_str()
 }
@@ -1035,6 +1045,7 @@ KEND:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ptx_target::TARGET_SM89;
 
     /// The `.visible .entry` names `fp8_pipe_ptx()` must declare, in emission order.
     const PIPE_ENTRIES: [&str; 12] = [
@@ -1069,7 +1080,17 @@ mod tests {
         ];
         for (label, ptx) in &modules {
             assert!(ptx.is_ascii(), "{label}: PTX must be ASCII");
-            assert!(ptx.contains(".target sm_89"), "{label}: must target sm_89");
+            // The fp8 floor is GENUINE, not a leftover device tag: the `e4m3` mma asserted below
+            // exists nowhere below Ada, so every module here must stay pinned to the family floor
+            // `TARGET_SM89` (never to whatever card the round happens to run on).
+            assert!(
+                ptx.contains(TARGET_SM89),
+                "{label}: must carry the fp8 family floor {TARGET_SM89}"
+            );
+            assert!(
+                ptx.starts_with(HDR_SM89_V84),
+                "{label}: must open with the routed HDR_SM89_V84 header"
+            );
             assert_eq!(
                 ptx.matches('{').count(),
                 ptx.matches('}').count(),
