@@ -139,6 +139,25 @@ impl GpuTarget {
 /// cannot run them at all, not slowly: the instructions are absent from its ISA.
 pub const FP8_MIN_CC: (i32, i32) = (8, 9);
 
+/// A [`LaunchConfig`] carrying a **dynamic** shared-memory window of `dyn_smem` bytes.
+///
+/// Every launch in this crate passes `shared_mem_bytes: 0` because every kernel declares its SMEM
+/// statically (and is therefore capped at the PTX ISA's 48 KiB). A kernel whose `.shared` is an
+/// `.extern` window instead gets its size *here*, at launch — and only up to the ceiling its entry was
+/// opted into by [`Gpu::function_dyn`].
+pub fn dyn_launch_cfg(
+    grid_dim: (u32, u32, u32),
+    block_dim: (u32, u32, u32),
+    dyn_smem: usize,
+) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim,
+        block_dim,
+        shared_mem_bytes: u32::try_from(dyn_smem)
+            .expect("dynamic SMEM byte count must fit in u32 (the driver's own type)"),
+    }
+}
+
 /// A GPU call's failure — either the driver said no, or **this device cannot run this kernel family
 /// at all**.
 ///
@@ -202,6 +221,11 @@ pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
+    /// The largest **dynamic** shared-memory ceiling already opted into per `(module key, entry name)`.
+    /// `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` is a property of the loaded `CUfunction`, so
+    /// it survives every later `load_function` for that entry: it is set once at load and re-set only
+    /// if a later caller needs a strictly larger window. See [`Gpu::function_dyn`].
+    dyn_smem: HashMap<(&'static str, String), usize>,
     /// Installed driver version — part of the on-disk cubin cache key (a cubin is driver-ABI specific).
     driver_tag: i32,
     /// The probed device identity — see [`GpuTarget`]. Queried once, here, and never re-queried.
@@ -219,6 +243,7 @@ impl Gpu {
             ctx,
             stream,
             modules: HashMap::new(),
+            dyn_smem: HashMap::new(),
             driver_tag: crate::cubin::driver_version(),
             target,
         })
@@ -325,6 +350,63 @@ impl Gpu {
             self.modules.insert(key, module);
         }
         self.modules[key].load_function(name)
+    }
+
+    /// **The most shared memory one block may use on this device**, bytes — `MAX_SHARED_MEMORY_PER_
+    /// BLOCK_OPTIN`, reachable *only* through the dynamic window ([`Gpu::function_dyn`]).
+    ///
+    /// The 48 KiB every generator in this crate assumes is a **PTX ISA rule about STATIC `.shared`**
+    /// (PTX §5.1.7), not a device fact: it is the same 48 KiB on a card with 99 KiB (this Ada part),
+    /// 164 KiB (A100) or 228 KiB (H100) of opt-in carveout. Retagging a module lifts nothing; only an
+    /// `.extern .shared` window plus `cuFuncSetAttribute` does.
+    pub fn smem_budget(&self) -> usize {
+        self.target.smem_per_block_optin
+    }
+
+    /// [`Gpu::function`], plus opting this entry into a **dynamic shared-memory window** of `dyn_smem`
+    /// bytes (`cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)`).
+    ///
+    /// The attribute is a ceiling on what a launch may request; the launch itself must then pass the
+    /// byte count in `LaunchConfig::shared_mem_bytes` ([`dyn_launch_cfg`] builds that config). Without
+    /// the opt-in, any launch above 48 KiB is rejected with `CUDA_ERROR_INVALID_VALUE` — which is what
+    /// `dynamic_smem_window_exceeds_the_static_48_kib_ceiling` proves in both directions.
+    ///
+    /// It is set **once per (module key, entry)**: the attribute lives on the loaded `CUfunction`, so
+    /// every later `load_function` for that entry already has it. A later, larger request raises it;
+    /// a smaller one is a no-op (the ceiling already covers it).
+    ///
+    /// **The module-cache rule is unchanged and still applies** ([`Gpu::function`]): the cache keys on
+    /// `key` alone and never re-examines `ptx`, so a distinct generated variant needs a distinct key —
+    /// here doubly so, since two variants sharing a key would also share one SMEM ceiling.
+    pub fn function_dyn(
+        &mut self,
+        key: &'static str,
+        ptx: &str,
+        name: &str,
+        dyn_smem: usize,
+    ) -> Result<CudaFunction, DriverError> {
+        // A launch-seam precondition, asserted at the seam: an over-budget request is a generator bug,
+        // and the driver's own rejection would name neither the budget nor the kernel.
+        assert!(
+            dyn_smem <= self.smem_budget(),
+            "{name}: dynamic SMEM request {dyn_smem} B exceeds the device ceiling {} B \
+             (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN on {})",
+            self.smem_budget(),
+            self.target.name
+        );
+        let f = self.function(key, ptx, name)?;
+        let slot = (key, name.to_string());
+        if self.dyn_smem.get(&slot).copied().unwrap_or(0) < dyn_smem {
+            // `cuFuncSetAttribute` needs a context current on THIS thread (cudarc binds inside
+            // load_module/launch, but not here), and libtest runs these on many threads.
+            let _ = self.ctx.bind_to_thread();
+            f.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                dyn_smem as i32,
+            )?;
+            self.dyn_smem.insert(slot, dyn_smem);
+        }
+        Ok(f)
     }
 
     /// Load a module for `ptx`, preferring a cached cubin over a fresh JIT. Warm path: a previously
@@ -5458,6 +5540,119 @@ mod tests {
                 t.sm_count,
                 t.smem_per_block_optin as f64 / 1024.0,
                 t.l2_bytes as f64 / (1024.0 * 1024.0),
+            );
+        });
+    }
+
+    /// **Dynamic shared memory, end to end: a block really can use more than 48 KiB.**
+    ///
+    /// The 48 KiB every generator in this crate assumes is a PTX ISA rule about *static* `.shared`,
+    /// not a device fact — and it is the reason the f16/int8 pipelines stop at 2 stages while CUTLASS's
+    /// SM80 floor is 3. This card has a **99 KiB opt-in carveout** the codebase has never touched
+    /// (`ptx_conv.rs`: "no opt-in to the larger Ada banks"). The host plumbing for it is proven here,
+    /// on the laptop, before any generator is parameterized — and it is the same plumbing that reaches
+    /// A100's 164 KiB and H100's 228 KiB.
+    ///
+    /// The kernel is a self-contained `.extern .shared` window (tagged at the **sm_80 floor**, so the
+    /// proof holds on Ampere too): every thread strides the whole window writing `3i+1`, syncs, then
+    /// reads back a slot near the FAR END and stores it to global. A window that is not really that
+    /// large cannot pass — the stores would land outside it.
+    ///
+    /// Both directions are asserted, because a one-directional test would pass even if
+    /// `function_dyn` did nothing:
+    ///   * **with** `function_dyn` + `dyn_launch_cfg`: the launch succeeds and every lane is exact;
+    ///   * **without** the opt-in (the same PTX under a second module key, so a fresh `CUfunction`
+    ///     with no attribute set), the identical launch is REJECTED by the driver.
+    #[test]
+    fn dynamic_smem_window_exceeds_the_static_48_kib_ceiling() {
+        /// 64 KiB — comfortably above the 48 KiB static ISA ceiling, and within the opt-in carveout of
+        /// every part this project targets (Turing 64 KiB, Ada 99 KiB, A100 164 KiB, H100 228 KiB).
+        const WANT: usize = 64 * 1024;
+        const THREADS: u32 = 256;
+        let slots = WANT / 4; // u32 slots in the window
+        // `.extern .shared` = the dynamic window; its size comes from the launch, not the declaration.
+        let body = format!(
+            ".extern .shared .align 16 .b8 dsmem[];\n\
+.visible .entry dyn_smem_probe(.param .u32 pn, .param .u64 pout)\n{{\n\
+    .reg .pred %p0;\n\
+    .reg .b32 %n,%tix,%nt,%i,%v,%sp,%ad;\n\
+    .reg .b64 %out,%off,%gp;\n\
+    ld.param.u32 %n,[pn];\n    ld.param.u64 %out,[pout];\n\
+    cvta.to.global.u64 %out,%out;\n\
+    mov.u32 %tix,%tid.x;\n    mov.u32 %nt,%ntid.x;\n    mov.u32 %sp,dsmem;\n\
+    mov.u32 %i,%tix;\n\
+L_FILL:\n\
+    setp.ge.u32 %p0,%i,%n;\n    @%p0 bra E_FILL;\n\
+    mul.lo.u32 %v,%i,3;\n    add.u32 %v,%v,1;\n\
+    shl.b32 %ad,%i,2;\n    add.u32 %ad,%ad,%sp;\n    st.shared.u32 [%ad],%v;\n\
+    add.u32 %i,%i,%nt;\n    bra L_FILL;\n\
+E_FILL:\n\
+    bar.sync 0;\n\
+    sub.u32 %i,%n,1;\n    sub.u32 %i,%i,%tix;\n\
+    shl.b32 %ad,%i,2;\n    add.u32 %ad,%ad,%sp;\n    ld.shared.u32 %v,[%ad];\n\
+    mul.wide.u32 %off,%tix,4;\n    add.s64 %gp,%out,%off;\n    st.global.u32 [%gp],%v;\n\
+    ret;\n}}\n"
+        );
+        let ptx = format!("{}{}", crate::ptx_target::HDR_SM80, body);
+        assert!(ptx.is_ascii(), "PTX must be pure ASCII (one non-ASCII char is a ptxas fatal)");
+        assert!(ptx.contains(crate::ptx_target::TARGET_SM80), "the probe must sit at the sm_80 floor");
+
+        with_gpu("dyn_smem", |g| {
+            let budget = g.smem_budget();
+            if budget < WANT {
+                // A legitimate capability skip: a pre-Volta-era carveout cannot express this at all.
+                eprintln!(
+                    "[skip:capability] dyn_smem: opt-in SMEM budget {budget} B < the {WANT} B window"
+                );
+                return;
+            }
+            let n = slots as u32;
+            let mut out_d = g.stream.alloc_zeros::<u32>(THREADS as usize).unwrap();
+            let cfg = dyn_launch_cfg((1, 1, 1), (THREADS, 1, 1), WANT);
+            assert_eq!(cfg.shared_mem_bytes as usize, WANT, "the launch must carry the window size");
+
+            // (1) With the opt-in: must launch and be exact at the far end of the window.
+            let f = g.function_dyn("dyn_smem_probe", &ptx, "dyn_smem_probe", WANT).unwrap();
+            {
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&n).arg(&mut out_d);
+                unsafe { bld.launch(cfg).unwrap() };
+            }
+            g.stream.synchronize().unwrap();
+            let got = g.stream.memcpy_dtov(&out_d).unwrap();
+            for t in 0..THREADS as usize {
+                let slot = slots - 1 - t; // the top of the 64 KiB window
+                let want = (slot as u32) * 3 + 1;
+                assert_eq!(
+                    got[t], want,
+                    "lane {t} read slot {slot} (byte offset {}) of the dynamic window as {} — the \
+                     window is not really {WANT} B",
+                    slot * 4,
+                    got[t]
+                );
+            }
+
+            // (2) Without the opt-in: the SAME launch must be refused. This is what proves step (1)
+            //     was bought by `cuFuncSetAttribute` and not by some default.
+            let f_plain = g.function("dyn_smem_probe_noattr", &ptx, "dyn_smem_probe").unwrap();
+            let refused = {
+                let mut bld = g.stream.launch_builder(&f_plain);
+                bld.arg(&n).arg(&mut out_d);
+                unsafe { bld.launch(cfg) }
+            };
+            assert!(
+                refused.is_err(),
+                "a {WANT} B dynamic launch WITHOUT MAX_DYNAMIC_SHARED_SIZE_BYTES must be rejected — \
+                 if the driver allows it, `function_dyn` is not what makes the window legal"
+            );
+            eprintln!(
+                "[gate] dynamic SMEM: requested {WANT} B ({} KiB) > the 48 KiB static ceiling, launch OK \
+                 and exact at slot {} (device opt-in budget {budget} B / {:.0} KiB); the same launch \
+                 without the opt-in was refused: {:?} \u{2713}",
+                WANT / 1024,
+                slots - 1,
+                budget as f64 / 1024.0,
+                refused.unwrap_err()
             );
         });
     }
