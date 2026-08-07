@@ -5,7 +5,41 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
-### Benchmark instrument — a byte-identical control column, a bias fix, and one retraction
+### GPU retarget, Phase 2 — the backend stops being fused to one laptop card
+The datacenter retarget's local phase (`GPU_RETARGET_PLAN.md`), landed as ~20 gated merges. No
+language or CLI surface changed; every measured claim in `BENCHMARKS.md` is untouched (the perf
+identity leg of the closing regression is deferred until the machine is on AC power — no number
+here is a performance claim).
+
+- **PTX module headers come from one authority** (`wukong_codegen_gpu::ptx_target`): 67 hardcoded
+  `.target sm_89` sites across 18 files now emit per-family floors — `sm_80` for the Ampere-legal
+  majority, `sm_89` only where `e4m3`/`e5m2` genuinely exist (fp8). `.version` obeys the same
+  lowest-legal rule (7.8 everywhere but fp8's 8.4) so no module demands a newer driver than its
+  instructions need. Every family carries a floor gate; an adversarial pass mutation-tested them.
+- **Device identity is probed, not assumed**: `Gpu::target()` (cc, SMs, opt-in SMEM, L2, VRAM,
+  driver) replaces the silent `.unwrap_or(20)` era. The probe settled a two-year comment
+  contradiction: this 4050's L2 reads 24 MiB, not 12. The f16 GEMM regime thresholds now derive
+  from the probed L2 with a unit test pinning byte-identical 4050 dispatch.
+- **fp8 is capability-gated before any module load** (`cc >= 8.9`, a loud decline distinct from
+  no-device/no-peer), enforced by a crate-wide, PTX-symbol-keyed law test that fails on any new
+  ungated fp8 load path. NVRTC peers now compile for the probed device; PTX modules tag the floor —
+  opposite directions, both documented.
+- **Caches are device-keyed**: cubin SASS by `sm_XX` (cross-arch cubin loads can succeed silently
+  under forward-minor compatibility, so the key closes what the loader cannot), autotune by
+  arch+SM-count. Pre-change caches read as clean misses.
+- **Dynamic shared memory works end-to-end** (`.extern .shared` window + `cuFuncSetAttribute`),
+  unlocking the >48 KiB budgets every non-`a` target forbids statically: deep-stage pipeline
+  variants now exist for int8 (s2–s5, plus 256×128/128×256 at s3), f16 (s2–s5, 128×256 s3) and
+  fp8 (to 90 KiB), each proven bit-identical to its shipped 2-stage kernel on device and declined
+  automatically where a card's budget cannot hold it.
+- **`Op::Iota` lowers to PTX** — a silent hole that had cost `--backend=gpu-native` ~10% of the
+  run corpus (183→217/357 oracle-matched; megakernel 69→87/103); coverage floors are now ratcheted
+  in both corpus gates so the next silent decline goes red, and megakernel declines print their
+  reason under `WUKONG_GPU_DUMP_PTX`.
+- Linux portability arms (per-OS driver-library names, peer discovery, venv paths, exe suffix), a
+  CI job that finally type-checks the `gpu` feature, and six derivation dossiers committed under
+  `docs/gpu/derive/` for the rented-silicon phases. `docs/internals.md` and this changelog were
+  de-duplicated from concatenated copies (with content-loss proofs).
 `wukong_xbench`'s opt-in `general` suite only. No kernel, no peer source and no compiler crate is
 touched — `wukong_xbench` is a leaf binary crate nothing depends on, so `wukongc` is byte-identical
 and no program's dispatch set can move. That makes the dispatch census a **non-regression argument
