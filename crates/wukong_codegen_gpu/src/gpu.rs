@@ -161,6 +161,31 @@ impl Gpu {
         self.target.name.clone()
     }
 
+    /// The device's **`compute_XX`** spelling for NVRTC's `--gpu-architecture`.
+    ///
+    /// This is the DEVICE's architecture, deliberately **not** a PTX family floor: our own PTX modules
+    /// are tagged with the lowest target their instruction mix is legal on (see [`crate::ptx_target`])
+    /// so they forward-JIT everywhere, but a peer kernel compiled *here, now* is compiled for the card
+    /// the round actually runs on. It used to be the literal `"compute_89"`.
+    ///
+    /// `cudarc::nvrtc::CompileOptions::arch` is `Option<&'static str>`, so the probed spelling is
+    /// interned in a process-wide `OnceLock`. A process talks to exactly one device (ordinal 0, one
+    /// primary context, one [`Gpu`] singleton), so first-writer-wins names the same device every later
+    /// caller would have asked for.
+    pub fn compute_arch(&self) -> &'static str {
+        static ARCH: OnceLock<String> = OnceLock::new();
+        ARCH.get_or_init(|| {
+            crate::ptx_target::compute_arch(self.target.cc_major, self.target.cc_minor)
+        })
+        .as_str()
+    }
+
+    /// The device's **`sm_XX`** spelling — the ptxas `-arch` flag and the device half of a cache key
+    /// (see `autotune`). The DEVICE's architecture, like [`Gpu::compute_arch`], never a family floor.
+    pub fn sm_arch(&self) -> String {
+        crate::ptx_target::sm_arch(self.target.cc_major, self.target.cc_minor)
+    }
+
     /// Load `ptx` once under `key`, caching the module in-process, and return the named entry
     /// function. The first load consults the persistent **cubin cache** (M10): a warm process loads
     /// precompiled SASS instead of re-JITing the PTX. The driver compiles PTX→SASS internally, so no
@@ -5081,6 +5106,20 @@ mod tests {
                 "l2_cache_size() diverged from the target"
             );
             assert_eq!(g.device_name(), t.name, "device_name() diverged from the target");
+            // The **device**-arch flag spellings (NVRTC `--gpu-architecture`, ptxas `-arch`, cache
+            // keys) must be derived from the probed capability, never a `compute_89`/`sm_89` literal
+            // and never a PTX family floor (which is a property of a module's instruction mix, not of
+            // the card — see `crate::ptx_target`).
+            assert_eq!(
+                g.compute_arch(),
+                crate::ptx_target::compute_arch(t.cc_major, t.cc_minor),
+                "compute_arch() is not the probed device"
+            );
+            assert_eq!(
+                g.sm_arch(),
+                crate::ptx_target::sm_arch(t.cc_major, t.cc_minor),
+                "sm_arch() is not the probed device"
+            );
             // Probed once: a second read is the same object, not a fresh driver round-trip.
             assert_eq!(g.target(), &t, "target() is not stable across calls");
             eprintln!(
@@ -7072,8 +7111,10 @@ mod tests {
     #[test]
     fn mma_m16n8k16_layout_verifies() {
         use half::f16;
-        const MMA_TEST_PTX: &str = "\
-.version 7.8\n.target sm_89\n.address_size 64\n\
+        // `mma.sync.m16n8k16.f32.f16.f16.f32` is Ampere-legal, so the module is tagged at the
+        // **sm_80 family floor** (`crate::ptx_target::HDR_SM80`), not at this device's `sm_89`: PTX is
+        // forward-compatible only, and a module tagged sm_89 loads on zero A100s.
+        const MMA_TEST_BODY: &str = "\
 .visible .entry mma_test(.param .u64 pA, .param .u64 pB, .param .u64 pC)\n{\n\
     .reg .b32 %lane,%grp,%tg,%tg2,%r,%c;\n\
     .reg .b32 %a0,%a1,%a2,%a3,%b0,%b1;\n\
@@ -7093,6 +7134,7 @@ mod tests {
     mul.lo.s32 %r,%grp,8;\n    add.s32 %r,%r,%tg2;\n    mul.wide.u32 %off,%r,4;\n    add.s64 %p,%C,%off;\n    st.global.f32 [%p],%d0;\n    st.global.f32 [%p+4],%d1;\n\
     add.s32 %r,%grp,8;\n    mul.lo.s32 %r,%r,8;\n    add.s32 %r,%r,%tg2;\n    mul.wide.u32 %off,%r,4;\n    add.s64 %p,%C,%off;\n    st.global.f32 [%p],%d2;\n    st.global.f32 [%p+4],%d3;\n\
     ret;\n}\n";
+        let mma_test_ptx = format!("{}{}", crate::ptx_target::HDR_SM80, MMA_TEST_BODY);
         with_gpu("mma_test", |g| {
             // A 16×16 row-major; B 16×8 stored col-major (b_mem[n*16+k] = B[k][n]); small ints (f16-exact).
             let mut a = vec![0f32; 16 * 16];
@@ -7112,7 +7154,7 @@ mod tests {
             let a_d = g.stream.memcpy_stod(&a16).unwrap();
             let b_d = g.stream.memcpy_stod(&b16).unwrap();
             let mut c_d = g.stream.alloc_zeros::<f32>(16 * 8).unwrap();
-            let f = g.function("mma_test", MMA_TEST_PTX, "mma_test").unwrap();
+            let f = g.function("mma_test", &mma_test_ptx, "mma_test").unwrap();
             let cfg = LaunchConfig {
                 grid_dim: (1, 1, 1),
                 block_dim: (32, 1, 1),
@@ -12074,8 +12116,11 @@ mod tests {
                 eprintln!("[skip] nvrtc_wmma_probe: NVRTC not loadable.");
                 return;
             }
-            let opts = || CompileOptions {
-                arch: Some("compute_89"),
+            // The DEVICE's arch (probed), not a hardcoded `compute_89`: a peer is compiled for the card
+            // the round runs on. `&'static str` (interned in `Gpu::compute_arch`) is what NVRTC wants.
+            let arch = g.compute_arch();
+            let opts = move || CompileOptions {
+                arch: Some(arch),
                 ..Default::default()
             };
             // (1) Does NVRTC bundle cuda_fp16.h? (expected yes — sanity for the header mechanism.)
@@ -12568,6 +12613,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 return;
             }
             eprintln!("device: {} | ptxas: {ptxas}", g.device_name());
+            // ptxas compiles the cubin for THIS device (probed), not a hardcoded `sm_89` — an offline
+            // cubin is arch-specific, so a literal would silently target the wrong card.
+            let sm_arch = g.sm_arch();
             let v = CLIFF_VARIANTS.iter().find(|v| v.name == "cliff_swz_s2").unwrap();
             let ptx = gemm_cliff_ptx();
             // Offline-compile the module with a few ptxas flag sets → cubin → driver-load.
@@ -12584,7 +12632,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             for (tag, flags) in flagsets {
                 let cubin_path = dir.join(format!("wukong_cliff_{pid}_{tag}.cubin"));
                 let out = std::process::Command::new(&ptxas)
-                    .arg("-arch=sm_89")
+                    .arg(format!("-arch={sm_arch}"))
                     .args(*flags)
                     .arg("-o")
                     .arg(&cubin_path)
