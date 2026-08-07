@@ -26,6 +26,12 @@
 //!   *register*-double-buffered ([`conv_wmma_db_ptx`]) variants, plus the standalone
 //!   [`pad_nchw_copy_ptx`] scatter and the unfused [`bias_relu_ptx`] baseline.
 
+// Every generator in this file opens its module with the shared `sm_80` header. The conv family
+// emits f32 arithmetic, shared memory, `cp.async`, `ldmatrix` and `wmma`/`mma.sync` fragments —
+// all Ampere-legal — and PTX is forward-compatible only, so the module is tagged with the LOWEST
+// legal target, never with the device's own arch (an `sm_89` tag loads on ZERO A100s).
+use crate::ptx_target::HDR_SM80;
+
 /// Output-tile height a tiled-conv CTA computes (threads in `y`).
 pub const TILE_P: usize = 16;
 /// Output-tile width a tiled-conv CTA computes (threads in `x`).
@@ -81,10 +87,7 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let w_iters = rs.div_ceil(nthreads); // weight loads per (kk, thread)
 
     let mut b = String::new();
-    let _ = writeln!(b, ".version 7.8");
-    let _ = writeln!(b, ".target sm_89");
-    let _ = writeln!(b, ".address_size 64");
-    let _ = writeln!(b);
+    let _ = writeln!(b, "{HDR_SM80}");
     let _ = writeln!(b, "// SMEM-tiled conv2d specialized to C={c} H={h} W={w} K={k} R={r} S={s}");
     let _ = writeln!(b, "// tile {tp}x{tq}, kblock {kb}, halo {halo_h}x{halo_w}, smem {smem_bytes} B");
     let _ = writeln!(b, ".visible .entry conv2d(");
@@ -232,10 +235,7 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
 pub fn bias_relu_ptx(k: usize, pq: usize) -> String {
     let total = k * pq;
     format!(
-        r#".version 7.8
-.target sm_89
-.address_size 64
-
+        r#"{HDR_SM80}
 .visible .entry bias_relu(
     .param .u64 pOut,
     .param .u64 pBias
@@ -277,8 +277,11 @@ RET:
 /// `conv2d(C,H,W,K,R,S,P,Q, Xin,Wt,Out)` -- the original **naive** one-thread-per-output kernel. Output
 /// index `idx = (k*P+p)*Q+q` is the linear thread id, so the store address is just `Out + idx`. Kept as
 /// the honest worst-case reference and the fallback for shapes the tiled generator rejects.
+/// (Header floor: this literal opens with exactly [`crate::ptx_target::HDR_SM80`] — it is a `const`
+/// consumed as a `&'static str` by `gpu.rs`, so it cannot interpolate the constant; the
+/// `conv_headers_are_at_the_sm80_floor` gate below asserts the two agree byte-for-byte.)
 pub const CONV2D: &str = r#".version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry conv2d(
@@ -539,10 +542,7 @@ pub fn pad_nchw_copy_ptx(c: usize, h: usize, w: usize, pad: usize) -> String {
     let hp = h + 2 * pad;
     let wp = w + 2 * pad;
     let mut b = String::new();
-    let _ = writeln!(b, ".version 7.8");
-    let _ = writeln!(b, ".target sm_89");
-    let _ = writeln!(b, ".address_size 64");
-    let _ = writeln!(b);
+    let _ = writeln!(b, "{HDR_SM80}");
     let _ = writeln!(b, "// zero-pad scatter: X[C{c} H{h} W{w}] -> Xpad[C {hp} {wp}] interior (fp16)");
     let _ = writeln!(b, ".visible .entry pad_nchw_copy(");
     let _ = writeln!(b, "    .param .u64 pXin,");
@@ -649,10 +649,7 @@ fn conv_wmma_ptx_impl(
     };
 
     let mut b = String::new();
-    let _ = writeln!(b, ".version 7.8");
-    let _ = writeln!(b, ".target sm_89");
-    let _ = writeln!(b, ".address_size 64");
-    let _ = writeln!(b);
+    let _ = writeln!(b, "{HDR_SM80}");
     let _ = writeln!(b, "// fp16 tensor-core implicit-GEMM conv: C{c} H{h} W{w} K{k} R{r} S{s}");
     let _ = writeln!(b, "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn}, {warps_m}x{warps_n} warps, per-warp {wm}x{wn}");
     if sk > 1 {
@@ -957,10 +954,7 @@ pub fn conv_splitk_reduce_ptx(mn: usize, sk: usize) -> String {
     use std::fmt::Write as _;
     let plane = mn * 4; // bytes between successive z-planes
     let mut b = String::new();
-    let _ = writeln!(b, ".version 7.8");
-    let _ = writeln!(b, ".target sm_89");
-    let _ = writeln!(b, ".address_size 64");
-    let _ = writeln!(b);
+    let _ = writeln!(b, "{HDR_SM80}");
     let _ = writeln!(b, "// split-K reduce: sum {sk} planes of {mn} f32 -> O, fixed z-order (deterministic)");
     let _ = writeln!(b, ".visible .entry conv_splitk_reduce(");
     let _ = writeln!(b, "    .param .u64 pPartial,");
@@ -1183,10 +1177,7 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
     };
 
     let mut b = String::new();
-    let _ = writeln!(b, ".version 7.8");
-    let _ = writeln!(b, ".target sm_89");
-    let _ = writeln!(b, ".address_size 64");
-    let _ = writeln!(b);
+    let _ = writeln!(b, "{HDR_SM80}");
     let _ = writeln!(b, "// fp16 tensor-core implicit-GEMM conv (register double-buffered): C{c} H{h} W{w} K{k} R{r} S{s}");
     let _ = writeln!(b, "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn}, {warps_m}x{warps_n} warps, per-warp {wm}x{wn}; 2 SMEM buffers");
     if sk > 1 {
@@ -1471,6 +1462,49 @@ mod tests {
             );
             assert_ptx_ascii("conv_splitk_reduce_ptx", &conv_splitk_reduce_ptx(k * 196, sk));
         }
+    }
+
+    /// **Header-floor gate, device-free.** Every conv module — the `CONV2D` literal included — must
+    /// open with exactly [`crate::ptx_target::HDR_SM80`]. PTX is forward-compatible *only*: a module
+    /// tagged with the development device's `sm_89` buys nothing on Ada and fails
+    /// `cuModuleLoadData` on every A100. Nothing in this family needs Ada (f32 arithmetic, shared
+    /// memory, `cp.async`, `ldmatrix`, `wmma`/`mma.sync.m16n8k16.f16` are all Ampere-legal), so the
+    /// floor *is* `sm_80`. `CONV2D` is a `const` consumed as a `&'static str` from `gpu.rs`, so it
+    /// cannot interpolate the constant — this assert is what keeps the copy honest.
+    #[test]
+    fn conv_headers_are_at_the_sm80_floor() {
+        use crate::ptx_target::{HDR_SM80, TARGET_SM89};
+        let (c, h, w, k, r, s) = (64usize, 28usize, 28usize, 64usize, 3usize, 3usize);
+        let mods: Vec<(&str, String)> = vec![
+            ("CONV2D", CONV2D.to_string()),
+            ("conv2d_ptx", conv2d_ptx(c, h, w, k, r, s)),
+            ("conv_wmma_ptx", conv_wmma_ptx(c, h, w, k, r, s)),
+            ("conv_wmma_strided_ptx", conv_wmma_strided_ptx(c, h, w, k, r, s, 2)),
+            ("conv_wmma_pad_ptx", conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1)),
+            ("conv_wmma_db_ptx", conv_wmma_db_ptx(c, h, w, k, r, s)),
+            (
+                "conv_wmma_epi_ptx",
+                conv_wmma_epi_ptx(c, h, w, k, r, s, crate::ptx_wmma::Act::Relu, true),
+            ),
+            ("conv_wmma_splitk_ptx", conv_wmma_splitk_ptx(c, h, w, k, r, s, 2)),
+            ("conv_wmma_db_splitk_ptx", conv_wmma_db_splitk_ptx(c, h, w, k, r, s, 2)),
+            ("conv_wmma_pad_splitk_ptx", conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, 2)),
+            ("conv_splitk_reduce_ptx", conv_splitk_reduce_ptx(k * 676, 2)),
+            ("bias_relu_ptx", bias_relu_ptx(k, 676)),
+            ("pad_nchw_copy_ptx", pad_nchw_copy_ptx(c, h, w, 1)),
+        ];
+        for (what, ptx) in &mods {
+            assert!(
+                ptx.starts_with(HDR_SM80),
+                "{what}: must open with ptx_target::HDR_SM80, got {:?}",
+                &ptx[..ptx.len().min(64)]
+            );
+            assert!(
+                !ptx.contains(TARGET_SM89),
+                "{what}: an Ampere-legal module must not claim the Ada floor"
+            );
+        }
+        assert_eq!(mods.len(), 13, "every conv generator must be covered by the header gate");
     }
 
     #[test]

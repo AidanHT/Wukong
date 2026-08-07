@@ -28,6 +28,12 @@
 //! * F(2×2,3×3): `α=4`, `m=2`, input tiles 4×4 → output tiles 2×2.
 //! * F(4×4,3×3): `α=6`, `m=4`, input tiles 6×6 → output tiles 4×4.
 
+// The module header for all four generators, from the single source (`crate::ptx_target`). The
+// Winograd pipeline emits only f32/f16 arithmetic, shared memory and `wmma` fragments — every one of
+// them legal at the `sm_80` floor. PTX is forward-compatible only, so the module is tagged with that
+// floor, never with the device's own arch (an `sm_89` tag loads on ZERO A100s).
+use crate::ptx_target::HDR_SM80;
+
 // ---------------------------------------------------------------------------------------------
 // Linear-algebra helpers (row-major, private).
 // ---------------------------------------------------------------------------------------------
@@ -428,7 +434,7 @@ pub fn wino_filter_xform_ptx(c: usize, k: usize, m: usize) -> String {
     let mf = filter_map(g, alpha);
     let kc = k * c;
     let mut s = String::new();
-    let _ = writeln!(s, ".version 7.8\n.target sm_89\n.address_size 64\n");
+    let _ = writeln!(s, "{HDR_SM80}");
     let _ = writeln!(s, "// Winograd F({m},3) filter transform: W[K{k},C{c},3,3] -> U[{aa},K,C]");
     let _ = writeln!(s, ".visible .entry wino_filter_xform(\n    .param .u64 pW,\n    .param .u64 pU\n)\n{{");
     let _ = writeln!(s, "    .reg .pred %p0;");
@@ -476,7 +482,7 @@ pub fn wino_input_xform_ptx(c: usize, h: usize, w: usize, m: usize) -> String {
     let ct = c * nt;
     let hw = h * w;
     let mut s = String::new();
-    let _ = writeln!(s, ".version 7.8\n.target sm_89\n.address_size 64\n");
+    let _ = writeln!(s, "{HDR_SM80}");
     let _ = writeln!(s, "// Winograd F({m},3) input transform: X[C{c},H{h},W{w}] -> V[{aa},C,T{nt}]");
     let _ = writeln!(s, ".visible .entry wino_input_xform(\n    .param .u64 pX,\n    .param .u64 pV\n)\n{{");
     let _ = writeln!(s, "    .reg .pred %p0,%pi,%pj;");
@@ -534,7 +540,7 @@ pub fn wino_output_xform_ptx(k: usize, h: usize, w: usize, m: usize) -> String {
     let (_nti, ntj, nt) = wino_ntiles(h, w, m);
     let kt = k * nt;
     let mut s = String::new();
-    let _ = writeln!(s, ".version 7.8\n.target sm_89\n.address_size 64\n");
+    let _ = writeln!(s, "{HDR_SM80}");
     let _ = writeln!(s, "// Winograd F({m},3) output transform: M[{aa},K{k},T{nt}] -> O[K,P{p},Q{q}]");
     let _ = writeln!(s, ".visible .entry wino_output_xform(\n    .param .u64 pM,\n    .param .u64 pO\n)\n{{");
     let _ = writeln!(s, "    .reg .pred %p0,%pi,%pj;");
@@ -618,7 +624,7 @@ pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
     };
 
     let mut b = String::new();
-    let _ = writeln!(b, ".version 7.8\n.target sm_89\n.address_size 64\n");
+    let _ = writeln!(b, "{HDR_SM80}");
     let _ = writeln!(b, "// Winograd batched NN GEMM: M[z][K{k},T{nt}] = U[z][K,C{c}] * V[z][C,T], z=gridDim.z");
     let _ = writeln!(b, ".visible .entry wino_bgemm(\n    .param .u64 pV,\n    .param .u64 pU,\n    .param .u64 pM\n)\n{{");
     let _ = writeln!(b, "    .shared .align 16 .b8 smemA[{smem_a}];");
@@ -851,6 +857,18 @@ mod tests {
                         );
                     }
                     assert!(!ptx.is_empty(), "{what}: generated an empty module");
+                    // Header floor: every Winograd module opens with the shared `sm_80` header, never
+                    // the device's arch — PTX is forward-compatible only, so an `sm_89` tag would be
+                    // unloadable on every A100 while buying nothing on Ada.
+                    assert!(
+                        ptx.starts_with(crate::ptx_target::HDR_SM80),
+                        "{what}: must open with ptx_target::HDR_SM80, got {:?}",
+                        &ptx[..ptx.len().min(64)]
+                    );
+                    assert!(
+                        !ptx.contains(crate::ptx_target::TARGET_SM89),
+                        "{what}: an Ampere-legal module must not claim the Ada floor"
+                    );
                 }
             }
         }
