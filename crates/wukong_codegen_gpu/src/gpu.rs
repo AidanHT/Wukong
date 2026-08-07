@@ -5787,6 +5787,215 @@ mod tests {
         eprintln!("[gate] {} fp8 launchers are capability-gated: {checked:?} \u{2713}", checked.len());
     }
 
+    /// **Every PTX module this crate emits without a device and without a MIR program**, as
+    /// `(what, ptx)`. Zero-argument generators and literal consts are taken whole; a parameterized
+    /// generator contributes one representative shape, lifted from the shape its own family gate
+    /// already uses (so an illegal config cannot make this list panic).
+    ///
+    /// **Not reachable here:** `lower::emit_ptx` / `emit_mega_ptx` / `fusion` / `megakernel` build
+    /// their module from a `Program`, so they are not enumerable from a `&str`-only list — `lower.rs`
+    /// carries the same `.version` law over its own output (`!ptx.contains(".version 8.4")`, asserted
+    /// per `--emit` at every `-O`), and `baselines.rs` carries it over the NVRTC peers.
+    fn device_free_modules() -> Vec<(String, String)> {
+        use crate::{
+            ptx, ptx_autodiff_bwd as bwd, ptx_conv as conv, ptx_fp8 as fp8, ptx_fp8_train as fp8t,
+            ptx_gemm, ptx_int4 as int4, ptx_int8 as int8, ptx_norm, ptx_optim as optim,
+            ptx_winograd as wino, ptx_wmma as wmma,
+        };
+        let (c, h, w, k, r, s) = (64usize, 28usize, 28usize, 64usize, 3usize, 3usize);
+        let (wc, wh, ww, wk, wm) = (64usize, 14usize, 14usize, 64usize, 2usize);
+        let (_, _, nt) = wino::wino_ntiles(wh, ww, wm);
+        let mut v: Vec<(String, String)> = vec![
+            // ptx.rs — the offload core.
+            ("ptx::SAXPY", ptx::SAXPY.to_string()),
+            ("ptx::VADD", ptx::VADD.to_string()),
+            ("ptx::CAST_F32_F16", ptx::CAST_F32_F16.to_string()),
+            ("ptx::HEAD_TRANSPOSE_PTX", ptx::HEAD_TRANSPOSE_PTX.to_string()),
+            ("ptx::COPY_V4", ptx::COPY_V4.to_string()),
+            ("ptx::REDUCE", ptx::REDUCE.to_string()),
+            ("ptx::GEMM", ptx::GEMM.to_string()),
+            ("ptx::vmath_ptx", ptx::vmath_ptx().to_string()),
+            // f32/f16/bf16 GEMM, norms, flash.
+            ("ptx_gemm::gemm_rb_ptx", ptx_gemm::gemm_rb_ptx().to_string()),
+            ("ptx_norm::norm_ptx", ptx_norm::norm_ptx().to_string()),
+            ("ptx_flash::flash_ptx", crate::ptx_flash::flash_ptx().to_string()),
+            ("wmma::gemm_deep_ptx", wmma::gemm_deep_ptx().to_string()),
+            ("wmma::gemm_cliff_ptx", wmma::gemm_cliff_ptx().to_string()),
+            ("wmma::wmma_f16_ptx", wmma::wmma_f16_ptx().to_string()),
+            ("wmma::wmma_bf16_ptx", wmma::wmma_bf16_ptx().to_string()),
+            ("wmma::roofline_f16_ptx", wmma::roofline_f16_ptx().to_string()),
+            ("wmma::wmma_f16_sm_static_ptx", wmma::wmma_f16_sm_static_ptx(256, 256, 256, false)),
+            ("wmma::wmma_f16_sm_static_ptx/128", wmma::wmma_f16_sm_static_ptx(256, 256, 256, true)),
+            // training: optimizers and backward.
+            ("optim::ADAMW_STEP_PTX", optim::ADAMW_STEP_PTX.to_string()),
+            ("optim::SGD_STEP_PTX", optim::SGD_STEP_PTX.to_string()),
+            ("bwd::TRANSPOSE_F32_PTX", bwd::TRANSPOSE_F32_PTX.to_string()),
+            ("bwd::TRANSPOSE_CAST_F32_F16_PTX", bwd::TRANSPOSE_CAST_F32_F16_PTX.to_string()),
+            ("bwd::ACT_BWD_PTX", bwd::ACT_BWD_PTX.to_string()),
+            ("bwd::TRAIN_ELEM_PTX", bwd::TRAIN_ELEM_PTX.to_string()),
+            ("bwd::norm_bwd_ptx", bwd::norm_bwd_ptx().to_string()),
+            ("bwd::train_gemm_ptx", bwd::train_gemm_ptx().to_string()),
+            // conv + winograd.
+            ("conv::CONV2D", conv::CONV2D.to_string()),
+            ("conv::conv2d_ptx", conv::conv2d_ptx(c, h, w, k, r, s)),
+            ("conv::conv_wmma_ptx", conv::conv_wmma_ptx(c, h, w, k, r, s)),
+            ("conv::conv_wmma_strided_ptx", conv::conv_wmma_strided_ptx(c, h, w, k, r, s, 2)),
+            ("conv::conv_wmma_pad_ptx", conv::conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1)),
+            ("conv::conv_wmma_db_ptx", conv::conv_wmma_db_ptx(c, h, w, k, r, s)),
+            (
+                "conv::conv_wmma_epi_ptx",
+                conv::conv_wmma_epi_ptx(c, h, w, k, r, s, crate::ptx_wmma::Act::Relu, true),
+            ),
+            ("conv::conv_wmma_splitk_ptx", conv::conv_wmma_splitk_ptx(c, h, w, k, r, s, 2)),
+            ("conv::conv_wmma_db_splitk_ptx", conv::conv_wmma_db_splitk_ptx(c, h, w, k, r, s, 2)),
+            (
+                "conv::conv_wmma_pad_splitk_ptx",
+                conv::conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, 2),
+            ),
+            ("conv::conv_splitk_reduce_ptx", conv::conv_splitk_reduce_ptx(k * 676, 2)),
+            ("conv::bias_relu_ptx", conv::bias_relu_ptx(k, 676)),
+            ("conv::pad_nchw_copy_ptx", conv::pad_nchw_copy_ptx(c, h, w, 1)),
+            ("wino::wino_filter_xform_ptx", wino::wino_filter_xform_ptx(wc, wk, wm)),
+            ("wino::wino_input_xform_ptx", wino::wino_input_xform_ptx(wc, wh, ww, wm)),
+            ("wino::wino_output_xform_ptx", wino::wino_output_xform_ptx(wk, wh, ww, wm)),
+            ("wino::wino_bgemm_ptx", wino::wino_bgemm_ptx(wc, nt, wk)),
+            // quantized: int4, int8.
+            ("int4::w4a16_ptx", int4::w4a16_ptx().to_string()),
+            ("int4::w4a16_splitk_ptx", int4::w4a16_splitk_ptx().to_string()),
+            ("int4::w4a16_static_ptx", int4::w4a16_static_ptx(256, 256, 256, false)),
+            ("int8::INT8_TILE", int8::INT8_TILE.to_string()),
+            ("int8::int8_gemm_ptx", int8::int8_gemm_ptx().to_string()),
+            ("int8::int8_gemm_mt_ptx", int8::int8_gemm_mt_ptx().to_string()),
+            ("int8::int8_gemm_smdb_ptx", int8::int8_gemm_smdb_ptx().to_string()),
+            ("int8::int8_gemm_smdb_deq_ptx", int8::int8_gemm_smdb_deq_ptx().to_string()),
+            ("int8::int8_gemm_smdb128_ptx", int8::int8_gemm_smdb128_ptx().to_string()),
+            ("int8::int8_gemm_smdb_s3_ptx", int8::int8_gemm_smdb_s3_ptx().to_string()),
+            ("int8::int8_gemm_smdb_s4_ptx", int8::int8_gemm_smdb_s4_ptx().to_string()),
+            ("int8::int8_gemm_smdb128_s3_ptx", int8::int8_gemm_smdb128_s3_ptx().to_string()),
+            ("int8::int8_gemm_smdb128_s4_ptx", int8::int8_gemm_smdb128_s4_ptx().to_string()),
+            ("int8::int8_gemm_smdb_swz_ptx", int8::int8_gemm_smdb_swz_ptx().to_string()),
+            ("int8::int8_gemm_smdb_swz_splitk_ptx", int8::int8_gemm_smdb_swz_splitk_ptx().to_string()),
+            ("int8::int8_gemm_smdb_swz_deq_ptx", int8::int8_gemm_smdb_swz_deq_ptx().to_string()),
+            ("int8::int8_gemm_smdb128_swz_ptx", int8::int8_gemm_smdb128_swz_ptx().to_string()),
+            ("int8::int8_gemm_w64_swz_ptx", int8::int8_gemm_w64_swz_ptx().to_string()),
+            ("int8::int8_gemm_w64_swz_s3_ptx", int8::int8_gemm_w64_swz_s3_ptx().to_string()),
+            ("int8::int8_gemm_w64_swz_r8_ptx", int8::int8_gemm_w64_swz_r8_ptx().to_string()),
+            ("int8::int8_gemm_w64_swz_deq_ptx", int8::int8_gemm_w64_swz_deq_ptx().to_string()),
+            ("int8::int8_gemm_smdb_swz_static_ptx", int8::int8_gemm_smdb_swz_static_ptx(256, 256, 256, false)),
+            ("int8::int8_gemm_smdb_swz_raster_ptx", int8::int8_gemm_smdb_swz_raster_ptx(false, 8)),
+            // fp8 (the licensed 8.4 / sm_89 family) and its sm_80-floored amax companion.
+            ("fp8::FP8_TILE", fp8::FP8_TILE.to_string()),
+            ("fp8::fp8_gemm_ptx", fp8::fp8_gemm_ptx().to_string()),
+            ("fp8::fp8_gemm_mt_ptx", fp8::fp8_gemm_mt_ptx().to_string()),
+            ("fp8::fp8_pipe_ptx", fp8::fp8_pipe_ptx().to_string()),
+            ("fp8::fp8_pipe_w64_ptx", fp8::fp8_pipe_w64_ptx().to_string()),
+            ("fp8::fp8_pipe_w64_s3_ptx", fp8::fp8_pipe_w64_s3_ptx().to_string()),
+            ("fp8::fp8_pipe_cfg_ptx", fp8::fp8_pipe_cfg_ptx(128, 128, 64, 2, 4, 2, 16)),
+            ("fp8t::AMAX_PTX", fp8t::AMAX_PTX.to_string()),
+            ("fp8t::fp8_bwd_gemm_ptx", fp8t::fp8_bwd_gemm_ptx().to_string()),
+            ("fp8t::fp8_e5m2_gemm_ptx", fp8t::fp8_e5m2_gemm_ptx().to_string()),
+            ("fp8t::quantize_scaled_e4m3_ptx", fp8t::quantize_scaled_e4m3_ptx().to_string()),
+            ("fp8t::quantize_scaled_e5m2_ptx", fp8t::quantize_scaled_e5m2_ptx().to_string()),
+            // paged KV serving.
+            ("paged::paged_attn_decode_ptx", crate::paged_attention::paged_attn_decode_ptx(128)),
+            (
+                "paged::paged_attn_decode_int8_ptx",
+                crate::paged_attention::paged_attn_decode_int8_ptx(128),
+            ),
+            ("paged::kv_append_ptx", crate::paged_attention::kv_append_ptx()),
+            ("paged::kv_append_int8_ptx", crate::paged_attention::kv_append_int8_ptx()),
+        ]
+        .into_iter()
+        .map(|(n, p)| (n.to_string(), p))
+        .collect();
+        // The int8 variable-stage grid (including the two dynamic-SMEM depths) at this card's budget.
+        for cfg in int8::INT8_STAGE_VARIANTS {
+            v.push((format!("int8::stage/{}", cfg.name), int8::int8_stage_ptx(cfg, 101 * 1024).0));
+        }
+        for (bm, bn, wm2, wn2) in [(256usize, 128usize, 4usize, 2usize), (128, 256, 2, 4)] {
+            let (name, ptx) = int8::int8_gemm_swz_tile_ptx(bm, bn, wm2, wn2, 0);
+            v.push((format!("int8::swz_tile/{name}"), ptx));
+        }
+        v
+    }
+
+    /// **The durable `.version` law: a module may declare an r550+ driver floor only if it emits an
+    /// instruction that needs one.** This is the gate that catches the NEXT over-declaration at
+    /// authorship, rather than on an A100 six months later.
+    ///
+    /// `.version` is a *driver* floor exactly as `.target` is a *device* floor, and `cuModuleLoadData`
+    /// enforces it: `.version 7.8` loads on r520+, `.version 8.4` demands **r550+** and fails on the
+    /// r535/r545 fleets this retarget exists to reach. Both the int8 family and the amax reduction had
+    /// inherited an 8.4 they never earned — nothing about the instruction mix, only about what the file
+    /// happened to be written with. Per-family header gates cannot see that class of bug: they pin
+    /// whatever constant the family currently uses, so an over-declaring family passes its own gate.
+    ///
+    /// So the law is stated over the **instruction mix** instead. If a module's text contains none of
+    /// `wgmma`, `stmatrix`, `elect.sync`, `cp.async.bulk`, `tcgen05`, `clusterlaunchcontrol` (the
+    /// Hopper/Blackwell-era instructions introduced above ISA 7.8) and no fp8 `mma` (`e4m3`/`e5m2`,
+    /// PTX ISA 8.1+), then everything it emits is ISA ≤ 7.8 and its header **must** say `.version 7.8`.
+    /// A new family that genuinely needs a higher `.version` names one of those instructions and is
+    /// licensed automatically; a family that does not, cannot quietly ask for a newer driver.
+    ///
+    /// **Coverage** ([`device_free_modules`]): every literal PTX const and every zero-argument
+    /// generator the crate exposes, plus one representative shape of each parameterized generator —
+    /// 88 modules across ptx, gemm, wmma, norm, flash, conv, winograd, optim, autodiff-bwd, int4, int8
+    /// (including the variable-stage grid and both dynamic-SMEM depths), fp8, fp8-train and paged KV.
+    /// Not covered here, because they need a MIR `Program` rather than a shape: `lower::emit_ptx` /
+    /// `emit_mega_ptx` / `fusion` / `megakernel`, which carry the identical `.version 8.4` negative in
+    /// `lower.rs` over their own output, and the NVRTC peers, which carry it in `baselines.rs`.
+    #[test]
+    fn no_module_declares_a_driver_floor_its_instructions_do_not_need() {
+        /// Instructions introduced above PTX ISA 7.8 — the only thing that licenses a higher
+        /// `.version`. (Hopper/Blackwell async + warp-group MMA, and the fp8 mma operand types.)
+        const ABOVE_78: &[&str] = &[
+            "wgmma",
+            "stmatrix",
+            "elect.sync",
+            "cp.async.bulk",
+            "tcgen05",
+            "clusterlaunchcontrol",
+            "e4m3",
+            "e5m2",
+        ];
+        let mods = device_free_modules();
+        let mut floored = 0usize;
+        let mut licensed: Vec<String> = Vec::new();
+        for (what, ptx) in &mods {
+            let head = ptx.trim_start();
+            let version = head
+                .lines()
+                .next()
+                .and_then(|l| l.strip_prefix(".version "))
+                .unwrap_or_else(|| panic!("{what}: module does not open with a `.version` directive"));
+            match ABOVE_78.iter().find(|i| ptx.contains(**i)) {
+                Some(instr) => licensed.push(format!("{what} (.version {version}, needs `{instr}`)")),
+                None => {
+                    assert_eq!(
+                        version, "7.8",
+                        "{what}: declares `.version {version}` while emitting nothing above PTX ISA \
+                         7.8 — 8.4 makes cuModuleLoadData demand driver r550+, so this module simply \
+                         will not load on the r535/r545 fleets. Float it to 7.8 (ptx_target::HDR_SM80), \
+                         or add the instruction that earns the higher floor to ABOVE_78."
+                    );
+                    floored += 1;
+                }
+            }
+        }
+        // EXACT, so a module leaving the enumeration is as loud as one arriving. Update deliberately.
+        const EXPECTED_MODULES: usize = 88;
+        assert_eq!(
+            mods.len(),
+            EXPECTED_MODULES,
+            "the device-free module set changed; update EXPECTED_MODULES deliberately"
+        );
+        eprintln!(
+            "[gate] .version law: {floored}/{} modules floored at 7.8; {} licensed above it: {licensed:?} \u{2713}",
+            mods.len(),
+            licensed.len()
+        );
+    }
+
     /// **The device-identity gate.** [`GpuTarget`] is probed once at `Gpu` construction and is the
     /// single source of every arch-dependent decision downstream (PTX headers, capability gating,
     /// SMEM budgets, cache keys), so a field that silently reports a default would mis-target the
