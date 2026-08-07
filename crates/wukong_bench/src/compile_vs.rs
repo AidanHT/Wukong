@@ -72,9 +72,7 @@ pub fn report(wukongc: Option<PathBuf>) {
     let dir = std::env::temp_dir().join("wukong_compile_vs");
     let _ = std::fs::create_dir_all(&dir);
 
-    println!(
-        "same-run compile-to-object wall time (best-of-N minimum), and speedup vs wukongc\n"
-    );
+    println!("same-run compile-to-object wall time (best-of-N minimum), and speedup vs wukongc\n");
     println!(
         "{:<10} {:>11} {:>11} {:>11} {:>11}   {:>7} {:>7} {:>7}",
         "kernel", "wukongc", "gcc", "g++", "rustc", "gcc/mc", "g++/mc", "rc/mc"
@@ -94,13 +92,7 @@ pub fn report(wukongc: Option<PathBuf>) {
         let o = |p: &std::path::Path| p.to_string_lossy().into_owned();
 
         let t_mc = best_of(|| {
-            run(Command::new(&mc).args([
-                "--emit=obj",
-                "-O2",
-                &o(&wk_path),
-                "-o",
-                &o(&out),
-            ]))
+            run(Command::new(&mc).args(["--emit=obj", "-O2", &o(&wk_path), "-o", &o(&out)]))
         });
         let t_gcc = have_gcc.then(|| {
             best_of(|| run(Command::new("gcc").args(["-O2", "-c", &o(&c_path), "-o", &o(&out)])))
@@ -154,7 +146,11 @@ pub fn report(wukongc: Option<PathBuf>) {
 }
 
 fn default_wukongc() -> PathBuf {
-    let exe = if cfg!(windows) { "wukongc.exe" } else { "wukongc" };
+    let exe = if cfg!(windows) {
+        "wukongc.exe"
+    } else {
+        "wukongc"
+    };
     PathBuf::from("target/release").join(exe)
 }
 

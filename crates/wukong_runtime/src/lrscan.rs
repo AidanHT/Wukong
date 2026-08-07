@@ -250,7 +250,13 @@ mod tests {
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
             unsafe {
-                wukong_lrscan_f32(a.as_ptr(), b.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_lrscan_f32(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    s.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
                 wukong_lrscan_f32_parallel(
                     a.as_ptr(),
                     b.as_ptr(),

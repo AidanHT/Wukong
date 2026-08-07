@@ -138,7 +138,14 @@ fn load_elem(b: &mut Builder, p: ValueId, idx: i64) -> ValueId {
         b.build(F64, Op::Load(p, F64))
     } else {
         let i = b.build(MirType::I64, Op::ConstInt(idx as i128, MirType::I64));
-        let gp = b.build(PTR, Op::Gep { ptr: p, index: i, elem: F64 });
+        let gp = b.build(
+            PTR,
+            Op::Gep {
+                ptr: p,
+                index: i,
+                elem: F64,
+            },
+        );
         b.build(F64, Op::Load(gp, F64))
     }
 }
@@ -156,7 +163,10 @@ fn square_scalar() {
     let out = b.add_param(PTR);
     let x0 = load_elem(&mut b, x, 0);
     let sq = b.build(F64, Op::Bin(BinOp::FMul, x0, x0));
-    b.build_void(Op::Store { ptr: out, value: sq });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: sq,
+    });
     b.ret(Some(sq));
     let fwd = Fwd {
         func: b.finish(),
@@ -288,7 +298,10 @@ fn sum_of_squares_vector() {
         let xi = load_elem(&mut b, x, i);
         acc = b.build(F64, Op::Fma(xi, xi, acc));
     }
-    b.build_void(Op::Store { ptr: out, value: acc });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: acc,
+    });
     b.ret(Some(acc));
     let fwd = Fwd {
         func: b.finish(),
@@ -319,7 +332,10 @@ fn relu_via_select() {
         let r = b.build(F64, Op::Select(pos, xi, zero));
         acc = b.build(F64, Op::Bin(BinOp::FAdd, acc, r));
     }
-    b.build_void(Op::Store { ptr: out, value: acc });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: acc,
+    });
     b.ret(Some(acc));
     let fwd = Fwd {
         func: b.finish(),
@@ -331,7 +347,10 @@ fn relu_via_select() {
     let xs = vec![-2.0, 1.5, -0.5, 3.0, 0.25];
     let inputs = vec![xs.clone(), vec![0.0]];
     let g = gate(&fwd, &[0], &inputs, &mut it);
-    let want: Vec<f64> = xs.iter().map(|&v| if v > 0.0 { 1.0 } else { 0.0 }).collect();
+    let want: Vec<f64> = xs
+        .iter()
+        .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
+        .collect();
     assert_close(&g[0], &want, "d(sum relu)/dx");
 }
 
@@ -383,7 +402,10 @@ fn build_mlp(it: &mut Interner) -> Fwd {
         let diff = b.build(F64, Op::Bin(BinOp::FSub, acc, to));
         loss = b.build(F64, Op::Fma(diff, diff, loss)); // loss += diff^2
     }
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     Fwd {
         func: b.finish(),
@@ -427,13 +449,7 @@ fn mlp_sgd_decreases_loss() {
     let t: Vec<f64> = vec![0.7, -0.2];
 
     let loss_now = |w1: &[f64], w2: &[f64], it: &Interner| -> f64 {
-        let mut bufs = vec![
-            w1.to_vec(),
-            x.clone(),
-            w2.to_vec(),
-            t.clone(),
-            vec![0.0],
-        ];
+        let mut bufs = vec![w1.to_vec(), x.clone(), w2.to_vec(), t.clone(), vec![0.0]];
         loss_at(&prog, fwd.func.name, &mut bufs, 4, it)
     };
 
@@ -670,7 +686,10 @@ fn linear_sum_vjp() {
             args: vec![p, p, mn, sumop],
         },
     );
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     let fwd = Fwd {
         func: b.finish(),
@@ -689,7 +708,14 @@ fn linear_sum_vjp() {
 
 /// Build `loss = reduce(act(X . W^T))`: a sgemm_nt, an optional activation (vmath `act` op), then a
 /// reduction — sum, or SSD against a target buffer `T` (= MSE loss). Params: X, W, [T if mse], out.
-fn build_linear(it: &mut Interner, m: usize, k: usize, n: usize, act: Option<i64>, mse: bool) -> Fwd {
+fn build_linear(
+    it: &mut Interner,
+    m: usize,
+    k: usize,
+    n: usize,
+    act: Option<i64>,
+    mse: bool,
+) -> Fwd {
     let sgemm_nt = it.intern("wukong_sgemm_nt");
     let vmath = it.intern("wukong_vmath_f32");
     let sreduce = it.intern("wukong_sreduce_f32");
@@ -743,7 +769,10 @@ fn build_linear(it: &mut Interner, m: usize, k: usize, n: usize, act: Option<i64
             },
         )
     };
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
 
     let (lens, loss_out) = if mse {
@@ -772,7 +801,9 @@ fn linear_relu_sum_vjp() {
         let xb = rand_vec(&mut seed, m * k);
         let wb = rand_vec(&mut seed, n * k);
         let p = matmul_nt_f64(&xb, &wb, m, k, n);
-        if p.iter().all(|&v| v.abs() > 0.2) && p.iter().any(|&v| v > 0.0) && p.iter().any(|&v| v < 0.0)
+        if p.iter().all(|&v| v.abs() > 0.2)
+            && p.iter().any(|&v| v > 0.0)
+            && p.iter().any(|&v| v < 0.0)
         {
             break (xb, wb, p);
         }
@@ -851,7 +882,10 @@ fn residual_two_linears_vjp() {
             args: vec![z, z, mn, sumop],
         },
     );
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     let fwd = Fwd {
         func: b.finish(),
@@ -1050,7 +1084,10 @@ fn build_norm_dot_sym(
             args: vec![c, y, rc, dotop],
         },
     );
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     Fwd {
         func: b.finish(),
@@ -1116,7 +1153,10 @@ fn layernorm_dot_vjp() {
         let sigma = (var + eps as f64).sqrt();
         let y: Vec<f64> = row.iter().map(|&v| (v as f64 - mu) / sigma).collect();
         let mean_dy = (0..cols).map(|j| cb[r * cols + j] as f64).sum::<f64>() / nf;
-        let mean_dyy = (0..cols).map(|j| cb[r * cols + j] as f64 * y[j]).sum::<f64>() / nf;
+        let mean_dyy = (0..cols)
+            .map(|j| cb[r * cols + j] as f64 * y[j])
+            .sum::<f64>()
+            / nf;
         for j in 0..cols {
             dx[r * cols + j] =
                 (1.0 / sigma) * (cb[r * cols + j] as f64 - mean_dy - y[j] * mean_dyy);
@@ -1143,7 +1183,10 @@ fn rmsnorm_dot_vjp() {
         let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / nf;
         let rr = (ms + eps as f64).sqrt();
         let y: Vec<f64> = row.iter().map(|&v| v as f64 / rr).collect();
-        let mean_dyy = (0..cols).map(|j| cb[r * cols + j] as f64 * y[j]).sum::<f64>() / nf;
+        let mean_dyy = (0..cols)
+            .map(|j| cb[r * cols + j] as f64 * y[j])
+            .sum::<f64>()
+            / nf;
         for j in 0..cols {
             dx[r * cols + j] = (1.0 / rr) * (cb[r * cols + j] as f64 - y[j] * mean_dyy);
         }
@@ -1183,7 +1226,10 @@ fn parallel_norm_dot_vjp() {
         let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / nf;
         let rr = (ms + eps as f64).sqrt();
         let y: Vec<f64> = row.iter().map(|&v| v as f64 / rr).collect();
-        let mean_dyy = (0..cols).map(|j| cb[r * cols + j] as f64 * y[j]).sum::<f64>() / nf;
+        let mean_dyy = (0..cols)
+            .map(|j| cb[r * cols + j] as f64 * y[j])
+            .sum::<f64>()
+            / nf;
         for j in 0..cols {
             dx[r * cols + j] = (1.0 / rr) * (cb[r * cols + j] as f64 - y[j] * mean_dyy);
         }
@@ -1197,7 +1243,13 @@ fn parallel_norm_dot_vjp() {
 /// seed, the silu backward (`wukong_vmath2_f32`), the matmul adjoints (transpose + two GEMMs), and
 /// the RMSNorm backward (per-row reductions + an elementwise combine) — the exact composition a
 /// transformer layer differentiates through. Params: X, W, out; intermediates h, p, a (allocas).
-fn build_prenorm_block(it: &mut Interner, rows: usize, cols: usize, n: usize, eps_bits: i64) -> Fwd {
+fn build_prenorm_block(
+    it: &mut Interner,
+    rows: usize,
+    cols: usize,
+    n: usize,
+    eps_bits: i64,
+) -> Fwd {
     let norm = it.intern("wukong_norm_f32");
     let sgemm_nt = it.intern("wukong_sgemm_nt");
     let vmath = it.intern("wukong_vmath_f32");
@@ -1247,7 +1299,10 @@ fn build_prenorm_block(it: &mut Interner, rows: usize, cols: usize, n: usize, ep
             args: vec![a, a, rn, sumop],
         },
     );
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     Fwd {
         func: b.finish(),
@@ -1332,7 +1387,10 @@ fn build_mlp2(it: &mut Interner) -> Fwd {
             args: vec![p2, t, bout, ssdop],
         },
     );
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     Fwd {
         func: b.finish(),
@@ -1521,7 +1579,9 @@ fn adamw_step_matches_reference() {
         m = bufs[2].clone();
         v = bufs[3].clone();
 
-        adamw_ref_f64(&mut wr, &gr, &mut mr, &mut vr, lr, beta1, beta2, eps, wd, bc1, bc2);
+        adamw_ref_f64(
+            &mut wr, &gr, &mut mr, &mut vr, lr, beta1, beta2, eps, wd, bc1, bc2,
+        );
 
         for (j, (&wk, &wref)) in w.iter().zip(&wr).enumerate() {
             assert!(
@@ -1575,19 +1635,27 @@ fn mlp2_adamw_decreases_loss() {
         let mut bufs = vec![xb.clone(), w1.to_vec(), w2.to_vec(), tb.clone(), vec![0.0]];
         loss_at_f32(&gprog, fwd.func.name, &mut bufs, 4, it)
     };
-    let run_adamw =
-        |name: Symbol, w: &mut Vec<f32>, g: &[f32], m: &mut Vec<f32>, v: &mut Vec<f32>, hpbuf: &[f32], it: &Interner| {
-            let mut bufs = vec![w.clone(), g.to_vec(), m.clone(), v.clone(), hpbuf.to_vec()];
-            let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
-            run_kernel_f32(&aprog, name, &mut views, it).expect("adamw run");
-            *w = bufs[0].clone();
-            *m = bufs[2].clone();
-            *v = bufs[3].clone();
-        };
+    let run_adamw = |name: Symbol,
+                     w: &mut Vec<f32>,
+                     g: &[f32],
+                     m: &mut Vec<f32>,
+                     v: &mut Vec<f32>,
+                     hpbuf: &[f32],
+                     it: &Interner| {
+        let mut bufs = vec![w.clone(), g.to_vec(), m.clone(), v.clone(), hpbuf.to_vec()];
+        let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+        run_kernel_f32(&aprog, name, &mut views, it).expect("adamw run");
+        *w = bufs[0].clone();
+        *m = bufs[2].clone();
+        *v = bufs[3].clone();
+    };
 
     let (lr, beta1, beta2, eps, wd) = (0.01f64, 0.9f64, 0.999f64, 1e-8f64, 0.0f64);
     let l0 = loss_now(&w1, &w2, &it);
-    assert!(l0 > 0.1, "test setup: initial loss should be substantial, got {l0}");
+    assert!(
+        l0 > 0.1,
+        "test setup: initial loss should be substantial, got {l0}"
+    );
     let mut last = l0;
     for t in 1..=300i32 {
         let inputs = vec![xb.clone(), w1.clone(), w2.clone(), tb.clone(), vec![0.0]];
@@ -1652,7 +1720,10 @@ fn parallel_region_declines_loudly() {
             elem: PTR,
         },
     );
-    b.build_void(Op::Store { ptr: s1, value: out });
+    b.build_void(Op::Store {
+        ptr: s1,
+        value: out,
+    });
     let n = ci(&mut b, 4);
     let addr = b.build(PTR, Op::FuncAddr(region_body));
     b.build_void(Op::Call {
@@ -1696,7 +1767,10 @@ fn self_dot_sumsq_vjp() {
             args: vec![x, x, nv, dotop],
         },
     );
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     let fwd = Fwd {
         func: b.finish(),
@@ -1783,7 +1857,10 @@ fn kernel_call_with_wrong_arity_declines_loudly() {
         });
         let x0 = b.build(MirType::F32, Op::Load(x, MirType::F32));
         let sq = b.build(MirType::F32, Op::Bin(BinOp::FMul, x0, x0));
-        b.build_void(Op::Store { ptr: out, value: sq });
+        b.build_void(Op::Store {
+            ptr: out,
+            value: sq,
+        });
         b.ret(Some(sq));
         let fwd = b.finish();
 
@@ -1833,7 +1910,10 @@ fn store_into_live_gradient_buffer_declines_loudly() {
             args: vec![h, h, nv, sumop],
         },
     );
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     let fwd = b.finish();
 
@@ -1859,11 +1939,28 @@ fn veckernel_declines_loudly() {
     let out = b.add_param(PTR);
     let ptrs = b.alloca(MirType::Array(Box::new(PTR), 2));
     let i0 = ci(&mut b, 0);
-    let s0 = b.build(PTR, Op::Gep { ptr: ptrs, index: i0, elem: PTR });
+    let s0 = b.build(
+        PTR,
+        Op::Gep {
+            ptr: ptrs,
+            index: i0,
+            elem: PTR,
+        },
+    );
     b.build_void(Op::Store { ptr: s0, value: x });
     let i1 = ci(&mut b, 1);
-    let s1 = b.build(PTR, Op::Gep { ptr: ptrs, index: i1, elem: PTR });
-    b.build_void(Op::Store { ptr: s1, value: out });
+    let s1 = b.build(
+        PTR,
+        Op::Gep {
+            ptr: ptrs,
+            index: i1,
+            elem: PTR,
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: s1,
+        value: out,
+    });
     let scalars = b.alloca(MirType::Array(Box::new(MirType::F32), 1));
     let n = ci(&mut b, 8);
     b.build_void(Op::VecKernelCall {
@@ -1909,7 +2006,10 @@ fn build_velem_sum(it: &mut Interner, n: usize, op: i64) -> Fwd {
             args: vec![t, t, nv, sumop],
         },
     );
-    b.build_void(Op::Store { ptr: out, value: loss });
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
     b.ret(Some(loss));
     Fwd {
         func: b.finish(),
@@ -1952,5 +2052,11 @@ fn velem_affine_still_differentiates() {
     let xb = rand_vec(&mut seed, n);
     let yb = rand_vec(&mut seed, n);
     let inputs = vec![xb, yb, vec![0.0]];
-    tape_gate(&fwd, &[0, 1], &inputs, &[vec![1.0; n], vec![1.0; n]], &mut it);
+    tape_gate(
+        &fwd,
+        &[0, 1],
+        &inputs,
+        &[vec![1.0; n], vec![1.0; n]],
+        &mut it,
+    );
 }

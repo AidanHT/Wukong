@@ -594,7 +594,9 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
 
     // ---- induction variable and trip count ---------------------------------------------------
     iv_verdict(l)?;
-    let iv = &l.ivs[l.primary_iv.expect("iv_verdict accepted a primary induction variable")];
+    let iv = &l.ivs[l
+        .primary_iv
+        .expect("iv_verdict accepted a primary induction variable")];
     let iv_index = iv.param_index;
     let iv_ty = iv.ty.clone();
 
@@ -740,7 +742,9 @@ fn linearize_region(
 
     // Each side is either an arm block that falls through to the latch, or the latch itself (a
     // triangle). `arm_args` is what that side passes to the latch's parameters.
-    let side = |blk: BlockId, direct: &[ValueId]| -> Result<(Option<BlockId>, Vec<ValueId>), &'static str> {
+    let side = |blk: BlockId,
+                direct: &[ValueId]|
+     -> Result<(Option<BlockId>, Vec<ValueId>), &'static str> {
         if blk == latch {
             return Ok((None, direct.to_vec()));
         }
@@ -788,7 +792,10 @@ fn linearize_region(
     };
     for (mine, theirs) in [(&t_acc, &e_acc), (&e_acc, &t_acc)] {
         for a in mine.iter().filter(|a| a.kind == AccessKind::Load) {
-            let covered = theirs.iter().chain(unconditional.iter()).any(|b| same_place(a, b));
+            let covered = theirs
+                .iter()
+                .chain(unconditional.iter())
+                .any(|b| same_place(a, b));
             if !covered {
                 return Err("an arm loads an address the other arm never touches");
             }
@@ -852,9 +859,7 @@ fn linearize_region(
         for inst in &f.blocks[b.0 as usize].insts {
             match &inst.op {
                 Op::Store { .. } => stored = true,
-                Op::Load(..) if stored => {
-                    return Err("an arm reads memory after writing it")
-                }
+                Op::Load(..) if stored => return Err("an arm reads memory after writing it"),
                 _ => {}
             }
         }
@@ -2233,7 +2238,10 @@ fn emit_body(
                 let at = if map.contains_key(&ptr.0) { vb } else { guard };
                 let ptr = resolve_uniform(&map, *ptr);
                 let nv = e.push(at, ty.clone(), Op::Load(ptr, ty.clone()));
-                map.insert(inst.result.expect("a load has a result").0, Wide::Uniform(nv));
+                map.insert(
+                    inst.result.expect("a load has a result").0,
+                    Wide::Uniform(nv),
+                );
             }
             Plan::VecLoad => {
                 let Op::Load(ptr, ty) = &inst.op else {
@@ -2318,11 +2326,7 @@ fn emit_body(
     for (k, a) in latch_args.iter().enumerate() {
         if k == p.iv_index {
             let step = e.int(vb, &p.iv_ty, p.w as i64);
-            out.push(e.push(
-                vb,
-                p.iv_ty.clone(),
-                Op::Bin(BinOp::Add, vh_params[k], step),
-            ));
+            out.push(e.push(vb, p.iv_ty.clone(), Op::Bin(BinOp::Add, vh_params[k], step)));
         } else if let Some(&acc) = acc_of.get(&k) {
             out.push(acc);
         } else if p
@@ -2370,7 +2374,11 @@ fn emit_reduction_fold(
             let lanes = extract_lanes(e, vb, map, a, &r.ty, w);
             let op = red_binop(r.kind);
             for lane in lanes {
-                let (x, y) = if left_is_acc { (acc, lane) } else { (lane, acc) };
+                let (x, y) = if left_is_acc {
+                    (acc, lane)
+                } else {
+                    (lane, acc)
+                };
                 acc = e.push(vb, r.ty.clone(), Op::Bin(op, x, y));
             }
         }
@@ -2597,7 +2605,9 @@ mod tests {
     fn vector_values(src: &str, func: &str) -> Vec<(MirType, u32)> {
         let (program, mut interner) = optimized(src, 2);
         let sym = interner.intern(func);
-        let f = program.function(sym).unwrap_or_else(|| panic!("no fn {func}"));
+        let f = program
+            .function(sym)
+            .unwrap_or_else(|| panic!("no fn {func}"));
         f.value_types
             .iter()
             .filter_map(|t| match t {
@@ -2803,7 +2813,10 @@ mod tests {
                     while i < n { let g: f32 = if x[i] > 0.0 { 1.5 } else { -0.5 }; \
                       o[i] = g; i = i + 1; } } \
                     fn main() -> i32 { return 0; }";
-        assert!(is_widened(step, "k"), "a two-constant merge was not widened");
+        assert!(
+            is_widened(step, "k"),
+            "a two-constant merge was not widened"
+        );
         scalar_and_vector_agree(
             "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
              while i < n { let g: f32 = if x[i] > 0.0 { 1.5 } else { -0.5 }; \
@@ -2827,7 +2840,10 @@ mod tests {
         let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
                    while i < n { s = s - x[i]; i = i + 1; } return s; } \
                    fn main() -> i32 { return 0; }";
-        assert!(is_widened(src, "k"), "a subtract accumulate was not widened");
+        assert!(
+            is_widened(src, "k"),
+            "a subtract accumulate was not widened"
+        );
         scalar_and_vector_agree(
             "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
              while i < n { s = s - x[i] * 2.0; i = i + 1; } return s; } \
@@ -3008,7 +3024,10 @@ mod tests {
                    while i < n { o[i] = (i as f32) * 0.25; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         let vs = vector_values(src, "k");
-        assert!(!vs.is_empty(), "an i32 counter over f32 data was not widened");
+        assert!(
+            !vs.is_empty(),
+            "an i32 counter over f32 data was not widened"
+        );
         let (program, mut interner) = optimized(src, 2);
         let sym = interner.intern("k");
         let f = program.function(sym).expect("no fn k");
@@ -3123,7 +3142,10 @@ mod tests {
                    while i < n { let mut t: f32 = x[i]; if t < 0.0 { t = 0.0; } \
                    o[i] = t; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
-        assert!(!vector_values(src, "k").is_empty(), "a triangle was not if-converted");
+        assert!(
+            !vector_values(src, "k").is_empty(),
+            "a triangle was not if-converted"
+        );
     }
 
     /// Only one arm stores, so the flattened body would write `o[i]` for lanes the scalar loop
@@ -3213,7 +3235,10 @@ mod tests {
         let alone = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
                      while i < n { s = s + x[i]; i = i + 1; } return s; } \
                      fn main() -> i32 { return 0; }";
-        assert!(is_widened(alone, "k"), "the reduction's body must be widened");
+        assert!(
+            is_widened(alone, "k"),
+            "the reduction's body must be widened"
+        );
 
         let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
                    while i < n { s = s + x[i]; i = i + 1; } return s; } \
@@ -3243,7 +3268,10 @@ mod tests {
         let alone = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
                      while i < n { s = s + x[i]; i = i + 1; } return s; } \
                      fn main() -> i32 { return 0; }";
-        assert!(is_widened(alone, "k"), "an integer reduction must be widened");
+        assert!(
+            is_widened(alone, "k"),
+            "an integer reduction must be widened"
+        );
 
         let src = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
                    while i < n { s = s + x[i]; i = i + 1; } return s; } \
@@ -3293,7 +3321,10 @@ mod tests {
                    fn main() -> i32 { return 0; }";
         let vs = vector_values(src, "k");
         assert!(!vs.is_empty(), "a row-wise inner loop was not widened");
-        assert!(vs.iter().all(|(l, n)| *l == MirType::F32 && *n == 4), "{vs:?}");
+        assert!(
+            vs.iter().all(|(l, n)| *l == MirType::F32 && *n == 4),
+            "{vs:?}"
+        );
     }
 
     /// …and the guard it gets is a real one: passing the same buffer for `x` and `o` at *different*
@@ -3321,7 +3352,10 @@ mod tests {
         let src = "fn k(w: []f32, mut g: []f32, mut b: []f32, d: i64) { \
                    for i in 0..d { g[i] = w[64 + i]; b[i] = w[128 + i]; } } \
                    fn main() -> i32 { return 0; }";
-        assert!(is_widened(src, "k"), "the two-constant-offset copy was not widened");
+        assert!(
+            is_widened(src, "k"),
+            "the two-constant-offset copy was not widened"
+        );
     }
 
     /// Two READS on one base at offsets that differ *symbolically* are two separate ranges, not one
@@ -3448,7 +3482,10 @@ mod tests {
             .flat_map(|b| b.insts.iter())
             .filter(|i| matches!(&i.op, Op::Load(_, t) if t.is_vector()))
             .count();
-        assert_eq!(vec_loads, 2, "both loops must be widened, one vector load each");
+        assert_eq!(
+            vec_loads, 2,
+            "both loops must be widened, one vector load each"
+        );
     }
 
     // ---- a lane mask selecting between uniform arms -------------------------------------------
@@ -3498,7 +3535,10 @@ mod tests {
         let alone = "fn k(x: []f32, mut o: []f32, n: i64) { \
                      for i in 0..n { o[i] = exp(x[i] * 0.25); } } \
                      fn main() -> i32 { return 0; }";
-        assert!(is_widened(alone, "k"), "an inlined exp loop was not widened");
+        assert!(
+            is_widened(alone, "k"),
+            "an inlined exp loop was not widened"
+        );
         let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
                    for i in 0..n { o[i] = exp(x[i] * 0.25); } } \
                    fn main() -> i32 { \

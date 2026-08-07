@@ -369,9 +369,30 @@ mod tests {
         unsafe {
             wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), -1, 4, 2);
             wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), 2, -4, 2);
-            wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), i64::MIN, 4, 2);
-            wukong_embedding_f32_parallel(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), -1, 4, 2);
-            wukong_embedding_f32_parallel(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), 2, -4, 2);
+            wukong_embedding_f32(
+                out.as_mut_ptr(),
+                weight.as_ptr(),
+                ids.as_ptr(),
+                i64::MIN,
+                4,
+                2,
+            );
+            wukong_embedding_f32_parallel(
+                out.as_mut_ptr(),
+                weight.as_ptr(),
+                ids.as_ptr(),
+                -1,
+                4,
+                2,
+            );
+            wukong_embedding_f32_parallel(
+                out.as_mut_ptr(),
+                weight.as_ptr(),
+                ids.as_ptr(),
+                2,
+                -4,
+                2,
+            );
             wukong_embedding_f32_parallel(
                 out.as_mut_ptr(),
                 weight.as_ptr(),

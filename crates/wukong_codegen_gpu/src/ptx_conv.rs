@@ -88,8 +88,14 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
 
     let mut b = String::new();
     let _ = writeln!(b, "{HDR_SM80}");
-    let _ = writeln!(b, "// SMEM-tiled conv2d specialized to C={c} H={h} W={w} K={k} R={r} S={s}");
-    let _ = writeln!(b, "// tile {tp}x{tq}, kblock {kb}, halo {halo_h}x{halo_w}, smem {smem_bytes} B");
+    let _ = writeln!(
+        b,
+        "// SMEM-tiled conv2d specialized to C={c} H={h} W={w} K={k} R={r} S={s}"
+    );
+    let _ = writeln!(
+        b,
+        "// tile {tp}x{tq}, kblock {kb}, halo {halo_h}x{halo_w}, smem {smem_bytes} B"
+    );
     let _ = writeln!(b, ".visible .entry conv2d(");
     let _ = writeln!(b, "    .param .u64 pXin,");
     let _ = writeln!(b, "    .param .u64 pWt,");
@@ -120,15 +126,28 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "    mul.lo.s32 %r7,%r4,{tp};     // p0");
     let _ = writeln!(b, "    add.s32 %r8,%r6,%r1;         // oq = q0+tx");
     let _ = writeln!(b, "    add.s32 %r9,%r7,%r2;         // op = p0+ty");
-    let _ = writeln!(b, "    mov.u32 %r10,smem;           // smem base addr (shared u32)");
+    let _ = writeln!(
+        b,
+        "    mov.u32 %r10,smem;           // smem base addr (shared u32)"
+    );
     // compute base addr in smem for this thread's window origin (ty*halo_w + tx)*4
-    let _ = writeln!(b, "    mad.lo.s32 %r11,%r2,{halo_w},%r1;  // ty*halo_w + tx");
+    let _ = writeln!(
+        b,
+        "    mad.lo.s32 %r11,%r2,{halo_w},%r1;  // ty*halo_w + tx"
+    );
     let _ = writeln!(b, "    shl.b32 %r11,%r11,2;");
-    let _ = writeln!(b, "    add.s32 %r12,%r10,%r11;      // smem compute base for (ty,tx)");
+    let _ = writeln!(
+        b,
+        "    add.s32 %r12,%r10,%r11;      // smem compute base for (ty,tx)"
+    );
     // tlin = ty*tq + tx
     let _ = writeln!(b, "    mad.lo.s32 %r13,%r2,{tq},%r1;      // tlin");
     // k0 = kblock * KB  ;  woff_k0 = k0*C*R*S
-    let _ = writeln!(b, "    mul.lo.s32 %r14,%r5,{};      // woff_k0 = (kb_idx*KB)*C*R*S", kb * c_rs);
+    let _ = writeln!(
+        b,
+        "    mul.lo.s32 %r14,%r5,{};      // woff_k0 = (kb_idx*KB)*C*R*S",
+        kb * c_rs
+    );
     // accumulators acc[kk] = %f{8+kk} := 0
     for kk in 0..kb {
         let _ = writeln!(b, "    mov.f32 %f{},0f00000000;", 8 + kk);
@@ -138,9 +157,15 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "    setp.ge.u32 %p0,%r15,{c};");
     let _ = writeln!(b, "    @%p0 bra CEND;");
     let _ = writeln!(b, "    mul.lo.s32 %r16,%r15,{};     // rXc = c*H*W", h * w);
-    let _ = writeln!(b, "    mad.lo.s32 %r17,%r15,{rs},%r14;    // base_c = woff_k0 + c*R*S");
+    let _ = writeln!(
+        b,
+        "    mad.lo.s32 %r17,%r15,{rs},%r14;    // base_c = woff_k0 + c*R*S"
+    );
     let _ = writeln!(b);
-    let _ = writeln!(b, "    // ---- cooperative halo load (X channel c, shared by all KB channels) ----");
+    let _ = writeln!(
+        b,
+        "    // ---- cooperative halo load (X channel c, shared by all KB channels) ----"
+    );
     for i in 0..row_iters {
         let hy_base = i * tp;
         let _ = writeln!(b, "    add.s32 %r18,%r2,{hy_base};        // hy");
@@ -153,37 +178,62 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
             let hx_base = j * tq;
             let _ = writeln!(b, "    add.s32 %r21,%r1,{hx_base};       // hx");
             let _ = writeln!(b, "    setp.lt.u32 %p3,%r21,{halo_w};    // colok");
-            let _ = writeln!(b, "    and.pred %p3,%p3,%p1;            // storeok = colok && rowok");
+            let _ = writeln!(
+                b,
+                "    and.pred %p3,%p3,%p1;            // storeok = colok && rowok"
+            );
             let _ = writeln!(b, "    add.s32 %r22,%r6,%r21;           // gx = q0+hx");
             let _ = writeln!(b, "    setp.lt.u32 %p4,%r22,{w};        // gxok");
-            let _ = writeln!(b, "    and.pred %p4,%p4,%p2;            // valok = gxok && gyok");
-            let _ = writeln!(b, "    add.s32 %r23,%r20,%r22;          // Xelem = gy*W+rXc+gx");
+            let _ = writeln!(
+                b,
+                "    and.pred %p4,%p4,%p2;            // valok = gxok && gyok"
+            );
+            let _ = writeln!(
+                b,
+                "    add.s32 %r23,%r20,%r22;          // Xelem = gy*W+rXc+gx"
+            );
             let _ = writeln!(b, "    mul.wide.s32 %rd4,%r23,4;");
             let _ = writeln!(b, "    add.s64 %rd4,%rd1,%rd4;");
             let _ = writeln!(b, "    mov.f32 %f1,0f00000000;");
             let _ = writeln!(b, "    @%p4 ld.global.f32 %f1,[%rd4];");
-            let _ = writeln!(b, "    mad.lo.s32 %r24,%r18,{halo_w},%r21;  // smem elem = hy*halo_w+hx");
+            let _ = writeln!(
+                b,
+                "    mad.lo.s32 %r24,%r18,{halo_w},%r21;  // smem elem = hy*halo_w+hx"
+            );
             let _ = writeln!(b, "    shl.b32 %r24,%r24,2;");
             let _ = writeln!(b, "    add.s32 %r24,%r10,%r24;");
             let _ = writeln!(b, "    @%p3 st.shared.f32 [%r24],%f1;");
         }
     }
     let _ = writeln!(b);
-    let _ = writeln!(b, "    // ---- cooperative weight load: KB windows of R*S, channel c ----");
+    let _ = writeln!(
+        b,
+        "    // ---- cooperative weight load: KB windows of R*S, channel c ----"
+    );
     for kk in 0..kb {
         // global base of (k0+kk, c) window = base_c + kk*(C*R*S)
-        let _ = writeln!(b, "    add.s32 %r28,%r17,{};        // wbase (k0+{kk},c)", kk * c_rs);
+        let _ = writeln!(
+            b,
+            "    add.s32 %r28,%r17,{};        // wbase (k0+{kk},c)",
+            kk * c_rs
+        );
         let smem_w_base = halo + kk * rs; // smem element offset of this window
         for j in 0..w_iters {
             let base = j * nthreads;
             let _ = writeln!(b, "    add.s32 %r25,%r13,{base};        // weight slot");
             let _ = writeln!(b, "    setp.lt.u32 %p1,%r25,{rs};");
-            let _ = writeln!(b, "    add.s32 %r26,%r25,%r28;         // global weight elem");
+            let _ = writeln!(
+                b,
+                "    add.s32 %r26,%r25,%r28;         // global weight elem"
+            );
             let _ = writeln!(b, "    mul.wide.s32 %rd5,%r26,4;");
             let _ = writeln!(b, "    add.s64 %rd5,%rd2,%rd5;");
             let _ = writeln!(b, "    mov.f32 %f1,0f00000000;");
             let _ = writeln!(b, "    @%p1 ld.global.f32 %f1,[%rd5];");
-            let _ = writeln!(b, "    add.s32 %r27,%r25,{smem_w_base};    // smem weight elem");
+            let _ = writeln!(
+                b,
+                "    add.s32 %r27,%r25,{smem_w_base};    // smem weight elem"
+            );
             let _ = writeln!(b, "    shl.b32 %r27,%r27,2;");
             let _ = writeln!(b, "    add.s32 %r27,%r10,%r27;");
             let _ = writeln!(b, "    @%p1 st.shared.f32 [%r27],%f1;");
@@ -191,11 +241,17 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     }
     let _ = writeln!(b);
     let _ = writeln!(b, "    bar.sync 0;");
-    let _ = writeln!(b, "    // ---- unrolled R*S reduction; each X reused across KB channels ----");
+    let _ = writeln!(
+        b,
+        "    // ---- unrolled R*S reduction; each X reused across KB channels ----"
+    );
     for rr in 0..r {
         for ss in 0..s {
             let x_off = (rr * halo_w + ss) * 4; // bytes from compute base %r12
-            let _ = writeln!(b, "    ld.shared.f32 %f1,[%r12+{x_off}];   // X[ty+{rr},tx+{ss}]");
+            let _ = writeln!(
+                b,
+                "    ld.shared.f32 %f1,[%r12+{x_off}];   // X[ty+{rr},tx+{ss}]"
+            );
             for kk in 0..kb {
                 let w_off = (halo + kk * rs + rr * s + ss) * 4; // bytes from smem base %r10
                 let _ = writeln!(b, "    ld.shared.f32 %f2,[%r10+{w_off}];");
@@ -213,11 +269,25 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "    and.pred %p0,%p0,%p1;");
     let _ = writeln!(b, "    @!%p0 bra RET;");
     // spat = op*Q + oq  ;  o0 = (k0)*P*Q + spat  ;  k0 = kb_idx*KB
-    let _ = writeln!(b, "    mad.lo.s32 %r30,%r9,{q},%r8;       // spat = op*Q + oq");
-    let _ = writeln!(b, "    mul.lo.s32 %r31,%r5,{};           // k0*P*Q", kb * pq);
-    let _ = writeln!(b, "    add.s32 %r31,%r31,%r30;           // o0 = k0*P*Q + spat");
+    let _ = writeln!(
+        b,
+        "    mad.lo.s32 %r30,%r9,{q},%r8;       // spat = op*Q + oq"
+    );
+    let _ = writeln!(
+        b,
+        "    mul.lo.s32 %r31,%r5,{};           // k0*P*Q",
+        kb * pq
+    );
+    let _ = writeln!(
+        b,
+        "    add.s32 %r31,%r31,%r30;           // o0 = k0*P*Q + spat"
+    );
     for kk in 0..kb {
-        let _ = writeln!(b, "    add.s32 %r32,%r31,{};         // oidx for channel +{kk}", kk * pq);
+        let _ = writeln!(
+            b,
+            "    add.s32 %r32,%r31,{};         // oidx for channel +{kk}",
+            kk * pq
+        );
         let _ = writeln!(b, "    mul.wide.s32 %rd6,%r32,4;");
         let _ = writeln!(b, "    add.s64 %rd6,%rd3,%rd6;");
         let _ = writeln!(b, "    st.global.f32 [%rd6],%f{};", 8 + kk);
@@ -456,7 +526,19 @@ pub fn conv_wmma_splitk_ptx(
     s: usize,
     sk: usize,
 ) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, sk, crate::ptx_wmma::Act::None, false, 1, 0)
+    conv_wmma_ptx_impl(
+        c,
+        h,
+        w,
+        k,
+        r,
+        s,
+        sk,
+        crate::ptx_wmma::Act::None,
+        false,
+        1,
+        0,
+    )
 }
 
 /// **Fused conv + bias + activation** implicit-GEMM (entry `conv2d_wmma`): the same tensor-core conv as
@@ -484,8 +566,28 @@ pub fn conv_wmma_epi_ptx(
 /// im2col gather changes — output pixel `(p,q)` reads input `(p·stride+r, q·stride+s)` (the hoisted
 /// `xpart` scales by `stride`). Single-pass (no split-K / fusion threaded here — orthogonal). `stride=1`
 /// reproduces the dense kernel byte-for-byte.
-pub fn conv_wmma_strided_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, stride: usize) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false, stride, 0)
+pub fn conv_wmma_strided_ptx(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+) -> String {
+    conv_wmma_ptx_impl(
+        c,
+        h,
+        w,
+        k,
+        r,
+        s,
+        1,
+        crate::ptx_wmma::Act::None,
+        false,
+        stride,
+        0,
+    )
 }
 
 /// **Strided + zero-padded** implicit-GEMM conv (entry `conv2d_wmma`): the general affine conv — output
@@ -504,7 +606,19 @@ pub fn conv_wmma_pad_ptx(
     stride: usize,
     pad: usize,
 ) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false, stride, pad)
+    conv_wmma_ptx_impl(
+        c,
+        h,
+        w,
+        k,
+        r,
+        s,
+        1,
+        crate::ptx_wmma::Act::None,
+        false,
+        stride,
+        pad,
+    )
 }
 
 /// **Split-K** affine conv (entry `conv2d_wmma_splitk`): the strided+padded [`conv_wmma_pad_ptx`] with
@@ -525,7 +639,19 @@ pub fn conv_wmma_pad_splitk_ptx(
     pad: usize,
     sk: usize,
 ) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, sk, crate::ptx_wmma::Act::None, false, stride, pad)
+    conv_wmma_ptx_impl(
+        c,
+        h,
+        w,
+        k,
+        r,
+        s,
+        sk,
+        crate::ptx_wmma::Act::None,
+        false,
+        stride,
+        pad,
+    )
 }
 
 /// **Explicit zero-pad scatter** (entry `pad_nchw_copy`): copy `X[C,H,W]` (fp16) into the interior of a
@@ -543,7 +669,10 @@ pub fn pad_nchw_copy_ptx(c: usize, h: usize, w: usize, pad: usize) -> String {
     let wp = w + 2 * pad;
     let mut b = String::new();
     let _ = writeln!(b, "{HDR_SM80}");
-    let _ = writeln!(b, "// zero-pad scatter: X[C{c} H{h} W{w}] -> Xpad[C {hp} {wp}] interior (fp16)");
+    let _ = writeln!(
+        b,
+        "// zero-pad scatter: X[C{c} H{h} W{w}] -> Xpad[C {hp} {wp}] interior (fp16)"
+    );
     let _ = writeln!(b, ".visible .entry pad_nchw_copy(");
     let _ = writeln!(b, "    .param .u64 pXin,");
     let _ = writeln!(b, "    .param .u64 pXpad");
@@ -563,19 +692,32 @@ pub fn pad_nchw_copy_ptx(c: usize, h: usize, w: usize, pad: usize) -> String {
     let _ = writeln!(b, "    mov.u32 %ntx,%ntid.x;");
     let _ = writeln!(b, "    mul.lo.s32 %gid,%gid,%ntx;");
     let _ = writeln!(b, "    mov.u32 %rem,%tid.x;");
-    let _ = writeln!(b, "    add.u32 %gid,%gid,%rem;            // global thread id");
+    let _ = writeln!(
+        b,
+        "    add.u32 %gid,%gid,%rem;            // global thread id"
+    );
     let _ = writeln!(b, "    setp.ge.u32 %p0,%gid,{total};");
     let _ = writeln!(b, "    @%p0 bra DONE;");
     // decode gid -> (c, i, j)
     let _ = writeln!(b, "    div.u32 %cc,%gid,{hw};            // c = gid/(H*W)");
-    let _ = writeln!(b, "    rem.u32 %rem,%gid,{hw};           // rem = gid%(H*W)");
+    let _ = writeln!(
+        b,
+        "    rem.u32 %rem,%gid,{hw};           // rem = gid%(H*W)"
+    );
     let _ = writeln!(b, "    div.u32 %ii,%rem,{w};             // i = rem/W");
     let _ = writeln!(b, "    rem.u32 %jj,%rem,{w};             // j = rem%W");
     // dst = c*(Hp*Wp) + (i+pad)*Wp + (j+pad)
     let _ = writeln!(b, "    add.u32 %ii,%ii,{pad};            // i+pad");
     let _ = writeln!(b, "    add.u32 %jj,%jj,{pad};            // j+pad");
-    let _ = writeln!(b, "    mad.lo.s32 %dst,%ii,{wp},%jj;     // (i+pad)*Wp + (j+pad)");
-    let _ = writeln!(b, "    mad.lo.s32 %dst,%cc,{},%dst;      // + c*Hp*Wp", hp * wp);
+    let _ = writeln!(
+        b,
+        "    mad.lo.s32 %dst,%ii,{wp},%jj;     // (i+pad)*Wp + (j+pad)"
+    );
+    let _ = writeln!(
+        b,
+        "    mad.lo.s32 %dst,%cc,{},%dst;      // + c*Hp*Wp",
+        hp * wp
+    );
     // load X[gid], store Xpad[dst]
     let _ = writeln!(b, "    mul.wide.u32 %off,%gid,2;");
     let _ = writeln!(b, "    add.s64 %ptr,%X,%off;");
@@ -609,22 +751,38 @@ fn conv_wmma_ptx_impl(
     // (p*stride+r-pad, q*stride+s-pad). pad==0,stride==1 is the dense conv (hoisted xpart fast path);
     // pad>0 switches the gather to per-(r,s) signed bounds checks (zero-pad OOB) since the linear
     // index fold would row-wrap once a coordinate leaves [0,H)×[0,W).
-    assert!(h + 2 * pad >= r && w + 2 * pad >= s, "kernel larger than padded input");
+    assert!(
+        h + 2 * pad >= r && w + 2 * pad >= s,
+        "kernel larger than padded input"
+    );
     let p = (h + 2 * pad - r) / stride + 1;
     let q = (w + 2 * pad - s) / stride + 1;
     let m = k; // GEMM M
     let n = p * q; // GEMM N
     let gk = c * r * s; // GEMM K (reduction)
-    assert!(sk >= 1 && gk % sk == 0, "split-K factor {sk} must divide GK={gk}");
+    assert!(
+        sk >= 1 && gk % sk == 0,
+        "split-K factor {sk} must divide GK={gk}"
+    );
     // Fusion composes only with the single-pass kernel: a split-K conv writes partial M×N planes that
     // are summed later, so a per-slice bias/activation would be applied sk× (and act before the sum).
-    assert!(sk == 1 || (matches!(act, crate::ptx_wmma::Act::None) && !bias), "split-K conv cannot fuse bias/act");
+    assert!(
+        sk == 1 || (matches!(act, crate::ptx_wmma::Act::None) && !bias),
+        "split-K conv cannot fuse bias/act"
+    );
     let gk_per = gk / sk; // reduction length per z-slice
-    // The K-loop advances in 16-wide WMMA tiles, so each slice must be a whole number of them — else a
-    // slice over-reads into the next slice's range (the staging guards against the full GK, not ktend).
-    assert!(sk == 1 || gk_per % 16 == 0, "split-K slice GK/sk={gk_per} must be a multiple of 16");
+                          // The K-loop advances in 16-wide WMMA tiles, so each slice must be a whole number of them — else a
+                          // slice over-reads into the next slice's range (the staging guards against the full GK, not ktend).
+    assert!(
+        sk == 1 || gk_per % 16 == 0,
+        "split-K slice GK/sk={gk_per} must be a multiple of 16"
+    );
     let mn = m * n; // one output plane (for the z-plane store offset)
-    let entry = if sk > 1 { "conv2d_wmma_splitk" } else { "conv2d_wmma" };
+    let entry = if sk > 1 {
+        "conv2d_wmma_splitk"
+    } else {
+        "conv2d_wmma"
+    };
     let rs = r * s;
     let hw = h * w;
     let (bm, bn) = (WMMA_BM, WMMA_BN);
@@ -650,10 +808,19 @@ fn conv_wmma_ptx_impl(
 
     let mut b = String::new();
     let _ = writeln!(b, "{HDR_SM80}");
-    let _ = writeln!(b, "// fp16 tensor-core implicit-GEMM conv: C{c} H{h} W{w} K{k} R{r} S{s}");
-    let _ = writeln!(b, "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn}, {warps_m}x{warps_n} warps, per-warp {wm}x{wn}");
+    let _ = writeln!(
+        b,
+        "// fp16 tensor-core implicit-GEMM conv: C{c} H{h} W{w} K{k} R{r} S{s}"
+    );
+    let _ = writeln!(
+        b,
+        "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn}, {warps_m}x{warps_n} warps, per-warp {wm}x{wn}"
+    );
     if sk > 1 {
-        let _ = writeln!(b, "// split-K: gridDim.z={sk} z-slices of GK/{sk}={gk_per}, disjoint M*N partial planes");
+        let _ = writeln!(
+            b,
+            "// split-K: gridDim.z={sk} z-slices of GK/{sk}={gk_per}, disjoint M*N partial planes"
+        );
     }
     let _ = writeln!(b, ".visible .entry {entry}(");
     let _ = writeln!(b, "    .param .u64 pXin,");
@@ -732,9 +899,19 @@ fn conv_wmma_ptx_impl(
     // warp partition: warpId -> (warpRow, warpCol); warpRowBase = warpRow*wm, warpColBase = warpCol*wn
     let _ = writeln!(b, "    shr.u32 %warpId,%tix,5;");
     let _ = writeln!(b, "    shr.u32 %tmp,%warpId,{wn_shift};       // warpRow");
-    let _ = writeln!(b, "    mul.lo.s32 %wrb,%tmp,{wm};            // warpRowBase");
-    let _ = writeln!(b, "    and.b32 %tmp,%warpId,{};             // warpCol", warps_n - 1);
-    let _ = writeln!(b, "    mul.lo.s32 %wcb,%tmp,{wn};            // warpColBase");
+    let _ = writeln!(
+        b,
+        "    mul.lo.s32 %wrb,%tmp,{wm};            // warpRowBase"
+    );
+    let _ = writeln!(
+        b,
+        "    and.b32 %tmp,%warpId,{};             // warpCol",
+        warps_n - 1
+    );
+    let _ = writeln!(
+        b,
+        "    mul.lo.s32 %wcb,%tmp,{wn};            // warpColBase"
+    );
     // zero accumulators
     for ti in 0..tm {
         for tj in 0..tn {
@@ -744,7 +921,10 @@ fn conv_wmma_ptx_impl(
         }
     }
     // Hoisted im2col decode: per B-staging slot compute nn=n0+ncol and xpart=p*W+q once (K-independent).
-    let _ = writeln!(b, "    // ---- hoist K-independent im2col decode (n -> p,q -> xpart) ----");
+    let _ = writeln!(
+        b,
+        "    // ---- hoist K-independent im2col decode (n -> p,q -> xpart) ----"
+    );
     for li in 0..b_per {
         let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
@@ -754,24 +934,40 @@ fn conv_wmma_ptx_impl(
         let _ = writeln!(b, "    rem.u32 %qq,%bnv{li},{q};     // q = nn%Q");
         if pad == 0 {
             if stride == 1 {
-                let _ = writeln!(b, "    mad.lo.s32 %bxp{li},%pp,{w},%qq;   // xpart = p*W + q");
+                let _ = writeln!(
+                    b,
+                    "    mad.lo.s32 %bxp{li},%pp,{w},%qq;   // xpart = p*W + q"
+                );
             } else {
                 // strided: input pixel (p*stride+r, q*stride+s) -> xpart = (p*stride)*W + q*stride
                 let _ = writeln!(b, "    mul.lo.s32 %qq,%qq,{stride};   // q*stride");
-                let _ = writeln!(b, "    mad.lo.s32 %bxp{li},%pp,{},%qq;   // (p*stride)*W + q*stride", stride * w);
+                let _ = writeln!(
+                    b,
+                    "    mad.lo.s32 %bxp{li},%pp,{},%qq;   // (p*stride)*W + q*stride",
+                    stride * w
+                );
             }
         } else {
             // padded: hoist signed top-left input coords ph=p*stride-pad, pw=q*stride-pad (may be <0).
             let _ = writeln!(b, "    mul.lo.s32 %tmp,%pp,{stride};");
-            let _ = writeln!(b, "    sub.s32 %bph{li},%tmp,{pad};   // ph = p*stride - pad");
+            let _ = writeln!(
+                b,
+                "    sub.s32 %bph{li},%tmp,{pad};   // ph = p*stride - pad"
+            );
             let _ = writeln!(b, "    mul.lo.s32 %tmp,%qq,{stride};");
-            let _ = writeln!(b, "    sub.s32 %bpw{li},%tmp,{pad};   // pw = q*stride - pad");
+            let _ = writeln!(
+                b,
+                "    sub.s32 %bpw{li},%tmp,{pad};   // pw = q*stride - pad"
+            );
         }
     }
     if sk > 1 {
         let _ = writeln!(b, "    mov.u32 %zsl,%ctaid.z;");
         let _ = writeln!(b, "    mul.lo.s32 %kt,%zsl,{gk_per};   // gk0 = z*GK/sk");
-        let _ = writeln!(b, "    add.u32 %ktend,%kt,{gk_per};    // gk_end = gk0+GK/sk");
+        let _ = writeln!(
+            b,
+            "    add.u32 %ktend,%kt,{gk_per};    // gk_end = gk0+GK/sk"
+        );
     } else {
         let _ = writeln!(b, "    mov.u32 %kt,0;              // gk0");
     }
@@ -783,7 +979,10 @@ fn conv_wmma_ptx_impl(
     }
     let _ = writeln!(b, "    @%p0 bra KEND;");
     let _ = writeln!(b);
-    let _ = writeln!(b, "    // ---- stage A (weights [M,GK]) into smemA[BM][16] ----");
+    let _ = writeln!(
+        b,
+        "    // ---- stage A (weights [M,GK]) into smemA[BM][16] ----"
+    );
     for li in 0..a_per {
         let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
@@ -805,14 +1004,20 @@ fn conv_wmma_ptx_impl(
         let _ = writeln!(b, "    st.shared.u16 [%saddr],%hv;");
     }
     let _ = writeln!(b);
-    let _ = writeln!(b, "    // ---- stage B (im2col of X) into smemB[16][BN]; n-decode is hoisted ----");
+    let _ = writeln!(
+        b,
+        "    // ---- stage B (im2col of X) into smemB[16][BN]; n-decode is hoisted ----"
+    );
     for li in 0..b_per {
         let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
         let _ = writeln!(b, "    shr.u32 %gkk,%e,{bn_shift};          // gkk = e/BN");
         let _ = writeln!(b, "    add.u32 %gkv,%kt,%gkk;       // gk = gk0+gkk");
         let _ = writeln!(b, "    setp.lt.u32 %pv,%gkv,{gk};");
-        let _ = writeln!(b, "    setp.lt.u32 %p0,%bnv{li},{n};   // nn<N (nn precomputed)");
+        let _ = writeln!(
+            b,
+            "    setp.lt.u32 %p0,%bnv{li},{n};   // nn<N (nn precomputed)"
+        );
         let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
         // decode only gk -> (c,r,s); (p,q) already folded into xpart=p*W+q.
         let _ = writeln!(b, "    div.u32 %cc,%gkv,{rs};       // c = gk/(R*S)");
@@ -821,7 +1026,10 @@ fn conv_wmma_ptx_impl(
         let _ = writeln!(b, "    rem.u32 %ss,%rem,{s};        // s = rem%S");
         if pad == 0 {
             // xidx = c*H*W + (p*stride+r)*W + (q*stride+s) = c*H*W + xpart + r*W + s
-            let _ = writeln!(b, "    mad.lo.s32 %xidx,%cc,{hw},%bxp{li};   // c*H*W + xpart");
+            let _ = writeln!(
+                b,
+                "    mad.lo.s32 %xidx,%cc,{hw},%bxp{li};   // c*H*W + xpart"
+            );
             let _ = writeln!(b, "    mad.lo.s32 %xidx,%rr,{w},%xidx;  // + r*W");
             let _ = writeln!(b, "    add.u32 %xidx,%xidx,%ss;     // + s");
         } else {
@@ -830,9 +1038,15 @@ fn conv_wmma_ptx_impl(
             // u32 >= H, so it fails) -- halves the bounds chain (2 setp+2 and.pred, not 4).
             let _ = writeln!(b, "    add.s32 %ih,%bph{li},%rr;    // ih = ph + r");
             let _ = writeln!(b, "    add.s32 %iw,%bpw{li},%ss;    // iw = pw + s");
-            let _ = writeln!(b, "    setp.lt.u32 %p0,%ih,{h};     // 0<=ih<H (unsigned wrap)");
+            let _ = writeln!(
+                b,
+                "    setp.lt.u32 %p0,%ih,{h};     // 0<=ih<H (unsigned wrap)"
+            );
             let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
-            let _ = writeln!(b, "    setp.lt.u32 %p0,%iw,{w};     // 0<=iw<W (unsigned wrap)");
+            let _ = writeln!(
+                b,
+                "    setp.lt.u32 %p0,%iw,{w};     // 0<=iw<W (unsigned wrap)"
+            );
             let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
             let _ = writeln!(b, "    mad.lo.s32 %xidx,%ih,{w},%iw;    // ih*W + iw");
             let _ = writeln!(b, "    mad.lo.s32 %xidx,%cc,{hw},%xidx; // + c*H*W");
@@ -851,26 +1065,42 @@ fn conv_wmma_ptx_impl(
     // load A fragments (row, ldm=16): warp row base = warpRowBase + ti*16
     let _ = writeln!(b, "    mov.u32 %tmp,16;");
     for ti in 0..tm {
-        let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};        // smem row = warpRowBase+{}", ti * 16, ti * 16);
+        let _ = writeln!(
+            b,
+            "    add.u32 %tmp2,%wrb,{};        // smem row = warpRowBase+{}",
+            ti * 16,
+            ti * 16
+        );
         let _ = writeln!(b, "    mul.lo.s32 %tmp2,%tmp2,32;    // *16*2 bytes");
         let _ = writeln!(b, "    mov.u32 %saddr,smemA;");
         let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%saddr;");
         let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
         let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
         let ra = veclist(&format!("a{ti}_"));
-        let _ = writeln!(b, "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;");
+        let _ = writeln!(
+            b,
+            "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;"
+        );
     }
     // load B fragments (row, ldm=BN): warp col base = warpColBase + tj*16
     let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
     for tj in 0..tn {
-        let _ = writeln!(b, "    add.u32 %tmp2,%wcb,{};        // smem col = warpColBase+{}", tj * 16, tj * 16);
+        let _ = writeln!(
+            b,
+            "    add.u32 %tmp2,%wcb,{};        // smem col = warpColBase+{}",
+            tj * 16,
+            tj * 16
+        );
         let _ = writeln!(b, "    shl.b32 %tmp2,%tmp2,1;        // *2 bytes");
         let _ = writeln!(b, "    mov.u32 %saddr,smemB;");
         let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%saddr;");
         let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
         let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
         let rb = veclist(&format!("b{tj}_"));
-        let _ = writeln!(b, "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {rb}, [%gp], %tmp;");
+        let _ = writeln!(
+            b,
+            "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {rb}, [%gp], %tmp;"
+        );
     }
     for ti in 0..tm {
         let ra = veclist(&format!("a{ti}_"));
@@ -891,7 +1121,12 @@ fn conv_wmma_ptx_impl(
     let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
     for ti in 0..tm {
         for tj in 0..tn {
-            let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};        // row = warpRowBase+{}", ti * 16, ti * 16);
+            let _ = writeln!(
+                b,
+                "    add.u32 %tmp2,%wrb,{};        // row = warpRowBase+{}",
+                ti * 16,
+                ti * 16
+            );
             let _ = writeln!(b, "    mul.lo.s32 %tmp2,%tmp2,{bn};   // row*BN");
             let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%wcb;     // + warpColBase");
             let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,{};        // + tj*16", tj * 16);
@@ -901,7 +1136,10 @@ fn conv_wmma_ptx_impl(
             let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
             let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
             let cc = veclist(&format!("c{ti}_{tj}_"));
-            let _ = writeln!(b, "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {cc}, %tmp;");
+            let _ = writeln!(
+                b,
+                "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {cc}, %tmp;"
+            );
         }
     }
     let _ = writeln!(b, "    bar.sync 0;");
@@ -934,7 +1172,10 @@ fn conv_wmma_ptx_impl(
         b.push_str(&act.epilogue("%cf")); // out = act(out)  (Act::None -> nothing)
         let _ = writeln!(b, "    mad.lo.s32 %xidx,%tmp,{n},%nn;   // gm*N + gn");
         if sk > 1 {
-            let _ = writeln!(b, "    mad.lo.s32 %xidx,%zsl,{mn},%xidx;   // + z*M*N (disjoint plane)");
+            let _ = writeln!(
+                b,
+                "    mad.lo.s32 %xidx,%zsl,{mn},%xidx;   // + z*M*N (disjoint plane)"
+            );
         }
         let _ = writeln!(b, "    mul.wide.u32 %off,%xidx,4;");
         let _ = writeln!(b, "    add.s64 %ptr,%O,%off;");
@@ -955,7 +1196,10 @@ pub fn conv_splitk_reduce_ptx(mn: usize, sk: usize) -> String {
     let plane = mn * 4; // bytes between successive z-planes
     let mut b = String::new();
     let _ = writeln!(b, "{HDR_SM80}");
-    let _ = writeln!(b, "// split-K reduce: sum {sk} planes of {mn} f32 -> O, fixed z-order (deterministic)");
+    let _ = writeln!(
+        b,
+        "// split-K reduce: sum {sk} planes of {mn} f32 -> O, fixed z-order (deterministic)"
+    );
     let _ = writeln!(b, ".visible .entry conv_splitk_reduce(");
     let _ = writeln!(b, "    .param .u64 pPartial,");
     let _ = writeln!(b, "    .param .u64 pOut");
@@ -977,7 +1221,10 @@ pub fn conv_splitk_reduce_ptx(mn: usize, sk: usize) -> String {
     let _ = writeln!(b, "    setp.ge.u32 %p0,%idx,{mn};");
     let _ = writeln!(b, "    @%p0 bra RET;");
     let _ = writeln!(b, "    mul.wide.u32 %off,%idx,4;");
-    let _ = writeln!(b, "    add.s64 %base,%P,%off;          // &partial[0*MN+idx]");
+    let _ = writeln!(
+        b,
+        "    add.s64 %base,%P,%off;          // &partial[0*MN+idx]"
+    );
     let _ = writeln!(b, "    mov.f32 %acc,0f00000000;");
     for z in 0..sk {
         let _ = writeln!(b, "    ld.global.f32 %v,[%base];");
@@ -1001,7 +1248,15 @@ pub fn conv_splitk_reduce_ptx(mn: usize, sk: usize) -> String {
 /// 16-wide WMMA K-tile, e.g. a 3-channel first layer). Pure (takes the SM count) so it is unit-testable
 /// without a device. Every returned `sk>1` satisfies the [`conv_wmma_splitk_ptx`] contract: `sk | GK`
 /// and `GK/sk` a multiple of 16.
-pub fn conv_splitk_factor(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sm_count: usize) -> usize {
+pub fn conv_splitk_factor(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sm_count: usize,
+) -> usize {
     let n = (h - r + 1) * (w - s + 1); // valid-conv output P*Q
     splitk_factor_for_n(c * r * s, n, k, sm_count)
 }
@@ -1013,7 +1268,15 @@ pub fn conv_splitk_factor(c: usize, h: usize, w: usize, k: usize, r: usize, s: u
 /// split-K helps; `stride=1, pad=0` reduces to [`conv_splitk_factor`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv_splitk_factor_affine(
-    c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, stride: usize, pad: usize, sm_count: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+    sm_count: usize,
 ) -> usize {
     let p = (h + 2 * pad - r) / stride + 1;
     let q = (w + 2 * pad - s) / stride + 1;
@@ -1067,22 +1330,48 @@ pub fn conv_wmma_db_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usi
 
 /// Split-K variant of [`conv_wmma_db_ptx`] (entry `conv2d_wmma_splitk`) — the double-buffered pipeline
 /// applied to each `GK/sk` z-slice. Pairs with the same [`conv_splitk_reduce_ptx`].
-pub fn conv_wmma_db_splitk_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sk: usize) -> String {
+pub fn conv_wmma_db_splitk_ptx(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sk: usize,
+) -> String {
     conv_wmma_db_ptx_impl(c, h, w, k, r, s, sk)
 }
 
-fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sk: usize) -> String {
+fn conv_wmma_db_ptx_impl(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sk: usize,
+) -> String {
     use std::fmt::Write as _;
     let p = h - r + 1;
     let q = w - s + 1;
     let m = k; // GEMM M
     let n = p * q; // GEMM N
     let gk = c * r * s; // GEMM K (reduction)
-    assert!(sk >= 1 && gk % sk == 0, "split-K factor {sk} must divide GK={gk}");
+    assert!(
+        sk >= 1 && gk % sk == 0,
+        "split-K factor {sk} must divide GK={gk}"
+    );
     let gk_per = gk / sk;
-    assert!(sk == 1 || gk_per % 16 == 0, "split-K slice GK/sk={gk_per} must be a multiple of 16");
+    assert!(
+        sk == 1 || gk_per % 16 == 0,
+        "split-K slice GK/sk={gk_per} must be a multiple of 16"
+    );
     let mn = m * n;
-    let entry = if sk > 1 { "conv2d_wmma_splitk" } else { "conv2d_wmma" };
+    let entry = if sk > 1 {
+        "conv2d_wmma_splitk"
+    } else {
+        "conv2d_wmma"
+    };
     let rs = r * s;
     let hw = h * w;
     let (bm, bn) = (WMMA_BM, WMMA_BN);
@@ -1099,7 +1388,10 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
     let c_per = bm * bn / threads;
     let tile_a = bm * 16 * 2; // one A buffer, f16 bytes
     let tile_b = 16 * bn * 2; // one B buffer
-    assert!(tile_a.is_power_of_two() && tile_b.is_power_of_two(), "buffer toggle is an XOR");
+    assert!(
+        tile_a.is_power_of_two() && tile_b.is_power_of_two(),
+        "buffer toggle is an XOR"
+    );
     let smem_a = 2 * tile_a; // double-buffered
     let smem_b = 2 * tile_b;
     let smem_c = bm * bn * 4; // f32 store scratch (single, epilogue-only)
@@ -1181,7 +1473,10 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
     let _ = writeln!(b, "// fp16 tensor-core implicit-GEMM conv (register double-buffered): C{c} H{h} W{w} K{k} R{r} S{s}");
     let _ = writeln!(b, "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn}, {warps_m}x{warps_n} warps, per-warp {wm}x{wn}; 2 SMEM buffers");
     if sk > 1 {
-        let _ = writeln!(b, "// split-K: gridDim.z={sk} z-slices of GK/{sk}={gk_per}, disjoint M*N partial planes");
+        let _ = writeln!(
+            b,
+            "// split-K: gridDim.z={sk} z-slices of GK/{sk}={gk_per}, disjoint M*N partial planes"
+        );
     }
     let _ = writeln!(b, ".visible .entry {entry}(");
     let _ = writeln!(b, "    .param .u64 pXin,");
@@ -1258,7 +1553,10 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
         }
     }
     // Hoist K-independent im2col decode: per B-staging slot, nn=n0+ncol and xpart=p*W+q (used by every kt).
-    let _ = writeln!(b, "    // ---- hoist K-independent im2col decode (n -> p,q -> xpart) ----");
+    let _ = writeln!(
+        b,
+        "    // ---- hoist K-independent im2col decode (n -> p,q -> xpart) ----"
+    );
     for li in 0..b_per {
         let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
@@ -1279,7 +1577,10 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
     // ---- prologue: stage the first slice into buffer 0 ----
     let _ = writeln!(b, "    mov.u32 %bufA,0;");
     let _ = writeln!(b, "    mov.u32 %bufB,0;");
-    let _ = writeln!(b, "    // ---- prologue: load+publish slice gk0 into buffer 0 ----");
+    let _ = writeln!(
+        b,
+        "    // ---- prologue: load+publish slice gk0 into buffer 0 ----"
+    );
     a_load("%kt", &mut b);
     b_load("%kt", &mut b);
     a_store("%bufA", &mut b);
@@ -1297,12 +1598,18 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
     let _ = writeln!(b);
     // Prefetch the next slice into registers FIRST (program order before the MMAs) so the global loads
     // are in flight while the tensor cores consume the current buffer. OOB lanes load 0 (gc/gkv>=GK).
-    let _ = writeln!(b, "    // ---- prefetch next slice (gk0+16) into registers ----");
+    let _ = writeln!(
+        b,
+        "    // ---- prefetch next slice (gk0+16) into registers ----"
+    );
     a_load("%ktn", &mut b);
     b_load("%ktn", &mut b);
     let _ = writeln!(b);
     // Load A/B fragments from the current READ buffer (%bufA/%bufB).
-    let _ = writeln!(b, "    // ---- consume current buffer: load fragments + MMA ----");
+    let _ = writeln!(
+        b,
+        "    // ---- consume current buffer: load fragments + MMA ----"
+    );
     let _ = writeln!(b, "    mov.u32 %tmp,16;");
     for ti in 0..tm {
         let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};", ti * 16);
@@ -1313,7 +1620,10 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
         let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
         let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
         let ra = veclist(&format!("a{ti}_"));
-        let _ = writeln!(b, "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;");
+        let _ = writeln!(
+            b,
+            "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;"
+        );
     }
     let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
     for tj in 0..tn {
@@ -1325,7 +1635,10 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
         let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
         let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
         let rb = veclist(&format!("b{tj}_"));
-        let _ = writeln!(b, "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {rb}, [%gp], %tmp;");
+        let _ = writeln!(
+            b,
+            "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {rb}, [%gp], %tmp;"
+        );
     }
     for ti in 0..tm {
         let ra = veclist(&format!("a{ti}_"));
@@ -1340,7 +1653,10 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
     }
     let _ = writeln!(b);
     // Publish the prefetched slice into the WRITE buffer (the alternate of the two), then one barrier.
-    let _ = writeln!(b, "    // ---- publish prefetched slice into the alternate buffer ----");
+    let _ = writeln!(
+        b,
+        "    // ---- publish prefetched slice into the alternate buffer ----"
+    );
     let _ = writeln!(b, "    xor.b32 %bufWA,%bufA,{tile_a};");
     let _ = writeln!(b, "    xor.b32 %bufWB,%bufB,{tile_b};");
     a_store("%bufWA", &mut b);
@@ -1365,7 +1681,10 @@ fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: us
             let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
             let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
             let cc = veclist(&format!("c{ti}_{tj}_"));
-            let _ = writeln!(b, "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {cc}, %tmp;");
+            let _ = writeln!(
+                b,
+                "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {cc}, %tmp;"
+            );
         }
     }
     let _ = writeln!(b, "    bar.sync 0;");
@@ -1405,7 +1724,10 @@ mod tests {
     /// opaque `DriverError` out of `cuModuleLoadData` with no hint that one byte is at fault (§3A P1).
     pub(super) fn assert_ptx_ascii(what: &str, ptx: &str) {
         if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
-            panic!("{what}: PTX line {} is not ASCII (ptxas fatal): {line:?}", i + 1);
+            panic!(
+                "{what}: PTX line {} is not ASCII (ptxas fatal): {line:?}",
+                i + 1
+            );
         }
         assert!(!ptx.is_empty(), "{what}: generated an empty module");
     }
@@ -1426,8 +1748,14 @@ mod tests {
             let pq = (h - r + 1) * (w - s + 1);
             assert_ptx_ascii("conv2d_ptx", &conv2d_ptx(c, h, w, k, r, s));
             assert_ptx_ascii("conv_wmma_ptx", &conv_wmma_ptx(c, h, w, k, r, s));
-            assert_ptx_ascii("conv_wmma_strided_ptx", &conv_wmma_strided_ptx(c, h, w, k, r, s, 2));
-            assert_ptx_ascii("conv_wmma_pad_ptx", &conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1));
+            assert_ptx_ascii(
+                "conv_wmma_strided_ptx",
+                &conv_wmma_strided_ptx(c, h, w, k, r, s, 2),
+            );
+            assert_ptx_ascii(
+                "conv_wmma_pad_ptx",
+                &conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1),
+            );
             assert_ptx_ascii("conv_wmma_db_ptx", &conv_wmma_db_ptx(c, h, w, k, r, s));
             for act in [
                 crate::ptx_wmma::Act::None,
@@ -1445,13 +1773,17 @@ mod tests {
         }
         // Split-K variants need `sk | GK` with `GK/sk` a multiple of 16, so they carry their own
         // shape list rather than being `continue`d out of the sweep above.
-        for (c, h, w, k, r, s, sk) in
-            [(256usize, 14usize, 14usize, 256usize, 3usize, 3usize, 4usize), (128, 28, 28, 128, 1, 1, 2)]
-        {
+        for (c, h, w, k, r, s, sk) in [
+            (256usize, 14usize, 14usize, 256usize, 3usize, 3usize, 4usize),
+            (128, 28, 28, 128, 1, 1, 2),
+        ] {
             let gk = c * r * s;
             assert_eq!(gk % sk, 0);
             assert_eq!((gk / sk) % 16, 0);
-            assert_ptx_ascii("conv_wmma_splitk_ptx", &conv_wmma_splitk_ptx(c, h, w, k, r, s, sk));
+            assert_ptx_ascii(
+                "conv_wmma_splitk_ptx",
+                &conv_wmma_splitk_ptx(c, h, w, k, r, s, sk),
+            );
             assert_ptx_ascii(
                 "conv_wmma_pad_splitk_ptx",
                 &conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, sk),
@@ -1460,7 +1792,10 @@ mod tests {
                 "conv_wmma_db_splitk_ptx",
                 &conv_wmma_db_splitk_ptx(c, h, w, k, r, s, sk),
             );
-            assert_ptx_ascii("conv_splitk_reduce_ptx", &conv_splitk_reduce_ptx(k * 196, sk));
+            assert_ptx_ascii(
+                "conv_splitk_reduce_ptx",
+                &conv_splitk_reduce_ptx(k * 196, sk),
+            );
         }
     }
 
@@ -1479,16 +1814,31 @@ mod tests {
             ("CONV2D", CONV2D.to_string()),
             ("conv2d_ptx", conv2d_ptx(c, h, w, k, r, s)),
             ("conv_wmma_ptx", conv_wmma_ptx(c, h, w, k, r, s)),
-            ("conv_wmma_strided_ptx", conv_wmma_strided_ptx(c, h, w, k, r, s, 2)),
-            ("conv_wmma_pad_ptx", conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1)),
+            (
+                "conv_wmma_strided_ptx",
+                conv_wmma_strided_ptx(c, h, w, k, r, s, 2),
+            ),
+            (
+                "conv_wmma_pad_ptx",
+                conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1),
+            ),
             ("conv_wmma_db_ptx", conv_wmma_db_ptx(c, h, w, k, r, s)),
             (
                 "conv_wmma_epi_ptx",
                 conv_wmma_epi_ptx(c, h, w, k, r, s, crate::ptx_wmma::Act::Relu, true),
             ),
-            ("conv_wmma_splitk_ptx", conv_wmma_splitk_ptx(c, h, w, k, r, s, 2)),
-            ("conv_wmma_db_splitk_ptx", conv_wmma_db_splitk_ptx(c, h, w, k, r, s, 2)),
-            ("conv_wmma_pad_splitk_ptx", conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, 2)),
+            (
+                "conv_wmma_splitk_ptx",
+                conv_wmma_splitk_ptx(c, h, w, k, r, s, 2),
+            ),
+            (
+                "conv_wmma_db_splitk_ptx",
+                conv_wmma_db_splitk_ptx(c, h, w, k, r, s, 2),
+            ),
+            (
+                "conv_wmma_pad_splitk_ptx",
+                conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, 2),
+            ),
             ("conv_splitk_reduce_ptx", conv_splitk_reduce_ptx(k * 676, 2)),
             ("bias_relu_ptx", bias_relu_ptx(k, 676)),
             ("pad_nchw_copy_ptx", pad_nchw_copy_ptx(c, h, w, 1)),
@@ -1504,7 +1854,11 @@ mod tests {
                 "{what}: an Ampere-legal module must not claim the Ada floor"
             );
         }
-        assert_eq!(mods.len(), 13, "every conv generator must be covered by the header gate");
+        assert_eq!(
+            mods.len(),
+            13,
+            "every conv generator must be covered by the header gate"
+        );
     }
 
     #[test]
@@ -1523,14 +1877,20 @@ mod tests {
         // First layer C3 R3 S3 -> GK=27, not a multiple of 16 -> cannot split.
         assert_eq!(conv_splitk_factor(3, 64, 64, 64, 3, 3, sm), 1);
         // Every split it returns must satisfy the kernel contract (sk|GK, GK/sk % 16 == 0).
-        for (c, h, w, k, r, s) in
-            [(256usize, 14, 14, 256, 3, 3), (128, 28, 28, 128, 3, 3), (256, 14, 14, 256, 1, 1)]
-        {
+        for (c, h, w, k, r, s) in [
+            (256usize, 14, 14, 256, 3, 3),
+            (128, 28, 28, 128, 3, 3),
+            (256, 14, 14, 256, 1, 1),
+        ] {
             let sk = conv_splitk_factor(c, h, w, k, r, s, sm);
             let gk = c * r * s;
             assert_eq!(gk % sk, 0);
             if sk > 1 {
-                assert_eq!((gk / sk) % 16, 0, "GK/sk must be a multiple of the WMMA K-tile");
+                assert_eq!(
+                    (gk / sk) % 16,
+                    0,
+                    "GK/sk must be a multiple of the WMMA K-tile"
+                );
             }
         }
     }

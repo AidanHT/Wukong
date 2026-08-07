@@ -69,7 +69,9 @@ use std::hash::{Hash, Hasher};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use wukong_backend::{Artifact, Backend};
-use wukong_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, Terminator, ValueId};
+use wukong_mir::{
+    BinOp, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, Terminator, ValueId,
+};
 use wukong_span::{Interner, Symbol};
 
 // --- Device context-buffer layout (u64 slots) -----------------------------------------------
@@ -262,7 +264,11 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
 /// (`crate::fusion::analyze`) guarantees the entry calls no other user function, so no `mfn_*`
 /// bodies are emitted — only the helpers it uses + the kernel. Public so `megakernel.rs` and tooling
 /// can JIT / inspect it.
-pub fn emit_mega_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result<String, String> {
+pub fn emit_mega_ptx(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> Result<String, String> {
     let entry_fn = program
         .function(entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
@@ -422,7 +428,7 @@ struct FnEmit<'a> {
     body: String,
     // Register counters per class (final values give the `.reg` declaration counts).
     n_rd: u32,
-    n_r: u32, // 32-bit scratch (`%r`) for narrow loads/stores, shift counts, bitcasts
+    n_r: u32,  // 32-bit scratch (`%r`) for narrow loads/stores, shift counts, bitcasts
     n_rs: u32, // 16-bit scratch (`%rs`) for bf16/f16 storage conversions
     n_f: u32,
     n_fd: u32,
@@ -697,7 +703,10 @@ impl<'a> FnEmit<'a> {
             let fr_raw = self.fresh(RC::Rd);
             self.frame_base = self.fresh(RC::Rd);
             self.emit(&format!("ld.param.u64 {fr_raw}, [p_frame];"));
-            self.emit(&format!("cvta.to.global.u64 {}, {fr_raw};", self.frame_base));
+            self.emit(&format!(
+                "cvta.to.global.u64 {}, {fr_raw};",
+                self.frame_base
+            ));
         }
 
         // tid0 = (threadIdx.x == 0): the predicate guarding stores + side effects in SPMD mode.
@@ -882,7 +891,14 @@ impl<'a> FnEmit<'a> {
 
     /// Emit `d = a OP b` for one (scalar or lane) value. Operands are registers already of the result
     /// type; floats round per op (no auto-FMA), ints compute in 64-bit and mask to the result width.
-    fn bin_into(&mut self, d: &str, op: BinOp, a: &str, b: &str, rty: &MirType) -> Result<(), String> {
+    fn bin_into(
+        &mut self,
+        d: &str,
+        op: BinOp,
+        a: &str,
+        b: &str,
+        rty: &MirType,
+    ) -> Result<(), String> {
         use BinOp::*;
         if op.is_float() {
             let sfx = float_suffix(rty);
@@ -1053,12 +1069,12 @@ impl<'a> FnEmit<'a> {
         let (a, b, opnd_ty) = if op.is_float() {
             // Compare in the wider operand type (Cranelift's rule), which preserves order vs the
             // interpreter's f64 compare.
-            let common = if matches!(self.ty(l), MirType::F64) || matches!(self.ty(r2), MirType::F64)
-            {
-                MirType::F64
-            } else {
-                MirType::F32
-            };
+            let common =
+                if matches!(self.ty(l), MirType::F64) || matches!(self.ty(r2), MirType::F64) {
+                    MirType::F64
+                } else {
+                    MirType::F32
+                };
             let rc = rc_of(&common);
             (self.coerce_float(l, rc), self.coerce_float(r2, rc), common)
         } else {
@@ -1177,7 +1193,11 @@ impl<'a> FnEmit<'a> {
                     MirType::BF16 | MirType::F16 => {
                         let h = self.fresh_r16();
                         let t = self.fresh(RC::F32);
-                        let c = if matches!(from, MirType::BF16) { "bf16" } else { "f16" };
+                        let c = if matches!(from, MirType::BF16) {
+                            "bf16"
+                        } else {
+                            "f16"
+                        };
                         self.emit(&format!("cvt.rn.{c}.f32 {h}, {x};"));
                         self.emit(&format!("cvt.f32.{c} {t}, {h};"));
                         t
@@ -1632,7 +1652,11 @@ impl<'a> FnEmit<'a> {
                 }
                 ls
             }
-            other => return Err(format!("{UNSUPPORTED} SIMD op {other:?} not yet lowered to PTX")),
+            other => {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD op {other:?} not yet lowered to PTX"
+                ))
+            }
         };
         self.vlanes.insert(r.0, out);
         Ok(())
@@ -1669,7 +1693,9 @@ impl<'a> FnEmit<'a> {
             // through to the generic `other =>` arm below and reaches the helper with this op-code
             // gate BYPASSED — an unimplemented op would then silently run `mrt_vmath`'s identity
             // default instead of declining.
-            "wukong_vmath_f32" | "wukong_vmath_f32_parallel" | "wukong_vmath_bf16"
+            "wukong_vmath_f32"
+            | "wukong_vmath_f32_parallel"
+            | "wukong_vmath_bf16"
             | "wukong_vmath_f16"
                 if args.len() == 4 =>
             {
@@ -1687,7 +1713,9 @@ impl<'a> FnEmit<'a> {
                     self.emit_helper_call(pname, None, args, None);
                     Ok(())
                 } else {
-                    Err(format!("{UNSUPPORTED} vmath op {op} not yet lowered to PTX"))
+                    Err(format!(
+                        "{UNSUPPORTED} vmath op {op} not yet lowered to PTX"
+                    ))
                 }
             }
             // Two-arg transcendentals: pow(0)/atan2(1)/hypot(2), dispatched on a compile-time op code.
@@ -1701,7 +1729,9 @@ impl<'a> FnEmit<'a> {
                     self.emit_helper_call("mrt_vmath2", None, args, None);
                     Ok(())
                 } else {
-                    Err(format!("{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"))
+                    Err(format!(
+                        "{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"
+                    ))
                 }
             }
             // `wukong_parallel_for(n, func_addr F, ctx)`: the @parallel outliner splits `[0,n)` into
@@ -1733,7 +1763,9 @@ impl<'a> FnEmit<'a> {
                     self.emit_helper_call(h.ptx_name, h.ret, args, result);
                     Ok(())
                 } else {
-                    Err(format!("{UNSUPPORTED} call to `{other}` not yet lowered to PTX"))
+                    Err(format!(
+                        "{UNSUPPORTED} call to `{other}` not yet lowered to PTX"
+                    ))
                 }
             }
         }
@@ -1756,7 +1788,9 @@ impl<'a> FnEmit<'a> {
     ) -> Result<(), String> {
         use crate::fusion::{classify_call, CallClass, CoopKind};
         let CallClass::Coop(kind) = classify_call(name) else {
-            return Err(format!("{UNSUPPORTED} mega call to `{name}` (not a cooperative op)"));
+            return Err(format!(
+                "{UNSUPPORTED} mega call to `{name}` (not a cooperative op)"
+            ));
         };
         // Op-code gates, mirroring the single-thread dispatch.
         match kind {
@@ -1767,7 +1801,9 @@ impl<'a> FnEmit<'a> {
                     .copied()
                     .ok_or_else(|| format!("{UNSUPPORTED} vmath op code is not a constant"))?;
                 if !vmath_supported(op) {
-                    return Err(format!("{UNSUPPORTED} vmath op {op} not yet lowered to PTX"));
+                    return Err(format!(
+                        "{UNSUPPORTED} vmath op {op} not yet lowered to PTX"
+                    ));
                 }
             }
             CoopKind::Vmath2 if args.len() == 5 => {
@@ -1777,11 +1813,15 @@ impl<'a> FnEmit<'a> {
                     .copied()
                     .ok_or_else(|| format!("{UNSUPPORTED} vmath2 op code is not a constant"))?;
                 if !matches!(op, 0..=2) {
-                    return Err(format!("{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"));
+                    return Err(format!(
+                        "{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"
+                    ));
                 }
             }
             CoopKind::ParallelFor => {
-                return Err(format!("{UNSUPPORTED} wukong_parallel_for not cooperative in mega"));
+                return Err(format!(
+                    "{UNSUPPORTED} wukong_parallel_for not cooperative in mega"
+                ));
             }
             _ => {}
         }
@@ -1801,9 +1841,14 @@ impl<'a> FnEmit<'a> {
                 // Keyed on the f32 family (`wukong_vmath_f32` and its `_parallel` twin), NOT on the
                 // one exact serial spelling: giving an f32 input buffer the bf16 2-byte stride would
                 // walk each thread's chunk over the wrong half of the array.
-                let in_esz = if name.starts_with("wukong_vmath_f32") { 4 } else { 2 };
-                let h = rt_helper(name)
-                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
+                let in_esz = if name.starts_with("wukong_vmath_f32") {
+                    4
+                } else {
+                    2
+                };
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1814,35 +1859,46 @@ impl<'a> FnEmit<'a> {
                 );
             }
             CoopKind::Vmath2 => {
-                let h = rt_helper(name)
-                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
                     args,
                     result,
                     3,
-                    &[(0, Stride::Const(4)), (1, Stride::Const(4)), (2, Stride::Const(4))],
+                    &[
+                        (0, Stride::Const(4)),
+                        (1, Stride::Const(4)),
+                        (2, Stride::Const(4)),
+                    ],
                 );
             }
             CoopKind::Velem => {
-                let h = rt_helper(name)
-                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
                     args,
                     result,
                     3,
-                    &[(0, Stride::Const(4)), (1, Stride::Const(4)), (2, Stride::Const(4))],
+                    &[
+                        (0, Stride::Const(4)),
+                        (1, Stride::Const(4)),
+                        (2, Stride::Const(4)),
+                    ],
                 );
             }
             // GEMM: the output rows are independent, so chunk `m` (rows). C[i,:] = A[i,:]·Bᵀ (+epi):
             // each thread owns a contiguous A-row / C-row block; B / bias / beta / act are shared. A-row
             // = `k` elems, C-row = `n` elems. (a=0, b=1, c=2, m=3, k=4, n=5, ...)
             CoopKind::Gemm | CoopKind::GemmNt | CoopKind::GemmNtEpi => {
-                let h = rt_helper(name)
-                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1854,8 +1910,9 @@ impl<'a> FnEmit<'a> {
             }
             // int8 GEMM: A rows are u8 (`k`*1 B), C rows are i32 (`n`*4 B).
             CoopKind::I8GemmNt => {
-                let h = rt_helper(name)
-                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1868,8 +1925,9 @@ impl<'a> FnEmit<'a> {
             // Row-wise norm: each row's softmax/LayerNorm/RMSNorm is independent -> chunk `rows`.
             // (x=0, out=1, rows=2, cols=3, ...); each row is `cols` f32.
             CoopKind::Norm => {
-                let h = rt_helper(name)
-                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -1882,8 +1940,9 @@ impl<'a> FnEmit<'a> {
             // Affine norm: (x=0, out=1, gamma=2, beta=3, rows=4, cols=5, ...); gamma/beta are
             // per-column (shared across rows), so only x/out are row-offset by `cols`*4 B.
             CoopKind::NormAffine => {
-                let h = rt_helper(name)
-                    .ok_or_else(|| format!("{UNSUPPORTED} no device helper for recognized op `{name}`"))?;
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
                 self.emit_chunked_call(
                     h.ptx_name,
                     h.ret,
@@ -2152,7 +2211,9 @@ impl<'a> FnEmit<'a> {
         let tagr = self.fresh(RC::Rd);
         let pw = self.fresh_pred();
         let ag = self.st_guard(); // `@tid0 ` (mega) or empty
-        self.emit(&format!("{ag}atom.global.add.u64 {idx}, [{ctx}+{CTX_COUNT_OFF}], 1;"));
+        self.emit(&format!(
+            "{ag}atom.global.add.u64 {idx}, [{ctx}+{CTX_COUNT_OFF}], 1;"
+        ));
         self.emit(&format!("setp.lt.u64 {pw}, {idx}, {RECORD_CAP};"));
         if self.mega {
             // Fold tid0 into the bounds predicate so non-zero threads (whose `idx` is undefined,
@@ -2178,7 +2239,14 @@ impl<'a> FnEmit<'a> {
         if aty.is_float() {
             let z = self.fresh(rc_of(&aty));
             let sfx = float_suffix(&aty);
-            self.emit(&format!("mov.{sfx} {z}, 0{};", if sfx == "f64" { "d0000000000000000" } else { "f00000000" }));
+            self.emit(&format!(
+                "mov.{sfx} {z}, 0{};",
+                if sfx == "f64" {
+                    "d0000000000000000"
+                } else {
+                    "f00000000"
+                }
+            ));
             self.emit(&format!("setp.eq.{sfx} {pz}, {cond}, {z};"));
         } else {
             self.emit(&format!("setp.eq.s64 {pz}, {cond}, 0;"));
@@ -2189,7 +2257,9 @@ impl<'a> FnEmit<'a> {
         }
         let one = self.fresh(RC::Rd);
         self.emit(&format!("mov.b64 {one}, 1;"));
-        self.emit(&format!("@{pz} st.global.u64 [{ctx}+{CTX_ASSERT_OFF}], {one};"));
+        self.emit(&format!(
+            "@{pz} st.global.u64 [{ctx}+{CTX_ASSERT_OFF}], {one};"
+        ));
         Ok(())
     }
 
@@ -2261,7 +2331,9 @@ impl<'a> FnEmit<'a> {
                 }
             }
         }
-        self.emit(&format!("@{tid0} st.global.u64 [{ctx}+{CTX_EXIT_OFF}], {code};"));
+        self.emit(&format!(
+            "@{tid0} st.global.u64 [{ctx}+{CTX_EXIT_OFF}], {code};"
+        ));
     }
 
     /// Realize the block-param convention for one edge: copy each arg into a temp, then each temp into
@@ -2451,20 +2523,36 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
             ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI.to_string())
         }
         // Mixed-precision (bf16/f16 storage, f32 compute) — generated per precision.
-        "wukong_vmath_bf16" => ("mrt_vmath_bf16", None, ptx_vmath_lowp("mrt_vmath_bf16", "bf16")?),
-        "wukong_vmath_f16" => ("mrt_vmath_f16", None, ptx_vmath_lowp("mrt_vmath_f16", "f16")?),
-        "wukong_dot_bf16" | "wukong_dot_bf16_parallel" => {
-            ("mrt_dot_bf16", Some(RC::F32), ptx_dot_lowp("mrt_dot_bf16", "bf16"))
-        }
-        "wukong_dot_f16" | "wukong_dot_f16_parallel" => {
-            ("mrt_dot_f16", Some(RC::F32), ptx_dot_lowp("mrt_dot_f16", "f16"))
-        }
-        "wukong_sum_bf16" | "wukong_sum_bf16_parallel" => {
-            ("mrt_sum_bf16", Some(RC::F32), ptx_sum_lowp("mrt_sum_bf16", "bf16"))
-        }
-        "wukong_sum_f16" | "wukong_sum_f16_parallel" => {
-            ("mrt_sum_f16", Some(RC::F32), ptx_sum_lowp("mrt_sum_f16", "f16"))
-        }
+        "wukong_vmath_bf16" => (
+            "mrt_vmath_bf16",
+            None,
+            ptx_vmath_lowp("mrt_vmath_bf16", "bf16")?,
+        ),
+        "wukong_vmath_f16" => (
+            "mrt_vmath_f16",
+            None,
+            ptx_vmath_lowp("mrt_vmath_f16", "f16")?,
+        ),
+        "wukong_dot_bf16" | "wukong_dot_bf16_parallel" => (
+            "mrt_dot_bf16",
+            Some(RC::F32),
+            ptx_dot_lowp("mrt_dot_bf16", "bf16"),
+        ),
+        "wukong_dot_f16" | "wukong_dot_f16_parallel" => (
+            "mrt_dot_f16",
+            Some(RC::F32),
+            ptx_dot_lowp("mrt_dot_f16", "f16"),
+        ),
+        "wukong_sum_bf16" | "wukong_sum_bf16_parallel" => (
+            "mrt_sum_bf16",
+            Some(RC::F32),
+            ptx_sum_lowp("mrt_sum_bf16", "bf16"),
+        ),
+        "wukong_sum_f16" | "wukong_sum_f16_parallel" => (
+            "mrt_sum_f16",
+            Some(RC::F32),
+            ptx_sum_lowp("mrt_sum_f16", "f16"),
+        ),
         "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => (
             "mrt_reduce_bf16",
             Some(RC::F32),
@@ -2480,7 +2568,11 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
             None,
             ptx_axpby_lowp("mrt_axpby_bf16", "bf16"),
         ),
-        "wukong_axpby_f16" => ("mrt_axpby_f16", None, ptx_axpby_lowp("mrt_axpby_f16", "f16")),
+        "wukong_axpby_f16" => (
+            "mrt_axpby_f16",
+            None,
+            ptx_axpby_lowp("mrt_axpby_f16", "f16"),
+        ),
         // Two-arg transcendentals (pow/atan2/hypot), op-gated in lower_call.
         "wukong_vmath2_f32" => ("mrt_vmath2", None, PTX_VMATH2.to_string()),
         // Streaming elementwise act(a*x + b*y + c) (residual add, fused bias/act).
@@ -3864,7 +3956,10 @@ fn run_on_device(
         // Persist the PTX so a JIT/ptxas error (otherwise an opaque driver code) is debuggable.
         let p = std::env::temp_dir().join(format!("{key}.ptx"));
         let _ = std::fs::write(&p, ptx);
-        format!("gpu-native JIT/load failed: {e:?}\n  (PTX written to {})", p.display())
+        format!(
+            "gpu-native JIT/load failed: {e:?}\n  (PTX written to {})",
+            p.display()
+        )
     })?;
 
     let host = new_ctx_host();
@@ -3974,7 +4069,10 @@ mod tests {
         );
         // And the splice really produces a kernel (markers in the right order, non-empty body).
         let k = ptx_vmath_lowp("mrt_vmath_bf16", "bf16").expect("bf16 vmath kernel");
-        assert!(k.contains("cvt.f32.bf16"), "spliced kernel lost its bf16 input widen");
+        assert!(
+            k.contains("cvt.f32.bf16"),
+            "spliced kernel lost its bf16 input widen"
+        );
         assert!(k.is_ascii(), "PTX must stay ASCII");
     }
 
@@ -4030,7 +4128,10 @@ fn main() -> i32 {
                     "{what}@O{opt}: must open with HDR_SM80 (`.version 7.8` / `.target sm_80`), got: {:?}",
                     ptx.lines().take(3).collect::<Vec<_>>()
                 );
-                assert!(ptx.contains(TARGET_SM80), "{what}@O{opt}: lost the sm_80 floor");
+                assert!(
+                    ptx.contains(TARGET_SM80),
+                    "{what}@O{opt}: lost the sm_80 floor"
+                );
                 assert!(
                     !ptx.contains(TARGET_SM89),
                     "{what}@O{opt}: `{TARGET_SM89}` loads on zero A100s and nothing here needs Ada"
@@ -4052,14 +4153,21 @@ fn main() -> i32 {
     /// Needs no CUDA device.
     #[test]
     fn integer_lines_compare_exactly() {
-        for (gpu, cpu) in [("10000", "10009"), ("10000", "9997"), ("32968", "33125"), ("3141", "3140")]
-        {
+        for (gpu, cpu) in [
+            ("10000", "10009"),
+            ("10000", "9997"),
+            ("32968", "33125"),
+            ("3141", "3140"),
+        ] {
             assert!(
                 !line_matches(gpu, cpu),
                 "integer line {gpu} must not match the oracle's {cpu}"
             );
         }
-        assert!(!outputs_match(b"10000\n10000\n32968\n3141\n", b"10009\n9997\n33125\n3140\n"));
+        assert!(!outputs_match(
+            b"10000\n10000\n32968\n3141\n",
+            b"10009\n9997\n33125\n3140\n"
+        ));
         // Equal integers still match, in any spelling that parses to the same value.
         assert!(line_matches("12345678901", "12345678901"));
         assert!(line_matches("-0", "0"));
@@ -4079,7 +4187,8 @@ fn main() -> i32 {
             return None;
         }
         let mut interner = Interner::new();
-        let (module, pd) = wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        let (module, pd) =
+            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
         if pd.iter().any(|d| d.is_error()) {
             return None;
         }
@@ -4284,7 +4393,10 @@ fn main() -> i32 {
             }
         }
         if !faults.is_empty() {
-            eprintln!("-- driver FAULTS ({}, root causes only — no cascade):", faults.len());
+            eprintln!(
+                "-- driver FAULTS ({}, root causes only — no cascade):",
+                faults.len()
+            );
             for f in &faults {
                 eprintln!("   {f}");
             }

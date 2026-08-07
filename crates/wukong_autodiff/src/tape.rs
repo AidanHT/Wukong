@@ -698,9 +698,10 @@ impl<'a> Vjp<'a> {
         if self.fwd.params.contains(&buf) {
             return Ok(None); // a non-differentiated input (e.g. the target labels)
         }
-        let count = *self.buf_count.get(&buf).ok_or_else(|| {
-            format!("autodiff: unknown size for intermediate buffer v{}", buf.0)
-        })?;
+        let count = *self
+            .buf_count
+            .get(&buf)
+            .ok_or_else(|| format!("autodiff: unknown size for intermediate buffer v{}", buf.0))?;
         let gb = self.alloc_buf(count);
         self.buf_adj.insert(buf, gb);
         Ok(Some(gb))

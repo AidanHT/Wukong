@@ -179,9 +179,7 @@ impl VecKernel {
         let mut stored: Vec<Option<f32>> = vec![None; self.streams as usize];
         for op in &self.ops {
             let v = match *op {
-                VecOp::Load { stream } => {
-                    stored[stream as usize].unwrap_or_else(|| load(stream))
-                }
+                VecOp::Load { stream } => stored[stream as usize].unwrap_or_else(|| load(stream)),
                 VecOp::Splat { scalar: k } => scalar(k),
                 VecOp::Const { bits } => f32::from_bits(bits),
                 VecOp::Bin { op, a, b } => {
@@ -193,7 +191,9 @@ impl VecKernel {
                         VecBin::Div => x / y,
                     }
                 }
-                VecOp::Fma { a, b, c } => vals[a as usize].mul_add(vals[b as usize], vals[c as usize]),
+                VecOp::Fma { a, b, c } => {
+                    vals[a as usize].mul_add(vals[b as usize], vals[c as usize])
+                }
                 VecOp::Sqrt { a } => vals[a as usize].sqrt(),
                 VecOp::Neg { a } => f32::from_bits(vals[a as usize].to_bits() ^ 0x8000_0000),
                 VecOp::Cmp { pred, a, b } => {
@@ -266,7 +266,9 @@ impl VecKernel {
         mut load: impl FnMut(u32, usize) -> f32,
         scalar: impl Fn(u32) -> f32,
     ) -> f32 {
-        let red = self.reduce.expect("eval_reduction on a non-reduction kernel");
+        let red = self
+            .reduce
+            .expect("eval_reduction on a non-reduction kernel");
         let lanes = LANES_USIZE;
         let u = self.reduction_unroll() as usize;
         // Fold one lane's addend into its accumulator: a fused `acc = fma(X, Y, acc)` in a single
@@ -374,8 +376,10 @@ impl VecKernel {
             }
             for v in op_operands(o) {
                 // Hoisted (Splat/Const) values never occupy a body register.
-                let hoisted =
-                    matches!(self.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. });
+                let hoisted = matches!(
+                    self.ops[v as usize],
+                    VecOp::Splat { .. } | VecOp::Const { .. }
+                );
                 if !hoisted && last_use[v as usize] == i {
                     live.retain(|&x| x != v as usize);
                 }

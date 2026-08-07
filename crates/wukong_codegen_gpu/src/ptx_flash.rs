@@ -180,7 +180,10 @@ fn entry_untiled(d: usize, warps: u32) -> String {
 /// into shared memory and reuse it (the launcher must match the block dim `32·warps`).
 fn entry_tiled(d: usize, warps: u32) -> String {
     assert!(d % 32 == 0, "D must be a multiple of 32");
-    assert!(1024 % d == 0, "D must divide 1024 (key-block tiling: BK = 1024/D)");
+    assert!(
+        1024 % d == 0,
+        "D must divide 1024 (key-block tiling: BK = 1024/D)"
+    );
     let r = d / 32; // values per lane
     let bk = 1024 / d; // keys per shared-memory block (BK·D = 1024 ⇒ 8 KB SMEM, uniform across D)
     let nthreads = 32 * warps; // threads per CTA
@@ -276,7 +279,9 @@ fn entry_tiled(d: usize, warps: u32) -> String {
     s += "    mov.f32 %m,%mnew;\n";
     s += &format!("    add.u32 %jj,%jj,1;\n    bra JJ_{name};\n");
     // barrier: every thread (active rows post-compute, inactive rows straight here) before next overwrite
-    s += &format!("AFTER_{name}:\n    bar.sync 0;\n    add.u32 %kblock,%kblock,{bk};\n    bra KB_{name};\n");
+    s += &format!(
+        "AFTER_{name}:\n    bar.sync 0;\n    add.u32 %kblock,%kblock,{bk};\n    bra KB_{name};\n"
+    );
 
     // O[row][lane+32r] = acc[r] / l   (only real rows store)
     s += &format!("KBDONE_{name}:\n    @!%active bra RET_{name};\n");
@@ -410,7 +415,7 @@ fn entry_wmma(d: usize) -> String {
     // online softmax over smemS row (lane==row, lanes 0..15): rmax→m→corr→P(f16)→l
     s += &format!("    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra SOFTDONE_{name};\n");
     s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_s};\n    mul.lo.s32 %tmp2,%lane,64;\n    add.u32 %sa,%tmp,%tmp2;\n"); // %sa := &smemS[lane][0] (row stride 16 f32 = 64 B)
-    // rmax = max_c scale*smemS[lane][c]
+                                                                                                                                                   // rmax = max_c scale*smemS[lane][c]
     s += "    mov.f32 %rmax,0fFF800000;\n";
     for c in 0..16 {
         s += &format!("    ld.shared.f32 %scv,[%sa+{}];\n    mul.f32 %scv,%scv,%scale;\n    max.f32 %rmax,%rmax,%scv;\n", c * 4);
@@ -769,7 +774,10 @@ fn entry_mma_reg(d: usize, causal: bool) -> String {
             s += &format!("    mov.f32 %s{nk}_{r},0f00000000;\n");
         }
         // gkey = kb + 8*nk + grp  (the key column n=grp for this n-tile)
-        s += &format!("    add.u32 %gkey,%kb,{};\n    add.u32 %gkey,%gkey,%grp;\n", nk * 8);
+        s += &format!(
+            "    add.u32 %gkey,%kb,{};\n    add.u32 %gkey,%gkey,%grp;\n",
+            nk * 8
+        );
         for kt in 0..ktq {
             // b0=pack(K[gkey][16kt+tg2], K[gkey][16kt+tg2+1]); b1=pack(K[gkey][16kt+tg2+8],..+9)
             s += &format!("    mul.lo.s32 %tmp,%gkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%K,%off;\n    ld.global.b32 %b0,[%base];\n", kt * 16);
@@ -785,12 +793,18 @@ fn entry_mma_reg(d: usize, causal: bool) -> String {
     if causal {
         s += "    add.u32 %ck0,%kb,%tg2;\n    add.u32 %ck1,%ck0,1;\n    add.u32 %ck8,%ck0,8;\n    add.u32 %ck9,%ck8,1;\n";
         for (sreg, key, qr) in [
-            ("%s0_0", "%ck0", "%qr0"), ("%s0_1", "%ck1", "%qr0"),
-            ("%s0_2", "%ck0", "%qr1"), ("%s0_3", "%ck1", "%qr1"),
-            ("%s1_0", "%ck8", "%qr0"), ("%s1_1", "%ck9", "%qr0"),
-            ("%s1_2", "%ck8", "%qr1"), ("%s1_3", "%ck9", "%qr1"),
+            ("%s0_0", "%ck0", "%qr0"),
+            ("%s0_1", "%ck1", "%qr0"),
+            ("%s0_2", "%ck0", "%qr1"),
+            ("%s0_3", "%ck1", "%qr1"),
+            ("%s1_0", "%ck8", "%qr0"),
+            ("%s1_1", "%ck9", "%qr0"),
+            ("%s1_2", "%ck8", "%qr1"),
+            ("%s1_3", "%ck9", "%qr1"),
         ] {
-            s += &format!("    setp.gt.u32 %p0,{key},{qr};\n    selp.f32 {sreg},0fFF800000,{sreg},%p0;\n");
+            s += &format!(
+                "    setp.gt.u32 %p0,{key},{qr};\n    selp.f32 {sreg},0fFF800000,{sreg},%p0;\n"
+            );
         }
     }
 
@@ -826,7 +840,7 @@ fn entry_mma_reg(d: usize, causal: bool) -> String {
     s += "    add.f32 %psum0,%tp0,%tp1;\n    add.f32 %psum0,%psum0,%tp2;\n    add.f32 %psum0,%psum0,%tp3;\n";
     s += &pack("%a0", "%tp0", "%tp1"); // n-tile0 keys tg2,tg2+1 (row grp)
     s += &pack("%a2", "%tp2", "%tp3"); // n-tile1 keys 8+tg2,8+tg2+1 (row grp)
-    // qrow1: tp0=p(s0_2), tp1=p(s0_3), tp2=p(s1_2), tp3=p(s1_3)
+                                       // qrow1: tp0=p(s0_2), tp1=p(s0_3), tp2=p(s1_2), tp3=p(s1_3)
     s += &prob("%tp0", "%s0_2", "%mnew1");
     s += &prob("%tp1", "%s0_3", "%mnew1");
     s += &prob("%tp2", "%s1_2", "%mnew1");
@@ -834,7 +848,7 @@ fn entry_mma_reg(d: usize, causal: bool) -> String {
     s += "    add.f32 %psum1,%tp0,%tp1;\n    add.f32 %psum1,%psum1,%tp2;\n    add.f32 %psum1,%psum1,%tp3;\n";
     s += &pack("%a1", "%tp0", "%tp1"); // n-tile0 keys tg2,tg2+1 (row grp+8)
     s += &pack("%a3", "%tp2", "%tp3"); // n-tile1 keys 8+tg2,8+tg2+1 (row grp+8)
-    // reduce the per-lane partial row sums across the tg-group, then l = l·corr + Σp.
+                                       // reduce the per-lane partial row sums across the tg-group, then l = l·corr + Σp.
     for off in [1, 2] {
         s += &format!("    shfl.sync.bfly.b32 %rt,%psum0,{off},0x1f,0xffffffff;\n    add.f32 %psum0,%psum0,%rt;\n");
         s += &format!("    shfl.sync.bfly.b32 %rt,%psum1,{off},0x1f,0xffffffff;\n    add.f32 %psum1,%psum1,%rt;\n");
@@ -846,7 +860,7 @@ fn entry_mma_reg(d: usize, causal: bool) -> String {
     //    b0=pack(V[kb+tg2][8nt+grp], V[kb+tg2+1][8nt+grp]); b1=pack(V[kb+tg2+8][..], V[kb+tg2+9][..]).
     for nt in 0..nto {
         s += &format!("    add.u32 %idx,%grp,{};\n", nt * 8); // hdim column = 8nt+grp
-        // b0: keys kb+tg2, kb+tg2+1 (stride d in global ⇒ two u16 loads)
+                                                              // b0: keys kb+tg2, kb+tg2+1 (stride d in global ⇒ two u16 loads)
         s += "    add.u32 %gkey,%kb,%tg2;\n";
         s += &format!("    mul.lo.s32 %tmp,%gkey,{d};\n    add.u32 %tmp,%tmp,%idx;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%V,%off;\n    ld.global.u16 %h0,[%base];\n");
         s += &format!("    add.u32 %tmp,%tmp,{d};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%V,%off;\n    ld.global.u16 %h1,[%base];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b0,%h0,%h1;\n");
@@ -1033,7 +1047,9 @@ fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool, single_buf: boo
         }
         s += &format!("    @%pnext bra NOPF_{name};\n");
         s += &stage("%next", "%bufp");
-        s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
+        s += &format!(
+            "    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n"
+        );
         s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
         s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
     }
@@ -1050,7 +1066,10 @@ fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool, single_buf: boo
             // 16-hdim contraction tile. One conflict-free warp-collective load replaces the 2 strided
             // `ld.shared.b32` (which 8-way bank-conflict: a grp's lanes read keys 0,2,4,6 at fixed hdim).
             for kt in 0..ktq {
-                s += &format!("    and.b32 %lkey,%lane,7;\n    add.u32 %lkey,%lkey,{};\n", nk * 8);
+                s += &format!(
+                    "    and.b32 %lkey,%lane,7;\n    add.u32 %lkey,%lkey,{};\n",
+                    nk * 8
+                );
                 s += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n");
                 s += "    shr.u32 %idx,%lane,3;\n    and.b32 %idx,%idx,1;\n    shl.b32 %idx,%idx,3;\n";
                 s += &format!("    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n", kt * 16);
@@ -1072,12 +1091,18 @@ fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool, single_buf: boo
     if causal {
         s += "    add.u32 %ck0,%kb,%tg2;\n    add.u32 %ck1,%ck0,1;\n    add.u32 %ck8,%ck0,8;\n    add.u32 %ck9,%ck8,1;\n";
         for (sreg, key, qr) in [
-            ("%s0_0", "%ck0", "%qr0"), ("%s0_1", "%ck1", "%qr0"),
-            ("%s0_2", "%ck0", "%qr1"), ("%s0_3", "%ck1", "%qr1"),
-            ("%s1_0", "%ck8", "%qr0"), ("%s1_1", "%ck9", "%qr0"),
-            ("%s1_2", "%ck8", "%qr1"), ("%s1_3", "%ck9", "%qr1"),
+            ("%s0_0", "%ck0", "%qr0"),
+            ("%s0_1", "%ck1", "%qr0"),
+            ("%s0_2", "%ck0", "%qr1"),
+            ("%s0_3", "%ck1", "%qr1"),
+            ("%s1_0", "%ck8", "%qr0"),
+            ("%s1_1", "%ck9", "%qr0"),
+            ("%s1_2", "%ck8", "%qr1"),
+            ("%s1_3", "%ck9", "%qr1"),
         ] {
-            s += &format!("    setp.gt.u32 %p0,{key},{qr};\n    selp.f32 {sreg},0fFF800000,{sreg},%p0;\n");
+            s += &format!(
+                "    setp.gt.u32 %p0,{key},{qr};\n    selp.f32 {sreg},0fFF800000,{sreg},%p0;\n"
+            );
         }
     }
 
@@ -1295,7 +1320,9 @@ fn entry_mma_reg_pipe_sp(d: usize) -> String {
     s += "    mov.u32 %kahead,0;\n";
     s += &qkt("s", "%kahead");
     s += &format!("    mov.u32 %vcur,{vbase};\n    mov.u32 %kahead,{ksz};\n");
-    s += &format!("    mov.u32 %next1,16;\n    setp.lt.u32 %p0,%next1,%S;\n    @!%p0 bra PNK1_{name};\n");
+    s += &format!(
+        "    mov.u32 %next1,16;\n    setp.lt.u32 %p0,%next1,%S;\n    @!%p0 bra PNK1_{name};\n"
+    );
     s += &stage_one("%K", "%next1", "%kahead");
     s += &format!("PNK1_{name}:\n");
     s += &stage_one("%V", "%kb", "%vcur");
@@ -1312,7 +1339,9 @@ fn entry_mma_reg_pipe_sp(d: usize) -> String {
     s += &stage_one("%K", "%next2", "%kdst");
     s += &format!("SKPK_{name}:\n    @!%pa bra SKPV_{name};\n");
     s += &stage_one("%V", "%next1", "%vdst");
-    s += &format!("SKPV_{name}:\n    @!%pa bra NOCM_{name};\n    cp.async.commit_group;\nNOCM_{name}:\n");
+    s += &format!(
+        "SKPV_{name}:\n    @!%pa bra NOCM_{name};\n    cp.async.commit_group;\nNOCM_{name}:\n"
+    );
     // wait: not-last ⇒ 2 groups in flight, wait_group 1 (drain tile i's group); last ⇒ 1, wait_group 0.
     s += &format!("    @%pa bra W1_{name};\n    cp.async.wait_group 0;\n    bra WD_{name};\nW1_{name}:\n    cp.async.wait_group 1;\nWD_{name}:\n    bar.sync 0;\n");
     // QKᵀ-ahead (tile i+1) → %sn, BEFORE softmax(i) so the score mma overlaps the softmax SFU work.
@@ -1501,7 +1530,9 @@ fn entry_mma_reg_pipe_hs(d: usize) -> String {
     s += "    add.u32 %next,%kb,16;\n    setp.ge.u32 %pnext,%next,%S;\n";
     s += &format!("    @%pnext bra NOPF_{name};\n");
     s += &stage("%next", "%bufp");
-    s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
+    s += &format!(
+        "    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n"
+    );
     s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
     s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
 
@@ -1559,7 +1590,10 @@ fn entry_mma_reg_pipe_hs(d: usize) -> String {
 
     // 4. O += P.V : HALF the PV — V columns hdim ∈ [hbase, hbase+hh). V read from SMEM at bufc+ksz.
     for nt in 0..nto {
-        s += &format!("    add.u32 %idx,%grp,{};\n    add.u32 %idx,%idx,%hbase;\n", nt * 8);
+        s += &format!(
+            "    add.u32 %idx,%grp,{};\n    add.u32 %idx,%idx,%hbase;\n",
+            nt * 8
+        );
         s += &format!("    mul.lo.u32 %tmp,%tg2,{d};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n");
         s += &format!("    ld.shared.u16 %hr0,[%sbase];\n    ld.shared.u16 %hr1,[%sbase+{}];\n    shl.b32 %hr1,%hr1,16;\n    or.b32 %b0,%hr0,%hr1;\n", 2 * d);
         s += &format!("    ld.shared.u16 %hr0,[%sbase+{}];\n    ld.shared.u16 %hr1,[%sbase+{}];\n    shl.b32 %hr1,%hr1,16;\n    or.b32 %b1,%hr0,%hr1;\n", 16 * d, 18 * d);
@@ -1694,7 +1728,9 @@ fn entry_mma_reg_pipe_mw(d: usize, warps: usize) -> String {
     s += "    add.u32 %next,%kb,16;\n    setp.ge.u32 %pnext,%next,%S;\n";
     s += &format!("    @%pnext bra NOPF_{name};\n");
     s += &stage("%next", "%bufp");
-    s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
+    s += &format!(
+        "    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n"
+    );
     s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
     s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
     // per-warp compute (active warps only); inactive warps fall through to the swap + next iteration.
@@ -1895,7 +1931,9 @@ fn entry_mma_reg_pipe_wide(d: usize, nkb: usize) -> String {
     s += &format!("    add.u32 %next,%kb,{bk};\n    setp.ge.u32 %pnext,%next,%S;\n");
     s += &format!("    @%pnext bra NOPF_{name};\n");
     s += &stage("%next", "%bufp");
-    s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
+    s += &format!(
+        "    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n"
+    );
     s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
     s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
 
@@ -2118,7 +2156,9 @@ fn entry_mma_reg_pipe_rope(d: usize) -> String {
     s += "    add.u32 %next,%kb,16;\n    setp.ge.u32 %pnext,%next,%S;\n";
     s += &format!("    @%pnext bra NOPF_{name};\n");
     s += &stage("%next", "%bufp");
-    s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
+    s += &format!(
+        "    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n"
+    );
     s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
     s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
 
@@ -2246,7 +2286,10 @@ fn entry_mma_reg_pipe_rope(d: usize) -> String {
 /// per-element diagonal mask as `flash_d{d}_mpc`. **`pv_ldmatrix`** (`_lm`, the D=128 production feed):
 /// K via `ldmatrix.x2`, V via `ldmatrix.x2.trans`, exactly as [`entry_mma_reg_pipe`]'s `_lm` variants.
 fn entry_mma_reg_pipe_ws(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
-    assert!(d % 32 == 0, "ws flash needs D % 32 == 0 (64-thread cooperative stage)");
+    assert!(
+        d % 32 == 0,
+        "ws flash needs D % 32 == 0 (64-thread cooperative stage)"
+    );
     let ktq = d / 16; // Q.Kt contraction tiles (over hdim)
     let nto = d / 8; // P.V output n-tiles (over hdim)
     let ksz = 16 * d * 2; // bytes of one staged K block (== one V block)
@@ -2356,7 +2399,10 @@ fn entry_mma_reg_pipe_ws(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
         if pv_ldmatrix {
             // K via `ldmatrix.x2` (no trans) — same as entry_mma_reg_pipe's `_lm` QK feed.
             for kt in 0..ktq {
-                qk += &format!("    and.b32 %lkey,%lane,7;\n    add.u32 %lkey,%lkey,{};\n", nk * 8);
+                qk += &format!(
+                    "    and.b32 %lkey,%lane,7;\n    add.u32 %lkey,%lkey,{};\n",
+                    nk * 8
+                );
                 qk += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n");
                 qk += "    shr.u32 %idx,%lane,3;\n    and.b32 %idx,%idx,1;\n    shl.b32 %idx,%idx,3;\n";
                 qk += &format!("    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n", kt * 16);
@@ -2377,12 +2423,18 @@ fn entry_mma_reg_pipe_ws(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
     if causal {
         qk += "    add.u32 %ck0,%kb,%tg2;\n    add.u32 %ck1,%ck0,1;\n    add.u32 %ck8,%ck0,8;\n    add.u32 %ck9,%ck8,1;\n";
         for (sreg, key, qr) in [
-            ("%s0_0", "%ck0", "%qr0"), ("%s0_1", "%ck1", "%qr0"),
-            ("%s0_2", "%ck0", "%qr1"), ("%s0_3", "%ck1", "%qr1"),
-            ("%s1_0", "%ck8", "%qr0"), ("%s1_1", "%ck9", "%qr0"),
-            ("%s1_2", "%ck8", "%qr1"), ("%s1_3", "%ck9", "%qr1"),
+            ("%s0_0", "%ck0", "%qr0"),
+            ("%s0_1", "%ck1", "%qr0"),
+            ("%s0_2", "%ck0", "%qr1"),
+            ("%s0_3", "%ck1", "%qr1"),
+            ("%s1_0", "%ck8", "%qr0"),
+            ("%s1_1", "%ck9", "%qr0"),
+            ("%s1_2", "%ck8", "%qr1"),
+            ("%s1_3", "%ck9", "%qr1"),
         ] {
-            qk += &format!("    setp.gt.u32 %p0,{key},{qr};\n    selp.f32 {sreg},0fFF800000,{sreg},%p0;\n");
+            qk += &format!(
+                "    setp.gt.u32 %p0,{key},{qr};\n    selp.f32 {sreg},0fFF800000,{sreg},%p0;\n"
+            );
         }
     }
 
@@ -2529,7 +2581,10 @@ fn entry_mma_reg_pipe_ws(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
 /// empty groups to keep per-thread group counts uniform. Buffer registers rotate 3-way
 /// (`bufc←bufp←bufn←bufc`). Non-causal only (the A/B probe regime); causal follows if the ring wins.
 fn entry_mma_reg_pipe_ws3(d: usize, pv_ldmatrix: bool) -> String {
-    assert!(d % 32 == 0, "ws3 flash needs D % 32 == 0 (64-thread cooperative stage)");
+    assert!(
+        d % 32 == 0,
+        "ws3 flash needs D % 32 == 0 (64-thread cooperative stage)"
+    );
     let ktq = d / 16; // Q.Kt contraction tiles (over hdim)
     let nto = d / 8; // P.V output n-tiles (over hdim)
     let ksz = 16 * d * 2; // bytes of one staged K block (== one V block)
@@ -2620,7 +2675,10 @@ fn entry_mma_reg_pipe_ws3(d: usize, pv_ldmatrix: bool) -> String {
         }
         if pv_ldmatrix {
             for kt in 0..ktq {
-                qk += &format!("    and.b32 %lkey,%lane,7;\n    add.u32 %lkey,%lkey,{};\n", nk * 8);
+                qk += &format!(
+                    "    and.b32 %lkey,%lane,7;\n    add.u32 %lkey,%lkey,{};\n",
+                    nk * 8
+                );
                 qk += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n");
                 qk += "    shr.u32 %idx,%lane,3;\n    and.b32 %idx,%idx,1;\n    shl.b32 %idx,%idx,3;\n";
                 qk += &format!("    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n", kt * 16);
@@ -2849,7 +2907,9 @@ mod tests {
         ptx.match_indices(".visible .entry ")
             .map(|(i, m)| {
                 let rest = &ptx[i + m.len()..];
-                &rest[..rest.find('(').expect("an entry declaration opens its param list")]
+                &rest[..rest
+                    .find('(')
+                    .expect("an entry declaration opens its param list")]
             })
             .collect()
     }
@@ -2863,7 +2923,10 @@ mod tests {
     fn flash_ptx_is_pure_ascii() {
         let ptx = flash_ptx();
         if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
-            panic!("flash PTX must be pure ASCII (ptxas fatal otherwise) -- line {}: {line}", i + 1);
+            panic!(
+                "flash PTX must be pure ASCII (ptxas fatal otherwise) -- line {}: {line}",
+                i + 1
+            );
         }
     }
 
@@ -2890,15 +2953,27 @@ mod tests {
     #[test]
     fn flash_ptx_is_structurally_well_formed() {
         let ptx = flash_ptx();
-        assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "unbalanced braces");
+        assert_eq!(
+            ptx.matches('{').count(),
+            ptx.matches('}').count(),
+            "unbalanced braces"
+        );
         let names = entry_names(ptx);
         assert!(!names.is_empty(), "the module must define kernels");
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), names.len(), "duplicate .visible .entry name in the flash module");
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "duplicate .visible .entry name in the flash module"
+        );
         for n in &names {
-            assert_eq!(ptx.matches(&format!(".visible .entry {n}(")).count(), 1, "{n} declared twice");
+            assert_eq!(
+                ptx.matches(&format!(".visible .entry {n}(")).count(),
+                1,
+                "{n} declared twice"
+            );
         }
     }
 
@@ -2916,22 +2991,32 @@ mod tests {
         for &d in &SUPPORTED_D {
             for tiled in [false, true] {
                 let (name, _) = crate::gpu::flash_plan_forced(d, 512, tiled);
-                assert!(defined(&name), "flash_plan_forced({d}, .., {tiled}) picks undefined entry `{name}`");
+                assert!(
+                    defined(&name),
+                    "flash_plan_forced({d}, .., {tiled}) picks undefined entry `{name}`"
+                );
             }
         }
         // The tensor-core dispatch (`wmma_flash_applies` gates d to 64/128).
         for d in [64usize, 128] {
             for s in [512usize, 1024, 4096] {
                 let name = crate::gpu::wmma_flash_entry(d, s);
-                assert!(defined(name), "wmma_flash_entry({d}, {s}) picks undefined entry `{name}`");
+                assert!(
+                    defined(name),
+                    "wmma_flash_entry({d}, {s}) picks undefined entry `{name}`"
+                );
             }
         }
         // The warp-specialized override (enabled + S >= 4096); the routing table itself is gated in
         // gpu.rs, here only its *products* must exist.
         for d in [64usize, 128] {
-            let name = crate::gpu::ws_flash_route_with(true, d, 4096)
-                .unwrap_or_else(|| panic!("ws_flash_route_with(true, {d}, 4096) must route somewhere"));
-            assert!(defined(name), "ws_flash_route_with(true, {d}, 4096) picks undefined entry `{name}`");
+            let name = crate::gpu::ws_flash_route_with(true, d, 4096).unwrap_or_else(|| {
+                panic!("ws_flash_route_with(true, {d}, 4096) must route somewhere")
+            });
+            assert!(
+                defined(name),
+                "ws_flash_route_with(true, {d}, 4096) picks undefined entry `{name}`"
+            );
         }
     }
 }

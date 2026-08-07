@@ -436,7 +436,9 @@ impl AffineExpr {
             return other.scale(k);
         }
         for (sym_side, lin) in [(self, other), (other, self)] {
-            let Some(v) = sym_side.as_symbol() else { continue };
+            let Some(v) = sym_side.as_symbol() else {
+                continue;
+            };
             if !lin.terms.is_empty() {
                 continue; // v · (w + …) — a product of two invariants, not representable
             }
@@ -1118,7 +1120,9 @@ impl<'a> LoopCtx<'a> {
             return false;
         }
         // A block parameter defined in the loop is where a cycle closes: assume it varies.
-        let Some(op) = self.op_of(v) else { return false };
+        let Some(op) = self.op_of(v) else {
+            return false;
+        };
         let pure = matches!(
             op,
             Op::ConstInt(..)
@@ -1139,7 +1143,9 @@ impl<'a> LoopCtx<'a> {
         seen.insert(v.0, false);
         let mut uses = Vec::new();
         each_op_use(op, &mut |u| uses.push(u));
-        let ok = uses.into_iter().all(|u| self.value_invariant(u, seen, depth + 1));
+        let ok = uses
+            .into_iter()
+            .all(|u| self.value_invariant(u, seen, depth + 1));
         seen.insert(v.0, ok);
         ok
     }
@@ -1193,17 +1199,28 @@ impl<'a> LoopCtx<'a> {
         // reduction, or a merge we do not model.
         let op = self.op_of(v)?;
         match op {
-            Op::ConstInt(c, ty) if ty.is_int() => Some(AffineExpr::constant(i64::try_from(*c).ok()?)),
+            Op::ConstInt(c, ty) if ty.is_int() => {
+                Some(AffineExpr::constant(i64::try_from(*c).ok()?))
+            }
             Op::Bin(BinOp::Add, a, b) => {
-                let (x, y) = (self.affine_of(*a, memo, depth + 1)?, self.affine_of(*b, memo, depth + 1)?);
+                let (x, y) = (
+                    self.affine_of(*a, memo, depth + 1)?,
+                    self.affine_of(*b, memo, depth + 1)?,
+                );
                 x.add(&y)
             }
             Op::Bin(BinOp::Sub, a, b) => {
-                let (x, y) = (self.affine_of(*a, memo, depth + 1)?, self.affine_of(*b, memo, depth + 1)?);
+                let (x, y) = (
+                    self.affine_of(*a, memo, depth + 1)?,
+                    self.affine_of(*b, memo, depth + 1)?,
+                );
                 x.sub(&y)
             }
             Op::Bin(BinOp::Mul, a, b) => {
-                let (x, y) = (self.affine_of(*a, memo, depth + 1)?, self.affine_of(*b, memo, depth + 1)?);
+                let (x, y) = (
+                    self.affine_of(*a, memo, depth + 1)?,
+                    self.affine_of(*b, memo, depth + 1)?,
+                );
                 x.mul(&y)
             }
             // `x << k` with a literal k is `x * 2^k`. Signed shifts by >= 63 are not modelled.
@@ -1264,7 +1281,9 @@ fn find_basic_ivs(ctx: &LoopCtx<'_>, l: &NaturalLoop) -> Vec<InductionVar> {
     let header = &f.blocks[l.header.0 as usize];
     let mut ivs = Vec::new();
     for (k, &p) in header.params.iter().enumerate() {
-        let Some(next) = latch_arg(f, l, k) else { continue };
+        let Some(next) = latch_arg(f, l, k) else {
+            continue;
+        };
         if next == p {
             continue; // carried unchanged — an invariant, not an IV
         }
@@ -1287,10 +1306,12 @@ fn find_basic_ivs(ctx: &LoopCtx<'_>, l: &NaturalLoop) -> Vec<InductionVar> {
             }
             // `p - c` is a countdown. Only a literal is accepted: there is no MIR value for `-s`
             // to point `IvStep::Invariant` at, and inventing one would be a transform.
-            Op::Bin(BinOp::Sub, a, b) if *a == p => match ctx.const_int(*b).and_then(i64::checked_neg) {
-                Some(c) => IvStep::Const(c),
-                None => continue,
-            },
+            Op::Bin(BinOp::Sub, a, b) if *a == p => {
+                match ctx.const_int(*b).and_then(i64::checked_neg) {
+                    Some(c) => IvStep::Const(c),
+                    None => continue,
+                }
+            }
             _ => continue,
         };
         ivs.push(InductionVar {
@@ -1348,7 +1369,11 @@ fn exit_test(
     if !ctx.is_value_invariant(bound) {
         return None;
     }
-    let pred = if continue_on_true { pred } else { negate_cmp(pred)? };
+    let pred = if continue_on_true {
+        pred
+    } else {
+        negate_cmp(pred)?
+    };
     Some((idx, pred, bound, from))
 }
 
@@ -1393,7 +1418,14 @@ fn negate_cmp(p: CmpOp) -> Option<CmpOp> {
 /// The number of iterations, from the exit test. Requires the single exit to be tested in the
 /// **header** — a bottom-tested loop runs its body once before the test, which is a different
 /// count — and a constant step in the direction the predicate walks.
-fn trip_count(ctx: &LoopCtx<'_>, l: &NaturalLoop, iv: &InductionVar, pred: CmpOp, bound: ValueId, from: BlockId) -> TripCount {
+fn trip_count(
+    ctx: &LoopCtx<'_>,
+    l: &NaturalLoop,
+    iv: &InductionVar,
+    pred: CmpOp,
+    bound: ValueId,
+    from: BlockId,
+) -> TripCount {
     use CmpOp::*;
     if from != l.header {
         return TripCount::Unknown;
@@ -1431,7 +1463,11 @@ fn trip_count(ctx: &LoopCtx<'_>, l: &NaturalLoop, iv: &InductionVar, pred: CmpOp
         if !signed && (s < 0 || e < 0) {
             return TripCount::Unknown;
         }
-        let span = if ascending { e.checked_sub(s) } else { s.checked_sub(e) };
+        let span = if ascending {
+            e.checked_sub(s)
+        } else {
+            s.checked_sub(e)
+        };
         let Some(span) = span else {
             return TripCount::Unknown;
         };
@@ -1755,10 +1791,7 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
             }
         }
     }
-    if accesses
-        .iter()
-        .any(|a| matches!(a.addr, AddrForm::Unknown))
-    {
+    if accesses.iter().any(|a| matches!(a.addr, AddrForm::Unknown)) {
         return carried("an address the analysis could not decompose");
     }
     let mut needs_runtime_check = false;
@@ -1978,11 +2011,7 @@ pub fn dump_function_loops(f: &Function, name: &str) -> String {
         let _ = writeln!(out, "== loops in fn {name}: none ==");
         return out;
     }
-    let _ = writeln!(
-        out,
-        "== loops in fn {name}: {} ==",
-        forest.loops.len()
-    );
+    let _ = writeln!(out, "== loops in fn {name}: {} ==", forest.loops.len());
     for id in forest.innermost_first() {
         let l = forest.get(id);
         let _ = writeln!(
@@ -2035,7 +2064,11 @@ pub fn dump_function_loops(f: &Function, name: &str) -> String {
                 .start
                 .map(|s| format!("v{}", s.0))
                 .unwrap_or_else(|| "?".into());
-            let mark = if l.primary_iv == Some(i) { " [primary]" } else { "" };
+            let mark = if l.primary_iv == Some(i) {
+                " [primary]"
+            } else {
+                ""
+            };
             let _ = writeln!(
                 out,
                 "    iv v{} {} start {start} step {step} next v{}{mark}",
@@ -2185,7 +2218,6 @@ mod tests {
              while i < n { a = a + i; i = i + 1; } return a; } \
              fn main() -> i32 { return s(4); }",
             "s",
-
             1,
         );
         let forest = analyze_function(&f);
@@ -2216,7 +2248,6 @@ mod tests {
                  i = i + 1; } } \
              fn main() -> i32 { return 0; }",
             "mm",
-
             1,
         );
         let forest = analyze_function(&f);
@@ -2237,7 +2268,11 @@ mod tests {
         let outer: FxHashSet<u32> = forest.loops[0].blocks.iter().map(|b| b.0).collect();
         for l in &forest.loops[1..] {
             for b in &l.blocks {
-                assert!(outer.contains(&b.0), "inner block bb{} escapes the outer loop", b.0);
+                assert!(
+                    outer.contains(&b.0),
+                    "inner block bb{} escapes the outer loop",
+                    b.0
+                );
             }
         }
 
@@ -2260,12 +2295,14 @@ mod tests {
              let mut j: i32 = 0; while j < n { a = a + j; j = j + 1; } return a; } \
              fn main() -> i32 { return two(3); }",
             "two",
-
             1,
         );
         let forest = analyze_function(&f);
         assert_eq!(forest.loops.len(), 2, "{}", dump_function_loops(&f, "two"));
-        assert!(forest.loops.iter().all(|l| l.parent.is_none() && l.depth == 0));
+        assert!(forest
+            .loops
+            .iter()
+            .all(|l| l.parent.is_none() && l.depth == 0));
         assert!(forest.loops.iter().all(|l| l.children.is_empty()));
         // Disjoint block sets.
         let a: FxHashSet<u32> = forest.loops[0].blocks.iter().map(|b| b.0).collect();
@@ -2281,7 +2318,6 @@ mod tests {
              while i < n { if i % 2 == 0 { a = a + i; } else { a = a - i; } i = i + 1; } \
              return a; } fn main() -> i32 { return c(5); }",
             "c",
-
             1,
         );
         let forest = analyze_function(&f);
@@ -2297,7 +2333,6 @@ mod tests {
             "fn f(a: i32) -> i32 { if a > 0 { return a; } return -a; } \
              fn main() -> i32 { return f(1); }",
             "f",
-
             1,
         );
         assert!(analyze_function(&f).is_empty());
@@ -2511,7 +2546,11 @@ mod tests {
         assert_eq!(p.coeff, Coeff::Sym(a, 1));
         assert_eq!(p.terms, vec![(a, 1)]);
         assert_eq!(p.konst, 0);
-        assert_eq!(p.coeff.as_const(), None, "a symbolic stride is not a constant");
+        assert_eq!(
+            p.coeff.as_const(),
+            None,
+            "a symbolic stride is not a constant"
+        );
 
         // a * b (two invariants) is not representable.
         assert!(AffineExpr::symbol(a).mul(&AffineExpr::symbol(b)).is_none());
@@ -2555,10 +2594,16 @@ mod tests {
                 assert!(!*inclusive);
                 assert!(*signed);
             }
-            other => panic!("expected an affine trip count, got {other:?}: {}", dump_function_loops(&f, "s")),
+            other => panic!(
+                "expected an affine trip count, got {other:?}: {}",
+                dump_function_loops(&f, "s")
+            ),
         }
         // `i + 1` is derived from `i`.
-        assert!(l.derived.iter().any(|d| d.value == iv.next && d.expr.coeff == Coeff::Const(1)));
+        assert!(l
+            .derived
+            .iter()
+            .any(|d| d.value == iv.next && d.expr.coeff == Coeff::Const(1)));
     }
 
     #[test]
@@ -2566,12 +2611,36 @@ mod tests {
         // (source, expected iterations). Written as `while` loops so the front-end cannot fold
         // them into a recognized kernel.
         let cases: [(&str, u64, i64); 6] = [
-            ("let mut i: i32 = 0; while i < 100 { a = a + i; i = i + 1; }", 100, 1),
-            ("let mut i: i32 = 0; while i <= 9 { a = a + i; i = i + 1; }", 10, 1),
-            ("let mut i: i32 = 0; while i < 10 { a = a + i; i = i + 3; }", 4, 3),
-            ("let mut i: i32 = 0; while i < 0 { a = a + i; i = i + 1; }", 0, 1),
-            ("let mut i: i32 = 10; while i > 0 { a = a + i; i = i - 1; }", 10, -1),
-            ("let mut i: i32 = 10; while i >= 0 { a = a + i; i = i - 2; }", 6, -2),
+            (
+                "let mut i: i32 = 0; while i < 100 { a = a + i; i = i + 1; }",
+                100,
+                1,
+            ),
+            (
+                "let mut i: i32 = 0; while i <= 9 { a = a + i; i = i + 1; }",
+                10,
+                1,
+            ),
+            (
+                "let mut i: i32 = 0; while i < 10 { a = a + i; i = i + 3; }",
+                4,
+                3,
+            ),
+            (
+                "let mut i: i32 = 0; while i < 0 { a = a + i; i = i + 1; }",
+                0,
+                1,
+            ),
+            (
+                "let mut i: i32 = 10; while i > 0 { a = a + i; i = i - 1; }",
+                10,
+                -1,
+            ),
+            (
+                "let mut i: i32 = 10; while i >= 0 { a = a + i; i = i - 2; }",
+                6,
+                -2,
+            ),
         ];
         for (body, want, step) in cases {
             let src = format!("fn t() -> i32 {{ let mut a: i32 = 0; {body} return a; }} fn main() -> i32 {{ return t(); }}");
@@ -2603,7 +2672,12 @@ mod tests {
         );
         let forest = analyze_function(&f);
         let l = only_loop(&forest);
-        assert_eq!(l.trip, TripCount::Const(64), "{}", dump_function_loops(&f, "t"));
+        assert_eq!(
+            l.trip,
+            TripCount::Const(64),
+            "{}",
+            dump_function_loops(&f, "t")
+        );
     }
 
     #[test]
@@ -2641,7 +2715,12 @@ mod tests {
         );
         let forest = analyze_function(&f);
         let l = only_loop(&forest);
-        assert_eq!(l.ivs.len(), 2, "both counters are basic IVs: {}", dump_function_loops(&f, "t"));
+        assert_eq!(
+            l.ivs.len(),
+            2,
+            "both counters are basic IVs: {}",
+            dump_function_loops(&f, "t")
+        );
         let primary = l.primary().expect("the exit test picks one");
         assert_eq!(primary.step, IvStep::Const(1), "the exit test walks `i`");
         assert!(l.ivs.iter().any(|iv| iv.step == IvStep::Const(3)));
@@ -2683,10 +2762,9 @@ mod tests {
         );
         // `b[k*n + j]`: the stride is the runtime pitch `n`, so it is symbolic, not constant.
         assert!(
-            inner
-                .derived
-                .iter()
-                .any(|d| matches!(d.expr.coeff, Coeff::Sym(..)) && d.expr.coeff.as_const().is_none()),
+            inner.derived.iter().any(
+                |d| matches!(d.expr.coeff, Coeff::Sym(..)) && d.expr.coeff.as_const().is_none()
+            ),
             "expected a symbolic-stride derived IV\n{dump}"
         );
     }
@@ -2750,9 +2828,16 @@ mod tests {
         let forest = analyze_function(&f);
         let l = only_loop(&forest);
         let dump = dump_function_loops(&f, "t");
-        assert!(l.exits.len() >= 2, "the early return is a second exit\n{dump}");
+        assert!(
+            l.exits.len() >= 2,
+            "the early return is a second exit\n{dump}"
+        );
         assert_eq!(l.trip, TripCount::Unknown, "{dump}");
-        assert_eq!(l.primary().map(|iv| iv.step), Some(IvStep::Const(1)), "{dump}");
+        assert_eq!(
+            l.primary().map(|iv| iv.step),
+            Some(IvStep::Const(1)),
+            "{dump}"
+        );
     }
 
     #[test]
@@ -2805,12 +2890,10 @@ mod tests {
                     ),
                     (
                         vec![],
-                        vec![
-                            Inst {
-                                result: Some(ValueId(4)),
-                                op: Op::Cast(cast, ValueId(2), MirType::I64),
-                            },
-                        ],
+                        vec![Inst {
+                            result: Some(ValueId(4)),
+                            op: Op::Cast(cast, ValueId(2), MirType::I64),
+                        }],
                         Terminator::Br {
                             target: BlockId(1),
                             args: vec![ValueId(2)],
@@ -2925,7 +3008,9 @@ mod tests {
         let (_, l) = kernel_loop(src, "k");
         let l = &l;
         assert!(
-            l.accesses.iter().any(|a| matches!(a.addr, AddrForm::Unknown)),
+            l.accesses
+                .iter()
+                .any(|a| matches!(a.addr, AddrForm::Unknown)),
             "a gathered address is not affine: {:?}",
             l.accesses
         );

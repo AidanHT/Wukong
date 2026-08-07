@@ -93,19 +93,27 @@ pub fn classify_call(name: &str) -> CallClass {
     use CoopKind::*;
     let kind = match name {
         "wukong_sreduce_f32" | "wukong_sreduce_f32_parallel" => Reduce,
-        "wukong_dot_bf16" | "wukong_dot_bf16_parallel" | "wukong_dot_f16"
-        | "wukong_dot_f16_parallel" | "wukong_sum_bf16" | "wukong_sum_bf16_parallel"
-        | "wukong_sum_f16" | "wukong_sum_f16_parallel" | "wukong_reduce_bf16"
-        | "wukong_reduce_bf16_parallel" | "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => {
-            ReduceLowp
-        }
+        "wukong_dot_bf16"
+        | "wukong_dot_bf16_parallel"
+        | "wukong_dot_f16"
+        | "wukong_dot_f16_parallel"
+        | "wukong_sum_bf16"
+        | "wukong_sum_bf16_parallel"
+        | "wukong_sum_f16"
+        | "wukong_sum_f16_parallel"
+        | "wukong_reduce_bf16"
+        | "wukong_reduce_bf16_parallel"
+        | "wukong_reduce_f16"
+        | "wukong_reduce_f16_parallel" => ReduceLowp,
         "wukong_sgemm" | "wukong_sgemm_parallel" => Gemm,
         "wukong_sgemm_nt" | "wukong_sgemm_nt_parallel" => GemmNt,
         "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => GemmNtEpi,
         "wukong_i8gemm_nt" | "wukong_i8gemm_nt_parallel" => I8GemmNt,
         "wukong_norm_f32" | "wukong_norm_f32_parallel" => Norm,
         "wukong_norm_affine_f32" | "wukong_norm_affine_f32_parallel" => NormAffine,
-        "wukong_vmath_f32" | "wukong_vmath_f32_parallel" | "wukong_vmath_bf16"
+        "wukong_vmath_f32"
+        | "wukong_vmath_f32_parallel"
+        | "wukong_vmath_bf16"
         | "wukong_vmath_f16" => Vmath,
         "wukong_vmath2_f32" => Vmath2,
         "wukong_velem_f32" | "wukong_velem_f32_parallel" => Velem,
@@ -148,7 +156,11 @@ pub struct MegaPlan {
 
 impl MegaPlan {
     fn ineligible(reason: impl Into<String>) -> Self {
-        MegaPlan { eligible: false, reason: reason.into(), coop_ops: Vec::new() }
+        MegaPlan {
+            eligible: false,
+            reason: reason.into(),
+            coop_ops: Vec::new(),
+        }
     }
 }
 
@@ -164,7 +176,11 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         | Op::GlobalAddr(_)
         | Op::Iota(_) => Vec::new(),
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) => vec![*a, *b],
-        Op::Neg(a) | Op::Not(a) | Op::Sqrt(a) | Op::Splat(a) | Op::Round(_, a)
+        Op::Neg(a)
+        | Op::Not(a)
+        | Op::Sqrt(a)
+        | Op::Splat(a)
+        | Op::Round(_, a)
         | Op::ExtractLane(a, _) => vec![*a],
         Op::Cast(_, a, _) => vec![*a],
         Op::Select(c, a, b) => vec![*c, *a, *b],
@@ -178,7 +194,9 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         // reported *eligible* here and is instead declined during lowering — `lower.rs` emits
         // `UNSUPPORTED: VecKernelCall`, which `megakernel::try_run` turns into `Ok(None)` (fall back
         // to the single-thread path). Reporting its reads keeps the taint fixpoint total.
-        Op::VecKernelCall { ptrs, scalars, n, .. } => vec![*ptrs, *scalars, *n],
+        Op::VecKernelCall {
+            ptrs, scalars, n, ..
+        } => vec![*ptrs, *scalars, *n],
     }
 }
 
@@ -198,9 +216,21 @@ pub fn mem_tainted(func: &Function) -> HashSet<u32> {
             Terminator::Br { target, args } => {
                 incoming.entry(target.0).or_default().push(args.clone());
             }
-            Terminator::CondBr { then_blk, then_args, else_blk, else_args, .. } => {
-                incoming.entry(then_blk.0).or_default().push(then_args.clone());
-                incoming.entry(else_blk.0).or_default().push(else_args.clone());
+            Terminator::CondBr {
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+                ..
+            } => {
+                incoming
+                    .entry(then_blk.0)
+                    .or_default()
+                    .push(then_args.clone());
+                incoming
+                    .entry(else_blk.0)
+                    .or_default()
+                    .push(else_args.clone());
             }
             Terminator::Ret(_) | Terminator::Unreachable => {}
         }
@@ -228,7 +258,10 @@ pub fn mem_tainted(func: &Function) -> HashSet<u32> {
                     if tainted.contains(&p.0) {
                         continue;
                     }
-                    if edges.iter().any(|args| args.get(i).is_some_and(|a| tainted.contains(&a.0))) {
+                    if edges
+                        .iter()
+                        .any(|args| args.get(i).is_some_and(|a| tainted.contains(&a.0)))
+                    {
                         tainted.insert(p.0);
                         changed = true;
                     }
@@ -331,7 +364,11 @@ pub fn analyze(program: &Program, entry: Symbol, interner: &Interner) -> MegaPla
         return MegaPlan::ineligible("no recognized cooperative op (single-thread path suffices)");
     }
 
-    MegaPlan { eligible: true, reason: String::new(), coop_ops }
+    MegaPlan {
+        eligible: true,
+        reason: String::new(),
+        coop_ops,
+    }
 }
 
 #[cfg(all(test, feature = "gpu"))]
@@ -348,7 +385,8 @@ mod tests {
             return None;
         }
         let mut interner = Interner::new();
-        let (module, pd) = wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        let (module, pd) =
+            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
         if pd.iter().any(|d| d.is_error()) {
             return None;
         }
@@ -373,9 +411,18 @@ mod tests {
 
     #[test]
     fn classify_symbols() {
-        assert_eq!(classify_call("wukong_sreduce_f32_parallel"), CallClass::Coop(CoopKind::Reduce));
-        assert_eq!(classify_call("wukong_sgemm_nt_epi"), CallClass::Coop(CoopKind::GemmNtEpi));
-        assert_eq!(classify_call("wukong_vmath_bf16"), CallClass::Coop(CoopKind::Vmath));
+        assert_eq!(
+            classify_call("wukong_sreduce_f32_parallel"),
+            CallClass::Coop(CoopKind::Reduce)
+        );
+        assert_eq!(
+            classify_call("wukong_sgemm_nt_epi"),
+            CallClass::Coop(CoopKind::GemmNtEpi)
+        );
+        assert_eq!(
+            classify_call("wukong_vmath_bf16"),
+            CallClass::Coop(CoopKind::Vmath)
+        );
         assert_eq!(classify_call("print"), CallClass::SideEffect);
         assert_eq!(classify_call("println"), CallClass::SideEffect);
         assert_eq!(classify_call("some_user_fn"), CallClass::Other);
@@ -398,7 +445,10 @@ mod tests {
             ("wukong_reduce_f16", "wukong_reduce_f16_parallel"),
         ] {
             let (a, b) = (classify_call(serial), classify_call(parallel));
-            assert!(matches!(a, CallClass::Coop(_)), "{serial} must be a cooperative op");
+            assert!(
+                matches!(a, CallClass::Coop(_)),
+                "{serial} must be a cooperative op"
+            );
             assert_eq!(a, b, "`{parallel}` must classify exactly like `{serial}`");
         }
     }
@@ -434,9 +484,14 @@ fn main() -> i32 {{
         let (p, _prog, _i) = plan(&src, 2);
         assert!(p.eligible, "expected eligible, got: {}", p.reason);
         assert!(
-            p.coop_ops.iter().any(|c| c.name == "wukong_vmath_f32_parallel"),
+            p.coop_ops
+                .iter()
+                .any(|c| c.name == "wukong_vmath_f32_parallel"),
             "expected the @parallel vmath twin, got {:?}",
-            p.coop_ops.iter().map(|c| (c.kind, c.name.clone())).collect::<Vec<_>>()
+            p.coop_ops
+                .iter()
+                .map(|c| (c.kind, c.name.clone()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -480,7 +535,10 @@ fn main() -> i32 {
         // At -O2 the nest is recognized to a GEMM call -> eligible with a Gemm/GemmNt coop op.
         let (p, _prog, _i) = plan(&src, 2);
         assert!(p.eligible, "matmul_f32 -O2 expected eligible: {}", p.reason);
-        assert!(p.coop_ops.iter().any(|c| matches!(c.kind, CoopKind::Gemm | CoopKind::GemmNt)));
+        assert!(p
+            .coop_ops
+            .iter()
+            .any(|c| matches!(c.kind, CoopKind::Gemm | CoopKind::GemmNt)));
     }
 
     /// Data-dependent control flow (a sort branches on loaded values) must be rejected — the SPMD
@@ -532,6 +590,10 @@ fn main() -> i32 {
 "#;
         let (p, _prog, _i) = plan(src, 2);
         assert!(!p.eligible);
-        assert!(p.reason.contains("no recognized cooperative op"), "reason: {}", p.reason);
+        assert!(
+            p.reason.contains("no recognized cooperative op"),
+            "reason: {}",
+            p.reason
+        );
     }
 }

@@ -159,7 +159,12 @@ TC_END:
 "#;
 
 /// Transpose `src (m×n)` → `dst (n×m)` on the GPU (host-slice convenience wrapper).
-pub fn transpose_f32(g: &mut Gpu, src: &[f32], m: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn transpose_f32(
+    g: &mut Gpu,
+    src: &[f32],
+    m: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     assert_eq!(src.len(), m * n, "transpose: src must be m×n");
     let f = g.function("transpose_f32", TRANSPOSE_F32_PTX, "transpose_f32")?;
     let src_d = g.stream.memcpy_stod(src)?;
@@ -695,7 +700,11 @@ pub fn gemm_f32(
     n: usize,
     k: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    assert_eq!(a.len(), m * k, "gemm A must be m*k elements (whatever its layout)");
+    assert_eq!(
+        a.len(),
+        m * k,
+        "gemm A must be m*k elements (whatever its layout)"
+    );
     assert_eq!(b.len(), k * n, "gemm B must be k*n elements");
     let f = g.function("train_gemm", train_gemm_ptx(), gemm_entry_name(ta, tb))?;
     let a_d = g.stream.memcpy_stod(a)?;
@@ -703,7 +712,12 @@ pub fn gemm_f32(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mu, nu, ku) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&mu).arg(&nu).arg(&ku);
+    bld.arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&mu)
+        .arg(&nu)
+        .arg(&ku);
     unsafe { bld.launch(gemm_cfg(m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -1172,7 +1186,11 @@ pub fn scale_inplace_device(
 
 /// Apply a causal mask to a square `s×s` score matrix in place: `S[i,j] = -inf` for `j > i` (each
 /// query attends only to keys at or before its position — the decoder mask).
-pub fn causal_mask_device(g: &mut Gpu, x: &mut CudaSlice<f32>, s: usize) -> Result<(), DriverError> {
+pub fn causal_mask_device(
+    g: &mut Gpu,
+    x: &mut CudaSlice<f32>,
+    s: usize,
+) -> Result<(), DriverError> {
     need_len("causal_mask_device x", x, s * s);
     let f = g.function("train_elem", TRAIN_ELEM_PTX, "causal_mask")?;
     let s_u = s as u32;
@@ -1306,7 +1324,11 @@ pub fn attention_backward(
     gemm_device(g, true, false, &ds_d, &q_d, &mut dk_d, s, d, s)?;
     scale_inplace_device(g, &mut dk_d, nd, scale)?;
 
-    Ok((st.memcpy_dtov(&dq_d)?, st.memcpy_dtov(&dk_d)?, st.memcpy_dtov(&dv_d)?))
+    Ok((
+        st.memcpy_dtov(&dq_d)?,
+        st.memcpy_dtov(&dk_d)?,
+        st.memcpy_dtov(&dv_d)?,
+    ))
 }
 
 #[cfg(test)]
@@ -1382,7 +1404,9 @@ mod tests {
             assert!(act_bwd_entry(op).is_ok(), "op {op} must dispatch");
         }
         // An op the module has no kernel for is a recoverable decline, not a panic.
-        let unsupported = (0i64..64).find(|&o| !act_bwd_supported(o)).expect("some op is unsupported");
+        let unsupported = (0i64..64)
+            .find(|&o| !act_bwd_supported(o))
+            .expect("some op is unsupported");
         assert_eq!(
             act_bwd_entry(unsupported).unwrap_err().0,
             cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED
@@ -1418,7 +1442,10 @@ mod tests {
             let mut ok = g.stream.alloc_zeros::<f32>(s * s).unwrap();
             causal_mask_device(g, &mut ok, s).unwrap();
             let masked = g.stream.memcpy_dtov(&ok).unwrap();
-            assert!(masked[1].is_infinite() && masked[1] < 0.0, "j>i must be -inf");
+            assert!(
+                masked[1].is_infinite() && masked[1] < 0.0,
+                "j>i must be -inf"
+            );
             assert_eq!(masked[0], 0.0, "j<=i untouched");
             // An over-sized (pooled) workspace is legal.
             let mut big = g.stream.alloc_zeros::<f32>(s * s + 4096).unwrap();
@@ -1445,7 +1472,10 @@ mod tests {
                 "norm_bwd_device must reject a rows-sized dx for a rows*cols write"
             );
             // The device is still healthy: nothing reached the driver, so no sticky fault.
-            assert!(!crate::gpu::device_lost(), "a rejected launch must not touch the device");
+            assert!(
+                !crate::gpu::device_lost(),
+                "a rejected launch must not touch the device"
+            );
             eprintln!("[gate] under-sized device buffers rejected on the host (no sticky fault) ✓");
         });
     }
@@ -1465,7 +1495,11 @@ mod tests {
                 }
                 // Pure data movement: bit-exact.
                 for i in 0..m * n {
-                    assert_eq!(got[i].to_bits(), want[i].to_bits(), "transpose {m}x{n} @ {i}");
+                    assert_eq!(
+                        got[i].to_bits(),
+                        want[i].to_bits(),
+                        "transpose {m}x{n} @ {i}"
+                    );
                 }
             }
         });
@@ -1536,7 +1570,8 @@ mod tests {
                     match op {
                         NORM_SOFTMAX => {
                             let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                            let exps: Vec<f64> = row.iter().map(|&v| ((v - m) as f64).exp()).collect();
+                            let exps: Vec<f64> =
+                                row.iter().map(|&v| ((v - m) as f64).exp()).collect();
                             let s: f64 = exps.iter().sum();
                             for c in 0..cols {
                                 y[r * cols + c] = (exps[c] / s) as f32;
@@ -1544,15 +1579,16 @@ mod tests {
                         }
                         NORM_LAYERNORM => {
                             let mu = row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
-                            let var =
-                                row.iter().map(|&v| (v as f64 - mu).powi(2)).sum::<f64>() / cols as f64;
+                            let var = row.iter().map(|&v| (v as f64 - mu).powi(2)).sum::<f64>()
+                                / cols as f64;
                             let sigma = (var + eps as f64).sqrt();
                             for c in 0..cols {
                                 y[r * cols + c] = ((row[c] as f64 - mu) / sigma) as f32;
                             }
                         }
                         NORM_RMSNORM => {
-                            let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+                            let ms =
+                                row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
                             let rr = (ms + eps as f64).sqrt();
                             for c in 0..cols {
                                 y[r * cols + c] = (row[c] as f64 / rr) as f32;
@@ -1582,7 +1618,8 @@ mod tests {
                         }
                         NORM_LAYERNORM => {
                             let mu = xr.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
-                            let ex2 = xr.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+                            let ex2 =
+                                xr.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
                             let inv = 1.0 / (ex2 - mu * mu + eps as f64).sqrt();
                             let mdy = dyr.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
                             let mdyy = dot(dyr, yr) / cols as f64;
@@ -1592,7 +1629,8 @@ mod tests {
                             }
                         }
                         NORM_RMSNORM => {
-                            let ms = xr.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+                            let ms =
+                                xr.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
                             let inv = 1.0 / (ms + eps as f64).sqrt();
                             let mdyy = dot(dyr, yr) / cols as f64;
                             for c in 0..cols {
@@ -1645,9 +1683,8 @@ mod tests {
     #[test]
     fn fp16_gemm_matches_f64_reference() {
         with_gpu("fp16_gemm_matches_f64_reference", |g| {
-            let round16 = |x: &[f32]| -> Vec<f32> {
-                x.iter().map(|&v| f16::from_f32(v).to_f32()).collect()
-            };
+            let round16 =
+                |x: &[f32]| -> Vec<f32> { x.iter().map(|&v| f16::from_f32(v).to_f32()).collect() };
             for &(m, n, k) in &[
                 (64usize, 64usize, 64usize), // _sm_db
                 (128, 192, 256),             // _sm_db, K>tile
@@ -1661,8 +1698,10 @@ mod tests {
                     let a = round16(&rng.vec(m * k, -1.0, 1.0));
                     let b = round16(&rng.vec(k * n, -1.0, 1.0));
                     let got = gemm_f16(g, ta, tb, &a, &b, m, n, k).unwrap();
-                    let aref = |i: usize, l: usize| if ta { a[l * m + i] } else { a[i * k + l] } as f64;
-                    let bref = |l: usize, j: usize| if tb { b[j * k + l] } else { b[l * n + j] } as f64;
+                    let aref =
+                        |i: usize, l: usize| if ta { a[l * m + i] } else { a[i * k + l] } as f64;
+                    let bref =
+                        |l: usize, j: usize| if tb { b[j * k + l] } else { b[l * n + j] } as f64;
                     let mut want = vec![0f32; m * n];
                     for i in 0..m {
                         for j in 0..n {

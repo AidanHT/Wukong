@@ -371,7 +371,8 @@ fn input_map(bt: &[f64], alpha: usize) -> Vec<f64> {
         for nu in 0..alpha {
             for a in 0..alpha {
                 for b in 0..alpha {
-                    mi[(xi * alpha + nu) * aa + (a * alpha + b)] = bt[xi * alpha + a] * bt[nu * alpha + b];
+                    mi[(xi * alpha + nu) * aa + (a * alpha + b)] =
+                        bt[xi * alpha + a] * bt[nu * alpha + b];
                 }
             }
         }
@@ -388,7 +389,8 @@ fn output_map(at: &[f64], m: usize, alpha: usize) -> Vec<f64> {
         for yj in 0..m {
             for xi in 0..alpha {
                 for nu in 0..alpha {
-                    mo[(yi * m + yj) * aa + (xi * alpha + nu)] = at[yi * alpha + xi] * at[yj * alpha + nu];
+                    mo[(yi * m + yj) * aa + (xi * alpha + nu)] =
+                        at[yi * alpha + xi] * at[yj * alpha + nu];
                 }
             }
         }
@@ -435,8 +437,14 @@ pub fn wino_filter_xform_ptx(c: usize, k: usize, m: usize) -> String {
     let kc = k * c;
     let mut s = String::new();
     let _ = writeln!(s, "{HDR_SM80}");
-    let _ = writeln!(s, "// Winograd F({m},3) filter transform: W[K{k},C{c},3,3] -> U[{aa},K,C]");
-    let _ = writeln!(s, ".visible .entry wino_filter_xform(\n    .param .u64 pW,\n    .param .u64 pU\n)\n{{");
+    let _ = writeln!(
+        s,
+        "// Winograd F({m},3) filter transform: W[K{k},C{c},3,3] -> U[{aa},K,C]"
+    );
+    let _ = writeln!(
+        s,
+        ".visible .entry wino_filter_xform(\n    .param .u64 pW,\n    .param .u64 pU\n)\n{{"
+    );
     let _ = writeln!(s, "    .reg .pred %p0;");
     let _ = writeln!(s, "    .reg .b16 %h;");
     let _ = writeln!(s, "    .reg .b32 %gid,%t,%n,%i;");
@@ -449,21 +457,38 @@ pub fn wino_filter_xform_ptx(c: usize, k: usize, m: usize) -> String {
     });
     let _ = writeln!(s, "    .reg .b64 %W,%U,%off,%base,%ptr;");
     let _ = writeln!(s, "    ld.param.u64 %W,[pW];\n    ld.param.u64 %U,[pU];");
-    let _ = writeln!(s, "    cvta.to.global.u64 %W,%W;\n    cvta.to.global.u64 %U,%U;");
-    let _ = writeln!(s, "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;");
+    let _ = writeln!(
+        s,
+        "    cvta.to.global.u64 %W,%W;\n    cvta.to.global.u64 %U,%U;"
+    );
+    let _ = writeln!(
+        s,
+        "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;"
+    );
     let _ = writeln!(s, "    mad.lo.s32 %gid,%t,%n,%i;");
     let _ = writeln!(s, "    setp.ge.u32 %p0,%gid,{kc};\n    @%p0 bra RET;");
     // load 9 taps: W[tid*9 + j]
     let _ = writeln!(s, "    mul.lo.s32 %t,%gid,9;");
     let _ = writeln!(s, "    mul.wide.u32 %off,%t,2;\n    add.s64 %base,%W,%off;");
     for j in 0..9 {
-        let _ = writeln!(s, "    ld.global.u16 %h,[%base+{}];\n    cvt.f32.f16 %in{j},%h;", j * 2);
+        let _ = writeln!(
+            s,
+            "    ld.global.u16 %h,[%base+{}];\n    cvt.f32.f16 %in{j},%h;",
+            j * 2
+        );
     }
     // U base for this thread: pU + tid*2 ; per-xi store adds xi*KC*2 (constant)
-    let _ = writeln!(s, "    mul.wide.u32 %off,%gid,2;\n    add.s64 %base,%U,%off;");
+    let _ = writeln!(
+        s,
+        "    mul.wide.u32 %off,%gid,2;\n    add.s64 %base,%U,%off;"
+    );
     for e in 0..aa {
         emit_lincomb(&mut s, "%acc", &mf[e * 9..e * 9 + 9], "in");
-        let _ = writeln!(s, "    cvt.rn.f16.f32 %h,%acc;\n    st.global.u16 [%base+{}],%h;", e * kc * 2);
+        let _ = writeln!(
+            s,
+            "    cvt.rn.f16.f32 %h,%acc;\n    st.global.u16 [%base+{}],%h;",
+            e * kc * 2
+        );
     }
     let _ = writeln!(s, "RET:\n    ret;\n}}");
     s
@@ -483,11 +508,20 @@ pub fn wino_input_xform_ptx(c: usize, h: usize, w: usize, m: usize) -> String {
     let hw = h * w;
     let mut s = String::new();
     let _ = writeln!(s, "{HDR_SM80}");
-    let _ = writeln!(s, "// Winograd F({m},3) input transform: X[C{c},H{h},W{w}] -> V[{aa},C,T{nt}]");
-    let _ = writeln!(s, ".visible .entry wino_input_xform(\n    .param .u64 pX,\n    .param .u64 pV\n)\n{{");
+    let _ = writeln!(
+        s,
+        "// Winograd F({m},3) input transform: X[C{c},H{h},W{w}] -> V[{aa},C,T{nt}]"
+    );
+    let _ = writeln!(
+        s,
+        ".visible .entry wino_input_xform(\n    .param .u64 pX,\n    .param .u64 pV\n)\n{{"
+    );
     let _ = writeln!(s, "    .reg .pred %p0,%pi,%pj;");
     let _ = writeln!(s, "    .reg .b16 %h;");
-    let _ = writeln!(s, "    .reg .b32 %gid,%t,%n,%i,%cc,%tile,%ti,%tj,%i0,%j0,%gi,%gj,%xb,%idx;");
+    let _ = writeln!(
+        s,
+        "    .reg .b32 %gid,%t,%n,%i,%cc,%tile,%ti,%tj,%i0,%j0,%gi,%gj,%xb,%idx;"
+    );
     let _ = writeln!(s, "    .reg .f32 {};", {
         let mut d = String::from("%acc");
         for e in 0..aa {
@@ -497,31 +531,65 @@ pub fn wino_input_xform_ptx(c: usize, h: usize, w: usize, m: usize) -> String {
     });
     let _ = writeln!(s, "    .reg .b64 %X,%V,%off,%base,%ptr;");
     let _ = writeln!(s, "    ld.param.u64 %X,[pX];\n    ld.param.u64 %V,[pV];");
-    let _ = writeln!(s, "    cvta.to.global.u64 %X,%X;\n    cvta.to.global.u64 %V,%V;");
-    let _ = writeln!(s, "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;");
+    let _ = writeln!(
+        s,
+        "    cvta.to.global.u64 %X,%X;\n    cvta.to.global.u64 %V,%V;"
+    );
+    let _ = writeln!(
+        s,
+        "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;"
+    );
     let _ = writeln!(s, "    mad.lo.s32 %gid,%t,%n,%i;");
     let _ = writeln!(s, "    setp.ge.u32 %p0,%gid,{ct};\n    @%p0 bra RET;");
     // c = tid/nt ; tile = tid%nt ; ti = tile/ntj ; tj = tile%ntj
-    let _ = writeln!(s, "    div.u32 %cc,%gid,{nt};\n    rem.u32 %tile,%gid,{nt};");
-    let _ = writeln!(s, "    div.u32 %ti,%tile,{ntj};\n    rem.u32 %tj,%tile,{ntj};");
-    let _ = writeln!(s, "    mul.lo.s32 %i0,%ti,{m};\n    mul.lo.s32 %j0,%tj,{m};");
+    let _ = writeln!(
+        s,
+        "    div.u32 %cc,%gid,{nt};\n    rem.u32 %tile,%gid,{nt};"
+    );
+    let _ = writeln!(
+        s,
+        "    div.u32 %ti,%tile,{ntj};\n    rem.u32 %tj,%tile,{ntj};"
+    );
+    let _ = writeln!(
+        s,
+        "    mul.lo.s32 %i0,%ti,{m};\n    mul.lo.s32 %j0,%tj,{m};"
+    );
     let _ = writeln!(s, "    mul.lo.s32 %xb,%cc,{hw};        // c*H*W");
     // gather d[a][b] -> %in{a*alpha+b}, zero-pad OOB
     for a in 0..alpha {
         let _ = writeln!(s, "    add.s32 %gi,%i0,{a};\n    setp.lt.u32 %pi,%gi,{h};");
         for b in 0..alpha {
             let e = a * alpha + b;
-            let _ = writeln!(s, "    add.s32 %gj,%j0,{b};\n    setp.lt.u32 %pj,%gj,{w};\n    and.pred %pj,%pj,%pi;");
-            let _ = writeln!(s, "    mad.lo.s32 %idx,%gi,{w},%xb;\n    add.s32 %idx,%idx,%gj;");
-            let _ = writeln!(s, "    mul.wide.u32 %off,%idx,2;\n    add.s64 %ptr,%X,%off;");
-            let _ = writeln!(s, "    mov.u16 %h,0;\n    @%pj ld.global.u16 %h,[%ptr];\n    cvt.f32.f16 %in{e},%h;");
+            let _ = writeln!(
+                s,
+                "    add.s32 %gj,%j0,{b};\n    setp.lt.u32 %pj,%gj,{w};\n    and.pred %pj,%pj,%pi;"
+            );
+            let _ = writeln!(
+                s,
+                "    mad.lo.s32 %idx,%gi,{w},%xb;\n    add.s32 %idx,%idx,%gj;"
+            );
+            let _ = writeln!(
+                s,
+                "    mul.wide.u32 %off,%idx,2;\n    add.s64 %ptr,%X,%off;"
+            );
+            let _ = writeln!(
+                s,
+                "    mov.u16 %h,0;\n    @%pj ld.global.u16 %h,[%ptr];\n    cvt.f32.f16 %in{e},%h;"
+            );
         }
     }
     // V base: pV + tid*2 ; per-xi store adds xi*CT*2
-    let _ = writeln!(s, "    mul.wide.u32 %off,%gid,2;\n    add.s64 %base,%V,%off;");
+    let _ = writeln!(
+        s,
+        "    mul.wide.u32 %off,%gid,2;\n    add.s64 %base,%V,%off;"
+    );
     for e in 0..aa {
         emit_lincomb(&mut s, "%acc", &mi[e * aa..e * aa + aa], "in");
-        let _ = writeln!(s, "    cvt.rn.f16.f32 %h,%acc;\n    st.global.u16 [%base+{}],%h;", e * ct * 2);
+        let _ = writeln!(
+            s,
+            "    cvt.rn.f16.f32 %h,%acc;\n    st.global.u16 [%base+{}],%h;",
+            e * ct * 2
+        );
     }
     let _ = writeln!(s, "RET:\n    ret;\n}}");
     s
@@ -541,11 +609,20 @@ pub fn wino_output_xform_ptx(k: usize, h: usize, w: usize, m: usize) -> String {
     let kt = k * nt;
     let mut s = String::new();
     let _ = writeln!(s, "{HDR_SM80}");
-    let _ = writeln!(s, "// Winograd F({m},3) output transform: M[{aa},K{k},T{nt}] -> O[K,P{p},Q{q}]");
-    let _ = writeln!(s, ".visible .entry wino_output_xform(\n    .param .u64 pM,\n    .param .u64 pO\n)\n{{");
+    let _ = writeln!(
+        s,
+        "// Winograd F({m},3) output transform: M[{aa},K{k},T{nt}] -> O[K,P{p},Q{q}]"
+    );
+    let _ = writeln!(
+        s,
+        ".visible .entry wino_output_xform(\n    .param .u64 pM,\n    .param .u64 pO\n)\n{{"
+    );
     let _ = writeln!(s, "    .reg .pred %p0,%pi,%pj;");
     let _ = writeln!(s, "    .reg .b16 %h;");
-    let _ = writeln!(s, "    .reg .b32 %gid,%t,%n,%i,%kk,%tile,%ti,%tj,%i0,%j0,%oi,%oj,%idx;");
+    let _ = writeln!(
+        s,
+        "    .reg .b32 %gid,%t,%n,%i,%kk,%tile,%ti,%tj,%i0,%j0,%oi,%oj,%idx;"
+    );
     let _ = writeln!(s, "    .reg .f32 {};", {
         let mut d = String::from("%acc");
         for e in 0..aa {
@@ -555,16 +632,34 @@ pub fn wino_output_xform_ptx(k: usize, h: usize, w: usize, m: usize) -> String {
     });
     let _ = writeln!(s, "    .reg .b64 %M,%O,%off,%base,%ptr;");
     let _ = writeln!(s, "    ld.param.u64 %M,[pM];\n    ld.param.u64 %O,[pO];");
-    let _ = writeln!(s, "    cvta.to.global.u64 %M,%M;\n    cvta.to.global.u64 %O,%O;");
-    let _ = writeln!(s, "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;");
+    let _ = writeln!(
+        s,
+        "    cvta.to.global.u64 %M,%M;\n    cvta.to.global.u64 %O,%O;"
+    );
+    let _ = writeln!(
+        s,
+        "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;"
+    );
     let _ = writeln!(s, "    mad.lo.s32 %gid,%t,%n,%i;");
     let _ = writeln!(s, "    setp.ge.u32 %p0,%gid,{kt};\n    @%p0 bra RET;");
-    let _ = writeln!(s, "    div.u32 %kk,%gid,{nt};\n    rem.u32 %tile,%gid,{nt};");
-    let _ = writeln!(s, "    div.u32 %ti,%tile,{ntj};\n    rem.u32 %tj,%tile,{ntj};");
-    let _ = writeln!(s, "    mul.lo.s32 %i0,%ti,{m};\n    mul.lo.s32 %j0,%tj,{m};");
+    let _ = writeln!(
+        s,
+        "    div.u32 %kk,%gid,{nt};\n    rem.u32 %tile,%gid,{nt};"
+    );
+    let _ = writeln!(
+        s,
+        "    div.u32 %ti,%tile,{ntj};\n    rem.u32 %tj,%tile,{ntj};"
+    );
+    let _ = writeln!(
+        s,
+        "    mul.lo.s32 %i0,%ti,{m};\n    mul.lo.s32 %j0,%tj,{m};"
+    );
     // gather M_flat[xi] = pM[xi*KT + tid]. M is **f32** (it is conv2d_wmma's f32 output), so a 4-byte
     // stride and a direct f32 load — no f16 widening.
-    let _ = writeln!(s, "    mul.wide.u32 %off,%gid,4;\n    add.s64 %base,%M,%off;");
+    let _ = writeln!(
+        s,
+        "    mul.wide.u32 %off,%gid,4;\n    add.s64 %base,%M,%off;"
+    );
     for e in 0..aa {
         let _ = writeln!(s, "    ld.global.f32 %in{e},[%base+{}];", e * kt * 4);
     }
@@ -576,7 +671,10 @@ pub fn wino_output_xform_ptx(k: usize, h: usize, w: usize, m: usize) -> String {
             emit_lincomb(&mut s, "%acc", &mo[e * aa..e * aa + aa], "in");
             let _ = writeln!(s, "    add.s32 %oj,%j0,{yj};\n    setp.lt.u32 %pj,%oj,{q};\n    and.pred %pj,%pj,%pi;");
             let _ = writeln!(s, "    mad.lo.s32 %idx,%kk,{p},%oi;\n    mul.lo.s32 %idx,%idx,{q};\n    add.s32 %idx,%idx,%oj;");
-            let _ = writeln!(s, "    mul.wide.u32 %off,%idx,4;\n    add.s64 %ptr,%O,%off;");
+            let _ = writeln!(
+                s,
+                "    mul.wide.u32 %off,%idx,4;\n    add.s64 %ptr,%O,%off;"
+            );
             let _ = writeln!(s, "    @%pj st.global.f32 [%ptr],%acc;");
         }
     }
@@ -625,7 +723,10 @@ pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
 
     let mut b = String::new();
     let _ = writeln!(b, "{HDR_SM80}");
-    let _ = writeln!(b, "// Winograd batched NN GEMM: M[z][K{k},T{nt}] = U[z][K,C{c}] * V[z][C,T], z=gridDim.z");
+    let _ = writeln!(
+        b,
+        "// Winograd batched NN GEMM: M[z][K{k},T{nt}] = U[z][K,C{c}] * V[z][C,T], z=gridDim.z"
+    );
     let _ = writeln!(b, ".visible .entry wino_bgemm(\n    .param .u64 pV,\n    .param .u64 pU,\n    .param .u64 pM\n)\n{{");
     let _ = writeln!(b, "    .shared .align 16 .b8 smemA[{smem_a}];");
     let _ = writeln!(b, "    .shared .align 16 .b8 smemB[{smem_b}];");
@@ -657,11 +758,20 @@ pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
     let _ = writeln!(b, "    .reg .f32 %cf;");
     let _ = writeln!(b, "    .reg .b32 {};", decl.trim_end_matches(','));
     let _ = writeln!(b, "    .reg .b64 %V,%U,%M,%off,%gp,%ptr;");
-    let _ = writeln!(b, "    ld.param.u64 %V,[pV];\n    ld.param.u64 %U,[pU];\n    ld.param.u64 %M,[pM];");
+    let _ = writeln!(
+        b,
+        "    ld.param.u64 %V,[pV];\n    ld.param.u64 %U,[pU];\n    ld.param.u64 %M,[pM];"
+    );
     let _ = writeln!(b, "    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %U,%U;\n    cvta.to.global.u64 %M,%M;");
     let _ = writeln!(b, "    mov.u32 %tix,%tid.x;");
-    let _ = writeln!(b, "    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %m0,%tmp,{bm};");
-    let _ = writeln!(b, "    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %n0,%tmp,{bn};");
+    let _ = writeln!(
+        b,
+        "    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %m0,%tmp,{bm};"
+    );
+    let _ = writeln!(
+        b,
+        "    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %n0,%tmp,{bn};"
+    );
     // plane (z) base offsets, in ELEMENTS (folded into each index below)
     let _ = writeln!(b, "    mov.u32 %z,%ctaid.z;");
     let _ = writeln!(b, "    mul.lo.s32 %zA,%z,{kc};      // U plane = z*K*C");
@@ -689,8 +799,14 @@ pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
         let _ = writeln!(b, "    shr.u32 %mm,%e,4;\n    and.b32 %gkk,%e,15;");
         let _ = writeln!(b, "    add.u32 %tmp,%m0,%mm;\n    add.u32 %tmp2,%kt,%gkk;");
         let _ = writeln!(b, "    setp.lt.u32 %pv,%tmp,{m};\n    setp.lt.u32 %p0,%tmp2,{gk};\n    and.pred %pv,%pv,%p0;");
-        let _ = writeln!(b, "    mad.lo.s32 %widx,%tmp,{gk},%tmp2;\n    add.u32 %widx,%widx,%zA;");
-        let _ = writeln!(b, "    mul.wide.u32 %off,%widx,2;\n    add.s64 %ptr,%U,%off;");
+        let _ = writeln!(
+            b,
+            "    mad.lo.s32 %widx,%tmp,{gk},%tmp2;\n    add.u32 %widx,%widx,%zA;"
+        );
+        let _ = writeln!(
+            b,
+            "    mul.wide.u32 %off,%widx,2;\n    add.s64 %ptr,%U,%off;"
+        );
         let _ = writeln!(b, "    mov.u16 %hv,0;\n    @%pv ld.global.u16 %hv,[%ptr];");
         let _ = writeln!(b, "    mov.u32 %saddr,smemA;\n    shl.b32 %tmp,%e,1;\n    add.u32 %saddr,%saddr,%tmp;\n    st.shared.u16 [%saddr],%hv;");
     }
@@ -698,37 +814,76 @@ pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
     for li in 0..b_per {
         let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
-        let _ = writeln!(b, "    shr.u32 %gkk,%e,{bn_shift};\n    and.b32 %ncol,%e,{};", bn - 1);
+        let _ = writeln!(
+            b,
+            "    shr.u32 %gkk,%e,{bn_shift};\n    and.b32 %ncol,%e,{};",
+            bn - 1
+        );
         let _ = writeln!(b, "    add.u32 %gkv,%kt,%gkk;\n    add.u32 %nn,%n0,%ncol;");
         let _ = writeln!(b, "    setp.lt.u32 %pv,%gkv,{gk};\n    setp.lt.u32 %p0,%nn,{n};\n    and.pred %pv,%pv,%p0;");
-        let _ = writeln!(b, "    mad.lo.s32 %xidx,%gkv,{nt},%nn;\n    add.u32 %xidx,%xidx,%zB;");
-        let _ = writeln!(b, "    mul.wide.u32 %off,%xidx,2;\n    add.s64 %ptr,%V,%off;");
+        let _ = writeln!(
+            b,
+            "    mad.lo.s32 %xidx,%gkv,{nt},%nn;\n    add.u32 %xidx,%xidx,%zB;"
+        );
+        let _ = writeln!(
+            b,
+            "    mul.wide.u32 %off,%xidx,2;\n    add.s64 %ptr,%V,%off;"
+        );
         let _ = writeln!(b, "    mov.u16 %hv,0;\n    @%pv ld.global.u16 %hv,[%ptr];");
         let _ = writeln!(b, "    mov.u32 %saddr,smemB;\n    shl.b32 %tmp,%e,1;\n    add.u32 %saddr,%saddr,%tmp;\n    st.shared.u16 [%saddr],%hv;");
     }
     let _ = writeln!(b, "    bar.sync 0;");
     let _ = writeln!(b, "    mov.u32 %tmp,16;");
     for ti in 0..tm {
-        let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};\n    mul.lo.s32 %tmp2,%tmp2,32;", ti * 16);
-        let _ = writeln!(b, "    mov.u32 %saddr,smemA;\n    add.u32 %tmp2,%tmp2,%saddr;");
-        let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;");
+        let _ = writeln!(
+            b,
+            "    add.u32 %tmp2,%wrb,{};\n    mul.lo.s32 %tmp2,%tmp2,32;",
+            ti * 16
+        );
+        let _ = writeln!(
+            b,
+            "    mov.u32 %saddr,smemA;\n    add.u32 %tmp2,%tmp2,%saddr;"
+        );
+        let _ = writeln!(
+            b,
+            "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;"
+        );
         let ra = veclist(&format!("a{ti}_"));
-        let _ = writeln!(b, "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;");
+        let _ = writeln!(
+            b,
+            "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;"
+        );
     }
     let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
     for tj in 0..tn {
-        let _ = writeln!(b, "    add.u32 %tmp2,%wcb,{};\n    shl.b32 %tmp2,%tmp2,1;", tj * 16);
-        let _ = writeln!(b, "    mov.u32 %saddr,smemB;\n    add.u32 %tmp2,%tmp2,%saddr;");
-        let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;");
+        let _ = writeln!(
+            b,
+            "    add.u32 %tmp2,%wcb,{};\n    shl.b32 %tmp2,%tmp2,1;",
+            tj * 16
+        );
+        let _ = writeln!(
+            b,
+            "    mov.u32 %saddr,smemB;\n    add.u32 %tmp2,%tmp2,%saddr;"
+        );
+        let _ = writeln!(
+            b,
+            "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;"
+        );
         let rb = veclist(&format!("b{tj}_"));
-        let _ = writeln!(b, "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {rb}, [%gp], %tmp;");
+        let _ = writeln!(
+            b,
+            "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {rb}, [%gp], %tmp;"
+        );
     }
     for ti in 0..tm {
         let ra = veclist(&format!("a{ti}_"));
         for tj in 0..tn {
             let rb = veclist(&format!("b{tj}_"));
             let cc = veclist(&format!("c{ti}_{tj}_"));
-            let _ = writeln!(b, "    wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32 {cc}, {ra}, {rb}, {cc};");
+            let _ = writeln!(
+                b,
+                "    wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32 {cc}, {ra}, {rb}, {cc};"
+            );
         }
     }
     let _ = writeln!(b, "    bar.sync 0;");
@@ -737,24 +892,48 @@ pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
     let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
     for ti in 0..tm {
         for tj in 0..tn {
-            let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};\n    mul.lo.s32 %tmp2,%tmp2,{bn};", ti * 16);
-            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%wcb;\n    add.u32 %tmp2,%tmp2,{};", tj * 16);
+            let _ = writeln!(
+                b,
+                "    add.u32 %tmp2,%wrb,{};\n    mul.lo.s32 %tmp2,%tmp2,{bn};",
+                ti * 16
+            );
+            let _ = writeln!(
+                b,
+                "    add.u32 %tmp2,%tmp2,%wcb;\n    add.u32 %tmp2,%tmp2,{};",
+                tj * 16
+            );
             let _ = writeln!(b, "    shl.b32 %tmp2,%tmp2,2;\n    mov.u32 %saddr,smemC;\n    add.u32 %tmp2,%tmp2,%saddr;");
-            let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;");
+            let _ = writeln!(
+                b,
+                "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;"
+            );
             let cc = veclist(&format!("c{ti}_{tj}_"));
-            let _ = writeln!(b, "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {cc}, %tmp;");
+            let _ = writeln!(
+                b,
+                "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {cc}, %tmp;"
+            );
         }
     }
     let _ = writeln!(b, "    bar.sync 0;");
     for li in 0..c_per {
         let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
-        let _ = writeln!(b, "    shr.u32 %mm,%e,{bn_shift};\n    and.b32 %ncol,%e,{};", bn - 1);
+        let _ = writeln!(
+            b,
+            "    shr.u32 %mm,%e,{bn_shift};\n    and.b32 %ncol,%e,{};",
+            bn - 1
+        );
         let _ = writeln!(b, "    add.u32 %tmp,%m0,%mm;\n    add.u32 %nn,%n0,%ncol;");
         let _ = writeln!(b, "    setp.lt.u32 %pv,%tmp,{m};\n    setp.lt.u32 %p0,%nn,{n};\n    and.pred %pv,%pv,%p0;");
         let _ = writeln!(b, "    mov.u32 %saddr,smemC;\n    shl.b32 %tmp2,%e,2;\n    add.u32 %saddr,%saddr,%tmp2;\n    ld.shared.f32 %cf,[%saddr];");
-        let _ = writeln!(b, "    mad.lo.s32 %xidx,%tmp,{n},%nn;\n    add.u32 %xidx,%xidx,%zM;");
-        let _ = writeln!(b, "    mul.wide.u32 %off,%xidx,4;\n    add.s64 %ptr,%M,%off;");
+        let _ = writeln!(
+            b,
+            "    mad.lo.s32 %xidx,%tmp,{n},%nn;\n    add.u32 %xidx,%xidx,%zM;"
+        );
+        let _ = writeln!(
+            b,
+            "    mul.wide.u32 %off,%xidx,4;\n    add.s64 %ptr,%M,%off;"
+        );
         let _ = writeln!(b, "    @%pv st.global.f32 [%ptr],%cf;");
     }
     let _ = writeln!(b, "    ret;\n}}");
@@ -840,8 +1019,11 @@ mod tests {
     #[test]
     fn every_winograd_generator_emits_ascii_ptx() {
         for m in [2usize, 4] {
-            for (c, h, w, k) in [(3usize, 32usize, 32usize, 16usize), (64, 14, 14, 64), (8, 9, 9, 32)]
-            {
+            for (c, h, w, k) in [
+                (3usize, 32usize, 32usize, 16usize),
+                (64, 14, 14, 64),
+                (8, 9, 9, 32),
+            ] {
                 let (_, _, nt) = wino_ntiles(h, w, m);
                 for (what, ptx) in [
                     ("wino_filter_xform_ptx", wino_filter_xform_ptx(c, k, m)),

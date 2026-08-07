@@ -180,7 +180,12 @@ fn object_emission_is_deterministic_across_processes() {
     // deterministic, so the subset does not drift between runs.
     let mut by_size: Vec<(u64, PathBuf)> = programs
         .iter()
-        .map(|p| (std::fs::metadata(p).map(|m| m.len()).unwrap_or(0), p.clone()))
+        .map(|p| {
+            (
+                std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                p.clone(),
+            )
+        })
         .collect();
     by_size.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let serial_subset: Vec<PathBuf> = by_size.into_iter().take(24).map(|(_, p)| p).collect();
@@ -199,7 +204,9 @@ fn object_emission_is_deterministic_across_processes() {
         };
         compared += 1;
         if o0 != o1 || o1 != o2 {
-            nondeterministic.push(format!("{name}: object bytes differ between fresh processes"));
+            nondeterministic.push(format!(
+                "{name}: object bytes differ between fresh processes"
+            ));
             continue;
         }
         if serial_subset.contains(p) {
@@ -208,14 +215,16 @@ fn object_emission_is_deterministic_across_processes() {
             match (emit_obj_o2(p, &s, true), emit_obj_o2(p, &t, true)) {
                 (Some(s0), Some(s1)) => {
                     if s0 != s1 {
-                        nondeterministic
-                            .push(format!("{name}: serial-codegen object bytes differ per process"));
+                        nondeterministic.push(format!(
+                            "{name}: serial-codegen object bytes differ per process"
+                        ));
                     } else if s0 != o0 {
                         serial_mismatch.push(name.clone());
                     }
                 }
-                _ => nondeterministic
-                    .push(format!("{name}: serial codegen failed where parallel succeeded")),
+                _ => nondeterministic.push(format!(
+                    "{name}: serial codegen failed where parallel succeeded"
+                )),
             }
         }
     }

@@ -190,16 +190,25 @@ pub fn peer_probe(g: &mut Gpu) -> Option<&'static str> {
         let libs = cuda_lib_names();
         let stream = g.stream.clone();
         let nvrtc = std::panic::catch_unwind(|| {
-            compile_ptx_with_opts("extern \"C\" __global__ void p(){}", CompileOptions::default())
+            compile_ptx_with_opts(
+                "extern \"C\" __global__ void p(){}",
+                CompileOptions::default(),
+            )
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+        })
+        .unwrap_or_else(|_| Err(format!("loader panicked ({} not found)", libs.nvrtc)));
+        let cublas = std::panic::catch_unwind(|| {
+            CudaBlas::new(stream)
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         })
-        .unwrap_or_else(|_| Err(format!("loader panicked ({} not found)", libs.nvrtc)));
-        let cublas = std::panic::catch_unwind(|| CudaBlas::new(stream).map(|_| ()).map_err(|e| format!("{e:?}")))
-            .unwrap_or_else(|_| Err(format!("loader panicked ({} not found)", libs.cublas)));
+        .unwrap_or_else(|_| Err(format!("loader panicked ({} not found)", libs.cublas)));
         match (nvrtc, cublas) {
             (Ok(()), Ok(())) => None,
-            (Err(n), Err(c)) => Some(format!("NVRTC unavailable ({n}) and cuBLAS unavailable ({c})")),
+            (Err(n), Err(c)) => Some(format!(
+                "NVRTC unavailable ({n}) and cuBLAS unavailable ({c})"
+            )),
             (Err(n), Ok(())) => Some(format!("NVRTC unavailable ({n})")),
             (Ok(()), Err(c)) => Some(format!("cuBLAS unavailable ({c})")),
         }
@@ -263,7 +272,12 @@ pub fn nvrtc_naive_gemm_nt(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as i32, n as i32, k as i32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(naive_cfg(m, n))? };
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
@@ -287,7 +301,12 @@ pub fn time_nvrtc_naive_gemm_nt(
     let cfg = naive_cfg(m, n);
     let mut launch = |g: &Gpu| -> Result<(), DriverError> {
         let mut bld = g.stream.launch_builder(&f);
-        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+        bld.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&a_d)
+            .arg(&b_d)
+            .arg(&mut c_d);
         unsafe { bld.launch(cfg) }.map(|_| ())
     };
     launch(g)?; // warm up
@@ -377,7 +396,14 @@ pub fn nvrtc_naive_attn(
     let mut o_d = g.stream.memcpy_stod(&vec![0f32; h * s * d])?;
     let (hh, ss, dd) = (h as i32, s as i32, d as i32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&hh).arg(&ss).arg(&dd).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+    bld.arg(&hh)
+        .arg(&ss)
+        .arg(&dd)
+        .arg(&scale)
+        .arg(&q_d)
+        .arg(&k_d)
+        .arg(&v_d)
+        .arg(&mut o_d);
     unsafe { bld.launch(naive_attn_cfg(h, s))? };
     Ok(g.stream.memcpy_dtov(&o_d)?)
 }
@@ -402,7 +428,14 @@ pub fn time_nvrtc_naive_attn(
     let cfg = naive_attn_cfg(h, s);
     let mut launch = |g: &Gpu| -> Result<(), DriverError> {
         let mut bld = g.stream.launch_builder(&f);
-        bld.arg(&hh).arg(&ss).arg(&dd).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+        bld.arg(&hh)
+            .arg(&ss)
+            .arg(&dd)
+            .arg(&scale)
+            .arg(&q_d)
+            .arg(&k_d)
+            .arg(&v_d)
+            .arg(&mut o_d);
         unsafe { bld.launch(cfg) }.map(|_| ())
     };
     launch(g)?; // warm up
@@ -513,7 +546,11 @@ unsafe fn cublas_attn_chain_once(
     {
         let (r, c) = (s as u32, s as u32);
         let eps = 0.0f32;
-        let cfg = LaunchConfig { grid_dim: (r, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (r, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut bld = stream.launch_builder(f_softmax);
         bld.arg(&r).arg(&c).arg(&eps).arg(&*s1_d).arg(&mut *p_d);
         unsafe { bld.launch(cfg)? };
@@ -595,8 +632,8 @@ pub fn time_cublas_attn_chain(
     let mut once = || -> Result<(), PeerError> {
         unsafe {
             cublas_attn_chain_once(
-                &blas, &stream, &f_softmax, &f_cast, &q_d, &k_d, &v_d, &mut o_d, &mut s1_d, &mut p_d,
-                &mut p16_d, s, d,
+                &blas, &stream, &f_softmax, &f_cast, &q_d, &k_d, &v_d, &mut o_d, &mut s1_d,
+                &mut p_d, &mut p16_d, s, d,
             )
         }
     };
@@ -908,7 +945,10 @@ impl CublasChainLayer {
             s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
             "CublasChainLayer needs S,D,Dff multiples of 64 (to match the WMMA peer's tiles)"
         );
-        assert!(heads >= 1 && d % heads == 0, "d={d} must be divisible by heads={heads}");
+        assert!(
+            heads >= 1 && d % heads == 0,
+            "d={d} must be divisible by heads={heads}"
+        );
         let dh = d / heads;
         assert!(
             crate::ptx_flash::SUPPORTED_D.contains(&dh),
@@ -922,8 +962,16 @@ impl CublasChainLayer {
         let blas = CudaBlas::new(g.stream.clone())?;
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
-        let f_qkv_trans = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "cast_transpose_qkv")?;
-        let f_attn_trans = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "transpose_attn_out")?;
+        let f_qkv_trans = g.function(
+            "htrans",
+            crate::ptx::HEAD_TRANSPOSE_PTX,
+            "cast_transpose_qkv",
+        )?;
+        let f_attn_trans = g.function(
+            "htrans",
+            crate::ptx::HEAD_TRANSPOSE_PTX,
+            "transpose_attn_out",
+        )?;
         let (flash_name, flash_cfg) = crate::gpu::flash_plan(dh, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
         let f_flash_w = if crate::gpu::wmma_flash_applies(dh, s) {
@@ -974,7 +1022,11 @@ impl CublasChainLayer {
     fn norm(&self, src: &CudaSlice<f32>, rows: usize) -> Result<CudaSlice<f32>, DriverError> {
         let mut out = self.stream.alloc_zeros::<f32>(rows * self.d)?;
         let (r, c) = (rows as u32, self.d as u32);
-        let cfg = LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut bld = self.stream.launch_builder(&self.f_norm);
         bld.arg(&r).arg(&c).arg(&self.eps).arg(src).arg(&mut out);
         unsafe { bld.launch(cfg)? };
@@ -1025,7 +1077,12 @@ impl CublasChainLayer {
                 let k16 = self.cast16(k)?;
                 let v16 = self.cast16(v)?;
                 let mut bld = self.stream.launch_builder(f_w);
-                bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut attn);
+                bld.arg(&ss)
+                    .arg(&scale)
+                    .arg(&q16)
+                    .arg(&k16)
+                    .arg(&v16)
+                    .arg(&mut attn);
                 unsafe { bld.launch(*cfg_w)? };
             } else {
                 let mut bld = self.stream.launch_builder(&self.f_flash);
@@ -1048,7 +1105,12 @@ impl CublasChainLayer {
             let mut attn_hsd = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
             let cfg = *cfg;
             let mut bld = self.stream.launch_builder(f_w);
-            bld.arg(&ss).arg(&scale).arg(&q_hsd).arg(&k_hsd).arg(&v_hsd).arg(&mut attn_hsd);
+            bld.arg(&ss)
+                .arg(&scale)
+                .arg(&q_hsd)
+                .arg(&k_hsd)
+                .arg(&v_hsd)
+                .arg(&mut attn_hsd);
             unsafe { bld.launch(cfg)? };
             self.transpose_back(&attn_hsd)
         }
@@ -1059,10 +1121,19 @@ impl CublasChainLayer {
     fn cast_transpose(&self, src: &CudaSlice<f32>) -> Result<CudaSlice<f16>, DriverError> {
         let n = self.s * self.d;
         let mut dst = self.stream.alloc_zeros::<f16>(n)?;
-        let (nn, dd, dhh, sdh) =
-            (n as u32, self.d as u32, self.dh as u32, (self.s * self.dh) as u32);
+        let (nn, dd, dhh, sdh) = (
+            n as u32,
+            self.d as u32,
+            self.dh as u32,
+            (self.s * self.dh) as u32,
+        );
         let mut b = self.stream.launch_builder(&self.f_qkv_trans);
-        b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut dst);
+        b.arg(&nn)
+            .arg(&dd)
+            .arg(&dhh)
+            .arg(&sdh)
+            .arg(src)
+            .arg(&mut dst);
         unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
         Ok(dst)
     }
@@ -1071,10 +1142,19 @@ impl CublasChainLayer {
     fn transpose_back(&self, src: &CudaSlice<f32>) -> Result<CudaSlice<f32>, DriverError> {
         let n = self.s * self.d;
         let mut dst = self.stream.alloc_zeros::<f32>(n)?;
-        let (nn, dd, dhh, sdh) =
-            (n as u32, self.d as u32, self.dh as u32, (self.s * self.dh) as u32);
+        let (nn, dd, dhh, sdh) = (
+            n as u32,
+            self.d as u32,
+            self.dh as u32,
+            (self.s * self.dh) as u32,
+        );
         let mut b = self.stream.launch_builder(&self.f_attn_trans);
-        b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut dst);
+        b.arg(&nn)
+            .arg(&dd)
+            .arg(&dhh)
+            .arg(&sdh)
+            .arg(src)
+            .arg(&mut dst);
         unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
         Ok(dst)
     }
@@ -1120,10 +1200,7 @@ impl CublasChainLayer {
     /// [`ResidentLayerF16::forward_device_unfused`] (norm → cast → 3 proj → flash → cast → O-proj →
     /// **separate** residual → norm → cast → up-proj → **separate** SiLU → cast → down-proj →
     /// **separate** residual), with every projection on cuBLAS instead of WMMA.
-    pub fn forward_device(
-        &self,
-        x_d: &CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, PeerError> {
+    pub fn forward_device(&self, x_d: &CudaSlice<f32>) -> Result<CudaSlice<f32>, PeerError> {
         let (s, d, dff) = (self.s, self.d, self.dff);
         // attention
         let h1 = self.norm(x_d, s)?;
@@ -1135,7 +1212,7 @@ impl CublasChainLayer {
         let attn_16 = self.cast(&attn, s * d)?;
         let o = self.gemm(&attn_16, &self.wo, s, d, d)?;
         let x1 = self.vadd(x_d, &o, s * d)?; // residual 1 (separate add)
-        // FFN
+                                             // FFN
         let h2 = self.norm(&x1, s)?;
         let h2_16 = self.cast(&h2, s * d)?;
         let f1 = self.gemm(&h2_16, &self.w1, s, d, dff)?;
@@ -1187,7 +1264,12 @@ impl CublasChainModel {
             layers.push(CublasChainLayer::new(g, w, s, d, dff)?);
         }
         let stream = g.stream.clone();
-        Ok(Self { stream, layers, s, d })
+        Ok(Self {
+            stream,
+            layers,
+            s,
+            d,
+        })
     }
 
     /// Number of layers in the stack.
@@ -1198,10 +1280,7 @@ impl CublasChainModel {
     /// Run the whole cuBLAS call-chain stack on a **resident** `[S,D]` buffer → resident final output, the
     /// pure on-device N-layer chain (no host transfer between layers) — the fair counterpart to
     /// [`ResidentModelF16::forward_device`], differing only in cuBLAS-GEMM + unfused epilogues per layer.
-    pub fn forward_device(
-        &self,
-        x_d: &CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, PeerError> {
+    pub fn forward_device(&self, x_d: &CudaSlice<f32>) -> Result<CudaSlice<f32>, PeerError> {
         let mut cur = self.layers[0].forward_device(x_d)?;
         for layer in &self.layers[1..] {
             cur = layer.forward_device(&cur)?;
@@ -1277,7 +1356,10 @@ pub fn nvrtc_naive_w4a16(
     assert_eq!(a.len(), m * k);
     assert_eq!(qw.n, n, "weight N mismatch");
     assert_eq!(qw.k, k, "weight K mismatch");
-    assert!(qw.signed, "naive_w4a16 peer expects the symmetric (signed) quant");
+    assert!(
+        qw.signed,
+        "naive_w4a16 peer expects the symmetric (signed) quant"
+    );
     let module = nvrtc_naive_w4a16_module(g)?;
     let f = module.load_function("naive_w4a16")?;
     let s_f32: Vec<f32> = qw.scales.iter().map(|x| x.to_f32()).collect();
@@ -1287,7 +1369,14 @@ pub fn nvrtc_naive_w4a16(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk, gg) = (m as i32, n as i32, k as i32, qw.group as i32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&gg).arg(&a_d).arg(&bq_d).arg(&s_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&gg)
+        .arg(&a_d)
+        .arg(&bq_d)
+        .arg(&s_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(naive_cfg(m, n))? };
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
@@ -1314,7 +1403,14 @@ pub fn time_nvrtc_naive_w4a16(
     let cfg = naive_cfg(m, n);
     let mut launch = |g: &Gpu| -> Result<(), DriverError> {
         let mut bld = g.stream.launch_builder(&f);
-        bld.arg(&mm).arg(&nn).arg(&kk).arg(&gg).arg(&a_d).arg(&bq_d).arg(&s_d).arg(&mut c_d);
+        bld.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&gg)
+            .arg(&a_d)
+            .arg(&bq_d)
+            .arg(&s_d)
+            .arg(&mut c_d);
         unsafe { bld.launch(cfg) }.map(|_| ())
     };
     launch(g)?; // warm up
@@ -1529,7 +1625,12 @@ pub fn nvrtc_naive_gemm_nt_int8(
     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
     let (mm, nn, kk) = (m as i32, n as i32, k as i32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(naive_cfg(m, n))? };
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
@@ -1553,7 +1654,12 @@ pub fn nvrtc_dp4a_gemm_nt_int8(
     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
     let (mm, nn, kk) = (m as i32, n as i32, k as i32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(naive_cfg(m, n))? };
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
@@ -1567,7 +1673,15 @@ pub fn time_nvrtc_naive_gemm_nt_int8(
     n: usize,
     iters: u32,
 ) -> Result<f64, PeerError> {
-    time_int8_peer(g, NAIVE_GEMM_NT_INT8_CUDA, "naive_gemm_nt_int8", m, k, n, iters)
+    time_int8_peer(
+        g,
+        NAIVE_GEMM_NT_INT8_CUDA,
+        "naive_gemm_nt_int8",
+        m,
+        k,
+        n,
+        iters,
+    )
 }
 
 /// Time the `dp4a` int8 CUDA-C GEMM (same timing shape as the naive peer). Seconds per launch.
@@ -1578,7 +1692,15 @@ pub fn time_nvrtc_dp4a_gemm_nt_int8(
     n: usize,
     iters: u32,
 ) -> Result<f64, PeerError> {
-    time_int8_peer(g, DP4A_GEMM_NT_INT8_CUDA, "dp4a_gemm_nt_int8", m, k, n, iters)
+    time_int8_peer(
+        g,
+        DP4A_GEMM_NT_INT8_CUDA,
+        "dp4a_gemm_nt_int8",
+        m,
+        k,
+        n,
+        iters,
+    )
 }
 
 /// Shared timing harness for the int8 CUDA-C peers: upload once (dummy bytes), `iters` resident
@@ -1601,7 +1723,12 @@ fn time_int8_peer(
     let cfg = naive_cfg(m, n);
     let mut launch = |g: &Gpu| -> Result<(), DriverError> {
         let mut bld = g.stream.launch_builder(&f);
-        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+        bld.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&a_d)
+            .arg(&b_d)
+            .arg(&mut c_d);
         unsafe { bld.launch(cfg) }.map(|_| ())
     };
     launch(g)?; // warm up
@@ -2136,7 +2263,12 @@ fn cudnn_conv_setup(
     // match to Wukong's fp16 path); f16-in/f32-out is CUDNN_STATUS_NOT_SUPPORTED for the TC algos.
     let y_desc = cudnn.create_4d_tensor::<f16>(nhwc, [1, k as i32, p as i32, q as i32])?;
     let algo = {
-        let fwd = ConvForward { conv: &conv_desc, x: &x_desc, w: &w_desc, y: &y_desc };
+        let fwd = ConvForward {
+            conv: &conv_desc,
+            x: &x_desc,
+            w: &w_desc,
+            y: &y_desc,
+        };
         fwd.pick_algorithm()?
     };
     Ok((cudnn, conv_desc, x_desc, w_desc, y_desc, algo, (p, q)))
@@ -2165,19 +2297,32 @@ pub fn cudnn_conv2d_run(
     let (cudnn, conv_desc, x_desc, w_desc, y_desc, algo, (p, q)) =
         cudnn_conv_setup(g, c, h, width, k, r, s, pad, stride)?;
     let _ = &cudnn; // keep the handle alive for the launch
-    let fwd = ConvForward { conv: &conv_desc, x: &x_desc, w: &w_desc, y: &y_desc };
+    let fwd = ConvForward {
+        conv: &conv_desc,
+        x: &x_desc,
+        w: &w_desc,
+        y: &y_desc,
+    };
     let ws_size = fwd.get_workspace_size(algo)?;
     let x_d = g.stream.memcpy_stod(&nchw_to_nhwc_f16(x, c, h, width))?;
     let w_d = g.stream.memcpy_stod(&kcrs_to_krsc_f16(w, k, c, r, s))?;
     let mut y_d = g.stream.alloc_zeros::<f16>(k * p * q)?;
-    let mut ws: Option<CudaSlice<u8>> =
-        if ws_size > 0 { Some(g.stream.alloc_zeros::<u8>(ws_size)?) } else { None };
+    let mut ws: Option<CudaSlice<u8>> = if ws_size > 0 {
+        Some(g.stream.alloc_zeros::<u8>(ws_size)?)
+    } else {
+        None
+    };
     let (one, zero) = (f16::from_f32(1.0), f16::from_f32(0.0));
     unsafe {
         fwd.launch(algo, ws.as_mut(), (one, zero), &x_d, &w_d, &mut y_d)?;
     }
     g.stream.synchronize()?;
-    let y_nhwc: Vec<f32> = g.stream.memcpy_dtov(&y_d)?.iter().map(|v| v.to_f32()).collect();
+    let y_nhwc: Vec<f32> = g
+        .stream
+        .memcpy_dtov(&y_d)?
+        .iter()
+        .map(|v| v.to_f32())
+        .collect();
     Ok((nhwc_out_to_kpq(&y_nhwc, k, p, q), algo))
 }
 
@@ -2201,18 +2346,31 @@ pub fn time_cudnn_conv2d(
     let (cudnn, conv_desc, x_desc, w_desc, y_desc, algo, (p, q)) =
         cudnn_conv_setup(g, c, h, width, k, r, s, pad, stride)?;
     let _ = &cudnn;
-    let fwd = ConvForward { conv: &conv_desc, x: &x_desc, w: &w_desc, y: &y_desc };
-    let ws_size = fwd.get_workspace_size(algo)?;
-    let x_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.01); c * h * width])?;
-    let w_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.01); k * c * r * s])?;
-    let mut y_d = g.stream.alloc_zeros::<f16>(k * p * q)?;
-    let mut ws: Option<CudaSlice<u8>> =
-        if ws_size > 0 { Some(g.stream.alloc_zeros::<u8>(ws_size)?) } else { None };
-    let (one, zero) = (f16::from_f32(1.0), f16::from_f32(0.0));
-    let do_launch = |ws: &mut Option<CudaSlice<u8>>, y: &mut CudaSlice<f16>| -> Result<(), PeerError> {
-        unsafe { fwd.launch(algo, ws.as_mut(), (one, zero), &x_d, &w_d, y)? };
-        Ok(())
+    let fwd = ConvForward {
+        conv: &conv_desc,
+        x: &x_desc,
+        w: &w_desc,
+        y: &y_desc,
     };
+    let ws_size = fwd.get_workspace_size(algo)?;
+    let x_d = g
+        .stream
+        .memcpy_stod(&vec![f16::from_f32(0.01); c * h * width])?;
+    let w_d = g
+        .stream
+        .memcpy_stod(&vec![f16::from_f32(0.01); k * c * r * s])?;
+    let mut y_d = g.stream.alloc_zeros::<f16>(k * p * q)?;
+    let mut ws: Option<CudaSlice<u8>> = if ws_size > 0 {
+        Some(g.stream.alloc_zeros::<u8>(ws_size)?)
+    } else {
+        None
+    };
+    let (one, zero) = (f16::from_f32(1.0), f16::from_f32(0.0));
+    let do_launch =
+        |ws: &mut Option<CudaSlice<u8>>, y: &mut CudaSlice<f16>| -> Result<(), PeerError> {
+            unsafe { fwd.launch(algo, ws.as_mut(), (one, zero), &x_d, &w_d, y)? };
+            Ok(())
+        };
     do_launch(&mut ws, &mut y_d)?; // warm up
     g.stream.synchronize()?;
     let t0 = std::time::Instant::now();
@@ -2336,7 +2494,11 @@ pub fn time_cublas_int8_gemm_dequant_chain(
     unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut ci_d, m, k, n)? };
     {
         let mut bld = stream.launch_builder(&deq);
-        bld.arg(&ci_d).arg(&scale_d).arg(&mut cf_d).arg(&mm).arg(&nn);
+        bld.arg(&ci_d)
+            .arg(&scale_d)
+            .arg(&mut cf_d)
+            .arg(&mm)
+            .arg(&nn);
         unsafe { bld.launch(dcfg)? };
     }
     stream.synchronize()?;
@@ -2344,7 +2506,11 @@ pub fn time_cublas_int8_gemm_dequant_chain(
     for _ in 0..iters {
         unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut ci_d, m, k, n)? };
         let mut bld = stream.launch_builder(&deq);
-        bld.arg(&ci_d).arg(&scale_d).arg(&mut cf_d).arg(&mm).arg(&nn);
+        bld.arg(&ci_d)
+            .arg(&scale_d)
+            .arg(&mut cf_d)
+            .arg(&mm)
+            .arg(&nn);
         unsafe { bld.launch(dcfg)? };
     }
     stream.synchronize()?;
@@ -2498,15 +2664,34 @@ pub fn fa2_sdpa_peer(
 
     let out = std::process::Command::new(&python)
         .arg(&peer)
-        .arg("--q").arg(&qp).arg("--k").arg(&kp).arg("--v").arg(&vp)
-        .arg("--o").arg(&op).arg("--report").arg(&rp)
-        .arg("--B").arg(b.to_string()).arg("--H").arg(h.to_string())
-        .arg("--S").arg(s.to_string()).arg("--D").arg(d.to_string())
-        .arg("--scale").arg(format!("{scale:.9}"))
-        .arg("--causal").arg(if causal { "1" } else { "0" })
-        .arg("--warmup").arg(warmup.to_string())
-        .arg("--iters").arg(iters.to_string())
-        .arg("--runs").arg(runs.to_string())
+        .arg("--q")
+        .arg(&qp)
+        .arg("--k")
+        .arg(&kp)
+        .arg("--v")
+        .arg(&vp)
+        .arg("--o")
+        .arg(&op)
+        .arg("--report")
+        .arg(&rp)
+        .arg("--B")
+        .arg(b.to_string())
+        .arg("--H")
+        .arg(h.to_string())
+        .arg("--S")
+        .arg(s.to_string())
+        .arg("--D")
+        .arg(d.to_string())
+        .arg("--scale")
+        .arg(format!("{scale:.9}"))
+        .arg("--causal")
+        .arg(if causal { "1" } else { "0" })
+        .arg("--warmup")
+        .arg(warmup.to_string())
+        .arg("--iters")
+        .arg(iters.to_string())
+        .arg("--runs")
+        .arg(runs.to_string())
         .output()?;
     if !out.status.success() {
         let _ = std::fs::remove_dir_all(&dir);
@@ -2532,14 +2717,20 @@ pub fn fa2_sdpa_peer(
         let _ = std::fs::remove_dir_all(&dir);
         return Err(format!("fa2 peer: no fused backend available; report:\n{rep}").into());
     }
-    let chosen_sec = getf(&format!("{chosen}_sec"))
-        .ok_or_else(|| -> PeerError { format!("fa2 peer: missing {chosen}_sec in report").into() })?;
+    let chosen_sec = getf(&format!("{chosen}_sec")).ok_or_else(|| -> PeerError {
+        format!("fa2 peer: missing {chosen}_sec in report").into()
+    })?;
     let chosen_gflops = getf(&format!("{chosen}_gflops")).unwrap_or(0.0);
 
     let obytes = std::fs::read(&op)?;
     if obytes.len() != n * 4 {
         let _ = std::fs::remove_dir_all(&dir);
-        return Err(format!("fa2 peer: O is {} bytes != expected {}", obytes.len(), n * 4).into());
+        return Err(format!(
+            "fa2 peer: O is {} bytes != expected {}",
+            obytes.len(),
+            n * 4
+        )
+        .into());
     }
     let o: Vec<f32> = obytes
         .chunks_exact(4)
@@ -2628,16 +2819,40 @@ pub fn fa2_sdpa_peer_rope(
 
     let out = std::process::Command::new(&python)
         .arg(&peer)
-        .arg("--q").arg(&qp).arg("--k").arg(&kp).arg("--v").arg(&vp)
-        .arg("--o").arg(&op).arg("--report").arg(&rp)
-        .arg("--B").arg(b.to_string()).arg("--H").arg(h.to_string())
-        .arg("--S").arg(s.to_string()).arg("--D").arg(d.to_string())
-        .arg("--scale").arg(format!("{scale:.9}"))
-        .arg("--causal").arg(if causal { "1" } else { "0" })
-        .arg("--warmup").arg(warmup.to_string())
-        .arg("--iters").arg(iters.to_string())
-        .arg("--runs").arg(runs.to_string())
-        .arg("--rope").arg("1").arg("--cos").arg(&cp).arg("--sin").arg(&sp)
+        .arg("--q")
+        .arg(&qp)
+        .arg("--k")
+        .arg(&kp)
+        .arg("--v")
+        .arg(&vp)
+        .arg("--o")
+        .arg(&op)
+        .arg("--report")
+        .arg(&rp)
+        .arg("--B")
+        .arg(b.to_string())
+        .arg("--H")
+        .arg(h.to_string())
+        .arg("--S")
+        .arg(s.to_string())
+        .arg("--D")
+        .arg(d.to_string())
+        .arg("--scale")
+        .arg(format!("{scale:.9}"))
+        .arg("--causal")
+        .arg(if causal { "1" } else { "0" })
+        .arg("--warmup")
+        .arg(warmup.to_string())
+        .arg("--iters")
+        .arg(iters.to_string())
+        .arg("--runs")
+        .arg(runs.to_string())
+        .arg("--rope")
+        .arg("1")
+        .arg("--cos")
+        .arg(&cp)
+        .arg("--sin")
+        .arg(&sp)
         .output()?;
     if !out.status.success() {
         let _ = std::fs::remove_dir_all(&dir);
@@ -2707,15 +2922,25 @@ mod tests {
         let mut guard = crate::gpu::gpu();
         let Some(g) = guard.as_mut() else {
             let why = crate::gpu::init_error().unwrap_or("no CUDA device reachable");
-            assert!(!crate::gpu::gpu_required(), "WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}");
+            assert!(
+                !crate::gpu::gpu_required(),
+                "WUKONG_GPU_REQUIRED is set but the GPU is unusable: {why}"
+            );
             eprintln!("[skip] peers_compile_for_the_probed_device: GPU unavailable: {why}");
             return;
         };
         let t = g.target();
         let want = format!("--gpu-architecture=compute_{}{}", t.cc_major, t.cc_minor);
         let opts = super::peer_compile_opts(g);
-        assert!(opts.arch.is_none(), "the static `arch` field must stay empty: the flag is runtime-built");
-        assert_eq!(opts.options, vec![want.clone()], "peer NVRTC arch != the probed device");
+        assert!(
+            opts.arch.is_none(),
+            "the static `arch` field must stay empty: the flag is runtime-built"
+        );
+        assert_eq!(
+            opts.options,
+            vec![want.clone()],
+            "peer NVRTC arch != the probed device"
+        );
         eprintln!("[gate] NVRTC peers compile with {want} for {} ✓", t.name);
     }
 
@@ -2733,12 +2958,18 @@ mod tests {
             "peer PTX must open with the sm_80 v7.8 header"
         );
         assert!(ptx.contains(crate::ptx_target::TARGET_SM80));
-        assert!(!ptx.contains(crate::ptx_target::TARGET_SM89), "this kernel needs no Ada instruction");
+        assert!(
+            !ptx.contains(crate::ptx_target::TARGET_SM89),
+            "this kernel needs no Ada instruction"
+        );
         assert!(
             !ptx.contains(".version 8.4"),
             "`.version 8.4` demands driver r550+; this kernel needs nothing above ISA 7.0"
         );
-        assert!(ptx.contains(".visible .entry int8_dequant_chain("), "the header must not have eaten the body");
+        assert!(
+            ptx.contains(".visible .entry int8_dequant_chain("),
+            "the header must not have eaten the body"
+        );
     }
 
     /// **The peer chain's attention must be the *same kernel* the Wukong layer runs** (device-free).
@@ -2759,15 +2990,34 @@ mod tests {
             for &s in &[512usize, 1024, 2048, 4096] {
                 let (entry, cfg) = CublasChainLayer::flash_plan_w(dh, s, heads);
                 let (want_entry, want_cfg) = crate::gpu::wmma_flash_plan(dh, s, heads);
-                assert_eq!(entry, want_entry, "chain flash entry dh={dh} S={s} heads={heads}");
-                assert_eq!(cfg.grid_dim, want_cfg.grid_dim, "chain flash grid dh={dh} S={s}");
-                assert_eq!(cfg.block_dim, want_cfg.block_dim, "chain flash block dh={dh} S={s}");
-                assert_eq!(cfg.grid_dim.1, heads as u32, "grid.y must carry the head count");
+                assert_eq!(
+                    entry, want_entry,
+                    "chain flash entry dh={dh} S={s} heads={heads}"
+                );
+                assert_eq!(
+                    cfg.grid_dim, want_cfg.grid_dim,
+                    "chain flash grid dh={dh} S={s}"
+                );
+                assert_eq!(
+                    cfg.block_dim, want_cfg.block_dim,
+                    "chain flash block dh={dh} S={s}"
+                );
+                assert_eq!(
+                    cfg.grid_dim.1, heads as u32,
+                    "grid.y must carry the head count"
+                );
                 // Entry and config must belong to the same family: the `_ws*` kernels are 2 warps per
                 // CTA with a halved grid; every other tensor-core flash entry is 1 warp, grid S/16.
                 if entry.contains("_ws") {
-                    assert_eq!(cfg.block_dim.0, 64, "{entry} is warp-specialized: 2 warps/CTA");
-                    assert_eq!(cfg.grid_dim.0, ((s / 16) as u32).div_ceil(2), "{entry} grid");
+                    assert_eq!(
+                        cfg.block_dim.0, 64,
+                        "{entry} is warp-specialized: 2 warps/CTA"
+                    );
+                    assert_eq!(
+                        cfg.grid_dim.0,
+                        ((s / 16) as u32).div_ceil(2),
+                        "{entry} grid"
+                    );
                 } else {
                     assert_eq!(cfg.block_dim.0, 32, "{entry} is 1 warp/CTA");
                     assert_eq!(cfg.grid_dim.0, (s / 16) as u32, "{entry} grid");

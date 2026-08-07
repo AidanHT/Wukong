@@ -70,7 +70,11 @@ impl<T: DeviceRepr + ValidAsZeroBits> PinnedBuf<T> {
 impl<T: DeviceRepr + ValidAsZeroBits + Copy> PinnedBuf<T> {
     /// Fill the pinned buffer from a host slice (host-side copy; syncs the buffer's event first).
     pub fn copy_from_slice(&mut self, src: &[T]) -> Result<(), DriverError> {
-        assert_eq!(src.len(), self.inner.len(), "PinnedBuf::copy_from_slice length mismatch");
+        assert_eq!(
+            src.len(),
+            self.inner.len(),
+            "PinnedBuf::copy_from_slice length mismatch"
+        );
         let dst = self.inner.as_mut_ptr()?;
         // SAFETY: `dst` has room for `len` elements (asserted); `src` is a valid host slice.
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
@@ -153,7 +157,11 @@ impl Graph {
             }
             return Err(e);
         }
-        Ok(Self { stream, graph, exec })
+        Ok(Self {
+            stream,
+            graph,
+            exec,
+        })
     }
 
     /// Replay the whole captured sequence with **one** `cuGraphLaunch` on the capture stream. The

@@ -19,12 +19,12 @@
 
 use std::fmt::Write as _;
 
+use std::collections::HashMap;
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
     BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
 };
 use wukong_span::{Interner, Symbol};
-use std::collections::HashMap;
 
 /// For each block, the incoming edges as `(predecessor block id, arguments passed)`. Used to build
 /// phi nodes for block parameters.

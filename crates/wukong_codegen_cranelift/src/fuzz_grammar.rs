@@ -235,8 +235,7 @@ impl Gen {
                     let nt = Ty::pick_numeric(&mut self.rng);
                     let a = self.expr(nt, depth - 1);
                     let b = self.expr(nt, depth - 1);
-                    let op = ["<", "<=", ">", ">=", "==", "!="]
-                        [self.rng.below(6) as usize];
+                    let op = ["<", "<=", ">", ">=", "==", "!="][self.rng.below(6) as usize];
                     format!("(({a}) {op} ({b}))")
                 }
                 2 => {
@@ -459,12 +458,11 @@ impl Gen {
                 let len = [4usize, 5, 8, 17, 24][self.rng.below(5) as usize];
                 let init = self.literal(t);
                 let name = self.fresh("a");
-                self.line(format!("let mut {name}: [{}; {len}] = [{init}; {len}];", t.name()));
-                self.arrs.push(Arr {
-                    name,
-                    elem: t,
-                    len,
-                });
+                self.line(format!(
+                    "let mut {name}: [{}; {len}] = [{init}; {len}];",
+                    t.name()
+                ));
+                self.arrs.push(Arr { name, elem: t, len });
             }
             // array store
             6 => {
@@ -475,7 +473,12 @@ impl Gen {
                     let idx = self.index_for(a.len);
                     let e = self.expr(a.elem, 2);
                     // Same strict-assign rule as scalar assigns: pin the element type.
-                    self.line(format!("{}[{}] = (({e}) as {});", a.name, idx, a.elem.name()));
+                    self.line(format!(
+                        "{}[{}] = (({e}) as {});",
+                        a.name,
+                        idx,
+                        a.elem.name()
+                    ));
                 }
             }
             // if / else
@@ -583,7 +586,9 @@ impl Gen {
                 } else {
                     let x = self.expr(Ty::F32, 1);
                     let y = self.expr(Ty::I32, 1);
-                    self.line(format!("let mut {name}: Pt = Pt {{ x: ({x}) as f32, y: ({y}) as i32 }};"));
+                    self.line(format!(
+                        "let mut {name}: Pt = Pt {{ x: ({x}) as f32, y: ({y}) as i32 }};"
+                    ));
                 }
                 self.pts.push(name);
             }
@@ -685,7 +690,9 @@ impl Gen {
                     let a = self.expr(Ty::I32, 1);
                     let b = self.expr(Ty::F32, 1);
                     let name = self.fresh("t");
-                    self.line(format!("let {name}: (i32, f32) = (({a}) as i32, ({b}) as f32);"));
+                    self.line(format!(
+                        "let {name}: (i32, f32) = (({a}) as i32, ({b}) as f32);"
+                    ));
                     self.tups.push(name);
                 } else {
                     let cands = self.tups.clone();
@@ -821,15 +828,14 @@ fn program(seed: u64) -> String {
 
 /// Compile `src` through the real pipeline at `opt`, then run it on the given backend.
 /// `Err` means the program did not compile — a generator bug worth failing loudly on.
-fn run_at(
-    src: &str,
-    opt: u8,
-    native: bool,
-) -> Result<Result<(i64, Vec<u8>), String>, String> {
+fn run_at(src: &str, opt: u8, native: bool) -> Result<Result<(i64, Vec<u8>), String>, String> {
     let mut interner = Interner::new();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
     if pd.iter().any(|d| d.is_error()) {
-        return Err(format!("parse error: {:?}", pd.iter().find(|d| d.is_error())));
+        return Err(format!(
+            "parse error: {:?}",
+            pd.iter().find(|d| d.is_error())
+        ));
     }
     let (sema, sd) = wukong_sema::check(&module, &interner);
     if sd.iter().any(|d| d.is_error()) {
@@ -922,7 +928,13 @@ fn fuzz_grammar_differential() {
         };
         // All five executions must agree on (exit, stdout) — or all fail.
         let outs = [&i0, &i2, &i3, &n0, &n3];
-        let names = ["interp -O0", "interp -O2", "interp -O3", "native -O0", "native -O3"];
+        let names = [
+            "interp -O0",
+            "interp -O2",
+            "interp -O3",
+            "native -O0",
+            "native -O3",
+        ];
         let first_ok = outs.iter().position(|r| r.is_ok());
         match first_ok {
             None => {} // all five failed — counted as uncompared by the assert after the loop.

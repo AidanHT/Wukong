@@ -50,7 +50,9 @@
 use std::sync::Arc;
 
 #[cfg(feature = "gpu")]
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+};
 
 // Only the (gpu-gated) launchers and device gates take a `KvConfig`; the generators, the quantizer
 // and the f64 reference are geometry-free, which is what lets this module compile un-gated.
@@ -80,7 +82,10 @@ pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
 /// head_dim]`, f16 cache, f32 query/out. **Bit-exact across block layouts** (the lane partition + merge
 /// order are layout-independent; the block table only changes the load address).
 pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
-    assert!(head_dim > 0 && head_dim % 2 == 0, "head_dim must be a positive even number");
+    assert!(
+        head_dim > 0 && head_dim % 2 == 0,
+        "head_dim must be a positive even number"
+    );
     let hd = head_dim;
     let w = PAGED_ATTN_WARPS as usize;
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
@@ -143,7 +148,8 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     // qshw = &qsh[warp*hd] (this warp's query staging in shared).
     s += &format!("    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n", hd * 4);
     // Cooperatively stage q into shared: lane stores d = lane, lane+32, … ; warp-sync before the dot.
-    s += &format!("    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QLE;\n");
+    s +=
+        &format!("    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QLE;\n");
     s += "    mul.wide.u32 %offb,%dd,4;\n    add.s64 %addr,%qrow,%offb;\n    ld.global.f32 %qv,[%addr];\n";
     s += "    add.s64 %addr,%qshw,%offb;\n    st.shared.f32 [%addr],%qv;\n    add.u32 %dd,%dd,32;\n    bra QL;\nQLE:\n";
     s += "    bar.warp.sync 0xffffffff;\n";
@@ -158,7 +164,9 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
     // e = ((((layer*nblk)+phys)*bsz + off)*heads + head)*hd ; kbase/vbase = slab + e*2.
     s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
-    s += &format!("    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%head;\n    mul.lo.s32 %e,%e,{hd};\n");
+    s += &format!(
+        "    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%head;\n    mul.lo.s32 %e,%e,{hd};\n"
+    );
     s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %kbase,%K,%offb;\n    add.s64 %vbase,%V,%offb;\n";
     // score = scale * dot(q, K[t])  (q from shared, K widened from f16).
     s += "    mov.f32 %score,0f00000000;\n";
@@ -167,8 +175,12 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     }
     s += "    mul.f32 %score,%score,%scale;\n";
     s += "    max.f32 %newm,%m,%score;\n";
-    s += &format!("    sub.f32 %t0,%m,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %corr,%t0;\n");
-    s += &format!("    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n");
+    s += &format!(
+        "    sub.f32 %t0,%m,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %corr,%t0;\n"
+    );
+    s += &format!(
+        "    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n"
+    );
     s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
     for d in 0..hd {
         s += &format!("    ld.global.u16 %h,[%vbase+{}];\n    cvt.f32.f16 %vf,%h;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%p,%vf,%acc{d};\n", d * 2);
@@ -177,7 +189,9 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     // Cross-lane merge (fixed butterfly order): M = max(m) ; rescale by exp(m−M) ; L = Σl ; ACC = Σacc.
     s += "    mov.f32 %M,%m;\n";
     s += &bfly("%M", "max");
-    s += &format!("    sub.f32 %t0,%m,%M;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %factor,%t0;\n");
+    s += &format!(
+        "    sub.f32 %t0,%m,%M;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %factor,%t0;\n"
+    );
     s += "    mul.f32 %l,%l,%factor;\n";
     for d in 0..hd {
         s += &format!("    mul.f32 %acc{d},%acc{d},%factor;\n");
@@ -191,7 +205,10 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     s += "    rcp.rn.f32 %invl,%L;\n    setp.gt.f32 %p2,%L,0f00000000;\n    selp.f32 %invl,%invl,0f00000000,%p2;\n";
     s += "    setp.ne.u32 %p0,%lane,0;\n    @%p0 bra DONE;\n";
     for d in 0..hd {
-        s += &format!("    mul.f32 %t0,%acc{d},%invl;\n    st.global.f32 [%obase+{}],%t0;\n", d * 4);
+        s += &format!(
+            "    mul.f32 %t0,%acc{d},%invl;\n    st.global.f32 [%obase+{}],%t0;\n",
+            d * 4
+        );
     }
     s += "DONE:\n    ret;\n}\n";
     s
@@ -224,11 +241,31 @@ pub fn launch_paged_attn_decode(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
-    debug_assert_eq!(q_d.len(), bcap * cfg.heads * cfg.head_dim, "q must be [bcap, heads*head_dim]");
-    debug_assert_eq!(out_d.len(), bcap * cfg.heads * cfg.head_dim, "out must be [bcap, heads*head_dim]");
-    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "k slab must be cfg.slab_elems()");
-    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "v slab must be cfg.slab_elems()");
-    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(
+        q_d.len(),
+        bcap * cfg.heads * cfg.head_dim,
+        "q must be [bcap, heads*head_dim]"
+    );
+    debug_assert_eq!(
+        out_d.len(),
+        bcap * cfg.heads * cfg.head_dim,
+        "out must be [bcap, heads*head_dim]"
+    );
+    debug_assert_eq!(
+        k_d.len(),
+        cfg.slab_elems(),
+        "k slab must be cfg.slab_elems()"
+    );
+    debug_assert_eq!(
+        v_d.len(),
+        cfg.slab_elems(),
+        "v slab must be cfg.slab_elems()"
+    );
+    debug_assert_eq!(
+        bt_d.len(),
+        bcap * cfg.max_blocks_per_seq,
+        "block table must be [bcap, cfg.max_blocks_per_seq]"
+    );
     debug_assert_eq!(cl_d.len(), bcap, "context lengths must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let cfg_launch = LaunchConfig {
@@ -236,12 +273,28 @@ pub fn launch_paged_attn_decode(
         block_dim: (32 * PAGED_ATTN_WARPS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (heads, bsz, nblk, mbps, layer_u) =
-        (cfg.heads as u32, cfg.block_size as u32, cfg.num_blocks as u32, cfg.max_blocks_per_seq as u32, layer as u32);
+    let (heads, bsz, nblk, mbps, layer_u) = (
+        cfg.heads as u32,
+        cfg.block_size as u32,
+        cfg.num_blocks as u32,
+        cfg.max_blocks_per_seq as u32,
+        layer as u32,
+    );
     let bcap_u = bcap as u32;
     let mut b = stream.launch_builder(func);
-    b.arg(q_d).arg(k_d).arg(v_d).arg(out_d).arg(bt_d).arg(cl_d).arg(&scale);
-    b.arg(&bcap_u).arg(&heads).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    b.arg(q_d)
+        .arg(k_d)
+        .arg(v_d)
+        .arg(out_d)
+        .arg(bt_d)
+        .arg(cl_d)
+        .arg(&scale);
+    b.arg(&bcap_u)
+        .arg(&heads)
+        .arg(&bsz)
+        .arg(&nblk)
+        .arg(&mbps)
+        .arg(&layer_u);
     // SAFETY: the pushed arguments match `PAGED_ATTN_ENTRY`'s parameter list in order and width (six
     // .u64 pointers, one .f32, six .u32 — see `paged_attn_decode_ptx`), and `func` was loaded from PTX
     // generated for `cfg.head_dim` (the entry is head_dim-specialized). Every buffer is at least as long
@@ -264,7 +317,10 @@ pub const PAGED_ATTN_INT8_ENTRY: &str = "paged_attn_decode_int8";
 /// slab is `head_dim×` smaller than the K slab. Same warp-cooperative online softmax; **bit-exact across
 /// block layouts** (the dequant multiply order is fixed per token). Tolerance-gated (lossy), not bit-exact.
 pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
-    assert!(head_dim > 0 && head_dim % 2 == 0, "head_dim must be a positive even number");
+    assert!(
+        head_dim > 0 && head_dim % 2 == 0,
+        "head_dim must be a positive even number"
+    );
     let hd = head_dim;
     let w = PAGED_ATTN_WARPS as usize;
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
@@ -322,7 +378,8 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
     s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n    add.s64 %obase,%O,%offb;\n";
     s += &format!("    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n", hd * 4);
-    s += &format!("    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QLE;\n");
+    s +=
+        &format!("    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QLE;\n");
     s += "    mul.wide.u32 %offb,%dd,4;\n    add.s64 %addr,%qrow,%offb;\n    ld.global.f32 %qv,[%addr];\n";
     s += "    add.s64 %addr,%qshw,%offb;\n    st.shared.f32 [%addr],%qv;\n    add.u32 %dd,%dd,32;\n    bra QL;\nQLE:\n";
     s += "    bar.warp.sync 0xffffffff;\n";
@@ -348,8 +405,12 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     }
     s += "    mul.f32 %score,%score,%scK;\n    mul.f32 %score,%score,%scale;\n";
     s += "    max.f32 %newm,%m,%score;\n";
-    s += &format!("    sub.f32 %t0,%m,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %corr,%t0;\n");
-    s += &format!("    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n");
+    s += &format!(
+        "    sub.f32 %t0,%m,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %corr,%t0;\n"
+    );
+    s += &format!(
+        "    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n"
+    );
     s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
     s += "    mul.f32 %pv,%p,%scV;\n";
     for d in 0..hd {
@@ -358,7 +419,9 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += "    mov.f32 %m,%newm;\n    add.u32 %t,%t,32;\n    bra LOOP;\nENDLOOP:\n";
     s += "    mov.f32 %M,%m;\n";
     s += &bfly("%M", "max");
-    s += &format!("    sub.f32 %t0,%m,%M;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %factor,%t0;\n");
+    s += &format!(
+        "    sub.f32 %t0,%m,%M;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %factor,%t0;\n"
+    );
     s += "    mul.f32 %l,%l,%factor;\n";
     for d in 0..hd {
         s += &format!("    mul.f32 %acc{d},%acc{d},%factor;\n");
@@ -371,7 +434,10 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += "    rcp.rn.f32 %invl,%L;\n    setp.gt.f32 %p2,%L,0f00000000;\n    selp.f32 %invl,%invl,0f00000000,%p2;\n";
     s += "    setp.ne.u32 %p0,%lane,0;\n    @%p0 bra DONE;\n";
     for d in 0..hd {
-        s += &format!("    mul.f32 %t0,%acc{d},%invl;\n    st.global.f32 [%obase+{}],%t0;\n", d * 4);
+        s += &format!(
+            "    mul.f32 %t0,%acc{d},%invl;\n    st.global.f32 [%obase+{}],%t0;\n",
+            d * 4
+        );
     }
     s += "DONE:\n    ret;\n}\n";
     s
@@ -398,13 +464,41 @@ pub fn launch_paged_attn_decode_int8(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
-    debug_assert_eq!(q_d.len(), bcap * cfg.heads * cfg.head_dim, "q must be [bcap, heads*head_dim]");
-    debug_assert_eq!(out_d.len(), bcap * cfg.heads * cfg.head_dim, "out must be [bcap, heads*head_dim]");
-    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "int8 k slab must be cfg.slab_elems()");
-    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "int8 v slab must be cfg.slab_elems()");
-    debug_assert_eq!(ksc_d.len(), cfg.scale_slab_elems(), "k scale slab must be cfg.scale_slab_elems()");
-    debug_assert_eq!(vsc_d.len(), cfg.scale_slab_elems(), "v scale slab must be cfg.scale_slab_elems()");
-    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
+    debug_assert_eq!(
+        q_d.len(),
+        bcap * cfg.heads * cfg.head_dim,
+        "q must be [bcap, heads*head_dim]"
+    );
+    debug_assert_eq!(
+        out_d.len(),
+        bcap * cfg.heads * cfg.head_dim,
+        "out must be [bcap, heads*head_dim]"
+    );
+    debug_assert_eq!(
+        k_d.len(),
+        cfg.slab_elems(),
+        "int8 k slab must be cfg.slab_elems()"
+    );
+    debug_assert_eq!(
+        v_d.len(),
+        cfg.slab_elems(),
+        "int8 v slab must be cfg.slab_elems()"
+    );
+    debug_assert_eq!(
+        ksc_d.len(),
+        cfg.scale_slab_elems(),
+        "k scale slab must be cfg.scale_slab_elems()"
+    );
+    debug_assert_eq!(
+        vsc_d.len(),
+        cfg.scale_slab_elems(),
+        "v scale slab must be cfg.scale_slab_elems()"
+    );
+    debug_assert_eq!(
+        bt_d.len(),
+        bcap * cfg.max_blocks_per_seq,
+        "block table must be [bcap, cfg.max_blocks_per_seq]"
+    );
     debug_assert_eq!(cl_d.len(), bcap, "context lengths must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let cfg_launch = LaunchConfig {
@@ -412,12 +506,30 @@ pub fn launch_paged_attn_decode_int8(
         block_dim: (32 * PAGED_ATTN_WARPS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (heads, bsz, nblk, mbps, layer_u) =
-        (cfg.heads as u32, cfg.block_size as u32, cfg.num_blocks as u32, cfg.max_blocks_per_seq as u32, layer as u32);
+    let (heads, bsz, nblk, mbps, layer_u) = (
+        cfg.heads as u32,
+        cfg.block_size as u32,
+        cfg.num_blocks as u32,
+        cfg.max_blocks_per_seq as u32,
+        layer as u32,
+    );
     let bcap_u = bcap as u32;
     let mut b = stream.launch_builder(func);
-    b.arg(q_d).arg(k_d).arg(v_d).arg(ksc_d).arg(vsc_d).arg(out_d).arg(bt_d).arg(cl_d).arg(&scale);
-    b.arg(&bcap_u).arg(&heads).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    b.arg(q_d)
+        .arg(k_d)
+        .arg(v_d)
+        .arg(ksc_d)
+        .arg(vsc_d)
+        .arg(out_d)
+        .arg(bt_d)
+        .arg(cl_d)
+        .arg(&scale);
+    b.arg(&bcap_u)
+        .arg(&heads)
+        .arg(&bsz)
+        .arg(&nblk)
+        .arg(&mbps)
+        .arg(&layer_u);
     // SAFETY: the pushed arguments match `PAGED_ATTN_INT8_ENTRY`'s parameter list in order and width
     // (eight .u64 pointers, one .f32, six .u32 — see `paged_attn_decode_int8_ptx`), and `func` was
     // loaded from PTX generated for `cfg.head_dim`. Every buffer is at least as long as the largest
@@ -432,7 +544,12 @@ pub fn launch_paged_attn_decode_int8(
 /// **Host reference quantizer**: per-slot f32 K/V (`[ctx, heads, head_dim]` row-major) → int8 values +
 /// per-(token, head) f32 scales (`scale = max_d |x| / 127`, `0 → 1`), `int8 = round(x / scale)` clamped.
 /// The device int8 cache stores exactly this; [`paged_attn_decode_int8_ptx`] dequants `int8 · scale`.
-pub fn quantize_kv_int8(slot: &[f32], ctx: usize, heads: usize, head_dim: usize) -> (Vec<i8>, Vec<f32>) {
+pub fn quantize_kv_int8(
+    slot: &[f32],
+    ctx: usize,
+    heads: usize,
+    head_dim: usize,
+) -> (Vec<i8>, Vec<f32>) {
     let mut q = vec![0i8; ctx * heads * head_dim];
     let mut sc = vec![0f32; ctx * heads];
     for t in 0..ctx {
@@ -544,12 +661,36 @@ pub fn launch_kv_append(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
-    debug_assert_eq!(knew_d.len(), bcap * cfg.heads * cfg.head_dim, "knew must be [bcap, heads*head_dim]");
-    debug_assert_eq!(vnew_d.len(), bcap * cfg.heads * cfg.head_dim, "vnew must be [bcap, heads*head_dim]");
-    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "k slab must be cfg.slab_elems()");
-    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "v slab must be cfg.slab_elems()");
-    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
-    debug_assert_eq!(wpos_d.len(), bcap, "write positions must be one u32 per slot");
+    debug_assert_eq!(
+        knew_d.len(),
+        bcap * cfg.heads * cfg.head_dim,
+        "knew must be [bcap, heads*head_dim]"
+    );
+    debug_assert_eq!(
+        vnew_d.len(),
+        bcap * cfg.heads * cfg.head_dim,
+        "vnew must be [bcap, heads*head_dim]"
+    );
+    debug_assert_eq!(
+        k_d.len(),
+        cfg.slab_elems(),
+        "k slab must be cfg.slab_elems()"
+    );
+    debug_assert_eq!(
+        v_d.len(),
+        cfg.slab_elems(),
+        "v slab must be cfg.slab_elems()"
+    );
+    debug_assert_eq!(
+        bt_d.len(),
+        bcap * cfg.max_blocks_per_seq,
+        "block table must be [bcap, cfg.max_blocks_per_seq]"
+    );
+    debug_assert_eq!(
+        wpos_d.len(),
+        bcap,
+        "write positions must be one u32 per slot"
+    );
     debug_assert_eq!(active_d.len(), bcap, "active mask must be one u32 per slot");
     let total = (bcap * cfg.heads * cfg.head_dim) as u32;
     let launch = LaunchConfig {
@@ -567,8 +708,20 @@ pub fn launch_kv_append(
         layer as u32,
     );
     let mut b = stream.launch_builder(func);
-    b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(bt_d).arg(wpos_d).arg(active_d);
-    b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    b.arg(knew_d)
+        .arg(vnew_d)
+        .arg(k_d)
+        .arg(v_d)
+        .arg(bt_d)
+        .arg(wpos_d)
+        .arg(active_d);
+    b.arg(&bcap_u)
+        .arg(&heads)
+        .arg(&hd)
+        .arg(&bsz)
+        .arg(&nblk)
+        .arg(&mbps)
+        .arg(&layer_u);
     // SAFETY: the pushed arguments match `KV_APPEND_ENTRY`'s parameter list in order and width (seven
     // .u64 pointers, seven .u32 — see `kv_append_ptx`). Every buffer is at least as long as the largest
     // index the kernel can produce for `bcap` slots at `layer`: the store index `%e` reproduces
@@ -719,14 +872,46 @@ pub fn launch_kv_append_int8(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
-    debug_assert_eq!(knew_d.len(), bcap * cfg.heads * cfg.head_dim, "knew must be [bcap, heads*head_dim]");
-    debug_assert_eq!(vnew_d.len(), bcap * cfg.heads * cfg.head_dim, "vnew must be [bcap, heads*head_dim]");
-    debug_assert_eq!(k_d.len(), cfg.slab_elems(), "int8 k slab must be cfg.slab_elems()");
-    debug_assert_eq!(v_d.len(), cfg.slab_elems(), "int8 v slab must be cfg.slab_elems()");
-    debug_assert_eq!(ksc_d.len(), cfg.scale_slab_elems(), "k scale slab must be cfg.scale_slab_elems()");
-    debug_assert_eq!(vsc_d.len(), cfg.scale_slab_elems(), "v scale slab must be cfg.scale_slab_elems()");
-    debug_assert_eq!(bt_d.len(), bcap * cfg.max_blocks_per_seq, "block table must be [bcap, cfg.max_blocks_per_seq]");
-    debug_assert_eq!(wpos_d.len(), bcap, "write positions must be one u32 per slot");
+    debug_assert_eq!(
+        knew_d.len(),
+        bcap * cfg.heads * cfg.head_dim,
+        "knew must be [bcap, heads*head_dim]"
+    );
+    debug_assert_eq!(
+        vnew_d.len(),
+        bcap * cfg.heads * cfg.head_dim,
+        "vnew must be [bcap, heads*head_dim]"
+    );
+    debug_assert_eq!(
+        k_d.len(),
+        cfg.slab_elems(),
+        "int8 k slab must be cfg.slab_elems()"
+    );
+    debug_assert_eq!(
+        v_d.len(),
+        cfg.slab_elems(),
+        "int8 v slab must be cfg.slab_elems()"
+    );
+    debug_assert_eq!(
+        ksc_d.len(),
+        cfg.scale_slab_elems(),
+        "k scale slab must be cfg.scale_slab_elems()"
+    );
+    debug_assert_eq!(
+        vsc_d.len(),
+        cfg.scale_slab_elems(),
+        "v scale slab must be cfg.scale_slab_elems()"
+    );
+    debug_assert_eq!(
+        bt_d.len(),
+        bcap * cfg.max_blocks_per_seq,
+        "block table must be [bcap, cfg.max_blocks_per_seq]"
+    );
+    debug_assert_eq!(
+        wpos_d.len(),
+        bcap,
+        "write positions must be one u32 per slot"
+    );
     debug_assert_eq!(active_d.len(), bcap, "active mask must be one u32 per slot");
     let nq = (bcap * cfg.heads) as u32;
     let launch = LaunchConfig {
@@ -744,8 +929,22 @@ pub fn launch_kv_append_int8(
         layer as u32,
     );
     let mut b = stream.launch_builder(func);
-    b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(ksc_d).arg(vsc_d).arg(bt_d).arg(wpos_d).arg(active_d);
-    b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    b.arg(knew_d)
+        .arg(vnew_d)
+        .arg(k_d)
+        .arg(v_d)
+        .arg(ksc_d)
+        .arg(vsc_d)
+        .arg(bt_d)
+        .arg(wpos_d)
+        .arg(active_d);
+    b.arg(&bcap_u)
+        .arg(&heads)
+        .arg(&hd)
+        .arg(&bsz)
+        .arg(&nblk)
+        .arg(&mbps)
+        .arg(&layer_u);
     // SAFETY: the pushed arguments match `KV_APPEND_INT8_ENTRY`'s parameter list in order and width
     // (nine .u64 pointers, seven .u32 — see `kv_append_int8_ptx`). Every buffer is at least as long as
     // the largest index the kernel can produce for `bcap` slots at `layer`: `%e` reproduces
@@ -853,14 +1052,26 @@ mod tests {
             let ptx = paged_attn_decode_ptx(hd);
             assert!(ptx.contains(".visible .entry paged_attn_decode("));
             assert_floor(&ptx, "paged_attn_decode");
-            assert!(ptx.contains(&format!("%acc{}", hd - 1)), "head dim {hd} must unroll the V accumulator");
-            assert!(!ptx.contains(&format!("%acc{hd}")), "must not over-unroll past head_dim {hd}");
+            assert!(
+                ptx.contains(&format!("%acc{}", hd - 1)),
+                "head dim {hd} must unroll the V accumulator"
+            );
+            assert!(
+                !ptx.contains(&format!("%acc{hd}")),
+                "must not over-unroll past head_dim {hd}"
+            );
             assert!(
                 ptx.contains(&format!("qsh[{}]", PAGED_ATTN_WARPS as usize * hd)),
                 "per-warp query staging in shared (WARPS*head_dim)"
             );
-            assert!(ptx.contains("ld.shared.f32"), "query read from shared in the dot");
-            assert!(ptx.contains("shfl.sync.bfly.b32"), "cross-lane online-softmax merge");
+            assert!(
+                ptx.contains("ld.shared.f32"),
+                "query read from shared in the dot"
+            );
+            assert!(
+                ptx.contains("shfl.sync.bfly.b32"),
+                "cross-lane online-softmax merge"
+            );
             assert!(ptx.contains("bar.warp.sync"), "warp sync after staging q");
             assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
             assert!(ptx.contains("cvt.f32.f16"), "f16 cache widened to f32");
@@ -881,11 +1092,23 @@ mod tests {
             assert!(ptx.contains(".visible .entry paged_attn_decode_int8("));
             assert_floor(&ptx, "paged_attn_decode_int8");
             assert!(ptx.contains("ld.global.s8"), "int8 cache read");
-            assert!(!ptx.contains("cvt.f32.f16"), "the int8 kernel stores no f16 — nothing to widen");
-            assert!(ptx.contains(&format!("%acc{}", hd - 1)), "head dim {hd} must unroll the V accumulator");
-            assert!(!ptx.contains(&format!("%acc{hd}")), "must not over-unroll past head_dim {hd}");
+            assert!(
+                !ptx.contains("cvt.f32.f16"),
+                "the int8 kernel stores no f16 — nothing to widen"
+            );
+            assert!(
+                ptx.contains(&format!("%acc{}", hd - 1)),
+                "head dim {hd} must unroll the V accumulator"
+            );
+            assert!(
+                !ptx.contains(&format!("%acc{hd}")),
+                "must not over-unroll past head_dim {hd}"
+            );
             assert!(ptx.contains(&format!("qsh[{}]", PAGED_ATTN_WARPS as usize * hd)));
-            assert!(ptx.contains("shfl.sync.bfly.b32"), "cross-lane online-softmax merge");
+            assert!(
+                ptx.contains("shfl.sync.bfly.b32"),
+                "cross-lane online-softmax merge"
+            );
             assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
             assert!(ptx.is_ascii(), "PTX must be pure ASCII (head_dim {hd})");
             assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
@@ -899,10 +1122,16 @@ mod tests {
         let ptx = kv_append_ptx();
         assert!(ptx.contains(".visible .entry kv_append("));
         assert_floor(&ptx, "kv_append");
-        assert!(ptx.contains("cvt.rn.f16.f32"), "f32 input narrowed into the f16 cache");
+        assert!(
+            ptx.contains("cvt.rn.f16.f32"),
+            "f32 input narrowed into the f16 cache"
+        );
         assert!(ptx.contains("st.global.b16"), "f16 value store");
         assert!(ptx.contains("setp.eq.u32 %p0,%tmp,0;"), "active-mask test");
-        assert!(ptx.contains("@%p0 bra DONE;"), "inactive rows exit before any store");
+        assert!(
+            ptx.contains("@%p0 bra DONE;"),
+            "inactive rows exit before any store"
+        );
         assert!(ptx.is_ascii(), "PTX must be pure ASCII");
         assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
     }
@@ -914,9 +1143,18 @@ mod tests {
         let ptx = kv_append_int8_ptx();
         assert!(ptx.contains(".visible .entry kv_append_int8("));
         assert_floor(&ptx, "kv_append_int8");
-        assert!(ptx.contains("shfl.sync.bfly.b32"), "warp-cooperative amax merge");
-        assert!(ptx.contains("div.rn.f32"), "IEEE-exact scale + quotient (approx would break the host match)");
-        assert!(!ptx.contains("div.approx"), "no approximate division anywhere");
+        assert!(
+            ptx.contains("shfl.sync.bfly.b32"),
+            "warp-cooperative amax merge"
+        );
+        assert!(
+            ptx.contains("div.rn.f32"),
+            "IEEE-exact scale + quotient (approx would break the host match)"
+        );
+        assert!(
+            !ptx.contains("div.approx"),
+            "no approximate division anywhere"
+        );
         assert!(ptx.contains("cvt.rni.f32.f32"), "ties-even rounding");
         assert!(ptx.contains("st.global.s8"), "int8 value store");
         assert!(ptx.contains("st.global.f32"), "f32 scale store");
@@ -977,13 +1215,24 @@ mod tests {
                 sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
                 sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
             ];
-            let mut vals: [*mut std::ffi::c_void; 2] = [log.as_mut_ptr() as *mut _, log.len() as *mut _];
+            let mut vals: [*mut std::ffi::c_void; 2] =
+                [log.as_mut_ptr() as *mut _, log.len() as *mut _];
             let mut module: sys::CUmodule = std::ptr::null_mut();
             let res = unsafe {
-                sys::cuModuleLoadDataEx(&mut module, ptx_c.as_ptr() as *const _, 2, opts.as_mut_ptr(), vals.as_mut_ptr())
+                sys::cuModuleLoadDataEx(
+                    &mut module,
+                    ptx_c.as_ptr() as *const _,
+                    2,
+                    opts.as_mut_ptr(),
+                    vals.as_mut_ptr(),
+                )
             };
             let s = String::from_utf8_lossy(&log);
-            eprintln!("=== paged-attn JIT result {:?} ===\n{}", res, s.trim_end_matches('\0'));
+            eprintln!(
+                "=== paged-attn JIT result {:?} ===\n{}",
+                res,
+                s.trim_end_matches('\0')
+            );
         });
     }
 
@@ -1043,11 +1292,17 @@ mod tests {
         let key: &'static str = match cfg.head_dim {
             64 => "paged_attn_d64",
             128 => "paged_attn_d128",
-            other => panic!("paged-attn test harness: no module-cache key for head_dim {other}; add an arm"),
+            other => panic!(
+                "paged-attn test harness: no module-cache key for head_dim {other}; add an arm"
+            ),
         };
-        let func = g.function(key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY).unwrap();
-        launch_paged_attn_decode(&g.stream, &func, &q_d, &k_d, &v_d, &mut out_d, &bt_d, &cl_d, cfg, layer, bcap, scale)
+        let func = g
+            .function(key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY)
             .unwrap();
+        launch_paged_attn_decode(
+            &g.stream, &func, &q_d, &k_d, &v_d, &mut out_d, &bt_d, &cl_d, cfg, layer, bcap, scale,
+        )
+        .unwrap();
         g.stream.synchronize().unwrap();
         g.stream.memcpy_dtov(&out_d).unwrap()
     }
@@ -1062,11 +1317,25 @@ mod tests {
         hd: usize,
         block_size: usize,
         ctx: Vec<usize>,
-    ) -> (KvConfig, Vec<usize>, Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>, f32) {
+    ) -> (
+        KvConfig,
+        Vec<usize>,
+        Vec<f32>,
+        Vec<Vec<f32>>,
+        Vec<Vec<f32>>,
+        f32,
+    ) {
         let mut rng = crate::diff::Rng::new(seed);
         let bcap = ctx.len();
         let d = heads * hd;
-        let max_bps = ctx.iter().copied().max().unwrap_or(0).div_ceil(block_size).max(1) + 1;
+        let max_bps = ctx
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .div_ceil(block_size)
+            .max(1)
+            + 1;
         let num_blocks = bcap * max_bps + 8;
         let cfg = KvConfig {
             layers: 1,
@@ -1099,7 +1368,12 @@ mod tests {
                 let (heads, block_size) = (4usize, 16usize);
                 let (cfg, ctx, q, k, v, scale) =
                     fixture(0x5E13, heads, hd, block_size, vec![37, 0, 16, 100, 5, 64]);
-                let mut mgr = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
                 for b in 0..cfg.num_slots {
                     if ctx[b] > 0 {
                         mgr.reserve(b, ctx[b]).unwrap();
@@ -1129,14 +1403,24 @@ mod tests {
             let (cfg, ctx, q, k, v, scale) =
                 fixture(0xB10C, heads, hd, block_size, vec![40, 7, 0, 96, 33]);
             // Layout A: allocate slots in ascending order.
-            let mut a = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+            let mut a = BlockManager::new(
+                cfg.num_blocks,
+                block_size,
+                cfg.num_slots,
+                cfg.max_blocks_per_seq,
+            );
             for b in 0..cfg.num_slots {
                 if ctx[b] > 0 {
                     a.reserve(b, ctx[b]).unwrap();
                 }
             }
             // Layout B: allocate in descending order ⇒ each active slot gets *different* physical blocks.
-            let mut bm = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+            let mut bm = BlockManager::new(
+                cfg.num_blocks,
+                block_size,
+                cfg.num_slots,
+                cfg.max_blocks_per_seq,
+            );
             for b in (0..cfg.num_slots).rev() {
                 if ctx[b] > 0 {
                     bm.reserve(b, ctx[b]).unwrap();
@@ -1223,9 +1507,16 @@ mod tests {
             128 => "paged_attn_int8_d128",
             other => panic!("paged-attn int8 test harness: no module-cache key for head_dim {other}; add an arm"),
         };
-        let func = g.function(key, &paged_attn_decode_int8_ptx(cfg.head_dim), PAGED_ATTN_INT8_ENTRY).unwrap();
+        let func = g
+            .function(
+                key,
+                &paged_attn_decode_int8_ptx(cfg.head_dim),
+                PAGED_ATTN_INT8_ENTRY,
+            )
+            .unwrap();
         launch_paged_attn_decode_int8(
-            &g.stream, &func, &q_d, &k_d, &v_d, &ksc_d, &vsc_d, &mut out_d, &bt_d, &cl_d, cfg, layer, bcap, scale,
+            &g.stream, &func, &q_d, &k_d, &v_d, &ksc_d, &vsc_d, &mut out_d, &bt_d, &cl_d, cfg,
+            layer, bcap, scale,
         )
         .unwrap();
         g.stream.synchronize().unwrap();
@@ -1243,7 +1534,12 @@ mod tests {
                 let (heads, block_size) = (4usize, 16usize);
                 let (cfg, ctx, q, k, v, scale) =
                     fixture(0x171AB, heads, hd, block_size, vec![37, 0, 16, 100, 5, 64]);
-                let mut mgr = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
                 for b in 0..cfg.num_slots {
                     if ctx[b] > 0 {
                         mgr.reserve(b, ctx[b]).unwrap();
@@ -1270,14 +1566,25 @@ mod tests {
     fn paged_int8_attention_invariant_to_block_layout() {
         with_gpu("paged_int8_attention_invariant_to_block_layout", |g| {
             let (heads, hd, block_size) = (4usize, 64usize, 16usize);
-            let (cfg, ctx, q, k, v, scale) = fixture(0x9C0DE, heads, hd, block_size, vec![40, 7, 0, 96, 33]);
-            let mut a = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+            let (cfg, ctx, q, k, v, scale) =
+                fixture(0x9C0DE, heads, hd, block_size, vec![40, 7, 0, 96, 33]);
+            let mut a = BlockManager::new(
+                cfg.num_blocks,
+                block_size,
+                cfg.num_slots,
+                cfg.max_blocks_per_seq,
+            );
             for b in 0..cfg.num_slots {
                 if ctx[b] > 0 {
                     a.reserve(b, ctx[b]).unwrap();
                 }
             }
-            let mut bm = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+            let mut bm = BlockManager::new(
+                cfg.num_blocks,
+                block_size,
+                cfg.num_slots,
+                cfg.max_blocks_per_seq,
+            );
             for b in (0..cfg.num_slots).rev() {
                 if ctx[b] > 0 {
                     bm.reserve(b, ctx[b]).unwrap();
@@ -1286,7 +1593,11 @@ mod tests {
             let out_a = run_paged_attn_int8(g, &a, &cfg, 0, &q, &k, &v, scale);
             let out_b = run_paged_attn_int8(g, &bm, &cfg, 0, &q, &k, &v, scale);
             for i in 0..out_a.len() {
-                assert_eq!(out_a[i].to_bits(), out_b[i].to_bits(), "int8 attention changed under a different block layout at {i}");
+                assert_eq!(
+                    out_a[i].to_bits(),
+                    out_b[i].to_bits(),
+                    "int8 attention changed under a different block layout at {i}"
+                );
             }
             eprintln!("int8-KV decode-attn BIT-IDENTICAL across 2 physical block layouts — paging invisible on the quantized path");
         });

@@ -85,7 +85,10 @@ pub enum PatKind {
     /// An integer (or other numeric) literal pattern, e.g. `1` / `-3` in a `match` arm. The raw
     /// source text is stored (like `ExprKind::Int`) and parsed later; a leading `-` is folded in by
     /// the parser (`neg: true`), since a literal pattern has no sub-expressions to negate.
-    Int { sym: Symbol, neg: bool },
+    Int {
+        sym: Symbol,
+        neg: bool,
+    },
     /// A char-literal pattern, e.g. `'a'` in a `match` arm. The raw source text (incl. quotes and
     /// any escape) is stored like `ExprKind::Char` and decoded to a code point later; it matches by
     /// comparing the scrutinee to that code point, exactly like an integer-literal pattern.
@@ -109,7 +112,10 @@ pub enum PatKind {
     /// `Shape::Circle { r }` (struct payload). `path` names `Enum::Variant`; `fields` destructures
     /// the payload, binding the inner values. Matches when the scrutinee's discriminant is the
     /// variant's *and* every sub-pattern matches — the payload-carrying sibling of `Path`.
-    Variant { path: Path, fields: VariantPat },
+    Variant {
+        path: Path,
+        fields: VariantPat,
+    },
 }
 
 /// The payload-destructuring part of a [`PatKind::Variant`].

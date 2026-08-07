@@ -8,12 +8,12 @@
 //! does depend on the workspace's `wukong_runtime`, so a recognized kernel call runs the *identical*
 //! microkernel the native backend links.
 
+use std::collections::HashMap;
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
     BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
 };
 use wukong_span::{Interner, Symbol};
-use std::collections::HashMap;
 
 /// A runtime value. Integers are stored width-agnostically in an `i128` and masked per result
 /// type; pointers are **slot** indices into the interpreter's flat memory (one slot per scalar
@@ -557,7 +557,11 @@ struct Interp<'a, 'k> {
 /// `main`) and asserts native == interp there, so a debug ceiling of 30000 made the *interpreter*
 /// — the semantic oracle — refuse a depth native completes, reintroducing the very divergence that
 /// test exists to catch. 40000 sits above that gate and below the measured 50000 debug ceiling.
-const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) { 40_000 } else { 300_000 };
+const MAX_CALL_DEPTH: usize = if cfg!(debug_assertions) {
+    40_000
+} else {
+    300_000
+};
 
 /// Marshal a recognized-kernel **extent** argument (`rows`, `cols`, `m`, `k`, `n`, `t`, `h`, `s`,
 /// `d`, `half`, `ncoeff`, ...) into a slot count, bailing out of the arm with the kernel's
@@ -598,7 +602,9 @@ impl<'a, 'k> Interp<'a, 'k> {
         // local of a single `exec` invocation, so a recursion that runs a handful of blocks per
         // frame increments no shared counter and would run to a process-killing stack overflow.
         if self.depth >= MAX_CALL_DEPTH {
-            return Err("interpreter call-depth limit exceeded (likely unbounded recursion)".into());
+            return Err(
+                "interpreter call-depth limit exceeded (likely unbounded recursion)".into(),
+            );
         }
         self.depth += 1;
         // Take a recycled register file (or a fresh one) and size it for this function. Values
@@ -860,7 +866,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Value::Unit
             }
-            Op::Gep { ptr: p, index, elem } => {
+            Op::Gep {
+                ptr: p,
+                index,
+                elem,
+            } => {
                 let base = ptr(reg(regs, *p))?;
                 let off = reg(regs, *index).as_int();
                 // Scale the index by the element's slot footprint so an aggregate-element array
@@ -902,12 +912,10 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // Resolve the stream base slots and the invariant scalars once.
                 let mut stream_bases: Vec<usize> = Vec::with_capacity(kern.streams as usize);
                 for s in 0..kern.streams as usize {
-                    stream_bases.push(ptr(
-                        *self
-                            .memory
-                            .get(ptrs_base + s)
-                            .ok_or("veckernel ptrs out of bounds")?,
-                    )?);
+                    stream_bases.push(ptr(*self
+                        .memory
+                        .get(ptrs_base + s)
+                        .ok_or("veckernel ptrs out of bounds")?)?);
                 }
                 let mut scalar_vals: Vec<f32> = Vec::with_capacity(kern.scalars as usize);
                 for k in 0..kern.scalars as usize {
@@ -1039,9 +1047,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Iota(ty) => {
                 let n = match ty {
                     MirType::Vec(_, n) => *n as usize,
-                    other => {
-                        return Err(format!("iota type is {}, not a vector", other.display()))
-                    }
+                    other => return Err(format!("iota type is {}, not a vector", other.display())),
                 };
                 self.push_vec((0..n).map(|k| Value::Int(k as i128)).collect())
             }
@@ -1108,7 +1114,9 @@ impl<'a, 'k> Interp<'a, 'k> {
     /// would hide the lowering bug; the durable fix is an operand check in `wukong_mir::verify`.
     fn vec_lanes(&self, v: Value, n: usize) -> Result<Vec<Value>, String> {
         match v {
-            Value::VecRef(i) if self.vecs[i as usize].len() == n => Ok(self.vecs[i as usize].clone()),
+            Value::VecRef(i) if self.vecs[i as usize].len() == n => {
+                Ok(self.vecs[i as usize].clone())
+            }
             _ => Err(format!(
                 "vector op operand is not a {n}-lane vector (MIR invariant violation)"
             )),
@@ -1234,12 +1242,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             // read error mid-way returns -2; success returns `n` (>= 0). The LE decode, the min(len,avail)
             // truncation, and the -1/-2/n codes are byte-identical to `wukong_runtime`, so the
             // interp==native differential gate holds.
-            "wukong_rt_read_f32"
-            | "wukong_rt_read_i32"
-            | "wukong_rt_read_i64"
-            | "wukong_rt_read_u8"
-            | "wukong_rt_read_f64"
-            | "wukong_rt_read_i8" => {
+            "wukong_rt_read_f32" | "wukong_rt_read_i32" | "wukong_rt_read_i64"
+            | "wukong_rt_read_u8" | "wukong_rt_read_f64" | "wukong_rt_read_i8" => {
                 use std::io::Read;
                 // `path` is a NUL-terminated `*u8`: walk `memory` collecting low bytes until NUL.
                 let path_base = match args.first().copied() {
@@ -1408,9 +1412,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         "wukong_rt_write_i64" => {
                             out.extend_from_slice(&(v.as_int() as i64).to_le_bytes())
                         }
-                        "wukong_rt_write_f64" => {
-                            out.extend_from_slice(&v.as_float().to_le_bytes())
-                        }
+                        "wukong_rt_write_f64" => out.extend_from_slice(&v.as_float().to_le_bytes()),
                         "wukong_rt_write_i8" => {
                             out.extend_from_slice(&(v.as_int() as i8).to_le_bytes())
                         }
@@ -1830,7 +1832,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let width = op & (0xff << 8);
                 let mut qbytes: Vec<u8> = Vec::with_capacity(n * 4);
                 for t in 0..n {
-                    let v = self.memory.get(q + t).ok_or("dequant q out of bounds")?.as_int();
+                    let v = self
+                        .memory
+                        .get(q + t)
+                        .ok_or("dequant q out of bounds")?
+                        .as_int();
                     if width == wukong_runtime::DQ_I32 {
                         qbytes.extend_from_slice(&(v as i32).to_ne_bytes());
                     } else if width == wukong_runtime::DQ_U8 {
@@ -1874,7 +1880,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = rows * cols;
                 let mut qbytes: Vec<u8> = Vec::with_capacity(n * 4);
                 for t in 0..n {
-                    let v = self.memory.get(q + t).ok_or("dequant_perchan q out of bounds")?.as_int();
+                    let v = self
+                        .memory
+                        .get(q + t)
+                        .ok_or("dequant_perchan q out of bounds")?
+                        .as_int();
                     if width == wukong_runtime::DQ_I32 {
                         qbytes.extend_from_slice(&(v as i32).to_ne_bytes());
                     } else if width == wukong_runtime::DQ_U8 {
@@ -1960,10 +1970,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // (`None`) or no accelerator falls back to the identical CPU kernel — same contract as the
                 // plain GEMM above. With no accelerator (the oracle) this is always the CPU path.
                 let bias_opt = bias_idx.is_some().then_some(biasbuf.as_slice());
-                let offloaded = self
-                    .accel
-                    .as_mut()
-                    .and_then(|acc| acc.sgemm_nt_epi(&abuf, &bbuf, &mut cbuf, m, k, n, beta, bias_opt, act));
+                let offloaded = self.accel.as_mut().and_then(|acc| {
+                    acc.sgemm_nt_epi(&abuf, &bbuf, &mut cbuf, m, k, n, beta, bias_opt, act)
+                });
                 match offloaded {
                     Some(Ok(())) => {}
                     Some(Err(e)) => return Err(e),
@@ -3282,7 +3291,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // unlike the f32 reductions (whose serial form is itself chunked, so the interp calls it),
             // the bf16/f16 serial kernels reduce the *whole* array flat, which reassociates vs the
             // chunked parallel fold — so we call the deterministic parallel kernel native runs, exactly.
-            "wukong_dot_bf16" | "wukong_sum_bf16" | "wukong_dot_bf16_parallel"
+            "wukong_dot_bf16"
+            | "wukong_sum_bf16"
+            | "wukong_dot_bf16_parallel"
             | "wukong_sum_bf16_parallel" => {
                 let is_dot = name == "wukong_dot_bf16" || name == "wukong_dot_bf16_parallel";
                 let is_par = name.ends_with("_parallel");
@@ -3359,7 +3370,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // marshaling as the bf16 reductions, but reconstruct the exact f16 bits via
             // `f32_to_f16_bits` (the stored value is already f16-rounded, so this is exact) and call
             // the F16C kernels. interp == native bit-for-bit (the widen is lossless, identical kernel).
-            "wukong_dot_f16" | "wukong_sum_f16" | "wukong_dot_f16_parallel"
+            "wukong_dot_f16"
+            | "wukong_sum_f16"
+            | "wukong_dot_f16_parallel"
             | "wukong_sum_f16_parallel" => {
                 let is_dot = name == "wukong_dot_f16" || name == "wukong_dot_f16_parallel";
                 let is_par = name.ends_with("_parallel");
@@ -3624,10 +3637,18 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // (TN reads A as [k,m] and B as [k,n], but those have the same flat element counts.)
                 unsafe {
                     match (is_f16, is_tn) {
-                        (false, false) => wukong_runtime::wukong_sgemm_bf16_nt(ap, bp, cp, ai, ki, ni, beta),
-                        (true, false) => wukong_runtime::wukong_sgemm_f16_nt(ap, bp, cp, ai, ki, ni, beta),
-                        (false, true) => wukong_runtime::wukong_sgemm_bf16_tn(ap, bp, cp, ai, ki, ni, beta),
-                        (true, true) => wukong_runtime::wukong_sgemm_f16_tn(ap, bp, cp, ai, ki, ni, beta),
+                        (false, false) => {
+                            wukong_runtime::wukong_sgemm_bf16_nt(ap, bp, cp, ai, ki, ni, beta)
+                        }
+                        (true, false) => {
+                            wukong_runtime::wukong_sgemm_f16_nt(ap, bp, cp, ai, ki, ni, beta)
+                        }
+                        (false, true) => {
+                            wukong_runtime::wukong_sgemm_bf16_tn(ap, bp, cp, ai, ki, ni, beta)
+                        }
+                        (true, true) => {
+                            wukong_runtime::wukong_sgemm_f16_tn(ap, bp, cp, ai, ki, ni, beta)
+                        }
                     }
                 }
                 for (t, &val) in cbuf.iter().enumerate() {
@@ -3995,7 +4016,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                     *self
                         .memory
                         .get_mut(grad_w + i)
-                        .ok_or("scatter_add grad_w output out of bounds")? = Value::Float(val as f64);
+                        .ok_or("scatter_add grad_w output out of bounds")? =
+                        Value::Float(val as f64);
                 }
                 Ok(Value::Unit)
             }
@@ -4554,11 +4576,15 @@ mod tests {
         assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
         let mut x = vec![0.0f32; 1];
         let mut out = vec![0.0f32; 1];
-        run_kernel_f32(&program, interner.intern("k"), &mut [&mut x, &mut out], &interner).unwrap();
+        run_kernel_f32(
+            &program,
+            interner.intern("k"),
+            &mut [&mut x, &mut out],
+            &interner,
+        )
+        .unwrap();
         assert_eq!(out[0], 20000.0);
     }
-
-
 
     /// MIR the verifier accepts must never panic the interpreter. `wukong_mir::verify`'s
     /// `Op::Cast` arm checks only the *result* type, so `%r: <4 x i32> = cast sext %s` with a
@@ -4568,7 +4594,9 @@ mod tests {
     /// fix is an operand-lane-count check in the verifier — see the handoff.)
     #[test]
     fn vector_op_with_a_scalar_operand_is_an_error_not_a_panic() {
-        use wukong_mir::{BasicBlock, BlockId, CastKind, Function, Inst, MirLevel, Op, Terminator, ValueId};
+        use wukong_mir::{
+            BasicBlock, BlockId, CastKind, Function, Inst, MirLevel, Op, Terminator, ValueId,
+        };
         let mut interner = Interner::new();
         let name = interner.intern("main");
         // %0: i32 = const 7 ; %1: <4 x i32> = cast sext %0 ; ret %0
@@ -4580,10 +4608,17 @@ mod tests {
                 id: BlockId(0),
                 params: Vec::new(),
                 insts: vec![
-                    Inst { result: Some(ValueId(0)), op: Op::ConstInt(7, MirType::I32) },
+                    Inst {
+                        result: Some(ValueId(0)),
+                        op: Op::ConstInt(7, MirType::I32),
+                    },
                     Inst {
                         result: Some(ValueId(1)),
-                        op: Op::Cast(CastKind::SExt, ValueId(0), MirType::Vec(Box::new(MirType::I32), 4)),
+                        op: Op::Cast(
+                            CastKind::SExt,
+                            ValueId(0),
+                            MirType::Vec(Box::new(MirType::I32), 4),
+                        ),
                     },
                 ],
                 term: Terminator::Ret(Some(ValueId(0))),

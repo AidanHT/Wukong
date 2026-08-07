@@ -291,7 +291,10 @@ unsafe fn colreduce_avx2(
         // |v| = andnot(-0.0, v) (clear the sign bit), then fold by max — the same sign-mask abs the
         // RED_MAXABS reduction uses, so it agrees lane-for-lane with `sfold_maxabs`'s `v.abs()`.
         ColKind::MaxAbs => {
-            fold_all!(|a, v| _mm256_max_ps(a, _mm256_andnot_ps(sign, v)), sfold_maxabs)
+            fold_all!(
+                |a, v| _mm256_max_ps(a, _mm256_andnot_ps(sign, v)),
+                sfold_maxabs
+            )
         }
     }
     // Per-column finalize for the statistics kinds (Mean -> /rows, L2 -> sqrt, Rms -> sqrt(/rows));
@@ -426,7 +429,15 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
         let j1 = (j0 + per).min(c);
         // SAFETY: disjoint out[] stripe per task; pointers re-derived from the captured addresses.
         unsafe {
-            colreduce_range(x_addr as *const f32, out_addr as *mut f32, r, c, j0, j1, kind);
+            colreduce_range(
+                x_addr as *const f32,
+                out_addr as *mut f32,
+                r,
+                c,
+                j0,
+                j1,
+                kind,
+            );
         }
     });
 }
@@ -440,7 +451,15 @@ pub unsafe extern "C" fn wukong_colsum_f32(x: *const f32, out: *mut f32, rows: i
     if rows <= 0 || cols <= 0 {
         return;
     }
-    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::Sum);
+    colreduce_range(
+        x,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        ColKind::Sum,
+    );
 }
 
 /// Multi-threaded `out[j] = Σ_i x[i, j]` (bit-identical to [`wukong_colsum_f32`]).
@@ -467,7 +486,15 @@ pub unsafe extern "C" fn wukong_colmax_f32(x: *const f32, out: *mut f32, rows: i
     if rows <= 0 || cols <= 0 {
         return;
     }
-    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::Max);
+    colreduce_range(
+        x,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        ColKind::Max,
+    );
 }
 
 /// Multi-threaded `out[j] = max_i x[i, j]` (bit-identical to [`wukong_colmax_f32`]).
@@ -494,7 +521,15 @@ pub unsafe extern "C" fn wukong_colmin_f32(x: *const f32, out: *mut f32, rows: i
     if rows <= 0 || cols <= 0 {
         return;
     }
-    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::Min);
+    colreduce_range(
+        x,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        ColKind::Min,
+    );
 }
 
 /// Multi-threaded `out[j] = min_i x[i, j]` (bit-identical to [`wukong_colmin_f32`]).
@@ -521,7 +556,15 @@ pub unsafe extern "C" fn wukong_colmaxabs_f32(x: *const f32, out: *mut f32, rows
     if rows <= 0 || cols <= 0 {
         return;
     }
-    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::MaxAbs);
+    colreduce_range(
+        x,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        ColKind::MaxAbs,
+    );
 }
 
 /// Multi-threaded `out[j] = max_i |x[i, j]|` (bit-identical to [`wukong_colmaxabs_f32`]).
@@ -549,7 +592,15 @@ pub unsafe extern "C" fn wukong_colmean_f32(x: *const f32, out: *mut f32, rows: 
     if rows <= 0 || cols <= 0 {
         return;
     }
-    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::Mean);
+    colreduce_range(
+        x,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        ColKind::Mean,
+    );
 }
 
 /// Multi-threaded `out[j] = (Σ_i x[i, j]) / rows` (bit-identical to [`wukong_colmean_f32`]).
@@ -577,7 +628,15 @@ pub unsafe extern "C" fn wukong_coll2_f32(x: *const f32, out: *mut f32, rows: i6
     if rows <= 0 || cols <= 0 {
         return;
     }
-    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::L2);
+    colreduce_range(
+        x,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        ColKind::L2,
+    );
 }
 
 /// Multi-threaded `out[j] = sqrt(Σ_i x[i, j]²)` (bit-identical to [`wukong_coll2_f32`]).
@@ -605,7 +664,15 @@ pub unsafe extern "C" fn wukong_colrms_f32(x: *const f32, out: *mut f32, rows: i
     if rows <= 0 || cols <= 0 {
         return;
     }
-    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::Rms);
+    colreduce_range(
+        x,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        ColKind::Rms,
+    );
 }
 
 /// Multi-threaded `out[j] = sqrt((Σ_i x[i, j]²) / rows)` (bit-identical to [`wukong_colrms_f32`]).
@@ -633,7 +700,15 @@ pub unsafe extern "C" fn wukong_colsumsq_f32(x: *const f32, out: *mut f32, rows:
     if rows <= 0 || cols <= 0 {
         return;
     }
-    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::SumSq);
+    colreduce_range(
+        x,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        ColKind::SumSq,
+    );
 }
 
 /// Multi-threaded `out[j] = Σ_i x[i, j]²` (bit-identical to [`wukong_colsumsq_f32`]).
@@ -658,7 +733,9 @@ mod tests {
         let mut out = vec![0.0f32; cols];
         for (j, o) in out.iter_mut().enumerate() {
             let mut s = match kind {
-                ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms => 0.0f32,
+                ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms => {
+                    0.0f32
+                }
                 ColKind::MaxAbs => x[j].abs(), // |first row|
                 _ => x[j],                     // first row
             };
@@ -727,7 +804,9 @@ mod tests {
         ] {
             // Distinct values per cell so max/min have a unique answer; an exact integer range so a
             // reordering (if any path had one) would show as a bit mismatch.
-            let x: Vec<f32> = (0..rows * cols).map(|t| ((t * 7 + 3) % 101) as f32 - 50.0).collect();
+            let x: Vec<f32> = (0..rows * cols)
+                .map(|t| ((t * 7 + 3) % 101) as f32 - 50.0)
+                .collect();
             for kind in [
                 ColKind::Sum,
                 ColKind::Max,
@@ -759,7 +838,11 @@ mod tests {
                     fp(x.as_ptr(), got_par.as_mut_ptr(), rows as i64, cols as i64);
                 }
                 assert_eq!(got, want, "{:?} {rows}x{cols} vs naive", kind as u8);
-                assert_eq!(got, got_par, "{:?} serial vs parallel {rows}x{cols}", kind as u8);
+                assert_eq!(
+                    got, got_par,
+                    "{:?} serial vs parallel {rows}x{cols}",
+                    kind as u8
+                );
             }
         }
     }
@@ -791,7 +874,9 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        for &cols in &[1usize, 7, 8, 9, 15, 16, 31, 32, 33, 39, 40, 41, 64, 65, 100, 257] {
+        for &cols in &[
+            1usize, 7, 8, 9, 15, 16, 31, 32, 33, 39, 40, 41, 64, 65, 100, 257,
+        ] {
             for &rows in &[1usize, 2, 3, 4, 5, 8, 9, 33, 100] {
                 let x: Vec<f32> = (0..rows * cols)
                     .map(|t| {
@@ -847,11 +932,21 @@ mod tests {
         }
         let nan = f32::NAN;
         let nan2 = f32::from_bits(0x7fc0_1234); // a different quiet-NaN payload
-        // 12 rows (3 full COL_RB blocks) x 37 columns (one 32-tile + a 5-column tail) so the awkward
-        // values land in the tiled body, the 8-wide tail and the scalar tail alike.
+                                                // 12 rows (3 full COL_RB blocks) x 37 columns (one 32-tile + a 5-column tail) so the awkward
+                                                // values land in the tiled body, the 8-wide tail and the scalar tail alike.
         let (rows, cols) = (12usize, 37usize);
         let pool = [
-            0.0f32, -0.0, nan, nan2, 1.0, -1.0, 3.5, -3.5, f32::INFINITY, f32::NEG_INFINITY, 2.0,
+            0.0f32,
+            -0.0,
+            nan,
+            nan2,
+            1.0,
+            -1.0,
+            3.5,
+            -3.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            2.0,
             2.0, // an exact tie with the entry before it
         ];
         let mut x = vec![0.0f32; rows * cols];
@@ -882,8 +977,18 @@ mod tests {
                 colreduce_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 0, 16, kind);
                 colreduce_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 16, cols, kind);
             }
-            assert_eq!(bits(&s), bits(&v), "NaN/±0/tie: scalar != avx2, kind={}", kind as u8);
-            assert_eq!(bits(&s), bits(&p), "NaN/±0/tie: scalar != striped, kind={}", kind as u8);
+            assert_eq!(
+                bits(&s),
+                bits(&v),
+                "NaN/±0/tie: scalar != avx2, kind={}",
+                kind as u8
+            );
+            assert_eq!(
+                bits(&s),
+                bits(&p),
+                "NaN/±0/tie: scalar != striped, kind={}",
+                kind as u8
+            );
         }
     }
 
@@ -902,9 +1007,17 @@ mod tests {
         let x = [0.0f32, -0.0];
         let mut got = [1.0f32];
         unsafe { wukong_colmax_f32(x.as_ptr(), got.as_mut_ptr(), 2, 1) };
-        assert_eq!(got[0].to_bits(), (-0.0f32).to_bits(), "colmax lost the ±0 tie rule");
+        assert_eq!(
+            got[0].to_bits(),
+            (-0.0f32).to_bits(),
+            "colmax lost the ±0 tie rule"
+        );
         let mut got = [1.0f32];
         unsafe { wukong_colmin_f32(x.as_ptr(), got.as_mut_ptr(), 2, 1) };
-        assert_eq!(got[0].to_bits(), (-0.0f32).to_bits(), "colmin lost the ±0 tie rule");
+        assert_eq!(
+            got[0].to_bits(),
+            (-0.0f32).to_bits(),
+            "colmin lost the ±0 tie rule"
+        );
     }
 }

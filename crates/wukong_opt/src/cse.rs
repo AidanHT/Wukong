@@ -260,9 +260,11 @@ fn pure_key(op: &Op, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
         Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
         Op::Sqrt(a) => Key::Sqrt(m(*a)),
         Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
-        Op::Load(..) | Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca(..) => {
-            return None
-        }
+        Op::Load(..)
+        | Op::Store { .. }
+        | Op::Call { .. }
+        | Op::VecKernelCall { .. }
+        | Op::Alloca(..) => return None,
     })
 }
 
@@ -319,7 +321,12 @@ mod tests {
         assert!(Cse.run_function(&mut f, &mut cache));
         Dce.run_function(&mut f, &mut cache);
         // The second header load forwards to the first, and with it the element load behind it.
-        assert_eq!(count_loads(&f), 2, "{}", wukong_mir::print::print_function(&f, &it));
+        assert_eq!(
+            count_loads(&f),
+            2,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
     }
 
     /// The same shape, but the intervening store goes through a pointer of unknown provenance —
@@ -348,7 +355,12 @@ mod tests {
         assert_eq!(count_loads(&f), 2);
         let mut cache = CfgAnalyses::default();
         Cse.run_function(&mut f, &mut cache);
-        assert_eq!(count_loads(&f), 2, "{}", wukong_mir::print::print_function(&f, &it));
+        assert_eq!(
+            count_loads(&f),
+            2,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
     }
 
     /// Two loads of one address at different widths are two different values: forwarding the i64
@@ -360,14 +372,25 @@ mod tests {
         let slot = b.alloca(blob(8));
         let a = b.build(MirType::I64, Op::Load(slot, MirType::I64));
         let c = b.build(MirType::F32, Op::Load(slot, MirType::F32));
-        b.build_void(Op::Store { ptr: slot, value: a });
-        b.build_void(Op::Store { ptr: slot, value: c });
+        b.build_void(Op::Store {
+            ptr: slot,
+            value: a,
+        });
+        b.build_void(Op::Store {
+            ptr: slot,
+            value: c,
+        });
         b.ret(None);
         let mut f = b.finish();
 
         let mut cache = CfgAnalyses::default();
         Cse.run_function(&mut f, &mut cache);
-        assert_eq!(count_loads(&f), 2, "{}", wukong_mir::print::print_function(&f, &it));
+        assert_eq!(
+            count_loads(&f),
+            2,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
     }
 
     use wukong_mir::{BasicBlock, BlockId, Inst, Terminator};
@@ -485,9 +508,10 @@ mod tests {
         let mut cache = CfgAnalyses::default();
         Cse.run_function(&mut f, &mut cache);
         assert!(wukong_mir::verify::verify_function(&f).is_empty());
-        let reload_survives = f.blocks[0].insts.iter().any(
-            |i| matches!(&i.op, Op::Store { value, .. } if *value == ValueId(3)),
-        );
+        let reload_survives = f.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(&i.op, Op::Store { value, .. } if *value == ValueId(3)));
         assert!(
             reload_survives,
             "the reload after the scalar store must not be forwarded to the pre-store value"

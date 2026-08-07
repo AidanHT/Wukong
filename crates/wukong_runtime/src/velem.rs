@@ -609,7 +609,7 @@ mod tests {
             (VE_RELU, 2.0, 0.0, 1.0),          // fused linear→relu
             (VE_RELU6, 1.0, 0.0, 0.0),         // relu6
             (VE_RELU6 | VE_USE_Y, 1.0, 1.0, 0.0),
-            (VE_HADAMARD, 1.0, 1.0, 0.0),      // hadamard x*y (a/b/c ignored)
+            (VE_HADAMARD, 1.0, 1.0, 0.0), // hadamard x*y (a/b/c ignored)
             (VE_RELU | VE_HADAMARD, 1.0, 1.0, 0.0), // relu(x*y)
         ];
         for &(op, a, b, c) in cases {
@@ -770,9 +770,9 @@ mod tests {
             (VE_RELU, 2.0, 0.0, 1.0),          // fused linear→relu
             (VE_RELU6, 1.0, 0.0, 0.0),         // relu6
             (VE_RELU6 | VE_USE_Y, 1.0, 1.0, 0.0),
-            (VE_HADAMARD, 1.0, 1.0, 0.0),      // hadamard x*y
+            (VE_HADAMARD, 1.0, 1.0, 0.0),           // hadamard x*y
             (VE_RELU | VE_HADAMARD, 1.0, 1.0, 0.0), // relu(x*y)
-            (VE_DIV, 1.0, 1.0, 0.0),           // quotient x/y
+            (VE_DIV, 1.0, 1.0, 0.0),                // quotient x/y
         ];
         // Sizes: below the ~256 Ki gate (serial fallback), then above it — 300 003 is past the gate
         // but under NT for both stream counts; 900 001 crosses NT for 3-stream ops (10.8 MiB) but not
@@ -787,7 +787,16 @@ mod tests {
                 let mut s = vec![0.0f32; n];
                 let mut p = vec![0.0f32; n];
                 unsafe {
-                    wukong_velem_f32(x.as_ptr(), y.as_ptr(), s.as_mut_ptr(), n as i64, a, b, c, op);
+                    wukong_velem_f32(
+                        x.as_ptr(),
+                        y.as_ptr(),
+                        s.as_mut_ptr(),
+                        n as i64,
+                        a,
+                        b,
+                        c,
+                        op,
+                    );
                     wukong_velem_f32_parallel(
                         x.as_ptr(),
                         y.as_ptr(),

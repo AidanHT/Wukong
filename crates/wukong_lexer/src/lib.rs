@@ -527,10 +527,7 @@ mod tests {
         assert_eq!(kinds(r#""hi\n" 'a' '\n'"#), vec![Str, Char, Char]);
         // Hex and Unicode escapes are single char tokens (multi-byte escape bodies), and an
         // escaped quote inside a string does not terminate it.
-        assert_eq!(
-            kinds(r#"'\x41' '\u{1F600}' "a\"b""#),
-            vec![Char, Char, Str]
-        );
+        assert_eq!(kinds(r#"'\x41' '\u{1F600}' "a\"b""#), vec![Char, Char, Str]);
         assert!(diags(r#"'\x41' '\u{1F600}'"#).is_empty());
     }
 
@@ -615,7 +612,11 @@ mod tests {
             let kind = TokenKind::keyword(text).unwrap_or_else(|| panic!("`{text}` not a keyword"));
             assert!(kind.is_keyword(), "`{text}` is not in is_keyword()");
             assert_eq!(kind.glyph(), Some(*text), "glyph() disagrees for `{text}`");
-            assert_eq!(kinds(text), vec![kind], "`{text}` does not lex as its keyword");
+            assert_eq!(
+                kinds(text),
+                vec![kind],
+                "`{text}` does not lex as its keyword"
+            );
         }
         assert!(TokenKind::keyword("fnx").is_none());
         assert!(!TokenKind::Ident.is_keyword());

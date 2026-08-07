@@ -605,7 +605,15 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq(
             while i + 2 <= m {
                 gemm_2rows_nt_vnni(a.add(i * k), a.add((i + 1) * k), b, r0, r0.add(n), k, n);
                 dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
-                dequant_row(r0.add(n), out.add((i + 1) * n), n, scale_a, scale_b, bias, act);
+                dequant_row(
+                    r0.add(n),
+                    out.add((i + 1) * n),
+                    n,
+                    scale_a,
+                    scale_b,
+                    bias,
+                    act,
+                );
                 i += 2;
             }
             if i < m {
@@ -835,11 +843,22 @@ mod tests {
             // i32 GEMM reference (the unfused path the dequant fuses).
             let mut ci = vec![0i32; m * n];
             unsafe {
-                wukong_i8gemm_nt(a.as_ptr(), b.as_ptr(), ci.as_mut_ptr(), m as i64, k as i64, n as i64);
+                wukong_i8gemm_nt(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    ci.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                );
             }
             for &act in &[0i64, 1, 2, 3] {
                 for use_bias in [false, true] {
-                    let bias_ptr = if use_bias { bias.as_ptr() } else { std::ptr::null() };
+                    let bias_ptr = if use_bias {
+                        bias.as_ptr()
+                    } else {
+                        std::ptr::null()
+                    };
                     let mut want = vec![0f32; m * n];
                     for i in 0..m {
                         for j in 0..n {
@@ -866,16 +885,38 @@ mod tests {
                     let mut got_par = vec![0f32; m * n];
                     unsafe {
                         wukong_i8gemm_nt_deq(
-                            a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), m as i64, k as i64, n as i64,
-                            scale_a, scale_b.as_ptr(), bias_ptr, act,
+                            a.as_ptr(),
+                            b.as_ptr(),
+                            got.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            scale_a,
+                            scale_b.as_ptr(),
+                            bias_ptr,
+                            act,
                         );
                         wukong_i8gemm_nt_deq_parallel(
-                            a.as_ptr(), b.as_ptr(), got_par.as_mut_ptr(), m as i64, k as i64, n as i64,
-                            scale_a, scale_b.as_ptr(), bias_ptr, act,
+                            a.as_ptr(),
+                            b.as_ptr(),
+                            got_par.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            scale_a,
+                            scale_b.as_ptr(),
+                            bias_ptr,
+                            act,
                         );
                     }
-                    assert_eq!(got, want, "fused deq != unfused (m={m} k={k} n={n} act={act} bias={use_bias})");
-                    assert_eq!(got, got_par, "deq serial != parallel (m={m} k={k} n={n} act={act} bias={use_bias})");
+                    assert_eq!(
+                        got, want,
+                        "fused deq != unfused (m={m} k={k} n={n} act={act} bias={use_bias})"
+                    );
+                    assert_eq!(
+                        got, got_par,
+                        "deq serial != parallel (m={m} k={k} n={n} act={act} bias={use_bias})"
+                    );
                 }
             }
         }

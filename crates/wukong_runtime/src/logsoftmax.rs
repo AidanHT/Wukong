@@ -47,9 +47,9 @@
 //! (Each reduction's lane reassociation is the documented reassociated-reduction exception: every
 //! backend runs this same kernel, so they agree.)
 
-use crate::vmath::{exp1, log1};
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
+use crate::vmath::{exp1, log1};
 use rayon::prelude::*;
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
@@ -275,12 +275,7 @@ const LOGSOFTMAX_PAR_MIN: usize = 8;
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` `f32` elements.
 #[no_mangle]
-pub unsafe extern "C" fn wukong_logsoftmax_f32(
-    x: *const f32,
-    out: *mut f32,
-    rows: i64,
-    cols: i64,
-) {
+pub unsafe extern "C" fn wukong_logsoftmax_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -335,12 +330,7 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
 /// # Safety
 /// `x` must be valid for `rows * cols` `f32`; `out` must be valid for `rows` `f32`.
 #[no_mangle]
-pub unsafe extern "C" fn wukong_logsumexp_f32(
-    x: *const f32,
-    out: *mut f32,
-    rows: i64,
-    cols: i64,
-) {
+pub unsafe extern "C" fn wukong_logsumexp_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -380,7 +370,13 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
     let (xa, oa) = (x as usize, out as usize);
     (0..r).into_par_iter().for_each(|row| {
         // SAFETY: disjoint row data / out slot; pointers re-derived from the captured addresses.
-        unsafe { logsumexp_row((xa as *const f32).add(row * c), (oa as *mut f32).add(row), c) };
+        unsafe {
+            logsumexp_row(
+                (xa as *const f32).add(row * c),
+                (oa as *mut f32).add(row),
+                c,
+            )
+        };
     });
 }
 
@@ -406,7 +402,9 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return;
         }
-        for &n in &[1usize, 2, 3, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 257, 1000] {
+        for &n in &[
+            1usize, 2, 3, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 257, 1000,
+        ] {
             let x = fill(n);
             // log-softmax: full row of outputs.
             let mut a = vec![0.0f32; n];
@@ -539,7 +537,12 @@ mod tests {
             let mut p = vec![0.0f32; rows * cols];
             unsafe {
                 wukong_logsoftmax_f32(x.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
-                wukong_logsoftmax_f32_parallel(x.as_ptr(), p.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_logsoftmax_f32_parallel(
+                    x.as_ptr(),
+                    p.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
             }
             for i in 0..rows * cols {
                 assert_eq!(
@@ -553,7 +556,12 @@ mod tests {
             let mut pl = vec![0.0f32; rows];
             unsafe {
                 wukong_logsumexp_f32(x.as_ptr(), sl.as_mut_ptr(), rows as i64, cols as i64);
-                wukong_logsumexp_f32_parallel(x.as_ptr(), pl.as_mut_ptr(), rows as i64, cols as i64);
+                wukong_logsumexp_f32_parallel(
+                    x.as_ptr(),
+                    pl.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
             }
             for r in 0..rows {
                 assert_eq!(

@@ -193,8 +193,11 @@ mod tests {
         for r in 0..rows {
             let row = &x[r * cols..(r + 1) * cols];
             let mean = row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
-            let var =
-                row.iter().map(|&v| (v as f64 - mean) * (v as f64 - mean)).sum::<f64>() / cols as f64;
+            let var = row
+                .iter()
+                .map(|&v| (v as f64 - mean) * (v as f64 - mean))
+                .sum::<f64>()
+                / cols as f64;
             let denom = (var + eps as f64).sqrt();
             for (i, &v) in row.iter().enumerate() {
                 out[r * cols + i] = ((v as f64 - mean) / denom) as f32;
@@ -278,12 +281,20 @@ mod tests {
 
             // (1) Tolerance-free: a normalized row is finite everywhere.
             let bad = got.iter().filter(|v| !v.is_finite()).count();
-            assert_eq!(bad, 0, "gpu layernorm produced {bad}/{} non-finite lanes", got.len());
+            assert_eq!(
+                bad,
+                0,
+                "gpu layernorm produced {bad}/{} non-finite lanes",
+                got.len()
+            );
 
             for (r, &b) in bases.iter().enumerate() {
                 let (lo, hi) = (r * cols, (r + 1) * cols);
                 let mean = x[lo..hi].iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
-                let sigma = (x[lo..hi].iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>()
+                let sigma = (x[lo..hi]
+                    .iter()
+                    .map(|&v| (v as f64 - mean).powi(2))
+                    .sum::<f64>()
                     / cols as f64)
                     .sqrt();
                 let cond = mean.abs() / sigma;
@@ -309,7 +320,9 @@ mod tests {
                     cs.max_abs
                 );
             }
-            eprintln!("[gate] gpu layernorm is finite and at the f32 error floor for means 0..1e6 ✓");
+            eprintln!(
+                "[gate] gpu layernorm is finite and at the f32 error floor for means 0..1e6 ✓"
+            );
         });
     }
 }

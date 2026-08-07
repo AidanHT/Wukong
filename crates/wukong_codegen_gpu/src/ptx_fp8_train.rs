@@ -70,7 +70,11 @@ pub fn f32_to_e5m2(x: f32) -> u8 {
         let round_bias = (1u32 << (sh - 1)) - 1 + ((full >> sh) & 1);
         let m = (full + round_bias) >> sh;
         // m == 4 carries out of the subnormal range into the smallest normal (exp field 1, mant 0).
-        return if m >= 4 { sign | 0x04 } else { sign | (m as u8) };
+        return if m >= 4 {
+            sign | 0x04
+        } else {
+            sign | (m as u8)
+        };
     }
     // round the 23-bit mantissa to 2 bits, ties-to-even
     let shift = 23 - 2;
@@ -150,8 +154,14 @@ fn gen_fp8_mt_typed(entry: &str, atype: &str, btype: &str) -> String {
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
     s += "    mov.u32 %lane,%tid.x;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg4,%lane,3;\n";
     s += "    shl.b32 %tg2,%tg4,1;\n    shl.b32 %tg4,%tg4,2;\n";
-    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %row0,%tmp,{};\n", 16 * tm);
-    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %col0,%tmp,{};\n", 8 * tn);
+    s += &format!(
+        "    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %row0,%tmp,{};\n",
+        16 * tm
+    );
+    s += &format!(
+        "    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %col0,%tmp,{};\n",
+        8 * tn
+    );
 
     for mi in 0..tm {
         s += &format!("    add.s32 %tmp,%row0,%grp;\n    add.s32 %tmp,%tmp,{};\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.s32 %tmp,%tmp,%tg4;\n    cvt.u64.u32 %t,%tmp;\n    add.s64 %a0p{mi},%A,%t;\n", mi * 16);
@@ -197,14 +207,16 @@ fn gen_fp8_mt_typed(entry: &str, atype: &str, btype: &str) -> String {
 /// Requires M%(16·TM)==0, N%(8·TN)==0, K%32==0. See [`gen_fp8_mt_typed`].
 pub fn fp8_bwd_gemm_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_fp8_mt_typed("fp8_bwd_gemm_nt", "e5m2", "e4m3")).as_str()
+    PTX.get_or_init(|| gen_fp8_mt_typed("fp8_bwd_gemm_nt", "e5m2", "e4m3"))
+        .as_str()
 }
 
 /// **fp8 E5M2×E5M2 GEMM** `C = A·Bᵀ`, both operands E5M2, f32 out (entry `fp8_e5m2_gemm_nt`) — the
 /// grad·grad-shaped backward contraction (e.g. when both operands are wide-range). See [`gen_fp8_mt_typed`].
 pub fn fp8_e5m2_gemm_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_fp8_mt_typed("fp8_e5m2_gemm_nt", "e5m2", "e5m2")).as_str()
+    PTX.get_or_init(|| gen_fp8_mt_typed("fp8_e5m2_gemm_nt", "e5m2", "e5m2"))
+        .as_str()
 }
 
 /// Max representable magnitude of each fp8 format (the delayed-scaling denominator).
@@ -363,13 +375,15 @@ QE_{entry}:
 /// Device delayed-scaling quantize to **E5M2** (`out[i] = e5m2(x[i]·recip)`, entry `quantize_scaled_e5m2`).
 pub fn quantize_scaled_e5m2_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_quantize_scaled("quantize_scaled_e5m2", "e5m2x2")).as_str()
+    PTX.get_or_init(|| gen_quantize_scaled("quantize_scaled_e5m2", "e5m2x2"))
+        .as_str()
 }
 
 /// Device delayed-scaling quantize to **E4M3** (`out[i] = e4m3(x[i]·recip)`, entry `quantize_scaled_e4m3`).
 pub fn quantize_scaled_e4m3_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_quantize_scaled("quantize_scaled_e4m3", "e4m3x2")).as_str()
+    PTX.get_or_init(|| gen_quantize_scaled("quantize_scaled_e4m3", "e4m3x2"))
+        .as_str()
 }
 
 #[cfg(test)]
@@ -432,9 +446,10 @@ mod tests {
 
         // `gen_quantize_scaled` over both Ada packed-converter formats. The entry name is interpolated
         // into the branch labels as well as the `.entry`, so it is swept alongside the format.
-        for (entry, fmt) in
-            [("quantize_scaled_e5m2", "e5m2x2"), ("quantize_scaled_e4m3", "e4m3x2")]
-        {
+        for (entry, fmt) in [
+            ("quantize_scaled_e5m2", "e5m2x2"),
+            ("quantize_scaled_e4m3", "e4m3x2"),
+        ] {
             assert_ptx_ascii(
                 &format!("gen_quantize_scaled({entry},{fmt})"),
                 &gen_quantize_scaled(entry, fmt),
@@ -454,10 +469,19 @@ mod tests {
         for (what, ptx) in [
             ("fp8_bwd_gemm_ptx", fp8_bwd_gemm_ptx().to_string()),
             ("fp8_e5m2_gemm_ptx", fp8_e5m2_gemm_ptx().to_string()),
-            ("quantize_scaled_e5m2_ptx", quantize_scaled_e5m2_ptx().to_string()),
-            ("quantize_scaled_e4m3_ptx", quantize_scaled_e4m3_ptx().to_string()),
+            (
+                "quantize_scaled_e5m2_ptx",
+                quantize_scaled_e5m2_ptx().to_string(),
+            ),
+            (
+                "quantize_scaled_e4m3_ptx",
+                quantize_scaled_e4m3_ptx().to_string(),
+            ),
         ] {
-            assert!(ptx.starts_with(HDR_SM89_V84), "{what}: must open with HDR_SM89_V84");
+            assert!(
+                ptx.starts_with(HDR_SM89_V84),
+                "{what}: must open with HDR_SM89_V84"
+            );
             assert!(ptx.contains(TARGET_SM89), "{what}: Ada is its true floor");
             // ...and it must be true: an Ada-only token has to be present to earn that floor.
             assert!(
@@ -466,9 +490,18 @@ mod tests {
             );
         }
 
-        assert!(AMAX_PTX.starts_with(HDR_SM80), "AMAX_PTX: must open with HDR_SM80 (.version 7.8)");
-        assert!(AMAX_PTX.contains(TARGET_SM80), "AMAX_PTX: plain f32 reduction, floor is sm_80");
-        assert!(!AMAX_PTX.contains("sm_89"), "AMAX_PTX: must not be pinned to Ada");
+        assert!(
+            AMAX_PTX.starts_with(HDR_SM80),
+            "AMAX_PTX: must open with HDR_SM80 (.version 7.8)"
+        );
+        assert!(
+            AMAX_PTX.contains(TARGET_SM80),
+            "AMAX_PTX: plain f32 reduction, floor is sm_80"
+        );
+        assert!(
+            !AMAX_PTX.contains("sm_89"),
+            "AMAX_PTX: must not be pinned to Ada"
+        );
         // The `.version` axis is checked separately from the `.target` axis because a half-done
         // conversion (target floated to sm_80, `.version` left at 8.4) still fails to load on the
         // r535/r545 drivers this retarget targets -- `.version 8.4` demands r550+.
@@ -479,9 +512,19 @@ mod tests {
         // The evidence for the lower floor: no fp8 type token, no MMA, and none of the other
         // arch-raising instruction families. Only plain-f32 global loads, `abs`, `max` and a store.
         for banned in [
-            "e4m3", "e5m2", "mma", "ldmatrix", "cp.async", "satfinite", "wgmma", "mbarrier",
+            "e4m3",
+            "e5m2",
+            "mma",
+            "ldmatrix",
+            "cp.async",
+            "satfinite",
+            "wgmma",
+            "mbarrier",
         ] {
-            assert!(!AMAX_PTX.contains(banned), "AMAX_PTX: unexpected `{banned}` -- re-check its floor");
+            assert!(
+                !AMAX_PTX.contains(banned),
+                "AMAX_PTX: unexpected `{banned}` -- re-check its floor"
+            );
         }
         for required in ["ld.global.f32", "abs.f32", "max.f32", "st.global.f32"] {
             assert!(AMAX_PTX.contains(required), "AMAX_PTX: lost `{required}`");
@@ -492,7 +535,9 @@ mod tests {
     #[test]
     fn e5m2_host_roundtrip() {
         // Exactly representable: 1.0, 1.25, 1.5, 1.75 (mantissa 0..3 at exp 15), powers of two, signs.
-        for &v in &[0.0f32, 1.0, -1.0, 1.25, 1.5, 1.75, 2.0, 0.5, 4.0, -3.5, 256.0, -49152.0] {
+        for &v in &[
+            0.0f32, 1.0, -1.0, 1.25, 1.5, 1.75, 2.0, 0.5, 4.0, -3.5, 256.0, -49152.0,
+        ] {
             let q = e5m2_to_f32(f32_to_e5m2(v));
             assert_eq!(q, v, "E5M2 should represent {v} exactly (got {q})");
         }
@@ -502,7 +547,7 @@ mod tests {
         // Round-to-nearest-even: 1.3 -> 1.25 (0.05 below) vs 1.375 tie -> even (1.5, mantissa 2).
         assert_eq!(e5m2_to_f32(f32_to_e5m2(1.3)), 1.25);
         assert_eq!(e5m2_to_f32(f32_to_e5m2(1.375)), 1.5); // tie to even mantissa (10b)
-        // Wider range than E4M3 (whose max is 448): 1024 is representable in E5M2.
+                                                          // Wider range than E4M3 (whose max is 448): 1024 is representable in E5M2.
         assert_eq!(e5m2_to_f32(f32_to_e5m2(1024.0)), 1024.0);
     }
 
@@ -518,11 +563,15 @@ mod tests {
             (3.0 * d, 0x03),
             (-d, 0x81),
             (-3.0 * d, 0x83),
-            (4.0 * d, 0x04),  // 2^-14: the smallest NORMAL (carry out of the subnormal range)
-            (-0.0, 0x80),     // the sign bit survives ±0
+            (4.0 * d, 0x04), // 2^-14: the smallest NORMAL (carry out of the subnormal range)
+            (-0.0, 0x80),    // the sign bit survives ±0
             (0.0, 0x00),
         ] {
-            assert_eq!(f32_to_e5m2(v), bits, "f32_to_e5m2({v:e}) should be {bits:#04x}");
+            assert_eq!(
+                f32_to_e5m2(v),
+                bits,
+                "f32_to_e5m2({v:e}) should be {bits:#04x}"
+            );
             // Exactly representable => the decode returns the same magnitude.
             assert_eq!(e5m2_to_f32(bits).abs(), v.abs(), "e5m2_to_f32({bits:#04x})");
         }
@@ -535,7 +584,11 @@ mod tests {
         assert_eq!(f32_to_e5m2(0.4 * d), 0x00);
         assert_eq!(f32_to_e5m2(-0.4 * d), 0x80);
         assert_eq!(f32_to_e5m2(0.5 * d), 0x00, "tie 0.5d -> even (zero)");
-        assert_eq!(f32_to_e5m2(f32::MIN_POSITIVE / 4.0), 0x00, "an f32 subnormal input flushes");
+        assert_eq!(
+            f32_to_e5m2(f32::MIN_POSITIVE / 4.0),
+            0x00,
+            "an f32 subnormal input flushes"
+        );
     }
 
     /// **The host encoder and the device converter must produce the SAME BITS** — the two halves of
@@ -548,9 +601,32 @@ mod tests {
     fn e5m2_host_matches_device_converter() {
         let d = 2f32.powi(-16);
         let mut xs: Vec<f32> = vec![
-            0.0, -0.0, d, -d, 1.4 * d, 1.5 * d, 2.5 * d, 3.0 * d, 4.0 * d, 0.5 * d, -0.4 * d,
-            1.0, -1.0, 1.3, 1.375, 0.5, -3.5, 256.0, -49152.0, 57344.0, -57344.0, 1e-5, -1e-5,
-            f32::MIN_POSITIVE, 6.1e-5, -6.1e-5,
+            0.0,
+            -0.0,
+            d,
+            -d,
+            1.4 * d,
+            1.5 * d,
+            2.5 * d,
+            3.0 * d,
+            4.0 * d,
+            0.5 * d,
+            -0.4 * d,
+            1.0,
+            -1.0,
+            1.3,
+            1.375,
+            0.5,
+            -3.5,
+            256.0,
+            -49152.0,
+            57344.0,
+            -57344.0,
+            1e-5,
+            -1e-5,
+            f32::MIN_POSITIVE,
+            6.1e-5,
+            -6.1e-5,
         ];
         let mut rng = crate::diff::Rng::new(0xE5E5);
         xs.extend(rng.vec(256, -2.0, 2.0));
@@ -575,7 +651,11 @@ mod tests {
             .filter(|((a, b), _)| a != b)
             .map(|((a, b), x)| format!("x={x:e}: device {a:#04x} != host {b:#04x}"))
             .collect();
-        assert!(bad.is_empty(), "host/device E5M2 encoders disagree:\n{}", bad.join("\n"));
+        assert!(
+            bad.is_empty(),
+            "host/device E5M2 encoders disagree:\n{}",
+            bad.join("\n")
+        );
         eprintln!(
             "[gate] E5M2 host encoder == device cvt.rn.satfinite.e5m2x2.f32 on {} values \
              (subnormals and -0.0 included) ✓",
@@ -594,10 +674,16 @@ mod tests {
         for &v in &x {
             let recovered = e5m2_to_f32(quantize_e5m2_scaled(v, recip)) / recip;
             let tol = v.abs() * 0.13 + 1e-6; // E5M2 half-ULP is <= 1/8 relative for normals
-            assert!((recovered - v).abs() <= tol, "delayed-scale {v} -> {recovered} (tol {tol})");
+            assert!(
+                (recovered - v).abs() <= tol,
+                "delayed-scale {v} -> {recovered} (tol {tol})"
+            );
         }
         // The scale actually used the upper fp8 range (the largest element maps near E5M2_MAX).
         let big = e5m2_to_f32(quantize_e5m2_scaled(-1000.0, recip)).abs();
-        assert!(big > 0.5 * E5M2_MAX, "largest element should use the upper fp8 range, got {big}");
+        assert!(
+            big > 0.5 * E5M2_MAX,
+            "largest element should use the upper fp8 range, got {big}"
+        );
     }
 }

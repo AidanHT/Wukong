@@ -133,12 +133,15 @@ unsafe fn pool_channel_avx2_sw1(
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn deinterleave_even_sw2(v0: std::arch::x86_64::__m256, v1: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+unsafe fn deinterleave_even_sw2(
+    v0: std::arch::x86_64::__m256,
+    v1: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let idx = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
     let e0 = _mm256_permutevar8x32_ps(v0, idx); // [v0[0],v0[2],v0[4],v0[6], (repeat)]
     let e1 = _mm256_permutevar8x32_ps(v1, idx); // [v1[0],v1[2],v1[4],v1[6], (repeat)]
-    // Keep low 128 from e0, high 128 from e1 -> {v0 evens, v1 evens}.
+                                                // Keep low 128 from e0, high 128 from e1 -> {v0 evens, v1 evens}.
     _mm256_blend_ps(e0, e1, 0b1111_0000)
 }
 
@@ -707,8 +710,7 @@ mod tests {
                         continue;
                     }
                     let n = channels * h * w;
-                    let x: Vec<f32> =
-                        (0..n).map(|t| ((t * 31 + 5) % 101) as f32 - 50.0).collect();
+                    let x: Vec<f32> = (0..n).map(|t| ((t * 31 + 5) % 101) as f32 - 50.0).collect();
                     let in_plane = h * w;
                     let out_plane = oh * ow;
                     for kind in [PoolKind::Max, PoolKind::Avg] {
@@ -753,18 +755,30 @@ mod tests {
                         // the scalar reference, and serial == parallel.
                         let (f, fp): (
                             unsafe extern "C" fn(
-                                *const f32, *mut f32, i64, i64, i64, i64, i64, i64, i64,
+                                *const f32,
+                                *mut f32,
+                                i64,
+                                i64,
+                                i64,
+                                i64,
+                                i64,
+                                i64,
+                                i64,
                             ),
                             unsafe extern "C" fn(
-                                *const f32, *mut f32, i64, i64, i64, i64, i64, i64, i64,
+                                *const f32,
+                                *mut f32,
+                                i64,
+                                i64,
+                                i64,
+                                i64,
+                                i64,
+                                i64,
+                                i64,
                             ),
                         ) = match kind {
-                            PoolKind::Max => {
-                                (wukong_maxpool2d_f32, wukong_maxpool2d_f32_parallel)
-                            }
-                            PoolKind::Avg => {
-                                (wukong_avgpool2d_f32, wukong_avgpool2d_f32_parallel)
-                            }
+                            PoolKind::Max => (wukong_maxpool2d_f32, wukong_maxpool2d_f32_parallel),
+                            PoolKind::Avg => (wukong_avgpool2d_f32, wukong_avgpool2d_f32_parallel),
                         };
                         let mut pub_got = vec![0.0f32; channels * out_plane];
                         let mut pub_par = vec![0.0f32; channels * out_plane];

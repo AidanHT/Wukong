@@ -75,11 +75,7 @@ fn probe_link_path() -> LinkPath {
 /// Compile `src` to an executable via `--emit=exe` (intermediates land in `tmp`, not the source
 /// tree) and run it. `Err` carries the compiler's captured stderr — the caller decides whether that
 /// is a failure or an earned skip, and either way the text is reported.
-fn build_and_run_exe(
-    tmp: &Path,
-    src: &Path,
-    stem: &str,
-) -> Result<(Option<i32>, String), String> {
+fn build_and_run_exe(tmp: &Path, src: &Path, stem: &str) -> Result<(Option<i32>, String), String> {
     // `<stem>` plus the *host's* executable suffix — `.exe` on Windows, empty on unix — matching what
     // `wukong_driver::emit_native` names an unqualified `--emit=exe` output. Hardcoding `.exe` here
     // happened to work on Linux (we pass `-o`, so the driver writes exactly this path) but named the
@@ -133,10 +129,10 @@ fn run_interp(src: &Path) -> (Option<i32>, String) {
 #[test]
 fn exe_matches_run() {
     let fixtures = [
-        "string_return.wk",        // read-only string `.rodata`, returned/threaded `*u8`
+        "string_return.wk",         // read-only string `.rodata`, returned/threaded `*u8`
         "transcendental_kernel.wk", // `wukong_vmath_f32` linked into the exe
-        "tensor_matmul.wk",        // `wukong_sgemm` linked into the exe
-        "heap_alloc.wk",           // `wukong_rt_alloc`/`wukong_rt_free` linked into the exe
+        "tensor_matmul.wk",         // `wukong_sgemm` linked into the exe
+        "heap_alloc.wk",            // `wukong_rt_alloc`/`wukong_rt_free` linked into the exe
     ];
 
     let path = probe_link_path();
@@ -182,10 +178,7 @@ fn exe_matches_run() {
                 );
             }
             Err(stderr) => match &path {
-                LinkPath::Rustc => failures.push(format!(
-                    "--- {name} ---\n{}",
-                    stderr.trim_end()
-                )),
+                LinkPath::Rustc => failures.push(format!("--- {name} ---\n{}", stderr.trim_end())),
                 LinkPath::CcFallback(cc) => {
                     skipped += 1;
                     eprintln!(

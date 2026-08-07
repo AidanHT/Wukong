@@ -359,7 +359,12 @@ unsafe fn argreduce_chunk(x: *const f32, lo: usize, hi: usize, is_max: bool) -> 
 ///
 /// # Safety
 /// `x` valid for reads on `[lo, hi)`.
-unsafe fn argreduce_chunk_scalar(x: *const f32, lo: usize, hi: usize, is_max: bool) -> (f32, usize) {
+unsafe fn argreduce_chunk_scalar(
+    x: *const f32,
+    lo: usize,
+    hi: usize,
+    is_max: bool,
+) -> (f32, usize) {
     let ident_v = if is_max {
         f32::NEG_INFINITY
     } else {
@@ -417,7 +422,7 @@ unsafe fn argreduce_chunk_avx2<const PRED: i32>(
     let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let mut vext = [_mm256_set1_ps(ident_v); 4]; // running extreme value per lane
     let mut vidx = [_mm256_set1_epi32(-1); 4]; // running index per lane (-1 = unconsumed sentinel)
-    // Absolute index of lane 0 of each accumulator at the current step.
+                                               // Absolute index of lane 0 of each accumulator at the current step.
     let mut ibase = [
         _mm256_add_epi32(_mm256_set1_epi32(lo as i32), lane),
         _mm256_add_epi32(_mm256_set1_epi32((lo + 8) as i32), lane),
@@ -589,13 +594,24 @@ mod tests {
     }
 
     const OPS: [i64; 9] = [
-        RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ, RED_MAX, RED_MIN, RED_MAXABS, RED_SUMABS, RED_ABSDIFF,
+        RED_DOT,
+        RED_SSD,
+        RED_SUM,
+        RED_SUMSQ,
+        RED_MAX,
+        RED_MIN,
+        RED_MAXABS,
+        RED_SUMABS,
+        RED_ABSDIFF,
     ];
 
     // The unary ops read only `x`; the recognizer passes `y == x` for them. RED_ABSDIFF is binary
     // (reads y), so it stays OUT of this set — the tests must marshal a real y for it, like RED_SSD.
     fn unary(op: i64) -> bool {
-        matches!(op, RED_SUM | RED_SUMSQ | RED_MAX | RED_MIN | RED_MAXABS | RED_SUMABS)
+        matches!(
+            op,
+            RED_SUM | RED_SUMSQ | RED_MAX | RED_MIN | RED_MAXABS | RED_SUMABS
+        )
     }
 
     #[test]
@@ -714,7 +730,13 @@ mod tests {
             ("all NaN", |n| vec![f32::NAN; n]),
             ("NaN/finite", |n| {
                 (0..n)
-                    .map(|i| if i % 3 == 0 { f32::NAN } else { i as f32 * 0.5 - 3.0 })
+                    .map(|i| {
+                        if i % 3 == 0 {
+                            f32::NAN
+                        } else {
+                            i as f32 * 0.5 - 3.0
+                        }
+                    })
                     .collect()
             }),
             ("-inf/finite", |n| {
@@ -744,7 +766,13 @@ mod tests {
                                 true,
                             )
                         } else {
-                            argreduce_chunk_avx2::<_CMP_LT_OQ>(x.as_ptr(), 0, n, f32::INFINITY, false)
+                            argreduce_chunk_avx2::<_CMP_LT_OQ>(
+                                x.as_ptr(),
+                                0,
+                                n,
+                                f32::INFINITY,
+                                false,
+                            )
                         }
                     };
                     assert_eq!(
@@ -764,10 +792,7 @@ mod tests {
         // that `wukong_argreduce_f32` reserves for `n <= 0`. Sized to span several RCHUNK chunks so
         // serial and parallel both exercise the multi-chunk fold.
         for &n in &[32usize, 33, 8192, 3 * 8192 + 13] {
-            for &(op, ident_v) in &[
-                (RED_ARGMAX, f32::NEG_INFINITY),
-                (RED_ARGMIN, f32::INFINITY),
-            ] {
+            for &(op, ident_v) in &[(RED_ARGMAX, f32::NEG_INFINITY), (RED_ARGMIN, f32::INFINITY)] {
                 let x = vec![ident_v; n];
                 let s = unsafe { wukong_argreduce_f32(x.as_ptr(), n as i64, op) };
                 let p = unsafe { wukong_argreduce_f32_parallel(x.as_ptr(), n as i64, op) };
@@ -784,7 +809,11 @@ mod tests {
         // (b) the extreme living in a `< 32` scalar tail of a non-multiple-of-32 length.
         let naive = |x: &[f32], is_max: bool| {
             let mut best = (
-                if is_max { f32::NEG_INFINITY } else { f32::INFINITY },
+                if is_max {
+                    f32::NEG_INFINITY
+                } else {
+                    f32::INFINITY
+                },
                 usize::MAX,
             );
             for (i, &v) in x.iter().enumerate() {

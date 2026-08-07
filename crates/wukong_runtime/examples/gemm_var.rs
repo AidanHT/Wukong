@@ -55,7 +55,13 @@ fn mkl_dll_path() -> Option<PathBuf> {
         bases.push(PathBuf::from(prefix).join("Library").join("bin"));
     }
     if let Ok(home) = std::env::var("USERPROFILE") {
-        for name in ["Anaconda3", "anaconda3", "miniconda3", "Miniconda3", "miniforge3"] {
+        for name in [
+            "Anaconda3",
+            "anaconda3",
+            "miniconda3",
+            "Miniconda3",
+            "miniforge3",
+        ] {
             bases.push(PathBuf::from(&home).join(name).join("Library").join("bin"));
         }
     }
@@ -78,10 +84,17 @@ fn load_mkl() -> Option<Mkl> {
     let lib: libloading::Library = lib.into();
     let api = unsafe {
         let sgemm = *lib.get::<CblasSgemmFn>(b"cblas_sgemm_64\0").ok()?;
-        let set_threads = *lib.get::<MklSetNumThreadsFn>(b"MKL_Set_Num_Threads\0").ok()?;
-        let max_threads = (*lib.get::<MklGetMaxThreadsFn>(b"MKL_Get_Max_Threads\0").ok()?)();
+        let set_threads = *lib
+            .get::<MklSetNumThreadsFn>(b"MKL_Set_Num_Threads\0")
+            .ok()?;
+        let max_threads = (*lib
+            .get::<MklGetMaxThreadsFn>(b"MKL_Get_Max_Threads\0")
+            .ok()?)();
         set_threads(max_threads);
-        println!("oneMKL: {} (pinned to {max_threads} threads)", path.display());
+        println!(
+            "oneMKL: {} (pinned to {max_threads} threads)",
+            path.display()
+        );
         Mkl { sgemm, max_threads }
     };
     std::mem::forget(lib);
@@ -138,12 +151,10 @@ fn main() {
         let cwp = cw.as_mut_ptr();
         let cmp = cm.as_mut_ptr();
 
-        let mut wuk = || unsafe { wukong_runtime::wukong_sgemm_parallel(ap, bp, cwp, ni, ni, ni, 0) };
-        let mut mklc = || unsafe {
-            (mkl.sgemm)(
-                101, 111, 111, ni, ni, ni, 1.0, ap, ni, bp, ni, 0.0, cmp, ni,
-            )
-        };
+        let mut wuk =
+            || unsafe { wukong_runtime::wukong_sgemm_parallel(ap, bp, cwp, ni, ni, ni, 0) };
+        let mut mklc =
+            || unsafe { (mkl.sgemm)(101, 111, 111, ni, ni, ni, 1.0, ap, ni, bp, ni, 0.0, cmp, ni) };
 
         // Warm both sides (pool spawn, packing scratch, MKL's own thread wake) and ABI-check once:
         // a garbage MKL layout would otherwise read as a fast wrong answer.
@@ -159,7 +170,10 @@ fn main() {
                 d / (y.abs() as f64).max(1e-6)
             })
             .fold(0.0f64, f64::max);
-        assert!(max_rel < 1e-4, "Wukong vs MKL disagree (rel {max_rel:.1e}) at {ns}³");
+        assert!(
+            max_rel < 1e-4,
+            "Wukong vs MKL disagree (rel {max_rel:.1e}) at {ns}³"
+        );
 
         // Batch reps sized off a calibration call so one batch is ~30 ms — long enough to blur
         // scheduler noise, short enough that 12 rounds×2 sides stay in one thermal window.
@@ -235,9 +249,18 @@ fn main() {
             ms.push(m);
             ratios.push(w / m * 100.0);
         }
-        let (wmin, wmax) = (ws.iter().cloned().fold(f64::MAX, f64::min), ws.iter().cloned().fold(0.0, f64::max));
-        let (mmin, mmax) = (ms.iter().cloned().fold(f64::MAX, f64::min), ms.iter().cloned().fold(0.0, f64::max));
-        let (rmin, rmax) = (ratios.iter().cloned().fold(f64::MAX, f64::min), ratios.iter().cloned().fold(0.0, f64::max));
+        let (wmin, wmax) = (
+            ws.iter().cloned().fold(f64::MAX, f64::min),
+            ws.iter().cloned().fold(0.0, f64::max),
+        );
+        let (mmin, mmax) = (
+            ms.iter().cloned().fold(f64::MAX, f64::min),
+            ms.iter().cloned().fold(0.0, f64::max),
+        );
+        let (rmin, rmax) = (
+            ratios.iter().cloned().fold(f64::MAX, f64::min),
+            ratios.iter().cloned().fold(0.0, f64::max),
+        );
         println!(
             "  wuk  min/med/max {wmin:.1}/{:.1}/{wmax:.1} GF/s  CoV {:.1}%",
             median(&mut ws.clone()),

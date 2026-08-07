@@ -129,8 +129,8 @@ const EXP_TBL_SCALE: f32 = (8.0f64 / std::f64::consts::LN_2) as f32; // 8/ln2 �
 const EXP_TBL_C1: f32 = EXP_C1 / 8.0; // ln2/8 high — n·C1 exact for |n| ≤ 2047 (test-pinned)
 const EXP_TBL_C2: f32 = EXP_C2 / 8.0; // ln2/8 low correction (a /8 of an f32 is exact)
 const EXP_TBL_MBIAS: i32 = 0x4B40_0000 - 1016; // bits(EXP_MAGIC) − 127·8: m = bits(t)−MBIAS = n+1016
-// T[j] = 2^(j/8) rounded once to f32 (T[0] pinned exactly 1.0 → exp(0) = 1.0 exactly). The
-// `vmath_exp_tables_consistent` test below re-derives every entry bit-for-bit.
+                                               // T[j] = 2^(j/8) rounded once to f32 (T[0] pinned exactly 1.0 → exp(0) = 1.0 exactly). The
+                                               // `vmath_exp_tables_consistent` test below re-derives every entry bit-for-bit.
 const EXP_TBL_T: [f32; 8] = [
     1.0,
     1.090_507_7,
@@ -174,9 +174,9 @@ const EXP_TBL_P3: f32 = 1.0 / 6.0;
 // NaN produce bit-identical values to the old kernel; denormals stay same-class garbage; only the
 // x < 0 garbage values differ (out of every gate's domain).
 const LOG_OFF: i32 = 0x3F32_0000; // z-range split point: z ∈ [0.6953125, 1.390625)
-// R[j] = 1/mid_j of bucket j rounded once to f32 (bucket 4 pinned to exactly 1.0 — see above);
-// L[j] = −ln(R[j]) computed in f64 *from the rounded-f32 R* and rounded once to f32. The
-// `vmath_log_tables_consistent` test below re-derives both invariants bit-for-bit.
+                                  // R[j] = 1/mid_j of bucket j rounded once to f32 (bucket 4 pinned to exactly 1.0 — see above);
+                                  // L[j] = −ln(R[j]) computed in f64 *from the rounded-f32 R* and rounded once to f32. The
+                                  // `vmath_log_tables_consistent` test below re-derives both invariants bit-for-bit.
 const LOG_TBL_R: [f32; 8] = [
     1.376_344_1,
     1.267_326_7,
@@ -1021,14 +1021,8 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64, unroll6: b
 /// `x`/`out` valid for `n` f32; `f` must be an avx2+fma 8-lane kernel.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn vmath_avx2_loop<F>(
-    x: *const f32,
-    out: *mut f32,
-    n: usize,
-    op: i64,
-    unroll6: bool,
-    f: F,
-) where
+unsafe fn vmath_avx2_loop<F>(x: *const f32, out: *mut f32, n: usize, op: i64, unroll6: bool, f: F)
+where
     F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256,
 {
     use std::arch::x86_64::*;
@@ -1618,14 +1612,8 @@ unsafe fn vmath2_avx2(x: *const f32, y: *const f32, out: *mut f32, n: usize, op:
 /// `x`/`y`/`out` valid for `n` f32; `f` must be an avx2+fma 8-lane two-input kernel.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn vmath2_avx2_loop<F>(
-    x: *const f32,
-    y: *const f32,
-    out: *mut f32,
-    n: usize,
-    op: i64,
-    f: F,
-) where
+unsafe fn vmath2_avx2_loop<F>(x: *const f32, y: *const f32, out: *mut f32, n: usize, op: i64, f: F)
+where
     F: Fn(std::arch::x86_64::__m256, std::arch::x86_64::__m256) -> std::arch::x86_64::__m256,
 {
     use std::arch::x86_64::*;
@@ -1657,8 +1645,14 @@ unsafe fn vmath2_avx2_loop<F>(
     while i + 32 <= n {
         let r0 = f(_mm256_loadu_ps(x.add(i)), _mm256_loadu_ps(y.add(i)));
         let r1 = f(_mm256_loadu_ps(x.add(i + 8)), _mm256_loadu_ps(y.add(i + 8)));
-        let r2 = f(_mm256_loadu_ps(x.add(i + 16)), _mm256_loadu_ps(y.add(i + 16)));
-        let r3 = f(_mm256_loadu_ps(x.add(i + 24)), _mm256_loadu_ps(y.add(i + 24)));
+        let r2 = f(
+            _mm256_loadu_ps(x.add(i + 16)),
+            _mm256_loadu_ps(y.add(i + 16)),
+        );
+        let r3 = f(
+            _mm256_loadu_ps(x.add(i + 24)),
+            _mm256_loadu_ps(y.add(i + 24)),
+        );
         store!(out.add(i), r0);
         store!(out.add(i + 8), r1);
         store!(out.add(i + 16), r2);
@@ -2043,7 +2037,10 @@ unsafe fn hardswish8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 
 /// `blendv`, matching the scalar `if quad == k` chain.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn sincos8(x: std::arch::x86_64::__m256, is_cos: bool) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn sincos8(
+    x: std::arch::x86_64::__m256,
+    is_cos: bool,
+) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let magic = _mm256_set1_ps(EXP_MAGIC);
     let tt = _mm256_fmadd_ps(x, _mm256_set1_ps(TWO_OVER_PI), magic);
@@ -2731,7 +2728,11 @@ mod tests {
         for (i, &x) in xs.iter().enumerate() {
             let got = out[i];
             // Lane == scalar twin, bit-for-bit (the tail and the no-AVX2 fallback both take log1).
-            assert_eq!(got.to_bits(), apply1(VM_LOG, x).to_bits(), "lane vs scalar at {x}");
+            assert_eq!(
+                got.to_bits(),
+                apply1(VM_LOG, x).to_bits(),
+                "lane vs scalar at {x}"
+            );
             let want = (x as f64).ln();
             if want == 0.0 {
                 assert_eq!(got.to_bits(), 0.0f32.to_bits(), "ln(1) must be exactly 0");
@@ -2784,28 +2785,49 @@ mod tests {
             let want = ((j as f64) / 8.0).exp2() as f32;
             assert_eq!(EXP_TBL_T[j].to_bits(), want.to_bits(), "T[{j}]");
         }
-        assert_eq!(EXP_TBL_T[0].to_bits(), 1.0f32.to_bits(), "T[0] must be exactly 1");
-        assert_eq!(EXP_TBL_SCALE.to_bits(), ((8.0f64 / std::f64::consts::LN_2) as f32).to_bits());
+        assert_eq!(
+            EXP_TBL_T[0].to_bits(),
+            1.0f32.to_bits(),
+            "T[0] must be exactly 1"
+        );
+        assert_eq!(
+            EXP_TBL_SCALE.to_bits(),
+            ((8.0f64 / std::f64::consts::LN_2) as f32).to_bits()
+        );
         assert_eq!(EXP_TBL_MBIAS, EXP_MAGIC.to_bits() as i32 - 127 * 8);
         // Cody-Waite hi: the exact /8 of EXP_C1, with ≥10 trailing mantissa zero bits (it has 15)
         // so that n·C1 is exact for the full |n| ≤ 1020 clamp range — checked exhaustively with
         // 2× headroom against the f64 product.
         assert_eq!(EXP_TBL_C1.to_bits(), (EXP_C1 / 8.0).to_bits());
         assert_eq!(EXP_TBL_C2.to_bits(), (EXP_C2 / 8.0).to_bits());
-        assert!(EXP_TBL_C1.to_bits().trailing_zeros() >= 10, "C1 lost its trailing zeros");
+        assert!(
+            EXP_TBL_C1.to_bits().trailing_zeros() >= 10,
+            "C1 lost its trailing zeros"
+        );
         for n in -2047i32..=2047 {
             let prod = (n as f32) * EXP_TBL_C1;
-            assert_eq!(prod as f64, (n as f64) * (EXP_TBL_C1 as f64), "n·C1 inexact at n={n}");
+            assert_eq!(
+                prod as f64,
+                (n as f64) * (EXP_TBL_C1 as f64),
+                "n·C1 inexact at n={n}"
+            );
         }
         // hi+lo reproduce ln2/8 to ≈2e-13 (×|n| ≤ 1020 → ≤2.2e-10 absolute in r — invisible in f32).
         let resid = ((EXP_TBL_C1 as f64 + EXP_TBL_C2 as f64) - std::f64::consts::LN_2 / 8.0).abs();
-        assert!(resid < 1e-12, "Cody-Waite pair drifted off ln2/8: {resid:e}");
+        assert!(
+            resid < 1e-12,
+            "Cody-Waite pair drifted off ln2/8: {resid:e}"
+        );
         // P2 is the Chebyshev-shifted r² coefficient 1/2 + (√2−1)/12·h² (h = ln2/16), rounded once;
         // P3 is 1/6 rounded once.
         let h = std::f64::consts::LN_2 / 16.0;
         let want_p2 = (0.5 + (2f64.sqrt() - 1.0) / 12.0 * h * h) as f32;
         assert_eq!(EXP_TBL_P2.to_bits(), want_p2.to_bits(), "P2");
-        assert_eq!(EXP_TBL_P3.to_bits(), ((1.0f64 / 6.0) as f32).to_bits(), "P3");
+        assert_eq!(
+            EXP_TBL_P3.to_bits(),
+            ((1.0f64 / 6.0) as f32).to_bits(),
+            "P3"
+        );
     }
 
     /// Dense accuracy sweep of the table-based exp core vs f64 `exp`: (1) 2M linear points over
@@ -2835,7 +2857,11 @@ mod tests {
         for (i, &x) in xs.iter().enumerate() {
             let got = out[i];
             // Lane == scalar twin, bit-for-bit (the tail and the no-AVX2 fallback both take exp1).
-            assert_eq!(got.to_bits(), apply1(VM_EXP, x).to_bits(), "lane vs scalar at {x}");
+            assert_eq!(
+                got.to_bits(),
+                apply1(VM_EXP, x).to_bits(),
+                "lane vs scalar at {x}"
+            );
             if x == 0.0 {
                 assert_eq!(got.to_bits(), 1.0f32.to_bits(), "exp(0) must be exactly 1");
                 continue;
@@ -2870,9 +2896,17 @@ mod tests {
         assert!(sat.is_finite());
         assert_eq!(sat.to_bits(), 0x7F35_04A4, "HI saturation value drifted");
         for x in [88.4, 1e6, f32::INFINITY, f32::NAN] {
-            assert_eq!(exp1(x).to_bits(), sat.to_bits(), "exp({x}) must saturate to exp(EXP_HI)");
+            assert_eq!(
+                exp1(x).to_bits(),
+                sat.to_bits(),
+                "exp({x}) must saturate to exp(EXP_HI)"
+            );
         }
-        assert_eq!(exp1(0.0).to_bits(), 1.0f32.to_bits(), "exp(0) must be exactly 1");
+        assert_eq!(
+            exp1(0.0).to_bits(),
+            1.0f32.to_bits(),
+            "exp(0) must be exactly 1"
+        );
         // Monotonicity across n boundaries (bucket steps, and exponent steps at n ≡ 4 mod 8's
         // neighbors ±1020 covers e transitions too). Bits ascend with value for positive floats
         // and descend for negative ones — walk in value order either way.
@@ -2996,7 +3030,11 @@ mod tests {
         fn acc(got: f32, want: f64) -> (f64, i64) {
             let rounded = want as f32;
             let ulps = (i64::from(got.to_bits()) - i64::from(rounded.to_bits())).abs();
-            let rel = if want == 0.0 { 0.0 } else { ((f64::from(got) - want) / want).abs() };
+            let rel = if want == 0.0 {
+                0.0
+            } else {
+                ((f64::from(got) - want) / want).abs()
+            };
             (rel, ulps)
         }
 
@@ -3006,7 +3044,10 @@ mod tests {
         let t0 = std::time::Instant::now();
         let (mut wrel, mut wulp, mut wat, mut wat_u) = (0.0f64, 0i64, 0.0f32, 0.0f32);
         let mut swept: u64 = 0;
-        for (sign, hi) in [(0u32, EXP_HI.to_bits()), (0x8000_0000u32, 87.0f32.to_bits())] {
+        for (sign, hi) in [
+            (0u32, EXP_HI.to_bits()),
+            (0x8000_0000u32, 87.0f32.to_bits()),
+        ] {
             let mut lo = 0u32;
             while lo <= hi {
                 let take = (((hi - lo) / stride) as usize + 1).min(CH);
@@ -3036,8 +3077,14 @@ mod tests {
              max {wulp} ULP at {wat_u:?} ({:.1}s, stride {stride})",
             t0.elapsed().as_secs_f64()
         );
-        assert!(wrel < 2.4e-7, "exp max rel {wrel:.3e} at {wat:?} exceeds the 2.4e-7 bar");
-        assert!(wulp <= EXP_ULP_BAR, "exp max {wulp} ULP at {wat_u:?} exceeds {EXP_ULP_BAR}");
+        assert!(
+            wrel < 2.4e-7,
+            "exp max rel {wrel:.3e} at {wat:?} exceeds the 2.4e-7 bar"
+        );
+        assert!(
+            wulp <= EXP_ULP_BAR,
+            "exp max {wulp} ULP at {wat_u:?} exceeds {EXP_ULP_BAR}"
+        );
 
         // --- pass 3: log worst case over every positive normal f32 --------------------------------
         let t0 = std::time::Instant::now();
@@ -3084,9 +3131,18 @@ mod tests {
              ({:.1}s, stride {stride})",
             t0.elapsed().as_secs_f64()
         );
-        assert!(wrel < 1e-6, "log max rel {wrel:.3e} at {wat:?} exceeds the 1e-6 bar");
-        assert!(brel < 7e-7, "log [0.25,4) max rel {brel:.3e} at {bat:?} exceeds 6.9e-7");
-        assert!(wulp <= LOG_ULP_BAR, "log max {wulp} ULP at {wat_u:?} exceeds {LOG_ULP_BAR}");
+        assert!(
+            wrel < 1e-6,
+            "log max rel {wrel:.3e} at {wat:?} exceeds the 1e-6 bar"
+        );
+        assert!(
+            brel < 7e-7,
+            "log [0.25,4) max rel {brel:.3e} at {bat:?} exceeds 6.9e-7"
+        );
+        assert!(
+            wulp <= LOG_ULP_BAR,
+            "log max {wulp} ULP at {wat_u:?} exceeds {LOG_ULP_BAR}"
+        );
     }
 
     /// Activation **backward** kernels `dx = dy·act'(x)` (silu/gelu): (1) the kernel output equals the
@@ -3318,10 +3374,16 @@ mod tests {
     #[test]
     fn vmath_op_tables_cover_the_declared_code_space() {
         for op in 0..=VM_CBRT {
-            assert!(vmath8_for(op).is_some(), "vmath8_for missing VM_* code {op}");
+            assert!(
+                vmath8_for(op).is_some(),
+                "vmath8_for missing VM_* code {op}"
+            );
         }
         for op in [-1i64, VM_CBRT + 1, 9999] {
-            assert!(vmath8_for(op).is_none(), "vmath8_for claims unknown code {op}");
+            assert!(
+                vmath8_for(op).is_none(),
+                "vmath8_for claims unknown code {op}"
+            );
         }
         for op in 0..=VM2_SIGMOID_GATE {
             assert!(
@@ -3521,7 +3583,13 @@ mod tests {
             let t_kernel = best(
                 iters,
                 Box::new(move || unsafe {
-                    wukong_vmath2_f32(xp as *const f32, yp as *const f32, outp as *mut f32, n as i64, op);
+                    wukong_vmath2_f32(
+                        xp as *const f32,
+                        yp as *const f32,
+                        outp as *mut f32,
+                        n as i64,
+                        op,
+                    );
                     std::hint::black_box(outp);
                 }),
             );
@@ -3554,13 +3622,17 @@ mod tests {
     #[test]
     fn vmath_nt_tail_matches_lanes() {
         let n = 1_500_001usize; // 2-stream = 12 MiB > NT_MIN_BYTES: forces NT + prologue + tail
-        // Kept > 0 so log/log-based ops stay in domain; a short period spans the poly's regions.
+                                // Kept > 0 so log/log-based ops stay in domain; a short period spans the poly's regions.
         let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
         for op in [VM_EXP, VM_LOG, VM_TANH, VM_GELU, VM_SIN, VM_ERF, VM_RELU] {
             let mut got = vec![0.0f32; n];
             unsafe { wukong_vmath_f32(xs.as_ptr(), got.as_mut_ptr(), n as i64, op) };
             for (i, &x) in xs.iter().enumerate() {
-                assert_eq!(got[i].to_bits(), apply1(op, x).to_bits(), "op {op} i {i} x {x}");
+                assert_eq!(
+                    got[i].to_bits(),
+                    apply1(op, x).to_bits(),
+                    "op {op} i {i} x {x}"
+                );
             }
         }
     }
@@ -3584,10 +3656,10 @@ mod tests {
     fn vmath_serial_matches_parallel_bit_for_bit() {
         let all: &[i64] = &[VM_EXP, VM_LOG, VM_TANH, VM_GELU, VM_SELU, VM_ERF, VM_RELU];
         for &(n, ops) in &[
-            (1_000usize, all),                   // < VMATH_PAR_MIN: the entry runs the serial kernel
-            (16_384, all),                       // == VMATH_PAR_MIN: exactly one chunk
-            (16_385, all),                       // one full chunk plus a 1-element chunk
-            (40_961, all),                       // two full chunks plus a ragged final one
+            (1_000usize, all), // < VMATH_PAR_MIN: the entry runs the serial kernel
+            (16_384, all),     // == VMATH_PAR_MIN: exactly one chunk
+            (16_385, all),     // one full chunk plus a 1-element chunk
+            (40_961, all),     // two full chunks plus a ragged final one
             (1_500_001, &[VM_EXP, VM_GELU][..]), // serial goes non-temporal, the chunks do not
         ] {
             // Kept > 0 so the log family stays in domain; a short period spans the poly's regions.
@@ -3629,7 +3701,9 @@ mod tests {
             return; // no AVX2: neither body is reachable, and the scalar twin is gated elsewhere
         }
         for n in [1usize, 7, 8, 31, 32, 47, 48, 49, 55, 95, 96, 143, 1001] {
-            let xs: Vec<f32> = (0..n).map(|i| (i as f32 - (n / 2) as f32) * 0.013).collect();
+            let xs: Vec<f32> = (0..n)
+                .map(|i| (i as f32 - (n / 2) as f32) * 0.013)
+                .collect();
             for op in [VM_EXP, VM_TANH, VM_GELU, VM_SIN, VM_ERF, VM_RELU, VM_SILU] {
                 let (mut x4, mut x6) = (vec![0.0f32; n], vec![0.0f32; n]);
                 // SAFETY: avx2+fma detected just above; xs/x4/x6 are each exactly n f32 long.
@@ -3638,7 +3712,11 @@ mod tests {
                     vmath_avx2(xs.as_ptr(), x6.as_mut_ptr(), n, op, true);
                 }
                 for i in 0..n {
-                    assert_eq!(x6[i].to_bits(), x4[i].to_bits(), "n {n} op {op} i {i}: ×6 vs ×4");
+                    assert_eq!(
+                        x6[i].to_bits(),
+                        x4[i].to_bits(),
+                        "n {n} op {op} i {i}: ×6 vs ×4"
+                    );
                     assert_eq!(
                         x6[i].to_bits(),
                         apply1(op, xs[i]).to_bits(),
@@ -3728,7 +3806,13 @@ mod tests {
             bases.push(PathBuf::from(prefix).join("Library").join("bin"));
         }
         if let Ok(home) = std::env::var("USERPROFILE") {
-            for name in ["Anaconda3", "anaconda3", "miniconda3", "Miniconda3", "miniforge3"] {
+            for name in [
+                "Anaconda3",
+                "anaconda3",
+                "miniconda3",
+                "Miniconda3",
+                "miniforge3",
+            ] {
                 bases.push(PathBuf::from(&home).join(name).join("Library").join("bin"));
             }
         }
@@ -3758,8 +3842,12 @@ mod tests {
     #[allow(dead_code)]
     #[cfg(windows)]
     #[allow(clippy::type_complexity)]
-    fn vml_full(
-    ) -> Option<(VmlUnaryFn, VmlUnaryFn, VmlUnaryFn, Option<(VmlSetModeFn, VmlGetModeFn)>)> {
+    fn vml_full() -> Option<(
+        VmlUnaryFn,
+        VmlUnaryFn,
+        VmlUnaryFn,
+        Option<(VmlSetModeFn, VmlGetModeFn)>,
+    )> {
         use libloading::os::windows::{Library as WinLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
         let path = mkl_dll_path()?;
         // SAFETY: loading a system DLL; ALTERED_SEARCH_PATH lets it resolve its own siblings.
@@ -3789,9 +3877,10 @@ mod tests {
         eprintln!("  oneMKL VML peer: {}", path.display());
         if let Some((_, get)) = out.3 {
             // SAFETY: `vmlGetMode` takes no arguments and returns the mode word.
-            eprintln!("  VML mode control: vmlSetMode/vmlGetMode present (mode {:#x} at load)", unsafe {
-                get()
-            });
+            eprintln!(
+                "  VML mode control: vmlSetMode/vmlGetMode present (mode {:#x} at load)",
+                unsafe { get() }
+            );
         } else {
             eprintln!("  VML mode control: ABSENT — only the default (HA) mode can be timed");
         }
@@ -3924,7 +4013,11 @@ mod tests {
              interleaved, 1 thread; shipped entry = {}; noise floor {NOISE_FLOOR:.2}x; clock \
              granularity {:.0} ns",
             n * 4 / 1024,
-            if vmath_fnptr() { "fnptr (WUKONG_VMATH_FNPTR=1)" } else { "mono" },
+            if vmath_fnptr() {
+                "fnptr (WUKONG_VMATH_FNPTR=1)"
+            } else {
+                "mono"
+            },
             granularity * 1e9
         );
         // Relative error and ULP distance of a whole arm against a f64 reference, on the timed data.
@@ -3936,16 +4029,35 @@ mod tests {
             for (i, &g) in got.iter().enumerate() {
                 let want = reference(f64::from(xs[i]));
                 let ulps = (i64::from(g.to_bits()) - i64::from((want as f32).to_bits())).abs();
-                let rel = if want == 0.0 { 0.0 } else { ((f64::from(g) - want) / want).abs() };
+                let rel = if want == 0.0 {
+                    0.0
+                } else {
+                    ((f64::from(g) - want) / want).abs()
+                };
                 wrel = wrel.max(rel);
                 wulp = wulp.max(ulps);
             }
             (wrel, wulp)
         };
         for (op, name, vf, reference) in [
-            (VM_EXP, "exp", peer.map(|p| p.0), &f64::exp as &dyn Fn(f64) -> f64),
-            (VM_LOG, "log", peer.map(|p| p.1), &f64::ln as &dyn Fn(f64) -> f64),
-            (VM_TANH, "tanh", peer.map(|p| p.2), &f64::tanh as &dyn Fn(f64) -> f64),
+            (
+                VM_EXP,
+                "exp",
+                peer.map(|p| p.0),
+                &f64::exp as &dyn Fn(f64) -> f64,
+            ),
+            (
+                VM_LOG,
+                "log",
+                peer.map(|p| p.1),
+                &f64::ln as &dyn Fn(f64) -> f64,
+            ),
+            (
+                VM_TANH,
+                "tanh",
+                peer.map(|p| p.2),
+                &f64::tanh as &dyn Fn(f64) -> f64,
+            ),
         ] {
             let (mut t_mono, mut t_fn, mut t_ent) = (f64::MAX, f64::MAX, f64::MAX);
             // [HA, HA-twin, LA, EP] — index 1 is the peer-side control, not a fourth mode.
@@ -3986,8 +4098,11 @@ mod tests {
                 // A B C .. (.. C B A) — each arm runs twice per round in mirrored order, so a
                 // monotone clock drift inside a round biases neither arm.
                 for order in [false, true] {
-                    let arms: [u8; 7] =
-                        if order { [0, 1, 2, 3, 4, 5, 6] } else { [6, 5, 4, 3, 2, 1, 0] };
+                    let arms: [u8; 7] = if order {
+                        [0, 1, 2, 3, 4, 5, 6]
+                    } else {
+                        [6, 5, 4, 3, 2, 1, 0]
+                    };
                     for arm in arms {
                         match arm {
                             // SAFETY: avx2+fma detected above; buffers are n f32 long.
@@ -4041,10 +4156,24 @@ mod tests {
             // Bit-identity of the three internal arms, on the very data that was timed: a "faster"
             // arm computing something else is not a result.
             for i in 0..n {
-                assert_eq!(a[i].to_bits(), b[i].to_bits(), "{name} i {i}: mono vs fnptr");
-                assert_eq!(a[i].to_bits(), e[i].to_bits(), "{name} i {i}: mono vs shipped entry");
+                assert_eq!(
+                    a[i].to_bits(),
+                    b[i].to_bits(),
+                    "{name} i {i}: mono vs fnptr"
+                );
+                assert_eq!(
+                    a[i].to_bits(),
+                    e[i].to_bits(),
+                    "{name} i {i}: mono vs shipped entry"
+                );
             }
-            let dir = |r: f64| if r >= 1.0 { ("faster", r) } else { ("slower", 1.0 / r) };
+            let dir = |r: f64| {
+                if r >= 1.0 {
+                    ("faster", r)
+                } else {
+                    ("slower", 1.0 / r)
+                }
+            };
             let (w1, r1) = dir(t_fn / t_mono);
             // `dir` reads "ours vs theirs", so the entry-vs-mono ratio is t_mono/t_ent: > 1 means the
             // entry finished sooner. Writing it the other way round labels a slower entry "faster".
@@ -4056,7 +4185,10 @@ mod tests {
             // exact fractions (8/7, 3/2, 5/4 …). That is an artefact of the clock, not a measurement
             // of the kernel, and it is why the smallest size in this sweep is not quotable.
             let us = |t: f64| t * 1e6;
-            let fastest = [t_mono, t_fn, t_ent].into_iter().chain(t_vml).fold(f64::MAX, f64::min);
+            let fastest = [t_mono, t_fn, t_ent]
+                .into_iter()
+                .chain(t_vml)
+                .fold(f64::MAX, f64::min);
             eprintln!(
                 "  {name:<5} TIMING        : best-of-{rounds} minima (µs) mono {:.2} fnptr {:.2} \
                  entry {:.2} | VML HA {:.2} HA' {:.2} LA {:.2} EP {:.2}{}",
@@ -4097,7 +4229,10 @@ mod tests {
                         at = i;
                     }
                 }
-                assert!(worst < 1e-3, "{name}: VML disagrees at [{at}] (rel {worst:.1e})");
+                assert!(
+                    worst < 1e-3,
+                    "{name}: VML disagrees at [{at}] (rel {worst:.1e})"
+                );
                 let mut control_worst = r4;
                 if t_vml[1].is_finite() {
                     let (wt, rt) = dir(t_vml[1] / t_vml[0]);
@@ -4117,10 +4252,18 @@ mod tests {
                     );
                 }
                 // Every ratio this laptop cannot resolve is printed as a TIE, in both directions.
-                let tag = |r: f64| if r < floor { "  [TIE — at/below the noise floor]" } else { "" };
+                let tag = |r: f64| {
+                    if r < floor {
+                        "  [TIE — at/below the noise floor]"
+                    } else {
+                        ""
+                    }
+                };
                 // (timing slot, mode-arm index, buffer) — slot 1 is the twin control, reported above.
                 for (idx, mk, buf) in [(0usize, 0usize, &c), (2, 1, &la), (3, 2, &ep)] {
-                    let Some((_, label)) = mode_arm(mk) else { continue };
+                    let Some((_, label)) = mode_arm(mk) else {
+                        continue;
+                    };
                     if !t_vml[idx].is_finite() {
                         continue;
                     }
@@ -4221,10 +4364,18 @@ mod tests {
             }
             // Bit-identity on the very data that was timed.
             for i in 0..n {
-                assert_eq!(a[i].to_bits(), b[i].to_bits(), "{name} i {i}: mono vs fnptr");
+                assert_eq!(
+                    a[i].to_bits(),
+                    b[i].to_bits(),
+                    "{name} i {i}: mono vs fnptr"
+                );
             }
             let r = t_fn / t_mono;
-            let (w, r) = if r >= 1.0 { ("faster", r) } else { ("slower", 1.0 / r) };
+            let (w, r) = if r >= 1.0 {
+                ("faster", r)
+            } else {
+                ("slower", 1.0 / r)
+            };
             eprintln!("  {name:<10} mono vs fnptr : {r:.3}x {w}");
         }
     }
@@ -4287,7 +4438,9 @@ mod tests {
         for n in [1usize, 7, 8, 9, 31, 32, 33, 47, 48, 49, 96, 257, 1001] {
             // Positive-and-mixed input: log/acosh/atanh want x > 0, exp/erf/sin want both signs.
             let xs: Vec<f32> = (0..n).map(|i| 0.05 + (i % 61) as f32 * 0.037).collect();
-            let ms: Vec<f32> = (0..n).map(|i| (i as f32 - (n / 2) as f32) * 0.013).collect();
+            let ms: Vec<f32> = (0..n)
+                .map(|i| (i as f32 - (n / 2) as f32) * 0.013)
+                .collect();
             for src in [&xs, &ms] {
                 for &op in &ops {
                     for unroll6 in [false, true] {
@@ -4327,7 +4480,11 @@ mod tests {
                 run_fnptr(xs.as_ptr(), b.as_mut_ptr(), n, op, false);
             }
             for i in 0..n {
-                assert_eq!(a[i].to_bits(), b[i].to_bits(), "NT op {op} i {i}: mono vs fnptr");
+                assert_eq!(
+                    a[i].to_bits(),
+                    b[i].to_bits(),
+                    "NT op {op} i {i}: mono vs fnptr"
+                );
                 assert_eq!(
                     a[i].to_bits(),
                     apply1(op, xs[i]).to_bits(),
@@ -4389,10 +4546,14 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return; // no AVX2: neither spelling is reachable
         }
-        let ops: Vec<i64> = (0..=VM2_SIGMOID_GATE).chain([VM2_SIGMOID_GATE + 1, -1]).collect();
+        let ops: Vec<i64> = (0..=VM2_SIGMOID_GATE)
+            .chain([VM2_SIGMOID_GATE + 1, -1])
+            .collect();
         for n in [1usize, 7, 8, 9, 31, 32, 33, 96, 257, 1001] {
             let xs: Vec<f32> = (0..n).map(|i| 0.07 + (i % 71) as f32 * 0.041).collect();
-            let ys: Vec<f32> = (0..n).map(|i| (i as f32 - (n / 2) as f32) * 0.017).collect();
+            let ys: Vec<f32> = (0..n)
+                .map(|i| (i as f32 - (n / 2) as f32) * 0.017)
+                .collect();
             for &op in &ops {
                 let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
                 // SAFETY: avx2+fma detected above; every buffer is exactly n f32 long.
@@ -4401,7 +4562,11 @@ mod tests {
                     run2_fnptr(xs.as_ptr(), ys.as_ptr(), b.as_mut_ptr(), n, op);
                 }
                 for i in 0..n {
-                    assert_eq!(a[i].to_bits(), b[i].to_bits(), "n {n} op {op} i {i}: mono vs fnptr");
+                    assert_eq!(
+                        a[i].to_bits(),
+                        b[i].to_bits(),
+                        "n {n} op {op} i {i}: mono vs fnptr"
+                    );
                     assert_eq!(
                         a[i].to_bits(),
                         apply2_1(op, xs[i], ys[i]).to_bits(),
@@ -4424,7 +4589,11 @@ mod tests {
                 run2_fnptr(xs.as_ptr(), ys.as_ptr(), b.as_mut_ptr(), n, op);
             }
             for i in 0..n {
-                assert_eq!(a[i].to_bits(), b[i].to_bits(), "NT op {op} i {i}: mono vs fnptr");
+                assert_eq!(
+                    a[i].to_bits(),
+                    b[i].to_bits(),
+                    "NT op {op} i {i}: mono vs fnptr"
+                );
                 assert_eq!(
                     a[i].to_bits(),
                     apply2_1(op, xs[i], ys[i]).to_bits(),
@@ -4442,7 +4611,14 @@ mod tests {
         let n = 1_500_001usize; // 3-stream = 18 MiB > NT_MIN_BYTES: forces NT + prologue + tail
         let xs: Vec<f32> = (0..n).map(|i| (i % 89) as f32 * 0.05 + 0.1).collect();
         let ys: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
-        for op in [VM2_POW, VM2_ATAN2, VM2_HYPOT, VM2_SILU_BWD, VM2_TANH_BWD, VM2_SILU_GATE] {
+        for op in [
+            VM2_POW,
+            VM2_ATAN2,
+            VM2_HYPOT,
+            VM2_SILU_BWD,
+            VM2_TANH_BWD,
+            VM2_SILU_GATE,
+        ] {
             let mut got = vec![0.0f32; n];
             unsafe { wukong_vmath2_f32(xs.as_ptr(), ys.as_ptr(), got.as_mut_ptr(), n as i64, op) };
             for i in 0..n {

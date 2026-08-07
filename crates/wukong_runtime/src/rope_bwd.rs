@@ -57,7 +57,13 @@ use rayon::prelude::*;
 /// `inv_freq` valid for `half` f32; `g`, `dx` valid for `2*half` f32 (`dx` may alias `g` — both of a
 /// pair's inputs are read before either output is written).
 #[inline]
-unsafe fn rope_bwd_row_scalar(pos: f32, inv_freq: *const f32, g: *const f32, dx: *mut f32, half: usize) {
+unsafe fn rope_bwd_row_scalar(
+    pos: f32,
+    inv_freq: *const f32,
+    g: *const f32,
+    dx: *mut f32,
+    half: usize,
+) {
     for j in 0..half {
         let theta = pos * *inv_freq.add(j);
         let c = crate::vmath::sincos1(theta, true);
@@ -83,7 +89,13 @@ unsafe fn rope_bwd_row_scalar(pos: f32, inv_freq: *const f32, g: *const f32, dx:
 /// available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn rope_bwd_row_avx2(pos: f32, inv_freq: *const f32, g: *const f32, dx: *mut f32, half: usize) {
+unsafe fn rope_bwd_row_avx2(
+    pos: f32,
+    inv_freq: *const f32,
+    g: *const f32,
+    dx: *mut f32,
+    half: usize,
+) {
     use std::arch::x86_64::*;
     let posv = _mm256_set1_ps(pos);
     let mut j = 0;

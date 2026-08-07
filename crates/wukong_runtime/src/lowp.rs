@@ -901,11 +901,23 @@ unsafe fn axpby_narrow_bf16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b
     stream_narrow!(
         out.as_mut_ptr(),
         out.len(),
-        |i: usize| _mm256_fmadd_ps(bv, widen_bf16(yp.add(i)), _mm256_mul_ps(av, widen_bf16(xp.add(i)))),
-        |i: usize| crate::f32_to_bf16_bits(b.mul_add(bf16_bits_to_f32(y[i]), a * bf16_bits_to_f32(x[i]))),
+        |i: usize| _mm256_fmadd_ps(
+            bv,
+            widen_bf16(yp.add(i)),
+            _mm256_mul_ps(av, widen_bf16(xp.add(i)))
+        ),
+        |i: usize| crate::f32_to_bf16_bits(
+            b.mul_add(bf16_bits_to_f32(y[i]), a * bf16_bits_to_f32(x[i]))
+        ),
         |i: usize| {
-            _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(yp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(
+                xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
+                _MM_HINT_T0,
+            );
+            _mm_prefetch(
+                yp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
+                _MM_HINT_T0,
+            );
         },
         narrow_bf16_pack,
         narrow_bf16
@@ -920,11 +932,21 @@ unsafe fn axpby_narrow_f16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b:
     stream_narrow!(
         out.as_mut_ptr(),
         out.len(),
-        |i: usize| _mm256_fmadd_ps(bv, widen_f16(yp.add(i)), _mm256_mul_ps(av, widen_f16(xp.add(i)))),
+        |i: usize| _mm256_fmadd_ps(
+            bv,
+            widen_f16(yp.add(i)),
+            _mm256_mul_ps(av, widen_f16(xp.add(i)))
+        ),
         |i: usize| crate::f32_to_f16_bits(b.mul_add(f16_to_f32(y[i]), a * f16_to_f32(x[i]))),
         |i: usize| {
-            _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(yp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(
+                xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
+                _MM_HINT_T0,
+            );
+            _mm_prefetch(
+                yp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
+                _MM_HINT_T0,
+            );
         },
         narrow_f16_pack,
         narrow_f16
@@ -952,7 +974,10 @@ unsafe fn vmath_narrow_bf16_avx(x: &[u16], out: &mut [u16], op: i64) {
         out.len(),
         |i: usize| f(widen_bf16(xp.add(i))),
         |i: usize| crate::f32_to_bf16_bits(crate::vmath::apply1(op, bf16_bits_to_f32(x[i]))),
-        |i: usize| _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
+        |i: usize| _mm_prefetch(
+            xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
+            _MM_HINT_T0
+        ),
         narrow_bf16_pack,
         narrow_bf16
     );
@@ -970,7 +995,10 @@ unsafe fn vmath_narrow_f16_avx(x: &[u16], out: &mut [u16], op: i64) {
         out.len(),
         |i: usize| f(widen_f16(xp.add(i))),
         |i: usize| crate::f32_to_f16_bits(crate::vmath::apply1(op, f16_to_f32(x[i]))),
-        |i: usize| _mm_prefetch(xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8, _MM_HINT_T0),
+        |i: usize| _mm_prefetch(
+            xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
+            _MM_HINT_T0
+        ),
         narrow_f16_pack,
         narrow_f16
     );
@@ -1154,7 +1182,9 @@ mod tests {
             }
         };
         for n in [0usize, 1, 7, 8, 9, 100, 1000, 4099] {
-            let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013 - 7.0).sin() * 3.0).collect();
+            let xs: Vec<f32> = (0..n)
+                .map(|i| (i as f32 * 0.013 - 7.0).sin() * 3.0)
+                .collect();
             let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
             let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
             for op in [RED_MAX, RED_MIN, RED_MAXABS] {
@@ -1236,12 +1266,27 @@ mod tests {
         }
         // A spread of tricky f32s: 0/±0, small/large, subnormal, ties, ±inf, NaN, negatives.
         let mut vals: Vec<f32> = vec![
-            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 3.14159, -2.71828,
-            1e-40, -1e-40, // subnormal after narrowing
-            65504.0, -65504.0, // f16 max
-            1e30, -1e30, // overflows f16 → inf
-            f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -f32::NAN,
-            1.0000001, 1.9999999, 0.999999, // near ties
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            3.14159,
+            -2.71828,
+            1e-40,
+            -1e-40, // subnormal after narrowing
+            65504.0,
+            -65504.0, // f16 max
+            1e30,
+            -1e30, // overflows f16 → inf
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            1.0000001,
+            1.9999999,
+            0.999999, // near ties
         ];
         // Add a deterministic sweep that hits many mantissa bits, then pad to a multiple of 8.
         for i in 0..128 {
@@ -1295,7 +1340,9 @@ mod tests {
         // The large sizes (> HALFOUT_NT_MIN_BYTES/6 ≈ 1.75M elems) drive the non-temporal 256-bit
         // streaming path — its scalar alignment prologue, 16-lane packs, and tail — not just the small
         // cacheable path. 1_749_000 straddles the NT threshold; the +3 keeps a non-mult-of-16 tail.
-        for n in [0usize, 1, 7, 8, 9, 16, 17, 100, 1000, 4099, 1_749_000, 2_000_003] {
+        for n in [
+            0usize, 1, 7, 8, 9, 16, 17, 100, 1000, 4099, 1_749_000, 2_000_003,
+        ] {
             let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011 - 2.3).sin()).collect();
             let ys: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017 + 0.9).cos()).collect();
             let (a, b) = (1.5f32, -0.75f32);
@@ -1309,10 +1356,20 @@ mod tests {
                 unsafe {
                     match kind {
                         Half::Bf16 => wukong_axpby_bf16_out(
-                            xb.as_ptr(), yb.as_ptr(), got.as_mut_ptr(), n as i64, a, b,
+                            xb.as_ptr(),
+                            yb.as_ptr(),
+                            got.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
                         ),
                         Half::F16 => wukong_axpby_f16_out(
-                            xb.as_ptr(), yb.as_ptr(), got.as_mut_ptr(), n as i64, a, b,
+                            xb.as_ptr(),
+                            yb.as_ptr(),
+                            got.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
                         ),
                     }
                 }
@@ -1333,10 +1390,14 @@ mod tests {
     #[test]
     fn vmath_narrow_out_simd_equals_scalar_twin() {
         use crate::vmath::{VM_ERF, VM_EXP, VM_GELU, VM_RELU, VM_SIGMOID, VM_SILU, VM_TANH};
-        for op in [VM_RELU, VM_SILU, VM_GELU, VM_EXP, VM_SIGMOID, VM_TANH, VM_ERF] {
+        for op in [
+            VM_RELU, VM_SILU, VM_GELU, VM_EXP, VM_SIGMOID, VM_TANH, VM_ERF,
+        ] {
             for n in [0usize, 1, 7, 8, 9, 16, 17, 100, 1000, 4099, 1_749_000] {
                 // A spread over sign/magnitude (activations bend near 0 and saturate for large |x|).
-                let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011 - 3.7).sin() * 4.0).collect();
+                let xs: Vec<f32> = (0..n)
+                    .map(|i| (i as f32 * 0.011 - 3.7).sin() * 4.0)
+                    .collect();
                 for (kind, conv) in [
                     (Half::Bf16, bf16_bits as fn(f32) -> u16),
                     (Half::F16, f16_bits as fn(f32) -> u16),
@@ -1755,14 +1816,12 @@ mod tests {
             );
             // max / min / absmax round nothing and the widen is lossless, so the parallel result is
             // the *exact* reduction of the widened values — assert bit-for-bit, no tolerance.
-            let widen = |b: &[u16]| -> Vec<f32> { b.iter().map(|&v| bf16_bits_to_f32(v)).collect() };
+            let widen =
+                |b: &[u16]| -> Vec<f32> { b.iter().map(|&v| bf16_bits_to_f32(v)).collect() };
             let xw = widen(&xbf);
             let want_max = xw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let want_min = xw.iter().copied().fold(f32::INFINITY, f32::min);
-            let want_amx = xw
-                .iter()
-                .map(|v| v.abs())
-                .fold(f32::NEG_INFINITY, f32::max);
+            let want_amx = xw.iter().map(|v| v.abs()).fold(f32::NEG_INFINITY, f32::max);
             assert_eq!(
                 wukong_reduce_bf16_parallel(xbf.as_ptr(), n as i64, RED_MAX).to_bits(),
                 want_max.to_bits(),

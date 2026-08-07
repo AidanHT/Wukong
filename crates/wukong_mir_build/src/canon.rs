@@ -136,7 +136,9 @@ pub(crate) fn canonicalize_module(module: &Module, sema: &SemaResult) -> Option<
             continue;
         };
         let params: Vec<Symbol> = f.params.iter().map(|p| p.name.sym).collect();
-        let Some(body) = f.body.as_mut() else { continue };
+        let Some(body) = f.body.as_mut() else {
+            continue;
+        };
         // A `defer` runs its expression at a *scope exit*, where a substituted loop variable no
         // longer holds the value it had at the `let`. Decline the whole function rather than reason
         // about it (lowering rejects `defer` anyway).
@@ -182,8 +184,7 @@ fn int_literal_consts(sema: &SemaResult) -> Vec<(Symbol, &Expr)> {
     sema.consts
         .iter()
         .filter_map(|(name, init)| {
-            let Some(wukong_sema::DefKind::Const(decl)) =
-                sema.defs.lookup(*name).map(|d| &d.kind)
+            let Some(wukong_sema::DefKind::Const(decl)) = sema.defs.lookup(*name).map(|d| &d.kind)
             else {
                 return None;
             };
@@ -275,16 +276,16 @@ fn fold_consts(
 fn block_admits_any(b: &Block, sema: &SemaResult) -> bool {
     for (i, s) in b.stmts.iter().enumerate() {
         if let StmtKind::Let {
-            pat:
-                Pattern {
-                    kind: PatKind::Ident(x),
-                    ..
-                },
+            pat: Pattern {
+                kind: PatKind::Ident(x),
+                ..
+            },
             init: Some(e),
             ..
         } = &s.kind
         {
-            if s.attrs.is_empty() && region_admits(&b.stmts[i + 1..], b.tail.as_deref(), *x, e, sema)
+            if s.attrs.is_empty()
+                && region_admits(&b.stmts[i + 1..], b.tail.as_deref(), *x, e, sema)
             {
                 return true;
             }
@@ -337,7 +338,9 @@ fn expr_admits_any(e: &Expr, sema: &SemaResult) -> bool {
         } => {
             expr_admits_any(cond, sema)
                 || block_admits_any(then_branch, sema)
-                || else_branch.as_ref().is_some_and(|x| expr_admits_any(x, sema))
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|x| expr_admits_any(x, sema))
         }
         ExprKind::Match { scrutinee, arms } => {
             expr_admits_any(scrutinee, sema)
@@ -452,11 +455,10 @@ fn sink_target_at(b: &Block, i: usize) -> Option<usize> {
     // dispatch census, since recognizers are gate-blind.
     let s = b.stmts.get(i)?;
     let StmtKind::Let {
-        pat:
-            Pattern {
-                kind: PatKind::Ident(x),
-                ..
-            },
+        pat: Pattern {
+            kind: PatKind::Ident(x),
+            ..
+        },
         mutable: true,
         init: Some(e),
         ..
@@ -620,9 +622,7 @@ fn canon_expr(e: &mut Expr, sema: &SemaResult) -> bool {
             }
             c
         }
-        ExprKind::ArrayRepeat { value, count } => {
-            canon_expr(value, sema) | canon_expr(count, sema)
-        }
+        ExprKind::ArrayRepeat { value, count } => canon_expr(value, sema) | canon_expr(count, sema),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -1248,9 +1248,7 @@ fn scan_defer_stmt(s: &Stmt, found: &mut bool) {
     match &s.kind {
         StmtKind::Defer(_) => *found = true,
         StmtKind::While { body, .. } | StmtKind::For { body, .. } => scan_defer_block(body, found),
-        StmtKind::Let {
-            init: Some(e), ..
-        }
+        StmtKind::Let { init: Some(e), .. }
         | StmtKind::Expr(e)
         | StmtKind::Return(Some(e))
         | StmtKind::Break(_, Some(e)) => scan_defer_expr(e, found),

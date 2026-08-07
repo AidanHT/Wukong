@@ -83,7 +83,8 @@ impl GpuTarget {
         };
         // A negative/zero size would silently underflow a `usize` budget downstream — reject it here.
         let bytes = |v: i32, what: &str| -> Result<usize, String> {
-            usize::try_from(v).map_err(|_| format!("cuDeviceGetAttribute({what}) returned {v} bytes"))
+            usize::try_from(v)
+                .map_err(|_| format!("cuDeviceGetAttribute({what}) returned {v} bytes"))
         };
 
         let name = {
@@ -96,9 +97,18 @@ impl GpuTarget {
         };
 
         use sys::CUdevice_attribute as A;
-        let cc_major = attr(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, "COMPUTE_CAPABILITY_MAJOR")?;
-        let cc_minor = attr(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, "COMPUTE_CAPABILITY_MINOR")?;
-        let sm_count = attr(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, "MULTIPROCESSOR_COUNT")?;
+        let cc_major = attr(
+            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            "COMPUTE_CAPABILITY_MAJOR",
+        )?;
+        let cc_minor = attr(
+            A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            "COMPUTE_CAPABILITY_MINOR",
+        )?;
+        let sm_count = attr(
+            A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            "MULTIPROCESSOR_COUNT",
+        )?;
         let smem_optin = attr(
             A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
             "MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
@@ -274,7 +284,13 @@ impl GpuError {
 ///
 /// A free function, not a `format!` at each call site, so the wording is identical everywhere and can
 /// be asserted by a test with no device attached.
-pub fn capability_decline(what: &str, cap: &str, min: (i32, i32), have: (i32, i32), device: &str) -> String {
+pub fn capability_decline(
+    what: &str,
+    cap: &str,
+    min: (i32, i32),
+    have: (i32, i32),
+    device: &str,
+) -> String {
     format!(
         "{what}: {cap} requires cc>={}.{}, device is {}.{} ({device})",
         min.0, min.1, have.0, have.1
@@ -533,7 +549,9 @@ impl Gpu {
         let mut val: i32 = 0;
         unsafe {
             sys::cuDeviceGet(&mut dev, 0).result().ok()?;
-            sys::cuDeviceGetAttribute(&mut val, attr, dev).result().ok()?;
+            sys::cuDeviceGetAttribute(&mut val, attr, dev)
+                .result()
+                .ok()?;
         }
         Some(val)
     }
@@ -560,7 +578,8 @@ impl Gpu {
     /// reported "memory clock" already folds in the per-pin multiplier, so this matches the spec
     /// sheet). `MEMORY_CLOCK_RATE` is kHz, `GLOBAL_MEMORY_BUS_WIDTH` is bits. `None` if unqueryable.
     pub fn peak_hbm_gbs(&self) -> Option<f64> {
-        let clk = self.device_attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?;
+        let clk =
+            self.device_attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?;
         let bus =
             self.device_attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?;
         if clk <= 0 || bus <= 0 {
@@ -726,7 +745,11 @@ fn stream_cfg(_g: &Gpu, n4: u32) -> LaunchConfig {
 /// `out := x`, a pure streaming copy on the GPU — the canonical HBM-bandwidth kernel (see
 /// `ptx::COPY_V4`). Exact bitwise copy. `x.len()` must be a multiple of 4 (128-bit vectorized access).
 pub fn copy(g: &mut Gpu, x: &[f32]) -> Result<Vec<f32>, DriverError> {
-    assert_eq!(x.len() % 4, 0, "copy: len must be a multiple of 4 (v4 access)");
+    assert_eq!(
+        x.len() % 4,
+        0,
+        "copy: len must be a multiple of 4 (v4 access)"
+    );
     let n4 = (x.len() / 4) as u32;
     let f = g.function("copy_v4", crate::ptx::COPY_V4, "copy_v4")?;
     let x_d = g.stream.memcpy_stod(x)?;
@@ -841,7 +864,11 @@ pub fn reduce(g: &mut Gpu, op: i64, x: &[f32], y: Option<&[f32]>) -> Result<f32,
         needs_y,
         y.is_some(),
         "reduce: op {op} {}",
-        if needs_y { "requires a second operand y" } else { "takes no second operand" }
+        if needs_y {
+            "requires a second operand y"
+        } else {
+            "takes no second operand"
+        }
     );
     if let Some(y) = y {
         assert_eq!(x.len(), y.len(), "reduce: x and y must be equal length");
@@ -1075,8 +1102,8 @@ pub fn gemm_nt_f16(
     // below; everything else measured a loss at both 2048³ and 4096³ and stays bench-only.
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
-    // The band edges are multiples of the PROBED L2 (see `f16_regime_thresholds`), not the 16/48 MiB
-    // literals they replace — on this 24 MiB-L2 card they evaluate to exactly those literals.
+                                        // The band edges are multiples of the PROBED L2 (see `f16_regime_thresholds`), not the 16/48 MiB
+                                        // literals they replace — on this 24 MiB-L2 card they evaluate to exactly those literals.
     let (l2_resident_max, hbm_bound_min) = f16_regime_thresholds(g.target().l2_bytes);
     if ws_bytes >= hbm_bound_min && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
         // **Largest regime (A+B ≥ 2·L2 = 48 MB here, ~4096³ up): the `_v2cs` epilogue variant** — the same swz
@@ -1101,7 +1128,11 @@ pub fn gemm_nt_f16(
         // (`gemm_cliff_ab`) showed the w22 2×2 warp grid (which DOES reach 3 CTAs/SM) is only a *noise-level*
         // tie with w24 at 4096³ (0.97–1.02× across runs) and *loses* at 2048³, so the whole regime uses w24
         // (not w22, not the padded base). Bit-gated by `mma_swizzle_matches_reference_within_tol`.
-        let swz_w24 = crate::ptx_wmma::PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..*wh };
+        let swz_w24 = crate::ptx_wmma::PipeCfg {
+            name: "mma_nt_f16_128_bk32_s2_r16_swz",
+            pad: 0,
+            ..*wh
+        };
         return gemm_nt_f16_pipe(g, a, b, m, k, n, &swz_w24);
     }
     if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
@@ -1165,7 +1196,11 @@ pub fn gemm_nt_f16_sm(
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
-    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm")?;
+    let f = g.function(
+        "wmma_f16",
+        crate::ptx_wmma::wmma_f16_ptx(),
+        "wmma_nt_f16_sm",
+    )?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
@@ -1206,7 +1241,10 @@ pub fn gemm_nt_f16_static(
     } else {
         (SM_BM, SM_BN, SM_THREADS)
     };
-    assert!(m % bm == 0 && n % bn == 0, "gemm_nt_f16_static requires M%{bm}==0, N%{bn}==0");
+    assert!(
+        m % bm == 0 && n % bn == 0,
+        "gemm_nt_f16_static requires M%{bm}==0, N%{bn}==0"
+    );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
     let ptx = crate::ptx_wmma::wmma_f16_sm_static_ptx(m, n, k, use_128);
@@ -1222,7 +1260,12 @@ pub fn gemm_nt_f16_static(
         shared_mem_bytes: 0,
     };
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -1250,13 +1293,22 @@ pub fn gemm_nt_f16_sm128(
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
-    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm128")?;
+    let f = g.function(
+        "wmma_f16",
+        crate::ptx_wmma::wmma_f16_ptx(),
+        "wmma_nt_f16_sm128",
+    )?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(wmma_sm128_cfg(m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -1295,7 +1347,11 @@ pub fn gemm_nt_f16_sm_db(
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
-    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db")?;
+    let f = g.function(
+        "wmma_f16",
+        crate::ptx_wmma::wmma_f16_ptx(),
+        "wmma_nt_f16_sm_db",
+    )?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
@@ -1413,15 +1469,24 @@ pub fn gemm_nt_f16_sm_db_residual(
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
-    let f =
-        g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db_residual")?;
+    let f = g.function(
+        "wmma_f16",
+        crate::ptx_wmma::wmma_f16_ptx(),
+        "wmma_nt_f16_sm_db_residual",
+    )?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let resid_d = g.stream.memcpy_stod(residual)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&resid_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&resid_d);
     unsafe { bld.launch(wmma_sm_cfg(m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -1545,7 +1610,11 @@ pub fn gemm_nt_f16_sm128_db(
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
-    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm128_db")?;
+    let f = g.function(
+        "wmma_f16",
+        crate::ptx_wmma::wmma_f16_ptx(),
+        "wmma_nt_f16_sm128_db",
+    )?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
@@ -1571,7 +1640,11 @@ fn pipe_cfg(v: &crate::ptx_wmma::PipeCfg, m: usize, n: usize) -> LaunchConfig {
     } else {
         ((n / v.bn) as u32, (m / v.bm) as u32, 1)
     };
-    LaunchConfig { grid_dim, block_dim: (v.threads() as u32, 1, 1), shared_mem_bytes: 0 }
+    LaunchConfig {
+        grid_dim,
+        block_dim: (v.threads() as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
 
 /// `C = A·Bᵀ` (fp16-in, f32-out) via a **multi-stage `cp.async` pipeline** variant `v` — the
@@ -1594,7 +1667,10 @@ pub fn gemm_nt_f16_pipe(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{} requires M%{}==0, N%{}==0, K%{}==0",
-        v.name, v.bm, v.bn, v.bk
+        v.name,
+        v.bm,
+        v.bn,
+        v.bk
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1604,7 +1680,12 @@ pub fn gemm_nt_f16_pipe(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(pipe_cfg(v, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -1639,7 +1720,10 @@ pub(crate) fn gemm_nt_f16_cliff(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{} requires M%{}==0, N%{}==0, K%{}==0",
-        v.name, v.bm, v.bn, v.bk
+        v.name,
+        v.bm,
+        v.bn,
+        v.bk
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1649,7 +1733,12 @@ pub(crate) fn gemm_nt_f16_cliff(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     // r16-rasterized ⇒ a 1-D grid of (M/bm)·(N/bn) blocks; all SMEM static.
     let cfg = LaunchConfig {
         grid_dim: (((m / v.bm) * (n / v.bn)) as u32, 1, 1),
@@ -1685,7 +1774,10 @@ pub fn gemm_nt_f16_deep(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{} requires M%{}==0, N%{}==0, K%{}==0",
-        v.name, v.bm, v.bn, v.bk
+        v.name,
+        v.bm,
+        v.bn,
+        v.bk
     );
     if v.smem_bytes() > g.smem_budget() {
         // A capability fact about the hardware, decided before any PTX is loaded — not a driver error,
@@ -1709,7 +1801,12 @@ pub fn gemm_nt_f16_deep(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     // r16-rasterized ⇒ a 1-D grid of (M/bm)·(N/bn) blocks.
     let cfg = dyn_launch_cfg(
         (((m / v.bm) * (n / v.bn)) as u32, 1, 1),
@@ -1777,7 +1874,9 @@ fn gemm_nt_f16_pipe_fused_bias_v(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{entry} requires M%{}==0, N%{}==0, K%{}==0",
-        v.bm, v.bn, v.bk
+        v.bm,
+        v.bn,
+        v.bk
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1788,7 +1887,13 @@ fn gemm_nt_f16_pipe_fused_bias_v(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d);
     unsafe { bld.launch(pipe_cfg(v, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -1810,7 +1915,16 @@ pub fn gemm_nt_f16_mma_bias(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_swz_bias")
+    gemm_nt_f16_pipe_fused_bias(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "mma_nt_f16_128_bk32_s2_r16_swz_bias",
+    )
 }
 
 /// `C = relu(A·Bᵀ + bias)` fused into the fast mma workhorse — Linear+ReLU (see [`gemm_nt_f16_pipe_fused_bias`]).
@@ -1823,7 +1937,16 @@ pub fn gemm_nt_f16_mma_bias_relu(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_swz_bias_relu")
+    gemm_nt_f16_pipe_fused_bias(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "mma_nt_f16_128_bk32_s2_r16_swz_bias_relu",
+    )
 }
 
 /// `C = silu(A·Bᵀ + bias)` fused into the fast mma workhorse — SiLU FFN (see [`gemm_nt_f16_pipe_fused_bias`]).
@@ -1836,7 +1959,16 @@ pub fn gemm_nt_f16_mma_bias_silu(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_swz_bias_silu")
+    gemm_nt_f16_pipe_fused_bias(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "mma_nt_f16_128_bk32_s2_r16_swz_bias_silu",
+    )
 }
 
 /// `C = gelu(A·Bᵀ + bias)` fused into the fast mma workhorse — the canonical transformer FFN first layer
@@ -1850,7 +1982,16 @@ pub fn gemm_nt_f16_mma_bias_gelu(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_swz_bias_gelu")
+    gemm_nt_f16_pipe_fused_bias(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "mma_nt_f16_128_bk32_s2_r16_swz_bias_gelu",
+    )
 }
 
 /// `C = A·Bᵀ + bias + residual` fused into the fast mma workhorse (`mma_nt_f16_128_bk32_s2_r16_bias_
@@ -1878,11 +2019,17 @@ pub fn gemm_nt_f16_mma_bias_residual(
     assert!(
         m % wh.bm == 0 && n % wh.bn == 0 && k % wh.bk == 0,
         "mma_nt_f16_128_bk32_s2_r16_bias_residual requires M%{}==0, N%{}==0, K%{}==0",
-        wh.bm, wh.bn, wh.bk
+        wh.bm,
+        wh.bn,
+        wh.bk
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
-    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "mma_nt_f16_128_bk32_s2_r16_swz_bias_residual")?;
+    let f = g.function(
+        "wmma_f16",
+        crate::ptx_wmma::wmma_f16_ptx(),
+        "mma_nt_f16_128_bk32_s2_r16_swz_bias_residual",
+    )?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let bias_d = g.stream.memcpy_stod(bias)?;
@@ -1890,7 +2037,14 @@ pub fn gemm_nt_f16_mma_bias_residual(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d)
+        .arg(&resid_d);
     unsafe { bld.launch(pipe_cfg(wh, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -1919,11 +2073,17 @@ pub fn gemm_nt_f16_pipe64_bias_residual(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "wmma_nt_f16_pipe_64_s6_bias_residual requires M%{}==0, N%{}==0, K%{}==0",
-        v.bm, v.bn, v.bk
+        v.bm,
+        v.bn,
+        v.bk
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
-    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_pipe_64_s6_bias_residual")?;
+    let f = g.function(
+        "wmma_f16",
+        crate::ptx_wmma::wmma_f16_ptx(),
+        "wmma_nt_f16_pipe_64_s6_bias_residual",
+    )?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let bias_d = g.stream.memcpy_stod(bias)?;
@@ -1931,7 +2091,14 @@ pub fn gemm_nt_f16_pipe64_bias_residual(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d)
+        .arg(&resid_d);
     unsafe { bld.launch(pipe_cfg(v, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -1961,23 +2128,95 @@ fn gemm_nt_f16_linear_dispatch(
 }
 
 /// `C = A·Bᵀ + bias` (affine `nn.Linear`), size-aware (see [`gemm_nt_f16_linear_dispatch`]).
-pub fn gemm_nt_f16_linear(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_linear_dispatch(g, a, b, bias, m, k, n, "wmma_nt_f16_pipe_64_s6_bias", gemm_nt_f16_mma_bias)
+pub fn gemm_nt_f16_linear(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_linear_dispatch(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "wmma_nt_f16_pipe_64_s6_bias",
+        gemm_nt_f16_mma_bias,
+    )
 }
 
 /// `C = relu(A·Bᵀ + bias)` (Linear+ReLU), size-aware (see [`gemm_nt_f16_linear_dispatch`]).
-pub fn gemm_nt_f16_linear_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_linear_dispatch(g, a, b, bias, m, k, n, "wmma_nt_f16_pipe_64_s6_bias_relu", gemm_nt_f16_mma_bias_relu)
+pub fn gemm_nt_f16_linear_relu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_linear_dispatch(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "wmma_nt_f16_pipe_64_s6_bias_relu",
+        gemm_nt_f16_mma_bias_relu,
+    )
 }
 
 /// `C = silu(A·Bᵀ + bias)` (Linear+SiLU FFN), size-aware (see [`gemm_nt_f16_linear_dispatch`]).
-pub fn gemm_nt_f16_linear_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_linear_dispatch(g, a, b, bias, m, k, n, "wmma_nt_f16_pipe_64_s6_bias_silu", gemm_nt_f16_mma_bias_silu)
+pub fn gemm_nt_f16_linear_silu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_linear_dispatch(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "wmma_nt_f16_pipe_64_s6_bias_silu",
+        gemm_nt_f16_mma_bias_silu,
+    )
 }
 
 /// `C = gelu(A·Bᵀ + bias)` (Linear+GELU FFN), size-aware (see [`gemm_nt_f16_linear_dispatch`]).
-pub fn gemm_nt_f16_linear_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_linear_dispatch(g, a, b, bias, m, k, n, "wmma_nt_f16_pipe_64_s6_bias_gelu", gemm_nt_f16_mma_bias_gelu)
+pub fn gemm_nt_f16_linear_gelu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_linear_dispatch(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "wmma_nt_f16_pipe_64_s6_bias_gelu",
+        gemm_nt_f16_mma_bias_gelu,
+    )
 }
 
 /// Launch config for the **128×64 dual-B gated-FFN** kernel ([`crate::ptx_wmma::entry_mma_gate`], raster=16,
@@ -2024,7 +2263,10 @@ fn gemm_nt_f16_gate(
         bias.is_some(),
         "{entry}: pushed launch args must match the kernel's declared .param count"
     );
-    assert!(m % 128 == 0 && n % 64 == 0 && k % 32 == 0, "{entry} requires M%128==0, N%64==0, K%32==0");
+    assert!(
+        m % 128 == 0 && n % 64 == 0 && k % 32 == 0,
+        "{entry} requires M%128==0, N%64==0, K%32==0"
+    );
     let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
     let wg16: Vec<f16> = wg.iter().map(|&v| f16::from_f32(v)).collect();
     let wu16: Vec<f16> = wu.iter().map(|&v| f16::from_f32(v)).collect();
@@ -2035,7 +2277,13 @@ fn gemm_nt_f16_gate(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&x_d).arg(&wg_d).arg(&wu_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&x_d)
+        .arg(&wg_d)
+        .arg(&wu_d)
+        .arg(&mut c_d);
     // The `*_bias` entries take two extra params (pBiasG, pBiasU); the device buffers must outlive launch.
     let (bg_d, bu_d);
     if let Some((bg, bu)) = bias {
@@ -2074,7 +2322,10 @@ fn gemm_nt_bf16_gate(
         bias.is_some(),
         "{entry}: pushed launch args must match the kernel's declared .param count"
     );
-    assert!(m % 128 == 0 && n % 64 == 0 && k % 32 == 0, "{entry} requires M%128==0, N%64==0, K%32==0");
+    assert!(
+        m % 128 == 0 && n % 64 == 0 && k % 32 == 0,
+        "{entry} requires M%128==0, N%64==0, K%32==0"
+    );
     let xb: Vec<bf16> = x.iter().map(|&v| bf16::from_f32(v)).collect();
     let wgb: Vec<bf16> = wg.iter().map(|&v| bf16::from_f32(v)).collect();
     let wub: Vec<bf16> = wu.iter().map(|&v| bf16::from_f32(v)).collect();
@@ -2085,7 +2336,13 @@ fn gemm_nt_bf16_gate(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&x_d).arg(&wg_d).arg(&wu_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&x_d)
+        .arg(&wg_d)
+        .arg(&wu_d)
+        .arg(&mut c_d);
     let (bg_d, bu_d);
     if let Some((bg, bu)) = bias {
         assert_eq!(bg.len(), n, "gate bias bg must have length N");
@@ -2111,22 +2368,54 @@ fn gemm_nt_bf16_gate(
 // uses the padded base (which also *wins* the beat-cuBLAS fusion bench: ~1.18–1.20× the chain @≤2048³).
 
 /// Fused **SwiGLU** FFN gate (fp16): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the Llama/Mistral/Gemma FFN gate, one kernel.
-pub fn gemm_nt_f16_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_f16_swiglu(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_f16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_f16_128x64_gate_silu")
 }
 
 /// Fused **GeGLU** FFN gate (fp16): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)` (the GLU-with-GELU FFN gate).
-pub fn gemm_nt_f16_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_f16_geglu(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_f16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_f16_128x64_gate_gelu")
 }
 
 /// Fused **SwiGLU** FFN gate (bf16, the training dtype): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
-pub fn gemm_nt_bf16_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_swiglu(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_bf16_128x64_gate_silu")
 }
 
 /// Fused **GeGLU** FFN gate (bf16): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
-pub fn gemm_nt_bf16_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_geglu(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_bf16_128x64_gate_gelu")
 }
 
@@ -2152,11 +2441,17 @@ pub fn gemm_nt_bf16_mma_bias_residual(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "mma_nt_bf16_128_bk32_s2_r16_bias_residual requires M%{}==0, N%{}==0, K%{}==0",
-        v.bm, v.bn, v.bk
+        v.bm,
+        v.bn,
+        v.bk
     );
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
     let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
-    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), "mma_nt_bf16_128_bk32_s2_r16_swz_bias_residual")?;
+    let f = g.function(
+        "wmma_bf16",
+        crate::ptx_wmma::wmma_bf16_ptx(),
+        "mma_nt_bf16_128_bk32_s2_r16_swz_bias_residual",
+    )?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let bias_d = g.stream.memcpy_stod(bias)?;
@@ -2164,7 +2459,14 @@ pub fn gemm_nt_bf16_mma_bias_residual(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d)
+        .arg(&resid_d);
     unsafe { bld.launch(pipe_cfg(v, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -2250,7 +2552,10 @@ fn gemm_nt_bf16_pipe_entry(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{} requires M%{}==0, N%{}==0, K%{}==0",
-        v.name, v.bm, v.bn, v.bk
+        v.name,
+        v.bm,
+        v.bn,
+        v.bk
     );
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
     let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -2260,7 +2565,12 @@ fn gemm_nt_bf16_pipe_entry(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     // The w22 swizzle workhorse is a 2×2 warp grid (128 threads); every other entry is the PIPE_BF16 w24
     // geometry (256 threads). Derive the launch from the entry so the w22 cliff kernel gets the right grid.
     let launch_v = if entry.ends_with("w22swz") {
@@ -2297,7 +2607,9 @@ fn gemm_nt_bf16_pipe_fused_bias(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{entry} requires M%{}==0, N%{}==0, K%{}==0",
-        v.bm, v.bn, v.bk
+        v.bm,
+        v.bn,
+        v.bk
     );
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
     let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -2308,26 +2620,100 @@ fn gemm_nt_bf16_pipe_fused_bias(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d);
     unsafe { bld.launch(pipe_cfg(v, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
 
 /// `C = A·Bᵀ + bias` fused into the fast bf16 mma workhorse (affine Linear) — see [`gemm_nt_bf16_pipe_fused_bias`].
-pub fn gemm_nt_bf16_mma_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz_bias")
+pub fn gemm_nt_bf16_mma_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_pipe_fused_bias(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "mma_nt_bf16_128_bk32_s2_r16_swz_bias",
+    )
 }
 /// `C = relu(A·Bᵀ + bias)` fused into the fast bf16 mma workhorse (see [`gemm_nt_bf16_pipe_fused_bias`]).
-pub fn gemm_nt_bf16_mma_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz_bias_relu")
+pub fn gemm_nt_bf16_mma_bias_relu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_pipe_fused_bias(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "mma_nt_bf16_128_bk32_s2_r16_swz_bias_relu",
+    )
 }
 /// `C = silu(A·Bᵀ + bias)` fused into the fast bf16 mma workhorse (see [`gemm_nt_bf16_pipe_fused_bias`]).
-pub fn gemm_nt_bf16_mma_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz_bias_silu")
+pub fn gemm_nt_bf16_mma_bias_silu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_pipe_fused_bias(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "mma_nt_bf16_128_bk32_s2_r16_swz_bias_silu",
+    )
 }
 /// `C = gelu(A·Bᵀ + bias)` fused into the fast bf16 mma workhorse (see [`gemm_nt_bf16_pipe_fused_bias`]).
-pub fn gemm_nt_bf16_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz_bias_gelu")
+pub fn gemm_nt_bf16_mma_bias_gelu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_pipe_fused_bias(
+        g,
+        a,
+        b,
+        bias,
+        m,
+        k,
+        n,
+        "mma_nt_bf16_128_bk32_s2_r16_swz_bias_gelu",
+    )
 }
 
 /// `C = act(A·Bᵀ)` in **bf16 inputs / f32 accumulate**, fused in one cp.async-pipelined WMMA kernel —
@@ -2358,21 +2744,47 @@ fn gemm_nt_bf16_fused(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(wmma_sm_cfg(m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
 
 /// `C = relu(A·Bᵀ)` fused, bf16 inputs (see [`gemm_nt_bf16_fused`]).
-pub fn gemm_nt_bf16_sm_db_relu(g: &mut Gpu, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_sm_db_relu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_fused(g, a, b, m, k, n, "wmma_nt_bf16_sm_db_relu")
 }
 /// `C = silu(A·Bᵀ)` fused, bf16 inputs — the SwiGLU FFN up-projection (see [`gemm_nt_bf16_fused`]).
-pub fn gemm_nt_bf16_sm_db_silu(g: &mut Gpu, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_sm_db_silu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_fused(g, a, b, m, k, n, "wmma_nt_bf16_sm_db_silu")
 }
 /// `C = gelu(A·Bᵀ)` fused, bf16 inputs (see [`gemm_nt_bf16_fused`]).
-pub fn gemm_nt_bf16_sm_db_gelu(g: &mut Gpu, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_sm_db_gelu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_fused(g, a, b, m, k, n, "wmma_nt_bf16_sm_db_gelu")
 }
 
@@ -2407,25 +2819,63 @@ fn gemm_nt_bf16_fused_bias(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d);
     unsafe { bld.launch(wmma_sm_cfg(m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
 
 /// `C = A·Bᵀ + bias` fused, bf16 inputs (affine Linear) — see [`gemm_nt_bf16_fused_bias`].
-pub fn gemm_nt_bf16_sm_db_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_sm_db_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_bf16_sm_db_bias")
 }
 /// `C = relu(A·Bᵀ + bias)` fused, bf16 inputs (see [`gemm_nt_bf16_fused_bias`]).
-pub fn gemm_nt_bf16_sm_db_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_sm_db_bias_relu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_bf16_sm_db_bias_relu")
 }
 /// `C = silu(A·Bᵀ + bias)` fused, bf16 inputs (see [`gemm_nt_bf16_fused_bias`]).
-pub fn gemm_nt_bf16_sm_db_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_sm_db_bias_silu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_bf16_sm_db_bias_silu")
 }
 /// `C = gelu(A·Bᵀ + bias)` fused, bf16 inputs (see [`gemm_nt_bf16_fused_bias`]).
-pub fn gemm_nt_bf16_sm_db_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+pub fn gemm_nt_bf16_sm_db_bias_gelu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
     gemm_nt_bf16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_bf16_sm_db_bias_gelu")
 }
 
@@ -3033,7 +3483,11 @@ pub fn winograd_conv2d(
     let fmod = g.load_module_cached(&fptx)?;
     let ff = fmod.load_function("wino_filter_xform")?;
     let kc = k * c;
-    let cfg1 = LaunchConfig { grid_dim: ((kc as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let cfg1 = LaunchConfig {
+        grid_dim: ((kc as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let mut b1 = g.stream.launch_builder(&ff);
     b1.arg(&w_d).arg(&mut u_d);
     unsafe { b1.launch(cfg1)? };
@@ -3043,7 +3497,11 @@ pub fn winograd_conv2d(
     let imod = g.load_module_cached(&iptx)?;
     let inf = imod.load_function("wino_input_xform")?;
     let cnt = c * nt;
-    let cfg2 = LaunchConfig { grid_dim: ((cnt as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let cfg2 = LaunchConfig {
+        grid_dim: ((cnt as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let mut b2 = g.stream.launch_builder(&inf);
     b2.arg(&x_d).arg(&mut v_d);
     unsafe { b2.launch(cfg2)? };
@@ -3064,7 +3522,11 @@ pub fn winograd_conv2d(
     let optx = crate::ptx_winograd::wino_output_xform_ptx(k, h, width, m);
     let omod = g.load_module_cached(&optx)?;
     let of = omod.load_function("wino_output_xform")?;
-    let cfg4 = LaunchConfig { grid_dim: (((k * nt) as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let cfg4 = LaunchConfig {
+        grid_dim: (((k * nt) as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let mut b4 = g.stream.launch_builder(&of);
     b4.arg(&m_d).arg(&mut o_d);
     unsafe { b4.launch(cfg4)? };
@@ -3096,7 +3558,11 @@ pub fn conv2d_wmma_epi(
     assert_eq!(x.len(), c * h * width, "X must be C×H×W");
     assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
     if let Some(bs) = bias {
-        assert_eq!(bs.len(), k, "bias must be length K (one per output channel)");
+        assert_eq!(
+            bs.len(),
+            k,
+            "bias must be length K (one per output channel)"
+        );
     }
     assert!(h >= r && width >= s, "kernel larger than input");
     let (p, q) = (h - r + 1, width - s + 1);
@@ -3155,7 +3621,11 @@ pub fn conv2d_wmma_strided(
     let w_d = g.stream.memcpy_stod(&w16)?;
     let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
     let cfg = LaunchConfig {
-        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+        grid_dim: (
+            (n as u32).div_ceil(WMMA_BN as u32),
+            (m as u32).div_ceil(WMMA_BM as u32),
+            1,
+        ),
         block_dim: (WMMA_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -3189,8 +3659,14 @@ pub fn conv2d_wmma_padded(
     assert!(stride >= 1, "stride must be >= 1");
     assert_eq!(x.len(), c * h * width, "X must be C×H×W");
     assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
-    assert!(h + 2 * pad >= r && width + 2 * pad >= s, "kernel larger than padded input");
-    let (p, q) = ((h + 2 * pad - r) / stride + 1, (width + 2 * pad - s) / stride + 1);
+    assert!(
+        h + 2 * pad >= r && width + 2 * pad >= s,
+        "kernel larger than padded input"
+    );
+    let (p, q) = (
+        (h + 2 * pad - r) / stride + 1,
+        (width + 2 * pad - s) / stride + 1,
+    );
     let (m, n) = (k, p * q);
     let ptx = crate::ptx_conv::conv_wmma_pad_ptx(c, h, width, k, r, s, stride, pad);
     let module = g.load_module_cached(&ptx)?;
@@ -3201,7 +3677,11 @@ pub fn conv2d_wmma_padded(
     let w_d = g.stream.memcpy_stod(&w16)?;
     let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
     let cfg = LaunchConfig {
-        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+        grid_dim: (
+            (n as u32).div_ceil(WMMA_BN as u32),
+            (m as u32).div_ceil(WMMA_BM as u32),
+            1,
+        ),
         block_dim: (WMMA_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -3239,7 +3719,10 @@ pub fn conv2d_wmma_padded_explicit(
     assert!(stride >= 1, "stride must be >= 1");
     assert_eq!(x.len(), c * h * width, "X must be C×H×W");
     assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
-    assert!(h + 2 * pad >= r && width + 2 * pad >= s, "kernel larger than padded input");
+    assert!(
+        h + 2 * pad >= r && width + 2 * pad >= s,
+        "kernel larger than padded input"
+    );
     if pad == 0 {
         // No padding -> the dense strided path directly (no scatter needed).
         return conv2d_wmma_strided(g, x, w, c, h, width, k, r, s, stride);
@@ -3270,7 +3753,11 @@ pub fn conv2d_wmma_padded_explicit(
     let f = module.load_function("conv2d_wmma")?;
     let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
     let cfg = LaunchConfig {
-        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+        grid_dim: (
+            (n as u32).div_ceil(WMMA_BN as u32),
+            (m as u32).div_ceil(WMMA_BM as u32),
+            1,
+        ),
         block_dim: (WMMA_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -3306,12 +3793,28 @@ pub fn conv2d_wmma_padded_auto(
     assert!(stride >= 1, "stride must be >= 1");
     assert_eq!(x.len(), c * h * width, "X must be C×H×W");
     assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
-    assert!(h + 2 * pad >= r && width + 2 * pad >= s, "kernel larger than padded input");
-    let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, width, k, r, s, stride, pad, g.sm_count() as usize);
+    assert!(
+        h + 2 * pad >= r && width + 2 * pad >= s,
+        "kernel larger than padded input"
+    );
+    let sk = crate::ptx_conv::conv_splitk_factor_affine(
+        c,
+        h,
+        width,
+        k,
+        r,
+        s,
+        stride,
+        pad,
+        g.sm_count() as usize,
+    );
     if sk == 1 {
         return conv2d_wmma_padded(g, x, w, c, h, width, k, r, s, stride, pad);
     }
-    let (p, q) = ((h + 2 * pad - r) / stride + 1, (width + 2 * pad - s) / stride + 1);
+    let (p, q) = (
+        (h + 2 * pad - r) / stride + 1,
+        (width + 2 * pad - s) / stride + 1,
+    );
     let (m, n) = (k, p * q);
     let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
     let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
@@ -3322,7 +3825,11 @@ pub fn conv2d_wmma_padded_auto(
     let module = g.load_module_cached(&ptx)?;
     let f = module.load_function("conv2d_wmma_splitk")?;
     let cfg = LaunchConfig {
-        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), sk as u32),
+        grid_dim: (
+            (n as u32).div_ceil(WMMA_BN as u32),
+            (m as u32).div_ceil(WMMA_BM as u32),
+            sk as u32,
+        ),
         block_dim: (WMMA_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -3475,7 +3982,11 @@ pub fn ffn_fused(
         let (r, c) = (s as u32, d as u32);
         let mut b = stream.launch_builder(&f_norm);
         b.arg(&r).arg(&c).arg(&eps).arg(&x_d).arg(&mut h2);
-        let cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (s as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe { b.launch(cfg)? };
     }
     let h2_16 = cast(&h2, s * d)?;
@@ -3485,7 +3996,12 @@ pub fn ffn_fused(
     {
         let (mm, nn, kk) = (s as u32, dff as u32, d as u32);
         let mut b = stream.launch_builder(&f_silu);
-        b.arg(&mm).arg(&nn).arg(&kk).arg(&h2_16).arg(&w1_d).arg(&mut f1a);
+        b.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&h2_16)
+            .arg(&w1_d)
+            .arg(&mut f1a);
         unsafe { b.launch(wmma_sm_cfg(s, dff))? };
     }
     let f1a_16 = cast(&f1a, s * dff)?;
@@ -3495,7 +4011,13 @@ pub fn ffn_fused(
     {
         let (mm, nn, kk) = (s as u32, d as u32, dff as u32);
         let mut b = stream.launch_builder(&f_resid);
-        b.arg(&mm).arg(&nn).arg(&kk).arg(&f1a_16).arg(&w2_d).arg(&mut out).arg(&x_d);
+        b.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&f1a_16)
+            .arg(&w2_d)
+            .arg(&mut out)
+            .arg(&x_d);
         unsafe { b.launch(wmma_sm_cfg(s, d))? };
     }
     stream.memcpy_dtov(&out)
@@ -3762,7 +4284,10 @@ impl ResidentLayerF16 {
             s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
             "ResidentLayerF16 needs S,D,Dff multiples of 64 (WMMA-staged tiles)"
         );
-        assert!(heads >= 1 && d % heads == 0, "d={d} must be divisible by heads={heads}");
+        assert!(
+            heads >= 1 && d % heads == 0,
+            "d={d} must be divisible by heads={heads}"
+        );
         let dh = d / heads;
         assert!(
             crate::ptx_flash::SUPPORTED_D.contains(&dh),
@@ -3775,8 +4300,16 @@ impl ResidentLayerF16 {
         );
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
-        let f_qkv_trans = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "cast_transpose_qkv")?;
-        let f_attn_trans = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "transpose_attn_out")?;
+        let f_qkv_trans = g.function(
+            "htrans",
+            crate::ptx::HEAD_TRANSPOSE_PTX,
+            "cast_transpose_qkv",
+        )?;
+        let f_attn_trans = g.function(
+            "htrans",
+            crate::ptx::HEAD_TRANSPOSE_PTX,
+            "transpose_attn_out",
+        )?;
         let (flash_name, flash_cfg) = flash_plan(dh, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
         let f_flash_w = if wmma_flash_applies(dh, s) {
@@ -3853,10 +4386,19 @@ impl ResidentLayerF16 {
     ) -> Result<cudarc::driver::CudaSlice<half::f16>, DriverError> {
         let n = self.s * self.d;
         let mut dst = self.stream.alloc_zeros::<half::f16>(n)?;
-        let (nn, dd, dhh, sdh) =
-            (n as u32, self.d as u32, self.dh as u32, (self.s * self.dh) as u32);
+        let (nn, dd, dhh, sdh) = (
+            n as u32,
+            self.d as u32,
+            self.dh as u32,
+            (self.s * self.dh) as u32,
+        );
         let mut b = self.stream.launch_builder(&self.f_qkv_trans);
-        b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut dst);
+        b.arg(&nn)
+            .arg(&dd)
+            .arg(&dhh)
+            .arg(&sdh)
+            .arg(src)
+            .arg(&mut dst);
         unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
         Ok(dst)
     }
@@ -3869,10 +4411,19 @@ impl ResidentLayerF16 {
     ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
         let n = self.s * self.d;
         let mut dst = self.stream.alloc_zeros::<f32>(n)?;
-        let (nn, dd, dhh, sdh) =
-            (n as u32, self.d as u32, self.dh as u32, (self.s * self.dh) as u32);
+        let (nn, dd, dhh, sdh) = (
+            n as u32,
+            self.d as u32,
+            self.dh as u32,
+            (self.s * self.dh) as u32,
+        );
         let mut b = self.stream.launch_builder(&self.f_attn_trans);
-        b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut dst);
+        b.arg(&nn)
+            .arg(&dd)
+            .arg(&dhh)
+            .arg(&sdh)
+            .arg(src)
+            .arg(&mut dst);
         unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
         Ok(dst)
     }
@@ -3897,7 +4448,11 @@ impl ResidentLayerF16 {
         s: usize,
         _d: usize,
     ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
-        assert_eq!(s, self.s, "run_attn: the flash entry was resolved for S={}", self.s);
+        assert_eq!(
+            s, self.s,
+            "run_attn: the flash entry was resolved for S={}",
+            self.s
+        );
         let scale = 1.0f32 / (self.dh as f32).sqrt();
         let ss = s as u32;
         if self.heads == 1 {
@@ -3907,7 +4462,12 @@ impl ResidentLayerF16 {
                 let k16 = self.cast16(k, s * self.d)?;
                 let v16 = self.cast16(v, s * self.d)?;
                 let mut bld = self.stream.launch_builder(f_w);
-                bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut attn);
+                bld.arg(&ss)
+                    .arg(&scale)
+                    .arg(&q16)
+                    .arg(&k16)
+                    .arg(&v16)
+                    .arg(&mut attn);
                 unsafe { bld.launch(*cfg_w)? };
             } else {
                 let mut bld = self.stream.launch_builder(&self.f_flash);
@@ -3931,7 +4491,12 @@ impl ResidentLayerF16 {
             // must come from the plan, not be assumed 1-warp.
             let (_, cfg) = wmma_flash_plan(self.dh, s, self.heads);
             let mut bld = self.stream.launch_builder(f_w);
-            bld.arg(&ss).arg(&scale).arg(&q_hsd).arg(&k_hsd).arg(&v_hsd).arg(&mut attn_hsd);
+            bld.arg(&ss)
+                .arg(&scale)
+                .arg(&q_hsd)
+                .arg(&k_hsd)
+                .arg(&v_hsd)
+                .arg(&mut attn_hsd);
             unsafe { bld.launch(cfg)? };
             self.transpose_back(&attn_hsd)
         }
@@ -3947,7 +4512,11 @@ impl ResidentLayerF16 {
         use half::f16;
         let stream = &self.stream;
         let (s, d, dff, eps) = (self.s, self.d, self.dff, self.eps);
-        let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let norm_cfg = LaunchConfig {
+            grid_dim: (s as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         // RMSNorm a `[rows, d]` f32 buffer into a fresh f32 buffer (one warp per row).
         let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
@@ -3959,7 +4528,9 @@ impl ResidentLayerF16 {
             Ok(out)
         };
         // device f32 -> device f16 narrowing (the stage boundary between norm/flash and the WMMA GEMMs).
-        let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
+        let cast = |src: &cudarc::driver::CudaSlice<f32>,
+                    n: usize|
+         -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
             let mut dst = stream.alloc_zeros::<f16>(n)?;
             let nn = n as u32;
             let mut b = stream.launch_builder(&self.f_cast);
@@ -3994,7 +4565,13 @@ impl ResidentLayerF16 {
             let mut c = stream.alloc_zeros::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(&self.f_resid);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c).arg(residual);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(a)
+                .arg(b)
+                .arg(&mut c)
+                .arg(residual);
             unsafe { bld.launch(wmma_sm_cfg(m, n))? };
             Ok(c)
         };
@@ -4032,7 +4609,11 @@ impl ResidentLayerF16 {
         use half::f16;
         let stream = &self.stream;
         let (s, d, dff, eps) = (self.s, self.d, self.dff, self.eps);
-        let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let norm_cfg = LaunchConfig {
+            grid_dim: (s as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
             let mut out = stream.alloc_zeros::<f32>(rows * d)?;
@@ -4042,7 +4623,9 @@ impl ResidentLayerF16 {
             unsafe { bld.launch(norm_cfg)? };
             Ok(out)
         };
-        let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
+        let cast = |src: &cudarc::driver::CudaSlice<f32>,
+                    n: usize|
+         -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
             let mut dst = stream.alloc_zeros::<f16>(n)?;
             let nn = n as u32;
             let mut b = stream.launch_builder(&self.f_cast);
@@ -4051,7 +4634,12 @@ impl ResidentLayerF16 {
             Ok(dst)
         };
         // plain C = A*Bᵀ, no epilogue (always self.f_gemm) — the down/out projections do NOT fold residual.
-        let gemm = |a: &cudarc::driver::CudaSlice<f16>, b: &cudarc::driver::CudaSlice<f16>, m: usize, k: usize, n: usize| -> Result<_, DriverError> {
+        let gemm = |a: &cudarc::driver::CudaSlice<f16>,
+                    b: &cudarc::driver::CudaSlice<f16>,
+                    m: usize,
+                    k: usize,
+                    n: usize|
+         -> Result<_, DriverError> {
             let mut c = stream.alloc_zeros::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(&self.f_gemm);
@@ -4060,7 +4648,10 @@ impl ResidentLayerF16 {
             Ok(c)
         };
         // separate residual add `out = a + b` (the kernel the fused residual GEMM folds away).
-        let vadd = |a: &cudarc::driver::CudaSlice<f32>, b: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<_, DriverError> {
+        let vadd = |a: &cudarc::driver::CudaSlice<f32>,
+                    b: &cudarc::driver::CudaSlice<f32>,
+                    n: usize|
+         -> Result<_, DriverError> {
             let mut out = stream.alloc_zeros::<f32>(n)?;
             let nn = n as u32;
             let mut bld = stream.launch_builder(&self.f_vadd);
@@ -4160,7 +4751,12 @@ impl ResidentModelF16 {
             layers.push(ResidentLayerF16::new(g, w, s, d, dff)?);
         }
         let stream = g.stream.clone();
-        Ok(Self { stream, layers, s, d })
+        Ok(Self {
+            stream,
+            layers,
+            s,
+            d,
+        })
     }
 
     /// Number of transformer layers in the stack.
@@ -4327,14 +4923,27 @@ pub fn gemm_nt_w4a16(
         None => {
             let f = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16")?;
             let mut bld = g.stream.launch_builder(&f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(&a_d)
+                .arg(&bq_d)
+                .arg(&scl_d)
+                .arg(&mut c_d);
             unsafe { bld.launch(cfg)? };
         }
         Some(zeros) => {
             let z_d = g.stream.memcpy_stod(zeros)?;
             let f = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16_z")?;
             let mut bld = g.stream.launch_builder(&f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d).arg(&z_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(&a_d)
+                .arg(&bq_d)
+                .arg(&scl_d)
+                .arg(&mut c_d)
+                .arg(&z_d);
             unsafe { bld.launch(cfg)? };
         }
     }
@@ -4363,7 +4972,10 @@ pub fn gemm_nt_w4a16_splitk(
     assert_eq!(qw.n, n, "weight N mismatch");
     assert_eq!(qw.k, k, "weight K mismatch");
     assert_eq!(qw.group, GROUP_SIZE, "kernel bakes group={GROUP_SIZE}");
-    assert!(qw.zeros.is_none(), "w4a16 split-K is the symmetric path (no zero-point)");
+    assert!(
+        qw.zeros.is_none(),
+        "w4a16 split-K is the symmetric path (no zero-point)"
+    );
     assert!(sk >= 1, "split count must be >= 1");
     assert!(
         m % W4_BM == 0 && n % W4_BN == 0 && k % (sk * GROUP_SIZE) == 0,
@@ -4376,7 +4988,11 @@ pub fn gemm_nt_w4a16_splitk(
     let mut part_d = g.stream.memcpy_stod(&vec![0f32; sk * m * n])?; // sk disjoint partial planes
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     // split-K GEMM: gridDim.z = sk, each CTA writes its own M×N plane of `part_d`.
-    let f = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "gemm_nt_w4a16_sk")?;
+    let f = g.function(
+        "w4a16_sk",
+        crate::ptx_int4::w4a16_splitk_ptx(),
+        "gemm_nt_w4a16_sk",
+    )?;
     let cfg = LaunchConfig {
         grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, sk as u32),
         block_dim: (W4_THREADS as u32, 1, 1),
@@ -4384,14 +5000,28 @@ pub fn gemm_nt_w4a16_splitk(
     };
     {
         let mut bld = g.stream.launch_builder(&f);
-        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut part_d);
+        bld.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&a_d)
+            .arg(&bq_d)
+            .arg(&scl_d)
+            .arg(&mut part_d);
         unsafe { bld.launch(cfg)? };
     }
     // deterministic fixed-order reduction of the sk planes → final C (same cached module).
-    let red = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "w4a16_splitk_reduce")?;
+    let red = g.function(
+        "w4a16_sk",
+        crate::ptx_int4::w4a16_splitk_ptx(),
+        "w4a16_splitk_reduce",
+    )?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mn, skk) = ((m * n) as u32, sk as u32);
-    let rcfg = LaunchConfig { grid_dim: (256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let rcfg = LaunchConfig {
+        grid_dim: (256, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
     {
         let mut bld = g.stream.launch_builder(&red);
         bld.arg(&mn).arg(&skk).arg(&part_d).arg(&mut c_d);
@@ -4445,13 +5075,26 @@ pub fn gemm_nt_w4a16_static(
     match &qw.zeros {
         None => {
             let mut bld = g.stream.launch_builder(&f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(&a_d)
+                .arg(&bq_d)
+                .arg(&scl_d)
+                .arg(&mut c_d);
             unsafe { bld.launch(cfg)? };
         }
         Some(zeros) => {
             let z_d = g.stream.memcpy_stod(zeros)?;
             let mut bld = g.stream.launch_builder(&f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d).arg(&z_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(&a_d)
+                .arg(&bq_d)
+                .arg(&scl_d)
+                .arg(&mut c_d)
+                .arg(&z_d);
             unsafe { bld.launch(cfg)? };
         }
     }
@@ -4497,16 +5140,23 @@ impl ResidentLayerF16 {
         out: &mut cudarc::driver::CudaSlice<f32>,
     ) -> Result<(), DriverError> {
         use crate::pool::{DevicePool, PoolBuf};
-        use cudarc::driver::{CudaSlice, CudaFunction};
+        use cudarc::driver::{CudaFunction, CudaSlice};
         use half::f16;
         let (s, d, dff, eps) = (self.s, self.d, self.dff, self.eps);
         assert_eq!(x_d.len(), s * d, "x_d must be S*D");
         assert_eq!(out.len(), s * d, "out must be S*D");
-        let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let norm_cfg = LaunchConfig {
+            grid_dim: (s as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         // Pooled equivalents of forward_device's closures. `pool` is threaded as a parameter (not
         // captured) so several pool buffers can be live at once without aliasing a single `&mut`.
-        let norm = |pool: &mut DevicePool, src: &CudaSlice<f32>, rows: usize| -> Result<PoolBuf<f32>, DriverError> {
+        let norm = |pool: &mut DevicePool,
+                    src: &CudaSlice<f32>,
+                    rows: usize|
+         -> Result<PoolBuf<f32>, DriverError> {
             let mut o = pool.alloc::<f32>(rows * d)?;
             let (r, c) = (rows as u32, d as u32);
             let mut b = stream.launch_builder(&self.f_norm);
@@ -4514,7 +5164,10 @@ impl ResidentLayerF16 {
             unsafe { b.launch(norm_cfg)? };
             Ok(o)
         };
-        let cast = |pool: &mut DevicePool, src: &CudaSlice<f32>, n: usize| -> Result<PoolBuf<f16>, DriverError> {
+        let cast = |pool: &mut DevicePool,
+                    src: &CudaSlice<f32>,
+                    n: usize|
+         -> Result<PoolBuf<f16>, DriverError> {
             let mut dst = pool.alloc::<f16>(n)?;
             let nn = n as u32;
             let mut b = stream.launch_builder(&self.f_cast);
@@ -4522,7 +5175,14 @@ impl ResidentLayerF16 {
             unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
             Ok(dst)
         };
-        let gemm16 = |pool: &mut DevicePool, f: &CudaFunction, a: &CudaSlice<f16>, b: &CudaSlice<f16>, m: usize, k: usize, n: usize| -> Result<PoolBuf<f32>, DriverError> {
+        let gemm16 = |pool: &mut DevicePool,
+                      f: &CudaFunction,
+                      a: &CudaSlice<f16>,
+                      b: &CudaSlice<f16>,
+                      m: usize,
+                      k: usize,
+                      n: usize|
+         -> Result<PoolBuf<f32>, DriverError> {
             let mut c = pool.alloc::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(f);
@@ -4530,11 +5190,24 @@ impl ResidentLayerF16 {
             unsafe { bld.launch(wmma_sm_cfg(m, n))? };
             Ok(c)
         };
-        let resid_gemm = |pool: &mut DevicePool, a: &CudaSlice<f16>, b: &CudaSlice<f16>, residual: &CudaSlice<f32>, m: usize, k: usize, n: usize| -> Result<PoolBuf<f32>, DriverError> {
+        let resid_gemm = |pool: &mut DevicePool,
+                          a: &CudaSlice<f16>,
+                          b: &CudaSlice<f16>,
+                          residual: &CudaSlice<f32>,
+                          m: usize,
+                          k: usize,
+                          n: usize|
+         -> Result<PoolBuf<f32>, DriverError> {
             let mut c = pool.alloc::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(&self.f_resid);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut *c).arg(residual);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(a)
+                .arg(b)
+                .arg(&mut *c)
+                .arg(residual);
             unsafe { bld.launch(wmma_sm_cfg(m, n))? };
             Ok(c)
         };
@@ -4558,22 +5231,43 @@ impl ResidentLayerF16 {
                     let k16 = cast(pool, &k, s * d)?;
                     let v16 = cast(pool, &v, s * d)?;
                     let mut bld = stream.launch_builder(f_w);
-                    bld.arg(&ss).arg(&scale).arg(&*q16).arg(&*k16).arg(&*v16).arg(&mut *attn);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&*q16)
+                        .arg(&*k16)
+                        .arg(&*v16)
+                        .arg(&mut *attn);
                     unsafe { bld.launch(*cfg_w)? };
                 } else {
                     let mut bld = stream.launch_builder(&self.f_flash);
-                    bld.arg(&ss).arg(&scale).arg(&*q).arg(&*k).arg(&*v).arg(&mut *attn);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&*q)
+                        .arg(&*k)
+                        .arg(&*v)
+                        .arg(&mut *attn);
                     unsafe { bld.launch(self.flash_cfg)? };
                 }
                 attn
             } else {
-                let (f_w, _) = self.f_flash_w.as_ref().expect("multi-head requires the tensor-core flash");
-                let cast_transpose = |pool: &mut DevicePool, src: &CudaSlice<f32>| -> Result<PoolBuf<f16>, DriverError> {
+                let (f_w, _) = self
+                    .f_flash_w
+                    .as_ref()
+                    .expect("multi-head requires the tensor-core flash");
+                let cast_transpose = |pool: &mut DevicePool,
+                                      src: &CudaSlice<f32>|
+                 -> Result<PoolBuf<f16>, DriverError> {
                     let n = s * d;
                     let mut dst = pool.alloc::<f16>(n)?;
-                    let (nn, dd, dhh, sdh) = (n as u32, d as u32, self.dh as u32, (s * self.dh) as u32);
+                    let (nn, dd, dhh, sdh) =
+                        (n as u32, d as u32, self.dh as u32, (s * self.dh) as u32);
                     let mut b = stream.launch_builder(&self.f_qkv_trans);
-                    b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut *dst);
+                    b.arg(&nn)
+                        .arg(&dd)
+                        .arg(&dhh)
+                        .arg(&sdh)
+                        .arg(src)
+                        .arg(&mut *dst);
                     unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
                     Ok(dst)
                 };
@@ -4584,13 +5278,28 @@ impl ResidentLayerF16 {
                 // Same plan-derived multi-head config as attention() — see the note there.
                 let (_, cfg) = wmma_flash_plan(self.dh, s, self.heads);
                 let mut bld = stream.launch_builder(f_w);
-                bld.arg(&ss).arg(&scale).arg(&*q_hsd).arg(&*k_hsd).arg(&*v_hsd).arg(&mut *attn_hsd);
+                bld.arg(&ss)
+                    .arg(&scale)
+                    .arg(&*q_hsd)
+                    .arg(&*k_hsd)
+                    .arg(&*v_hsd)
+                    .arg(&mut *attn_hsd);
                 unsafe { bld.launch(cfg)? };
                 // transpose the [H,S,dh] flash output back to token-major [S,H·dh].
                 let mut dst = pool.alloc::<f32>(s * d)?;
-                let (nn, dd, dhh, sdh) = ((s * d) as u32, d as u32, self.dh as u32, (s * self.dh) as u32);
+                let (nn, dd, dhh, sdh) = (
+                    (s * d) as u32,
+                    d as u32,
+                    self.dh as u32,
+                    (s * self.dh) as u32,
+                );
                 let mut b = stream.launch_builder(&self.f_attn_trans);
-                b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(&*attn_hsd).arg(&mut *dst);
+                b.arg(&nn)
+                    .arg(&dd)
+                    .arg(&dhh)
+                    .arg(&sdh)
+                    .arg(&*attn_hsd)
+                    .arg(&mut *dst);
                 unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
                 dst
             }
@@ -4608,7 +5317,13 @@ impl ResidentLayerF16 {
         {
             let (mm, nn, kk) = (s as u32, d as u32, dff as u32);
             let mut bld = stream.launch_builder(&self.f_resid);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(&*f1_16).arg(&self.w2).arg(&mut *out).arg(&*x1);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(&*f1_16)
+                .arg(&self.w2)
+                .arg(&mut *out)
+                .arg(&*x1);
             unsafe { bld.launch(wmma_sm_cfg(s, d))? };
         }
         Ok(())
@@ -4645,11 +5360,29 @@ pub fn gemm_nt_fp8_pipe(
     let w64ok = m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0;
     let (bm, threads, key, ptx, entry): (usize, usize, &str, &str, &str) =
         if w64ok && m <= 2048 && n <= 2048 && k >= 96 {
-            (FP8_PIPE_BM, 128, "fp8_pipe_w64_s3", crate::ptx_fp8::fp8_pipe_w64_s3_ptx(), "fp8_gemm_pipe")
+            (
+                FP8_PIPE_BM,
+                128,
+                "fp8_pipe_w64_s3",
+                crate::ptx_fp8::fp8_pipe_w64_s3_ptx(),
+                "fp8_gemm_pipe",
+            )
         } else if w64ok {
-            (FP8_PIPE_BM, 128, "fp8_pipe_w64", crate::ptx_fp8::fp8_pipe_w64_ptx(), "fp8_gemm_pipe")
+            (
+                FP8_PIPE_BM,
+                128,
+                "fp8_pipe_w64",
+                crate::ptx_fp8::fp8_pipe_w64_ptx(),
+                "fp8_gemm_pipe",
+            )
         } else {
-            (FP8_PIPE_M64_BM, FP8_PIPE_THREADS, "fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe_m64")
+            (
+                FP8_PIPE_M64_BM,
+                FP8_PIPE_THREADS,
+                "fp8_pipe",
+                crate::ptx_fp8::fp8_pipe_ptx(),
+                "fp8_gemm_pipe_m64",
+            )
         };
     assert!(
         m % bm == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
@@ -4668,7 +5401,12 @@ pub fn gemm_nt_fp8_pipe(
     };
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
@@ -4706,7 +5444,10 @@ pub fn gemm_nt_fp8_deep(
     assert!(
         m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
         "{} requires M%{}==0, N%{}==0, K%{}==0",
-        v.name, v.bm, v.bn, v.bk
+        v.name,
+        v.bm,
+        v.bn,
+        v.bk
     );
     if v.smem_bytes() > g.smem_budget() {
         // A capability fact about the hardware, decided before any PTX is loaded — not a driver error.
@@ -4731,7 +5472,12 @@ pub fn gemm_nt_fp8_deep(
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     // Rasterized ⇒ a 1-D grid of (M/bm)·(N/bn) blocks.
     let cfg = dyn_launch_cfg(
         (((m / v.bm) * (n / v.bn)) as u32, 1, 1),
@@ -4781,25 +5527,63 @@ fn gemm_nt_fp8_pipe_fused_bias(
     };
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d);
     unsafe { bld.launch(cfg)? };
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
 /// `C = A·Bᵀ + bias` fused, fp8 inputs (affine Linear) — see [`gemm_nt_fp8_pipe_fused_bias`].
-pub fn gemm_nt_fp8_mma_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
+pub fn gemm_nt_fp8_mma_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias")
 }
 /// `C = relu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
+pub fn gemm_nt_fp8_mma_bias_relu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_relu")
 }
 /// `C = silu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
+pub fn gemm_nt_fp8_mma_bias_silu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_silu")
 }
 /// `C = gelu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
-pub fn gemm_nt_fp8_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
+pub fn gemm_nt_fp8_mma_bias_gelu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_gelu")
 }
 
@@ -4829,7 +5613,11 @@ pub fn gemm_nt_fp8_mma_bias_residual(
     );
     let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
     let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
-    let f = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe_bias_residual")?;
+    let f = g.function(
+        "fp8_pipe",
+        crate::ptx_fp8::fp8_pipe_ptx(),
+        "fp8_gemm_pipe_bias_residual",
+    )?;
     let a_d = g.stream.memcpy_stod(&a8)?;
     let b_d = g.stream.memcpy_stod(&b8)?;
     let bias_d = g.stream.memcpy_stod(bias)?;
@@ -4842,7 +5630,14 @@ pub fn gemm_nt_fp8_mma_bias_residual(
     };
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d)
+        .arg(&resid_d);
     unsafe { bld.launch(cfg)? };
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
@@ -4870,7 +5665,10 @@ fn gemm_nt_fp8_gate(
     assert_eq!(x.len(), m * k);
     assert_eq!(wg.len(), n * k);
     assert_eq!(wu.len(), n * k);
-    assert!(m % 128 == 0 && n % 64 == 0 && k % 64 == 0, "{entry} requires M%128==0, N%64==0, K%64==0");
+    assert!(
+        m % 128 == 0 && n % 64 == 0 && k % 64 == 0,
+        "{entry} requires M%128==0, N%64==0, K%64==0"
+    );
     let x8: Vec<u8> = x.iter().map(|&v| f32_to_e4m3(v)).collect();
     let wg8: Vec<u8> = wg.iter().map(|&v| f32_to_e4m3(v)).collect();
     let wu8: Vec<u8> = wu.iter().map(|&v| f32_to_e4m3(v)).collect();
@@ -4886,7 +5684,13 @@ fn gemm_nt_fp8_gate(
     };
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&x_d).arg(&wg_d).arg(&wu_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&x_d)
+        .arg(&wg_d)
+        .arg(&wu_d)
+        .arg(&mut c_d);
     let (bg_d, bu_d);
     if let Some((bg, bu)) = bias {
         assert_eq!(bg.len(), n, "gate bias bg must have length N");
@@ -4902,12 +5706,28 @@ fn gemm_nt_fp8_gate(
 }
 
 /// Fused **SwiGLU** FFN gate (fp8 E4M3 — the fastest fused inference gate): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
-pub fn gemm_nt_fp8_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
+pub fn gemm_nt_fp8_swiglu(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_silu")
 }
 
 /// Fused **GeGLU** FFN gate (fp8 E4M3): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
-pub fn gemm_nt_fp8_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, GpuError> {
+pub fn gemm_nt_fp8_geglu(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
     gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_gelu")
 }
 
@@ -4976,7 +5796,11 @@ pub fn gemm_nt_int8(
         )
     } else {
         (
-            g.function("int8_gemm", crate::ptx_int8::int8_gemm_ptx(), "int8_gemm_nt")?,
+            g.function(
+                "int8_gemm",
+                crate::ptx_int8::int8_gemm_ptx(),
+                "int8_gemm_nt",
+            )?,
             LaunchConfig {
                 grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
                 block_dim: (32, 1, 1),
@@ -5026,8 +5850,9 @@ pub fn gemm_nt_int8_smdb(
     n: usize,
 ) -> Result<Vec<i32>, DriverError> {
     use crate::ptx_int8::{
-        INT8_BK, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128,
-        INT8_WARPS_N, INT8_WARPS_N128, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+        INT8_BK, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_W64_BM, INT8_W64_BN,
+        INT8_W64_WARPS_M, INT8_W64_WARPS_N, INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N,
+        INT8_WARPS_N128,
     };
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
@@ -5047,7 +5872,8 @@ pub fn gemm_nt_int8_smdb(
     let swz = k % 64 == 0;
     let use_w64 = swz && m >= 2048 && n >= 2048 && m % INT8_W64_BM == 0 && n % INT8_W64_BN == 0;
     let use_128_hand = !swz && m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
-    let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) = if use_w64 {
+    let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) = if use_w64
+    {
         (
             crate::ptx_int8::int8_gemm_w64_swz_ptx(),
             "int8_gemm_nt_w64_swz",
@@ -5118,7 +5944,10 @@ pub fn gemm_nt_int8_static(
     };
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
-    assert!(k % 64 == 0, "gemm_nt_int8_static requires K%64==0 (the swz BK)");
+    assert!(
+        k % 64 == 0,
+        "gemm_nt_int8_static requires K%64==0 (the swz BK)"
+    );
     // Same regime rule as the dynamic swz dispatch: the 128×128 tile once reuse-bound (≥4096²), else 64×64.
     let use_128 = m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
     let (bm, bn, warps) = if use_128 {
@@ -5126,7 +5955,10 @@ pub fn gemm_nt_int8_static(
     } else {
         (INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N)
     };
-    assert!(m % bm == 0 && n % bn == 0, "gemm_nt_int8_static requires M%{bm}==0, N%{bn}==0");
+    assert!(
+        m % bm == 0 && n % bn == 0,
+        "gemm_nt_int8_static requires M%{bm}==0, N%{bn}==0"
+    );
     let ptx = crate::ptx_int8::int8_gemm_smdb_swz_static_ptx(m, n, k, use_128);
     let module = g.ctx.load_module(ptx.as_str().into())?;
     let f = module.load_function(crate::ptx_int8::int8_gemm_smdb_swz_static_entry(use_128))?;
@@ -5136,7 +5968,12 @@ pub fn gemm_nt_int8_static(
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -5179,7 +6016,12 @@ pub fn gemm_nt_int8_splitk(
     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?; // split-K accumulates → C must start zeroed
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -5199,8 +6041,8 @@ pub fn gemm_nt_int8_smdb_dequant(
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
     use crate::ptx_int8::{
-        INT8_BK, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, INT8_W64_BM, INT8_W64_BN,
-        INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+        INT8_BK, INT8_BM, INT8_BN, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+        INT8_WARPS_M, INT8_WARPS_N,
     };
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
@@ -5215,7 +6057,8 @@ pub fn gemm_nt_int8_smdb_dequant(
     // purely throughput — so the fused inference output stage rides the fastest int8 base it can.
     let swz = k % 64 == 0;
     let use_w64 = swz && m >= 2048 && n >= 2048 && m % INT8_W64_BM == 0 && n % INT8_W64_BN == 0;
-    let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) = if use_w64 {
+    let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) = if use_w64
+    {
         (
             crate::ptx_int8::int8_gemm_w64_swz_deq_ptx(),
             "int8_gemm_nt_w64_swz_deq",
@@ -5282,9 +6125,16 @@ pub fn gemm_nt_fp8_bwd(
         16 * FP8_TM,
         8 * FP8_TN
     );
-    let a8: Vec<u8> = dy.iter().map(|&x| crate::ptx_fp8_train::f32_to_e5m2(x)).collect();
+    let a8: Vec<u8> = dy
+        .iter()
+        .map(|&x| crate::ptx_fp8_train::f32_to_e5m2(x))
+        .collect();
     let b8: Vec<u8> = w.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
-    let f = g.function("fp8_bwd_gemm", crate::ptx_fp8_train::fp8_bwd_gemm_ptx(), "fp8_bwd_gemm_nt")?;
+    let f = g.function(
+        "fp8_bwd_gemm",
+        crate::ptx_fp8_train::fp8_bwd_gemm_ptx(),
+        "fp8_bwd_gemm_nt",
+    )?;
     let a_d = g.stream.memcpy_stod(&a8)?;
     let b_d = g.stream.memcpy_stod(&b8)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
@@ -5295,7 +6145,12 @@ pub fn gemm_nt_fp8_bwd(
     };
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
-    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
@@ -5347,14 +6202,23 @@ pub fn quantize_scaled_fp8(
     // needs, and the plan splits it out precisely so it survives there.)
     g.require_fp8("quantize_scaled_fp8")?;
     let n = x.len();
-    assert!(n % 2 == 0, "device fp8 quantize needs an even element count");
+    assert!(
+        n % 2 == 0,
+        "device fp8 quantize needs an even element count"
+    );
     if n == 0 {
         return Ok(Vec::new());
     }
     let (ptx, entry) = if e5m2 {
-        (crate::ptx_fp8_train::quantize_scaled_e5m2_ptx(), "quantize_scaled_e5m2")
+        (
+            crate::ptx_fp8_train::quantize_scaled_e5m2_ptx(),
+            "quantize_scaled_e5m2",
+        )
     } else {
-        (crate::ptx_fp8_train::quantize_scaled_e4m3_ptx(), "quantize_scaled_e4m3")
+        (
+            crate::ptx_fp8_train::quantize_scaled_e4m3_ptx(),
+            "quantize_scaled_e4m3",
+        )
     };
     let x_d = g.stream.memcpy_stod(x)?;
     let mut o_d = g.stream.memcpy_stod(&vec![0u8; n])?;
@@ -5394,13 +6258,19 @@ mod tests {
             let q5 = quantize_scaled_fp8(g, &x, r5, true).unwrap();
             for (i, &v) in x.iter().enumerate() {
                 let rec = e5m2_to_f32(q5[i]) / r5;
-                assert!((rec - v).abs() <= v.abs() * 0.13 + 1e-3, "e5m2 dev quant {v} -> {rec}");
+                assert!(
+                    (rec - v).abs() <= v.abs() * 0.13 + 1e-3,
+                    "e5m2 dev quant {v} -> {rec}"
+                );
             }
             let r4 = delayed_scale_recip(amax, E4M3_MAX);
             let q4 = quantize_scaled_fp8(g, &x, r4, false).unwrap();
             for (i, &v) in x.iter().enumerate() {
                 let rec = e4m3_to_f32(q4[i]) / r4;
-                assert!((rec - v).abs() <= v.abs() * 0.07 + 1e-3, "e4m3 dev quant {v} -> {rec}");
+                assert!(
+                    (rec - v).abs() <= v.abs() * 0.07 + 1e-3,
+                    "e4m3 dev quant {v} -> {rec}"
+                );
             }
             eprintln!("[gate] device fp8 quantize (hw cvt e5m2x2/e4m3x2) within ULP ✓");
         });
@@ -5451,8 +6321,17 @@ mod tests {
                 }
                 let got = gemm_nt_fp8_bwd(g, &dy, &w, m, k, n).unwrap();
                 let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
-                let st = crate::diff::assert_close(&format!("fp8_bwd {m}x{k}x{n}"), &got, &want, 1e-2, rel);
-                eprintln!("fp8_bwd {m}x{k}x{n} (E5M2·E4M3): max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                let st = crate::diff::assert_close(
+                    &format!("fp8_bwd {m}x{k}x{n}"),
+                    &got,
+                    &want,
+                    1e-2,
+                    rel,
+                );
+                eprintln!(
+                    "fp8_bwd {m}x{k}x{n} (E5M2·E4M3): max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
             }
             eprintln!("[gate] fp8 backward GEMM (E5M2·E4M3) matches f64 reference ✓");
         });
@@ -5560,10 +6439,19 @@ mod tests {
         let h100 = fake_target("NVIDIA H100 80GB HBM3", (9, 0));
         let ada = fake_target("NVIDIA GeForce RTX 4050 Laptop GPU", (8, 9));
         let ampere_consumer = fake_target("NVIDIA GeForce RTX 3090", (8, 6));
-        assert!(!a100.supports(FP8_MIN_CC), "A100 (cc 8.0) has no fp8 tensor cores");
-        assert!(!ampere_consumer.supports(FP8_MIN_CC), "GA102 (cc 8.6) has no fp8 tensor cores");
+        assert!(
+            !a100.supports(FP8_MIN_CC),
+            "A100 (cc 8.0) has no fp8 tensor cores"
+        );
+        assert!(
+            !ampere_consumer.supports(FP8_MIN_CC),
+            "GA102 (cc 8.6) has no fp8 tensor cores"
+        );
         assert!(ada.supports(FP8_MIN_CC), "Ada (cc 8.9) is the fp8 floor");
-        assert!(h100.supports(FP8_MIN_CC), "Hopper (cc 9.0) is above the floor — 9.0 > 8.9");
+        assert!(
+            h100.supports(FP8_MIN_CC),
+            "Hopper (cc 9.0) is above the floor — 9.0 > 8.9"
+        );
         assert!(fake_target("sm_120", (12, 0)).supports(FP8_MIN_CC));
 
         // The message a capability skip carries.
@@ -5583,7 +6471,8 @@ mod tests {
                 cc.1
             );
             if g.supports_fp8() {
-                g.require_fp8("probe").expect("a cc>=8.9 device must not decline fp8");
+                g.require_fp8("probe")
+                    .expect("a cc>=8.9 device must not decline fp8");
                 // ... and a real launcher must reach the device rather than decline.
                 let a: Vec<f32> = (0..16 * 32).map(|i| ((i % 5) as f32) - 2.0).collect();
                 let b: Vec<f32> = (0..32 * 8).map(|i| ((i % 3) as f32) - 1.0).collect();
@@ -5603,7 +6492,10 @@ mod tests {
                 let msg = e
                     .unsupported()
                     .expect("the decline must be a CAPABILITY error, not a driver error");
-                assert!(msg.contains("fp8 requires cc>=8.9"), "decline must name the capability: {msg}");
+                assert!(
+                    msg.contains("fp8 requires cc>=8.9"),
+                    "decline must name the capability: {msg}"
+                );
                 eprintln!("[gate] fp8 capability: {msg} \u{2713}");
             }
         });
@@ -5655,7 +6547,10 @@ mod tests {
     fn crate_source_list_is_complete() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let Ok(entries) = std::fs::read_dir(&dir) else {
-            eprintln!("[skip] {} unreadable — CRATE_SOURCES completeness unproven", dir.display());
+            eprintln!(
+                "[skip] {} unreadable — CRATE_SOURCES completeness unproven",
+                dir.display()
+            );
             return;
         };
         let mut on_disk: Vec<String> = entries
@@ -5718,13 +6613,23 @@ mod tests {
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim_start();
             let indent = line.len() - t.len();
-            let Some(sig) = ["pub fn ", "pub(crate) fn ", "fn ", "pub async fn ", "async fn "]
-                .iter()
-                .find_map(|p| t.strip_prefix(p))
-            else {
+            let Some(sig) = [
+                "pub fn ",
+                "pub(crate) fn ",
+                "fn ",
+                "pub async fn ",
+                "async fn ",
+            ]
+            .iter()
+            .find_map(|p| t.strip_prefix(p)) else {
                 continue;
             };
-            let name = sig.split(['(', '<']).next().unwrap_or("").trim().to_string();
+            let name = sig
+                .split(['(', '<'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let close = format!("{}}}", " ".repeat(indent));
             let mut body = String::new();
             for (j, l) in lines[i..].iter().enumerate() {
@@ -5750,11 +6655,16 @@ mod tests {
                 if let Some(tail) = after.strip_prefix('{') {
                     let group = &tail[..tail.find('}').unwrap_or(tail.len())];
                     refs.extend(
-                        group.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                        group
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
                     );
                 } else {
-                    let sym: String =
-                        after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    let sym: String = after
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
                     if !sym.is_empty() {
                         refs.push(sym);
                     }
@@ -5856,7 +6766,10 @@ mod tests {
             EXPECTED_LAUNCHERS,
             "the gated fp8 launcher set changed; update EXPECTED_LAUNCHERS deliberately: {checked:#?}"
         );
-        eprintln!("[gate] {} fp8 launchers are capability-gated: {checked:?} \u{2713}", checked.len());
+        eprintln!(
+            "[gate] {} fp8 launchers are capability-gated: {checked:?} \u{2713}",
+            checked.len()
+        );
     }
 
     /// **Every PTX module this crate emits without a device and without a MIR program**, as
@@ -5882,7 +6795,10 @@ mod tests {
             ("ptx::SAXPY", ptx::SAXPY.to_string()),
             ("ptx::VADD", ptx::VADD.to_string()),
             ("ptx::CAST_F32_F16", ptx::CAST_F32_F16.to_string()),
-            ("ptx::HEAD_TRANSPOSE_PTX", ptx::HEAD_TRANSPOSE_PTX.to_string()),
+            (
+                "ptx::HEAD_TRANSPOSE_PTX",
+                ptx::HEAD_TRANSPOSE_PTX.to_string(),
+            ),
             ("ptx::COPY_V4", ptx::COPY_V4.to_string()),
             ("ptx::REDUCE", ptx::REDUCE.to_string()),
             ("ptx::GEMM", ptx::GEMM.to_string()),
@@ -5890,19 +6806,34 @@ mod tests {
             // f32/f16/bf16 GEMM, norms, flash.
             ("ptx_gemm::gemm_rb_ptx", ptx_gemm::gemm_rb_ptx().to_string()),
             ("ptx_norm::norm_ptx", ptx_norm::norm_ptx().to_string()),
-            ("ptx_flash::flash_ptx", crate::ptx_flash::flash_ptx().to_string()),
+            (
+                "ptx_flash::flash_ptx",
+                crate::ptx_flash::flash_ptx().to_string(),
+            ),
             ("wmma::gemm_deep_ptx", wmma::gemm_deep_ptx().to_string()),
             ("wmma::gemm_cliff_ptx", wmma::gemm_cliff_ptx().to_string()),
             ("wmma::wmma_f16_ptx", wmma::wmma_f16_ptx().to_string()),
             ("wmma::wmma_bf16_ptx", wmma::wmma_bf16_ptx().to_string()),
-            ("wmma::roofline_f16_ptx", wmma::roofline_f16_ptx().to_string()),
-            ("wmma::wmma_f16_sm_static_ptx", wmma::wmma_f16_sm_static_ptx(256, 256, 256, false)),
-            ("wmma::wmma_f16_sm_static_ptx/128", wmma::wmma_f16_sm_static_ptx(256, 256, 256, true)),
+            (
+                "wmma::roofline_f16_ptx",
+                wmma::roofline_f16_ptx().to_string(),
+            ),
+            (
+                "wmma::wmma_f16_sm_static_ptx",
+                wmma::wmma_f16_sm_static_ptx(256, 256, 256, false),
+            ),
+            (
+                "wmma::wmma_f16_sm_static_ptx/128",
+                wmma::wmma_f16_sm_static_ptx(256, 256, 256, true),
+            ),
             // training: optimizers and backward.
             ("optim::ADAMW_STEP_PTX", optim::ADAMW_STEP_PTX.to_string()),
             ("optim::SGD_STEP_PTX", optim::SGD_STEP_PTX.to_string()),
             ("bwd::TRANSPOSE_F32_PTX", bwd::TRANSPOSE_F32_PTX.to_string()),
-            ("bwd::TRANSPOSE_CAST_F32_F16_PTX", bwd::TRANSPOSE_CAST_F32_F16_PTX.to_string()),
+            (
+                "bwd::TRANSPOSE_CAST_F32_F16_PTX",
+                bwd::TRANSPOSE_CAST_F32_F16_PTX.to_string(),
+            ),
             ("bwd::ACT_BWD_PTX", bwd::ACT_BWD_PTX.to_string()),
             ("bwd::TRAIN_ELEM_PTX", bwd::TRAIN_ELEM_PTX.to_string()),
             ("bwd::norm_bwd_ptx", bwd::norm_bwd_ptx().to_string()),
@@ -5911,78 +6842,198 @@ mod tests {
             ("conv::CONV2D", conv::CONV2D.to_string()),
             ("conv::conv2d_ptx", conv::conv2d_ptx(c, h, w, k, r, s)),
             ("conv::conv_wmma_ptx", conv::conv_wmma_ptx(c, h, w, k, r, s)),
-            ("conv::conv_wmma_strided_ptx", conv::conv_wmma_strided_ptx(c, h, w, k, r, s, 2)),
-            ("conv::conv_wmma_pad_ptx", conv::conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1)),
-            ("conv::conv_wmma_db_ptx", conv::conv_wmma_db_ptx(c, h, w, k, r, s)),
+            (
+                "conv::conv_wmma_strided_ptx",
+                conv::conv_wmma_strided_ptx(c, h, w, k, r, s, 2),
+            ),
+            (
+                "conv::conv_wmma_pad_ptx",
+                conv::conv_wmma_pad_ptx(c, h, w, k, r, s, 2, 1),
+            ),
+            (
+                "conv::conv_wmma_db_ptx",
+                conv::conv_wmma_db_ptx(c, h, w, k, r, s),
+            ),
             (
                 "conv::conv_wmma_epi_ptx",
                 conv::conv_wmma_epi_ptx(c, h, w, k, r, s, crate::ptx_wmma::Act::Relu, true),
             ),
-            ("conv::conv_wmma_splitk_ptx", conv::conv_wmma_splitk_ptx(c, h, w, k, r, s, 2)),
-            ("conv::conv_wmma_db_splitk_ptx", conv::conv_wmma_db_splitk_ptx(c, h, w, k, r, s, 2)),
+            (
+                "conv::conv_wmma_splitk_ptx",
+                conv::conv_wmma_splitk_ptx(c, h, w, k, r, s, 2),
+            ),
+            (
+                "conv::conv_wmma_db_splitk_ptx",
+                conv::conv_wmma_db_splitk_ptx(c, h, w, k, r, s, 2),
+            ),
             (
                 "conv::conv_wmma_pad_splitk_ptx",
                 conv::conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, 2),
             ),
-            ("conv::conv_splitk_reduce_ptx", conv::conv_splitk_reduce_ptx(k * 676, 2)),
+            (
+                "conv::conv_splitk_reduce_ptx",
+                conv::conv_splitk_reduce_ptx(k * 676, 2),
+            ),
             ("conv::bias_relu_ptx", conv::bias_relu_ptx(k, 676)),
-            ("conv::pad_nchw_copy_ptx", conv::pad_nchw_copy_ptx(c, h, w, 1)),
-            ("wino::wino_filter_xform_ptx", wino::wino_filter_xform_ptx(wc, wk, wm)),
-            ("wino::wino_input_xform_ptx", wino::wino_input_xform_ptx(wc, wh, ww, wm)),
-            ("wino::wino_output_xform_ptx", wino::wino_output_xform_ptx(wk, wh, ww, wm)),
+            (
+                "conv::pad_nchw_copy_ptx",
+                conv::pad_nchw_copy_ptx(c, h, w, 1),
+            ),
+            (
+                "wino::wino_filter_xform_ptx",
+                wino::wino_filter_xform_ptx(wc, wk, wm),
+            ),
+            (
+                "wino::wino_input_xform_ptx",
+                wino::wino_input_xform_ptx(wc, wh, ww, wm),
+            ),
+            (
+                "wino::wino_output_xform_ptx",
+                wino::wino_output_xform_ptx(wk, wh, ww, wm),
+            ),
             ("wino::wino_bgemm_ptx", wino::wino_bgemm_ptx(wc, nt, wk)),
             // quantized: int4, int8.
             ("int4::w4a16_ptx", int4::w4a16_ptx().to_string()),
-            ("int4::w4a16_splitk_ptx", int4::w4a16_splitk_ptx().to_string()),
-            ("int4::w4a16_static_ptx", int4::w4a16_static_ptx(256, 256, 256, false)),
+            (
+                "int4::w4a16_splitk_ptx",
+                int4::w4a16_splitk_ptx().to_string(),
+            ),
+            (
+                "int4::w4a16_static_ptx",
+                int4::w4a16_static_ptx(256, 256, 256, false),
+            ),
             ("int8::INT8_TILE", int8::INT8_TILE.to_string()),
             ("int8::int8_gemm_ptx", int8::int8_gemm_ptx().to_string()),
-            ("int8::int8_gemm_mt_ptx", int8::int8_gemm_mt_ptx().to_string()),
-            ("int8::int8_gemm_smdb_ptx", int8::int8_gemm_smdb_ptx().to_string()),
-            ("int8::int8_gemm_smdb_deq_ptx", int8::int8_gemm_smdb_deq_ptx().to_string()),
-            ("int8::int8_gemm_smdb128_ptx", int8::int8_gemm_smdb128_ptx().to_string()),
-            ("int8::int8_gemm_smdb_s3_ptx", int8::int8_gemm_smdb_s3_ptx().to_string()),
-            ("int8::int8_gemm_smdb_s4_ptx", int8::int8_gemm_smdb_s4_ptx().to_string()),
-            ("int8::int8_gemm_smdb128_s3_ptx", int8::int8_gemm_smdb128_s3_ptx().to_string()),
-            ("int8::int8_gemm_smdb128_s4_ptx", int8::int8_gemm_smdb128_s4_ptx().to_string()),
-            ("int8::int8_gemm_smdb_swz_ptx", int8::int8_gemm_smdb_swz_ptx().to_string()),
-            ("int8::int8_gemm_smdb_swz_splitk_ptx", int8::int8_gemm_smdb_swz_splitk_ptx().to_string()),
-            ("int8::int8_gemm_smdb_swz_deq_ptx", int8::int8_gemm_smdb_swz_deq_ptx().to_string()),
-            ("int8::int8_gemm_smdb128_swz_ptx", int8::int8_gemm_smdb128_swz_ptx().to_string()),
-            ("int8::int8_gemm_w64_swz_ptx", int8::int8_gemm_w64_swz_ptx().to_string()),
-            ("int8::int8_gemm_w64_swz_s3_ptx", int8::int8_gemm_w64_swz_s3_ptx().to_string()),
-            ("int8::int8_gemm_w64_swz_r8_ptx", int8::int8_gemm_w64_swz_r8_ptx().to_string()),
-            ("int8::int8_gemm_w64_swz_deq_ptx", int8::int8_gemm_w64_swz_deq_ptx().to_string()),
-            ("int8::int8_gemm_smdb_swz_static_ptx", int8::int8_gemm_smdb_swz_static_ptx(256, 256, 256, false)),
-            ("int8::int8_gemm_smdb_swz_raster_ptx", int8::int8_gemm_smdb_swz_raster_ptx(false, 8)),
+            (
+                "int8::int8_gemm_mt_ptx",
+                int8::int8_gemm_mt_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb_ptx",
+                int8::int8_gemm_smdb_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb_deq_ptx",
+                int8::int8_gemm_smdb_deq_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb128_ptx",
+                int8::int8_gemm_smdb128_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb_s3_ptx",
+                int8::int8_gemm_smdb_s3_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb_s4_ptx",
+                int8::int8_gemm_smdb_s4_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb128_s3_ptx",
+                int8::int8_gemm_smdb128_s3_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb128_s4_ptx",
+                int8::int8_gemm_smdb128_s4_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb_swz_ptx",
+                int8::int8_gemm_smdb_swz_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb_swz_splitk_ptx",
+                int8::int8_gemm_smdb_swz_splitk_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb_swz_deq_ptx",
+                int8::int8_gemm_smdb_swz_deq_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb128_swz_ptx",
+                int8::int8_gemm_smdb128_swz_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_w64_swz_ptx",
+                int8::int8_gemm_w64_swz_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_w64_swz_s3_ptx",
+                int8::int8_gemm_w64_swz_s3_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_w64_swz_r8_ptx",
+                int8::int8_gemm_w64_swz_r8_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_w64_swz_deq_ptx",
+                int8::int8_gemm_w64_swz_deq_ptx().to_string(),
+            ),
+            (
+                "int8::int8_gemm_smdb_swz_static_ptx",
+                int8::int8_gemm_smdb_swz_static_ptx(256, 256, 256, false),
+            ),
+            (
+                "int8::int8_gemm_smdb_swz_raster_ptx",
+                int8::int8_gemm_smdb_swz_raster_ptx(false, 8),
+            ),
             // fp8 (the licensed 8.4 / sm_89 family) and its sm_80-floored amax companion.
             ("fp8::FP8_TILE", fp8::FP8_TILE.to_string()),
             ("fp8::fp8_gemm_ptx", fp8::fp8_gemm_ptx().to_string()),
             ("fp8::fp8_gemm_mt_ptx", fp8::fp8_gemm_mt_ptx().to_string()),
             ("fp8::fp8_pipe_ptx", fp8::fp8_pipe_ptx().to_string()),
             ("fp8::fp8_pipe_w64_ptx", fp8::fp8_pipe_w64_ptx().to_string()),
-            ("fp8::fp8_pipe_w64_s3_ptx", fp8::fp8_pipe_w64_s3_ptx().to_string()),
-            ("fp8::fp8_pipe_cfg_ptx", fp8::fp8_pipe_cfg_ptx(128, 128, 64, 2, 4, 2, 16)),
+            (
+                "fp8::fp8_pipe_w64_s3_ptx",
+                fp8::fp8_pipe_w64_s3_ptx().to_string(),
+            ),
+            (
+                "fp8::fp8_pipe_cfg_ptx",
+                fp8::fp8_pipe_cfg_ptx(128, 128, 64, 2, 4, 2, 16),
+            ),
             ("fp8t::AMAX_PTX", fp8t::AMAX_PTX.to_string()),
-            ("fp8t::fp8_bwd_gemm_ptx", fp8t::fp8_bwd_gemm_ptx().to_string()),
-            ("fp8t::fp8_e5m2_gemm_ptx", fp8t::fp8_e5m2_gemm_ptx().to_string()),
-            ("fp8t::quantize_scaled_e4m3_ptx", fp8t::quantize_scaled_e4m3_ptx().to_string()),
-            ("fp8t::quantize_scaled_e5m2_ptx", fp8t::quantize_scaled_e5m2_ptx().to_string()),
+            (
+                "fp8t::fp8_bwd_gemm_ptx",
+                fp8t::fp8_bwd_gemm_ptx().to_string(),
+            ),
+            (
+                "fp8t::fp8_e5m2_gemm_ptx",
+                fp8t::fp8_e5m2_gemm_ptx().to_string(),
+            ),
+            (
+                "fp8t::quantize_scaled_e4m3_ptx",
+                fp8t::quantize_scaled_e4m3_ptx().to_string(),
+            ),
+            (
+                "fp8t::quantize_scaled_e5m2_ptx",
+                fp8t::quantize_scaled_e5m2_ptx().to_string(),
+            ),
             // paged KV serving.
-            ("paged::paged_attn_decode_ptx", crate::paged_attention::paged_attn_decode_ptx(128)),
+            (
+                "paged::paged_attn_decode_ptx",
+                crate::paged_attention::paged_attn_decode_ptx(128),
+            ),
             (
                 "paged::paged_attn_decode_int8_ptx",
                 crate::paged_attention::paged_attn_decode_int8_ptx(128),
             ),
-            ("paged::kv_append_ptx", crate::paged_attention::kv_append_ptx()),
-            ("paged::kv_append_int8_ptx", crate::paged_attention::kv_append_int8_ptx()),
+            (
+                "paged::kv_append_ptx",
+                crate::paged_attention::kv_append_ptx(),
+            ),
+            (
+                "paged::kv_append_int8_ptx",
+                crate::paged_attention::kv_append_int8_ptx(),
+            ),
         ]
         .into_iter()
         .map(|(n, p)| (n.to_string(), p))
         .collect();
         // The int8 variable-stage grid (including the two dynamic-SMEM depths) at this card's budget.
         for cfg in int8::INT8_STAGE_VARIANTS {
-            v.push((format!("int8::stage/{}", cfg.name), int8::int8_stage_ptx(cfg, 101 * 1024).0));
+            v.push((
+                format!("int8::stage/{}", cfg.name),
+                int8::int8_stage_ptx(cfg, 101 * 1024).0,
+            ));
         }
         // The fp8 deep-stage grid — one module per row, four of the six carving their rings out of the
         // dynamic window. These are the family whose `.version 8.4` is genuinely earned (`e4m3` mma).
@@ -6048,9 +7099,13 @@ mod tests {
                 .lines()
                 .next()
                 .and_then(|l| l.strip_prefix(".version "))
-                .unwrap_or_else(|| panic!("{what}: module does not open with a `.version` directive"));
+                .unwrap_or_else(|| {
+                    panic!("{what}: module does not open with a `.version` directive")
+                });
             match ABOVE_78.iter().find(|i| ptx.contains(**i)) {
-                Some(instr) => licensed.push(format!("{what} (.version {version}, needs `{instr}`)")),
+                Some(instr) => {
+                    licensed.push(format!("{what} (.version {version}, needs `{instr}`)"))
+                }
                 None => {
                     assert_eq!(
                         version, "7.8",
@@ -6141,7 +7196,10 @@ mod tests {
                 "smem_per_sm {} < the 48 KiB static per-block floor",
                 t.smem_per_sm
             );
-            assert!(t.l2_bytes > 0, "l2_bytes is 0 — the old .unwrap_or(0) default");
+            assert!(
+                t.l2_bytes > 0,
+                "l2_bytes is 0 — the old .unwrap_or(0) default"
+            );
             assert!(
                 t.total_mem > (1usize << 30),
                 "total_mem {} B is under 1 GiB",
@@ -6154,13 +7212,21 @@ mod tests {
             );
 
             // The legacy accessors must be the descriptor, not an independent re-query.
-            assert_eq!(g.sm_count(), t.sm_count, "sm_count() diverged from the target");
+            assert_eq!(
+                g.sm_count(),
+                t.sm_count,
+                "sm_count() diverged from the target"
+            );
             assert_eq!(
                 g.l2_cache_size() as usize,
                 t.l2_bytes,
                 "l2_cache_size() diverged from the target"
             );
-            assert_eq!(g.device_name(), t.name, "device_name() diverged from the target");
+            assert_eq!(
+                g.device_name(),
+                t.name,
+                "device_name() diverged from the target"
+            );
             // The **device**-arch flag spellings (NVRTC `--gpu-architecture`, ptxas `-arch`, cache
             // keys) must be derived from the probed capability, never a `compute_89`/`sm_89` literal
             // and never a PTX family floor (which is a property of a module's instruction mix, not of
@@ -6215,7 +7281,7 @@ mod tests {
         const WANT: usize = 64 * 1024;
         const THREADS: u32 = 256;
         let slots = WANT / 4; // u32 slots in the window
-        // `.extern .shared` = the dynamic window; its size comes from the launch, not the declaration.
+                              // `.extern .shared` = the dynamic window; its size comes from the launch, not the declaration.
         let body = format!(
             ".extern .shared .align 16 .b8 dsmem[];\n\
 .visible .entry dyn_smem_probe(.param .u32 pn, .param .u64 pout)\n{{\n\
@@ -6239,8 +7305,14 @@ E_FILL:\n\
     ret;\n}}\n"
         );
         let ptx = format!("{}{}", crate::ptx_target::HDR_SM80, body);
-        assert!(ptx.is_ascii(), "PTX must be pure ASCII (one non-ASCII char is a ptxas fatal)");
-        assert!(ptx.contains(crate::ptx_target::TARGET_SM80), "the probe must sit at the sm_80 floor");
+        assert!(
+            ptx.is_ascii(),
+            "PTX must be pure ASCII (one non-ASCII char is a ptxas fatal)"
+        );
+        assert!(
+            ptx.contains(crate::ptx_target::TARGET_SM80),
+            "the probe must sit at the sm_80 floor"
+        );
 
         with_gpu("dyn_smem", |g| {
             let budget = g.smem_budget();
@@ -6254,10 +7326,15 @@ E_FILL:\n\
             let n = slots as u32;
             let mut out_d = g.stream.alloc_zeros::<u32>(THREADS as usize).unwrap();
             let cfg = dyn_launch_cfg((1, 1, 1), (THREADS, 1, 1), WANT);
-            assert_eq!(cfg.shared_mem_bytes as usize, WANT, "the launch must carry the window size");
+            assert_eq!(
+                cfg.shared_mem_bytes as usize, WANT,
+                "the launch must carry the window size"
+            );
 
             // (1) With the opt-in: must launch and be exact at the far end of the window.
-            let f = g.function_dyn("dyn_smem_probe", &ptx, "dyn_smem_probe", WANT).unwrap();
+            let f = g
+                .function_dyn("dyn_smem_probe", &ptx, "dyn_smem_probe", WANT)
+                .unwrap();
             {
                 let mut bld = g.stream.launch_builder(&f);
                 bld.arg(&n).arg(&mut out_d);
@@ -6269,7 +7346,8 @@ E_FILL:\n\
                 let slot = slots - 1 - t; // the top of the 64 KiB window
                 let want = (slot as u32) * 3 + 1;
                 assert_eq!(
-                    got[t], want,
+                    got[t],
+                    want,
                     "lane {t} read slot {slot} (byte offset {}) of the dynamic window as {} — the \
                      window is not really {WANT} B",
                     slot * 4,
@@ -6279,7 +7357,9 @@ E_FILL:\n\
 
             // (2) Without the opt-in: the SAME launch must be refused. This is what proves step (1)
             //     was bought by `cuFuncSetAttribute` and not by some default.
-            let f_plain = g.function("dyn_smem_probe_noattr", &ptx, "dyn_smem_probe").unwrap();
+            let f_plain = g
+                .function("dyn_smem_probe_noattr", &ptx, "dyn_smem_probe")
+                .unwrap();
             let refused = {
                 let mut bld = g.stream.launch_builder(&f_plain);
                 bld.arg(&n).arg(&mut out_d);
@@ -6322,16 +7402,35 @@ E_FILL:\n\
         /// 24-vs-12 MB confusion the cliff comments carried).
         const L2_RTX_4050: usize = 25_165_824;
         let (lo, hi) = f16_regime_thresholds(L2_RTX_4050);
-        assert_eq!(lo, 16 * 1024 * 1024, "the L2-resident ceiling drifted off the old 16 MiB literal");
-        assert_eq!(hi, 48 * 1024 * 1024, "the HBM-bound floor drifted off the old 48 MiB literal");
+        assert_eq!(
+            lo,
+            16 * 1024 * 1024,
+            "the L2-resident ceiling drifted off the old 16 MiB literal"
+        );
+        assert_eq!(
+            hi,
+            48 * 1024 * 1024,
+            "the HBM-bound floor drifted off the old 48 MiB literal"
+        );
         assert_eq!((lo, hi), (16_777_216, 50_331_648));
         // Evaluation order: `·2/3`, not `/3·2`. Both agree here (24 MiB is a multiple of 3) and on the
         // A100/H100 L2s, but they diverge whenever `l2 % 3 == 2` — so the order is pinned, not lucky.
         assert_eq!(lo, L2_RTX_4050 * 2 / 3);
-        assert_eq!(f16_regime_thresholds(8).0, 5, "`*2/3` rounds down from 5.33");
-        assert_eq!(8 / 3 * 2, 4, "`/3*2` would truncate first — a different, lower band edge");
+        assert_eq!(
+            f16_regime_thresholds(8).0,
+            5,
+            "`*2/3` rounds down from 5.33"
+        );
+        assert_eq!(
+            8 / 3 * 2,
+            4,
+            "`/3*2` would truncate first — a different, lower band edge"
+        );
         // The shape ports: a 40 MiB A100 L2 and a 50 MiB H100 L2 scale, they do not inherit 16/48 MiB.
-        assert_eq!(f16_regime_thresholds(40 * 1024 * 1024), (27_962_026, 83_886_080));
+        assert_eq!(
+            f16_regime_thresholds(40 * 1024 * 1024),
+            (27_962_026, 83_886_080)
+        );
         assert!(f16_regime_thresholds(50 * 1024 * 1024).0 > lo);
 
         with_gpu("f16_regime_thresholds", |g| {
@@ -6412,7 +7511,10 @@ E_FILL:\n\
                     1e-2,
                     2e-3,
                 );
-                eprintln!("w4a16 sym  {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                eprintln!(
+                    "w4a16 sym  {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
 
                 // Asymmetric (per-group zero-point) — the AWQ/GPTQ form.
                 let qwz = quantize_weight_asymmetric(&w, n, k, GROUP_SIZE);
@@ -6425,7 +7527,10 @@ E_FILL:\n\
                     1e-2,
                     2e-3,
                 );
-                eprintln!("w4a16 asym {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", sz.max_abs, sz.max_rel);
+                eprintln!(
+                    "w4a16 asym {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    sz.max_abs, sz.max_rel
+                );
 
                 // M12 determinism: a second launch is byte-identical (fixed grid, no nondeterministic atomics).
                 let c2 = gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap();
@@ -6466,7 +7571,11 @@ E_FILL:\n\
         use crate::ptx_int4::{quantize_weight_symmetric, reference_w4a16, GROUP_SIZE};
         with_gpu("int4_splitk", |g| {
             let mut rng = crate::diff::Rng::new(0x4517);
-            for (m, n, k, sk) in [(64usize, 64usize, 256usize, 2usize), (64, 128, 512, 4), (128, 64, 1024, 8)] {
+            for (m, n, k, sk) in [
+                (64usize, 64usize, 256usize, 2usize),
+                (64, 128, 512, 4),
+                (128, 64, 1024, 8),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let w = rng.vec(n * k, -0.8, 0.8);
                 let qw = quantize_weight_symmetric(&w, n, k, GROUP_SIZE);
@@ -6506,10 +7615,29 @@ E_FILL:\n\
             let mut rng = crate::diff::Rng::new(0x4D0DE);
             const ROUNDS: usize = 8;
             const ITERS: usize = 50;
-            let f_base = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16").unwrap();
-            let f_sk = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "gemm_nt_w4a16_sk").unwrap();
-            let f_red = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "w4a16_splitk_reduce").unwrap();
-            for (m, n, k) in [(64usize, 256usize, 4096usize), (64, 512, 4096), (128, 256, 8192), (64, 128, 8192)] {
+            let f_base = g
+                .function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16")
+                .unwrap();
+            let f_sk = g
+                .function(
+                    "w4a16_sk",
+                    crate::ptx_int4::w4a16_splitk_ptx(),
+                    "gemm_nt_w4a16_sk",
+                )
+                .unwrap();
+            let f_red = g
+                .function(
+                    "w4a16_sk",
+                    crate::ptx_int4::w4a16_splitk_ptx(),
+                    "w4a16_splitk_reduce",
+                )
+                .unwrap();
+            for (m, n, k) in [
+                (64usize, 256usize, 4096usize),
+                (64, 512, 4096),
+                (128, 256, 8192),
+                (64, 128, 8192),
+            ] {
                 let flop = 2.0 * m as f64 * n as f64 * k as f64;
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let w = rng.vec(n * k, -0.8, 0.8);
@@ -6523,10 +7651,20 @@ E_FILL:\n\
                 let (mm, nn, kk) = (m as u32, n as u32, k as u32);
                 let base_ctas = (n / W4_BN) * (m / W4_BM);
                 eprintln!("\nM{m} N{n} K{k} (base grid = {base_ctas} CTAs):");
-                let cfg0 = LaunchConfig { grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1), block_dim: (W4_THREADS as u32, 1, 1), shared_mem_bytes: 0 };
+                let cfg0 = LaunchConfig {
+                    grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
+                    block_dim: (W4_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 {
                     let mut b = g.stream.launch_builder(&f_base);
-                    b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+                    b.arg(&mm)
+                        .arg(&nn)
+                        .arg(&kk)
+                        .arg(&a_d)
+                        .arg(&bq_d)
+                        .arg(&scl_d)
+                        .arg(&mut c_d);
                     unsafe { b.launch(cfg0).unwrap() };
                 }
                 g.stream.synchronize().unwrap();
@@ -6535,7 +7673,13 @@ E_FILL:\n\
                     let t0 = Instant::now();
                     for _ in 0..ITERS {
                         let mut b = g.stream.launch_builder(&f_base);
-                        b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+                        b.arg(&mm)
+                            .arg(&nn)
+                            .arg(&kk)
+                            .arg(&a_d)
+                            .arg(&bq_d)
+                            .arg(&scl_d)
+                            .arg(&mut c_d);
                         unsafe { b.launch(cfg0).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
@@ -6546,8 +7690,16 @@ E_FILL:\n\
                     if k % (sk * GROUP_SIZE) != 0 {
                         continue;
                     }
-                    let cfg_sk = LaunchConfig { grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, sk as u32), block_dim: (W4_THREADS as u32, 1, 1), shared_mem_bytes: 0 };
-                    let rcfg = LaunchConfig { grid_dim: (256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    let cfg_sk = LaunchConfig {
+                        grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, sk as u32),
+                        block_dim: (W4_THREADS as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let rcfg = LaunchConfig {
+                        grid_dim: (256, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
                     let (mn, skk) = ((m * n) as u32, sk as u32);
                     let mut split = f64::INFINITY;
                     for _ in 0..ROUNDS {
@@ -6555,7 +7707,13 @@ E_FILL:\n\
                         for _ in 0..ITERS {
                             {
                                 let mut b = g.stream.launch_builder(&f_sk);
-                                b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut part_d);
+                                b.arg(&mm)
+                                    .arg(&nn)
+                                    .arg(&kk)
+                                    .arg(&a_d)
+                                    .arg(&bq_d)
+                                    .arg(&scl_d)
+                                    .arg(&mut part_d);
                                 unsafe { b.launch(cfg_sk).unwrap() };
                             }
                             {
@@ -6567,7 +7725,12 @@ E_FILL:\n\
                         g.stream.synchronize().unwrap();
                         split = split.min(t0.elapsed().as_secs_f64() / ITERS as f64);
                     }
-                    eprintln!("  sk={sk} ({:>4} CTAs + reduce): {:>7.0} GFLOP/s  → {:.3}× base", base_ctas * sk, flop / split / 1e9, base / split);
+                    eprintln!(
+                        "  sk={sk} ({:>4} CTAs + reduce): {:>7.0} GFLOP/s  → {:.3}× base",
+                        base_ctas * sk,
+                        flop / split / 1e9,
+                        base / split
+                    );
                 }
             }
         });
@@ -6646,8 +7809,9 @@ E_FILL:\n\
             // Several multiples of 4, incl. ones smaller than and far larger than one wave, to exercise
             // the grid-stride loop (each thread copies many float4s) and the device-saturating grid cap.
             for &n in &[4usize, 4096, 1 << 20] {
-                let x: Vec<f32> =
-                    (0..n).map(|i| f32::from_bits(0xCAFE_0000 ^ i as u32)).collect();
+                let x: Vec<f32> = (0..n)
+                    .map(|i| f32::from_bits(0xCAFE_0000 ^ i as u32))
+                    .collect();
                 let out = copy(g, &x).unwrap();
                 assert_eq!(out.len(), n);
                 for i in 0..n {
@@ -6779,7 +7943,11 @@ E_FILL:\n\
             for (op, y, why) in [
                 (RED_DOT, None, "3 args at the 4-param reduce_dot"),
                 (RED_SUM, Some(&x), "4 args at the 3-param reduce_sum"),
-                (RED_DOT, Some(&short), "|y| != |x| reads past the end of y_d"),
+                (
+                    RED_DOT,
+                    Some(&short),
+                    "|y| != |x| reads past the end of y_d",
+                ),
             ] {
                 let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _ = reduce(g, op, &x, y.map(|v| v.as_slice()));
@@ -6800,8 +7968,7 @@ E_FILL:\n\
     #[test]
     fn norm_supported_covers_exactly_the_entries_norm_can_launch() {
         for op in -1i64..=6 {
-            let launchable =
-                std::panic::catch_unwind(|| norm_entry(op)).is_ok();
+            let launchable = std::panic::catch_unwind(|| norm_entry(op)).is_ok();
             assert_eq!(
                 norm_supported(op),
                 launchable,
@@ -7068,8 +8235,8 @@ E_FILL:\n\
                     v.smem_bytes()
                 );
                 let mut shapes = vec![
-                    (v.bm, v.bk, v.bn),                          // 1 CTA, 1 K-tile (full prologue guard)
-                    (v.bm, v.bk * 2, v.bn),                      // 1 CTA, 2 K-tiles
+                    (v.bm, v.bk, v.bn),     // 1 CTA, 1 K-tile (full prologue guard)
+                    (v.bm, v.bk * 2, v.bn), // 1 CTA, 2 K-tiles
                     (2 * v.bm, v.bk * (v.stages + 3), 2 * v.bn), // 4 CTAs, ring wrap (K-tiles > stages)
                     (v.bm, v.bk * (v.stages + 1), 3 * v.bn),     // rectangular, multi-tile
                 ];
@@ -7087,7 +8254,13 @@ E_FILL:\n\
                     let b = rng.vec(n * k, -1.0, 1.0);
                     let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
                     let c = gemm_nt_f16_pipe(g, &a, &b, m, k, n, v).unwrap();
-                    let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
+                    let s = crate::diff::assert_close(
+                        &format!("{} {m}x{k}x{n}", v.name),
+                        &c,
+                        &r,
+                        1e-2,
+                        2e-3,
+                    );
                     eprintln!(
                         "{} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e} (smem={}B)",
                         v.name,
@@ -7114,7 +8287,11 @@ E_FILL:\n\
         with_gpu("mma_swizzle", |g| {
             let mut rng = crate::diff::Rng::new(0x5712_BEEF);
             let wh = *pipe_variant("mma_nt_f16_128_bk32_s2_r16");
-            let swz = PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..wh };
+            let swz = PipeCfg {
+                name: "mma_nt_f16_128_bk32_s2_r16_swz",
+                pad: 0,
+                ..wh
+            };
             for (m, k, n) in [
                 (128usize, 32usize, 128usize),
                 (128, 64, 128),
@@ -7129,17 +8306,30 @@ E_FILL:\n\
                 let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
                 let c = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &swz).unwrap();
                 let s = crate::diff::assert_close(&format!("swz {m}x{k}x{n}"), &c, &r, 1e-2, 2e-3);
-                eprintln!("mma_swz {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                eprintln!(
+                    "mma_swz {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
             }
             // bf16 swizzle twin — the same swz path keyed to bf16 (precision-generic); the HBM-bound-4096³
             // win carried to the training dtype. bf16-rounded reference, the wider bf16 tolerance.
-            for (m, k, n) in [(128usize, 32usize, 128usize), (256, 160, 256), (128, 96, 384)] {
+            for (m, k, n) in [
+                (128usize, 32usize, 128usize),
+                (256, 160, 256),
+                (128, 96, 384),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let r = ref_nt_rounded(&a, &b, m, k, n, |x| half::bf16::from_f32(x).to_f32());
-                let c = gemm_nt_bf16_pipe_entry(g, &a, &b, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz").unwrap();
-                let s = crate::diff::assert_close(&format!("bf16 swz {m}x{k}x{n}"), &c, &r, 5e-2, 2e-2);
-                eprintln!("mma_bf16_swz {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                let c =
+                    gemm_nt_bf16_pipe_entry(g, &a, &b, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz")
+                        .unwrap();
+                let s =
+                    crate::diff::assert_close(&format!("bf16 swz {m}x{k}x{n}"), &c, &r, 5e-2, 2e-2);
+                eprintln!(
+                    "mma_bf16_swz {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
             }
         });
     }
@@ -7154,14 +8344,23 @@ E_FILL:\n\
         use half::bf16;
         with_gpu("wmma_bf16_pipe", |g| {
             let mut rng = crate::diff::Rng::new(0xB16E);
-            let shapes = [(128usize, 32usize, 128usize), (128, 64, 128), (256, 256, 256), (128, 160, 384)];
+            let shapes = [
+                (128usize, 32usize, 128usize),
+                (128, 64, 128),
+                (256, 256, 256),
+                (128, 160, 384),
+            ];
             for (m, k, n) in shapes {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let r = ref_nt_rounded(&a, &b, m, k, n, |x| bf16::from_f32(x).to_f32());
                 let c = gemm_nt_bf16_pipe(g, &a, &b, m, k, n).unwrap();
-                let s = crate::diff::assert_close(&format!("bf16 mma {m}x{k}x{n}"), &c, &r, 2e-2, 1e-2);
-                eprintln!("bf16 mma {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                let s =
+                    crate::diff::assert_close(&format!("bf16 mma {m}x{k}x{n}"), &c, &r, 2e-2, 1e-2);
+                eprintln!(
+                    "bf16 mma {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
             }
         });
     }
@@ -7288,7 +8487,11 @@ E_FILL:\n\
         use half::f16;
         with_gpu("wmma_sm_db_relu", |g| {
             let mut rng = crate::diff::Rng::new(0x0DB2);
-            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+            for (m, k, n) in [
+                (64usize, 64usize, 64usize),
+                (128, 256, 128),
+                (256, 128, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let c = gemm_nt_f16_sm_db_relu(g, &a, &b, m, k, n).unwrap();
@@ -7296,7 +8499,10 @@ E_FILL:\n\
                 for v in &mut r {
                     *v = v.max(0.0); // fused relu
                 }
-                assert!(c.iter().all(|&v| v >= 0.0), "relu output must be non-negative");
+                assert!(
+                    c.iter().all(|&v| v >= 0.0),
+                    "relu output must be non-negative"
+                );
                 let s = crate::diff::assert_close(
                     &format!("wmma_f16_sm_db_relu {m}x{k}x{n}"),
                     &c,
@@ -7327,7 +8533,11 @@ E_FILL:\n\
                 let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
-            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+            for (m, k, n) in [
+                (64usize, 64usize, 64usize),
+                (128, 256, 128),
+                (256, 128, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let base = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
@@ -7376,7 +8586,11 @@ E_FILL:\n\
                 let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
-            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+            for (m, k, n) in [
+                (64usize, 64usize, 64usize),
+                (128, 256, 128),
+                (256, 128, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let bias = rng.vec(n, -0.5, 0.5);
@@ -7446,7 +8660,11 @@ E_FILL:\n\
                 let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 512)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 128, 256),
+                (128, 256, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let bias = rng.vec(n, -0.5, 0.5);
@@ -7517,7 +8735,11 @@ E_FILL:\n\
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
             // All ≤1024 and 64-/16-divisible (the pipe_64_s6 regime the size-aware Linear dispatch picks).
-            for (m, k, n) in [(64usize, 64usize, 128usize), (128, 256, 256), (512, 128, 512)] {
+            for (m, k, n) in [
+                (64usize, 64usize, 128usize),
+                (128, 256, 256),
+                (512, 128, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let bias = rng.vec(n, -0.5, 0.5);
@@ -7545,27 +8767,72 @@ E_FILL:\n\
                 for (name, got, refv) in [
                     (
                         "bias",
-                        gemm_nt_f16_pipe_fused_bias_v(g, &a, &b, &bias, m, k, n, p, "wmma_nt_f16_pipe_64_s6_bias").unwrap(),
+                        gemm_nt_f16_pipe_fused_bias_v(
+                            g,
+                            &a,
+                            &b,
+                            &bias,
+                            m,
+                            k,
+                            n,
+                            p,
+                            "wmma_nt_f16_pipe_64_s6_bias",
+                        )
+                        .unwrap(),
                         with_bias(&id),
                     ),
                     (
                         "bias_relu",
-                        gemm_nt_f16_pipe_fused_bias_v(g, &a, &b, &bias, m, k, n, p, "wmma_nt_f16_pipe_64_s6_bias_relu").unwrap(),
+                        gemm_nt_f16_pipe_fused_bias_v(
+                            g,
+                            &a,
+                            &b,
+                            &bias,
+                            m,
+                            k,
+                            n,
+                            p,
+                            "wmma_nt_f16_pipe_64_s6_bias_relu",
+                        )
+                        .unwrap(),
                         with_bias(&|x| x.max(0.0)),
                     ),
                     (
                         "bias_silu",
-                        gemm_nt_f16_pipe_fused_bias_v(g, &a, &b, &bias, m, k, n, p, "wmma_nt_f16_pipe_64_s6_bias_silu").unwrap(),
+                        gemm_nt_f16_pipe_fused_bias_v(
+                            g,
+                            &a,
+                            &b,
+                            &bias,
+                            m,
+                            k,
+                            n,
+                            p,
+                            "wmma_nt_f16_pipe_64_s6_bias_silu",
+                        )
+                        .unwrap(),
                         with_bias(&silu),
                     ),
                     (
                         "bias_gelu",
-                        gemm_nt_f16_pipe_fused_bias_v(g, &a, &b, &bias, m, k, n, p, "wmma_nt_f16_pipe_64_s6_bias_gelu").unwrap(),
+                        gemm_nt_f16_pipe_fused_bias_v(
+                            g,
+                            &a,
+                            &b,
+                            &bias,
+                            m,
+                            k,
+                            n,
+                            p,
+                            "wmma_nt_f16_pipe_64_s6_bias_gelu",
+                        )
+                        .unwrap(),
                         with_bias(&gelu),
                     ),
                     (
                         "bias_residual",
-                        gemm_nt_f16_pipe64_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap(),
+                        gemm_nt_f16_pipe64_bias_residual(g, &a, &b, &bias, &resid, m, k, n)
+                            .unwrap(),
                         with_resid.clone(),
                     ),
                 ] {
@@ -7601,7 +8868,11 @@ E_FILL:\n\
                 let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 512)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 128, 256),
+                (128, 256, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let bias = rng.vec(n, -0.5, 0.5);
@@ -7664,7 +8935,11 @@ E_FILL:\n\
         use half::{bf16, f16};
         with_gpu("wmma_mma_bias_residual", |g| {
             let mut rng = crate::diff::Rng::new(0x3B1A_5E51);
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 512)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 128, 256),
+                (128, 256, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let bias = rng.vec(n, -0.5, 0.5);
@@ -7680,7 +8955,8 @@ E_FILL:\n\
                     r
                 };
                 let f16r = reference(&|x| f16::from_f32(x).to_f32());
-                let got_f16 = gemm_nt_f16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
+                let got_f16 =
+                    gemm_nt_f16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
                 let s = crate::diff::assert_close(
                     &format!("wmma_f16_mma_bias_residual {m}x{k}x{n}"),
                     &got_f16,
@@ -7694,7 +8970,8 @@ E_FILL:\n\
                 );
 
                 let bf16r = reference(&|x| bf16::from_f32(x).to_f32());
-                let got_bf16 = gemm_nt_bf16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
+                let got_bf16 =
+                    gemm_nt_bf16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
                 let s = crate::diff::assert_close(
                     &format!("wmma_bf16_mma_bias_residual {m}x{k}x{n}"),
                     &got_bf16,
@@ -7731,14 +9008,21 @@ E_FILL:\n\
             };
             let id = |x: f32| x;
             // M%128, N%64, K%32 — incl. a rectangular case (N=320 stresses the raster edge band).
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 320)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 128, 256),
+                (128, 256, 320),
+            ] {
                 let x = rng.vec(m * k, -1.0, 1.0);
                 let wg = rng.vec(n * k, -1.0, 1.0);
                 let wu = rng.vec(n * k, -1.0, 1.0);
                 let bg = rng.vec(n, -0.5, 0.5);
                 let bu = rng.vec(n, -0.5, 0.5);
                 // out[i,j] = act(round(x·Wgᵀ)[i,j] + (bg[j] if bias)) · (round(x·Wuᵀ)[i,j] + (bu[j] if bias))
-                let gate_ref = |round: &dyn Fn(f32) -> f32, act: &dyn Fn(f32) -> f32, with_bias: bool| -> Vec<f32> {
+                let gate_ref = |round: &dyn Fn(f32) -> f32,
+                                act: &dyn Fn(f32) -> f32,
+                                with_bias: bool|
+                 -> Vec<f32> {
                     let gp = ref_nt_rounded(&x, &wg, m, k, n, round);
                     let up = ref_nt_rounded(&x, &wu, m, k, n, round);
                     let mut out = vec![0f32; m * n];
@@ -7772,13 +9056,26 @@ E_FILL:\n\
                     ("mma_nt_f16_128x64_gate_gelu_bias_swz", &gelu, true),
                 ];
                 for (entry, act, wb) in f16_cases {
-                    let bias = if wb { Some((bg.as_slice(), bu.as_slice())) } else { None };
+                    let bias = if wb {
+                        Some((bg.as_slice(), bu.as_slice()))
+                    } else {
+                        None
+                    };
                     let got = gemm_nt_f16_gate(g, &x, &wg, &wu, bias, m, k, n, entry).unwrap();
                     let refv = gate_ref(&f16r, act, wb);
                     // Measured max_abs ≤ 4.3e-4 over these shapes; 5e-3 keeps ~10× margin (every lane
                     // passes on abs), with rel as a secondary guard for any future large-K shape.
-                    let s = crate::diff::assert_close(&format!("{entry} {m}x{k}x{n}"), &got, &refv, 5e-3, 2e-2);
-                    eprintln!("{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                    let s = crate::diff::assert_close(
+                        &format!("{entry} {m}x{k}x{n}"),
+                        &got,
+                        &refv,
+                        5e-3,
+                        2e-2,
+                    );
+                    eprintln!(
+                        "{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
                 }
                 // bf16 (training): the precision-generic twin.
                 let bf16r = |x: f32| bf16::from_f32(x).to_f32();
@@ -7795,12 +9092,25 @@ E_FILL:\n\
                     ("mma_nt_bf16_128x64_gate_gelu_bias_swz", &gelu, true),
                 ];
                 for (entry, act, wb) in bf16_cases {
-                    let bias = if wb { Some((bg.as_slice(), bu.as_slice())) } else { None };
+                    let bias = if wb {
+                        Some((bg.as_slice(), bu.as_slice()))
+                    } else {
+                        None
+                    };
                     let got = gemm_nt_bf16_gate(g, &x, &wg, &wu, bias, m, k, n, entry).unwrap();
                     let refv = gate_ref(&bf16r, act, wb);
                     // Measured max_abs ≤ 1.9e-4; 1e-2 keeps wide margin (every lane passes on abs).
-                    let s = crate::diff::assert_close(&format!("{entry} {m}x{k}x{n}"), &got, &refv, 1e-2, 3e-2);
-                    eprintln!("{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                    let s = crate::diff::assert_close(
+                        &format!("{entry} {m}x{k}x{n}"),
+                        &got,
+                        &refv,
+                        1e-2,
+                        3e-2,
+                    );
+                    eprintln!(
+                        "{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
                 }
             }
         });
@@ -7824,7 +9134,11 @@ E_FILL:\n\
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
             let id = |x: f32| x;
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 192, 384)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 128, 256),
+                (128, 192, 384),
+            ] {
                 let x = rng.vec(m * k, -1.0, 1.0);
                 let wg = rng.vec(n * k, -1.0, 1.0);
                 let wu = rng.vec(n * k, -1.0, 1.0);
@@ -7854,15 +9168,28 @@ E_FILL:\n\
                     ("fp8_gemm_pipe_gate_gelu_bias", &gelu, true),
                 ];
                 for (entry, act, wb) in cases {
-                    let bias = if wb { Some((bg.as_slice(), bu.as_slice())) } else { None };
+                    let bias = if wb {
+                        Some((bg.as_slice(), bu.as_slice()))
+                    } else {
+                        None
+                    };
                     let got = gemm_nt_fp8_gate(g, &x, &wg, &wu, bias, m, k, n, entry).unwrap();
                     let refv = gate_ref(act, wb);
                     // fp8 e4m3 is ~3-mantissa-bit, so the single GEMM is ~1e-2 accurate (cf. the fp8 bias
                     // gate) and the **product of two** GEMMs amplifies that: measured max_abs ≤ 9.6e-2 at
                     // K=192. 1.5e-1 keeps every lane passing on abs alone (a real bug = ~tens, so still a
                     // meaningful gate); rel is a secondary guard. This is fp8's honest precision, not slack.
-                    let s = crate::diff::assert_close(&format!("{entry} {m}x{k}x{n}"), &got, &refv, 1.5e-1, 6e-2);
-                    eprintln!("{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                    let s = crate::diff::assert_close(
+                        &format!("{entry} {m}x{k}x{n}"),
+                        &got,
+                        &refv,
+                        1.5e-1,
+                        6e-2,
+                    );
+                    eprintln!(
+                        "{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
                 }
             }
         });
@@ -7883,7 +9210,11 @@ E_FILL:\n\
                 let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
-            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+            for (m, k, n) in [
+                (64usize, 64usize, 64usize),
+                (128, 256, 128),
+                (256, 128, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let base = ref_nt_rounded(&a, &b, m, k, n, |x| bf16::from_f32(x).to_f32());
@@ -7934,7 +9265,11 @@ E_FILL:\n\
                 let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
-            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+            for (m, k, n) in [
+                (64usize, 64usize, 64usize),
+                (128, 256, 128),
+                (256, 128, 512),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let bias = rng.vec(n, -0.5, 0.5);
@@ -7950,7 +9285,11 @@ E_FILL:\n\
                 };
                 let id = |x: f32| x;
                 for (name, got, refv) in [
-                    ("bias", gemm_nt_bf16_sm_db_bias(g, &a, &b, &bias, m, k, n).unwrap(), with_bias(&id)),
+                    (
+                        "bias",
+                        gemm_nt_bf16_sm_db_bias(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&id),
+                    ),
                     (
                         "bias_relu",
                         gemm_nt_bf16_sm_db_bias_relu(g, &a, &b, &bias, m, k, n).unwrap(),
@@ -8072,7 +9411,12 @@ E_FILL:\n\
                     .unwrap_or_else(|_| panic!("{tag}: entry missing"));
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                bld.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&a_d)
+                    .arg(&b_d)
+                    .arg(&mut c_d);
                 unsafe { bld.launch(wmma_sm_cfg(m, n)).unwrap() };
                 outs.push(g.stream.memcpy_dtov(&c_d).unwrap());
             }
@@ -8109,14 +9453,20 @@ E_FILL:\n\
                 "expected an ELF SASS cubin, got {} bytes",
                 cubin.len()
             );
-            let tmp = std::env::temp_dir()
-                .join(format!("wukong_cubin_roundtrip_{}.cubin", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "wukong_cubin_roundtrip_{}.cubin",
+                std::process::id()
+            ));
             crate::cubin::write_atomic(&tmp, &cubin).unwrap();
             let m = g
                 .ctx
                 .load_module(Ptx::from_file(&tmp))
                 .expect("a cached cubin must load without JIT");
-            for entry in ["wmma_nt_f16_sm", "wmma_nt_f16_sm_db", "wmma_nt_f16_sm128_db"] {
+            for entry in [
+                "wmma_nt_f16_sm",
+                "wmma_nt_f16_sm_db",
+                "wmma_nt_f16_sm128_db",
+            ] {
                 m.load_function(entry)
                     .unwrap_or_else(|_| panic!("entry {entry} missing from the cubin"));
             }
@@ -8137,8 +9487,8 @@ E_FILL:\n\
             let _ = g.ctx.bind_to_thread();
             let ptx = crate::ptx_wmma::wmma_f16_ptx();
             let cubin = crate::cubin::ptx_to_cubin(ptx).expect("link PTX→cubin");
-            let tmp = std::env::temp_dir()
-                .join(format!("wukong_cubin_lat_{}.cubin", std::process::id()));
+            let tmp =
+                std::env::temp_dir().join(format!("wukong_cubin_lat_{}.cubin", std::process::id()));
             crate::cubin::write_atomic(&tmp, &cubin).unwrap();
 
             // First load = true cold for this process (may populate the driver's own JIT cache).
@@ -8161,8 +9511,14 @@ E_FILL:\n\
                 ptx.len(),
                 cubin.len()
             );
-            eprintln!("  cold PTX JIT (first this process) : {:>7.2} ms", cold_first * 1e3);
-            eprintln!("  PTX load, driver-cache warm       : {:>7.2} ms  (best/10)", ptx_warm * 1e3);
+            eprintln!(
+                "  cold PTX JIT (first this process) : {:>7.2} ms",
+                cold_first * 1e3
+            );
+            eprintln!(
+                "  PTX load, driver-cache warm       : {:>7.2} ms  (best/10)",
+                ptx_warm * 1e3
+            );
             eprintln!(
                 "  cubin load (Wukong cache)        : {:>7.2} ms  (best/10) | {:.1}× vs cold-first | {:.1}× vs PTX-warm",
                 cubin_warm * 1e3,
@@ -8250,7 +9606,14 @@ E_FILL:\n\
 
     /// f64 reference for **causal** single-head attention: query `i` attends only to keys `j ≤ i`
     /// (`scores[j>i] = -∞` → `exp = 0`). The independent oracle for `flash_d{d}_mc`.
-    fn ref_attn_causal(q: &[f32], k: &[f32], v: &[f32], seq: usize, d: usize, scale: f32) -> Vec<f32> {
+    fn ref_attn_causal(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq: usize,
+        d: usize,
+        scale: f32,
+    ) -> Vec<f32> {
         let mut o = vec![0.0f32; seq * d];
         for i in 0..seq {
             let mut scores = vec![f64::NEG_INFINITY; seq];
@@ -8305,8 +9668,7 @@ E_FILL:\n\
                 let oracle = ref_attn(&q, &k, &v, seq, d, scale);
                 for tiled in [false, true] {
                     let (entry, cfg) = flash_plan_forced(d, seq, tiled);
-                    let got =
-                        flash_attn_run(g, &q, &k, &v, seq, d, scale, &entry, cfg).unwrap();
+                    let got = flash_attn_run(g, &q, &k, &v, seq, d, scale, &entry, cfg).unwrap();
                     let s = crate::diff::assert_close(
                         &format!("flash s={seq} d={d} [{entry}]"),
                         &got,
@@ -8399,7 +9761,10 @@ E_FILL:\n\
                 }
             }
             let st = crate::diff::assert_close("mma_m16n8k16", &got, &refc, 1e-3, 1e-3);
-            eprintln!("mma.sync.m16n8k16 fp16 layout VERIFIED: max_abs={:.2e}", st.max_abs);
+            eprintln!(
+                "mma.sync.m16n8k16 fp16 layout VERIFIED: max_abs={:.2e}",
+                st.max_abs
+            );
         });
     }
 
@@ -8634,14 +9999,26 @@ E_FILL:\n\
                     shared_mem_bytes: 0,
                 };
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                bld.arg(&s32)
+                    .arg(&scale)
+                    .arg(&q_d)
+                    .arg(&k_d)
+                    .arg(&v_d)
+                    .arg(&mut o_d);
                 unsafe { bld.launch(cfg).unwrap() };
                 let got = g.stream.memcpy_dtov(&o_d).unwrap();
                 let (qf, kf, vf) = (back(&q16), back(&k16), back(&v16));
                 let mut max_abs = 0f64;
                 for h in 0..heads {
                     let sl = h * seq * d..(h + 1) * seq * d;
-                    let oracle = ref_attn(&qf[sl.clone()], &kf[sl.clone()], &vf[sl.clone()], seq, d, scale);
+                    let oracle = ref_attn(
+                        &qf[sl.clone()],
+                        &kf[sl.clone()],
+                        &vf[sl.clone()],
+                        seq,
+                        d,
+                        scale,
+                    );
                     let st = crate::diff::assert_close(
                         &format!("mh flash H={heads} s={seq} h={h}"),
                         &got[sl],
@@ -8692,7 +10069,12 @@ E_FILL:\n\
                         .function("flash", crate::ptx_flash::flash_ptx(), entry)
                         .unwrap();
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    bld.arg(&s32)
+                        .arg(&scale)
+                        .arg(&q_d)
+                        .arg(&k_d)
+                        .arg(&v_d)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                     let got = g.stream.memcpy_dtov(&o_d).unwrap();
                     let oracle = if causal {
@@ -8742,7 +10124,9 @@ E_FILL:\n\
                 let s32 = seq as u32;
                 for (warps, entry) in [(4u32, "flash_d64_mp4"), (8, "flash_d64_mp8")] {
                     let mut o_d = g.stream.alloc_zeros::<f32>(seq * d).unwrap();
-                    let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                    let f = g
+                        .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                        .unwrap();
                     let blocks = (seq / 16) as u32;
                     let cfg = LaunchConfig {
                         grid_dim: (blocks.div_ceil(warps), 1, 1),
@@ -8750,7 +10134,12 @@ E_FILL:\n\
                         shared_mem_bytes: 0,
                     };
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    bld.arg(&s32)
+                        .arg(&scale)
+                        .arg(&q_d)
+                        .arg(&k_d)
+                        .arg(&v_d)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                     let got = g.stream.memcpy_dtov(&o_d).unwrap();
                     let st = crate::diff::assert_close(
@@ -8800,10 +10189,14 @@ E_FILL:\n\
             let f_mp = g
                 .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp")
                 .unwrap();
-            let to16 =
-                |x: &[f32]| -> Vec<half::f16> { x.iter().map(|&v| half::f16::from_f32(v)).collect() };
+            let to16 = |x: &[f32]| -> Vec<half::f16> {
+                x.iter().map(|&v| half::f16::from_f32(v)).collect()
+            };
             // (heads, [seq lengths]) — single-head sweep, then the H=12 GPU-filled sweep.
-            for (heads, seqs) in [(1usize, &[512usize, 1024, 2048, 4096][..]), (12, &[512, 1024, 2048][..])] {
+            for (heads, seqs) in [
+                (1usize, &[512usize, 1024, 2048, 4096][..]),
+                (12, &[512, 1024, 2048][..]),
+            ] {
                 for &s in seqs {
                     let n = heads * s * d;
                     let qf = rng.vec(n, -1.0, 1.0);
@@ -8823,14 +10216,24 @@ E_FILL:\n\
                     // correctness: m and mp must agree (bit-identical math, SMEM vs global load only).
                     {
                         let mut b = g.stream.launch_builder(&f_m);
-                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        b.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(&mut o);
                         unsafe { b.launch(cfg).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
                     let out_m = g.stream.memcpy_dtov(&o).unwrap();
                     {
                         let mut b = g.stream.launch_builder(&f_mp);
-                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        b.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(&mut o);
                         unsafe { b.launch(cfg).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
@@ -8840,14 +10243,22 @@ E_FILL:\n\
                         .zip(&out_mp)
                         .map(|(a, b)| (a - b).abs())
                         .fold(0.0f32, f32::max);
-                    assert!(dmax < 5e-3, "H={heads} S={s}: mp vs m disagree, max_abs={dmax:.2e}");
+                    assert!(
+                        dmax < 5e-3,
+                        "H={heads} S={s}: mp vs m disagree, max_abs={dmax:.2e}"
+                    );
 
                     pin!();
                     let t_m = best_of(5, || {
                         let t0 = Instant::now();
                         for _ in 0..100 {
                             let mut b = g.stream.launch_builder(&f_m);
-                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                            b.arg(&ss)
+                                .arg(&scale)
+                                .arg(&q16)
+                                .arg(&k16)
+                                .arg(&v16)
+                                .arg(&mut o);
                             unsafe { b.launch(cfg).unwrap() };
                         }
                         g.stream.synchronize().unwrap();
@@ -8858,7 +10269,12 @@ E_FILL:\n\
                         let t0 = Instant::now();
                         for _ in 0..100 {
                             let mut b = g.stream.launch_builder(&f_mp);
-                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                            b.arg(&ss)
+                                .arg(&scale)
+                                .arg(&q16)
+                                .arg(&k16)
+                                .arg(&v16)
+                                .arg(&mut o);
                             unsafe { b.launch(cfg).unwrap() };
                         }
                         g.stream.synchronize().unwrap();
@@ -8892,24 +10308,40 @@ E_FILL:\n\
             let wa = rng.vec(1024 * 1024, -1.0, 1.0);
             let wb = rng.vec(1024 * 1024, -1.0, 1.0);
             macro_rules! pin {
-                () => {{ for _ in 0..40 { gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap(); } }};
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
             }
             for _ in 0..1500 {
                 gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
             }
-            let to16 = |x: &[f32]| -> Vec<half::f16> { x.iter().map(|&v| half::f16::from_f32(v)).collect() };
+            let to16 = |x: &[f32]| -> Vec<half::f16> {
+                x.iter().map(|&v| half::f16::from_f32(v)).collect()
+            };
             // (entry, warps): warps=1 is the 1-warp baseline (block 32, grid.x = S/16).
-            let variants = [("flash_d64_mp", 1u32), ("flash_d64_mp4", 4), ("flash_d64_mp8", 8)];
+            let variants = [
+                ("flash_d64_mp", 1u32),
+                ("flash_d64_mp4", 4),
+                ("flash_d64_mp8", 8),
+            ];
             let funcs: Vec<_> = variants
                 .iter()
-                .map(|(e, _)| g.function("flash", crate::ptx_flash::flash_ptx(), e).unwrap())
+                .map(|(e, _)| {
+                    g.function("flash", crate::ptx_flash::flash_ptx(), e)
+                        .unwrap()
+                })
                 .collect();
             let cfg_for = |w: u32, s: usize, heads: u32| LaunchConfig {
                 grid_dim: (((s / 16) as u32).div_ceil(w), heads, 1),
                 block_dim: (32 * w, 1, 1),
                 shared_mem_bytes: 0,
             };
-            for (heads, seqs) in [(1u32, &[512usize, 1024, 2048, 4096][..]), (12, &[512, 1024, 2048][..])] {
+            for (heads, seqs) in [
+                (1u32, &[512usize, 1024, 2048, 4096][..]),
+                (12, &[512, 1024, 2048][..]),
+            ] {
                 for &s in seqs {
                     let n = heads as usize * s * d;
                     let qf = rng.vec(n, -1.0, 1.0);
@@ -8925,7 +10357,12 @@ E_FILL:\n\
                     macro_rules! launch {
                         ($i:expr, $w:expr) => {{
                             let mut b = g.stream.launch_builder(&funcs[$i]);
-                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                            b.arg(&ss)
+                                .arg(&scale)
+                                .arg(&q16)
+                                .arg(&k16)
+                                .arg(&v16)
+                                .arg(&mut o);
                             unsafe { b.launch(cfg_for($w, s, heads)).unwrap() };
                         }};
                     }
@@ -8939,12 +10376,22 @@ E_FILL:\n\
                         launch!(i, w);
                         g.stream.synchronize().unwrap();
                         let out = g.stream.memcpy_dtov(&o).unwrap();
-                        let dmax = base.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                        assert!(dmax < 5e-3, "H={heads} S={s} {}: disagree max_abs={dmax:.2e}", variants[i].0);
+                        let dmax = base
+                            .iter()
+                            .zip(&out)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        assert!(
+                            dmax < 5e-3,
+                            "H={heads} S={s} {}: disagree max_abs={dmax:.2e}",
+                            variants[i].0
+                        );
                         pin!();
                         let t = best_of(5, || {
                             let t0 = Instant::now();
-                            for _ in 0..100 { launch!(i, w); }
+                            for _ in 0..100 {
+                                launch!(i, w);
+                            }
                             g.stream.synchronize().unwrap();
                             t0.elapsed().as_secs_f64() / 100.0
                         });
@@ -9109,7 +10556,12 @@ E_FILL:\n\
                 // exact, so the only honest deviation is f16 input quantization (~1e-3 here).
                 {
                     let mut bld = g.stream.launch_builder(&f_wmma4);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(&mut o);
                     unsafe { bld.launch(cfg_w).unwrap() };
                 }
                 g.stream.synchronize().unwrap();
@@ -9151,7 +10603,12 @@ E_FILL:\n\
                     let t0 = Instant::now();
                     for _ in 0..100 {
                         let mut bld = g.stream.launch_builder(&f_wmma);
-                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        bld.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(&mut o);
                         unsafe { bld.launch(cfg_w).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
@@ -9162,7 +10619,12 @@ E_FILL:\n\
                     let t0 = Instant::now();
                     for _ in 0..100 {
                         let mut bld = g.stream.launch_builder(&f_wmma4);
-                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        bld.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(&mut o);
                         unsafe { bld.launch(cfg_w).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
@@ -9216,8 +10678,9 @@ E_FILL:\n\
             let f_m = g
                 .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m")
                 .unwrap();
-            let to16 =
-                |x: &[f32]| -> Vec<half::f16> { x.iter().map(|&v| half::f16::from_f32(v)).collect() };
+            let to16 = |x: &[f32]| -> Vec<half::f16> {
+                x.iter().map(|&v| half::f16::from_f32(v)).collect()
+            };
             for s in [256usize, 512, 1024, 2048, 4096] {
                 let qf = rng.vec(s * d, -1.0, 1.0);
                 let kf = rng.vec(s * d, -1.0, 1.0);
@@ -9247,7 +10710,12 @@ E_FILL:\n\
                 let out_ref = g.stream.memcpy_dtov(&o).unwrap();
                 {
                     let mut b = g.stream.launch_builder(&f_m);
-                    b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                    b.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(&mut o);
                     unsafe { b.launch(cfg_w).unwrap() };
                 }
                 g.stream.synchronize().unwrap();
@@ -9257,7 +10725,10 @@ E_FILL:\n\
                     .zip(&out_m)
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
-                assert!(mdiff < 5e-2, "S={s}: mma flash vs f32 ref disagree, max_abs={mdiff:.2e}");
+                assert!(
+                    mdiff < 5e-2,
+                    "S={s}: mma flash vs f32 ref disagree, max_abs={mdiff:.2e}"
+                );
 
                 pin!();
                 let t_til = best_of(5, || {
@@ -9275,7 +10746,12 @@ E_FILL:\n\
                     let t0 = Instant::now();
                     for _ in 0..100 {
                         let mut b = g.stream.launch_builder(&f_w4);
-                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        b.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(&mut o);
                         unsafe { b.launch(cfg_w).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
@@ -9286,7 +10762,12 @@ E_FILL:\n\
                     let t0 = Instant::now();
                     for _ in 0..100 {
                         let mut b = g.stream.launch_builder(&f_m);
-                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        b.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(&mut o);
                         unsafe { b.launch(cfg_w).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
@@ -9455,7 +10936,11 @@ E_FILL:\n\
                 let (p, q) = (h - r + 1, wd - s + 1);
                 let x = rng.vec(c * h * wd, -1.0, 1.0);
                 let w = rng.vec(k * c * r * s, -1.0, 1.0);
-                let entry = if sk == 1 { "conv2d_wmma" } else { "conv2d_wmma_splitk" };
+                let entry = if sk == 1 {
+                    "conv2d_wmma"
+                } else {
+                    "conv2d_wmma_splitk"
+                };
                 let sb_ptx = if sk == 1 {
                     crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s)
                 } else {
@@ -9488,7 +10973,11 @@ E_FILL:\n\
                 };
                 let mut outs: Vec<Vec<f32>> = Vec::new();
                 for ptx in [&sb_ptx, &db_ptx] {
-                    let f = g.load_module_cached(ptx).unwrap().load_function(entry).unwrap();
+                    let f = g
+                        .load_module_cached(ptx)
+                        .unwrap()
+                        .load_function(entry)
+                        .unwrap();
                     let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
                     if sk == 1 {
                         let mut b = g.stream.launch_builder(&f);
@@ -9563,10 +11052,17 @@ E_FILL:\n\
                         })
                         .sum::<f64>()
                         .sqrt();
-                    let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                    let ref_f = oracle
+                        .iter()
+                        .map(|b| (*b as f64) * (*b as f64))
+                        .sum::<f64>()
+                        .sqrt();
                     let fro_rel = err_f / ref_f.max(1e-9);
-                    let max_abs =
-                        got.iter().zip(&oracle).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0.0, f64::max);
+                    let max_abs = got
+                        .iter()
+                        .zip(&oracle)
+                        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+                        .fold(0.0, f64::max);
                     // fp16 + amplification + the small-output shapes here; ≫ a real-bug threshold (1e-1).
                     let fro_tol = if m == 4 { 8e-3 } else { 4e-3 };
                     let abs_backstop = if m == 4 { 3e-1 } else { 1.5e-1 };
@@ -9618,10 +11114,18 @@ E_FILL:\n\
                 let conv = ref_conv2d(&x, &w, c, h, width, k, r, s);
                 let (p, q) = (h - r + 1, width - s + 1);
                 let bias_v = rng.vec(k, -0.5, 0.5);
-                for (use_bias, act) in
-                    [(true, Act::None), (true, Act::Relu), (false, Act::Relu), (true, Act::Silu), (true, Act::Gelu)]
-                {
-                    let bias = if use_bias { Some(bias_v.as_slice()) } else { None };
+                for (use_bias, act) in [
+                    (true, Act::None),
+                    (true, Act::Relu),
+                    (false, Act::Relu),
+                    (true, Act::Silu),
+                    (true, Act::Gelu),
+                ] {
+                    let bias = if use_bias {
+                        Some(bias_v.as_slice())
+                    } else {
+                        None
+                    };
                     let act_name = match act {
                         Act::None => "none",
                         Act::Relu => "relu",
@@ -9640,7 +11144,9 @@ E_FILL:\n\
                     }
                     let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
                     let st = crate::diff::assert_close(
-                        &format!("conv_epi C{c} {h}x{width} K{k} {r}x{s} bias={use_bias} {act_name}"),
+                        &format!(
+                            "conv_epi C{c} {h}x{width} K{k} {r}x{s} bias={use_bias} {act_name}"
+                        ),
                         &got,
                         &oracle,
                         5e-2,
@@ -9659,7 +11165,15 @@ E_FILL:\n\
     fn conv2d_wmma_strided_matches_reference_within_tol() {
         // Strided conv f64 reference (output (p,q) reads input (p·st+r, q·st+s)).
         fn ref_strided(
-            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize, st: usize,
+            x: &[f32],
+            w: &[f32],
+            c: usize,
+            h: usize,
+            wd: usize,
+            k: usize,
+            r: usize,
+            s: usize,
+            st: usize,
         ) -> Vec<f32> {
             let p = (h - r) / st + 1;
             let q = (wd - s) / st + 1;
@@ -9725,8 +11239,16 @@ E_FILL:\n\
         // coordinate outside [0,H)×[0,W) contributing 0 (zero-padding). Signed math avoids usize underflow.
         #[allow(clippy::too_many_arguments)]
         fn ref_padded(
-            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
-            st: usize, pad: usize,
+            x: &[f32],
+            w: &[f32],
+            c: usize,
+            h: usize,
+            wd: usize,
+            k: usize,
+            r: usize,
+            s: usize,
+            st: usize,
+            pad: usize,
         ) -> Vec<f32> {
             let p = (h + 2 * pad - r) / st + 1;
             let q = (wd + 2 * pad - s) / st + 1;
@@ -9758,7 +11280,9 @@ E_FILL:\n\
             let mut rng = crate::diff::Rng::new(0x9AD12C);
             // (C,H,W,K,R,S,stride,pad): canonical "same" 3×3 p1; ResNet 3×3 s2 p1 + 7×7 s2 p3 stem; 5×5 p2.
             let cases = [
-                (16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 1usize, 1usize),
+                (
+                    16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 1usize, 1usize,
+                ),
                 (32, 28, 28, 64, 3, 3, 1, 1),
                 (16, 56, 56, 32, 3, 3, 2, 1),
                 (3, 64, 64, 64, 7, 7, 2, 3),
@@ -9795,8 +11319,16 @@ E_FILL:\n\
         // same padded conv as the f64 oracle. Same cases/tolerance as the bounds-checked padded gate.
         #[allow(clippy::too_many_arguments)]
         fn ref_padded(
-            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
-            st: usize, pad: usize,
+            x: &[f32],
+            w: &[f32],
+            c: usize,
+            h: usize,
+            wd: usize,
+            k: usize,
+            r: usize,
+            s: usize,
+            st: usize,
+            pad: usize,
         ) -> Vec<f32> {
             let p = (h + 2 * pad - r) / st + 1;
             let q = (wd + 2 * pad - s) / st + 1;
@@ -9827,7 +11359,9 @@ E_FILL:\n\
         with_gpu("conv2d_wmma_padded_explicit", |g| {
             let mut rng = crate::diff::Rng::new(0xE7912D);
             let cases = [
-                (16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 1usize, 1usize),
+                (
+                    16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 1usize, 1usize,
+                ),
                 (32, 28, 28, 64, 3, 3, 1, 1),
                 (16, 56, 56, 32, 3, 3, 2, 1),
                 (3, 64, 64, 64, 7, 7, 2, 3),
@@ -9840,7 +11374,8 @@ E_FILL:\n\
                 }
                 let x = rng.vec(c * h * width, -1.0, 1.0);
                 let w = rng.vec(k * c * r * s, -1.0, 1.0);
-                let got = conv2d_wmma_padded_explicit(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let got =
+                    conv2d_wmma_padded_explicit(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
                 let oracle = ref_padded(&x, &w, c, h, width, k, r, s, st, pad);
                 let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
                 let stx = crate::diff::assert_close(
@@ -9865,8 +11400,16 @@ E_FILL:\n\
         // the printed sk confirms the split-K reduce path is actually exercised.
         #[allow(clippy::too_many_arguments)]
         fn ref_padded(
-            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
-            st: usize, pad: usize,
+            x: &[f32],
+            w: &[f32],
+            c: usize,
+            h: usize,
+            wd: usize,
+            k: usize,
+            r: usize,
+            s: usize,
+            st: usize,
+            pad: usize,
         ) -> Vec<f32> {
             let p = (h + 2 * pad - r) / st + 1;
             let q = (wd + 2 * pad - s) / st + 1;
@@ -9899,7 +11442,9 @@ E_FILL:\n\
             let sm = g.sm_count() as usize;
             // (C,H,W,K,R,S,stride,pad): deep-channel small-spatial downsamples (sk>1) + one sk==1 control.
             let cases = [
-                (128usize, 28usize, 28usize, 128usize, 3usize, 3usize, 2usize, 1usize),
+                (
+                    128usize, 28usize, 28usize, 128usize, 3usize, 3usize, 2usize, 1usize,
+                ),
                 (256, 14, 14, 256, 3, 3, 1, 1),
                 (64, 56, 56, 64, 3, 3, 2, 1),
                 (128, 28, 28, 128, 3, 3, 1, 1),
@@ -9910,10 +11455,12 @@ E_FILL:\n\
                 if k < 16 || c * r * s < 16 || p * q < 16 {
                     continue;
                 }
-                let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, width, k, r, s, st, pad, sm);
+                let sk =
+                    crate::ptx_conv::conv_splitk_factor_affine(c, h, width, k, r, s, st, pad, sm);
                 let x = rng.vec(c * h * width, -1.0, 1.0);
                 let w = rng.vec(k * c * r * s, -1.0, 1.0);
-                let got = conv2d_wmma_padded_auto(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let got =
+                    conv2d_wmma_padded_auto(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
                 let oracle = ref_padded(&x, &w, c, h, width, k, r, s, st, pad);
                 let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
                 let stx = crate::diff::assert_close(
@@ -9939,8 +11486,16 @@ E_FILL:\n\
         // lane; the printed routing confirms the dispatch picked what we expect.
         #[allow(clippy::too_many_arguments)]
         fn ref_affine(
-            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
-            st: usize, pad: usize,
+            x: &[f32],
+            w: &[f32],
+            c: usize,
+            h: usize,
+            wd: usize,
+            k: usize,
+            r: usize,
+            s: usize,
+            st: usize,
+            pad: usize,
         ) -> Vec<f32> {
             let p = (h + 2 * pad - r) / st + 1;
             let q = (wd + 2 * pad - s) / st + 1;
@@ -9976,7 +11531,10 @@ E_FILL:\n\
             // sent every case to the GEMM lane would still satisfy the accuracy bound below and
             // still print "winograd", leaving the Winograd kernel with zero coverage.
             let cases = [
-                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 0usize, "winograd", ""),
+                (
+                    64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 0usize, "winograd",
+                    "",
+                ),
                 (128, 28, 28, 128, 3, 3, 1, 0, "winograd", ""),
                 (32, 64, 64, 64, 3, 3, 1, 0, "valid-auto", "C<64"),
                 (64, 56, 56, 64, 1, 1, 1, 0, "valid-auto", "1x1"),
@@ -10006,7 +11564,11 @@ E_FILL:\n\
                     })
                     .sum::<f64>()
                     .sqrt();
-                let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                let ref_f = oracle
+                    .iter()
+                    .map(|b| (*b as f64) * (*b as f64))
+                    .sum::<f64>()
+                    .sqrt();
                 let fro_rel = err_f / ref_f.max(1e-9);
                 // Per-element backstop, the same one `conv_winograd_matches_reference_within_tol`
                 // carries and for the same stated reason: a Frobenius ratio over 186k outputs whose
@@ -10079,7 +11641,16 @@ E_FILL:\n\
                 let mut o_d = g.stream.alloc_zeros::<f32>(k * pq).unwrap();
                 let cfg = conv_wmma_cfg(h, wd, k, r, s);
                 let ef = g
-                    .load_module_cached(&crate::ptx_conv::conv_wmma_epi_ptx(c, h, wd, k, r, s, Act::Relu, true))
+                    .load_module_cached(&crate::ptx_conv::conv_wmma_epi_ptx(
+                        c,
+                        h,
+                        wd,
+                        k,
+                        r,
+                        s,
+                        Act::Relu,
+                        true,
+                    ))
                     .unwrap()
                     .load_function("conv2d_wmma")
                     .unwrap();
@@ -10093,7 +11664,11 @@ E_FILL:\n\
                     .unwrap()
                     .load_function("bias_relu")
                     .unwrap();
-                let cfg_br = LaunchConfig { grid_dim: (((k * pq) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let cfg_br = LaunchConfig {
+                    grid_dim: (((k * pq) as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 let fused = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut b = g.stream.launch_builder(&ef);
                     b.arg(&x_d).arg(&w_d).arg(&mut *o).arg(&bias_d);
@@ -10116,13 +11691,38 @@ E_FILL:\n\
                 unfused(g, &mut o_d);
                 g.stream.synchronize().unwrap();
                 let uo = g.stream.memcpy_dtov(&o_d).unwrap();
-                let maxd = fo.iter().zip(&uo).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let maxd = fo
+                    .iter()
+                    .zip(&uo)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
                 assert!(maxd < 1e-4, "fused vs unfused mismatch: {maxd:.2e}");
 
                 let iters = 50usize;
-                let t_fused = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { fused(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
-                let t_plain = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { plain(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
-                let t_unf = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { unfused(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
+                let t_fused = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        fused(g, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_plain = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        plain(g, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_unf = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        unfused(g, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
                 let flop = conv_flop(c, h, wd, k, r, s);
                 eprintln!(
                     "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: fused {:>6.0} GF | unfused(conv+pass) {:>6.0} GF | fusion {:>4.2}x faster | epilogue {:>+4.1}% vs plain ({:>6.0} GF)",
@@ -10166,7 +11766,7 @@ E_FILL:\n\
             const ROUNDS: usize = 5;
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             let m = 4usize; // F(4×4,3×3) — the cuDNN-grade tile
-            // Large feature maps (3×3, stride 1): T=tiles is a fat GEMM N → Winograd's regime.
+                            // Large feature maps (3×3, stride 1): T=tiles is a fat GEMM N → Winograd's regime.
             let cases = [
                 (64usize, 56usize, 56usize, 64usize),
                 (32, 64, 64, 64),
@@ -10210,11 +11810,23 @@ E_FILL:\n\
                     .load_function("wino_output_xform")
                     .unwrap();
                 let (kc, cnt) = (k * c, c * nt);
-                let cfg1 = LaunchConfig { grid_dim: ((kc as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
-                let cfg2 = LaunchConfig { grid_dim: ((cnt as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                let cfg1 = LaunchConfig {
+                    grid_dim: ((kc as u32).div_ceil(128), 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let cfg2 = LaunchConfig {
+                    grid_dim: ((cnt as u32).div_ceil(128), 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 let mut cfg3 = conv_wmma_cfg(1, nt, k, 1, 1);
                 cfg3.grid_dim.2 = aa as u32;
-                let cfg4 = LaunchConfig { grid_dim: (((k * nt) as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                let cfg4 = LaunchConfig {
+                    grid_dim: (((k * nt) as u32).div_ceil(128), 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 let wino = |g: &Gpu,
                             u: &mut cudarc::driver::CudaSlice<f16>,
                             v: &mut cudarc::driver::CudaSlice<f16>,
@@ -10236,10 +11848,25 @@ E_FILL:\n\
                 wino(g, &mut u_d, &mut v_d, &mut m_d, &mut o_d);
                 g.stream.synchronize().unwrap();
                 let got = g.stream.memcpy_dtov(&o_d).unwrap();
-                let err_f = got.iter().zip(&oracle).map(|(a, b)| { let d = *a as f64 - *b as f64; d * d }).sum::<f64>().sqrt();
-                let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                let err_f = got
+                    .iter()
+                    .zip(&oracle)
+                    .map(|(a, b)| {
+                        let d = *a as f64 - *b as f64;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                let ref_f = oracle
+                    .iter()
+                    .map(|b| (*b as f64) * (*b as f64))
+                    .sum::<f64>()
+                    .sqrt();
                 let fro_rel = err_f / ref_f.max(1e-9);
-                assert!(fro_rel < 8e-3, "winograd C{c} {h}x{wd}: rel-Frobenius {fro_rel:.3e}");
+                assert!(
+                    fro_rel < 8e-3,
+                    "winograd C{c} {h}x{wd}: rel-Frobenius {fro_rel:.3e}"
+                );
 
                 // Implicit-GEMM resident (Wukong's other conv path, R=S=3).
                 let xi_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
@@ -10264,8 +11891,15 @@ E_FILL:\n\
                 let (cudnn_algo, g_c) = if have_cudnn {
                     let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, 3, 3, 0, 1).unwrap();
                     crate::diff::assert_close(&format!("cudnn C{c}"), &yc, &oracle, 5e-2, 5e-2);
-                    let t_c = best_of(ROUNDS, || time_cudnn_conv2d(g, c, h, wd, k, 3, 3, 0, 1, 100).unwrap().0);
-                    (cudnn_fwd_algo_name(algo), conv_flop(c, h, wd, k, 3, 3) / t_c)
+                    let t_c = best_of(ROUNDS, || {
+                        time_cudnn_conv2d(g, c, h, wd, k, 3, 3, 0, 1, 100)
+                            .unwrap()
+                            .0
+                    });
+                    (
+                        cudnn_fwd_algo_name(algo),
+                        conv_flop(c, h, wd, k, 3, 3) / t_c,
+                    )
                 } else {
                     ("n/a", 0.0)
                 };
@@ -10273,13 +11907,17 @@ E_FILL:\n\
                 let iters = 50usize;
                 let t_wino = best_of(ROUNDS, || {
                     let t0 = Instant::now();
-                    for _ in 0..iters { wino(g, &mut u_d, &mut v_d, &mut m_d, &mut o_d); }
+                    for _ in 0..iters {
+                        wino(g, &mut u_d, &mut v_d, &mut m_d, &mut o_d);
+                    }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
                 let t_ig = best_of(ROUNDS, || {
                     let t0 = Instant::now();
-                    for _ in 0..iters { ig(g, &mut oi_d); }
+                    for _ in 0..iters {
+                        ig(g, &mut oi_d);
+                    }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
@@ -10311,8 +11949,8 @@ E_FILL:\n\
                 (64usize, 28usize, 28usize, 64usize, 3usize, 3usize, 4usize), // GK=576
                 (128, 14, 14, 128, 3, 3, 8),                                  // GK=1152
                 (32, 16, 16, 32, 3, 3, 2),                                    // GK=288 (gk_per=144)
-                (64, 16, 16, 32, 1, 1, 4),                                    // 1×1, GK=64 (gk_per=16)
-                (48, 18, 18, 16, 3, 3, 3),                                    // GK=432 (gk_per=144)
+                (64, 16, 16, 32, 1, 1, 4), // 1×1, GK=64 (gk_per=16)
+                (48, 18, 18, 16, 3, 3, 3), // GK=432 (gk_per=144)
             ];
             for (c, h, width, k, r, s, sk) in cases {
                 if !crate::ptx_conv::wmma_applies(c, h, width, k, r, s) {
@@ -10333,7 +11971,10 @@ E_FILL:\n\
                 );
                 // M12 determinism: disjoint planes + fixed ascending-z reduction ⇒ bit-reproducible.
                 let again = conv2d_wmma_splitk(g, &x, &w, c, h, width, k, r, s, sk).unwrap();
-                assert_eq!(got, again, "split-K conv must be deterministic (C{c} {r}x{s} sk{sk})");
+                assert_eq!(
+                    got, again,
+                    "split-K conv must be deterministic (C{c} {r}x{s} sk{sk})"
+                );
                 eprintln!(
                     "conv2d_wmma_splitk C{c} {h}x{width} K{k} {r}x{s} sk{sk}: max_abs={:.2e} max_rel={:.2e}",
                     st.max_abs, st.max_rel
@@ -10364,20 +12005,32 @@ E_FILL:\n\
         with_gpu("conv_vs_peers", |g| {
             if !peers_available(g) {
                 peer_gate("conv_vs_peers");
-                eprintln!("[skip] conv_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] conv_vs_peers: NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
             let mut rng = crate::diff::Rng::new(0xC04F1E);
 
             // --- Correctness first: naive CUDA-C conv matches the f64 oracle on small shapes. ---
-            for (c, h, wd, k, r, s) in [(3usize, 16usize, 16usize, 8usize, 3usize, 3usize), (16, 24, 24, 8, 5, 5)] {
+            for (c, h, wd, k, r, s) in [
+                (3usize, 16usize, 16usize, 8usize, 3usize, 3usize),
+                (16, 24, 24, 8, 5, 5),
+            ] {
                 let x = rng.vec(c * h * wd, -1.0, 1.0);
                 let w = rng.vec(k * c * r * s, -1.0, 1.0);
                 let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
                 let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
                 let rel = ((8.0 * ((c * r * s) as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
-                crate::diff::assert_close(&format!("naive conv C{c} {r}x{s}"), &naive, &oracle, 1e-4, rel);
+                crate::diff::assert_close(
+                    &format!("naive conv C{c} {r}x{s}"),
+                    &naive,
+                    &oracle,
+                    1e-4,
+                    rel,
+                );
             }
             eprintln!("[gate] naive CUDA-C conv matches the f64 oracle ✓");
 
@@ -10401,8 +12054,14 @@ E_FILL:\n\
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
             for (c, h, wd, k, r, s) in cases {
-                assert!(crate::ptx_conv::tiled_applies(c, h, wd, k, r, s), "shape not tiled");
-                assert!(crate::ptx_conv::wmma_applies(c, h, wd, k, r, s), "shape not wmma");
+                assert!(
+                    crate::ptx_conv::tiled_applies(c, h, wd, k, r, s),
+                    "shape not tiled"
+                );
+                assert!(
+                    crate::ptx_conv::wmma_applies(c, h, wd, k, r, s),
+                    "shape not wmma"
+                );
                 let (p, q) = (h - r + 1, wd - s + 1);
                 let x = rng.vec(c * h * wd, -1.0, 1.0);
                 let w = rng.vec(k * c * r * s, -1.0, 1.0);
@@ -10425,7 +12084,10 @@ E_FILL:\n\
                 launch_t(g, &mut ot_d);
                 g.stream.synchronize().unwrap();
                 let cs_t = csum(&g.stream.memcpy_dtov(&ot_d).unwrap());
-                assert!((cs_t - cs_n).abs() / cs_n.max(1.0) < 2e-2, "tiled checksum: t={cs_t:.3e} n={cs_n:.3e}");
+                assert!(
+                    (cs_t - cs_n).abs() / cs_n.max(1.0) < 2e-2,
+                    "tiled checksum: t={cs_t:.3e} n={cs_n:.3e}"
+                );
 
                 // --- Wukong fp16 tensor-core implicit-GEMM conv (resident; f16 X/W) ---
                 let ptx_w = crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s);
@@ -10443,19 +12105,26 @@ E_FILL:\n\
                 launch_w(g, &mut ow_d);
                 g.stream.synchronize().unwrap();
                 let cs_w = csum(&g.stream.memcpy_dtov(&ow_d).unwrap());
-                assert!((cs_w - cs_n).abs() / cs_n.max(1.0) < 6e-2, "wmma checksum: w={cs_w:.3e} n={cs_n:.3e}");
+                assert!(
+                    (cs_w - cs_n).abs() / cs_n.max(1.0) < 6e-2,
+                    "wmma checksum: w={cs_w:.3e} n={cs_n:.3e}"
+                );
 
                 // Speed, same-run.
                 let iters = 50usize;
                 let t_t = best_of(ROUNDS, || {
                     let t0 = Instant::now();
-                    for _ in 0..iters { launch_t(g, &mut ot_d); }
+                    for _ in 0..iters {
+                        launch_t(g, &mut ot_d);
+                    }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
                 let t_w = best_of(ROUNDS, || {
                     let t0 = Instant::now();
-                    for _ in 0..iters { launch_w(g, &mut ow_d); }
+                    for _ in 0..iters {
+                        launch_w(g, &mut ow_d);
+                    }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
@@ -10497,7 +12166,10 @@ E_FILL:\n\
         with_gpu("conv_vs_cudnn", |g| {
             if !peers_available(g) {
                 peer_gate("conv_vs_cudnn");
-                eprintln!("[skip] conv_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] conv_vs_cudnn: NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             let have_cudnn = cudnn_available(g);
@@ -10541,28 +12213,47 @@ E_FILL:\n\
 
                 // naive CUDA-C (Tier A): cross-check + checksum.
                 let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
-                crate::diff::assert_close(&format!("naive C{c} {r}x{s}"), &naive, &oracle, 5e-2, rel);
+                crate::diff::assert_close(
+                    &format!("naive C{c} {r}x{s}"),
+                    &naive,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
                 let cs_n = csum(&naive);
 
                 // Wukong fp16 implicit-GEMM conv, AUTO-DISPATCHED (split-K when the base grid starves
                 // the SMs); resident, f16 X/W, conv (+ reduce) on persistent buffers so timing is pure.
-                let sk = crate::ptx_conv::conv_splitk_factor(c, h, wd, k, r, s, g.sm_count() as usize);
+                let sk =
+                    crate::ptx_conv::conv_splitk_factor(c, h, wd, k, r, s, g.sm_count() as usize);
                 // Production path: the single-buffer implicit-GEMM (auto split-K). We ALSO build the
                 // register double-buffered pipeline below and time it same-run, so the pipeline delta is an
                 // honest in-run A/B — it lands neutral here (these convs are L2-resident, not HBM-latency
                 // bound, and the prefetch registers cut occupancy on the split-K shapes).
                 let (conv_ptx, conv_fn) = if sk == 1 {
-                    (crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                    (
+                        crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s),
+                        "conv2d_wmma",
+                    )
                 } else {
-                    (crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                    (
+                        crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk),
+                        "conv2d_wmma_splitk",
+                    )
                 };
                 let cmod = g.load_module_cached(&conv_ptx).unwrap();
                 let cf = cmod.load_function(conv_fn).unwrap();
                 // Double-buffered A/B (same entry name, distinct module since the PTX differs).
                 let (sb_ptx, _) = if sk == 1 {
-                    (crate::ptx_conv::conv_wmma_db_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                    (
+                        crate::ptx_conv::conv_wmma_db_ptx(c, h, wd, k, r, s),
+                        "conv2d_wmma",
+                    )
                 } else {
-                    (crate::ptx_conv::conv_wmma_db_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                    (
+                        crate::ptx_conv::conv_wmma_db_splitk_ptx(c, h, wd, k, r, s, sk),
+                        "conv2d_wmma_splitk",
+                    )
                 };
                 let sbmod = g.load_module_cached(&sb_ptx).unwrap();
                 let sbf = sbmod.load_function(conv_fn).unwrap();
@@ -10588,63 +12279,87 @@ E_FILL:\n\
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let launch_w = |g: &Gpu,
-                                part: &mut cudarc::driver::CudaSlice<f32>,
-                                o: &mut cudarc::driver::CudaSlice<f32>| {
-                    if sk == 1 {
-                        let mut b = g.stream.launch_builder(&cf);
-                        b.arg(&xw_d).arg(&ww_d).arg(&mut *o);
-                        unsafe { b.launch(cfg_w).unwrap() };
-                    } else {
-                        let mut b = g.stream.launch_builder(&cf);
-                        b.arg(&xw_d).arg(&ww_d).arg(&mut *part);
-                        unsafe { b.launch(cfg_w).unwrap() };
-                        let (_, rf) = red.as_ref().unwrap();
-                        let mut rb = g.stream.launch_builder(rf);
-                        rb.arg(&*part).arg(&mut *o);
-                        unsafe { rb.launch(rcfg).unwrap() };
-                    }
-                };
-                let launch_sb = |g: &Gpu,
-                                 part: &mut cudarc::driver::CudaSlice<f32>,
-                                 o: &mut cudarc::driver::CudaSlice<f32>| {
-                    if sk == 1 {
-                        let mut b = g.stream.launch_builder(&sbf);
-                        b.arg(&xw_d).arg(&ww_d).arg(&mut *o);
-                        unsafe { b.launch(cfg_w).unwrap() };
-                    } else {
-                        let mut b = g.stream.launch_builder(&sbf);
-                        b.arg(&xw_d).arg(&ww_d).arg(&mut *part);
-                        unsafe { b.launch(cfg_w).unwrap() };
-                        let (_, rf) = red.as_ref().unwrap();
-                        let mut rb = g.stream.launch_builder(rf);
-                        rb.arg(&*part).arg(&mut *o);
-                        unsafe { rb.launch(rcfg).unwrap() };
-                    }
-                };
+                let launch_w =
+                    |g: &Gpu,
+                     part: &mut cudarc::driver::CudaSlice<f32>,
+                     o: &mut cudarc::driver::CudaSlice<f32>| {
+                        if sk == 1 {
+                            let mut b = g.stream.launch_builder(&cf);
+                            b.arg(&xw_d).arg(&ww_d).arg(&mut *o);
+                            unsafe { b.launch(cfg_w).unwrap() };
+                        } else {
+                            let mut b = g.stream.launch_builder(&cf);
+                            b.arg(&xw_d).arg(&ww_d).arg(&mut *part);
+                            unsafe { b.launch(cfg_w).unwrap() };
+                            let (_, rf) = red.as_ref().unwrap();
+                            let mut rb = g.stream.launch_builder(rf);
+                            rb.arg(&*part).arg(&mut *o);
+                            unsafe { rb.launch(rcfg).unwrap() };
+                        }
+                    };
+                let launch_sb =
+                    |g: &Gpu,
+                     part: &mut cudarc::driver::CudaSlice<f32>,
+                     o: &mut cudarc::driver::CudaSlice<f32>| {
+                        if sk == 1 {
+                            let mut b = g.stream.launch_builder(&sbf);
+                            b.arg(&xw_d).arg(&ww_d).arg(&mut *o);
+                            unsafe { b.launch(cfg_w).unwrap() };
+                        } else {
+                            let mut b = g.stream.launch_builder(&sbf);
+                            b.arg(&xw_d).arg(&ww_d).arg(&mut *part);
+                            unsafe { b.launch(cfg_w).unwrap() };
+                            let (_, rf) = red.as_ref().unwrap();
+                            let mut rb = g.stream.launch_builder(rf);
+                            rb.arg(&*part).arg(&mut *o);
+                            unsafe { rb.launch(rcfg).unwrap() };
+                        }
+                    };
                 launch_w(g, &mut part_d, &mut ow_d);
                 g.stream.synchronize().unwrap();
                 let merc = g.stream.memcpy_dtov(&ow_d).unwrap();
-                crate::diff::assert_close(&format!("wukong C{c} {r}x{s} sk{sk}"), &merc, &oracle, 5e-2, rel);
+                crate::diff::assert_close(
+                    &format!("wukong C{c} {r}x{s} sk{sk}"),
+                    &merc,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
                 // The single-buffer kernel must produce the **same** result (identical reduction order).
                 launch_sb(g, &mut part_d, &mut ow_d);
                 g.stream.synchronize().unwrap();
                 let merc_sb = g.stream.memcpy_dtov(&ow_d).unwrap();
-                assert_eq!(merc, merc_sb, "db vs single-buffer conv must be bit-identical (same MMA order)");
+                assert_eq!(
+                    merc, merc_sb,
+                    "db vs single-buffer conv must be bit-identical (same MMA order)"
+                );
 
                 // cuDNN (Tier B): cross-check + checksum + disclosed algo. Timed **best_of(ROUNDS)** — the
                 // SAME robustness Wukong gets below — so a single thermal dip in cuDNN's window can't tank
                 // the ratio (a single-shot cuDNN timing vs Wukong's best-of swung the gap ~7× run-to-run).
                 let (cudnn_algo, g_c) = if have_cudnn {
                     let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, 0, 1).unwrap();
-                    crate::diff::assert_close(&format!("cudnn C{c} {r}x{s}"), &yc, &oracle, 5e-2, rel);
+                    crate::diff::assert_close(
+                        &format!("cudnn C{c} {r}x{s}"),
+                        &yc,
+                        &oracle,
+                        5e-2,
+                        rel,
+                    );
                     let cs_c = csum(&yc);
                     assert!(
                         (cs_c - cs_n).abs() / cs_n.max(1.0) < 6e-2,
                         "cudnn checksum: c={cs_c:.3e} n={cs_n:.3e}"
                     );
-                    let t_c = best_of(ROUNDS, || time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100).unwrap().0);
-                    (cudnn_fwd_algo_name(algo), conv_flop(c, h, wd, k, r, s) / t_c)
+                    let t_c = best_of(ROUNDS, || {
+                        time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100)
+                            .unwrap()
+                            .0
+                    });
+                    (
+                        cudnn_fwd_algo_name(algo),
+                        conv_flop(c, h, wd, k, r, s) / t_c,
+                    )
                 } else {
                     ("n/a", 0.0)
                 };
@@ -10717,8 +12432,16 @@ E_FILL:\n\
         // f64 affine-conv oracle: out(p,q) = sum over (c,r,s) of X[c, p*st+r-pad, q*st+s-pad]·W, OOB=0.
         #[allow(clippy::too_many_arguments)]
         fn ref_affine(
-            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
-            st: usize, pad: usize,
+            x: &[f32],
+            w: &[f32],
+            c: usize,
+            h: usize,
+            wd: usize,
+            k: usize,
+            r: usize,
+            s: usize,
+            st: usize,
+            pad: usize,
         ) -> Vec<f32> {
             let p = (h + 2 * pad - r) / st + 1;
             let q = (wd + 2 * pad - s) / st + 1;
@@ -10749,7 +12472,10 @@ E_FILL:\n\
         with_gpu("conv_affine_vs_cudnn", |g| {
             if !peers_available(g) {
                 peer_gate("conv_affine_vs_cudnn");
-                eprintln!("[skip] conv_affine_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] conv_affine_vs_cudnn: NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             let have_cudnn = cudnn_available(g);
@@ -10770,7 +12496,9 @@ E_FILL:\n\
 
             // (C,H,W,K,R,S,stride,pad): 3×3 "same"; 3×3 s2 p1 + 7×7 s2 p3 downsamples; 1×1 pointwise.
             let cases = [
-                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 1usize),
+                (
+                    64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 1usize,
+                ),
                 (128, 28, 28, 128, 3, 3, 1, 1),
                 (64, 56, 56, 64, 3, 3, 2, 1),
                 (128, 28, 28, 128, 3, 3, 2, 1),
@@ -10791,20 +12519,40 @@ E_FILL:\n\
                 // Wukong fp16 AUTO padded implicit-GEMM (conv2d_wmma_padded_auto), resident (x/w uploaded
                 // once → pure-compute timing): single bounds-checked kernel, or split-K + deterministic
                 // reduce when the downsampled grid starves the SMs (deep-channel small-spatial).
-                let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, wd, k, r, s, st, pad, g.sm_count() as usize);
+                let sk = crate::ptx_conv::conv_splitk_factor_affine(
+                    c,
+                    h,
+                    wd,
+                    k,
+                    r,
+                    s,
+                    st,
+                    pad,
+                    g.sm_count() as usize,
+                );
                 let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
                 let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
                 let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
                 let mut part_d = g.stream.alloc_zeros::<f32>(sk * m * n).unwrap();
                 let (cptx, centry) = if sk == 1 {
-                    (crate::ptx_conv::conv_wmma_pad_ptx(c, h, wd, k, r, s, st, pad), "conv2d_wmma")
+                    (
+                        crate::ptx_conv::conv_wmma_pad_ptx(c, h, wd, k, r, s, st, pad),
+                        "conv2d_wmma",
+                    )
                 } else {
-                    (crate::ptx_conv::conv_wmma_pad_splitk_ptx(c, h, wd, k, r, s, st, pad, sk), "conv2d_wmma_splitk")
+                    (
+                        crate::ptx_conv::conv_wmma_pad_splitk_ptx(c, h, wd, k, r, s, st, pad, sk),
+                        "conv2d_wmma_splitk",
+                    )
                 };
                 let cmod = g.load_module_cached(&cptx).unwrap();
                 let f = cmod.load_function(centry).unwrap();
                 let cfg = LaunchConfig {
-                    grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), sk as u32),
+                    grid_dim: (
+                        (n as u32).div_ceil(WMMA_BN as u32),
+                        (m as u32).div_ceil(WMMA_BM as u32),
+                        sk as u32,
+                    ),
                     block_dim: (WMMA_THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 };
@@ -10839,7 +12587,13 @@ E_FILL:\n\
                 launch(g, &mut part_d, &mut o_d);
                 g.stream.synchronize().unwrap();
                 let merc = g.stream.memcpy_dtov(&o_d).unwrap();
-                crate::diff::assert_close(&format!("wukong affine C{c} {r}x{s} s{st}p{pad} sk{sk}"), &merc, &oracle, 5e-2, rel);
+                crate::diff::assert_close(
+                    &format!("wukong affine C{c} {r}x{s} s{st}p{pad} sk{sk}"),
+                    &merc,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
                 let cs_m = csum(&merc);
 
                 // Wukong EXPLICIT-PAD path (same-run A/B): scatter X into a zeroed (H+2p)×(W+2p) buffer,
@@ -10864,7 +12618,11 @@ E_FILL:\n\
                     shared_mem_bytes: 0,
                 };
                 let vcfg = LaunchConfig {
-                    grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+                    grid_dim: (
+                        (n as u32).div_ceil(WMMA_BN as u32),
+                        (m as u32).div_ceil(WMMA_BM as u32),
+                        1,
+                    ),
                     block_dim: (WMMA_THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 };
@@ -10885,15 +12643,35 @@ E_FILL:\n\
                 launch_e(g, &mut xpad_d, &mut o_d);
                 g.stream.synchronize().unwrap();
                 let merc_e = g.stream.memcpy_dtov(&o_d).unwrap();
-                crate::diff::assert_close(&format!("wukong affine-explicit C{c} {r}x{s} s{st}p{pad}"), &merc_e, &oracle, 5e-2, rel);
+                crate::diff::assert_close(
+                    &format!("wukong affine-explicit C{c} {r}x{s} s{st}p{pad}"),
+                    &merc_e,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
 
                 // cuDNN with the SAME pad/stride: cross-check + checksum + disclosed algo, best_of(ROUNDS).
                 let (cudnn_algo, g_c) = if have_cudnn {
-                    let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, pad, st).unwrap();
-                    crate::diff::assert_close(&format!("cudnn affine C{c} {r}x{s} s{st}p{pad}"), &yc, &oracle, 5e-2, rel);
+                    let (yc, algo) =
+                        cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, pad, st).unwrap();
+                    crate::diff::assert_close(
+                        &format!("cudnn affine C{c} {r}x{s} s{st}p{pad}"),
+                        &yc,
+                        &oracle,
+                        5e-2,
+                        rel,
+                    );
                     let cs_c = csum(&yc);
-                    assert!((cs_c - cs_m).abs() / cs_m.max(1.0) < 6e-2, "cudnn checksum: c={cs_c:.3e} m={cs_m:.3e}");
-                    let t_c = best_of(ROUNDS, || time_cudnn_conv2d(g, c, h, wd, k, r, s, pad, st, 100).unwrap().0);
+                    assert!(
+                        (cs_c - cs_m).abs() / cs_m.max(1.0) < 6e-2,
+                        "cudnn checksum: c={cs_c:.3e} m={cs_m:.3e}"
+                    );
+                    let t_c = best_of(ROUNDS, || {
+                        time_cudnn_conv2d(g, c, h, wd, k, r, s, pad, st, 100)
+                            .unwrap()
+                            .0
+                    });
                     let flop = 2.0 * (k * p * q * c * r * s) as f64;
                     (cudnn_fwd_algo_name(algo), flop / t_c)
                 } else {
@@ -10957,7 +12735,10 @@ E_FILL:\n\
         with_gpu("conv_splitk_vs_cudnn", |g| {
             if !peers_available(g) {
                 peer_gate("conv_splitk_vs_cudnn");
-                eprintln!("[skip] conv_splitk_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] conv_splitk_vs_cudnn: NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             let have_cudnn = cudnn_available(g);
@@ -10973,7 +12754,15 @@ E_FILL:\n\
 
             // (C,H,W,K,R,S, sk candidates) — sk must divide GK and GK/sk be a multiple of 16.
             let cases = [
-                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, vec![1usize, 2, 4]),
+                (
+                    64usize,
+                    56usize,
+                    56usize,
+                    64usize,
+                    3usize,
+                    3usize,
+                    vec![1usize, 2, 4],
+                ),
                 (128, 28, 28, 128, 3, 3, vec![1usize, 2, 4, 8]),
                 (256, 14, 14, 256, 3, 3, vec![1usize, 2, 4, 8]),
                 (256, 28, 28, 256, 3, 3, vec![1usize, 2, 4]),
@@ -10989,7 +12778,13 @@ E_FILL:\n\
 
                 let (g_c, algo) = if have_cudnn {
                     let (yc, a) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, 0, 1).unwrap();
-                    crate::diff::assert_close(&format!("cudnn C{c} {r}x{s}"), &yc, &oracle, 5e-2, rel);
+                    crate::diff::assert_close(
+                        &format!("cudnn C{c} {r}x{s}"),
+                        &yc,
+                        &oracle,
+                        5e-2,
+                        rel,
+                    );
                     let (t_c, _) = time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100).unwrap();
                     (flop / t_c, cudnn_fwd_algo_name(a))
                 } else {
@@ -10997,12 +12792,19 @@ E_FILL:\n\
                 };
 
                 let mut line = format!("C{c:>3} {h}x{wd} K{k:>3} {r}x{s}:");
-                let base_ctas = m.div_ceil(crate::ptx_conv::WMMA_BM) * n.div_ceil(crate::ptx_conv::WMMA_BN);
+                let base_ctas =
+                    m.div_ceil(crate::ptx_conv::WMMA_BM) * n.div_ceil(crate::ptx_conv::WMMA_BN);
                 for sk in sks {
                     let (conv_ptx, conv_fn) = if sk == 1 {
-                        (crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                        (
+                            crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s),
+                            "conv2d_wmma",
+                        )
                     } else {
-                        (crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                        (
+                            crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk),
+                            "conv2d_wmma_splitk",
+                        )
                     };
                     let cmod = g.load_module_cached(&conv_ptx).unwrap();
                     let cf = cmod.load_function(conv_fn).unwrap();
@@ -11046,7 +12848,13 @@ E_FILL:\n\
                     launch(g, &mut partial_d, &mut o_d);
                     g.stream.synchronize().unwrap();
                     let got = g.stream.memcpy_dtov(&o_d).unwrap();
-                    crate::diff::assert_close(&format!("sk{sk} C{c} {r}x{s}"), &got, &oracle, 5e-2, rel);
+                    crate::diff::assert_close(
+                        &format!("sk{sk} C{c} {r}x{s}"),
+                        &got,
+                        &oracle,
+                        5e-2,
+                        rel,
+                    );
                     let iters = 50usize;
                     let t = best_of(ROUNDS, || {
                         let t0 = Instant::now();
@@ -11060,7 +12868,11 @@ E_FILL:\n\
                     let pct = if g_c > 0.0 { 100.0 * gf / g_c } else { 0.0 };
                     line += &format!("  sk{sk} {:>5.0}GF({:>3.0}%)", gf / 1e9, pct);
                 }
-                eprintln!("{line}  | {base_ctas} base CTAs | cuDNN {:>5.0}GF [{}]", g_c / 1e9, algo);
+                eprintln!(
+                    "{line}  | {base_ctas} base CTAs | cuDNN {:>5.0}GF [{}]",
+                    g_c / 1e9,
+                    algo
+                );
             }
         });
     }
@@ -11163,8 +12975,11 @@ E_FILL:\n\
         let mut a = vec![0.0f32; s * d];
         let scale = 1.0 / (dh as f32).sqrt();
         for head in 0..heads {
-            let (mut qh, mut kh, mut vh) =
-                (vec![0.0f32; s * dh], vec![0.0f32; s * dh], vec![0.0f32; s * dh]);
+            let (mut qh, mut kh, mut vh) = (
+                vec![0.0f32; s * dh],
+                vec![0.0f32; s * dh],
+                vec![0.0f32; s * dh],
+            );
             for row in 0..s {
                 for i in 0..dh {
                     qh[row * dh + i] = q[row * d + head * dh + i];
@@ -11237,7 +13052,11 @@ E_FILL:\n\
             );
             let again = ffn_fused(g, &x, &w1, &w2, s, d, dff).unwrap();
             let bits = |v: &[f32]| v.iter().map(|z| z.to_bits()).collect::<Vec<_>>();
-            assert_eq!(bits(&got), bits(&again), "ffn_fused must be bit-reproducible run-to-run");
+            assert_eq!(
+                bits(&got),
+                bits(&again),
+                "ffn_fused must be bit-reproducible run-to-run"
+            );
         });
     }
 
@@ -11299,8 +13118,18 @@ E_FILL:\n\
             let wo = rng.vec(d * d, -0.1, 0.1);
             let w1 = rng.vec(dff * d, -0.1, 0.1);
             let w2 = rng.vec(d * dff, -0.1, 0.1);
-            let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
-            let got = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap().forward(&x).unwrap();
+            let w = TransformerWeights {
+                wq: &wq,
+                wk: &wk,
+                wv: &wv,
+                wo: &wo,
+                w1: &w1,
+                w2: &w2,
+            };
+            let got = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads)
+                .unwrap()
+                .forward(&x)
+                .unwrap();
             let oracle = ref_transformer_layer_f16_mha(&x, &w, s, d, dff, heads);
             let st = crate::diff::assert_close("transformer_layer_mha", &got, &oracle, 3e-2, 3e-2);
             eprintln!(
@@ -11309,9 +13138,16 @@ E_FILL:\n\
                 st.max_abs,
                 st.max_rel
             );
-            let again = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap().forward(&x).unwrap();
+            let again = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads)
+                .unwrap()
+                .forward(&x)
+                .unwrap();
             let bits = |v: &[f32]| v.iter().map(|z| z.to_bits()).collect::<Vec<_>>();
-            assert_eq!(bits(&got), bits(&again), "multi-head layer must be deterministic");
+            assert_eq!(
+                bits(&got),
+                bits(&again),
+                "multi-head layer must be deterministic"
+            );
         });
     }
 
@@ -11346,7 +13182,11 @@ E_FILL:\n\
                 let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
                 let st =
                     crate::diff::assert_close("transformer_layer_f16", &got, &oracle, 5e-2, 5e-2);
-                let flash = if wmma_flash_applies(d, s) { "wmma" } else { "f32" };
+                let flash = if wmma_flash_applies(d, s) {
+                    "wmma"
+                } else {
+                    "f32"
+                };
                 eprintln!(
                     "transformer_layer_f16 S={s} D={d} Dff={dff} [{flash} flash]: max_abs={:.2e} max_rel={:.2e}",
                     st.max_abs, st.max_rel
@@ -11409,7 +13249,11 @@ E_FILL:\n\
             );
             let again = model.forward(&x).unwrap();
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-            assert_eq!(bits(&got), bits(&again), "resident model must be deterministic run-to-run");
+            assert_eq!(
+                bits(&got),
+                bits(&again),
+                "resident model must be deterministic run-to-run"
+            );
         });
     }
 
@@ -11425,7 +13269,9 @@ E_FILL:\n\
     /// reductions by `reductions_match_reference_within_tol_and_are_deterministic`.)
     #[test]
     fn gpu_kernels_bit_reproducible() {
-        use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX, RED_DOT, RED_SUM, VM_GELU};
+        use wukong_runtime::{
+            NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX, RED_DOT, RED_SUM, VM_GELU,
+        };
         with_gpu("bit_reproducible", |g| {
             let mut rng = crate::diff::Rng::new(0xD37E);
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -11434,7 +13280,11 @@ E_FILL:\n\
                 ($label:literal, $call:expr) => {{
                     let a = $call;
                     let b = $call;
-                    assert_eq!(bits(&a), bits(&b), concat!($label, " must be bit-reproducible"));
+                    assert_eq!(
+                        bits(&a),
+                        bits(&b),
+                        concat!($label, " must be bit-reproducible")
+                    );
                 }};
             }
 
@@ -11444,8 +13294,14 @@ E_FILL:\n\
             let a = rng.vec(m * k, -1.0, 1.0);
             let bmat = rng.vec(n * k, -1.0, 1.0);
             twice_eq!("gemm_nt_f16", gemm_nt_f16(g, &a, &bmat, m, k, n).unwrap());
-            twice_eq!("gemm_nt_f16_sm", gemm_nt_f16_sm(g, &a, &bmat, m, k, n).unwrap());
-            twice_eq!("gemm_nt_f16_sm_db", gemm_nt_f16_sm_db(g, &a, &bmat, m, k, n).unwrap());
+            twice_eq!(
+                "gemm_nt_f16_sm",
+                gemm_nt_f16_sm(g, &a, &bmat, m, k, n).unwrap()
+            );
+            twice_eq!(
+                "gemm_nt_f16_sm_db",
+                gemm_nt_f16_sm_db(g, &a, &bmat, m, k, n).unwrap()
+            );
 
             // Fused row norms — one warp/row, shfl-butterfly reduction over a fixed lane order.
             let (rows, cols) = (40usize, 128usize);
@@ -11459,7 +13315,10 @@ E_FILL:\n\
             let q = rng.vec(seq * d, -1.0, 1.0);
             let kk = rng.vec(seq * d, -1.0, 1.0);
             let vv = rng.vec(seq * d, -1.0, 1.0);
-            twice_eq!("flash_attn", flash_attn(g, &q, &kk, &vv, seq, d, 0.125).unwrap());
+            twice_eq!(
+                "flash_attn",
+                flash_attn(g, &q, &kk, &vv, seq, d, 0.125).unwrap()
+            );
 
             // Conv2d — one thread/output, fixed C·R·S fma order.
             let (c, h, wd, kc, r, s) = (3usize, 16usize, 16usize, 4usize, 3usize, 3usize);
@@ -11471,13 +13330,19 @@ E_FILL:\n\
             let (c2, h2, w2, k2, r2, s2) = (16usize, 16usize, 16usize, 32usize, 3usize, 3usize);
             let xw = rng.vec(c2 * h2 * w2, -1.0, 1.0);
             let ww = rng.vec(k2 * c2 * r2 * s2, -1.0, 1.0);
-            twice_eq!("conv2d_wmma", conv2d_wmma(g, &xw, &ww, c2, h2, w2, k2, r2, s2).unwrap());
+            twice_eq!(
+                "conv2d_wmma",
+                conv2d_wmma(g, &xw, &ww, c2, h2, w2, k2, r2, s2).unwrap()
+            );
 
             // Reductions — fixed grid + fixed ascending host combine.
             let xr = rng.vec(1 << 16, 0.0, 1.0);
             let yr = rng.vec(1 << 16, 0.0, 1.0);
             twice_eq!("reduce_sum", vec![reduce(g, RED_SUM, &xr, None).unwrap()]);
-            twice_eq!("reduce_dot", vec![reduce(g, RED_DOT, &xr, Some(&yr)).unwrap()]);
+            twice_eq!(
+                "reduce_dot",
+                vec![reduce(g, RED_DOT, &xr, Some(&yr)).unwrap()]
+            );
 
             // Elementwise — trivially deterministic, included for completeness.
             twice_eq!("vmath_gelu", vmath(g, VM_GELU, &xr).unwrap());
@@ -11500,7 +13365,10 @@ E_FILL:\n\
         with_gpu("repro_vs_cublas", |g| {
             if !peers_available(g) {
                 peer_gate("reproducibility_vs_cublas");
-                eprintln!("[skip] reproducibility_vs_cublas: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] reproducibility_vs_cublas: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             let mut rng = crate::diff::Rng::new(0xC0FFEE);
@@ -11509,11 +13377,15 @@ E_FILL:\n\
             let b = rng.vec(n * k, -1.0, 1.0);
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
 
-            let wuk: Vec<_> = (0..3).map(|_| gemm_nt_f16_sm_db(g, &a, &b, m, k, n).unwrap()).collect();
+            let wuk: Vec<_> = (0..3)
+                .map(|_| gemm_nt_f16_sm_db(g, &a, &b, m, k, n).unwrap())
+                .collect();
             let wk_stable = bits(&wuk[0]) == bits(&wuk[1]) && bits(&wuk[1]) == bits(&wuk[2]);
             assert!(wk_stable, "Wukong GEMM must be bit-identical run-to-run");
 
-            let cub: Vec<_> = (0..3).map(|_| cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap()).collect();
+            let cub: Vec<_> = (0..3)
+                .map(|_| cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap())
+                .collect();
             let cub_stable = bits(&cub[0]) == bits(&cub[1]) && bits(&cub[1]) == bits(&cub[2]);
 
             eprintln!("reproducibility @ {m}³ fp16 (3 runs, same buffers):");
@@ -11885,7 +13757,11 @@ E_FILL:\n\
                 gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
             }
             let f_gemm = g
-                .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db")
+                .function(
+                    "wmma_f16",
+                    crate::ptx_wmma::wmma_f16_ptx(),
+                    "wmma_nt_f16_sm_db",
+                )
                 .unwrap();
             let to16 = |v: &[f32]| -> Vec<f16> { v.iter().map(|&x| f16::from_f32(x)).collect() };
             for s in [256usize, 512, 1024] {
@@ -11894,8 +13770,14 @@ E_FILL:\n\
                 let k = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
                 let v = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
                 let mut o = g.stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
-                let a16 = g.stream.memcpy_stod(&to16(&rng.vec(s * d, -1.0, 1.0))).unwrap();
-                let b16 = g.stream.memcpy_stod(&to16(&rng.vec(dff * d, -1.0, 1.0))).unwrap();
+                let a16 = g
+                    .stream
+                    .memcpy_stod(&to16(&rng.vec(s * d, -1.0, 1.0)))
+                    .unwrap();
+                let b16 = g
+                    .stream
+                    .memcpy_stod(&to16(&rng.vec(dff * d, -1.0, 1.0)))
+                    .unwrap();
                 let mut c = g.stream.memcpy_stod(&vec![0f32; s * dff]).unwrap();
                 let scale = 1.0f32 / (d as f32).sqrt();
                 let ss = s as u32;
@@ -11921,7 +13803,12 @@ E_FILL:\n\
                     let t0 = Instant::now();
                     for _ in 0..100 {
                         let mut bld = g.stream.launch_builder(&f_gemm);
-                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a16).arg(&b16).arg(&mut c);
+                        bld.arg(&mm)
+                            .arg(&nn)
+                            .arg(&kk)
+                            .arg(&a16)
+                            .arg(&b16)
+                            .arg(&mut c);
                         unsafe { bld.launch(gemm_cfg).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
@@ -11985,10 +13872,22 @@ E_FILL:\n\
                 let x_d = g.stream.memcpy_stod(&x).unwrap();
                 // Correctness before speed: BOTH paths must match the f64 oracle at this shape.
                 let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
-                let fused_out = g.stream.memcpy_dtov(&layer.forward_device(&x_d).unwrap()).unwrap();
-                let unfused_out = g.stream.memcpy_dtov(&layer.forward_device_unfused(&x_d).unwrap()).unwrap();
+                let fused_out = g
+                    .stream
+                    .memcpy_dtov(&layer.forward_device(&x_d).unwrap())
+                    .unwrap();
+                let unfused_out = g
+                    .stream
+                    .memcpy_dtov(&layer.forward_device_unfused(&x_d).unwrap())
+                    .unwrap();
                 crate::diff::assert_close(&format!("fused S={s}"), &fused_out, &oracle, 5e-2, 5e-2);
-                crate::diff::assert_close(&format!("unfused S={s}"), &unfused_out, &oracle, 5e-2, 5e-2);
+                crate::diff::assert_close(
+                    &format!("unfused S={s}"),
+                    &unfused_out,
+                    &oracle,
+                    5e-2,
+                    5e-2,
+                );
 
                 let iters = 60;
                 pin_clock!();
@@ -12069,15 +13968,33 @@ E_FILL:\n\
             let wo = rng.vec(d * d, -0.1, 0.1);
             let w1 = rng.vec(dff * d, -0.1, 0.1);
             let w2 = rng.vec(d * dff, -0.1, 0.1);
-            let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+            let w = TransformerWeights {
+                wq: &wq,
+                wk: &wk,
+                wv: &wv,
+                wo: &wo,
+                w1: &w1,
+                w2: &w2,
+            };
 
-            let chain_out = CublasChainLayer::new(g, &w, s, d, dff).unwrap().forward(&x).unwrap();
+            let chain_out = CublasChainLayer::new(g, &w, s, d, dff)
+                .unwrap()
+                .forward(&x)
+                .unwrap();
             let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
             let st = crate::diff::assert_close("cublas_chain", &chain_out, &oracle, 5e-2, 5e-2);
 
-            let wk_out = ResidentLayerF16::new(g, &w, s, d, dff).unwrap().forward(&x).unwrap();
-            let st2 =
-                crate::diff::assert_close("cublas_chain vs Wukong-fused", &chain_out, &wk_out, 5e-2, 5e-2);
+            let wk_out = ResidentLayerF16::new(g, &w, s, d, dff)
+                .unwrap()
+                .forward(&x)
+                .unwrap();
+            let st2 = crate::diff::assert_close(
+                "cublas_chain vs Wukong-fused",
+                &chain_out,
+                &wk_out,
+                5e-2,
+                5e-2,
+            );
 
             eprintln!(
                 "cuBLAS call-chain layer S={s} D={d} Dff={dff}: vs f64 oracle max_abs={:.2e} max_rel={:.2e} | vs Wukong-fused max_abs={:.2e} max_rel={:.2e}",
@@ -12143,17 +14060,42 @@ E_FILL:\n\
                 let wo = rng.vec(d * d, -0.1, 0.1);
                 let w1 = rng.vec(dff * d, -0.1, 0.1);
                 let w2 = rng.vec(d * dff, -0.1, 0.1);
-                let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+                let w = TransformerWeights {
+                    wq: &wq,
+                    wk: &wk,
+                    wv: &wv,
+                    wo: &wo,
+                    w1: &w1,
+                    w2: &w2,
+                };
                 let wuk = ResidentLayerF16::new(g, &w, s, d, dff).unwrap();
                 let chain = CublasChainLayer::new(g, &w, s, d, dff).unwrap();
                 let x_d = g.stream.memcpy_stod(&x).unwrap();
 
                 // Correctness before speed: both stacks must match the f64 oracle at this shape.
                 let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
-                let wk_out = g.stream.memcpy_dtov(&wuk.forward_device(&x_d).unwrap()).unwrap();
-                let chain_out = g.stream.memcpy_dtov(&chain.forward_device(&x_d).unwrap()).unwrap();
-                crate::diff::assert_close(&format!("Wukong fused S={s}"), &wk_out, &oracle, 5e-2, 5e-2);
-                crate::diff::assert_close(&format!("cuBLAS chain S={s}"), &chain_out, &oracle, 5e-2, 5e-2);
+                let wk_out = g
+                    .stream
+                    .memcpy_dtov(&wuk.forward_device(&x_d).unwrap())
+                    .unwrap();
+                let chain_out = g
+                    .stream
+                    .memcpy_dtov(&chain.forward_device(&x_d).unwrap())
+                    .unwrap();
+                crate::diff::assert_close(
+                    &format!("Wukong fused S={s}"),
+                    &wk_out,
+                    &oracle,
+                    5e-2,
+                    5e-2,
+                );
+                crate::diff::assert_close(
+                    &format!("cuBLAS chain S={s}"),
+                    &chain_out,
+                    &oracle,
+                    5e-2,
+                    5e-2,
+                );
 
                 let iters = 60;
                 pin_clock!();
@@ -12251,17 +14193,42 @@ E_FILL:\n\
                 let wo = rng.vec(d * d, -0.1, 0.1);
                 let w1 = rng.vec(dff * d, -0.1, 0.1);
                 let w2 = rng.vec(d * dff, -0.1, 0.1);
-                let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+                let w = TransformerWeights {
+                    wq: &wq,
+                    wk: &wk,
+                    wv: &wv,
+                    wo: &wo,
+                    w1: &w1,
+                    w2: &w2,
+                };
                 let wuk = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap();
                 let chain = CublasChainLayer::new_mha(g, &w, s, d, dff, heads).unwrap();
                 let x_d = g.stream.memcpy_stod(&x).unwrap();
 
                 // Correctness before speed: both stacks vs the per-head f64 oracle at the real shape.
                 let oracle = ref_transformer_layer_f16_mha(&x, &w, s, d, dff, heads);
-                let wk_out = g.stream.memcpy_dtov(&wuk.forward_device(&x_d).unwrap()).unwrap();
-                let chain_out = g.stream.memcpy_dtov(&chain.forward_device(&x_d).unwrap()).unwrap();
-                crate::diff::assert_close(&format!("Wukong fused MHA S={s}"), &wk_out, &oracle, 5e-2, 5e-2);
-                crate::diff::assert_close(&format!("cuBLAS chain MHA S={s}"), &chain_out, &oracle, 5e-2, 5e-2);
+                let wk_out = g
+                    .stream
+                    .memcpy_dtov(&wuk.forward_device(&x_d).unwrap())
+                    .unwrap();
+                let chain_out = g
+                    .stream
+                    .memcpy_dtov(&chain.forward_device(&x_d).unwrap())
+                    .unwrap();
+                crate::diff::assert_close(
+                    &format!("Wukong fused MHA S={s}"),
+                    &wk_out,
+                    &oracle,
+                    5e-2,
+                    5e-2,
+                );
+                crate::diff::assert_close(
+                    &format!("cuBLAS chain MHA S={s}"),
+                    &chain_out,
+                    &oracle,
+                    5e-2,
+                    5e-2,
+                );
 
                 let iters = if s >= 2048 { 20 } else { 50 };
                 pin_clock!();
@@ -12387,14 +14354,23 @@ E_FILL:\n\
         with_fp8("fp8_pipe", |g| {
             let mut rng = crate::diff::Rng::new(0xF8B1);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
-            for (m, k, n) in [(128usize, 64usize, 128usize), (128, 128, 128), (256, 256, 256), (128, 192, 384)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (128, 128, 128),
+                (256, 256, 256),
+                (128, 192, 384),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let c = gemm_nt_fp8_pipe(g, &a, &b, m, k, n).unwrap();
                 let r = ref_nt_rounded(&a, &b, m, k, n, round);
                 let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
-                let st = crate::diff::assert_close(&format!("fp8_pipe {m}x{k}x{n}"), &c, &r, 1e-2, rel);
-                eprintln!("fp8_pipe {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                let st =
+                    crate::diff::assert_close(&format!("fp8_pipe {m}x{k}x{n}"), &c, &r, 1e-2, rel);
+                eprintln!(
+                    "fp8_pipe {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
             }
         });
     }
@@ -12425,7 +14401,11 @@ E_FILL:\n\
                 let c = gemm_nt_fp8_pipe(g, &a, &b, m, k, n).unwrap();
                 let r = ref_nt_rounded(&a, &b, m, k, n, round);
                 let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
-                let bm = if m % 128 != 0 || n % 128 != 0 { 64 } else { 128 };
+                let bm = if m % 128 != 0 || n % 128 != 0 {
+                    64
+                } else {
+                    128
+                };
                 let st = crate::diff::assert_close(
                     &format!("fp8_pipe_regime {m}x{k}x{n} bm={bm}"),
                     &c,
@@ -12433,7 +14413,10 @@ E_FILL:\n\
                     1e-2,
                     rel,
                 );
-                eprintln!("fp8_pipe_regime {m}x{k}x{n} (bm={bm}): max_abs={:.2e}", st.max_abs);
+                eprintln!(
+                    "fp8_pipe_regime {m}x{k}x{n} (bm={bm}): max_abs={:.2e}",
+                    st.max_abs
+                );
             }
         });
     }
@@ -12505,13 +14488,22 @@ E_FILL:\n\
                 });
                 let (f, dyn_bytes) = {
                     let (ptx, mode) = crate::ptx_fp8::fp8_stage_ptx(v, budget);
-                    assert_eq!(mode, v.smem_mode(), "{}: generator and table disagree on the form", v.name);
+                    assert_eq!(
+                        mode,
+                        v.smem_mode(),
+                        "{}: generator and table disagree on the form",
+                        v.name
+                    );
                     let (f, bytes) = g.function_smem(v.name, &ptx, v.name, mode).unwrap();
                     assert_eq!(bytes, mode.launch_bytes());
                     (f, bytes)
                 };
                 let occ = f
-                    .occupancy_max_active_blocks_per_multiprocessor(v.threads() as u32, dyn_bytes, None)
+                    .occupancy_max_active_blocks_per_multiprocessor(
+                        v.threads() as u32,
+                        dyn_bytes,
+                        None,
+                    )
                     .unwrap_or(0);
                 eprintln!(
                     "  {:<16} {}x{} s{} SMEM {:>6} B ({:>2} KiB) {:<8} launch_bytes={:<6} occupancy={} CTA/SM",
@@ -12527,10 +14519,10 @@ E_FILL:\n\
                 );
                 // K-corners of this depth's ring, each at its own rectangular CTA grid.
                 let mut shapes = vec![
-                    (v.bm, v.bk, v.bn),                        // 1 CTA, single K-tile: full prologue guard
-                    (v.bm, v.min_k(), v.bn),                   // prologue exactly fills the ring
-                    (2 * v.bm, v.bk * v.stages, 2 * v.bn),     // 4 CTAs, first ring wrap
-                    (v.bm, v.bk * (v.stages + 2), 2 * v.bn),   // several wraps, rectangular
+                    (v.bm, v.bk, v.bn),                    // 1 CTA, single K-tile: full prologue guard
+                    (v.bm, v.min_k(), v.bn),               // prologue exactly fills the ring
+                    (2 * v.bm, v.bk * v.stages, 2 * v.bn), // 4 CTAs, first ring wrap
+                    (v.bm, v.bk * (v.stages + 2), 2 * v.bn), // several wraps, rectangular
                 ];
                 shapes.dedup();
                 for (m, k, n) in shapes {
@@ -12540,8 +14532,13 @@ E_FILL:\n\
                     let c = gemm_nt_fp8_deep(g, &a, &b, m, k, n, v).unwrap();
                     // The family's tolerance convention: c*sqrt(K)*eps, floored at E4M3's own coarseness.
                     let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
-                    let st =
-                        crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, rel);
+                    let st = crate::diff::assert_close(
+                        &format!("{} {m}x{k}x{n}", v.name),
+                        &c,
+                        &r,
+                        1e-2,
+                        rel,
+                    );
                     // ...and against the shipped 2-stage row of the same tile — asserted **element-wise
                     // `==`, not within tolerance**. Depth changes only the cp.async *copy schedule*: the
                     // per-output `mma.sync` sequence, its operand registers and the f32 accumulator chain
@@ -12561,7 +14558,10 @@ E_FILL:\n\
                     ran += 1;
                 }
             }
-            assert!(ran >= 12, "the fp8 deep grid must actually have run (only {ran} shapes)");
+            assert!(
+                ran >= 12,
+                "the fp8 deep grid must actually have run (only {ran} shapes)"
+            );
             eprintln!(
                 "[gate] fp8 deep pipeline: {ran} K-corner shapes across the 128x128 s2..s4 and 64x128 \
                  s2/s4/s6 rows, every one within the E4M3 tolerance of the f64 oracle AND of the shipped \
@@ -12579,14 +14579,28 @@ E_FILL:\n\
         with_fp8("fp8_deep_decline", |g| {
             let budget = g.smem_budget();
             // 32 stages at 128x128 bk64 pad16 = 640 KiB — past every part's opt-in ceiling.
-            let over = Fp8StageCfg { stages: 32, ..*fp8_deep_variant("fp8_deep_128_s2") };
-            assert!(over.smem_bytes() > budget, "the probe config must exceed the device ceiling");
+            let over = Fp8StageCfg {
+                stages: 32,
+                ..*fp8_deep_variant("fp8_deep_128_s2")
+            };
+            assert!(
+                over.smem_bytes() > budget,
+                "the probe config must exceed the device ceiling"
+            );
             let a = vec![0f32; 128 * 64];
             let b = vec![0f32; 128 * 64];
             let err = gemm_nt_fp8_deep(g, &a, &b, 128, 64, 128, &over).unwrap_err();
-            let msg = err.unsupported().expect("an over-budget row must be a CAPABILITY decline");
-            assert!(msg.contains("shared memory"), "the decline must name what was refused: {msg}");
-            assert!(msg.contains(&budget.to_string()), "the decline must name the ceiling: {msg}");
+            let msg = err
+                .unsupported()
+                .expect("an over-budget row must be a CAPABILITY decline");
+            assert!(
+                msg.contains("shared memory"),
+                "the decline must name what was refused: {msg}"
+            );
+            assert!(
+                msg.contains(&budget.to_string()),
+                "the decline must name the ceiling: {msg}"
+            );
             eprintln!("[gate] over-budget fp8 deep row declined: {msg}");
         });
     }
@@ -12608,7 +14622,11 @@ E_FILL:\n\
                 let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 192, 384)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 128, 256),
+                (128, 192, 384),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let bias = rng.vec(n, -0.5, 0.5);
@@ -12674,7 +14692,11 @@ E_FILL:\n\
         with_fp8("fp8_mma_bias_residual", |g| {
             let mut rng = crate::diff::Rng::new(0xF8B3);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 192, 384)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 128, 256),
+                (128, 192, 384),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let bias = rng.vec(n, -0.5, 0.5);
@@ -12871,7 +14893,9 @@ E_FILL:\n\
     #[test]
     #[ignore = "throughput bench; run explicitly"]
     fn fp8_pipe_vs_peers() {
-        use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS, FP8_TM, FP8_TN};
+        use crate::ptx_fp8::{
+            f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS, FP8_TM, FP8_TN,
+        };
         use half::f16;
         with_fp8("fp8_pipe_vs_peers", |g| {
             let mut rng = crate::diff::Rng::new(0xF8FE);
@@ -12895,23 +14919,35 @@ E_FILL:\n\
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
 
                 // fp8 pipelined (new) — 1-D rasterized grid.
-                let f_pipe = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe").unwrap();
+                let f_pipe = g
+                    .function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe")
+                    .unwrap();
                 let cfg_pipe = LaunchConfig {
                     grid_dim: (((m / FP8_PIPE_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1),
                     block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let s_pipe = best_of(4, || time_wmma(g, &f_pipe, cfg_pipe, dims, &a8_d, &b8_d, &mut c_d, 50));
+                let s_pipe = best_of(4, || {
+                    time_wmma(g, &f_pipe, cfg_pipe, dims, &a8_d, &b8_d, &mut c_d, 50)
+                });
                 let cs_pipe = csum(&g.stream.memcpy_dtov(&c_d).unwrap());
 
                 // fp8 fragment-reuse multi-tile (old, un-staged global loads).
-                let f_mt = g.function("fp8_gemm_mt", crate::ptx_fp8::fp8_gemm_mt_ptx(), "fp8_gemm_nt_mt").unwrap();
+                let f_mt = g
+                    .function(
+                        "fp8_gemm_mt",
+                        crate::ptx_fp8::fp8_gemm_mt_ptx(),
+                        "fp8_gemm_nt_mt",
+                    )
+                    .unwrap();
                 let cfg_mt = LaunchConfig {
                     grid_dim: ((n / (8 * FP8_TN)) as u32, (m / (16 * FP8_TM)) as u32, 1),
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let s_mt = best_of(4, || time_wmma(g, &f_mt, cfg_mt, dims, &a8_d, &b8_d, &mut c_d, 50));
+                let s_mt = best_of(4, || {
+                    time_wmma(g, &f_mt, cfg_mt, dims, &a8_d, &b8_d, &mut c_d, 50)
+                });
                 let cs_mt = csum(&g.stream.memcpy_dtov(&c_d).unwrap());
                 assert!(
                     (cs_pipe - cs_mt).abs() / cs_mt.max(1.0) < 3e-2,
@@ -12924,8 +14960,21 @@ E_FILL:\n\
                 let a16_d = g.stream.memcpy_stod(&a16).unwrap();
                 let b16_d = g.stream.memcpy_stod(&b16).unwrap();
                 let v = crate::ptx_wmma::pipe_variant("mma_nt_f16_128_bk32_s2_r16");
-                let f16f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), v.name).unwrap();
-                let s_f16 = best_of(4, || time_wmma(g, &f16f, pipe_cfg(v, m, n), dims, &a16_d, &b16_d, &mut c_d, 50));
+                let f16f = g
+                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), v.name)
+                    .unwrap();
+                let s_f16 = best_of(4, || {
+                    time_wmma(
+                        g,
+                        &f16f,
+                        pipe_cfg(v, m, n),
+                        dims,
+                        &a16_d,
+                        &b16_d,
+                        &mut c_d,
+                        50,
+                    )
+                });
 
                 eprintln!(
                     "{sz}³ fp8 (same-run): pipe {:>7.0} GFLOP/s | {:>4.2}× vs fp8-mt ({:.0}) | {:>4.2}× vs fp16 (Ada 2× rate: fp16 {:.0})",
@@ -12954,19 +15003,28 @@ E_FILL:\n\
         with_gpu("cublaslt_fp8_gate", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("cublaslt_fp8_matches_reference_within_tol");
-                eprintln!("[skip] cublaslt_fp8_gate: cuBLASLt not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] cublaslt_fp8_gate: cuBLASLt not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             let mut rng = crate::diff::Rng::new(0xF8C7);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 256, 256), (128, 512, 384)] {
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 256, 256),
+                (128, 512, 384),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let c = match cublaslt_gemm_nt_fp8_e4m3(g, &a, &b, m, k, n) {
                     Ok(c) => c,
                     Err(e) => {
                         peer_gate("cublaslt_fp8_matches_reference_within_tol");
-                        eprintln!("[skip] cuBLASLt fp8 unsupported for {m}x{k}x{n} on this device: {e}");
+                        eprintln!(
+                            "[skip] cuBLASLt fp8 unsupported for {m}x{k}x{n} on this device: {e}"
+                        );
                         return;
                     }
                 };
@@ -12998,12 +15056,16 @@ E_FILL:\n\
             cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3,
         };
         use crate::ptx_fp8::{
-            f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS, FP8_TM, FP8_TN,
+            f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS, FP8_TM,
+            FP8_TN,
         };
         with_fp8("fp8_vs_cublaslt", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("fp8_vs_cublaslt_pct");
-                eprintln!("[skip] fp8_vs_cublaslt: cuBLASLt not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] fp8_vs_cublaslt: cuBLASLt not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             let mut rng = crate::diff::Rng::new(0xF8C8);
@@ -13026,13 +15088,14 @@ E_FILL:\n\
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
 
                 // cuBLASLt fp8 peer (plan built once inside, then 50 resident matmuls).
-                let s_lt = match time_cublaslt_gemm_nt_fp8_e4m3(g, &a8_d, &b8_d, &mut c_d, m, k, n, 50) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("{sz}³ [skip] cuBLASLt fp8 unsupported: {e}");
-                        continue;
-                    }
-                };
+                let s_lt =
+                    match time_cublaslt_gemm_nt_fp8_e4m3(g, &a8_d, &b8_d, &mut c_d, m, k, n, 50) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("{sz}³ [skip] cuBLASLt fp8 unsupported: {e}");
+                            continue;
+                        }
+                    };
 
                 // Wukong fp8 pipelined — the *dispatched* tile (`gemm_nt_fp8_pipe`'s regime rule:
                 // 64×128 for M≤2048, else 128×128), so the reported % reflects what ships.
@@ -13041,22 +15104,34 @@ E_FILL:\n\
                 } else {
                     ("fp8_gemm_pipe", FP8_PIPE_BM)
                 };
-                let f_pipe = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), pipe_entry).unwrap();
+                let f_pipe = g
+                    .function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), pipe_entry)
+                    .unwrap();
                 let cfg_pipe = LaunchConfig {
                     grid_dim: (((m / pipe_bm) * (n / FP8_PIPE_BN)) as u32, 1, 1),
                     block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let s_pipe = best_of(4, || time_wmma(g, &f_pipe, cfg_pipe, dims, &a8_d, &b8_d, &mut c_d, 50));
+                let s_pipe = best_of(4, || {
+                    time_wmma(g, &f_pipe, cfg_pipe, dims, &a8_d, &b8_d, &mut c_d, 50)
+                });
 
                 // Wukong fp8 fragment-reuse (_mt).
-                let f_mt = g.function("fp8_gemm_mt", crate::ptx_fp8::fp8_gemm_mt_ptx(), "fp8_gemm_nt_mt").unwrap();
+                let f_mt = g
+                    .function(
+                        "fp8_gemm_mt",
+                        crate::ptx_fp8::fp8_gemm_mt_ptx(),
+                        "fp8_gemm_nt_mt",
+                    )
+                    .unwrap();
                 let cfg_mt = LaunchConfig {
                     grid_dim: ((n / (8 * FP8_TN)) as u32, (m / (16 * FP8_TM)) as u32, 1),
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let s_mt = best_of(4, || time_wmma(g, &f_mt, cfg_mt, dims, &a8_d, &b8_d, &mut c_d, 50));
+                let s_mt = best_of(4, || {
+                    time_wmma(g, &f_mt, cfg_mt, dims, &a8_d, &b8_d, &mut c_d, 50)
+                });
 
                 eprintln!(
                     "{sz}³ fp8 vs cuBLASLt (same-run): cuBLASLt {:>7.0} GFLOP/s | pipe {:>7.0} = {:>5.1}% of LT | mt {:>7.0} = {:>5.1}% of LT",
@@ -13086,12 +15161,24 @@ E_FILL:\n\
         with_fp8("fp8_pipe_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("fp8_pipe_config_sweep_vs_cublaslt");
-                eprintln!("[skip] fp8_pipe_config_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] fp8_pipe_config_sweep: cuBLASLt not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             // (key, bm, bn, bk, warps_m, warps_n, stages, raster) — each ≤48 KiB SMEM.
-            let configs: [(&'static str, usize, usize, usize, usize, usize, usize, usize); 5] = [
-                ("fp8sw_def", 128, 128, 64, 2, 4, 2, 16),   // shipped default (40 KiB)
+            let configs: [(
+                &'static str,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+            ); 5] = [
+                ("fp8sw_def", 128, 128, 64, 2, 4, 2, 16), // shipped default (40 KiB)
                 ("fp8sw_s3b32", 128, 128, 32, 2, 4, 3, 16), // deeper pipeline, shorter k-step (36 KiB)
                 ("fp8sw_m64", 64, 128, 64, 2, 4, 2, 16),    // smaller tile → more CTAs (30 KiB)
                 ("fp8sw_r8", 128, 128, 64, 2, 4, 2, 8),     // tighter rasterization
@@ -13115,13 +15202,14 @@ E_FILL:\n\
                 let a8_d = g.stream.memcpy_stod(&a8).unwrap();
                 let b8_d = g.stream.memcpy_stod(&b8).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let s_lt = match time_cublaslt_gemm_nt_fp8_e4m3(g, &a8_d, &b8_d, &mut c_d, m, k, n, 50) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("{sz}³ [skip] cuBLASLt fp8: {e}");
-                        continue;
-                    }
-                };
+                let s_lt =
+                    match time_cublaslt_gemm_nt_fp8_e4m3(g, &a8_d, &b8_d, &mut c_d, m, k, n, 50) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("{sz}³ [skip] cuBLASLt fp8: {e}");
+                            continue;
+                        }
+                    };
                 eprint!("{sz}³ cuBLASLt {:>6.0} GFLOP/s |", flop / s_lt / 1e9);
                 for (key, bm, bn, bk, wm, wn, stg, ras) in configs {
                     if m % bm != 0 || n % bn != 0 || k % bk != 0 {
@@ -13135,7 +15223,9 @@ E_FILL:\n\
                         block_dim: ((wm * wn * 32) as u32, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    let s = best_of(4, || time_wmma(g, &f, cfg, dims, &a8_d, &b8_d, &mut c_d, 50));
+                    let s = best_of(4, || {
+                        time_wmma(g, &f, cfg, dims, &a8_d, &b8_d, &mut c_d, 50)
+                    });
                     eprint!(" {key} {:>5.1}%", 100.0 * s_lt / s);
                 }
                 eprintln!();
@@ -13152,7 +15242,9 @@ E_FILL:\n\
     #[test]
     #[ignore = "throughput A/B; run explicitly (GPU; no DLLs needed)"]
     fn fp8_pipe_m64_vs_default_ab() {
-        use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS};
+        use crate::ptx_fp8::{
+            f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS,
+        };
         with_fp8("fp8_m64_ab", |g| {
             let mut rng = crate::diff::Rng::new(0xF8DA);
             let wa = rng.vec(2048 * 2048, -1.0, 1.0);
@@ -13171,8 +15263,16 @@ E_FILL:\n\
                 let a8_d = g.stream.memcpy_stod(&a8).unwrap();
                 let b8_d = g.stream.memcpy_stod(&b8).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let f_def = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe").unwrap();
-                let f_m64 = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe_m64").unwrap();
+                let f_def = g
+                    .function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe")
+                    .unwrap();
+                let f_m64 = g
+                    .function(
+                        "fp8_pipe",
+                        crate::ptx_fp8::fp8_pipe_ptx(),
+                        "fp8_gemm_pipe_m64",
+                    )
+                    .unwrap();
                 let cfg_def = LaunchConfig {
                     grid_dim: (((m / FP8_PIPE_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1),
                     block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
@@ -13186,8 +15286,12 @@ E_FILL:\n\
                 // Interleaved best-of so default and m64 sample the same clock state.
                 let (mut bd, mut bm) = (f64::MAX, f64::MAX);
                 for _ in 0..6 {
-                    bd = bd.min(time_wmma(g, &f_def, cfg_def, dims, &a8_d, &b8_d, &mut c_d, 50));
-                    bm = bm.min(time_wmma(g, &f_m64, cfg_m64, dims, &a8_d, &b8_d, &mut c_d, 50));
+                    bd = bd.min(time_wmma(
+                        g, &f_def, cfg_def, dims, &a8_d, &b8_d, &mut c_d, 50,
+                    ));
+                    bm = bm.min(time_wmma(
+                        g, &f_m64, cfg_m64, dims, &a8_d, &b8_d, &mut c_d, 50,
+                    ));
                 }
                 eprintln!(
                     "{sz}³ fp8 m64-vs-default (same-family A/B): default {:>6.0} GFLOP/s | m64 {:>6.0} = {:.3}× speedup",
@@ -13285,7 +15389,10 @@ E_FILL:\n\
         with_gpu("gemm_vs_peers", |g| {
             if !peers_available(g) {
                 peer_gate("gemm_vs_peers");
-                eprintln!("[skip] gemm_vs_peers: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] gemm_vs_peers: cuBLAS/NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -13301,10 +15408,22 @@ E_FILL:\n\
                 // sum itself is f32), not the √K accumulation growth — a ~2% rel / 5e-2 abs bound passes
                 // a correct fp16 GEMM comfortably yet still fails a transpose/index slip (off by ~100%).
                 let cub = cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap();
-                crate::diff::assert_close(&format!("cuBLAS fp16 {m}x{k}x{n}"), &cub, &r, 5e-2, 2e-2);
+                crate::diff::assert_close(
+                    &format!("cuBLAS fp16 {m}x{k}x{n}"),
+                    &cub,
+                    &r,
+                    5e-2,
+                    2e-2,
+                );
                 let naive = nvrtc_naive_gemm_nt(g, &a, &b, m, k, n).unwrap();
                 let rel_f32 = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
-                crate::diff::assert_close(&format!("naive CUDA-C {m}x{k}x{n}"), &naive, &r, 1e-3, rel_f32);
+                crate::diff::assert_close(
+                    &format!("naive CUDA-C {m}x{k}x{n}"),
+                    &naive,
+                    &r,
+                    1e-3,
+                    rel_f32,
+                );
             }
             eprintln!("[gate] cuBLAS + naive CUDA-C both match the f64 oracle ✓");
 
@@ -13335,34 +15454,92 @@ E_FILL:\n\
                 let b16_d = g.stream.memcpy_stod(&b16).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                 let (e16, c16) = wmma_pick("wmma_nt_f16", m, n);
-                let f16f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), &e16).unwrap();
-                let s_mt = best_of(ROUNDS, || time_wmma(g, &f16f, c16, dims, &a16_d, &b16_d, &mut c_d, 50));
+                let f16f = g
+                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), &e16)
+                    .unwrap();
+                let s_mt = best_of(ROUNDS, || {
+                    time_wmma(g, &f16f, c16, dims, &a16_d, &b16_d, &mut c_d, 50)
+                });
                 // Wukong SMEM-staged kernel — the Phase-1 lever (CTA-cooperative shared-memory tiles).
                 let f_sm = g
-                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm")
+                    .function(
+                        "wmma_f16",
+                        crate::ptx_wmma::wmma_f16_ptx(),
+                        "wmma_nt_f16_sm",
+                    )
                     .unwrap();
-                let s_sm =
-                    best_of(ROUNDS, || time_wmma(g, &f_sm, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50));
+                let s_sm = best_of(ROUNDS, || {
+                    time_wmma(
+                        g,
+                        &f_sm,
+                        wmma_sm_cfg(m, n),
+                        dims,
+                        &a16_d,
+                        &b16_d,
+                        &mut c_d,
+                        50,
+                    )
+                });
                 // Wukong cp.async double-buffered 64×64 kernel — overlap next-tile load with compute.
                 let f_db = g
-                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db")
+                    .function(
+                        "wmma_f16",
+                        crate::ptx_wmma::wmma_f16_ptx(),
+                        "wmma_nt_f16_sm_db",
+                    )
                     .unwrap();
-                let s_db =
-                    best_of(ROUNDS, || time_wmma(g, &f_db, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50));
+                let s_db = best_of(ROUNDS, || {
+                    time_wmma(
+                        g,
+                        &f_db,
+                        wmma_sm_cfg(m, n),
+                        dims,
+                        &a16_d,
+                        &b16_d,
+                        &mut c_d,
+                        50,
+                    )
+                });
                 // Wukong 128×128 + cp.async double-buffered — the cuBLAS recipe (big tile + pipeline).
                 let f_sm128 = g
-                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm128_db")
+                    .function(
+                        "wmma_f16",
+                        crate::ptx_wmma::wmma_f16_ptx(),
+                        "wmma_nt_f16_sm128_db",
+                    )
                     .unwrap();
                 let s_sm128 = best_of(ROUNDS, || {
-                    time_wmma(g, &f_sm128, wmma_sm128_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50)
+                    time_wmma(
+                        g,
+                        &f_sm128,
+                        wmma_sm128_cfg(m, n),
+                        dims,
+                        &a16_d,
+                        &b16_d,
+                        &mut c_d,
+                        50,
+                    )
                 });
                 // Single-buffered 128 tile — same big tile, no cp.async pipeline (the occupancy-bound
                 // large-GEMM candidate: the clean scoreboard shows pipelining loses once A/B spill L2).
                 let f_sm128s = g
-                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm128")
+                    .function(
+                        "wmma_f16",
+                        crate::ptx_wmma::wmma_f16_ptx(),
+                        "wmma_nt_f16_sm128",
+                    )
                     .unwrap();
                 let s_sm128s = best_of(ROUNDS, || {
-                    time_wmma(g, &f_sm128s, wmma_sm128_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50)
+                    time_wmma(
+                        g,
+                        &f_sm128s,
+                        wmma_sm128_cfg(m, n),
+                        dims,
+                        &a16_d,
+                        &b16_d,
+                        &mut c_d,
+                        50,
+                    )
                 });
 
                 // Peers (same buffers' worth of work). Naive is slow → fewer iters, still per-iter time.
@@ -13387,8 +15564,13 @@ E_FILL:\n\
                 );
 
                 let (g_mt, g_sm, g_sm128, g_sm128s, g_db, g_cub, g_naive) = (
-                    flop / s_mt, flop / s_sm, flop / s_sm128, flop / s_sm128s,
-                    flop / s_db, flop / s_cub, flop / s_naive,
+                    flop / s_mt,
+                    flop / s_sm,
+                    flop / s_sm128,
+                    flop / s_sm128s,
+                    flop / s_db,
+                    flop / s_cub,
+                    flop / s_naive,
                 );
                 eprintln!(
                     "\n{sz}³ fp16 GEMM (same-run):\n  \
@@ -13424,7 +15606,12 @@ E_FILL:\n\
         use half::f16;
         with_gpu("head_transpose_round_trips", |g| {
             let mut rng = crate::diff::Rng::new(0x7AB1E5);
-            for &(s, heads, dh) in &[(16usize, 1usize, 64usize), (64, 12, 64), (32, 4, 32), (16, 2, 128)] {
+            for &(s, heads, dh) in &[
+                (16usize, 1usize, 64usize),
+                (64, 12, 64),
+                (32, 4, 32),
+                (16, 2, 128),
+            ] {
                 let d = heads * dh;
                 let (n, dd, dhh, sdh) = ((s * d) as u32, d as u32, dh as u32, (s * dh) as u32);
 
@@ -13434,29 +15621,56 @@ E_FILL:\n\
                 for row in 0..s {
                     for head in 0..heads {
                         for i in 0..dh {
-                            want_fwd[head * s * dh + row * dh + i] = f16::from_f32(src[row * d + head * dh + i]);
+                            want_fwd[head * s * dh + row * dh + i] =
+                                f16::from_f32(src[row * d + head * dh + i]);
                         }
                     }
                 }
-                let f_fwd = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "cast_transpose_qkv").unwrap();
+                let f_fwd = g
+                    .function(
+                        "htrans",
+                        crate::ptx::HEAD_TRANSPOSE_PTX,
+                        "cast_transpose_qkv",
+                    )
+                    .unwrap();
                 let src_d = g.stream.memcpy_stod(&src).unwrap();
                 let mut dst_d = g.stream.alloc_zeros::<f16>(s * d).unwrap();
                 let mut b = g.stream.launch_builder(&f_fwd);
-                b.arg(&n).arg(&dd).arg(&dhh).arg(&sdh).arg(&src_d).arg(&mut dst_d);
+                b.arg(&n)
+                    .arg(&dd)
+                    .arg(&dhh)
+                    .arg(&sdh)
+                    .arg(&src_d)
+                    .arg(&mut dst_d);
                 unsafe { b.launch(LaunchConfig::for_num_elems(n)).unwrap() };
                 g.stream.synchronize().unwrap();
                 let got_fwd = g.stream.memcpy_dtov(&dst_d).unwrap();
                 for (idx, (a, e)) in got_fwd.iter().zip(want_fwd.iter()).enumerate() {
-                    assert_eq!(a.to_bits(), e.to_bits(), "fwd mismatch s={s} h={heads} dh={dh} idx={idx}");
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "fwd mismatch s={s} h={heads} dh={dh} idx={idx}"
+                    );
                 }
 
                 // --- inverse: head-major [H,S,dh] f32 -> token-major [S,H·dh] f32 (exact) ---
                 let hsd = rng.vec(s * d, -1.0, 1.0);
-                let f_inv = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "transpose_attn_out").unwrap();
+                let f_inv = g
+                    .function(
+                        "htrans",
+                        crate::ptx::HEAD_TRANSPOSE_PTX,
+                        "transpose_attn_out",
+                    )
+                    .unwrap();
                 let hsd_d = g.stream.memcpy_stod(&hsd).unwrap();
                 let mut out_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
                 let mut b2 = g.stream.launch_builder(&f_inv);
-                b2.arg(&n).arg(&dd).arg(&dhh).arg(&sdh).arg(&hsd_d).arg(&mut out_d);
+                b2.arg(&n)
+                    .arg(&dd)
+                    .arg(&dhh)
+                    .arg(&sdh)
+                    .arg(&hsd_d)
+                    .arg(&mut out_d);
                 unsafe { b2.launch(LaunchConfig::for_num_elems(n)).unwrap() };
                 g.stream.synchronize().unwrap();
                 let got_inv = g.stream.memcpy_dtov(&out_d).unwrap();
@@ -13553,7 +15767,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("gemm_pipe_sweep", |g| {
             if !peers_available(g) {
                 peer_gate("gemm_pipe_sweep");
-                eprintln!("[skip] gemm_pipe_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] gemm_pipe_sweep: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -13568,7 +15785,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let c = gemm_nt_f16_pipe(g, &a, &b, m, k, n, v).unwrap();
                 crate::diff::assert_close(&format!("{} gate", v.name), &c, &r, 5e-2, 2e-2);
             }
-            eprintln!("[gate] all {} pipe variants match the f64 oracle ✓", PIPE_VARIANTS.len());
+            eprintln!(
+                "[gate] all {} pipe variants match the f64 oracle ✓",
+                PIPE_VARIANTS.len()
+            );
 
             // --- Clock warmup (same-run peak-vs-peak; cf. gemm_vs_peers). ---
             for _ in 0..40 {
@@ -13591,7 +15811,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let a16_d = g.stream.memcpy_stod(&a16).unwrap();
                 let b16_d = g.stream.memcpy_stod(&b16).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let cs_c = cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                let cs_c = cublas_gemm_nt_f16(g, &a, &b, m, k, n)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum::<f64>();
 
                 eprintln!("\n{sz}³ fp16 GEMM pipe sweep (same-run, cuBLAS-adjacent best_pair):");
                 let mut best: Option<(&str, f64)> = None;
@@ -13599,7 +15823,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     if m % v.bm != 0 || n % v.bn != 0 || k % v.bk != 0 {
                         continue;
                     }
-                    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), v.name).unwrap();
+                    let f = g
+                        .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), v.name)
+                        .unwrap();
                     let cfg = pipe_cfg(v, m, n);
                     // Interleave variant and cuBLAS round-by-round (inlined, not a 2-closure helper: the
                     // variant borrows `g` shared via time_wmma, cuBLAS borrows it mutably — they can't be
@@ -13610,7 +15836,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         s_cub = s_cub.min(time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap());
                     }
                     // Checksum cross-check at this size: the timed kernel computes cuBLAS's matrix.
-                    let cs = gemm_nt_f16_pipe(g, &a, &b, m, k, n, v).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                    let cs = gemm_nt_f16_pipe(g, &a, &b, m, k, n, v)
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.abs() as f64)
+                        .sum::<f64>();
                     assert!(
                         (cs - cs_c).abs() / cs_c.max(1.0) < 3e-2,
                         "{sz}³ {} checksum {cs:.3e} vs cuBLAS {cs_c:.3e}",
@@ -13646,18 +15876,27 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore]
     fn mma_swizzle_vs_handplaced() {
-        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16};
+        use crate::baselines::{
+            gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+        };
         use crate::ptx_wmma::{pipe_variant, PipeCfg};
         use half::f16;
         with_gpu("mma_swizzle_bench", |g| {
             if !peers_available(g) {
                 peer_gate("mma_swizzle_vs_handplaced");
-                eprintln!("[skip] mma_swizzle_vs_handplaced: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] mma_swizzle_vs_handplaced: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
             let wh = *pipe_variant("mma_nt_f16_128_bk32_s2_r16");
-            let swz = PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..wh };
+            let swz = PipeCfg {
+                name: "mma_nt_f16_128_bk32_s2_r16_swz",
+                pad: 0,
+                ..wh
+            };
             eprintln!(
                 "SMEM/CTA: hand-placed (padded) {} KiB → {} CTAs/SM | swz (no-pad) {} KiB → {} CTAs/SM",
                 wh.smem_bytes() / 1024,
@@ -13682,9 +15921,20 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let a_d = g.stream.memcpy_stod(&a16).unwrap();
                 let b_d = g.stream.memcpy_stod(&b16).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let cs_hp = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &wh).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
-                let cs_sz = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &swz).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
-                assert!((cs_hp - cs_sz).abs() / cs_hp.max(1.0) < 1e-3, "{sz}³ swz checksum {cs_sz:.3e} vs hand-placed {cs_hp:.3e}");
+                let cs_hp = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &wh)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum::<f64>();
+                let cs_sz = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &swz)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum::<f64>();
+                assert!(
+                    (cs_hp - cs_sz).abs() / cs_hp.max(1.0) < 1e-3,
+                    "{sz}³ swz checksum {cs_sz:.3e} vs hand-placed {cs_hp:.3e}"
+                );
                 let f_hp = g.function("wmma_f16", ptx, wh.name).unwrap();
                 let f_sz = g.function("wmma_f16", ptx, swz.name).unwrap();
                 let cfg = pipe_cfg(&wh, m, n);
@@ -13762,11 +16012,25 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let f = g.function("gemm_cliff", gemm_cliff_ptx(), v.name).unwrap();
                     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                    bld.arg(&mm)
+                        .arg(&nn)
+                        .arg(&kk)
+                        .arg(&a_d)
+                        .arg(&b_d)
+                        .arg(&mut c_d);
                     unsafe { bld.launch(cliff_cfg_for(v, m, n)).unwrap() };
                     let c = g.stream.memcpy_dtov(&c_d).unwrap();
-                    let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
-                    eprintln!("{:<20} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", v.name, s.max_abs, s.max_rel);
+                    let s = crate::diff::assert_close(
+                        &format!("{} {m}x{k}x{n}", v.name),
+                        &c,
+                        &r,
+                        1e-2,
+                        2e-3,
+                    );
+                    eprintln!(
+                        "{:<20} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        v.name, s.max_abs, s.max_rel
+                    );
                     launched.iter_mut().find(|(n, _)| *n == v.name).unwrap().1 += 1;
                 }
             }
@@ -13776,10 +16040,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     *hits > 0,
                     "CLIFF_VARIANTS entry `{name}` was never gated — no test shape tiles its \
                      {}x{}x{} macro-tile; add one to this test's shape list",
-                    v.bm, v.bn, v.bk
+                    v.bm,
+                    v.bn,
+                    v.bk
                 );
             }
-            eprintln!("[gate] all {} CLIFF_VARIANTS entries launched ✓", launched.len());
+            eprintln!(
+                "[gate] all {} CLIFF_VARIANTS entries launched ✓",
+                launched.len()
+            );
         });
     }
 
@@ -13831,11 +16100,20 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // context for why this part's verdict on depth is not the datacenter's. Not a timing.
                 let occ = {
                     let (f, dyn_bytes) = g
-                        .function_smem("gemm_deep", crate::ptx_wmma::gemm_deep_ptx(), v.name, v.smem_mode())
+                        .function_smem(
+                            "gemm_deep",
+                            crate::ptx_wmma::gemm_deep_ptx(),
+                            v.name,
+                            v.smem_mode(),
+                        )
                         .unwrap();
                     assert_eq!(dyn_bytes, v.smem_mode().launch_bytes());
-                    f.occupancy_max_active_blocks_per_multiprocessor(v.threads() as u32, dyn_bytes, None)
-                        .unwrap_or(0)
+                    f.occupancy_max_active_blocks_per_multiprocessor(
+                        v.threads() as u32,
+                        dyn_bytes,
+                        None,
+                    )
+                    .unwrap_or(0)
                 };
                 eprintln!(
                     "  {:<20} {}x{} s{} SMEM {:>5} B ({:>2} KiB) {:<8} occupancy={} CTA/SM",
@@ -13845,15 +16123,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     v.stages,
                     v.smem_bytes(),
                     v.smem_bytes() / 1024,
-                    if v.smem_mode().is_dynamic() { "DYNAMIC" } else { "static" },
+                    if v.smem_mode().is_dynamic() {
+                        "DYNAMIC"
+                    } else {
+                        "static"
+                    },
                     occ
                 );
                 let mut shapes = vec![
-                    (v.bm, v.bk, v.bn),                          // 1 CTA, 1 K-tile — full prologue guard
-                    (v.bm, v.bk * (v.stages - 1), v.bn),         // prologue exactly fills the ring
-                    (2 * v.bm, v.bk * v.stages, 2 * v.bn),       // 4 CTAs, first ring wrap
-                    (v.bm, v.bk * (v.stages + 3), 2 * v.bn),     // several wraps, rectangular
-                    (v.bm, v.bk, (v.raster + 1) * v.bn),         // tiles_n = 17 > raster = 16
+                    (v.bm, v.bk, v.bn),                      // 1 CTA, 1 K-tile — full prologue guard
+                    (v.bm, v.bk * (v.stages - 1), v.bn),     // prologue exactly fills the ring
+                    (2 * v.bm, v.bk * v.stages, 2 * v.bn),   // 4 CTAs, first ring wrap
+                    (v.bm, v.bk * (v.stages + 3), 2 * v.bn), // several wraps, rectangular
+                    (v.bm, v.bk, (v.raster + 1) * v.bn),     // tiles_n = 17 > raster = 16
                 ];
                 shapes.dedup();
                 for (m, k, n) in shapes {
@@ -13861,15 +16143,34 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let b = rng.vec(n * k, -1.0, 1.0);
                     let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
                     let c = gemm_nt_f16_deep(g, &a, &b, m, k, n, v).unwrap();
-                    let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
+                    let s = crate::diff::assert_close(
+                        &format!("{} {m}x{k}x{n}", v.name),
+                        &c,
+                        &r,
+                        1e-2,
+                        2e-3,
+                    );
                     // …and against the shipped 2-stage row at the same shape (the regression oracle).
-                    let (peer_max, peer_note) = if m % base.bm == 0 && n % base.bn == 0 && k % base.bk == 0 {
-                        let c2 = gemm_nt_f16_deep(g, &a, &b, m, k, n, base).unwrap();
-                        crate::diff::assert_close(&format!("{} vs s2 {m}x{k}x{n}", v.name), &c, &c2, 1e-2, 2e-3);
-                        (c.iter().zip(&c2).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max), "")
-                    } else {
-                        (f32::NAN, " (s2 does not tile this shape)")
-                    };
+                    let (peer_max, peer_note) =
+                        if m % base.bm == 0 && n % base.bn == 0 && k % base.bk == 0 {
+                            let c2 = gemm_nt_f16_deep(g, &a, &b, m, k, n, base).unwrap();
+                            crate::diff::assert_close(
+                                &format!("{} vs s2 {m}x{k}x{n}", v.name),
+                                &c,
+                                &c2,
+                                1e-2,
+                                2e-3,
+                            );
+                            (
+                                c.iter()
+                                    .zip(&c2)
+                                    .map(|(x, y)| (x - y).abs())
+                                    .fold(0f32, f32::max),
+                                "",
+                            )
+                        } else {
+                            (f32::NAN, " (s2 does not tile this shape)")
+                        };
                     eprintln!(
                         "    {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e} | vs s2 max_abs={:.2e}{peer_note}",
                         s.max_abs, s.max_rel, peer_max
@@ -13877,7 +16178,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     ran += 1;
                 }
             }
-            assert!(ran >= 10, "the deep grid must actually have run (only {ran} shapes)");
+            assert!(
+                ran >= 10,
+                "the deep grid must actually have run (only {ran} shapes)"
+            );
             eprintln!(
                 "[gate] f16 deep pipeline: {ran} K-corner shapes across s2..s5 + the 128x256 tile, every one \
                  within fp16 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the >48 KiB rows \
@@ -13897,14 +16201,29 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("gemm_deep_decline", |g| {
             let budget = g.smem_budget();
             // 32 stages at 128x128 bk32 = 512 KiB — past every part's opt-in ceiling (H100's is 227 KiB).
-            let over = CliffCfg { name: "deep_swz_128_s2", stages: 32, ..*deep_variant("deep_swz_128_s2") };
-            assert!(over.smem_bytes() > budget, "the probe config must exceed the device ceiling");
+            let over = CliffCfg {
+                name: "deep_swz_128_s2",
+                stages: 32,
+                ..*deep_variant("deep_swz_128_s2")
+            };
+            assert!(
+                over.smem_bytes() > budget,
+                "the probe config must exceed the device ceiling"
+            );
             let a = vec![0f32; 128 * 32];
             let b = vec![0f32; 128 * 32];
             let err = gemm_nt_f16_deep(g, &a, &b, 128, 32, 128, &over).unwrap_err();
-            let msg = err.unsupported().expect("an over-budget row must be a CAPABILITY decline");
-            assert!(msg.contains("shared memory"), "the decline must name what was refused: {msg}");
-            assert!(msg.contains(&budget.to_string()), "the decline must name the ceiling: {msg}");
+            let msg = err
+                .unsupported()
+                .expect("an over-budget row must be a CAPABILITY decline");
+            assert!(
+                msg.contains("shared memory"),
+                "the decline must name what was refused: {msg}"
+            );
+            assert!(
+                msg.contains(&budget.to_string()),
+                "the decline must name the ceiling: {msg}"
+            );
             eprintln!("[gate] over-budget deep row declined: {msg}");
         });
     }
@@ -13935,12 +16254,29 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let ad = g.stream.memcpy_stod(&af).unwrap();
                 let bd = g.stream.memcpy_stod(&bf).unwrap();
                 let mut cd = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let f = g.function("wmma_f16", wmma_f16_ptx(), "mma_nt_f16_128_bk32_s2_r16_w22swz").unwrap();
+                let f = g
+                    .function(
+                        "wmma_f16",
+                        wmma_f16_ptx(),
+                        "mma_nt_f16_128_bk32_s2_r16_w22swz",
+                    )
+                    .unwrap();
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&mm).arg(&nn).arg(&kk).arg(&ad).arg(&bd).arg(&mut cd);
+                bld.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&ad)
+                    .arg(&bd)
+                    .arg(&mut cd);
                 unsafe { bld.launch(cfg).unwrap() };
                 let cf = g.stream.memcpy_dtov(&cd).unwrap();
-                let s = crate::diff::assert_close(&format!("f16 w22swz {m}x{k}x{n}"), &cf, &rf, 1e-2, 2e-3);
+                let s = crate::diff::assert_close(
+                    &format!("f16 w22swz {m}x{k}x{n}"),
+                    &cf,
+                    &rf,
+                    1e-2,
+                    2e-3,
+                );
                 eprintln!("f16  w22swz {m}x{k}x{n}: max_abs={:.2e}", s.max_abs);
                 // bf16
                 let rb = ref_nt_rounded(&a, &b, m, k, n, |x| bf16::from_f32(x).to_f32());
@@ -13949,12 +16285,29 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let ad = g.stream.memcpy_stod(&ab).unwrap();
                 let bd = g.stream.memcpy_stod(&bb).unwrap();
                 let mut cd = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let f = g.function("wmma_bf16", wmma_bf16_ptx(), "mma_nt_bf16_128_bk32_s2_r16_w22swz").unwrap();
+                let f = g
+                    .function(
+                        "wmma_bf16",
+                        wmma_bf16_ptx(),
+                        "mma_nt_bf16_128_bk32_s2_r16_w22swz",
+                    )
+                    .unwrap();
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&mm).arg(&nn).arg(&kk).arg(&ad).arg(&bd).arg(&mut cd);
+                bld.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&ad)
+                    .arg(&bd)
+                    .arg(&mut cd);
                 unsafe { bld.launch(cfg).unwrap() };
                 let cb = g.stream.memcpy_dtov(&cd).unwrap();
-                let s = crate::diff::assert_close(&format!("bf16 w22swz {m}x{k}x{n}"), &cb, &rb, 5e-2, 2e-2);
+                let s = crate::diff::assert_close(
+                    &format!("bf16 w22swz {m}x{k}x{n}"),
+                    &cb,
+                    &rb,
+                    5e-2,
+                    2e-2,
+                );
                 eprintln!("bf16 w22swz {m}x{k}x{n}: max_abs={:.2e}", s.max_abs);
             }
         });
@@ -13982,7 +16335,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("gemm_cliff_ab", |g| {
             if !peers_available(g) {
                 peer_gate("gemm_cliff_ab");
-                eprintln!("[skip] gemm_cliff_ab: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] gemm_cliff_ab: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -14009,9 +16365,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let a_d = g.stream.memcpy_stod(&a16).unwrap();
                 let b_d = g.stream.memcpy_stod(&b16).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let cs_ref = cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                let cs_ref = cublas_gemm_nt_f16(g, &a, &b, m, k, n)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum::<f64>();
                 // Preload every variant function, gate its checksum vs cuBLAS, record achieved occupancy.
-                let mut variants: Vec<(&str, cudarc::driver::CudaFunction, u32, usize, LaunchConfig)> = Vec::new();
+                let mut variants: Vec<(
+                    &str,
+                    cudarc::driver::CudaFunction,
+                    u32,
+                    usize,
+                    LaunchConfig,
+                )> = Vec::new();
                 for v in CLIFF_VARIANTS {
                     if m % v.bm != 0 || n % v.bn != 0 || k % v.bk != 0 {
                         continue;
@@ -14024,10 +16390,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let (mm, nn, kk) = dims;
                     {
                         let mut bld = g.stream.launch_builder(&f);
-                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                        bld.arg(&mm)
+                            .arg(&nn)
+                            .arg(&kk)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut c_d);
                         unsafe { bld.launch(vcfg).unwrap() };
                     }
-                    let cs = g.stream.memcpy_dtov(&c_d).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                    let cs = g
+                        .stream
+                        .memcpy_dtov(&c_d)
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.abs() as f64)
+                        .sum::<f64>();
                     assert!(
                         (cs - cs_ref).abs() / cs_ref.max(1.0) < 3e-2,
                         "{sz}³ {} checksum {cs:.3e} vs cuBLAS {cs_ref:.3e}",
@@ -14050,12 +16427,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     (f64::INFINITY, f64::INFINITY, f64::INFINITY);
                 for _ in 0..rounds {
                     for (i, (_, f, _, _, vcfg)) in variants.iter().enumerate() {
-                        best[i] = best[i].min(time_wmma(g, f, *vcfg, dims, &a_d, &b_d, &mut c_d, iters));
+                        best[i] =
+                            best[i].min(time_wmma(g, f, *vcfg, dims, &a_d, &b_d, &mut c_d, iters));
                     }
-                    best_cub = best_cub.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
-                    best_cub2 = best_cub2.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
-                    best_cub_f32 =
-                        best_cub_f32.min(time_cublas_gemm_nt_f16_f32out(g, m, k, n, iters as u32).unwrap());
+                    best_cub =
+                        best_cub.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
+                    best_cub2 =
+                        best_cub2.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
+                    best_cub_f32 = best_cub_f32
+                        .min(time_cublas_gemm_nt_f16_f32out(g, m, k, n, iters as u32).unwrap());
                 }
                 let base_i = variants.iter().position(|v| v.0 == "cliff_swz_s2").unwrap();
                 let base_t = best[base_i];
@@ -14096,7 +16476,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore]
     fn gemm_cliff_ptxas_ab() {
-        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16};
+        use crate::baselines::{
+            gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+        };
         use crate::ptx_wmma::{gemm_cliff_ptx, CLIFF_VARIANTS};
         use cudarc::nvrtc::Ptx;
         use half::f16;
@@ -14118,7 +16500,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // ptxas compiles the cubin for THIS device (probed), not a hardcoded `sm_89` — an offline
             // cubin is arch-specific, so a literal would silently target the wrong card.
             let sm_arch = g.sm_arch();
-            let v = CLIFF_VARIANTS.iter().find(|v| v.name == "cliff_swz_s2").unwrap();
+            let v = CLIFF_VARIANTS
+                .iter()
+                .find(|v| v.name == "cliff_swz_s2")
+                .unwrap();
             let ptx = gemm_cliff_ptx();
             // Offline-compile the module with a few ptxas flag sets → cubin → driver-load.
             let dir = std::env::temp_dir();
@@ -14128,7 +16513,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let _ = g.ctx.bind_to_thread();
             let flagsets: &[(&str, &[&str])] = &[
                 ("ptxas12.9_O3", &["-O3"]),
-                ("ptxas12.9_O3_xpa", &["-O3", "--allow-expensive-optimizations=true"]),
+                (
+                    "ptxas12.9_O3_xpa",
+                    &["-O3", "--allow-expensive-optimizations=true"],
+                ),
             ];
             let mut cands: Vec<(String, cudarc::driver::CudaFunction)> = Vec::new();
             for (tag, flags) in flagsets {
@@ -14141,14 +16529,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     .arg(&ptx_path)
                     .output();
                 match out {
-                    Ok(o) if o.status.success() => match g.ctx.load_module(Ptx::from_file(&cubin_path)) {
-                        Ok(m) => match m.load_function(v.name) {
-                            Ok(f) => cands.push((tag.to_string(), f)),
-                            Err(e) => eprintln!("[skip] {tag}: load_function {e}"),
-                        },
-                        Err(e) => eprintln!("[skip] {tag}: driver rejected cubin (driver < 12.9?) {e}"),
-                    },
-                    Ok(o) => eprintln!("[skip] {tag}: ptxas exit {:?}: {}", o.status.code(), String::from_utf8_lossy(&o.stderr)),
+                    Ok(o) if o.status.success() => {
+                        match g.ctx.load_module(Ptx::from_file(&cubin_path)) {
+                            Ok(m) => match m.load_function(v.name) {
+                                Ok(f) => cands.push((tag.to_string(), f)),
+                                Err(e) => eprintln!("[skip] {tag}: load_function {e}"),
+                            },
+                            Err(e) => eprintln!(
+                                "[skip] {tag}: driver rejected cubin (driver < 12.9?) {e}"
+                            ),
+                        }
+                    }
+                    Ok(o) => eprintln!(
+                        "[skip] {tag}: ptxas exit {:?}: {}",
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stderr)
+                    ),
                     Err(e) => eprintln!("[skip] {tag}: spawn ptxas: {e}"),
                 }
             }
@@ -14178,17 +16574,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let b_d = g.stream.memcpy_stod(&b16).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                 // checksum: every build must produce the identical result (same PTX/algorithm).
-                let checksum = |g: &Gpu, f: &cudarc::driver::CudaFunction, c_d: &mut cudarc::driver::CudaSlice<f32>| -> f64 {
+                let checksum = |g: &Gpu,
+                                f: &cudarc::driver::CudaFunction,
+                                c_d: &mut cudarc::driver::CudaSlice<f32>|
+                 -> f64 {
                     let (mm, nn, kk) = dims;
                     {
                         let mut bld = g.stream.launch_builder(f);
-                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut *c_d);
+                        bld.arg(&mm)
+                            .arg(&nn)
+                            .arg(&kk)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut *c_d);
                         unsafe { bld.launch(cfg).unwrap() };
                     }
-                    g.stream.memcpy_dtov(&*c_d).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>()
+                    g.stream
+                        .memcpy_dtov(&*c_d)
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.abs() as f64)
+                        .sum::<f64>()
                 };
                 let cs_jit = checksum(g, &jit, &mut c_d);
-                let mut fns: Vec<(&str, &cudarc::driver::CudaFunction)> = vec![("driver_jit", &jit)];
+                let mut fns: Vec<(&str, &cudarc::driver::CudaFunction)> =
+                    vec![("driver_jit", &jit)];
                 for (t, f) in &cands {
                     let cs = checksum(g, f, &mut c_d);
                     assert!(
@@ -14201,7 +16611,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let (mut bc, mut bc2) = (f64::INFINITY, f64::INFINITY);
                 for _ in 0..rounds {
                     for (i, (_, f)) in fns.iter().enumerate() {
-                        best[i] = best[i].min(time_wmma(g, f, cfg, dims, &a_d, &b_d, &mut c_d, iters));
+                        best[i] =
+                            best[i].min(time_wmma(g, f, cfg, dims, &a_d, &b_d, &mut c_d, iters));
                     }
                     bc = bc.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
                     bc2 = bc2.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
@@ -14253,7 +16664,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("flash_vs_peers", |g| {
             if !peers_available(g) {
                 peer_gate("flash_vs_peers");
-                eprintln!("[skip] flash_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] flash_vs_peers: NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -14269,11 +16683,23 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let oracle = ref_attn(&qf, &kf, &vf, s, d, scale);
                 let naive = nvrtc_naive_attn(g, &qf, &kf, &vf, 1, s, d, scale).unwrap();
                 let rel_f32 = ((8.0 * (d as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
-                crate::diff::assert_close(&format!("naive attn s={s}"), &naive, &oracle, 1e-3, rel_f32);
+                crate::diff::assert_close(
+                    &format!("naive attn s={s}"),
+                    &naive,
+                    &oracle,
+                    1e-3,
+                    rel_f32,
+                );
                 // cuBLAS chain takes f16 Q/K/V (the tensor-core dtype) ⇒ ~f16 tol; loose enough that only
                 // a transpose/config slip (O(0.1+) scatter) trips it, tight enough to catch one.
                 let chain = cublas_attn_chain(g, &qf, &kf, &vf, s, d, scale).unwrap();
-                crate::diff::assert_close(&format!("cublas attn chain s={s}"), &chain, &oracle, 3e-2, 5e-2);
+                crate::diff::assert_close(
+                    &format!("cublas attn chain s={s}"),
+                    &chain,
+                    &oracle,
+                    3e-2,
+                    5e-2,
+                );
             }
             eprintln!("[gate] naive CUDA-C + cuBLAS-chain attention both match the f64 oracle ✓");
 
@@ -14288,8 +16714,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let f_m = g
                 .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp")
                 .unwrap();
-            let to16 =
-                |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             for s in [512usize, 1024, 2048, 4096] {
                 let qf = rng.vec(s * d, -1.0, 1.0);
                 let kf = rng.vec(s * d, -1.0, 1.0);
@@ -14305,7 +16730,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // Checksum cross-check: Wukong flash vs naive (f16-vs-f32 input ⇒ ~f16 tol on the sum).
                 {
                     let mut bld = g.stream.launch_builder(&f_m);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                 }
                 g.stream.synchronize().unwrap();
@@ -14323,7 +16753,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let t0 = Instant::now();
                     for _ in 0..100 {
                         let mut bld = g.stream.launch_builder(&f_m);
-                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                        bld.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(&mut o_d);
                         unsafe { bld.launch(cfg).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
@@ -14340,7 +16775,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     (cs_c - cs_n).abs() / cs_n.max(1.0) < 3e-2,
                     "S={s}: cuBLAS chain vs naive checksum disagree: chain={cs_c:.3e} naive={cs_n:.3e}"
                 );
-                let t_c = time_cublas_attn_chain(g, s, d, scale, if s >= 2048 { 10 } else { 30 }).unwrap();
+                let t_c = time_cublas_attn_chain(g, s, d, scale, if s >= 2048 { 10 } else { 30 })
+                    .unwrap();
 
                 let flop = attn_flop(1, s, d);
                 let (g_m, g_n, g_c) = (flop / t_m, flop / t_n, flop / t_c);
@@ -14379,7 +16815,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // checksum cross-check vs naive multi-head
                 {
                     let mut bld = g.stream.launch_builder(&f_m);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                 }
                 g.stream.synchronize().unwrap();
@@ -14395,13 +16836,20 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let t0 = Instant::now();
                     for _ in 0..50 {
                         let mut bld = g.stream.launch_builder(&f_m);
-                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                        bld.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(&mut o_d);
                         unsafe { bld.launch(cfg).unwrap() };
                     }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / 50.0
                 });
-                let t_n = time_nvrtc_naive_attn(g, heads, s, d, scale, if s >= 2048 { 2 } else { 5 }).unwrap();
+                let t_n =
+                    time_nvrtc_naive_attn(g, heads, s, d, scale, if s >= 2048 { 2 } else { 5 })
+                        .unwrap();
                 let flop = attn_flop(heads, s, d);
                 let (g_m, g_n) = (flop / t_m, flop / t_n);
                 eprintln!(
@@ -14435,7 +16883,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("fused_act", |g| {
             if !peers_available(g) {
                 peer_gate("fused_gemm_activation_vs_chain");
-                eprintln!("[skip] fused_gemm_activation_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] fused_gemm_activation_vs_chain: cuBLAS/NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -14470,9 +16921,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db").unwrap();
                 // best-of-N (min = least clock-throttled) so the fused/chain ratio is peer-vs-peer at
                 // peak clock and stable run-to-run, not a single throttle-skewed sample.
-                let t_gemm = best_of(5, || time_wmma(g, &f_gemm, wmma_sm_cfg(m, n), dims, &a_d, &b_d, &mut c_d, 30));
+                let t_gemm = best_of(5, || {
+                    time_wmma(
+                        g,
+                        &f_gemm,
+                        wmma_sm_cfg(m, n),
+                        dims,
+                        &a_d,
+                        &b_d,
+                        &mut c_d,
+                        30,
+                    )
+                });
                 let t_cub = best_of(5, || time_cublas_gemm_nt_f16(g, m, k, n, 30).unwrap());
-                eprintln!("\n{sz}³ act(A·Bᵀ) (same-run, on-device; gemm {:.3} ms, cuBLAS {:.3} ms):", t_gemm * 1e3, t_cub * 1e3);
+                eprintln!(
+                    "\n{sz}³ act(A·Bᵀ) (same-run, on-device; gemm {:.3} ms, cuBLAS {:.3} ms):",
+                    t_gemm * 1e3,
+                    t_cub * 1e3
+                );
 
                 for act in ["relu", "silu", "gelu"] {
                     // Correctness: the fused kernel must equal the activation applied to cuBLAS's GEMM.
@@ -14490,13 +16956,30 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             _ => gelu(x),
                         })
                         .collect();
-                    crate::diff::assert_close(&format!("fused {act} vs cuBLAS chain {sz}³"), &fused, &refout, 5e-2, 2e-2);
+                    crate::diff::assert_close(
+                        &format!("fused {act} vs cuBLAS chain {sz}³"),
+                        &fused,
+                        &refout,
+                        5e-2,
+                        2e-2,
+                    );
 
                     // Timing: fused one-kernel vs the activation kernel that a call-chain adds.
                     let entry = format!("wmma_nt_f16_sm_db_{act}");
                     let f_fused = g.function("wmma_f16", ptx, &entry).unwrap();
                     let f_act = g.function("vmath", crate::ptx::vmath_ptx(), act).unwrap();
-                    let t_fused = best_of(5, || time_wmma(g, &f_fused, wmma_sm_cfg(m, n), dims, &a_d, &b_d, &mut c_d, 30));
+                    let t_fused = best_of(5, || {
+                        time_wmma(
+                            g,
+                            &f_fused,
+                            wmma_sm_cfg(m, n),
+                            dims,
+                            &a_d,
+                            &b_d,
+                            &mut c_d,
+                            30,
+                        )
+                    });
                     let t_act = best_of(5, || time_vmath(g, &f_act, m * n, 30));
                     let (wk_chain, cub_chain) = (t_gemm + t_act, t_cub + t_act);
                     eprintln!(
@@ -14514,8 +16997,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // honest, simplest peer is gemm + vadd.) Same megakernel-beats-call-chain principle (M13).
                 let resid = rng.vec(m * n, -1.0, 1.0);
                 let fused_r = gemm_nt_f16_sm_db_residual(g, &a, &b, &resid, m, k, n).unwrap();
-                let ref_r: Vec<f32> =
-                    cub_out.iter().zip(resid.iter()).map(|(&c, &x)| c + x).collect();
+                let ref_r: Vec<f32> = cub_out
+                    .iter()
+                    .zip(resid.iter())
+                    .map(|(&c, &x)| c + x)
+                    .collect();
                 crate::diff::assert_close(
                     &format!("fused residual vs cuBLAS+add {sz}³"),
                     &fused_r,
@@ -14524,10 +17010,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     2e-2,
                 );
                 let resid_d = g.stream.memcpy_stod(&resid).unwrap();
-                let f_resid = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual").unwrap();
+                let f_resid = g
+                    .function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual")
+                    .unwrap();
                 let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd").unwrap();
                 let t_fused_r = best_of(5, || {
-                    time_wmma_residual(g, &f_resid, wmma_sm_cfg(m, n), dims, &a_d, &b_d, &mut c_d, &resid_d, 30)
+                    time_wmma_residual(
+                        g,
+                        &f_resid,
+                        wmma_sm_cfg(m, n),
+                        dims,
+                        &a_d,
+                        &b_d,
+                        &mut c_d,
+                        &resid_d,
+                        30,
+                    )
                 });
                 let t_add = best_of(5, || time_vadd(g, &f_vadd, m * n, 30));
                 let (wk_chain_r, cub_chain_r) = (t_gemm + t_add, t_cub + t_add);
@@ -14562,7 +17060,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("fused_bias_act", |g| {
             if !peers_available(g) {
                 peer_gate("fused_gemm_bias_act_vs_chain");
-                eprintln!("[skip] fused_gemm_bias_act_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] fused_gemm_bias_act_vs_chain: cuBLAS/NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -14620,8 +17121,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         "bias_silu" => silu(x),
                         _ => gelu(x),
                     };
-                    let refout: Vec<f32> =
-                        cub_out.iter().enumerate().map(|(i, &x)| act_fn(x + bias[i % n])).collect();
+                    let refout: Vec<f32> = cub_out
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &x)| act_fn(x + bias[i % n]))
+                        .collect();
                     crate::diff::assert_close(
                         &format!("fused {act} vs cuBLAS chain {sz}³"),
                         &fused,
@@ -14636,7 +17140,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     // vmath time stands in: same memory traffic, a slight over-charge for the no-op math).
                     let f_fused = g.function("wmma_f16", ptx, entry).unwrap();
                     let proxy_act = if act == "bias" { "relu" } else { &act[5..] };
-                    let f_act = g.function("vmath", crate::ptx::vmath_ptx(), proxy_act).unwrap();
+                    let f_act = g
+                        .function("vmath", crate::ptx::vmath_ptx(), proxy_act)
+                        .unwrap();
                     // The **pipe_64_s6** fused twin — the ≤1024³ champion base. At 1024³ the mma-workhorse
                     // base loses (its GEMM is ~80% of cuBLAS there vs pipe_64_s6's ~90%), so the workhorse
                     // fused kernel's GEMM deficit outweighs the saved epilogue round-trip; the pipe_64_s6
@@ -14648,7 +17154,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         "bias_silu" => "wmma_nt_f16_pipe_64_s6_bias_silu",
                         _ => "wmma_nt_f16_pipe_64_s6_bias_gelu",
                     };
-                    let f_p64 = if do_p64 { Some(g.function("wmma_f16", ptx, p64_entry).unwrap()) } else { None };
+                    let f_p64 = if do_p64 {
+                        Some(g.function("wmma_f16", ptx, p64_entry).unwrap())
+                    } else {
+                        None
+                    };
                     let cfg64 = pipe_cfg(pipe64(), m, n);
                     // Contention-robust same-run timing: interleave the cuBLAS GEMM, the epilogue round-trip,
                     // and the fused kernel(s) round-by-round, taking each kernel's min across rounds, so all
@@ -14660,9 +17170,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     for _ in 0..6 {
                         bc = bc.min(time_cublas_gemm_nt_f16(g, m, k, n, 20).unwrap());
                         be = be.min(time_vmath(g, &f_act, m * n, 20));
-                        bf = bf.min(time_wmma_bias(g, &f_fused, cfg, dims, &a_d, &b_d, &mut c_d, &bias_d, 20));
+                        bf = bf.min(time_wmma_bias(
+                            g, &f_fused, cfg, dims, &a_d, &b_d, &mut c_d, &bias_d, 20,
+                        ));
                         if let Some(ref f) = f_p64 {
-                            bp = bp.min(time_wmma_bias(g, f, cfg64, dims, &a_d, &b_d, &mut c_d, &bias_d, 20));
+                            bp = bp.min(time_wmma_bias(
+                                g, f, cfg64, dims, &a_d, &b_d, &mut c_d, &bias_d, 20,
+                            ));
                         }
                     }
                     let (t_cub, t_epi, t_fused) = (bc, be, bf);
@@ -14692,9 +17206,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 {
                     let resid = rng.vec(m * n, -1.0, 1.0);
                     let resid_d = g.stream.memcpy_stod(&resid).unwrap();
-                    let fused = gemm_nt_f16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
-                    let refout: Vec<f32> =
-                        cub_out.iter().enumerate().map(|(i, &x)| x + bias[i % n] + resid[i]).collect();
+                    let fused =
+                        gemm_nt_f16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
+                    let refout: Vec<f32> = cub_out
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &x)| x + bias[i % n] + resid[i])
+                        .collect();
                     crate::diff::assert_close(
                         &format!("fused bias_residual vs cuBLAS chain {sz}³"),
                         &fused,
@@ -14709,7 +17227,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     // The pipe_64_s6 down-proj twin — interleaved for the ≤1024³ A/B (wins where mma loses).
                     let do_p64 = sz <= 1024;
                     let f_p64 = if do_p64 {
-                        Some(g.function("wmma_f16", ptx, "wmma_nt_f16_pipe_64_s6_bias_residual").unwrap())
+                        Some(
+                            g.function("wmma_f16", ptx, "wmma_nt_f16_pipe_64_s6_bias_residual")
+                                .unwrap(),
+                        )
                     } else {
                         None
                     };
@@ -14763,13 +17284,23 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn ffn_fused_vs_chain_throughput() {
         use half::f16;
         with_gpu("ffn_throughput", |g| {
-            let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm").unwrap();
-            let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16").unwrap();
+            let f_norm = g
+                .function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")
+                .unwrap();
+            let f_cast = g
+                .function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")
+                .unwrap();
             let ptx = crate::ptx_wmma::wmma_f16_ptx();
-            let f_silu_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu").unwrap();
-            let f_resid_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual").unwrap();
+            let f_silu_gemm = g
+                .function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu")
+                .unwrap();
+            let f_resid_gemm = g
+                .function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual")
+                .unwrap();
             let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db").unwrap();
-            let f_siluv = g.function("vmath", crate::ptx::vmath_ptx(), "silu").unwrap();
+            let f_siluv = g
+                .function("vmath", crate::ptx::vmath_ptx(), "silu")
+                .unwrap();
             let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd").unwrap();
             let stream = g.stream.clone();
             let eps = 1e-5f32;
@@ -14796,14 +17327,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let w1_d = stream.memcpy_stod(&w1).unwrap();
                 let w2_d = stream.memcpy_stod(&w2).unwrap();
                 let mut h2 = stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
-                let mut h2_16 = stream.memcpy_stod(&vec![f16::from_f32(0.0); s * d]).unwrap();
+                let mut h2_16 = stream
+                    .memcpy_stod(&vec![f16::from_f32(0.0); s * d])
+                    .unwrap();
                 let mut t_dff = stream.memcpy_stod(&vec![0f32; s * dff]).unwrap();
                 let mut t_dff_b = stream.memcpy_stod(&vec![0f32; s * dff]).unwrap();
-                let mut t_dff16 = stream.memcpy_stod(&vec![f16::from_f32(0.0); s * dff]).unwrap();
+                let mut t_dff16 = stream
+                    .memcpy_stod(&vec![f16::from_f32(0.0); s * dff])
+                    .unwrap();
                 let mut t_d = stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
                 let mut out = stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
-                let norm_cfg =
-                    LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+                let norm_cfg = LaunchConfig {
+                    grid_dim: (s as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 let cfg1 = wmma_sm_cfg(s, dff); // up-proj  C[S,Dff]
                 let cfg2 = wmma_sm_cfg(s, d); // down-proj C[S,D]
                 let (mm1, nn1, kk1) = (s as u32, dff as u32, d as u32);
@@ -14824,13 +17362,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         b.arg(&n_sd).arg(&h2).arg(&mut h2_16);
                         unsafe { b.launch(cast_sd).unwrap() };
                         let mut b = stream.launch_builder(&f_silu_gemm);
-                        b.arg(&mm1).arg(&nn1).arg(&kk1).arg(&h2_16).arg(&w1_d).arg(&mut t_dff);
+                        b.arg(&mm1)
+                            .arg(&nn1)
+                            .arg(&kk1)
+                            .arg(&h2_16)
+                            .arg(&w1_d)
+                            .arg(&mut t_dff);
                         unsafe { b.launch(cfg1).unwrap() };
                         let mut b = stream.launch_builder(&f_cast);
                         b.arg(&n_sdff).arg(&t_dff).arg(&mut t_dff16);
                         unsafe { b.launch(cast_sdff).unwrap() };
                         let mut b = stream.launch_builder(&f_resid_gemm);
-                        b.arg(&mm2).arg(&nn2).arg(&kk2).arg(&t_dff16).arg(&w2_d).arg(&mut out).arg(&x_d);
+                        b.arg(&mm2)
+                            .arg(&nn2)
+                            .arg(&kk2)
+                            .arg(&t_dff16)
+                            .arg(&w2_d)
+                            .arg(&mut out)
+                            .arg(&x_d);
                         unsafe { b.launch(cfg2).unwrap() };
                     }
                     stream.synchronize().unwrap();
@@ -14848,7 +17397,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         b.arg(&n_sd).arg(&h2).arg(&mut h2_16);
                         unsafe { b.launch(cast_sd).unwrap() };
                         let mut b = stream.launch_builder(&f_gemm);
-                        b.arg(&mm1).arg(&nn1).arg(&kk1).arg(&h2_16).arg(&w1_d).arg(&mut t_dff);
+                        b.arg(&mm1)
+                            .arg(&nn1)
+                            .arg(&kk1)
+                            .arg(&h2_16)
+                            .arg(&w1_d)
+                            .arg(&mut t_dff);
                         unsafe { b.launch(cfg1).unwrap() };
                         let mut b = stream.launch_builder(&f_siluv);
                         b.arg(&n_sdff).arg(&t_dff).arg(&mut t_dff_b);
@@ -14857,7 +17411,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         b.arg(&n_sdff).arg(&t_dff_b).arg(&mut t_dff16);
                         unsafe { b.launch(cast_sdff).unwrap() };
                         let mut b = stream.launch_builder(&f_gemm);
-                        b.arg(&mm2).arg(&nn2).arg(&kk2).arg(&t_dff16).arg(&w2_d).arg(&mut t_d);
+                        b.arg(&mm2)
+                            .arg(&nn2)
+                            .arg(&kk2)
+                            .arg(&t_dff16)
+                            .arg(&w2_d)
+                            .arg(&mut t_d);
                         unsafe { b.launch(cfg2).unwrap() };
                         let mut b = stream.launch_builder(&f_vadd);
                         b.arg(&n_sd).arg(&t_d).arg(&x_d).arg(&mut out);
@@ -14923,7 +17482,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let mut dst = g.stream.memcpy_stod(&vec![0f32; n]).unwrap();
 
             // --- copy: dst = src. Moves 2N floats (read + write) — the hardest 1:1 mix. ---
-            let f_copy = g.function("copy_v4", crate::ptx::COPY_V4, "copy_v4").unwrap();
+            let f_copy = g
+                .function("copy_v4", crate::ptx::COPY_V4, "copy_v4")
+                .unwrap();
             let cfg_copy = stream_cfg(g, n4);
             let bw_copy = best_bw(g, 2.0 * n as f64 * 4.0, || {
                 let mut b = g.stream.launch_builder(&f_copy);
@@ -14944,8 +17505,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             eprintln!("  saxpy  (3N tr): {bw_saxpy:>6.1} GB/s  {}", pct(bw_saxpy));
 
             // --- reduce_sum: read N floats (partials write is negligible). ---
-            let mut partials = g.stream.memcpy_stod(&vec![0f32; RED_GRID as usize]).unwrap();
-            let f_red = g.function("reduce", crate::ptx::REDUCE, "reduce_sum").unwrap();
+            let mut partials = g
+                .stream
+                .memcpy_stod(&vec![0f32; RED_GRID as usize])
+                .unwrap();
+            let f_red = g
+                .function("reduce", crate::ptx::REDUCE, "reduce_sum")
+                .unwrap();
             let cfg_red = LaunchConfig {
                 grid_dim: (RED_GRID, 1, 1),
                 block_dim: (RED_BLOCK, 1, 1),
@@ -15057,7 +17623,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let (mm, nn, kk) = dims;
         let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
             let mut bld = g.stream.launch_builder(f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d).arg(resid_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(a_d)
+                .arg(b_d)
+                .arg(c_d)
+                .arg(resid_d);
             unsafe { bld.launch(cfg).unwrap() };
         };
         launch(c_d);
@@ -15087,7 +17659,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let (mm, nn, kk) = dims;
         let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
             let mut bld = g.stream.launch_builder(f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d).arg(bias_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(a_d)
+                .arg(b_d)
+                .arg(c_d)
+                .arg(bias_d);
             unsafe { bld.launch(cfg).unwrap() };
         };
         launch(c_d);
@@ -15118,7 +17696,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let (mm, nn, kk) = dims;
         let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
             let mut bld = g.stream.launch_builder(f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d).arg(bias_d).arg(resid_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(a_d)
+                .arg(b_d)
+                .arg(c_d)
+                .arg(bias_d)
+                .arg(resid_d);
             unsafe { bld.launch(cfg).unwrap() };
         };
         launch(c_d);
@@ -15148,7 +17733,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let (mm, nn, kk) = dims;
         let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
             let mut bld = g.stream.launch_builder(f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(x_d).arg(wg_d).arg(wu_d).arg(c_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(x_d)
+                .arg(wg_d)
+                .arg(wu_d)
+                .arg(c_d);
             unsafe { bld.launch(cfg).unwrap() };
         };
         launch(c_d);
@@ -15185,7 +17776,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("swiglu_gate_bench", |g| {
             if !peers_available(g) {
                 peer_gate("fused_swiglu_gate_vs_chain");
-                eprintln!("[skip] fused_swiglu_gate_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] fused_swiglu_gate_vs_chain: cuBLAS/NVRTC not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -15198,7 +17792,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
             // Square sizes + a 7B-class rectangular FFN sub-GEMM (M=512 seq, K=4096 hidden, N=4096): the
             // ≥16 MB working set where the wrapper routes to the swz twin (`gate_use_swz`).
-            for (m, k, n) in [(512usize, 512usize, 512usize), (1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (512, 4096, 4096)] {
+            for (m, k, n) in [
+                (512usize, 512usize, 512usize),
+                (1024, 1024, 1024),
+                (2048, 2048, 2048),
+                (4096, 4096, 4096),
+                (512, 4096, 4096),
+            ] {
                 let x = rng.vec(m * k, -1.0, 1.0);
                 let wg = rng.vec(n * k, -1.0, 1.0);
                 let wu = rng.vec(n * k, -1.0, 1.0);
@@ -15220,32 +17820,60 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // many lanes. The binding correctness proof is [`swiglu_gate_match_reference_within_tol`].
                 let gate_cub = cublas_gemm_nt_f16(g, &x, &wg, m, k, n).unwrap();
                 let up_cub = cublas_gemm_nt_f16(g, &x, &wu, m, k, n).unwrap();
-                let fused = gemm_nt_f16_gate(g, &x, &wg, &wu, None, m, k, n, "mma_nt_f16_128x64_gate_silu").unwrap();
-                let refout: Vec<f32> =
-                    gate_cub.iter().zip(&up_cub).map(|(&gv, &uv)| silu(gv) * uv).collect();
+                let fused = gemm_nt_f16_gate(
+                    g,
+                    &x,
+                    &wg,
+                    &wu,
+                    None,
+                    m,
+                    k,
+                    n,
+                    "mma_nt_f16_128x64_gate_silu",
+                )
+                .unwrap();
+                let refout: Vec<f32> = gate_cub
+                    .iter()
+                    .zip(&up_cub)
+                    .map(|(&gv, &uv)| silu(gv) * uv)
+                    .collect();
                 let peak = refout.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1.0) as f64;
-                crate::diff::assert_close(&format!("fused swiglu vs cuBLAS chain {m}x{k}x{n}"), &fused, &refout, 1e-2 * peak, 5e-2);
+                crate::diff::assert_close(
+                    &format!("fused swiglu vs cuBLAS chain {m}x{k}x{n}"),
+                    &fused,
+                    &refout,
+                    1e-2 * peak,
+                    5e-2,
+                );
 
                 // Interleaved best-of-6 (clock-cancelling): cuBLAS GEMM, elementwise combine (vadd proxy,
                 // 3·M·N traffic = read gate + read up + write out), the PADDED gate, and the SWZ gate. The
                 // padded vs swz pair is the internal same-family A/B that isolates the swizzle win from the
                 // shared clock; the chain comparison is the beat-cuBLAS fusion statistic (one kernel vs the
                 // library's unavoidable 2 GEMMs + elementwise combine, both [M,N] intermediates HBM-round-tripped).
-                let f_pad = g.function("wmma_f16", ptx, "mma_nt_f16_128x64_gate_silu").unwrap();
-                let f_swz = g.function("wmma_f16", ptx, "mma_nt_f16_128x64_gate_silu_swz").unwrap();
+                let f_pad = g
+                    .function("wmma_f16", ptx, "mma_nt_f16_128x64_gate_silu")
+                    .unwrap();
+                let f_swz = g
+                    .function("wmma_f16", ptx, "mma_nt_f16_128x64_gate_silu_swz")
+                    .unwrap();
                 let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd").unwrap();
                 let (mut bc, mut be, mut bpad, mut bswz) =
                     (f64::INFINITY, f64::INFINITY, f64::INFINITY, f64::INFINITY);
                 for _ in 0..6 {
                     bc = bc.min(time_cublas_gemm_nt_f16(g, m, k, n, 20).unwrap());
                     be = be.min(time_vadd(g, &f_vadd, m * n, 20));
-                    bpad = bpad.min(time_gate(g, &f_pad, cfg, dims, &x_d, &wg_d, &wu_d, &mut c_d, 20));
-                    bswz = bswz.min(time_gate(g, &f_swz, cfg, dims, &x_d, &wg_d, &wu_d, &mut c_d, 20));
+                    bpad = bpad.min(time_gate(
+                        g, &f_pad, cfg, dims, &x_d, &wg_d, &wu_d, &mut c_d, 20,
+                    ));
+                    bswz = bswz.min(time_gate(
+                        g, &f_swz, cfg, dims, &x_d, &wg_d, &wu_d, &mut c_d, 20,
+                    ));
                 }
                 let chain = 2.0 * bc + be; // two GEMMs + the elementwise combine
-                // Headline: the production (padded) fused gate vs the cuBLAS 3-kernel chain (the beat-cuBLAS
-                // fusion statistic). Trailing `swz A/B` is the same-family swz-vs-padded ratio (>1 ⇒ swz
-                // would win) — measured ≤1 for this dual-B tile, which is why production stays on padded.
+                                           // Headline: the production (padded) fused gate vs the cuBLAS 3-kernel chain (the beat-cuBLAS
+                                           // fusion statistic). Trailing `swz A/B` is the same-family swz-vs-padded ratio (>1 ⇒ swz
+                                           // would win) — measured ≤1 for this dual-B tile, which is why production stays on padded.
                 eprintln!(
                     "  {m}x{k}x{n} swiglu: fused {:>8.3} ms ({:>6.0} GFLOP/s) | cuBLAS 2×GEMM {:>7.3} + silu⊙ {:>5.3} = {:>8.3} ms (fused {:>4.2}× chain) | swz A/B {:>4.2}× padded",
                     bpad * 1e3,
@@ -15333,7 +17961,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let (mm, nn, kk) = dims;
         let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
             let mut bld = g.stream.launch_builder(f);
-            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(bq_d).arg(scl_d).arg(c_d);
+            bld.arg(&mm)
+                .arg(&nn)
+                .arg(&kk)
+                .arg(a_d)
+                .arg(bq_d)
+                .arg(scl_d)
+                .arg(c_d);
             unsafe { bld.launch(cfg).unwrap() };
         };
         launch(c_d);
@@ -15373,7 +18007,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("int4_gemm_vs_peers", |g| {
             if !peers_available(g) {
                 peer_gate("int4_gemm_vs_peers");
-                eprintln!("[skip] int4_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] int4_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -15387,11 +18024,25 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let qw = quantize_weight_symmetric(&w, n, k, group);
                 let r = reference_w4a16(&a, &qw, m);
                 let merc = gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap();
-                crate::diff::assert_close(&format!("Wukong W4A16 {m}x{k}x{n}"), &merc, &r, 1e-2, 2e-3);
+                crate::diff::assert_close(
+                    &format!("Wukong W4A16 {m}x{k}x{n}"),
+                    &merc,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
                 let naive = nvrtc_naive_w4a16(g, &a, &qw, m, k, n).unwrap();
-                crate::diff::assert_close(&format!("naive W4A16 {m}x{k}x{n}"), &naive, &r, 5e-2, 2e-2);
+                crate::diff::assert_close(
+                    &format!("naive W4A16 {m}x{k}x{n}"),
+                    &naive,
+                    &r,
+                    5e-2,
+                    2e-2,
+                );
             }
-            eprintln!("[gate] Wukong W4A16 + naive CUDA-C W4A16 both match the f64 dequant oracle ✓");
+            eprintln!(
+                "[gate] Wukong W4A16 + naive CUDA-C W4A16 both match the f64 dequant oracle ✓"
+            );
             eprintln!(
                 "[peer] No robust library int4-decode GEMM is bindable here (cuBLASLt has no general \
                  W4A16 decode), so naive CUDA-C is the honest Tier-A peer and M4 is a *documented lead*."
@@ -15423,7 +18074,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let bq_d = g.stream.memcpy_stod(&qw.packed).unwrap();
                 let scl_d = g.stream.memcpy_stod(&qw.scales).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let f_w4 = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16").unwrap();
+                let f_w4 = g
+                    .function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16")
+                    .unwrap();
                 let cfg_w4 = LaunchConfig {
                     grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
                     block_dim: (W4_THREADS as u32, 1, 1),
@@ -15441,14 +18094,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // to it would confound the loading path with the specialization).
                 let ptx_s = crate::ptx_int4::w4a16_static_ptx(m, n, k, false);
                 let mod_s = g.ctx.load_module(ptx_s.as_str().into()).unwrap();
-                let f_s = mod_s.load_function(crate::ptx_int4::w4a16_static_entry(false)).unwrap();
+                let f_s = mod_s
+                    .load_function(crate::ptx_int4::w4a16_static_entry(false))
+                    .unwrap();
                 let s_static = best_of(ROUNDS, || {
                     time_w4a16(g, &f_s, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
                 });
-                let mod_dyn_raw = g.ctx.load_module(crate::ptx_int4::w4a16_ptx().into()).unwrap();
+                let mod_dyn_raw = g
+                    .ctx
+                    .load_module(crate::ptx_int4::w4a16_ptx().into())
+                    .unwrap();
                 let f_dyn_raw = mod_dyn_raw.load_function("gemm_nt_w4a16").unwrap();
                 let s_dyn_raw = best_of(ROUNDS, || {
-                    time_w4a16(g, &f_dyn_raw, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
+                    time_w4a16(
+                        g, &f_dyn_raw, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50,
+                    )
                 });
 
                 // Wukong fp16 on the SAME 64×64 tile (`wmma_nt_f16_sm`) — full fp16 weights. The only
@@ -15456,14 +18116,32 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // weight-bandwidth win in the decode regime.
                 let b16: Vec<f16> = w.iter().map(|&x| f16::from_f32(x)).collect();
                 let bf16_d = g.stream.memcpy_stod(&b16).unwrap();
-                let f_f16 =
-                    g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm").unwrap();
+                let f_f16 = g
+                    .function(
+                        "wmma_f16",
+                        crate::ptx_wmma::wmma_f16_ptx(),
+                        "wmma_nt_f16_sm",
+                    )
+                    .unwrap();
                 let s_f16 = best_of(ROUNDS, || {
-                    time_wmma(g, &f_f16, wmma_sm_cfg(m, n), dims, &a_d, &bf16_d, &mut c_d, 50)
+                    time_wmma(
+                        g,
+                        &f_f16,
+                        wmma_sm_cfg(m, n),
+                        dims,
+                        &a_d,
+                        &bf16_d,
+                        &mut c_d,
+                        50,
+                    )
                 });
 
                 // Naive CUDA-C W4A16 (Tier A). Slow (one thread/output, full K-loop) → fewer iters.
-                let naive_iters = if (m * n * k) as u64 >= 500_000_000 { 3 } else { 10 };
+                let naive_iters = if (m * n * k) as u64 >= 500_000_000 {
+                    3
+                } else {
+                    10
+                };
                 let s_naive = time_nvrtc_naive_w4a16(g, m, k, n, group, naive_iters).unwrap();
 
                 // Checksum cross-check: Wukong and naive compute the same matrix (within the dequant gap).
@@ -15530,7 +18208,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let wo = rng.vec(d * d, -0.08, 0.08);
         let w1 = rng.vec(dff * d, -0.05, 0.05);
         let w2 = rng.vec(d * dff, -0.05, 0.05);
-        let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+        let w = TransformerWeights {
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wo: &wo,
+            w1: &w1,
+            w2: &w2,
+        };
         let layer = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap();
         let x = rng.vec(s * d, -1.0, 1.0);
         (layer, x)
@@ -15548,7 +18233,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("resident_layer_pooled_matches_eager", |g| {
             // (S, D, Dff, heads): single-head small (f32 flash); multi-head (tensor-core flash);
             // GPT-2 layer (D=768/H=12).
-            let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+            let cases = [
+                (64usize, 64usize, 256usize, 1usize),
+                (512, 128, 512, 2),
+                (512, 768, 3072, 12),
+            ];
             for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
                 let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x9001 + ci as u64);
                 let stream = g.stream.clone();
@@ -15563,7 +18252,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let mut pool = crate::pool::DevicePool::new(stream.clone(), cap).unwrap();
                 pool.poison(0xFF).unwrap();
                 let mut out_d = stream.alloc_zeros::<f32>(s * d).unwrap();
-                layer.forward_device_pooled(&mut pool, &x_d, &mut out_d).unwrap();
+                layer
+                    .forward_device_pooled(&mut pool, &x_d, &mut out_d)
+                    .unwrap();
                 let pooled_host = stream.memcpy_dtov(&out_d).unwrap();
 
                 assert_eq!(pooled_host.len(), ref_host.len());
@@ -15641,7 +18332,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         g.stream.synchronize().unwrap();
         // Warmup once on the capture stream, then capture into a graph.
         pool.reset();
-        layer.forward_device_pooled_on(&cap, &mut pool, &x_d, &mut out_d).unwrap();
+        layer
+            .forward_device_pooled_on(&cap, &mut pool, &x_d, &mut out_d)
+            .unwrap();
         cap.synchronize().unwrap();
         pool.reset();
         let graph = crate::graph::Graph::capture(cap.clone(), || {
@@ -15662,14 +18355,20 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn resident_layer_graphed_matches_eager() {
         with_gpu("resident_layer_graphed_matches_eager", |g| {
             with_event_tracking_disabled(g, |g| {
-                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                let cases = [
+                    (64usize, 64usize, 256usize, 1usize),
+                    (512, 128, 512, 2),
+                    (512, 768, 3072, 12),
+                ];
                 for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
                     let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0xA001 + ci as u64);
 
                     // eager reference on the default stream (same kernels, same weights, same input).
                     let x_d_ref = g.stream.memcpy_stod(&x).unwrap();
-                    let ref_host =
-                        g.stream.memcpy_dtov(&layer.forward_device(&x_d_ref).unwrap()).unwrap();
+                    let ref_host = g
+                        .stream
+                        .memcpy_dtov(&layer.forward_device(&x_d_ref).unwrap())
+                        .unwrap();
 
                     // capture the pooled forward into a graph on a dedicated stream.
                     let (cap, mut pool, _x_d, out_d, graph) =
@@ -15751,7 +18450,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("pool_graph_vs_unpooled", |g| {
             eprintln!("device: {}", g.device_name());
             with_event_tracking_disabled(g, |g| {
-                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                let cases = [
+                    (64usize, 64usize, 256usize, 1usize),
+                    (512, 128, 512, 2),
+                    (512, 768, 3072, 12),
+                ];
                 let cap_bytes = 256 * 1024 * 1024;
                 for &(s, d, dff, heads) in &cases {
                     let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x7001);
@@ -15770,11 +18473,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let mut pool2 = crate::pool::DevicePool::new(cap.clone(), cap_bytes).unwrap();
                     let mut out2 = cap.alloc_zeros::<f32>(s * d).unwrap();
                     pool2.reset();
-                    layer.forward_device_pooled_on(&cap, &mut pool2, &x_d_cap, &mut out2).unwrap();
+                    layer
+                        .forward_device_pooled_on(&cap, &mut pool2, &x_d_cap, &mut out2)
+                        .unwrap();
                     let allocs_per_fwd = pool2.served();
                     let pooled = min_latency(&cap, || {
                         pool2.reset();
-                        layer.forward_device_pooled_on(&cap, &mut pool2, &x_d_cap, &mut out2).unwrap();
+                        layer
+                            .forward_device_pooled_on(&cap, &mut pool2, &x_d_cap, &mut out2)
+                            .unwrap();
                     });
 
                     // graphed on the capture stream: one cuGraphLaunch replays the whole layer.
@@ -15836,8 +18543,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let nb = 2;
             let cs = g.ctx.new_stream().unwrap();
             let cp = g.ctx.new_stream().unwrap();
-            let x_d = (0..nb).map(|_| cs.alloc_zeros::<f32>(s * d).unwrap()).collect();
-            let out_d = (0..nb).map(|_| cs.alloc_zeros::<f32>(s * d).unwrap()).collect();
+            let x_d = (0..nb)
+                .map(|_| cs.alloc_zeros::<f32>(s * d).unwrap())
+                .collect();
+            let out_d = (0..nb)
+                .map(|_| cs.alloc_zeros::<f32>(s * d).unwrap())
+                .collect();
             let pool = (0..nb)
                 .map(|_| crate::pool::DevicePool::new(cs.clone(), cap_bytes).unwrap())
                 .collect();
@@ -15857,7 +18568,18 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             g.stream.synchronize().unwrap();
             let _ = (s, d); // shapes are captured by the device buffers; not stored.
             Self {
-                layer, cs, cp, nb, x_d, out_d, pool, h2d_done, comp_done, d2h_done, pin_in, pin_out,
+                layer,
+                cs,
+                cp,
+                nb,
+                x_d,
+                out_d,
+                pool,
+                h2d_done,
+                comp_done,
+                d2h_done,
+                pin_in,
+                pin_out,
                 b: inputs.len(),
             }
         }
@@ -15866,12 +18588,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         /// overlap. Even with pinned memory, a single stream cannot overlap its own copies and compute.
         fn run_serial(&mut self) {
             for i in 0..self.b {
-                self.cs.memcpy_htod(&*self.pin_in[i], &mut self.x_d[0]).unwrap();
+                self.cs
+                    .memcpy_htod(&*self.pin_in[i], &mut self.x_d[0])
+                    .unwrap();
                 self.pool[0].reset();
                 self.layer
-                    .forward_device_pooled_on(&self.cs, &mut self.pool[0], &self.x_d[0], &mut self.out_d[0])
+                    .forward_device_pooled_on(
+                        &self.cs,
+                        &mut self.pool[0],
+                        &self.x_d[0],
+                        &mut self.out_d[0],
+                    )
                     .unwrap();
-                self.cs.memcpy_dtoh(&self.out_d[0], &mut *self.pin_out[i]).unwrap();
+                self.cs
+                    .memcpy_dtoh(&self.out_d[0], &mut *self.pin_out[i])
+                    .unwrap();
             }
             self.cs.synchronize().unwrap();
         }
@@ -15887,7 +18618,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 if i >= nb {
                     self.cp.wait(&self.comp_done[b]).unwrap();
                 }
-                self.cp.memcpy_htod(&*self.pin_in[i], &mut self.x_d[b]).unwrap();
+                self.cp
+                    .memcpy_htod(&*self.pin_in[i], &mut self.x_d[b])
+                    .unwrap();
                 self.h2d_done[b].record(&self.cp).unwrap();
                 // Compute waits for its input (RAW on x_d[b]); WAR on out_d[b]: don't overwrite until
                 // D2H(i-nb), which read it, has finished.
@@ -15897,12 +18630,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
                 self.pool[b].reset();
                 self.layer
-                    .forward_device_pooled_on(&self.cs, &mut self.pool[b], &self.x_d[b], &mut self.out_d[b])
+                    .forward_device_pooled_on(
+                        &self.cs,
+                        &mut self.pool[b],
+                        &self.x_d[b],
+                        &mut self.out_d[b],
+                    )
                     .unwrap();
                 self.comp_done[b].record(&self.cs).unwrap();
                 // D2H waits for compute (RAW on out_d[b]).
                 self.cp.wait(&self.comp_done[b]).unwrap();
-                self.cp.memcpy_dtoh(&self.out_d[b], &mut *self.pin_out[i]).unwrap();
+                self.cp
+                    .memcpy_dtoh(&self.out_d[b], &mut *self.pin_out[i])
+                    .unwrap();
                 self.d2h_done[b].record(&self.cp).unwrap();
             }
             self.cs.synchronize().unwrap();
@@ -15947,12 +18687,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn multistream_overlap_matches_serial() {
         with_gpu("multistream_overlap_matches_serial", |g| {
             with_event_tracking_disabled(g, |g| {
-                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                let cases = [
+                    (64usize, 64usize, 256usize, 1usize),
+                    (512, 128, 512, 2),
+                    (512, 768, 3072, 12),
+                ];
                 for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
                     let (layer, _x) = pool_layer_fixture(g, s, d, dff, heads, 0xB001 + ci as u64);
                     let mut rng = crate::diff::Rng::new(0x00C0_FFEE + ci as u64);
                     let bsz = 12usize;
-                    let inputs: Vec<Vec<f32>> = (0..bsz).map(|_| rng.vec(s * d, -1.0, 1.0)).collect();
+                    let inputs: Vec<Vec<f32>> =
+                        (0..bsz).map(|_| rng.vec(s * d, -1.0, 1.0)).collect();
                     let cap_bytes = 64 * 1024 * 1024;
 
                     let mut serial = OverlapPipeline::new(g, &layer, &inputs, s, d, cap_bytes);
@@ -15974,7 +18719,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }
                     // Sanity: the serial path ties the established eager reference for input 0.
                     let x_d = g.stream.memcpy_stod(&inputs[0]).unwrap();
-                    let eager = g.stream.memcpy_dtov(&layer.forward_device(&x_d).unwrap()).unwrap();
+                    let eager = g
+                        .stream
+                        .memcpy_dtov(&layer.forward_device(&x_d).unwrap())
+                        .unwrap();
                     for j in 0..s * d {
                         assert_eq!(
                             serial_out[0][j].to_bits(),
@@ -16012,10 +18760,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 for &(s, d, dff, heads) in &cases {
                     let (layer, _x) = pool_layer_fixture(g, s, d, dff, heads, 0x7777);
                     let mut rng = crate::diff::Rng::new(0x5EED);
-                    let inputs: Vec<Vec<f32>> = (0..bsz).map(|_| rng.vec(s * d, -1.0, 1.0)).collect();
+                    let inputs: Vec<Vec<f32>> =
+                        (0..bsz).map(|_| rng.vec(s * d, -1.0, 1.0)).collect();
                     // Two pipelines so serial and overlapped can be timed interleaved (shared clock).
-                    let mut pipe_s = OverlapPipeline::new(g, &layer, &inputs, s, d, 64 * 1024 * 1024);
-                    let mut pipe_o = OverlapPipeline::new(g, &layer, &inputs, s, d, 64 * 1024 * 1024);
+                    let mut pipe_s =
+                        OverlapPipeline::new(g, &layer, &inputs, s, d, 64 * 1024 * 1024);
+                    let mut pipe_o =
+                        OverlapPipeline::new(g, &layer, &inputs, s, d, 64 * 1024 * 1024);
 
                     let (serial, over) =
                         best_batch_pair(|| pipe_s.run_serial(), || pipe_o.run_overlapped());
@@ -16072,19 +18823,30 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("concurrent_forwards_throughput", |g| {
             eprintln!("device: {}", g.device_name());
             with_event_tracking_disabled(g, |g| {
-                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                let cases = [
+                    (64usize, 64usize, 256usize, 1usize),
+                    (512, 128, 512, 2),
+                    (512, 768, 3072, 12),
+                ];
                 let kk = 4usize;
                 for &(s, d, dff, heads) in &cases {
                     let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x9999);
-                    let streams: Vec<Arc<CudaStream>> = (0..kk).map(|_| g.ctx.new_stream().unwrap()).collect();
+                    let streams: Vec<Arc<CudaStream>> =
+                        (0..kk).map(|_| g.ctx.new_stream().unwrap()).collect();
                     let mut pools: Vec<crate::pool::DevicePool> = streams
                         .iter()
-                        .map(|st| crate::pool::DevicePool::new(st.clone(), 64 * 1024 * 1024).unwrap())
+                        .map(|st| {
+                            crate::pool::DevicePool::new(st.clone(), 64 * 1024 * 1024).unwrap()
+                        })
                         .collect();
-                    let x_ds: Vec<cudarc::driver::CudaSlice<f32>> =
-                        streams.iter().map(|st| st.memcpy_stod(&x).unwrap()).collect();
-                    let mut out_ds: Vec<cudarc::driver::CudaSlice<f32>> =
-                        streams.iter().map(|st| st.alloc_zeros::<f32>(s * d).unwrap()).collect();
+                    let x_ds: Vec<cudarc::driver::CudaSlice<f32>> = streams
+                        .iter()
+                        .map(|st| st.memcpy_stod(&x).unwrap())
+                        .collect();
+                    let mut out_ds: Vec<cudarc::driver::CudaSlice<f32>> = streams
+                        .iter()
+                        .map(|st| st.alloc_zeros::<f32>(s * d).unwrap())
+                        .collect();
                     g.stream.synchronize().unwrap();
 
                     // serial: K forwards back-to-back on ONE stream.
@@ -16092,7 +18854,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         for _ in 0..kk {
                             pools[0].reset();
                             layer
-                                .forward_device_pooled_on(&streams[0], &mut pools[0], &x_ds[0], &mut out_ds[0])
+                                .forward_device_pooled_on(
+                                    &streams[0],
+                                    &mut pools[0],
+                                    &x_ds[0],
+                                    &mut out_ds[0],
+                                )
                                 .unwrap();
                         }
                     });
@@ -16102,7 +18869,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         for k in 0..kk {
                             pools[k].reset();
                             layer
-                                .forward_device_pooled_on(&streams[k], &mut pools[k], &x_ds[k], &mut out_ds[k])
+                                .forward_device_pooled_on(
+                                    &streams[k],
+                                    &mut pools[k],
+                                    &x_ds[k],
+                                    &mut out_ds[k],
+                                )
                                 .unwrap();
                         }
                     });
@@ -16172,7 +18944,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let wo = rng.vec(d * d, -0.08, 0.08);
             let w1 = rng.vec(dff * d, -0.05, 0.05);
             let w2 = rng.vec(d * dff, -0.05, 0.05);
-            let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+            let w = TransformerWeights {
+                wq: &wq,
+                wk: &wk,
+                wv: &wv,
+                wo: &wo,
+                w1: &w1,
+                w2: &w2,
+            };
             layers.push(ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap());
         }
         let x = rng.vec(s * d, -1.0, 1.0);
@@ -16201,7 +18980,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let cap = g.ctx.new_stream().unwrap();
         let mut pool = crate::pool::DevicePool::new(cap.clone(), cap_bytes).unwrap();
         let x_d = cap.memcpy_stod(x).unwrap();
-        let mut bufs = [cap.alloc_zeros::<f32>(s * d).unwrap(), cap.alloc_zeros::<f32>(s * d).unwrap()];
+        let mut bufs = [
+            cap.alloc_zeros::<f32>(s * d).unwrap(),
+            cap.alloc_zeros::<f32>(s * d).unwrap(),
+        ];
         g.stream.synchronize().unwrap();
         // Warmup, then capture.
         let _ = forward_stack_pooled_on(layers, &cap, &mut pool, &x_d, &mut bufs).unwrap();
@@ -16248,8 +19030,16 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
                 assert_eq!(g1.len(), ref_host.len());
                 for i in 0..ref_host.len() {
-                    assert_eq!(g1[i].to_bits(), ref_host[i].to_bits(), "stack graphed != eager at {i}");
-                    assert_eq!(g1[i].to_bits(), g2[i].to_bits(), "stack replay non-deterministic at {i}");
+                    assert_eq!(
+                        g1[i].to_bits(),
+                        ref_host[i].to_bits(),
+                        "stack graphed != eager at {i}"
+                    );
+                    assert_eq!(
+                        g1[i].to_bits(),
+                        g2[i].to_bits(),
+                        "stack replay non-deterministic at {i}"
+                    );
                 }
                 eprintln!(
                     "{n}-layer stack graphed==eager bit-identical & deterministic (S={s} D={d} Dff={dff}); \
@@ -16342,7 +19132,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 (64, 64, 64),
                 (128, 256, 96),
                 (128, 128, 128), // multi-CTA, multi-K-step — exercises the smdb pipeline (swz, K%64==0)
-                (128, 96, 128),  // K%32==0 but K%64!=0 — exercises the smdb dispatch's hand-placed fallback
+                (128, 96, 128), // K%32==0 but K%64!=0 — exercises the smdb dispatch's hand-placed fallback
             ] {
                 // u8 activations in [0,255], i8 weights in [-128,127] — full range, deterministic.
                 let a: Vec<u8> = (0..m * k)
@@ -16381,7 +19171,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("int8_dequant", |g| {
             let mut rng = crate::diff::Rng::new(0x0DE9);
             // K=64/128/256 take the swz_deq path (K%64==0); K=96 is K%32==0 only → hand-placed deq fallback.
-            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 128, 128), (64, 256, 192), (64, 96, 128)] {
+            for (m, k, n) in [
+                (64usize, 64usize, 64usize),
+                (128, 128, 128),
+                (64, 256, 192),
+                (64, 96, 128),
+            ] {
                 let a: Vec<u8> = (0..m * k)
                     .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
                     .collect();
@@ -16430,8 +19225,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let (m, k, n) = (sz, sz, sz);
                 let flop = 2.0 * m as f64 * n as f64 * k as f64;
                 let dims = (m as u32, n as u32, k as u32);
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 let scale: Vec<f32> = (0..n).map(|_| rng.f32_range(1e-3, 5e-2)).collect();
                 let a_d = g.stream.memcpy_stod(&a).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
@@ -16440,24 +19239,46 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
 
                 // plain i32-output kernel
-                let f_i32 = g.function("int8_gemm_smdb", crate::ptx_int8::int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb").unwrap();
+                let f_i32 = g
+                    .function(
+                        "int8_gemm_smdb",
+                        crate::ptx_int8::int8_gemm_smdb_ptx(),
+                        "int8_gemm_nt_smdb",
+                    )
+                    .unwrap();
                 let mut ci_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
-                let s_i32 = best_of(4, || time_gemm_int8(g, &f_i32, cfg, dims, &a_d, &b_d, &mut ci_d, 50));
+                let s_i32 = best_of(4, || {
+                    time_gemm_int8(g, &f_i32, cfg, dims, &a_d, &b_d, &mut ci_d, 50)
+                });
 
                 // fused dequant kernel (f32 out + scale) — time its resident launches.
-                let f_deq = g.function("int8_gemm_smdb_deq", crate::ptx_int8::int8_gemm_smdb_deq_ptx(), "int8_gemm_nt_smdb_deq").unwrap();
+                let f_deq = g
+                    .function(
+                        "int8_gemm_smdb_deq",
+                        crate::ptx_int8::int8_gemm_smdb_deq_ptx(),
+                        "int8_gemm_nt_smdb_deq",
+                    )
+                    .unwrap();
                 let mut cf_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                 let time_deq = || {
                     let launch = |c: &mut cudarc::driver::CudaSlice<f32>| {
                         let (mm, nn, kk) = dims;
                         let mut bld = g.stream.launch_builder(&f_deq);
-                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(c).arg(&scale_d);
+                        bld.arg(&mm)
+                            .arg(&nn)
+                            .arg(&kk)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(c)
+                            .arg(&scale_d);
                         unsafe { bld.launch(cfg).unwrap() };
                     };
                     launch(&mut cf_d);
                     g.stream.synchronize().unwrap();
                     let t0 = Instant::now();
-                    for _ in 0..50 { launch(&mut cf_d); }
+                    for _ in 0..50 {
+                        launch(&mut cf_d);
+                    }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / 50.0
                 };
@@ -16544,7 +19365,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("int8_gemm_vs_peers", |g| {
             if !peers_available(g) {
                 peer_gate("int8_gemm_vs_peers");
-                eprintln!("[skip] int8_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] int8_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -16555,12 +19379,30 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             for (m, k, n) in [(256usize, 256usize, 256usize), (128, 320, 96)] {
                 let (a_u8, a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
                 let r = ref_nt_int8(&a_u8, &b, m, k, n);
-                assert_eq!(gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "Wukong int8 {m}x{k}x{n}");
-                assert_eq!(nvrtc_naive_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "naive {m}x{k}x{n}");
-                assert_eq!(nvrtc_dp4a_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "dp4a {m}x{k}x{n}");
-                assert_eq!(cublas_gemm_nt_int8(g, &a_i8, &b, m, k, n).unwrap(), r, "cuBLAS {m}x{k}x{n}");
+                assert_eq!(
+                    gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(),
+                    r,
+                    "Wukong int8 {m}x{k}x{n}"
+                );
+                assert_eq!(
+                    nvrtc_naive_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(),
+                    r,
+                    "naive {m}x{k}x{n}"
+                );
+                assert_eq!(
+                    nvrtc_dp4a_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(),
+                    r,
+                    "dp4a {m}x{k}x{n}"
+                );
+                assert_eq!(
+                    cublas_gemm_nt_int8(g, &a_i8, &b, m, k, n).unwrap(),
+                    r,
+                    "cuBLAS {m}x{k}x{n}"
+                );
             }
-            eprintln!("[gate] Wukong + naive + dp4a + cuBLAS int8 all equal the i32 oracle bit-for-bit ✓");
+            eprintln!(
+                "[gate] Wukong + naive + dp4a + cuBLAS int8 all equal the i32 oracle bit-for-bit ✓"
+            );
 
             // --- Clock warmup (cf. gemm_vs_peers): boost the clock before sampling so each size's ratio
             // is peak-vs-peak. Hammer cuBLAS int8 (the heaviest) until the clock settles. ---
@@ -16580,25 +19422,37 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                 let f_mt = g
-                    .function("int8_gemm_mt", crate::ptx_int8::int8_gemm_mt_ptx(), "int8_gemm_nt_mt")
+                    .function(
+                        "int8_gemm_mt",
+                        crate::ptx_int8::int8_gemm_mt_ptx(),
+                        "int8_gemm_nt_mt",
+                    )
                     .unwrap();
                 let cfg_mt = LaunchConfig {
                     grid_dim: ((n / (8 * INT8_TN)) as u32, (m / (16 * INT8_TM)) as u32, 1),
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let s_mt = best_of(ROUNDS, || time_gemm_int8(g, &f_mt, cfg_mt, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_mt = best_of(ROUNDS, || {
+                    time_gemm_int8(g, &f_mt, cfg_mt, dims, &a_d, &b_d, &mut c_d, 50)
+                });
 
                 // Wukong single-tile path (one 16×8 tile/warp — the pre-fragment-reuse baseline).
                 let f_st = g
-                    .function("int8_gemm", crate::ptx_int8::int8_gemm_ptx(), "int8_gemm_nt")
+                    .function(
+                        "int8_gemm",
+                        crate::ptx_int8::int8_gemm_ptx(),
+                        "int8_gemm_nt",
+                    )
                     .unwrap();
                 let cfg_st = LaunchConfig {
                     grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let s_st = best_of(ROUNDS, || time_gemm_int8(g, &f_st, cfg_st, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_st = best_of(ROUNDS, || {
+                    time_gemm_int8(g, &f_st, cfg_st, dims, &a_d, &b_d, &mut c_d, 50)
+                });
 
                 // Wukong SMEM-staged + cp.async double-buffered paths (the latency-hiding lever): 64×64
                 // and the bigger-reuse 128×128 tile. Report the better as `_smdb`.
@@ -16607,16 +19461,34 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     INT8_WARPS_N, INT8_WARPS_N128,
                 };
                 let f_smdb = g
-                    .function("int8_gemm_smdb", crate::ptx_int8::int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb")
+                    .function(
+                        "int8_gemm_smdb",
+                        crate::ptx_int8::int8_gemm_smdb_ptx(),
+                        "int8_gemm_nt_smdb",
+                    )
                     .unwrap();
                 let cfg_smdb = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
-                let s_smdb64 = best_of(ROUNDS, || time_gemm_int8(g, &f_smdb, cfg_smdb, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_smdb64 = best_of(ROUNDS, || {
+                    time_gemm_int8(g, &f_smdb, cfg_smdb, dims, &a_d, &b_d, &mut c_d, 50)
+                });
                 let s_smdb128 = if m % INT8_BM128 == 0 && n % INT8_BN128 == 0 {
                     let f = g
-                        .function("int8_gemm_smdb128", crate::ptx_int8::int8_gemm_smdb128_ptx(), "int8_gemm_nt_smdb128")
+                        .function(
+                            "int8_gemm_smdb128",
+                            crate::ptx_int8::int8_gemm_smdb128_ptx(),
+                            "int8_gemm_nt_smdb128",
+                        )
                         .unwrap();
-                    let cfg = int8_smdb_cfg(m, n, INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128);
-                    best_of(ROUNDS, || time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50))
+                    let cfg = int8_smdb_cfg(
+                        m,
+                        n,
+                        INT8_BM128,
+                        INT8_BN128,
+                        INT8_WARPS_M128 * INT8_WARPS_N128,
+                    );
+                    best_of(ROUNDS, || {
+                        time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50)
+                    })
                 } else {
                     f64::INFINITY
                 };
@@ -16626,7 +19498,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // int8 IMMA is the Tier-B gold standard (Wukong reported as % of it).
                 let naive_iters = if sz >= 4096 { 3 } else { 10 };
                 let s_naive = time_nvrtc_naive_gemm_nt_int8(g, m, k, n, naive_iters).unwrap();
-                let s_dp4a = best_of(ROUNDS, || time_nvrtc_dp4a_gemm_nt_int8(g, m, k, n, 20).unwrap());
+                let s_dp4a = best_of(ROUNDS, || {
+                    time_nvrtc_dp4a_gemm_nt_int8(g, m, k, n, 20).unwrap()
+                });
                 let s_cub = best_of(ROUNDS, || time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
 
                 // Checksum cross-check at this shape: all paths compute the same matrix.
@@ -16642,8 +19516,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 );
 
                 let (g_mt, g_st, g_smdb64, g_smdb128, g_naive, g_dp4a, g_cub) = (
-                    flop / s_mt, flop / s_st, flop / s_smdb64, flop / s_smdb128,
-                    flop / s_naive, flop / s_dp4a, flop / s_cub,
+                    flop / s_mt,
+                    flop / s_st,
+                    flop / s_smdb64,
+                    flop / s_smdb128,
+                    flop / s_naive,
+                    flop / s_dp4a,
+                    flop / s_cub,
                 );
                 let g_smdb = flop / s_smdb;
                 eprintln!(
@@ -16690,7 +19569,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
         let (mm, nn, kk) = (m as u32, n as u32, k as u32);
         let mut bld = g.stream.launch_builder(&f);
-        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+        bld.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&a_d)
+            .arg(&b_d)
+            .arg(&mut c_d);
         unsafe { bld.launch(cfg).unwrap() };
         g.stream.memcpy_dtov(&c_d).unwrap()
     }
@@ -16710,8 +19594,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("int8_smdb_ms", |g| {
             let mut rng = crate::diff::Rng::new(0x5A8D);
             let gen = |rng: &mut crate::diff::Rng, m: usize, k: usize, n: usize| {
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 (a, b)
             };
             // 64×64 variants (M%64==0, N%64==0, K%32==0); 160/96 exercise non-128 + short K.
@@ -16740,7 +19628,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     (int8_gemm_smdb128_s4_ptx(), "int8_gemm_nt_smdb128_s4"),
                 ] {
                     assert_eq!(
-                        launch_int8_smdb(g, ptx, entry, INT8_BM128, INT8_BN128, w128, m, k, n, &a, &b),
+                        launch_int8_smdb(
+                            g, ptx, entry, INT8_BM128, INT8_BN128, w128, m, k, n, &a, &b
+                        ),
                         r,
                         "{entry} {m}x{k}x{n}"
                     );
@@ -16766,8 +19656,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("int8_smdb_swz", |g| {
             let mut rng = crate::diff::Rng::new(0x5111);
             let gen = |rng: &mut crate::diff::Rng, m: usize, k: usize, n: usize| {
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 (a, b)
             };
             // 64×64 swz (M%64==0, N%64==0, K%64==0); 192/128 exercise the multi-CTA tail.
@@ -16776,7 +19670,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let (a, b) = gen(&mut rng, m, k, n);
                 let r = ref_nt_int8(&a, &b, m, k, n);
                 assert_eq!(
-                    launch_int8_smdb(g, int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, w64, m, k, n, &a, &b),
+                    launch_int8_smdb(
+                        g,
+                        int8_gemm_smdb_swz_ptx(),
+                        "int8_gemm_nt_smdb_swz",
+                        INT8_BM,
+                        INT8_BN,
+                        w64,
+                        m,
+                        k,
+                        n,
+                        &a,
+                        &b
+                    ),
                     r,
                     "smdb_swz 64x64 {m}x{k}x{n}"
                 );
@@ -16787,7 +19693,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let (a, b) = gen(&mut rng, m, k, n);
                 let r = ref_nt_int8(&a, &b, m, k, n);
                 assert_eq!(
-                    launch_int8_smdb(g, int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, w128, m, k, n, &a, &b),
+                    launch_int8_smdb(
+                        g,
+                        int8_gemm_smdb128_swz_ptx(),
+                        "int8_gemm_nt_smdb128_swz",
+                        INT8_BM128,
+                        INT8_BN128,
+                        w128,
+                        m,
+                        k,
+                        n,
+                        &a,
+                        &b
+                    ),
                     r,
                     "smdb128_swz {m}x{k}x{n}"
                 );
@@ -16804,11 +19722,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// property a float split-K reduction can't offer. K % (sk·64) == 0 (each split is whole BK=64 slabs).
     #[test]
     fn int8_smdb_swz_splitk_matches_reference() {
-        use crate::ptx_int8::{int8_gemm_smdb_swz_splitk_ptx, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+        use crate::ptx_int8::{
+            int8_gemm_smdb_swz_splitk_ptx, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N,
+        };
         with_gpu("int8_smdb_swz_sk", |g| {
             let mut rng = crate::diff::Rng::new(0x5C0DE);
             let entry = "int8_gemm_nt_smdb_swz_sk";
-            let f = g.function(entry, int8_gemm_smdb_swz_splitk_ptx(), entry).unwrap();
+            let f = g
+                .function(entry, int8_gemm_smdb_swz_splitk_ptx(), entry)
+                .unwrap();
             let warps = INT8_WARPS_M * INT8_WARPS_N;
             // (m,k,n,sk): K % (sk·64) == 0; sk≥2 K-splits each fold a partial via red.global.add.u32.
             for (m, k, n, sk) in [
@@ -16818,8 +19740,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 (64, 256, 192, 2),
                 (192, 128, 128, 2),
             ] {
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 let want = ref_nt_int8(&a, &b, m, k, n);
                 let a_d = g.stream.memcpy_stod(&a).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
@@ -16828,7 +19754,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 cfg.grid_dim.2 = sk as u32; // gridDim.z = number of K-splits
                 let (mm, nn, kk) = (m as u32, n as u32, k as u32);
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                bld.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&a_d)
+                    .arg(&b_d)
+                    .arg(&mut c_d);
                 unsafe { bld.launch(cfg).unwrap() };
                 let got = g.stream.memcpy_dtov(&c_d).unwrap();
                 assert_eq!(got, want, "smdb_swz_sk {m}x{k}x{n} sk={sk}");
@@ -16836,12 +19767,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // gate the public launcher wrapper (gemm_nt_int8_splitk) end-to-end too.
             {
                 let (m, k, n, sk) = (128usize, 256usize, 128usize, 4usize);
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 let want = ref_nt_int8(&a, &b, m, k, n);
-                assert_eq!(gemm_nt_int8_splitk(g, &a, &b, m, k, n, sk).unwrap(), want, "gemm_nt_int8_splitk {m}x{k}x{n} sk={sk}");
+                assert_eq!(
+                    gemm_nt_int8_splitk(g, &a, &b, m, k, n, sk).unwrap(),
+                    want,
+                    "gemm_nt_int8_splitk {m}x{k}x{n} sk={sk}"
+                );
             }
-            eprintln!("[gate] int8 split-K swz (red.global.add.u32, sk=2/4/8) bit-exact vs i32 oracle ✓");
+            eprintln!(
+                "[gate] int8 split-K swz (red.global.add.u32, sk=2/4/8) bit-exact vs i32 oracle ✓"
+            );
         });
     }
 
@@ -16854,17 +19795,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
     fn int8_smdb_sweep() {
-        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::baselines::{
+            gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8,
+        };
         use crate::ptx_int8::{
             int8_gemm_smdb128_ptx, int8_gemm_smdb128_s3_ptx, int8_gemm_smdb128_s4_ptx,
             int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_ptx, int8_gemm_smdb_s3_ptx,
-            int8_gemm_smdb_s4_ptx, int8_gemm_smdb_swz_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128,
-            INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
+            int8_gemm_smdb_s4_ptx, int8_gemm_smdb_swz_ptx, INT8_BM, INT8_BM128, INT8_BN,
+            INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
         };
         with_gpu("int8_smdb_sweep", |g| {
             if !peers_available(g) {
                 peer_gate("int8_smdb_sweep");
-                eprintln!("[skip] int8_smdb_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] int8_smdb_sweep: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -16874,14 +19820,78 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // ldmatrix+XOR-swizzle conflict-free-SMEM candidates (BK=64); same-run vs the s2/s3/s4
             // hand-placed depths and cuBLAS picks the per-size winner.
             let variants: [(&str, &'static str, &'static str, usize, usize, usize, bool); 8] = [
-                ("smdb64_s2", int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb", INT8_BM, INT8_BN, w64, false),
-                ("smdb64_s3", int8_gemm_smdb_s3_ptx(), "int8_gemm_nt_smdb_s3", INT8_BM, INT8_BN, w64, false),
-                ("smdb64_s4", int8_gemm_smdb_s4_ptx(), "int8_gemm_nt_smdb_s4", INT8_BM, INT8_BN, w64, false),
-                ("smdb64_swz", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, w64, false),
-                ("smdb128_s2", int8_gemm_smdb128_ptx(), "int8_gemm_nt_smdb128", INT8_BM128, INT8_BN128, w128, true),
-                ("smdb128_s3", int8_gemm_smdb128_s3_ptx(), "int8_gemm_nt_smdb128_s3", INT8_BM128, INT8_BN128, w128, true),
-                ("smdb128_s4", int8_gemm_smdb128_s4_ptx(), "int8_gemm_nt_smdb128_s4", INT8_BM128, INT8_BN128, w128, true),
-                ("smdb128_swz", int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, w128, true),
+                (
+                    "smdb64_s2",
+                    int8_gemm_smdb_ptx(),
+                    "int8_gemm_nt_smdb",
+                    INT8_BM,
+                    INT8_BN,
+                    w64,
+                    false,
+                ),
+                (
+                    "smdb64_s3",
+                    int8_gemm_smdb_s3_ptx(),
+                    "int8_gemm_nt_smdb_s3",
+                    INT8_BM,
+                    INT8_BN,
+                    w64,
+                    false,
+                ),
+                (
+                    "smdb64_s4",
+                    int8_gemm_smdb_s4_ptx(),
+                    "int8_gemm_nt_smdb_s4",
+                    INT8_BM,
+                    INT8_BN,
+                    w64,
+                    false,
+                ),
+                (
+                    "smdb64_swz",
+                    int8_gemm_smdb_swz_ptx(),
+                    "int8_gemm_nt_smdb_swz",
+                    INT8_BM,
+                    INT8_BN,
+                    w64,
+                    false,
+                ),
+                (
+                    "smdb128_s2",
+                    int8_gemm_smdb128_ptx(),
+                    "int8_gemm_nt_smdb128",
+                    INT8_BM128,
+                    INT8_BN128,
+                    w128,
+                    true,
+                ),
+                (
+                    "smdb128_s3",
+                    int8_gemm_smdb128_s3_ptx(),
+                    "int8_gemm_nt_smdb128_s3",
+                    INT8_BM128,
+                    INT8_BN128,
+                    w128,
+                    true,
+                ),
+                (
+                    "smdb128_s4",
+                    int8_gemm_smdb128_s4_ptx(),
+                    "int8_gemm_nt_smdb128_s4",
+                    INT8_BM128,
+                    INT8_BN128,
+                    w128,
+                    true,
+                ),
+                (
+                    "smdb128_swz",
+                    int8_gemm_smdb128_swz_ptx(),
+                    "int8_gemm_nt_smdb128_swz",
+                    INT8_BM128,
+                    INT8_BN128,
+                    w128,
+                    true,
+                ),
             ];
             let mut rng = crate::diff::Rng::new(0x5A8D5);
             for _ in 0..40 {
@@ -16893,7 +19903,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let flop = gemm_flop(m, n, k);
                 let dims = (m as u32, n as u32, k as u32);
                 let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
-                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n)
+                    .iter()
+                    .map(|&x| x as i64)
+                    .sum();
                 let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
@@ -16909,9 +19922,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let cs: i64 = {
                         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                         let mut bld = g.stream.launch_builder(&f);
-                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        bld.arg(&dims.0)
+                            .arg(&dims.1)
+                            .arg(&dims.2)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut cc);
                         unsafe { bld.launch(cfg).unwrap() };
-                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                        g.stream
+                            .memcpy_dtov(&cc)
+                            .unwrap()
+                            .iter()
+                            .map(|&x| x as i64)
+                            .sum()
                     };
                     assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
                     // Interleave the variant and cuBLAS round-by-round so each %-of-cuBLAS uses a
@@ -16924,7 +19947,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }
                     let (gf, g_cub) = (flop / s_v, flop / s_cub);
                     let pct = 100.0 * gf / g_cub;
-                    eprintln!("  {label:<11}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", gf / 1e9, pct, g_cub / 1e9);
+                    eprintln!(
+                        "  {label:<11}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})",
+                        gf / 1e9,
+                        pct,
+                        g_cub / 1e9
+                    );
                     if best.map_or(true, |(_, p)| pct > p) {
                         best = Some((label, pct));
                     }
@@ -16961,8 +19989,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 (384, 64, 256, 16),
                 (256, 256, 256, 32),
             ] {
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 let want = ref_nt_int8(&a, &b, m, k, n);
                 let ptx = int8_gemm_smdb_swz_raster_ptx(true, r);
                 let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
@@ -16977,10 +20009,18 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     shared_mem_bytes: 0,
                 };
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                bld.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&a_d)
+                    .arg(&b_d)
+                    .arg(&mut c_d);
                 unsafe { bld.launch(cfg).unwrap() };
                 let got = g.stream.memcpy_dtov(&c_d).unwrap();
-                assert_eq!(got, want, "rasterized swz128 r={r} {m}x{k}x{n} must equal the i32 oracle bit-for-bit");
+                assert_eq!(
+                    got, want,
+                    "rasterized swz128 r={r} {m}x{k}x{n} must equal the i32 oracle bit-for-bit"
+                );
                 eprintln!("int8 raster r={r} {m}x{k}x{n}: bit-exact ✓");
             }
         });
@@ -16999,15 +20039,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "throughput sweep; needs CUDA redist DLLs on PATH; run explicitly"]
     fn quant_int8_raster_sweep() {
-        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::baselines::{
+            gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8,
+        };
         use crate::ptx_int8::{
-            int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_swz_raster_entry, int8_gemm_smdb_swz_raster_ptx,
-            INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128,
+            int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_swz_raster_entry,
+            int8_gemm_smdb_swz_raster_ptx, INT8_BM128, INT8_BN128, INT8_WARPS_M128,
+            INT8_WARPS_N128,
         };
         with_gpu("quant_int8_raster_sweep", |g| {
             if !peers_available(g) {
                 peer_gate("quant_int8_raster_sweep");
-                eprintln!("[skip] quant_int8_raster_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] quant_int8_raster_sweep: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -17019,19 +20065,39 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
             const ROUNDS: usize = 6;
             // checksum of one launch of `f` with cfg — bit-exact cross-check before any timing (first law).
-            let cs_of = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, dims: (u32, u32, u32), a_d: &cudarc::driver::CudaSlice<u8>, b_d: &cudarc::driver::CudaSlice<i8>, mn: usize| -> i64 {
+            let cs_of = |g: &Gpu,
+                         f: &cudarc::driver::CudaFunction,
+                         cfg: LaunchConfig,
+                         dims: (u32, u32, u32),
+                         a_d: &cudarc::driver::CudaSlice<u8>,
+                         b_d: &cudarc::driver::CudaSlice<i8>,
+                         mn: usize|
+             -> i64 {
                 let mut cc = g.stream.memcpy_stod(&vec![0i32; mn]).unwrap();
                 let mut bld = g.stream.launch_builder(f);
-                bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(a_d).arg(b_d).arg(&mut cc);
+                bld.arg(&dims.0)
+                    .arg(&dims.1)
+                    .arg(&dims.2)
+                    .arg(a_d)
+                    .arg(b_d)
+                    .arg(&mut cc);
                 unsafe { bld.launch(cfg).unwrap() };
-                g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                g.stream
+                    .memcpy_dtov(&cc)
+                    .unwrap()
+                    .iter()
+                    .map(|&x| x as i64)
+                    .sum()
             };
             for sz in [2048usize, 4096] {
                 let (m, k, n) = (sz, sz, sz);
                 let flop = gemm_flop(m, n, k);
                 let dims = (m as u32, n as u32, k as u32);
                 let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
-                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n)
+                    .iter()
+                    .map(|&x| x as i64)
+                    .sum();
                 let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
@@ -17039,29 +20105,52 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
                 // Baseline: un-rasterized swz128 (2-D grid).
                 let f_base = g
-                    .function("int8_swz128_base", int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz")
+                    .function(
+                        "int8_swz128_base",
+                        int8_gemm_smdb128_swz_ptx(),
+                        "int8_gemm_nt_smdb128_swz",
+                    )
                     .unwrap();
                 let cfg_base = int8_smdb_cfg(m, n, bm, bn, w128);
-                assert_eq!(cs_of(g, &f_base, cfg_base, dims, &a_d, &b_d, m * n), cs_ref, "swz128 base {sz}³ checksum");
+                assert_eq!(
+                    cs_of(g, &f_base, cfg_base, dims, &a_d, &b_d, m * n),
+                    cs_ref,
+                    "swz128 base {sz}³ checksum"
+                );
                 let (mut s_base, mut s_cub) = (f64::INFINITY, f64::INFINITY);
                 for _ in 0..ROUNDS {
-                    s_base = s_base.min(time_gemm_int8(g, &f_base, cfg_base, dims, &a_d, &b_d, &mut c_d, 50));
+                    s_base = s_base.min(time_gemm_int8(
+                        g, &f_base, cfg_base, dims, &a_d, &b_d, &mut c_d, 50,
+                    ));
                     s_cub = s_cub.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
                 }
                 let (g_base, g_cub) = (flop / s_base, flop / s_cub);
                 let base_pct = 100.0 * g_base / g_cub;
-                eprintln!("  swz128 no-raster : {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", g_base / 1e9, base_pct, g_cub / 1e9);
+                eprintln!(
+                    "  swz128 no-raster : {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})",
+                    g_base / 1e9,
+                    base_pct,
+                    g_cub / 1e9
+                );
 
                 // Rasterized sweep (1-D grid: gridDim.x = tiles_m·tiles_n).
                 let entry = int8_gemm_smdb_swz_raster_entry(true);
                 let grid1d = ((m / bm) * (n / bn)) as u32;
-                let cfg_r = LaunchConfig { grid_dim: (grid1d, 1, 1), block_dim: ((w128 * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                let cfg_r = LaunchConfig {
+                    grid_dim: (grid1d, 1, 1),
+                    block_dim: ((w128 * 32) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 let mut best: Option<(usize, f64)> = None;
                 for r in [4usize, 8, 16, 32] {
                     let ptx = int8_gemm_smdb_swz_raster_ptx(true, r);
                     let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
                     let f = module.load_function(entry).unwrap();
-                    assert_eq!(cs_of(g, &f, cfg_r, dims, &a_d, &b_d, m * n), cs_ref, "swz128_r{r} {sz}³ checksum");
+                    assert_eq!(
+                        cs_of(g, &f, cfg_r, dims, &a_d, &b_d, m * n),
+                        cs_ref,
+                        "swz128_r{r} {sz}³ checksum"
+                    );
                     let (mut s_v, mut s_c) = (f64::INFINITY, f64::INFINITY);
                     for _ in 0..ROUNDS {
                         s_v = s_v.min(time_gemm_int8(g, &f, cfg_r, dims, &a_d, &b_d, &mut c_d, 50));
@@ -17069,7 +20158,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }
                     let (gf, gc) = (flop / s_v, flop / s_c);
                     let pct = 100.0 * gf / gc;
-                    eprintln!("  swz128 raster={r:<2} : {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS", gf / 1e9, pct);
+                    eprintln!(
+                        "  swz128 raster={r:<2} : {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS",
+                        gf / 1e9,
+                        pct
+                    );
                     if best.map_or(true, |(_, p)| pct > p) {
                         best = Some((r, pct));
                     }
@@ -17091,11 +20184,20 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("quant_int8_bigtile", |g| {
             let mut rng = crate::diff::Rng::new(0x4A59);
             // (bm,bn,wm,wn,raster): 256×128 & 128×256, plain + rasterized (1-D grid). M%bm==N%bn==K%64==0.
-            let cfgs = [(256usize, 128usize, 4usize, 2usize, 0usize), (128, 256, 2, 4, 0), (256, 128, 4, 2, 8), (128, 256, 2, 4, 8)];
+            let cfgs = [
+                (256usize, 128usize, 4usize, 2usize, 0usize),
+                (128, 256, 2, 4, 0),
+                (256, 128, 4, 2, 8),
+                (128, 256, 2, 4, 8),
+            ];
             for (bm, bn, wm, wn, r) in cfgs {
                 for (m, k, n) in [(bm, 128usize, bn), (2 * bm, 64usize, 2 * bn)] {
-                    let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                    let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                    let a: Vec<u8> = (0..m * k)
+                        .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                        .collect();
+                    let b: Vec<i8> = (0..n * k)
+                        .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                        .collect();
                     let want = ref_nt_int8(&a, &b, m, k, n);
                     let (entry, ptx) = crate::ptx_int8::int8_gemm_swz_tile_ptx(bm, bn, wm, wn, r);
                     let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
@@ -17104,12 +20206,29 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let b_d = g.stream.memcpy_stod(&b).unwrap();
                     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
-                    let grid = if r > 0 { (((m / bm) * (n / bn)) as u32, 1, 1) } else { ((n / bn) as u32, (m / bm) as u32, 1) };
-                    let cfg = LaunchConfig { grid_dim: grid, block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                    let grid = if r > 0 {
+                        (((m / bm) * (n / bn)) as u32, 1, 1)
+                    } else {
+                        ((n / bn) as u32, (m / bm) as u32, 1)
+                    };
+                    let cfg = LaunchConfig {
+                        grid_dim: grid,
+                        block_dim: ((wm * wn * 32) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                    bld.arg(&mm)
+                        .arg(&nn)
+                        .arg(&kk)
+                        .arg(&a_d)
+                        .arg(&b_d)
+                        .arg(&mut c_d);
                     unsafe { bld.launch(cfg).unwrap() };
-                    assert_eq!(g.stream.memcpy_dtov(&c_d).unwrap(), want, "swz {bm}x{bn} w{wm}x{wn} r{r} {m}x{k}x{n}");
+                    assert_eq!(
+                        g.stream.memcpy_dtov(&c_d).unwrap(),
+                        want,
+                        "swz {bm}x{bn} w{wm}x{wn} r{r} {m}x{k}x{n}"
+                    );
                 }
             }
             eprintln!("int8 big-tile swz (256×128 / 128×256, ±raster): bit-exact ✓");
@@ -17126,12 +20245,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "throughput sweep; needs CUDA redist DLLs on PATH; run explicitly"]
     fn quant_int8_bigtile_sweep() {
-        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::baselines::{
+            gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8,
+        };
         use crate::ptx_int8::int8_gemm_swz_tile_ptx;
         with_gpu("quant_int8_bigtile_sweep", |g| {
             if !peers_available(g) {
                 peer_gate("quant_int8_bigtile_sweep");
-                eprintln!("[skip] quant_int8_bigtile_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] quant_int8_bigtile_sweep: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -17158,7 +20282,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let flop = gemm_flop(m, n, k);
                 let dims = (m as u32, n as u32, k as u32);
                 let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
-                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n)
+                    .iter()
+                    .map(|&x| x as i64)
+                    .sum();
                 let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
@@ -17172,15 +20299,33 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let (entry, ptx) = int8_gemm_swz_tile_ptx(bm, bn, wm, wn, r);
                     let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
                     let f = module.load_function(entry.as_str()).unwrap();
-                    let grid = if r > 0 { (((m / bm) * (n / bn)) as u32, 1, 1) } else { ((n / bn) as u32, (m / bm) as u32, 1) };
-                    let cfg = LaunchConfig { grid_dim: grid, block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                    let grid = if r > 0 {
+                        (((m / bm) * (n / bn)) as u32, 1, 1)
+                    } else {
+                        ((n / bn) as u32, (m / bm) as u32, 1)
+                    };
+                    let cfg = LaunchConfig {
+                        grid_dim: grid,
+                        block_dim: ((wm * wn * 32) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
                     // bit-exact cross-check (first law) before timing.
                     let cs: i64 = {
                         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                         let mut bld = g.stream.launch_builder(&f);
-                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        bld.arg(&dims.0)
+                            .arg(&dims.1)
+                            .arg(&dims.2)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut cc);
                         unsafe { bld.launch(cfg).unwrap() };
-                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                        g.stream
+                            .memcpy_dtov(&cc)
+                            .unwrap()
+                            .iter()
+                            .map(|&x| x as i64)
+                            .sum()
                     };
                     assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
                     let (mut s_v, mut s_cub) = (f64::INFINITY, f64::INFINITY);
@@ -17190,7 +20335,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }
                     let (gf, gc) = (flop / s_v, flop / s_cub);
                     let pct = 100.0 * gf / gc;
-                    eprintln!("  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", gf / 1e9, pct, gc / 1e9);
+                    eprintln!(
+                        "  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})",
+                        gf / 1e9,
+                        pct,
+                        gc / 1e9
+                    );
                     if best.as_ref().map_or(true, |(_, p)| pct > *p) {
                         best = Some((label.trim().to_string(), pct));
                     }
@@ -17211,15 +20361,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "throughput sweep; needs CUDA redist DLLs on PATH; run explicitly"]
     fn quant_int8_w64_confirm() {
-        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::baselines::{
+            gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8,
+        };
         use crate::ptx_int8::{
-            int8_gemm_smdb_swz_ptx, int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_r8_ptx, INT8_BM, INT8_BN,
-            INT8_WARPS_M, INT8_WARPS_N, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+            int8_gemm_smdb_swz_ptx, int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_r8_ptx, INT8_BM,
+            INT8_BN, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, INT8_WARPS_M,
+            INT8_WARPS_N,
         };
         with_gpu("quant_int8_w64_confirm", |g| {
             if !peers_available(g) {
                 peer_gate("quant_int8_w64_confirm");
-                eprintln!("[skip] quant_int8_w64_confirm: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] quant_int8_w64_confirm: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -17227,9 +20383,33 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let w64v = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
             // (label, ptx, entry, bm, bn, warps, raster)
             let variants: [(&str, &'static str, &'static str, usize, usize, usize, usize); 3] = [
-                ("smdb64_swz   ", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, w_small, 0),
-                ("w64          ", int8_gemm_w64_swz_ptx(), "int8_gemm_nt_w64_swz", INT8_W64_BM, INT8_W64_BN, w64v, 0),
-                ("w64_raster8  ", int8_gemm_w64_swz_r8_ptx(), "int8_gemm_nt_w64_swz_r8", INT8_W64_BM, INT8_W64_BN, w64v, 8),
+                (
+                    "smdb64_swz   ",
+                    int8_gemm_smdb_swz_ptx(),
+                    "int8_gemm_nt_smdb_swz",
+                    INT8_BM,
+                    INT8_BN,
+                    w_small,
+                    0,
+                ),
+                (
+                    "w64          ",
+                    int8_gemm_w64_swz_ptx(),
+                    "int8_gemm_nt_w64_swz",
+                    INT8_W64_BM,
+                    INT8_W64_BN,
+                    w64v,
+                    0,
+                ),
+                (
+                    "w64_raster8  ",
+                    int8_gemm_w64_swz_r8_ptx(),
+                    "int8_gemm_nt_w64_swz_r8",
+                    INT8_W64_BM,
+                    INT8_W64_BN,
+                    w64v,
+                    8,
+                ),
             ];
             let mut rng = crate::diff::Rng::new(0x4A60);
             for _ in 0..40 {
@@ -17241,7 +20421,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let flop = gemm_flop(m, n, k);
                 let dims = (m as u32, n as u32, k as u32);
                 let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
-                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n)
+                    .iter()
+                    .map(|&x| x as i64)
+                    .sum();
                 let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
@@ -17253,14 +20436,32 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         continue;
                     }
                     let f = g.function(entry, ptx, entry).unwrap();
-                    let grid = if raster > 0 { (((m / bm) * (n / bn)) as u32, 1, 1) } else { ((n / bn) as u32, (m / bm) as u32, 1) };
-                    let cfg = LaunchConfig { grid_dim: grid, block_dim: ((warps * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                    let grid = if raster > 0 {
+                        (((m / bm) * (n / bn)) as u32, 1, 1)
+                    } else {
+                        ((n / bn) as u32, (m / bm) as u32, 1)
+                    };
+                    let cfg = LaunchConfig {
+                        grid_dim: grid,
+                        block_dim: ((warps * 32) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
                     let cs: i64 = {
                         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                         let mut bld = g.stream.launch_builder(&f);
-                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        bld.arg(&dims.0)
+                            .arg(&dims.1)
+                            .arg(&dims.2)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut cc);
                         unsafe { bld.launch(cfg).unwrap() };
-                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                        g.stream
+                            .memcpy_dtov(&cc)
+                            .unwrap()
+                            .iter()
+                            .map(|&x| x as i64)
+                            .sum()
                     };
                     assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
                     let (mut s_v, mut s_cub) = (f64::INFINITY, f64::INFINITY);
@@ -17270,7 +20471,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }
                     let (gf, gc) = (flop / s_v, flop / s_cub);
                     let pct = 100.0 * gf / gc;
-                    eprintln!("  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", gf / 1e9, pct, gc / 1e9);
+                    eprintln!(
+                        "  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})",
+                        gf / 1e9,
+                        pct,
+                        gc / 1e9
+                    );
                     if best.as_ref().map_or(true, |(_, p)| pct > *p) {
                         best = Some((label.trim().to_string(), pct));
                     }
@@ -17294,19 +20500,32 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     fn quant_int8_w64_s3_matches_reference() {
         use crate::ptx_int8::{
-            int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_s3_ptx, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M,
-            INT8_W64_WARPS_N,
+            int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_s3_ptx, INT8_W64_BM, INT8_W64_BN,
+            INT8_W64_WARPS_M, INT8_W64_WARPS_N,
         };
         with_gpu("quant_int8_w64_s3", |g| {
             let warps = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
             let f2 = g
-                .function("int8_gemm_nt_w64_swz", int8_gemm_w64_swz_ptx(), "int8_gemm_nt_w64_swz")
+                .function(
+                    "int8_gemm_nt_w64_swz",
+                    int8_gemm_w64_swz_ptx(),
+                    "int8_gemm_nt_w64_swz",
+                )
                 .unwrap();
             let f3 = g
-                .function("int8_gemm_nt_w64_swz_s3", int8_gemm_w64_swz_s3_ptx(), "int8_gemm_nt_w64_swz_s3")
+                .function(
+                    "int8_gemm_nt_w64_swz_s3",
+                    int8_gemm_w64_swz_s3_ptx(),
+                    "int8_gemm_nt_w64_swz_s3",
+                )
                 .unwrap();
             let mut rng = crate::diff::Rng::new(0x5A30);
-            for (m, k, n) in [(128usize, 128usize, 128usize), (256, 256, 256), (128, 384, 256), (384, 256, 128)] {
+            for (m, k, n) in [
+                (128usize, 128usize, 128usize),
+                (256, 256, 256),
+                (128, 384, 256),
+                (384, 256, 128),
+            ] {
                 let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
                 let rf = ref_nt_int8(&a_u8, &b, m, k, n);
                 let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
@@ -17320,7 +20539,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let run = |g: &mut Gpu, f: &_| -> Vec<i32> {
                     let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                     let mut bld = g.stream.launch_builder(f);
-                    bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                    bld.arg(&dims.0)
+                        .arg(&dims.1)
+                        .arg(&dims.2)
+                        .arg(&a_d)
+                        .arg(&b_d)
+                        .arg(&mut cc);
                     unsafe { bld.launch(cfg).unwrap() };
                     g.stream.memcpy_dtov(&cc).unwrap()
                 };
@@ -17328,7 +20552,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let c3 = run(g, &f3);
                 assert_eq!(c3, rf, "w64_s3 {m}x{k}x{n} != i32 oracle (element-wise)");
                 assert_eq!(c3, c2, "w64_s3 {m}x{k}x{n} != w64 2-stage (element-wise)");
-                eprintln!("int8 w64_s3 {m}x{k}x{n}: 3-stage == 2-stage == i32 oracle ✓ ({} elems)", m * n);
+                eprintln!(
+                    "int8 w64_s3 {m}x{k}x{n}: 3-stage == 2-stage == i32 oracle ✓ ({} elems)",
+                    m * n
+                );
             }
         });
     }
@@ -17374,7 +20601,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             );
             // The shipped 2-stage kernel: the regression oracle every depth must also equal.
             let f_ship = g
-                .function("int8_gemm_nt_w64_swz", crate::ptx_int8::int8_gemm_w64_swz_ptx(), "int8_gemm_nt_w64_swz")
+                .function(
+                    "int8_gemm_nt_w64_swz",
+                    crate::ptx_int8::int8_gemm_w64_swz_ptx(),
+                    "int8_gemm_nt_w64_swz",
+                )
                 .unwrap();
             let mut rng = crate::diff::Rng::new(0x5A31);
             let mut ran = 0usize;
@@ -17390,13 +20621,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     continue;
                 }
                 let (ptx, mode) = int8_stage_ptx(v, budget);
-                assert_eq!(mode, v.smem_mode(), "{}: generator and table disagree on the SMEM form", v.name);
+                assert_eq!(
+                    mode,
+                    v.smem_mode(),
+                    "{}: generator and table disagree on the SMEM form",
+                    v.name
+                );
                 // ONE call for both forms: static ⇒ plain load + 0 launch bytes; dynamic ⇒ the opt-in.
                 // The key is the variant name, so no two depths can share a module (or an SMEM ceiling).
                 let (f, dyn_bytes) = g.function_smem(v.name, &ptx, v.name, mode).unwrap();
                 assert_eq!(dyn_bytes, mode.launch_bytes());
                 let occ = f
-                    .occupancy_max_active_blocks_per_multiprocessor(v.threads() as u32, dyn_bytes, None)
+                    .occupancy_max_active_blocks_per_multiprocessor(
+                        v.threads() as u32,
+                        dyn_bytes,
+                        None,
+                    )
                     .unwrap_or(0);
                 eprintln!(
                     "  {:<16} s{} SMEM {:>5} B ({:>2} KiB) {:<8} launch_bytes={:<6} occupancy={} CTA/SM",
@@ -17425,18 +20665,34 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let run = |g: &mut Gpu, f: &_, bytes: usize| -> Vec<i32> {
                         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                         let mut bld = g.stream.launch_builder(f);
-                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        bld.arg(&dims.0)
+                            .arg(&dims.1)
+                            .arg(&dims.2)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut cc);
                         unsafe { bld.launch(dyn_launch_cfg(grid, block, bytes)).unwrap() };
                         g.stream.memcpy_dtov(&cc).unwrap()
                     };
                     let got = run(g, &f, dyn_bytes);
-                    assert_eq!(got, want, "{} {m}x{k}x{n}: != the i32 oracle (element-wise)", v.name);
+                    assert_eq!(
+                        got, want,
+                        "{} {m}x{k}x{n}: != the i32 oracle (element-wise)",
+                        v.name
+                    );
                     let ship = run(g, &f_ship, 0);
-                    assert_eq!(got, ship, "{} {m}x{k}x{n}: != the shipped 2-stage kernel", v.name);
+                    assert_eq!(
+                        got, ship,
+                        "{} {m}x{k}x{n}: != the shipped 2-stage kernel",
+                        v.name
+                    );
                     ran += 1;
                 }
             }
-            assert!(ran >= 8, "the stage grid must actually have run (only {ran} shapes)");
+            assert!(
+                ran >= 8,
+                "the stage grid must actually have run (only {ran} shapes)"
+            );
             eprintln!(
                 "[gate] int8 stage grid s2..s5: {ran} K-corner shapes, every one == the i32 oracle AND == the \
                  shipped 2-stage kernel, element-wise; s4/s5 ran out of the dynamic SMEM window (>48 KiB static) ✓"
@@ -17463,7 +20719,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     continue;
                 }
                 let (name, ptx, mode) = int8_gemm_swz_tile_stage_ptx(bm, bn, wm, wn, 0, 3, budget);
-                assert_eq!(mode, SmemMode::Dynamic(bytes as u32), "{name}: 72 KiB must be dynamic");
+                assert_eq!(
+                    mode,
+                    SmemMode::Dynamic(bytes as u32),
+                    "{name}: 72 KiB must be dynamic"
+                );
                 // An owned per-shape module: load it directly rather than fabricate a `&'static str` key.
                 let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
                 let f = module.load_function(name.as_str()).unwrap();
@@ -17474,9 +20734,16 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 )
                 .unwrap();
                 let occ = f
-                    .occupancy_max_active_blocks_per_multiprocessor((wm * wn * 32) as u32, bytes, None)
+                    .occupancy_max_active_blocks_per_multiprocessor(
+                        (wm * wn * 32) as u32,
+                        bytes,
+                        None,
+                    )
                     .unwrap_or(0);
-                eprintln!("  {name}: SMEM {bytes} B ({} KiB) DYNAMIC, occupancy={occ} CTA/SM", bytes / 1024);
+                eprintln!(
+                    "  {name}: SMEM {bytes} B ({} KiB) DYNAMIC, occupancy={occ} CTA/SM",
+                    bytes / 1024
+                );
                 for k in [64usize, 128, 192, 320] {
                     let (m, n) = (bm, bn);
                     let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
@@ -17486,13 +20753,29 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut cc);
+                    bld.arg(&mm)
+                        .arg(&nn)
+                        .arg(&kk)
+                        .arg(&a_d)
+                        .arg(&b_d)
+                        .arg(&mut cc);
                     unsafe {
-                        bld.launch(dyn_launch_cfg((1, 1, 1), ((wm * wn * 32) as u32, 1, 1), bytes)).unwrap()
+                        bld.launch(dyn_launch_cfg(
+                            (1, 1, 1),
+                            ((wm * wn * 32) as u32, 1, 1),
+                            bytes,
+                        ))
+                        .unwrap()
                     };
-                    assert_eq!(g.stream.memcpy_dtov(&cc).unwrap(), want, "{name} {m}x{k}x{n} != i32 oracle");
+                    assert_eq!(
+                        g.stream.memcpy_dtov(&cc).unwrap(),
+                        want,
+                        "{name} {m}x{k}x{n} != i32 oracle"
+                    );
                 }
-                eprintln!("[gate] {name}: bit-exact at 4 K-corners out of a {bytes}-B dynamic window ✓");
+                eprintln!(
+                    "[gate] {name}: bit-exact at 4 K-corners out of a {bytes}-B dynamic window ✓"
+                );
             }
         });
     }
@@ -17506,24 +20789,51 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "throughput sweep; needs CUDA redist DLLs on PATH; run explicitly"]
     fn quant_int8_w64_s3_sweep() {
-        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::baselines::{
+            gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8,
+        };
         use crate::ptx_int8::{
-            int8_gemm_smdb_swz_ptx, int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_s3_ptx, INT8_BM, INT8_BN,
-            INT8_WARPS_M, INT8_WARPS_N, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+            int8_gemm_smdb_swz_ptx, int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_s3_ptx, INT8_BM,
+            INT8_BN, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, INT8_WARPS_M,
+            INT8_WARPS_N,
         };
         with_gpu("quant_int8_w64_s3_sweep", |g| {
             if !peers_available(g) {
                 peer_gate("quant_int8_w64_s3_sweep");
-                eprintln!("[skip] quant_int8_w64_s3_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] quant_int8_w64_s3_sweep: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
             // (label, ptx, entry, bm, bn, warps): the current per-size shipped winner (smdb64_swz @1024,
             // w64 @2048/4096) vs the new 3-stage w64 ring. s3 only legal at 128-div M,N (skipped otherwise).
             let variants: [(&str, &'static str, &'static str, usize, usize, usize); 3] = [
-                ("smdb64_swz   ", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N),
-                ("w64 (2-stage)", int8_gemm_w64_swz_ptx(), "int8_gemm_nt_w64_swz", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M * INT8_W64_WARPS_N),
-                ("w64_s3       ", int8_gemm_w64_swz_s3_ptx(), "int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M * INT8_W64_WARPS_N),
+                (
+                    "smdb64_swz   ",
+                    int8_gemm_smdb_swz_ptx(),
+                    "int8_gemm_nt_smdb_swz",
+                    INT8_BM,
+                    INT8_BN,
+                    INT8_WARPS_M * INT8_WARPS_N,
+                ),
+                (
+                    "w64 (2-stage)",
+                    int8_gemm_w64_swz_ptx(),
+                    "int8_gemm_nt_w64_swz",
+                    INT8_W64_BM,
+                    INT8_W64_BN,
+                    INT8_W64_WARPS_M * INT8_W64_WARPS_N,
+                ),
+                (
+                    "w64_s3       ",
+                    int8_gemm_w64_swz_s3_ptx(),
+                    "int8_gemm_nt_w64_swz_s3",
+                    INT8_W64_BM,
+                    INT8_W64_BN,
+                    INT8_W64_WARPS_M * INT8_W64_WARPS_N,
+                ),
             ];
             let mut rng = crate::diff::Rng::new(0x5A31);
             for _ in 0..40 {
@@ -17535,7 +20845,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let flop = gemm_flop(m, n, k);
                 let dims = (m as u32, n as u32, k as u32);
                 let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
-                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n)
+                    .iter()
+                    .map(|&x| x as i64)
+                    .sum();
                 let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
@@ -17555,9 +20868,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let cs: i64 = {
                         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                         let mut bld = g.stream.launch_builder(&f);
-                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        bld.arg(&dims.0)
+                            .arg(&dims.1)
+                            .arg(&dims.2)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut cc);
                         unsafe { bld.launch(cfg).unwrap() };
-                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                        g.stream
+                            .memcpy_dtov(&cc)
+                            .unwrap()
+                            .iter()
+                            .map(|&x| x as i64)
+                            .sum()
                     };
                     assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
                     let (mut s_v, mut s_cub) = (f64::INFINITY, f64::INFINITY);
@@ -17567,7 +20890,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }
                     let (gf, gc) = (flop / s_v, flop / s_cub);
                     let pct = 100.0 * gf / gc;
-                    eprintln!("  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", gf / 1e9, pct, gc / 1e9);
+                    eprintln!(
+                        "  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})",
+                        gf / 1e9,
+                        pct,
+                        gc / 1e9
+                    );
                     if best.as_ref().map_or(true, |(_, p)| pct > *p) {
                         best = Some((label.trim().to_string(), pct));
                     }
@@ -17592,11 +20920,23 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let warps = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
             let mut rng = crate::diff::Rng::new(0x4DEA);
             let f = g
-                .function("int8_gemm_nt_w64_swz_deq", int8_gemm_w64_swz_deq_ptx(), "int8_gemm_nt_w64_swz_deq")
+                .function(
+                    "int8_gemm_nt_w64_swz_deq",
+                    int8_gemm_w64_swz_deq_ptx(),
+                    "int8_gemm_nt_w64_swz_deq",
+                )
                 .unwrap();
-            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 384)] {
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+            for (m, k, n) in [
+                (128usize, 64usize, 128usize),
+                (256, 128, 256),
+                (128, 256, 384),
+            ] {
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 let scale: Vec<f32> = (0..n).map(|_| rng.f32_range(1e-3, 5e-2)).collect();
                 let acc = ref_nt_int8(&a, &b, m, k, n);
                 let want: Vec<f32> = (0..m * n).map(|t| acc[t] as f32 * scale[t % n]).collect();
@@ -17607,10 +20947,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let (mm, nn, kk) = (m as u32, n as u32, k as u32);
                 let cfg = int8_smdb_cfg(m, n, INT8_W64_BM, INT8_W64_BN, warps);
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&scale_d);
+                bld.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&a_d)
+                    .arg(&b_d)
+                    .arg(&mut c_d)
+                    .arg(&scale_d);
                 unsafe { bld.launch(cfg).unwrap() };
                 let got = g.stream.memcpy_dtov(&c_d).unwrap();
-                let st = crate::diff::assert_close(&format!("w64_dequant {m}x{k}x{n}"), &got, &want, 1e-3, 1e-6);
+                let st = crate::diff::assert_close(
+                    &format!("w64_dequant {m}x{k}x{n}"),
+                    &got,
+                    &want,
+                    1e-3,
+                    1e-6,
+                );
                 eprintln!("int8 w64_dequant {m}x{k}x{n}: ✓ max_abs={:.2e}", st.max_abs);
             }
         });
@@ -17633,13 +20985,16 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             time_cublas_int8_gemm_dequant_chain,
         };
         use crate::ptx_int8::{
-            int8_gemm_smdb_swz_deq_ptx, int8_gemm_w64_swz_deq_ptx, INT8_BM, INT8_BN, INT8_WARPS_M,
-            INT8_WARPS_N, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+            int8_gemm_smdb_swz_deq_ptx, int8_gemm_w64_swz_deq_ptx, INT8_BM, INT8_BN, INT8_W64_BM,
+            INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, INT8_WARPS_M, INT8_WARPS_N,
         };
         with_gpu("quant_int8_fused_dequant_vs_chain", |g| {
             if !peers_available(g) {
                 peer_gate("quant_int8_fused_dequant_vs_chain");
-                eprintln!("[skip] quant_int8_fused_dequant_vs_chain: cuBLAS not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] quant_int8_fused_dequant_vs_chain: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
@@ -17654,9 +21009,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // Wukong's dispatched fused-dequant kernel for this size (mirrors gemm_nt_int8_smdb_dequant).
                 let use_w64 = m >= 2048 && n >= 2048;
                 let (ptx, entry, bm, bn, warps) = if use_w64 {
-                    (int8_gemm_w64_swz_deq_ptx(), "int8_gemm_nt_w64_swz_deq", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M * INT8_W64_WARPS_N)
+                    (
+                        int8_gemm_w64_swz_deq_ptx(),
+                        "int8_gemm_nt_w64_swz_deq",
+                        INT8_W64_BM,
+                        INT8_W64_BN,
+                        INT8_W64_WARPS_M * INT8_W64_WARPS_N,
+                    )
                 } else {
-                    (int8_gemm_smdb_swz_deq_ptx(), "int8_gemm_nt_smdb_swz_deq", INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N)
+                    (
+                        int8_gemm_smdb_swz_deq_ptx(),
+                        "int8_gemm_nt_smdb_swz_deq",
+                        INT8_BM,
+                        INT8_BN,
+                        INT8_WARPS_M * INT8_WARPS_N,
+                    )
                 };
                 let f = g.function(entry, ptx, entry).unwrap();
                 let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
@@ -17664,13 +21031,20 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let b_d = g.stream.memcpy_stod(&vec![1i8; n * k]).unwrap();
                 let scale_d = g.stream.memcpy_stod(&vec![1.0f32 / 127.0; n]).unwrap();
                 let mut cf_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let (mut s_fused, mut s_chain, mut s_gemm) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+                let (mut s_fused, mut s_chain, mut s_gemm) =
+                    (f64::INFINITY, f64::INFINITY, f64::INFINITY);
                 for _ in 0..ROUNDS {
                     // Wukong single fused kernel (GEMM+dequant), resident, best-of this round.
                     let s_f = {
                         let launch = |c: &mut cudarc::driver::CudaSlice<f32>| {
                             let mut bld = g.stream.launch_builder(&f);
-                            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(c).arg(&scale_d);
+                            bld.arg(&mm)
+                                .arg(&nn)
+                                .arg(&kk)
+                                .arg(&a_d)
+                                .arg(&b_d)
+                                .arg(c)
+                                .arg(&scale_d);
                             unsafe { bld.launch(cfg).unwrap() };
                         };
                         launch(&mut cf_d);
@@ -17683,7 +21057,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         t0.elapsed().as_secs_f64() / 50.0
                     };
                     s_fused = s_fused.min(s_f);
-                    s_chain = s_chain.min(time_cublas_int8_gemm_dequant_chain(g, m, k, n, 50).unwrap());
+                    s_chain =
+                        s_chain.min(time_cublas_int8_gemm_dequant_chain(g, m, k, n, 50).unwrap());
                     s_gemm = s_gemm.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
                 }
                 eprintln!(
@@ -17715,26 +21090,57 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("quant_fp8_warp_tile", |g| {
             let mut rng = crate::diff::Rng::new(0xF8E1);
             let (m, k, n) = (256usize, 128usize, 256usize);
-            let a: Vec<u8> = rng.vec(m * k, -1.0, 1.0).iter().map(|&x| f32_to_e4m3(x)).collect();
-            let b: Vec<u8> = rng.vec(n * k, -1.0, 1.0).iter().map(|&x| f32_to_e4m3(x)).collect();
+            let a: Vec<u8> = rng
+                .vec(m * k, -1.0, 1.0)
+                .iter()
+                .map(|&x| f32_to_e4m3(x))
+                .collect();
+            let b: Vec<u8> = rng
+                .vec(n * k, -1.0, 1.0)
+                .iter()
+                .map(|&x| f32_to_e4m3(x))
+                .collect();
             let a_d = g.stream.memcpy_stod(&a).unwrap();
             let b_d = g.stream.memcpy_stod(&b).unwrap();
             let dims = (m as u32, n as u32, k as u32);
             // (key, bm,bn,bk,wm,wn,stages,raster): default 64×32 warp tile vs the 64×64 warp tile (the lever).
-            let cfgs = [("fp8w24", 128usize, 128usize, 64usize, 2usize, 4usize, 2usize, 16usize), ("fp8w22", 128, 128, 64, 2, 2, 2, 16)];
+            let cfgs = [
+                (
+                    "fp8w24", 128usize, 128usize, 64usize, 2usize, 4usize, 2usize, 16usize,
+                ),
+                ("fp8w22", 128, 128, 64, 2, 2, 2, 16),
+            ];
             let mut ref_sum: Option<f64> = None;
             for (key, bm, bn, bk, wm, wn, stg, ras) in cfgs {
                 let ptx = fp8_pipe_cfg_ptx(bm, bn, bk, wm, wn, stg, ras);
                 let f = g.function(key, &ptx, "fp8_gemm_pipe").unwrap();
-                let cfg = LaunchConfig { grid_dim: (((m / bm) * (n / bn)) as u32, 1, 1), block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                let cfg = LaunchConfig {
+                    grid_dim: (((m / bm) * (n / bn)) as u32, 1, 1),
+                    block_dim: ((wm * wn * 32) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                bld.arg(&dims.0)
+                    .arg(&dims.1)
+                    .arg(&dims.2)
+                    .arg(&a_d)
+                    .arg(&b_d)
+                    .arg(&mut c_d);
                 unsafe { bld.launch(cfg).unwrap() };
-                let sum: f64 = g.stream.memcpy_dtov(&c_d).unwrap().iter().map(|&x| x as f64).sum();
+                let sum: f64 = g
+                    .stream
+                    .memcpy_dtov(&c_d)
+                    .unwrap()
+                    .iter()
+                    .map(|&x| x as f64)
+                    .sum();
                 match ref_sum {
                     None => ref_sum = Some(sum),
-                    Some(r) => assert!((sum - r).abs() <= 1e-4 * r.abs().max(1.0), "fp8 {key} checksum {sum} != default {r}"),
+                    Some(r) => assert!(
+                        (sum - r).abs() <= 1e-4 * r.abs().max(1.0),
+                        "fp8 {key} checksum {sum} != default {r}"
+                    ),
                 }
             }
             eprintln!("fp8 warp-tile w2×2 (64×64) == w2×4 default: checksum match ✓");
@@ -17751,17 +21157,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "throughput sweep; needs cublasLt64_12.dll on PATH; run explicitly"]
     fn quant_fp8_warp_tile_sweep() {
-        use crate::baselines::{cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3};
+        use crate::baselines::{
+            cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3,
+        };
         use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
         with_fp8("quant_fp8_warp_tile_sweep", |g| {
             if !peers_available(g) || !cublaslt_available() {
                 peer_gate("quant_fp8_warp_tile_sweep");
-                eprintln!("[skip] quant_fp8_warp_tile_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
+                eprintln!(
+                    "[skip] quant_fp8_warp_tile_sweep: cuBLASLt not loadable.\n{}",
+                    peer_env_hint()
+                );
                 return;
             }
             eprintln!("device: {}", g.device_name());
             // (key, bm,bn,bk,wm,wn,stages,raster). All ≤48 KiB padded SMEM.
-            let configs: [(&'static str, usize, usize, usize, usize, usize, usize, usize); 4] = [
+            let configs: [(
+                &'static str,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+            ); 4] = [
                 ("fp8_w24_64x32def", 128, 128, 64, 2, 4, 2, 16),
                 ("fp8_w22_64x64   ", 128, 128, 64, 2, 2, 2, 16),
                 ("fp8_w42_32x64   ", 128, 128, 64, 4, 2, 2, 16),
@@ -17778,19 +21198,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let (m, k, n) = (sz, sz, sz);
                 let flop = 2.0 * m as f64 * k as f64 * n as f64;
                 let dims = (m as u32, n as u32, k as u32);
-                let a: Vec<u8> = rng.vec(m * k, -1.0, 1.0).iter().map(|&x| f32_to_e4m3(x)).collect();
-                let b: Vec<u8> = rng.vec(n * k, -1.0, 1.0).iter().map(|&x| f32_to_e4m3(x)).collect();
+                let a: Vec<u8> = rng
+                    .vec(m * k, -1.0, 1.0)
+                    .iter()
+                    .map(|&x| f32_to_e4m3(x))
+                    .collect();
+                let b: Vec<u8> = rng
+                    .vec(n * k, -1.0, 1.0)
+                    .iter()
+                    .map(|&x| f32_to_e4m3(x))
+                    .collect();
                 let a_d = g.stream.memcpy_stod(&a).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let s_lt = match time_cublaslt_gemm_nt_fp8_e4m3(g, &a_d, &b_d, &mut c_d, m, k, n, 50) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("{sz}³ [skip] cuBLASLt fp8: {e}");
-                        continue;
-                    }
-                };
-                eprintln!("\n{sz}³ fp8 warp-tile sweep vs cuBLASLt {:>6.0} GFLOP/s (same-run):", flop / s_lt / 1e9);
+                let s_lt =
+                    match time_cublaslt_gemm_nt_fp8_e4m3(g, &a_d, &b_d, &mut c_d, m, k, n, 50) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("{sz}³ [skip] cuBLASLt fp8: {e}");
+                            continue;
+                        }
+                    };
+                eprintln!(
+                    "\n{sz}³ fp8 warp-tile sweep vs cuBLASLt {:>6.0} GFLOP/s (same-run):",
+                    flop / s_lt / 1e9
+                );
                 let mut ref_sum: Option<f64> = None;
                 let mut best: Option<(&str, f64)> = None;
                 for (key, bm, bn, bk, wm, wn, stg, ras) in configs {
@@ -17800,27 +21232,50 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }
                     let ptx = fp8_pipe_cfg_ptx(bm, bn, bk, wm, wn, stg, ras);
                     let f = g.function(key, &ptx, "fp8_gemm_pipe").unwrap();
-                    let cfg = LaunchConfig { grid_dim: (((m / bm) * (n / bn)) as u32, 1, 1), block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                    let cfg = LaunchConfig {
+                        grid_dim: (((m / bm) * (n / bn)) as u32, 1, 1),
+                        block_dim: ((wm * wn * 32) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
                     let sum: f64 = {
                         let mut cc = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                         let mut bld = g.stream.launch_builder(&f);
-                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        bld.arg(&dims.0)
+                            .arg(&dims.1)
+                            .arg(&dims.2)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut cc);
                         unsafe { bld.launch(cfg).unwrap() };
-                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as f64).sum()
+                        g.stream
+                            .memcpy_dtov(&cc)
+                            .unwrap()
+                            .iter()
+                            .map(|&x| x as f64)
+                            .sum()
                     };
                     match ref_sum {
                         None => ref_sum = Some(sum),
-                        Some(r) => assert!((sum - r).abs() <= 1e-3 * r.abs().max(1.0), "{key} {sz}³ fp8 checksum {sum} vs default {r}"),
+                        Some(r) => assert!(
+                            (sum - r).abs() <= 1e-3 * r.abs().max(1.0),
+                            "{key} {sz}³ fp8 checksum {sum} vs default {r}"
+                        ),
                     }
-                    let s = best_of(ROUNDS, || time_wmma(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                    let s = best_of(ROUNDS, || {
+                        time_wmma(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50)
+                    });
                     let pct = 100.0 * s_lt / s;
-                    eprintln!("  {key}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLASLt", flop / s / 1e9, pct);
+                    eprintln!(
+                        "  {key}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLASLt",
+                        flop / s / 1e9,
+                        pct
+                    );
                     if best.map_or(true, |(_, p)| pct > p) {
                         best = Some((key.trim(), pct));
                     }
                 }
                 if let Some((key, pct)) = best {
-                    eprintln!("  → best @{sz}³: {key} at {pct:.1}% of cuBLASLt", );
+                    eprintln!("  → best @{sz}³: {key} at {pct:.1}% of cuBLASLt",);
                 }
             }
         });
@@ -17852,17 +21307,48 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             const ROUNDS: usize = 8;
             // (label, ptx, entry, bm, bn, warps); rows 0/1 are the 64×64 pair, 2/3 the 128×128 pair.
             let pairs: [(&str, &'static str, &'static str, usize, usize, usize); 4] = [
-                ("smdb64    ", int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb", INT8_BM, INT8_BN, w64),
-                ("smdb64_swz", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, w64),
-                ("smdb128   ", int8_gemm_smdb128_ptx(), "int8_gemm_nt_smdb128", INT8_BM128, INT8_BN128, w128),
-                ("smdb128swz", int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, w128),
+                (
+                    "smdb64    ",
+                    int8_gemm_smdb_ptx(),
+                    "int8_gemm_nt_smdb",
+                    INT8_BM,
+                    INT8_BN,
+                    w64,
+                ),
+                (
+                    "smdb64_swz",
+                    int8_gemm_smdb_swz_ptx(),
+                    "int8_gemm_nt_smdb_swz",
+                    INT8_BM,
+                    INT8_BN,
+                    w64,
+                ),
+                (
+                    "smdb128   ",
+                    int8_gemm_smdb128_ptx(),
+                    "int8_gemm_nt_smdb128",
+                    INT8_BM128,
+                    INT8_BN128,
+                    w128,
+                ),
+                (
+                    "smdb128swz",
+                    int8_gemm_smdb128_swz_ptx(),
+                    "int8_gemm_nt_smdb128_swz",
+                    INT8_BM128,
+                    INT8_BN128,
+                    w128,
+                ),
             ];
             for sz in [1024usize, 2048, 4096] {
                 let (m, k, n) = (sz, sz, sz);
                 let flop = gemm_flop(m, n, k);
                 let dims = (m as u32, n as u32, k as u32);
                 let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
-                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n)
+                    .iter()
+                    .map(|&x| x as i64)
+                    .sum();
                 let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
@@ -17878,9 +21364,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let cs: i64 = {
                         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                         let mut bld = g.stream.launch_builder(&f);
-                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        bld.arg(&dims.0)
+                            .arg(&dims.1)
+                            .arg(&dims.2)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut cc);
                         unsafe { bld.launch(cfg).unwrap() };
-                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                        g.stream
+                            .memcpy_dtov(&cc)
+                            .unwrap()
+                            .iter()
+                            .map(|&x| x as i64)
+                            .sum()
                     };
                     assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
                     let mut s = f64::INFINITY;
@@ -17914,17 +21410,30 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("int8_static", |g| {
             let mut rng = crate::diff::Rng::new(0x5777);
             let gen = |rng: &mut crate::diff::Rng, m: usize, k: usize, n: usize| {
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 (a, b)
             };
             // 64×64 static via the public launcher: == the i32 oracle AND the dynamic kernel, exactly.
-            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 128, 192), (192, 64, 128), (256, 192, 256)] {
+            for (m, k, n) in [
+                (64usize, 64usize, 64usize),
+                (128, 128, 192),
+                (192, 64, 128),
+                (256, 192, 256),
+            ] {
                 let (a, b) = gen(&mut rng, m, k, n);
                 let r = ref_nt_int8(&a, &b, m, k, n);
                 let cs = gemm_nt_int8_static(g, &a, &b, m, k, n).unwrap();
                 assert_eq!(cs, r, "int8_static vs oracle {m}x{k}x{n}");
-                assert_eq!(cs, gemm_nt_int8_smdb(g, &a, &b, m, k, n).unwrap(), "int8_static vs dynamic {m}x{k}x{n}");
+                assert_eq!(
+                    cs,
+                    gemm_nt_int8_smdb(g, &a, &b, m, k, n).unwrap(),
+                    "int8_static vs dynamic {m}x{k}x{n}"
+                );
             }
             // 128×128 static entry directly (small shape; the dispatch only selects it at ≥4096²).
             let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
@@ -17933,16 +21442,27 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let r = ref_nt_int8(&a, &b, m, k, n);
                 let ptx = int8_gemm_smdb_swz_static_ptx(m, n, k, true);
                 let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
-                let f = module.load_function(int8_gemm_smdb_swz_static_entry(true)).unwrap();
+                let f = module
+                    .load_function(int8_gemm_smdb_swz_static_entry(true))
+                    .unwrap();
                 let a_d = g.stream.memcpy_stod(&a).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                 let (mm, nn, kk) = (m as u32, n as u32, k as u32);
                 let cfg = int8_smdb_cfg(m, n, INT8_BM128, INT8_BN128, w128);
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                bld.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&a_d)
+                    .arg(&b_d)
+                    .arg(&mut c_d);
                 unsafe { bld.launch(cfg).unwrap() };
-                assert_eq!(g.stream.memcpy_dtov(&c_d).unwrap(), r, "int8_static128 {m}x{k}x{n}");
+                assert_eq!(
+                    g.stream.memcpy_dtov(&c_d).unwrap(),
+                    r,
+                    "int8_static128 {m}x{k}x{n}"
+                );
             }
             eprintln!("[gate] int8 static-shape (64 & 128) bit-exact vs i32 oracle AND the dynamic swz kernel ✓");
         });
@@ -17968,12 +21488,29 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let mut rng = crate::diff::Rng::new(0x5817);
             const ROUNDS: usize = 8;
             // Square compute shapes + a decode-ish thin-M shape. K%64; the 4096² shape exercises the 128 tile.
-            for (m, k, n) in [(1024usize, 1024usize, 1024usize), (2048, 2048, 2048), (4096, 4096, 4096), (256, 4096, 4096)] {
+            for (m, k, n) in [
+                (1024usize, 1024usize, 1024usize),
+                (2048, 2048, 2048),
+                (4096, 4096, 4096),
+                (256, 4096, 4096),
+            ] {
                 let use_128 = m >= 4096 && n >= 4096;
                 let (bm, bn, warps, dyn_ptx, dyn_entry) = if use_128 {
-                    (INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128, int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz")
+                    (
+                        INT8_BM128,
+                        INT8_BN128,
+                        INT8_WARPS_M128 * INT8_WARPS_N128,
+                        int8_gemm_smdb128_swz_ptx(),
+                        "int8_gemm_nt_smdb128_swz",
+                    )
                 } else {
-                    (INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N, int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz")
+                    (
+                        INT8_BM,
+                        INT8_BN,
+                        INT8_WARPS_M * INT8_WARPS_N,
+                        int8_gemm_smdb_swz_ptx(),
+                        "int8_gemm_nt_smdb_swz",
+                    )
                 };
                 if m % bm != 0 || n % bn != 0 {
                     continue;
@@ -17995,11 +21532,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // Both raw-loaded (same JIT path) → the ratio isolates the baked-constants effect.
                 let ps = int8_gemm_smdb_swz_static_ptx(m, n, k, use_128);
                 let mod_s = g.ctx.load_module(ps.as_str().into()).unwrap();
-                let f_s = mod_s.load_function(int8_gemm_smdb_swz_static_entry(use_128)).unwrap();
+                let f_s = mod_s
+                    .load_function(int8_gemm_smdb_swz_static_entry(use_128))
+                    .unwrap();
                 let mod_d = g.ctx.load_module(dyn_ptx.into()).unwrap();
                 let f_d = mod_d.load_function(dyn_entry).unwrap();
-                let s_static = best_of(ROUNDS, || time_gemm_int8(g, &f_s, cfg, dims, &a_d, &b_d, &mut c_d, 50));
-                let s_dyn = best_of(ROUNDS, || time_gemm_int8(g, &f_d, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_static = best_of(ROUNDS, || {
+                    time_gemm_int8(g, &f_s, cfg, dims, &a_d, &b_d, &mut c_d, 50)
+                });
+                let s_dyn = best_of(ROUNDS, || {
+                    time_gemm_int8(g, &f_d, cfg, dims, &a_d, &b_d, &mut c_d, 50)
+                });
                 eprintln!(
                     "{m}x{k}x{n} int8 static-vs-dynamic (same raw-JIT load, M/N/K baked): dynamic {:>7.0} GFLOP/s | static {:>7.0} = {:.3}× speedup",
                     flop / s_dyn / 1e9,
@@ -18024,7 +21567,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("f16_static", |g| {
             let mut rng = crate::diff::Rng::new(0x6111);
             // 64×64 static via the public launcher == the dynamic _sm kernel, bit-exact (same f16 codegen).
-            for (m, k, n) in [(64usize, 16usize, 64usize), (128, 64, 192), (192, 32, 128), (256, 80, 256)] {
+            for (m, k, n) in [
+                (64usize, 16usize, 64usize),
+                (128, 64, 192),
+                (192, 32, 128),
+                (256, 80, 256),
+            ] {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
                 let cs = gemm_nt_f16_static(g, &a, &b, m, k, n).unwrap();
@@ -18040,7 +21588,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
                 let ptx = wmma_f16_sm_static_ptx(m, n, k, true);
                 let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
-                let f = module.load_function(wmma_f16_sm_static_entry(true)).unwrap();
+                let f = module
+                    .load_function(wmma_f16_sm_static_entry(true))
+                    .unwrap();
                 let a_d = g.stream.memcpy_stod(&a16).unwrap();
                 let b_d = g.stream.memcpy_stod(&b16).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
@@ -18051,9 +21601,18 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     shared_mem_bytes: 0,
                 };
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                bld.arg(&mm)
+                    .arg(&nn)
+                    .arg(&kk)
+                    .arg(&a_d)
+                    .arg(&b_d)
+                    .arg(&mut c_d);
                 unsafe { bld.launch(cfg).unwrap() };
-                assert_eq!(g.stream.memcpy_dtov(&c_d).unwrap(), cd, "f16_static128 vs dynamic _sm128 {m}x{k}x{n}");
+                assert_eq!(
+                    g.stream.memcpy_dtov(&c_d).unwrap(),
+                    cd,
+                    "f16_static128 vs dynamic _sm128 {m}x{k}x{n}"
+                );
             }
             eprintln!("[gate] fp16 static-shape (64 & 128) bit-exact vs the dynamic _sm kernel ✓");
         });
@@ -18076,7 +21635,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             eprintln!("device: {}", g.device_name());
             let mut rng = crate::diff::Rng::new(0x6817);
             const ROUNDS: usize = 8;
-            for (m, k, n) in [(1024usize, 1024usize, 1024usize), (2048, 2048, 2048), (4096, 4096, 4096), (256, 4096, 4096)] {
+            for (m, k, n) in [
+                (1024usize, 1024usize, 1024usize),
+                (2048, 2048, 2048),
+                (4096, 4096, 4096),
+                (256, 4096, 4096),
+            ] {
                 let use_128 = m >= 4096 && n >= 4096;
                 let (bm, bn, threads, dyn_entry) = if use_128 {
                     (SM128_BM, SM128_BN, SM128_THREADS, "wmma_nt_f16_sm128")
@@ -18112,11 +21676,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // Both raw-loaded (same JIT path) → the ratio isolates the baked-constants effect.
                 let ps = wmma_f16_sm_static_ptx(m, n, k, use_128);
                 let mod_s = g.ctx.load_module(ps.as_str().into()).unwrap();
-                let f_s = mod_s.load_function(wmma_f16_sm_static_entry(use_128)).unwrap();
+                let f_s = mod_s
+                    .load_function(wmma_f16_sm_static_entry(use_128))
+                    .unwrap();
                 let mod_d = g.ctx.load_module(wmma_f16_ptx().into()).unwrap();
                 let f_d = mod_d.load_function(dyn_entry).unwrap();
-                let s_static = best_of(ROUNDS, || time_wmma(g, &f_s, cfg, dims, &a_d, &b_d, &mut c_d, 50));
-                let s_dyn = best_of(ROUNDS, || time_wmma(g, &f_d, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_static = best_of(ROUNDS, || {
+                    time_wmma(g, &f_s, cfg, dims, &a_d, &b_d, &mut c_d, 50)
+                });
+                let s_dyn = best_of(ROUNDS, || {
+                    time_wmma(g, &f_d, cfg, dims, &a_d, &b_d, &mut c_d, 50)
+                });
                 eprintln!(
                     "{m}x{k}x{n} f16 static-vs-dynamic (same raw-JIT load, M/N/K baked): dynamic {:>7.0} GFLOP/s | static {:>7.0} = {:.3}× speedup",
                     flop / s_dyn / 1e9,
@@ -18148,16 +21718,33 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let mut rng = crate::diff::Rng::new(0x5C0FF);
             const ROUNDS: usize = 8;
             let f_base = g
-                .function("int8_gemm_nt_smdb_swz", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz")
+                .function(
+                    "int8_gemm_nt_smdb_swz",
+                    int8_gemm_smdb_swz_ptx(),
+                    "int8_gemm_nt_smdb_swz",
+                )
                 .unwrap();
             let f_sk = g
-                .function("int8_gemm_nt_smdb_swz_sk", int8_gemm_smdb_swz_splitk_ptx(), "int8_gemm_nt_smdb_swz_sk")
+                .function(
+                    "int8_gemm_nt_smdb_swz_sk",
+                    int8_gemm_smdb_swz_splitk_ptx(),
+                    "int8_gemm_nt_smdb_swz_sk",
+                )
                 .unwrap();
-            for (m, n, k) in [(64usize, 256usize, 4096usize), (64, 512, 4096), (128, 256, 8192), (64, 128, 8192)] {
+            for (m, n, k) in [
+                (64usize, 256usize, 4096usize),
+                (64, 512, 4096),
+                (128, 256, 8192),
+                (64, 128, 8192),
+            ] {
                 let flop = gemm_flop(m, n, k);
                 let dims = (m as u32, n as u32, k as u32);
-                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
-                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
                 let cs_ref: i64 = ref_nt_int8(&a, &b, m, k, n).iter().map(|&x| x as i64).sum();
                 let a_d = g.stream.memcpy_stod(&a).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
@@ -18167,16 +21754,35 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                 {
                     let mut bld = g.stream.launch_builder(&f_base);
-                    bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
-                    unsafe { bld.launch(int8_smdb_cfg(m, n, INT8_BM, INT8_BN, warps)).unwrap() };
+                    bld.arg(&dims.0)
+                        .arg(&dims.1)
+                        .arg(&dims.2)
+                        .arg(&a_d)
+                        .arg(&b_d)
+                        .arg(&mut cc);
+                    unsafe {
+                        bld.launch(int8_smdb_cfg(m, n, INT8_BM, INT8_BN, warps))
+                            .unwrap()
+                    };
                 }
-                assert_eq!(g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum::<i64>(), cs_ref, "base {m}x{k}x{n}");
+                assert_eq!(
+                    g.stream
+                        .memcpy_dtov(&cc)
+                        .unwrap()
+                        .iter()
+                        .map(|&x| x as i64)
+                        .sum::<i64>(),
+                    cs_ref,
+                    "base {m}x{k}x{n}"
+                );
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                 let base = {
                     let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, warps);
                     let mut s = f64::INFINITY;
                     for _ in 0..ROUNDS {
-                        s = s.min(time_gemm_int8(g, &f_base, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                        s = s.min(time_gemm_int8(
+                            g, &f_base, cfg, dims, &a_d, &b_d, &mut c_d, 50,
+                        ));
                     }
                     flop / s
                 };
@@ -18191,17 +21797,36 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let mut cz = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                     {
                         let mut bld = g.stream.launch_builder(&f_sk);
-                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cz);
+                        bld.arg(&dims.0)
+                            .arg(&dims.1)
+                            .arg(&dims.2)
+                            .arg(&a_d)
+                            .arg(&b_d)
+                            .arg(&mut cz);
                         unsafe { bld.launch(cfg).unwrap() };
                     }
-                    assert_eq!(g.stream.memcpy_dtov(&cz).unwrap().iter().map(|&x| x as i64).sum::<i64>(), cs_ref, "sk={sk} {m}x{k}x{n}");
+                    assert_eq!(
+                        g.stream
+                            .memcpy_dtov(&cz)
+                            .unwrap()
+                            .iter()
+                            .map(|&x| x as i64)
+                            .sum::<i64>(),
+                        cs_ref,
+                        "sk={sk} {m}x{k}x{n}"
+                    );
                     let mut c2 = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                     let mut s = f64::INFINITY;
                     for _ in 0..ROUNDS {
                         s = s.min(time_gemm_int8(g, &f_sk, cfg, dims, &a_d, &b_d, &mut c2, 50));
                     }
                     let gf = flop / s;
-                    eprintln!("  sk={sk} ({:>4} CTAs): {:>7.0} GFLOP/s  → {:.3}× base", base_ctas * sk, gf / 1e9, gf / base);
+                    eprintln!(
+                        "  sk={sk} ({:>4} CTAs): {:>7.0} GFLOP/s  → {:.3}× base",
+                        base_ctas * sk,
+                        gf / 1e9,
+                        gf / base
+                    );
                 }
             }
         });
@@ -18231,7 +21856,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 );
                 return;
             }
-            eprintln!("device: {} | peer: PyTorch SDPA fused (cuDNN / cutlass-efficient)", g.device_name());
+            eprintln!(
+                "device: {} | peer: PyTorch SDPA fused (cuDNN / cutlass-efficient)",
+                g.device_name()
+            );
             let d = 64usize;
             let heads = 8usize;
             let mut rng = crate::diff::Rng::new(0x0FA2_0064);
@@ -18270,7 +21898,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 };
                 let launch_m = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut bld = g.stream.launch_builder(&f_m);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                 };
 
@@ -18280,8 +21913,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
 
                 // The fused peer over the IDENTICAL f16 bytes; its O is f32 [H,S,D].
-                let rep = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
-                    .unwrap();
+                let rep =
+                    fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
+                        .unwrap();
 
                 // Correctness: at small S gate BOTH outputs against the per-head f64 oracle (f16 tol); at
                 // all S checksum-cross-check Wukong vs the peer (catches a gross layout/scale slip).
@@ -18342,8 +21976,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         t0.elapsed().as_secs_f64() / 50.0
                     });
                     best_m = best_m.min(tm);
-                    let r = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
-                        .unwrap();
+                    let r =
+                        fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
+                            .unwrap();
                     if r.chosen_sec < best_peer_sec {
                         best_peer_sec = r.chosen_sec;
                         peer_name = r.chosen.clone();
@@ -18383,10 +22018,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         with_gpu("attn_variants_vs_fused_peer", |g| {
             if !fa2_peer_available() {
                 peer_gate("attn_variants_vs_fused_peer");
-                eprintln!("[skip] attn_variants_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
+                eprintln!(
+                    "[skip] attn_variants_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch."
+                );
                 return;
             }
-            eprintln!("device: {} | peer: cuDNN/cutlass fused SDPA", g.device_name());
+            eprintln!(
+                "device: {} | peer: cuDNN/cutlass fused SDPA",
+                g.device_name()
+            );
             let d = 64usize;
             let heads = 8usize;
             // (label, entry, warps-per-CTA). Each warp owns 16 query rows; W warps share one staged K/V
@@ -18408,7 +22048,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let funcs: Vec<_> = variants
                 .iter()
                 .map(|(_, e, w)| {
-                    (g.function("flash", crate::ptx_flash::flash_ptx(), e).unwrap(), *w)
+                    (
+                        g.function("flash", crate::ptx_flash::flash_ptx(), e)
+                            .unwrap(),
+                        *w,
+                    )
                 })
                 .collect();
             for &s in &[512usize, 1024, 2048, 4096] {
@@ -18423,8 +22067,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let v16 = g.stream.memcpy_stod(&v16h).unwrap();
                 let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
                 let ss = s as u32;
-                let rep = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
-                    .unwrap();
+                let rep =
+                    fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
+                        .unwrap();
                 let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
                 let cs_p = csum(&rep.o);
                 let flop = attn_flop(heads, s, d);
@@ -18489,7 +22134,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
             for &(entry, bk) in &[("flash_d64_mpw2", 32usize), ("flash_d64_mpw4", 64usize)] {
-                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                    .unwrap();
                 for &s in &[64usize, 128, 512, 1024] {
                     if s % bk != 0 {
                         continue;
@@ -18509,7 +22156,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         shared_mem_bytes: 0,
                     };
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&ss).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q_d)
+                        .arg(&k_d)
+                        .arg(&v_d)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                     g.stream.synchronize().unwrap();
                     let got = g.stream.memcpy_dtov(&o_d).unwrap();
@@ -18551,7 +22203,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             ];
             let funcs: Vec<_> = variants
                 .iter()
-                .map(|(_, e)| g.function("flash", crate::ptx_flash::flash_ptx(), e).unwrap())
+                .map(|(_, e)| {
+                    g.function("flash", crate::ptx_flash::flash_ptx(), e)
+                        .unwrap()
+                })
                 .collect();
             let wa = rng.vec(1024 * 1024, -1.0, 1.0);
             let wb = rng.vec(1024 * 1024, -1.0, 1.0);
@@ -18575,20 +22230,30 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         block_dim: (32, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
-                        let mut b = g.stream.launch_builder(f);
-                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
-                        unsafe { b.launch(cfg).unwrap() };
-                    };
+                    let run =
+                        |g: &Gpu,
+                         f: &cudarc::driver::CudaFunction,
+                         o: &mut cudarc::driver::CudaSlice<f32>| {
+                            let mut b = g.stream.launch_builder(f);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        };
                     // checksum cross-check: all variants agree.
                     let mut sums = [0f64; 3];
                     for (i, f) in funcs.iter().enumerate() {
                         run(g, f, &mut o_d);
                         g.stream.synchronize().unwrap();
-                        sums[i] = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                        sums[i] = g
+                            .stream
+                            .memcpy_dtov(&o_d)
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.abs() as f64)
+                            .sum();
                     }
                     assert!(
-                        (sums[1] - sums[0]).abs() / sums[0] < 3e-2 && (sums[2] - sums[0]).abs() / sums[0] < 3e-2,
+                        (sums[1] - sums[0]).abs() / sums[0] < 3e-2
+                            && (sums[2] - sums[0]).abs() / sums[0] < 3e-2,
                         "H={heads} S={s}: wide vs mp checksum disagree {sums:?}"
                     );
                     // per-round ratios (clock-invariant).
@@ -18641,8 +22306,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let d = 64usize;
             let mut rng = crate::diff::Rng::new(0x3FA4A);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
-            let f_mp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp").unwrap();
-            let f_mp4 = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp4").unwrap();
+            let f_mp = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp")
+                .unwrap();
+            let f_mp4 = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp4")
+                .unwrap();
             let wa = rng.vec(1024 * 1024, -1.0, 1.0);
             let wb = rng.vec(1024 * 1024, -1.0, 1.0);
             let pin = |g: &mut Gpu| {
@@ -18670,18 +22339,34 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         block_dim: (128, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
-                        let mut b = g.stream.launch_builder(f);
-                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
-                        unsafe { b.launch(cfg).unwrap() };
-                    };
+                    let run =
+                        |g: &Gpu,
+                         f: &cudarc::driver::CudaFunction,
+                         cfg: LaunchConfig,
+                         o: &mut cudarc::driver::CudaSlice<f32>| {
+                            let mut b = g.stream.launch_builder(f);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        };
                     // checksum cross-check: mp4 must agree with mp.
                     run(g, &f_mp, cfg_mp, &mut o_d);
                     g.stream.synchronize().unwrap();
-                    let s_mp: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    let s_mp: f64 = g
+                        .stream
+                        .memcpy_dtov(&o_d)
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.abs() as f64)
+                        .sum();
                     run(g, &f_mp4, cfg_mp4, &mut o_d);
                     g.stream.synchronize().unwrap();
-                    let s_mp4: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    let s_mp4: f64 = g
+                        .stream
+                        .memcpy_dtov(&o_d)
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.abs() as f64)
+                        .sum();
                     assert!(
                         (s_mp4 - s_mp).abs() / s_mp < 3e-2,
                         "H={heads} S={s}: mp4 vs mp checksum disagree mp={s_mp:.3e} mp4={s_mp4:.3e}"
@@ -18701,16 +22386,25 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         g.stream.synchronize().unwrap();
                         // Time each TWICE in opposite order (mp,mp4,mp4,mp) and take the min per kernel,
                         // so any residual intra-round drift hits both kernels symmetrically.
-                        let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
-                            let t0 = Instant::now();
-                            for _ in 0..50 {
-                                let mut b = g.stream.launch_builder(f);
-                                b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
-                                unsafe { b.launch(cfg).unwrap() };
-                            }
-                            g.stream.synchronize().unwrap();
-                            t0.elapsed().as_secs_f64() / 50.0
-                        };
+                        let time1 =
+                            |g: &Gpu,
+                             f: &cudarc::driver::CudaFunction,
+                             cfg: LaunchConfig,
+                             o: &mut cudarc::driver::CudaSlice<f32>| {
+                                let t0 = Instant::now();
+                                for _ in 0..50 {
+                                    let mut b = g.stream.launch_builder(f);
+                                    b.arg(&ss)
+                                        .arg(&scale)
+                                        .arg(&q16)
+                                        .arg(&k16)
+                                        .arg(&v16)
+                                        .arg(&mut *o);
+                                    unsafe { b.launch(cfg).unwrap() };
+                                }
+                                g.stream.synchronize().unwrap();
+                                t0.elapsed().as_secs_f64() / 50.0
+                            };
                         let a1 = time1(g, &f_mp, cfg_mp, &mut o_d);
                         let b1 = time1(g, &f_mp4, cfg_mp4, &mut o_d);
                         let b2 = time1(g, &f_mp4, cfg_mp4, &mut o_d);
@@ -18763,12 +22457,23 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let pairs = [
                 ("d64-causal", "flash_d64_mpc", "flash_d64_mpc_lm", 64usize),
                 ("d64-noncausal", "flash_d64_mp", "flash_d64_mp_lm", 64usize),
-                ("d128-noncausal", "flash_d128_mp", "flash_d128_mp_lm", 128usize),
+                (
+                    "d128-noncausal",
+                    "flash_d128_mp",
+                    "flash_d128_mp_lm",
+                    128usize,
+                ),
             ];
             for &(label, base_e, lm_e, d) in &pairs {
-                let f_base = g.function("flash", crate::ptx_flash::flash_ptx(), base_e).unwrap();
-                let f_lm = g.function("flash", crate::ptx_flash::flash_ptx(), lm_e).unwrap();
-                eprintln!("--- {label}: {lm_e} vs {base_e} (clock-cancelled, median of {ROUNDS}) ---");
+                let f_base = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), base_e)
+                    .unwrap();
+                let f_lm = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), lm_e)
+                    .unwrap();
+                eprintln!(
+                    "--- {label}: {lm_e} vs {base_e} (clock-cancelled, median of {ROUNDS}) ---"
+                );
                 for &s in &[512usize, 1024, 2048, 4096] {
                     let n = heads * s * d;
                     let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
@@ -18782,18 +22487,33 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         block_dim: (32, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
-                        let mut b = g.stream.launch_builder(f);
-                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
-                        unsafe { b.launch(cfg).unwrap() };
-                    };
+                    let run =
+                        |g: &Gpu,
+                         f: &cudarc::driver::CudaFunction,
+                         o: &mut cudarc::driver::CudaSlice<f32>| {
+                            let mut b = g.stream.launch_builder(f);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        };
                     // checksum cross-check: lm must agree with the hand-packed baseline.
                     run(g, &f_base, &mut o_d);
                     g.stream.synchronize().unwrap();
-                    let s_b: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    let s_b: f64 = g
+                        .stream
+                        .memcpy_dtov(&o_d)
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.abs() as f64)
+                        .sum();
                     run(g, &f_lm, &mut o_d);
                     g.stream.synchronize().unwrap();
-                    let s_l: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    let s_l: f64 = g
+                        .stream
+                        .memcpy_dtov(&o_d)
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.abs() as f64)
+                        .sum();
                     assert!(
                         (s_l - s_b).abs() / s_b.max(1.0) < 3e-2,
                         "{label} S={s}: lm vs base checksum disagree base={s_b:.3e} lm={s_l:.3e}"
@@ -18807,16 +22527,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             run(g, &f_lm, &mut o_d);
                         }
                         g.stream.synchronize().unwrap();
-                        let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
-                            let t0 = Instant::now();
-                            for _ in 0..50 {
-                                let mut b = g.stream.launch_builder(f);
-                                b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
-                                unsafe { b.launch(cfg).unwrap() };
-                            }
-                            g.stream.synchronize().unwrap();
-                            t0.elapsed().as_secs_f64() / 50.0
-                        };
+                        let time1 =
+                            |g: &Gpu,
+                             f: &cudarc::driver::CudaFunction,
+                             o: &mut cudarc::driver::CudaSlice<f32>| {
+                                let t0 = Instant::now();
+                                for _ in 0..50 {
+                                    let mut b = g.stream.launch_builder(f);
+                                    b.arg(&ss)
+                                        .arg(&scale)
+                                        .arg(&q16)
+                                        .arg(&k16)
+                                        .arg(&v16)
+                                        .arg(&mut *o);
+                                    unsafe { b.launch(cfg).unwrap() };
+                                }
+                                g.stream.synchronize().unwrap();
+                                t0.elapsed().as_secs_f64() / 50.0
+                            };
                         let a1 = time1(g, &f_base, &mut o_d);
                         let b1 = time1(g, &f_lm, &mut o_d);
                         let b2 = time1(g, &f_lm, &mut o_d);
@@ -18853,7 +22581,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let mut rng = crate::diff::Rng::new(0x5B_0011);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
-            let f = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_msp").unwrap();
+            let f = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_msp")
+                .unwrap();
             for &s in &[16usize, 32, 64, 256, 512] {
                 let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
                 let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
@@ -18870,7 +22600,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     shared_mem_bytes: 0,
                 };
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                bld.arg(&s32)
+                    .arg(&scale)
+                    .arg(&q_d)
+                    .arg(&k_d)
+                    .arg(&v_d)
+                    .arg(&mut o_d);
                 unsafe { bld.launch(cfg).unwrap() };
                 let got = g.stream.memcpy_dtov(&o_d).unwrap();
                 let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
@@ -18881,7 +22616,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     3e-3,
                     3e-2,
                 );
-                eprintln!("flash_d64_msp s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                eprintln!(
+                    "flash_d64_msp s={s} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
             }
         });
     }
@@ -18913,8 +22651,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             };
             const ROUNDS: usize = 9;
             let (heads, d) = (12usize, 64usize);
-            let f_mp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp").unwrap();
-            let f_m1 = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m1").unwrap();
+            let f_mp = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp")
+                .unwrap();
+            let f_m1 = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m1")
+                .unwrap();
             eprintln!(
                 "--- flash_single_vs_double: flash_d64_m1 (single/4KB, ~50% occ) vs flash_d64_mp \
                  (double/8KB, ~25% occ), H={heads} D={d}, clock-cancelled median of {ROUNDS} ---"
@@ -18932,7 +22674,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                let run = |g: &Gpu,
+                           f: &cudarc::driver::CudaFunction,
+                           o: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut b = g.stream.launch_builder(f);
                     b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
                     unsafe { b.launch(cfg).unwrap() };
@@ -18940,10 +22684,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 // checksum cross-check: single-buffered must agree with the double-buffered baseline.
                 run(g, &f_mp, &mut o_d);
                 g.stream.synchronize().unwrap();
-                let s_mp: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                let s_mp: f64 = g
+                    .stream
+                    .memcpy_dtov(&o_d)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum();
                 run(g, &f_m1, &mut o_d);
                 g.stream.synchronize().unwrap();
-                let s_m1: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                let s_m1: f64 = g
+                    .stream
+                    .memcpy_dtov(&o_d)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum();
                 assert!(
                     (s_m1 - s_mp).abs() / s_mp.max(1.0) < 3e-2,
                     "S={s}: m1 vs mp checksum disagree mp={s_mp:.3e} m1={s_m1:.3e}"
@@ -18957,16 +22713,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         run(g, &f_m1, &mut o_d);
                     }
                     g.stream.synchronize().unwrap();
-                    let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
-                        let t0 = Instant::now();
-                        for _ in 0..50 {
-                            let mut b = g.stream.launch_builder(f);
-                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
-                            unsafe { b.launch(cfg).unwrap() };
-                        }
-                        g.stream.synchronize().unwrap();
-                        t0.elapsed().as_secs_f64() / 50.0
-                    };
+                    let time1 =
+                        |g: &Gpu,
+                         f: &cudarc::driver::CudaFunction,
+                         o: &mut cudarc::driver::CudaSlice<f32>| {
+                            let t0 = Instant::now();
+                            for _ in 0..50 {
+                                let mut b = g.stream.launch_builder(f);
+                                b.arg(&ss)
+                                    .arg(&scale)
+                                    .arg(&q16)
+                                    .arg(&k16)
+                                    .arg(&v16)
+                                    .arg(&mut *o);
+                                unsafe { b.launch(cfg).unwrap() };
+                            }
+                            g.stream.synchronize().unwrap();
+                            t0.elapsed().as_secs_f64() / 50.0
+                        };
                     let a1 = time1(g, &f_mp, &mut o_d);
                     let b1 = time1(g, &f_m1, &mut o_d);
                     let b2 = time1(g, &f_m1, &mut o_d);
@@ -19009,8 +22773,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let d = 64usize;
             let mut rng = crate::diff::Rng::new(0x5B_0A0B);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
-            let f_base = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp").unwrap();
-            let f_sp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_msp").unwrap();
+            let f_base = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp")
+                .unwrap();
+            let f_sp = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_msp")
+                .unwrap();
             let wa = rng.vec(1024 * 1024, -1.0, 1.0);
             let wb = rng.vec(1024 * 1024, -1.0, 1.0);
             let pin = |g: &mut Gpu| {
@@ -19033,17 +22801,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                let run = |g: &Gpu,
+                           f: &cudarc::driver::CudaFunction,
+                           o: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut b = g.stream.launch_builder(f);
                     b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
                     unsafe { b.launch(cfg).unwrap() };
                 };
                 run(g, &f_base, &mut o_d);
                 g.stream.synchronize().unwrap();
-                let s_b: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                let s_b: f64 = g
+                    .stream
+                    .memcpy_dtov(&o_d)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum();
                 run(g, &f_sp, &mut o_d);
                 g.stream.synchronize().unwrap();
-                let s_l: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                let s_l: f64 = g
+                    .stream
+                    .memcpy_dtov(&o_d)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum();
                 assert!(
                     (s_l - s_b).abs() / s_b.max(1.0) < 3e-2,
                     "S={s}: sp vs base checksum disagree base={s_b:.3e} sp={s_l:.3e}"
@@ -19057,16 +22839,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         run(g, &f_sp, &mut o_d);
                     }
                     g.stream.synchronize().unwrap();
-                    let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
-                        let t0 = Instant::now();
-                        for _ in 0..50 {
-                            let mut b = g.stream.launch_builder(f);
-                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
-                            unsafe { b.launch(cfg).unwrap() };
-                        }
-                        g.stream.synchronize().unwrap();
-                        t0.elapsed().as_secs_f64() / 50.0
-                    };
+                    let time1 =
+                        |g: &Gpu,
+                         f: &cudarc::driver::CudaFunction,
+                         o: &mut cudarc::driver::CudaSlice<f32>| {
+                            let t0 = Instant::now();
+                            for _ in 0..50 {
+                                let mut b = g.stream.launch_builder(f);
+                                b.arg(&ss)
+                                    .arg(&scale)
+                                    .arg(&q16)
+                                    .arg(&k16)
+                                    .arg(&v16)
+                                    .arg(&mut *o);
+                                unsafe { b.launch(cfg).unwrap() };
+                            }
+                            g.stream.synchronize().unwrap();
+                            t0.elapsed().as_secs_f64() / 50.0
+                        };
                     let a1 = time1(g, &f_base, &mut o_d);
                     let b1 = time1(g, &f_sp, &mut o_d);
                     let b2 = time1(g, &f_sp, &mut o_d);
@@ -19107,7 +22897,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 eprintln!("[skip] attn_lm_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
                 return;
             }
-            eprintln!("device: {} | peer: PyTorch SDPA fused (cuDNN / cutlass-efficient) — _lm kernels", g.device_name());
+            eprintln!(
+                "device: {} | peer: PyTorch SDPA fused (cuDNN / cutlass-efficient) — _lm kernels",
+                g.device_name()
+            );
             let heads = 8usize;
             let mut rng = crate::diff::Rng::new(0x0FA2_1D11);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
@@ -19125,7 +22918,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 ("flash_d128_mpc_lm", 128usize, true),
             ];
             for &(entry, d, causal) in &configs {
-                let f_m = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                let f_m = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                    .unwrap();
                 eprintln!("--- {entry} (D={d}, causal={causal}) ---");
                 for &s in &[512usize, 1024, 2048, 4096] {
                     let n = heads * s * d;
@@ -19146,13 +22941,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     };
                     let launch_m = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
                         let mut bld = g.stream.launch_builder(&f_m);
-                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o_d);
+                        bld.arg(&ss)
+                            .arg(&scale)
+                            .arg(&q16)
+                            .arg(&k16)
+                            .arg(&v16)
+                            .arg(o_d);
                         unsafe { bld.launch(cfg).unwrap() };
                     };
                     launch_m(g, &mut o_d);
                     g.stream.synchronize().unwrap();
                     let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
-                    let rep = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, causal, 20, 50, 4).unwrap();
+                    let rep = fa2_sdpa_peer(
+                        1, heads, s, d, &q16h, &k16h, &v16h, scale, causal, 20, 50, 4,
+                    )
+                    .unwrap();
                     if s <= 512 {
                         let mut oracle = vec![0f32; n];
                         for hh in 0..heads {
@@ -19165,7 +22968,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             };
                             oracle[lo..hi].copy_from_slice(&r);
                         }
-                        let sm = crate::diff::assert_close(&format!("Wukong {entry} S={s}"), &out_m, &oracle, 3e-3, 3e-2);
+                        let sm = crate::diff::assert_close(
+                            &format!("Wukong {entry} S={s}"),
+                            &out_m,
+                            &oracle,
+                            3e-3,
+                            3e-2,
+                        );
                         eprintln!("[gate] {entry} S={s}: Wukong max_abs={:.2e} | {} peer (vs f64 oracle) ✓", sm.max_abs, rep.chosen);
                     }
                     let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
@@ -19195,7 +23004,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             t0.elapsed().as_secs_f64() / 50.0
                         });
                         best_m = best_m.min(tm);
-                        let r = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, causal, 20, 50, 4).unwrap();
+                        let r = fa2_sdpa_peer(
+                            1, heads, s, d, &q16h, &k16h, &v16h, scale, causal, 20, 50, 4,
+                        )
+                        .unwrap();
                         if r.chosen_sec < best_peer_sec {
                             best_peer_sec = r.chosen_sec;
                             peer_name = r.chosen.clone();
@@ -19228,7 +23040,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let mut rng = crate::diff::Rng::new(0x45_0150);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
-            let f = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_hs").unwrap();
+            let f = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_hs")
+                .unwrap();
             for &s in &[16usize, 64, 256, 512] {
                 let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
                 let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
@@ -19245,7 +23059,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     shared_mem_bytes: 0,
                 };
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                bld.arg(&s32)
+                    .arg(&scale)
+                    .arg(&q_d)
+                    .arg(&k_d)
+                    .arg(&v_d)
+                    .arg(&mut o_d);
                 unsafe { bld.launch(cfg).unwrap() };
                 let got = g.stream.memcpy_dtov(&o_d).unwrap();
                 let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
@@ -19256,7 +23075,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     3e-3,
                     3e-2,
                 );
-                eprintln!("flash_d128_hs s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                eprintln!(
+                    "flash_d128_hs s={s} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
             }
         });
     }
@@ -19275,8 +23097,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let d = 128usize;
             let mut rng = crate::diff::Rng::new(0x45_0AB0);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
-            let f_mp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_mp").unwrap();
-            let f_hs = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_hs").unwrap();
+            let f_mp = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_mp")
+                .unwrap();
+            let f_hs = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_hs")
+                .unwrap();
             let wa = rng.vec(1024 * 1024, -1.0, 1.0);
             let wb = rng.vec(1024 * 1024, -1.0, 1.0);
             let pin = |g: &mut Gpu| {
@@ -19304,17 +23130,32 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     block_dim: (64, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
+                let run = |g: &Gpu,
+                           f: &cudarc::driver::CudaFunction,
+                           cfg: LaunchConfig,
+                           o: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut b = g.stream.launch_builder(f);
                     b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
                     unsafe { b.launch(cfg).unwrap() };
                 };
                 run(g, &f_mp, cfg_mp, &mut o_d);
                 g.stream.synchronize().unwrap();
-                let s_mp: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                let s_mp: f64 = g
+                    .stream
+                    .memcpy_dtov(&o_d)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum();
                 run(g, &f_hs, cfg_hs, &mut o_d);
                 g.stream.synchronize().unwrap();
-                let s_hs: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                let s_hs: f64 = g
+                    .stream
+                    .memcpy_dtov(&o_d)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.abs() as f64)
+                    .sum();
                 assert!(
                     (s_hs - s_mp).abs() / s_mp.max(1.0) < 3e-2,
                     "S={s}: hs vs mp checksum disagree mp={s_mp:.3e} hs={s_hs:.3e}"
@@ -19328,16 +23169,25 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         run(g, &f_hs, cfg_hs, &mut o_d);
                     }
                     g.stream.synchronize().unwrap();
-                    let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
-                        let t0 = Instant::now();
-                        for _ in 0..50 {
-                            let mut b = g.stream.launch_builder(f);
-                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
-                            unsafe { b.launch(cfg).unwrap() };
-                        }
-                        g.stream.synchronize().unwrap();
-                        t0.elapsed().as_secs_f64() / 50.0
-                    };
+                    let time1 =
+                        |g: &Gpu,
+                         f: &cudarc::driver::CudaFunction,
+                         cfg: LaunchConfig,
+                         o: &mut cudarc::driver::CudaSlice<f32>| {
+                            let t0 = Instant::now();
+                            for _ in 0..50 {
+                                let mut b = g.stream.launch_builder(f);
+                                b.arg(&ss)
+                                    .arg(&scale)
+                                    .arg(&q16)
+                                    .arg(&k16)
+                                    .arg(&v16)
+                                    .arg(&mut *o);
+                                unsafe { b.launch(cfg).unwrap() };
+                            }
+                            g.stream.synchronize().unwrap();
+                            t0.elapsed().as_secs_f64() / 50.0
+                        };
                     let a1 = time1(g, &f_mp, cfg_mp, &mut o_d);
                     let b1 = time1(g, &f_hs, cfg_hs, &mut o_d);
                     let b2 = time1(g, &f_hs, cfg_hs, &mut o_d);
@@ -19420,7 +23270,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     shared_mem_bytes: 0,
                 };
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&ss).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d).arg(&cos_d).arg(&sin_d);
+                bld.arg(&ss)
+                    .arg(&scale)
+                    .arg(&q_d)
+                    .arg(&k_d)
+                    .arg(&v_d)
+                    .arg(&mut o_d)
+                    .arg(&cos_d)
+                    .arg(&sin_d);
                 unsafe { bld.launch(cfg).unwrap() };
                 g.stream.synchronize().unwrap();
                 let got = g.stream.memcpy_dtov(&o_d).unwrap();
@@ -19431,7 +23288,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     3e-3,
                     3e-2,
                 );
-                eprintln!("flash rope s={s}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                eprintln!(
+                    "flash rope s={s}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
             }
         });
     }
@@ -19519,7 +23379,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 };
                 let launch_m = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut bld = g.stream.launch_builder(&f_m);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o_d).arg(&cos_d).arg(&sin_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(o_d)
+                        .arg(&cos_d)
+                        .arg(&sin_d);
                     unsafe { bld.launch(cfg).unwrap() };
                 };
 
@@ -19662,7 +23529,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 );
                 return;
             }
-            eprintln!("device: {} | peer: PyTorch SDPA fused causal (cuDNN / cutlass-efficient)", g.device_name());
+            eprintln!(
+                "device: {} | peer: PyTorch SDPA fused causal (cuDNN / cutlass-efficient)",
+                g.device_name()
+            );
             let d = 64usize;
             let heads = 8usize;
             let mut rng = crate::diff::Rng::new(0x0FA2_CA05);
@@ -19699,7 +23569,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 };
                 let launch_m = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut bld = g.stream.launch_builder(&f_mc);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                 };
 
@@ -19708,8 +23583,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
 
                 // The fused peer with is_causal=true over the IDENTICAL f16 bytes.
-                let rep = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, true, 20, 50, 4)
-                    .unwrap();
+                let rep =
+                    fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, true, 20, 50, 4)
+                        .unwrap();
 
                 if s <= 512 {
                     let mut oracle = vec![0f32; n];
@@ -19766,8 +23642,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         t0.elapsed().as_secs_f64() / 50.0
                     });
                     best_m = best_m.min(tm);
-                    let r = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, true, 20, 50, 4)
-                        .unwrap();
+                    let r =
+                        fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, true, 20, 50, 4)
+                            .unwrap();
                     if r.chosen_sec < best_peer_sec {
                         best_peer_sec = r.chosen_sec;
                         peer_name = r.chosen.clone();
@@ -19808,7 +23685,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
             for &(entry, causal) in &[("flash_d128_mp", false), ("flash_d128_mpc", true)] {
-                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                    .unwrap();
                 for &s in &[16usize, 64, 256, 512] {
                     let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
                     let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
@@ -19825,7 +23704,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         shared_mem_bytes: 0,
                     };
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    bld.arg(&s32)
+                        .arg(&scale)
+                        .arg(&q_d)
+                        .arg(&k_d)
+                        .arg(&v_d)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                     let got = g.stream.memcpy_dtov(&o_d).unwrap();
                     let oracle = if causal {
@@ -19840,7 +23724,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         3e-3,
                         3e-2,
                     );
-                    eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                    eprintln!(
+                        "{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                        st.max_abs, st.max_rel
+                    );
                 }
             }
         });
@@ -19858,19 +23745,40 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use half::f16;
         with_gpu("wmma_flash_dispatch_d128", |g| {
             // D=64 dispatch is unchanged (the hand-packed feed stays — ldmatrix is only ~2–4% there).
-            assert_eq!(wmma_flash_entry(64, 512), "flash_d64_mp", "D=64 dispatch must not change");
+            assert_eq!(
+                wmma_flash_entry(64, 512),
+                "flash_d64_mp",
+                "D=64 dispatch must not change"
+            );
             let d = 128usize;
             let mut rng = crate::diff::Rng::new(0x0D12_8A5);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
             for &s in &[512usize, 1024] {
-                assert!(wmma_flash_applies(d, s), "D=128 S={s} must take the tensor-core flash path");
+                assert!(
+                    wmma_flash_applies(d, s),
+                    "D=128 S={s} must take the tensor-core flash path"
+                );
                 let entry = wmma_flash_entry(d, s);
-                assert_eq!(entry, "flash_d128_mp_lm", "D=128 must dispatch the ldmatrix kernel");
+                assert_eq!(
+                    entry, "flash_d128_mp_lm",
+                    "D=128 must dispatch the ldmatrix kernel"
+                );
                 let cfg = wmma_flash_cfg(s);
-                assert_eq!(cfg.grid_dim, ((s / 16) as u32, 1u32, 1u32), "grid must be S/16 CTAs");
-                assert_eq!(cfg.block_dim, (32u32, 1u32, 1u32), "block must be one warp/CTA");
-                assert_eq!(cfg.shared_mem_bytes, 0, "SMEM is static in the kernel (no launch param)");
+                assert_eq!(
+                    cfg.grid_dim,
+                    ((s / 16) as u32, 1u32, 1u32),
+                    "grid must be S/16 CTAs"
+                );
+                assert_eq!(
+                    cfg.block_dim,
+                    (32u32, 1u32, 1u32),
+                    "block must be one warp/CTA"
+                );
+                assert_eq!(
+                    cfg.shared_mem_bytes, 0,
+                    "SMEM is static in the kernel (no launch param)"
+                );
                 let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
                 let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
                 let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
@@ -19879,10 +23787,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let k_d = g.stream.memcpy_stod(&k16).unwrap();
                 let v_d = g.stream.memcpy_stod(&v16).unwrap();
                 let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
-                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                    .unwrap();
                 let s32 = s as u32;
                 let mut bld = g.stream.launch_builder(&f);
-                bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                bld.arg(&s32)
+                    .arg(&scale)
+                    .arg(&q_d)
+                    .arg(&k_d)
+                    .arg(&v_d)
+                    .arg(&mut o_d);
                 unsafe { bld.launch(cfg).unwrap() };
                 let got = g.stream.memcpy_dtov(&o_d).unwrap();
                 let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
@@ -19919,7 +23834,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 ("flash_d128_mp_lm", 128usize, false),
                 ("flash_d128_mpc_lm", 128usize, true),
             ] {
-                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                    .unwrap();
                 for &s in &[16usize, 64, 256, 512] {
                     let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
                     let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
@@ -19936,7 +23853,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         shared_mem_bytes: 0,
                     };
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    bld.arg(&s32)
+                        .arg(&scale)
+                        .arg(&q_d)
+                        .arg(&k_d)
+                        .arg(&v_d)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                     let got = g.stream.memcpy_dtov(&o_d).unwrap();
                     let oracle = if causal {
@@ -19951,7 +23873,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         3e-3,
                         3e-2,
                     );
-                    eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                    eprintln!(
+                        "{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                        st.max_abs, st.max_rel
+                    );
                 }
             }
         });
@@ -19986,16 +23911,39 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         assert_eq!(wmma_flash_entry(64, 512), "flash_d64_mp");
         assert_eq!(wmma_flash_entry(128, 512), "flash_d128_mp_lm");
         // dh=32 is in SUPPORTED_D for the f32 flash but has no tensor-core kernel.
-        assert!(bad(&|| { wmma_flash_entry(32, 512); }), "d=32 must not silently take the D=64 kernel");
-        assert!(bad(&|| { wmma_flash_entry(96, 512); }), "d=96 must not silently take the D=64 kernel");
+        assert!(
+            bad(&|| {
+                wmma_flash_entry(32, 512);
+            }),
+            "d=32 must not silently take the D=64 kernel"
+        );
+        assert!(
+            bad(&|| {
+                wmma_flash_entry(96, 512);
+            }),
+            "d=96 must not silently take the D=64 kernel"
+        );
         // The 16-query-row block: a ragged S would truncate the grid and drop the tail rows.
         assert_eq!(wmma_flash_cfg(512).grid_dim.0, 32);
-        assert!(bad(&|| { wmma_flash_cfg(520); }), "S%16!=0 must not silently truncate the grid");
+        assert!(
+            bad(&|| {
+                wmma_flash_cfg(520);
+            }),
+            "S%16!=0 must not silently truncate the grid"
+        );
         // The whole plan carries the precondition, so an (entry, cfg) pair cannot be built at all
         // for a shape outside `wmma_flash_applies`.
         for (d, s) in [(32usize, 512usize), (64, 520), (64, 256), (96, 1024)] {
-            assert!(!wmma_flash_applies(d, s), "test shape (d={d}, S={s}) must be out of contract");
-            assert!(bad(&|| { wmma_flash_plan(d, s, 1); }), "wmma_flash_plan(d={d}, S={s}) must reject");
+            assert!(
+                !wmma_flash_applies(d, s),
+                "test shape (d={d}, S={s}) must be out of contract"
+            );
+            assert!(
+                bad(&|| {
+                    wmma_flash_plan(d, s, 1);
+                }),
+                "wmma_flash_plan(d={d}, S={s}) must reject"
+            );
         }
         for (d, s) in [(64usize, 512usize), (64, 4096), (128, 512), (128, 4096)] {
             assert!(wmma_flash_applies(d, s));
@@ -20012,24 +23960,76 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // Dispatch wiring (pure, no GPU): ws routes ONLY the measured S>=4096 win regime
             // (flash_ws_vs_mp: 4-6% win @4096, tie @2048, 10-52% LOSS at S<=1024 — the pins below
             // are what keep a regressing regime out of the route).
-            assert_eq!(ws_flash_route_with(false, 64, 4096), None, "kill-switch must never route ws");
-            assert_eq!(ws_flash_route_with(false, 128, 4096), None, "kill-switch must never route ws");
+            assert_eq!(
+                ws_flash_route_with(false, 64, 4096),
+                None,
+                "kill-switch must never route ws"
+            );
+            assert_eq!(
+                ws_flash_route_with(false, 128, 4096),
+                None,
+                "kill-switch must never route ws"
+            );
             assert_eq!(ws_flash_route_with(true, 64, 4096), Some("flash_d64_ws"));
-            assert_eq!(ws_flash_route_with(true, 128, 4096), Some("flash_d128_ws3_lm"), "d128 winner is the ws3 ring");
-            assert_eq!(ws_flash_route_with(true, 64, 2048), None, "S=2048 is a measured tie — mp stays");
-            assert_eq!(ws_flash_route_with(true, 128, 2048), None, "S=2048 is a measured tie — mp stays");
-            assert_eq!(ws_flash_route_with(true, 64, 1024), None, "ws LOSES at S<=1024");
-            assert_eq!(ws_flash_route_with(true, 128, 1024), None, "ws LOSES at S<=1024 (1.14-1.32x)");
-            assert_eq!(ws_flash_route_with(true, 128, 512), None, "S<=512 win kernels stay unreachable");
-            assert_eq!(ws_flash_route_with(true, 64, 512), None, "S<=512 win kernels stay unreachable");
-            assert_eq!(ws_flash_route_with(true, 32, 4096), None, "no ws kernel below d=64");
-            assert_eq!(wmma_flash_entry(64, 4096), "flash_d64_mp", "non-ws D=64 entry must not change");
-            assert_eq!(wmma_flash_entry(128, 4096), "flash_d128_mp_lm", "non-ws D=128 entry must not change");
+            assert_eq!(
+                ws_flash_route_with(true, 128, 4096),
+                Some("flash_d128_ws3_lm"),
+                "d128 winner is the ws3 ring"
+            );
+            assert_eq!(
+                ws_flash_route_with(true, 64, 2048),
+                None,
+                "S=2048 is a measured tie — mp stays"
+            );
+            assert_eq!(
+                ws_flash_route_with(true, 128, 2048),
+                None,
+                "S=2048 is a measured tie — mp stays"
+            );
+            assert_eq!(
+                ws_flash_route_with(true, 64, 1024),
+                None,
+                "ws LOSES at S<=1024"
+            );
+            assert_eq!(
+                ws_flash_route_with(true, 128, 1024),
+                None,
+                "ws LOSES at S<=1024 (1.14-1.32x)"
+            );
+            assert_eq!(
+                ws_flash_route_with(true, 128, 512),
+                None,
+                "S<=512 win kernels stay unreachable"
+            );
+            assert_eq!(
+                ws_flash_route_with(true, 64, 512),
+                None,
+                "S<=512 win kernels stay unreachable"
+            );
+            assert_eq!(
+                ws_flash_route_with(true, 32, 4096),
+                None,
+                "no ws kernel below d=64"
+            );
+            assert_eq!(
+                wmma_flash_entry(64, 4096),
+                "flash_d64_mp",
+                "non-ws D=64 entry must not change"
+            );
+            assert_eq!(
+                wmma_flash_entry(128, 4096),
+                "flash_d128_mp_lm",
+                "non-ws D=128 entry must not change"
+            );
             let cfg = ws_flash_cfg(2048);
             assert_eq!(cfg.grid_dim, (64, 1, 1), "ws grid must be ceil((S/16)/2)");
             assert_eq!(cfg.block_dim, (64, 1, 1), "ws block must be 2 warps");
             assert_eq!(cfg.shared_mem_bytes, 0, "SMEM is static in the kernel");
-            assert_eq!(ws_flash_cfg(48).grid_dim.0, 2, "odd S/16 rounds up (ragged final CTA)");
+            assert_eq!(
+                ws_flash_cfg(48).grid_dim.0,
+                2,
+                "odd S/16 rounds up (ragged final CTA)"
+            );
 
             let mut rng = crate::diff::Rng::new(0x775F1A);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
@@ -20052,9 +24052,16 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let cfg = ws_flash_cfg(s);
                     for (entry, causal) in [(entry_nc, false), (entry_c, true)] {
                         let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
-                        let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                        let f = g
+                            .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                            .unwrap();
                         let mut bld = g.stream.launch_builder(&f);
-                        bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                        bld.arg(&s32)
+                            .arg(&scale)
+                            .arg(&q_d)
+                            .arg(&k_d)
+                            .arg(&v_d)
+                            .arg(&mut o_d);
                         unsafe { bld.launch(cfg).unwrap() };
                         let got = g.stream.memcpy_dtov(&o_d).unwrap();
                         let oracle = if causal {
@@ -20091,16 +24098,30 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let scale = 1.0f32 / (d as f32).sqrt();
                 let ss = s as u32;
                 let mut sums = [0f64; 2];
-                for (i, (entry, mut cfg)) in
-                    [(mp_e, wmma_flash_cfg(s)), (ws_e, ws_flash_cfg(s))].into_iter().enumerate()
+                for (i, (entry, mut cfg)) in [(mp_e, wmma_flash_cfg(s)), (ws_e, ws_flash_cfg(s))]
+                    .into_iter()
+                    .enumerate()
                 {
                     cfg.grid_dim.1 = heads as u32;
                     let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
-                    let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                    let f = g
+                        .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                        .unwrap();
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
-                    sums[i] = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    sums[i] = g
+                        .stream
+                        .memcpy_dtov(&o_d)
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.abs() as f64)
+                        .sum();
                 }
                 assert!(
                     (sums[1] - sums[0]).abs() / sums[0].max(1.0) < 3e-2,
@@ -20108,7 +24129,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     sums[0],
                     sums[1]
                 );
-                eprintln!("ws-vs-mp checksum d={d} S={s} H={heads}: mp={:.6e} ws={:.6e}", sums[0], sums[1]);
+                eprintln!(
+                    "ws-vs-mp checksum d={d} S={s} H={heads}: mp={:.6e} ws={:.6e}",
+                    sums[0], sums[1]
+                );
             }
         });
     }
@@ -20128,7 +24152,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
             for &(d, entry) in &[(64usize, "flash_d64_ws3"), (128, "flash_d128_ws3_lm")] {
                 let (abs_tol, rel_tol) = if d == 64 { (2e-3, 2e-2) } else { (3e-3, 3e-2) };
-                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                    .unwrap();
                 for &s in &[16usize, 32, 48, 64, 256, 512, 2048] {
                     let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
                     let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
@@ -20140,7 +24166,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
                     let s32 = s as u32;
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    bld.arg(&s32)
+                        .arg(&scale)
+                        .arg(&q_d)
+                        .arg(&k_d)
+                        .arg(&v_d)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(ws_flash_cfg(s)).unwrap() };
                     let got = g.stream.memcpy_dtov(&o_d).unwrap();
                     let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
@@ -20151,7 +24182,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         abs_tol,
                         rel_tol,
                     );
-                    eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                    eprintln!(
+                        "{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                        st.max_abs, st.max_rel
+                    );
                 }
             }
             // **Multi-head.** Everything above runs at grid.y = 1, but `flash_d128_ws3_lm` is the
@@ -20176,14 +24210,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let scale = 1.0f32 / (d as f32).sqrt();
                 let ss = s as u32;
                 let mut outs: Vec<Vec<f32>> = Vec::new();
-                for (entry, mut cfg) in
-                    [(mp_e, wmma_flash_cfg(s)), (ws3_e, ws_flash_cfg(s))]
-                {
+                for (entry, mut cfg) in [(mp_e, wmma_flash_cfg(s)), (ws3_e, ws_flash_cfg(s))] {
                     cfg.grid_dim.1 = heads as u32;
                     let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
-                    let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                    let f = g
+                        .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                        .unwrap();
                     let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(&mut o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                     outs.push(g.stream.memcpy_dtov(&o_d).unwrap());
                 }
@@ -20231,13 +24270,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             const ROUNDS: usize = 9;
             let heads = 8usize;
             let triples = [
-                ("d64", "flash_d64_mp", "flash_d64_ws", "flash_d64_ws3", 64usize),
-                ("d128", "flash_d128_mp_lm", "flash_d128_ws_lm", "flash_d128_ws3_lm", 128usize),
+                (
+                    "d64",
+                    "flash_d64_mp",
+                    "flash_d64_ws",
+                    "flash_d64_ws3",
+                    64usize,
+                ),
+                (
+                    "d128",
+                    "flash_d128_mp_lm",
+                    "flash_d128_ws_lm",
+                    "flash_d128_ws3_lm",
+                    128usize,
+                ),
             ];
             for &(label, base_e, ws_e, ws3_e, d) in &triples {
-                let f_base = g.function("flash", crate::ptx_flash::flash_ptx(), base_e).unwrap();
-                let f_ws = g.function("flash", crate::ptx_flash::flash_ptx(), ws_e).unwrap();
-                let f_ws3 = g.function("flash", crate::ptx_flash::flash_ptx(), ws3_e).unwrap();
+                let f_base = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), base_e)
+                    .unwrap();
+                let f_ws = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), ws_e)
+                    .unwrap();
+                let f_ws3 = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), ws3_e)
+                    .unwrap();
                 eprintln!("--- {label}: {ws_e}/{ws3_e} vs {base_e} (clock-cancelled, median of {ROUNDS}) ---");
                 for &s in &[512usize, 1024, 2048, 4096] {
                     let n = heads * s * d;
@@ -20251,19 +24308,30 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     cfg_base.grid_dim.1 = heads as u32;
                     let mut cfg_ws = ws_flash_cfg(s);
                     cfg_ws.grid_dim.1 = heads as u32;
-                    let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
-                        let mut b = g.stream.launch_builder(f);
-                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
-                        unsafe { b.launch(cfg).unwrap() };
-                    };
+                    let run =
+                        |g: &Gpu,
+                         f: &cudarc::driver::CudaFunction,
+                         cfg: LaunchConfig,
+                         o: &mut cudarc::driver::CudaSlice<f32>| {
+                            let mut b = g.stream.launch_builder(f);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        };
                     // checksum cross-check: ws and ws3 must agree with the production baseline.
                     let mut sums = [0f64; 3];
-                    for (i, (f, cfg)) in
-                        [(&f_base, cfg_base), (&f_ws, cfg_ws), (&f_ws3, cfg_ws)].into_iter().enumerate()
+                    for (i, (f, cfg)) in [(&f_base, cfg_base), (&f_ws, cfg_ws), (&f_ws3, cfg_ws)]
+                        .into_iter()
+                        .enumerate()
                     {
                         run(g, f, cfg, &mut o_d);
                         g.stream.synchronize().unwrap();
-                        sums[i] = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                        sums[i] = g
+                            .stream
+                            .memcpy_dtov(&o_d)
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.abs() as f64)
+                            .sum();
                     }
                     assert!(
                         (sums[1] - sums[0]).abs() / sums[0].max(1.0) < 3e-2
@@ -20283,16 +24351,25 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             run(g, &f_ws3, cfg_ws, &mut o_d);
                         }
                         g.stream.synchronize().unwrap();
-                        let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
-                            let t0 = Instant::now();
-                            for _ in 0..50 {
-                                let mut b = g.stream.launch_builder(f);
-                                b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
-                                unsafe { b.launch(cfg).unwrap() };
-                            }
-                            g.stream.synchronize().unwrap();
-                            t0.elapsed().as_secs_f64() / 50.0
-                        };
+                        let time1 =
+                            |g: &Gpu,
+                             f: &cudarc::driver::CudaFunction,
+                             cfg: LaunchConfig,
+                             o: &mut cudarc::driver::CudaSlice<f32>| {
+                                let t0 = Instant::now();
+                                for _ in 0..50 {
+                                    let mut b = g.stream.launch_builder(f);
+                                    b.arg(&ss)
+                                        .arg(&scale)
+                                        .arg(&q16)
+                                        .arg(&k16)
+                                        .arg(&v16)
+                                        .arg(&mut *o);
+                                    unsafe { b.launch(cfg).unwrap() };
+                                }
+                                g.stream.synchronize().unwrap();
+                                t0.elapsed().as_secs_f64() / 50.0
+                            };
                         let a1 = time1(g, &f_base, cfg_base, &mut o_d);
                         let b1 = time1(g, &f_ws, cfg_ws, &mut o_d);
                         let c1 = time1(g, &f_ws3, cfg_ws, &mut o_d);
@@ -20340,7 +24417,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 eprintln!("[skip] attn_d128_vs_fused_peer: set WUKONG_FA2_PYTHON to CUDA torch.");
                 return;
             }
-            eprintln!("device: {} | peer: PyTorch SDPA fused (cuDNN / cutlass-efficient), D=128", g.device_name());
+            eprintln!(
+                "device: {} | peer: PyTorch SDPA fused (cuDNN / cutlass-efficient), D=128",
+                g.device_name()
+            );
             let d = 128usize;
             let heads = 8usize;
             let mut rng = crate::diff::Rng::new(0x0FA2_0128);
@@ -20352,7 +24432,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
             const ROUNDS: usize = 5;
             const REPS: usize = 3;
-            let f_m = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_mp").unwrap();
+            let f_m = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_mp")
+                .unwrap();
             for &s in &[512usize, 1024, 2048, 4096] {
                 let n = heads * s * d;
                 let qf = rng.vec(n, -1.0, 1.0);
@@ -20372,14 +24454,20 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 };
                 let launch_m = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut bld = g.stream.launch_builder(&f_m);
-                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o_d);
+                    bld.arg(&ss)
+                        .arg(&scale)
+                        .arg(&q16)
+                        .arg(&k16)
+                        .arg(&v16)
+                        .arg(o_d);
                     unsafe { bld.launch(cfg).unwrap() };
                 };
                 launch_m(g, &mut o_d);
                 g.stream.synchronize().unwrap();
                 let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
-                let rep = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
-                    .unwrap();
+                let rep =
+                    fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
+                        .unwrap();
                 if s <= 512 {
                     let mut oracle = vec![0f32; n];
                     for hh in 0..heads {
@@ -20388,15 +24476,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         let r = ref_attn(&qf[lo..hi], &kf[lo..hi], &vf[lo..hi], s, d, scale);
                         oracle[lo..hi].copy_from_slice(&r);
                     }
-                    let sm = crate::diff::assert_close(&format!("Wukong d128 S={s}"), &out_m, &oracle, 3e-3, 3e-2);
-                    let sp = crate::diff::assert_close(&format!("{} d128 S={s}", rep.chosen), &rep.o, &oracle, 3e-3, 3e-2);
-                    eprintln!("[gate] D=128 S={s}: Wukong max_abs={:.2e} | {} peer max_abs={:.2e} ✓", sm.max_abs, rep.chosen, sp.max_abs);
+                    let sm = crate::diff::assert_close(
+                        &format!("Wukong d128 S={s}"),
+                        &out_m,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    let sp = crate::diff::assert_close(
+                        &format!("{} d128 S={s}", rep.chosen),
+                        &rep.o,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    eprintln!(
+                        "[gate] D=128 S={s}: Wukong max_abs={:.2e} | {} peer max_abs={:.2e} ✓",
+                        sm.max_abs, rep.chosen, sp.max_abs
+                    );
                 }
                 let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
                 let (cs_m, cs_p) = (csum(&out_m), csum(&rep.o));
                 assert!(
                     (cs_m - cs_p).abs() / cs_p.max(1.0) < 3e-2,
-                    "D=128 S={s}: Wukong vs {} checksum disagree wuk={cs_m:.4e} peer={cs_p:.4e}", rep.chosen
+                    "D=128 S={s}: Wukong vs {} checksum disagree wuk={cs_m:.4e} peer={cs_p:.4e}",
+                    rep.chosen
                 );
                 let flop = attn_flop(heads, s, d);
                 let mut best_m = f64::INFINITY;
@@ -20404,19 +24508,27 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let mut peer_name = rep.chosen.clone();
                 let (mut cud, mut eff) = (rep.cudnn_sec, rep.efficient_sec);
                 let upd = |slot: &mut Option<f64>, v: Option<f64>| {
-                    if let Some(x) = v { *slot = Some(slot.map_or(x, |c: f64| c.min(x))); }
+                    if let Some(x) = v {
+                        *slot = Some(slot.map_or(x, |c: f64| c.min(x)));
+                    }
                 };
                 for _ in 0..REPS {
                     let tm = best_of(ROUNDS, || {
                         let t0 = Instant::now();
-                        for _ in 0..50 { launch_m(g, &mut o_d); }
+                        for _ in 0..50 {
+                            launch_m(g, &mut o_d);
+                        }
                         g.stream.synchronize().unwrap();
                         t0.elapsed().as_secs_f64() / 50.0
                     });
                     best_m = best_m.min(tm);
-                    let r = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
-                        .unwrap();
-                    if r.chosen_sec < best_peer_sec { best_peer_sec = r.chosen_sec; peer_name = r.chosen.clone(); }
+                    let r =
+                        fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
+                            .unwrap();
+                    if r.chosen_sec < best_peer_sec {
+                        best_peer_sec = r.chosen_sec;
+                        peer_name = r.chosen.clone();
+                    }
                     upd(&mut cud, r.cudnn_sec);
                     upd(&mut eff, r.efficient_sec);
                 }

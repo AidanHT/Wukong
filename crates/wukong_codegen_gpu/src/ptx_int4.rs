@@ -124,7 +124,10 @@ fn pack_nibble(out: &mut u32, kk: usize, u: i32) {
 pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) -> QuantWeight {
     assert_eq!(w.len(), n * k, "weight must be N*K");
     assert!(k % group == 0, "K={k} must be a multiple of group={group}");
-    assert!(group % 8 == 0, "group={group} must be a multiple of 8 (nibble packing)");
+    assert!(
+        group % 8 == 0,
+        "group={group} must be a multiple of 8 (nibble packing)"
+    );
     let kg = k / group;
     let kw = k / 8;
     let mut packed = vec![0u32; n * kw];
@@ -136,7 +139,11 @@ pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) ->
             for i in 0..group {
                 amax = amax.max(w[base + i].abs());
             }
-            let scale16 = if amax > 0.0 { f16::from_f32(amax / 7.0) } else { f16::ONE };
+            let scale16 = if amax > 0.0 {
+                f16::from_f32(amax / 7.0)
+            } else {
+                f16::ONE
+            };
             scales[r * kg + g] = scale16;
             let inv = 1.0f32 / scale16.to_f32();
             for i in 0..group {
@@ -146,7 +153,15 @@ pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) ->
             }
         }
     }
-    QuantWeight { n, k, group, packed, scales, zeros: None, signed: true }
+    QuantWeight {
+        n,
+        k,
+        group,
+        packed,
+        scales,
+        zeros: None,
+        signed: true,
+    }
 }
 
 /// **Asymmetric** (AWQ/GPTQ-style) group-wise int4 quantization: unsigned nibbles `q ∈ [0,15]` with a
@@ -159,7 +174,10 @@ pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) ->
 pub fn quantize_weight_asymmetric(w: &[f32], n: usize, k: usize, group: usize) -> QuantWeight {
     assert_eq!(w.len(), n * k, "weight must be N*K");
     assert!(k % group == 0, "K={k} must be a multiple of group={group}");
-    assert!(group % 8 == 0, "group={group} must be a multiple of 8 (nibble packing)");
+    assert!(
+        group % 8 == 0,
+        "group={group} must be a multiple of 8 (nibble packing)"
+    );
     let kg = k / group;
     let kw = k / 8;
     let mut packed = vec![0u32; n * kw];
@@ -173,7 +191,11 @@ pub fn quantize_weight_asymmetric(w: &[f32], n: usize, k: usize, group: usize) -
                 lo = lo.min(w[base + i]);
                 hi = hi.max(w[base + i]);
             }
-            let scale16 = if hi > lo { f16::from_f32((hi - lo) / 15.0) } else { f16::ONE };
+            let scale16 = if hi > lo {
+                f16::from_f32((hi - lo) / 15.0)
+            } else {
+                f16::ONE
+            };
             let s = scale16.to_f32();
             let zero = (-lo / s).round().clamp(0.0, 15.0) as i32;
             scales[r * kg + g] = scale16;
@@ -186,7 +208,15 @@ pub fn quantize_weight_asymmetric(w: &[f32], n: usize, k: usize, group: usize) -
             }
         }
     }
-    QuantWeight { n, k, group, packed, scales, zeros: Some(zeros), signed: false }
+    QuantWeight {
+        n,
+        k,
+        group,
+        packed,
+        scales,
+        zeros: Some(zeros),
+        signed: false,
+    }
 }
 
 /// Reconstruct the fp16 weight `[N,K]` **exactly as the kernel does** — read the unsigned interleaved
@@ -230,7 +260,10 @@ pub fn reference_w4a16(a: &[f32], qw: &QuantWeight, m: usize) -> Vec<f32> {
     let (k, n) = (qw.k, qw.n);
     assert_eq!(a.len(), m * k, "A must be M*K");
     let w = dequant_weight(qw);
-    let af: Vec<f64> = a.iter().map(|&x| f16::from_f32(x).to_f32() as f64).collect();
+    let af: Vec<f64> = a
+        .iter()
+        .map(|&x| f16::from_f32(x).to_f32() as f64)
+        .collect();
     let wf: Vec<f64> = w.iter().map(|x| x.to_f32() as f64).collect();
     let mut c = vec![0.0f32; m * n];
     for i in 0..m {
@@ -276,10 +309,19 @@ fn entry_w4a16(
     static_dims: Option<(usize, usize, usize)>,
     splitk: bool,
 ) -> String {
-    assert!(group.is_power_of_two() && group % BK == 0, "group must be a power of two ≥ {BK}");
-    assert!(!(splitk && static_dims.is_some()), "{name}: split-K uses runtime M·N for the plane offset (dynamic dims)");
+    assert!(
+        group.is_power_of_two() && group % BK == 0,
+        "group must be a power of two ≥ {BK}"
+    );
+    assert!(
+        !(splitk && static_dims.is_some()),
+        "{name}: split-K uses runtime M·N for the plane offset (dynamic dims)"
+    );
     if let Some((m, n, k)) = static_dims {
-        assert!(m % bm == 0 && n % bn == 0 && k % group == 0, "static dims must tile the kernel");
+        assert!(
+            m % bm == 0 && n % bn == 0 && k % group == 0,
+            "static dims must tile the kernel"
+        );
     }
     let nab = 8; // f16 WMMA a/b fragment is 8×.b32
     let threads = warps_m * warps_n * 32;
@@ -290,7 +332,10 @@ fn entry_w4a16(
     let a_chunks = bm * BK / (threads * 8); // 128-bit (8×f16) A chunks per thread
     let b_words = bn * BK / 8; // packed int4 words in the B tile
     let b_chunks = b_words / threads; // one packed word per thread per chunk
-    assert!(a_chunks * threads * 8 == bm * BK, "A staging must tile evenly");
+    assert!(
+        a_chunks * threads * 8 == bm * BK,
+        "A staging must tile evenly"
+    );
     assert!(b_chunks * threads == b_words, "B staging must tile evenly");
     let wn_shift = warps_n.trailing_zeros();
     let wm = (16 * tm) as i64;
@@ -303,7 +348,11 @@ fn entry_w4a16(
         format!("{{{}}}", regs.join(","))
     };
 
-    let zeros_param = if zero_point { ",\n    .param .u64 pZeros" } else { "" };
+    let zeros_param = if zero_point {
+        ",\n    .param .u64 pZeros"
+    } else {
+        ""
+    };
     let mut s = String::new();
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    \
@@ -360,7 +409,8 @@ fn entry_w4a16(
             s += &format!("    mov.u32 %M,{m};\n    mov.u32 %N,{n};\n    mov.u32 %K,{k};\n");
         }
         None => {
-            s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+            s +=
+                "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
         }
     }
     s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %Bq,[pBq];\n    ld.param.u64 %Scl,[pScales];\n    ld.param.u64 %C,[pC];\n";
@@ -394,7 +444,11 @@ fn entry_w4a16(
         }
     }
 
-    let (kstart, kstop) = if splitk { ("%kbeg", "%kend") } else { ("0", "%K") };
+    let (kstart, kstop) = if splitk {
+        ("%kbeg", "%kend")
+    } else {
+        ("0", "%K")
+    };
     s += &format!("    mov.u32 %kt,{kstart};\n");
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,{kstop};\n    @%p0 bra KEND_{name};\n");
 
@@ -463,7 +517,10 @@ fn entry_w4a16(
     // --- Compute: each warp loads its fragments from SMEM and accumulates (identical to fp16 path). ---
     for ti in 0..tm {
         s += &format!("    mov.u32 %tmp,smemA_{name};\n");
-        s += &format!("    mul.lo.s32 %tmp2,%warpRow,{wm};\n    add.u32 %tmp2,%tmp2,{};\n", ti * 16);
+        s += &format!(
+            "    mul.lo.s32 %tmp2,%warpRow,{wm};\n    add.u32 %tmp2,%tmp2,{};\n",
+            ti * 16
+        );
         s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
         s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
         let ra = veclist(&format!("a{ti}_"), nab);
@@ -471,7 +528,10 @@ fn entry_w4a16(
     }
     for tj in 0..tn {
         s += &format!("    mov.u32 %tmp,smemB_{name};\n");
-        s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+        s += &format!(
+            "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+            tj * 16
+        );
         s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
         s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
         let rb = veclist(&format!("b{tj}_"), nab);
@@ -482,7 +542,9 @@ fn entry_w4a16(
         for tj in 0..tn {
             let rb = veclist(&format!("b{tj}_"), nab);
             let cc = veclist(&format!("c{ti}_{tj}_"), 8);
-            s += &format!("    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 {cc}, {ra}, {rb}, {cc};\n");
+            s += &format!(
+                "    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 {cc}, {ra}, {rb}, {cc};\n"
+            );
         }
     }
     s += "    bar.sync 0;\n";
@@ -491,9 +553,15 @@ fn entry_w4a16(
     s += &format!("KEND_{name}:\n");
     for ti in 0..tm {
         for tj in 0..tn {
-            s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+            s += &format!(
+                "    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n",
+                ti * 16
+            );
             s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
-            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+            s += &format!(
+                "    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n",
+                tj * 16
+            );
             s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
             s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
             let cc = veclist(&format!("c{ti}_{tj}_"), 8);
@@ -518,8 +586,28 @@ pub fn w4a16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
         let mut m = String::from(HDR_SM80);
-        m += &entry_w4a16("gemm_nt_w4a16", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false, None, false);
-        m += &entry_w4a16("gemm_nt_w4a16_z", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, true, None, false);
+        m += &entry_w4a16(
+            "gemm_nt_w4a16",
+            W4_BM,
+            W4_BN,
+            W4_WARPS_M,
+            W4_WARPS_N,
+            GROUP_SIZE,
+            false,
+            None,
+            false,
+        );
+        m += &entry_w4a16(
+            "gemm_nt_w4a16_z",
+            W4_BM,
+            W4_BN,
+            W4_WARPS_M,
+            W4_WARPS_N,
+            GROUP_SIZE,
+            true,
+            None,
+            false,
+        );
         m
     })
     .as_str()
@@ -592,7 +680,17 @@ pub fn w4a16_splitk_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
         let mut m = String::from(HDR_SM80);
-        m += &entry_w4a16("gemm_nt_w4a16_sk", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false, None, true);
+        m += &entry_w4a16(
+            "gemm_nt_w4a16_sk",
+            W4_BM,
+            W4_BN,
+            W4_WARPS_M,
+            W4_WARPS_N,
+            GROUP_SIZE,
+            false,
+            None,
+            true,
+        );
         m += W4A16_SPLITK_REDUCE;
         m
     })
@@ -606,15 +704,33 @@ pub fn w4a16_splitk_ptx() -> &'static str {
 /// (`_z` for the zero-point path). Returns an owned module string (per-shape ⇒ not interned); the
 /// driver JIT + the persistent cubin cache (M10) make the per-shape compile a one-time, cached cost.
 pub fn w4a16_static_ptx(m: usize, n: usize, k: usize, zero_point: bool) -> String {
-    let name = if zero_point { "gemm_nt_w4a16_static_z" } else { "gemm_nt_w4a16_static" };
+    let name = if zero_point {
+        "gemm_nt_w4a16_static_z"
+    } else {
+        "gemm_nt_w4a16_static"
+    };
     let mut s = String::from(HDR_SM80);
-    s += &entry_w4a16(name, W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, zero_point, Some((m, n, k)), false);
+    s += &entry_w4a16(
+        name,
+        W4_BM,
+        W4_BN,
+        W4_WARPS_M,
+        W4_WARPS_N,
+        GROUP_SIZE,
+        zero_point,
+        Some((m, n, k)),
+        false,
+    );
     s
 }
 
 /// Entry name for the static-shape kernel ([`w4a16_static_ptx`]); `_z` suffix for the zero-point path.
 pub fn w4a16_static_entry(zero_point: bool) -> &'static str {
-    if zero_point { "gemm_nt_w4a16_static_z" } else { "gemm_nt_w4a16_static" }
+    if zero_point {
+        "gemm_nt_w4a16_static_z"
+    } else {
+        "gemm_nt_w4a16_static"
+    }
 }
 
 #[cfg(test)]
@@ -685,15 +801,29 @@ mod tests {
         // `Some(zeros)` arm and dequants (u - z)*scale, so the reference must do the same.
         let asym = quantize_weight_asymmetric(&w, n, k, group);
         let want = dequant_weight(&asym);
-        let mislabelled = QuantWeight { signed: true, ..asym.clone() };
-        assert_eq!(dequant_weight(&mislabelled), want, "oracle must follow `zeros`, not `signed`");
+        let mislabelled = QuantWeight {
+            signed: true,
+            ..asym.clone()
+        };
+        assert_eq!(
+            dequant_weight(&mislabelled),
+            want,
+            "oracle must follow `zeros`, not `signed`"
+        );
 
         // The mirror case: a symmetric weight mislabelled `signed: false`. The launcher takes the
         // `None` arm (Z = 8); the reference must not panic on `zeros.unwrap()`.
         let sym = quantize_weight_symmetric(&w, n, k, group);
         let want = dequant_weight(&sym);
-        let mislabelled = QuantWeight { signed: false, ..sym.clone() };
-        assert_eq!(dequant_weight(&mislabelled), want, "oracle must not read `signed` for Z");
+        let mislabelled = QuantWeight {
+            signed: false,
+            ..sym.clone()
+        };
+        assert_eq!(
+            dequant_weight(&mislabelled),
+            want,
+            "oracle must not read `signed` for Z"
+        );
     }
 
     /// The generated PTX must be **pure ASCII** (a single non-ASCII byte is a `ptxas fatal` on this
@@ -702,11 +832,18 @@ mod tests {
     /// A100 for nothing. PTX is forward-compatible only, so the floor must be the lowest legal arch.
     #[test]
     fn w4a16_ptx_is_ascii_and_complete() {
-        for (label, ptx) in
-            [("w4a16", w4a16_ptx().to_string()), ("w4a16_splitk", w4a16_splitk_ptx().to_string())]
-        {
-            assert!(ptx.starts_with(HDR_SM80), "{label}: must open with the routed HDR_SM80 header");
-            assert!(ptx.contains(TARGET_SM80), "{label}: must carry the int4 floor {TARGET_SM80}");
+        for (label, ptx) in [
+            ("w4a16", w4a16_ptx().to_string()),
+            ("w4a16_splitk", w4a16_splitk_ptx().to_string()),
+        ] {
+            assert!(
+                ptx.starts_with(HDR_SM80),
+                "{label}: must open with the routed HDR_SM80 header"
+            );
+            assert!(
+                ptx.contains(TARGET_SM80),
+                "{label}: must carry the int4 floor {TARGET_SM80}"
+            );
             assert!(!ptx.contains("sm_89"), "{label}: nothing here is Ada-only");
         }
         let ptx = w4a16_ptx();
@@ -714,13 +851,22 @@ mod tests {
         assert!(ptx.contains(".visible .entry gemm_nt_w4a16("));
         assert!(ptx.contains(".visible .entry gemm_nt_w4a16_z("));
         assert!(ptx.contains("wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32"));
-        assert!(ptx.contains("lop3.b32"), "fast Marlin/AWQ unpack must use lop3");
+        assert!(
+            ptx.contains("lop3.b32"),
+            "fast Marlin/AWQ unpack must use lop3"
+        );
         // Static-shape module: ASCII, the right entry, and the dims baked as `mov` constants (not loaded
         // from params) so ptxas can strength-reduce — e.g. K=4096 appears as an immediate.
         let st = w4a16_static_ptx(64, 4096, 4096, false);
         assert!(st.is_ascii(), "static PTX must be ASCII");
-        assert!(st.starts_with(HDR_SM80), "static PTX must open with the routed HDR_SM80 header");
+        assert!(
+            st.starts_with(HDR_SM80),
+            "static PTX must open with the routed HDR_SM80 header"
+        );
         assert!(st.contains(".visible .entry gemm_nt_w4a16_static("));
-        assert!(st.contains("mov.u32 %K,4096;"), "static kernel must bake K as a constant");
+        assert!(
+            st.contains("mov.u32 %K,4096;"),
+            "static kernel must bake K as a constant"
+        );
     }
 }

@@ -371,8 +371,7 @@ pub unsafe extern "C" fn wukong_layernorm_bwd_f32_parallel(
     use rayon::prelude::*;
     // Raw pointers cross the rayon boundary as integers (null `gamma` round-trips through 0); rows are
     // disjoint, gamma is shared read-only — the same pattern as the parallel norm/reduce kernels.
-    let (x_addr, dy_addr, g_addr, dx_addr) =
-        (x as usize, dy as usize, gamma as usize, dx as usize);
+    let (x_addr, dy_addr, g_addr, dx_addr) = (x as usize, dy as usize, gamma as usize, dx as usize);
     // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
     // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
     // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
@@ -422,7 +421,13 @@ mod tests {
     /// four reductions with `stats_row_scalar`, then the naive `dx` apply. Equality with the kernel
     /// output is literal bits (this pins AVX2 == scalar across the 8-lane edge, gamma null/non-null).
     /// `gamma` is the length-`cols` per-column array shared across rows.
-    fn reference(x: &[f32], dy: &[f32], gamma: Option<&[f32]>, rows: usize, cols: usize) -> Vec<f32> {
+    fn reference(
+        x: &[f32],
+        dy: &[f32],
+        gamma: Option<&[f32]>,
+        rows: usize,
+        cols: usize,
+    ) -> Vec<f32> {
         let mut want = vec![0.0f32; rows * cols];
         let gptr = match gamma {
             Some(g) => g.as_ptr(),
@@ -536,16 +541,52 @@ mod tests {
                     unsafe { stats_row_scalar(x.as_ptr(), dy.as_ptr(), gptr, n, EPS) };
                 let (mv, rv, a1v, a2v) =
                     unsafe { stats_row_avx2(x.as_ptr(), dy.as_ptr(), gptr, n, EPS) };
-                assert_eq!(ms.to_bits(), mv.to_bits(), "mean scalar!=avx2 n={n} g={use_gamma}");
-                assert_eq!(rs.to_bits(), rv.to_bits(), "rstd scalar!=avx2 n={n} g={use_gamma}");
-                assert_eq!(a1s.to_bits(), a1v.to_bits(), "s1/C scalar!=avx2 n={n} g={use_gamma}");
-                assert_eq!(a2s.to_bits(), a2v.to_bits(), "s2/C scalar!=avx2 n={n} g={use_gamma}");
+                assert_eq!(
+                    ms.to_bits(),
+                    mv.to_bits(),
+                    "mean scalar!=avx2 n={n} g={use_gamma}"
+                );
+                assert_eq!(
+                    rs.to_bits(),
+                    rv.to_bits(),
+                    "rstd scalar!=avx2 n={n} g={use_gamma}"
+                );
+                assert_eq!(
+                    a1s.to_bits(),
+                    a1v.to_bits(),
+                    "s1/C scalar!=avx2 n={n} g={use_gamma}"
+                );
+                assert_eq!(
+                    a2s.to_bits(),
+                    a2v.to_bits(),
+                    "s2/C scalar!=avx2 n={n} g={use_gamma}"
+                );
                 // apply: scalar vs avx2 must agree bit-for-bit.
                 let mut a = vec![0.0f32; n];
                 let mut b = vec![0.0f32; n];
                 unsafe {
-                    apply_row_scalar(x.as_ptr(), dy.as_ptr(), gptr, a.as_mut_ptr(), n, ms, rs, a1s, a2s);
-                    apply_row_avx2(x.as_ptr(), dy.as_ptr(), gptr, b.as_mut_ptr(), n, mv, rv, a1v, a2v);
+                    apply_row_scalar(
+                        x.as_ptr(),
+                        dy.as_ptr(),
+                        gptr,
+                        a.as_mut_ptr(),
+                        n,
+                        ms,
+                        rs,
+                        a1s,
+                        a2s,
+                    );
+                    apply_row_avx2(
+                        x.as_ptr(),
+                        dy.as_ptr(),
+                        gptr,
+                        b.as_mut_ptr(),
+                        n,
+                        mv,
+                        rv,
+                        a1v,
+                        a2v,
+                    );
                 }
                 for i in 0..n {
                     assert_eq!(

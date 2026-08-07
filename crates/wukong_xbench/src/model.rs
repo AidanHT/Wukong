@@ -898,7 +898,10 @@ fn kernel_calls(mir: &str) -> Vec<(String, usize)> {
 fn par_region_split(mir: &str) -> Option<(String, String)> {
     let start = mir.find("fn wukong$par$")?;
     let after = &mir[start..];
-    let end = after[3..].find("\nfn ").map(|i| i + 4).unwrap_or(after.len());
+    let end = after[3..]
+        .find("\nfn ")
+        .map(|i| i + 4)
+        .unwrap_or(after.len());
     Some((
         after[..end].to_string(),
         format!("{}{}", &mir[..start], &after[end..]),
@@ -909,7 +912,11 @@ fn par_region_split(mir: &str) -> Option<(String, String)> {
 /// GEMM, the plain PV GEMM and the batched softmax. If the region body is missing these, the
 /// region is not the head loop and the heads are running serially — a regression that is still
 /// *correct*, so only this scan can see it.
-const PAR_REGION_KERNELS: [&str; 3] = ["wukong_sgemm_nt", "wukong_sgemm_nt_alpha", "wukong_norm_f32"];
+const PAR_REGION_KERNELS: [&str; 3] = [
+    "wukong_sgemm_nt",
+    "wukong_sgemm_nt_alpha",
+    "wukong_norm_f32",
+];
 
 /// The suite's magnitude-normalized full-buffer metric `max|Δ| / max|out|`, or `Err(reason)` when
 /// the two buffers **cannot be compared at all**.
@@ -1318,9 +1325,10 @@ fn find_vcvars() -> Option<PathBuf> {
                     continue;
                 }
                 // Prefer the real MSVC tools version as the sort key; fall back to 0 if absent.
-                let ver = std::fs::read_to_string(build.join("Microsoft.VCToolsVersion.default.txt"))
-                    .map(|s| version_tuple(&s))
-                    .unwrap_or_default();
+                let ver =
+                    std::fs::read_to_string(build.join("Microsoft.VCToolsVersion.default.txt"))
+                        .map(|s| version_tuple(&s))
+                        .unwrap_or_default();
                 if best.as_ref().is_none_or(|(bv, _)| ver > *bv) {
                     best = Some((ver, vcvars));
                 }
@@ -2027,7 +2035,11 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
             .collect::<Vec<_>>(),
         Err(_) => vec![128, 512],
     };
-    let sizes = if sizes.is_empty() { vec![128, 512] } else { sizes };
+    let sizes = if sizes.is_empty() {
+        vec![128, 512]
+    } else {
+        sizes
+    };
     for s in sizes {
         bench_model_size(
             cc,
@@ -2167,7 +2179,15 @@ fn interp_gate() -> Option<f64> {
     let mut y_native = vec![0.0f32; sd];
     unsafe {
         run_forward_mer(
-            block_fn, ln_fn, &weights, &mut sc2, &x0, &mut xa2, &mut xb2, &lnf_g, &lnf_b,
+            block_fn,
+            ln_fn,
+            &weights,
+            &mut sc2,
+            &x0,
+            &mut xa2,
+            &mut xb2,
+            &lnf_g,
+            &lnf_b,
             &mut y_native,
         );
     }
@@ -2287,13 +2307,19 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("  block dispatches (per layer, from optimized MIR): {summary}");
-            for need in ["wukong_sgemm_nt", "wukong_sgemm_nt_epi", "wukong_norm_affine_f32"] {
+            for need in [
+                "wukong_sgemm_nt",
+                "wukong_sgemm_nt_epi",
+                "wukong_norm_affine_f32",
+            ] {
                 if !calls.iter().any(|(k, _)| k == need) {
                     println!("  ! WARNING: expected recognized kernel {need} did NOT dispatch — timing scalar loops");
                 }
             }
-            let (Some(bp), Some(lp)) = (m.func(&mut interner, "kbench"), l.func(&mut interner, "kbench"))
-            else {
+            let (Some(bp), Some(lp)) = (
+                m.func(&mut interner, "kbench"),
+                l.func(&mut interner, "kbench"),
+            ) else {
                 println!("  ! wukong kbench symbol missing");
                 return;
             };
@@ -2316,8 +2342,8 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             let ns = on_big_stack(|| {
                 let mut run = || unsafe {
                     run_forward_mer(
-                        block_fn, ln_fn, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g,
-                        &lnf_b, &mut y,
+                        block_fn, ln_fn, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
+                        &mut y,
                     )
                 };
                 time_forward(&mut run)
@@ -2421,7 +2447,11 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             &format!("model_s{}", cfg.s),
             "rs",
             "rustc",
-            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &[
+                "-Copt-level=3",
+                "-Ctarget-cpu=native",
+                "--crate-type=cdylib",
+            ],
             "fn kbench(",
             "fn kfinal(",
         )
@@ -2444,30 +2474,34 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     };
 
     // --- C(fast): identical source, -ffast-math ---
-    let cfast_m = if no_c { None } else { compile_c_model(
-        &c_src,
-        dir,
-        &format!("model_s{}_fast", cfg.s),
-        "c",
-        cc,
-        &["-O3", "-march=native", "-ffast-math", "-shared"],
-        "void kbench(",
-        "void kfinal(",
-    )
-    .map(|cm| {
-        let mut run = || unsafe {
-            run_forward(
-                cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
-                &mut y,
-            )
-        };
-        let ns = time_forward(&mut run);
-        MeasureModel {
-            compile: cm.compile,
-            ns_per_fwd: ns,
-            out: y.clone(),
-        }
-    }) };
+    let cfast_m = if no_c {
+        None
+    } else {
+        compile_c_model(
+            &c_src,
+            dir,
+            &format!("model_s{}_fast", cfg.s),
+            "c",
+            cc,
+            &["-O3", "-march=native", "-ffast-math", "-shared"],
+            "void kbench(",
+            "void kfinal(",
+        )
+        .map(|cm| {
+            let mut run = || unsafe {
+                run_forward(
+                    cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
+                    &mut y,
+                )
+            };
+            let ns = time_forward(&mut run);
+            MeasureModel {
+                compile: cm.compile,
+                ns_per_fwd: ns,
+                out: y.clone(),
+            }
+        })
+    };
 
     // --- Wukong @parallel, measured LAST so its all-core heat pollutes no single-core column ---
     let wk_par_compiled = if torch_only {
@@ -2668,7 +2702,9 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     row("tokens/sec", &|x| {
         format!("{:.0}", cfg.s as f64 / (x.ns_per_fwd / 1e9))
     });
-    row("GFLOP/s (context)", &|x| format!("{:.1}", flops / x.ns_per_fwd));
+    row("GFLOP/s (context)", &|x| {
+        format!("{:.1}", flops / x.ns_per_fwd)
+    });
     row("compile ms", &|x| {
         if x.compile == Duration::ZERO {
             "eager".into()
@@ -2690,7 +2726,10 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         // Compiled timings + the cold-start compile wall (printed separately so it never pollutes
         // any per-forward number).
         if t.comp_1t.is_some() || t.comp_nt.is_some() {
-            let wall = |ms: &Option<f64>| ms.map(|m| format!("{m:.0} ms")).unwrap_or_else(|| "n/a".into());
+            let wall = |ms: &Option<f64>| {
+                ms.map(|m| format!("{m:.0} ms"))
+                    .unwrap_or_else(|| "n/a".into())
+            };
             // The raw peer telemetry is still echoed when the T1(comp) column was suppressed, so
             // it has to carry the reason HERE too — this line is itself a point where a number is
             // printed, and the whole defect being fixed is a peer time appearing without a
@@ -2735,26 +2774,41 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         }
         // If compilation was attempted (MSVC present) yet a compiled variant produced no time, say
         // so plainly next to the n/a cells.
-        if vcvars_env().is_some() && torch1c_m.is_none() && torchnc_m.is_none() && t.disclosures.is_empty() {
+        if vcvars_env().is_some()
+            && torch1c_m.is_none()
+            && torchnc_m.is_none()
+            && t.disclosures.is_empty()
+        {
             println!("  note: T1(comp)/Tn(comp) n/a — torch.compile produced no timed result");
         }
     }
 
-    let ratio_line = |wuk: &Option<MeasureModel>, peer: &Option<MeasureModel>, who: &str, peer_name: &str| {
-        if let (Some(m), Some(p)) = (wuk, peer) {
-            let r = p.ns_per_fwd / m.ns_per_fwd;
-            println!(
-                "  -> Wukong {who} is {:.2}x {} than {peer_name}",
-                if r >= 1.0 { r } else { 1.0 / r },
-                if r >= 1.0 { "faster" } else { "slower" }
-            );
-        }
-    };
+    let ratio_line =
+        |wuk: &Option<MeasureModel>, peer: &Option<MeasureModel>, who: &str, peer_name: &str| {
+            if let (Some(m), Some(p)) = (wuk, peer) {
+                let r = p.ns_per_fwd / m.ns_per_fwd;
+                println!(
+                    "  -> Wukong {who} is {:.2}x {} than {peer_name}",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" }
+                );
+            }
+        };
     ratio_line(&wk_m, &c_m, "(1 core)", "C (gcc -O3 -march=native)");
     ratio_line(&wk_m, &cpp_m, "(1 core)", "C++ (g++ -O3 -march=native)");
-    ratio_line(&wk_m, &rust_m, "(1 core)", "Rust (rustc -Copt-level=3 -Ctarget-cpu=native)");
+    ratio_line(
+        &wk_m,
+        &rust_m,
+        "(1 core)",
+        "Rust (rustc -Copt-level=3 -Ctarget-cpu=native)",
+    );
     ratio_line(&wk_m, &cfast_m, "(1 core)", "C(fast) (gcc -ffast-math)");
-    ratio_line(&wk_par_m, &cfast_m, "@parallel", "C(fast) (single-threaded)");
+    ratio_line(
+        &wk_par_m,
+        &cfast_m,
+        "@parallel",
+        "C(fast) (single-threaded)",
+    );
     ratio_line(
         &wk_m,
         &torch1_m,
@@ -2826,16 +2880,20 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             match cross_check_rel(&x.out, &z.out) {
                 Err(why) => {
                     println!("  ! cross-check {who}: NOT RUN — {why}");
-                    unpassed.borrow_mut().push(format!("{who}: not run ({why})"));
+                    unpassed
+                        .borrow_mut()
+                        .push(format!("{who}: not run ({why})"));
                 }
                 Ok(rel) if rel > tol => {
                     println!("  ! full-buffer mismatch {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e})");
-                    unpassed
-                        .borrow_mut()
-                        .push(format!("{who}: max|Δ|/max|out| = {rel:.2e} > tol {tol:.0e}"));
+                    unpassed.borrow_mut().push(format!(
+                        "{who}: max|Δ|/max|out| = {rel:.2e} > tol {tol:.0e}"
+                    ));
                 }
                 Ok(rel) => {
-                    println!("  cross-check {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e}) — PASS")
+                    println!(
+                        "  cross-check {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e}) — PASS"
+                    )
                 }
             }
         }
@@ -2850,7 +2908,12 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // The compiled output is cross-checked exactly like the eager SDPA output — vs Wukong at the
     // same 1e-3 magnitude-normalized tolerance (the script already gated it vs eager, so a
     // fast-but-wrong compiled path never reached a timed column in the first place).
-    check(&wk_m, &torch1c_m, "Wukong vs Torch (compiled max-autotune)", 1e-3);
+    check(
+        &wk_m,
+        &torch1c_m,
+        "Wukong vs Torch (compiled max-autotune)",
+        1e-3,
+    );
     // Serial vs @parallel Wukong: every dispatched _parallel kernel is bit-identical to its serial
     // twin (fixed chunking / row-mapped) and the outlined glue loops are deterministic, so this one
     // stays the strict per-element check — it is expected EXACT.
@@ -2872,9 +2935,9 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
                      expected bit-exact",
                     x.out[at], z.out[at]
                 );
-                unpassed
-                    .borrow_mut()
-                    .push(format!("Wukong serial vs @parallel: rel {rel:.2e} at [{at}], expected bit-exact"));
+                unpassed.borrow_mut().push(format!(
+                    "Wukong serial vs @parallel: rel {rel:.2e} at [{at}], expected bit-exact"
+                ));
             } else {
                 println!("  cross-check Wukong serial vs @parallel: BIT-EXACT");
             }
@@ -2919,12 +2982,15 @@ mod tests {
     /// split one. Both halves are asserted here so neither can be dropped without a red test.
     #[test]
     fn the_power_key_ignores_drain_but_never_a_state_change() {
-        let cap = "power: AC+CHARGING (68%) — ALL-CORE CAPPED (~25%): single-core numbers are fine, \
+        let cap =
+            "power: AC+CHARGING (68%) — ALL-CORE CAPPED (~25%): single-core numbers are fine, \
                    every multicore row below is DIRECTIONAL ONLY";
         let full = "power: AC+full (68%) — REPORTABLE";
-        let batt = "power: BATTERY (71%) — NON-REPORTABLE: single-core noisy, all-core meaningless \
+        let batt =
+            "power: BATTERY (71%) — NON-REPORTABLE: single-core noisy, all-core meaningless \
                     (2-4x slow); not comparable to AC runs";
-        let batt2 = "power: BATTERY (70%) — NON-REPORTABLE: single-core noisy, all-core meaningless \
+        let batt2 =
+            "power: BATTERY (70%) — NON-REPORTABLE: single-core noisy, all-core meaningless \
                      (2-4x slow); not comparable to AC runs";
         let desk = "power: AC (desktop, no battery) — REPORTABLE";
 
@@ -2944,7 +3010,13 @@ mod tests {
 
         // The three states are three different machines and must never collide, including the two
         // that differ only after the "AC" prefix.
-        for (a, b) in [(cap, full), (cap, batt), (full, batt), (full, desk), (cap, desk)] {
+        for (a, b) in [
+            (cap, full),
+            (cap, batt),
+            (full, batt),
+            (full, desk),
+            (cap, desk),
+        ] {
             assert_ne!(state_key_of(a), state_key_of(b), "{a}\nvs\n{b}");
         }
 
@@ -2980,7 +3052,10 @@ mod tests {
         let ours: Vec<f32> = (0..1024).map(|i| (i % 97) as f32 * 0.031 - 1.5).collect();
 
         // No peer output at all — the compiled-peer dump-failure path.
-        assert!(cross_check_rel(&ours, &[]).is_err(), "empty peer must not pass");
+        assert!(
+            cross_check_rel(&ours, &[]).is_err(),
+            "empty peer must not pass"
+        );
         // Partial peer output: zip truncates, so this used to read as a perfect match.
         assert!(
             cross_check_rel(&ours, &ours[..4]).is_err(),
@@ -2988,7 +3063,10 @@ mod tests {
         );
         // All-NaN peer: max() discards NaN, so maxerr folded to 0.0.
         let nans = vec![f32::NAN; ours.len()];
-        assert!(cross_check_rel(&ours, &nans).is_err(), "NaN peer must not pass");
+        assert!(
+            cross_check_rel(&ours, &nans).is_err(),
+            "NaN peer must not pass"
+        );
 
         // Real comparisons still produce the same magnitude-normalized number as before.
         assert_eq!(cross_check_rel(&ours, &ours), Ok(0.0));
@@ -3007,30 +3085,67 @@ mod tests {
     /// `cargo test` mirror, so the mismatch is caught before anyone calls through the pointer.
     #[test]
     fn generated_entry_arities_match_the_fn_pointer_types() {
-        let cfg = Cfg { s: 16, d: 64, h: 4, dff: 256 };
+        let cfg = Cfg {
+            s: 16,
+            d: 64,
+            h: 4,
+            dff: 256,
+        };
         let mut interner = Interner::new();
         let entry = interner.intern("kbench");
         let block = build_program(&wk_block(cfg, false), &mut interner).expect("block lowers");
         let par = build_program(&wk_block(cfg, true), &mut interner).expect("@parallel lowers");
         let ln = build_program(&wk_final_ln(cfg), &mut interner).expect("final LN lowers");
-        assert_eq!(entry_param_count(&block, entry), WUK_BLOCK_PARAMS, "WukBlockFn arity");
-        assert_eq!(entry_param_count(&par, entry), WUK_BLOCK_PARAMS, "WukBlockFn arity (@parallel)");
+        assert_eq!(
+            entry_param_count(&block, entry),
+            WUK_BLOCK_PARAMS,
+            "WukBlockFn arity"
+        );
+        assert_eq!(
+            entry_param_count(&par, entry),
+            WUK_BLOCK_PARAMS,
+            "WukBlockFn arity (@parallel)"
+        );
         assert_eq!(entry_param_count(&ln, entry), LN_PARAMS, "LnFn arity");
 
         let c = c_model(cfg);
-        assert_eq!(c_proto_params(&c, "void kbench("), C_BLOCK_PARAMS, "BlockFn arity");
-        assert_eq!(c_proto_params(&c, "void kfinal("), LN_PARAMS, "LnFn arity (C)");
+        assert_eq!(
+            c_proto_params(&c, "void kbench("),
+            C_BLOCK_PARAMS,
+            "BlockFn arity"
+        );
+        assert_eq!(
+            c_proto_params(&c, "void kfinal("),
+            LN_PARAMS,
+            "LnFn arity (C)"
+        );
 
         // The C++ column is the C source through `cpp_from_c`, which must not disturb the prototype.
         let cpp = crate::cpp_from_c(&c);
-        assert_eq!(c_proto_params(&cpp, "void kbench("), C_BLOCK_PARAMS, "BlockFn arity (C++)");
-        assert_eq!(c_proto_params(&cpp, "void kfinal("), LN_PARAMS, "LnFn arity (C++)");
+        assert_eq!(
+            c_proto_params(&cpp, "void kbench("),
+            C_BLOCK_PARAMS,
+            "BlockFn arity (C++)"
+        );
+        assert_eq!(
+            c_proto_params(&cpp, "void kfinal("),
+            LN_PARAMS,
+            "LnFn arity (C++)"
+        );
 
         // The Rust peer is transmuted through the SAME `BlockFn`/`LnFn`, so it needs the same
         // assert — with its own prototype spelling, since `c_proto_params` matches a marker.
         let rs = rust_model(cfg);
-        assert_eq!(c_proto_params(&rs, "fn kbench("), C_BLOCK_PARAMS, "BlockFn arity (Rust)");
-        assert_eq!(c_proto_params(&rs, "fn kfinal("), LN_PARAMS, "LnFn arity (Rust)");
+        assert_eq!(
+            c_proto_params(&rs, "fn kbench("),
+            C_BLOCK_PARAMS,
+            "BlockFn arity (Rust)"
+        );
+        assert_eq!(
+            c_proto_params(&rs, "fn kfinal("),
+            LN_PARAMS,
+            "LnFn arity (Rust)"
+        );
     }
 
     /// Pin the model block's recognized-kernel dispatch sets for BOTH variants. The recognizers
@@ -3039,7 +3154,12 @@ mod tests {
     /// scan catches it. Uses the interp-gate config (small dims) to keep the test fast.
     #[test]
     fn block_dispatch_sets_pinned() {
-        let cfg = Cfg { s: 16, d: 64, h: 4, dff: 256 };
+        let cfg = Cfg {
+            s: 16,
+            d: 64,
+            h: 4,
+            dff: 256,
+        };
         let mut interner = Interner::new();
 
         let serial = compile_wukong(&wk_block(cfg, false), &mut interner)
@@ -3086,8 +3206,8 @@ mod tests {
         // reported S, so the runtime warning and this test cannot disagree about what "the head
         // loop was outlined" means. The reduced config is kept here only for speed — the full
         // 768-wide configs are covered by the identical check inside `bench_model_size`.
-        let (region, rest) =
-            par_region_split(&par.mir).expect("outlined head-region body missing from @parallel MIR");
+        let (region, rest) = par_region_split(&par.mir)
+            .expect("outlined head-region body missing from @parallel MIR");
         let rcalls = kernel_calls(&region);
         for need in PAR_REGION_KERNELS {
             assert!(
@@ -3112,7 +3232,12 @@ mod tests {
     /// other way round — so the fused `c_attn` form is pinned here, not left to review.
     #[test]
     fn torch_peer_uses_the_fused_hf_qkv_projection() {
-        let cfg = Cfg { s: 128, d: 768, h: 12, dff: 3072 };
+        let cfg = Cfg {
+            s: 128,
+            d: 768,
+            h: 12,
+            dff: 3072,
+        };
         let p = Path::new("unused.bin");
         let src = torch_script(cfg, p, p, p, p, true);
         assert!(
@@ -3151,7 +3276,12 @@ mod tests {
     /// one process over identical buffers), because no loop text moved.
     #[test]
     fn rust_model_peer_takes_its_buffers_as_slice_parameters() {
-        let src = rust_model(Cfg { s: 16, d: 64, h: 4, dff: 256 });
+        let src = rust_model(Cfg {
+            s: 16,
+            d: 64,
+            h: 4,
+            dff: 256,
+        });
         assert!(
             src.contains("fn kbody("),
             "rust_model lost its `kbody` shim — its 24 buffers must cross a fn boundary as slices, \
@@ -3162,7 +3292,10 @@ mod tests {
             .expect("rust_model must export kbench");
         let body = &src[entry..];
         let open = body.find(") {").expect("kbench must open a body") + 3;
-        let close = open + body[open..].find("\n}").expect("kbench must close its body");
+        let close = open
+            + body[open..]
+                .find("\n}")
+                .expect("kbench must close its body");
         let entry_body = &body[open..close];
         assert!(
             entry_body.contains("kbody("),

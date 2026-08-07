@@ -56,7 +56,14 @@ fn bias_scalar(x: &[f32], b: &[f32], out: &mut [f32], rows: usize, cols: usize, 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn bias_avx2(x: *const f32, b: *const f32, out: *mut f32, rows: usize, cols: usize, op: i64) {
+unsafe fn bias_avx2(
+    x: *const f32,
+    b: *const f32,
+    out: *mut f32,
+    rows: usize,
+    cols: usize,
+    op: i64,
+) {
     use std::arch::x86_64::*;
     // The 8-lane activation (or `None` for identity / an unrecognized op → the sum unmodified). Resolved
     // once here and dispatched on **once** (the `match` below), so the hot loop carries no per-block

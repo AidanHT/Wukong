@@ -502,11 +502,7 @@ impl AstPrinter<'_> {
                 });
             }
             PatKind::Path(path) => self.line(format!("pat {}", self.path_str(path, "::"))),
-            PatKind::Range {
-                lo,
-                hi,
-                inclusive,
-            } => {
+            PatKind::Range { lo, hi, inclusive } => {
                 self.line(format!("pat range{}", if *inclusive { "=" } else { "" }));
                 self.indented(|p| {
                     p.pattern(lo);

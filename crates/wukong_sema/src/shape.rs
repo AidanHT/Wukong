@@ -58,13 +58,13 @@ fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
     };
     match name {
         "abs" | "round" | "floor" | "ceil" | "trunc" => Some(preserve_ty),
-        "sqrt" | "rsqrt" | "exp" | "log" | "pow" | "exp2" | "log2" | "exp10" | "log10" | "expm1"
-        | "log1p" | "sinh" | "cosh" | "asinh" | "acosh" | "atanh" | "atan" | "tan" | "asin"
-        | "acos" | "atan2" | "hypot" | "cbrt" | "erf" | "sin" | "cos" | "tanh" | "sigmoid"
-        | "silu" | "gelu" | "silu_backward" | "gelu_backward" | "sigmoid_backward"
+        "sqrt" | "rsqrt" | "exp" | "log" | "pow" | "exp2" | "log2" | "exp10" | "log10"
+        | "expm1" | "log1p" | "sinh" | "cosh" | "asinh" | "acosh" | "atanh" | "atan" | "tan"
+        | "asin" | "acos" | "atan2" | "hypot" | "cbrt" | "erf" | "sin" | "cos" | "tanh"
+        | "sigmoid" | "silu" | "gelu" | "silu_backward" | "gelu_backward" | "sigmoid_backward"
         | "tanh_backward" | "elu_backward" | "softplus_backward" | "elu" | "leaky_relu"
-        | "softplus" | "mish" | "selu" | "tanhshrink" | "hardsigmoid" | "hardswish" | "softsign"
-        | "logsigmoid" | "fmax" | "fmin" => Some(float_ty),
+        | "softplus" | "mish" | "selu" | "tanhshrink" | "hardsigmoid" | "hardswish"
+        | "softsign" | "logsigmoid" | "fmax" | "fmin" => Some(float_ty),
         _ => None,
     }
 }
@@ -152,8 +152,10 @@ impl Sema<'_> {
                     // divergence on accepted input. Reject it here. (Tensors are not aggregates by
                     // `is_aggregate_ty`, so tensor intrinsics stay lenient, as do `Unknown` args.)
                     if let Some(bad) = arg_tys.iter().find(|t| {
-                        matches!(t, Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Unit | Ty::Fn { .. })
-                            || self.is_aggregate_ty(t)
+                        matches!(
+                            t,
+                            Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Unit | Ty::Fn { .. }
+                        ) || self.is_aggregate_ty(t)
                     }) {
                         self.error(
                             span,

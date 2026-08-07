@@ -242,7 +242,11 @@ pub fn adamw_step(
     assert_eq!(grad.len(), n, "adamw: grad length");
     assert_eq!(m.len(), n, "adamw: m length");
     assert_eq!(v.len(), n, "adamw: v length");
-    assert!(hp.len() >= hp::LEN, "adamw: hp must have >= {} entries", hp::LEN);
+    assert!(
+        hp.len() >= hp::LEN,
+        "adamw: hp must have >= {} entries",
+        hp::LEN
+    );
 
     let f = g.function("adamw_step", ADAMW_STEP_PTX, "adamw_step")?;
     let mut w_d = g.stream.memcpy_stod(w)?;
@@ -323,7 +327,11 @@ pub fn adamw_step_device(
 pub fn sgd_step(g: &mut Gpu, w: &mut [f32], grad: &[f32], hp: &[f32]) -> Result<(), DriverError> {
     let n = w.len();
     assert_eq!(grad.len(), n, "sgd: grad length");
-    assert!(hp.len() >= hp::LEN, "sgd: hp must have >= {} entries", hp::LEN);
+    assert!(
+        hp.len() >= hp::LEN,
+        "sgd: hp must have >= {} entries",
+        hp::LEN
+    );
 
     let f = g.function("sgd_step", SGD_STEP_PTX, "sgd_step")?;
     let mut w_d = g.stream.memcpy_stod(w)?;
@@ -373,9 +381,15 @@ mod tests {
     /// it fails on any machine, with or without a GPU.
     #[test]
     fn optimizer_ptx_is_ascii() {
-        for (what, ptx) in [("ADAMW_STEP_PTX", ADAMW_STEP_PTX), ("SGD_STEP_PTX", SGD_STEP_PTX)] {
+        for (what, ptx) in [
+            ("ADAMW_STEP_PTX", ADAMW_STEP_PTX),
+            ("SGD_STEP_PTX", SGD_STEP_PTX),
+        ] {
             if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
-                panic!("{what}: PTX line {} is not ASCII (ptxas fatal): {line:?}", i + 1);
+                panic!(
+                    "{what}: PTX line {} is not ASCII (ptxas fatal): {line:?}",
+                    i + 1
+                );
             }
             // Header floor. Both kernels are plain single-rounded f32 (`fma.rn`/`div.rn`/`sqrt.rn`)
             // over a grid-stride loop — nothing above `sm_80` — and PTX is forward-compatible only,
@@ -446,8 +460,15 @@ mod tests {
                 let hpv = make_hp(lr, b1, b2, eps, wd, t);
 
                 // CPU reference: run the emitted AdamW MIR on the interpreter.
-                let mut bufs = vec![cw.clone(), grad.clone(), cm.clone(), cv.clone(), hpv.clone()];
-                let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+                let mut bufs = vec![
+                    cw.clone(),
+                    grad.clone(),
+                    cm.clone(),
+                    cv.clone(),
+                    hpv.clone(),
+                ];
+                let mut views: Vec<&mut [f32]> =
+                    bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
                 run_kernel_f32(&prog, kname, &mut views, &it).expect("cpu adamw run");
                 cw = bufs[0].clone();
                 cm = bufs[2].clone();
@@ -460,7 +481,11 @@ mod tests {
                 assert_close(&format!("adamw w step {t}"), &gw, &cw, 1e-6, 1e-5);
                 assert_close(&format!("adamw m step {t}"), &gm, &cm, 1e-6, 1e-5);
                 assert_close(&format!("adamw v step {t}"), &gv, &cv, 1e-6, 1e-5);
-                for (a, b) in gw.iter().zip(&cw).chain(gm.iter().zip(&cm)).chain(gv.iter().zip(&cv))
+                for (a, b) in gw
+                    .iter()
+                    .zip(&cw)
+                    .chain(gm.iter().zip(&cm))
+                    .chain(gv.iter().zip(&cv))
                 {
                     if a.to_bits() == b.to_bits() {
                         bit_exact += 1;
@@ -530,7 +555,8 @@ mod tests {
             let hp_d = g.stream.memcpy_stod(&hpv).unwrap();
 
             // Exactly-sized: launches normally.
-            adamw_step_device(g, &mut w, &grad, &mut m, &mut v, &hp_d, n).expect("exact n launches");
+            adamw_step_device(g, &mut w, &grad, &mut m, &mut v, &hp_d, n)
+                .expect("exact n launches");
 
             // One element past the end: refused before the launch.
             let e = catch_unwind(AssertUnwindSafe(|| {
@@ -538,7 +564,10 @@ mod tests {
             }))
             .expect_err("n past the buffer length must be refused, not launched");
             let msg = panic_msg(e);
-            assert!(msg.contains("exceeds a parameter buffer"), "unexpected panic: {msg}");
+            assert!(
+                msg.contains("exceeds a parameter buffer"),
+                "unexpected panic: {msg}"
+            );
 
             // A short hyperparameter buffer is refused too (the kernel reads hp[0..hp::LEN)).
             let short = g.stream.memcpy_stod(&hpv[..hp::LEN - 1]).unwrap();
@@ -568,13 +597,20 @@ mod tests {
             let (lr, b1, b2, eps, wd) = (0.05f32, 0.9f32, 0.999f32, 1e-8f32, 0.0f32);
 
             let loss = |w: &[f32]| -> f64 {
-                w.iter().zip(&target).map(|(&a, &b)| (a as f64 - b as f64).powi(2)).sum()
+                w.iter()
+                    .zip(&target)
+                    .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+                    .sum()
             };
             let mut prev = loss(&w);
             let l0 = prev;
             for t in 1..=200i32 {
                 // grad of sum (w-t)^2 = 2(w-t)
-                let grad: Vec<f32> = w.iter().zip(&target).map(|(&a, &b)| 2.0 * (a - b)).collect();
+                let grad: Vec<f32> = w
+                    .iter()
+                    .zip(&target)
+                    .map(|(&a, &b)| 2.0 * (a - b))
+                    .collect();
                 let hpv = make_hp(lr, b1, b2, eps, wd, t);
                 adamw_step(g, &mut w, &grad, &mut m, &mut v, &hpv).expect("gpu adamw");
                 let cur = loss(&w);
@@ -585,7 +621,10 @@ mod tests {
                 prev = cur;
             }
             eprintln!("gpu adamw: loss {l0:.4e} -> {prev:.4e} over 200 steps");
-            assert!(prev < l0 * 1e-3, "expected strong convergence; {prev} vs {l0}");
+            assert!(
+                prev < l0 * 1e-3,
+                "expected strong convergence; {prev} vs {l0}"
+            );
         });
     }
 }

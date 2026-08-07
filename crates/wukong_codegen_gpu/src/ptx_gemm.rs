@@ -173,7 +173,11 @@ mod tests {
         if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
             panic!("gemm_rb PTX must be pure ASCII -- line {}: {line}", i + 1);
         }
-        assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "unbalanced braces");
+        assert_eq!(
+            ptx.matches('{').count(),
+            ptx.matches('}').count(),
+            "unbalanced braces"
+        );
         for n in ["gemm_nt_rb", "gemm_nn_rb"] {
             assert_eq!(
                 ptx.matches(&format!(".visible .entry {n}(")).count(),
@@ -191,7 +195,10 @@ mod tests {
     #[test]
     fn gemm_rb_module_opens_at_the_sm80_floor() {
         let ptx = gemm_rb_ptx();
-        assert!(ptx.starts_with(HDR_SM80), "gemm_rb must open with ptx_target::HDR_SM80");
+        assert!(
+            ptx.starts_with(HDR_SM80),
+            "gemm_rb must open with ptx_target::HDR_SM80"
+        );
         assert!(
             !ptx.contains(crate::ptx_target::TARGET_SM89),
             "gemm_rb emits no Ada-only instruction, so it must not be tagged sm_89"

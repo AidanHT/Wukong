@@ -971,7 +971,8 @@ mod tests {
         optimize(&mut prog, 2);
         let main = find_fn(&prog, &interner, "main");
         assert!(
-            !main.blocks
+            !main
+                .blocks
                 .iter()
                 .flat_map(|b| &b.insts)
                 .any(|i| matches!(i.op, wukong_mir::Op::Call { .. })),
@@ -1183,7 +1184,6 @@ mod tests {
         assert_eq!(run_main_opt(src, 0), 15);
     }
 
-
     #[test]
     fn mem2reg_ptr_promotion_keeps_the_pointee_in_memory() {
         // Promoting the *pointer* must not promote what it points at. `p` starts at `&a` and
@@ -1220,7 +1220,10 @@ mod tests {
         let (mut prog, mut interner) = lower(src);
         optimize(&mut prog, 2);
         let (slots, _) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main"));
-        assert_eq!(slots, 1, "a late-initialized pointer slot must stay in memory");
+        assert_eq!(
+            slots, 1,
+            "a late-initialized pointer slot must stay in memory"
+        );
         for f in &prog.funcs {
             assert!(wukong_mir::verify::verify_function(f).is_empty());
         }
@@ -1228,5 +1231,4 @@ mod tests {
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
         assert_eq!(run_main_opt(src, 0), 15);
     }
-
 }

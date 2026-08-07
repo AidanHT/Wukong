@@ -119,7 +119,9 @@ pub fn report(files: &[PathBuf]) {
     }
 
     if profs.is_empty() {
-        println!("compile-profile: no corpus file compiled to object (measured 0, skipped {skipped})");
+        println!(
+            "compile-profile: no corpus file compiled to object (measured 0, skipped {skipped})"
+        );
         return;
     }
 
@@ -144,7 +146,10 @@ pub fn report(files: &[PathBuf]) {
          corpus: {} file(s) compiled to object, {skipped} skipped; -O{LEVEL}; best-of-N per stage.\n",
         profs.len()
     );
-    println!("{:<14} {:>11} {:>7}   {}", "stage", "total", "%", "throughput (work / stage-time)");
+    println!(
+        "{:<14} {:>11} {:>7}   {}",
+        "stage", "total", "%", "throughput (work / stage-time)"
+    );
     println!("{}", "-".repeat(72));
     for (i, s) in Stage::ALL.iter().enumerate() {
         let t = stage_tot[i];
@@ -188,8 +193,19 @@ pub fn report(files: &[PathBuf]) {
     );
     println!(
         "{:<24} {:>7} {:>6} {:>6} {:>7} {:>7}  {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}",
-        "file", "bytes", "toks", "ast", "mirops", "obj", "lex", "parse", "sema", "mir", "opt",
-        "cg+obj", "total"
+        "file",
+        "bytes",
+        "toks",
+        "ast",
+        "mirops",
+        "obj",
+        "lex",
+        "parse",
+        "sema",
+        "mir",
+        "opt",
+        "cg+obj",
+        "total"
     );
     println!("{}", "-".repeat(139));
     for p in &heavy[..n] {
@@ -380,7 +396,9 @@ pub fn spawn_report(files: &[PathBuf]) {
         chosen.push((name, wk, src));
     }
     if chosen.is_empty() {
-        eprintln!("spawn-overhead: no corpus file compiled to object in-process — nothing to compare.");
+        eprintln!(
+            "spawn-overhead: no corpus file compiled to object in-process — nothing to compare."
+        );
         return;
     }
 
@@ -476,7 +494,9 @@ pub fn spawn_report(files: &[PathBuf]) {
          row's\n  spawn columns are warm-image first-calls, so they are NOT cold-start numbers."
     );
     if warm_rows.is_empty() {
-        eprintln!("spawn-overhead: every chosen file failed to compile under the driver — no rows.");
+        eprintln!(
+            "spawn-overhead: every chosen file failed to compile under the driver — no rows."
+        );
         return;
     }
 
@@ -560,7 +580,11 @@ fn spawn_compile(mc: &Path, wk: &Path, workdir: &Path, emit: &str, out: &Path) -
 }
 
 fn default_wukongc() -> PathBuf {
-    let exe = if cfg!(windows) { "wukongc.exe" } else { "wukongc" };
+    let exe = if cfg!(windows) {
+        "wukongc.exe"
+    } else {
+        "wukongc"
+    };
     PathBuf::from("target/release").join(exe)
 }
 

@@ -37,9 +37,9 @@
 //! whose kernel evaluates an f32 polynomial have none, and are FD-gated only).
 //! A wrong gradient is a miscompile — it must be fixed before any throughput counts.
 
+use std::collections::{HashMap, HashSet};
 use wukong_mir::{BasicBlock, BinOp, Function, Inst, MirType, Op, Terminator, ValueId};
 use wukong_span::{Interner, Symbol};
-use std::collections::{HashMap, HashSet};
 
 pub mod optim;
 mod tape;
@@ -432,9 +432,9 @@ impl<'a> Vjp<'a> {
             return Ok((ptr, None));
         }
         match self.def_op.get(&ptr) {
-            Some(Op::Gep { ptr: base, index, .. }) if self.fwd.params.contains(base) => {
-                Ok((*base, Some(self.remap(*index))))
-            }
+            Some(Op::Gep {
+                ptr: base, index, ..
+            }) if self.fwd.params.contains(base) => Ok((*base, Some(self.remap(*index)))),
             _ => Err(format!(
                 "autodiff: cannot route gradient for load pointer v{} (not a parameter or a \
                  one-level gep of a parameter)",

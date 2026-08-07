@@ -147,7 +147,10 @@ fn lexer_and_parser_diagnostics_are_reachable() {
         let path = dir.join(format!("probe_{code}.wk"));
         std::fs::write(&path, src).expect("write probe source");
         let (ok, stderr) = compile_json(&path);
-        assert!(!ok, "{code}: the probe source compiled successfully:\n{src}");
+        assert!(
+            !ok,
+            "{code}: the probe source compiled successfully:\n{src}"
+        );
         assert!(
             stderr.contains(&format!("\"code\":\"{code}\"")),
             "{code}: the probe source no longer reaches this diagnostic. Source:\n{src}\nGot:\n{stderr}"

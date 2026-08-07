@@ -313,7 +313,11 @@ impl AliasInfo {
         // an `Unknown` pointer and writable by any callee. A function with no `alloca` has nothing
         // to escape, so the whole scan is skipped — worth checking because it is a third of the
         // analysis and this runs on the compiler's hot path.
-        if !info.facts.iter().any(|fa| matches!(fa.prov, Prov::Alloca(_))) {
+        if !info
+            .facts
+            .iter()
+            .any(|fa| matches!(fa.prov, Prov::Alloca(_)))
+        {
             return info;
         }
         // Provenance never settled (see `MAX_PROV_ROUNDS`). Some `gep` may still be carrying a
@@ -385,10 +389,7 @@ impl AliasInfo {
     /// known here, so two disjoint constant offsets off a common base still answer `true` — use
     /// [`AliasInfo::may_alias_sized`] when the widths are available.
     pub fn may_alias(&self, a: ValueId, b: ValueId) -> bool {
-        self.may_alias_access(
-            Access { v: a, size: None },
-            Access { v: b, size: None },
-        )
+        self.may_alias_access(Access { v: a, size: None }, Access { v: b, size: None })
     }
 
     /// [`AliasInfo::may_alias`] refined by the byte width of each access, which lets disjoint

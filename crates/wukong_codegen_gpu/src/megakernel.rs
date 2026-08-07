@@ -76,7 +76,10 @@ pub fn try_run(
         return decline(format_args!("ineligible: {}", plan.reason));
     }
     let Some(entry_fn) = program.function(entry) else {
-        return decline(format_args!("no entry function `{}`", interner.resolve(entry)));
+        return decline(format_args!(
+            "no entry function `{}`",
+            interner.resolve(entry)
+        ));
     };
     let frame_bytes = lower::mega_frame_bytes(entry_fn);
 
@@ -116,7 +119,10 @@ fn launch_mega(
     let f = g.function(key, ptx, MEGA_KERNEL_NAME).map_err(|e| {
         let p = std::env::temp_dir().join(format!("{key}.ptx"));
         let _ = std::fs::write(&p, ptx);
-        format!("gpu-mega JIT/load failed: {e:?}\n  (PTX written to {})", p.display())
+        format!(
+            "gpu-mega JIT/load failed: {e:?}\n  (PTX written to {})",
+            p.display()
+        )
     })?;
 
     let host = lower::new_ctx_host();
@@ -153,8 +159,8 @@ fn launch_mega(
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
-    use wukong_span::SourceMap;
     use std::path::PathBuf;
+    use wukong_span::SourceMap;
 
     fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
         let mut sm = SourceMap::new();
@@ -164,7 +170,8 @@ mod tests {
             return None;
         }
         let mut interner = Interner::new();
-        let (module, pd) = wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        let (module, pd) =
+            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
         if pd.iter().any(|d| d.is_error()) {
             return None;
         }
@@ -284,7 +291,7 @@ mod tests {
                 let gpu = try_run(&program, entry, &interner);
                 match (&cpu, &gpu) {
                     (Err(_), Ok(None)) | (Ok(_), Ok(None)) => {} // declined at launch: not a miscompile
-                    (Err(_), Err(_)) => {}                        // both error (e.g. assert) -> agree
+                    (Err(_), Err(_)) => {} // both error (e.g. assert) -> agree
                     (Ok((ce, co)), Ok(Some((ge, go)))) => {
                         ran += 1;
                         if ce != ge || !outputs_match(go, co) {
@@ -314,7 +321,10 @@ mod tests {
             "\n=== megakernel: {ran} ran / {eligible} eligible program-configs match the interp oracle ===",
         );
         if !faults.is_empty() {
-            eprintln!("-- driver FAULTS ({}, root causes only — no cascade):", faults.len());
+            eprintln!(
+                "-- driver FAULTS ({}, root causes only — no cascade):",
+                faults.len()
+            );
             for f in &faults {
                 eprintln!("   {f}");
             }
@@ -341,7 +351,10 @@ mod tests {
             lost.len(),
             faults.join("\n")
         );
-        assert!(ran > 0, "no eligible program ran on the megakernel — pipeline broken");
+        assert!(
+            ran > 0,
+            "no eligible program ran on the megakernel — pipeline broken"
+        );
         assert!(
             ran >= MEGA_CORPUS_COVERAGE_FLOOR,
             "megakernel corpus coverage regressed below the recorded floor: {ran} program-configs \
@@ -407,9 +420,14 @@ fn main() -> i32 {{
             plan.reason
         );
         assert!(
-            plan.coop_ops.iter().any(|c| c.name == "wukong_vmath_f32_parallel"),
+            plan.coop_ops
+                .iter()
+                .any(|c| c.name == "wukong_vmath_f32_parallel"),
             "expected the @parallel vmath twin, got {:?}",
-            plan.coop_ops.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            plan.coop_ops
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
         );
         let oracle = wukong_interp::run_with_output(&program, entry, &interner).expect("interp");
         if crate::gpu::gpu().is_none() {
@@ -495,13 +513,24 @@ fn main() -> i32 {{
         );
 
         // Correctness cross-check FIRST: mega and single-thread must agree (and with the oracle).
-        let mega0 = try_run(&program, entry, &interner).expect("mega run").expect("mega eligible");
+        let mega0 = try_run(&program, entry, &interner)
+            .expect("mega run")
+            .expect("mega eligible");
         let single0 = lower::jit_run_single(&program, entry, &interner).expect("single run");
         let oracle = wukong_interp::run_with_output(&program, entry, &interner).expect("interp");
         assert_eq!(mega0.0, single0.0, "exit codes differ");
-        assert!(outputs_match(&mega0.1, &single0.1), "mega vs single output differs");
-        assert!(outputs_match(&mega0.1, &oracle.1), "mega vs oracle output differs");
-        eprintln!("checksum (mega==single==oracle): {}", String::from_utf8_lossy(&mega0.1).trim());
+        assert!(
+            outputs_match(&mega0.1, &single0.1),
+            "mega vs single output differs"
+        );
+        assert!(
+            outputs_match(&mega0.1, &oracle.1),
+            "mega vs oracle output differs"
+        );
+        eprintln!(
+            "checksum (mega==single==oracle): {}",
+            String::from_utf8_lossy(&mega0.1).trim()
+        );
 
         // Warm the JIT/module caches for both paths, then best-of-N (smallest = least contention).
         let _ = try_run(&program, entry, &interner);
@@ -571,15 +600,23 @@ fn main() -> i32 {{
         let (program, mut interner) = build(&src, 2).expect("frontend ok");
         let entry = interner.intern("main");
         if !crate::fusion::analyze(&program, entry, &interner).eligible {
-            crate::diff::skip_or_fail("mega_vs_single_vmath", "the bench program is not megakernel-eligible");
+            crate::diff::skip_or_fail(
+                "mega_vs_single_vmath",
+                "the bench program is not megakernel-eligible",
+            );
             return;
         }
-        let mega0 = try_run(&program, entry, &interner).expect("mega").expect("eligible");
+        let mega0 = try_run(&program, entry, &interner)
+            .expect("mega")
+            .expect("eligible");
         let single0 = lower::jit_run_single(&program, entry, &interner).expect("single");
         let oracle = wukong_interp::run_with_output(&program, entry, &interner).expect("interp");
         assert!(outputs_match(&mega0.1, &single0.1), "mega vs single differ");
         assert!(outputs_match(&mega0.1, &oracle.1), "mega vs oracle differ");
-        eprintln!("checksum (mega==single==oracle): {}", String::from_utf8_lossy(&mega0.1).trim());
+        eprintln!(
+            "checksum (mega==single==oracle): {}",
+            String::from_utf8_lossy(&mega0.1).trim()
+        );
 
         let _ = try_run(&program, entry, &interner);
         let _ = lower::jit_run_single(&program, entry, &interner);
@@ -658,15 +695,23 @@ fn main() -> i32 {{
         let (program, mut interner) = build(&src, 2).expect("frontend ok");
         let entry = interner.intern("main");
         if !crate::fusion::analyze(&program, entry, &interner).eligible {
-            crate::diff::skip_or_fail("mega_vs_single_gemm", "the bench program is not megakernel-eligible");
+            crate::diff::skip_or_fail(
+                "mega_vs_single_gemm",
+                "the bench program is not megakernel-eligible",
+            );
             return;
         }
-        let mega0 = try_run(&program, entry, &interner).expect("mega").expect("eligible");
+        let mega0 = try_run(&program, entry, &interner)
+            .expect("mega")
+            .expect("eligible");
         let single0 = lower::jit_run_single(&program, entry, &interner).expect("single");
         let oracle = wukong_interp::run_with_output(&program, entry, &interner).expect("interp");
         assert!(outputs_match(&mega0.1, &single0.1), "mega vs single differ");
         assert!(outputs_match(&mega0.1, &oracle.1), "mega vs oracle differ");
-        eprintln!("checksum (mega==single==oracle): {}", String::from_utf8_lossy(&mega0.1).trim());
+        eprintln!(
+            "checksum (mega==single==oracle): {}",
+            String::from_utf8_lossy(&mega0.1).trim()
+        );
 
         let _ = try_run(&program, entry, &interner);
         let _ = lower::jit_run_single(&program, entry, &interner);
@@ -769,11 +814,17 @@ fn main() -> i32 {{
 
         // Correctness: megakernel computes the whole chain (acc=REPEAT*N); each chain element computes
         // N; the two agree when the chain elements are summed -> the megakernel fused them losslessly.
-        let mega0 = try_run(&loop_p, loop_e, &li).expect("mega").expect("eligible");
+        let mega0 = try_run(&loop_p, loop_e, &li)
+            .expect("mega")
+            .expect("eligible");
         let one0 = try_run(&one_p, one_e, &oi).expect("one").expect("eligible");
         let mega_val: i64 = String::from_utf8_lossy(&mega0.1).trim().parse().unwrap();
         let one_val: i64 = String::from_utf8_lossy(&one0.1).trim().parse().unwrap();
-        assert_eq!(mega_val, one_val * REPEAT as i64, "mega chain != sum of per-op results");
+        assert_eq!(
+            mega_val,
+            one_val * REPEAT as i64,
+            "mega chain != sum of per-op results"
+        );
         eprintln!("checksum: megakernel acc={mega_val} == {REPEAT} * per-op {one_val}");
 
         // Warm both, then best-of-N.

@@ -272,7 +272,10 @@ fn fp8_pipe_entry(
     };
     let a_chunks = bm * bk / (threads * 16); // 16-byte (16×e4m3) cp.async chunks
     let b_chunks = bn * bk / (threads * 16);
-    assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk/thread");
+    assert!(
+        a_chunks >= 1 && b_chunks >= 1,
+        "{name}: tile too small for one 128-bit chunk/thread"
+    );
     let bk_chunks = bk / 16;
     let row_shift = bk_chunks.trailing_zeros();
     let col_mask = bk_chunks - 1;
@@ -284,7 +287,11 @@ fn fp8_pipe_entry(
     let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
     // Fused-residual: a `residual[M,N]` (f32) added to the post-activation accumulators before the store,
     // out = act(A·Bᵀ + bias) + residual — the fp8 transformer down-proj / output-proj (cf. entry_mma_pipe).
-    let resid_param = if residual { ",\n    .param .u64 pResid" } else { "" };
+    let resid_param = if residual {
+        ",\n    .param .u64 pResid"
+    } else {
+        ""
+    };
     let mut s = String::new();
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
@@ -356,8 +363,13 @@ fn fp8_pipe_entry(
     }
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += "    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg4,%tg,2;\n    shl.b32 %tg2,%tg,1;\n";
-    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
-    s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
+    s += &format!(
+        "    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n",
+        warps_n - 1
+    );
+    s += &format!(
+        "    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n"
+    );
     // per-lane SMEM byte offset shared by A and B fragment loads: grp·ldp + tg·4 (k byte offset).
     s += &format!("    mul.lo.s32 %laneoff,%grp,{ldp};\n    add.u32 %laneoff,%laneoff,%tg4;\n");
     for mi in 0..tm {
@@ -399,14 +411,22 @@ fn fp8_pipe_entry(
 
     for st in 0..(stages - 1) {
         s += &format!("    mov.u32 %kcol,{};\n", st * bk);
-        s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", st * tile_a, st * tile_b);
+        s += &format!(
+            "    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n",
+            st * tile_a,
+            st * tile_b
+        );
         s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
         stage("%baseRow", "%A", &sym_a, 0, "%bufwA", a_chunks, &mut s);
         stage("%baseCol", "%B", &sym_b, off_b, "%bufwB", b_chunks, &mut s);
         s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
     }
     s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcB,0;\n";
-    s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", (stages - 1) * tile_a, (stages - 1) * tile_b);
+    s += &format!(
+        "    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n",
+        (stages - 1) * tile_a,
+        (stages - 1) * tile_b
+    );
     s += "    mov.u32 %kt,0;\n";
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
     s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
@@ -420,7 +440,10 @@ fn fp8_pipe_entry(
     for ks in 0..nks {
         s += &format!("    mov.u32 %aptr,{sym_a};\n    add.u32 %aptr,%aptr,%bufcA;\n");
         s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    add.u32 %aptr,%aptr,%tmp;\n");
-        s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
+        s += &format!(
+            "    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n",
+            ks * 32
+        );
         for mi in 0..tm {
             let base = mi * 16 * ldp; // m16-block row offset (bytes, padded stride)
             let r8 = 8 * ldp;
@@ -433,7 +456,10 @@ fn fp8_pipe_entry(
         s += &fp8_slab_add("%bptr", off_b);
         s += "    add.u32 %bptr,%bptr,%bufcB;\n";
         s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    add.u32 %bptr,%bptr,%tmp;\n");
-        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+        s += &format!(
+            "    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n",
+            ks * 32
+        );
         for ni in 0..tn {
             let base = ni * 8 * ldp;
             s += &format!("    ld.shared.b32 %b{ni}_0,[%bptr+{}];\n", base);
@@ -444,7 +470,9 @@ fn fp8_pipe_entry(
                 let d = fp8_veclist(&format!("d{mi}_{ni}_"), 4);
                 let a = fp8_veclist(&format!("a{mi}_"), 4);
                 let b = fp8_veclist(&format!("b{ni}_"), 2);
-                s += &format!("    mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {d},{a},{b},{d};\n");
+                s += &format!(
+                    "    mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {d},{a},{b},{d};\n"
+                );
             }
         }
     }
@@ -543,14 +571,21 @@ fn fp8_gate_entry(
     );
     let a_chunks = bm * bk / (threads * 16);
     let b_chunks = bn * bk / (threads * 16);
-    assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk/thread");
+    assert!(
+        a_chunks >= 1 && b_chunks >= 1,
+        "{name}: tile too small for one 128-bit chunk/thread"
+    );
     let bk_chunks = bk / 16;
     let row_shift = bk_chunks.trailing_zeros();
     let col_mask = bk_chunks - 1;
     let wn_shift = warps_n.trailing_zeros();
     let (wmr, wnc) = (bm / warps_m, bn / warps_n);
 
-    let bias_param = if bias { ",\n    .param .u64 pBiasG,\n    .param .u64 pBiasU" } else { "" };
+    let bias_param = if bias {
+        ",\n    .param .u64 pBiasG,\n    .param .u64 pBiasU"
+    } else {
+        ""
+    };
     let mut s = String::new();
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pBg,\n    .param .u64 pBu,\n    .param .u64 pC{bias_param}\n)\n{{\n"
@@ -612,8 +647,13 @@ fn fp8_gate_entry(
     }
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += "    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg4,%tg,2;\n    shl.b32 %tg2,%tg,1;\n";
-    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
-    s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
+    s += &format!(
+        "    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n",
+        warps_n - 1
+    );
+    s += &format!(
+        "    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n"
+    );
     s += &format!("    mul.lo.s32 %laneoff,%grp,{ldp};\n    add.u32 %laneoff,%laneoff,%tg4;\n");
     for mi in 0..tm {
         for ni in 0..tn {
@@ -623,7 +663,12 @@ fn fp8_gate_entry(
         }
     }
 
-    let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+    let stage = |g_base: &str,
+                 gbase_ptr: &str,
+                 smem: &str,
+                 bufoff: &str,
+                 chunks: usize,
+                 s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
                 *s += "    mov.u32 %e,%tix;\n";
@@ -641,22 +686,74 @@ fn fp8_gate_entry(
 
     for st in 0..(stages - 1) {
         s += &format!("    mov.u32 %kcol,{};\n", st * bk);
-        s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n", st * tile_a, st * tile_b, st * tile_b);
+        s += &format!(
+            "    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n",
+            st * tile_a,
+            st * tile_b,
+            st * tile_b
+        );
         s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
-        stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-        stage("%baseCol", "%Bg", &format!("smemBg_{name}"), "%bufwBg", b_chunks, &mut s);
-        stage("%baseCol", "%Bu", &format!("smemBu_{name}"), "%bufwBu", b_chunks, &mut s);
+        stage(
+            "%baseRow",
+            "%A",
+            &format!("smemA_{name}"),
+            "%bufwA",
+            a_chunks,
+            &mut s,
+        );
+        stage(
+            "%baseCol",
+            "%Bg",
+            &format!("smemBg_{name}"),
+            "%bufwBg",
+            b_chunks,
+            &mut s,
+        );
+        stage(
+            "%baseCol",
+            "%Bu",
+            &format!("smemBu_{name}"),
+            "%bufwBu",
+            b_chunks,
+            &mut s,
+        );
         s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
     }
     s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcBg,0;\n    mov.u32 %bufcBu,0;\n";
-    s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n", (stages - 1) * tile_a, (stages - 1) * tile_b, (stages - 1) * tile_b);
+    s += &format!(
+        "    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n",
+        (stages - 1) * tile_a,
+        (stages - 1) * tile_b,
+        (stages - 1) * tile_b
+    );
     s += "    mov.u32 %kt,0;\n";
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
     s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
     s += &format!("    add.u32 %kcol,%kt,{};\n    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra NOPRE_{name};\n", (stages - 1) * bk);
-    stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-    stage("%baseCol", "%Bg", &format!("smemBg_{name}"), "%bufwBg", b_chunks, &mut s);
-    stage("%baseCol", "%Bu", &format!("smemBu_{name}"), "%bufwBu", b_chunks, &mut s);
+    stage(
+        "%baseRow",
+        "%A",
+        &format!("smemA_{name}"),
+        "%bufwA",
+        a_chunks,
+        &mut s,
+    );
+    stage(
+        "%baseCol",
+        "%Bg",
+        &format!("smemBg_{name}"),
+        "%bufwBg",
+        b_chunks,
+        &mut s,
+    );
+    stage(
+        "%baseCol",
+        "%Bu",
+        &format!("smemBu_{name}"),
+        "%bufwBu",
+        b_chunks,
+        &mut s,
+    );
     s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
 
     // Compute: load A fragments ONCE, preload BOTH B tiles (Wg, Wu), then interleave the independent
@@ -664,7 +761,10 @@ fn fp8_gate_entry(
     for ks in 0..nks {
         s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
         s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    add.u32 %aptr,%aptr,%tmp;\n");
-        s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
+        s += &format!(
+            "    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n",
+            ks * 32
+        );
         for mi in 0..tm {
             let base = mi * 16 * ldp;
             let r8 = 8 * ldp;
@@ -675,7 +775,10 @@ fn fp8_gate_entry(
         }
         s += &format!("    mov.u32 %bptr,smemBg_{name};\n    add.u32 %bptr,%bptr,%bufcBg;\n");
         s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    add.u32 %bptr,%bptr,%tmp;\n");
-        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+        s += &format!(
+            "    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n",
+            ks * 32
+        );
         for ni in 0..tn {
             let base = ni * 8 * ldp;
             s += &format!("    ld.shared.b32 %bg{ni}_0,[%bptr+{}];\n", base);
@@ -683,7 +786,10 @@ fn fp8_gate_entry(
         }
         s += &format!("    mov.u32 %bptr,smemBu_{name};\n    add.u32 %bptr,%bptr,%bufcBu;\n");
         s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    add.u32 %bptr,%bptr,%tmp;\n");
-        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+        s += &format!(
+            "    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n",
+            ks * 32
+        );
         for ni in 0..tn {
             let base = ni * 8 * ldp;
             s += &format!("    ld.shared.b32 %bu{ni}_0,[%bptr+{}];\n", base);
@@ -842,7 +948,19 @@ pub fn fp8_pipe_ptx() -> &'static str {
             ("gate_silu_bias", Act::Silu, true),
             ("gate_gelu_bias", Act::Gelu, true),
         ] {
-            m += &fp8_gate_entry(&format!("fp8_gemm_pipe_{suffix}"), 128, 64, 64, 2, 4, 2, 16, 16, act, gbias);
+            m += &fp8_gate_entry(
+                &format!("fp8_gemm_pipe_{suffix}"),
+                128,
+                64,
+                64,
+                2,
+                4,
+                2,
+                16,
+                16,
+                act,
+                gbias,
+            );
         }
         m
     })
@@ -899,7 +1017,8 @@ pub fn fp8_pipe_cfg_ptx(
 /// Best at 4096³; for M,N≤2048 the 3-stage [`fp8_pipe_w64_s3_ptx`] adds ~10–19 pts.
 pub fn fp8_pipe_w64_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| fp8_pipe_cfg_ptx(FP8_PIPE_BM, FP8_PIPE_BN, 64, 2, 2, 2, FP8_PIPE_RASTER)).as_str()
+    PTX.get_or_init(|| fp8_pipe_cfg_ptx(FP8_PIPE_BM, FP8_PIPE_BN, 64, 2, 2, 2, FP8_PIPE_RASTER))
+        .as_str()
 }
 
 /// 3-stage (`BK=32`) sibling of [`fp8_pipe_w64_ptx`] — the deeper `cp.async` pipeline that wins at the
@@ -908,7 +1027,8 @@ pub fn fp8_pipe_w64_ptx() -> &'static str {
 /// only for M,N≤2048. Same `fp8_gemm_pipe` entry / 128-thread launch; same bit-identical K-accumulation.
 pub fn fp8_pipe_w64_s3_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| fp8_pipe_cfg_ptx(FP8_PIPE_BM, FP8_PIPE_BN, 32, 2, 2, 3, FP8_PIPE_RASTER)).as_str()
+    PTX.get_or_init(|| fp8_pipe_cfg_ptx(FP8_PIPE_BM, FP8_PIPE_BN, 32, 2, 2, 3, FP8_PIPE_RASTER))
+        .as_str()
 }
 
 /// One row of the **fp8 variable-stage grid** — the family's `(tile, warps, depth)` point, its stable
@@ -984,13 +1104,67 @@ impl Fp8StageCfg {
 /// transfers 100% is the PTX: this is the exact module an H100 will run, validated on the metal at $0.
 pub const FP8_DEEP_VARIANTS: &[Fp8StageCfg] = &[
     // 128x128 CTA on the 64x64 warp tile (wm=wn=2, 128 threads) — the measured fp8 dispatch winner.
-    Fp8StageCfg { name: "fp8_deep_128_s2", bm: 128, bn: 128, bk: FP8_PIPE_BK, wm: 2, wn: 2, stages: 2, raster: FP8_PIPE_RASTER }, // 40 KiB static
-    Fp8StageCfg { name: "fp8_deep_128_s3", bm: 128, bn: 128, bk: FP8_PIPE_BK, wm: 2, wn: 2, stages: 3, raster: FP8_PIPE_RASTER }, // 60 KiB dynamic
-    Fp8StageCfg { name: "fp8_deep_128_s4", bm: 128, bn: 128, bk: FP8_PIPE_BK, wm: 2, wn: 2, stages: 4, raster: FP8_PIPE_RASTER }, // 80 KiB dynamic
+    Fp8StageCfg {
+        name: "fp8_deep_128_s2",
+        bm: 128,
+        bn: 128,
+        bk: FP8_PIPE_BK,
+        wm: 2,
+        wn: 2,
+        stages: 2,
+        raster: FP8_PIPE_RASTER,
+    }, // 40 KiB static
+    Fp8StageCfg {
+        name: "fp8_deep_128_s3",
+        bm: 128,
+        bn: 128,
+        bk: FP8_PIPE_BK,
+        wm: 2,
+        wn: 2,
+        stages: 3,
+        raster: FP8_PIPE_RASTER,
+    }, // 60 KiB dynamic
+    Fp8StageCfg {
+        name: "fp8_deep_128_s4",
+        bm: 128,
+        bn: 128,
+        bk: FP8_PIPE_BK,
+        wm: 2,
+        wn: 2,
+        stages: 4,
+        raster: FP8_PIPE_RASTER,
+    }, // 80 KiB dynamic
     // 64x128 small/mid-M tile (wm=2, wn=4, 256 threads) — half the A ring, so it reaches s6 in budget.
-    Fp8StageCfg { name: "fp8_deep_m64_s2", bm: FP8_PIPE_M64_BM, bn: 128, bk: FP8_PIPE_BK, wm: FP8_PIPE_WM, wn: FP8_PIPE_WN, stages: 2, raster: FP8_PIPE_RASTER }, // 30 KiB static
-    Fp8StageCfg { name: "fp8_deep_m64_s4", bm: FP8_PIPE_M64_BM, bn: 128, bk: FP8_PIPE_BK, wm: FP8_PIPE_WM, wn: FP8_PIPE_WN, stages: 4, raster: FP8_PIPE_RASTER }, // 60 KiB dynamic
-    Fp8StageCfg { name: "fp8_deep_m64_s6", bm: FP8_PIPE_M64_BM, bn: 128, bk: FP8_PIPE_BK, wm: FP8_PIPE_WM, wn: FP8_PIPE_WN, stages: 6, raster: FP8_PIPE_RASTER }, // 90 KiB dynamic
+    Fp8StageCfg {
+        name: "fp8_deep_m64_s2",
+        bm: FP8_PIPE_M64_BM,
+        bn: 128,
+        bk: FP8_PIPE_BK,
+        wm: FP8_PIPE_WM,
+        wn: FP8_PIPE_WN,
+        stages: 2,
+        raster: FP8_PIPE_RASTER,
+    }, // 30 KiB static
+    Fp8StageCfg {
+        name: "fp8_deep_m64_s4",
+        bm: FP8_PIPE_M64_BM,
+        bn: 128,
+        bk: FP8_PIPE_BK,
+        wm: FP8_PIPE_WM,
+        wn: FP8_PIPE_WN,
+        stages: 4,
+        raster: FP8_PIPE_RASTER,
+    }, // 60 KiB dynamic
+    Fp8StageCfg {
+        name: "fp8_deep_m64_s6",
+        bm: FP8_PIPE_M64_BM,
+        bn: 128,
+        bk: FP8_PIPE_BK,
+        wm: FP8_PIPE_WM,
+        wn: FP8_PIPE_WN,
+        stages: 6,
+        raster: FP8_PIPE_RASTER,
+    }, // 90 KiB dynamic
 ];
 
 /// Look up a [`FP8_DEEP_VARIANTS`] row by entry name — a wrong name is a loud panic at the call site,
@@ -1308,7 +1482,10 @@ mod tests {
             ("fp8_gemm_pipe", fp8_pipe_ptx().to_string()),
             ("fp8_gemm_pipe(w64)", fp8_pipe_w64_ptx().to_string()),
             ("fp8_gemm_pipe(w64_s3)", fp8_pipe_w64_s3_ptx().to_string()),
-            ("fp8_gemm_pipe(cfg)", fp8_pipe_cfg_ptx(128, 128, 64, 2, 4, 2, 16)),
+            (
+                "fp8_gemm_pipe(cfg)",
+                fp8_pipe_cfg_ptx(128, 128, 64, 2, 4, 2, 16),
+            ),
         ]
         .into_iter()
         .map(|(n, p)| (n.to_string(), p))
@@ -1317,7 +1494,10 @@ mod tests {
         // that lost its Ada floor or its E4M3 mma would be a load failure on the very parts this exists
         // to reach. Generated at the deep budget so the >48 KiB rows take the dynamic arm here.
         for v in FP8_DEEP_VARIANTS {
-            modules.push((format!("deep/{}", v.name), fp8_stage_ptx(v, DEEP_SMEM_BUDGET).0));
+            modules.push((
+                format!("deep/{}", v.name),
+                fp8_stage_ptx(v, DEEP_SMEM_BUDGET).0,
+            ));
         }
         let modules = modules;
         for (label, ptx) in &modules {
@@ -1347,7 +1527,10 @@ mod tests {
         // `gpu::gemm_nt_fp8_pipe` and the fused-epilogue launchers look these names up by string.
         let pipe = fp8_pipe_ptx();
         for e in PIPE_ENTRIES {
-            assert!(pipe.contains(&format!(".visible .entry {e}(")), "fp8_pipe_ptx: missing entry {e}");
+            assert!(
+                pipe.contains(&format!(".visible .entry {e}(")),
+                "fp8_pipe_ptx: missing entry {e}"
+            );
         }
         assert_eq!(
             pipe.matches(".visible .entry ").count(),
@@ -1364,12 +1547,12 @@ mod tests {
     fn e4m3_encoding_matches_hand_derived_bits() {
         for (x, bits) in [
             (0.0f32, 0x00u8),
-            (-0.0f32, 0x00),      // both zeros encode as +0 (the `x == 0.0` early return)
-            (1.0, 0x38),          // exp 7 << 3, m3 = 0
-            (-1.0, 0xb8),         // sign bit set
-            (2.0, 0x40),          // exp 8 << 3
-            (448.0, 0x7e),        // max normal: exp 15, m3 = 6
-            (1000.0, 0x7e),       // saturates to max normal (E4M3 has no Inf)
+            (-0.0f32, 0x00), // both zeros encode as +0 (the `x == 0.0` early return)
+            (1.0, 0x38),     // exp 7 << 3, m3 = 0
+            (-1.0, 0xb8),    // sign bit set
+            (2.0, 0x40),     // exp 8 << 3
+            (448.0, 0x7e),   // max normal: exp 15, m3 = 6
+            (1000.0, 0x7e),  // saturates to max normal (E4M3 has no Inf)
             (f32::INFINITY, 0x7e),
             (-f32::INFINITY, 0xfe),
             (2f32.powi(-9), 0x00), // below the subnormal range -> flushed to zero
@@ -1379,7 +1562,10 @@ mod tests {
         ] {
             assert_eq!(f32_to_e4m3(x), bits, "f32_to_e4m3({x}) != {bits:#04x}");
         }
-        assert!(f32_to_e4m3(f32::NAN) & 0x7f == 0x7f, "NaN must encode as the OCP NaN pattern");
+        assert!(
+            f32_to_e4m3(f32::NAN) & 0x7f == 0x7f,
+            "NaN must encode as the OCP NaN pattern"
+        );
         // Every *normal* encoding must survive decode->encode unchanged. Excluded by construction:
         // exp==0 (zero + the subnormals this codec flushes) and 0x7f/0xff (the OCP NaN, which
         // `e4m3_to_f32` decodes as the finite 480 and the encoder then saturates to 448 = 0x7e).
@@ -1388,7 +1574,11 @@ mod tests {
             if exp == 0 || (exp == 15 && m == 7) {
                 continue;
             }
-            assert_eq!(f32_to_e4m3(e4m3_to_f32(b)), b, "e4m3 round-trip failed for {b:#04x}");
+            assert_eq!(
+                f32_to_e4m3(e4m3_to_f32(b)),
+                b,
+                "e4m3 round-trip failed for {b:#04x}"
+            );
         }
     }
 
@@ -1426,8 +1616,16 @@ mod tests {
     #[test]
     fn fp8_deep_grid_s2_rows_are_the_shipped_kernels() {
         for (grid, shipped_name, shipped_module) in [
-            ("fp8_deep_128_s2", "fp8_gemm_pipe", fp8_pipe_w64_ptx().to_string()),
-            ("fp8_deep_m64_s2", "fp8_gemm_pipe_m64", fp8_pipe_ptx().to_string()),
+            (
+                "fp8_deep_128_s2",
+                "fp8_gemm_pipe",
+                fp8_pipe_w64_ptx().to_string(),
+            ),
+            (
+                "fp8_deep_m64_s2",
+                "fp8_gemm_pipe_m64",
+                fp8_pipe_ptx().to_string(),
+            ),
         ] {
             let v = fp8_deep_variant(grid);
             let (ptx, mode) = fp8_stage_ptx(v, DEEP_SMEM_BUDGET);
@@ -1471,11 +1669,20 @@ mod tests {
             (4, 61440, true),
             (6, 92160, true),
         ];
-        assert_eq!(FP8_DEEP_VARIANTS.len(), expect.len(), "grid length changed — update `expect`");
+        assert_eq!(
+            FP8_DEEP_VARIANTS.len(),
+            expect.len(),
+            "grid length changed — update `expect`"
+        );
         for (v, (stages, bytes, dynamic)) in FP8_DEEP_VARIANTS.iter().zip(expect) {
             assert_eq!(v.stages, stages, "{}: grid order", v.name);
             assert_eq!(v.smem_bytes(), bytes, "{}: SMEM closed form", v.name);
-            assert_eq!(v.smem_mode().is_dynamic(), dynamic, "{}: emission form at {bytes} B", v.name);
+            assert_eq!(
+                v.smem_mode().is_dynamic(),
+                dynamic,
+                "{}: emission form at {bytes} B",
+                v.name
+            );
             assert_eq!(
                 v.smem_mode().launch_bytes(),
                 if dynamic { bytes } else { 0 },
@@ -1488,43 +1695,85 @@ mod tests {
                 v.name
             );
             let (ptx, mode) = fp8_stage_ptx(v, DEEP_SMEM_BUDGET);
-            assert_eq!(mode, v.smem_mode(), "{}: generator and table disagree on the form", v.name);
-            assert_eq!(ptx.matches(".extern .shared").count(), usize::from(dynamic), "{}", v.name);
+            assert_eq!(
+                mode,
+                v.smem_mode(),
+                "{}: generator and table disagree on the form",
+                v.name
+            );
+            assert_eq!(
+                ptx.matches(".extern .shared").count(),
+                usize::from(dynamic),
+                "{}",
+                v.name
+            );
             let ring_a = v.stages * v.bm * (v.bk + FP8_PIPE_PAD);
             if dynamic {
                 let (decl, entry) = (
                     ptx.find(".extern .shared").expect("window"),
                     ptx.find(".visible .entry").expect("entry"),
                 );
-                assert!(decl < entry, "{}: the window must be declared at MODULE scope", v.name);
+                assert!(
+                    decl < entry,
+                    "{}: the window must be declared at MODULE scope",
+                    v.name
+                );
                 assert!(
                     !ptx.contains(&format!(".shared .align 16 .b8 smemA_{}", v.name)),
                     "{}: no statics beside the window",
                     v.name
                 );
                 // Both rings address the one window; B starts after the whole A ring, 16-B aligned.
-                assert!(ptx.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")), "{}", v.name);
+                assert!(
+                    ptx.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")),
+                    "{}",
+                    v.name
+                );
                 assert!(
                     ptx.contains(&format!("add.u32 %bptr,%bptr,{ring_a};")),
                     "{}: the B ring must start after the whole A ring ({ring_a} B)",
                     v.name
                 );
-                assert_eq!(ring_a % 16, 0, "{}: window offset must be 16-B aligned", v.name);
+                assert_eq!(
+                    ring_a % 16,
+                    0,
+                    "{}: window offset must be 16-B aligned",
+                    v.name
+                );
             } else {
                 assert!(
-                    ptx.contains(&format!(".shared .align 16 .b8 smemA_{}[{ring_a}];", v.name)),
+                    ptx.contains(&format!(
+                        ".shared .align 16 .b8 smemA_{}[{ring_a}];",
+                        v.name
+                    )),
                     "{}",
                     v.name
                 );
-                assert!(!ptx.contains(DSMEM_SYM), "{}: a static kernel must not touch the window", v.name);
+                assert!(
+                    !ptx.contains(DSMEM_SYM),
+                    "{}: a static kernel must not touch the window",
+                    v.name
+                );
             }
             // Ring cursor: add+wrap at EVERY depth. fp8 never had the XOR toggle, and must not gain one.
-            assert!(!ptx.contains("xor.b32 %bufcA"), "{}: XOR wrap is invalid past 2 buffers", v.name);
-            assert!(ptx.contains(&format!("setp.ge.u32 %pmore,%bufcA,{ring_a};")), "{}", v.name);
+            assert!(
+                !ptx.contains("xor.b32 %bufcA"),
+                "{}: XOR wrap is invalid past 2 buffers",
+                v.name
+            );
+            assert!(
+                ptx.contains(&format!("setp.ge.u32 %pmore,%bufcA,{ring_a};")),
+                "{}",
+                v.name
+            );
             // cp.async bookkeeping: the prologue commits `stages-1` groups (one guarded staging block
             // each, the commit deliberately OUTSIDE the guard because `wait_group` counts positionally),
             // and the steady state keeps `stages-2` in flight.
-            assert!(ptx.contains(&format!("cp.async.wait_group {};", v.stages - 2)), "{}", v.name);
+            assert!(
+                ptx.contains(&format!("cp.async.wait_group {};", v.stages - 2)),
+                "{}",
+                v.name
+            );
             assert_eq!(
                 ptx.matches("setp.lt.u32 %pmore,%kcol,%K;").count(),
                 v.stages,
@@ -1548,8 +1797,16 @@ mod tests {
     fn fp8_deep_over_budget_panics_at_generation() {
         // 128x128 s5 = 5*(128+128)*80 = 102400 B — four bytes past this Ada part's 101376 B opt-in, and
         // the reason the shipped grid stops at s4. It is legal on A100/H100 and this same call proves it.
-        let over =
-            Fp8StageCfg { name: "fp8_deep_probe_s5", bm: 128, bn: 128, bk: FP8_PIPE_BK, wm: 2, wn: 2, stages: 5, raster: FP8_PIPE_RASTER };
+        let over = Fp8StageCfg {
+            name: "fp8_deep_probe_s5",
+            bm: 128,
+            bn: 128,
+            bk: FP8_PIPE_BK,
+            wm: 2,
+            wn: 2,
+            stages: 5,
+            raster: FP8_PIPE_RASTER,
+        };
         assert_eq!(over.smem_bytes(), 102400);
         let _ = fp8_stage_ptx(&over, DEEP_SMEM_BUDGET);
     }

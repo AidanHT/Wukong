@@ -269,9 +269,9 @@ mod tests {
             (4, 64, 3),
             (100, 70, 23),
             (1, 257, 2),
-            (300, 16, 80),  // v >= SCATTER_PAR_MIN so the multicore path runs
-            (500, 17, 64),  // v == SCATTER_PAR_MIN (boundary, multicore) with an H tail
-            (260, 70, 96),  // multicore + wide H with a tail; T >> V => heavy collisions
+            (300, 16, 80), // v >= SCATTER_PAR_MIN so the multicore path runs
+            (500, 17, 64), // v == SCATTER_PAR_MIN (boundary, multicore) with an H tail
+            (260, 70, 96), // multicore + wide H with a tail; T >> V => heavy collisions
         ] {
             // Small integers (1..=9), varying by flat index so any mis-scatter — wrong row, wrong token,
             // dropped or duplicated token, or an off-by-one within the row — changes a sum and shows as a
@@ -284,14 +284,7 @@ mod tests {
             let mut got = vec![0.0f32; v * h];
             let mut got_par = vec![0.0f32; v * h];
             unsafe {
-                wukong_scatter_add_f32(
-                    got.as_mut_ptr(),
-                    grad_out.as_ptr(),
-                    ids.as_ptr(),
-                    t,
-                    h,
-                    v,
-                );
+                wukong_scatter_add_f32(got.as_mut_ptr(), grad_out.as_ptr(), ids.as_ptr(), t, h, v);
                 wukong_scatter_add_f32_parallel(
                     got_par.as_mut_ptr(),
                     grad_out.as_ptr(),
@@ -353,7 +346,10 @@ mod tests {
                 );
             }
             assert_eq!(got, want, "collision scatter vs naive");
-            assert_eq!(got, got_par, "collision serial vs parallel (bit-exact determinism)");
+            assert_eq!(
+                got, got_par,
+                "collision serial vs parallel (bit-exact determinism)"
+            );
         }
     }
 
@@ -397,9 +393,30 @@ mod tests {
         let ids = [0i32; 2];
         let mut grad_w = vec![42.0f32; 8];
         unsafe {
-            wukong_scatter_add_f32(grad_w.as_mut_ptr(), grad_out.as_ptr(), ids.as_ptr(), 0, 4, 2);
-            wukong_scatter_add_f32(grad_w.as_mut_ptr(), grad_out.as_ptr(), ids.as_ptr(), 2, 0, 2);
-            wukong_scatter_add_f32(grad_w.as_mut_ptr(), grad_out.as_ptr(), ids.as_ptr(), 2, 4, 0);
+            wukong_scatter_add_f32(
+                grad_w.as_mut_ptr(),
+                grad_out.as_ptr(),
+                ids.as_ptr(),
+                0,
+                4,
+                2,
+            );
+            wukong_scatter_add_f32(
+                grad_w.as_mut_ptr(),
+                grad_out.as_ptr(),
+                ids.as_ptr(),
+                2,
+                0,
+                2,
+            );
+            wukong_scatter_add_f32(
+                grad_w.as_mut_ptr(),
+                grad_out.as_ptr(),
+                ids.as_ptr(),
+                2,
+                4,
+                0,
+            );
             wukong_scatter_add_f32_parallel(
                 grad_w.as_mut_ptr(),
                 grad_out.as_ptr(),
@@ -409,6 +426,9 @@ mod tests {
                 2,
             );
         }
-        assert!(grad_w.iter().all(|&x| x == 42.0), "no-op must not write grad_w");
+        assert!(
+            grad_w.iter().all(|&x| x == 42.0),
+            "no-op must not write grad_w"
+        );
     }
 }

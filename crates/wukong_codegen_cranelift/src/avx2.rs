@@ -94,13 +94,13 @@ fn cmp_imm(p: VecCmp) -> u32 {
 /// live-register count, and which invariant broadcasts / sign-mask occupy fixed registers.
 struct Plan {
     unroll: u32,
-    per_group: u8,               // P: registers a single group needs
-    hoist_scalars: Vec<u32>,     // distinct invariant scalars, each in a fixed reg
-    signmask_reg: Option<u8>,    // fixed reg holding -0.0 lanes, if the body negates
-    scalar_reg: Vec<(u32, u8)>,  // scalar index → fixed reg
-    acc_regs: Vec<u8>,           // reduction accumulators, one per unroll copy (empty if elementwise)
-    saved: Vec<u8>,              // xmm6..xmm15 we must preserve (callee-saved on Win64)
-    last_use: Vec<usize>,        // last_use[i] = last op index referencing value i
+    per_group: u8,              // P: registers a single group needs
+    hoist_scalars: Vec<u32>,    // distinct invariant scalars, each in a fixed reg
+    signmask_reg: Option<u8>,   // fixed reg holding -0.0 lanes, if the body negates
+    scalar_reg: Vec<(u32, u8)>, // scalar index → fixed reg
+    acc_regs: Vec<u8>, // reduction accumulators, one per unroll copy (empty if elementwise)
+    saved: Vec<u8>,    // xmm6..xmm15 we must preserve (callee-saved on Win64)
+    last_use: Vec<usize>, // last_use[i] = last op index referencing value i
 }
 
 /// Plan the register allocation, or return `Err` (→ the caller keeps the 128-bit fallback) when the
@@ -111,7 +111,10 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
     // backend-agnostic `pressure()` in `wukong_mir`, single-sourced with the vectorizer's gate so a
     // body the vectorizer accepted never fails to assemble here.
     let pressure = k.pressure().ok_or_else(|| {
-        format!("avx2: body outside emitter coverage (streams={}, or Const present)", k.streams)
+        format!(
+            "avx2: body outside emitter coverage (streams={}, or Const present)",
+            k.streams
+        )
     })?;
     let VecPressure {
         hoist_scalars,
@@ -267,7 +270,14 @@ fn emit(k: &VecKernel, plan: &Plan) -> Result<Vec<u8>, IcedError> {
         a.cmp(rax, r8)?;
         a.ja(single_head)?;
         for u in 0..plan.unroll {
-            emit_group(&mut a, k, plan, u, (u * LANES) as i32 * 4, plan.acc_regs.get(u as usize).copied())?;
+            emit_group(
+                &mut a,
+                k,
+                plan,
+                u,
+                (u * LANES) as i32 * 4,
+                plan.acc_regs.get(u as usize).copied(),
+            )?;
         }
         a.add(rcx, step)?;
         a.jmp(head)?;
@@ -336,13 +346,12 @@ fn emit_group(
     // The register currently holding value `v` (a hoisted scalar resolves to its fixed register).
     let reg_of = |vreg: &[Option<u8>], v: u32| -> u8 {
         match k.ops[v as usize] {
-            VecOp::Splat { scalar } => {
-                plan.scalar_reg
-                    .iter()
-                    .find(|(s, _)| *s == scalar)
-                    .map(|(_, r)| *r)
-                    .expect("hoisted scalar reg")
-            }
+            VecOp::Splat { scalar } => plan
+                .scalar_reg
+                .iter()
+                .find(|(s, _)| *s == scalar)
+                .map(|(_, r)| *r)
+                .expect("hoisted scalar reg"),
             _ => vreg[v as usize].expect("value has a register"),
         }
     };
@@ -542,7 +551,8 @@ mod tests {
         let mut sig = Signature::new(module.target_config().default_call_conv);
         sig.params.push(AbiParam::new(ptr)); // ptrs
         sig.params.push(AbiParam::new(ptr)); // scalars
-        sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I64)); // n
+        sig.params
+            .push(AbiParam::new(cranelift_codegen::ir::types::I64)); // n
         let fid = module
             .declare_function("saxpy_probe", Linkage::Export, &sig)
             .unwrap();
@@ -606,10 +616,9 @@ mod tests {
         let mut sig = Signature::new(module.target_config().default_call_conv);
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
-        sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I64));
-        let fid = module
-            .declare_function("k", Linkage::Export, &sig)
-            .unwrap();
+        sig.params
+            .push(AbiParam::new(cranelift_codegen::ir::types::I64));
+        let fid = module.declare_function("k", Linkage::Export, &sig).unwrap();
         module.define_function_bytes(fid, 16, &bytes, &[]).unwrap();
         module.finalize_definitions().unwrap();
         let code = module.get_finalized_function(fid);
@@ -641,8 +650,7 @@ mod tests {
         }
         let bytes = assemble_kernel(k).expect("assemble reduction");
         let vlen = n / LANES as usize * LANES as usize;
-        let want =
-            k.eval_reduction(vlen, |s, e| streams[s as usize][e], |c| scalars[c as usize]);
+        let want = k.eval_reduction(vlen, |s, e| streams[s as usize][e], |c| scalars[c as usize]);
 
         let isa = crate::make_isa(false).expect("isa");
         let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -651,10 +659,13 @@ mod tests {
         let mut sig = Signature::new(module.target_config().default_call_conv);
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
-        sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I64));
+        sig.params
+            .push(AbiParam::new(cranelift_codegen::ir::types::I64));
         sig.returns
             .push(AbiParam::new(cranelift_codegen::ir::types::F32));
-        let fid = module.declare_function("kr", Linkage::Export, &sig).unwrap();
+        let fid = module
+            .declare_function("kr", Linkage::Export, &sig)
+            .unwrap();
         module.define_function_bytes(fid, 16, &bytes, &[]).unwrap();
         module.finalize_definitions().unwrap();
         let code = module.get_finalized_function(fid);
@@ -750,8 +761,16 @@ mod tests {
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Load { stream: 1 },
-                VecOp::Bin { op: VecBin::Add, a: 0, b: 1 }, // X = a+b
-                VecOp::Bin { op: VecBin::Sub, a: 0, b: 1 }, // Y = a-b
+                VecOp::Bin {
+                    op: VecBin::Add,
+                    a: 0,
+                    b: 1,
+                }, // X = a+b
+                VecOp::Bin {
+                    op: VecBin::Sub,
+                    a: 0,
+                    b: 1,
+                }, // Y = a-b
             ],
         };
         for n in [8usize, 16, 24, 32, 64, 128, 256, 512] {
@@ -870,9 +889,21 @@ mod tests {
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Load { stream: 1 },
-                VecOp::Bin { op: VecBin::Add, a: 0, b: 1 },
-                VecOp::Bin { op: VecBin::Sub, a: 0, b: 1 },
-                VecOp::Bin { op: VecBin::Mul, a: 2, b: 3 },
+                VecOp::Bin {
+                    op: VecBin::Add,
+                    a: 0,
+                    b: 1,
+                },
+                VecOp::Bin {
+                    op: VecBin::Sub,
+                    a: 0,
+                    b: 1,
+                },
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 2,
+                    b: 3,
+                },
                 VecOp::Store { stream: 2, val: 4 },
             ],
         };
@@ -894,7 +925,11 @@ mod tests {
                 VecOp::Load { stream: 0 },
                 VecOp::Load { stream: 1 },
                 VecOp::Sqrt { a: 1 },
-                VecOp::Bin { op: VecBin::Div, a: 0, b: 2 },
+                VecOp::Bin {
+                    op: VecBin::Div,
+                    a: 0,
+                    b: 2,
+                },
                 VecOp::Store { stream: 2, val: 3 },
             ],
         };
@@ -917,18 +952,34 @@ mod tests {
             unroll: 4,
             reduce: None,
             ops: vec![
-                VecOp::Load { stream: 0 },                  // v0 = x
-                VecOp::Splat { scalar: 0 },                 // v1 = 2.0
-                VecOp::Bin { op: VecBin::Mul, a: 0, b: 1 }, // v2 = 2*x
-                VecOp::Splat { scalar: 1 },                 // v3 = 1.0
-                VecOp::Bin { op: VecBin::Add, a: 2, b: 3 }, // v4 = 2*x + 1
-                VecOp::Store { stream: 1, val: 4 },         // t = 2*x + 1
-                VecOp::Load { stream: 1 },                  // v6 = t   (forwarded)
-                VecOp::Splat { scalar: 2 },                 // v7 = 0.0
-                VecOp::Cmp { pred: VecCmp::Gt, a: 6, b: 7 }, // v8 = t > 0
-                VecOp::Load { stream: 1 },                  // v9 = t   (forwarded again)
-                VecOp::Select { mask: 8, a: 9, b: 7 },      // v10 = t>0 ? t : 0
-                VecOp::Store { stream: 2, val: 10 },        // o = relu(t)
+                VecOp::Load { stream: 0 },  // v0 = x
+                VecOp::Splat { scalar: 0 }, // v1 = 2.0
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 1,
+                }, // v2 = 2*x
+                VecOp::Splat { scalar: 1 }, // v3 = 1.0
+                VecOp::Bin {
+                    op: VecBin::Add,
+                    a: 2,
+                    b: 3,
+                }, // v4 = 2*x + 1
+                VecOp::Store { stream: 1, val: 4 }, // t = 2*x + 1
+                VecOp::Load { stream: 1 },  // v6 = t   (forwarded)
+                VecOp::Splat { scalar: 2 }, // v7 = 0.0
+                VecOp::Cmp {
+                    pred: VecCmp::Gt,
+                    a: 6,
+                    b: 7,
+                }, // v8 = t > 0
+                VecOp::Load { stream: 1 },  // v9 = t   (forwarded again)
+                VecOp::Select {
+                    mask: 8,
+                    a: 9,
+                    b: 7,
+                }, // v10 = t>0 ? t : 0
+                VecOp::Store { stream: 2, val: 10 }, // o = relu(t)
             ],
         };
         for n in [8usize, 16, 40, 96] {
@@ -955,7 +1006,11 @@ mod tests {
                 VecOp::Load { stream: 0 },
                 VecOp::Neg { a: 0 },
                 VecOp::Load { stream: 1 },
-                VecOp::Bin { op: VecBin::Add, a: 1, b: 2 },
+                VecOp::Bin {
+                    op: VecBin::Add,
+                    a: 1,
+                    b: 2,
+                },
                 VecOp::Store { stream: 2, val: 3 },
             ],
         };
@@ -976,8 +1031,16 @@ mod tests {
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Splat { scalar: 0 }, // 0.0
-                VecOp::Cmp { pred: VecCmp::Gt, a: 0, b: 1 },
-                VecOp::Select { mask: 2, a: 0, b: 1 },
+                VecOp::Cmp {
+                    pred: VecCmp::Gt,
+                    a: 0,
+                    b: 1,
+                },
+                VecOp::Select {
+                    mask: 2,
+                    a: 0,
+                    b: 1,
+                },
                 VecOp::Store { stream: 1, val: 3 },
             ],
         };
@@ -998,7 +1061,11 @@ mod tests {
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Splat { scalar: 0 },
-                VecOp::Bin { op: VecBin::Mul, a: 0, b: 1 },
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 1,
+                },
                 VecOp::Store { stream: 0, val: 2 },
             ],
         };
@@ -1044,12 +1111,24 @@ mod tests {
             unroll: 4,
             reduce: None,
             ops: vec![
-                VecOp::Load { stream: 0 },                  // v0 = a
-                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
-                VecOp::Load { stream: 1 },                  // v2 = b
-                VecOp::Load { stream: 2 },                  // v3 = c
-                VecOp::Bin { op: VecBin::Mul, a: 2, b: 3 }, // v4 = b*c
-                VecOp::Bin { op: VecBin::Add, a: 1, b: 4 }, // v5 = a*a + b*c
+                VecOp::Load { stream: 0 }, // v0 = a
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 0,
+                }, // v1 = a*a
+                VecOp::Load { stream: 1 }, // v2 = b
+                VecOp::Load { stream: 2 }, // v3 = c
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 2,
+                    b: 3,
+                }, // v4 = b*c
+                VecOp::Bin {
+                    op: VecBin::Add,
+                    a: 1,
+                    b: 4,
+                }, // v5 = a*a + b*c
                 VecOp::Store { stream: 3, val: 5 },
             ],
         };
@@ -1061,12 +1140,28 @@ mod tests {
             unroll: 4,
             reduce: None,
             ops: vec![
-                VecOp::Load { stream: 0 },                  // v0 = a
-                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
-                VecOp::Load { stream: 1 },                  // v2 = b
-                VecOp::Bin { op: VecBin::Mul, a: 2, b: 2 }, // v3 = b*b
-                VecOp::Bin { op: VecBin::Add, a: 1, b: 3 }, // v4 = a*a + b*b
-                VecOp::Bin { op: VecBin::Add, a: 4, b: 2 }, // v5 = … + b
+                VecOp::Load { stream: 0 }, // v0 = a
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 0,
+                }, // v1 = a*a
+                VecOp::Load { stream: 1 }, // v2 = b
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 2,
+                    b: 2,
+                }, // v3 = b*b
+                VecOp::Bin {
+                    op: VecBin::Add,
+                    a: 1,
+                    b: 3,
+                }, // v4 = a*a + b*b
+                VecOp::Bin {
+                    op: VecBin::Add,
+                    a: 4,
+                    b: 2,
+                }, // v5 = … + b
                 VecOp::Store { stream: 2, val: 5 },
             ],
         };
@@ -1079,20 +1174,38 @@ mod tests {
             unroll: 2,
             reduce: None,
             ops: vec![
-                VecOp::Load { stream: 0 },                  // v0 = a
-                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // v1 = a*a
-                VecOp::Load { stream: 1 },                  // v2 = b
-                VecOp::Load { stream: 2 },                  // v3 = c
-                VecOp::Fma { a: 1, b: 3, c: 2 },            // v4 = (a*a)*c + b
-                VecOp::Bin { op: VecBin::Mul, a: 4, b: 3 }, // v5 = v4 * c
+                VecOp::Load { stream: 0 }, // v0 = a
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 0,
+                }, // v1 = a*a
+                VecOp::Load { stream: 1 }, // v2 = b
+                VecOp::Load { stream: 2 }, // v3 = c
+                VecOp::Fma { a: 1, b: 3, c: 2 }, // v4 = (a*a)*c + b
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 4,
+                    b: 3,
+                }, // v5 = v4 * c
                 VecOp::Store { stream: 3, val: 5 },
             ],
         };
         for n in [8usize, 16, 24, 64] {
             let s = |seed| ramp(n, seed);
-            check(&dup_then_loads, &[s(0.0), s(1.0), s(2.0), vec![0.0; n]], &[], n);
+            check(
+                &dup_then_loads,
+                &[s(0.0), s(1.0), s(2.0), vec![0.0; n]],
+                &[],
+                n,
+            );
             check(&dup_then_dup, &[s(0.0), s(1.0), vec![0.0; n]], &[], n);
-            check(&dup_then_fma, &[s(0.0), s(1.0), s(2.0), vec![0.0; n]], &[], n);
+            check(
+                &dup_then_fma,
+                &[s(0.0), s(1.0), s(2.0), vec![0.0; n]],
+                &[],
+                n,
+            );
         }
         // Same defect on the reduction path: the fold reads its addend after the body, so a register
         // handed out twice corrupts the accumulator. `acc += (a*a) * (b*c)`.
@@ -1108,11 +1221,23 @@ mod tests {
             }),
             ops: vec![
                 VecOp::Load { stream: 0 },
-                VecOp::Bin { op: VecBin::Mul, a: 0, b: 0 }, // a*a
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 0,
+                }, // a*a
                 VecOp::Load { stream: 1 },
                 VecOp::Load { stream: 2 },
-                VecOp::Bin { op: VecBin::Mul, a: 2, b: 3 }, // b*c
-                VecOp::Bin { op: VecBin::Mul, a: 1, b: 4 },
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 2,
+                    b: 3,
+                }, // b*c
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 1,
+                    b: 4,
+                },
             ],
         };
         for n in [8usize, 16, 64, 256] {
@@ -1133,7 +1258,10 @@ mod tests {
                 VecOp::Store { stream: 4, val: 0 },
             ],
         };
-        assert!(assemble_kernel(&k).is_err(), "5 streams must bail to fallback");
+        assert!(
+            assemble_kernel(&k).is_err(),
+            "5 streams must bail to fallback"
+        );
     }
 
     /// `assemble_kernel` promises `Err` for a body it cannot express, and callers rely on that (the
@@ -1155,6 +1283,9 @@ mod tests {
         };
         assert_eq!(k.pressure().map(|p| p.per_group), Some(256), "test premise");
         let err = assemble_kernel(&k).expect_err("256 live values must bail, not panic");
-        assert!(err.contains("registers") || err.contains("Win64"), "unexpected: {err}");
+        assert!(
+            err.contains("registers") || err.contains("Win64"),
+            "unexpected: {err}"
+        );
     }
 }

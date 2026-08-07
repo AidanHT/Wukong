@@ -158,7 +158,16 @@ pub unsafe extern "C" fn wukong_sgevm_f32(
     if rows <= 0 || cols <= 0 {
         return;
     }
-    gevm_range(w, a, out, rows as usize, cols as usize, 0, cols as usize, alpha);
+    gevm_range(
+        w,
+        a,
+        out,
+        rows as usize,
+        cols as usize,
+        0,
+        cols as usize,
+        alpha,
+    );
 }
 
 /// Column count below which the parallel vector·matrix product just runs serially (thread wake/sync
@@ -350,8 +359,14 @@ mod tests {
                         alpha,
                     );
                 }
-                assert_eq!(got, want, "sgevm {rows}x{cols} alpha={alpha} vs scalar fma reference");
-                assert_eq!(got, got_par, "sgevm serial vs parallel {rows}x{cols} alpha={alpha}");
+                assert_eq!(
+                    got, want,
+                    "sgevm {rows}x{cols} alpha={alpha} vs scalar fma reference"
+                );
+                assert_eq!(
+                    got, got_par,
+                    "sgevm serial vs parallel {rows}x{cols} alpha={alpha}"
+                );
             }
         }
     }

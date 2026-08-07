@@ -22,8 +22,8 @@
 //! pointer-typed parameter (`*T`, `&T`, `Tensor[…]`) an `alloca ptr` + `store` in the entry block and
 //! then re-`load`s the base pointer at *every* element access. Array and vector slots stay in memory.
 
-use std::collections::{BTreeMap, BTreeSet};
 use crate::fxhash::{FxHashMap, FxHashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use wukong_mir::{Function, Inst, MirType, Op, Terminator, ValueId};
 

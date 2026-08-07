@@ -72,8 +72,11 @@ impl CfgAnalyses {
         if self.df.is_none() {
             self.ensure_idom(f);
             self.ensure_preds(f);
-            let df =
-                dom::dominance_frontiers_from(f, self.idom.as_ref().unwrap(), self.preds.as_ref().unwrap());
+            let df = dom::dominance_frontiers_from(
+                f,
+                self.idom.as_ref().unwrap(),
+                self.preds.as_ref().unwrap(),
+            );
             self.df = Some(df);
         }
     }
