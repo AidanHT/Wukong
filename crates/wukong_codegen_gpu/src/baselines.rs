@@ -16,11 +16,14 @@
 //!   out-of-process **PyTorch SDPA** fused-attention peer driven through a Python script. Some shapes
 //!   have no library peer at all (W4A16 decode) and are honestly measured against Tier A only.
 //!
-//! Every peer `dlopen`s its redistributable DLLs (`nvrtc64_120_0.dll`, `cublas64_12.dll`,
-//! `cublasLt64_12.dll`, `cudnn64_9.dll`) exactly the way `cudarc` already `dlopen`s the driver
-//! (`nvcuda.dll`). So *building* this crate still needs no CUDA toolkit; only *running these benches*
-//! needs the DLLs reachable on the loader path. On this box they live in a git-ignored
-//! `tools/cuda-redist/` (see `peer_env_hint`), put on `PATH` by the bench invocation. If they are
+//! Every peer `dlopen`s its redistributable libraries — on Windows the DLLs (`nvrtc64_120_0.dll`,
+//! `cublas64_12.dll`, `cublasLt64_12.dll`, `cudnn64_9.dll`), on Linux the SONAME-versioned shared
+//! objects (`libnvrtc.so.12`, `libcublas.so.12`, `libcublasLt.so.12`, `libcudnn.so`) — exactly the way
+//! `cudarc` already `dlopen`s the driver (`nvcuda.dll` on Windows, `libcuda.so.1` on Linux); the
+//! per-OS spellings live in one place, [`cuda_lib_names`]. So *building* this crate still needs no
+//! CUDA toolkit; only *running these benches* needs the libraries reachable on the loader path
+//! (`PATH` on Windows, `LD_LIBRARY_PATH` on Linux). On this box they live in a git-ignored
+//! `tools/cuda-redist/` (see `peer_env_hint`), put on that path by the bench invocation. If they are
 //! absent the loader would `panic!`, so [`peers_available`] (NVRTC + cuBLAS), [`cudnn_available`] and
 //! [`fa2_peer_available`] probe under `catch_unwind` and the peer benches skip when they are missing —
 //! the same "green without the hardware" discipline the GPU tests already follow. **A skip is not
@@ -51,17 +54,87 @@ use crate::gpu::{Gpu, TransformerWeights};
 /// families (driver / NVRTC compile / cuBLAS) with one type.
 pub type PeerError = Box<dyn std::error::Error + Send + Sync>;
 
-/// One-line hint, printed by the benches, for reproducing the redistributable DLLs and the `PATH`
-/// they must sit on. Kept here so the "how do I run the peer benches" answer lives next to the code.
+/// The **library file names** the CUDA loader actually looks for on the host this build runs on.
+///
+/// One source of truth for every "which library is missing?" string in the GPU path, because the
+/// answer is not portable: Windows ships version-suffixed DLLs found on `PATH`, Linux ships
+/// SONAME-versioned shared objects found on `LD_LIBRARY_PATH`, and telling a Linux operator to
+/// install `cublas64_12.dll` is worse than saying nothing. The names are not invented here — they
+/// are the candidates `cudarc`'s `get_lib_name_candidates` synthesizes for *this* build out of
+/// `std::env::consts::{DLL_PREFIX, DLL_SUFFIX}` and the `cuda-12060` feature (major 12, minor 6), so
+/// they are the names that get `dlopen`ed.
+///
+/// **cuDNN is the one asymmetry.** cudarc's candidate list happens to contain the Windows
+/// `cudnn64_9.dll` (its `{lib}64_9{suffix}` entry) but on Linux it only reaches `libcudnn.so` and
+/// `libcudnn.so.{12,11,10,1}` — never `libcudnn.so.9`, which is the only file the
+/// `nvidia-cudnn-cu12` wheel ships. So the Linux name recorded here is the unversioned
+/// `libcudnn.so`, and [`peer_env_hint`] tells the operator to symlink it.
+pub struct CudaLibNames {
+    /// The NVIDIA driver itself — what a "no CUDA device was reachable" message should name.
+    pub driver: &'static str,
+    pub nvrtc: &'static str,
+    pub cublas: &'static str,
+    pub cublas_lt: &'static str,
+    pub cudnn: &'static str,
+}
+
+/// Per-OS [`CudaLibNames`]. A **runtime** `cfg!` branch, not `#[cfg]`: both arms then type-check on
+/// both hosts, so the Linux spellings cannot rot on a Windows-only developer box (and vice versa).
+pub fn cuda_lib_names() -> CudaLibNames {
+    if cfg!(windows) {
+        CudaLibNames {
+            driver: "nvcuda.dll",
+            nvrtc: "nvrtc64_120_0.dll",
+            cublas: "cublas64_12.dll",
+            cublas_lt: "cublasLt64_12.dll",
+            cudnn: "cudnn64_9.dll",
+        }
+    } else {
+        CudaLibNames {
+            driver: "libcuda.so.1",
+            nvrtc: "libnvrtc.so.12",
+            cublas: "libcublas.so.12",
+            cublas_lt: "libcublasLt.so.12",
+            cudnn: "libcudnn.so",
+        }
+    }
+}
+
+/// Just the driver library's name on this OS (`nvcuda.dll` / `libcuda.so.1`) — the one field the
+/// *other* crates need, for the "`--backend=gpu` found no CUDA device" messages in
+/// `wukong_driver` and [`crate::lower`]. Kept as a function so those messages cannot drift apart.
+pub fn cuda_driver_lib_name() -> &'static str {
+    cuda_lib_names().driver
+}
+
+/// One-line hint, printed by the benches, for reproducing the redistributable libraries and the
+/// loader path they must sit on. Kept here so the "how do I run the peer benches" answer lives next
+/// to the code — and OS-conditional, because neither the loader variable (`PATH` vs
+/// `LD_LIBRARY_PATH`) nor the wheel's own layout (`<pkg>/bin` vs `<pkg>/lib`) is shared.
 pub fn peer_env_hint() -> &'static str {
     // cudarc 0.16's `cuda-12060` bindings actually reference 12.8-era NVRTC PCH symbols and 12.9-era
     // cuBLAS emulation symbols, so the redist DLLs must be the 12.9 superset; NVRTC 12.9 also hard-
     // imports nvJitLink, hence the third wheel. Install all three in ONE command — pip's `--target`
-    // clobbers the shared `nvidia/` namespace if they go in separately.
-    "GPU peer baselines need the CUDA 12.9 redist DLLs on PATH. From the repo root:\n  \
-     pip install --target tools/cuda-redist --no-deps nvidia-cuda-nvrtc-cu12==12.9.86 \
-     nvidia-cublas-cu12==12.9.2.10 nvidia-nvjitlink-cu12==12.9.86\n  \
-     then prepend these to PATH: tools/cuda-redist/nvidia/{cuda_nvrtc,cublas,nvjitlink}/bin"
+    // clobbers the shared `nvidia/` namespace if they go in separately. The three wheels are the same
+    // on both hosts; only the directory inside them and the search variable differ.
+    if cfg!(windows) {
+        "GPU peer baselines need the CUDA 12.9 redist DLLs on PATH. From the repo root:\n  \
+         pip install --target tools/cuda-redist --no-deps nvidia-cuda-nvrtc-cu12==12.9.86 \
+         nvidia-cublas-cu12==12.9.2.10 nvidia-nvjitlink-cu12==12.9.86\n  \
+         then prepend these to PATH: tools/cuda-redist/nvidia/{cuda_nvrtc,cublas,nvjitlink}/bin"
+    } else {
+        "GPU peer baselines need the CUDA 12.9 redist shared objects on LD_LIBRARY_PATH. From the \
+         repo root:\n  \
+         pip install --target tools/cuda-redist --no-deps nvidia-cuda-nvrtc-cu12==12.9.86 \
+         nvidia-cublas-cu12==12.9.2.10 nvidia-nvjitlink-cu12==12.9.86\n  \
+         then prepend these to LD_LIBRARY_PATH: \
+         tools/cuda-redist/nvidia/{cuda_nvrtc,cublas,nvjitlink}/lib\n  \
+         (the Linux wheels put the .so files in `lib/`, not `bin/`; the loader wants \
+         libnvrtc.so.12, libcublas.so.12 and libcublasLt.so.12. For the cuDNN conv peer, \
+         `pip install --target tools/cuda-redist --no-deps nvidia-cudnn-cu12` ships only \
+         libcudnn.so.9, which cudarc's candidate list never tries: add a `libcudnn.so` symlink \
+         beside it, or the conv peer silently skips.)"
+    }
 }
 
 /// Probe whether the NVRTC + cuBLAS DLLs are loadable in this process, **without** letting a missing
@@ -83,16 +156,19 @@ pub fn peer_probe(g: &mut Gpu) -> Option<&'static str> {
     static WHY: OnceLock<Option<String>> = OnceLock::new();
     WHY.get_or_init(|| {
         // NVRTC: compile a trivial program. cuBLAS: create a handle on the stream. Either touching a
-        // missing DLL panics inside cudarc's loader; catch it so we report a reason instead of crashing.
+        // missing library panics inside cudarc's loader; catch it so we report a reason instead of
+        // crashing — and name the file THIS host needs (`cublas64_12.dll` vs `libcublas.so.12`), which
+        // is the whole point of [`cuda_lib_names`].
+        let libs = cuda_lib_names();
         let stream = g.stream.clone();
         let nvrtc = std::panic::catch_unwind(|| {
             compile_ptx_with_opts("extern \"C\" __global__ void p(){}", CompileOptions::default())
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         })
-        .unwrap_or_else(|_| Err("loader panicked (DLL not found)".to_string()));
+        .unwrap_or_else(|_| Err(format!("loader panicked ({} not found)", libs.nvrtc)));
         let cublas = std::panic::catch_unwind(|| CudaBlas::new(stream).map(|_| ()).map_err(|e| format!("{e:?}")))
-            .unwrap_or_else(|_| Err("loader panicked (DLL not found)".to_string()));
+            .unwrap_or_else(|_| Err(format!("loader panicked ({} not found)", libs.cublas)));
         match (nvrtc, cublas) {
             (Ok(()), Ok(())) => None,
             (Err(n), Err(c)) => Some(format!("NVRTC unavailable ({n}) and cuBLAS unavailable ({c})")),
@@ -1888,11 +1964,12 @@ pub fn time_cublaslt_gemm_nt_fp8_e4m3(
     Ok(t0.elapsed().as_secs_f64() / iters as f64)
 }
 
-/// Probe whether `cublasLt64_12.dll` is loadable (it lives beside `cublas64_12.dll` in the redist, so
-/// in practice it tracks [`peers_available`], but [`peers_available`] only checks cublas/nvrtc). The fp8
-/// peer benches gate on this to **skip, not fail**, when the DLL is absent — the same "green without the
-/// hardware" discipline as the other peers. Loading `cublasLt` panics if the DLL is missing, so the
-/// probe is wrapped in `catch_unwind`.
+/// Probe whether cuBLASLt (`cublasLt64_12.dll` / `libcublasLt.so.12` — see [`cuda_lib_names`]) is
+/// loadable: it ships beside cuBLAS in the same redist wheel, so in practice it tracks
+/// [`peers_available`], but [`peers_available`] only checks cublas/nvrtc. The fp8
+/// peer benches gate on this to **skip, not fail**, when the library is absent — the same "green
+/// without the hardware" discipline as the other peers. Loading `cublasLt` panics if it is missing,
+/// so the probe is wrapped in `catch_unwind`.
 pub fn cublaslt_available() -> bool {
     std::panic::catch_unwind(|| match cublaslt_result::create_handle() {
         Ok(h) => {
@@ -1980,7 +2057,9 @@ pub fn cudnn_fwd_algo_name(algo: cudarc::cudnn::sys::cudnnConvolutionFwdAlgo_t) 
 }
 
 /// Probe whether cuDNN (the Tier-B conv peer) is loadable in this process **without** aborting the run:
-/// `Cudnn::new` dlopens `cudnn64_9.dll` + the cuDNN-9 sublibraries; a missing DLL panics inside cudarc's
+/// `Cudnn::new` dlopens `cudnn64_9.dll` (Windows) / `libcudnn.so` (Linux — see the cuDNN note on
+/// [`cuda_lib_names`], the wheel's `libcudnn.so.9` is *not* a name cudarc tries) plus the cuDNN-9
+/// sublibraries; a missing library panics inside cudarc's
 /// loader, so drive it under `catch_unwind` and report `false` (→ the conv bench skips the cuDNN column)
 /// on any failure. Cheap; cached for the whole process.
 pub fn cudnn_available(g: &mut Gpu) -> bool {
@@ -2248,6 +2327,9 @@ pub fn time_cublas_int8_gemm_dequant_chain(
 // cross-check Wukong's flash gets, and a flat `key=value` report this driver parses (no serde). On the
 // Windows PyTorch wheel FLASH_ATTENTION is not built, but **CUDNN_ATTENTION (cuDNN's fused flash) and
 // EFFICIENT_ATTENTION (cutlass mem-efficient fMHA) are** — both genuinely fused; the faster is chosen.
+// On the **Linux** wheels FLASH_ATTENTION *is* built, so the peer there is the real FA2 kernel — a
+// strictly harder bar, and the reason a Windows-measured ratio may not carry to a cloud box. Nothing in
+// this driver changes: the script forces every backend in turn and reports which one won.
 //
 // Honesty: cross-process means the GPU clock can differ between Wukong's timing and the peer's, so the
 // caller must (a) warm the GPU, (b) run the peer and Wukong back-to-back in one window, (c) repeat >=3x
@@ -2284,15 +2366,24 @@ pub struct Fa2PeerReport {
 /// Resolve `(python, peer_script)`: env `WUKONG_FA2_PYTHON` / `WUKONG_FA2_PEER` override the defaults
 /// (the workspace `tools/torch-cuda-venv` python + `tools/fa2_sdpa_peer.py`, relative to this crate).
 /// In a git worktree the venv usually lives in the main checkout, so set `WUKONG_FA2_PYTHON` there.
+///
+/// The default interpreter path is **per-OS**, because `venv` itself is: Windows lays the venv out as
+/// `Scripts/python.exe`, every unix as `bin/python`. Picked with a runtime `cfg!` so both spellings
+/// stay compiled (and thus typo-checked) on either host.
 fn fa2_peer_paths() -> (std::path::PathBuf, std::path::PathBuf) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .unwrap_or_default(); // crates/wukong_codegen_gpu -> workspace root
+    let venv_python = if cfg!(windows) {
+        "tools/torch-cuda-venv/Scripts/python.exe"
+    } else {
+        "tools/torch-cuda-venv/bin/python"
+    };
     let python = std::env::var_os("WUKONG_FA2_PYTHON")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| root.join("tools/torch-cuda-venv/Scripts/python.exe"));
+        .unwrap_or_else(|| root.join(venv_python));
     let peer = std::env::var_os("WUKONG_FA2_PEER")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| root.join("tools/fa2_sdpa_peer.py"));
