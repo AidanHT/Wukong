@@ -4130,6 +4130,26 @@ fn main() -> i32 {
         gl.len() == cl.len() && gl.iter().zip(&cl).all(|(a, b)| line_matches(a, b))
     }
 
+    /// The **coverage ratchet** for `run_corpus_matches_interp_oracle`: how many `tests/run`
+    /// programs must lower, run on the device and match the interpreter oracle at BOTH -O0 and -O3.
+    ///
+    /// The gate below asserts correctness *of what runs*. A `lower::UNSUPPORTED` decline is a skip,
+    /// so without this floor a change that stops lowering some construct turns **nothing** red — it
+    /// just quietly shrinks the set being checked. That is proven history, not theory: the
+    /// loop-vectorizer campaign cost gpu-native ~10% of the corpus (39 programs declined on a single
+    /// missing `Op::Iota` arm) and every gate in the workspace stayed green until an agent probed a
+    /// decline by hand.
+    ///
+    /// Deliberately a **count**, not a ratio: a newly added fixture that declines leaves `covered`
+    /// unchanged, so corpus growth can never trip this, while a construct that stops lowering always
+    /// does.
+    ///
+    /// Recorded 2026-08-06 at `5870053` on an RTX 4050 / driver r5xx: 217 of 357 programs. The other
+    /// 140 are honest `UNSUPPORTED` declines, dominated by 94 not-yet-lowered `wukong_*` runtime
+    /// kernel calls and 23 raw-AVX2 CPU kernels. Raise this whenever coverage grows; lower it ONLY in
+    /// the same commit as the intentional decline, and say why here.
+    const RUN_CORPUS_COVERAGE_FLOOR: usize = 217;
+
     #[test]
     fn run_corpus_matches_interp_oracle() {
         if crate::gpu::gpu().is_none() {
@@ -4292,6 +4312,18 @@ fn main() -> i32 {
             faults.join("\n")
         );
         assert!(covered > 0, "no programs covered — pipeline broken");
+        assert!(
+            covered >= RUN_CORPUS_COVERAGE_FLOOR,
+            "gpu-native corpus coverage regressed below the recorded floor: {covered} of {} \
+             programs match the oracle, floor is {RUN_CORPUS_COVERAGE_FLOOR} ({} lost). Every \
+             program that stopped running is on the `-- not yet covered` list printed above (re-run \
+             with --nocapture). If the decline is INTENTIONAL, update RUN_CORPUS_COVERAGE_FLOOR in \
+             the SAME commit and say why in its comment. If it is not, you just silently lost \
+             gpu-native corpus coverage — a decline is a skip here, so no other gate in this \
+             workspace would ever have told you.",
+            files.len(),
+            RUN_CORPUS_COVERAGE_FLOOR - covered
+        );
     }
 
     /// Diagnostic: JIT the PTX file named by `WUKONG_PTX_FILE` with the driver error-log buffer

@@ -201,6 +201,26 @@ mod tests {
         gl.len() == cl.len() && gl.iter().zip(&cl).all(|(a, b)| line_matches(a, b))
     }
 
+    /// The **coverage ratchet** for `mega_corpus_matches_oracle`: how many `tests/run`
+    /// program-configs (one per fixture per `-O` level) must be fusion-eligible AND actually launch
+    /// cooperatively AND match the interpreter oracle.
+    ///
+    /// This gate needs the floor even more than the single-thread one does, because a megakernel
+    /// decline is *doubly* invisible: `analyze(..).eligible == false` `continue`s without a word, and
+    /// a launch-time decline (`Ok(None)`) is explicitly excused as "not a miscompile". Both paths
+    /// shrink the set being checked while the gate stays green. The precedent is the single-thread
+    /// path's own history — the loop-vectorizer campaign silently declined 39 corpus programs on one
+    /// missing `Op::Iota` arm and no gate noticed.
+    ///
+    /// Deliberately a **count**, not a ratio: a new fixture that is ineligible leaves `ran`
+    /// unchanged, so corpus growth can never trip this. And because `ran` is a subset of `eligible`,
+    /// one floor catches both regressions — an eligibility loss in `fusion::analyze` and a decline at
+    /// launch.
+    ///
+    /// Recorded 2026-08-06 at `5870053` on an RTX 4050: 87 ran / 103 eligible. Raise it whenever
+    /// coverage grows; lower it ONLY in the same commit as the intentional decline, with the reason.
+    const MEGA_CORPUS_COVERAGE_FLOOR: usize = 87;
+
     /// Every **megakernel-eligible** `tests/run` program, run through the cooperative megakernel,
     /// matches the interpreter oracle (tolerance for floats, exact otherwise) at both -O0 and -O3.
     /// Ineligible programs are skipped here (the single-thread gate covers them); this proves the
@@ -322,6 +342,18 @@ mod tests {
             faults.join("\n")
         );
         assert!(ran > 0, "no eligible program ran on the megakernel — pipeline broken");
+        assert!(
+            ran >= MEGA_CORPUS_COVERAGE_FLOOR,
+            "megakernel corpus coverage regressed below the recorded floor: {ran} program-configs \
+             ran and matched the oracle (of {eligible} eligible), floor is \
+             {MEGA_CORPUS_COVERAGE_FLOOR} ({} lost). Either `fusion::analyze` stopped finding \
+             programs eligible or the megakernel started declining them at launch — both are silent \
+             here. If the decline is INTENTIONAL, update MEGA_CORPUS_COVERAGE_FLOOR in the SAME \
+             commit and say why in its comment. If it is not, you just silently lost megakernel \
+             corpus coverage — a decline is a skip here, so no other gate in this workspace would \
+             ever have told you.",
+            MEGA_CORPUS_COVERAGE_FLOOR - ran
+        );
     }
 
     /// **The `@parallel` activation shape runs cooperatively and is correct** (full output, not a
