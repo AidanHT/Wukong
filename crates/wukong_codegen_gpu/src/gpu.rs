@@ -4673,6 +4673,75 @@ pub fn gemm_nt_fp8_pipe(
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
+/// `C = A·Bᵀ` (fp8 E4M3 in, f32 out) via a named
+/// [`FP8_DEEP_VARIANTS`](crate::ptx_fp8::FP8_DEEP_VARIANTS) row — the **fp8 deep-stage pipeline**, whose
+/// deeper rings live in dynamic shared memory because the PTX ISA's 48 KiB static cap cannot express
+/// them at these tiles.
+///
+/// fp8 is where pipeline depth is cheapest (1 byte per e4m3 halves every slab against fp16) and where
+/// Ada's `mma.sync` programming model is Hopper's, so these are the campaign's most directly
+/// H100-transferable kernels — and ones an A100 cannot run at all, which is why the capability gate
+/// comes first, ahead of the host-side conversion and any module load.
+///
+/// The SMEM form comes from the config, not from this function: [`Gpu::function_smem`] loads the entry
+/// the way its [`SmemMode`] says (plain load + 0 launch bytes for a static row; `cuFuncSetAttribute`
+/// opt-in + the window size for a dynamic one) and hands back the byte count the launch must carry.
+/// A row past this device's opt-in ceiling declines **loudly** — never a silent downshift to a
+/// shallower ring the caller did not ask for. Requires `M%bm==0`, `N%bn==0`, `K%bk==0`.
+pub fn gemm_nt_fp8_deep(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    v: &crate::ptx_fp8::Fp8StageCfg,
+) -> Result<Vec<f32>, GpuError> {
+    // FIRST — before the e4m3 conversion, before any PTX is generated, before any module is loaded.
+    // On a pre-Ada card this must name the missing capability, not die inside the JIT naming an
+    // instruction, and above all must never quietly compute the same call in another dtype.
+    g.require_fp8(v.name)?;
+    assert_eq!(a.len(), m * k, "A must be m×k");
+    assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
+    assert!(
+        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        "{} requires M%{}==0, N%{}==0, K%{}==0",
+        v.name, v.bm, v.bn, v.bk
+    );
+    if v.smem_bytes() > g.smem_budget() {
+        // A capability fact about the hardware, decided before any PTX is loaded — not a driver error.
+        return Err(GpuError::Unsupported(format!(
+            "fp8 deep pipeline `{}`: needs {} B of shared memory per block, but {} reports a {} B \
+             opt-in ceiling (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+            v.name,
+            v.smem_bytes(),
+            g.target.name,
+            g.smem_budget()
+        )));
+    }
+    let (ptx, mode) = crate::ptx_fp8::fp8_stage_ptx(v, g.smem_budget());
+    let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+    let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+    // The row's name is BOTH the module-cache key and the entry symbol (crate hard rule 4): the cache
+    // never re-examines PTX on a hit, so two depths under one key would share the first's kernel *and*
+    // its opted-in SMEM ceiling — a wrong-tail-behaviour bug that still returns `Ok`.
+    let (f, dyn_bytes) = g.function_smem(v.name, &ptx, v.name, mode)?;
+    let a_d = g.stream.memcpy_stod(&a8)?;
+    let b_d = g.stream.memcpy_stod(&b8)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    // Rasterized ⇒ a 1-D grid of (M/bm)·(N/bn) blocks.
+    let cfg = dyn_launch_cfg(
+        (((m / v.bm) * (n / v.bn)) as u32, 1, 1),
+        (v.threads() as u32, 1, 1),
+        dyn_bytes,
+    );
+    unsafe { bld.launch(cfg)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
 /// `C = act(A·Bᵀ + bias)` (fp8 E4M3 in, f32 out) fused into the pipelined fp8 workhorse store epilogue —
 /// the **fastest fused inference path** (Ada runs fp8 `mma.sync` at 2× the fp16 TC rate). `entry` selects
 /// the variant (`fp8_gemm_pipe_bias{,_relu,_silu,_gelu}`); bias is added to the f32 accumulators
@@ -5778,7 +5847,10 @@ mod tests {
         // number in the same commit, and read the printed list to confirm it is the set you meant.
         // (The cuBLASLt fp8 peer `baselines::cublaslt_gemm_nt_fp8_e4m3` is deliberately NOT here: it
         // rounds on the host and loads no PTX module at all, so there is no module load to precede.)
-        const EXPECTED_LAUNCHERS: usize = 8;
+        // 8 -> 9 with `gemm_nt_fp8_deep` (the fp8 deep-stage grid's launcher): it reaches
+        // `ptx_fp8::fp8_stage_ptx` and loads through `function_smem`, and gates on `require_fp8` first —
+        // deliberately, because an A100 has no fp8 ISA at all and must decline rather than JIT-fail.
+        const EXPECTED_LAUNCHERS: usize = 9;
         assert_eq!(
             checked.len(),
             EXPECTED_LAUNCHERS,
@@ -5912,6 +5984,14 @@ mod tests {
         for cfg in int8::INT8_STAGE_VARIANTS {
             v.push((format!("int8::stage/{}", cfg.name), int8::int8_stage_ptx(cfg, 101 * 1024).0));
         }
+        // The fp8 deep-stage grid — one module per row, four of the six carving their rings out of the
+        // dynamic window. These are the family whose `.version 8.4` is genuinely earned (`e4m3` mma).
+        for cfg in fp8::FP8_DEEP_VARIANTS {
+            v.push((
+                format!("fp8::deep/{}", cfg.name),
+                fp8::fp8_stage_ptx(cfg, wmma::DEEP_SMEM_BUDGET).0,
+            ));
+        }
         for (bm, bn, wm2, wn2) in [(256usize, 128usize, 4usize, 2usize), (128, 256, 2, 4)] {
             let (name, ptx) = int8::int8_gemm_swz_tile_ptx(bm, bn, wm2, wn2, 0);
             v.push((format!("int8::swz_tile/{name}"), ptx));
@@ -5939,8 +6019,9 @@ mod tests {
     ///
     /// **Coverage** ([`device_free_modules`]): every literal PTX const and every zero-argument
     /// generator the crate exposes, plus one representative shape of each parameterized generator —
-    /// 88 modules across ptx, gemm, wmma, norm, flash, conv, winograd, optim, autodiff-bwd, int4, int8
-    /// (including the variable-stage grid and both dynamic-SMEM depths), fp8, fp8-train and paged KV.
+    /// 94 modules across ptx, gemm, wmma, norm, flash, conv, winograd, optim, autodiff-bwd, int4, int8
+    /// (including the variable-stage grid and both dynamic-SMEM depths), fp8 (including all six
+    /// deep-stage rows), fp8-train and paged KV.
     /// Not covered here, because they need a MIR `Program` rather than a shape: `lower::emit_ptx` /
     /// `emit_mega_ptx` / `fusion` / `megakernel`, which carry the identical `.version 8.4` negative in
     /// `lower.rs` over their own output, and the NVRTC peers, which carry it in `baselines.rs`.
@@ -5983,7 +6064,9 @@ mod tests {
             }
         }
         // EXACT, so a module leaving the enumeration is as loud as one arriving. Update deliberately.
-        const EXPECTED_MODULES: usize = 88;
+        // 88 -> 94 with the six `FP8_DEEP_VARIANTS` rows; the fp8-licensed count rises 11 -> 17 with
+        // them, since every one issues the `e4m3` mma that genuinely earns the `.version 8.4` floor.
+        const EXPECTED_MODULES: usize = 94;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -12352,6 +12435,159 @@ E_FILL:\n\
                 );
                 eprintln!("fp8_pipe_regime {m}x{k}x{n} (bm={bm}): max_abs={:.2e}", st.max_abs);
             }
+        });
+    }
+
+    /// **THE fp8 DEEP-PIPELINE GATE — E4M3 `mma.sync` rings past the 48 KiB static wall.**
+    ///
+    /// Four of the six [`FP8_DEEP_VARIANTS`](crate::ptx_fp8::FP8_DEEP_VARIANTS) rows (128-tile s3 = 60 KiB
+    /// and s4 = 80 KiB, m64 s4 = 60 KiB and s6 = 90 KiB) **cannot be declared statically on any device** —
+    /// the 48 KiB cap is a PTX ISA rule about static `.shared`, not a device fact — so they exist only
+    /// through the module-scope `.extern .shared` window plus `cuFuncSetAttribute`. This runs them, on
+    /// the metal, at $0. They are also the campaign's most transferable kernels: Ada's fp8 `mma.sync` IS
+    /// Hopper's programming model, and an A100 has no fp8 ISA to compare against at all.
+    ///
+    /// Two oracles, because a float kernel has no bit-exact one:
+    ///   * the **E4M3-rounded f64 reference** at the family's `c*sqrt(K)*eps` tolerance — the independent
+    ///     check, so a wrong kernel cannot pass by agreeing with a wrong sibling. The host encoder that
+    ///     feeds it is *itself* pinned independently, against hand-derived bit patterns, by
+    ///     `ptx_fp8::tests::e4m3_encoding_matches_hand_derived_bits` — without that the reference would
+    ///     be circular (it quantizes with the same `f32_to_e4m3` the kernel's inputs went through);
+    ///   * the **shipped 2-stage row of the same tile** (`_s2`, byte-identical to the dispatched kernel)
+    ///     — the regression check, at element-wise **`==`**. A deeper ring reorders only *when* each
+    ///     K-slab is staged; the per-output `mma` sequence and f32 accumulator chain are the 2-stage
+    ///     kernel's exactly, so bit-identity is the true invariant (measured: 0.0 max_abs on every shape)
+    ///     and a tolerance here would hide the very reordering bug the gate exists to catch.
+    ///
+    /// Shapes are **the ring's K-corners per depth**, which is where a variable-depth `cp.async` pipeline
+    /// actually goes wrong:
+    ///   * `K = bk` — a single K-tile, *shorter than the prologue*: slabs 1..stages-2 are staged at
+    ///     absolute K columns past the end of A and B and must be guarded, while their `commit_group`
+    ///     must NOT be (the `wait_group stages-2` count is positional). An off-by-one here consumes an
+    ///     in-flight slab and silently returns wrong C, only at particular K.
+    ///   * `K = (stages-1)*bk` — the prologue exactly fills the ring; the main loop never prefetches.
+    ///   * `K = stages*bk` — the first ring **wrap** (the add+wrap cursor's first lap).
+    ///   * `K = (stages+2)*bk` — several wraps, so a cursor drifting one tile per lap is caught.
+    /// Each K runs at a different rectangular CTA grid, so multi-CTA tile ownership is covered too.
+    ///
+    /// Occupancy is *printed*, not asserted: it is a device fact (`cuOccupancyMaxActiveBlocksPerMultiprocessor`)
+    /// that explains why this 20-SM Ada part's verdict on depth is not the datacenter's. No timing is
+    /// taken here. A row past this device's opt-in ceiling is a **capability skip**, never a silent pass.
+    #[test]
+    fn fp8_deep_matches_reference_within_tol() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3, FP8_DEEP_VARIANTS};
+        with_fp8("fp8_deep", |g| {
+            let budget = g.smem_budget();
+            eprintln!(
+                "fp8 deep pipeline on {} — opt-in SMEM budget {budget} B ({} KiB); static ISA cap {} KiB",
+                g.device_name(),
+                budget / 1024,
+                STATIC_SMEM_CAP / 1024
+            );
+            let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
+            let mut rng = crate::diff::Rng::new(0xF8DE_E900);
+            let mut ran = 0usize;
+            for v in FP8_DEEP_VARIANTS {
+                if v.smem_bytes() > budget {
+                    eprintln!(
+                        "[skip:capability] {}: {} B > this device's opt-in ceiling {budget} B",
+                        v.name,
+                        v.smem_bytes()
+                    );
+                    continue;
+                }
+                // The 2-stage row of the SAME tile is this row's regression oracle — same bm/bn/bk, so
+                // it tiles every shape below by construction.
+                let anchor = crate::ptx_fp8::fp8_deep_variant(if v.bm == 128 {
+                    "fp8_deep_128_s2"
+                } else {
+                    "fp8_deep_m64_s2"
+                });
+                let (f, dyn_bytes) = {
+                    let (ptx, mode) = crate::ptx_fp8::fp8_stage_ptx(v, budget);
+                    assert_eq!(mode, v.smem_mode(), "{}: generator and table disagree on the form", v.name);
+                    let (f, bytes) = g.function_smem(v.name, &ptx, v.name, mode).unwrap();
+                    assert_eq!(bytes, mode.launch_bytes());
+                    (f, bytes)
+                };
+                let occ = f
+                    .occupancy_max_active_blocks_per_multiprocessor(v.threads() as u32, dyn_bytes, None)
+                    .unwrap_or(0);
+                eprintln!(
+                    "  {:<16} {}x{} s{} SMEM {:>6} B ({:>2} KiB) {:<8} launch_bytes={:<6} occupancy={} CTA/SM",
+                    v.name,
+                    v.bm,
+                    v.bn,
+                    v.stages,
+                    v.smem_bytes(),
+                    v.smem_bytes() / 1024,
+                    if v.smem_mode().is_dynamic() { "DYNAMIC" } else { "static" },
+                    dyn_bytes,
+                    occ
+                );
+                // K-corners of this depth's ring, each at its own rectangular CTA grid.
+                let mut shapes = vec![
+                    (v.bm, v.bk, v.bn),                        // 1 CTA, single K-tile: full prologue guard
+                    (v.bm, v.min_k(), v.bn),                   // prologue exactly fills the ring
+                    (2 * v.bm, v.bk * v.stages, 2 * v.bn),     // 4 CTAs, first ring wrap
+                    (v.bm, v.bk * (v.stages + 2), 2 * v.bn),   // several wraps, rectangular
+                ];
+                shapes.dedup();
+                for (m, k, n) in shapes {
+                    let a = rng.vec(m * k, -1.0, 1.0);
+                    let b = rng.vec(n * k, -1.0, 1.0);
+                    let r = ref_nt_rounded(&a, &b, m, k, n, round);
+                    let c = gemm_nt_fp8_deep(g, &a, &b, m, k, n, v).unwrap();
+                    // The family's tolerance convention: c*sqrt(K)*eps, floored at E4M3's own coarseness.
+                    let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
+                    let st =
+                        crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, rel);
+                    // ...and against the shipped 2-stage row of the same tile — asserted **element-wise
+                    // `==`, not within tolerance**. Depth changes only the cp.async *copy schedule*: the
+                    // per-output `mma.sync` sequence, its operand registers and the f32 accumulator chain
+                    // are the 2-stage kernel's exactly, so bit-identity is the real invariant here and a
+                    // tolerance would hide precisely the reordering bug this gate exists to catch.
+                    let c2 = gemm_nt_fp8_deep(g, &a, &b, m, k, n, anchor).unwrap();
+                    assert_eq!(
+                        c, c2,
+                        "{} {m}x{k}x{n}: differs from the shipped 2-stage `{}` — a deeper ring must \
+                         reorder only WHEN slabs are staged, never the accumulation itself",
+                        v.name, anchor.name
+                    );
+                    eprintln!(
+                        "    {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e} | vs {}: bit-identical",
+                        st.max_abs, st.max_rel, anchor.name
+                    );
+                    ran += 1;
+                }
+            }
+            assert!(ran >= 12, "the fp8 deep grid must actually have run (only {ran} shapes)");
+            eprintln!(
+                "[gate] fp8 deep pipeline: {ran} K-corner shapes across the 128x128 s2..s4 and 64x128 \
+                 s2/s4/s6 rows, every one within the E4M3 tolerance of the f64 oracle AND of the shipped \
+                 2-stage kernel; the >48 KiB rows ran out of the dynamic SMEM window \u{2713}"
+            );
+        });
+    }
+
+    /// **An fp8 deep row that does not fit the device declines LOUDLY** — it never silently runs a
+    /// shallower ring or a truncated window. Probed with a fabricated over-budget config so the check
+    /// fires on every card, however large its carveout (H100's opt-in is 227 KiB).
+    #[test]
+    fn fp8_deep_declines_over_budget_instead_of_downshifting() {
+        use crate::ptx_fp8::{fp8_deep_variant, Fp8StageCfg};
+        with_fp8("fp8_deep_decline", |g| {
+            let budget = g.smem_budget();
+            // 32 stages at 128x128 bk64 pad16 = 640 KiB — past every part's opt-in ceiling.
+            let over = Fp8StageCfg { stages: 32, ..*fp8_deep_variant("fp8_deep_128_s2") };
+            assert!(over.smem_bytes() > budget, "the probe config must exceed the device ceiling");
+            let a = vec![0f32; 128 * 64];
+            let b = vec![0f32; 128 * 64];
+            let err = gemm_nt_fp8_deep(g, &a, &b, 128, 64, 128, &over).unwrap_err();
+            let msg = err.unsupported().expect("an over-budget row must be a CAPABILITY decline");
+            assert!(msg.contains("shared memory"), "the decline must name what was refused: {msg}");
+            assert!(msg.contains(&budget.to_string()), "the decline must name the ceiling: {msg}");
+            eprintln!("[gate] over-budget fp8 deep row declined: {msg}");
         });
     }
 
