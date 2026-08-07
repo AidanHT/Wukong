@@ -20,7 +20,8 @@
 //! **bit-exact** against a CPU `i32` reference — a strictly stronger gate. The MMA without `.satfinite`
 //! wraps mod 2³², which is exactly what the CPU reference (wrapping `i32` adds) computes.
 
-use crate::ptx_target::HDR_SM80_V84;
+use crate::gpu::{smem_mode_for, SmemMode, DSMEM_DECL, DSMEM_SYM, STATIC_SMEM_CAP};
+use crate::ptx_target::{HDR_SM80, HDR_SM80_V84};
 
 /// One `mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32` tile: A is `16×32` **u8** row-major, B is
 /// `32×8` **i8** column-major (the `.row.col` operand layout), D = A·B is `16×8` **i32** row-major. One
@@ -488,7 +489,8 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
 /// reference (the swizzle only reorders SMEM; the integer arithmetic is untouched). Entry `name`;
 /// requires M%bm==0, N%bn==0, K%64==0, bm%(16·wm)==0, bn%(8·wn)==0, (bm/wm)%8==(bn/wn)%8==0, `bm·bk`
 /// and `bn·bk` powers of two (the XOR buffer toggle) and each a multiple of `threads·16` (128-bit
-/// cp.async staging), and `stages·(bm+bn)·bk` ≤ 48 KiB. Every *tile-shape* condition is asserted in
+/// cp.async staging), and `stages·(bm+bn)·bk` ≤ the caller's `smem_budget` (48 KiB here — the ISA's
+/// static cap — so this shim's PTX is the historical text to the byte). Every *tile-shape* condition is asserted in
 /// [`gen_int8_smdb_swz_impl`], so an untileable tile config panics at generation rather than staging
 /// a partial slab; the M/N/K divisibility is asserted only when `static_dims` bakes the dims in — on
 /// the dynamic-dims entries (the default, and the only ones split-K uses) M/N/K are runtime
@@ -507,7 +509,9 @@ fn gen_int8_smdb_swz(
 ) -> String {
     // The shipped 2-stage double-buffer — every existing caller routes here, byte-identical to before the
     // `stages` generalization (the `_impl` `stages==2` branch contains the verbatim XOR-toggle path).
-    gen_int8_smdb_swz_impl(name, bm, bn, wm, wn, dequant, splitk, static_dims, raster, 2)
+    // The 48 KiB budget is the PTX ISA's static cap, so every shipped kernel stays on the static
+    // emission path and its PTX text is unchanged to the byte.
+    gen_int8_smdb_swz_impl(name, bm, bn, wm, wn, dequant, splitk, static_dims, raster, 2, STATIC_SMEM_CAP, HDR_SM80_V84)
 }
 
 /// `stages`-deep generalization of [`gen_int8_smdb_swz`]: `stages==2` is the original XOR double-buffer
@@ -517,6 +521,16 @@ fn gen_int8_smdb_swz(
 /// each slab is staged, so it stays **bit-exact mod 2³²** vs the i32 oracle. `stages>=3` is supported only
 /// on the plain dynamic path (no split-K / static-dims / raster — those each reuse `ctaid`/baked constants
 /// the ring prologue does not thread). 3-stage 128×128 BK=64 = exactly 48 KiB static SMEM (the no-carveout max).
+///
+/// **`smem_budget` (bytes) is the ceiling this kernel may spend, and it also selects the emission form**
+/// ([`crate::gpu::smem_mode_for`]): at or below the PTX ISA's 48 KiB static cap the `.shared` arrays are
+/// declared exactly as they always were — **byte-identical PTX**, so every shipped entry (and its warm
+/// cubin) is untouched — and beyond it the two rings are carved out of ONE module-scope
+/// [`crate::gpu::DSMEM_DECL`] window at constant offsets (A at 0, B at `stages·bm·bk`). Generators stay
+/// pure text functions: the budget is *passed in* by the dispatch layer from `Gpu::smem_budget()`, never
+/// probed here, so the whole stage grid is enumerable off-device and an A100/H100 budget is testable on
+/// the laptop. Note the shape: the deep rings this unlocks are `stages ≥ 4`, which is exactly the
+/// occupancy-free depth the datacenter parts have and Ada does not (D3 §2b).
 #[allow(clippy::too_many_arguments)]
 fn gen_int8_smdb_swz_impl(
     name: &str,
@@ -529,6 +543,14 @@ fn gen_int8_smdb_swz_impl(
     static_dims: Option<(usize, usize, usize)>,
     raster: usize,
     stages: usize,
+    smem_budget: usize,
+    // The module header ([`crate::ptx_target`]). Shipped entries keep `HDR_SM80_V84` so their PTX text
+    // is unchanged; NEW modules take `HDR_SM80` (`.version 7.8`). The `.version` is a **driver**
+    // requirement, not an ISA one: 8.4 makes `cuModuleLoadData` demand r550+, while this family's whole
+    // instruction mix (`mma.sync.m16n8k32.u8.s8` = PTX 7.0, `ldmatrix` 6.5, `cp.async` 7.0, and the
+    // `.extern .shared` window — verified loading under 7.8) needs nothing past 7.0. Cloud fleets run
+    // r535+, so an unnecessary 8.4 is a portability hole for exactly the parts this work targets.
+    hdr: &str,
 ) -> String {
     let bk = 64usize; // u8 K-slab: nc = bk/16 = 4 chunks/row (reuses the fp16 nc=4 swizzle phase), 2 k32 steps
     let threads = wm * wn * 32;
@@ -559,7 +581,19 @@ fn gen_int8_smdb_swz_impl(
         stages == 2 || (!splitk && static_dims.is_none() && raster == 0),
         "{name}: multistage (stages>=3) only supports the plain dynamic non-raster path"
     );
-    assert!(stages * (bm * bk) + stages * (bn * bk) <= 48 * 1024, "{name}: static SMEM exceeds 48 KiB");
+    // SMEM(stages) = stages·(bm+bn)·bk — the family's closed form (bk=64 pinned, no pad: the XOR
+    // swizzle IS the conflict fix). The budget is the ceiling; the 48 KiB ISA cap decides the FORM.
+    let smem_total = stages * (a_tile + b_tile);
+    let mode = smem_mode_for(smem_total);
+    assert!(
+        smem_total <= smem_budget,
+        "{name}: SMEM {smem_total} B (stages={stages}, {bm}x{bn}, bk={bk}) exceeds the budget {smem_budget} B"
+    );
+    // Sub-slab alignment inside the single window: B starts at stages·a_tile, which must stay 16-B
+    // aligned or every `cp.async …,16` and `ldmatrix` into the B ring is misaligned. Every shipped tile
+    // byte-count is a multiple of 1 KiB, so this holds trivially — assert it anyway, because a forgotten
+    // offset assert is the one way risk #4 (swizzle/alignment) escapes generation silently.
+    assert!((stages * a_tile) % 16 == 0, "{name}: B slab offset {} is not 16-B aligned", stages * a_tile);
     assert!((bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0, "{name}: threads*16 must divide the tile bytes");
     // split-K folds each CTA's partial product into C by `red.global.add.u32` (deterministic for i32 —
     // integer add commutes, so the result is order-independent and bit-exact, unlike a float reduction).
@@ -583,11 +617,36 @@ fn gen_int8_smdb_swz_impl(
     let a_chunks = bm * bk / (threads * 16); // 16-byte cp.async chunks per thread
     let b_chunks = bn * bk / (threads * 16);
 
+    // Where each ring lives. Static: its own `.shared` array, base offset 0 — the historical spelling,
+    // emitted verbatim. Dynamic: BOTH rings are windows into the single module-scope `wk_dsmem` (two
+    // module-scope externs would ALIAS, measured), A at 0 and B at stages·a_tile.
+    let (sym_a, sym_b, off_b) = match mode {
+        SmemMode::Static => ("smemA", "smemB", 0usize),
+        SmemMode::Dynamic(_) => (DSMEM_SYM, DSMEM_SYM, stages * a_tile),
+    };
+    // `mov.u32 %reg,<window>;` (+ the constant slab offset when the window is shared). Always through
+    // the symbol: the dynamic window's base is NOT guaranteed to be 0 (it starts after any statics).
+    let base_into = |reg: &str, sym: &str, off: usize| -> String {
+        if off == 0 {
+            format!("    mov.u32 {reg},{sym};\n")
+        } else {
+            format!("    mov.u32 {reg},{sym};\n    add.u32 {reg},{reg},{off};\n")
+        }
+    };
+    let a_base = base_into("%tmp", sym_a, 0);
+    let b_base = base_into("%tmp", sym_b, off_b);
+
     let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
-    let mut s = format!("{HDR_SM80_V84}\n");
+    let mut s = format!("{hdr}\n");
+    if mode.is_dynamic() {
+        // MODULE SCOPE, not inside the entry — the identical line in an entry body is CUDA_ERROR_INVALID_PTX.
+        s += DSMEM_DECL;
+    }
     s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
-    s += &format!("    .shared .align 16 .b8 smemA[{}];\n", stages * bm * bk);
-    s += &format!("    .shared .align 16 .b8 smemB[{}];\n", stages * bn * bk);
+    if !mode.is_dynamic() {
+        s += &format!("    .shared .align 16 .b8 smemA[{}];\n", stages * bm * bk);
+        s += &format!("    .shared .align 16 .b8 smemB[{}];\n", stages * bn * bk);
+    }
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%ktn,%kcol,%tmp,%tmp2,%tmp3,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufcA,%bufpA,%bufcB,%bufpB,%lane,%grp,%tg2,%warpMrow,%warpNcol,%aptr,%bptr,%phaseA,%phaseB,%arowb,%browb,%la16,%lb8,%swztmp;\n";
     if splitk {
@@ -703,7 +762,10 @@ fn gen_int8_smdb_swz_impl(
             *s += &format!("    cvt.u64.u32 %off,%tmp;\n    add.s64 %gptr,{gptr_base},%off;\n");
             // dst = swizzled SMEM byte: chunk = %c>>4; chunk_swz = chunk XOR ((r>>1)&nc_mask).
             *s += &format!("    shr.u32 %swztmp,%c,4;\n    shr.u32 %tmp2,%r,1;\n    and.b32 %tmp2,%tmp2,{nc_mask};\n    xor.b32 %swztmp,%swztmp,%tmp2;\n    shl.b32 %swztmp,%swztmp,4;\n");
-            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n    mul.lo.s32 %tmp3,%r,{bk};\n    add.u32 %tmp,%tmp,%tmp3;\n    add.u32 %tmp,%tmp,%swztmp;\n");
+            // `smem` is the pre-rendered ring base (`mov` + the constant slab offset when the two rings
+            // share the dynamic window); the static form is the historical single `mov`, byte for byte.
+            *s += smem;
+            *s += &format!("    add.u32 %tmp,%tmp,{bufoff};\n    mul.lo.s32 %tmp3,%r,{bk};\n    add.u32 %tmp,%tmp,%tmp3;\n    add.u32 %tmp,%tmp,%swztmp;\n");
             *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
         }
     };
@@ -713,8 +775,8 @@ fn gen_int8_smdb_swz_impl(
     let kstop = if splitk { "%kend" } else { "%K" };
     if stages == 2 {
         s += &format!("    mov.u32 %kcol,{kstart};\n");
-        stage("%baseRow", "%A", "smemA", "%bufcA", a_chunks, &mut s);
-        stage("%baseCol", "%B", "smemB", "%bufcB", b_chunks, &mut s);
+        stage("%baseRow", "%A", &a_base, "%bufcA", a_chunks, &mut s);
+        stage("%baseCol", "%B", &b_base, "%bufcB", b_chunks, &mut s);
         s += "    cp.async.commit_group;\n";
     } else {
         // Multistage prologue: prefetch slabs 0..stages-2 into buffers 0..stages-2 (stages-1 committed
@@ -728,8 +790,8 @@ fn gen_int8_smdb_swz_impl(
             if j > 0 {
                 s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{j};\n");
             }
-            stage("%baseRow", "%A", "smemA", &offa, a_chunks, &mut s);
-            stage("%baseCol", "%B", "smemB", &offb, b_chunks, &mut s);
+            stage("%baseRow", "%A", &a_base, &offa, a_chunks, &mut s);
+            stage("%baseCol", "%B", &b_base, &offb, b_chunks, &mut s);
             if j > 0 {
                 s += &format!("PRO_{name}_{j}:\n");
             }
@@ -743,8 +805,8 @@ fn gen_int8_smdb_swz_impl(
         s += &format!("    add.u32 %ktn,%kt,{bk};\n    setp.lt.u32 %pmore,%ktn,{kstop};\n");
         s += &format!("    @!%pmore bra LAST_{name};\n");
         s += "    mov.u32 %kcol,%ktn;\n";
-        stage("%baseRow", "%A", "smemA", "%bufpA", a_chunks, &mut s);
-        stage("%baseCol", "%B", "smemB", "%bufpB", b_chunks, &mut s);
+        stage("%baseRow", "%A", &a_base, "%bufpA", a_chunks, &mut s);
+        stage("%baseCol", "%B", &b_base, "%bufpB", b_chunks, &mut s);
         s += "    cp.async.commit_group;\n    cp.async.wait_group 1;\n";
         s += &format!("    bra SYNC_{name};\nLAST_{name}:\n    cp.async.wait_group 0;\nSYNC_{name}:\n");
         s += "    bar.sync 0;\n";
@@ -754,8 +816,8 @@ fn gen_int8_smdb_swz_impl(
         s += &format!("    add.u32 %ktn,%kt,{};\n    setp.lt.u32 %pmore,%ktn,{kstop};\n", (stages - 1) * bk);
         s += &format!("    @!%pmore bra NOSTAGE_{name};\n");
         s += "    mov.u32 %kcol,%ktn;\n";
-        stage("%baseRow", "%A", "smemA", "%bufpA", a_chunks, &mut s);
-        stage("%baseCol", "%B", "smemB", "%bufpB", b_chunks, &mut s);
+        stage("%baseRow", "%A", &a_base, "%bufpA", a_chunks, &mut s);
+        stage("%baseCol", "%B", &b_base, "%bufpB", b_chunks, &mut s);
         s += &format!("NOSTAGE_{name}:\n");
         s += &format!("    cp.async.commit_group;\n    cp.async.wait_group {};\n", stages - 1);
         s += "    bar.sync 0;\n";
@@ -765,13 +827,15 @@ fn gen_int8_smdb_swz_impl(
     // XOR-swizzled (conflict-free, no-pad) SMEM, then `tm·tn` `mma.sync.m16n8k32` (A frag reused across N,
     // B across M). chunk_off = ((ks·2 | la16/lb8) XOR phase)·16 selects the k16/k32 half (per-lane const).
     for ks in 0..nks {
-        s += "    mov.u32 %aptr,smemA;\n    add.u32 %aptr,%aptr,%bufcA;\n    add.u32 %aptr,%aptr,%arowb;\n";
+        s += &base_into("%aptr", sym_a, 0);
+        s += "    add.u32 %aptr,%aptr,%bufcA;\n    add.u32 %aptr,%aptr,%arowb;\n";
         s += &format!("    or.b32 %swztmp,%la16,{};\n    xor.b32 %swztmp,%swztmp,%phaseA;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
         for mi in 0..tm {
             let mibase = mi * 16 * bk;
             s += &format!("    add.u32 %tmp,%aptr,%swztmp;\n    add.u32 %tmp,%tmp,{mibase};\n    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},[%tmp];\n");
         }
-        s += "    mov.u32 %bptr,smemB;\n    add.u32 %bptr,%bptr,%bufcB;\n    add.u32 %bptr,%bptr,%browb;\n";
+        s += &base_into("%bptr", sym_b, off_b);
+        s += "    add.u32 %bptr,%bptr,%bufcB;\n    add.u32 %bptr,%bptr,%browb;\n";
         s += &format!("    or.b32 %swztmp,%lb8,{};\n    xor.b32 %swztmp,%swztmp,%phaseB;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
         for ni in 0..tn {
             let nibase = ni * 8 * bk;
@@ -930,6 +994,31 @@ pub fn int8_gemm_swz_tile_ptx(bm: usize, bn: usize, wm: usize, wn: usize, raster
     (name, ptx)
 }
 
+/// **[`int8_gemm_swz_tile_ptx`] at an arbitrary pipeline depth** — the big-tile × depth axis D3's P5
+/// asks for (CUTLASS's SM80 int8 shape class 256×128 w64×64 at `stages=3` is 72 KiB, expressible only
+/// through the dynamic window). Returns `(entry_name, ptx, mode)`; the name embeds tile, warps and depth
+/// so the module-cache key stays unique per variant. `stages ≥ 3` forbids rasterization (the ring
+/// prologue does not thread the rasterized tile map — asserted in the generator).
+pub fn int8_gemm_swz_tile_stage_ptx(
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    raster: usize,
+    stages: usize,
+    smem_budget: usize,
+) -> (String, String, SmemMode) {
+    let name = if raster > 0 {
+        format!("int8_swz_{bm}x{bn}_w{wm}x{wn}_r{raster}_s{stages}")
+    } else {
+        format!("int8_swz_{bm}x{bn}_w{wm}x{wn}_s{stages}")
+    };
+    let ptx = gen_int8_smdb_swz_impl(
+        &name, bm, bn, wm, wn, false, false, None, raster, stages, smem_budget, HDR_SM80,
+    );
+    (name, ptx, smem_mode_for(stages * (bm + bn) * 64))
+}
+
 /// **The winning int8 swz config (perf/gpu-quant-2): a 128×128 CTA with a 64×64 warp tile** — 4 warps
 /// (`wm=wn=2`) instead of the shipped 8-warp 32×64. Doubling the per-warp tile (`tm=4` 16-row × `tn=8`
 /// 8-col = 32 subtiles, a 64×64 warp tile) doubles the A/B fragment reuse per `mma.sync` — the lever the
@@ -964,7 +1053,86 @@ pub fn int8_gemm_w64_swz_ptx() -> &'static str {
 /// **Bit-exact** mod 2³² (a deeper prefetch ring only reorders staging; the i32 mma arithmetic is identical).
 pub fn int8_gemm_w64_swz_s3_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz_impl("int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0, 3)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz_impl("int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0, 3, STATIC_SMEM_CAP, HDR_SM80_V84)).as_str()
+}
+
+/// One row of the **int8 variable-stage grid** — the family's `(tile, warps, depth)` point, its stable
+/// module-cache key **and** its PTX entry name in one `&'static str`.
+///
+/// The name carries the stage count *and* (via [`Self::smem_mode`], a pure function of the same fields)
+/// the SMEM form, because `Gpu::function` keys the module cache on the key alone and **never re-examines
+/// the PTX on a hit**: two depths under one key would silently run the first one's kernel with the
+/// second one's launch window — a wrong-tail-behaviour bug that still returns `Ok`. One row = one key =
+/// one entry = one depth.
+#[derive(Clone, Copy, Debug)]
+pub struct Int8StageCfg {
+    /// PTX entry symbol *and* module-cache key (a `&'static str`, as `Gpu::function` requires).
+    pub name: &'static str,
+    pub bm: usize,
+    pub bn: usize,
+    pub wm: usize,
+    pub wn: usize,
+    pub stages: usize,
+}
+
+impl Int8StageCfg {
+    /// `stages·(bm+bn)·64` — the family's closed form (BK=64 pinned, no pad).
+    pub const fn smem_bytes(&self) -> usize {
+        self.stages * (self.bm + self.bn) * 64
+    }
+    pub const fn threads(&self) -> usize {
+        self.wm * self.wn * 32
+    }
+    /// Static at or below the 48 KiB ISA cap, one dynamic window beyond it — the single emission rule.
+    pub const fn smem_mode(&self) -> SmemMode {
+        smem_mode_for(self.smem_bytes())
+    }
+    /// Shortest K this depth can run: the ring prologue stages `stages-1` slabs, so `K ≥ (stages-1)·64`
+    /// is what makes the pipeline well-defined (shorter K is *correct* — every prologue slab past K is
+    /// guarded — but the buffers beyond `ceil(K/64)` never fill, so depth there is pure waste).
+    pub const fn min_k(&self) -> usize {
+        (self.stages - 1) * 64
+    }
+}
+
+/// **The int8 `w64` stage grid, s2..s5** — one CTA tile (128×128, the measured winner), one warp tile
+/// (64×64, `wm=wn=2`), four pipeline depths. This is the payoff table of the dynamic-SMEM work:
+///
+/// | depth | SMEM | form | CTAs/SM on this Ada card (100 KiB/SM, 1 KiB reserved) | on A100 (164) | on H100 (228) |
+/// |---|---|---|---|---|---|
+/// | s2 | 32 KiB | static (shipped) | 3 (register-bound) | 4 | 6 |
+/// | s3 | 48 KiB | static (shipped) | **2 — SMEM binds** | 3 | 4 |
+/// | s4 | 64 KiB | **dynamic** | 1 | 2 | 3 |
+/// | s5 | 80 KiB | **dynamic** | 1 | 2 | 2 |
+///
+/// s2/s3 are the shipped kernels under grid names (their PTX is byte-identical bar the entry symbol —
+/// `int8_stage_grid_s2_s3_are_the_shipped_kernels` proves it), so the grid's own correctness gate
+/// covers the shipped pair too. s4/s5 exist **only** through the extern window: 64/80 KiB cannot be
+/// declared statically on any device (the 48 KiB cap is an ISA rule, not a device fact).
+///
+/// **This grid is a correctness deliverable, not a perf bet on this card.** The 4050 measured s3 a loss
+/// at every size and the mechanism was the occupancy cut above — which the datacenter budgets dissolve
+/// (D3 §2b: s3 keeps 3 CTAs/SM on A100). What transfers 100% is the PTX: these are the exact modules an
+/// A100/H100 will run, validated bit-exactly here at $0.
+pub const INT8_STAGE_VARIANTS: &[Int8StageCfg] = &[
+    Int8StageCfg { name: "int8_w64_swz_s2", bm: 128, bn: 128, wm: 2, wn: 2, stages: 2 }, // 32 KiB static
+    Int8StageCfg { name: "int8_w64_swz_s3", bm: 128, bn: 128, wm: 2, wn: 2, stages: 3 }, // 48 KiB static
+    Int8StageCfg { name: "int8_w64_swz_s4", bm: 128, bn: 128, wm: 2, wn: 2, stages: 4 }, // 64 KiB dynamic
+    Int8StageCfg { name: "int8_w64_swz_s5", bm: 128, bn: 128, wm: 2, wn: 2, stages: 5 }, // 80 KiB dynamic
+];
+
+/// Generate one [`INT8_STAGE_VARIANTS`] row against `smem_budget` bytes (the running device's
+/// `Gpu::smem_budget()`, or a target's budget when enumerating off-device). Returns the PTX and the
+/// [`SmemMode`] its launch must honour — `Gpu::function_smem` consumes exactly this pair, so no caller
+/// re-derives a byte count the generator already knows.
+///
+/// Panics (loudly, at generation) if the row does not fit `smem_budget` — a decline belongs in the
+/// dispatcher's `applicable()`, never in a silently-clamped launch.
+pub fn int8_stage_ptx(v: &Int8StageCfg, smem_budget: usize) -> (String, SmemMode) {
+    let ptx = gen_int8_smdb_swz_impl(
+        v.name, v.bm, v.bn, v.wm, v.wn, false, false, None, 0, v.stages, smem_budget, HDR_SM80,
+    );
+    (ptx, v.smem_mode())
 }
 
 /// 64×64-warp-tile int8 swz GEMM **with threadblock rasterization** (`raster=8`, entry
@@ -1343,6 +1511,11 @@ mod tests {
     use super::*;
     use crate::ptx_target::TARGET_SM80;
 
+    /// This Ada card's probed `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` (99 KiB), spelled as a literal so the
+    /// generator gates stay **device-free** — the whole point of D6 §5.1's "budget is a parameter, not a
+    /// probe" decision is that the stage grid is enumerable and text-gateable with no GPU in the room.
+    const ADA_OPTIN_BUDGET: usize = 101_376;
+
     /// Every module this file emits, paired with the entry it must declare. `int8_gemm_swz_tile_ptx`
     /// returns its own entry name, so it is folded in separately below.
     fn modules() -> Vec<(&'static str, String)> {
@@ -1445,6 +1618,146 @@ mod tests {
         // The s4 prologue really does reach K column 64 — the column the shipped 64x64x64 gate shape
         // would read out of bounds without the guard.
         assert!(int8_gemm_smdb_s4_ptx().contains("mov.u32 %kcol,64;"));
+    }
+
+    /// Every module the **variable-stage** generators emit, paired with its entry name.
+    fn stage_modules() -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = INT8_STAGE_VARIANTS
+            .iter()
+            .map(|c| (c.name.to_string(), int8_stage_ptx(c, ADA_OPTIN_BUDGET).0))
+            .collect();
+        for (bm, bn, wm, wn) in [(256usize, 128usize, 4usize, 2usize), (128, 256, 2, 4)] {
+            let (name, ptx, _) = int8_gemm_swz_tile_stage_ptx(bm, bn, wm, wn, 0, 3, ADA_OPTIN_BUDGET);
+            v.push((name, ptx));
+        }
+        v
+    }
+
+    /// **ASCII + floor gate for the variable-stage modules**, which are exactly the ones destined for a
+    /// machine this box cannot test on — one non-ASCII byte in a `format!` is a `ptxas fatal` at
+    /// `cuModuleLoadData`, and no local device gate would ever see it.
+    ///
+    /// They are pinned at [`HDR_SM80`] (**`.version 7.8`**), not the `8.4` the shipped int8 entries carry.
+    /// The `.version` is a **driver** requirement, not an instruction-set one: 8.4 makes the JIT demand
+    /// r550+, while this family needs nothing past PTX ISA 7.0 (`mma.sync.m16n8k32.u8.s8` 7.0, `ldmatrix`
+    /// 6.5, `cp.async` 7.0) — and the `.extern .shared` window itself loads fine under 7.8, since dynamic
+    /// SMEM is launch-time state rather than an ISA feature. Cloud fleets run r535+, so an unnecessary
+    /// 8.4 would refuse to load on the very parts this work exists to reach.
+    #[test]
+    fn int8_stage_modules_are_ascii_at_the_portable_floor() {
+        for (entry, ptx) in stage_modules() {
+            assert!(ptx.is_ascii(), "{entry}: PTX must be ASCII");
+            assert!(
+                ptx.starts_with(HDR_SM80),
+                "{entry}: a NEW int8 module must open at .version 7.8 / sm_80 — 8.4 needs driver r550+ \
+                 for no instruction this family emits"
+            );
+            assert!(!ptx.contains("sm_89"), "{entry}: no Ada-only instruction here");
+            assert!(ptx.contains(&format!(".visible .entry {entry}(")), "{entry}: entry missing");
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "{entry}: unbalanced braces");
+            assert!(
+                ptx.contains("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32"),
+                "{entry}: must issue the 8-bit u8xi8->i32 mma"
+            );
+        }
+    }
+
+    /// **ZERO REGRESSION on the ≤48 KiB path: the grid's s2/s3 rows ARE the shipped kernels, byte for
+    /// byte below the header.** The whole dynamic-SMEM migration hangs on one promise — that adding a
+    /// budget parameter and an extern-window arm changes *nothing* about the kernels this card already
+    /// runs. A behavioural A/B could only sample that; this proves it: generate the grid's s2 and s3
+    /// rows, rename the entry back, and demand string equality with `int8_gemm_w64_swz_ptx()` /
+    /// `int8_gemm_w64_swz_s3_ptx()`. The shipped functions themselves are untouched (still `.version
+    /// 8.4`), so their on-disk cubins stay warm; the grid rows differ *only* in the deliberate `.version`
+    /// floor — asserted here as the sole difference, so a body change cannot hide behind it.
+    #[test]
+    fn int8_stage_grid_s2_s3_are_the_shipped_kernels() {
+        for (grid, shipped_name, shipped) in [
+            ("int8_w64_swz_s2", "int8_gemm_nt_w64_swz", int8_gemm_w64_swz_ptx()),
+            ("int8_w64_swz_s3", "int8_gemm_nt_w64_swz_s3", int8_gemm_w64_swz_s3_ptx()),
+        ] {
+            let v = INT8_STAGE_VARIANTS.iter().find(|v| v.name == grid).expect("grid row");
+            let (ptx, mode) = int8_stage_ptx(v, ADA_OPTIN_BUDGET);
+            assert_eq!(mode, SmemMode::Static, "{grid} is {} B — must stay on the static path", v.smem_bytes());
+            let body = ptx.strip_prefix(HDR_SM80).expect("grid rows open at the 7.8 floor");
+            let shipped_body = shipped.strip_prefix(HDR_SM80_V84).expect("shipped entries are 8.4");
+            assert_eq!(
+                body.replace(grid, shipped_name),
+                shipped_body,
+                "{grid}: the stage-parameterized generator no longer reproduces the shipped `{shipped_name}` \
+                 byte for byte — the <=48 KiB path is NOT allowed to move"
+            );
+        }
+    }
+
+    /// **The grid's SMEM arithmetic, emission form, and window discipline (no GPU).** Four things a
+    /// wrong dynamic-SMEM kernel gets wrong silently, each checked from the text:
+    ///   * the closed form `stages·(bm+bn)·64` and the 48 KiB boundary that splits static from dynamic;
+    ///   * `.extern .shared` sits at **module scope** — the identical line inside the entry body is
+    ///     `CUDA_ERROR_INVALID_PTX` (measured), so its offset must precede `.visible .entry`;
+    ///   * exactly **one** window per module: two module-scope externs ALIAS (measured), so a second one
+    ///     would put the B ring on top of the A ring and quietly compute garbage;
+    ///   * a dynamic entry declares **no** static `.shared` array (it would count against the same
+    ///     opt-in ceiling), and a static entry declares no window.
+    #[test]
+    fn int8_stage_grid_smem_math_and_modes() {
+        let expect: [(usize, usize, bool); 4] =
+            [(2, 32768, false), (3, 49152, false), (4, 65536, true), (5, 81920, true)];
+        assert_eq!(INT8_STAGE_VARIANTS.len(), expect.len());
+        for (v, (stages, bytes, dynamic)) in INT8_STAGE_VARIANTS.iter().zip(expect) {
+            assert_eq!(v.stages, stages, "{}: grid order", v.name);
+            assert_eq!(v.smem_bytes(), bytes, "{}: SMEM closed form", v.name);
+            assert_eq!(v.smem_mode().is_dynamic(), dynamic, "{}: emission form at {bytes} B", v.name);
+            assert_eq!(v.smem_mode().launch_bytes(), if dynamic { bytes } else { 0 }, "{}", v.name);
+            assert!(v.smem_bytes() <= ADA_OPTIN_BUDGET, "{}: must fit this card", v.name);
+            let (ptx, mode) = int8_stage_ptx(v, ADA_OPTIN_BUDGET);
+            assert_eq!(mode, v.smem_mode());
+            assert_eq!(ptx.matches(".extern .shared").count(), usize::from(dynamic), "{}", v.name);
+            if dynamic {
+                let (decl, entry) = (
+                    ptx.find(".extern .shared").expect("window"),
+                    ptx.find(".visible .entry").expect("entry"),
+                );
+                assert!(decl < entry, "{}: the window must be declared at MODULE scope", v.name);
+                assert!(!ptx.contains(".shared .align 16 .b8 smemA"), "{}: no statics beside the window", v.name);
+                // Both rings address the one window; B is offset by the whole A ring.
+                assert!(ptx.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")), "{}", v.name);
+                assert!(
+                    ptx.contains(&format!("add.u32 %bptr,%bptr,{};", v.stages * v.bm * 64)),
+                    "{}: B ring must start after the A ring",
+                    v.name
+                );
+            } else {
+                assert!(ptx.contains(&format!(".shared .align 16 .b8 smemA[{}];", v.stages * v.bm * 64)), "{}", v.name);
+                assert!(!ptx.contains(DSMEM_SYM), "{}: a static kernel must not touch the window", v.name);
+            }
+            // The ring is add+wrap at every depth: the XOR toggle only cycles TWO buffers, so reusing it
+            // at s>=3 would corrupt every stage past the second (D6 risk #2).
+            let ring = v.stages * v.bm * 64;
+            if v.stages == 2 {
+                assert!(ptx.contains(&format!("xor.b32 %bufcA,%bufcA,{};", v.bm * 64)), "{}", v.name);
+            } else {
+                assert!(!ptx.contains("xor.b32 %bufcA"), "{}: XOR wrap is invalid past 2 buffers", v.name);
+                assert!(ptx.contains(&format!("setp.ge.u32 %pmore,%bufcA,{ring};")), "{}", v.name);
+            }
+            // cp.async bookkeeping: `stages-1` groups stay in flight, and every prologue slab past the
+            // first is guarded against a short K while its commit stays outside the guard (positional).
+            assert!(ptx.contains(&format!("cp.async.wait_group {};", v.stages - 1)), "{}", v.name);
+            let guards = ptx.matches("setp.lt.u32 %pmore,%kcol,%K;").count();
+            assert_eq!(guards, v.stages.saturating_sub(2), "{}: one guard per j>0 prologue slab", v.name);
+            assert!(ptx.matches("cp.async.commit_group;").count() > guards, "{}: commit outside the guard", v.name);
+        }
+    }
+
+    /// **An over-budget depth is a loud generation failure, never a clamped launch.** The budget is the
+    /// device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`; a kernel past it cannot run at all, and the driver's
+    /// own rejection (`CUDA_ERROR_INVALID_VALUE` at launch) names neither the kernel nor the ceiling.
+    #[test]
+    #[should_panic(expected = "exceeds the budget")]
+    fn int8_stage_over_budget_panics_at_generation() {
+        // s5 at 128x128 is 80 KiB; a 64 KiB budget (a Turing-class opt-in) cannot hold it.
+        let v = Int8StageCfg { name: "int8_probe_over", bm: 128, bn: 128, wm: 2, wn: 2, stages: 5 };
+        let _ = int8_stage_ptx(&v, 64 * 1024);
     }
 
     /// **The two hand-placed generators state their tile preconditions.** `gen_int8_smdb` /

@@ -1,11 +1,22 @@
 //! **Phase 10 — per-(op, shape, dtype) autotuning** with an on-disk config cache and a regression mode.
 //!
 //! Wukong builds *several* kernels for one op at one dtype — for int8 GEMM alone: the hand-placed
-//! `_smdb` (64×64 / 128×128, BK=32), the `ldmatrix`+XOR-swizzle `_swz` (64×64 / 128×128, BK=64), and the
-//! split-K `_swz_sk` (sk ∈ {2,4,8}). Which wins is *shape-dependent*: swz dominates large squares, the
-//! 128×128 tile wins once reuse-bound, split-K wins when a thin-M / small-N grid leaves SMs idle. A fixed
-//! dispatch heuristic can only approximate this; the autotuner **measures** it per shape and **caches** the
-//! winner, so the very first call pays the search and every later call is a hash lookup.
+//! `_smdb` (64×64 / 128×128, BK=32), the `ldmatrix`+XOR-swizzle `_swz` (64×64 / 128×128, BK=64), the
+//! split-K `_swz_sk` (sk ∈ {2,4,8}), and the **variable-stage** `w64_s{3,4,5}` rings. Which wins is
+//! *shape-dependent*: swz dominates large squares, the 128×128 tile wins once reuse-bound, split-K wins
+//! when a thin-M / small-N grid leaves SMs idle. A fixed dispatch heuristic can only approximate this;
+//! the autotuner **measures** it per shape and **caches** the winner, so the very first call pays the
+//! search and every later call is a hash lookup.
+//!
+//! **The candidate SET is device-dependent, not just the winner.** `w64_s4`/`_s5` need 64/80 KiB of
+//! shared memory per block — more than the PTX ISA lets any kernel declare statically — so they exist
+//! only through the dynamic-SMEM window and only on a card whose `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`
+//! covers them (Ada 99 KiB, A100 163, H100 227, Turing 64). [`applicable`] therefore takes the probed
+//! budget and declines a row the running device cannot host, instead of letting it reach
+//! `cuFuncSetAttribute` and fail there. This is also the axis where a hardcoded verdict would age
+//! worst: pipeline depth *lost* on the 20-SM laptop that cuts its occupancy 3→1 CTAs/SM and is
+//! predicted to pay on A100 where the same ring is occupancy-free — so it is precisely a thing to
+//! measure per machine and key by device, which the cache already does.
 //!
 //! **Honesty under contention.** The search times candidates *back-to-back, same-run* and compares them by
 //! ratio (best-of-N min), exactly the methodology the int8 swz / split-K A/B benches use — the shared
@@ -35,13 +46,28 @@ use cudarc::driver::{CudaFunction, CudaSlice, DriverError, LaunchConfig, PushKer
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+/// Where a candidate's PTX comes from.
+///
+/// The shipped kernels are `&'static` modules built once. The **variable-stage** rows are generated
+/// against the running device's shared-memory budget instead ([`crate::gpu::Gpu::smem_budget`]), because
+/// past the PTX ISA's 48 KiB static cap the ring has to live in the `.extern .shared` window and the
+/// budget is what decides whether that is legal here at all.
+#[derive(Clone, Copy)]
+enum Int8Src {
+    /// A shipped module: one `&'static` PTX text, static SMEM, launched with `shared_mem_bytes: 0`.
+    Fixed(fn() -> &'static str),
+    /// A [`crate::ptx_int8::INT8_STAGE_VARIANTS`] row — generated per device budget, and loaded through
+    /// `Gpu::function_smem` so a >48 KiB row gets its `cuFuncSetAttribute` opt-in and its launch window.
+    Stage(&'static crate::ptx_int8::Int8StageCfg),
+}
+
 /// One tunable int8 GEMM candidate: a kernel (PTX + entry) plus its CTA tile, warp count, K-split factor
 /// (`gridDim.z`; > 1 only for the split-K kernel), and the K-divisibility it requires (BK=32 hand-placed,
 /// BK=64 swz, `sk·64` split-K). `name` is the stable token written to / read from the cache.
 #[derive(Clone, Copy)]
 struct Int8Cand {
     name: &'static str,
-    ptx: fn() -> &'static str,
+    src: Int8Src,
     entry: &'static str,
     bm: usize,
     bn: usize,
@@ -51,6 +77,14 @@ struct Int8Cand {
     /// Threadblock-rasterization band width (0 = none / 2-D grid). When > 0 the kernel uses a 1-D CTA
     /// grid (`gridDim.x = tiles_m·tiles_n`) — mutually exclusive with split-K (which uses `gridDim.z`).
     raster: usize,
+    /// Shared memory per CTA, bytes. `0` for the shipped kernels (all static and all ≤ 48 KiB by
+    /// construction); the real footprint for a variable-stage row, which is what [`applicable`] tests
+    /// against the device's opt-in ceiling.
+    smem: usize,
+    /// Shortest K at which this candidate's pipeline can fill — `(stages-1)·64` for a deep ring, `0`
+    /// for the shipped 2-stage kernels. Below it the extra buffers never fill (D6 §3.2-4: the prologue
+    /// guards them, so it is *correct*, just pure waste), and a tuner should not spend a round on it.
+    min_k: usize,
 }
 
 /// The full int8 GEMM candidate set (the kernels owned by this crate). Filtered per shape by
@@ -60,28 +94,50 @@ fn int8_candidates() -> Vec<Int8Cand> {
     use crate::ptx_int8::{
         int8_gemm_smdb128_ptx, int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_ptx,
         int8_gemm_smdb_swz_ptx, int8_gemm_smdb_swz_splitk_ptx, int8_gemm_w64_swz_ptx,
-        int8_gemm_w64_swz_r8_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M,
-        INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M,
-        INT8_W64_WARPS_N,
+        int8_gemm_w64_swz_r8_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_STAGE_VARIANTS,
+        INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128, INT8_W64_BM, INT8_W64_BN,
+        INT8_W64_WARPS_M, INT8_W64_WARPS_N,
     };
     let w64 = INT8_WARPS_M * INT8_WARPS_N;
     let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
     let ww64 = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
     let mut v = vec![
-        Int8Cand { name: "smdb64", ptx: int8_gemm_smdb_ptx, entry: "int8_gemm_nt_smdb", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 32, raster: 0 },
-        Int8Cand { name: "smdb128", ptx: int8_gemm_smdb128_ptx, entry: "int8_gemm_nt_smdb128", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 32, raster: 0 },
-        Int8Cand { name: "swz64", ptx: int8_gemm_smdb_swz_ptx, entry: "int8_gemm_nt_smdb_swz", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 64, raster: 0 },
-        Int8Cand { name: "swz128", ptx: int8_gemm_smdb128_swz_ptx, entry: "int8_gemm_nt_smdb128_swz", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 64, raster: 0 },
+        Int8Cand { name: "smdb64", src: Int8Src::Fixed(int8_gemm_smdb_ptx), entry: "int8_gemm_nt_smdb", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 32, raster: 0, smem: 0, min_k: 0 },
+        Int8Cand { name: "smdb128", src: Int8Src::Fixed(int8_gemm_smdb128_ptx), entry: "int8_gemm_nt_smdb128", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 32, raster: 0, smem: 0, min_k: 0 },
+        Int8Cand { name: "swz64", src: Int8Src::Fixed(int8_gemm_smdb_swz_ptx), entry: "int8_gemm_nt_smdb_swz", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 64, raster: 0, smem: 0, min_k: 0 },
+        Int8Cand { name: "swz128", src: Int8Src::Fixed(int8_gemm_smdb128_swz_ptx), entry: "int8_gemm_nt_smdb128_swz", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 64, raster: 0, smem: 0, min_k: 0 },
         // The 64×64-warp-tile workhorse (128×128 CTA, 4 warps) — the perf/gpu-quant-2 winner (~1.2–1.3×
         // the 8-warp swz128 same-run; 2048³→92%, +raster8→99.6% of cuBLAS) — and its rasterized sibling.
-        Int8Cand { name: "w64", ptx: int8_gemm_w64_swz_ptx, entry: "int8_gemm_nt_w64_swz", bm: INT8_W64_BM, bn: INT8_W64_BN, warps: ww64, sk: 1, k_mult: 64, raster: 0 },
-        Int8Cand { name: "w64_r8", ptx: int8_gemm_w64_swz_r8_ptx, entry: "int8_gemm_nt_w64_swz_r8", bm: INT8_W64_BM, bn: INT8_W64_BN, warps: ww64, sk: 1, k_mult: 64, raster: 8 },
+        Int8Cand { name: "w64", src: Int8Src::Fixed(int8_gemm_w64_swz_ptx), entry: "int8_gemm_nt_w64_swz", bm: INT8_W64_BM, bn: INT8_W64_BN, warps: ww64, sk: 1, k_mult: 64, raster: 0, smem: 0, min_k: 0 },
+        Int8Cand { name: "w64_r8", src: Int8Src::Fixed(int8_gemm_w64_swz_r8_ptx), entry: "int8_gemm_nt_w64_swz_r8", bm: INT8_W64_BM, bn: INT8_W64_BN, warps: ww64, sk: 1, k_mult: 64, raster: 8 , smem: 0, min_k: 0 },
     ];
+    // **The variable-stage rows** (`INT8_STAGE_VARIANTS`, same 128×128 CTA / 64×64 warp tile as `w64`,
+    // deeper `cp.async` ring). s2 is byte-identical to `w64` above, so it is skipped rather than timed
+    // twice; s3 is 48 KiB static; s4/s5 (64/80 KiB) exist only through the dynamic-SMEM window and are
+    // the reason this is a search axis at all. Whether depth pays is a *device* question — it lost at
+    // every size on the 20-SM Ada laptop that cut 3 CTAs/SM to 2 for it, and D3 predicts it flips on
+    // A100 where the same ring is occupancy-free — which is exactly why the tuner, not a hardcoded
+    // heuristic, should decide: the cache is device-keyed, so each part gets its own verdict.
+    for cfg in INT8_STAGE_VARIANTS.iter().filter(|c| c.stages > 2) {
+        v.push(Int8Cand {
+            name: match cfg.stages { 3 => "w64_s3", 4 => "w64_s4", _ => "w64_s5" },
+            src: Int8Src::Stage(cfg),
+            entry: cfg.name,
+            bm: cfg.bm,
+            bn: cfg.bn,
+            warps: cfg.threads() / 32,
+            sk: 1,
+            k_mult: 64,
+            raster: 0,
+            smem: cfg.smem_bytes(),
+            min_k: cfg.min_k(),
+        });
+    }
     // split-K variants of the 64×64 swz kernel (one entry, gridDim.z = sk; thin-M / small-N lever).
     for sk in [2usize, 4, 8] {
         v.push(Int8Cand {
             name: match sk { 2 => "swz64_sk2", 4 => "swz64_sk4", _ => "swz64_sk8" },
-            ptx: int8_gemm_smdb_swz_splitk_ptx,
+            src: Int8Src::Fixed(int8_gemm_smdb_swz_splitk_ptx),
             entry: "int8_gemm_nt_smdb_swz_sk",
             bm: INT8_BM,
             bn: INT8_BN,
@@ -89,16 +145,42 @@ fn int8_candidates() -> Vec<Int8Cand> {
             sk,
             k_mult: sk * 64,
             raster: 0,
+            smem: 0,
+            min_k: 0,
         });
     }
     v
 }
 
-fn applicable(c: &Int8Cand, m: usize, n: usize, k: usize) -> bool {
-    m % c.bm == 0 && n % c.bn == 0 && k % c.k_mult == 0
+/// Can this candidate run this shape **on this device**?
+///
+/// Two independent facts, and the second one is new: a shape fact (the tile must divide M/N and the
+/// K-slab must divide K, else the grid is short and part of C is never written) **and a capability
+/// fact** — a deep ring's `smem` must fit `budget`, the device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`.
+/// The budget is a per-card number (Ada 99 KiB, A100 163, H100 227, Turing 64), so the candidate SET
+/// itself is device-dependent, not just the winner. Declining here is what keeps a too-deep row out of
+/// the search entirely, rather than letting it reach `function_dyn`'s assert or the driver's own
+/// unhelpful `CUDA_ERROR_INVALID_VALUE`. `min_k` additionally drops depths whose buffers cannot fill at
+/// this K — correct but pure waste, and a wasted round is a worse measurement for everything else.
+fn applicable(c: &Int8Cand, m: usize, n: usize, k: usize, budget: usize) -> bool {
+    m % c.bm == 0 && n % c.bn == 0 && k % c.k_mult == 0 && k >= c.min_k && c.smem <= budget
 }
 
-fn launch_cfg(c: &Int8Cand, m: usize, n: usize) -> LaunchConfig {
+/// Load a candidate, returning its function and **the shared-memory bytes its launch must carry** — 0
+/// for a static kernel, the window size for a dynamic one. The module-cache key is the candidate's own
+/// entry name, which embeds (tile, warps, stages): `Gpu::function` never re-examines PTX on a key hit,
+/// so two depths sharing a key would silently run the first one's kernel *and* inherit its SMEM ceiling.
+fn load(g: &mut Gpu, c: &Int8Cand) -> Result<(CudaFunction, usize), DriverError> {
+    match c.src {
+        Int8Src::Fixed(f) => Ok((g.function(c.entry, f(), c.entry)?, 0)),
+        Int8Src::Stage(cfg) => {
+            let (ptx, mode) = crate::ptx_int8::int8_stage_ptx(cfg, g.smem_budget());
+            g.function_smem(cfg.name, &ptx, cfg.name, mode)
+        }
+    }
+}
+
+fn launch_cfg(c: &Int8Cand, m: usize, n: usize, dyn_smem: usize) -> LaunchConfig {
     // The grid is `m/bm × n/bn` tiles — integer division, so a shape the candidate does not tile
     // exactly would silently launch a SHORT grid and leave the trailing rows/columns of C untouched
     // (whatever the caller pre-filled, typically zeros). Reject it here rather than return a partial
@@ -118,7 +200,10 @@ fn launch_cfg(c: &Int8Cand, m: usize, n: usize) -> LaunchConfig {
     } else {
         ((n / c.bn) as u32, (m / c.bm) as u32, c.sk as u32)
     };
-    LaunchConfig { grid_dim, block_dim: ((c.warps * 32) as u32, 1, 1), shared_mem_bytes: 0 }
+    // `shared_mem_bytes` is memory allocated ON TOP of the entry's statics, so a static candidate must
+    // pass 0 — its own size again would allocate the tile twice and silently halve residency. The value
+    // comes from `load`, i.e. from the generator's own `SmemMode`; it is never re-derived here.
+    crate::gpu::dyn_launch_cfg(grid_dim, ((c.warps * 32) as u32, 1, 1), dyn_smem)
 }
 
 /// best-of-`rounds` min over `iters` launches each (clock-warmed) — wall-clock seconds per launch. The
@@ -177,8 +262,9 @@ pub struct TuneResult {
 /// than silently caching a wrong "winner"), then times each best-of-N. Returns the ranking, fastest
 /// first. Panics if no candidate fits the shape (needs at least M%64==0, N%64==0, K%32==0).
 pub fn tune_int8_gemm(g: &mut Gpu, m: usize, n: usize, k: usize) -> Result<TuneResult, DriverError> {
+    let budget = g.smem_budget();
     let cands: Vec<Int8Cand> =
-        int8_candidates().into_iter().filter(|c| applicable(c, m, n, k)).collect();
+        int8_candidates().into_iter().filter(|c| applicable(c, m, n, k, budget)).collect();
     assert!(
         !cands.is_empty(),
         "autotune: no int8 GEMM candidate fits {m}x{n}x{k} (need M%64==0, N%64==0, K%32==0)"
@@ -193,8 +279,8 @@ pub fn tune_int8_gemm(g: &mut Gpu, m: usize, n: usize, k: usize) -> Result<TuneR
     let mut reference: Option<Vec<i32>> = None;
     let mut ranked: Vec<Ranked> = Vec::with_capacity(cands.len());
     for c in &cands {
-        let f = g.function(c.entry, (c.ptx)(), c.entry)?;
-        let cfg = launch_cfg(c, m, n);
+        let (f, dyn_smem) = load(g, c)?;
+        let cfg = launch_cfg(c, m, n, dyn_smem);
         // Correctness cross-check (first law): every int8 candidate is bit-exact ⇒ identical output.
         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n])?; // split-K needs a zeroed C
         {
@@ -336,8 +422,8 @@ impl AutotuneCache {
 /// set, or a candidate that does not fit the shape it is keyed by. Neither may reach a launch: an
 /// unknown token used to `panic!` and a mis-tiled one used to launch a truncated grid, returning `Ok`
 /// with part of C left at its pre-fill. Both are treated as a cache miss and re-tuned.
-fn int8_token_usable(token: &str, m: usize, n: usize, k: usize) -> bool {
-    int8_candidates().iter().any(|c| c.name == token && applicable(c, m, n, k))
+fn int8_token_usable(token: &str, m: usize, n: usize, k: usize, budget: usize) -> bool {
+    int8_candidates().iter().any(|c| c.name == token && applicable(c, m, n, k, budget))
 }
 
 /// Look up the tuned config for `m×n×k`, tuning + caching it on a miss. Returns the config token.
@@ -351,9 +437,9 @@ pub fn tune_int8_cached(
     n: usize,
     k: usize,
 ) -> Result<String, DriverError> {
-    let dev = g.device_tag();
+    let (dev, budget) = (g.device_tag(), g.smem_budget());
     if let Some(e) = cache.get_int8(&dev, m, n, k) {
-        if int8_token_usable(&e.config, m, n, k) {
+        if int8_token_usable(&e.config, m, n, k, budget) {
             return Ok(e.config.clone());
         }
     }
@@ -429,12 +515,13 @@ pub fn launch_int8_tuned(
     // `tune_int8_cached` only ever returns a token that `int8_token_usable` accepted (a fresh search
     // winner, or a cache hit it re-validated against this shape), so this cannot fail — but state the
     // precondition where the launch geometry is built rather than trust it silently.
+    let budget = g.smem_budget();
     let cand = int8_candidates()
         .into_iter()
-        .find(|c| c.name == name && applicable(c, m, n, k))
+        .find(|c| c.name == name && applicable(c, m, n, k, budget))
         .expect("tuned int8 config token must name a candidate applicable to this shape");
-    let f = g.function(cand.entry, (cand.ptx)(), cand.entry)?;
-    let cfg = launch_cfg(&cand, m, n);
+    let (f, dyn_smem) = load(g, &cand)?;
+    let cfg = launch_cfg(&cand, m, n, dyn_smem);
     let a_d = g.stream.memcpy_stod(a)?;
     let b_d = g.stream.memcpy_stod(b)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?; // split-K accumulates → C must start zeroed
@@ -719,22 +806,36 @@ mod tests {
     /// Both are now "not usable at this shape" → a miss → re-tune.
     #[test]
     fn stale_cache_tokens_are_not_usable() {
+        const ADA: usize = 101_376; // this card's opt-in ceiling; the shipped kernels never approach it
         // A known token that fits its shape is usable.
-        assert!(int8_token_usable("smdb128", 256, 256, 256));
-        assert!(int8_token_usable("smdb64", 192, 256, 256), "64x64 tiles do divide M=192");
+        assert!(int8_token_usable("smdb128", 256, 256, 256, ADA));
+        assert!(int8_token_usable("smdb64", 192, 256, 256, ADA), "64x64 tiles do divide M=192");
         // The two escapes above.
-        assert!(!int8_token_usable("smdb128", 192, 256, 256), "128 does not divide M=192");
-        assert!(!int8_token_usable("swz64_sk16", 256, 256, 256), "unknown candidate token");
-        assert!(!int8_token_usable("", 256, 256, 256));
+        assert!(!int8_token_usable("smdb128", 192, 256, 256, ADA), "128 does not divide M=192");
+        assert!(!int8_token_usable("swz64_sk16", 256, 256, 256, ADA), "unknown candidate token");
+        assert!(!int8_token_usable("", 256, 256, 256, ADA));
         // K-divisibility is part of the contract too: the BK=64 swz kernels need K%64==0, split-K sk*64.
-        assert!(!int8_token_usable("swz64", 256, 256, 96), "BK=64 kernel needs K%64==0");
-        assert!(int8_token_usable("smdb64", 256, 256, 96), "BK=32 kernel accepts K=96");
-        assert!(!int8_token_usable("swz64_sk8", 256, 256, 256), "sk=8 needs K%512==0");
+        assert!(!int8_token_usable("swz64", 256, 256, 96, ADA), "BK=64 kernel needs K%64==0");
+        assert!(int8_token_usable("smdb64", 256, 256, 96, ADA), "BK=32 kernel accepts K=96");
+        assert!(!int8_token_usable("swz64_sk8", 256, 256, 256, ADA), "sk=8 needs K%512==0");
+        // **The device budget is part of the contract now.** A deep-ring token is a real candidate on a
+        // card with the carveout for it and NOT a candidate on one without — the same token, the same
+        // shape, a different answer per machine. This is the class of stale hit the campaign cares about:
+        // the cache travels to a rented box, and a 64 KiB ring replayed on a 64 KiB-opt-in Turing part
+        // would reach `cuFuncSetAttribute` and fail there, naming neither kernel nor ceiling.
+        assert!(int8_token_usable("w64_s4", 256, 256, 256, ADA), "s4 is 64 KiB — fits a 99 KiB carveout");
+        assert!(!int8_token_usable("w64_s4", 256, 256, 256, 49_152), "s4 cannot exist under a 48 KiB ceiling");
+        assert!(int8_token_usable("w64_s3", 256, 256, 256, 49_152), "s3 is 48 KiB exactly — still static");
+        assert!(int8_token_usable("w64_s5", 256, 256, 256, 166_912), "s5 is 80 KiB — fits an A100");
+        assert!(!int8_token_usable("w64_s5", 256, 256, 256, 65_536), "s5 does not fit a 64 KiB ceiling");
+        // …and a depth whose ring cannot fill at this K is not a candidate either (correct, but waste).
+        assert!(!int8_token_usable("w64_s5", 256, 256, 192, ADA), "s5 needs K >= (5-1)*64 = 256");
+        assert!(int8_token_usable("w64_s4", 256, 256, 192, ADA), "s4 needs K >= 192");
         // A parsed cache entry is only trusted through the same predicate.
         let c = AutotuneCache::from_text("int8 sm_89x20 192 256 256 = smdb128 999.9\n");
         let e = c.get_int8("sm_89x20", 192, 256, 256).expect("entry parses");
         assert_eq!(e.config, "smdb128");
-        assert!(!int8_token_usable(&e.config, 192, 256, 256), "a parsed hit is still re-validated");
+        assert!(!int8_token_usable(&e.config, 192, 256, 256, ADA), "a parsed hit is still re-validated");
         // W4A16: the split count must divide K by GROUP_SIZE·sk, and be one this build searches.
         use crate::ptx_int4::GROUP_SIZE;
         assert!(w4a16_token_usable("w4a16", 4 * GROUP_SIZE));
@@ -845,6 +946,78 @@ mod tests {
             assert!(reg.speedup_available > 1.10, "a flagged regression must clear the 1.10 threshold");
         }
         eprintln!("[gate] autotune int8: search bit-exact + tuned launch correct + cache round-trip + revalidation well-formed ✓");
+    }
+
+    /// **GPU: the dynamic-SMEM stage rows really enter the int8 search — and win or lose on measurement.**
+    ///
+    /// The deep rings (`w64_s4` = 64 KiB, `w64_s5` = 80 KiB) are the first candidates in this crate that
+    /// cannot be declared statically at all, so three things have to hold that no earlier test covers:
+    /// they are *applicable* here (this card's 99 KiB carveout admits them), they *load* (each through
+    /// its own module key, with its own `cuFuncSetAttribute` opt-in), and they *rank* — i.e. the search
+    /// actually timed them rather than silently dropping them. `tune_int8_gemm` cross-checks every
+    /// candidate bit-exactly against the first before timing any of them, so a ranking that contains a
+    /// deep row is also proof that row computed the identical i32 output through its dynamic window.
+    ///
+    /// The ORDER is printed but deliberately **not asserted**: this box is a contended, power-state-
+    /// sensitive laptop, and the depth verdict is a device question anyway — the 4050 cuts 3 CTAs/SM to
+    /// 1 for these rows while an A100 keeps 3, which is the whole reason the tuner is device-keyed
+    /// rather than a hardcoded heuristic. What is asserted is participation and correctness.
+    #[test]
+    fn the_dynamic_smem_stage_rows_enter_the_int8_search() {
+        use crate::ptx_int8::INT8_STAGE_VARIANTS;
+        let mut guard = crate::gpu::gpu();
+        let Some(g) = guard.as_mut() else {
+            crate::diff::skip_or_fail(
+                "the_dynamic_smem_stage_rows_enter_the_int8_search",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        };
+        let budget = g.smem_budget();
+        let (m, n, k) = (256usize, 256usize, 256usize);
+        // Which deep rows this device can host at all. `w64_s2` is byte-identical to the shipped `w64`
+        // and is deliberately not a separate candidate (it would be the same kernel timed twice).
+        let expected: Vec<&'static str> = int8_candidates()
+            .iter()
+            .filter(|c| matches!(c.src, Int8Src::Stage(_)) && applicable(c, m, n, k, budget))
+            .map(|c| c.name)
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "no variable-stage candidate is applicable at {m}x{n}x{k} on a {budget} B budget — the \
+             registration never took effect"
+        );
+        for cfg in INT8_STAGE_VARIANTS.iter().filter(|c| c.stages > 2 && c.smem_bytes() <= budget) {
+            eprintln!(
+                "  candidate s{} : SMEM {:>5} B ({:>2} KiB) {:<8} min_k={}",
+                cfg.stages,
+                cfg.smem_bytes(),
+                cfg.smem_bytes() / 1024,
+                if cfg.smem_mode().is_dynamic() { "DYNAMIC" } else { "static" },
+                cfg.min_k()
+            );
+        }
+        let r = tune_int8_gemm(g, m, n, k).unwrap();
+        for name in &expected {
+            assert!(
+                r.ranked.iter().any(|x| &x.name == name),
+                "`{name}` is applicable at {m}x{n}x{k} but never appeared in the ranking — the search \
+                 dropped a dynamic-SMEM candidate instead of measuring it"
+            );
+        }
+        // The tuned launch still equals the i32 oracle whichever candidate won (they are all bit-exact).
+        let a: Vec<u8> = (0..m * k).map(|i| (i % 251) as u8).collect();
+        let b: Vec<i8> = (0..n * k).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+        let mut cache = AutotuneCache::new();
+        assert_eq!(launch_int8_tuned(g, &mut cache, &a, &b, m, n, k).unwrap(), ref_nt_int8(&a, &b, m, k, n));
+        // Order only — no numbers. This machine is contended and its depth verdict is not portable.
+        let order: Vec<&str> = r.ranked.iter().map(|x| x.name.as_str()).collect();
+        eprintln!(
+            "[gate] int8 search at {m}x{n}x{k}: {} candidates, including the dynamic-SMEM rows {expected:?}; \
+             every one bit-exact against the reference candidate before timing. Order (4050, contended, \
+             indicative only, NOT a verdict): {order:?}",
+            r.ranked.len()
+        );
     }
 
     /// **GPU: the W4A16 split-K search picks a valid config and the tuned launch is correct.** Skips
