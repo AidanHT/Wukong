@@ -223,7 +223,9 @@ pub enum Op {
     ///
     /// The interpreter materializes the lanes directly; the Cranelift backend emits a `vconst` from
     /// the constant pool; the textual-LLVM emitter emits the vector literal. The GPU MIR→PTX path
-    /// declines it, exactly as it declines every other vectorized-MIR op.
+    /// scalarizes it like every other vectorized-MIR op, materializing lane `k` as the constant `k`
+    /// (`mov.b64`) — exact for the same reason the interpreter can store lanes untruncated: the
+    /// verifier admits integer lanes only, and `n` is at most 16.
     Iota(MirType),
     /// Fused multiply-add: `a * b + c` with a *single* rounding. The front-end contracts a float
     /// `x + y*z` into this; it is faster (one instruction) and more accurate than separate
