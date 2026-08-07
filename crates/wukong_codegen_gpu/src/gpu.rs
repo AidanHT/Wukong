@@ -1660,6 +1660,66 @@ pub(crate) fn gemm_nt_f16_cliff(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// `C = A·Bᵀ` via a named [`PIPE_DEEP_VARIANTS`](crate::ptx_wmma::PIPE_DEEP_VARIANTS) kernel — the
+/// **variable-stage** f16 pipeline, half of whose rows live in dynamic shared memory (rings deeper than
+/// the PTX ISA's 48 KiB static cap can express at this tile).
+///
+/// The SMEM form comes from the config, not from this function: `function_smem` loads the entry the way
+/// its [`SmemMode`] says (plain load + 0 launch bytes for a static row; `cuFuncSetAttribute` opt-in +
+/// the window size for a dynamic one) and hands back the byte count the launch must carry. Declines
+/// loudly — never silently downshifts to a shallower ring — when the row does not fit this device's
+/// opt-in ceiling. Numerically identical to every other f16 GEMM here (f32 accumulate); tolerance-gated.
+pub fn gemm_nt_f16_deep(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    v: &crate::ptx_wmma::CliffCfg,
+) -> Result<Vec<f32>, GpuError> {
+    use crate::ptx_wmma::gemm_deep_ptx;
+    use half::f16;
+    assert_eq!(a.len(), m * k, "A must be m×k");
+    assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
+    assert!(
+        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        "{} requires M%{}==0, N%{}==0, K%{}==0",
+        v.name, v.bm, v.bn, v.bk
+    );
+    if v.smem_bytes() > g.smem_budget() {
+        // A capability fact about the hardware, decided before any PTX is loaded — not a driver error,
+        // and above all not a silent fall-back to a shallower ring the caller did not ask for.
+        return Err(GpuError::Unsupported(format!(
+            "f16 deep pipeline `{}`: needs {} B of shared memory per block, but {} reports a {} B \
+             opt-in ceiling (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+            v.name,
+            v.smem_bytes(),
+            g.target.name,
+            g.smem_budget()
+        )));
+    }
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    // One key for the one deep module; the ENTRY name carries (tile, stages) and the SMEM ceiling is
+    // tracked per (key, entry), so no two depths can inherit each other's window.
+    let (f, dyn_bytes) = g.function_smem("gemm_deep", gemm_deep_ptx(), v.name, v.smem_mode())?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    // r16-rasterized ⇒ a 1-D grid of (M/bm)·(N/bn) blocks.
+    let cfg = dyn_launch_cfg(
+        (((m / v.bm) * (n / v.bn)) as u32, 1, 1),
+        (v.threads() as u32, 1, 1),
+        dyn_bytes,
+    );
+    unsafe { bld.launch(cfg)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
 /// The fp16 `mma.sync` workhorse config (`mma_nt_f16_128_bk32_s2_r16`) — the fastest large-GEMM base, and
 /// thus the one the fused `act(A·Bᵀ+bias)` epilogues build on (`gemm_nt_f16_pipe_fused_bias`).
 fn mma_workhorse() -> &'static crate::ptx_wmma::PipeCfg {
@@ -13072,6 +13132,132 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 );
             }
             eprintln!("[gate] all {} CLIFF_VARIANTS entries launched ✓", launched.len());
+        });
+    }
+
+    /// **THE f16 DEEP-PIPELINE GATE — `mma.sync` rings past the 48 KiB static wall.**
+    ///
+    /// Three of the five [`PIPE_DEEP_VARIANTS`](crate::ptx_wmma::PIPE_DEEP_VARIANTS) rows (s4 = 64 KiB,
+    /// s5 = 80 KiB, 128×256 s3 = 72 KiB) **cannot be declared statically on any device** — the 48 KiB cap
+    /// is a PTX ISA rule about static `.shared`, not a device fact — so they exist only through the
+    /// module-scope `.extern .shared` window plus `cuFuncSetAttribute`. This runs them, on the metal.
+    ///
+    /// Two oracles, because a float kernel has no bit-exact one:
+    ///   * the **f16-rounded f64 reference** at the crate's fp16 GEMM tolerance (abs 1e-2, rel 2e-3) —
+    ///     the independent check, so a wrong kernel cannot pass by agreeing with a wrong sibling;
+    ///   * the **shipped 2-stage row** (`deep_swz_128_s2`, byte-identical to `cliff_swz_s2`) at the same
+    ///     tolerance — the regression check. A deeper ring only reorders *when* each K-slab is staged;
+    ///     the mma sequence and the f32 accumulation ORDER per output are identical, so in practice the
+    ///     depths agree far more tightly than the oracle bound, and the observed max_abs is printed.
+    ///
+    /// Shapes are the ring's K-corners per depth — one K-tile (the prologue stages slabs past the end of
+    /// A/B and must guard every one of them), exactly `stages-1` K-tiles (prologue fills the ring, the
+    /// main loop never prefetches), a wrap, and several wraps — plus a multi-band raster shape
+    /// (`tiles_n = 17 > raster = 16`), the arm every small test shape leaves dead. A row past this
+    /// device's opt-in ceiling is a **capability skip**, never a silent pass.
+    #[test]
+    fn gemm_deep_matches_reference_within_tol() {
+        use crate::ptx_wmma::PIPE_DEEP_VARIANTS;
+        use half::f16;
+        with_gpu("gemm_deep", |g| {
+            let budget = g.smem_budget();
+            eprintln!(
+                "f16 deep pipeline on {} — opt-in SMEM budget {budget} B ({} KiB); static ISA cap {} KiB",
+                g.device_name(),
+                budget / 1024,
+                STATIC_SMEM_CAP / 1024
+            );
+            let base = crate::ptx_wmma::deep_variant("deep_swz_128_s2");
+            let mut rng = crate::diff::Rng::new(0x0DEE_9176);
+            let mut ran = 0usize;
+            for v in PIPE_DEEP_VARIANTS {
+                if v.smem_bytes() > budget {
+                    eprintln!(
+                        "[skip:capability] {}: {} B > this device's opt-in ceiling {budget} B",
+                        v.name,
+                        v.smem_bytes()
+                    );
+                    continue;
+                }
+                // The occupancy the depth actually buys/costs on THIS card — a device fact, printed as
+                // context for why this part's verdict on depth is not the datacenter's. Not a timing.
+                let occ = {
+                    let (f, dyn_bytes) = g
+                        .function_smem("gemm_deep", crate::ptx_wmma::gemm_deep_ptx(), v.name, v.smem_mode())
+                        .unwrap();
+                    assert_eq!(dyn_bytes, v.smem_mode().launch_bytes());
+                    f.occupancy_max_active_blocks_per_multiprocessor(v.threads() as u32, dyn_bytes, None)
+                        .unwrap_or(0)
+                };
+                eprintln!(
+                    "  {:<20} {}x{} s{} SMEM {:>5} B ({:>2} KiB) {:<8} occupancy={} CTA/SM",
+                    v.name,
+                    v.bm,
+                    v.bn,
+                    v.stages,
+                    v.smem_bytes(),
+                    v.smem_bytes() / 1024,
+                    if v.smem_mode().is_dynamic() { "DYNAMIC" } else { "static" },
+                    occ
+                );
+                let mut shapes = vec![
+                    (v.bm, v.bk, v.bn),                          // 1 CTA, 1 K-tile — full prologue guard
+                    (v.bm, v.bk * (v.stages - 1), v.bn),         // prologue exactly fills the ring
+                    (2 * v.bm, v.bk * v.stages, 2 * v.bn),       // 4 CTAs, first ring wrap
+                    (v.bm, v.bk * (v.stages + 3), 2 * v.bn),     // several wraps, rectangular
+                    (v.bm, v.bk, (v.raster + 1) * v.bn),         // tiles_n = 17 > raster = 16
+                ];
+                shapes.dedup();
+                for (m, k, n) in shapes {
+                    let a = rng.vec(m * k, -1.0, 1.0);
+                    let b = rng.vec(n * k, -1.0, 1.0);
+                    let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                    let c = gemm_nt_f16_deep(g, &a, &b, m, k, n, v).unwrap();
+                    let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
+                    // …and against the shipped 2-stage row at the same shape (the regression oracle).
+                    let (peer_max, peer_note) = if m % base.bm == 0 && n % base.bn == 0 && k % base.bk == 0 {
+                        let c2 = gemm_nt_f16_deep(g, &a, &b, m, k, n, base).unwrap();
+                        crate::diff::assert_close(&format!("{} vs s2 {m}x{k}x{n}", v.name), &c, &c2, 1e-2, 2e-3);
+                        (c.iter().zip(&c2).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max), "")
+                    } else {
+                        (f32::NAN, " (s2 does not tile this shape)")
+                    };
+                    eprintln!(
+                        "    {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e} | vs s2 max_abs={:.2e}{peer_note}",
+                        s.max_abs, s.max_rel, peer_max
+                    );
+                    ran += 1;
+                }
+            }
+            assert!(ran >= 10, "the deep grid must actually have run (only {ran} shapes)");
+            eprintln!(
+                "[gate] f16 deep pipeline: {ran} K-corner shapes across s2..s5 + the 128x256 tile, every one \
+                 within fp16 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the >48 KiB rows \
+                 ran out of the dynamic SMEM window ✓"
+            );
+        });
+    }
+
+    /// **A deep row that does not fit the device declines LOUDLY** — it never silently runs a shallower
+    /// ring or a truncated window. The launch path asserts the request against
+    /// `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` *at the seam*, because the driver's own rejection
+    /// (`CUDA_ERROR_INVALID_VALUE` at launch) names neither the kernel nor the ceiling. Probed with a
+    /// fabricated over-budget config so the check fires on every card, however large its carveout.
+    #[test]
+    fn gemm_deep_declines_over_budget_instead_of_downshifting() {
+        use crate::ptx_wmma::{deep_variant, CliffCfg};
+        with_gpu("gemm_deep_decline", |g| {
+            let budget = g.smem_budget();
+            // 32 stages at 128x128 bk32 = 512 KiB — past every part's opt-in ceiling (H100's is 227 KiB).
+            let over = CliffCfg { name: "deep_swz_128_s2", stages: 32, ..*deep_variant("deep_swz_128_s2") };
+            assert!(over.smem_bytes() > budget, "the probe config must exceed the device ceiling");
+            let a = vec![0f32; 128 * 32];
+            let b = vec![0f32; 128 * 32];
+            let err = gemm_nt_f16_deep(g, &a, &b, 128, 32, 128, &over).unwrap_err();
+            let msg = err.unsupported().expect("an over-budget row must be a CAPABILITY decline");
+            assert!(msg.contains("shared memory"), "the decline must name what was refused: {msg}");
+            assert!(msg.contains(&budget.to_string()), "the decline must name the ceiling: {msg}");
+            eprintln!("[gate] over-budget deep row declined: {msg}");
         });
     }
 
