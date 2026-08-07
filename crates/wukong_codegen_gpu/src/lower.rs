@@ -43,6 +43,16 @@
 //! oracle (integer/control-flow programs bit-exact; float programs within the CPU<->GPU tolerance) and
 //! `-O0` == `-O3` (see the `#[cfg(test)]` module). The existing offload path and the toolchain-free
 //! core stay byte-for-byte unchanged — this path is purely additive.
+//!
+//! **Target floor.** Both modules this file emits — [`emit_ptx`] (the per-entry kernel) and
+//! [`emit_mega_ptx`] (the cooperative megakernel [`crate::megakernel`] launches) — open with
+//! [`crate::ptx_target::HDR_SM80`]. The whole instruction mix is generic scalar PTX that predates
+//! Ampere: `ld`/`st`, integer/float ALU, `bra`, `bar.sync`, `red.f32` and one `atom.global.add`.
+//! The emission tables contain no Ada-or-later token at all (the census greps them for the fp8
+//! converters, the Hopper-era async/warpgroup families and cluster-scoped sync, and find zero), so
+//! `sm_80` is the LOWEST legal target — and PTX is forward-compatible only: an `sm_80` module
+//! driver-JITs on every later part, an `sm_89` one loads on zero A100s. `megakernel.rs` emits no
+//! header of its own, so these two `push_str` calls are the single floor for all gpu-native output.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -181,7 +191,8 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
     }
 
     let mut out = String::new();
-    out.push_str(".version 7.8\n.target sm_89\n.address_size 64\n\n");
+    out.push_str(crate::ptx_target::HDR_SM80);
+    out.push('\n');
 
     // Emit a device `.func` helper for each recognized runtime kernel the program calls (matmul /
     // reduce / norm / int8 GEMM / elementwise). These reproduce the CPU microkernels' numeric
@@ -261,7 +272,8 @@ pub fn emit_mega_ptx(program: &Program, entry: Symbol, interner: &Interner) -> R
     }
 
     let mut out = String::new();
-    out.push_str(".version 7.8\n.target sm_89\n.address_size 64\n\n");
+    out.push_str(crate::ptx_target::HDR_SM80);
+    out.push('\n');
 
     // Scan the entry for the helpers it needs: cooperative reduce (+ its shared scratch), the serial
     // `mrt_*` defs for not-yet-cooperative recognized ops, and the device fmod for float `%`.

@@ -21,6 +21,11 @@
 //! is *not* incremental — a `div.u32` per position recovers `logical`/`offset`; making it incremental
 //! is still an unclaimed perf lever.
 //!
+//! Every generator here is tagged with the **`sm_80` floor** ([`crate::ptx_target::HDR_SM80`]): the
+//! instruction mix is `shfl.sync.bfly` + `red.f32` + ordinary ld/st and f32 math, all Ampere-legal,
+//! so the module driver-JITs on every part from A100 up. The `assert_floor` gate below pins it, and
+//! being un-gated it runs in a plain toolchain-free `cargo test`.
+//!
 //! ## The first-law property the gates prove
 //! - **Absolute correctness**: tolerance-gated vs an f64 full-softmax CPU reference
 //!   ([`reference_decode_attn`]) — the only legitimate error is the GPU's `ex2.approx` exp + f32 order.
@@ -51,6 +56,11 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DriverError, LaunchCon
 // and the f64 reference are geometry-free, which is what lets this module compile un-gated.
 #[cfg(feature = "gpu")]
 use crate::paged_kv::KvConfig;
+
+// The module header every generator below opens with. `ptx_target` is deliberately un-gated (pure
+// strings, no `cudarc`) precisely so this un-gated module — whose PTX-shape gates run in a plain,
+// toolchain-free `cargo test` — can route through it like the gpu-gated families do.
+use crate::ptx_target::HDR_SM80;
 
 /// `(slot, head)` pairs per CTA — one **warp** each (block_dim = `32 * PAGED_ATTN_WARPS`). The warp's
 /// 32 lanes cooperatively stream the context, so the launch fills the GPU (`num_slots*heads` warps)
@@ -86,7 +96,8 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
         t
     };
     let mut s = String::new();
-    s += ".version 7.8\n.target sm_89\n.address_size 64\n\n";
+    s += HDR_SM80;
+    s += "\n";
     s += &format!(
         ".visible .entry {PAGED_ATTN_ENTRY}(\n\
         \x20   .param .u64 pQ,\n\
@@ -266,7 +277,8 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
         t
     };
     let mut s = String::new();
-    s += ".version 7.8\n.target sm_89\n.address_size 64\n\n";
+    s += HDR_SM80;
+    s += "\n";
     s += &format!(
         ".visible .entry {PAGED_ATTN_INT8_ENTRY}(\n\
         \x20   .param .u64 pQ,\n\
@@ -447,7 +459,8 @@ pub const KV_APPEND_ENTRY: &str = "kv_append";
 /// This is the device twin of [`crate::paged_kv::BlockManager::append`]'s `(phys, off)` address.
 pub fn kv_append_ptx() -> String {
     let mut s = String::new();
-    s += ".version 7.8\n.target sm_89\n.address_size 64\n\n";
+    s += HDR_SM80;
+    s += "\n";
     s += &format!(
         ".visible .entry {KV_APPEND_ENTRY}(\n\
         \x20   .param .u64 pKnew,\n\
@@ -603,7 +616,8 @@ pub fn kv_append_int8_ptx() -> String {
         t
     };
     let mut s = String::new();
-    s += ".version 7.8\n.target sm_89\n.address_size 64\n\n";
+    s += HDR_SM80;
+    s += "\n";
     s += &format!(
         ".visible .entry {KV_APPEND_INT8_ENTRY}(\n\
         \x20   .param .u64 pKnew,\n\
@@ -810,6 +824,27 @@ mod tests {
     /// regression there surfaced first as a `CUDA_ERROR_INVALID_PTX` at model construction.
     const GATED_HEAD_DIMS: [usize; 2] = [64, 128];
 
+    /// Every generator in this module must open at the **`sm_80` floor**, not at the device's own
+    /// architecture. The instruction mix here is `shfl.sync.bfly` + `red.f32` + ordinary ld/st and
+    /// f32 math — all Ampere-legal — and PTX is forward-compatible only, so a module tagged `sm_89`
+    /// would load on zero A100s while buying nothing on Ada. Pinning the whole header (not just the
+    /// `.target`) also catches a `.version` drift, and the negative check keeps a stray `sm_89`
+    /// out of the *body* — a `.target` can only be declared once, so a second mention would be a
+    /// hand-written directive someone slipped into a `format!`.
+    ///
+    /// This module is un-gated, so these run under a plain toolchain-free `cargo test`: they are
+    /// the only floor gate for the serving family that does not need a GPU.
+    fn assert_floor(ptx: &str, what: &str) {
+        assert!(
+            ptx.starts_with(crate::ptx_target::HDR_SM80),
+            "{what}: must open with exactly ptx_target::HDR_SM80 (the family's lowest legal target)"
+        );
+        assert!(
+            !ptx.contains(crate::ptx_target::TARGET_SM89),
+            "{what}: nothing here needs an Ada-only instruction, so nothing may pin sm_89"
+        );
+    }
+
     // PTX shape sanity (no device): the generator emits the entry, an unrolled query cache + accumulator
     // sized to head_dim, the exp recurrence, and a single bit-exact-friendly output normalize.
     #[test]
@@ -817,7 +852,7 @@ mod tests {
         for hd in GATED_HEAD_DIMS {
             let ptx = paged_attn_decode_ptx(hd);
             assert!(ptx.contains(".visible .entry paged_attn_decode("));
-            assert!(ptx.contains(".target sm_89"));
+            assert_floor(&ptx, "paged_attn_decode");
             assert!(ptx.contains(&format!("%acc{}", hd - 1)), "head dim {hd} must unroll the V accumulator");
             assert!(!ptx.contains(&format!("%acc{hd}")), "must not over-unroll past head_dim {hd}");
             assert!(
@@ -844,7 +879,7 @@ mod tests {
         for hd in GATED_HEAD_DIMS {
             let ptx = paged_attn_decode_int8_ptx(hd);
             assert!(ptx.contains(".visible .entry paged_attn_decode_int8("));
-            assert!(ptx.contains(".target sm_89"));
+            assert_floor(&ptx, "paged_attn_decode_int8");
             assert!(ptx.contains("ld.global.s8"), "int8 cache read");
             assert!(!ptx.contains("cvt.f32.f16"), "the int8 kernel stores no f16 — nothing to widen");
             assert!(ptx.contains(&format!("%acc{}", hd - 1)), "head dim {hd} must unroll the V accumulator");
@@ -863,7 +898,7 @@ mod tests {
     fn kv_append_ptx_is_well_formed() {
         let ptx = kv_append_ptx();
         assert!(ptx.contains(".visible .entry kv_append("));
-        assert!(ptx.contains(".target sm_89"));
+        assert_floor(&ptx, "kv_append");
         assert!(ptx.contains("cvt.rn.f16.f32"), "f32 input narrowed into the f16 cache");
         assert!(ptx.contains("st.global.b16"), "f16 value store");
         assert!(ptx.contains("setp.eq.u32 %p0,%tmp,0;"), "active-mask test");
@@ -878,7 +913,7 @@ mod tests {
     fn int8_append_ptx_is_well_formed() {
         let ptx = kv_append_int8_ptx();
         assert!(ptx.contains(".visible .entry kv_append_int8("));
-        assert!(ptx.contains(".target sm_89"));
+        assert_floor(&ptx, "kv_append_int8");
         assert!(ptx.contains("shfl.sync.bfly.b32"), "warp-cooperative amax merge");
         assert!(ptx.contains("div.rn.f32"), "IEEE-exact scale + quotient (approx would break the host match)");
         assert!(!ptx.contains("div.approx"), "no approximate division anywhere");
