@@ -15,7 +15,8 @@
 //! is byte-identical, while the cooperative ops use the whole block instead of one lane.
 //!
 //! This is **additive and opt-in**: [`try_run`] returns `Ok(None)` for any program it can't accelerate
-//! (the caller falls back to the correct single-thread `--backend=gpu-native` path), and the existing
+//! (the caller falls back to the correct single-thread `--backend=gpu-native` path — set
+//! `WUKONG_GPU_DUMP_PTX` to have [`decline`] print *which* of the three reasons it was), and the existing
 //! offload `--backend=gpu` path and plain `cargo test` are untouched. The megakernel is the spine the
 //! op-graph fusion ([`crate::fusion`]) and the resident-chain comparison ([M13]) build on; GEMM, vmath
 //! and norm now have chunked-cooperative bodies (see `lower::lower_call_mega`), so what remains for
@@ -37,10 +38,29 @@ use crate::lower::{self, MEGA_KERNEL_NAME};
 /// `mrt_red_smem[1024]` scratch ceiling. Multi-block grid execution is a later increment.
 pub const MEGA_BLOCK: u32 = 256;
 
+/// Report why the megakernel declined, under the existing `WUKONG_GPU_DUMP_PTX` knob, and return the
+/// `Ok(None)` the caller falls back on.
+///
+/// All four decline paths below collapse to the same bare `Ok(None)`, so from the outside "this
+/// program has data-dependent control flow", "the emitter hit an op it cannot lower" and "there is no
+/// GPU in this machine" are indistinguishable — and a *silent* fallback still passes
+/// `mega_corpus_matches_oracle`, because falling back to the single-thread oracle is by construction
+/// correct. That is exactly how the `Op::Iota` lowering hole survived: it declined 39 corpus programs
+/// on both gpu-native paths while every gate stayed green, and it only surfaced when a test asserted
+/// eligibility separately. Coverage is the headline for this phase, so a coverage loss must be
+/// *legible*, not merely harmless.
+fn decline(why: impl std::fmt::Display) -> Result<Option<(i64, Vec<u8>)>, String> {
+    if std::env::var_os("WUKONG_GPU_DUMP_PTX").is_some() {
+        eprintln!("gpu-mega: declined ({why})");
+    }
+    Ok(None)
+}
+
 /// Try to run `program`'s `entry` as the cooperative megakernel. Returns:
 ///  - `Ok(Some((exit, stdout)))` — it ran on the megakernel (eligible + launched);
 ///  - `Ok(None)` — not megakernel-eligible, an op declined (`UNSUPPORTED:`), or no device: the caller
-///    must fall back to the single-thread path (which stays the correctness reference);
+///    must fall back to the single-thread path (which stays the correctness reference). Set
+///    `WUKONG_GPU_DUMP_PTX` to have [`decline`] name which of the three it was;
 ///  - `Err(_)` — a genuine JIT / launch / readback failure of an *eligible* program.
 ///
 /// The single-thread path remains the oracle: this never changes a program's result, only how fast an
@@ -52,23 +72,27 @@ pub fn try_run(
 ) -> Result<Option<(i64, Vec<u8>)>, String> {
     let plan = crate::fusion::analyze(program, entry, interner);
     if !plan.eligible {
-        return Ok(None);
+        // `MegaPlan` already carries a human-readable reason; surface it instead of dropping it.
+        return decline(format_args!("ineligible: {}", plan.reason));
     }
     let Some(entry_fn) = program.function(entry) else {
-        return Ok(None);
+        return decline(format_args!("no entry function `{}`", interner.resolve(entry)));
     };
     let frame_bytes = lower::mega_frame_bytes(entry_fn);
 
     let ptx = match lower::emit_mega_ptx(program, entry, interner) {
         Ok(p) => p,
         // A recognized op declined (e.g. an unsupported vmath op code) -> fall back, don't fail.
-        Err(e) if e.starts_with(lower::UNSUPPORTED) => return Ok(None),
+        Err(e) if e.starts_with(lower::UNSUPPORTED) => {
+            return decline(format_args!("emitter declined: {e}"))
+        }
         Err(e) => return Err(e),
     };
 
     let mut guard = crate::gpu::gpu();
     let Some(g) = guard.as_mut() else {
-        return Ok(None); // no device: let the single-thread path surface the helpful error
+        // No device: let the single-thread path surface the helpful error.
+        return decline("no device");
     };
     let r = launch_mega(g, &ptx, frame_bytes)?;
     Ok(Some(r))
