@@ -21,7 +21,7 @@
 //! wraps mod 2³², which is exactly what the CPU reference (wrapping `i32` adds) computes.
 
 use crate::gpu::{smem_mode_for, SmemMode, DSMEM_DECL, DSMEM_SYM, STATIC_SMEM_CAP};
-use crate::ptx_target::HDR_SM80_V84;
+use crate::ptx_target::{HDR_SM80, HDR_SM80_V84};
 
 /// One `mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32` tile: A is `16×32` **u8** row-major, B is
 /// `32×8` **i8** column-major (the `.row.col` operand layout), D = A·B is `16×8` **i32** row-major. One
@@ -511,7 +511,7 @@ fn gen_int8_smdb_swz(
     // `stages` generalization (the `_impl` `stages==2` branch contains the verbatim XOR-toggle path).
     // The 48 KiB budget is the PTX ISA's static cap, so every shipped kernel stays on the static
     // emission path and its PTX text is unchanged to the byte.
-    gen_int8_smdb_swz_impl(name, bm, bn, wm, wn, dequant, splitk, static_dims, raster, 2, STATIC_SMEM_CAP)
+    gen_int8_smdb_swz_impl(name, bm, bn, wm, wn, dequant, splitk, static_dims, raster, 2, STATIC_SMEM_CAP, HDR_SM80_V84)
 }
 
 /// `stages`-deep generalization of [`gen_int8_smdb_swz`]: `stages==2` is the original XOR double-buffer
@@ -544,6 +544,13 @@ fn gen_int8_smdb_swz_impl(
     raster: usize,
     stages: usize,
     smem_budget: usize,
+    // The module header ([`crate::ptx_target`]). Shipped entries keep `HDR_SM80_V84` so their PTX text
+    // is unchanged; NEW modules take `HDR_SM80` (`.version 7.8`). The `.version` is a **driver**
+    // requirement, not an ISA one: 8.4 makes `cuModuleLoadData` demand r550+, while this family's whole
+    // instruction mix (`mma.sync.m16n8k32.u8.s8` = PTX 7.0, `ldmatrix` 6.5, `cp.async` 7.0, and the
+    // `.extern .shared` window — verified loading under 7.8) needs nothing past 7.0. Cloud fleets run
+    // r535+, so an unnecessary 8.4 is a portability hole for exactly the parts this work targets.
+    hdr: &str,
 ) -> String {
     let bk = 64usize; // u8 K-slab: nc = bk/16 = 4 chunks/row (reuses the fp16 nc=4 swizzle phase), 2 k32 steps
     let threads = wm * wn * 32;
@@ -630,7 +637,7 @@ fn gen_int8_smdb_swz_impl(
     let b_base = base_into("%tmp", sym_b, off_b);
 
     let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
-    let mut s = format!("{HDR_SM80_V84}\n");
+    let mut s = format!("{hdr}\n");
     if mode.is_dynamic() {
         // MODULE SCOPE, not inside the entry — the identical line in an entry body is CUDA_ERROR_INVALID_PTX.
         s += DSMEM_DECL;
@@ -1007,7 +1014,7 @@ pub fn int8_gemm_swz_tile_stage_ptx(
         format!("int8_swz_{bm}x{bn}_w{wm}x{wn}_s{stages}")
     };
     let ptx = gen_int8_smdb_swz_impl(
-        &name, bm, bn, wm, wn, false, false, None, raster, stages, smem_budget,
+        &name, bm, bn, wm, wn, false, false, None, raster, stages, smem_budget, HDR_SM80,
     );
     (name, ptx, smem_mode_for(stages * (bm + bn) * 64))
 }
@@ -1046,7 +1053,7 @@ pub fn int8_gemm_w64_swz_ptx() -> &'static str {
 /// **Bit-exact** mod 2³² (a deeper prefetch ring only reorders staging; the i32 mma arithmetic is identical).
 pub fn int8_gemm_w64_swz_s3_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz_impl("int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0, 3, STATIC_SMEM_CAP)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz_impl("int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0, 3, STATIC_SMEM_CAP, HDR_SM80_V84)).as_str()
 }
 
 /// One row of the **int8 variable-stage grid** — the family's `(tile, warps, depth)` point, its stable
@@ -1123,7 +1130,7 @@ pub const INT8_STAGE_VARIANTS: &[Int8StageCfg] = &[
 /// dispatcher's `applicable()`, never in a silently-clamped launch.
 pub fn int8_stage_ptx(v: &Int8StageCfg, smem_budget: usize) -> (String, SmemMode) {
     let ptx = gen_int8_smdb_swz_impl(
-        v.name, v.bm, v.bn, v.wm, v.wn, false, false, None, 0, v.stages, smem_budget,
+        v.name, v.bm, v.bn, v.wm, v.wn, false, false, None, 0, v.stages, smem_budget, HDR_SM80,
     );
     (ptx, v.smem_mode())
 }
@@ -1549,17 +1556,6 @@ mod tests {
         let (tile_name, tile_ptx) = int8_gemm_swz_tile_ptx(256, 128, 4, 2, 0);
         assert_eq!(tile_name, "int8_swz_256x128_w4x2");
         all.push(("int8_swz_256x128_w4x2", tile_ptx));
-        // The variable-stage grid (s2..s5, half of it dynamic-SMEM) is covered by the SAME ASCII/floor
-        // gate: one non-ASCII byte anywhere in a `format!` is a `ptxas fatal` at `cuModuleLoadData`, and
-        // these modules are exactly the ones destined for a machine this box cannot test on.
-        for v in INT8_STAGE_VARIANTS {
-            let (ptx, _) = int8_stage_ptx(v, ADA_OPTIN_BUDGET);
-            all.push((v.name, ptx));
-        }
-        // …and the big-tile × depth sibling (CUTLASS's SM80 int8 shape at s3 = 72 KiB, dynamic-only).
-        let (bt_name, bt_ptx, _) = int8_gemm_swz_tile_stage_ptx(256, 128, 4, 2, 0, 3, ADA_OPTIN_BUDGET);
-        assert_eq!(bt_name, "int8_swz_256x128_w4x2_s3");
-        all.push(("int8_swz_256x128_w4x2_s3", bt_ptx));
         for (entry, ptx) in &all {
             assert!(ptx.is_ascii(), "{entry}: PTX must be ASCII");
             // The int8 family's instruction mix (`mma.sync.m16n8k32` .u8/.s8, `ldmatrix`, `cp.async`)
@@ -1624,12 +1620,56 @@ mod tests {
         assert!(int8_gemm_smdb_s4_ptx().contains("mov.u32 %kcol,64;"));
     }
 
+    /// Every module the **variable-stage** generators emit, paired with its entry name.
+    fn stage_modules() -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = INT8_STAGE_VARIANTS
+            .iter()
+            .map(|c| (c.name.to_string(), int8_stage_ptx(c, ADA_OPTIN_BUDGET).0))
+            .collect();
+        for (bm, bn, wm, wn) in [(256usize, 128usize, 4usize, 2usize), (128, 256, 2, 4)] {
+            let (name, ptx, _) = int8_gemm_swz_tile_stage_ptx(bm, bn, wm, wn, 0, 3, ADA_OPTIN_BUDGET);
+            v.push((name, ptx));
+        }
+        v
+    }
+
+    /// **ASCII + floor gate for the variable-stage modules**, which are exactly the ones destined for a
+    /// machine this box cannot test on — one non-ASCII byte in a `format!` is a `ptxas fatal` at
+    /// `cuModuleLoadData`, and no local device gate would ever see it.
+    ///
+    /// They are pinned at [`HDR_SM80`] (**`.version 7.8`**), not the `8.4` the shipped int8 entries carry.
+    /// The `.version` is a **driver** requirement, not an instruction-set one: 8.4 makes the JIT demand
+    /// r550+, while this family needs nothing past PTX ISA 7.0 (`mma.sync.m16n8k32.u8.s8` 7.0, `ldmatrix`
+    /// 6.5, `cp.async` 7.0) — and the `.extern .shared` window itself loads fine under 7.8, since dynamic
+    /// SMEM is launch-time state rather than an ISA feature. Cloud fleets run r535+, so an unnecessary
+    /// 8.4 would refuse to load on the very parts this work exists to reach.
+    #[test]
+    fn int8_stage_modules_are_ascii_at_the_portable_floor() {
+        for (entry, ptx) in stage_modules() {
+            assert!(ptx.is_ascii(), "{entry}: PTX must be ASCII");
+            assert!(
+                ptx.starts_with(HDR_SM80),
+                "{entry}: a NEW int8 module must open at .version 7.8 / sm_80 — 8.4 needs driver r550+ \
+                 for no instruction this family emits"
+            );
+            assert!(!ptx.contains("sm_89"), "{entry}: no Ada-only instruction here");
+            assert!(ptx.contains(&format!(".visible .entry {entry}(")), "{entry}: entry missing");
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count(), "{entry}: unbalanced braces");
+            assert!(
+                ptx.contains("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32"),
+                "{entry}: must issue the 8-bit u8xi8->i32 mma"
+            );
+        }
+    }
+
     /// **ZERO REGRESSION on the ≤48 KiB path: the grid's s2/s3 rows ARE the shipped kernels, byte for
-    /// byte.** The whole dynamic-SMEM migration hangs on one promise — that adding a budget parameter
-    /// and an extern-window arm changes *nothing* about the kernels this card already runs. A behavioural
-    /// A/B could only sample that; this proves it: generate the grid's s2 and s3 rows, rename the entry
-    /// back, and demand string equality with `int8_gemm_w64_swz_ptx()` / `int8_gemm_w64_swz_s3_ptx()`.
-    /// Byte-identical PTX also means the on-disk cubin cache (keyed on the PTX text) stays warm.
+    /// byte below the header.** The whole dynamic-SMEM migration hangs on one promise — that adding a
+    /// budget parameter and an extern-window arm changes *nothing* about the kernels this card already
+    /// runs. A behavioural A/B could only sample that; this proves it: generate the grid's s2 and s3
+    /// rows, rename the entry back, and demand string equality with `int8_gemm_w64_swz_ptx()` /
+    /// `int8_gemm_w64_swz_s3_ptx()`. The shipped functions themselves are untouched (still `.version
+    /// 8.4`), so their on-disk cubins stay warm; the grid rows differ *only* in the deliberate `.version`
+    /// floor — asserted here as the sole difference, so a body change cannot hide behind it.
     #[test]
     fn int8_stage_grid_s2_s3_are_the_shipped_kernels() {
         for (grid, shipped_name, shipped) in [
@@ -1639,9 +1679,11 @@ mod tests {
             let v = INT8_STAGE_VARIANTS.iter().find(|v| v.name == grid).expect("grid row");
             let (ptx, mode) = int8_stage_ptx(v, ADA_OPTIN_BUDGET);
             assert_eq!(mode, SmemMode::Static, "{grid} is {} B — must stay on the static path", v.smem_bytes());
+            let body = ptx.strip_prefix(HDR_SM80).expect("grid rows open at the 7.8 floor");
+            let shipped_body = shipped.strip_prefix(HDR_SM80_V84).expect("shipped entries are 8.4");
             assert_eq!(
-                ptx.replace(grid, shipped_name),
-                shipped,
+                body.replace(grid, shipped_name),
+                shipped_body,
                 "{grid}: the stage-parameterized generator no longer reproduces the shipped `{shipped_name}` \
                  byte for byte — the <=48 KiB path is NOT allowed to move"
             );
