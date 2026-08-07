@@ -1,9 +1,18 @@
-//! **int8 (W8A8) tensor cores** on Ada (`sm_89`) — the quantized-inference GEMM. Like fp8, int8 has
-//! **no WMMA** path on `sm_89`: it is the warp-level `mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32`
+//! **int8 (W8A8) tensor cores** — the quantized-inference GEMM. Like fp8, int8 has **no WMMA** path at
+//! this geometry: it is the warp-level `mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32`
 //! only, which needs the A/B fragments loaded into registers in the exact per-lane layout the PTX ISA
 //! defines for 8-bit `m16n8k32` (no `wmma.load` to do it). That layout is **identical to fp8's** (both
 //! are 8-bit operands in the same `m16n8k32` geometry) — so this module mirrors [`crate::ptx_fp8`] tile
 //! for tile, swapping the `mma` type to `.s32.u8.s8.s32` and the accumulators from f32 to **s32**.
+//!
+//! **Target floor: `sm_80`** ([`crate::ptx_target::HDR_SM80_V84`]). This family shares fp8's tile
+//! *geometry* but none of its Ada-only *instructions*: the full emitted set is `mma.sync.m16n8k32` with
+//! `.u8`/`.s8` operands, `ldmatrix.sync.aligned.m8n8.x2/x4.shared.b16`, and
+//! `cp.async.cg.shared.global` / `commit_group` / `wait_group` — every one of them Ampere-legal
+//! (PTX ISA: 8-bit integer `m16n8k32` MMA is `sm_80`+). These modules were tagged `sm_89` only because
+//! that was the development card's own arch — a tag that loads on **zero** A100s while buying nothing.
+//! The `.version` stays **8.4** (a driver/ISA-vintage requirement, orthogonal to the arch floor); only
+//! the target floats down.
 //!
 //! **Semantics** match Wukong's CPU int8 GEMM (the AVX-VNNI `vpdpbusd` quantized `nn.Linear`):
 //! **`u8` activations × `i8` weights → `i32`**, `C = A·Bᵀ`. The integer accumulate is associative and
@@ -11,14 +20,19 @@
 //! **bit-exact** against a CPU `i32` reference — a strictly stronger gate. The MMA without `.satfinite`
 //! wraps mod 2³², which is exactly what the CPU reference (wrapping `i32` adds) computes.
 
+use crate::ptx_target::HDR_SM80_V84;
+
 /// One `mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32` tile: A is `16×32` **u8** row-major, B is
 /// `32×8` **i8** column-major (the `.row.col` operand layout), D = A·B is `16×8` **i32** row-major. One
 /// warp; the per-lane fragment addresses are the PTX-ISA layout for 8-bit `m16n8k32` (groupID =
 /// laneid≫2, threadID-in-group = laneid&3; A/B pack 4 bytes per `.b32` register). Byte-for-byte the
 /// same address math as [`crate::ptx_fp8::FP8_TILE`] — only the `mma` type and accumulator/store width
 /// differ (s32, but s32 and f32 are both 4 bytes, so even the store strides are unchanged).
+///
+/// A `const` cannot interpolate [`HDR_SM80_V84`], so the header is spelled literally here and pinned
+/// against the constant by `tests::int8_ptx_is_ascii_and_structural`.
 pub const INT8_TILE: &str = r#".version 8.4
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry int8_tile(
@@ -96,7 +110,7 @@ pub fn int8_gemm_mt_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
         let (tm, tn) = (INT8_TM, INT8_TN);
-        let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+        let mut s = format!("{HDR_SM80_V84}\n");
         s += ".visible .entry int8_gemm_nt_mt(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{\n";
         s += "    .reg .pred %p;\n";
         s += "    .reg .b32 %M,%N,%K,%lane,%grp,%tg4,%tg2,%row0,%col0,%k,%tmp;\n";
@@ -298,7 +312,7 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
 
         // The fused-dequant variant takes an extra `scale[N]` (f32) per-output-channel scale param.
         let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
-        let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+        let mut s = format!("{HDR_SM80_V84}\n");
         s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
         s += &format!("    .shared .align 16 .b8 smemA[{}];\n", 2 * tile_bytes);
         s += &format!("    .shared .align 16 .b8 smemB[{}];\n", 2 * tile_bytes);
@@ -570,7 +584,7 @@ fn gen_int8_smdb_swz_impl(
     let b_chunks = bn * bk / (threads * 16);
 
     let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
-    let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+    let mut s = format!("{HDR_SM80_V84}\n");
     s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
     s += &format!("    .shared .align 16 .b8 smemA[{}];\n", stages * bm * bk);
     s += &format!("    .shared .align 16 .b8 smemB[{}];\n", stages * bn * bk);
@@ -979,11 +993,8 @@ pub fn int8_gemm_w64_swz_deq_ptx() -> &'static str {
 pub fn int8_gemm_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
-        String::from(
-            r#".version 8.4
-.target sm_89
-.address_size 64
-
+        HDR_SM80_V84.to_string()
+            + (r#"
 .visible .entry int8_gemm_nt(
     .param .u32 pM,
     .param .u32 pN,
@@ -1079,8 +1090,7 @@ KEND:
     st.global.u32 [%cp+4],%d3;
     ret;
 }
-"#,
-        )
+"#)
     })
     .as_str()
 }
@@ -1124,7 +1134,7 @@ fn gen_int8_smdb_ms(
     let wn_shift = wn.trailing_zeros();
 
     let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
-    let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+    let mut s = format!("{HDR_SM80_V84}\n");
     s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
     s += &format!("    .shared .align 16 .b8 smemA[{ring}];\n");
     s += &format!("    .shared .align 16 .b8 smemB[{ring}];\n");
@@ -1331,6 +1341,7 @@ pub fn int8_gemm_smdb128_s4_ptx() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ptx_target::TARGET_SM80;
 
     /// Every module this file emits, paired with the entry it must declare. `int8_gemm_swz_tile_ptx`
     /// returns its own entry name, so it is folded in separately below.
@@ -1374,7 +1385,21 @@ mod tests {
         all.push(("int8_swz_256x128_w4x2", tile_ptx));
         for (entry, ptx) in &all {
             assert!(ptx.is_ascii(), "{entry}: PTX must be ASCII");
-            assert!(ptx.contains(".target sm_89"), "{entry}: must target sm_89");
+            // The int8 family's instruction mix (`mma.sync.m16n8k32` .u8/.s8, `ldmatrix`, `cp.async`)
+            // is Ampere-legal, so its FLOOR is sm_80. Pinning the floor - not the dev card's arch -
+            // is what keeps these modules loadable on A100/H100: PTX is forward-compatible only.
+            assert!(
+                ptx.contains(TARGET_SM80),
+                "{entry}: must carry the int8 family floor {TARGET_SM80}"
+            );
+            assert!(
+                ptx.starts_with(HDR_SM80_V84),
+                "{entry}: must open with the routed HDR_SM80_V84 header"
+            );
+            assert!(
+                !ptx.contains("sm_89"),
+                "{entry}: no Ada-only instruction here - the sm_89 tag must not come back"
+            );
             assert!(ptx.contains(&format!(".visible .entry {entry}(")), "{entry}: entry missing");
             assert_eq!(
                 ptx.matches('{').count(),
