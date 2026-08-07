@@ -153,9 +153,15 @@ pub fn jit_run_single(
 
     let mut guard = crate::gpu::gpu();
     let g = guard.as_mut().ok_or_else(|| {
-        "`--backend=gpu-native` requires a CUDA device, but none was reachable (the driver \
-         dlopens `nvcuda.dll`; check the NVIDIA driver is installed)"
-            .to_string()
+        // The library name is per-OS (`nvcuda.dll` on Windows, `libcuda.so.1` on Linux) — naming the
+        // wrong one sends the operator hunting for a file their box will never have. Resolved at run
+        // time through `baselines::cuda_driver_lib_name`, the single source of truth this message and
+        // `wukong_driver`'s `--backend=gpu` twin both read.
+        format!(
+            "`--backend=gpu-native` requires a CUDA device, but none was reachable (the driver \
+             dlopens `{}`; check the NVIDIA driver is installed)",
+            crate::baselines::cuda_driver_lib_name()
+        )
     })?;
     run_on_device(g, &ptx, &ret)
 }
