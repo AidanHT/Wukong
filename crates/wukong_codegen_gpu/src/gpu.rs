@@ -260,6 +260,18 @@ impl Gpu {
         crate::ptx_target::sm_arch(self.target.cc_major, self.target.cc_minor)
     }
 
+    /// **The device half of a persistent cache key** — `"sm_89x20"`: this device's arch and its SM
+    /// count, one whitespace-free token so it drops into a hand-editable text key.
+    ///
+    /// The arch alone is not enough identity. A tuned config is a verdict about a *machine*: the
+    /// autotuner's own axes (split-K factor, CTA/warp tile) are chosen by how a grid fills the SMs, so
+    /// an RTX 4090 (`sm_89`, 128 SMs) must not inherit an RTX 4050's (`sm_89`, 20 SMs) winners even
+    /// though the ISA is identical. Arch + SM count separates every part this project targets
+    /// (4050 `sm_89x20`, A100 `sm_80x108`, H100 `sm_90x132`).
+    pub fn device_tag(&self) -> String {
+        format!("{}x{}", self.sm_arch(), self.target.sm_count)
+    }
+
     /// Can this device run the **fp8** kernel families at all? (cc >= 8.9 — see [`FP8_MIN_CC`].)
     pub fn supports_fp8(&self) -> bool {
         self.target.supports(FP8_MIN_CC)
