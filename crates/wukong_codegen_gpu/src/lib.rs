@@ -17,6 +17,12 @@
 /// Whether this build has the GPU backend compiled in (`--features gpu`).
 pub const GPU_ENABLED: bool = cfg!(feature = "gpu");
 
+/// The single source of PTX module headers (`.version`/`.target` floors per family) and of the
+/// device-arch flag spellings (`compute_XX`/`sm_XX`). Un-gated on purpose: pure strings with no
+/// `cudarc` dependency, consumed by the un-gated `paged_attention` generators as well as every
+/// gated family, and its gates run in a plain `cargo test`.
+pub mod ptx_target;
+
 #[cfg(feature = "gpu")]
 pub mod baselines;
 
