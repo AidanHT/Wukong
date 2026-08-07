@@ -20,6 +20,7 @@
 //! are f32. f16·f16→f32 and bf16·bf16→f32 are exact per product, so the only deviation from an f64
 //! reference is the f32 accumulation order (tolerance-gated).
 
+use crate::gpu::{smem_mode_for, SmemMode, DSMEM_DECL, DSMEM_SYM, STATIC_SMEM_CAP};
 use crate::ptx_target::HDR_SM80;
 use std::sync::OnceLock;
 
@@ -306,12 +307,18 @@ pub struct CliffCfg {
 }
 
 impl CliffCfg {
-    /// Static SMEM bytes (`stages·(bm+bn)·(bk+pad)·2`); `pad==0` on the swizzle path.
+    /// SMEM bytes (`stages·(bm+bn)·(bk+pad)·2`); `pad==0` on the swizzle path.
     pub const fn smem_bytes(&self) -> usize {
         self.stages * (self.bm + self.bn) * (self.bk + self.pad) * 2
     }
     pub const fn threads(&self) -> usize {
         self.wm * self.wn * 32
+    }
+    /// How this config's SMEM is declared, and therefore how its launch must be sized — static at or
+    /// below the PTX ISA's 48 KiB cap, one `.extern` window beyond it. The launch wrapper takes the
+    /// byte count from here (`SmemMode::launch_bytes`), never re-derives it.
+    pub const fn smem_mode(&self) -> SmemMode {
+        smem_mode_for(self.smem_bytes())
     }
 }
 
@@ -353,6 +360,82 @@ pub const CLIFF_VARIANTS: &[CliffCfg] = &[
     CliffCfg { name: "cliff_swz_s2_v2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::V2 },
     CliffCfg { name: "cliff_swz_s2_v2cs", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::V2Cs },
 ];
+
+/// The SMEM budget the **deep** table is generated against: the *smallest* opt-in carveout among the
+/// parts this project targets (Ada, 99 KiB = 101376 B, measured on the dev card; A100 163 KiB, H100
+/// 227 KiB). Spelled as a constant rather than probed, so `gemm_deep_ptx()` stays a pure text function
+/// with one cached module and its gates run with no device present — and so every row is guaranteed
+/// loadable on **every** target, not just the biggest. A device whose ceiling is lower than a row's
+/// footprint declines that row at dispatch (`Gpu::smem_budget()`), it does not get a different kernel.
+pub const DEEP_SMEM_BUDGET: usize = 101_376;
+
+/// **The f16 variable-stage grid — the `mma.sync` pipeline past the 48 KiB static wall.**
+///
+/// The dispatched workhorse is 2-stage and the deepest thing this crate could previously express was
+/// `cliff_swz_s3` at 3·(128+128)·32·2 = **48 KiB exactly** — not a tuning verdict, a wall: PTX caps a
+/// *static* `.shared` declaration at 48 KiB on every device, so stage 4 had nowhere to live. These rows
+/// put the ring in the `.extern` window instead:
+///
+/// | row | tile | SMEM | form | CTAs/SM here (100 KiB/SM) | A100 (164) | H100 (228) |
+/// |---|---|---|---|---|---|---|
+/// | `deep_swz_128_s2` | 128×128 | 32 KiB | static (== `cliff_swz_s2`) | 2 (register-bound) | 2 | 2 |
+/// | `deep_swz_128_s3` | 128×128 | 48 KiB | static (== `cliff_swz_s3`) | 2 | 2 | 2 |
+/// | `deep_swz_128_s4` | 128×128 | 64 KiB | **dynamic** | 1 | 2 | 2 |
+/// | `deep_swz_128_s5` | 128×128 | 80 KiB | **dynamic** | 1 | 2 | 2 |
+/// | `deep_swz_128x256_s3` | 128×256 | 72 KiB | **dynamic** | 1 | 2 | 2 |
+///
+/// `_s4` is D1's A2 — "the cheapest possible test of the whole dynamic-SMEM capability", one table row.
+/// `_128x256_s3` is D1's #1-ranked Act-1 lever's *shape class* (128×256, where widening N moves the
+/// binding ceiling off L2-fill bandwidth onto the mma issue rate) at the deepest ring a 99 KiB card can
+/// hold; the full A3 config is s6 = 144 KiB and needs an A100/H100 budget, which this same generator
+/// produces unchanged. The s2/s3 rows are the shipped cliff kernels byte for byte
+/// (`deep_grid_s2_s3_are_the_shipped_cliff_kernels`), so they are the equivalence anchor: every deep row
+/// must agree with them, and with the f64 oracle, at the crate's fp16 tolerance.
+pub const PIPE_DEEP_VARIANTS: &[CliffCfg] = &[
+    CliffCfg { name: "deep_swz_128_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg { name: "deep_swz_128_s3", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 3, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg { name: "deep_swz_128_s4", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 4, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg { name: "deep_swz_128_s5", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 5, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+    CliffCfg { name: "deep_swz_128x256_s3", bm: 128, bn: 256, bk: 32, wm: 2, wn: 4, stages: 3, raster: 16, swz: true, pad: 0, min_ctas: 0, store: Store::Scalar },
+];
+
+/// Look up a [`PIPE_DEEP_VARIANTS`] row by entry name (a wrong name is a loud panic at the call site,
+/// never a silent mis-dispatch).
+pub fn deep_variant(name: &str) -> &'static CliffCfg {
+    PIPE_DEEP_VARIANTS
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("unknown deep variant {name:?}"))
+}
+
+/// Emit the **deep** (variable-stage) f16 module: the module-scope dynamic-SMEM window followed by one
+/// `mma.sync` entry per [`PIPE_DEEP_VARIANTS`] row.
+///
+/// One module, one window, many entries — legal and deliberate: `sharedMemBytes` is a *per-launch*
+/// quantity and `cuFuncSetAttribute` is per-`CUfunction`, so each entry sizes its own window
+/// independently even though they share the symbol. Static rows keep their own entry-local `.shared`
+/// arrays alongside it (statics and the window do not alias; the window simply starts after them).
+/// Separate from `gemm_cliff_ptx`/`wmma_f16_ptx` so the deep experiments never perturb the dispatched
+/// modules or their warm cubins.
+pub fn gemm_deep_ptx() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let mut m = String::from(HDR_SM80);
+        // Declared once, at MODULE scope (inside an entry body it is CUDA_ERROR_INVALID_PTX), and only
+        // when some row actually needs it — so a hypothetical all-static table emits historical text.
+        if PIPE_DEEP_VARIANTS.iter().any(|v| v.smem_mode().is_dynamic()) {
+            m += DSMEM_DECL;
+        }
+        for v in PIPE_DEEP_VARIANTS {
+            m += &entry_mma_pipe_budget(
+                v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None,
+                false, false, v.swz, v.min_ctas, v.store, DEEP_SMEM_BUDGET,
+            );
+        }
+        m
+    })
+    .as_str()
+}
 
 /// Emit the cliff candidate PTX module (separate from `wmma_f16_ptx` so experiments never perturb the
 /// dispatched module / its cubin cache). Each [`CliffCfg`] becomes one `mma.sync` entry.
@@ -1252,7 +1335,37 @@ pub enum Store {
 /// Per-warp tile is `(bm/wm)×(bn/wn)` = `tm` m16-blocks × `tn` n8-blocks; accumulators are `tm·tn·4`
 /// f32. Requires `M%bm==0`, `N%bn==0`, `K%bk==0`, `bk%16==0`, `bk/8` a power of two, `bm%(16·wm)==0`,
 /// `bn%(8·wn)==0`, and the [`entry_smem_pipe`] staging constraints. Total static SMEM ≤ 48 KiB.
+#[allow(clippy::too_many_arguments)]
 fn entry_mma_pipe(
+    name: &str,
+    ty: &str,
+    bm: usize,
+    bn: usize,
+    bk: usize,
+    warps_m: usize,
+    warps_n: usize,
+    stages: usize,
+    raster: usize,
+    pad: usize,
+    act: Act,
+    bias: bool,
+    residual: bool,
+    swz: bool,
+    min_ctas: usize,
+    store: Store,
+) -> String {
+    // Every shipped entry spends at most the PTX ISA's static 48 KiB, so it takes the static emission
+    // path and its PTX is the historical text to the byte. Only the deliberately-deep variants
+    // ([`PIPE_DEEP_VARIANTS`]) pass a device budget and cross into the dynamic window.
+    entry_mma_pipe_budget(
+        name, ty, bm, bn, bk, warps_m, warps_n, stages, raster, pad, act, bias, residual, swz,
+        min_ctas, store, STATIC_SMEM_CAP,
+    )
+}
+
+/// [`entry_mma_pipe`] with an explicit shared-memory budget — see the `smem_budget` parameter.
+#[allow(clippy::too_many_arguments)]
+fn entry_mma_pipe_budget(
     name: &str,
     ty: &str,
     bm: usize,
@@ -1276,6 +1389,14 @@ fn entry_mma_pipe(
     // Epilogue store mode ([`Store`]): scalar `st.global.f32` (historical) vs vectorized `st.global.v2.f32`
     // (± `.cs` streaming hint). Bit-identical output; the `v2` forms halve the C-write store count.
     store: Store,
+    // The SMEM ceiling this entry may spend, in bytes — and, via `smem_mode_for`, the choice of
+    // *emission form*. `STATIC_SMEM_CAP` (what every historical caller passes) keeps the entry on the
+    // static `.shared` path and its PTX byte-identical; a larger budget (the device's
+    // `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`) lets a deeper ring be carved out of the module-scope
+    // `.extern .shared` window instead. The generator stays a pure text function: the budget is passed
+    // in by the dispatch layer, never probed here, so the whole candidate lattice is enumerable and
+    // gateable with no device present — and an A100/H100 budget is testable on this laptop.
+    smem_budget: usize,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
@@ -1316,7 +1437,18 @@ fn entry_mma_pipe(
     let tile_b = bn * ldp * 2;
     let smem_a = stages * tile_a;
     let smem_b = stages * tile_b;
-    assert!(smem_a + smem_b <= 48 * 1024, "{name}: static SMEM {} B exceeds 48 KiB", smem_a + smem_b);
+    // SMEM(stages) = stages·(bm+bn)·ldp·2 — the family's closed form. The budget is the ceiling; the
+    // 48 KiB PTX ISA cap (STATIC_SMEM_CAP) decides the FORM, not the ceiling.
+    let mode = smem_mode_for(smem_a + smem_b);
+    assert!(
+        smem_a + smem_b <= smem_budget,
+        "{name}: SMEM {} B (stages={stages}, {bm}x{bn}, ldp={ldp}) exceeds the budget {smem_budget} B",
+        smem_a + smem_b
+    );
+    // Sub-slab alignment inside the shared window: B starts right after the whole A ring, and every
+    // `cp.async …,16` / `ldmatrix` into it assumes 16-B alignment. Loud at generation, because a
+    // forgotten offset assert is the one way the swizzle/alignment risk escapes silently.
+    assert!(smem_a % 16 == 0, "{name}: B slab offset {smem_a} is not 16-B aligned");
     let a_chunks = bm * bk / (threads * 8);
     let b_chunks = bn * bk / (threads * 8);
     assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk per thread");
@@ -1344,8 +1476,10 @@ fn entry_mma_pipe(
         s += &format!(".maxntid {threads}, 1, 1\n.minnctapersm {min_ctas}\n");
     }
     s += "{\n";
-    s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
-    s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
+    if !mode.is_dynamic() {
+        s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
+        s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
+    }
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufcA,%bufcB,%bufwA,%bufwB,%lane,%grp,%tg,%tg2,%laneoff,%warpMrow,%warpNcol,%aptr,%bptr,%grow,%gcol;\n";
     // Fused-epilogue scratch: %act0/%act1 for the transcendental activations, %biasv0/%biasv1 for the
@@ -1442,6 +1576,29 @@ fn entry_mma_pipe(
     // ldp=bk+pad) — the layout the hand-placed b32 fragment loads read conflict-free. swz: **no-pad +
     // XOR-swizzle** (`bufoff + row·bk·2 + (chunk XOR ((row>>1)&nc_mask))·16`) — the layout the `ldmatrix`
     // gathers read conflict-free, at the higher occupancy the dropped padding buys. Same global read either way.
+    // Where each ring lives. Static: its own entry-name-qualified `.shared` array, offset 0 — the
+    // historical spelling, emitted verbatim. Dynamic: BOTH rings are windows into the single
+    // module-scope `wk_dsmem` (two module-scope externs ALIAS), A at 0 and B at the whole A ring.
+    let (sym_a, sym_b, off_b): (String, String, usize) = if mode.is_dynamic() {
+        (DSMEM_SYM.to_string(), DSMEM_SYM.to_string(), smem_a)
+    } else {
+        (format!("smemA_{name}"), format!("smemB_{name}"), 0)
+    };
+    // `mov.u32 %reg,<window>;` plus the constant slab offset when the two rings share one window.
+    // Always through the symbol: the dynamic window does not start at address 0 when an entry also
+    // declares statics, so a hardcoded base would silently land in the wrong place.
+    let base_into = |reg: &str, sym: &str, off: usize| -> String {
+        if off == 0 {
+            format!("    mov.u32 {reg},{sym};\n")
+        } else {
+            format!("    mov.u32 {reg},{sym};\n    add.u32 {reg},{reg},{off};\n")
+        }
+    };
+    let a_base = base_into("%tmp", &sym_a, 0);
+    let b_base = base_into("%tmp", &sym_b, off_b);
+
+    // `smem` is the pre-rendered ring base (the `mov`, plus the constant slab offset in the shared
+    // window); the static form is the historical single `mov`, byte for byte.
     let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
@@ -1456,9 +1613,11 @@ fn entry_mma_pipe(
                 // chunk_col = %c>>3 (col8→chunk); chunk_swz = chunk XOR ((row>>1)&nc_mask); dest = smem +
                 // bufoff + row·bk·2 + chunk_swz·16 — the swizzle the ldmatrix reads invert (write/read agree).
                 *s += &format!("    shr.u32 %swztmp,%c,3;\n    shr.u32 %tmp2,%r,1;\n    and.b32 %tmp2,%tmp2,{nc_mask};\n    xor.b32 %swztmp,%swztmp,%tmp2;\n    shl.b32 %swztmp,%swztmp,4;\n");
-                *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n    mul.lo.s32 %tmp3,%r,{};\n    add.u32 %tmp,%tmp,%tmp3;\n    add.u32 %tmp,%tmp,%swztmp;\n", bk * 2);
+                *s += smem;
+                *s += &format!("    add.u32 %tmp,%tmp,{bufoff};\n    mul.lo.s32 %tmp3,%r,{};\n    add.u32 %tmp,%tmp,%tmp3;\n    add.u32 %tmp,%tmp,%swztmp;\n", bk * 2);
             } else {
-                *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n");
+                *s += smem;
+                *s += &format!("    add.u32 %tmp,%tmp,{bufoff};\n");
                 *s += &format!("    mul.lo.s32 %tmp2,%r,{};\n    add.u32 %tmp,%tmp,%tmp2;\n    shl.b32 %tmp2,%c,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ldp * 2);
             }
             *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
@@ -1469,8 +1628,8 @@ fn entry_mma_pipe(
         s += &format!("    mov.u32 %kcol,{};\n", st * bk);
         s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", st * tile_a, st * tile_b);
         s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
-        stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-        stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+        stage("%baseRow", "%A", &a_base, "%bufwA", a_chunks, &mut s);
+        stage("%baseCol", "%B", &b_base, "%bufwB", b_chunks, &mut s);
         s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
     }
     s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcB,0;\n";
@@ -1479,8 +1638,8 @@ fn entry_mma_pipe(
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
     s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
     s += &format!("    add.u32 %kcol,%kt,{};\n    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra NOPRE_{name};\n", (stages - 1) * bk);
-    stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
-    stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+    stage("%baseRow", "%A", &a_base, "%bufwA", a_chunks, &mut s);
+    stage("%baseCol", "%B", &b_base, "%bufwB", b_chunks, &mut s);
     s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
 
     // Compute: for each k16 step load the A/B fragments — swz: one `ldmatrix.x4`/`.x2` warp-cooperative
@@ -1490,7 +1649,8 @@ fn entry_mma_pipe(
         if swz {
             // A: aptr = smemA + bufcA + arowb (this lane's row base). chunk_off = ((ks·2 | la16) XOR phaseA)·16
             // (per-ks, per-lane); per mi add mi·16·bk·2 → ldmatrix.x4 {A00,A10,A01,A11} = the mma A regs.
-            s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n    add.u32 %aptr,%aptr,%arowb;\n");
+            s += &base_into("%aptr", &sym_a, 0);
+            s += "    add.u32 %aptr,%aptr,%bufcA;\n    add.u32 %aptr,%aptr,%arowb;\n";
             s += &format!("    or.b32 %swztmp,%la16,{};\n    xor.b32 %swztmp,%swztmp,%phaseA;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
             for mi in 0..tm {
                 let mibase = mi * 16 * bk * 2;
@@ -1498,7 +1658,8 @@ fn entry_mma_pipe(
             }
             // B: bptr = smemB + bufcB + browb. chunk_off = ((ks·2 | lb8) XOR phaseB)·16; per ni add ni·8·bk·2
             // → ldmatrix.x2 {B0,B1} = the mma B regs.
-            s += &format!("    mov.u32 %bptr,smemB_{name};\n    add.u32 %bptr,%bptr,%bufcB;\n    add.u32 %bptr,%bptr,%browb;\n");
+            s += &base_into("%bptr", &sym_b, off_b);
+            s += "    add.u32 %bptr,%bptr,%bufcB;\n    add.u32 %bptr,%bptr,%browb;\n";
             s += &format!("    or.b32 %swztmp,%lb8,{};\n    xor.b32 %swztmp,%swztmp,%phaseB;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
             for ni in 0..tn {
                 let nibase = ni * 8 * bk * 2;
@@ -1506,7 +1667,8 @@ fn entry_mma_pipe(
             }
         } else {
             // A base ptr = smemA + bufcA + (warpMrow·ldp)·2 + laneoff + (ks·16)·2  (ldp = padded row stride).
-            s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
+            s += &base_into("%aptr", &sym_a, 0);
+            s += "    add.u32 %aptr,%aptr,%bufcA;\n";
             s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
             s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
             for mi in 0..tm {
@@ -1518,7 +1680,8 @@ fn entry_mma_pipe(
                 s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
             }
             // B base ptr = smemB + bufcB + (warpNcol·ldp)·2 + laneoff + (ks·16)·2.
-            s += &format!("    mov.u32 %bptr,smemB_{name};\n    add.u32 %bptr,%bptr,%bufcB;\n");
+            s += &base_into("%bptr", &sym_b, off_b);
+            s += "    add.u32 %bptr,%bptr,%bufcB;\n";
             s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
             s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
             for ni in 0..tn {
@@ -2530,10 +2693,11 @@ mod tests {
     /// text loadable.
     #[test]
     fn every_tensor_core_module_is_pure_ascii() {
-        let modules: [(&str, &str); 5] = [
+        let modules: [(&str, &str); 6] = [
             ("wmma_f16_ptx", wmma_f16_ptx()),
             ("wmma_bf16_ptx", wmma_bf16_ptx()),
             ("gemm_cliff_ptx", gemm_cliff_ptx()),
+            ("gemm_deep_ptx", gemm_deep_ptx()),
             ("roofline_f16_ptx", roofline_f16_ptx()),
             ("wmma_f16_sm_static_ptx", &wmma_f16_sm_static_ptx(128, 128, 128, false)),
         ];
@@ -2550,6 +2714,91 @@ mod tests {
         }
     }
 
+    /// **ZERO REGRESSION on the ≤48 KiB path: the deep grid's s2/s3 rows ARE the shipped cliff kernels,
+    /// byte for byte.** The dynamic-SMEM migration's whole promise is that adding a budget parameter and
+    /// an extern-window arm changes *nothing* about the kernels already measured on this card. Proven,
+    /// not sampled: regenerate `deep_swz_128_s2`/`_s3`, rename the entries to `cliff_swz_s2`/`_s3`, and
+    /// demand string equality with what `gemm_cliff_ptx` emits for those rows. (`cliff_swz_s3` is
+    /// 3·(128+128)·32·2 = 48 KiB *exactly* — the last depth expressible without the window, which is why
+    /// it is the anchor.) Byte-identity also keeps the cubin cache, keyed on PTX text, warm.
+    #[test]
+    fn deep_grid_s2_s3_are_the_shipped_cliff_kernels() {
+        let cliff = gemm_cliff_ptx();
+        let entry_of = |ptx: &str, name: &str| -> String {
+            let at = ptx.find(&format!(".visible .entry {name}(")).expect("entry exists");
+            let rest = &ptx[at..];
+            // Entries are emitted back-to-back; take up to the next one (or the module end).
+            let end = rest[1..].find(".visible .entry ").map_or(rest.len(), |i| i + 1);
+            rest[..end].to_string()
+        };
+        let deep = gemm_deep_ptx();
+        for (deep_name, cliff_name) in [("deep_swz_128_s2", "cliff_swz_s2"), ("deep_swz_128_s3", "cliff_swz_s3")] {
+            let v = deep_variant(deep_name);
+            assert_eq!(v.smem_mode(), SmemMode::Static, "{deep_name} must stay on the static path");
+            assert_eq!(
+                entry_of(deep, deep_name).replace(deep_name, cliff_name),
+                entry_of(cliff, cliff_name),
+                "{deep_name}: the budget-parameterized generator no longer reproduces the shipped \
+                 `{cliff_name}` byte for byte — the <=48 KiB path is NOT allowed to move"
+            );
+        }
+    }
+
+    /// **The deep grid's SMEM arithmetic, emission form, and window discipline (no GPU).** The four ways
+    /// a dynamic-SMEM kernel goes wrong *silently*, each checked from the emitted text:
+    ///   * the closed form `stages·(bm+bn)·(bk+pad)·2` and the 48 KiB boundary that splits the forms;
+    ///   * the window is declared **once** and at **module scope** — two module-scope externs ALIAS (so a
+    ///     second one would drop the B ring on top of the A ring), and the same line inside an entry body
+    ///     is `CUDA_ERROR_INVALID_PTX`;
+    ///   * a dynamic entry declares no static `.shared` array of its own (it would eat the same opt-in
+    ///     ceiling) and a static entry never touches the window;
+    ///   * the B ring starts at the constant `stages·tile_a`, and both rings are reached through the
+    ///     SYMBOL — the window base is not 0 when an entry also has statics.
+    /// Also pins every row inside [`DEEP_SMEM_BUDGET`], so no row can be born un-loadable on the
+    /// smallest target this project ships to.
+    #[test]
+    fn deep_grid_smem_math_and_window_discipline() {
+        let deep = gemm_deep_ptx();
+        assert_eq!(deep.matches(".extern .shared").count(), 1, "exactly ONE window per module");
+        let decl = deep.find(".extern .shared").expect("window");
+        let first_entry = deep.find(".visible .entry").expect("entry");
+        assert!(decl < first_entry, "the window must be declared at MODULE scope, before any entry");
+        let expect: [(&str, usize, bool); 5] = [
+            ("deep_swz_128_s2", 32768, false),
+            ("deep_swz_128_s3", 49152, false),
+            ("deep_swz_128_s4", 65536, true),
+            ("deep_swz_128_s5", 81920, true),
+            ("deep_swz_128x256_s3", 73728, true),
+        ];
+        assert_eq!(PIPE_DEEP_VARIANTS.len(), expect.len());
+        for (v, (name, bytes, dynamic)) in PIPE_DEEP_VARIANTS.iter().zip(expect) {
+            assert_eq!(v.name, name, "deep grid order");
+            assert_eq!(v.smem_bytes(), bytes, "{name}: SMEM closed form");
+            assert_eq!(v.smem_mode().is_dynamic(), dynamic, "{name}: emission form at {bytes} B");
+            assert_eq!(v.smem_mode().launch_bytes(), if dynamic { bytes } else { 0 }, "{name}");
+            assert!(v.smem_bytes() <= DEEP_SMEM_BUDGET, "{name}: must fit the smallest target's ceiling");
+            let tile_a = v.stages * v.bm * (v.bk + v.pad) * 2 / v.stages; // one A buffer
+            if dynamic {
+                assert!(!deep.contains(&format!("smemA_{name}")), "{name}: no statics beside the window");
+                assert!(deep.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")), "{name}: B ring via the symbol");
+                assert!(
+                    deep.contains(&format!("add.u32 %bptr,%bptr,{};", v.stages * tile_a)),
+                    "{name}: the B ring must start after the whole A ring"
+                );
+            } else {
+                assert!(
+                    deep.contains(&format!(".shared .align 16 .b8 smemA_{name}[{}];", v.stages * tile_a)),
+                    "{name}: static rows keep their own arrays"
+                );
+            }
+            // Every depth keeps `stages-2` cp.async groups in flight and guards each prologue slab.
+            assert!(deep.contains(&format!("cp.async.wait_group {};", v.stages - 2)), "{name}");
+            for st in 0..(v.stages - 1) {
+                assert!(deep.contains(&format!("PRO_{name}_{st}:")), "{name}: prologue slab {st} unguarded");
+            }
+        }
+    }
+
     /// Retarget gate (GPU_RETARGET_PLAN.md §5, Phase 2): every tensor-core module here must open with
     /// the `sm_80` FLOOR header, never the development box's `sm_89`. `wmma.*.m16n16k16`,
     /// `mma.sync.m16n8k16`, `ldmatrix` and `cp.async` are all Ampere-ISA instructions, and PTX is
@@ -2559,10 +2808,11 @@ mod tests {
     #[test]
     fn every_tensor_core_module_opens_at_the_sm80_floor() {
         let statics = [wmma_f16_sm_static_ptx(128, 128, 128, false), wmma_f16_sm_static_ptx(128, 128, 128, true)];
-        let modules: [(&str, &str); 6] = [
+        let modules: [(&str, &str); 7] = [
             ("wmma_f16_ptx", wmma_f16_ptx()),
             ("wmma_bf16_ptx", wmma_bf16_ptx()),
             ("gemm_cliff_ptx", gemm_cliff_ptx()),
+            ("gemm_deep_ptx", gemm_deep_ptx()),
             ("roofline_f16_ptx", roofline_f16_ptx()),
             ("wmma_f16_sm_static_ptx(64)", &statics[0]),
             ("wmma_f16_sm_static_ptx(128)", &statics[1]),
@@ -2596,6 +2846,10 @@ mod tests {
         }
         for v in CLIFF_VARIANTS {
             assert!(has(cliff, v.name), "CLIFF_VARIANTS entry `{}` missing from gemm_cliff_ptx", v.name);
+        }
+        let deep = gemm_deep_ptx();
+        for v in PIPE_DEEP_VARIANTS {
+            assert!(has(deep, v.name), "PIPE_DEEP_VARIANTS entry `{}` missing from gemm_deep_ptx", v.name);
         }
         assert!(has(bf16, PIPE_BF16.name), "PIPE_BF16 entry `{}` missing", PIPE_BF16.name);
         for use_128 in [false, true] {
