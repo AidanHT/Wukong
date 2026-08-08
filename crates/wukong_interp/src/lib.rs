@@ -140,6 +140,10 @@ pub trait Accelerator {
     /// Linear, 1=relu, 2=gelu, 3=silu). Return `None` for any case the device kernel doesn't cover
     /// (non-zero beta, a bias it can't fuse, an unsupported activation, or an unaligned shape) so it
     /// falls back to the CPU fused kernel.
+    // One parameter per `wukong_sgemm_nt_epi` C-ABI operand, deliberately: the trait mirrors the
+    // kernel ABI, and a params struct here would ripple through every Accelerator impl
+    // (`wukong_driver/src/gpu_accel.rs`) without making the seam clearer.
+    #[allow(clippy::too_many_arguments)]
     fn sgemm_nt_epi(
         &mut self,
         _a: &[f32],
