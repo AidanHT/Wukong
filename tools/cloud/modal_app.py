@@ -127,6 +127,14 @@ IGNORE = [
     "tools/cuda-redist/**", "tools/cuda-redist",       # 11 GB of vendor DLLs; the image has these
     "tools/torch-venv/**", "tools/torch-cuda-venv/**",
     "data/**", "data",                                 # ~477 MB of exported GPT-2 weights
+    # Round LOGS, and they must be ignored for a structural reason, not to save bytes. The mount is
+    # `copy=False`, and Modal aborts the whole run with "<path> was modified during build process"
+    # if any mounted file changes while the image is building. The runbook (docs/gpu/phase1-runbook
+    # .md §2.1/§2.2) writes the provenance header into `bench/gpu/<dev>/<date>-s<N>-*.log` and then
+    # tees the command's output into that same file -- i.e. it writes inside the mount *during* the
+    # run it is logging. Ignoring the directory is what makes the documented logging protocol legal.
+    # Only `bench/gpu/**`: `bench/kernels` is a real corpus and must keep shipping.
+    "bench/gpu/**", "bench/gpu",
     "**/__pycache__/**", "**/*.pyc",
     "**/*.exe", "**/*.o", "**/*.obj", "**/*.pdb",
     "**/io_test_*.bin",
