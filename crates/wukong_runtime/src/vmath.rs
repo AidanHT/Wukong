@@ -81,7 +81,7 @@ const INV6: f32 = 1.0 / 6.0;
 
 // SELU (self-normalizing networks, Klambauer 2017) constants — the fixed λ, α that make the
 // activation variance-preserving.
-const SELU_LAMBDA: f32 = 1.050_700_98;
+const SELU_LAMBDA: f32 = 1.050_701; // == mir_build's 1.050_700_98 splat bit-for-bit (0x3F867D5F)
 const SELU_ALPHA: f32 = 1.673_263_2;
 
 /// Leaky-ReLU negative-slope (the conventional 0.01); fixed so `leaky_relu` stays a single-arg
@@ -131,6 +131,9 @@ const EXP_TBL_C2: f32 = EXP_C2 / 8.0; // ln2/8 low correction (a /8 of an f32 is
 const EXP_TBL_MBIAS: i32 = 0x4B40_0000 - 1016; // bits(EXP_MAGIC) − 127·8: m = bits(t)−MBIAS = n+1016
                                                // T[j] = 2^(j/8) rounded once to f32 (T[0] pinned exactly 1.0 → exp(0) = 1.0 exactly). The
                                                // `vmath_exp_tables_consistent` test below re-derives every entry bit-for-bit.
+#[allow(clippy::approx_constant)] // T[4] = 2^(4/8) happens to be √2; the entry is "2^(j/8) rounded
+                                  // once to f32", pinned bit-for-bit by `vmath_exp_tables_consistent` and mirrored in `mir_build` —
+                                  // respelling it via consts::SQRT_2 would obscure the derivation the test re-checks.
 const EXP_TBL_T: [f32; 8] = [
     1.0,
     1.090_507_7,
@@ -243,7 +246,7 @@ const LOG10_E: f32 = std::f64::consts::LOG10_E as f32; // log10(x) = log(x)·log
 // tan(3π/8)=1+√2, each mapping into [0, tan(π/8)] where a degree-3 odd minimax poly is ≈1 ULP. The
 // `f64 as f32` casts mirror `splat_const_f` in mir_build so the dispatched kernel equals the inlined form.
 const ATAN_TAN_3PI8: f32 = 2.414213562373095_f64 as f32; // tan(3π/8) = 1 + √2
-const ATAN_TAN_PI8: f32 = 0.4142135623730950_f64 as f32; // tan(π/8) = √2 − 1
+const ATAN_TAN_PI8: f32 = 0.414_213_562_373_095_f64 as f32; // tan(π/8) = √2 − 1
 const ATAN_PIO2: f32 = std::f64::consts::FRAC_PI_2 as f32; // π/2 offset (big region)
 const ATAN_PIO4: f32 = std::f64::consts::FRAC_PI_4 as f32; // π/4 offset (mid region)
 const ATAN_P: [f32; 4] = [
@@ -495,7 +498,9 @@ pub(crate) fn sincos1(x: f32, is_cos: bool) -> f32 {
     // quadrant: (int)qf & 3, back to an exact float for the float-eq selects.
     let quad = ((qf as i32) & 3) as f32;
     // `* -1.0` (not unary `-`) to match the AVX2 `mulps` and `emit_trig`'s `FMul(_, -1)` on signed zero.
+    #[allow(clippy::neg_multiply)]
     let neg_sin = sin_p * -1.0;
+    #[allow(clippy::neg_multiply)]
     let neg_cos = cos_p * -1.0;
     let (a0, a1, a2, a3) = if is_cos {
         (cos_p, neg_sin, neg_cos, sin_p)
@@ -515,6 +520,10 @@ pub(crate) fn sincos1(x: f32, is_cos: bool) -> f32 {
 /// Mirrors `emit_erf_f32` op-for-op (incl. `|x| = max(x, −x)` via compare+select and the odd-function
 /// sign fixup), so a dispatched `erf(x)` loop agrees with a composed one — and gives the exact
 /// (erf-based) GELU the original BERT/GPT-2 use.
+// `* -1.0` throughout, never unary `-`: the AVX2 twin negates with `mulps` by a -1.0 splat, and the
+// scalar twin must be the same *operation* so the pair stays bit-exact on signed zero and NaN
+// payloads (crate invariant #1). Same rule in `sincos1`/`sinh1`/`cosh1`.
+#[allow(clippy::neg_multiply)]
 #[inline]
 fn erf1(x: f32) -> f32 {
     let negx = x * -1.0;
@@ -562,12 +571,14 @@ fn log10_1(x: f32) -> f32 {
 }
 
 /// `sinh(x) = (e^x − e^{−x})/2`. Reuses [`exp1`]; overflows like `libm` for large |x|.
+#[allow(clippy::neg_multiply)] // `* -1.0` matches the AVX2 twin's mulps — see `erf1`.
 #[inline]
 fn sinh1(x: f32) -> f32 {
     (exp1(x) - exp1(x * -1.0)) * 0.5
 }
 
 /// `cosh(x) = (e^x + e^{−x})/2`. Reuses [`exp1`]; overflows like `libm` for large |x|.
+#[allow(clippy::neg_multiply)] // `* -1.0` matches the AVX2 twin's mulps — see `erf1`.
 #[inline]
 fn cosh1(x: f32) -> f32 {
     (exp1(x) + exp1(x * -1.0)) * 0.5
@@ -2313,6 +2324,11 @@ unsafe fn log1p_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 
 #[cfg(test)]
 mod tests {
+    // The release-only exhaustive probes open with `assert!(!cfg!(debug_assertions), "…rebuild
+    // with --release…")` — a deliberately constant assertion whose message tells the runner how to
+    // rerun; the lint would have it deleted.
+    #![allow(clippy::assertions_on_constants)]
+
     use super::*;
 
     /// The dispatched kernel is ≈1 ULP of `libm` for exp/log/tanh/sigmoid over a representative
@@ -2357,10 +2373,10 @@ mod tests {
                 2e-5,
             ),
             (VM_TANHSHRINK, |x| x - x.tanh(), 2e-5),
-            (VM_HARDSIGMOID, |x| (x + 3.0).max(0.0).min(6.0) * INV6, 1e-6),
+            (VM_HARDSIGMOID, |x| (x + 3.0).clamp(0.0, 6.0) * INV6, 1e-6),
             (
                 VM_HARDSWISH,
-                |x| x * ((x + 3.0).max(0.0).min(6.0) * INV6),
+                |x| x * ((x + 3.0).clamp(0.0, 6.0) * INV6),
                 1e-6,
             ),
             // sin/cos vs Rust's libm over [-20.48, 20.47] — the 3-part π/2 reduction holds well past
@@ -2781,9 +2797,9 @@ mod tests {
     /// round to these same bits) cannot survive.
     #[test]
     fn vmath_exp_tables_consistent() {
-        for j in 0..8usize {
+        for (j, &t) in EXP_TBL_T.iter().enumerate() {
             let want = ((j as f64) / 8.0).exp2() as f32;
-            assert_eq!(EXP_TBL_T[j].to_bits(), want.to_bits(), "T[{j}]");
+            assert_eq!(t.to_bits(), want.to_bits(), "T[{j}]");
         }
         assert_eq!(
             EXP_TBL_T[0].to_bits(),
