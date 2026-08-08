@@ -1189,12 +1189,19 @@ mod tests {
 
     /// Local copy of the harness `with_gpu` (the gpu.rs one is private to its test module): runs `body`
     /// with the process-wide `Gpu`, or skips cleanly when no device is reachable.
+    ///
+    /// The skip goes through [`crate::diff::skip_or_fail`], exactly like `gpu.rs`'s original: this
+    /// copy printed and returned unconditionally, so under `WUKONG_GPU_REQUIRED=1` — the invocation
+    /// a rented-GPU run uses — these gates reported `ok` having touched no device at all.
     #[cfg(feature = "gpu")]
     fn with_gpu(name: &str, body: impl FnOnce(&mut crate::Gpu)) {
         let mut guard = crate::gpu();
         match guard.as_mut() {
             Some(g) => body(g),
-            None => eprintln!("[skip] {name}: no CUDA device reachable"),
+            None => crate::diff::skip_or_fail(
+                name,
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            ),
         }
     }
 
