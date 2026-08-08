@@ -534,9 +534,9 @@ mod tests {
     ///  - a column whose max appears at rows 2 AND 5 must return 2 (not 5),
     ///  - the same for argmin with the min at rows 2 AND 5,
     ///  - an all-equal column must return 0.
-    /// `cols = 300 > COLARG_PAR_MIN` so the parallel path's stripe split actually runs, and the planted
-    /// columns sit at different lanes/stripes; `rows = 8` so the planted low row (2) must survive all the
-    /// blend updates across rows 3..7.
+    ///    `cols = 300 > COLARG_PAR_MIN` so the parallel path's stripe split actually runs, and the planted
+    ///    columns sit at different lanes/stripes; `rows = 8` so the planted low row (2) must survive all the
+    ///    blend updates across rows 3..7.
     #[test]
     fn duplicate_extrema_return_lowest_row_index() {
         let rows = 8usize;
@@ -545,7 +545,7 @@ mod tests {
 
         // Column 0: all-equal → argmax and argmin both row 0.
         for i in 0..rows {
-            x[i * cols + 0] = 3.0;
+            x[i * cols] = 3.0;
         }
         // Column 1: baseline 0, the MAX 9.0 planted at rows 2 and 5 → argmax must be 2; argmin (all the
         // 0.0 baseline, first at row 0, and 9.0 is not a min) → row 0.
