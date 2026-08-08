@@ -596,11 +596,7 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = Command::new(&cc)
-        .arg(&obj_path)
-        .arg(&rt_path)
-        .arg("-o")
-        .arg(&out)
-        .arg("-O2")
+        .args(cc_link_args(&obj_path, &rt_path, &out))
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -624,6 +620,26 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
             exit::UNIMPLEMENTED
         }
     }
+}
+
+/// The `cc` fallback's command line, factored out of [`emit_native`] so it can be pinned by a test.
+///
+/// **`-lm` is load-bearing and must stay last.** [`WUKONG_RT_C`] *unconditionally* defines
+/// `wukong_rt_fmod_f64`/`_f32` over C's `fmod`/`fmodf`, and on glibc those live in `libm`, which
+/// `cc` does **not** link by default — so without this flag the fallback could not link *any*
+/// program on Linux (`undefined reference to 'fmod'`), not merely one that uses `%` on floats. It is
+/// a no-op where libm is already folded into the C library (macOS/libSystem, MinGW's stub
+/// `libm.a`), so the Windows and macOS link lines are unaffected. Position matters: GNU `ld`
+/// resolves left to right, so a library must follow the objects that reference it.
+fn cc_link_args(obj_path: &Path, rt_path: &Path, out: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        obj_path.into(),
+        rt_path.into(),
+        "-o".into(),
+        out.into(),
+        "-O2".into(),
+        "-lm".into(),
+    ]
 }
 
 /// The outcome of the [`rustc_link`] attempt (the preferred `--emit=exe` link path).
@@ -1849,6 +1865,31 @@ mod native_link_tests {
         assert!(
             !dir.exists(),
             "the scratch directory must be removed when the link finishes"
+        );
+    }
+
+    /// The `cc` fallback must link `libm`. `WUKONG_RT_C` always defines `wukong_rt_fmod_*` over
+    /// `fmod`/`fmodf`, which glibc keeps in `libm` and `cc` does not link by default — so the whole
+    /// fallback path failed to link *every* program on Linux with `undefined reference to 'fmod'`.
+    /// A library must also follow the objects that reference it, or GNU `ld` discards it unused.
+    #[test]
+    fn the_cc_fallback_links_libm_after_its_objects() {
+        let args = cc_link_args(
+            Path::new("prog.o"),
+            Path::new("prog_rt.c"),
+            Path::new("prog"),
+        );
+        let lm = args
+            .iter()
+            .position(|a| a == "-lm")
+            .expect("the `cc` fallback link line must pass `-lm`");
+        let rt = args
+            .iter()
+            .position(|a| a == "prog_rt.c")
+            .expect("the generated C runtime must be on the link line");
+        assert!(
+            lm > rt,
+            "`-lm` must follow `prog_rt.c` (GNU ld resolves left to right): {args:?}"
         );
     }
 }
