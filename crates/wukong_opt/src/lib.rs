@@ -256,7 +256,7 @@ impl PassManager {
                 break;
             }
         }
-        if let Some(t) = timings.as_deref_mut() {
+        if let Some(t) = timings {
             t.max_iterations = t.max_iterations.max(iterations);
         }
     }
