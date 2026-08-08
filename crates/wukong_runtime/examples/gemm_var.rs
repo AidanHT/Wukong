@@ -7,12 +7,13 @@
 //! can distinguish:
 //!   * both sides swing together        → machine state (clock/thermal/background), not Wukong;
 //!   * only Wukong swings               → our scheduling/packing has a nondeterministic stall;
-//!   * per-round ratio tight in-process but different across invocations
-//!                                      → process-level state (pool placement, page placement).
+//!   * per-round ratio tight in-process but different across invocations → process-level state
+//!     (pool placement, page placement).
 //!
 //! Run: `cargo run -p wukong_runtime --release --example gemm_var [-- <rounds>]`
 //! Env: `WUKONG_MKL_DLL` to point at mkl_rt.dll explicitly; `GEMM_VAR_HUGE=1` adds 2048³.
 
+#[cfg(windows)]
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -35,7 +36,9 @@ type CblasSgemmFn = unsafe extern "C" fn(
     *mut f32,
     i64,
 );
+#[cfg(windows)]
 type MklSetNumThreadsFn = unsafe extern "C" fn(i32);
+#[cfg(windows)]
 type MklGetMaxThreadsFn = unsafe extern "C" fn() -> i32;
 
 struct Mkl {
@@ -43,6 +46,7 @@ struct Mkl {
     max_threads: i32,
 }
 
+#[cfg(windows)]
 fn mkl_dll_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("WUKONG_MKL_DLL") {
         let pb = PathBuf::from(p);
@@ -77,6 +81,14 @@ fn mkl_dll_path() -> Option<PathBuf> {
     None
 }
 
+/// The MKL peer resolves `mkl_rt.dll` through the Windows loader; elsewhere the column is absent
+/// (the un-gated `libloading::os::windows` import broke `--all-targets` on Linux, E0432).
+#[cfg(not(windows))]
+fn load_mkl() -> Option<Mkl> {
+    None
+}
+
+#[cfg(windows)]
 fn load_mkl() -> Option<Mkl> {
     let path = mkl_dll_path()?;
     use libloading::os::windows::{Library as WinLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
