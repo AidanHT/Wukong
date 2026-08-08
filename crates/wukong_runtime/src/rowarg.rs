@@ -369,9 +369,7 @@ mod tests {
         let mut x = vec![0.0f32; rows * cols];
 
         // Row 0: all equal → argmax and argmin both 0.
-        for j in 0..cols {
-            x[j] = 3.0;
-        }
+        x[..cols].fill(3.0);
         // Row 1: baseline 0, the MAX 9.0 planted at indices 2 and 5 → argmax must be 2.
         let r1 = cols;
         x[r1 + 2] = 9.0;
