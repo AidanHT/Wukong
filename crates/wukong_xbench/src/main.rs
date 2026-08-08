@@ -3153,7 +3153,7 @@ fn bench_dequant(cc: &str, dir: &Path) {
         // (an unused-but-aliasing `restrict` pointer to a modified object). No peer — Wukong, C, C++
         // or Rust — ever indexes this parameter, so one element is enough; the point is only that it
         // is not the output buffer.
-        let dummy_buf = vec![0.0f32; 1];
+        let dummy_buf = [0.0f32; 1];
         let dummy = dummy_buf.as_ptr();
         let bytes = (in_bytes + 4) as f64 * n as f64;
         let gbps = |v: &Option<Measure>| {
@@ -6318,6 +6318,7 @@ fn rust_bf16(n: usize, is_dot: bool) -> String {
 ///      narrow: gcc/rustc leave the bf16 round scalar, so Wukong's 256-bit `narrow_bf16` (pack +
 ///      permute) wins. Cross-checked full-buffer at a bf16-scale tolerance (Wukong FMAs the sum, C
 ///      does not, so the last bf16 bit can differ).
+///
 /// N = 1<<24 (32 MB per bf16 array ≫ L3) so the narrowing store dominates.
 fn bench_axpby_half_out(cc: &str, dir: &Path) {
     let n = 1usize << 24;
@@ -8020,6 +8021,7 @@ type CblasSgemmFn = unsafe extern "C" fn(
     i64,
 );
 type MklSetNumThreadsFn = unsafe extern "C" fn(i32);
+#[cfg(windows)] // resolved only inside the Windows-only `mkl()` loader
 type MklGetMaxThreadsFn = unsafe extern "C" fn() -> i32;
 // oneMKL VML (Vector Math Library) single-precision unary op: `vsExp(n, a, y)` ⇒ `y[i] = exp(a[i])`.
 // The `n` width follows the same interface layer as CBLAS — ILP64 here (so `i64`, matching the
@@ -8045,6 +8047,7 @@ struct MklApi {
 /// Best-effort discovery of `mkl_rt.dll`: an explicit `WUKONG_MKL_DLL` override first, then the
 /// standard conda layouts (`$CONDA_PREFIX`, `%USERPROFILE%\{Anaconda3,miniconda3,…}\Library\bin`,
 /// and the system-wide ProgramData install).
+#[cfg(windows)]
 fn mkl_dll_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("WUKONG_MKL_DLL") {
         let pb = PathBuf::from(p);
@@ -8079,8 +8082,18 @@ fn mkl_dll_path() -> Option<PathBuf> {
     None
 }
 
+/// The oneMKL peer is Windows-only in this harness (it resolves `mkl_rt.dll` through the Windows
+/// loader); elsewhere the MKL columns are simply absent, same as any other missing toolchain.
+/// This stub is what let the whole binary compile on Linux at all — the un-gated
+/// `libloading::os::windows` import below broke `cargo check --all-targets` on ubuntu (E0432).
+#[cfg(not(windows))]
+fn mkl() -> Option<&'static MklApi> {
+    None
+}
+
 /// Load oneMKL once (cached). `LOAD_WITH_ALTERED_SEARCH_PATH` makes the Windows loader resolve MKL's
 /// own dependencies (`libiomp5md.dll`, `mkl_core`, `mkl_intel_thread`) from the DLL's directory.
+#[cfg(windows)]
 fn mkl() -> Option<&'static MklApi> {
     static API: OnceLock<Option<MklApi>> = OnceLock::new();
     API.get_or_init(|| {
@@ -10391,7 +10404,10 @@ mod tests {
         ] {
             let r = parse_rounds(set);
             assert_eq!(r, want, "XBENCH_ROUNDS={set:?}");
-            assert!(r >= 2 && r % 2 == 0, "XBENCH_ROUNDS={set:?} gave {r}");
+            assert!(
+                r >= 2 && r.is_multiple_of(2),
+                "XBENCH_ROUNDS={set:?} gave {r}"
+            );
         }
         // And the live reader must agree with the pure one under the ambient environment.
         assert_eq!(
