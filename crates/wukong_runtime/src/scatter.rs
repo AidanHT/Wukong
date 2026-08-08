@@ -389,7 +389,7 @@ mod tests {
     /// Edge: zero tokens, zero hidden, or an empty table (`v == 0`) is a no-op — don't write, don't panic.
     #[test]
     fn degenerate_shapes_are_noops() {
-        let grad_out = vec![1.0f32; 8];
+        let grad_out = [1.0f32; 8];
         let ids = [0i32; 2];
         let mut grad_w = vec![42.0f32; 8];
         unsafe {

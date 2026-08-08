@@ -343,7 +343,7 @@ mod tests {
     /// Edge: zero rows or zero hidden is a no-op (don't write, don't panic).
     #[test]
     fn degenerate_shapes_are_noops() {
-        let weight = vec![1.0f32; 8];
+        let weight = [1.0f32; 8];
         let ids = [0i32; 2];
         let mut out = vec![42.0f32; 8];
         unsafe {
@@ -363,7 +363,7 @@ mod tests {
     /// of `usize::MAX` rows.
     #[test]
     fn negative_extents_are_noops() {
-        let weight = vec![1.0f32; 8];
+        let weight = [1.0f32; 8];
         let ids = [0i32; 2];
         let mut out = vec![42.0f32; 8];
         unsafe {
