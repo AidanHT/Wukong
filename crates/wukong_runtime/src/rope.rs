@@ -231,8 +231,8 @@ mod tests {
     }
 
     /// 1) scalar path == AVX2 path bit-for-bit across `half` straddling the 8-lane edge (incl.
-    /// non-multiples of 8 and `half < 8`) and several positions — the body/tail agreement that
-    /// underwrites the differential gate.
+    ///    non-multiples of 8 and `half < 8`) and several positions — the body/tail agreement that
+    ///    underwrites the differential gate.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
@@ -265,7 +265,7 @@ mod tests {
     }
 
     /// 2) serial == parallel bit-for-bit across shapes straddling the parallel threshold and the
-    /// 8-lane edge (rows ≥ ROPE_PAR_MIN actually fan out).
+    ///    8-lane edge (rows ≥ ROPE_PAR_MIN actually fan out).
     #[test]
     fn serial_matches_parallel_bit_for_bit() {
         for (rows, half) in [
@@ -311,8 +311,8 @@ mod tests {
     }
 
     /// 3) the kernel ≈ an independent f64 reference (the rotation recomputed with f64 `sin`/`cos`),
-    /// within a tolerance reflecting the ~1-ULP f32 Cephes poly — guards the *formula* (not just
-    /// scalar==avx2). Positions are the row indices, as in the real op.
+    ///    within a tolerance reflecting the ~1-ULP f32 Cephes poly — guards the *formula* (not just
+    ///    scalar==avx2). Positions are the row indices, as in the real op.
     #[test]
     fn rope_matches_f64_reference() {
         let (rows, half) = (12usize, 96usize);
@@ -353,8 +353,8 @@ mod tests {
     }
 
     /// 4) norm-preservation: RoPE is a 2×2 rotation, so each pair's `a² + b²` is preserved. Check
-    /// `out[j]² + out[j+half]² ≈ x[j]² + x[j+half]²` per pair (f32 tolerance — the rotation and the
-    /// squares both round).
+    ///    `out[j]² + out[j+half]² ≈ x[j]² + x[j+half]²` per pair (f32 tolerance — the rotation and the
+    ///    squares both round).
     #[test]
     fn rope_preserves_pair_norm() {
         let (rows, half) = (9usize, 80usize);
@@ -390,7 +390,7 @@ mod tests {
     }
 
     /// 5) in-place (`out == x`) equals the out-of-place result — RoPE reads both of a pair's inputs
-    /// before writing either output, so aliasing is sound.
+    ///    before writing either output, so aliasing is sound.
     #[test]
     fn rope_in_place_matches_out_of_place() {
         let (rows, half) = (6usize, 70usize);
