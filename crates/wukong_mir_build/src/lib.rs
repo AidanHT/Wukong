@@ -19,6 +19,13 @@
 //! driver stops before any backend — the front end accepts the construct, only lowering to runnable
 //! code refuses, so this crate never hands a backend knowingly-broken MIR.
 
+// Crate-wide, deliberately: the recognizer emit helpers mirror `wukong_runtime`'s C kernel ABIs
+// argument-for-argument (the signature IS the documentation of the call they emit), and the
+// `match_*` analyses return match-tuples consumed by exactly one emit site each. Renaming those
+// shapes to satisfy the arg-count / type-complexity lints would obscure the runtime mirror this
+// crate's correctness hangs on.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 mod canon;
 mod tindex;
 
@@ -8565,7 +8572,8 @@ impl FnLowerer<'_> {
         // which computes `act(bias + s)` correctly. Bit-identical to the unfused GEMM → bias →
         // activation the interpreter marshals as the oracle.
         if nest.bias.is_some() || nest.act != EPI_ACT_IDENTITY {
-            if !(nest.transposed && !nest.transposed_a) || nest.alpha.is_some() {
+            // Decline unless the nest is NT (and not TN), and never with a coexisting α.
+            if !nest.transposed || nest.transposed_a || nest.alpha.is_some() {
                 return false;
             }
             // An absent bias is a null pointer built as an integer `0` (a `Ptr`-typed `ConstInt` is
@@ -8603,7 +8611,8 @@ impl FnLowerer<'_> {
         // head offsets are already applied to `a`/`b`/`c` above, so a *batched* α matmul (multi-head
         // attention scores) works: the per-head sub-matmul is `alpha·(A·Bᵀ)` under a constant base shift.
         if let Some(alpha) = nest.alpha {
-            if !(nest.transposed && !nest.transposed_a) {
+            // NT only (and not TN) — see above.
+            if !nest.transposed || nest.transposed_a {
                 return false;
             }
             let Some(alpha_v) = self.alpha_value(alpha) else {
@@ -21485,7 +21494,7 @@ fn region_extent(
             }
         };
         total = total.checked_add(mx)?;
-        if sm.map_or(true, |sm| stride.rem_euclid(sm) != 0) {
+        if sm.is_none_or(|sm| stride.rem_euclid(sm) != 0) {
             low = low.checked_add(mx)?;
         }
     }
@@ -21708,6 +21717,7 @@ fn tensor_inner_stride(base: &Expr, sema: &SemaResult) -> Option<Dim> {
 ///   * the flat form `base[row*stride + col (+ offset…)]` — stride read from the index arithmetic
 ///     (delegates to [`match_row_col_off`], so the flat path is byte-identical to before), and
 ///   * the shape-typed 2-index form `base[row, col]` — stride = the tensor's inner dim, no offset.
+///
 /// The 2-index branch is what makes `c[i,j] += a[i,k]*b[k,j]` dispatch to the tuned GEMM kernel
 /// instead of running as a scalar nest. Both indices must be exactly the expected `row`/`col` vars
 /// (a strided or offset 2-index access is not a plain matmul operand). `None` if neither shape matches.
@@ -22181,7 +22191,7 @@ fn peel_dequant_act<'a>(e: &'a Expr, interner: &Interner, sema: &SemaResult) -> 
 
 /// Peel an optional `+ bias[j]` (either addend order) off the int8 dequant value; return the
 /// remaining product and the bias array. `None` when there is no per-column add (bias-free decode).
-fn peel_bias_add<'a>(e: &'a Expr, jvar: Symbol) -> Option<(&'a Expr, Symbol)> {
+fn peel_bias_add(e: &Expr, jvar: Symbol) -> Option<(&Expr, Symbol)> {
     let ExprKind::Binary {
         op: ast::BinOp::Add,
         lhs,
@@ -25112,8 +25122,9 @@ struct ColSumNest {
 /// — reduce each column of `x` (`[M, N]`) over the outer/batch axis into `out` (`[N]`): the **sum** is
 /// the bias gradient `db = Σ_batch dY` / batch sum; **max**/**min** are per-channel statistics (the
 /// quantization range, axis-0 max/min pooling). The data index `i*N + j` strides by `N` over the inner
-/// loop, which gcc/rustc leave scalar (verified) for *all three* folds; the kernel streams `x` row-major
-/// + 8-wide. The fold order is i-ascending per column — exactly the scalar nest's — so the kernel is its
+/// loop, which gcc/rustc leave scalar (verified) for *all three* folds; the kernel streams `x`
+/// row-major + 8-wide. The fold order is i-ascending per column — exactly the scalar nest's — so the
+/// kernel is its
 /// own bit-exact oracle (no reassociation; both backends marshal the identical kernel). `x` and `out`
 /// must be distinct f32 arrays. The strides pin `N`/`M` to the loop bounds, so it never misfires. The
 /// max/min seed is the first row `x[0,j] = x[j]` (so the inner loop folds `1..M`, idempotent from 0).
@@ -25363,6 +25374,7 @@ fn col_divisor_matches(d: &Expr, count: &Expr, interner: &Interner) -> bool {
 /// - `out[j] = s / M`          → COL_MEAN   (only from a SUM fold).
 /// - `out[j] = sqrt(s)`        → COL_L2     (only from a SUMSQ fold).
 /// - `out[j] = sqrt(s / M)`    → COL_RMS    (only from a SUMSQ fold).
+///
 /// Returns `None` for any other store, and rejects a finalize on a non-additive base (max/min/maxabs).
 fn colreduce_final_op(
     ov: &Expr,
@@ -26212,7 +26224,7 @@ fn float_lit_bits_free(e: &Expr, interner: &Interner) -> Option<i64> {
 
 /// Match a single-statement reduction body `acc = acc + <addend>` (or `acc += <addend>`), returning the
 /// addend expr. Free, shared by the norm-backward matchers.
-fn match_add_accum<'a>(body: &'a Block, acc: Symbol) -> Option<&'a Expr> {
+fn match_add_accum(body: &Block, acc: Symbol) -> Option<&Expr> {
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
     }
@@ -27801,7 +27813,7 @@ const COS_P: [f64; 3] = [
 // atan (Cephes): 3-region reduction breakpoints + the π/4·π/2 offsets + the degree-3 odd minimax poly
 // (mirror `wukong_runtime::vmath`'s ATAN_* so the inlined form equals the dispatched kernel).
 const ATAN_TAN_3PI8: f64 = 2.414213562373095; // tan(3π/8) = 1 + √2
-const ATAN_TAN_PI8: f64 = 0.4142135623730950; // tan(π/8) = √2 − 1
+const ATAN_TAN_PI8: f64 = 0.414_213_562_373_095; // tan(π/8) = √2 − 1
 const ATAN_PIO2: f64 = std::f64::consts::FRAC_PI_2;
 const ATAN_PIO4: f64 = std::f64::consts::FRAC_PI_4;
 const ATAN_P: [f64; 4] = [
@@ -28346,9 +28358,9 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
     #[test]
     fn exp_table_literals_match_kernel_bits() {
         // T[j] = 2^(j/8) rounded once to f32 (T[0] pinned exactly 1.0 → exp(0) = 1.0).
-        for j in 0..8usize {
+        for (j, &t) in EXP_TBL_T.iter().enumerate() {
             let want = ((j as f64) / 8.0).exp2() as f32;
-            assert_eq!((EXP_TBL_T[j] as f32).to_bits(), want.to_bits(), "T[{j}]");
+            assert_eq!((t as f32).to_bits(), want.to_bits(), "T[{j}]");
         }
         assert_eq!(
             (EXP_TBL_T[0] as f32).to_bits(),
