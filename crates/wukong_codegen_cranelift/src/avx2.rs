@@ -363,12 +363,12 @@ fn emit_group(
     // `vreg[v]`; the reduction fold's addend / fused operands have `last_use == ops.len()` (set by
     // `pressure()`), which equals no op index, so their registers survive to the post-loop fold.
     let free_after = |free: &mut Vec<u8>, vreg: &mut [Option<u8>], i: usize, v: u32| {
-        if plan.last_use[v as usize] == i {
-            if !matches!(k.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. }) {
-                if let Some(r) = vreg[v as usize].take() {
-                    debug_assert!(!free.contains(&r), "avx2: ymm{r} released twice at op {i}");
-                    free.push(r);
-                }
+        if plan.last_use[v as usize] == i
+            && !matches!(k.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. })
+        {
+            if let Some(r) = vreg[v as usize].take() {
+                debug_assert!(!free.contains(&r), "avx2: ymm{r} released twice at op {i}");
+                free.push(r);
             }
         }
     };
