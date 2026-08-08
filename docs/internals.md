@@ -436,9 +436,16 @@ does. The interpreter is the sound oracle for differential testing.
 signless ints, explicit `alloca`/`load`/`store`/`gep`). It JIT-compiles in-process for
 `--backend=native` and emits a host object for `--emit=obj|exe` — for `exe` it prefers a rustc-driven link that pulls
 in the `wukong_runtime` kernels (so a recognized-kernel program and string `.rodata` both resolve),
-falling back to a `cc`/`$CC` C-runtime link. The rustc path is chosen only when
-`libwukong_runtime.rlib` sits next to the running compiler (a cargo target layout); otherwise the
-driver reports that path unavailable and uses `cc`. The rustc invocation passes `-C panic=abort`,
+falling back to a `cc`/`$CC` C-runtime link. The rustc path is chosen when the `wukong_runtime` rlib
+is reachable from the running compiler's directory — either the uplifted `libwukong_runtime.rlib`
+next to it (what a plain `cargo build` leaves) or a hash-suffixed `deps/libwukong_runtime-*.rlib`
+(where cargo *always* writes it, and the only copy a `cargo test` / `cargo run -p wukongc` tree has,
+because cargo uplifts a library only when it is a root unit of a `build`). Both are resolved by the
+one function `wukong_driver::runtime_rlib_in`, which `tests/exe.rs` also calls so its probe cannot
+drift; only when it finds nothing does the driver report that path unavailable and use `cc`. The
+`cc` fallback link line ends in `-lm`, because the generated C runtime always defines
+`wukong_rt_fmod_*` over `fmod`/`fmodf` and glibc keeps those in libm. The rustc invocation passes
+`-C panic=abort`,
 because the workspace's release profile sets `panic = "abort"` and rustc would otherwise reject the
 shim's default `unwind` strategy against that rlib. The generated link inputs (the Rust shim, or the C
 runtime for the fallback) are written into a pid-keyed scratch directory that is deleted when the link
@@ -767,8 +774,9 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
 
 All of the above runs with `cargo test` and needs no C or LLVM toolchain (Cranelift is a pure-Rust
 crate). Two suites are conditional and say so out loud: the `--emit=exe` gate needs either `rustc` with
-`libwukong_runtime.rlib` beside the compiler binary or a working `cc`/`$CC`, and prints why it skipped
-otherwise; and the GPU suites need `--features gpu` plus a reachable device — plain `cargo test` does not
+a `wukong_runtime` rlib reachable from the compiler binary (see `runtime_rlib_in` above) or a working
+`cc`/`$CC`, and prints why it skipped otherwise — and it fails outright if it linked *nothing*, so it
+cannot go dark; and the GPU suites need `--features gpu` plus a reachable device — plain `cargo test` does not
 even type-check that backend, so `cargo check --features gpu --all-targets` is a required second half of
 the gate. `WUKONG_GPU_REQUIRED=1` and `WUKONG_PEER_REQUIRED=1` turn a device- or peer-absent skip into a
 failure on machines that are supposed to have them.
