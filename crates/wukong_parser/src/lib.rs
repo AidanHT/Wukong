@@ -533,10 +533,7 @@ impl<'a> Parser<'a> {
     fn parse_expr_bp(&mut self, min_bp: u8) -> Expr {
         let saved = self.depth;
         let mut lhs = self.parse_cast();
-        loop {
-            let Some(op) = token_to_binop(self.kind()) else {
-                break;
-            };
+        while let Some(op) = token_to_binop(self.kind()) {
             let bp = binop_bp(op);
             if bp < min_bp {
                 break;
