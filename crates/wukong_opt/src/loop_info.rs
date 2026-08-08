@@ -1361,10 +1361,9 @@ fn exit_test(
     // Orient as `iv <pred> bound`.
     let (idx, pred, bound) = if let Some(i) = ivs.iter().position(|iv| iv.value == *a) {
         (i, *pred, *b)
-    } else if let Some(i) = ivs.iter().position(|iv| iv.value == *b) {
-        (i, swap_cmp(*pred)?, *a)
     } else {
-        return None;
+        let i = ivs.iter().position(|iv| iv.value == *b)?;
+        (i, swap_cmp(*pred)?, *a)
     };
     if !ctx.is_value_invariant(bound) {
         return None;

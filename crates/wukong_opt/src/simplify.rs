@@ -491,13 +491,8 @@ fn algebra(b: BinOp, l: ValueId, lc: Option<CV>, r: ValueId, rc: Option<CV>) -> 
                 return None;
             }
         }
-        Shl | LShr | AShr => {
-            if is0(rc) {
-                Alg::Replace(l)
-            } else {
-                return None;
-            }
-        }
+        // A failed guard falls through to the `_` arm below — same `return None` as before.
+        Shl | LShr | AShr if is0(rc) => Alg::Replace(l),
         _ => return None,
     })
 }
