@@ -156,8 +156,8 @@ unsafe fn attention_avx2(
 ) {
     use std::arch::x86_64::*;
     let dv = d & !7; // largest multiple of 8 ≤ d
-    let mut m = vec![f32::NEG_INFINITY; ATT_QB];
-    let mut l = vec![0.0f32; ATT_QB];
+    let mut m = [f32::NEG_INFINITY; ATT_QB];
+    let mut l = [0.0f32; ATT_QB];
     let mut acc = vec![0.0f32; ATT_QB * d];
     let mut i0 = 0;
     while i0 < s {
@@ -215,8 +215,8 @@ unsafe fn attention_avx2(
             }
         }
         // O_i = acc_i / l_i for each query in the block.
-        for ii in 0..qb {
-            let inv = if l[ii] != 0.0 { 1.0 / l[ii] } else { 0.0 };
+        for (ii, &lv) in l.iter().take(qb).enumerate() {
+            let inv = if lv != 0.0 { 1.0 / lv } else { 0.0 };
             let oi = o.add((i0 + ii) * d);
             let accp = acc.as_ptr().add(ii * d);
             let invv = _mm256_set1_ps(inv);
