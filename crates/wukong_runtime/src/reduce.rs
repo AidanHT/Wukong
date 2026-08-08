@@ -310,15 +310,14 @@ pub unsafe extern "C" fn wukong_sreduce_f32_parallel(
 // displaces the running candidate (strict `>`/`<`), matching the value reductions' NaN behavior.
 
 /// Combine two `(value, index)` candidates. A strictly-better value wins; on an exact value tie the
-/// LOWER index wins; else keep `a`. `is_max`: argmax (larger wins) vs argmin (smaller). Strict compare
-/// + explicit lower-index tie = a total order on the (unique-index) pairs, so the fold is associative
-/// and serial == parallel == interp.
+/// LOWER index wins; else keep `a`. `is_max`: argmax (larger wins) vs argmin (smaller). The strict
+/// compare plus the explicit lower-index tie form a total order on the (unique-index) pairs, so the
+/// fold is associative and serial == parallel == interp.
 #[inline(always)]
 pub(crate) fn arg_fold(a: (f32, usize), b: (f32, usize), is_max: bool) -> (f32, usize) {
     let b_better = if is_max { b.0 > a.0 } else { b.0 < a.0 };
-    if b_better {
-        b
-    } else if a.0 == b.0 && b.1 < a.1 {
+    // One expression, two rules, checked in this order: strictly better, else tie on the lower index.
+    if b_better || (a.0 == b.0 && b.1 < a.1) {
         b
     } else {
         a
