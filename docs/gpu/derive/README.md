@@ -15,6 +15,17 @@ succeeds teaches nothing.
 | [D5_peer_builds.md](D5_peer_builds.md) | Exact build recipes for the strong peers on cloud Linux (cuBLASLt, torch.compile, FA2/FA3/FA4, CUTLASS profiler, Marlin/machete) | CUDA 12.9.2 image + torch 2.13.0+cu129; cudarc 0.16.6 has no CUDA-13 bindings; FA4 is a pure-Python wheel; ~$0.50 of metered GPU for the whole smoke battery |
 | [D6_dynamic_smem.md](D6_dynamic_smem.md) | Dynamic-SMEM mechanics **verified live on the 4050 through cudarc 0.16.6**, SMEM closed forms, the stage-depth decision model, the C2/C3 migration design | The extern window JITs under today's `.version 7.8`; `set_attribute` + `shared_mem_bytes` suffice; static >48 KiB is rejected by ptxas on every non-`a` target — dynamic SMEM is the only unlock |
 
+## Predict-before-measure documents
+
+Same provenance rules, different job: these are written *before* a measurement and are its
+acceptance checklist. Read the relevant one first when a round comes back, and treat every row that
+disagrees as a finding to explain rather than a number to accept.
+
+| Document | Predicts | Measured yet? |
+|---|---|---|
+| [p1-expected-l4.md](p1-expected-l4.md) | What the device suite should do on a Modal L4 (`sm_89`, rented) | **No** — blocked on the workspace budget cap |
+| [p2-expected-4050-identity.md](p2-expected-4050-identity.md) | That Phase 2 cost the 4050 nothing: `0e1b2ea` vs `main`, 11 body-identical benches, self-control | **No** — needs the laptop on AC power |
+
 ## Provenance and epistemic status
 
 Every dossier separates **FACT** (with a source URL), **DERIVED** (arithmetic from facts), and
