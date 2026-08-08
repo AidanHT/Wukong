@@ -362,7 +362,8 @@ mod tests {
     }
 
     /// 1) serial == parallel bit-for-bit across shapes straddling the 8-lane edge and the parallel
-    /// threshold, gamma both NULL and non-null; and == the scalar reference (the kernel's own oracle).
+    ///    threshold, gamma both NULL and non-null; and == the scalar reference (the kernel's own
+    ///    oracle).
     #[test]
     fn rmsnorm_bwd_matches_reference_and_parallel() {
         for (rows, cols) in [
