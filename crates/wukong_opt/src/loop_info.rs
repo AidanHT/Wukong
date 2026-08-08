@@ -1627,6 +1627,9 @@ fn collect_accesses(
 /// a `Recurrence`. This matters because a negated accumulate is how a loss is spelled:
 /// `lr = lr - alpha*q*(1-p)^2*log p` in a focal loss, `e = e - t[i]*log(y[i])` in a cross-entropy.
 /// Refusing it made the entire enclosing loop unvectorizable, transcendental and all.
+// The tuple return is three independent optional facts about one combining instruction; a named
+// struct for a single internal caller would add ceremony, not clarity.
+#[allow(clippy::type_complexity)]
 fn combine_kind(
     ctx: &LoopCtx<'_>,
     p: ValueId,
@@ -1980,7 +1983,7 @@ fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize, stages: Stage
 /// The branch arguments a terminator passes to `target`. `None` when the answer is ambiguous — a
 /// `cond_br` whose two arms both go to `target` with different argument lists.
 #[allow(dead_code)] // used by the induction-variable stage
-fn args_to<'a>(t: &'a Terminator, target: BlockId) -> Option<&'a [ValueId]> {
+fn args_to(t: &Terminator, target: BlockId) -> Option<&[ValueId]> {
     match t {
         Terminator::Br { target: tb, args } if *tb == target => Some(args),
         Terminator::CondBr {
@@ -2847,7 +2850,8 @@ mod tests {
         let ctx_expr = |cast: CastKind| {
             //  v0: i32 base ptr slot (unused), v1: i1 cond, v2: i32 IV param, v3: i32 one,
             //  v4: i32 next, v5: i64 widened iv
-            let f = build(
+
+            build(
                 vec![
                     MirType::I1,
                     MirType::I32,
@@ -2901,8 +2905,7 @@ mod tests {
                     ),
                     (vec![], vec![], Terminator::Ret(None)),
                 ],
-            );
-            f
+            )
         };
         // The IV never advances here (the latch passes the param straight back), so instead build
         // the real shape below; this test only checks the cast rule, via `affine_of` directly.

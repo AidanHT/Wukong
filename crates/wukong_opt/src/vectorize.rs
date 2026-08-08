@@ -1194,6 +1194,9 @@ fn pick_width(l: &NaturalLoop) -> Option<u32> {
 
 /// Decide, for every instruction of the body, whether it stays scalar or is widened — and check
 /// that every widened one *can* be. Returns `None` the moment one cannot.
+// Plans, widened types, and reduction plans travel together to exactly one caller; the tuple is
+// the seam, not an abstraction worth naming.
+#[allow(clippy::type_complexity)]
 fn plan_body(
     f: &Function,
     l: &NaturalLoop,
