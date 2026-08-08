@@ -299,10 +299,10 @@ impl VecKernel {
         }
         // Cleanup: remaining full 8-groups fold into accumulator 0.
         while i + lanes <= n {
-            for lane in 0..lanes {
+            for (lane, a) in acc.iter_mut().take(lanes).enumerate() {
                 let e = i + lane;
                 let vals = self.eval_all(|s| load(s, e), &scalar, |_, _| {});
-                acc[lane] = addend(acc[lane], &vals);
+                *a = addend(*a, &vals);
             }
             i += lanes;
         }
@@ -314,8 +314,8 @@ impl VecKernel {
         }
         // Horizontal fold of the eight lanes, in order 0..8.
         let mut r = acc[0];
-        for lane in 1..lanes {
-            r = red.op.fold(r, acc[lane]);
+        for &a in &acc[1..lanes] {
+            r = red.op.fold(r, a);
         }
         r
     }
