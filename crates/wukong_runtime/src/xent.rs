@@ -292,9 +292,9 @@ mod tests {
             for &rows in &[1usize, 3, 5] {
                 let x = fill(rows * cols);
                 let tg = fill_targets(rows, cols);
-                for row in 0..rows {
+                for (row, &tgv) in tg.iter().enumerate() {
                     let off = row * cols;
-                    let t = tg[row] as usize;
+                    let t = tgv as usize;
                     let a = unsafe { xent_row_scalar(x[off..].as_ptr(), t, cols) };
                     let b = unsafe { xent_row_avx2(x[off..].as_ptr(), t, cols) };
                     assert_eq!(
