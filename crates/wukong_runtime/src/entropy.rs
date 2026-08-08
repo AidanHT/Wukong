@@ -102,9 +102,9 @@ unsafe fn entropy_row_avx2(p: *const f32, n: usize) -> f32 {
     let mut acc = [0.0f32; 8];
     _mm256_storeu_ps(acc.as_mut_ptr(), accv);
     // Tail: fold into the SAME lanes, same ops, as the scalar twin.
-    for j in 0..(n - i) {
+    for (j, a) in acc.iter_mut().take(n - i).enumerate() {
         let v = *p.add(i + j);
-        acc[j] += v * log1(v);
+        *a += v * log1(v);
     }
     -hsum8(acc) // same hsum8 + negation as the scalar twin, on the same lane bits.
 }
