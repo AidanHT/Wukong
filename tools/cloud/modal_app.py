@@ -97,8 +97,11 @@ image = (
     modal.Image.from_registry(f"nvidia/cuda:{WK_CUDA_TAG}", add_python="3.11")
     .apt_install("curl", "ca-certificates", "build-essential", "pkg-config", "git")
     .run_commands(
+        # No --component here, deliberately: rustup-init rejects space-separated component lists
+        # ("error: unexpected argument 'clippy' found" killed the first image build), and the cloud
+        # image only builds and tests — fmt/clippy run in CI, never on metered time.
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | "
-        "sh -s -- -y --profile minimal --default-toolchain stable --component rustfmt clippy"
+        "sh -s -- -y --profile minimal --default-toolchain stable"
     )
     .env(
         {
@@ -108,6 +111,10 @@ image = (
             "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu",
             "CARGO_TERM_COLOR": "always",
             "RUST_BACKTRACE": "1",
+            # Bake the requested SKU into the container: WK_GPU is read at import time, and the
+            # first L4 run proved the container re-import falls back to the default ("L40S") —
+            # the provenance gate then compared a healthy L4 against 142 SMs and cried MISMATCH.
+            "WK_GPU": WK_GPU,
         }
     )
     .add_local_dir(str(REPO_ROOT), REMOTE_SRC, ignore=IGNORE, copy=False)
