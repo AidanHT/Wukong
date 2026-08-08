@@ -24,15 +24,18 @@ fn run_dir() -> PathBuf {
         .join("run")
 }
 
-/// Which link path `wukongc --emit=exe` will take here — mirroring the driver's own decision
-/// procedure in `wukong_driver::emit_native`/`rustc_link` so the gate can tell a real break from a
-/// missing toolchain.
+/// Which link path `wukongc --emit=exe` will take here. The rlib half of the decision is not
+/// mirrored but *shared*: it calls the driver's own `runtime_rlib_in`, so the probe cannot drift
+/// from `wukong_driver::rustc_link`. (It drifted once already — the probe hardcoded
+/// `libwukong_runtime.rlib` next to the binary, which only a `cargo build` tree has, so under CI's
+/// `cargo test --workspace` the probe reported `CcFallback`, every fixture skipped, and the gate
+/// went dark.)
 #[derive(Debug, PartialEq, Eq)]
 enum LinkPath {
-    /// `rustc` runs *and* `libwukong_runtime.rlib` sits next to the compiler binary — the driver's
-    /// preferred path, the one that is supposed to link every fixture here (it pulls in the
-    /// `wukong_*` microkernels and links the string `.rodata` relocations). A failure on this path
-    /// is a COMPILER bug, never an environment one.
+    /// `rustc` runs *and* the `wukong_runtime` rlib is reachable from the compiler binary's
+    /// directory — the driver's preferred path, the one that is supposed to link every fixture here
+    /// (it pulls in the `wukong_*` microkernels and links the string `.rodata` relocations). A
+    /// failure on this path is a COMPILER bug, never an environment one.
     Rustc,
     /// No rlib (or no rustc), but a C compiler runs: the driver falls back to its small C runtime,
     /// which by construction resolves only `wukong_rt_*` — a program needing a `wukong_*` kernel or
@@ -50,13 +53,16 @@ fn probe_link_path() -> LinkPath {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    // The driver locates the runtime rlib next to its own executable (`current_exe().parent()`),
-    // which for these tests is `target/<profile>/`.
+    // The driver locates the runtime rlib from the directory holding its own executable
+    // (`current_exe().parent()`), which for the binary these tests spawn is `target/<profile>/`.
+    // Ask the driver itself rather than re-deriving the rule: `runtime_rlib_in` knows that cargo
+    // leaves the rlib in `deps/` under a hash-suffixed name unless a plain `cargo build` uplifted
+    // it. NOTE this must be the *compiler binary's* directory, not the test binary's — the test
+    // binary lives one level down in `deps/`.
     let rlib = Path::new(env!("CARGO_BIN_EXE_wukongc"))
         .parent()
-        .map(|d| d.join("libwukong_runtime.rlib"))
-        .map(|p| p.exists())
-        .unwrap_or(false);
+        .and_then(wukong_driver::runtime_rlib_in)
+        .is_some();
     if rustc_runs && rlib {
         return LinkPath::Rustc;
     }
@@ -138,7 +144,7 @@ fn exe_matches_run() {
     let path = probe_link_path();
     if path == LinkPath::None {
         eprintln!(
-            "exe_matches_run: neither `rustc` + libwukong_runtime.rlib nor a C compiler runs on \
+            "exe_matches_run: neither `rustc` + a `wukong_runtime` rlib nor a C compiler runs on \
              this box — AOT gate skipped (this is not a failure; install rustc and build the \
              runtime rlib, or a C compiler, to exercise it)"
         );
@@ -182,9 +188,11 @@ fn exe_matches_run() {
                 LinkPath::CcFallback(cc) => {
                     skipped += 1;
                     eprintln!(
-                        "exe_matches_run: skipping {name} — libwukong_runtime.rlib is not next to \
-                         the compiler binary, so the driver fell back to the `{cc}` C runtime, \
-                         which cannot resolve the `wukong_*` kernels. Compiler stderr:\n{}",
+                        "exe_matches_run: skipping {name} — no `wukong_runtime` rlib is reachable \
+                         from the compiler binary (neither the uplifted `libwukong_runtime.rlib` \
+                         nor a hash-suffixed one in `deps/`), so the driver fell back to the \
+                         `{cc}` C runtime, which cannot resolve the `wukong_*` kernels. Compiler \
+                         stderr:\n{}",
                         stderr.trim_end()
                     );
                 }
@@ -196,15 +204,15 @@ fn exe_matches_run() {
     assert!(
         failures.is_empty(),
         "`wukongc --emit=exe` failed for {} of the AOT fixtures while its PREFERRED link path is \
-         available here (rustc runs and libwukong_runtime.rlib sits next to the compiler binary), \
+         available here (rustc runs and `wukong_driver::runtime_rlib_in` found the runtime rlib), \
          so this is the compiler's own link invocation breaking — not a missing toolchain. Fix \
          `rustc_link`/`WUKONG_RT_SHIM` in crates/wukong_driver/src/lib.rs. If the stderr below \
          reports `LNK1107: invalid or corrupt file` on libwukong_runtime.rlib, the rlib holds \
          LLVM bitcode rather than native objects (the workspace `[profile.release]` sets \
          `lto = \"thin\"`), so `rustc_link` has to be told to consume it accordingly — that is the \
          release-profile shape of this break, and every `wukong_*` symbol then reads as \
-         unresolved. If instead exactly one or two `wukong_*` symbols are unresolved, the rlib next \
-         to the compiler is simply STALE — rebuild the workspace so it is re-uplifted. (This gate \
+         unresolved. If instead exactly one or two `wukong_*` symbols are unresolved, the rlib \
+         `runtime_rlib_in` picked is simply STALE — rebuild the workspace. (This gate \
          previously reported every one of these states as \"no linker toolchain to produce an \
          exe\" and passed green, which is why the break went unreported.)\n{}",
         failures.len(),

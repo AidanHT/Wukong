@@ -596,11 +596,7 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = Command::new(&cc)
-        .arg(&obj_path)
-        .arg(&rt_path)
-        .arg("-o")
-        .arg(&out)
-        .arg("-O2")
+        .args(cc_link_args(&obj_path, &rt_path, &out))
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -624,6 +620,26 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
             exit::UNIMPLEMENTED
         }
     }
+}
+
+/// The `cc` fallback's command line, factored out of [`emit_native`] so it can be pinned by a test.
+///
+/// **`-lm` is load-bearing and must stay last.** [`WUKONG_RT_C`] *unconditionally* defines
+/// `wukong_rt_fmod_f64`/`_f32` over C's `fmod`/`fmodf`, and on glibc those live in `libm`, which
+/// `cc` does **not** link by default — so without this flag the fallback could not link *any*
+/// program on Linux (`undefined reference to 'fmod'`), not merely one that uses `%` on floats. It is
+/// a no-op where libm is already folded into the C library (macOS/libSystem, MinGW's stub
+/// `libm.a`), so the Windows and macOS link lines are unaffected. Position matters: GNU `ld`
+/// resolves left to right, so a library must follow the objects that reference it.
+fn cc_link_args(obj_path: &Path, rt_path: &Path, out: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        obj_path.into(),
+        rt_path.into(),
+        "-o".into(),
+        out.into(),
+        "-O2".into(),
+        "-lm".into(),
+    ]
 }
 
 /// The outcome of the [`rustc_link`] attempt (the preferred `--emit=exe` link path).
@@ -696,13 +712,73 @@ pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
 }
 "##;
 
+/// Locate the `wukong_runtime` rlib that [`rustc_link`] will link, given the directory holding the
+/// compiler binary (`current_exe().parent()`, i.e. cargo's `target/<profile>/`). `None` means the
+/// preferred `--emit=exe` link path is unavailable here and the `cc` fallback is all there is.
+///
+/// **Two locations, and the second is the one that is always there.** `target/<profile>/` holds
+/// `libwukong_runtime.rlib` only when cargo *uplifted* it out of `deps/`, and cargo only uplifts a
+/// library when that library is a **root unit of a `build`** — i.e. after a plain `cargo build`.
+/// Under `cargo test --workspace` the package's root unit is its *test* binary and the plain rlib is
+/// merely a dependency unit, so it stays in `target/<profile>/deps/` under its hash-suffixed name
+/// and nothing is uplifted; `cargo run -p wukongc` does not uplift it either, because `-p` makes
+/// `wukong_runtime` a dependency rather than a selected member. A tree that has the uplifted copy
+/// has it as a *leftover* of some earlier `cargo build`, which is why this looked fine locally and
+/// broke on every clean checkout: CI runs `cargo test --workspace`, never `cargo build`, so the
+/// preferred link path silently degraded to the `cc` fallback — whose output is knowingly *not*
+/// byte-identical to the oracle (no `wukong_rt_print_str`, no `wukong_*` kernels, under-precise
+/// `printf("%g")` floats). Searching `deps/` too makes the preferred path available whenever cargo
+/// built the runtime at all, however the compiler was built.
+///
+/// A `deps/` directory can hold several hash-suffixed rlibs (a metadata hash changes when the
+/// profile or a dependency does, and cargo does not garbage-collect the old ones), so the newest by
+/// mtime wins — the one cargo just linked everything else against. Ties break on the path so the
+/// choice is deterministic.
+pub fn runtime_rlib_in(dir: &Path) -> Option<PathBuf> {
+    // The uplifted name: what `cargo build` (and an installed target layout) leaves next to the
+    // binary. Preferred, because it is unambiguous.
+    let uplifted = dir.join("libwukong_runtime.rlib");
+    if uplifted.is_file() {
+        return Some(uplifted);
+    }
+    // `deps/libwukong_runtime-<metadata hash>.rlib` — where cargo *always* writes it. The trailing
+    // `-` in the prefix is load-bearing: it keeps a hypothetical `libwukong_runtime_foo` crate out.
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir.join("deps")).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rlib") {
+            continue;
+        }
+        let matches = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("libwukong_runtime-"));
+        if !matches {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let better = match &best {
+            None => true,
+            Some((t, p)) => (mtime, &path) > (*t, p),
+        };
+        if better {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// Link the Cranelift object into an executable with **`rustc` as the link driver**. rustc invokes
 /// the object's native platform linker (on the MSVC host, the installed `link.exe`, discovered
 /// automatically) and links `wukong_runtime` as a real dependency, so a recognized-kernel program's
 /// `wukong_*` symbols resolve and the string `.rodata` relocations link — neither of which the MinGW
-/// `cc` path can do here. The runtime rlib + its dependency dir are located next to this compiler
-/// binary (the cargo `target/<profile>/` layout). Returns [`LinkOutcome::Unavailable`] when rustc or
-/// the rlib is absent so the caller can try the `cc` fallback.
+/// `cc` path can do here. The runtime rlib is located by [`runtime_rlib_in`] from the directory
+/// holding this compiler binary, and `deps/` next to it goes on `-L dependency=` for the runtime's
+/// own dependencies. Returns [`LinkOutcome::Unavailable`] when rustc or the rlib is absent so the
+/// caller can try the `cc` fallback.
 fn rustc_link(
     scratch: Option<&ScratchDir>,
     stem: &str,
@@ -719,12 +795,12 @@ fn rustc_link(
         Some(d) => d.to_path_buf(),
         None => return LinkOutcome::Unavailable,
     };
-    let rlib = dir.join("libwukong_runtime.rlib");
     let deps = dir.join("deps");
-    if !rlib.exists() {
+    let rlib = match runtime_rlib_in(&dir) {
+        Some(p) => p,
         // Not a cargo target layout (e.g. an installed binary without the rlib) — use the cc path.
-        return LinkOutcome::Unavailable;
-    }
+        None => return LinkOutcome::Unavailable,
+    };
 
     let shim_path = scratch_path(scratch, format!("{stem}_shim.rs"));
     if let Err(e) = std::fs::write(&shim_path, WUKONG_RT_SHIM) {
@@ -1850,6 +1926,79 @@ mod native_link_tests {
             !dir.exists(),
             "the scratch directory must be removed when the link finishes"
         );
+    }
+
+    /// The `cc` fallback must link `libm`. `WUKONG_RT_C` always defines `wukong_rt_fmod_*` over
+    /// `fmod`/`fmodf`, which glibc keeps in `libm` and `cc` does not link by default — so the whole
+    /// fallback path failed to link *every* program on Linux with `undefined reference to 'fmod'`.
+    /// A library must also follow the objects that reference it, or GNU `ld` discards it unused.
+    #[test]
+    fn the_cc_fallback_links_libm_after_its_objects() {
+        let args = cc_link_args(
+            Path::new("prog.o"),
+            Path::new("prog_rt.c"),
+            Path::new("prog"),
+        );
+        let lm = args
+            .iter()
+            .position(|a| a == "-lm")
+            .expect("the `cc` fallback link line must pass `-lm`");
+        let rt = args
+            .iter()
+            .position(|a| a == "prog_rt.c")
+            .expect("the generated C runtime must be on the link line");
+        assert!(
+            lm > rt,
+            "`-lm` must follow `prog_rt.c` (GNU ld resolves left to right): {args:?}"
+        );
+    }
+
+    /// The runtime rlib must be found in `deps/` under its hash-suffixed name, not only under the
+    /// uplifted `libwukong_runtime.rlib`. Cargo uplifts a library only when it is a root unit of a
+    /// **`build`**, so after `cargo test --workspace` (what CI runs) or `cargo run -p wukongc` the
+    /// uplifted copy does not exist and only `deps/` has it — and `--emit=exe` silently degraded to
+    /// the `cc` fallback, which cannot resolve `wukong_*` at all.
+    #[test]
+    fn the_runtime_rlib_is_found_in_the_deps_directory() {
+        let dir = std::env::temp_dir().join(format!("wukong_rlib_probe-{}", std::process::id()));
+        let deps = dir.join("deps");
+        // A pid can be recycled, and a previous *failed* run leaves its files behind — start clean
+        // so the "nothing matches" assertions below cannot be poisoned by an earlier process.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&deps).expect("create probe layout");
+
+        // Nothing at all: the `cc` fallback is genuinely all there is.
+        assert_eq!(runtime_rlib_in(&dir), None, "empty layout must not match");
+
+        // Decoys: another crate's rlib, a same-prefixed crate name, and a non-rlib artifact.
+        for decoy in [
+            "libwukong_interp-1111111111111111.rlib",
+            "libwukong_runtime_extra-2222222222222222.rlib",
+            "libwukong_runtime-3333333333333333.rmeta",
+        ] {
+            std::fs::write(deps.join(decoy), b"x").expect("write decoy");
+        }
+        assert_eq!(runtime_rlib_in(&dir), None, "a decoy must not match");
+
+        // The cargo-test / cargo-run layout: hash-suffixed, in `deps/` only.
+        let hashed = deps.join("libwukong_runtime-4444444444444444.rlib");
+        std::fs::write(&hashed, b"x").expect("write hashed rlib");
+        assert_eq!(
+            runtime_rlib_in(&dir),
+            Some(hashed),
+            "the hash-suffixed rlib in `deps/` must be found"
+        );
+
+        // The `cargo build` layout wins when both exist: it is the unambiguous one.
+        let uplifted = dir.join("libwukong_runtime.rlib");
+        std::fs::write(&uplifted, b"x").expect("write uplifted rlib");
+        assert_eq!(
+            runtime_rlib_in(&dir),
+            Some(uplifted),
+            "the uplifted rlib must take precedence"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

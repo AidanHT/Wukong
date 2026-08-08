@@ -5,6 +5,35 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Fixed — `--emit=exe` takes its preferred link path on any cargo-built compiler, and the `cc` fallback links libm
+Two independent link-path defects, both of which made `--emit=exe` quietly worse than it looks. They
+were found together because the AOT gate (`crates/wukongc/tests/exe.rs`) reported them as a single
+red on ubuntu CI. Neither changes what any program *computes*.
+
+- **The runtime rlib is now located wherever cargo actually put it.** `rustc_link` looked only for
+  `libwukong_runtime.rlib` next to the compiler binary — and cargo *uplifts* a library there only
+  when it is a root unit of a **`build`**. Under `cargo test --workspace` the package's root unit is
+  its test binary and the plain rlib stays hash-suffixed in `target/<profile>/deps/`; `cargo run -p
+  wukongc` does not uplift it either, because `-p` makes `wukong_runtime` a dependency rather than a
+  selected member. So on any tree that had not *also* had a plain `cargo build` run in it — every
+  clean checkout, including CI's — `--emit=exe` silently degraded to the `cc` fallback, whose output
+  is knowingly *not* byte-identical to the oracle (no `wukong_rt_print_str`, no `wukong_*` kernels,
+  under-precise `printf("%g")` floats). This was invisible locally purely because the working tree
+  had a leftover uplifted rlib. The lookup is now the single function
+  `wukong_driver::runtime_rlib_in` (uplifted copy first, then the newest
+  `deps/libwukong_runtime-*.rlib`), which `tests/exe.rs` calls too, so the gate's probe cannot drift
+  from the driver's decision — it had drifted exactly that way, leaving the AOT gate dark: on ubuntu
+  every fixture skipped and the "compared ZERO linked executables" assertion fired. Reproducing that
+  artifact layout on Windows (a scratch `CARGO_TARGET_DIR`) shows the same darkness passing quietly
+  there: three of four fixtures skip and only the scalar `heap_alloc.wk` links, through MinGW `cc`,
+  which is enough to keep the count non-zero while proving almost nothing. Both layouts now link all
+  four through the preferred path.
+- **The `cc` fallback passes `-lm`.** The generated C runtime unconditionally defines
+  `wukong_rt_fmod_f64`/`_f32` over `fmod`/`fmodf`, which glibc keeps in `libm` and `cc` does not link
+  by default — so the fallback could not link a *single* program on Linux, regardless of whether it
+  used `%` on floats (`undefined reference to 'fmod'`). The flag goes last, after the objects that
+  reference it, and is a no-op where libm is folded into the C library (macOS, MinGW).
+
 ### Fixed — `--backend=native` builds again on every non-Windows host
 The general vectorizer built a 256-bit raw-AVX2 `VecKernel` recipe whenever the body qualified, with
 **no host check** — but `avx2::assemble_kernel` refuses on any host that is not x86-64 Windows with
