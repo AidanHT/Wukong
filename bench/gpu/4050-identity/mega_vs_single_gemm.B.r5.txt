@@ -1,0 +1,11 @@
+
+running 1 test
+checksum (mega==single==oracle): 1024
+
+=== mega_vs_single_gemm  M=256 K=64 N=64 REPEAT=16 (16777216 fma) ===
+single-thread: 538.792 ms   megakernel(256t): 9.634 ms   speedup: 55.93x (same-run ratio)
+test megakernel::tests::mega_vs_single_gemm ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 339 filtered out; finished in 5.70s
+
+wall_ms=5746 exit=0 arm=B round=5
