@@ -549,7 +549,7 @@ fn fuzz_full_buffer_interp_vs_native() {
     // remainder boundaries; matmul sizes straddle the 6×16 microkernel tile remainders.
     const EW_SIZES: &[usize] = &[1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100];
     const MM_SIZES: &[usize] = &[1, 2, 5, 6, 7, 8, 9, 16, 17];
-    let mut rng = Rng(0x_C0FF_EE_123);
+    let mut rng = Rng(0xC0FFEE123);
     let mut runs = 0u64;
 
     for k in kernels() {
@@ -698,6 +698,7 @@ fn fuzz_full_buffer_i8_interp_vs_native() {
 #[test]
 fn vmath_kernels_match_f64_reference() {
     // (name, true-function f64 reference, input regime, max relative error).
+    #[allow(clippy::type_complexity)] // the row IS that 4-tuple; naming it would obscure the table
     let cases: &[(&str, fn(f64) -> f64, Regime, f64)] = &[
         ("sqrt", |v| v.sqrt(), Regime::Positive, 1e-6), // hardware fsqrt
         ("exp", |v| v.exp(), Regime::Normal, 1e-6),     // direct minimax poly

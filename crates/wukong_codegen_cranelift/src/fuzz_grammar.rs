@@ -397,7 +397,7 @@ impl Gen {
     fn stmt(&mut self) {
         match self.rng.below(18) {
             // let
-            0 | 1 | 2 => {
+            0..=2 => {
                 let t = if self.rng.chance(15) {
                     Ty::Bool
                 } else {
