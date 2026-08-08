@@ -382,9 +382,9 @@ fn build_mlp(it: &mut Interner) -> Fwd {
     let mut h = Vec::with_capacity(HID);
     for j in 0..HID {
         let mut acc = b.build(F64, Op::ConstFloat(0.0, F64));
-        for k in 0..IN {
+        for (k, &xk) in xs.iter().enumerate() {
             let w = load_elem(&mut b, w1, (j * IN + k) as i64);
-            acc = b.build(F64, Op::Fma(w, xs[k], acc));
+            acc = b.build(F64, Op::Fma(w, xk, acc));
         }
         let pos = b.build(MirType::I1, Op::Cmp(wukong_mir::CmpOp::Fogt, acc, zero));
         h.push(b.build(F64, Op::Select(pos, acc, zero)));
@@ -394,9 +394,9 @@ fn build_mlp(it: &mut Interner) -> Fwd {
     let mut loss = b.build(F64, Op::ConstFloat(0.0, F64));
     for o in 0..OUT {
         let mut acc = b.build(F64, Op::ConstFloat(0.0, F64));
-        for j in 0..HID {
+        for (j, &hj) in h.iter().enumerate() {
             let w = load_elem(&mut b, w2, (o * HID + j) as i64);
-            acc = b.build(F64, Op::Fma(w, h[j], acc));
+            acc = b.build(F64, Op::Fma(w, hj, acc));
         }
         let to = load_elem(&mut b, t, o as i64);
         let diff = b.build(F64, Op::Bin(BinOp::FSub, acc, to));
@@ -1572,7 +1572,7 @@ fn adamw_step_matches_reference() {
         hpbuf[hp::BC1] = bc1 as f32;
         hpbuf[hp::BC2] = bc2 as f32;
 
-        let mut bufs = vec![w.clone(), g.clone(), m.clone(), v.clone(), hpbuf];
+        let mut bufs = [w.clone(), g.clone(), m.clone(), v.clone(), hpbuf];
         let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
         run_kernel_f32(&prog, name, &mut views, &it).expect("adamw run failed");
         w = bufs[0].clone();
@@ -1642,7 +1642,7 @@ fn mlp2_adamw_decreases_loss() {
                      v: &mut Vec<f32>,
                      hpbuf: &[f32],
                      it: &Interner| {
-        let mut bufs = vec![w.clone(), g.to_vec(), m.clone(), v.clone(), hpbuf.to_vec()];
+        let mut bufs = [w.clone(), g.to_vec(), m.clone(), v.clone(), hpbuf.to_vec()];
         let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
         run_kernel_f32(&aprog, name, &mut views, it).expect("adamw run");
         *w = bufs[0].clone();
