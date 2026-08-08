@@ -735,6 +735,9 @@ impl<'a> Vjp<'a> {
     // --- emit helpers: kernel calls ------------------------------------------------------------
 
     /// `wukong_sgemm(a, b, c, m, k, n, beta)`: `C(m x n) = A(m x k) . B(k x n) (+ beta C)`.
+    // One Rust parameter per C-ABI operand, deliberately: the signature IS the documentation of
+    // the runtime call it emits. Bundling into a struct would obscure the mirror.
+    #[allow(clippy::too_many_arguments)]
     fn sgemm(
         &mut self,
         a: ValueId,
