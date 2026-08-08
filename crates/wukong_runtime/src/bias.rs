@@ -131,7 +131,7 @@ unsafe fn bias_avx2(
         };
     }
     match act8 {
-        None => run!(|xr, j| addv(xr, j)),
+        None => run!(&addv),
         Some(f) => run!(|xr, j| f(addv(xr, j))),
     }
     if nt {
