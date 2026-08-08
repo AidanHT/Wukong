@@ -372,7 +372,7 @@ mod tests {
                     cols as i64,
                 );
             }
-            for row in 0..rows {
+            for (row, &gr) in got.iter().enumerate() {
                 let off = row * cols;
                 let xd: Vec<f64> = x[off..off + cols].iter().map(|&v| v as f64).collect();
                 let qd: Vec<f64> = q[off..off + cols].iter().map(|&v| v as f64).collect();
@@ -382,9 +382,8 @@ mod tests {
                 let want: f64 = (0..cols).map(|i| qd[i] * (lse - xd[i])).sum();
                 let denom = want.abs().max(1.0);
                 assert!(
-                    ((got[row] as f64 - want).abs() / denom) <= 1e-5,
-                    "f64 ref rows={rows} cols={cols} row={row}: {} vs {want}",
-                    got[row]
+                    ((gr as f64 - want).abs() / denom) <= 1e-5,
+                    "f64 ref rows={rows} cols={cols} row={row}: {gr} vs {want}"
                 );
             }
         }

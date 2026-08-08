@@ -261,7 +261,7 @@ mod tests {
                     cols as i64,
                 );
             }
-            for row in 0..rows {
+            for (row, &gr) in got.iter().enumerate() {
                 let off = row * cols;
                 let want: f64 = (0..cols)
                     .map(|i| {
@@ -272,9 +272,8 @@ mod tests {
                     .sum();
                 let denom = want.abs().max(1.0);
                 assert!(
-                    ((got[row] as f64 - want).abs() / denom) <= 1e-5,
-                    "f64 ref rows={rows} cols={cols} row={row}: {} vs {want}",
-                    got[row]
+                    ((gr as f64 - want).abs() / denom) <= 1e-5,
+                    "f64 ref rows={rows} cols={cols} row={row}: {gr} vs {want}"
                 );
             }
         }
@@ -334,12 +333,8 @@ mod tests {
                     cols as i64,
                 );
             }
-            for row in 0..rows {
-                assert!(
-                    got[row].abs() <= 1e-6,
-                    "KL(p‖p) != 0 cols={cols} row={row}: {}",
-                    got[row]
-                );
+            for (row, g) in got.iter().enumerate() {
+                assert!(g.abs() <= 1e-6, "KL(p‖p) != 0 cols={cols} row={row}: {g}");
             }
         }
     }
