@@ -4262,7 +4262,15 @@ fn main() -> i32 {
     #[test]
     fn run_corpus_matches_interp_oracle() {
         if crate::gpu::gpu().is_none() {
-            eprintln!("skip run_corpus_matches_interp_oracle: no CUDA device");
+            // §3A P3: a bare `eprintln!` + `return` here reported `ok` having lowered nothing —
+            // and this is the widest gate in the crate (357 fixtures x 2 opt levels). Its
+            // megakernel sibling already escalates (`megakernel.rs`'s `mega_corpus_matches_oracle`);
+            // match it, so a rented box that cannot reach its device fails loudly instead of
+            // billing for a green run.
+            crate::diff::skip_or_fail(
+                "run_corpus_matches_interp_oracle",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
             return;
         }
         // The mission corpus: the e2e `tests/run` fixtures. (The example/bench kernels are
