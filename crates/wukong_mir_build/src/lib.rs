@@ -6915,10 +6915,9 @@ impl FnLowerer<'_> {
         // Identify the `p[r*C+iv]` factor and the `(log p - log q)` factor.
         let (p, diff) = if let Some(p) = self.index_off(lhs, iv, batch) {
             (p, rhs.as_ref())
-        } else if let Some(p) = self.index_off(rhs, iv, batch) {
-            (p, lhs.as_ref())
         } else {
-            return None;
+            let p = self.index_off(rhs, iv, batch)?;
+            (p, lhs.as_ref())
         };
         let ExprKind::Binary {
             op: ast::BinOp::Sub,
@@ -6978,13 +6977,12 @@ impl FnLowerer<'_> {
                 return None;
             }
             p
-        } else if let Some(p) = self.index_off(rhs, iv, batch) {
+        } else {
+            let p = self.index_off(rhs, iv, batch)?;
             if self.match_log_index(lhs, iv, batch) != Some(p) {
                 return None;
             }
             p
-        } else {
-            return None;
         };
         let cols = as_dim(n_expr, self.interner)?;
         if out == p {
@@ -7059,13 +7057,12 @@ impl FnLowerer<'_> {
                 return None;
             }
             q
-        } else if let Some(q) = self.index_off(rhs, v6, data_batch) {
+        } else {
+            let q = self.index_off(rhs, v6, data_batch)?;
             if !is_lse_sub(lhs) {
                 return None;
             }
             q
-        } else {
-            return None;
         };
         let StmtKind::Assign {
             target,
@@ -7537,10 +7534,9 @@ impl FnLowerer<'_> {
         // `sum / count`.
         let (ms, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
             (lhs.as_ref(), b)
-        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
-            (rhs.as_ref(), b)
         } else {
-            return None;
+            let b = self.eps_lit_bits(lhs, prior)?;
+            (rhs.as_ref(), b)
         };
         if self.scaled_by_inv_count(ms, sum, n) {
             Some((name, eps_bits))
@@ -7592,10 +7588,9 @@ impl FnLowerer<'_> {
         };
         let (ms, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
             (lhs.as_ref(), b)
-        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
-            (rhs.as_ref(), b)
         } else {
-            return None;
+            let b = self.eps_lit_bits(lhs, prior)?;
+            (rhs.as_ref(), b)
         };
         if self.scaled_by_inv_count(ms, sum, n) {
             Some((name, eps_bits))
@@ -7773,10 +7768,9 @@ impl FnLowerer<'_> {
         };
         let (base, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
             (lhs.as_ref(), b)
-        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
-            (rhs.as_ref(), b)
         } else {
-            return None;
+            let b = self.eps_lit_bits(lhs, prior)?;
+            (rhs.as_ref(), b)
         };
         if single_path(base) == Some(sum) {
             Some((name, eps_bits))
@@ -7816,10 +7810,9 @@ impl FnLowerer<'_> {
         };
         let (base, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
             (lhs.as_ref(), b)
-        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
-            (rhs.as_ref(), b)
         } else {
-            return None;
+            let b = self.eps_lit_bits(lhs, prior)?;
+            (rhs.as_ref(), b)
         };
         if single_path(base) == Some(sum) {
             Some((name, eps_bits))
@@ -17609,17 +17602,11 @@ impl FnLowerer<'_> {
             ast::PatKind::Or(alts) => {
                 let mut acc: Option<ValueId> = None;
                 for alt in alts {
-                    match self.pattern_cond(alt, scrut, scrut_mir, scrut_ty, alt.span) {
-                        None => return None,
-                        Some(c) => {
-                            acc = Some(match acc {
-                                Some(a) => {
-                                    self.builder.build(MirType::I1, Op::Bin(BinOp::Or, a, c))
-                                }
-                                None => c,
-                            });
-                        }
-                    }
+                    let c = self.pattern_cond(alt, scrut, scrut_mir, scrut_ty, alt.span)?;
+                    acc = Some(match acc {
+                        Some(a) => self.builder.build(MirType::I1, Op::Bin(BinOp::Or, a, c)),
+                        None => c,
+                    });
                 }
                 acc
             }
@@ -23156,13 +23143,13 @@ fn match_residual_store_value(
                 return None;
             }
             saw_s = true;
-        } else if let Some(b) = index_by_var(t, jvar) {
+        } else {
+            // An unrecognized additive term (the `?`) is not a residual projection.
+            let b = index_by_var(t, jvar)?;
             if bias.is_some() {
                 return None; // at most one per-column (bias) term
             }
             bias = Some(b);
-        } else {
-            return None; // an unrecognized additive term — not a residual projection
         }
     }
     if saw_c && saw_s {
