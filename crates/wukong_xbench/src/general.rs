@@ -142,10 +142,10 @@ impl Dims {
         2.0 * (4.0 * s * d * d + 2.0 * s * s * d + 3.0 * s * d * f)
     }
     fn ok(&self) -> Result<(), String> {
-        if self.d % self.h != 0 {
+        if !self.d.is_multiple_of(self.h) {
             return Err(format!("D={} is not divisible by H={}", self.d, self.h));
         }
-        if self.hd() % 2 != 0 {
+        if !self.hd().is_multiple_of(2) {
             return Err(format!("head dim {} must be even for RoPE", self.hd()));
         }
         Ok(())
@@ -596,6 +596,9 @@ impl Rounds {
     /// Time `n` columns over `rounds` rounds. `visit(i, r)` takes exactly one round-local sample of
     /// column `i` in round `r` and returns its ns; the caller is responsible for snapshotting that
     /// column's output buffer on round 0, because only it knows which buffer that is.
+    // `r` is a round counter driving the interleave order, the power sampler and the per-round
+    // cell together — iterating `ns` instead would invert what the loop means.
+    #[allow(clippy::needless_range_loop)]
     fn run(n: usize, rounds: usize, mut visit: impl FnMut(usize, usize) -> f64) -> Rounds {
         let mut ns = vec![vec![f64::NAN; rounds]; n];
         let mut power = Vec::with_capacity(rounds + 1);
@@ -673,8 +676,10 @@ impl Rounds {
 /// dropped until the last round is done.
 // Both payloads are write-only by design: the fn pointer taken at build time is what gets called,
 // and these exist solely so the JIT module stays mapped and the DLL stays loaded until the last
-// round. Dropping either early would leave a live `Col::f` pointing at unmapped memory.
-#[allow(dead_code)]
+// round. Dropping either early would leave a live `Col::f` pointing at unmapped memory. The variant
+// size difference is immaterial for the same reason: one `Keep` per loaded column, held for
+// liveness only, never moved through hot code.
+#[allow(dead_code, clippy::large_enum_variant)]
 enum Keep {
     Jit(wukong_codegen_cranelift::JitModuleHandle),
     Dll(libloading::Library),
@@ -849,7 +854,7 @@ fn compile_block(src: &str, label: &str, nparams: usize) -> Option<WukBlock> {
     if !block_abi_ok(&program, sym, label, nparams) {
         return None;
     }
-    let handle = match wukong_codegen_cranelift::jit_module(&program, &mut interner) {
+    let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("general/{label}: wukong codegen error: {e}");
@@ -1271,10 +1276,8 @@ fn reference_f64(m: Dims, inp: &[Vec<f32>]) -> Vec<f64> {
         let ho = e * hd;
         for i in 0..s {
             let (src, dst) = (i * d + ho, i * hd);
-            for p in 0..hd {
-                qh[dst + p] = q[src + p];
-                kh[dst + p] = k[src + p];
-            }
+            qh[dst..dst + hd].copy_from_slice(&q[src..src + hd]);
+            kh[dst..dst + hd].copy_from_slice(&k[src..src + hd]);
         }
         for j in 0..hd {
             let dst = j * s;
@@ -1334,9 +1337,7 @@ fn reference_f64(m: Dims, inp: &[Vec<f32>]) -> Vec<f64> {
         }
         for i in 0..s {
             let (dst, ib) = (i * d + ho, i * hd);
-            for j in 0..hd {
-                ctx[dst + j] = ah[ib + j];
-            }
+            ctx[dst..dst + hd].copy_from_slice(&ah[ib..ib + hd]);
         }
     }
 
@@ -1563,8 +1564,8 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
 
     println!();
     println!(
-        "  {:<14} {:>10} {:>9}  {:<30}  {}",
-        "variant", "ms/fwd", "GF/s*", "vs C (median [min-max])", "spelling"
+        "  {:<14} {:>10} {:>9}  {:<30}  spelling",
+        "variant", "ms/fwd", "GF/s*", "vs C (median [min-max])"
     );
     let rule = "-".repeat(112);
     println!("  {rule}");
@@ -1962,6 +1963,9 @@ unsafe fn call_loss(f: LossFn, b: &mut LossBufs) {
 /// The loss and its gradient recomputed in f64 by a straight transcription of the specification.
 /// Returns `(loss, dz)`, both checked lane by lane — a mean over the loss vector would hide a row
 /// whose gradient is entirely wrong.
+// Index loops ARE the specification here: the f64 reference mirrors the scalar spelling of the
+// loss so a reader can diff it against the math, not against iterator combinators.
+#[allow(clippy::needless_range_loop)]
 fn reference_loss_f64(m: LossDims, b: &LossBufs) -> (Vec<f64>, Vec<f64>) {
     let (r, c) = (m.r, m.c);
     let (qt, qo) = (m.qt() as f64, m.qo() as f64);
@@ -2107,8 +2111,8 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
 
     println!();
     println!(
-        "  {:<10} {:>10} {:>12}  {:<30}  {}",
-        "impl", "ms/call", "Melem/s", "vs C (median [min-max])", "what"
+        "  {:<10} {:>10} {:>12}  {:<30}  what",
+        "impl", "ms/call", "Melem/s", "vs C (median [min-max])"
     );
     let rule = "-".repeat(102);
     println!("  {rule}");
@@ -2317,7 +2321,7 @@ fn bench_ablation() {
          the machine's state."
     );
     println!();
-    println!("  {:<26} {:<36} {}", "probe", "edit", "dispatches");
+    println!("  {:<26} {:<36} dispatches", "probe", "edit");
     println!("  {}", "-".repeat(100));
     for (name, edit, src) in ABLATIONS {
         println!("  {name:<26} {edit:<36} {}", probe_census(src, name));
@@ -2584,8 +2588,8 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
 
     println!();
     println!(
-        "  {:<10} {:>10} {:>12}  {:<30}  {}",
-        "impl", "ms/call", "Mstate/s", "vs C (median [min-max])", "what"
+        "  {:<10} {:>10} {:>12}  {:<30}  what",
+        "impl", "ms/call", "Mstate/s", "vs C (median [min-max])"
     );
     let rule = "-".repeat(102);
     println!("  {rule}");
