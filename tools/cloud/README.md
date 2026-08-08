@@ -39,7 +39,7 @@ was asked for (Modal does **not** forward local environment variables into conta
 # Provenance first — ALWAYS. Verifies you got a full device, not a MIG slice, and that nvcc works.
 $env:WK_GPU="L4"; modal run tools/cloud/modal_app.py::device_info
 
-# Compile on CPU (no GPU attached, ~$0.42/hr for 8 cores + 16 GiB instead of $0.80–$3.95/hr).
+# Compile on CPU (no GPU attached: ~$0.51/hr for 8 cores + 16 GiB, and no $0.80–$3.95/hr of GPU).
 modal run tools/cloud/modal_app.py::build
 
 # Run the device correctness suite on the GPU, with skips escalated to failures.
@@ -86,7 +86,8 @@ pay GPU-minutes to discover.
 Four mechanisms, all load-bearing:
 
 1. **Build on CPU, run on GPU.** `build` attaches no GPU. Compiling 21 crates with `--features gpu`
-   takes minutes; doing it on an H100 costs ~10× more per second than 8 CPU cores.
+   takes minutes; the same container with an H100 attached costs ~8× more per second
+   ($3.95 + $0.51 vs $0.51/hr for 8 cores + 16 GiB).
 2. **The GPU entry points refuse to compile.** `test` and `bench` abort in seconds if the Volume has
    no prebuilt test binary *for the profile they were asked for*. `bench` hardcodes `--release`
    while `build` defaults to debug, so without this guard the first `::bench` of a session would
