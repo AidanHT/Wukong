@@ -68,6 +68,15 @@ fn p4_write_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
 #[ignore]
 fn p4_bench_256_vs_128() {
     let _env = p4_write_lock();
+    // Outside the AVX2/Win64 gate `mir_build` never builds a recipe, so BOTH sides compile to the
+    // 128-bit strips and the printed ratio would read ~1.00x as if widening bought nothing. Say so
+    // rather than publish a 128-vs-128 measurement.
+    if !crate::avx2::host_supports_kernels() {
+        eprintln!(
+            "p4 256-vs-128: SKIPPED — host outside the AVX2+FMA3/Win64 gate, no 256-bit path"
+        );
+        return;
+    }
     // Compute-bound, L1-resident body: a high arithmetic-intensity FMA chain (no sqrt, no memory
     // spill) over a 512-element array (3×2KB ≪ L1), repeated so wall-clock dominates setup. This
     // isolates the SIMD-width win; memory-bound bodies (large arrays, few flops/elem) see less
@@ -122,6 +131,13 @@ fn p4_bench_256_vs_128() {
 #[ignore]
 fn p4_bench_reduction_256_vs_128() {
     let _env = p4_write_lock();
+    // As above: without the 256-bit path this would compare 128 against 128 and report ~1.00x.
+    if !crate::avx2::host_supports_kernels() {
+        eprintln!(
+            "p4 reduction 256-vs-128: SKIPPED — host outside the AVX2+FMA3/Win64 gate, no 256-bit path"
+        );
+        return;
+    }
     // One `+ addend` off `s` (so `reduction_of` claims it); the addend's top `*` fuses via FMA. N is
     // ≥ `VEC256_REDUCTION_MIN_TRIP` so the gated 256-bit path actually fires (below it, both compile to
     // the inlined 128-bit reduction and this would compare 128 against 128).
@@ -167,6 +183,15 @@ fn p4_bench_reduction_256_vs_128() {
 /// tail, in both `for` and normalized-`while` form. Each must agree native-vs-interp AND -O0-vs-O3.
 /// This is the regression lock for the whole feature — if a lane, a tail, or an aliasing case ever
 /// drifts, one of these fails.
+///
+/// It asserts no non-vacuity (no `vec_kernels` count), deliberately: every assertion here is an
+/// *equivalence*, so on a host outside the AVX2+FMA3/Win64 gate — where `mir_build` declines the
+/// recipe and the same bodies lower to the 128-bit CLIF strips — it keeps running and sweeps those
+/// instead. That is real coverage no other test has at this breadth, so it is not host-gated; read a
+/// green run on such a host as "the 128-bit strips agree", not as proof the recipe path fired. The
+/// tests that *do* assert a recipe was built (`p4_vec256_general_matches_interp`,
+/// `p4_counting_while_normalizes_and_matches_interp`, `p4_kill_switch_is_result_identical`,
+/// `p4_reduction256_gate_and_differential`) skip there instead.
 #[test]
 fn p4_vec256_coverage_sweep() {
     let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this sweep
@@ -252,6 +277,13 @@ fn p4_vec256_coverage_sweep() {
 #[test]
 fn p4_kill_switch_is_result_identical() {
     let _env = p4_write_lock();
+    // Non-vacuity below (`k256 > 0`) is the whole point of this test, and outside the
+    // AVX2+FMA3/Win64 gate `mir_build` builds no recipe with the knob either way — both sides would
+    // be the same 128-bit code and there is no A/B left to police. Skip rather than assert-fail on a
+    // host the switch does not apply to; see `wukong_mir::host_supports_vec_kernels`.
+    if !crate::avx2::host_supports_kernels() {
+        return;
+    }
     let bodies: &[&str] = &[
         "o[i] = a[i] + b[i] - c[i]",
         "o[i] = a[i] * b[i] * c[i]",
@@ -3848,6 +3880,11 @@ fn reduction_reassociation_is_backend_consistent() {
 /// the documented check for reassociated float reductions — it catches a wrong horizontal fold or a
 /// dropped lane that a bit-for-bit backend match alone would miss (both backends could agree on a
 /// wrong reassociation). Fractional inputs so the low bits genuinely differ from a strict sum.
+///
+/// Not host-gated, and never was width-specific in practice: only `n = 4096` clears
+/// `VEC256_REDUCTION_MIN_TRIP` (2048), so three of its four sizes already measure the *128-bit*
+/// reassociated reduction against the same f64 reference. On a host outside the AVX2+FMA3/Win64 gate
+/// all four do — still a real check of a reassociated fold, just of the other width.
 #[test]
 fn p4_reduction_f64_reference() {
     for n in [64usize, 257, 1000, 4096] {
@@ -3888,7 +3925,13 @@ fn p4_reduction_f64_reference() {
 #[test]
 fn p4_reduction256_gate_and_differential() {
     let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this gate
-                               // Full program: init streams a,b (deterministic, both signs), then the reduction `red`, print s.
+                               // Asserts a `veckernel` appears at/above the threshold, so it cannot run where `mir_build` declines
+                               // the recipe for the host (see `wukong_mir::host_supports_vec_kernels`). The trip gate it exists to
+                               // pin is a property of the 256-bit path; with no 256-bit path there is nothing to gate.
+    if !crate::avx2::host_supports_kernels() {
+        return;
+    }
+    // Full program: init streams a,b (deterministic, both signs), then the reduction `red`, print s.
     let mk = |n: usize, red: &str| {
         format!(
             "fn main() -> i32 {{ let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
@@ -4191,6 +4234,13 @@ fn fusion_collapses_adjacent_loops() {
 #[test]
 fn p4_vec256_general_matches_interp() {
     let _env = p4_read_lock(); // asserts a kernel was synthesized, so the knob must stay clear
+                               // …and so it cannot run where `mir_build` declines the recipe for the host: outside the
+                               // AVX2+FMA3/Win64 gate these bodies lower to the 128-bit strips and the assertion below is
+                               // false by construction. See `wukong_mir::host_supports_vec_kernels`; the 128-bit lowering of
+                               // the same shapes is still swept by `p4_vec256_coverage_sweep`, which is host-agnostic.
+    if !crate::avx2::host_supports_kernels() {
+        return;
+    }
     let prog = |n: usize| {
         format!(
             "fn main() -> i32 {{ \
@@ -4232,12 +4282,19 @@ fn p4_vec256_general_matches_interp() {
 /// vectorizer (`try_normalize_counting_while`). The rewrite must (a) match the interpreter oracle
 /// bit-for-bit, (b) preserve the while's post-loop counter — `N` if it ran, else the untouched
 /// start (the `start >= N` empty-run case), and (c) leave `i` reachable for code after the loop.
+///
+/// (a)–(c) are properties of the *normalization*, not of the lane width, so the differential half
+/// runs on every host: outside the AVX2+FMA3/Win64 gate the normalized loop simply lowers to the
+/// 128-bit CLIF strips and the same three properties must hold. Only the non-vacuity anchor — "the
+/// rewrite reached the 256-bit recipe" — is host-gated, since off-gate `mir_build` builds no recipe
+/// by design (`wukong_mir::host_supports_vec_kernels`).
 #[test]
 fn p4_counting_while_normalizes_and_matches_interp() {
     let _env = p4_read_lock(); // asserts a kernel was synthesized, so the knob must stay clear
-                               // `lo` lets us cover both the ran case (lo < N) and the empty case (lo == N ⇒ never runs). The
-                               // counting-while body is a stream×stream product plus a third stream (`a*b + e`) — velem can't
-                               // claim that shape, so it reaches the general recipe (a real `vec_kernels` entry).
+    let recipe_path = crate::avx2::host_supports_kernels();
+    // `lo` lets us cover both the ran case (lo < N) and the empty case (lo == N ⇒ never runs). The
+    // counting-while body is a stream×stream product plus a third stream (`a*b + e`) — velem can't
+    // claim that shape, so it reaches the general recipe (a real `vec_kernels` entry).
     let prog = |n: usize, lo: usize| {
         format!(
             "fn main() -> i32 {{ \
@@ -4255,7 +4312,7 @@ fn p4_counting_while_normalizes_and_matches_interp() {
         for lo in [0usize, n] {
             // lo < n runs (final k == n); lo == n never runs (final k == n == lo). Both must hold.
             let src = prog(n, lo);
-            if lo < n {
+            if lo < n && recipe_path {
                 let (p, _) = lowered(&src, 3);
                 assert!(
                     p.funcs.iter().any(|f| !f.vec_kernels.is_empty()),
