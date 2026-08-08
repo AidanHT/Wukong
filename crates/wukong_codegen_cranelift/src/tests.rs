@@ -4597,6 +4597,8 @@ fn parallel_row_loss_and_gather_nests_reach_their_kernels() {
         )
     };
 
+    #[allow(clippy::type_complexity)]
+    // (kernel name, source generator) — a table, not an abstraction
     let cases: &[(&str, &dyn Fn(&str) -> String)] = &[
         ("wukong_xent_fwd_f32", &xent),
         ("wukong_logsumexp_f32", &lse),
