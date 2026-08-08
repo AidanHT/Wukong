@@ -132,7 +132,7 @@ fn use_nt(n: usize, in_bytes: usize) -> bool {
 unsafe fn widen8(q: *const u8, i: usize, width: i64) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
     match width {
-        DQ_U8 => _mm256_cvtepu8_epi32(_mm_loadl_epi64((q as *const u8).add(i) as *const __m128i)),
+        DQ_U8 => _mm256_cvtepu8_epi32(_mm_loadl_epi64(q.add(i) as *const __m128i)),
         DQ_I32 => _mm256_loadu_si256((q as *const i32).add(i) as *const __m256i),
         _ => _mm256_cvtepi8_epi32(_mm_loadl_epi64((q as *const i8).add(i) as *const __m128i)),
     }
@@ -609,7 +609,7 @@ mod tests {
         for &act in &[DQ_ID, DQ_RELU, DQ_GELU, DQ_SILU] {
             for &(width, qptr) in &[
                 (DQ_I8, qi8.as_ptr() as *const u8),
-                (DQ_U8, qu8.as_ptr() as *const u8),
+                (DQ_U8, qu8.as_ptr()),
                 (DQ_I32, qi32.as_ptr() as *const u8),
             ] {
                 let op = act | width;
