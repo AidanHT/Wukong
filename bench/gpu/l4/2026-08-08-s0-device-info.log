@@ -1,0 +1,184 @@
+# ---- WUKONG ROUND PROVENANCE (GPU_RETARGET_PLAN.md 6.1) ----
+round_id         : 2026-08-08-l4-s0-device-info
+local_time_start : 2026-08-08T18:23:31.3644371-04:00
+operator         : Aidan (via Claude Code)
+checkout         : C:/Users/Quant/Documents/Programming/Projects/Compiler/Mercury   (MAIN checkout, not a worktree)
+git_branch       : main
+git_head         : 4ceda630c2df1a58ed8de46789af72bddf964fa0  fix(cloud): ignore bench/gpu in the mount — the runbook's own logging aborted every run
+git_dirty        : NO
+provider / SKU   : Modal / L4    (WK_GPU=L4)
+image tag        : nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
+modal client     : 1.5.3
+command          : modal run tools/cloud/modal_app.py::device_info
+cargo profile    : n/a (no build)
+env              : WK_TIMEOUT=5400
+clock lock       : NONE - Modal is a container (plan 6.3). ITERATION data, NOT publication data.
+# --------------------------------------------------------------
+
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-VAhASrZE3f5jslbviZWVX9
+Building image im-JdrfuD8t3kc6yxIP28bTRp
+
+=> Step 0: FROM base
+
+=> Step 1: RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /root/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+
+  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.1 (8bab26f4f 2026-07-14)
+
+
+Rust is installed now. Great!
+
+To get started you may need to restart your current shell.
+This would reload your PATH environment variable to include
+Cargo's bin directory ($HOME/.cargo/bin).
+
+To configure your current shell, you need to source
+the corresponding env file under $HOME/.cargo.
+
+This is usually done by running one of the following (note the leading DOT):
+. "$HOME/.cargo/env"            # For sh/bash/zsh/ash/dash/pdksh
+source "$HOME/.cargo/env.fish"  # For fish
+source "~/.cargo/env.nu"  # For nushell
+source "$HOME/.cargo/env.tcsh"  # For tcsh
+. "$HOME/.cargo/env.ps1"        # For pwsh
+source "$HOME/.cargo/env.xsh"   # For xonsh
+
+=> Step 2: RUN if [ ! -e /usr/lib/x86_64-linux-gnu/libcudnn.so ] &&    [ -e /usr/lib/x86_64-linux-gnu/libcudnn.so.9 ]; then   ln -s libcudnn.so.9 /usr/lib/x86_64-linux-gnu/libcudnn.so; fi; ldconfig
+Saving image...
+Image saved, took 879.11ms
+
+Built image im-JdrfuD8t3kc6yxIP28bTRp in 14.39s
+
+
+Building image im-j306BgV2gsBP71su87iMkG
+
+=> Step 0: FROM base
+
+=> Step 1: ENV PATH=/root/.cargo/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+=> Step 2: ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+
+=> Step 3: ENV WK_GPU=L4
+
+=> Step 4: ENV CARGO_TERM_COLOR=always
+
+=> Step 5: ENV RUST_BACKTRACE=1
+Saving image...
+Image saved, took 1.04s
+
+Built image im-j306BgV2gsBP71su87iMkG in 2.49s
+
+
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] device_info: L4 + 8.0 cpu + 16 GiB = $1.306/hr; timeout 7200s caps this call at $2.61
+==============================================================================
+WUKONG GPU PROVENANCE — image was built for SKU: L4
+==============================================================================
+
+[1m$ nvidia-smi[0m
+Sat Aug  8 22:25:05 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA L4                      On  |   00000000:4D:00.0 Off |                    0 |
+| N/A   54C    P8             17W /   72W |       3MiB /  23034MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+[1m-> ok in 0.3s[0m
+
+[1m$ nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,clocks.max.sm,clocks.max.mem,power.limit,mig.mode.current --format=csv[0m
+name, compute_cap, driver_version, memory.total [MiB], clocks.max.sm [MHz], clocks.max.memory [MHz], power.limit [W], mig.mode.current
+NVIDIA L4, 8.9, 580.95.05, 23034 MiB, 2040 MHz, 6251 MHz, 72.00 W, [N/A]
+[1m-> ok in 0.0s[0m
+
+[1m$ nvcc -o /tmp/probe/probe /tmp/probe/probe.cu[0m
+nvcc warning : Support for offline compilation for architectures prior to '<compute/sm/lto>_75' will be removed in a future release (Use -Wno-deprecated-gpu-targets to suppress warning).
+[1m-> ok in 1.4s[0m
+
+--- CUDA device properties (the numbers the retarget keys on) ---
+driver_api        : 13.0
+runtime_api       : 12.9
+--- device 0 ---
+name              : NVIDIA L4
+compute_capability: sm_89
+sm_count          : 58
+smem_per_block    : 48 KiB (static)
+smem_optin        : 99 KiB (dynamic opt-in)
+smem_per_sm       : 100 KiB
+regs_per_sm       : 65536
+max_blocks_per_sm : 24
+warps_per_sm      : 48
+l2_cache          : 48 MiB
+total_vram        : 22563 MiB (free 22369 MiB)
+mem_clock         : 6251 MHz
+mem_bus_width     : 192 bit
+peak_bw_GBs       : 300.0
+sm_clock_max      : 2040 MHz
+is_multi_gpu_board: 0
+cooperative_launch: 1
+integrated        : 0
+
+--- provenance gate ---
+device 'NVIDIA L4' matched 'L4': expected sm_89, 58 SMs        got: sm_89, 58 SMs
+OK — full device, matches spec. Safe to tune occupancy against.
+
+--- peer libraries (exact cudarc candidate order, resolved by the real loader) ---
+  LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+  cuda       libcuda.so           -> /usr/lib/x86_64-linux-gnu/libcuda.so.580.95.05   (the driver — everything)
+  nvrtc      libnvrtc.so          -> /usr/local/cuda-12.9/targets/x86_64-linux/lib/libnvrtc.so.12.9.86   (Tier-A naive CUDA-C peers)
+  cublas     libcublas.so         -> /usr/local/cuda-12.9/targets/x86_64-linux/lib/libcublas.so.12.9.2.10   (Tier-B cuBLAS GEMM / IMMA int8)
+  cublasLt   libcublasLt.so       -> /usr/local/cuda-12.9/targets/x86_64-linux/lib/libcublasLt.so.12.9.2.10   (fp8 E4M3 matmul (the only fp8 peer surface))
+  cudnn      libcudnn.so          -> /usr/lib/x86_64-linux-gnu/libcudnn.so.9.10.2   (conv2d peer; unversioned .so ONLY — see _cudarc_candidates)
+[meter] device_info: 2.2s wall = $0.001 (record this in the round log)
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-VAhASrZE3f5jslbviZWVX9
+exit_code : 0
