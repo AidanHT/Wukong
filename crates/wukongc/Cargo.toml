@@ -14,6 +14,14 @@ path = "src/main.rs"
 [dependencies]
 wukong_driver = { workspace = true }
 
+[dev-dependencies]
+# `tests/tensor_parity.rs` asserts that a residual add reached the 256-bit `veckernel` recipe, and
+# that recipe is host-gated. The predicate is single-sourced as `wukong_mir::host_supports_vec_kernels`
+# (the vectorizer and the raw-AVX2 assembler both call it), so the test consults the same function
+# rather than re-deriving a `cfg` test that could desync. Dev-only: the binary reaches MIR through
+# `wukong_driver`.
+wukong_mir = { workspace = true }
+
 [features]
 # Opt-in GPU backend (`--backend=gpu`): pulls `cudarc` in via the driver. Off by default so the
 # stock `wukongc` stays toolchain-free.

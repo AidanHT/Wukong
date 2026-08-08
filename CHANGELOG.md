@@ -5,6 +5,34 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Fixed — `--backend=native` builds again on every non-Windows host
+The general vectorizer built a 256-bit raw-AVX2 `VecKernel` recipe whenever the body qualified, with
+**no host check** — but `avx2::assemble_kernel` refuses on any host that is not x86-64 Windows with
+runtime AVX2 + FMA3, because the emitted bytes hardcode the Win64 argument registers (rcx/rdx/r8) and
+carry no in-kernel dispatch. `populate_module` propagates that `Err`, so on Linux/macOS *the whole
+compile died* — `avx2 assemble vec kernel 0.0: avx2: host lacks AVX2+FMA3 under the Win64 ABI these
+kernels encode` — for any program with a vectorizable f32 loop. The GitHub Actions ubuntu job had
+been red on ~20 `wukong_codegen_cranelift` tests since 2026-07-07.
+
+- The host predicate is now **one function**, `wukong_mir::host_supports_vec_kernels`, placed below
+  both users. `avx2::host_supports_kernels` is a thin wrapper over it (name and behaviour unchanged),
+  and both `wukong_mir_build` recipe sites — elementwise (`emit_vectorized_for`) and reduction
+  (`emit_reduction`) — test it in the same condition as `WUKONG_P4_NO_256`. Off-gate the loop keeps
+  the 128-bit CLIF strips: the documented, result-identical fallback the kill-switch already forces
+  (`p4_kill_switch_is_result_identical`). The Win64/AVX2 requirement itself is **not** weakened, and
+  `assemble_kernel`'s refusal stays as a backstop.
+- The tests that assert a recipe was actually built are host-gated to match, since off-gate they are
+  false by construction rather than failing meaningfully: `p4_vec256_general_matches_interp`,
+  `p4_kill_switch_is_result_identical`, `p4_reduction256_gate_and_differential`, the non-vacuity
+  anchor inside `p4_counting_while_normalizes_and_matches_interp` (its differential half still runs
+  everywhere, since while-normalization is width-independent), and the two `#[ignore]`d 256-vs-128
+  benches, which would otherwise print a 128-vs-128 ratio as if widening bought nothing. The pure
+  equivalence sweeps (`p4_vec256_coverage_sweep`, `p4_reduction_f64_reference`) stay host-agnostic
+  and sweep the 128-bit strips there instead.
+- `wukongc`'s `transformer_block_tensor_dispatches_the_same_kernels` counted `veckernel #` in
+  `--emit=mir` output — which never reaches codegen, so it had been passing on Linux over a recipe
+  that could not have been assembled. It now accepts the 128-bit `<4 x f32>` form off-gate only.
+
 ### GPU retarget, Phase 2 — the backend stops being fused to one laptop card
 The datacenter retarget's local phase (`GPU_RETARGET_PLAN.md`), landed as ~20 gated merges. No
 language or CLI surface changed; every measured claim in `BENCHMARKS.md` is untouched (the perf

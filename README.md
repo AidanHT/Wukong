@@ -273,12 +273,14 @@ The front-end, optimizer, the from-scratch **MIR interpreter**, *and* the **Cran
 backend** build and test with plain `cargo test` on any machine — no LLVM, no toolchain. The native
 backend JIT-compiles in-process (and emits host objects) and is differentially tested against the
 interpreter bit-for-bit; the interpreter links the same `wukong_runtime` microkernels the native
-backend calls, which is what keeps the two bit-exact. One platform caveat: the raw 256-bit AVX2
-vec-kernel emitter hardcodes the Win64 argument registers and VEX.256 AVX2+FMA encodings, so it
-requires an **x86-64 Windows host with AVX2 + FMA** (`avx2::host_supports_kernels`). On any other
-host `assemble_kernel` refuses and native codegen of a program containing a 256-bit recipe fails —
-build and run with `WUKONG_P4_NO_256=1` to keep the whole tree on the portable 128-bit CLIF path. The
-interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
+backend calls, which is what keeps the two bit-exact. One platform caveat, and it is a *performance*
+one only: the raw 256-bit AVX2 vec-kernel emitter hardcodes the Win64 argument registers and VEX.256
+AVX2+FMA encodings, so it requires an **x86-64 Windows host with AVX2 + FMA**
+(`wukong_mir::host_supports_vec_kernels`, which `avx2::host_supports_kernels` delegates to). On any
+other host the vectorizer consults that same predicate and never builds a 256-bit recipe in the first
+place, so those loops stay on the portable 128-bit CLIF path — the identical lowering
+`WUKONG_P4_NO_256=1` forces, and result-identical by construction. Everything still compiles and
+runs; only the widest lane is unavailable. The interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
 behind `--features gpu`, and LLVM is an optional *textual-IR* emitter exposed via `--emit=llvm-ir` (always built; no feature flag).
 
 ## Status

@@ -321,12 +321,13 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   Cranelift's 128-bit CLIF cap (`WUKONG_P4_NO_256` disables it) — with **no** trip-count requirement,
   so a 32-element loop and a runtime-`n` loop both take it. Only a float **reduction** additionally
   requires a *compile-time-known* trip ≥ 2048 (`VEC256_REDUCTION_MIN_TRIP`), below which the inlined
-  128-bit reduction wins. The raw-AVX2 emitter is **host-gated**: `host_supports_kernels()` requires
-  **x86-64 Windows with AVX2 + FMA** (the emitted body hardcodes the Win64 rcx/rdx/r8 argument
-  registers, and there is no in-kernel fallback), and `assemble_kernel` refuses otherwise. The refusal
-  is *not* a fallback: `mir_build` attaches the kernel recipe with no host check, so on any other host
-  native codegen fails the compile with that error rather than silently reverting to the 128-bit CLIF
-  form (`WUKONG_P4_NO_256=1` is the knob that actually keeps the 128-bit form).
+  128-bit reduction wins. The raw-AVX2 emitter is **host-gated**:
+  `wukong_mir::host_supports_vec_kernels()` requires **x86-64 Windows with AVX2 + FMA** (the emitted
+  body hardcodes the Win64 rcx/rdx/r8 argument registers, and there is no in-kernel fallback).
+  `mir_build` tests that predicate alongside `WUKONG_P4_NO_256`, so off-gate no recipe is built and
+  the loop keeps the 128-bit CLIF form — the same result-identical fallback the kill-switch forces.
+  `assemble_kernel` still refuses on the same predicate, but that is now a backstop: it fires only if
+  the two ever disagree.
   saxpy/poly/relu/relu6 vectorize.
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
@@ -629,11 +630,12 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   (`crates/wukong_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`;
   `WUKONG_P4_NO_256` disables it) — the same way the GEMM/vmath runtime microkernels reach 256-bit,
   and precisely *why* that raw emitter exists (Cranelift can't legalize the wider lane). That path is
-  **platform-gated**: `avx2::host_supports_kernels()` requires x86-64 **Windows** with runtime
-  AVX2 + FMA3, because the Win64 argument registers (rcx/rdx/r8) are literal in the emitted bytes and
-  there is no in-kernel dispatch; on any other host `assemble_kernel` refuses and the compile reports a
-  diagnostic rather than emitting non-executable code. `WUKONG_P4_NO_256=1` forces the 128-bit CLIF
-  path and is **result-identical** — the 256-bit recipe contracts `x + y*z` into one FMA exactly like
+  **platform-gated**: `wukong_mir::host_supports_vec_kernels()` requires x86-64 **Windows** with
+  runtime AVX2 + FMA3, because the Win64 argument registers (rcx/rdx/r8) are literal in the emitted
+  bytes and there is no in-kernel dispatch. Both ends consult that one predicate — the vectorizer
+  declines to build the recipe off-gate (so the loop stays 128-bit, and everything still compiles and
+  runs), and `assemble_kernel` refuses as a backstop rather than emit non-executable code.
+  `WUKONG_P4_NO_256=1` forces the 128-bit CLIF path and is **result-identical** — the 256-bit recipe contracts `x + y*z` into one FMA exactly like
   its scalar tail, so the knob changes instruction selection and never the answer (pinned by
   `p4_kill_switch_is_result_identical`). Below that
   threshold an out-of-line 256-bit reduction call would lose to the inlined 128-bit path, so small or
