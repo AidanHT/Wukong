@@ -4309,11 +4309,8 @@ fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {
         UDiv => {
             let w = rty.map(int_bits).unwrap_or(64);
             let (xu, yu) = (uval(x, w), uval(y, w));
-            if yu == 0 {
-                0
-            } else {
-                (xu / yu) as i128
-            }
+            // Division by zero yields 0 (matched to Cranelift), same as the sibling arms.
+            xu.checked_div(yu).unwrap_or(0) as i128
         }
         SRem => {
             if y == 0 {
