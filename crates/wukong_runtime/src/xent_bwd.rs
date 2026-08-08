@@ -323,9 +323,9 @@ mod tests {
             for &rows in &[1usize, 3, 5] {
                 let x = fill(rows * cols);
                 let tg = fill_targets(rows, cols);
-                for row in 0..rows {
+                for (row, &tgr) in tg.iter().enumerate() {
                     let off = row * cols;
-                    let t = tg[row] as usize;
+                    let t = tgr as usize;
                     let mut a = vec![0.0f32; cols];
                     let mut b = vec![0.0f32; cols];
                     unsafe {
@@ -364,12 +364,12 @@ mod tests {
                     cols as i64,
                 );
             }
-            for row in 0..rows {
+            for (row, &tgr) in tg.iter().enumerate() {
                 let off = row * cols;
                 let xd: Vec<f64> = x[off..off + cols].iter().map(|&v| v as f64).collect();
                 let m = xd.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let z: f64 = xd.iter().map(|&v| (v - m).exp()).sum();
-                let tgt = tg[row] as usize;
+                let tgt = tgr as usize;
                 for i in 0..cols {
                     let want = (xd[i] - m).exp() / z - if i == tgt { 1.0 } else { 0.0 };
                     let denom = want.abs().max(1.0);
@@ -518,14 +518,13 @@ mod tests {
                     "serial != parallel cols={cols} i={i}"
                 );
             }
-            for row in 0..rows {
+            for (row, &tgr) in tg.iter().enumerate() {
                 let off = row * cols;
                 let sum: f64 = s[off..off + cols].iter().map(|&v| v as f64).sum();
                 let want = if row < bad.len() { 1.0 } else { 0.0 };
                 assert!(
                     (sum - want).abs() <= 1e-5,
-                    "cols={cols} row={row} target={}: row sum {sum} != {want}",
-                    tg[row]
+                    "cols={cols} row={row} target={tgr}: row sum {sum} != {want}"
                 );
             }
         }
