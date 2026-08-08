@@ -193,8 +193,7 @@ fn live_values(f: &Function) -> FxHashSet<u32> {
         let Some(&(b, k)) = param_pos.get(&v) else {
             continue; // not a block parameter: nothing feeds it on an edge
         };
-        for i in 0..incoming[b as usize][k].len() {
-            let a = incoming[b as usize][k][i];
+        for &a in &incoming[b as usize][k] {
             mark(a, &mut live, &mut work);
         }
     }

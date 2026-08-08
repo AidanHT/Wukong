@@ -255,7 +255,7 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
     let mut r = Rename {
         promotable,
         block_phis: &block_phis,
-        children: &children,
+        children,
         stack: FxHashMap::default(),
         replace: FxHashMap::default(),
         delete: FxHashSet::default(),
