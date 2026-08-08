@@ -647,7 +647,7 @@ mod tests {
                 );
                 wukong_logsumexp_f32(x.as_ptr(), lse.as_mut_ptr(), rows as i64, cols as i64);
             }
-            for r in 0..rows {
+            for (r, &lser) in lse.iter().enumerate() {
                 for i in 0..cols {
                     let k = r * cols + i;
                     assert_eq!(
@@ -659,10 +659,10 @@ mod tests {
                     );
                     assert_eq!(
                         via_norm[k].to_bits(),
-                        (x[k] - lse[r]).to_bits(),
+                        (x[k] - lser).to_bits(),
                         "logsoftmax != x − logsumexp rows={rows} cols={cols} k={k}: {} vs {}",
                         via_norm[k],
-                        x[k] - lse[r]
+                        x[k] - lser
                     );
                 }
             }
