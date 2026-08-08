@@ -112,7 +112,7 @@ pub fn report(files: &[PathBuf]) {
         tot_unroll,
         if tot_unroll > Duration::ZERO { 1 } else { 0 },
     ));
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     for (name, time, calls) in rows {
         println!(
             "  {:<14} {:>10} {:>6.1}% {:>10}",
