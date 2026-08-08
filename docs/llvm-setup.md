@@ -6,8 +6,11 @@ path is **Cranelift** (pure Rust, in-process): `--run --backend=native` JITs, an
 `clang` installed — `--emit=obj` emits a COFF/ELF object directly from Cranelift). `--emit=exe` then
 links that object into an executable — preferring a **`rustc`-driven link** (rustc drives the
 platform's native linker and links `wukong_runtime`), falling back to the system C compiler (`cc`, or
-`$CC`) **only when rustc cannot be run at all or `libwukong_runtime.rlib` is not next to the
-`wukongc` binary**: if rustc runs and the link *fails*, that is reported as an error (exit 1) and is
+`$CC`) **only when rustc cannot be run at all or no `wukong_runtime` rlib is reachable from the
+`wukongc` binary's directory** — that means neither `libwukong_runtime.rlib` beside it (what a plain
+`cargo build` uplifts) nor a hash-suffixed `deps/libwukong_runtime-*.rlib` (what a `cargo test` or
+`cargo run -p wukongc` tree has instead, since cargo uplifts a library only for a `build`): if rustc
+runs and the link *fails*, that is reported as an error (exit 1) and is
 deliberately *not* retried with `cc`, so a real link bug is never swallowed. If neither linker can be
 run it exits with code 2 (`UNIMPLEMENTED`) but still writes the object; a linker that runs and fails
 to link exits 1.
