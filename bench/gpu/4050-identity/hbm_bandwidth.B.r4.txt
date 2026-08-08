@@ -1,0 +1,14 @@
+
+running 1 test
+device: NVIDIA GeForce RTX 4050 Laptop GPU
+theoretical peak HBM: 192.0 GB/s  (20 SMs)
+  copy   (2N rw):  167.9 GB/s   87.4% of peak
+  saxpy  (3N tr):  181.2 GB/s   94.3% of peak
+  reduce (1N r ):  158.4 GB/s   82.5% of peak
+
+best streaming kernel: 181.2 GB/s = 94.3% of 192 GB/s peak ΓåÆ M9 (ΓëÑ90%): MET Γ£ô
+test gpu::tests::hbm_bandwidth ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 339 filtered out; finished in 3.29s
+
+wall_ms=3335 exit=0 arm=B round=4

@@ -1,0 +1,11 @@
+
+running 1 test
+checksum (mega==single==oracle): 311
+
+=== mega_vs_single_vmath  N=8192 REPEAT=600 (4915200 silu) ===
+single-thread: 889.990 ms   megakernel(256t): 6.178 ms   speedup: 144.05x (same-run ratio)
+test megakernel::tests::mega_vs_single_vmath ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 339 filtered out; finished in 11.07s
+
+wall_ms=11115 exit=0 arm=B round=0

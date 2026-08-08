@@ -1,0 +1,32 @@
+
+running 1 test
+device: NVIDIA GeForce RTX 4050 Laptop GPU
+
+1024┬│ int8 swz-vs-handplaced (same-run, internal ratio):
+  smdb64    :    35152 GFLOP/s
+  smdb64_swz:    36290 GFLOP/s
+  smdb128   :    25260 GFLOP/s
+  smdb128swz:    31104 GFLOP/s
+  ΓåÆ 64├ù64   swz/handplaced = 1.032├ù
+  ΓåÆ 128├ù128 swz/handplaced = 1.231├ù
+
+2048┬│ int8 swz-vs-handplaced (same-run, internal ratio):
+  smdb64    :    26670 GFLOP/s
+  smdb64_swz:    33042 GFLOP/s
+  smdb128   :    29908 GFLOP/s
+  smdb128swz:    40011 GFLOP/s
+  ΓåÆ 64├ù64   swz/handplaced = 1.239├ù
+  ΓåÆ 128├ù128 swz/handplaced = 1.338├ù
+
+4096┬│ int8 swz-vs-handplaced (same-run, internal ratio):
+  smdb64    :    26900 GFLOP/s
+  smdb64_swz:    48846 GFLOP/s
+  smdb128   :    39846 GFLOP/s
+  smdb128swz:    62440 GFLOP/s
+  ΓåÆ 64├ù64   swz/handplaced = 1.816├ù
+  ΓåÆ 128├ù128 swz/handplaced = 1.567├ù
+test gpu::tests::int8_swz_vs_handplaced ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 339 filtered out; finished in 23.10s
+
+wall_ms=23132 exit=0 arm=B round=4

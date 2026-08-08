@@ -1,0 +1,10 @@
+
+running 1 test
+gemm_nt 512┬│: simple 381 GFLOP/s (0.70 ms) | reg-blocked 972 GFLOP/s (0.28 ms)  ΓåÆ 2.55├ù 
+gemm_nt 1024┬│: simple 448 GFLOP/s (4.80 ms) | reg-blocked 1822 GFLOP/s (1.18 ms)  ΓåÆ 4.07├ù 
+gemm_nt 2048┬│: simple 544 GFLOP/s (31.57 ms) | reg-blocked 1503 GFLOP/s (11.43 ms)  ΓåÆ 2.76├ù 
+test gpu::tests::gemm_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 294 filtered out; finished in 1.76s
+
+wall_ms=1809 exit=0 arm=A round=0
