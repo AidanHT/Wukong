@@ -83,7 +83,7 @@ pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
 /// order are layout-independent; the block table only changes the load address).
 pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     assert!(
-        head_dim > 0 && head_dim % 2 == 0,
+        head_dim > 0 && head_dim.is_multiple_of(2),
         "head_dim must be a positive even number"
     );
     let hd = head_dim;
@@ -318,7 +318,7 @@ pub const PAGED_ATTN_INT8_ENTRY: &str = "paged_attn_decode_int8";
 /// block layouts** (the dequant multiply order is fixed per token). Tolerance-gated (lossy), not bit-exact.
 pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     assert!(
-        head_dim > 0 && head_dim % 2 == 0,
+        head_dim > 0 && head_dim.is_multiple_of(2),
         "head_dim must be a positive even number"
     );
     let hd = head_dim;
