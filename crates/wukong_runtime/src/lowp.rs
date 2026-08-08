@@ -1114,6 +1114,10 @@ pub unsafe extern "C" fn wukong_vmath_f16_out(x: *const u16, out: *mut u16, n: i
 
 #[cfg(test)]
 mod tests {
+    // See vmath.rs: the release-only probes guard with a deliberately constant
+    // `assert!(!cfg!(debug_assertions), …)` whose message says how to rerun.
+    #![allow(clippy::assertions_on_constants)]
+
     use super::*;
 
     fn bf16_bits(x: f32) -> u16 {
@@ -1272,8 +1276,8 @@ mod tests {
             -1.0,
             0.5,
             -0.5,
-            3.14159,
-            -2.71828,
+            std::f32::consts::PI,
+            -std::f32::consts::E,
             1e-40,
             -1e-40, // subnormal after narrowing
             65504.0,
@@ -1292,7 +1296,7 @@ mod tests {
         for i in 0..128 {
             vals.push((i as f32 * 0.013 - 0.4).sin() * 123.456);
         }
-        while vals.len() % 8 != 0 {
+        while !vals.len().is_multiple_of(8) {
             vals.push(0.0);
         }
         let chunks = vals.len() / 8;
@@ -1312,7 +1316,7 @@ mod tests {
         }
         // The 16-lane pack helpers (the 256-bit NT-store core) must produce the identical bits as two
         // 8-lane narrows concatenated — same round, just a wider pack.
-        while vals.len() % 16 != 0 {
+        while !vals.len().is_multiple_of(16) {
             vals.push(0.0);
         }
         for c in 0..vals.len() / 16 {
