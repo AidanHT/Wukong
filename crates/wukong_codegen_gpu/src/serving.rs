@@ -1014,11 +1014,18 @@ mod tests {
     };
     use crate::paged_kv::BlockManager;
 
+    /// Local copy of the harness `with_gpu`. The skip goes through [`crate::diff::skip_or_fail`],
+    /// exactly like `gpu.rs`'s original: this copy printed and returned unconditionally, so under
+    /// `WUKONG_GPU_REQUIRED=1` — the invocation a rented-GPU run uses — all 15 device gates in this
+    /// module reported `ok` having touched no device at all.
     fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
         let mut guard = crate::gpu();
         match guard.as_mut() {
             Some(g) => body(g),
-            None => eprintln!("[skip] {name}: no CUDA device reachable"),
+            None => crate::diff::skip_or_fail(
+                name,
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            ),
         }
     }
 
