@@ -12,6 +12,13 @@
 //! the deterministic loop reference, not the native lowering target — that is
 //! [`wukong_parallel_for`].
 
+// Crate-wide, deliberately: the ~150 `extern "C"` kernel entries take one Rust parameter per C-ABI
+// operand — the signature IS the ABI the recognizers in `wukong_mir_build` emit against, and
+// bundling operands into structs to satisfy the arg-count lint would break that mirror. The
+// type-complexity allow covers the twin/probe test tables, which key on bare fn-pointer tuples so
+// a row reads as the (kernel, reference, tolerance) triple it is.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 mod attention;
 mod gemm;
 pub use attention::wukong_attention_f32;
@@ -599,6 +606,11 @@ pub extern "C" fn wukong_rt_alloc(count: i64, elem_size: i64, _elem_is_float: i6
 /// double-freeing, or touching the slice after the free is **undefined behavior** on the native
 /// backend; the interpreter's mark-and-forget model (its run-scoped memory is never reclaimed)
 /// keeps such programs from crashing there, but they are outside the differential contract.
+// Non-`unsafe` deliberately (and the file-I/O entries below likewise): these are `#[no_mangle]`
+// C entries whose only Rust caller is the interpreter's marshalling layer, and their raw-pointer
+// contract lives in the `# Safety` docs. Converting the frozen family to `unsafe fn` is a
+// considered ABI-surface change, not a lint fix.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn wukong_rt_free(data: *mut u8) {
     if data.is_null() {
@@ -658,6 +670,8 @@ macro_rules! rt_file_io {
         /// `data` must address at least `len` writable `
         #[doc = stringify!($T)]
         /// ` slots, and `path` must satisfy [`rt_path`]'s contract.
+        // See `wukong_rt_free`: non-`unsafe` C entry by design; the pointer contract is `# Safety`.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[no_mangle]
         pub extern "C" fn $read(path: *const u8, data: *mut $T, len: i64) -> i64 {
             use std::io::Read;
@@ -707,6 +721,8 @@ macro_rules! rt_file_io {
         /// `data` must address at least `len` readable `
         #[doc = stringify!($T)]
         /// ` slots, and `path` must satisfy [`rt_path`]'s contract.
+        // See `wukong_rt_free`: non-`unsafe` C entry by design; the pointer contract is `# Safety`.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[no_mangle]
         pub extern "C" fn $write(path: *const u8, data: *const $T, len: i64) -> i64 {
             use std::io::Write;
@@ -1074,7 +1090,7 @@ mod tests {
         let path = io_tmp("f32");
         let cp = cpath(&path);
         let ptr = cp.as_ptr() as *const u8;
-        let src = [1.5f32, -2.25, 0.0, 3.141_592_7, 6.022e23, -1.0e-9];
+        let src = [1.5f32, -2.25, 0.0, std::f32::consts::PI, 6.022e23, -1.0e-9];
         assert_eq!(wukong_rt_write_f32(ptr, src.as_ptr(), src.len() as i64), 6);
         let mut dst = [0f32; 6];
         assert_eq!(wukong_rt_read_f32(ptr, dst.as_mut_ptr(), 6), 6);
