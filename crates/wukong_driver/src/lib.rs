@@ -1855,12 +1855,26 @@ mod native_link_tests {
 
 /// End-to-end GPU-backend gate: the `--backend=gpu` path (offloading interpreter + [`gpu_accel`])
 /// must match the pure-interpreter oracle within the CPU↔GPU tolerance over the **same** lowered MIR.
-/// Only built with `--features gpu`; skips (does not fail) when no CUDA device is present.
+/// Only built with `--features gpu`; skips when no CUDA device is present — loudly, and as a
+/// *failure* under `WUKONG_GPU_REQUIRED=1` (see `skip_no_device`).
 #[cfg(all(test, feature = "gpu"))]
 mod gpu_e2e_tests {
     use super::*;
     use wukong_codegen_gpu::diff::{assert_close, Rng};
     use wukong_span::SourceMap;
+
+    /// Every gate below early-`return`s when no CUDA device is reachable. libtest captures stderr on
+    /// a *pass*, so that return is invisible: the crate reports `test result: ok` having offloaded
+    /// nothing. `WUKONG_GPU_REQUIRED=1` — what a rented-GPU run sets — must turn that into a failure,
+    /// exactly as it already does for every device gate inside `wukong_codegen_gpu`
+    /// (`wukong_codegen_gpu::diff::skip_or_fail`, which this delegates to so one env var still
+    /// governs every skip in the workspace).
+    fn skip_no_device(name: &str) {
+        wukong_codegen_gpu::diff::skip_or_fail(
+            name,
+            wukong_codegen_gpu::gpu::init_error().unwrap_or("no CUDA device reachable"),
+        );
+    }
 
     /// Lex → parse → sema → mir_build → opt(2), asserting each stage is clean. The recognizers run in
     /// mir_build, so the resulting MIR already carries the `wukong_sgemm_nt` call the GPU offloads.
@@ -1945,7 +1959,7 @@ mod gpu_e2e_tests {
         let g = match guard.as_mut() {
             Some(g) => g,
             None => {
-                eprintln!("skip gpu_backend_linear_matches_interp_within_tol: no CUDA device");
+                skip_no_device("gpu_backend_linear_matches_interp_within_tol");
                 return;
             }
         };
@@ -2001,7 +2015,7 @@ mod gpu_e2e_tests {
         let g = match guard.as_mut() {
             Some(g) => g,
             None => {
-                eprintln!("skip gpu_backend_fused_epilogue_matches_interp: no CUDA device");
+                skip_no_device("gpu_backend_fused_epilogue_matches_interp");
                 return;
             }
         };
@@ -2065,7 +2079,7 @@ mod gpu_e2e_tests {
         let g = match guard.as_mut() {
             Some(g) => g,
             None => {
-                eprintln!("skip gpu_backend_fused_bias_epilogue_matches_interp: no CUDA device");
+                skip_no_device("gpu_backend_fused_bias_epilogue_matches_interp");
                 return;
             }
         };
@@ -2153,9 +2167,7 @@ mod gpu_e2e_tests {
         let g = match guard.as_mut() {
             Some(g) => g,
             None => {
-                eprintln!(
-                    "skip gpu_backend_activation_reduction_norm_match_interp: no CUDA device"
-                );
+                skip_no_device("gpu_backend_activation_reduction_norm_match_interp");
                 return;
             }
         };
@@ -2238,9 +2250,7 @@ mod gpu_e2e_tests {
         let g = match guard.as_mut() {
             Some(g) => g,
             None => {
-                eprintln!(
-                    "skip gpu_backend_declines_unimplemented_norm_ops_to_cpu: no CUDA device"
-                );
+                skip_no_device("gpu_backend_declines_unimplemented_norm_ops_to_cpu");
                 return;
             }
         };
