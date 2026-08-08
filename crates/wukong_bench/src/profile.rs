@@ -128,8 +128,8 @@ pub fn report(files: &[PathBuf]) {
     // --- Stage totals + shares ---
     let mut stage_tot = [Duration::ZERO; 6];
     for p in &profs {
-        for i in 0..6 {
-            stage_tot[i] += p.stage[i];
+        for (tot, st) in stage_tot.iter_mut().zip(&p.stage) {
+            *tot += *st;
         }
     }
     let grand: Duration = stage_tot.iter().copied().sum();
@@ -147,8 +147,8 @@ pub fn report(files: &[PathBuf]) {
         profs.len()
     );
     println!(
-        "{:<14} {:>11} {:>7}   {}",
-        "stage", "total", "%", "throughput (work / stage-time)"
+        "{:<14} {:>11} {:>7}   throughput (work / stage-time)",
+        "stage", "total", "%"
     );
     println!("{}", "-".repeat(72));
     for (i, s) in Stage::ALL.iter().enumerate() {
@@ -186,7 +186,7 @@ pub fn report(files: &[PathBuf]) {
 
     // --- Heaviest files ---
     let mut heavy: Vec<&Prof> = profs.iter().collect();
-    heavy.sort_by(|a, b| b.total().cmp(&a.total()));
+    heavy.sort_by_key(|p| std::cmp::Reverse(p.total()));
     let n = heavy.len().min(10);
     println!(
         "\nheaviest {n} file(s) by total pipeline time  [regime: warm steady-state, best-of-N min]"
