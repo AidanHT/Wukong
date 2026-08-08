@@ -325,17 +325,17 @@ fn make_weights(cfg: Cfg, seed: &mut u64) -> Vec<LayerW> {
 ///  * batched masked softmax    -> `wukong_norm_f32`
 ///  * GEMM + `gelu` epilogue    -> `wukong_sgemm_nt_epi`
 ///  * residual adds             -> `wukong_velem_f32`
-/// Attention runs per head over contiguous slices (extract Qh/Kh, V transposed) so each head's
-/// scores / PV products are plain NT GEMMs — the same structure the C implementation uses. The
-/// head loop is spelled the natural way for independent iterations: its scratch (qh/kh/vt/scores/
-/// ah) is declared INSIDE the loop body, private per head. Under `@parallel` the compiler outlines
-/// the loop into a `wukong_parallel_for` region — heads across cores, each running the identical
-/// serial per-head kernel sequence — instead of a serial chain of small multicore kernels.
-/// (A (head, row-tile) div/mod respelling — h·4 units via the outliner's mixed-radix legality —
-/// was measured 2026-07-11 in a same-state binary A/B: @parallel was a WASH at S=128 and S=512
-/// (243.7 vs 244.7 ms) and the serial twin paid ~6% (1151.7 vs 1088.0 ms) for the per-tile kh/vt
-/// re-packing, so the untiled spelling stays; the legality extension remains as compiler
-/// infrastructure, exercised by tests/run/parallel_divmod_tiling.wk.)
+///    Attention runs per head over contiguous slices (extract Qh/Kh, V transposed) so each head's
+///    scores / PV products are plain NT GEMMs — the same structure the C implementation uses. The
+///    head loop is spelled the natural way for independent iterations: its scratch (qh/kh/vt/scores/
+///    ah) is declared INSIDE the loop body, private per head. Under `@parallel` the compiler outlines
+///    the loop into a `wukong_parallel_for` region — heads across cores, each running the identical
+///    serial per-head kernel sequence — instead of a serial chain of small multicore kernels.
+///    (A (head, row-tile) div/mod respelling — h·4 units via the outliner's mixed-radix legality —
+///    was measured 2026-07-11 in a same-state binary A/B: @parallel was a WASH at S=128 and S=512
+///    (243.7 vs 244.7 ms) and the serial twin paid ~6% (1151.7 vs 1088.0 ms) for the per-tile kh/vt
+///    re-packing, so the untiled spelling stays; the legality extension remains as compiler
+///    infrastructure, exercised by tests/run/parallel_divmod_tiling.wk.)
 fn wk_block(cfg: Cfg, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let (s, d, h, dff, hd) = (cfg.s, cfg.d, cfg.h, cfg.dff, cfg.hd());
@@ -2099,8 +2099,7 @@ fn interp_gate() -> Option<f64> {
     let mut y_interp = vec![0.0f32; sd];
     xa.copy_from_slice(&x0);
     let mut ok = true;
-    for l in 0..LAYERS {
-        let w = &mut weights[l];
+    for (l, w) in weights.iter_mut().enumerate() {
         let (xi, xo) = if l % 2 == 0 {
             (&mut xa, &mut xb)
         } else {
@@ -2683,10 +2682,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     let row = |label: &str, f: &dyn Fn(&MeasureModel) -> String| {
         print!("  {:<22}", label);
         for (_, m) in &cols {
-            print!(
-                " {:>10}",
-                m.as_ref().map(|x| f(x)).unwrap_or_else(|| "n/a".into())
-            );
+            print!(" {:>10}", m.as_ref().map(f).unwrap_or_else(|| "n/a".into()));
         }
         println!();
     };
@@ -3040,7 +3036,7 @@ mod tests {
             !k.contains('%') && !k.contains('(') && !k.contains(' '),
             "the invalidation key still carries a charge or commentary: {k:?}"
         );
-        assert!(p.map_or(true, |v| v <= 100), "charge out of range: {p:?}");
+        assert!(p.is_none_or(|v| v <= 100), "charge out of range: {p:?}");
     }
 
     /// A cross-check that inspected no elements must never report agreement. The old closure
