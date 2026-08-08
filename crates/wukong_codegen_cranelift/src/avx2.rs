@@ -30,6 +30,12 @@
 //! [`assemble_kernel`] refuses on any host that does not supply both (see [`host_supports_kernels`]),
 //! which is the only CPU-feature gate on this path — the Cranelift side declares the kernel with the
 //! module's `default_call_conv` and installs the bytes verbatim, so a mismatch is silent corruption.
+//!
+//! That refusal is a **backstop, not the policy**: `wukong_mir_build` consults the same predicate
+//! before it attaches a recipe at all, so on a host outside the gate the loop simply stays on the
+//! 128-bit CLIF strips (the result-identical form `WUKONG_P4_NO_256=1` forces). Reaching
+//! [`assemble_kernel`]'s `Err` now means a recipe was built where the vectorizer said it would not
+//! be — a bug in that gating, not an expected platform outcome.
 
 // Covers the test-only `assemble_saxpy_probe` reference emitter plus `GROUP_BYTES` and
 // `Plan::hoist_scalars`, which the recipe path computes but no longer reads.
@@ -48,16 +54,15 @@ const NREG: u32 = wukong_mir::VEC_NREG;
 /// body encodes, delivered under the Win64 argument-register mapping (rcx/rdx/r8) the body hardcodes.
 /// Every other AVX2 consumer in the tree (`wukong_runtime`'s gemm/gemv/attention/… kernels) gates the
 /// same way and keeps a scalar twin; this path has no in-kernel fallback, so the gate is the refusal
-/// in [`assemble_kernel`]. `is_x86_feature_detected!` caches its CPUID probe, so this is cheap.
+/// in [`assemble_kernel`].
+///
+/// The predicate itself is **single-sourced in `wukong_mir`** ([`wukong_mir::host_supports_vec_kernels`]),
+/// because the general vectorizer in `wukong_mir_build` has to reach the same answer: it must decline
+/// to *build* a recipe this module would then refuse to assemble, or `populate_module` hard-fails the
+/// whole compile. Two mirrored `cfg` tests is exactly the shape that has desynced here before, so this
+/// stays a delegating wrapper — keep it, the call sites and the docs name it.
 pub fn host_supports_kernels() -> bool {
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    {
-        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
-    {
-        false
-    }
+    wukong_mir::host_supports_vec_kernels()
 }
 
 fn ymm(n: u8) -> AsmRegisterYmm {

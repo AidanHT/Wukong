@@ -37,8 +37,8 @@ use wukong_ast::{
 };
 use wukong_diag::Diagnostic;
 use wukong_mir::{
-    BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId, VecBin,
-    VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
+    host_supports_vec_kernels, BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program,
+    RoundMode, ValueId, VecBin, VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
 use wukong_sema::{heap_alloc_elem, is_now_ns, DefKind, EnumVariant, SemaResult, VariantPayload};
 use wukong_span::{Interner, Span, Symbol};
@@ -15035,7 +15035,18 @@ impl FnLowerer<'_> {
         // the kernel is bit-exact to the tail element-for-element, and the interp marshals the same
         // recipe as the oracle. `WUKONG_P4_NO_256` forces the 128-bit path — a same-run A/B knob for
         // measuring the 256-bit win, and a kill-switch should a body ever be found miscompiled.
-        if *lane == MirType::F32 && std::env::var_os("WUKONG_P4_NO_256").is_none() {
+        //
+        // `host_supports_vec_kernels()` is the same predicate `avx2::assemble_kernel` refuses on
+        // (single-sourced in `wukong_mir`), and it gates *building* the recipe for the same reason
+        // the kill-switch does: the emitted bytes hardcode the Win64 argument registers, so on any
+        // other host there is nothing to lower to. Without this test a Linux/macOS build attached a
+        // recipe the backend could never assemble and `populate_module` failed the entire compile
+        // ("avx2 assemble vec kernel 0.0: avx2: host lacks AVX2+FMA3 under the Win64 ABI these
+        // kernels encode") — declining here is the documented, result-identical 128-bit fallback.
+        if *lane == MirType::F32
+            && host_supports_vec_kernels()
+            && std::env::var_os("WUKONG_P4_NO_256").is_none()
+        {
             if let Some(recipe) = self.build_vec_recipe(body, j) {
                 let kern = VecKernel {
                     name: self.builder.func_name(),
@@ -15465,9 +15476,13 @@ impl FnLowerer<'_> {
         // through to the 128-bit CLIF reduction below when the addend isn't an f32 recipe or won't fit,
         // or when the trip isn't known to be large enough to amortize the out-of-line call (the 256-bit
         // path loses to the inlined 128-bit reduction on small arrays — see `VEC256_REDUCTION_MIN_TRIP`).
+        // `host_supports_vec_kernels()` mirrors the elementwise gate above: the recipe is only worth
+        // building where `avx2::assemble_kernel` can turn it into bytes, otherwise the whole compile
+        // hard-fails in `populate_module` instead of falling back. Single-sourced in `wukong_mir`.
         let trip_ok = known_trip.is_some_and(|t| t >= VEC256_REDUCTION_MIN_TRIP);
         if trip_ok
             && *lane == MirType::F32
+            && host_supports_vec_kernels()
             && std::env::var_os("WUKONG_P4_NO_256").is_none()
             && self.try_emit_reduction_256(j, s0, end_v, ity, s_sym, addend, redop)
         {

@@ -394,6 +394,42 @@ impl VecKernel {
     }
 }
 
+/// Whether **this host** can execute an assembled [`VecKernel`]: the AVX2 + FMA3 instructions the
+/// Cranelift assembler encodes, delivered under the Win64 argument-register mapping (rcx/rdx/r8)
+/// that same emitter hardcodes with no in-kernel dispatch.
+///
+/// It lives here — below both users — because two crates have to answer it *identically*:
+///
+/// * `wukong_codegen_cranelift::avx2::host_supports_kernels` (a thin wrapper over this), which makes
+///   `assemble_kernel` refuse rather than emit bytes that would `#UD` or dereference whatever rcx
+///   happened to hold; and
+/// * the general vectorizer in `wukong_mir_build`, which must therefore not *produce* a recipe the
+///   backend is going to refuse.
+///
+/// Only the first half existed until this predicate was shared, so on every non-Windows host
+/// `mir_build` attached a recipe that `populate_module` then hard-failed on
+/// (`avx2 assemble vec kernel 0.0: …`), taking the whole compile with it. Declining the recipe up
+/// front is safe and result-identical: the 128-bit CLIF strips are the documented fallback — the
+/// very same one `WUKONG_P4_NO_256=1` forces, pinned by `p4_kill_switch_is_result_identical`.
+///
+/// This is a *host* test, not a target test, and both consumers want it that way: the kernels are
+/// assembled into the JIT module and into `--emit=obj` alike, and that object is host-ISA- and
+/// host-ABI-specific either way.
+///
+/// LANDMINE: `std::is_x86_feature_detected!` only exists on x86/x86-64, so the other arm must be a
+/// plain `false` — do not "simplify" the two `cfg` blocks into one expression. The macro caches its
+/// CPUID probe, so calling this once per vectorizable loop is cheap.
+pub fn host_supports_vec_kernels() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 /// Architectural YMM registers a kernel may use.
 pub const VEC_NREG: u32 = 16;
 /// f32 lanes per 256-bit YMM register.

@@ -13,10 +13,12 @@ key design bets. It is aimed at contributors.
    execution path and the differential-testing oracle; the native backend is validated bit-for-bit
    against it (see Testing). See `BENCHMARKS.md` for the cross-language standing. One platform
    caveat: the 256-bit raw-AVX2 kernel path (`wukong_codegen_cranelift::avx2`) encodes the Win64
-   argument registers literally and has no in-kernel dispatch, so `assemble_kernel` refuses on any
-   host that is not x86-64 Windows with runtime AVX2+FMA3. `WUKONG_P4_NO_256=1` forces the portable
-   128-bit path. Everything else — front end, optimizer, interpreter, and the ordinary Cranelift
-   lowering — is host-agnostic.
+   argument registers literally and has no in-kernel dispatch, so it is available only on an x86-64
+   Windows host with runtime AVX2+FMA3. That test is one function —
+   `wukong_mir::host_supports_vec_kernels` — and **the vectorizer consults it too**, so off-gate the
+   recipe is simply never built and the loop keeps the 128-bit CLIF form, exactly as
+   `WUKONG_P4_NO_256=1` forces. Everything else — front end, optimizer, interpreter, and the ordinary
+   Cranelift lowering — is host-agnostic.
 2. **One SSA MIR, built low.** Instead of separate HIR/MIR/LIR there is a single block-structured
    SSA IR, and `wukong_mir_build` produces scalar SSA (explicit loops, `alloca`/`load`/`store`, SIMD
    ops) *directly* — there is one lowering stage, not two. The `MirLevel` enum and `Program::level`
@@ -485,13 +487,20 @@ exactly that; without it a spliced call names one of the caller's own recipes). 
 range-checks the index and requires the call's result to match the recipe kind: a reduction recipe
 yields an `f32`, an elementwise one yields nothing.
 
-That assembler path is host-gated: `avx2::host_supports_kernels()` requires `target_arch = "x86_64"`
-**and** `target_os = "windows"` **and** runtime AVX2 + FMA3, because the emitted bytes read their three
-arguments out of the Win64 registers rcx/rdx/r8 literally and there is no dispatch inside a kernel.
-`assemble_kernel` refuses on that gate before it encodes anything, so on any other host a program whose
-loop produced a recipe fails to compile with an `avx2:` error rather than emitting bytes that would
-`#UD` or dereference garbage. The kernels are assembled while the module is populated — the same code
-path for the JIT and for `--emit=obj` — so an emitted object is host-ISA- and host-ABI-specific.
+That assembler path is host-gated: `wukong_mir::host_supports_vec_kernels()` requires
+`target_arch = "x86_64"` **and** `target_os = "windows"` **and** runtime AVX2 + FMA3, because the
+emitted bytes read their three arguments out of the Win64 registers rcx/rdx/r8 literally and there is
+no dispatch inside a kernel. The predicate lives in `wukong_mir` — below both users — because two
+crates must answer it identically: `avx2::host_supports_kernels()` is a thin wrapper over it and makes
+`assemble_kernel` refuse before it encodes anything, and **`wukong_mir_build` calls it as part of the
+same condition as `WUKONG_P4_NO_256`**, so off-gate no recipe is built and the loop keeps the 128-bit
+CLIF strips. Only the second half of that was true originally, and the consequence was that on every
+non-Windows host `mir_build` attached a recipe `populate_module` could not assemble and the *entire*
+compile failed with `avx2 assemble vec kernel …` — a hard error where a documented, result-identical
+fallback already existed. `assemble_kernel`'s `Err` is now a backstop: reaching it means the gating
+disagreed with the emitter, which is a bug rather than a platform outcome. The kernels are assembled
+while the module is populated — the same code path for the JIT and for `--emit=obj` — so an emitted
+object is host-ISA- and host-ABI-specific.
 `WUKONG_P4_NO_256` forces the portable 128-bit path — a same-run A/B knob and a kill-switch. The
 float-reduction path has an analogous 256-bit kernel, gated to large trips
 (`VEC256_REDUCTION_MIN_TRIP` = 2048 elements) because the out-of-line call loses to the inlined
