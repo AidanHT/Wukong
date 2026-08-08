@@ -205,7 +205,6 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
                 *(y_addr as *mut f32).add(i) = if alpha != 1.0 { s * alpha } else { s };
             }
         });
-        return;
     }
     #[cfg(not(target_arch = "x86_64"))]
     wukong_sgemv_alpha(a, x, y, m, n, alpha);
@@ -252,7 +251,6 @@ pub unsafe extern "C" fn wukong_sgemv_parallel(
                     gemv_row((a_addr as *const f32).add(i * nu), x_addr as *const f32, nu);
             }
         });
-        return;
     }
     #[cfg(not(target_arch = "x86_64"))]
     wukong_sgemv(a, x, y, m, n);
