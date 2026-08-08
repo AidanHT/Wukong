@@ -1834,7 +1834,7 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
             let (bi, bj) = (t / nbj, t % nbj);
             let (i0, j0) = (bi * bm, bj * bn);
             // A null bias-addr (0) stays null; the block body shifts to its global column origin.
-            let epi = epi_on.then(|| Epilogue {
+            let epi = epi_on.then_some(Epilogue {
                 bias: epi_bias_addr as *const f32,
                 act: epi_act,
                 alpha: epi_alpha,
@@ -2050,6 +2050,7 @@ fn dyn_block_order(m: usize, n: usize, bm: usize, bn: usize, nbi: usize, nbj: us
 ///   permutation `Vec` is the one exception, and it is off by default;
 /// * TLS traffic — the scratch take/put runs ONCE per worker per call, not once per block as the
 ///   static path's per-task `with` does.
+///
 /// For reference, the rest of the entry path is already lean: `gemm_dispatch` is OnceLock reads +
 /// cached feature tests, and the generic `wukong_parallel_for` broadcast machinery (lib.rs) is
 /// NOT on this path — recognized GEMMs call these kernels directly.
@@ -2189,7 +2190,7 @@ unsafe fn sgemm_2d_blocks_dyn(
         let chunks_ref = &chunks;
         (0..nworkers).into_par_iter().for_each(|_| {
             // A null bias-addr (0) stays null; each block shifts to its global column origin.
-            let epi = epi_on.then(|| Epilogue {
+            let epi = epi_on.then_some(Epilogue {
                 bias: epi_bias_addr as *const f32,
                 act: epi_act,
                 alpha: epi_alpha,
@@ -3340,6 +3341,8 @@ mod tests {
     /// thread at TIME_CRITICAL and the process at HIGH while the rayon workers doing the actual
     /// work stayed at NORMAL. On this hybrid P/E laptop that changes core placement, so the
     /// printed parallel GFLOP/s were not reproducible by a run that did not include this probe.
+    // On non-Windows the restore path is a no-op, so the fields are written but never read there.
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[derive(Clone, Copy)]
     struct PrevSched {
         /// Thread affinity mask; 0 means "nothing to restore" (the non-Windows no-op).
