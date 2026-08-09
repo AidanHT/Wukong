@@ -1,0 +1,3389 @@
+# ---- WUKONG ROUND PROVENANCE (GPU_RETARGET_PLAN.md 6.1) ----
+round_id         : 2026-08-08-l4-s1a-build-debug
+local_time_start : 2026-08-08T18:26:13.7362829-04:00
+operator         : Aidan (via Claude Code)
+checkout         : C:/Users/Quant/Documents/Programming/Projects/Compiler/Mercury   (MAIN checkout, not a worktree)
+git_branch       : main
+git_head         : 4ceda630c2df1a58ed8de46789af72bddf964fa0  fix(cloud): ignore bench/gpu in the mount — the runbook's own logging aborted every run
+git_dirty        : YES -- PROVENANCE VIOLATION
+provider / SKU   : Modal / L4    (WK_GPU=L4)  [NO GPU ATTACHED for ::build]
+image tag        : nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
+modal client     : 1.5.3
+command          : modal run tools/cloud/modal_app.py::build
+cargo profile    : debug
+env              : WK_TIMEOUT=5400
+device           : NVIDIA L4 / sm_89 / 58 SMs / smem_optin 99 KiB / L2 48 MiB / VRAM 22563 MiB   (from S0)
+driver / runtime : 13.0 / 12.9                          (from S0)
+MIG              : N/A                                  (from S0)
+provenance gate  : OK                                   (from S0)
+clock lock       : NONE - Modal is a container (plan 6.3). ITERATION data, NOT publication data.
+# --------------------------------------------------------------
+
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-ga7MAGzRIumikyF7kmkhDb
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped (bootstrap: existing mtimes adopted, so a warm Volume stays warm)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 1.2s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.1s[0m
+
+[1m$ cargo check --features gpu --all-targets[0m
+[1m[92m    Updating[0m crates.io index
+[1m[92m Downloading[0m crates ...
+[1m[92m  Downloaded[0m allocator-api2 v0.2.21
+[1m[92m  Downloaded[0m anyhow v1.0.102
+[1m[92m  Downloaded[0m bitflags v1.3.2
+[1m[92m  Downloaded[0m arbitrary v1.4.2
+[1m[92m  Downloaded[0m autocfg v1.5.1
+[1m[92m  Downloaded[0m cfg-if v1.0.4
+[1m[92m  Downloaded[0m crossbeam-deque v0.8.6
+[1m[92m  Downloaded[0m bumpalo v3.20.3
+[1m[92m  Downloaded[0m equivalent v1.0.2
+[1m[92m  Downloaded[0m heck v0.5.0
+[1m[92m  Downloaded[0m lazy_static v1.5.0
+[1m[92m  Downloaded[0m rawpointer v0.2.1
+[1m[92m  Downloaded[0m rustc-hash v2.1.2
+[1m[92m  Downloaded[0m stable_deref_trait v1.2.1
+[1m[92m  Downloaded[0m either v1.16.0
+[1m[92m  Downloaded[0m fallible-iterator v0.3.0
+[1m[92m  Downloaded[0m foldhash v0.1.5
+[1m[92m  Downloaded[0m libloading v0.8.9
+[1m[92m  Downloaded[0m num_cpus v1.17.0
+[1m[92m  Downloaded[0m ppv-lite86 v0.2.21
+[1m[92m  Downloaded[0m quote v1.0.45
+[1m[92m  Downloaded[0m rand_chacha v0.9.0
+[1m[92m  Downloaded[0m rand_core v0.9.5
+[1m[92m  Downloaded[0m region v3.0.2
+[1m[92m  Downloaded[0m smallvec v1.15.2
+[1m[92m  Downloaded[0m target-lexicon v0.13.5
+[1m[92m  Downloaded[0m unicode-ident v1.0.24
+[1m[92m  Downloaded[0m crc32fast v1.5.0
+[1m[92m  Downloaded[0m crossbeam-epoch v0.9.18
+[1m[92m  Downloaded[0m crossbeam-utils v0.8.21
+[1m[92m  Downloaded[0m getrandom v0.3.4
+[1m[92m  Downloaded[0m half v2.7.1
+[1m[92m  Downloaded[0m log v0.4.32
+[1m[92m  Downloaded[0m matrixmultiply v0.3.10
+[1m[92m  Downloaded[0m num-traits v0.2.19
+[1m[92m  Downloaded[0m proc-macro2 v1.0.106
+[1m[92m  Downloaded[0m rand_distr v0.5.1
+[1m[92m  Downloaded[0m rayon-core v1.13.0
+[1m[92m  Downloaded[0m serde_core v1.0.228
+[1m[92m  Downloaded[0m indexmap v2.14.0
+[1m[92m  Downloaded[0m memchr v2.8.2
+[1m[92m  Downloaded[0m rand v0.9.4
+[1m[92m  Downloaded[0m serde v1.0.228
+[1m[92m  Downloaded[0m zerocopy-derive v0.8.52
+[1m[92m  Downloaded[0m hashbrown v0.15.5
+[1m[92m  Downloaded[0m hashbrown v0.17.1
+[1m[92m  Downloaded[0m libm v0.2.16
+[1m[92m  Downloaded[0m rayon v1.12.0
+[1m[92m  Downloaded[0m regalloc2 v0.13.5
+[1m[92m  Downloaded[0m gimli v0.32.3
+[1m[92m  Downloaded[0m syn v2.0.117
+[1m[92m  Downloaded[0m zerocopy v0.8.52
+[1m[92m  Downloaded[0m cudarc v0.16.6
+[1m[92m  Downloaded[0m object v0.37.3
+[1m[92m  Downloaded[0m libc v0.2.186
+[1m[92m  Downloaded[0m iced-x86 v1.21.0
+[1m[92m  Downloaded[0m cranelift-bitset v0.124.3
+[1m[92m  Downloaded[0m cranelift-assembler-x64 v0.124.3
+[1m[92m  Downloaded[0m cranelift-assembler-x64-meta v0.124.3
+[1m[92m  Downloaded[0m cranelift-control v0.124.3
+[1m[92m  Downloaded[0m cranelift-entity v0.124.3
+[1m[92m  Downloaded[0m cranelift-codegen-meta v0.124.3
+[1m[92m  Downloaded[0m cranelift-bforest v0.124.3
+[1m[92m  Downloaded[0m cranelift-isle v0.124.3
+[1m[92m  Downloaded[0m cranelift-native v0.124.3
+[1m[92m  Downloaded[0m cranelift-srcgen v0.124.3
+[1m[92m  Downloaded[0m cranelift-frontend v0.124.3
+[1m[92m  Downloaded[0m wasmtime-internal-math v37.0.3
+[1m[92m  Downloaded[0m cranelift-codegen v0.124.3
+[1m[92m  Downloaded[0m wasmtime-internal-jit-icache-coherence v37.0.3
+[1m[92m  Downloaded[0m cranelift-module v0.124.3
+[1m[92m  Downloaded[0m cranelift-object v0.124.3
+[1m[92m  Downloaded[0m cranelift-codegen-shared v0.124.3
+[1m[92m  Downloaded[0m cranelift-jit v0.124.3
+[1m[92m    Checking[0m wukong_span v0.1.0 (/wukong/crates/wukong_span)
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m libm v0.2.16
+[1m[92m    Checking[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m proc-macro2 v1.0.106
+[1m[92m   Compiling[0m unicode-ident v1.0.24
+[1m[92m   Compiling[0m quote v1.0.45
+[1m[92m   Compiling[0m autocfg v1.5.1
+[1m[92m   Compiling[0m getrandom v0.3.4
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m   Compiling[0m crossbeam-utils v0.8.21
+[1m[92m   Compiling[0m rayon-core v1.13.0
+[1m[92m    Checking[0m either v1.16.0
+[1m[92m   Compiling[0m cranelift-srcgen v0.124.3
+[1m[92m   Compiling[0m cranelift-isle v0.124.3
+[1m[92m    Checking[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m heck v0.5.0
+[1m[92m    Checking[0m equivalent v1.0.2
+[1m[92m   Compiling[0m cranelift-codegen-shared v0.124.3
+[1m[92m    Checking[0m foldhash v0.1.5
+[1m[92m    Checking[0m cranelift-bitset v0.124.3
+[1m[92m    Checking[0m allocator-api2 v0.2.21
+[1m[92m   Compiling[0m target-lexicon v0.13.5
+[1m[92m    Checking[0m log v0.4.32
+[1m[92m    Checking[0m rustc-hash v2.1.2
+[1m[92m    Checking[0m wukong_types v0.1.0 (/wukong/crates/wukong_types)
+[1m[92m    Checking[0m wukong_diag v0.1.0 (/wukong/crates/wukong_diag)
+[1m[92m    Checking[0m wukong_ast v0.1.0 (/wukong/crates/wukong_ast)
+[1m[92m   Compiling[0m cranelift-assembler-x64-meta v0.124.3
+[1m[92m    Checking[0m arbitrary v1.4.2
+[1m[92m    Checking[0m hashbrown v0.15.5
+[1m[92m    Checking[0m cranelift-entity v0.124.3
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m    Checking[0m smallvec v1.15.2
+[1m[92m   Compiling[0m anyhow v1.0.102
+[1m[92m   Compiling[0m crc32fast v1.5.0
+[1m[92m    Checking[0m wukong_lexer v0.1.0 (/wukong/crates/wukong_lexer)
+[1m[92m    Checking[0m wukong_mir v0.1.0 (/wukong/crates/wukong_mir)
+[1m[92m    Checking[0m wukong_sema v0.1.0 (/wukong/crates/wukong_sema)
+[1m[92m   Compiling[0m object v0.37.3
+[1m[92m    Checking[0m bumpalo v3.20.3
+[1m[92m    Checking[0m indexmap v2.14.0
+[1m[92m    Checking[0m libloading v0.8.9
+[1m[92m    Checking[0m memchr v2.8.2
+[1m[92m    Checking[0m cranelift-bforest v0.124.3
+[1m[92m    Checking[0m bitflags v1.3.2
+[1m[92m    Checking[0m wukong_parser v0.1.0 (/wukong/crates/wukong_parser)
+[1m[92m    Checking[0m lazy_static v1.5.0
+[1m[92m   Compiling[0m cudarc v0.16.6
+[1m[92m    Checking[0m wukong_backend v0.1.0 (/wukong/crates/wukong_backend)
+[1m[92m   Compiling[0m cranelift-codegen-meta v0.124.3
+[1m[92m    Checking[0m wukong_mir_build v0.1.0 (/wukong/crates/wukong_mir_build)
+[1m[92m    Checking[0m wukong_opt v0.1.0 (/wukong/crates/wukong_opt)
+[1m[92m    Checking[0m regalloc2 v0.13.5
+[1m[92m    Checking[0m iced-x86 v1.21.0
+[1m[92m    Checking[0m wukong_autodiff v0.1.0 (/wukong/crates/wukong_autodiff)
+[1m[92m   Compiling[0m matrixmultiply v0.3.10
+[1m[92m    Checking[0m wukong_codegen_llvm v0.1.0 (/wukong/crates/wukong_codegen_llvm)
+[1m[92m    Checking[0m rawpointer v0.2.1
+[1m[92m    Checking[0m gimli v0.32.3
+[1m[92m    Checking[0m crossbeam-epoch v0.9.18
+[1m[92m    Checking[0m cranelift-control v0.124.3
+[1m[92m    Checking[0m crossbeam-deque v0.8.6
+[1m[92m   Compiling[0m cranelift-assembler-x64 v0.124.3
+[1m[92m   Compiling[0m syn v2.0.117
+[1m[92m    Checking[0m num_cpus v1.17.0
+[1m[92m    Checking[0m wasmtime-internal-jit-icache-coherence v37.0.3
+[1m[92m    Checking[0m region v3.0.2
+[1m[92m   Compiling[0m cranelift-codegen v0.124.3
+[1m[92m    Checking[0m wasmtime-internal-math v37.0.3
+[1m[92m    Checking[0m rand_core v0.9.5
+[1m[92m    Checking[0m rayon v1.12.0
+[1m[92m   Compiling[0m zerocopy-derive v0.8.52
+[1m[92m    Checking[0m ppv-lite86 v0.2.21
+[1m[92m    Checking[0m rand_chacha v0.9.0
+[1m[92m    Checking[0m rand v0.9.4
+[1m[92m    Checking[0m rand_distr v0.5.1
+[1m[92m    Checking[0m half v2.7.1
+[1m[92m    Checking[0m wukong_runtime v0.1.0 (/wukong/crates/wukong_runtime)
+[1m[92m    Checking[0m wukong_interp v0.1.0 (/wukong/crates/wukong_interp)
+[1m[92m    Checking[0m wukong_codegen_gpu v0.1.0 (/wukong/crates/wukong_codegen_gpu)
+[1m[92m    Checking[0m cranelift-module v0.124.3
+[1m[92m    Checking[0m cranelift-native v0.124.3
+[1m[92m    Checking[0m cranelift-frontend v0.124.3
+[1m[92m    Checking[0m cranelift-object v0.124.3
+[1m[92m    Checking[0m cranelift-jit v0.124.3
+[1m[92m    Checking[0m wukong_codegen_cranelift v0.1.0 (/wukong/crates/wukong_codegen_cranelift)
+[1m[92m    Checking[0m wukong_driver v0.1.0 (/wukong/crates/wukong_driver)
+[1m[92m    Checking[0m wukong_bench v0.1.0 (/wukong/crates/wukong_bench)
+[1m[92m    Checking[0m wukong_xbench v0.1.0 (/wukong/crates/wukong_xbench)
+[1m[92m    Checking[0m wukongc v0.1.0 (/wukong/crates/wukongc)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 49.94s
+[1m-> ok in 50.2s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run[0m
+[1m[92m   Compiling[0m wukong_span v0.1.0 (/wukong/crates/wukong_span)
+[1m[92m   Compiling[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m either v1.16.0
+[1m[92m   Compiling[0m libloading v0.8.9
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m crossbeam-utils v0.8.21
+[1m[92m   Compiling[0m libm v0.2.16
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m   Compiling[0m wukong_types v0.1.0 (/wukong/crates/wukong_types)
+[1m[92m   Compiling[0m wukong_diag v0.1.0 (/wukong/crates/wukong_diag)
+[1m[92m   Compiling[0m wukong_ast v0.1.0 (/wukong/crates/wukong_ast)
+[1m[92m   Compiling[0m wukong_mir v0.1.0 (/wukong/crates/wukong_mir)
+[1m[92m   Compiling[0m wukong_lexer v0.1.0 (/wukong/crates/wukong_lexer)
+[1m[92m   Compiling[0m crossbeam-epoch v0.9.18
+[1m[92m   Compiling[0m wukong_sema v0.1.0 (/wukong/crates/wukong_sema)
+[1m[92m   Compiling[0m wukong_parser v0.1.0 (/wukong/crates/wukong_parser)
+[1m[92m   Compiling[0m crossbeam-deque v0.8.6
+[1m[92m   Compiling[0m wukong_backend v0.1.0 (/wukong/crates/wukong_backend)
+[1m[92m   Compiling[0m wukong_autodiff v0.1.0 (/wukong/crates/wukong_autodiff)
+[1m[92m   Compiling[0m wukong_opt v0.1.0 (/wukong/crates/wukong_opt)
+[1m[92m   Compiling[0m rayon-core v1.13.0
+[1m[92m   Compiling[0m getrandom v0.3.4
+[1m[92m   Compiling[0m num_cpus v1.17.0
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m   Compiling[0m wukong_mir_build v0.1.0 (/wukong/crates/wukong_mir_build)
+[1m[92m   Compiling[0m rand_core v0.9.5
+[1m[92m   Compiling[0m rayon v1.12.0
+[1m[92m   Compiling[0m ppv-lite86 v0.2.21
+[1m[92m   Compiling[0m rand_chacha v0.9.0
+[1m[92m   Compiling[0m rand v0.9.4
+[1m[92m   Compiling[0m rand_distr v0.5.1
+[1m[92m   Compiling[0m half v2.7.1
+[1m[92m   Compiling[0m wukong_runtime v0.1.0 (/wukong/crates/wukong_runtime)
+[1m[92m   Compiling[0m cudarc v0.16.6
+[1m[92m   Compiling[0m wukong_interp v0.1.0 (/wukong/crates/wukong_interp)
+[1m[92m   Compiling[0m wukong_codegen_gpu v0.1.0 (/wukong/crates/wukong_codegen_gpu)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 27.58s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+[1m-> ok in 27.7s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run[0m
+[1m[92m   Compiling[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m foldhash v0.1.5
+[1m[92m   Compiling[0m equivalent v1.0.2
+[1m[92m   Compiling[0m cranelift-codegen-shared v0.124.3
+[1m[92m   Compiling[0m allocator-api2 v0.2.21
+[1m[92m   Compiling[0m cranelift-bitset v0.124.3
+[1m[92m   Compiling[0m arbitrary v1.4.2
+[1m[92m   Compiling[0m log v0.4.32
+[1m[92m   Compiling[0m rustc-hash v2.1.2
+[1m[92m   Compiling[0m smallvec v1.15.2
+[1m[92m   Compiling[0m cranelift-codegen-meta v0.124.3
+[1m[92m   Compiling[0m target-lexicon v0.13.5
+[1m[92m   Compiling[0m hashbrown v0.15.5
+[1m[92m   Compiling[0m cranelift-entity v0.124.3
+[1m[92m   Compiling[0m wasmtime-internal-math v37.0.3
+[1m[92m   Compiling[0m anyhow v1.0.102
+[1m[92m   Compiling[0m cranelift-assembler-x64 v0.124.3
+[1m[92m   Compiling[0m crc32fast v1.5.0
+[1m[92m   Compiling[0m memchr v2.8.2
+[1m[92m   Compiling[0m bitflags v1.3.2
+[1m[92m   Compiling[0m lazy_static v1.5.0
+[1m[92m   Compiling[0m wukong_codegen_llvm v0.1.0 (/wukong/crates/wukong_codegen_llvm)
+[1m[92m   Compiling[0m bumpalo v3.20.3
+[1m[92m   Compiling[0m region v3.0.2
+[1m[92m   Compiling[0m iced-x86 v1.21.0
+[1m[92m   Compiling[0m cranelift-bforest v0.124.3
+[1m[92m   Compiling[0m wasmtime-internal-jit-icache-coherence v37.0.3
+[1m[92m   Compiling[0m indexmap v2.14.0
+[1m[92m   Compiling[0m regalloc2 v0.13.5
+[1m[92m   Compiling[0m cranelift-control v0.124.3
+[1m[92m   Compiling[0m gimli v0.32.3
+[1m[92m   Compiling[0m object v0.37.3
+[1m[92m   Compiling[0m cranelift-codegen v0.124.3
+[1m[92m   Compiling[0m cranelift-module v0.124.3
+[1m[92m   Compiling[0m cranelift-native v0.124.3
+[1m[92m   Compiling[0m cranelift-frontend v0.124.3
+[1m[92m   Compiling[0m cranelift-jit v0.124.3
+[1m[92m   Compiling[0m cranelift-object v0.124.3
+[1m[92m   Compiling[0m wukong_codegen_cranelift v0.1.0 (/wukong/crates/wukong_codegen_cranelift)
+[1m[92m   Compiling[0m wukong_driver v0.1.0 (/wukong/crates/wukong_driver)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 31.10s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+[1m-> ok in 31.2s[0m
+
+[1m$ cargo test --workspace[0m
+[1m[92m   Compiling[0m rawpointer v0.2.1
+[1m[92m   Compiling[0m wukong_codegen_gpu v0.1.0 (/wukong/crates/wukong_codegen_gpu)
+[1m[92m   Compiling[0m wukong_mir_build v0.1.0 (/wukong/crates/wukong_mir_build)
+[1m[92m   Compiling[0m wukong_sema v0.1.0 (/wukong/crates/wukong_sema)
+[1m[92m   Compiling[0m wukong_codegen_llvm v0.1.0 (/wukong/crates/wukong_codegen_llvm)
+[1m[92m   Compiling[0m wukong_backend v0.1.0 (/wukong/crates/wukong_backend)
+[1m[92m   Compiling[0m wukong_parser v0.1.0 (/wukong/crates/wukong_parser)
+[1m[92m   Compiling[0m wukong_mir v0.1.0 (/wukong/crates/wukong_mir)
+[1m[92m   Compiling[0m wukong_diag v0.1.0 (/wukong/crates/wukong_diag)
+[1m[92m   Compiling[0m wukong_lexer v0.1.0 (/wukong/crates/wukong_lexer)
+[1m[92m   Compiling[0m wukong_ast v0.1.0 (/wukong/crates/wukong_ast)
+[1m[92m   Compiling[0m wukong_types v0.1.0 (/wukong/crates/wukong_types)
+[1m[92m   Compiling[0m wukong_span v0.1.0 (/wukong/crates/wukong_span)
+[1m[92m   Compiling[0m half v2.7.1
+[1m[92m   Compiling[0m matrixmultiply v0.3.10
+[1m[92m   Compiling[0m wukong_runtime v0.1.0 (/wukong/crates/wukong_runtime)
+[1m[92m   Compiling[0m wukong_interp v0.1.0 (/wukong/crates/wukong_interp)
+[1m[92m   Compiling[0m wukong_codegen_cranelift v0.1.0 (/wukong/crates/wukong_codegen_cranelift)
+[1m[92m   Compiling[0m wukong_driver v0.1.0 (/wukong/crates/wukong_driver)
+[1m[92m   Compiling[0m wukong_opt v0.1.0 (/wukong/crates/wukong_opt)
+[1m[92m   Compiling[0m wukong_autodiff v0.1.0 (/wukong/crates/wukong_autodiff)
+[1m[92m   Compiling[0m wukongc v0.1.0 (/wukong/crates/wukongc)
+[1m[92m   Compiling[0m wukong_xbench v0.1.0 (/wukong/crates/wukong_xbench)
+[1m[92m   Compiling[0m wukong_bench v0.1.0 (/wukong/crates/wukong_bench)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 13.79s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_ast-d9edd32c644156d2)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::empty_module_with_name ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_autodiff-dff5ea40256d0b87)
+
+running 37 tests
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::div_and_sub ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::fma_rule ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::relu_via_select ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::two_op_chain ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_sum_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::linear_mse_vjp ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::velem_affine_still_differentiates ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.52s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_backend-ab426b35aba604fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/debug/deps/wukong_bench-e94c78710c9c33a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_cranelift-786e6eaacbef3d51)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test tests::backend_compile_ab ... ignored
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::batched_norm_dispatch ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::array_index_and_reduction ... ok
+test tests::casts_and_signed_modulo ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_batched_matmul ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::differential_bf16_reduce ... ok
+test tests::differential_array_of_aggregate ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test tests::differential_binary_const_adapt ... ok
+test tests::differential_char_type ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_embedding ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_enum ... ok
+test tests::differential_floats ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_erf ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_pointer ... ok
+test tests::differential_nested_tuple_field ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_short_circuit ... ok
+test tests::differential_struct ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_match ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::differential_unsigned_print ... ok
+test tests::failed_assert_is_error ... ok
+test tests::differential_deep_recursion ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::differential_struct_assign ... ok
+test tests::for_step_loop ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::differential_u64_range_literal ... ok
+test tests::float_modulo ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::differential_tuple ... ok
+test tests::loop_sum ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::differential_string_literals ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::matmul_accumulate_differential ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::differential_struct_return ... ok
+test tests::matmul_overwrite_differential ... ok
+test tests::differential_radix_literals ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::differential_top_level_const ... ok
+test tests::differential_trig ... ok
+test tests::if_as_expression ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::differential_match_patterns ... ok
+test tests::print_captures_stdout ... ok
+test tests::recursive_fib ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::differential_tuple_match ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::matmul_is_correct ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::differential_transcendentals ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::differential_dequant ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::p4_vec256_coverage_sweep has been running for over 60 seconds
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 62.96s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cf026a3427abab94)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_llvm-3d3703d0d7d68dcf)
+
+running 4 tests
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_diag-c4c3e4ccd014396e)
+
+running 11 tests
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test catalog::tests::explain_is_case_insensitive ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::color_adds_escapes ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/debug/deps/catalog_coverage-8469f3d3e437cd05)
+
+running 2 tests
+test every_emitted_code_is_catalogued ... ok
+test every_catalogued_code_has_an_emitter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-c7c9f20f6d522e08)
+
+running 20 tests
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test grad_cli_tests::cubic_scalar_grad ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_interp-4eaf00b65bdfc8fc)
+
+running 19 tests
+test tests::failed_assert_is_an_error ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::runs_loop_sum ... ok
+test tests::runs_recursive_fib ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort has been running for over 60 seconds
+Runner killed (SIGKILL), exit code: 137. Most often this happens when the process runs out of memory. Consider increasing or reserving memory to avoid unexpected termination: https://modal.com/docs/guide/resources
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 1.6s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.2s[0m
+
+[1m$ cargo check --features gpu --all-targets[0m
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 1m 09s
+[1m-> ok in 69.9s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 9.62s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+[1m-> ok in 9.7s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 10.81s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+[1m-> ok in 10.9s[0m
+
+[1m$ cargo test --workspace[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 17.50s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_ast-d9edd32c644156d2)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::empty_module_with_name ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_autodiff-dff5ea40256d0b87)
+
+running 37 tests
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::div_and_sub ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::fma_rule ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::relu_via_select ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::two_op_chain ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::linear_sum_vjp ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::linear_mse_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::velem_affine_still_differentiates ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.83s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_backend-ab426b35aba604fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/debug/deps/wukong_bench-e94c78710c9c33a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_cranelift-786e6eaacbef3d51)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test tests::backend_compile_ab ... ignored
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::batched_norm_dispatch ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::array_index_and_reduction ... ok
+test tests::casts_and_signed_modulo ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_batched_matmul ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::differential_array_of_aggregate ... ok
+test tests::differential_char_type ... ok
+test tests::differential_bf16_reduce ... ok
+test tests::differential_binary_const_adapt ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_embedding ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_floats ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_enum ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_erf ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_nested_tuple_field ... ok
+test tests::differential_pointer ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_short_circuit ... ok
+test tests::differential_struct ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_match ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::differential_unsigned_print ... ok
+test tests::failed_assert_is_error ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::differential_struct_assign ... ok
+test tests::for_step_loop ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::differential_deep_recursion ... ok
+test tests::float_modulo ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::differential_tuple ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::loop_sum ... ok
+test tests::differential_u64_range_literal ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::differential_radix_literals ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::differential_string_literals ... ok
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::differential_struct_return ... ok
+test tests::matmul_accumulate_differential ... ok
+test tests::matmul_overwrite_differential ... ok
+test tests::differential_top_level_const ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::if_as_expression ... ok
+test tests::differential_match_patterns ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::print_captures_stdout ... ok
+test tests::differential_trig ... ok
+test tests::recursive_fib ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::differential_tuple_match ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::matmul_is_correct ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::differential_transcendentals ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::differential_dequant ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::p4_vec256_coverage_sweep has been running for over 60 seconds
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 69.94s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cf026a3427abab94)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_llvm-3d3703d0d7d68dcf)
+
+running 4 tests
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_diag-c4c3e4ccd014396e)
+
+running 11 tests
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test catalog::tests::explain_is_case_insensitive ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::color_adds_escapes ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/debug/deps/catalog_coverage-8469f3d3e437cd05)
+
+running 2 tests
+test every_catalogued_code_has_an_emitter ... ok
+test every_emitted_code_is_catalogued ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-c7c9f20f6d522e08)
+
+running 20 tests
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test grad_cli_tests::cubic_scalar_grad ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_interp-4eaf00b65bdfc8fc)
+
+running 19 tests
+test tests::failed_assert_is_an_error ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::runs_loop_sum ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::runs_recursive_fib ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort has been running for over 60 seconds
+Runner killed (SIGKILL), exit code: 137. Most often this happens when the process runs out of memory. Consider increasing or reserving memory to avoid unexpected termination: https://modal.com/docs/guide/resources
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 1.4s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.1s[0m
+
+[1m$ cargo check --features gpu --all-targets[0m
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 1.28s
+[1m-> ok in 1.6s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+[1m-> ok in 0.6s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.89s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+[1m-> ok in 1.0s[0m
+
+[1m$ cargo test --workspace[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.33s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_ast-d9edd32c644156d2)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::empty_module_with_name ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_autodiff-dff5ea40256d0b87)
+
+running 37 tests
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::div_and_sub ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::fma_rule ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::relu_via_select ... ok
+test tests::two_op_chain ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::linear_mse_vjp ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::linear_sum_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::velem_affine_still_differentiates ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.86s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_backend-ab426b35aba604fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/debug/deps/wukong_bench-e94c78710c9c33a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_cranelift-786e6eaacbef3d51)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test tests::backend_compile_ab ... ignored
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::batched_norm_dispatch ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::array_index_and_reduction ... ok
+test tests::casts_and_signed_modulo ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_batched_matmul ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::differential_array_of_aggregate ... ok
+test tests::differential_char_type ... ok
+test tests::differential_bf16_reduce ... ok
+test tests::differential_binary_const_adapt ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_embedding ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_enum ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_floats ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_erf ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_deep_recursion ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_pointer ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_nested_tuple_field ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_struct ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_short_circuit ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::differential_match ... ok
+test tests::failed_assert_is_error ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::differential_unsigned_print ... ok
+test tests::differential_struct_assign ... ok
+test tests::for_step_loop ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::float_modulo ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::loop_sum ... ok
+test tests::differential_tuple ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::differential_string_literals ... ok
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::differential_u64_range_literal ... ok
+test tests::differential_radix_literals ... ok
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::differential_struct_return ... ok
+test tests::matmul_accumulate_differential ... ok
+test tests::matmul_overwrite_differential ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::differential_top_level_const ... ok
+test tests::if_as_expression ... ok
+test tests::differential_match_patterns ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::print_captures_stdout ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::recursive_fib ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::differential_trig ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::differential_tuple_match ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::matmul_is_correct ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::differential_transcendentals ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::differential_dequant ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::p4_vec256_coverage_sweep has been running for over 60 seconds
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 70.67s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cf026a3427abab94)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_llvm-3d3703d0d7d68dcf)
+
+running 4 tests
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_diag-c4c3e4ccd014396e)
+
+running 11 tests
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test catalog::tests::explain_is_case_insensitive ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::color_adds_escapes ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/debug/deps/catalog_coverage-8469f3d3e437cd05)
+
+running 2 tests
+test every_emitted_code_is_catalogued ... ok
+test every_catalogued_code_has_an_emitter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-c7c9f20f6d522e08)
+
+running 20 tests
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test grad_cli_tests::cubic_scalar_grad ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_interp-4eaf00b65bdfc8fc)
+
+running 19 tests
+test tests::failed_assert_is_an_error ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::runs_loop_sum ... ok
+test tests::runs_recursive_fib ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort has been running for over 60 seconds
+Runner killed (SIGKILL), exit code: 137. Most often this happens when the process runs out of memory. Consider increasing or reserving memory to avoid unexpected termination: https://modal.com/docs/guide/resources
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 2.1s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.5s[0m
+
+[1m$ cargo check --features gpu --all-targets[0m
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 9.51s
+[1m-> ok in 9.8s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.31s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+[1m-> ok in 1.4s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.76s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+[1m-> ok in 1.9s[0m
+
+[1m$ cargo test --workspace[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 3.63s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_ast-d9edd32c644156d2)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::empty_module_with_name ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_autodiff-dff5ea40256d0b87)
+
+running 37 tests
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::div_and_sub ... ok
+test tests::fma_rule ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::relu_via_select ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::two_op_chain ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::linear_mse_vjp ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::linear_sum_vjp ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::velem_affine_still_differentiates ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.91s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_backend-ab426b35aba604fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/debug/deps/wukong_bench-e94c78710c9c33a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_cranelift-786e6eaacbef3d51)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test tests::backend_compile_ab ... ignored
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::batched_norm_dispatch ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::array_index_and_reduction ... ok
+test tests::casts_and_signed_modulo ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_batched_matmul ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::differential_bf16_reduce ... ok
+test tests::differential_char_type ... ok
+test tests::differential_array_of_aggregate ... ok
+test tests::differential_binary_const_adapt ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_embedding ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_floats ... ok
+test tests::differential_enum ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_erf ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_nested_tuple_field ... ok
+test tests::differential_pointer ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_struct ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_short_circuit ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_match ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::differential_unsigned_print ... ok
+test tests::failed_assert_is_error ... ok
+test tests::differential_struct_assign ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::for_step_loop ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::float_modulo ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::differential_tuple ... ok
+test tests::differential_u64_range_literal ... ok
+test tests::differential_radix_literals ... ok
+test tests::differential_deep_recursion ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::loop_sum ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::differential_string_literals ... ok
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::matmul_accumulate_differential ... ok
+test tests::differential_struct_return ... ok
+test tests::matmul_overwrite_differential ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::differential_top_level_const ... ok
+test tests::if_as_expression ... ok
+test tests::differential_match_patterns ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::print_captures_stdout ... ok
+test tests::recursive_fib ... ok
+test tests::differential_trig ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::differential_tuple_match ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::matmul_is_correct ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::differential_transcendentals ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::differential_dequant ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::p4_vec256_coverage_sweep has been running for over 60 seconds
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 70.70s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cf026a3427abab94)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_llvm-3d3703d0d7d68dcf)
+
+running 4 tests
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_diag-c4c3e4ccd014396e)
+
+running 11 tests
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test catalog::tests::explain_is_case_insensitive ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::color_adds_escapes ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/debug/deps/catalog_coverage-8469f3d3e437cd05)
+
+running 2 tests
+test every_catalogued_code_has_an_emitter ... ok
+test every_emitted_code_is_catalogued ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-c7c9f20f6d522e08)
+
+running 20 tests
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test grad_cli_tests::cubic_scalar_grad ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_interp-4eaf00b65bdfc8fc)
+
+running 19 tests
+test tests::failed_assert_is_an_error ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::runs_loop_sum ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::runs_recursive_fib ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort has been running for over 60 seconds
+Runner killed (SIGKILL), exit code: 137. Most often this happens when the process runs out of memory. Consider increasing or reserving memory to avoid unexpected termination: https://modal.com/docs/guide/resources
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 1.9s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.3s[0m
+
+[1m$ cargo check --features gpu --all-targets[0m
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 24.58s
+[1m-> ok in 24.9s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 3.99s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+[1m-> ok in 4.1s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 4.57s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+[1m-> ok in 4.7s[0m
+
+[1m$ cargo test --workspace[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 8.01s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_ast-d9edd32c644156d2)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::empty_module_with_name ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_autodiff-dff5ea40256d0b87)
+
+running 37 tests
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::div_and_sub ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::fma_rule ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::relu_via_select ... ok
+test tests::two_op_chain ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::linear_mse_vjp ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::linear_sum_vjp ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::velem_affine_still_differentiates ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.61s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_backend-ab426b35aba604fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/debug/deps/wukong_bench-e94c78710c9c33a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_cranelift-786e6eaacbef3d51)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test tests::backend_compile_ab ... ignored
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::batched_norm_dispatch ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::array_index_and_reduction ... ok
+test tests::casts_and_signed_modulo ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_batched_matmul ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::differential_array_of_aggregate ... ok
+test tests::differential_bf16_reduce ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test tests::differential_binary_const_adapt ... ok
+test tests::differential_char_type ... ok
+test tests::differential_embedding ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_floats ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_enum ... ok
+test tests::differential_erf ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_pointer ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_nested_tuple_field ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_short_circuit ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_struct ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_match ... ok
+test tests::differential_deep_recursion ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::differential_unsigned_print ... ok
+test tests::failed_assert_is_error ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::differential_struct_assign ... ok
+test tests::for_step_loop ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::float_modulo ... ok
+test tests::differential_tuple ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::differential_u64_range_literal ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::loop_sum ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::matmul_accumulate_differential ... ok
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::differential_trig ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::matmul_overwrite_differential ... ok
+test tests::differential_string_literals ... ok
+test tests::differential_radix_literals ... ok
+test tests::differential_struct_return ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::differential_top_level_const ... ok
+test tests::if_as_expression ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::print_captures_stdout ... ok
+test tests::recursive_fib ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::differential_match_patterns ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::differential_tuple_match ... ok
+test tests::matmul_is_correct ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::differential_transcendentals ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::differential_dequant ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::p4_vec256_coverage_sweep has been running for over 60 seconds
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 64.38s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cf026a3427abab94)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_llvm-3d3703d0d7d68dcf)
+
+running 4 tests
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_diag-c4c3e4ccd014396e)
+
+running 11 tests
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test catalog::tests::explain_is_case_insensitive ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::color_adds_escapes ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/debug/deps/catalog_coverage-8469f3d3e437cd05)
+
+running 2 tests
+test every_catalogued_code_has_an_emitter ... ok
+test every_emitted_code_is_catalogued ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-c7c9f20f6d522e08)
+
+running 20 tests
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test grad_cli_tests::cubic_scalar_grad ... ok
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_interp-4eaf00b65bdfc8fc)
+
+running 19 tests
+test tests::failed_assert_is_an_error ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::runs_loop_sum ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::runs_recursive_fib ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort has been running for over 60 seconds
+Runner killed (SIGKILL), exit code: 137. Most often this happens when the process runs out of memory. Consider increasing or reserving memory to avoid unexpected termination: https://modal.com/docs/guide/resources
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 1.7s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.2s[0m
+
+[1m$ cargo check --features gpu --all-targets[0m
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 11.21s
+[1m-> ok in 11.6s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.36s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+[1m-> ok in 1.5s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.89s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+[1m-> ok in 2.0s[0m
+
+[1m$ cargo test --workspace[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 3.15s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_ast-d9edd32c644156d2)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::empty_module_with_name ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_autodiff-dff5ea40256d0b87)
+
+running 37 tests
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::div_and_sub ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::fma_rule ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::relu_via_select ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::two_op_chain ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::linear_mse_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::linear_sum_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::velem_affine_still_differentiates ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.86s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_backend-ab426b35aba604fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/debug/deps/wukong_bench-e94c78710c9c33a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_cranelift-786e6eaacbef3d51)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test tests::backend_compile_ab ... ignored
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::batched_norm_dispatch ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::array_index_and_reduction ... ok
+test tests::casts_and_signed_modulo ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_batched_matmul ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::differential_array_of_aggregate ... ok
+test tests::differential_binary_const_adapt ... ok
+test tests::differential_bf16_reduce ... ok
+test tests::differential_char_type ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_embedding ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_floats ... ok
+test tests::differential_enum ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_erf ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_pointer ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_nested_tuple_field ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_short_circuit ... ok
+test tests::differential_struct ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_match ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::failed_assert_is_error ... ok
+test tests::differential_struct_assign ... ok
+test tests::differential_unsigned_print ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::for_step_loop ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::differential_deep_recursion ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::float_modulo ... ok
+test tests::differential_tuple ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::differential_u64_range_literal ... ok
+test tests::loop_sum ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::matmul_accumulate_differential ... ok
+test tests::differential_string_literals ... ok
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::differential_struct_return ... ok
+test tests::differential_radix_literals ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::matmul_overwrite_differential ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::differential_top_level_const ... ok
+test tests::if_as_expression ... ok
+test tests::differential_match_patterns ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::print_captures_stdout ... ok
+test tests::differential_trig ... ok
+test tests::recursive_fib ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::differential_tuple_match ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::matmul_is_correct ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::differential_transcendentals ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::differential_dequant ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::p4_vec256_coverage_sweep has been running for over 60 seconds
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 71.65s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cf026a3427abab94)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_llvm-3d3703d0d7d68dcf)
+
+running 4 tests
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_diag-c4c3e4ccd014396e)
+
+running 11 tests
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test catalog::tests::explain_is_case_insensitive ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::color_adds_escapes ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/debug/deps/catalog_coverage-8469f3d3e437cd05)
+
+running 2 tests
+test every_emitted_code_is_catalogued ... ok
+test every_catalogued_code_has_an_emitter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-c7c9f20f6d522e08)
+
+running 20 tests
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test grad_cli_tests::cubic_scalar_grad ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_interp-4eaf00b65bdfc8fc)
+
+running 19 tests
+test tests::failed_assert_is_an_error ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::runs_loop_sum ... ok
+test tests::runs_recursive_fib ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort has been running for over 60 seconds
+Runner killed (SIGKILL), exit code: 137. Most often this happens when the process runs out of memory. Consider increasing or reserving memory to avoid unexpected termination: https://modal.com/docs/guide/resources
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 1.6s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.2s[0m
+
+[1m$ cargo check --features gpu --all-targets[0m
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 9.66s
+[1m-> ok in 9.9s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.35s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+[1m-> ok in 1.4s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.77s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+[1m-> ok in 1.9s[0m
+
+[1m$ cargo test --workspace[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 2.65s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_ast-d9edd32c644156d2)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::empty_module_with_name ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_autodiff-dff5ea40256d0b87)
+
+running 37 tests
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::div_and_sub ... ok
+test tests::fma_rule ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::relu_via_select ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::two_op_chain ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::linear_mse_vjp ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::linear_sum_vjp ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::velem_affine_still_differentiates ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.89s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_backend-ab426b35aba604fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/debug/deps/wukong_bench-e94c78710c9c33a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_cranelift-786e6eaacbef3d51)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test tests::backend_compile_ab ... ignored
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::batched_norm_dispatch ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::array_index_and_reduction ... ok
+test tests::casts_and_signed_modulo ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_batched_matmul ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::differential_array_of_aggregate ... ok
+test tests::differential_bf16_reduce ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test tests::differential_binary_const_adapt ... ok
+test tests::differential_char_type ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_embedding ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_floats ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_enum ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_erf ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_nested_tuple_field ... ok
+test tests::differential_pointer ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_short_circuit ... ok
+test tests::differential_struct ... ok
+test tests::differential_match ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::failed_assert_is_error ... ok
+test tests::differential_unsigned_print ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::differential_struct_assign ... ok
+test tests::for_step_loop ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::differential_deep_recursion ... ok
+test tests::float_modulo ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::differential_tuple ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::loop_sum ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::differential_u64_range_literal ... ok
+test tests::differential_string_literals ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::differential_radix_literals ... ok
+test tests::differential_struct_return ... ok
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::matmul_accumulate_differential ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::matmul_overwrite_differential ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::differential_top_level_const ... ok
+test tests::if_as_expression ... ok
+test tests::differential_match_patterns ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::print_captures_stdout ... ok
+test tests::recursive_fib ... ok
+test tests::differential_trig ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::differential_tuple_match ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::matmul_is_correct ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::differential_transcendentals ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::differential_dequant ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::p4_vec256_coverage_sweep has been running for over 60 seconds
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 70.35s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cf026a3427abab94)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_llvm-3d3703d0d7d68dcf)
+
+running 4 tests
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_diag-c4c3e4ccd014396e)
+
+running 11 tests
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test catalog::tests::explain_is_case_insensitive ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::color_adds_escapes ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/debug/deps/catalog_coverage-8469f3d3e437cd05)
+
+running 2 tests
+test every_emitted_code_is_catalogued ... ok
+test every_catalogued_code_has_an_emitter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-c7c9f20f6d522e08)
+
+running 20 tests
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test grad_cli_tests::cubic_scalar_grad ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_interp-4eaf00b65bdfc8fc)
+
+running 19 tests
+test tests::failed_assert_is_an_error ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::runs_recursive_fib ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::runs_loop_sum ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort has been running for over 60 seconds
+Runner killed (SIGKILL), exit code: 137. Most often this happens when the process runs out of memory. Consider increasing or reserving memory to avoid unexpected termination: https://modal.com/docs/guide/resources
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 1.1s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.1s[0m
+
+[1m$ cargo check --features gpu --all-targets[0m
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 5.61s
+[1m-> ok in 5.8s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.95s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+[1m-> ok in 1.0s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.30s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+[1m-> ok in 1.4s[0m
+
+[1m$ cargo test --workspace[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.96s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_ast-d9edd32c644156d2)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::empty_module_with_name ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_autodiff-dff5ea40256d0b87)
+
+running 37 tests
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::div_and_sub ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::fma_rule ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::relu_via_select ... ok
+test tests::two_op_chain ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::linear_mse_vjp ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::linear_sum_vjp ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::velem_affine_still_differentiates ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.20s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_backend-ab426b35aba604fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/debug/deps/wukong_bench-e94c78710c9c33a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_cranelift-786e6eaacbef3d51)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test tests::backend_compile_ab ... ignored
+test tests::batched_norm_dispatch ... ok
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::array_index_and_reduction ... ok
+test tests::casts_and_signed_modulo ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_batched_matmul ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::differential_bf16_reduce ... ok
+test tests::differential_array_of_aggregate ... ok
+test tests::differential_binary_const_adapt ... ok
+test tests::differential_char_type ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_embedding ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_floats ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_enum ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_erf ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_pointer ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_nested_tuple_field ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_short_circuit ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_struct ... ok
+test tests::differential_unsigned_print ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::differential_match ... ok
+test tests::failed_assert_is_error ... ok
+test tests::differential_struct_assign ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::for_step_loop ... ok
+test tests::differential_deep_recursion ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::float_modulo ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::differential_u64_range_literal ... ok
+test tests::loop_sum ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::differential_tuple ... ok
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::differential_struct_return ... ok
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::differential_string_literals ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::matmul_accumulate_differential ... ok
+test tests::matmul_overwrite_differential ... ok
+test tests::differential_radix_literals ... ok
+test tests::differential_top_level_const ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::if_as_expression ... ok
+test tests::differential_match_patterns ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::print_captures_stdout ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::recursive_fib ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::differential_trig ... ok
+test tests::differential_tuple_match ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::matmul_is_correct ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::differential_transcendentals ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::differential_dequant ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 56.27s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cf026a3427abab94)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_llvm-3d3703d0d7d68dcf)
+
+running 4 tests
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_diag-c4c3e4ccd014396e)
+
+running 11 tests
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test catalog::tests::explain_is_case_insensitive ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::color_adds_escapes ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/debug/deps/catalog_coverage-8469f3d3e437cd05)
+
+running 2 tests
+test every_emitted_code_is_catalogued ... ok
+test every_catalogued_code_has_an_emitter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-c7c9f20f6d522e08)
+
+running 20 tests
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test grad_cli_tests::cubic_scalar_grad ... ok
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_interp-4eaf00b65bdfc8fc)
+
+running 19 tests
+test tests::failed_assert_is_an_error ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::runs_loop_sum ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::runs_recursive_fib ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort has been running for over 60 seconds
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+Runner killed (SIGKILL), exit code: 137. Most often this happens when the process runs out of memory. Consider increasing or reserving memory to avoid unexpected termination: https://modal.com/docs/guide/resources
+Stopping app - uncaught exception raised locally: InternalFailure('Server has lost track of input').
+┌─ Error ─────────────────────────────────────────────────────────────────────┐
+│ Server has lost track of input                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+wall_time : 7138s
+exit_code : 1
