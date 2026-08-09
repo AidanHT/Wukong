@@ -29,10 +29,40 @@ pub const HDR_SM80: &str = ".version 7.8\n.target sm_80\n.address_size 64\n";
 /// below Ada, and their PTX-ISA introduction is past 7.8.
 pub const HDR_SM89_V84: &str = ".version 8.4\n.target sm_89\n.address_size 64\n";
 
+/// `.version 8.0` at the **`sm_90a`** floor — the Hopper warpgroup family (`wgmma` + TMA +
+/// `setmaxnreg` + `mbarrier` transaction barriers). The third and last shipped floor, and the only
+/// one that is **architecture-LOCKED** rather than merely arch-floored.
+///
+/// **Why `sm_90a` and not `sm_90`.** `wgmma.mma_async` is documented "Requires `sm_90a`" (PTX ISA
+/// §9.7.16, D1 §1.4). The trailing `a` marks an *architecture-specific* target: unlike `sm_80` or
+/// `sm_89`, which are floors that every later part JITs from, an `sm_90a` module is legal on Hopper
+/// **and nowhere else**. It will not load on `sm_100`/`sm_120` and it cannot be relaxed to plain
+/// `sm_90` — `wgmma` is simply not in that target's instruction set. So this constant forfeits the
+/// forward compatibility the emission rule above buys everywhere else, deliberately, because there
+/// is no alternative spelling that keeps it.
+///
+/// The consequence for callers is a **third category** in the emission rule (D1 §6 finding 3):
+/// `sm_80`/`sm_89` are floors, `sm_90a` is a lock. A module tagged with it MUST be reached only
+/// through a capability gate that has established a cc of 9.x on the *probed* device
+/// (`ptx_wgmma::require_sm90a`) — never emitted speculatively, never for a device below cc 9.0, and
+/// never assumed to survive onto a later architecture.
+///
+/// **Why `.version 8.0` and not higher.** The newest instructions the family emits — `wgmma.*`,
+/// `cp.async.bulk.tensor.*` and `setmaxnreg` — are "Introduced in PTX ISA version 8.0"; the rest
+/// (`mbarrier.arrive.expect_tx`, `mbarrier.try_wait.parity`, `cvta.param`) are older still. Nothing
+/// in the mix postdates 8.0, so by the same rule that keeps the Ampere families at 7.8 this declares
+/// 8.0 and no more: `.version 8.0` asks for driver r525+, while `.version 8.4` would ask for r550+
+/// and buy nothing.
+pub const HDR_SM90A_V80: &str = ".version 8.0\n.target sm_90a\n.address_size 64\n";
+
 /// Bare target directives, for containment asserts in tests and for generators that interpolate a
 /// header into a larger `format!`. Tests should pin a family's FLOOR via these, never the device.
 pub const TARGET_SM80: &str = ".target sm_80";
 pub const TARGET_SM89: &str = ".target sm_89";
+/// The architecture-LOCKED Hopper target — see [`HDR_SM90A_V80`]. Note it is **not** a prefix-free
+/// relative of `.target sm_90`: a containment test for one must not be written as a `contains` of
+/// the other (`".target sm_90"` is a substring of `".target sm_90a"`).
+pub const TARGET_SM90A: &str = ".target sm_90a";
 
 /// A header from explicit parts, for the odd module whose (version, target) pair is not one of the
 /// shipped constants. Prefer the constants — they are the grep point for "what floors exist".
@@ -63,15 +93,52 @@ mod tests {
 
     #[test]
     fn headers_are_ascii_well_formed_and_agree_with_the_builder() {
-        for h in [HDR_SM80, HDR_SM89_V84] {
+        for h in [HDR_SM80, HDR_SM89_V84, HDR_SM90A_V80] {
             assert!(h.is_ascii(), "PTX header must be pure ASCII");
             assert!(h.starts_with(".version "));
             assert!(h.ends_with("\n.address_size 64\n"));
         }
         assert!(HDR_SM80.contains(TARGET_SM80));
         assert!(HDR_SM89_V84.contains(TARGET_SM89));
+        assert!(HDR_SM90A_V80.contains(TARGET_SM90A));
         assert_eq!(header("7.8", "sm_80"), HDR_SM80);
         assert_eq!(header("8.4", "sm_89"), HDR_SM89_V84);
+        assert_eq!(header("8.0", "sm_90a"), HDR_SM90A_V80);
+    }
+
+    /// **The `a` in `sm_90a` is load-bearing and easy to lose.** `.target sm_90` and `.target sm_90a`
+    /// differ by one byte, `sm_90` is a *prefix* of `sm_90a`, and the wrong one of the two is not a
+    /// compile error anywhere in this repo — it is a `cuModuleLoadData` failure on an H100 six months
+    /// from now, naming `wgmma` rather than the target. So the pairing is pinned in both directions:
+    /// the Hopper header carries the `a`, and no *other* shipped header may carry a `sm_90*` target
+    /// (a family that is merely Hopper-legal belongs at the `sm_80` floor, which JITs there anyway).
+    #[test]
+    fn the_hopper_floor_is_architecture_locked_and_alone() {
+        assert!(
+            HDR_SM90A_V80.contains(".target sm_90a\n"),
+            "the Hopper floor must be the architecture-specific `sm_90a`, not plain `sm_90`"
+        );
+        for h in [HDR_SM80, HDR_SM89_V84] {
+            assert!(
+                !h.contains(".target sm_90"),
+                "only the wgmma family may name a Hopper target: {h:?}"
+            );
+        }
+        // `sm_90` is a prefix of `sm_90a`: a `contains(".target sm_90")` test would pass on both, so
+        // anything pinning the plain target must pin the newline too. Proven here so the trap is a
+        // recorded fact rather than a comment.
+        assert!(HDR_SM90A_V80.contains(".target sm_90"));
+        assert!(!HDR_SM90A_V80.contains(".target sm_90\n"));
+    }
+
+    /// The Hopper family declares the LOWEST `.version` its instruction mix needs, exactly as the
+    /// Ampere and Ada floors do. `wgmma`, `cp.async.bulk.tensor`, `mbarrier.arrive.expect_tx`,
+    /// `mbarrier.try_wait.parity` and `setmaxnreg` are all "Introduced in PTX ISA version 8.0", so
+    /// 8.0 is earned and 8.4 (driver r550+) would be an unearned load failure on an r53x fleet.
+    #[test]
+    fn the_hopper_floor_asks_for_the_r525_driver_and_no_more() {
+        assert!(HDR_SM90A_V80.starts_with(".version 8.0"));
+        assert!(!HDR_SM90A_V80.contains(".version 8.4"));
     }
 
     /// **`.version 8.4` is spelled in exactly one shipped constant, and it is the `sm_89` one.** The
@@ -82,7 +149,7 @@ mod tests {
     /// constant would reintroduce the hole silently, so the pairing is pinned here.
     #[test]
     fn only_the_ada_floor_declares_the_r550_driver_version() {
-        for h in [HDR_SM80, HDR_SM89_V84] {
+        for h in [HDR_SM80, HDR_SM89_V84, HDR_SM90A_V80] {
             if h.contains(".version 8.4") {
                 assert!(
                     h.contains(TARGET_SM89),
