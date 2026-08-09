@@ -45,6 +45,21 @@
 //! position-keyed: partitioning by *physical block* — the obvious next optimization, and one that still
 //! satisfies "one fixed accumulation order per lane" — makes the accumulation order a function of the
 //! layout and breaks bit-exactness.
+//!
+//! ## Grouped-query attention
+//! The decode kernels take **two** head counts (see [`crate::paged_kv::GqaConfig`]): `pHeads`, the
+//! **query**-head count, sizes the grid and addresses the Q and O rows; `pKvHeads` addresses the cache
+//! and nothing else. A warp still owns one `(slot, q_head)` pair and simply gathers from KV head
+//! `q_head / (q_heads / kv_heads)` — Q, O and the lane partition are untouched. `kv_append` and the
+//! int8 quantizer are KV-headed throughout and needed no change at all, because the thing they write
+//! *is* the K/V projection.
+//!
+//! **The layout-invariance proof survives GQA by the argument above, not by luck**: the property rests
+//! on the lane partition being a function of the logical position index alone (`t % 32`) and on a fixed
+//! butterfly merge order. GQA changes which *head's* K/V a lane reads and neither of those two things,
+//! so `paged_gqa_attention_invariant_to_block_layout` holds for the same reason its MHA twin does. It
+//! is worth saying out loud because this is exactly the kind of change that looks like it should break
+//! it — and the gate is run anyway rather than the argument trusted.
 
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
@@ -54,10 +69,10 @@ use cudarc::driver::{
     CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
 
-// Only the (gpu-gated) launchers and device gates take a `KvConfig`; the generators, the quantizer
-// and the f64 reference are geometry-free, which is what lets this module compile un-gated.
+// Only the (gpu-gated) launchers and device gates take a `KvConfig`/`GqaConfig`; the generators, the
+// quantizer and the f64 reference are geometry-free, which is what lets this module compile un-gated.
 #[cfg(feature = "gpu")]
-use crate::paged_kv::KvConfig;
+use crate::paged_kv::{GqaConfig, KvConfig};
 
 // The module header every generator below opens with. `ptx_target` is deliberately un-gated (pure
 // strings, no `cudarc`) precisely so this un-gated module — whose PTX-shape gates run in a plain,
@@ -78,9 +93,17 @@ pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
 /// lanes split the context positions (`lane, lane+32, …`), each keeping a partial online-softmax state,
 /// then a fixed shfl-butterfly merge combines them (`m`→max, rescale, `l`/`acc`→sum). The query vector
 /// lives in shared memory (one copy per warp, read by every lane). `PAGED_ATTN_WARPS` `(slot,head)`
-/// pairs per CTA. Layout matches [`crate::paged_kv::KvConfig::elem_offset`]: `[layers, num_blocks, block_size, heads,
+/// pairs per CTA. Layout matches [`crate::paged_kv::KvConfig::elem_offset`]: `[layers, num_blocks, block_size, kv_heads,
 /// head_dim]`, f16 cache, f32 query/out. **Bit-exact across block layouts** (the lane partition + merge
 /// order are layout-independent; the block table only changes the load address).
+///
+/// **GQA:** the warp owns a `(slot, q_head)` pair and reads KV head `q_head / (q_heads / kv_heads)`.
+/// `pHeads` is the **query**-head count (it drives the grid, the `(slot, head)` split and the Q/O row);
+/// `pKvHeads` is the **KV**-head count (it drives the cache offset alone). Both are runtime `.param`s
+/// rather than baked constants precisely so one PTX per `head_dim` still serves every grouping — a
+/// per-`g` variant would need a per-`g` module-cache key, and [`crate::Gpu::function`] caches on the
+/// key alone and never re-examines the PTX on a hit. `q_heads == kv_heads` makes the group size 1 and
+/// the mapping the identity, i.e. exactly the pre-GQA kernel.
 pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     assert!(
         head_dim > 0 && head_dim.is_multiple_of(2),
@@ -114,6 +137,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
         \x20   .param .f32 pScale,\n\
         \x20   .param .u32 pBcap,\n\
         \x20   .param .u32 pHeads,\n\
+        \x20   .param .u32 pKvHeads,\n\
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
@@ -123,7 +147,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
     s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt;\n";
     s += "    .reg .b16 %h;\n";
-    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%dd;\n";
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%dd,%kvheads,%kvhead,%grp;\n";
     s += "    .reg .b64 %Q,%K,%V,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
     s += "    .reg .pred %p0,%p1,%p2;\n";
     s += "    ld.param.u64 %Q,[pQ];   cvta.to.global.u64 %Q,%Q;\n";
@@ -133,14 +157,18 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     s += "    ld.param.u64 %BT,[pBT]; cvta.to.global.u64 %BT,%BT;\n";
     s += "    ld.param.u64 %CL,[pCL]; cvta.to.global.u64 %CL,%CL;\n";
     s += "    ld.param.f32 %scale,[pScale];\n";
-    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
+    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %kvheads,[pKvHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
     s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
     // tid = tid.x ; warp = tid/32 ; lane = tid%32 ; gid = ctaid.x*WARPS + warp.
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
     s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
-    // slot = gid/heads ; head = gid - slot*heads ; ctx = CL[slot].
+    // slot = gid/heads ; head = gid - slot*heads ; ctx = CL[slot].  (`heads` is the QUERY head count.)
     s += "    div.u32 %slot,%gid,%heads;\n    mul.lo.s32 %tmp,%slot,%heads;\n    sub.u32 %head,%gid,%tmp;\n";
+    // GQA: grp = q_heads/kv_heads ; kvhead = head/grp. Both warp-uniform and loop-invariant, so this
+    // is two integer divides per warp, once. The host validates q_heads % kv_heads == 0 (GqaConfig),
+    // which is what makes `grp` exact and non-zero; MHA gives grp = 1 and kvhead = head.
+    s += "    div.u32 %grp,%heads,%kvheads;\n    div.u32 %kvhead,%head,%grp;\n";
     s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
     // qidx = slot*D + head*hd ; qrow = Q + qidx*4 ; obase = O + qidx*4.
     s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
@@ -162,10 +190,12 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     // logical = t/bsz ; off = t - logical*bsz ; phys = BT[slot*mbps + logical].
     s += "    div.u32 %logical,%t,%bsz;\n    mul.lo.s32 %off,%logical,%bsz;\n    sub.u32 %off,%t,%off;\n";
     s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
-    // e = ((((layer*nblk)+phys)*bsz + off)*heads + head)*hd ; kbase/vbase = slab + e*2.
+    // e = ((((layer*nblk)+phys)*bsz + off)*kvheads + kvhead)*hd ; kbase/vbase = slab + e*2.
+    // The cache is KV-headed: this chain reproduces `KvConfig::elem_offset`, whose head axis is
+    // `kv_heads` wide. Using the query head here would index past the (g-times-smaller) slab.
     s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
     s += &format!(
-        "    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%head;\n    mul.lo.s32 %e,%e,{hd};\n"
+        "    mul.lo.s32 %e,%e,%kvheads;\n    add.u32 %e,%e,%kvhead;\n    mul.lo.s32 %e,%e,{hd};\n"
     );
     s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %kbase,%K,%offb;\n    add.s64 %vbase,%V,%offb;\n";
     // score = scale * dot(q, K[t])  (q from shared, K widened from f16).
@@ -225,6 +255,10 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
 ///
 /// `scale` is `1/sqrt(head_dim)`. Drawn-from-`alloc` (uninitialized) `out_d` is safe — the kernel fully
 /// overwrites every active slot's row (inactive slots get zeros).
+///
+/// This is the **multi-head** entry point: it treats `cfg.heads` as both the query- and the KV-head
+/// count. A grouped-query model must go through [`launch_paged_attn_decode_gqa`], which takes the two
+/// counts separately; this function is exactly that one at `GqaConfig::mha(*cfg)`.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn launch_paged_attn_decode(
@@ -241,25 +275,67 @@ pub fn launch_paged_attn_decode(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    launch_paged_attn_decode_gqa(
+        stream,
+        func,
+        q_d,
+        k_d,
+        v_d,
+        out_d,
+        bt_d,
+        cl_d,
+        &GqaConfig::mha(*cfg),
+        layer,
+        bcap,
+        scale,
+    )
+}
+
+/// Launch the **grouped-query** paged decode-attention kernel for one layer — [`launch_paged_attn_decode`]
+/// with the query- and KV-head counts held apart by [`GqaConfig`]:
+/// - `q_d` / `out_d`: f32 `[bcap, gqa.q_dim()]` — **query**-headed (`q_heads * head_dim`, the hidden size).
+/// - `k_d` / `v_d`: the f16 KV slabs (`gqa.kv().slab_elems()` each), **KV**-headed
+///   `[layers, num_blocks, block_size, kv_heads, head_dim]`.
+///
+/// Query head `h` reads KV head `h / gqa.group_size()`; the kernel recomputes that mapping on device
+/// from the two `.param` head counts. MQA (`kv_heads == 1`) and MHA (`kv_heads == q_heads`) are the
+/// endpoints of the same code path, not special cases.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_gqa(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    k_d: &CudaSlice<half::f16>,
+    v_d: &CudaSlice<half::f16>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let cfg = gqa.kv();
     debug_assert_eq!(
         q_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "q must be [bcap, heads*head_dim]"
+        bcap * gqa.q_dim(),
+        "q must be [bcap, q_heads*head_dim] (query-headed, not KV-headed)"
     );
     debug_assert_eq!(
         out_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "out must be [bcap, heads*head_dim]"
+        bcap * gqa.q_dim(),
+        "out must be [bcap, q_heads*head_dim] (query-headed, not KV-headed)"
     );
     debug_assert_eq!(
         k_d.len(),
         cfg.slab_elems(),
-        "k slab must be cfg.slab_elems()"
+        "k slab must be cfg.slab_elems() (KV-headed)"
     );
     debug_assert_eq!(
         v_d.len(),
         cfg.slab_elems(),
-        "v slab must be cfg.slab_elems()"
+        "v slab must be cfg.slab_elems() (KV-headed)"
     );
     debug_assert_eq!(
         bt_d.len(),
@@ -267,14 +343,16 @@ pub fn launch_paged_attn_decode(
         "block table must be [bcap, cfg.max_blocks_per_seq]"
     );
     debug_assert_eq!(cl_d.len(), bcap, "context lengths must be one u32 per slot");
-    let nq = (bcap * cfg.heads) as u32;
+    // One warp per (slot, QUERY head) — the grid is query-headed even though the cache is not.
+    let nq = (bcap * gqa.q_heads()) as u32;
     let cfg_launch = LaunchConfig {
         grid_dim: (nq.div_ceil(PAGED_ATTN_WARPS), 1, 1),
         block_dim: (32 * PAGED_ATTN_WARPS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (heads, bsz, nblk, mbps, layer_u) = (
-        cfg.heads as u32,
+    let (heads, kvheads, bsz, nblk, mbps, layer_u) = (
+        gqa.q_heads() as u32,
+        gqa.kv_heads() as u32,
         cfg.block_size as u32,
         cfg.num_blocks as u32,
         cfg.max_blocks_per_seq as u32,
@@ -291,17 +369,23 @@ pub fn launch_paged_attn_decode(
         .arg(&scale);
     b.arg(&bcap_u)
         .arg(&heads)
+        .arg(&kvheads)
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
         .arg(&layer_u);
     // SAFETY: the pushed arguments match `PAGED_ATTN_ENTRY`'s parameter list in order and width (six
-    // .u64 pointers, one .f32, six .u32 — see `paged_attn_decode_ptx`), and `func` was loaded from PTX
-    // generated for `cfg.head_dim` (the entry is head_dim-specialized). Every buffer is at least as long
-    // as the largest index this kernel's address arithmetic can produce for `bcap` slots at `layer`: the
-    // `%e` chain reproduces `KvConfig::elem_offset`, bounded by `slab_elems()`; `BT[slot*mbps+logical]`
-    // by `bcap * max_blocks_per_seq`; `CL[slot]` and the `Q`/`O` rows by the shapes asserted above —
-    // which the caller guarantees and the debug asserts check at the call site.
+    // .u64 pointers, one .f32, **seven** .u32 — `pKvHeads` sits between `pHeads` and `pBsz`; see
+    // `paged_attn_decode_ptx`, and `attention_entry_param_counts_match_the_launcher_push_lists` pins
+    // the counts textually against this list). `func` was loaded from PTX generated for
+    // `cfg.head_dim` (the entry is head_dim-specialized). Every buffer is at least as long as the
+    // largest index this kernel's address arithmetic can produce for `bcap` slots at `layer`: the
+    // `%e` chain reproduces `KvConfig::elem_offset` at the **KV** head axis, bounded by
+    // `slab_elems()`; `BT[slot*mbps+logical]` by `bcap * max_blocks_per_seq`; `CL[slot]` and the
+    // query-headed `Q`/`O` rows by the shapes asserted above — which the caller guarantees and the
+    // debug asserts check at the call site. The device `div.u32 %grp,%heads,%kvheads` is exact and
+    // non-zero because `GqaConfig`'s constructor rejects a non-divisible or zero pair, so `%kvhead`
+    // cannot exceed `kv_heads - 1` and the offset cannot leave the slab.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
@@ -316,6 +400,11 @@ pub const PAGED_ATTN_INT8_ENTRY: &str = "paged_attn_decode_int8";
 /// `acc += (p·scaleV)·int8V[d]`. Halves the cache footprint vs f16 (a quarter of f32); the tiny scale
 /// slab is `head_dim×` smaller than the K slab. Same warp-cooperative online softmax; **bit-exact across
 /// block layouts** (the dequant multiply order is fixed per token). Tolerance-gated (lossy), not bit-exact.
+///
+/// **GQA:** identical treatment to the f16 twin — `pHeads` is the query-head count, `pKvHeads` the KV
+/// one, and query head `h` reads KV head `h / (q_heads / kv_heads)`. Both the int8 value index and the
+/// per-(token, head) *scale* index are KV-headed, since the scale slab has one entry per cached
+/// `(token, kv_head)`.
 pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     assert!(
         head_dim > 0 && head_dim.is_multiple_of(2),
@@ -348,6 +437,7 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
         \x20   .param .f32 pScale,\n\
         \x20   .param .u32 pBcap,\n\
         \x20   .param .u32 pHeads,\n\
+        \x20   .param .u32 pKvHeads,\n\
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
@@ -356,7 +446,7 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
     s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt,%scK,%scV,%pv;\n";
-    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%es,%ki,%dd;\n";
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%es,%ki,%dd,%kvheads,%kvhead,%grp;\n";
     s += "    .reg .b64 %Q,%K,%V,%Ksc,%Vsc,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
     s += "    .reg .pred %p0,%p1,%p2;\n";
     s += "    ld.param.u64 %Q,[pQ];     cvta.to.global.u64 %Q,%Q;\n";
@@ -368,12 +458,14 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += "    ld.param.u64 %BT,[pBT];   cvta.to.global.u64 %BT,%BT;\n";
     s += "    ld.param.u64 %CL,[pCL];   cvta.to.global.u64 %CL,%CL;\n";
     s += "    ld.param.f32 %scale,[pScale];\n";
-    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
+    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %kvheads,[pKvHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
     s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
     s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
     s += "    div.u32 %slot,%gid,%heads;\n    mul.lo.s32 %tmp,%slot,%heads;\n    sub.u32 %head,%gid,%tmp;\n";
+    // GQA head mapping, exactly as in the f16 twin: kvhead = q_head / (q_heads / kv_heads).
+    s += "    div.u32 %grp,%heads,%kvheads;\n    div.u32 %kvhead,%head,%grp;\n";
     s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
     s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
     s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n    add.s64 %obase,%O,%offb;\n";
@@ -390,9 +482,10 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += "    mov.u32 %t,%lane;\nLOOP:\n    setp.ge.u32 %p1,%t,%ctx;\n    @%p1 bra ENDLOOP;\n";
     s += "    div.u32 %logical,%t,%bsz;\n    mul.lo.s32 %off,%logical,%bsz;\n    sub.u32 %off,%t,%off;\n";
     s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
-    // es = token-head linear index (scale slab) ; e = es*hd (int8 element index).
+    // es = (token, KV head) linear index (scale slab) ; e = es*hd (int8 element index). Both axes are
+    // KV-headed — the scale slab holds one entry per cached (token, kv_head), not per query head.
     s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
-    s += "    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%head;\n    mov.u32 %es,%e;\n";
+    s += "    mul.lo.s32 %e,%e,%kvheads;\n    add.u32 %e,%e,%kvhead;\n    mov.u32 %es,%e;\n";
     s += &format!("    mul.lo.s32 %e,%e,{hd};\n");
     // Per-token-head dequant scales.
     s += "    mul.wide.u32 %offb,%es,4;\n    add.s64 %addr,%Ksc,%offb;\n    ld.global.f32 %scK,[%addr];\n    add.s64 %addr,%Vsc,%offb;\n    ld.global.f32 %scV,[%addr];\n";
@@ -446,6 +539,9 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
 /// Launch the **int8-KV** paged decode-attention kernel. Like [`launch_paged_attn_decode`] but `k_d`/`v_d`
 /// are `int8` slabs and `ksc_d`/`vsc_d` the per-(token, head) f32 scale slabs (`cfg.scale_slab_elems()`
 /// each). `scale` is `1/sqrt(head_dim)`. Full-overwrite of every active slot's output row.
+///
+/// The multi-head entry point; a grouped-query model wants
+/// [`launch_paged_attn_decode_int8_gqa`], of which this is the `GqaConfig::mha(*cfg)` case.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn launch_paged_attn_decode_int8(
@@ -464,15 +560,56 @@ pub fn launch_paged_attn_decode_int8(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    launch_paged_attn_decode_int8_gqa(
+        stream,
+        func,
+        q_d,
+        k_d,
+        v_d,
+        ksc_d,
+        vsc_d,
+        out_d,
+        bt_d,
+        cl_d,
+        &GqaConfig::mha(*cfg),
+        layer,
+        bcap,
+        scale,
+    )
+}
+
+/// Launch the **grouped-query int8-KV** paged decode-attention kernel — the int8 twin of
+/// [`launch_paged_attn_decode_gqa`]. `q_d`/`out_d` are query-headed `[bcap, gqa.q_dim()]`; the int8
+/// value slabs and both f32 scale slabs are KV-headed, and query head `h` dequants KV head
+/// `h / gqa.group_size()` with that head's own per-(token, head) scale.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_int8_gqa(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    k_d: &CudaSlice<i8>,
+    v_d: &CudaSlice<i8>,
+    ksc_d: &CudaSlice<f32>,
+    vsc_d: &CudaSlice<f32>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let cfg = gqa.kv();
     debug_assert_eq!(
         q_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "q must be [bcap, heads*head_dim]"
+        bcap * gqa.q_dim(),
+        "q must be [bcap, q_heads*head_dim] (query-headed, not KV-headed)"
     );
     debug_assert_eq!(
         out_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "out must be [bcap, heads*head_dim]"
+        bcap * gqa.q_dim(),
+        "out must be [bcap, q_heads*head_dim] (query-headed, not KV-headed)"
     );
     debug_assert_eq!(
         k_d.len(),
@@ -500,14 +637,16 @@ pub fn launch_paged_attn_decode_int8(
         "block table must be [bcap, cfg.max_blocks_per_seq]"
     );
     debug_assert_eq!(cl_d.len(), bcap, "context lengths must be one u32 per slot");
-    let nq = (bcap * cfg.heads) as u32;
+    // One warp per (slot, QUERY head).
+    let nq = (bcap * gqa.q_heads()) as u32;
     let cfg_launch = LaunchConfig {
         grid_dim: (nq.div_ceil(PAGED_ATTN_WARPS), 1, 1),
         block_dim: (32 * PAGED_ATTN_WARPS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (heads, bsz, nblk, mbps, layer_u) = (
-        cfg.heads as u32,
+    let (heads, kvheads, bsz, nblk, mbps, layer_u) = (
+        gqa.q_heads() as u32,
+        gqa.kv_heads() as u32,
         cfg.block_size as u32,
         cfg.num_blocks as u32,
         cfg.max_blocks_per_seq as u32,
@@ -526,24 +665,30 @@ pub fn launch_paged_attn_decode_int8(
         .arg(&scale);
     b.arg(&bcap_u)
         .arg(&heads)
+        .arg(&kvheads)
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
         .arg(&layer_u);
     // SAFETY: the pushed arguments match `PAGED_ATTN_INT8_ENTRY`'s parameter list in order and width
-    // (eight .u64 pointers, one .f32, six .u32 — see `paged_attn_decode_int8_ptx`), and `func` was
-    // loaded from PTX generated for `cfg.head_dim`. Every buffer is at least as long as the largest
-    // index the kernel can produce for `bcap` slots at `layer`: `%e` reproduces `KvConfig::elem_offset`
-    // (bounded by `slab_elems()`) and `%es` reproduces `KvConfig::scale_offset` (bounded by
-    // `scale_slab_elems()`); the table/lengths/rows are bounded by the shapes asserted above, which the
-    // caller guarantees and the debug asserts check at the call site.
+    // (eight .u64 pointers, one .f32, **seven** .u32 — `pKvHeads` between `pHeads` and `pBsz`; see
+    // `paged_attn_decode_int8_ptx`, textually pinned by
+    // `attention_entry_param_counts_match_the_launcher_push_lists`), and `func` was loaded from PTX
+    // generated for `cfg.head_dim`. Every buffer is at least as long as the largest index the kernel
+    // can produce for `bcap` slots at `layer`: `%e` reproduces `KvConfig::elem_offset` and `%es`
+    // `KvConfig::scale_offset`, both at the **KV** head axis (bounded by `slab_elems()` /
+    // `scale_slab_elems()`); the table/lengths/query-headed rows are bounded by the shapes asserted
+    // above, which the caller guarantees and the debug asserts check at the call site. `GqaConfig`'s
+    // constructor is what makes the device `div.u32 %grp,%heads,%kvheads` exact and non-zero.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
 
-/// **Host reference quantizer**: per-slot f32 K/V (`[ctx, heads, head_dim]` row-major) → int8 values +
-/// per-(token, head) f32 scales (`scale = max_d |x| / 127`, `0 → 1`), `int8 = round(x / scale)` clamped.
-/// The device int8 cache stores exactly this; [`paged_attn_decode_int8_ptx`] dequants `int8 · scale`.
+/// **Host reference quantizer**: per-slot f32 K/V (`[ctx, kv_heads, head_dim]` row-major) → int8
+/// values plus per-(token, KV head) f32 scales (`scale = max_d |x| / 127`, `0 → 1`),
+/// `int8 = round(x / scale)` clamped. The device int8 cache stores exactly this;
+/// [`paged_attn_decode_int8_ptx`] dequants `int8 · scale`. `heads` is a **KV**-head count: the cache
+/// and its scales have no query-head axis.
 pub fn quantize_kv_int8(
     slot: &[f32],
     ctx: usize,
@@ -570,10 +715,18 @@ pub fn quantize_kv_int8(
 /// PTX entry name for the KV-append (scatter) kernel.
 pub const KV_APPEND_ENTRY: &str = "kv_append";
 
-/// Generate the **KV-append** PTX: scatter each slot's just-projected new token K and V (f32 `[bcap,
-/// D]`) into the paged f16 cache at the slot's write position, through its block table. One thread per
-/// `(slot, channel)` element. `head_dim` is a runtime param (no unroll needed — it's a pure scatter).
-/// This is the device twin of [`crate::paged_kv::BlockManager::append`]'s `(phys, off)` address.
+/// Generate the **KV-append** PTX: scatter each slot's just-projected new token K and V (f32
+/// `[bcap, kv_heads*head_dim]`) into the paged f16 cache at the slot's write position, through its
+/// block table. One thread per `(slot, channel)` element. `head_dim` is a runtime param (no unroll
+/// needed — it's a pure scatter). This is the device twin of
+/// [`crate::paged_kv::BlockManager::append`]'s `(phys, off)` address.
+///
+/// **GQA needs no change here, and that is a fact worth stating rather than leaving to inference.**
+/// The append writes the K/V *projection*, which a grouped-query model emits at `kv_heads*head_dim`
+/// wide — so `pHeads` is a KV-head count, `pHd*pHeads` is the source row stride, and the query-head
+/// count never enters this kernel at all. Passing a query-headed `knew`/`vnew` is therefore the
+/// GQA bug this kernel cannot detect for itself; [`launch_kv_append_gqa`] exists to assert the shape
+/// at the seam where both counts are still in scope.
 pub fn kv_append_ptx() -> String {
     let mut s = String::new();
     s += HDR_SM80;
@@ -639,7 +792,9 @@ pub fn kv_append_ptx() -> String {
 pub const KV_APPEND_BLOCK: u32 = 256;
 
 /// Launch the KV-append scatter for **one layer**: write the new token K/V (`knew_d`/`vnew_d`, f32
-/// `[bcap, D]`) into the f16 cache slabs at each slot's `wpos_d[slot]` position, via the block table.
+/// `[bcap, kv_heads*head_dim]`) into the f16 cache slabs at each slot's `wpos_d[slot]` position, via
+/// the block table. (`cfg.heads` is the KV-head count; see [`launch_kv_append_gqa`] for the
+/// grouped-query seam that asserts the projection width.)
 /// `wpos_d[slot]` must be the slot's pre-append position and its block must already be reserved (the
 /// host [`BlockManager::append`](crate::paged_kv::BlockManager::append) does both). `active_d[slot]`
 /// (u32 0/1) gates the write: a `0` (free/padding) slot is skipped entirely — its block table pads to
@@ -732,6 +887,54 @@ pub fn launch_kv_append(
     // asserts above check the lengths at the call site.
     unsafe { b.launch(launch)? };
     Ok(())
+}
+
+/// [`launch_kv_append`] for a **grouped-query** model. The append is KV-headed end to end, so this is
+/// `launch_kv_append(.., gqa.kv(), ..)` plus the one assertion that catches the GQA mistake the kernel
+/// cannot: `knew_d`/`vnew_d` must be `[bcap, gqa.kv_dim()]` — the **K/V projection** width — and never
+/// `[bcap, gqa.q_dim()]`. Getting that wrong is silent, not a fault: a query-headed source row is `g`
+/// times too long, so every slot past the first reads its neighbour's channels and the cache fills
+/// with plausible garbage that no tolerance gate downstream can attribute.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_gqa(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    k_d: &mut CudaSlice<half::f16>,
+    v_d: &mut CudaSlice<half::f16>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    debug_assert_eq!(
+        knew_d.len(),
+        bcap * gqa.kv_dim(),
+        "knew must be [bcap, kv_heads*head_dim] — the K/V projection width, not the hidden size"
+    );
+    debug_assert_eq!(
+        vnew_d.len(),
+        bcap * gqa.kv_dim(),
+        "vnew must be [bcap, kv_heads*head_dim] — the K/V projection width, not the hidden size"
+    );
+    launch_kv_append(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        k_d,
+        v_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        gqa.kv(),
+        layer,
+        bcap,
+    )
 }
 
 /// PTX entry name for the **int8** KV-append (quantize + scatter) kernel.
@@ -851,7 +1054,7 @@ pub fn kv_append_int8_ptx() -> String {
 }
 
 /// Launch the **int8** KV-append for one layer: quantize + scatter the new token K/V (`knew_d`/
-/// `vnew_d`, f32 `[bcap, D]`) into the int8 slabs and the per-(token, head) f32 scale slabs at each
+/// `vnew_d`, f32 `[bcap, kv_heads*head_dim]`) into the int8 slabs and the per-(token, KV head) f32 scale slabs at each
 /// slot's `wpos_d[slot]` position, via the block table. Same contract as [`launch_kv_append`]
 /// (reserved positions, `active_d` mask gating every write); one warp per `(slot, head)`.
 #[cfg(feature = "gpu")]
@@ -957,10 +1160,63 @@ pub fn launch_kv_append_int8(
     Ok(())
 }
 
+/// [`launch_kv_append_int8`] for a **grouped-query** model — the int8 twin of
+/// [`launch_kv_append_gqa`], and KV-headed for the same reason: one warp per `(slot, kv_head)`, one
+/// amax reduction and one f32 scale pair per cached `(token, kv_head)`. The added assertion is again
+/// that `knew_d`/`vnew_d` carry the **K/V projection** width `gqa.kv_dim()`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_int8_gqa(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    k_d: &mut CudaSlice<i8>,
+    v_d: &mut CudaSlice<i8>,
+    ksc_d: &mut CudaSlice<f32>,
+    vsc_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    debug_assert_eq!(
+        knew_d.len(),
+        bcap * gqa.kv_dim(),
+        "knew must be [bcap, kv_heads*head_dim] — the K/V projection width, not the hidden size"
+    );
+    debug_assert_eq!(
+        vnew_d.len(),
+        bcap * gqa.kv_dim(),
+        "vnew must be [bcap, kv_heads*head_dim] — the K/V projection width, not the hidden size"
+    );
+    launch_kv_append_int8(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        k_d,
+        v_d,
+        ksc_d,
+        vsc_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        gqa.kv(),
+        layer,
+        bcap,
+    )
+}
+
 /// **f64 full-softmax CPU reference** for the decode attention — the tolerance oracle. `q` is
 /// `[bcap, D]`; `k_slots`/`v_slots[b]` are slot `b`'s contiguous context, each `[ctx_b, heads,
 /// head_dim]` row-major (`ctx_b == ctx_lens[b]`). Returns `out` `[bcap, D]` f32. A slot with `ctx_b ==
 /// 0` (inactive) produces a zero row — exactly what the kernel emits.
+///
+/// Multi-head only: for a grouped-query model use [`reference_decode_attn_gqa`], of which this is the
+/// `q_heads == kv_heads` case (and bit-identical to it, gated).
 pub fn reference_decode_attn(
     q: &[f32],
     k_slots: &[Vec<f32>],
@@ -970,9 +1226,45 @@ pub fn reference_decode_attn(
     head_dim: usize,
     scale: f32,
 ) -> Vec<f32> {
+    reference_decode_attn_gqa(q, k_slots, v_slots, ctx_lens, heads, heads, head_dim, scale)
+}
+
+/// **f64 full-softmax CPU reference for grouped-query decode attention** — the tolerance oracle for
+/// the GQA path. `q` is `[bcap, q_heads*head_dim]`; `k_slots`/`v_slots[b]` are slot `b`'s contiguous
+/// context, each `[ctx_b, kv_heads, head_dim]` row-major. Returns `out` `[bcap, q_heads*head_dim]`.
+/// Query head `h` attends over KV head `h / (q_heads / kv_heads)` — the contiguous grouping. A slot
+/// with `ctx_b == 0` produces a zero row, as the kernel does.
+///
+/// **This is an independent oracle, deliberately.** It shares no code with the launch path: it does
+/// not build the KV layout with [`crate::paged_kv::KvConfig::elem_offset`] (its `k_slots` are plain
+/// contiguous per-slot contexts, and the *caller* is what scatters them into the paged slab), it
+/// re-derives the head mapping from the definition of GQA rather than calling
+/// [`crate::paged_kv::GqaConfig::kv_head_of`], and it computes a full materialized softmax in f64
+/// where the kernel runs a streaming online softmax in f32. Routing it through the same host encoder
+/// the kernel path uses is the circular oracle this crate has already been bitten by (`bb52f08`).
+#[allow(clippy::too_many_arguments)]
+pub fn reference_decode_attn_gqa(
+    q: &[f32],
+    k_slots: &[Vec<f32>],
+    v_slots: &[Vec<f32>],
+    ctx_lens: &[usize],
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    assert!(
+        q_heads > 0 && kv_heads > 0 && q_heads.is_multiple_of(kv_heads),
+        "reference_decode_attn_gqa: q_heads ({q_heads}) must be a positive whole multiple of \
+         kv_heads ({kv_heads})"
+    );
+    // The GQA definition, written out here rather than borrowed from the geometry helper: query heads
+    // [j*group, (j+1)*group) all read KV head j.
+    let group = q_heads / kv_heads;
     let bcap = ctx_lens.len();
-    let d = heads * head_dim;
-    let mut out = vec![0f32; bcap * d];
+    let qd = q_heads * head_dim;
+    let kvd = kv_heads * head_dim;
+    let mut out = vec![0f32; bcap * qd];
     for b in 0..bcap {
         let ctx = ctx_lens[b];
         if ctx == 0 {
@@ -980,15 +1272,26 @@ pub fn reference_decode_attn(
         }
         let kb = &k_slots[b];
         let vb = &v_slots[b];
-        for h in 0..heads {
-            // scores[t] = scale * dot(q[b,h], K[b,t,h])  (f64 accumulate).
+        assert_eq!(
+            kb.len(),
+            ctx * kvd,
+            "slot {b}: K context must be [ctx, kv_heads, head_dim]"
+        );
+        assert_eq!(
+            vb.len(),
+            ctx * kvd,
+            "slot {b}: V context must be [ctx, kv_heads, head_dim]"
+        );
+        for h in 0..q_heads {
+            let kvh = h / group;
+            // scores[t] = scale * dot(q[b,h], K[b,t,kvh])  (f64 accumulate).
             let mut scores = vec![0f64; ctx];
             let mut mx = f64::NEG_INFINITY;
             for (t, sc) in scores.iter_mut().enumerate() {
                 let mut acc = 0f64;
                 for dh in 0..head_dim {
-                    let qv = q[b * d + h * head_dim + dh] as f64;
-                    let kv = kb[(t * heads + h) * head_dim + dh] as f64;
+                    let qv = q[b * qd + h * head_dim + dh] as f64;
+                    let kv = kb[(t * kv_heads + kvh) * head_dim + dh] as f64;
                     acc += qv * kv;
                 }
                 *sc = acc * scale as f64;
@@ -1005,9 +1308,9 @@ pub fn reference_decode_attn(
                 let mut acc = 0f64;
                 for (t, sc) in scores.iter().enumerate() {
                     let w = (*sc - mx).exp();
-                    acc += w * vb[(t * heads + h) * head_dim + dh] as f64;
+                    acc += w * vb[(t * kv_heads + kvh) * head_dim + dh] as f64;
                 }
-                out[b * d + h * head_dim + dh] = (acc / denom) as f32;
+                out[b * qd + h * head_dim + dh] = (acc / denom) as f32;
             }
         }
     }
@@ -1077,9 +1380,93 @@ mod tests {
             assert!(ptx.contains("cvt.f32.f16"), "f16 cache widened to f32");
             // The output uses rcp + select (the empty-sequence NaN guard).
             assert!(ptx.contains("rcp.rn.f32") && ptx.contains("selp.f32"));
+            assert_gqa_shape(&ptx, "paged_attn_decode");
             assert!(ptx.is_ascii(), "PTX must be pure ASCII (head_dim {hd})");
             // Balanced braces.
             assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
+        }
+    }
+
+    /// The two head counts must be *structurally* separated in the generated PTX, not merely intended
+    /// to be. The query count drives the grid and the Q/O row; the KV count drives the cache offset;
+    /// the bridge between them is `kvhead = head / (heads / kvheads)`. A regression that reverted the
+    /// cache offset to `%heads`/`%head` would still produce loadable PTX and still pass every MHA gate
+    /// (they are equal there) — it would only fail once `g > 1`, on device. This catches it in a plain
+    /// `cargo test`.
+    fn assert_gqa_shape(ptx: &str, what: &str) {
+        assert!(
+            ptx.contains(".param .u32 pKvHeads"),
+            "{what}: the KV-head count must be a runtime .param (a baked constant would need a \
+             per-group module-cache key, and Gpu::function never re-examines the PTX on a hit)"
+        );
+        assert!(
+            ptx.contains("ld.param.u32 %kvheads,[pKvHeads];"),
+            "{what}: pKvHeads must actually be loaded"
+        );
+        assert!(
+            ptx.contains("div.u32 %grp,%heads,%kvheads;"),
+            "{what}: the group size must be derived from both counts"
+        );
+        assert!(
+            ptx.contains("div.u32 %kvhead,%head,%grp;"),
+            "{what}: the query head must be mapped to its KV head"
+        );
+        // The cache offset chain must fold the KV head, and must not fold the query head.
+        assert!(
+            ptx.contains("mul.lo.s32 %e,%e,%kvheads;\n    add.u32 %e,%e,%kvhead;"),
+            "{what}: the slab offset must step by kv_heads and add the KV head"
+        );
+        assert!(
+            !ptx.contains("add.u32 %e,%e,%head;"),
+            "{what}: the slab offset must never fold the QUERY head — the slab has no such axis"
+        );
+        // Q/O addressing stays query-headed: D = heads*hd, and the grid is bcap*heads warps.
+        assert!(
+            ptx.contains("mul.lo.s32 %D,%heads,"),
+            "{what}: the Q/O row stride must stay query-headed"
+        );
+        assert!(
+            ptx.contains("mul.lo.s32 %nq,%bcap,%heads;"),
+            "{what}: the warp grid must stay query-headed"
+        );
+    }
+
+    /// **Launch-seam law (crate rule 2).** The argument list each launcher pushes must match its
+    /// entry's declared `.param` count, derived from the same text. `pKvHeads` moved every attention
+    /// entry from six `.u32` params to seven; pushing the old six would make the driver read adjacent
+    /// host stack as the layer index. The counts below are the ones the four `SAFETY` comments state,
+    /// so this test is what keeps those comments honest.
+    #[test]
+    fn attention_entry_param_counts_match_the_launcher_push_lists() {
+        let count = |ptx: &str, ty: &str| ptx.matches(&format!(".param .{ty} ")).count();
+        for (what, ptx, u64s, f32s, u32s) in [
+            // (pointers, scale, [bcap, heads, kv_heads, bsz, nblk, mbps, layer])
+            ("paged_attn_decode", paged_attn_decode_ptx(64), 6, 1, 7),
+            (
+                "paged_attn_decode_int8",
+                paged_attn_decode_int8_ptx(64),
+                8,
+                1,
+                7,
+            ),
+            // The appends are KV-headed and gained nothing: [bcap, heads, hd, bsz, nblk, mbps, layer].
+            ("kv_append", kv_append_ptx(), 7, 0, 7),
+            ("kv_append_int8", kv_append_int8_ptx(), 9, 0, 7),
+        ] {
+            assert_eq!(count(&ptx, "u64"), u64s, "{what}: .u64 param count");
+            assert_eq!(count(&ptx, "f32"), f32s, "{what}: .f32 param count");
+            assert_eq!(count(&ptx, "u32"), u32s, "{what}: .u32 param count");
+        }
+        // The appends must NOT have grown a KV-head param: they never see a query head at all.
+        for (what, ptx) in [
+            ("kv_append", kv_append_ptx()),
+            ("kv_append_int8", kv_append_int8_ptx()),
+        ] {
+            assert!(
+                !ptx.contains("pKvHeads"),
+                "{what}: the append writes the K/V projection, so its `pHeads` already IS the \
+                 KV-head count — a second one would be two encodings of one fact"
+            );
         }
     }
 
@@ -1110,6 +1497,14 @@ mod tests {
                 "cross-lane online-softmax merge"
             );
             assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
+            assert_gqa_shape(&ptx, "paged_attn_decode_int8");
+            // The per-(token, head) dequant scale index is KV-headed too — the scale slab has one
+            // entry per cached (token, kv_head), so folding the query head there would read a
+            // neighbouring head's scale and silently mis-dequant the whole row.
+            assert!(
+                ptx.contains("mov.u32 %es,%e;"),
+                "the scale index must be taken from the KV-headed offset chain"
+            );
             assert!(ptx.is_ascii(), "PTX must be pure ASCII (head_dim {hd})");
             assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
         }
@@ -1181,6 +1576,135 @@ mod tests {
         for &o in &out[d..2 * d] {
             assert_eq!(o, 0.0);
         }
+    }
+
+    // ==================== GQA reference oracle (no device, no feature gate) ====================
+
+    /// A tiny deterministic generator, so the reference tests below need neither `diff::Rng` (which is
+    /// `gpu`-gated) nor a device. Values are spread across a couple of octaves so the softmax is not
+    /// degenerate.
+    fn seq(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// `reference_decode_attn` must be **bit-for-bit** `reference_decode_attn_gqa` at
+    /// `q_heads == kv_heads`. The MHA entry point is now a delegation, and this is what proves the
+    /// delegation changed no arithmetic — every existing tolerance gate in this crate and in
+    /// `serving.rs` is anchored on the old function, so a drift here would move all of them at once.
+    #[test]
+    fn gqa_reference_is_bit_identical_to_the_mha_reference_at_group_size_one() {
+        for (heads, hd) in [(1usize, 2usize), (3, 4), (4, 8)] {
+            let ctx = vec![5usize, 0, 2];
+            let d = heads * hd;
+            let q = seq(ctx.len() * d, 7 + heads as u32);
+            let k: Vec<Vec<f32>> = ctx.iter().map(|&c| seq(c * d, 11 + c as u32)).collect();
+            let v: Vec<Vec<f32>> = ctx.iter().map(|&c| seq(c * d, 23 + c as u32)).collect();
+            let scale = 1.0 / (hd as f32).sqrt();
+            let mha = reference_decode_attn(&q, &k, &v, &ctx, heads, hd, scale);
+            let gqa = reference_decode_attn_gqa(&q, &k, &v, &ctx, heads, heads, hd, scale);
+            assert_eq!(mha.len(), gqa.len());
+            for i in 0..mha.len() {
+                assert_eq!(
+                    mha[i].to_bits(),
+                    gqa[i].to_bits(),
+                    "heads={heads} hd={hd}: element {i} drifted"
+                );
+            }
+        }
+    }
+
+    /// **The head mapping, proved analytically rather than by agreeing with the kernel.** Give KV head
+    /// `j` a value vector that is the constant `j + 1` at every position and channel. Then whatever the
+    /// scores are, the softmax weights sum to 1 and the output of *every* query head in group `j` is
+    /// exactly `j + 1`. Reading the wrong KV head therefore shows up as an integer-valued output that
+    /// is off by a whole group — no tolerance argument required.
+    #[test]
+    fn gqa_reference_reads_the_grouped_kv_head() {
+        for (q_heads, kv_heads, hd) in [(8usize, 2usize, 4usize), (32, 8, 2), (4, 1, 6), (6, 6, 2)]
+        {
+            let group = q_heads / kv_heads;
+            let (ctx, bcap) = (7usize, 2usize);
+            let kvd = kv_heads * hd;
+            // K varies (so the scores are non-degenerate); V is constant per KV head.
+            let k: Vec<Vec<f32>> = (0..bcap).map(|b| seq(ctx * kvd, 31 + b as u32)).collect();
+            let v: Vec<Vec<f32>> = (0..bcap)
+                .map(|_| {
+                    (0..ctx)
+                        .flat_map(|_| {
+                            (0..kv_heads).flat_map(|j| (0..hd).map(move |_| (j + 1) as f32))
+                        })
+                        .collect()
+                })
+                .collect();
+            let q = seq(bcap * q_heads * hd, 97);
+            let out = reference_decode_attn_gqa(
+                &q,
+                &k,
+                &v,
+                &[ctx; 2],
+                q_heads,
+                kv_heads,
+                hd,
+                1.0 / (hd as f32).sqrt(),
+            );
+            for b in 0..bcap {
+                for h in 0..q_heads {
+                    let want = (h / group + 1) as f32;
+                    for dh in 0..hd {
+                        let got = out[b * q_heads * hd + h * hd + dh];
+                        assert!(
+                            (got - want).abs() < 1e-5,
+                            "{q_heads}q/{kv_heads}kv: slot {b} query head {h} must read KV head \
+                             {} (expected {want}, got {got})",
+                            h / group
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A slot's context must be `[ctx, kv_heads, head_dim]`. Handing the reference a query-headed
+    /// context (`g` times too long) is the single most likely GQA mistake, and it would otherwise
+    /// silently read every value from the wrong offset and still return finite numbers.
+    #[test]
+    #[should_panic(expected = "K context must be")]
+    fn gqa_reference_rejects_a_query_headed_context() {
+        let (q_heads, kv_heads, hd, ctx) = (8usize, 2usize, 4usize, 3usize);
+        let wrong = vec![0.5f32; ctx * q_heads * hd]; // query-headed, not KV-headed
+        let slots = std::slice::from_ref(&wrong);
+        reference_decode_attn_gqa(
+            &vec![0.5f32; q_heads * hd],
+            slots,
+            slots,
+            &[ctx],
+            q_heads,
+            kv_heads,
+            hd,
+            0.5,
+        );
+    }
+
+    /// The reference validates the grouping itself rather than dividing by a bogus group size.
+    #[test]
+    #[should_panic(expected = "whole multiple of")]
+    fn gqa_reference_rejects_an_indivisible_grouping() {
+        reference_decode_attn_gqa(
+            &[0.0; 8],
+            &[vec![0.0; 6]],
+            &[vec![0.0; 6]],
+            &[1],
+            8,
+            3,
+            2,
+            1.0,
+        );
     }
 
     // ============================ GPU gates (need a device; skip if none) ============================
@@ -1269,18 +1793,46 @@ mod tests {
         v_slots: &[Vec<f32>],
         scale: f32,
     ) -> Vec<f32> {
+        run_paged_attn_gqa(
+            g,
+            mgr,
+            &GqaConfig::mha(*cfg),
+            layer,
+            q,
+            k_slots,
+            v_slots,
+            scale,
+        )
+    }
+
+    /// [`run_paged_attn`] for a grouped-query geometry: `q` is `[bcap, q_heads*head_dim]` and each
+    /// slot's `k_slots[b]`/`v_slots[b]` is `[ctx_b, kv_heads, head_dim]` — the **KV**-headed context
+    /// that actually lives in the cache.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_attn_gqa(
+        g: &mut crate::Gpu,
+        mgr: &BlockManager,
+        gqa: &GqaConfig,
+        layer: usize,
+        q: &[f32],
+        k_slots: &[Vec<f32>],
+        v_slots: &[Vec<f32>],
+        scale: f32,
+    ) -> Vec<f32> {
         use half::f16;
+        let cfg = gqa.kv();
         let bcap = cfg.num_slots;
-        let d = cfg.heads * cfg.head_dim;
+        let (kvh_n, hd) = (gqa.kv_heads(), cfg.head_dim);
         let mut kh = vec![f16::from_f32(0.0); cfg.slab_elems()];
         let mut vh = vec![f16::from_f32(0.0); cfg.slab_elems()];
         for b in 0..bcap {
             for t in 0..mgr.context_len(b) {
                 let (phys, off) = mgr.locate(b, t);
-                for h in 0..cfg.heads {
-                    for dh in 0..cfg.head_dim {
+                for h in 0..kvh_n {
+                    for dh in 0..hd {
                         let idx = cfg.elem_offset(layer, phys, off, h, dh);
-                        let src = (t * cfg.heads + h) * cfg.head_dim + dh;
+                        let src = (t * kvh_n + h) * hd + dh;
                         kh[idx] = f16::from_f32(k_slots[b][src]);
                         vh[idx] = f16::from_f32(v_slots[b][src]);
                     }
@@ -1292,11 +1844,13 @@ mod tests {
         let v_d = g.stream.memcpy_stod(&vh).unwrap();
         let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
         let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
-        let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+        let mut out_d = g.stream.alloc_zeros::<f32>(bcap * gqa.q_dim()).unwrap();
         // `Gpu::function` caches on the key alone and never re-examines the PTX on a hit, so a key
-        // shared by two head dims silently hands the second one the first's compiled kernel. No
-        // catch-all: an unmapped head dim must fail loudly, as the production path does (serving.rs).
-        let key: &'static str = match cfg.head_dim {
+        // shared by two head dims silently hands the second one the first's compiled kernel. The
+        // head *counts* are runtime `.param`s, so one key per head_dim still covers every grouping —
+        // which is exactly why they were not baked. No catch-all: an unmapped head dim must fail
+        // loudly, as the production path does (serving.rs).
+        let key: &'static str = match hd {
             64 => "paged_attn_d64",
             128 => "paged_attn_d128",
             other => panic!(
@@ -1304,10 +1858,10 @@ mod tests {
             ),
         };
         let func = g
-            .function(key, &paged_attn_decode_ptx(cfg.head_dim), PAGED_ATTN_ENTRY)
+            .function(key, &paged_attn_decode_ptx(hd), PAGED_ATTN_ENTRY)
             .unwrap();
-        launch_paged_attn_decode(
-            &g.stream, &func, &q_d, &k_d, &v_d, &mut out_d, &bt_d, &cl_d, cfg, layer, bcap, scale,
+        launch_paged_attn_decode_gqa(
+            &g.stream, &func, &q_d, &k_d, &v_d, &mut out_d, &bt_d, &cl_d, gqa, layer, bcap, scale,
         )
         .unwrap();
         g.stream.synchronize().unwrap();
@@ -1332,9 +1886,33 @@ mod tests {
         Vec<Vec<f32>>,
         f32,
     ) {
+        let (gqa, ctx, q, k, v, scale) = fixture_gqa(seed, heads, heads, hd, block_size, ctx);
+        (*gqa.kv(), ctx, q, k, v, scale)
+    }
+
+    /// [`fixture`] for a grouped-query geometry. `q` is `[bcap, q_heads*hd]`; each slot's K/V context
+    /// is `[ctx_b, kv_heads, hd]` (f16-rounded, so only the GPU's f32 order and `ex2.approx` remain as
+    /// error against the reference). The cache is sized for `kv_heads` — which is the point.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::type_complexity)]
+    fn fixture_gqa(
+        seed: u64,
+        q_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        block_size: usize,
+        ctx: Vec<usize>,
+    ) -> (
+        GqaConfig,
+        Vec<usize>,
+        Vec<f32>,
+        Vec<Vec<f32>>,
+        Vec<Vec<f32>>,
+        f32,
+    ) {
         let mut rng = crate::diff::Rng::new(seed);
         let bcap = ctx.len();
-        let d = heads * hd;
+        let kvd = kv_heads * hd;
         let max_bps = ctx
             .iter()
             .copied()
@@ -1344,20 +1922,56 @@ mod tests {
             .max(1)
             + 1;
         let num_blocks = bcap * max_bps + 8;
-        let cfg = KvConfig {
-            layers: 1,
-            heads,
-            head_dim: hd,
-            block_size,
-            num_blocks,
-            num_slots: bcap,
-            max_blocks_per_seq: max_bps,
-        };
-        let k: Vec<Vec<f32>> = (0..bcap).map(|b| rng.vec(ctx[b] * d, -1.0, 1.0)).collect();
-        let v: Vec<Vec<f32>> = (0..bcap).map(|b| rng.vec(ctx[b] * d, -1.0, 1.0)).collect();
-        let q = rng.vec(bcap * d, -1.0, 1.0);
+        let gqa = GqaConfig::new(
+            KvConfig {
+                layers: 1,
+                heads: kv_heads,
+                head_dim: hd,
+                block_size,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            },
+            q_heads,
+        );
+        let k: Vec<Vec<f32>> = (0..bcap)
+            .map(|b| rng.vec(ctx[b] * kvd, -1.0, 1.0))
+            .collect();
+        let v: Vec<Vec<f32>> = (0..bcap)
+            .map(|b| rng.vec(ctx[b] * kvd, -1.0, 1.0))
+            .collect();
+        let q = rng.vec(bcap * q_heads * hd, -1.0, 1.0);
         let scale = 1.0 / (hd as f32).sqrt();
-        (cfg, ctx, q, f16_round(&k), f16_round(&v), scale)
+        (gqa, ctx, q, f16_round(&k), f16_round(&v), scale)
+    }
+
+    /// Replicate a KV-headed per-slot context into the **query-headed** context an equivalent MHA
+    /// model would have to store: query head `h` gets a verbatim copy of KV head `h / g`. This is the
+    /// definition of GQA written as data, and it is what the bit-exactness gate compares against.
+    /// Deliberately *not* built from any launcher-side helper — it is an independent restatement.
+    #[cfg(feature = "gpu")]
+    fn replicate_kv_heads(
+        slots: &[Vec<f32>],
+        ctx: &[usize],
+        q_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+    ) -> Vec<Vec<f32>> {
+        let group = q_heads / kv_heads;
+        slots
+            .iter()
+            .zip(ctx)
+            .map(|(s, &c)| {
+                let mut out = vec![0f32; c * q_heads * hd];
+                for t in 0..c {
+                    for h in 0..q_heads {
+                        let (src, dst) = ((t * kv_heads + h / group) * hd, (t * q_heads + h) * hd);
+                        out[dst..dst + hd].copy_from_slice(&s[src..src + hd]);
+                    }
+                }
+                out
+            })
+            .collect()
     }
 
     /// **Absolute-correctness gate (the first law).** The paged decode-attention kernel must reproduce an
@@ -1459,6 +2073,290 @@ mod tests {
         });
     }
 
+    // ============================== GQA device gates (grouped-query) ==============================
+
+    /// The GQA shapes worth running on real silicon: `(q_heads, kv_heads, head_dim)`. Llama-3-8B's
+    /// grouping (g=4) at both gated head dims, the 70B grouping (g=8), MQA (every query head on one
+    /// KV head — the extreme the divide has to survive), and an MHA control so the same harness proves
+    /// `g = 1` still works through the new code path.
+    #[cfg(feature = "gpu")]
+    const GQA_SHAPES: [(usize, usize, usize); 5] = [
+        (8, 2, 64),  // g = 4, Llama-3-8B's grouping
+        (8, 1, 64),  // MQA
+        (8, 8, 64),  // MHA control through the GQA path
+        (8, 2, 128), // g = 4 at the wider head dim (doubles the register accumulator)
+        (16, 2, 64), // g = 8, Llama-3-70B's grouping
+    ];
+
+    /// **GQA absolute-correctness gate.** Grouped-query paged decode attention must reproduce the f64
+    /// full-softmax reference within tolerance at every grouping — including MQA and the `g = 1`
+    /// control. Ragged contexts (an inactive 0, a sub-block length, a multi-block length) exercise the
+    /// block-table walk and the empty-sequence guard at the same time.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn paged_gqa_attention_matches_reference() {
+        with_gpu("paged_gqa_attention_matches_reference", |g| {
+            for (q_heads, kv_heads, hd) in GQA_SHAPES {
+                let block_size = 16usize;
+                let (gqa, ctx, q, k, v, scale) = fixture_gqa(
+                    0x69A0,
+                    q_heads,
+                    kv_heads,
+                    hd,
+                    block_size,
+                    vec![37, 0, 16, 100, 5, 64],
+                );
+                let cfg = *gqa.kv();
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
+                for (b, &c) in ctx.iter().enumerate() {
+                    if c > 0 {
+                        mgr.reserve(b, c).unwrap();
+                    }
+                }
+                let got = run_paged_attn_gqa(g, &mgr, &gqa, 0, &q, &k, &v, scale);
+                let refv =
+                    reference_decode_attn_gqa(&q, &k, &v, &ctx, q_heads, kv_heads, hd, scale);
+                let s = crate::diff::assert_close("paged_attn_decode_gqa", &got, &refv, 1e-2, 3e-3);
+                eprintln!(
+                    "GQA decode-attn {q_heads}q/{kv_heads}kv x {hd} (g={}) vs f64 ref: max_abs={:.2e} \
+                     max_rel={:.2e} — cache is {}x smaller than the MHA equivalent",
+                    gqa.group_size(),
+                    s.max_abs,
+                    s.max_rel,
+                    gqa.group_size()
+                );
+            }
+        });
+    }
+
+    /// **The head mapping, proved on device against a second kernel run rather than against a host
+    /// helper.** A `g`-grouped cache must give **bit-for-bit** the output an ungrouped cache gives when
+    /// its K/V is the same data with each KV head replicated `g` times — that is what GQA *means*, and
+    /// it is bit-exact rather than tolerance-bounded because the two runs feed identical values to
+    /// identical lanes in identical order (only the load address differs, exactly as for paging).
+    ///
+    /// This is the gate that would catch a mapping that is in-range but wrong (round-robin
+    /// `h % kv_heads` instead of `h / g`), which the tolerance gate above cannot distinguish from
+    /// noise once the values are random.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn paged_gqa_attention_equals_mha_over_replicated_kv() {
+        with_gpu("paged_gqa_attention_equals_mha_over_replicated_kv", |g| {
+            for (q_heads, kv_heads, hd) in GQA_SHAPES {
+                let block_size = 16usize;
+                let ctx = vec![41usize, 0, 16, 77];
+                let (gqa, ctx, q, k, v, scale) =
+                    fixture_gqa(0xC0FFEE, q_heads, kv_heads, hd, block_size, ctx);
+                let cfg = *gqa.kv();
+                // The ungrouped twin: same pool, same block policy, q_heads KV heads.
+                let mha = GqaConfig::mha(KvConfig {
+                    heads: q_heads,
+                    ..cfg
+                });
+                let k_rep = replicate_kv_heads(&k, &ctx, q_heads, kv_heads, hd);
+                let v_rep = replicate_kv_heads(&v, &ctx, q_heads, kv_heads, hd);
+                // One block layout drives both runs, so the only difference is the head axis.
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
+                for (b, &c) in ctx.iter().enumerate() {
+                    if c > 0 {
+                        mgr.reserve(b, c).unwrap();
+                    }
+                }
+                let grouped = run_paged_attn_gqa(g, &mgr, &gqa, 0, &q, &k, &v, scale);
+                let ungrouped = run_paged_attn_gqa(g, &mgr, &mha, 0, &q, &k_rep, &v_rep, scale);
+                assert_eq!(grouped.len(), ungrouped.len());
+                for i in 0..grouped.len() {
+                    assert_eq!(
+                        grouped[i].to_bits(),
+                        ungrouped[i].to_bits(),
+                        "{q_heads}q/{kv_heads}kv: element {i} differs from the replicated-KV MHA run \
+                         — the query head is reading the wrong KV head"
+                    );
+                }
+                eprintln!(
+                    "GQA {q_heads}q/{kv_heads}kv x {hd}: BIT-IDENTICAL to MHA over {}x-replicated KV, \
+                     from a cache holding {} of the elements ({} vs {})",
+                    gqa.group_size(),
+                    if gqa.is_mha() { "all" } else { "a fraction" },
+                    cfg.slab_elems(),
+                    mha.kv().slab_elems()
+                );
+            }
+        });
+    }
+
+    /// **GQA does not disturb paging invariance.** Same logical sequences, two different physical
+    /// block layouts, bit-identical output — the argument in this module's header says GQA changes
+    /// which head's K/V a lane reads and neither the position→lane partition nor the merge order, so
+    /// the property must survive. Run it rather than trust it.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn paged_gqa_attention_invariant_to_block_layout() {
+        with_gpu("paged_gqa_attention_invariant_to_block_layout", |g| {
+            let (q_heads, kv_heads, hd, block_size) = (8usize, 2usize, 64usize, 16usize);
+            let (gqa, ctx, q, k, v, scale) = fixture_gqa(
+                0xB10C6A4,
+                q_heads,
+                kv_heads,
+                hd,
+                block_size,
+                vec![40, 7, 0, 96, 33],
+            );
+            let cfg = *gqa.kv();
+            let mk = || {
+                BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                )
+            };
+            let (mut a, mut bm) = (mk(), mk());
+            for (b, &c) in ctx.iter().enumerate() {
+                if c > 0 {
+                    a.reserve(b, c).unwrap();
+                }
+            }
+            for b in (0..cfg.num_slots).rev() {
+                if ctx[b] > 0 {
+                    bm.reserve(b, ctx[b]).unwrap();
+                }
+            }
+            let first_active = (0..cfg.num_slots).find(|&b| ctx[b] > 0).unwrap();
+            assert_ne!(
+                a.table(first_active),
+                bm.table(first_active),
+                "the two layouts must physically differ for the gate to be meaningful"
+            );
+            let out_a = run_paged_attn_gqa(g, &a, &gqa, 0, &q, &k, &v, scale);
+            let out_b = run_paged_attn_gqa(g, &bm, &gqa, 0, &q, &k, &v, scale);
+            for i in 0..out_a.len() {
+                assert_eq!(
+                    out_a[i].to_bits(),
+                    out_b[i].to_bits(),
+                    "GQA paged attention changed under a different physical block layout at {i}"
+                );
+            }
+            eprintln!(
+                "GQA decode-attn ({q_heads}q/{kv_heads}kv) BIT-IDENTICAL across 2 physical block \
+                 layouts (slot {first_active}: A={:?} vs B={:?}) — paging stays invisible under grouping",
+                a.table(first_active),
+                bm.table(first_active)
+            );
+        });
+    }
+
+    /// **`kv_append` must mask free slots — re-pinned at a GQA shape.** A free slot's block table pads
+    /// with 0, so an unmasked append scatters into physical block 0, which is a *live* block belonging
+    /// to some other sequence. The whole slab is compared against an exact expectation, so an inactive
+    /// row that wrote anything anywhere fails.
+    ///
+    /// The GQA half: the append is KV-headed, so `knew`/`vnew` are `[bcap, kv_heads*head_dim]` and the
+    /// expectation is built over `kv_heads` rows. Passing a query-headed projection here is the GQA
+    /// mistake [`launch_kv_append_gqa`]'s debug assert exists to catch, and the exact-slab comparison
+    /// is what would catch it if the assert were compiled out.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gqa_kv_append_masks_free_slots() {
+        with_gpu("gqa_kv_append_masks_free_slots", |g| {
+            use half::f16;
+            let (q_heads, kv_heads, hd, bsz, bcap) = (8usize, 2usize, 64usize, 16usize, 8usize);
+            let active = [true, false, true, true, false, false, true, false];
+            let wpos = [3usize, 0, 7, 16, 0, 0, 20, 0];
+            let max_bps = wpos.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 4;
+            let gqa = GqaConfig::new(
+                KvConfig {
+                    layers: 1,
+                    heads: kv_heads,
+                    head_dim: hd,
+                    block_size: bsz,
+                    num_blocks,
+                    num_slots: bcap,
+                    max_blocks_per_seq: max_bps,
+                },
+                q_heads,
+            );
+            let cfg = *gqa.kv();
+            let kvd = gqa.kv_dim();
+            assert_eq!(kvd * gqa.group_size(), gqa.q_dim(), "fixture sanity");
+            let mut mgr = BlockManager::new(num_blocks, bsz, bcap, max_bps);
+            for (b, &a) in active.iter().enumerate() {
+                if a {
+                    mgr.reserve(b, wpos[b] + 1).unwrap();
+                }
+            }
+            let mut rng = crate::diff::Rng::new(0x5A1D6A4);
+            let knew = rng.vec(bcap * kvd, -1.0, 1.0);
+            let vnew = rng.vec(bcap * kvd, -1.0, 1.0);
+            let knew_d = g.stream.memcpy_stod(&knew).unwrap();
+            let vnew_d = g.stream.memcpy_stod(&vnew).unwrap();
+            let mut k_d = g.stream.alloc_zeros::<f16>(cfg.slab_elems()).unwrap();
+            let mut v_d = g.stream.alloc_zeros::<f16>(cfg.slab_elems()).unwrap();
+            let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
+            let wpos_u: Vec<u32> = wpos.iter().map(|&p| p as u32).collect();
+            let wpos_d = g.stream.memcpy_stod(&wpos_u).unwrap();
+            let act_u: Vec<u32> = active.iter().map(|&a| a as u32).collect();
+            let act_d = g.stream.memcpy_stod(&act_u).unwrap();
+            let func = g
+                .function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)
+                .unwrap();
+            launch_kv_append_gqa(
+                &g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &bt_d, &wpos_d, &act_d,
+                &gqa, 0, bcap,
+            )
+            .unwrap();
+            g.stream.synchronize().unwrap();
+            let kh = g.stream.memcpy_dtov(&k_d).unwrap();
+            let vh = g.stream.memcpy_dtov(&v_d).unwrap();
+            // Exact slab expectation: zeros everywhere except each ACTIVE slot's KV-headed channels.
+            let mut ek = vec![0f32; cfg.slab_elems()];
+            let mut ev = vec![0f32; cfg.slab_elems()];
+            for b in 0..bcap {
+                if !active[b] {
+                    continue;
+                }
+                let (phys, off) = mgr.locate(b, wpos[b]);
+                for h in 0..kv_heads {
+                    for dh in 0..hd {
+                        let idx = cfg.elem_offset(0, phys, off, h, dh);
+                        let src = b * kvd + h * hd + dh;
+                        ek[idx] = f16::from_f32(knew[src]).to_f32();
+                        ev[idx] = f16::from_f32(vnew[src]).to_f32();
+                    }
+                }
+            }
+            for i in 0..cfg.slab_elems() {
+                assert_eq!(
+                    kh[i].to_f32(),
+                    ek[i],
+                    "K slab elem {i} (inactive-row leak?)"
+                );
+                assert_eq!(
+                    vh[i].to_f32(),
+                    ev[i],
+                    "V slab elem {i} (inactive-row leak?)"
+                );
+            }
+            let written = active.iter().filter(|&&a| a).count();
+            eprintln!(
+                "GQA kv_append ({q_heads}q/{kv_heads}kv, {kvd}-wide projection): {written}/{bcap} \
+                 active slots written at their KV-headed addresses; every inactive row skipped \
+                 (block 0 intact)"
+            );
+        });
+    }
+
     // ===================== P6: int8-KV quantization (tolerance-gated footprint win) =================
 
     /// Quantize each slot's f32 K/V to the int8 cache (per-(token, head) scale), lay them + the scales
@@ -1476,24 +2374,53 @@ mod tests {
         v_slots: &[Vec<f32>],
         scale: f32,
     ) -> Vec<f32> {
+        run_paged_attn_int8_gqa(
+            g,
+            mgr,
+            &GqaConfig::mha(*cfg),
+            layer,
+            q,
+            k_slots,
+            v_slots,
+            scale,
+        )
+    }
+
+    /// [`run_paged_attn_int8`] for a grouped-query geometry: the int8 values *and* both f32 scale
+    /// slabs are KV-headed (one scale per cached `(token, kv_head)`), while `q`/`out` stay
+    /// query-headed.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_attn_int8_gqa(
+        g: &mut crate::Gpu,
+        mgr: &BlockManager,
+        gqa: &GqaConfig,
+        layer: usize,
+        q: &[f32],
+        k_slots: &[Vec<f32>],
+        v_slots: &[Vec<f32>],
+        scale: f32,
+    ) -> Vec<f32> {
+        let cfg = gqa.kv();
         let bcap = cfg.num_slots;
-        let d = cfg.heads * cfg.head_dim;
+        let (kvh_n, hd) = (gqa.kv_heads(), cfg.head_dim);
+        let d = gqa.q_dim();
         let mut kq = vec![0i8; cfg.slab_elems()];
         let mut vq = vec![0i8; cfg.slab_elems()];
         let mut ks = vec![0f32; cfg.scale_slab_elems()];
         let mut vs = vec![0f32; cfg.scale_slab_elems()];
         for b in 0..bcap {
             let ctx = mgr.context_len(b);
-            let (kqi, ksi) = quantize_kv_int8(&k_slots[b], ctx, cfg.heads, cfg.head_dim);
-            let (vqi, vsi) = quantize_kv_int8(&v_slots[b], ctx, cfg.heads, cfg.head_dim);
+            let (kqi, ksi) = quantize_kv_int8(&k_slots[b], ctx, kvh_n, hd);
+            let (vqi, vsi) = quantize_kv_int8(&v_slots[b], ctx, kvh_n, hd);
             for t in 0..ctx {
                 let (phys, off) = mgr.locate(b, t);
-                for h in 0..cfg.heads {
-                    ks[cfg.scale_offset(layer, phys, off, h)] = ksi[t * cfg.heads + h];
-                    vs[cfg.scale_offset(layer, phys, off, h)] = vsi[t * cfg.heads + h];
-                    for dh in 0..cfg.head_dim {
+                for h in 0..kvh_n {
+                    ks[cfg.scale_offset(layer, phys, off, h)] = ksi[t * kvh_n + h];
+                    vs[cfg.scale_offset(layer, phys, off, h)] = vsi[t * kvh_n + h];
+                    for dh in 0..hd {
                         let idx = cfg.elem_offset(layer, phys, off, h, dh);
-                        let src = (t * cfg.heads + h) * cfg.head_dim + dh;
+                        let src = (t * kvh_n + h) * hd + dh;
                         kq[idx] = kqi[src];
                         vq[idx] = vqi[src];
                     }
@@ -1508,21 +2435,17 @@ mod tests {
         let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
         let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
         let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
-        // No catch-all — see the f16 twin in `run_paged_attn`: one cache key must mean one PTX.
-        let key: &'static str = match cfg.head_dim {
+        // No catch-all — see the f16 twin in `run_paged_attn_gqa`: one cache key must mean one PTX.
+        let key: &'static str = match hd {
             64 => "paged_attn_int8_d64",
             128 => "paged_attn_int8_d128",
             other => panic!("paged-attn int8 test harness: no module-cache key for head_dim {other}; add an arm"),
         };
         let func = g
-            .function(
-                key,
-                &paged_attn_decode_int8_ptx(cfg.head_dim),
-                PAGED_ATTN_INT8_ENTRY,
-            )
+            .function(key, &paged_attn_decode_int8_ptx(hd), PAGED_ATTN_INT8_ENTRY)
             .unwrap();
-        launch_paged_attn_decode_int8(
-            &g.stream, &func, &q_d, &k_d, &v_d, &ksc_d, &vsc_d, &mut out_d, &bt_d, &cl_d, cfg,
+        launch_paged_attn_decode_int8_gqa(
+            &g.stream, &func, &q_d, &k_d, &v_d, &ksc_d, &vsc_d, &mut out_d, &bt_d, &cl_d, gqa,
             layer, bcap, scale,
         )
         .unwrap();
@@ -1608,5 +2531,111 @@ mod tests {
             }
             eprintln!("int8-KV decode-attn BIT-IDENTICAL across 2 physical block layouts — paging invisible on the quantized path");
         });
+    }
+
+    /// **GQA on the int8 path.** The two footprint levers compose: grouping divides the cache by `g`
+    /// and int8 storage halves what is left, so a Llama-3-8B-shaped cache lands at ~1/8 of an f16 MHA
+    /// one. Correctness-wise this exercises the piece the f16 kernel does not have — the per-(token,
+    /// **KV** head) dequant scale — where folding a query head into `%es` would read a neighbouring
+    /// head's scale and mis-scale a whole row.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn paged_gqa_int8_attention_matches_reference() {
+        with_gpu("paged_gqa_int8_attention_matches_reference", |g| {
+            for (q_heads, kv_heads, hd) in GQA_SHAPES {
+                let block_size = 16usize;
+                let (gqa, ctx, q, k, v, scale) = fixture_gqa(
+                    0x171AB6A4,
+                    q_heads,
+                    kv_heads,
+                    hd,
+                    block_size,
+                    vec![37, 0, 16, 100, 5, 64],
+                );
+                let cfg = *gqa.kv();
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
+                for (b, &c) in ctx.iter().enumerate() {
+                    if c > 0 {
+                        mgr.reserve(b, c).unwrap();
+                    }
+                }
+                let got = run_paged_attn_int8_gqa(g, &mgr, &gqa, 0, &q, &k, &v, scale);
+                let refv =
+                    reference_decode_attn_gqa(&q, &k, &v, &ctx, q_heads, kv_heads, hd, scale);
+                // Same tolerance as the MHA int8 gate: the error is the int8 K/V quantization, and
+                // grouping changes which head is read, not how precisely it is stored.
+                let s = crate::diff::assert_close("paged_attn_int8_gqa", &got, &refv, 1e-2, 5e-2);
+                eprintln!(
+                    "GQA int8-KV decode-attn {q_heads}q/{kv_heads}kv x {hd} (g={}) vs f64 ref: \
+                     max_abs={:.2e} max_rel={:.2e} — KV bytes {} vs {} f16-ungrouped",
+                    gqa.group_size(),
+                    s.max_abs,
+                    s.max_rel,
+                    cfg.kv_bytes_int8(),
+                    gqa.mha_equivalent_kv_bytes(2)
+                );
+            }
+        });
+    }
+
+    /// **GQA on the int8 path is the replicated-KV MHA run, to the bit** — the int8 twin of
+    /// [`paged_gqa_attention_equals_mha_over_replicated_kv`]. Quantization is per (token, head) and the
+    /// replicated heads are byte-identical copies, so each replica quantizes to the same int8 values
+    /// and the same scale; any difference in the output is the head mapping, not the quantizer.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn paged_gqa_int8_attention_equals_mha_over_replicated_kv() {
+        with_gpu(
+            "paged_gqa_int8_attention_equals_mha_over_replicated_kv",
+            |g| {
+                let (q_heads, kv_heads, hd, block_size) = (8usize, 2usize, 64usize, 16usize);
+                let (gqa, ctx, q, k, v, scale) = fixture_gqa(
+                    0x9C0DE6A4,
+                    q_heads,
+                    kv_heads,
+                    hd,
+                    block_size,
+                    vec![40, 7, 0, 96, 33],
+                );
+                let cfg = *gqa.kv();
+                let mha = GqaConfig::mha(KvConfig {
+                    heads: q_heads,
+                    ..cfg
+                });
+                let k_rep = replicate_kv_heads(&k, &ctx, q_heads, kv_heads, hd);
+                let v_rep = replicate_kv_heads(&v, &ctx, q_heads, kv_heads, hd);
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
+                for (b, &c) in ctx.iter().enumerate() {
+                    if c > 0 {
+                        mgr.reserve(b, c).unwrap();
+                    }
+                }
+                let grouped = run_paged_attn_int8_gqa(g, &mgr, &gqa, 0, &q, &k, &v, scale);
+                let ungrouped =
+                    run_paged_attn_int8_gqa(g, &mgr, &mha, 0, &q, &k_rep, &v_rep, scale);
+                for i in 0..grouped.len() {
+                    assert_eq!(
+                        grouped[i].to_bits(),
+                        ungrouped[i].to_bits(),
+                        "int8 GQA element {i} differs from the replicated-KV MHA run"
+                    );
+                }
+                eprintln!(
+                "GQA int8-KV {q_heads}q/{kv_heads}kv: BIT-IDENTICAL to MHA over {}x-replicated KV \
+                 (values and per-(token,head) scales alike)",
+                gqa.group_size()
+            );
+            },
+        );
     }
 }
