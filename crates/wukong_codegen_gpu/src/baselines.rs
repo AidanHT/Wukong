@@ -133,8 +133,942 @@ pub fn peer_env_hint() -> &'static str {
          libnvrtc.so.12, libcublas.so.12 and libcublasLt.so.12. For the cuDNN conv peer, \
          `pip install --target tools/cuda-redist --no-deps nvidia-cudnn-cu12` ships only \
          libcudnn.so.9, which cudarc's candidate list never tries: add a `libcudnn.so` symlink \
-         beside it, or the conv peer silently skips.)"
+         beside it, or the conv peer silently skips.)\n  \
+         On a `nvidia/cuda:*-cudnn-devel` cloud image none of that is needed — the toolkit IS the \
+         system: `export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu`, and \
+         NEVER add /usr/local/cuda/lib64/stubs (see `loader_path_issues`)."
     }
+}
+
+// ===================================================================================================
+// The loader path — the two ways it silently disarms every peer
+// ===================================================================================================
+
+/// The environment variable this OS resolves shared libraries through: `PATH` on Windows,
+/// `LD_LIBRARY_PATH` on every unix. A **runtime** `cfg!`, like [`cuda_lib_names`], so both spellings
+/// stay compiled on either host.
+pub fn loader_path_var() -> &'static str {
+    if cfg!(windows) {
+        "PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    }
+}
+
+/// Split a raw loader-path value into its entries (`;` on Windows, `:` on unix), dropping the empty
+/// segments a trailing separator leaves behind. Pure, so the diagnostics below are unit-testable
+/// without mutating this process's environment (which would race libtest's threads).
+pub fn split_loader_path(raw: &str) -> Vec<std::path::PathBuf> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    raw.split(sep)
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// One diagnosable defect in the loader path: what is wrong, and the fix. Both strings are meant to
+/// be printed verbatim to an operator who is about to spend metered GPU-seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderIssue {
+    pub what: String,
+    pub fix: String,
+}
+
+fn canon(p: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Does this directory hold anything the loader could actually answer with?
+fn holds_shared_objects(dir: &std::path::Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+        if cfg!(windows) {
+            n.ends_with(".dll")
+        } else {
+            n.contains(".so")
+        }
+    })
+}
+
+/// **The single highest-blast-radius Linux landmine** (D5 §9 pitfall 1, and the reason
+/// `tools/cloud/modal_app.py::_assert_no_stubs` exists).
+///
+/// `/usr/local/cuda/lib64/stubs/libcuda.so` is a *link-time placeholder* with no driver behind it,
+/// and `libcuda.so` is literally cudarc's **first** driver candidate — so a stubs directory anywhere
+/// on the loader path shadows the real `libcuda.so.1` and every driver call fails with a symptom
+/// that reads exactly like broken hardware ("no CUDA device"). Several peer build recipes (CUTLASS,
+/// FA2/FA3, vLLM) tell you to add it; it belongs on that one `cmake`/`pip` command's environment and
+/// never on the one a Wukong process inherits. Note that the devel images legitimately put the stubs
+/// dir on `LIBRARY_PATH` — that is gcc's *link* search path, a different variable.
+pub fn stub_dir_on_loader_path(entries: &[std::path::PathBuf]) -> Option<LoaderIssue> {
+    let hit = entries.iter().find(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("stubs"))
+            .unwrap_or(false)
+    })?;
+    Some(LoaderIssue {
+        what: format!(
+            "{} contains the CUDA stubs directory {} — its stub `libcuda.so` is cudarc's FIRST \
+             driver candidate and will shadow the real driver. Every call then fails as if the box \
+             had no GPU.",
+            loader_path_var(),
+            hit.display()
+        ),
+        fix: format!(
+            "Remove {} from {}. Add it only for the duration of a single cmake/pip command that \
+             needs to LINK against the driver stub, never to a Wukong process's environment.",
+            hit.display(),
+            loader_path_var()
+        ),
+    })
+}
+
+/// The Linux restatement of this repo's recorded Windows bug: **a pip CUDA-redist tree is a set of
+/// sibling `nvidia/<pkg>/{bin,lib}` directories and EVERY one must be on the loader path** — put
+/// three of the four on and the fourth peer (in practice cuDNN, the one nothing else needs) skips
+/// quietly and the round publishes a column it never measured. Reports each sibling that holds
+/// shared objects and is not on the path.
+///
+/// One `nvidia/` tree gets the opposite advice, and getting this backwards would be worse than
+/// saying nothing: an `nvidia/` directory **inside a Python `site-packages`** belongs to a PyTorch
+/// install, and adding its members is D5 §9 pitfall 5 — a cu130 torch drops `libcublas.so.13` there,
+/// which can shadow the 12.9 system library *inside the Rust process*. That case is reported as a
+/// shadowing hazard instead, and its siblings are never suggested.
+pub fn split_redist_on_loader_path(entries: &[std::path::PathBuf]) -> Vec<LoaderIssue> {
+    let on_path: Vec<std::path::PathBuf> = entries.iter().map(|p| canon(p)).collect();
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for e in entries {
+        let leaf = e
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if leaf != "bin" && leaf != "lib" {
+            continue;
+        }
+        let Some(root) = e.parent().and_then(|pkg| pkg.parent()) else {
+            continue;
+        };
+        if root.file_name().map(|n| n != "nvidia").unwrap_or(true) {
+            continue;
+        }
+        let c = canon(root);
+        if !roots.contains(&c) {
+            roots.push(c);
+        }
+    }
+
+    let mut out = Vec::new();
+    for root in roots {
+        if root
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with("site-packages"))
+        {
+            out.push(LoaderIssue {
+                what: format!(
+                    "{} contains {}, an `nvidia/*` tree inside a Python site-packages. That is a \
+                     framework's private CUDA copy (a cu130 torch ships libcublas.so.13 there); on \
+                     the loader path it can shadow the system CUDA library inside the Rust process.",
+                    loader_path_var(),
+                    root.display()
+                ),
+                fix: "Keep the peer redist tree and the torch venv separate and never merge their \
+                      environments. The out-of-process peers (fa2_sdpa_peer.py, the torch.compile \
+                      harness) are subprocesses and carry their own env, so they need nothing here."
+                    .to_string(),
+            });
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut missing: Vec<String> = Vec::new();
+        for ent in rd.flatten() {
+            let pkg = ent.path();
+            if !pkg.is_dir() {
+                continue;
+            }
+            for payload in ["bin", "lib"] {
+                let dir = pkg.join(payload);
+                if dir.is_dir() && holds_shared_objects(&dir) && !on_path.contains(&canon(&dir)) {
+                    missing.push(dir.display().to_string());
+                }
+            }
+        }
+        // read_dir order is filesystem-dependent; this repo's diagnostics are a pure function of
+        // their input, so sort before reporting.
+        missing.sort();
+        if !missing.is_empty() {
+            out.push(LoaderIssue {
+                what: format!(
+                    "the CUDA redist tree {} has {} sibling package director{} with shared objects \
+                     that are NOT on {}: {}",
+                    root.display(),
+                    missing.len(),
+                    if missing.len() == 1 { "y" } else { "ies" },
+                    loader_path_var(),
+                    missing.join(", ")
+                ),
+                fix: format!(
+                    "Prepend every one of them to {}. A redist tree is all-or-nothing: the peer \
+                     whose library is missing skips politely and its column is never measured.",
+                    loader_path_var()
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// Every defect this build can diagnose in the *live* loader path. Empty is the healthy answer.
+/// Cheap (a few `read_dir`s), so it is worth printing at the top of any peer round.
+pub fn loader_path_issues() -> Vec<LoaderIssue> {
+    let raw = std::env::var(loader_path_var()).unwrap_or_default();
+    let entries = split_loader_path(&raw);
+    let mut out = Vec::new();
+    out.extend(stub_dir_on_loader_path(&entries));
+    out.extend(split_redist_on_loader_path(&entries));
+    out
+}
+
+// ===================================================================================================
+// The STRONG out-of-process peers — GPU_RETARGET_PLAN.md §0's bar, and the gate that makes a missing
+// one a failure instead of a shrug
+// ===================================================================================================
+//
+// The in-process peers above (NVRTC, cuBLAS, cuBLASLt, cuDNN) are libraries this process dlopens.
+// §0 sets a *harder* bar than any of them, and every item on it is an out-of-process program:
+//
+//   * GEMM        — cuBLASLt with fused epilogues, and CUTLASS's own profiler (a best-of-many-kernels
+//                   number chosen by exhaustive search: a stronger bar than cuBLAS at some shapes).
+//   * attention   — cuDNN and a REAL FlashAttention build (FA4 on Hopper, FA2 / torch-SDPA's FLASH
+//                   backend on Ampere and Ada), not an unfused cuBLAS chain.
+//   * framework   — `torch.compile` with Inductor + Triton. **Eager PyTorch is not a bar.** The
+//                   published "beats PyTorch at every S" is an eager-only number that was justified
+//                   by Triton not installing on Windows; on Linux that excuse expires.
+//   * int4 / int8 — Marlin (Ampere) / Machete (Hopper) class kernels, not "no library peer exists".
+//
+// Building them is `tools/cloud/`'s job (recipes, pins and the Modal image; see
+// `docs/gpu/derive/D5_peer_builds.md`). This module's job is narrower and is the part that decides
+// whether a round is honest: **find them, report exactly what was found, and fail loudly when a round
+// SAID it had one and did not.**
+//
+// Why a second env var rather than reusing `WUKONG_PEER_REQUIRED`: that variable already means "the
+// dlopen-able library peers must load", it is baked into the cloud image's env, and every existing
+// round sets it. Overloading it so that it *also* demands a CUTLASS profiler would break every round
+// that legitimately does not need one. `WUKONG_STRONG_PEERS` is therefore a separate, explicit
+// declaration of what THIS round claims to be measuring against — and an unknown name in it is an
+// error, because a typo that silently means "require nothing" is precisely the failure this exists to
+// prevent.
+
+/// A strong out-of-process peer: one of §0's four bars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrongPeer {
+    /// `torch.compile` with Inductor + Triton — the framework bar (NOT eager PyTorch).
+    TorchCompile,
+    /// A real FlashAttention build (FA4 / FA2 / torch-SDPA's FLASH backend) — the attention bar.
+    FlashAttn,
+    /// The CUTLASS profiler — the exhaustive-search GEMM bar.
+    Cutlass,
+    /// Marlin / Machete W4A16 kernels, via vLLM's prebuilt wheel — the int4 bar.
+    Marlin,
+}
+
+impl StrongPeer {
+    /// Every peer, in the order a report should print them.
+    pub const ALL: [StrongPeer; 4] = [
+        StrongPeer::TorchCompile,
+        StrongPeer::FlashAttn,
+        StrongPeer::Cutlass,
+        StrongPeer::Marlin,
+    ];
+
+    /// The canonical name used in `WUKONG_STRONG_PEERS` and in reports.
+    pub fn key(self) -> &'static str {
+        match self {
+            StrongPeer::TorchCompile => "torch-compile",
+            StrongPeer::FlashAttn => "flash-attn",
+            StrongPeer::Cutlass => "cutlass",
+            StrongPeer::Marlin => "marlin",
+        }
+    }
+
+    /// Which of §0's bars this peer stands in for — quoted in the failure message so the operator
+    /// sees *why* the round is being stopped rather than just which file was missing.
+    pub fn bar(self) -> &'static str {
+        match self {
+            StrongPeer::TorchCompile => {
+                "the framework bar: torch.compile with Inductor+Triton (eager PyTorch is NOT a bar)"
+            }
+            StrongPeer::FlashAttn => {
+                "the attention bar: a real FlashAttention build, not an unfused cuBLAS chain"
+            }
+            StrongPeer::Cutlass => {
+                "the GEMM bar: CUTLASS's profiler, best-of-many-kernels by exhaustive search"
+            }
+            StrongPeer::Marlin => {
+                "the int4 bar: Marlin/Machete-class kernels, not \"no library peer exists\""
+            }
+        }
+    }
+
+    /// The environment variable that points this peer at its program.
+    pub fn env_var(self) -> &'static str {
+        match self {
+            StrongPeer::TorchCompile | StrongPeer::FlashAttn => "WUKONG_TORCH_PYTHON",
+            StrongPeer::Cutlass => "WUKONG_CUTLASS_PROFILER",
+            StrongPeer::Marlin => "WUKONG_VLLM_PYTHON",
+        }
+    }
+
+    /// Accepted spellings in `WUKONG_STRONG_PEERS`, so a round can write what it means.
+    fn aliases(self) -> &'static [&'static str] {
+        match self {
+            StrongPeer::TorchCompile => &[
+                "torch-compile",
+                "torch_compile",
+                "torch",
+                "inductor",
+                "triton",
+            ],
+            StrongPeer::FlashAttn => &[
+                "flash-attn",
+                "flash_attn",
+                "flash",
+                "fa",
+                "fa2",
+                "fa3",
+                "fa4",
+            ],
+            StrongPeer::Cutlass => &["cutlass", "cutlass-profiler"],
+            StrongPeer::Marlin => &["marlin", "machete", "int4", "w4a16", "vllm"],
+        }
+    }
+}
+
+/// The workspace root, derived from this crate's manifest directory (`crates/wukong_codegen_gpu`).
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default()
+}
+
+/// `Scripts/python.exe` on Windows, `bin/python` on every unix — `venv`'s own layout, chosen with a
+/// runtime `cfg!` so both spellings stay compiled (and typo-checked) on either host.
+fn venv_python(venv: &str) -> std::path::PathBuf {
+    let rel = if cfg!(windows) {
+        "Scripts/python.exe"
+    } else {
+        "bin/python"
+    };
+    repo_root().join(venv).join(rel)
+}
+
+fn env_path(var: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The interpreter that drives torch.compile / FlashAttention / the SDPA peer.
+///
+/// `WUKONG_TORCH_PYTHON`, else the older `WUKONG_FA2_PYTHON` (so a box already wired for the SDPA
+/// peer needs no second variable), else the repo-local venv. **No cloud path is hardcoded here** —
+/// the image sets the variable (`tools/cloud/modal_app.py`); a compiler crate that knew where Modal
+/// puts its venvs would be wrong the first time a round runs anywhere else.
+pub fn torch_peer_python() -> std::path::PathBuf {
+    env_path("WUKONG_TORCH_PYTHON")
+        .or_else(|| env_path("WUKONG_FA2_PYTHON"))
+        .unwrap_or_else(|| venv_python("tools/torch-cuda-venv"))
+}
+
+/// The interpreter for the Marlin/Machete peer. Deliberately a **separate** venv: vLLM hard-pins
+/// `torch==2.11.0` (a cu130 wheel), so installing it beside the torch-2.13 venv silently downgrades
+/// torch and breaks the framework and FlashAttention bars at once (D5 §9 pitfall 10).
+pub fn vllm_peer_python() -> std::path::PathBuf {
+    env_path("WUKONG_VLLM_PYTHON").unwrap_or_else(|| venv_python("tools/vllm-venv"))
+}
+
+/// vLLM's own kernel-benchmark directory (`benchmark_marlin.py`, `benchmark_machete.py`). Those
+/// scripts import only the prebuilt wheel's `_custom_ops`, so no vLLM source build is needed — but
+/// the scripts themselves ship in the source tree, not the wheel.
+pub fn vllm_bench_dir() -> std::path::PathBuf {
+    env_path("WUKONG_VLLM_BENCH_DIR")
+        .unwrap_or_else(|| repo_root().join("tools/vllm-src/benchmarks/kernels"))
+}
+
+/// The `cutlass_profiler` executable. It is a single self-contained binary, so a round stages one
+/// artifact rather than a checkout.
+pub fn cutlass_profiler_path() -> std::path::PathBuf {
+    env_path("WUKONG_CUTLASS_PROFILER").unwrap_or_else(|| {
+        repo_root().join(if cfg!(windows) {
+            "tools/cutlass/build/tools/profiler/cutlass_profiler.exe"
+        } else {
+            "tools/cutlass/build/tools/profiler/cutlass_profiler"
+        })
+    })
+}
+
+/// What one peer's `python -c` probe reported. Flat `key=value` lines, the same no-serde wire format
+/// `tools/fa2_sdpa_peer.py` already uses.
+const TORCH_STACK_PROBE_PY: &str = r#"
+def p(k, v):
+    print(str(k) + "=" + str(v))
+try:
+    import torch
+    p("torch", torch.__version__)
+    p("cuda", torch.version.cuda or "none")
+    if torch.cuda.is_available():
+        d = torch.cuda.get_device_properties(0)
+        p("device", d.name)
+        p("cc", d.major * 10 + d.minor)
+    else:
+        p("device", "cpu-only")
+except Exception as e:
+    p("torch_err", type(e).__name__)
+try:
+    import triton
+    p("triton", triton.__version__)
+except Exception as e:
+    p("triton_err", type(e).__name__)
+try:
+    from flash_attn.cute import flash_attn_func
+    p("fa4", "1")
+except Exception:
+    pass
+try:
+    import flash_attn
+    p("fa2", getattr(flash_attn, "__version__", "unknown"))
+except Exception:
+    pass
+try:
+    import torch
+    import torch.nn.attention as A
+    if torch.cuda.is_available():
+        q = torch.randn(1, 2, 64, 64, device="cuda", dtype=torch.float16)
+        with A.sdpa_kernel(A.SDPBackend.FLASH_ATTENTION):
+            torch.nn.functional.scaled_dot_product_attention(q, q, q)
+        p("sdpa_flash", "1")
+except Exception:
+    pass
+"#;
+
+/// One peer's resolution: the program we looked for, whether it answered, and what it said.
+#[derive(Debug, Clone)]
+pub struct StrongPeerStatus {
+    pub peer: StrongPeer,
+    /// The program this build looked for (an interpreter or the profiler binary).
+    pub program: std::path::PathBuf,
+    /// True iff the peer is usable as a bar right now.
+    pub ok: bool,
+    /// Versions when `ok`, the reason when not — printed verbatim into round provenance.
+    pub detail: String,
+}
+
+fn parse_kv(s: &str) -> std::collections::HashMap<String, String> {
+    s.lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
+/// What a bounded probe run produced.
+struct ProbeRun {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run a peer probe **with a hard deadline**, draining both pipes.
+///
+/// `Command::output()` waits forever, and these probes start interpreters that import torch or vLLM.
+/// On a rented box billed by the second, a probe that hangs does not merely fail — it burns the whole
+/// function timeout at the GPU rate before anyone looks, which is precisely the cost failure
+/// `tools/cloud` exists to prevent.
+///
+/// Three things have to be true at once, and each is a separate trap:
+///
+/// 1. **The pipes must be drained concurrently.** A `try_wait` poll loop on its own deadlocks the
+///    instant the child fills a 64 KiB pipe buffer — a Python traceback will do it. Hence reader
+///    threads.
+/// 2. **The deadline must terminate the child**, not merely stop waiting for it.
+/// 3. **Collecting the output must ALSO be bounded**, and this is the subtle one: `join()`ing the
+///    readers re-imports the unbounded wait through the back door. Killing a process does not kill
+///    its children, and a grandchild inherits the stdout handle — so the pipe stays open and
+///    `read_to_string` blocks until the grandchild exits. A regression test caught exactly that here
+///    (`a_hung_peer_probe_is_killed_at_its_deadline` measured 19 s under a 1 s deadline), and the
+///    real peers can do it for real: torch spawns Inductor compile workers, vLLM spawns its own.
+///    So the readers report through a channel and the parent waits only a short grace period,
+///    accepting truncated output over an unbounded wait. A thread left blocked on a dead probe's
+///    pipe costs a stack; a blocked *round* costs money.
+fn run_probe(program: &std::path::Path, args: &[&str], secs: u64) -> Result<ProbeRun, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .args(args)
+        // Never inherit stdin: a probe that decided to prompt would block forever on a container
+        // whose stdin is a closed pipe *or* the parent's terminal, depending on how it was invoked.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{} could not be run: {e}", program.display()))?;
+
+    let mut out_pipe = child.stdout.take().expect("stdout was piped");
+    let mut err_pipe = child.stderr.take().expect("stderr was piped");
+    // `true` = this is stdout. Two senders, one receiver, so the parent can take whichever arrives
+    // and stop waiting on the other.
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx_err = tx.clone();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = out_pipe.read_to_string(&mut s);
+        let _ = tx.send((true, s));
+    });
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err_pipe.read_to_string(&mut s);
+        let _ = tx_err.send((false, s));
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("{} could not be waited on: {e}", program.display())),
+        }
+    };
+
+    // A child that exited cleanly gets a few seconds for its pipes to close; a killed one gets
+    // almost none, because whatever is still holding that pipe is by definition not answering.
+    let grace = std::time::Duration::from_secs(if status.is_some() { 5 } else { 1 });
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    for _ in 0..2 {
+        match rx.recv_timeout(grace) {
+            Ok((true, s)) => stdout = s,
+            Ok((false, s)) => stderr = s,
+            Err(_) => break,
+        }
+    }
+
+    match status {
+        Some(st) => Ok(ProbeRun {
+            ok: st.success(),
+            stdout,
+            stderr,
+        }),
+        None => Err(format!(
+            "{} did not answer within {secs}s and was killed. Treating a hung peer probe as \
+             absent, deliberately: on metered hardware a probe that never returns costs more than \
+             one that fails.",
+            program.display()
+        )),
+    }
+}
+
+/// How long each probe may take. Generous, because a cold `import torch` off a network volume is
+/// genuinely slow and a false "absent" here would fail an otherwise-good round — but finite, because
+/// the alternative is unbounded spend. vLLM gets the longest budget: its import pulls in torch, the
+/// custom-ops extension and its platform detection, and 30-60 s is normal rather than a symptom.
+const TORCH_PROBE_SECS: u64 = 300;
+const CUTLASS_PROBE_SECS: u64 = 120;
+const VLLM_PROBE_SECS: u64 = 600;
+
+/// Run the torch-stack probe once per process. Both the framework bar and the attention bar read it,
+/// so they cost one interpreter start between them (importing torch is seconds, not milliseconds).
+fn torch_stack() -> &'static std::collections::HashMap<String, String> {
+    use std::sync::OnceLock;
+    static STACK: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    STACK.get_or_init(|| {
+        let python = torch_peer_python();
+        if !python.exists() {
+            return std::collections::HashMap::new();
+        }
+        match run_probe(&python, &["-c", TORCH_STACK_PROBE_PY], TORCH_PROBE_SECS) {
+            Ok(r) => {
+                let mut m = parse_kv(&r.stdout);
+                // A probe that timed out or crashed before printing anything must not look like
+                // "torch is simply absent" — record why, so `probe_torch_compile` can say it.
+                if m.is_empty() && !r.ok {
+                    m.insert(
+                        "torch_err".to_string(),
+                        format!("the probe exited without output: {}", r.stderr.trim()),
+                    );
+                }
+                m
+            }
+            Err(why) => {
+                let mut m = std::collections::HashMap::new();
+                m.insert("torch_err".to_string(), why);
+                m
+            }
+        }
+    })
+}
+
+fn probe_torch_compile() -> (bool, String) {
+    let m = torch_stack();
+    let python = torch_peer_python();
+    if !python.exists() {
+        return (false, format!("no interpreter at {}", python.display()));
+    }
+    match (m.get("torch"), m.get("triton")) {
+        (Some(t), Some(tr)) => (
+            true,
+            format!(
+                "torch {t} (cuda {}) + triton {tr}, device {}",
+                m.get("cuda").map(String::as_str).unwrap_or("?"),
+                m.get("device").map(String::as_str).unwrap_or("?")
+            ),
+        ),
+        (Some(t), None) => (
+            false,
+            format!(
+                "torch {t} imports but Triton does not ({}) — without Triton, torch.compile falls \
+                 back to ATen and the peer degrades to eager, which is NOT a bar",
+                m.get("triton_err").map(String::as_str).unwrap_or("absent")
+            ),
+        ),
+        (None, _) => (
+            false,
+            format!(
+                "{} could not import torch ({})",
+                python.display(),
+                m.get("torch_err")
+                    .map(String::as_str)
+                    .unwrap_or("no output")
+            ),
+        ),
+    }
+}
+
+fn probe_flash_attn() -> (bool, String) {
+    let m = torch_stack();
+    let python = torch_peer_python();
+    if !python.exists() {
+        return (false, format!("no interpreter at {}", python.display()));
+    }
+    // FA4 targets **SM90 and SM100 only**. It installs and imports perfectly well on an Ada L4/L40S
+    // (it is a pure-Python wheel that JITs through CuTeDSL), so "it imports" is not evidence that
+    // this box has an attention bar — counting it below sm_90 would mark the bar satisfied on a
+    // device that cannot run the kernel. The probe reports the device's compute capability for
+    // exactly this reason; below sm_90 the FA4 line is informational and does not count.
+    let cc: u32 = m.get("cc").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut have: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    if m.contains_key("fa4") {
+        if cc >= 90 {
+            have.push("flash-attn-4 (CuTeDSL)".to_string());
+        } else {
+            notes.push(format!(
+                "flash-attn-4 is installed but targets sm_90/sm_100 and this device is sm_{cc}"
+            ));
+        }
+    }
+    if let Some(v) = m.get("fa2") {
+        have.push(format!("flash-attn {v}"));
+    }
+    if m.contains_key("sdpa_flash") {
+        have.push("torch SDPA FLASH_ATTENTION backend".to_string());
+    }
+    if have.is_empty() {
+        if !notes.is_empty() {
+            return (
+                false,
+                format!(
+                    "no usable FlashAttention on this device: {} (and no flash_attn, and the torch \
+                     SDPA FLASH backend did not run)",
+                    notes.join("; ")
+                ),
+            );
+        }
+        (
+            false,
+            format!(
+                "no FlashAttention reachable from {} (no flash_attn.cute, no flash_attn, and the \
+                 torch SDPA FLASH backend did not run)",
+                python.display()
+            ),
+        )
+    } else {
+        have.extend(notes.into_iter().map(|n| format!("[{n}]")));
+        (true, have.join(" + "))
+    }
+}
+
+/// The CUTLASS profiler, proved to be *runnable here* rather than merely present on disk.
+///
+/// Two flags are tried, and the fallback is not defensive padding — it removes a one-shot failure
+/// mode. `--version` is the informative answer (it names the CUTLASS release in the round log), but
+/// it is a profiler CLI flag, not a contract this repo controls: a build that does not carry it
+/// would exit non-zero, the peer would be declared absent, and a round with a perfectly good
+/// profiler staged would fail on metered time. `--help` is answered by every build. Either one
+/// returning cleanly proves what actually matters at probe time — the binary executes on this box
+/// (right glibc, right libstdc++, not a truncated Volume copy).
+///
+/// What this deliberately does **not** prove is the arch it was compiled for. A profiler built for
+/// plain `sm_90` runs fine on Hopper and silently omits the wgmma kernels — a *weakened* peer, the
+/// most dangerous kind. That check needs the arch recorded at build time and belongs where it is:
+/// `tools/cloud/modal_app.py::peers` compares the manifest's arch against the device before a round.
+fn probe_cutlass() -> (bool, String) {
+    let bin = cutlass_profiler_path();
+    if !bin.exists() {
+        return (false, format!("no cutlass_profiler at {}", bin.display()));
+    }
+    let mut why = Vec::new();
+    for flag in ["--version", "--help"] {
+        match run_probe(&bin, &[flag], CUTLASS_PROBE_SECS) {
+            Ok(r) if r.ok => {
+                let line = r
+                    .stdout
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("cutlass_profiler")
+                    .trim()
+                    .to_string();
+                let note = if flag == "--version" {
+                    String::new()
+                } else {
+                    " (this build has no --version; --help answered)".to_string()
+                };
+                return (true, format!("{line}{note} [{}]", bin.display()));
+            }
+            Ok(r) => why.push(format!(
+                "{flag} exited {}{}",
+                if r.ok { "0" } else { "non-zero" },
+                if r.stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", r.stderr.trim())
+                }
+            )),
+            Err(e) => why.push(format!("{flag}: {e}")),
+        }
+    }
+    (
+        false,
+        format!(
+            "{} is present but did not run — {}",
+            bin.display(),
+            why.join("; ")
+        ),
+    )
+}
+
+fn probe_marlin() -> (bool, String) {
+    let python = vllm_peer_python();
+    if !python.exists() {
+        return (false, format!("no interpreter at {}", python.display()));
+    }
+    let dir = vllm_bench_dir();
+    for script in ["benchmark_marlin.py", "benchmark_machete.py"] {
+        if !dir.join(script).is_file() {
+            return (
+                false,
+                format!(
+                    "{} is missing from the vLLM kernel-benchmark directory {} (the scripts ship in \
+                     the source tree, not the wheel)",
+                    script,
+                    dir.display()
+                ),
+            );
+        }
+    }
+    // `vllm._custom_ops` is the load-bearing import, not `vllm`: it is the compiled extension that
+    // actually holds the Marlin/Machete kernels, so importing it is what distinguishes "the wheel is
+    // installed" from "the kernels can run".
+    match run_probe(
+        &python,
+        &[
+            "-c",
+            "import vllm,vllm._custom_ops;print('vllm='+vllm.__version__)",
+        ],
+        VLLM_PROBE_SECS,
+    ) {
+        Ok(r) if r.ok => (true, format!("{} + {}", r.stdout.trim(), dir.display())),
+        Ok(r) => (
+            false,
+            format!(
+                "{} cannot import vllm._custom_ops: {}",
+                python.display(),
+                r.stderr.trim()
+            ),
+        ),
+        Err(e) => (false, e),
+    }
+}
+
+/// Probe one strong peer. Cached for the whole process — the torch probe starts an interpreter and
+/// imports torch, which is seconds, and a sweep must never pay that per shape.
+pub fn probe_strong_peer(peer: StrongPeer) -> StrongPeerStatus {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<StrongPeerStatus>> = OnceLock::new();
+    let all = CACHE.get_or_init(|| {
+        StrongPeer::ALL
+            .iter()
+            .map(|&p| {
+                let (ok, detail) = match p {
+                    StrongPeer::TorchCompile => probe_torch_compile(),
+                    StrongPeer::FlashAttn => probe_flash_attn(),
+                    StrongPeer::Cutlass => probe_cutlass(),
+                    StrongPeer::Marlin => probe_marlin(),
+                };
+                let program = match p {
+                    StrongPeer::TorchCompile | StrongPeer::FlashAttn => torch_peer_python(),
+                    StrongPeer::Cutlass => cutlass_profiler_path(),
+                    StrongPeer::Marlin => vllm_peer_python(),
+                };
+                StrongPeerStatus {
+                    peer: p,
+                    program,
+                    ok,
+                    detail,
+                }
+            })
+            .collect()
+    });
+    all.iter()
+        .find(|s| s.peer == peer)
+        .expect("StrongPeer::ALL covers every variant")
+        .clone()
+}
+
+/// Parse `WUKONG_STRONG_PEERS`: a comma/space-separated list of peer names, or `all`, or `none`
+/// (the unset default). **An unknown name is an error, not an ignored token** — a typo that quietly
+/// means "require nothing" would hand back exactly the silent skip this mechanism exists to remove.
+pub fn required_strong_peers() -> Result<Vec<StrongPeer>, String> {
+    match std::env::var("WUKONG_STRONG_PEERS") {
+        Ok(v) => parse_strong_peers(&v),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// The pure half of [`required_strong_peers`], so the parser is unit-testable without mutating this
+/// process's environment (libtest runs threads; `set_var` would race every other test).
+pub fn parse_strong_peers(raw: &str) -> Result<Vec<StrongPeer>, String> {
+    let mut out: Vec<StrongPeer> = Vec::new();
+    for tok in raw
+        .split([',', ' ', ';'])
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+    {
+        if tok == "none" || tok == "0" {
+            continue;
+        }
+        if tok == "all" || tok == "1" {
+            for p in StrongPeer::ALL {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+            continue;
+        }
+        match StrongPeer::ALL
+            .iter()
+            .find(|p| p.aliases().contains(&tok.as_str()))
+        {
+            Some(&p) => {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+            None => {
+                return Err(format!(
+                    "WUKONG_STRONG_PEERS names an unknown peer {tok:?}. Known: {} (or `all` / \
+                     `none`). Refusing to guess — a typo here would mean the round requires nothing \
+                     while claiming to require a peer.",
+                    StrongPeer::ALL
+                        .iter()
+                        .map(|p| p.key())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One printable line per strong peer, for a round's provenance block.
+pub fn strong_peer_report() -> Vec<String> {
+    let required = required_strong_peers();
+    StrongPeer::ALL
+        .iter()
+        .map(|&p| {
+            let s = probe_strong_peer(p);
+            let need = match &required {
+                Ok(r) if r.contains(&p) => "REQUIRED",
+                Ok(_) => "optional",
+                Err(_) => "unknown",
+            };
+            format!(
+                "  {:<14} {:<8} {:<3} {}",
+                p.key(),
+                need,
+                if s.ok { "ok" } else { "--" },
+                s.detail
+            )
+        })
+        .collect()
+}
+
+/// **The loud gate.** `Ok` when every peer this round declared in `WUKONG_STRONG_PEERS` is present;
+/// `Err` with a message naming the peer, the §0 bar it stands for, why it did not resolve, the
+/// environment variable that would point at it, and any loader-path defect that could explain it.
+///
+/// This is the strong-peer twin of `gpu::tests::peer_gate`: same doctrine (a sweep that cannot find
+/// its peer must fail, never report green having measured nothing), different mechanism, because
+/// these peers are separate programs rather than libraries this process dlopens.
+pub fn strong_peer_gate() -> Result<(), String> {
+    let required = required_strong_peers()?;
+    if required.is_empty() {
+        return Ok(());
+    }
+    let mut bad = Vec::new();
+    for p in &required {
+        let s = probe_strong_peer(*p);
+        if !s.ok {
+            bad.push(format!(
+                "  {} — {}\n      wanted for {}\n      point {} at it, or build it with \
+                 tools/cloud (see docs/gpu/derive/D5_peer_builds.md)",
+                p.key(),
+                s.detail,
+                p.bar(),
+                p.env_var()
+            ));
+        }
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "WUKONG_STRONG_PEERS requires {} strong peer(s) and {} did not resolve. This round would \
+         have published a number measured against a WEAKER bar than it claims:\n{}",
+        required.len(),
+        bad.len(),
+        bad.join("\n")
+    );
+    for issue in loader_path_issues() {
+        msg.push_str(&format!(
+            "\n  loader path: {}\n      fix: {}",
+            issue.what, issue.fix
+        ));
+    }
+    Err(msg)
 }
 
 /// NVRTC options that compile a peer **for the device it is about to run on**.
@@ -2572,25 +3506,13 @@ pub struct Fa2PeerReport {
 /// In a git worktree the venv usually lives in the main checkout, so set `WUKONG_FA2_PYTHON` there.
 ///
 /// The default interpreter path is **per-OS**, because `venv` itself is: Windows lays the venv out as
-/// `Scripts/python.exe`, every unix as `bin/python`. Picked with a runtime `cfg!` so both spellings
-/// stay compiled (and thus typo-checked) on either host.
+/// `Scripts/python.exe`, every unix as `bin/python` ([`venv_python`]). The interpreter itself is
+/// [`torch_peer_python`] — the SAME one the strong `torch.compile` / FlashAttention bars use, so a
+/// box wired with one variable gets all three peers and cannot end up timing two different torches.
 fn fa2_peer_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default(); // crates/wukong_codegen_gpu -> workspace root
-    let venv_python = if cfg!(windows) {
-        "tools/torch-cuda-venv/Scripts/python.exe"
-    } else {
-        "tools/torch-cuda-venv/bin/python"
-    };
-    let python = std::env::var_os("WUKONG_FA2_PYTHON")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| root.join(venv_python));
-    let peer = std::env::var_os("WUKONG_FA2_PEER")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| root.join("tools/fa2_sdpa_peer.py"));
+    let python = torch_peer_python();
+    let peer =
+        env_path("WUKONG_FA2_PEER").unwrap_or_else(|| repo_root().join("tools/fa2_sdpa_peer.py"));
     (python, peer)
 }
 
@@ -2910,6 +3832,400 @@ pub fn fa2_sdpa_peer_rope(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        parse_strong_peers, split_loader_path, split_redist_on_loader_path,
+        stub_dir_on_loader_path, StrongPeer,
+    };
+
+    /// A throwaway directory under the OS temp dir. No `tempfile` dev-dep in this workspace, and the
+    /// FS-walking diagnostics genuinely need real directories to walk.
+    struct TmpTree(std::path::PathBuf);
+
+    impl TmpTree {
+        fn new(tag: &str) -> Self {
+            static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let uid = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "wukong_peerpath_{}_{}_{}",
+                tag,
+                std::process::id(),
+                uid
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("temp dir");
+            TmpTree(p)
+        }
+        /// Create `<root>/<rel>` and drop one plausible shared object into it.
+        fn lib_dir(&self, rel: &str) -> std::path::PathBuf {
+            let d = self.0.join(rel);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            let name = if cfg!(windows) {
+                "peer64_12.dll"
+            } else {
+                "libpeer.so.12"
+            };
+            std::fs::write(d.join(name), b"not really a library").expect("write");
+            d
+        }
+    }
+
+    impl Drop for TmpTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The loader path splits on this OS's separator and drops the empties a trailing separator
+    /// leaves — the entries feed two FS-walking diagnostics, and a `""` entry would canonicalize to
+    /// the current directory and produce nonsense advice.
+    #[test]
+    fn loader_path_splits_on_the_host_separator() {
+        let raw = if cfg!(windows) {
+            r"C:\a;C:\b;;"
+        } else {
+            "/a:/b::"
+        };
+        let got = split_loader_path(raw);
+        assert_eq!(got.len(), 2, "two real entries in {raw:?}, got {got:?}");
+        assert!(got[0].ends_with("a") && got[1].ends_with("b"));
+        assert!(split_loader_path("").is_empty());
+    }
+
+    /// **D5 §9 pitfall 1, the highest-blast-radius Linux landmine.** A CUDA `stubs` directory on the
+    /// loader path shadows the real driver with a link-time placeholder, and the resulting failure
+    /// reads as "this box has no GPU" — so it must be *named*, not diagnosed by the operator.
+    #[test]
+    fn a_stubs_directory_on_the_loader_path_is_named() {
+        let clean = split_loader_path(if cfg!(windows) {
+            r"C:\cuda\bin"
+        } else {
+            "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+        });
+        assert!(stub_dir_on_loader_path(&clean).is_none());
+
+        let dirty = split_loader_path(if cfg!(windows) {
+            r"C:\cuda\bin;C:\cuda\lib64\stubs"
+        } else {
+            "/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs"
+        });
+        let issue = stub_dir_on_loader_path(&dirty).expect("the stubs dir must be reported");
+        assert!(issue.what.contains("stubs"), "{}", issue.what);
+        assert!(
+            issue.what.contains("libcuda.so"),
+            "the message must say WHICH library is shadowed: {}",
+            issue.what
+        );
+        assert!(issue.fix.contains(super::loader_path_var()));
+    }
+
+    /// **The Linux restatement of this repo's recorded Windows bug** (`gpu-peer-dll-path`): a pip
+    /// CUDA-redist tree is a set of sibling `nvidia/<pkg>/{bin,lib}` dirs and every one must be on
+    /// the loader path. Put three of four on and the fourth peer skips *politely* — the round then
+    /// reports green having never measured that column.
+    #[test]
+    fn a_split_redist_tree_names_every_missing_sibling() {
+        let t = TmpTree::new("redist");
+        let on = t.lib_dir("nvidia/cublas/lib");
+        let missing_nvrtc = t.lib_dir("nvidia/cuda_nvrtc/lib");
+        let missing_cudnn = t.lib_dir("nvidia/cudnn/lib");
+        // A package dir with no shared objects must NOT be reported: nothing could load from it.
+        std::fs::create_dir_all(t.0.join("nvidia/cuda_runtime/include")).expect("mkdir");
+
+        let issues = split_redist_on_loader_path(&[on.clone()]);
+        assert_eq!(issues.len(), 1, "one tree, one issue: {issues:?}");
+        let what = &issues[0].what;
+        for m in [&missing_nvrtc, &missing_cudnn] {
+            assert!(
+                what.contains(&m.display().to_string())
+                    || what.contains(&super::canon(m).display().to_string()),
+                "missing sibling {} not named in: {what}",
+                m.display()
+            );
+        }
+        assert!(
+            !what.contains("cuda_runtime"),
+            "a dir with no shared objects is not a missing peer: {what}"
+        );
+
+        // With every sibling on the path there is nothing to report.
+        assert!(
+            split_redist_on_loader_path(&[on, missing_nvrtc, missing_cudnn]).is_empty(),
+            "a complete tree must be silent"
+        );
+    }
+
+    /// **The two sides of the declaration must accept the same words.**
+    ///
+    /// `WUKONG_STRONG_PEERS` is parsed twice: here, by the gate that fails a round, and in
+    /// `tools/cloud/peers/verify_peers.py`, by the battery `::peers` runs. If one side learns a
+    /// spelling the other has not, the failure is silent in the worst direction — `::peers` reports
+    /// the bar satisfied and the Rust gate never demanded it, or the reverse. The Python file says
+    /// it is "kept in step with `StrongPeer::aliases`"; this is what makes that true rather than
+    /// aspirational. Textual, because the check has to work without a Python interpreter.
+    #[test]
+    fn the_python_peer_battery_accepts_exactly_the_same_names() {
+        let script = super::repo_root().join("tools/cloud/peers/verify_peers.py");
+        let Ok(src) = std::fs::read_to_string(&script) else {
+            eprintln!(
+                "[skip] {} is not present (a packaged crate, not a checkout) — cannot cross-check \
+                 the peer alias tables.",
+                script.display()
+            );
+            return;
+        };
+        // The `PEERS = { ... }` literal: `"name": ["alias", ...],`
+        let body = src
+            .split_once("PEERS = {")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(b, _)| b)
+            .unwrap_or_else(|| panic!("no `PEERS = {{` table in {}", script.display()));
+
+        let mut seen: Vec<(String, Vec<String>)> = Vec::new();
+        for line in body.lines() {
+            let Some((key, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let key = key.trim().trim_matches(['"', '\'']).to_string();
+            if key.is_empty() || !rest.contains('[') {
+                continue;
+            }
+            let aliases: Vec<String> = rest
+                .trim()
+                .trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .map(|a| a.trim().trim_matches(['"', '\'']).to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            seen.push((key, aliases));
+        }
+
+        assert_eq!(
+            seen.len(),
+            StrongPeer::ALL.len(),
+            "{} declares {} peers, Rust has {}: {seen:?}",
+            script.display(),
+            seen.len(),
+            StrongPeer::ALL.len()
+        );
+        for p in StrongPeer::ALL {
+            let (_, py) = seen.iter().find(|(k, _)| k == p.key()).unwrap_or_else(|| {
+                panic!("{} does not know the peer {:?}", script.display(), p.key())
+            });
+            let mut rs: Vec<&str> = p.aliases().to_vec();
+            let mut py: Vec<&str> = py.iter().map(String::as_str).collect();
+            rs.sort_unstable();
+            py.sort_unstable();
+            assert_eq!(
+                rs,
+                py,
+                "the alias lists for {:?} have drifted: Rust {rs:?} vs {} {py:?}. A spelling one \
+                 side accepts and the other rejects is a round that thinks it declared a bar and \
+                 did not.",
+                p.key(),
+                script.display()
+            );
+        }
+    }
+
+    /// A shell command that sleeps, and one that prints — spelled for whichever host is running the
+    /// suite. Both interpreters ship with the OS on the two platforms this repo's CI covers.
+    fn shell_cmd(sleep: bool) -> (&'static str, Vec<&'static str>) {
+        if cfg!(windows) {
+            if sleep {
+                // `ping -n 20 127.0.0.1` waits ~19 s and is present on every Windows install;
+                // `timeout` refuses to run when stdin is redirected, which `run_probe` always does.
+                ("cmd", vec!["/C", "ping", "-n", "20", "127.0.0.1"])
+            } else {
+                ("cmd", vec!["/C", "echo", "probe-ok"])
+            }
+        } else if sleep {
+            ("sh", vec!["-c", "sleep 20"])
+        } else {
+            ("sh", vec!["-c", "echo probe-ok"])
+        }
+    }
+
+    /// **A peer probe must not be able to hang.** These probes start interpreters that import torch
+    /// or vLLM, and they run inside the device suite on a box billed by the second — so an
+    /// unbounded wait does not merely fail, it spends the whole function timeout at the GPU rate
+    /// before anyone looks. This proves the deadline really terminates the child rather than merely
+    /// returning while it keeps running, and that a timeout is reported as a *diagnosis*.
+    #[test]
+    fn a_hung_peer_probe_is_killed_at_its_deadline() {
+        let (prog, args) = shell_cmd(true);
+        let t0 = std::time::Instant::now();
+        let got = super::run_probe(std::path::Path::new(prog), &args, 1);
+        let dt = t0.elapsed();
+        let err = got
+            .err()
+            .expect("a 20s child under a 1s deadline must time out");
+        assert!(
+            err.contains("did not answer within 1s"),
+            "the message must name the deadline: {err}"
+        );
+        assert!(
+            dt < std::time::Duration::from_secs(15),
+            "run_probe returned only after {dt:?} — the deadline did not fire, so a hung peer \
+             would still burn metered time"
+        );
+    }
+
+    /// The other half: a probe that answers is read to completion. The pipes are drained by threads
+    /// precisely so a chatty child cannot deadlock the poll loop by filling a 64 KiB pipe buffer.
+    #[test]
+    fn a_probe_that_answers_is_captured() {
+        let (prog, args) = shell_cmd(false);
+        let r = super::run_probe(std::path::Path::new(prog), &args, 60).expect("echo must run");
+        assert!(r.ok, "echo exited non-zero: {}", r.stderr);
+        assert!(r.stdout.contains("probe-ok"), "stdout was {:?}", r.stdout);
+
+        // A program that is not there is an error, never a silent success.
+        let missing = super::run_probe(
+            std::path::Path::new("wukong-no-such-peer-program"),
+            &["--version"],
+            5,
+        );
+        assert!(
+            missing.is_err(),
+            "a missing program must not look like a peer"
+        );
+    }
+
+    /// The same shape with the OPPOSITE correct advice (D5 §9 pitfall 5). An `nvidia/*` tree inside a
+    /// Python `site-packages` is a framework's private CUDA copy — a cu130 torch drops
+    /// `libcublas.so.13` there, which can shadow the 12.9 system library inside the Rust process.
+    /// Telling the operator to add its siblings would actively cause the bug.
+    #[test]
+    fn a_site_packages_nvidia_tree_is_a_shadowing_hazard_not_a_split_tree() {
+        let t = TmpTree::new("venv");
+        let inside = t.lib_dir("lib/python3.12/site-packages/nvidia/cublas/lib");
+        t.lib_dir("lib/python3.12/site-packages/nvidia/cudnn/lib");
+
+        let issues = split_redist_on_loader_path(&[inside]);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].what.contains("site-packages"),
+            "{}",
+            issues[0].what
+        );
+        assert!(
+            issues[0].what.contains("shadow"),
+            "the hazard is shadowing, not a split tree: {}",
+            issues[0].what
+        );
+        assert!(
+            !issues[0].fix.to_ascii_lowercase().contains("prepend"),
+            "must NOT advise adding the siblings: {}",
+            issues[0].fix
+        );
+    }
+
+    /// `WUKONG_STRONG_PEERS` parsing, including the case that decides whether this mechanism is worth
+    /// anything: **an unknown name is an error.** A typo'd peer name that parsed to "require nothing"
+    /// would hand back exactly the silent skip the gate exists to remove.
+    #[test]
+    fn strong_peer_names_parse_and_a_typo_is_an_error() {
+        assert_eq!(parse_strong_peers("").unwrap(), Vec::<StrongPeer>::new());
+        assert_eq!(
+            parse_strong_peers("none").unwrap(),
+            Vec::<StrongPeer>::new()
+        );
+        assert_eq!(parse_strong_peers("all").unwrap(), StrongPeer::ALL.to_vec());
+        assert_eq!(
+            parse_strong_peers("torch, CUTLASS").unwrap(),
+            vec![StrongPeer::TorchCompile, StrongPeer::Cutlass]
+        );
+        // Aliases and duplicates collapse to one entry each, in ALL order.
+        assert_eq!(
+            parse_strong_peers("fa4 flash-attn machete marlin").unwrap(),
+            vec![StrongPeer::FlashAttn, StrongPeer::Marlin]
+        );
+        let err = parse_strong_peers("torch,cutlas").unwrap_err();
+        assert!(err.contains("cutlas"), "{err}");
+        assert!(
+            err.contains("cutlass"),
+            "the message must list the real names: {err}"
+        );
+        // Every canonical key must parse back to its own peer, or a report and a request disagree.
+        for p in StrongPeer::ALL {
+            assert_eq!(parse_strong_peers(p.key()).unwrap(), vec![p], "{}", p.key());
+            assert!(
+                p.aliases().contains(&p.key()),
+                "{} is not its own alias",
+                p.key()
+            );
+        }
+    }
+
+    /// **The strong-peer gate, participating in the suite.** A round that *declares* a bar —
+    /// `WUKONG_STRONG_PEERS=torch,cutlass` — fails here if that bar is not actually on the box,
+    /// which is the whole point: a weak-peer round must not be publishable. With the variable unset
+    /// (the default, so nothing in the tree changes) it reports what it *would* look for and passes.
+    ///
+    /// Why the undeclared path deliberately does **no** probing: this test is not `#[ignore]`d, so it
+    /// runs inside every `--features gpu` suite, including the metered cloud one. Probing all four
+    /// peers starts a torch interpreter and a vLLM interpreter — tens of seconds of GPU-rate time,
+    /// spent to answer a question the round did not ask. When a bar *is* declared the probes are the
+    /// point and are paid for; when none is, the paths alone are the honest provenance, and
+    /// `tools/cloud/peers/verify_peers.py` (run by `::device_info` and `::peers`, off the critical
+    /// path) is where the full resolution table with versions comes from.
+    #[test]
+    fn declared_strong_peers_are_actually_present() {
+        for issue in super::loader_path_issues() {
+            eprintln!("[loader] {}\n         fix: {}", issue.what, issue.fix);
+        }
+        let required = match super::required_strong_peers() {
+            // A malformed declaration is a failure in its own right: the round asked for a bar and
+            // the name did not resolve to one, so it does not know what it is measuring against.
+            Err(why) => panic!("{why}"),
+            Ok(r) => r,
+        };
+        if required.is_empty() {
+            eprintln!(
+                "[skip] declared_strong_peers_are_actually_present: WUKONG_STRONG_PEERS is unset, \
+                 so this round declares no strong bar and nothing is probed. Set it (e.g. \
+                 `WUKONG_STRONG_PEERS=torch,flash-attn,cutlass,marlin`) on any round that publishes \
+                 against one."
+            );
+            for p in StrongPeer::ALL {
+                let program = match p {
+                    StrongPeer::TorchCompile | StrongPeer::FlashAttn => super::torch_peer_python(),
+                    StrongPeer::Cutlass => super::cutlass_profiler_path(),
+                    StrongPeer::Marlin => super::vllm_peer_python(),
+                };
+                eprintln!(
+                    "  {:<14} would use {} ({}, from {})",
+                    p.key(),
+                    program.display(),
+                    if program.exists() {
+                        "present"
+                    } else {
+                        "ABSENT"
+                    },
+                    p.env_var()
+                );
+            }
+            return;
+        }
+        eprintln!(
+            "[gate] strong peers required: {}",
+            required
+                .iter()
+                .map(|p| p.key())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for line in super::strong_peer_report() {
+            eprintln!("{line}");
+        }
+        if let Err(why) = super::strong_peer_gate() {
+            panic!("{why}");
+        }
+    }
+
     /// **A peer must be compiled for the device it races on** (§2.2 / Phase 2 step 5).
     ///
     /// Every NVRTC peer here used to pass `arch: Some("compute_89")`, so on any part that is not a
