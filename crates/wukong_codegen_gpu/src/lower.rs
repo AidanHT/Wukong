@@ -4043,6 +4043,197 @@ pub fn mega_frame_bytes(func: &Function) -> u64 {
 }
 
 // ============================================================================================
+// Corpus-sweep MIR normalization (test support, shared with `megakernel.rs`).
+// ============================================================================================
+
+/// **Makes the corpus coverage counts a property of this backend instead of a property of the host
+/// CPU.** Every gate in this crate that reports a coverage number builds its MIR through [`build`]
+/// here — including `megakernel.rs`'s, which shares this module's copy rather than keeping its own.
+///
+/// The confound it removes: `wukong_mir_build`'s general 256-bit loop vectorizer emits an
+/// `Op::VecKernelCall` (a raw-AVX2 CPU microkernel recipe) only where
+/// [`wukong_mir::host_supports_vec_kernels`] is true — and that predicate is
+/// `cfg(all(target_arch = "x86_64", target_os = "windows"))`, because the assembled bytes hardcode
+/// the Win64 argument registers. `lower.rs` declines exactly that op
+/// (`UNSUPPORTED: VecKernelCall`), so on Windows every program carrying one is a skip, while on
+/// Linux the same source compiles to 128-bit CLIF strips and lowers fine.
+///
+/// Measured on this corpus, device-free, by `corpus_lowering_floors_are_host_vectorizer_invariant`:
+/// 26 of the 357 `tests/run` programs carry a `VecKernelCall` on Win64, and 18 of them lower once
+/// it is gone. That is the entire difference between the Windows sweep's 217/357 + 87 mega and the
+/// Modal L4 sweep's (2026-08-09) 235/357 + 90 mega. **The Linux run was not better at lowering; it
+/// simply never saw the op.** With two hosts reading two numbers, one hardcoded floor is a live
+/// gate on exactly one of them and vacuous on the other — and the datacenter round is about to
+/// spend real money running this gate on Linux.
+///
+/// The fix is to normalize the *input*, not to special-case the floor: `WUKONG_P4_NO_256=1` forces
+/// the same 128-bit fallback the non-Windows host takes anyway, so the swept MIR is byte-comparable
+/// on both. That switch is documented and pinned as **result-identical** by
+/// `wukong_codegen_cranelift`'s `p4_kill_switch_is_result_identical`, so the interpreter oracle in
+/// the same sweep is unaffected — and gpu-native gets *more* device coverage on Windows, not less,
+/// since those 18 programs now really run.
+///
+/// Excluding the `VecKernelCall` carriers from the denominator instead — count coverage only over
+/// the programs where "can gpu-native lower this?" is well-posed — reads like the more conservative
+/// fix, but it does not actually produce one number: **the excluded set is itself host-dependent.**
+/// On Win64 it is 26 programs and the ratio is 217/331; on Linux no program carries the op, nothing
+/// is excluded, and the ratio is 235/357. To exclude the same set on both hosts you must first know
+/// which programs *would* carry the op under the Win64 ABI, and the only way to learn that is to
+/// build the corpus both ways — i.e. this switch. A `#[cfg(windows)] 217 / #[cfg(unix)] 235` floor
+/// is worse still: it encodes the confound instead of removing it, leaves each arm ratcheting a
+/// different quantity, and has to be re-derived on every new host.
+///
+/// With the normalization in place the *device* sweep on this RTX 4050 reads 235/357 and 90/103 —
+/// the L4's numbers exactly, on a different OS and a different card, with zero mismatches and zero
+/// faults. The invariance is measured, not argued.
+///
+/// LANDMINE: the switch is read from the process environment, which is global to the test binary,
+/// so [`normalized`] and [`host_native`] take one crate-wide mutex and restore the previous value
+/// on the way out (including on a panic) — two gates can hold opposite settings without racing.
+/// They touch the environment **only where [`switch_can_matter`] holds**; see its comment for why
+/// that is a soundness property and not a shortcut. The one MIR builder in this crate outside the
+/// lock is `fusion.rs`'s test `build`, whose seven tests are eligibility-shape assertions and were
+/// checked to be insensitive to the switch (`cargo test -p wukong_codegen_gpu --features gpu --lib
+/// fusion::` passes 7/7 identically with and without `WUKONG_P4_NO_256=1`). Route any new
+/// MIR-building helper through here rather than re-checking that.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) mod hostvec {
+    use super::{Interner, Program};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The `wukong_mir_build` kill-switch that forces the 128-bit fallback for both 256-bit recipe
+    /// sites (elementwise and reduction).
+    const VAR: &str = "WUKONG_P4_NO_256";
+
+    /// Serializes every window in which this crate's tests hold a non-default value of [`VAR`].
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Whether [`VAR`] can change one byte of MIR on this host.
+    ///
+    /// It is the *other* conjunct at both `mir_build` recipe sites, which read
+    /// `lane == F32 && host_supports_vec_kernels() && var_os(VAR).is_none()`, and those two sites
+    /// are the only non-test readers of the variable in the workspace. `&&` short-circuits, so
+    /// where this is false the environment is never even consulted — and [`scoped`] below then
+    /// skips the write entirely: `normalized(f)` is literally `f()`, over the MIR an untouched
+    /// `mir_build` produced.
+    ///
+    /// That is a soundness property, not a micro-optimization. `setenv` racing another thread's
+    /// `getenv` is a data race in glibc — Rust makes `std::env::set_var` `unsafe` in edition 2024
+    /// for exactly this reason — and this crate does have a concurrent reader outside the lock
+    /// (`fusion.rs`'s test `build`, plus anything in `std` that reads the environment). On Windows
+    /// the calls go to `SetEnvironmentVariableW`/`GetEnvironmentVariableW`, which are serialized by
+    /// the OS and cannot corrupt; on Linux they are not. So the arrangement is: the host that has
+    /// the confound (Win64) pays a lock to remove it, and the host that never had it (every other,
+    /// including the datacenter fleet this gate is being flown to) is not touched at all.
+    fn switch_can_matter() -> bool {
+        wukong_mir::host_supports_vec_kernels()
+    }
+
+    /// Holds the lock for the window and puts the previous value back when dropped — field drops
+    /// run *after* `Drop::drop`, so the restore happens while the lock is still held.
+    struct Scoped {
+        prev: Option<OsString>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(VAR, v),
+                None => std::env::remove_var(VAR),
+            }
+        }
+    }
+
+    /// `None` where the switch is inert — the caller's closure then runs against this host's
+    /// ordinary `mir_build` output, which on such a host is already the normalized MIR.
+    fn scoped(set: bool) -> Option<Scoped> {
+        if !switch_can_matter() {
+            return None;
+        }
+        // A panicking test must not wedge every later one: take the guard out of a poisoned lock.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os(VAR);
+        if set {
+            std::env::set_var(VAR, "1");
+        } else {
+            std::env::remove_var(VAR);
+        }
+        Some(Scoped {
+            prev,
+            _guard: guard,
+        })
+    }
+
+    /// Run `f` with the host's 256-bit raw-AVX2 loop vectorizer suppressed — the host-invariant
+    /// condition every corpus coverage count in this crate is measured in. Where the vectorizer
+    /// does not exist this is already that condition, so `f` simply runs.
+    pub(crate) fn normalized<R>(f: impl FnOnce() -> R) -> R {
+        let _s = scoped(true);
+        f()
+    }
+
+    /// Run `f` with the kill-switch *removed*, i.e. with whatever `mir_build` does by default on
+    /// this host. Only the invariance gate wants this — it is the condition that makes a coverage
+    /// count host-dependent in the first place, and it is the arm that reproduces the old 217/87.
+    /// (Removing rather than merely not-setting matters: it keeps the arm meaningful even when the
+    /// whole suite is run with `WUKONG_P4_NO_256=1` in the environment, and the previous value is
+    /// restored on the way out.) Where [`switch_can_matter`] is false this is indistinguishable
+    /// from [`normalized`] by construction, and the gate skips the arm rather than compare a
+    /// sweep against itself.
+    pub(crate) fn host_native<R>(f: impl FnOnce() -> R) -> R {
+        let _s = scoped(false);
+        f()
+    }
+
+    /// **The one MIR builder both corpus gates use** (lex -> parse -> sema -> mir_build -> opt),
+    /// normalized. It lives here rather than once per test module because the two gates now ratchet
+    /// cross-referenced constants — [`super::tests::RUN_CORPUS_COVERAGE_FLOOR`] and
+    /// [`crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR`] are asserted together by
+    /// `corpus_lowering_floors_are_host_vectorizer_invariant` — and two copies of the builder is
+    /// how the two sweeps would quietly start measuring different MIR while both stayed green.
+    pub(crate) fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
+        normalized(|| build_in_current_host_mode(src, opt))
+    }
+
+    /// [`build`] without the normalization: whatever MIR *this* host's `mir_build` produces under
+    /// whichever window is currently open. Every gate that reports a number must use [`build`];
+    /// this exists for the invariance gate, whose two sweeps pick the condition per program and so
+    /// must supply their own [`normalized`]/[`host_native`] wrapper.
+    ///
+    /// It deliberately does NOT take the lock itself. [`ENV_LOCK`] is a plain `Mutex` and is not
+    /// reentrant, so a caller that already holds a window and then called [`build`] would deadlock
+    /// against itself — which is exactly what `sweep_corpus` would do if it wrapped [`build`]
+    /// instead of this.
+    pub(crate) fn build_in_current_host_mode(src: &str, opt: u8) -> Option<(Program, Interner)> {
+        use wukong_span::SourceMap;
+        let mut sm = SourceMap::new();
+        let id = sm.add("gate.wk".to_string(), src.to_string());
+        let (tokens, ld) = wukong_lexer::tokenize(sm.source(id), id);
+        if ld.iter().any(|d| d.is_error()) {
+            return None;
+        }
+        let mut interner = Interner::new();
+        let (module, pd) =
+            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        if pd.iter().any(|d| d.is_error()) {
+            return None;
+        }
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        if sd.iter().any(|d| d.is_error()) {
+            return None;
+        }
+        let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        if md.iter().any(|d| d.is_error()) {
+            return None;
+        }
+        wukong_opt::optimize(&mut program, opt);
+        Some((program, interner))
+    }
+}
+
+// ============================================================================================
 // Coverage gate: tests/run corpus through the GPU-lowering backend vs the interpreter oracle.
 // ============================================================================================
 #[cfg(all(test, feature = "gpu"))]
@@ -4177,32 +4368,13 @@ fn main() -> i32 {
         assert!(!line_matches("1.5", "2.5"));
     }
 
-    /// Build a program from `.wk` source at `opt` (lex -> parse -> sema -> mir_build -> opt).
-    fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
-        use wukong_span::SourceMap;
-        let mut sm = SourceMap::new();
-        let id = sm.add("gate.wk".to_string(), src.to_string());
-        let (tokens, ld) = wukong_lexer::tokenize(sm.source(id), id);
-        if ld.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let mut interner = Interner::new();
-        let (module, pd) =
-            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
-        if pd.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let (sema, sd) = wukong_sema::check(&module, &interner);
-        if sd.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
-        if md.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        wukong_opt::optimize(&mut program, opt);
-        Some((program, interner))
-    }
+    // `build` compiles `.wk` source with the host's 256-bit raw-AVX2 loop vectorizer suppressed —
+    // the normalization that makes every coverage count below mean the same thing on a Win64 box
+    // and on a Linux datacenter box. `build_in_current_host_mode` is the un-normalized twin, for
+    // the invariance gate's attribution arm only. Both are shared with `megakernel.rs`'s corpus
+    // gate so the two sweeps cannot drift; see `crate::lower::hostvec` for mechanism and
+    // measurement.
+    use hostvec::{build, build_in_current_host_mode};
 
     /// Compare one output line. **Integer output is compared exactly**: `decode_ctx` replays an
     /// integer print record with the identical `format!("{}\n", payload as i64)` the interpreter
@@ -4253,11 +4425,325 @@ fn main() -> i32 {
     /// unchanged, so corpus growth can never trip this, while a construct that stops lowering always
     /// does.
     ///
-    /// Recorded 2026-08-06 at `5870053` on an RTX 4050 / driver r5xx: 217 of 357 programs. The other
-    /// 140 are honest `UNSUPPORTED` declines, dominated by 94 not-yet-lowered `wukong_*` runtime
-    /// kernel calls and 23 raw-AVX2 CPU kernels. Raise this whenever coverage grows; lower it ONLY in
-    /// the same commit as the intentional decline, and say why here.
-    const RUN_CORPUS_COVERAGE_FLOOR: usize = 217;
+    /// **The count is host-invariant**, which it was not until 2026-08-09. It is measured over MIR
+    /// built with the host CPU's 256-bit raw-AVX2 loop vectorizer suppressed (see
+    /// [`crate::lower::hostvec`], which every `build` here routes through), because that vectorizer
+    /// only exists on Win64 and this backend declines the `Op::VecKernelCall` it emits. The old
+    /// floor of 217 was a Windows number: the very same sweep read 235 on a Modal L4 purely because
+    /// Linux never produced the op, so on Linux `235 > 217` passed trivially and the ratchet could
+    /// never have caught a regression there — on the hosts the datacenter round is paid for.
+    /// Normalizing the input rather than the floor also *adds* Windows device coverage: the 18
+    /// affected programs now genuinely lower, run and get compared.
+    ///
+    /// Recorded 2026-08-09 by this gate on an RTX 4050 / Windows: **235 of 357** programs, zero
+    /// mismatches, zero faults. The same number three independent ways — the pre-normalization
+    /// Modal L4 (Linux) sweep the same day read exactly 235/357, because Linux was already in this
+    /// condition; the device-free `corpus_lowering_floors_are_host_vectorizer_invariant` counts 235
+    /// lowerable; and that gate reproduces the old 217 exactly when it re-sweeps host-native, which
+    /// is what pins the +18 on the host CPU vectorizer and nothing else. Two operating systems and
+    /// two cards now agree on one constant. The remaining 122 declines are honest `UNSUPPORTED`,
+    /// dominated by not-yet-lowered `wukong_*` runtime kernel calls. Raise this whenever coverage
+    /// grows; lower it ONLY in the same commit as the intentional decline, and say why here.
+    const RUN_CORPUS_COVERAGE_FLOOR: usize = 235;
+
+    /// The corpus directory both coverage gates and the invariance gate below sweep.
+    fn corpus_files() -> Vec<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/run");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("read tests/run")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "wk").unwrap_or(false))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// What one device-free sweep of the corpus can establish about coverage.
+    #[derive(Default)]
+    struct Sweep {
+        /// Programs `jit_run` would obtain a PTX module for at BOTH -O0 and -O3 — an upper bound on
+        /// `run_corpus_matches_interp_oracle`'s `covered`, and empirically equal to it (see the
+        /// gate's doc).
+        lowerable: std::collections::BTreeSet<String>,
+        /// `name@O{opt}` configs `fusion::analyze` accepts — `mega_corpus_matches_oracle`'s
+        /// `eligible`.
+        mega_eligible: std::collections::BTreeSet<String>,
+        /// `name@O{opt}` configs the megakernel emitter also produces a module for — its `ran`.
+        mega_lowerable: std::collections::BTreeSet<String>,
+        /// Programs whose MIR carries a raw-AVX2 `Op::VecKernelCall`. **This is the entire
+        /// host-dependent term** in every count above.
+        veckernel: std::collections::BTreeSet<String>,
+        /// Emitter errors that are NOT an `UNSUPPORTED:` decline. A decline is coverage the backend
+        /// honestly does not have; anything else is a bug that would show up on the device as a
+        /// *fault*, so it is asserted away here where no GPU is needed to see it.
+        hard_errors: Vec<String>,
+    }
+
+    /// Sweep the corpus device-free, either with the host's 256-bit raw-AVX2 loop vectorizer
+    /// suppressed (`normalize`) or with this host's own setting — the two arms whose difference is
+    /// the whole point of the gate below.
+    ///
+    /// Because the condition is a parameter, it opens the window itself around
+    /// [`hostvec::build_in_current_host_mode`] rather than calling [`build`], which hardcodes the
+    /// normalized arm and would re-enter `hostvec`'s non-reentrant mutex and deadlock.
+    fn sweep_corpus(files: &[PathBuf], normalize: bool) -> Sweep {
+        /// An emitter result as coverage: `Ok` covers, an `UNSUPPORTED:` decline does not, anything
+        /// else is a bug recorded on `hard`.
+        fn covers(
+            hard: &mut Vec<String>,
+            cfg: &str,
+            what: &str,
+            r: Result<String, String>,
+        ) -> bool {
+            match r {
+                Ok(_) => true,
+                Err(e) if e.starts_with(UNSUPPORTED) => false,
+                Err(e) => {
+                    hard.push(format!("{cfg}: {what}: {e}"));
+                    false
+                }
+            }
+        }
+
+        let mut s = Sweep::default();
+        for path in files {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let src = std::fs::read_to_string(path).unwrap();
+            let mut lowerable = true;
+            for opt in [0u8, 3u8] {
+                let cfg = format!("{name}@O{opt}");
+                let built = if normalize {
+                    hostvec::normalized(|| build_in_current_host_mode(&src, opt))
+                } else {
+                    hostvec::host_native(|| build_in_current_host_mode(&src, opt))
+                };
+                let Some((program, mut interner)) = built else {
+                    lowerable = false;
+                    continue;
+                };
+                let entry = interner.intern("main");
+                if program.function(entry).is_none() {
+                    lowerable = false;
+                    continue;
+                }
+                if program.funcs.iter().any(|f| {
+                    f.blocks.iter().any(|b| {
+                        b.insts
+                            .iter()
+                            .any(|i| matches!(i.op, Op::VecKernelCall { .. }))
+                    })
+                }) {
+                    s.veckernel.insert(name.clone());
+                }
+
+                // Model `jit_run`: the megakernel first when `fusion::analyze` accepts the program,
+                // then the single-thread lowering. Either module means the device would have run it.
+                let mega = if crate::fusion::analyze(&program, entry, &interner).eligible {
+                    s.mega_eligible.insert(cfg.clone());
+                    covers(
+                        &mut s.hard_errors,
+                        &cfg,
+                        "emit_mega_ptx",
+                        emit_mega_ptx(&program, entry, &interner),
+                    )
+                } else {
+                    false
+                };
+                let single = covers(
+                    &mut s.hard_errors,
+                    &cfg,
+                    "emit_ptx",
+                    emit_ptx(&program, entry, &interner),
+                );
+                if mega {
+                    s.mega_lowerable.insert(cfg);
+                }
+                lowerable &= mega || single;
+            }
+            if lowerable {
+                s.lowerable.insert(name);
+            }
+        }
+        s
+    }
+
+    /// **The device-free proof that both corpus floors measure this backend and not the host CPU.**
+    ///
+    /// [`RUN_CORPUS_COVERAGE_FLOOR`] and
+    /// [`crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR`] used to be Windows numbers: 217 and
+    /// 87 here, 235 and 90 on a Modal L4 the same day, because `wukong_mir_build`'s 256-bit
+    /// raw-AVX2 loop vectorizer exists only under the Win64 ABI and this backend declines the
+    /// `Op::VecKernelCall` it emits. A single hardcoded floor cannot ratchet two numbers: on the
+    /// higher-reading host it passes with slack and would never catch a regression — and the higher
+    /// reading was Linux, i.e. exactly the datacenter fleet the GPU retarget is being paid to run
+    /// on. Worse, the +18 read as *progress* in a log.
+    ///
+    /// So the sweeps normalize their input (`crate::lower::hostvec`) and this gate proves the
+    /// normalization is both effective and complete:
+    ///
+    /// 1. **Effective** — no program in the normalized corpus carries a `VecKernelCall` at all, so
+    ///    the one host-dependent term in the count is identically zero on every host. Delete the
+    ///    normalization and this fails on Windows immediately (26 programs carry one). And it is
+    ///    checked **non-vacuously**: where the vectorizer exists, the host-native re-sweep must
+    ///    find at least one carrier, or "the normalized sweep has none" would hold for free.
+    /// 2. **Complete** — re-sweeping host-native (only meaningful where
+    ///    `wukong_mir::host_supports_vec_kernels()` is true; elsewhere the two sweeps are the same
+    ///    build by construction) recovers the *old* counts, and every program the normalization
+    ///    gained is one that carried a `VecKernelCall`, with nothing lost. That is what attributes
+    ///    the whole 217→235 / 87→90 delta to the host CPU vectorizer rather than to anything in
+    ///    `lower.rs`. Note this is the only direction that can be checked from one machine: it
+    ///    shows the Win64 sweep reproduces the Linux number, which is what "invariant" has to mean
+    ///    when you can only run one OS at a time.
+    /// 3. It re-asserts both floors against a count that needs **no GPU**, so a lowering regression
+    ///    is catchable on any box with the toolchain — until now the two device gates were the only
+    ///    check and they skip wherever there is no card. (It is still behind `--features gpu` like
+    ///    everything else in this module, and CI's gpu job is `cargo check`, so CI compiles this
+    ///    but does not run it. `cargo test -p wukong_codegen_gpu --features gpu` runs it anywhere.)
+    ///
+    /// `emit_ptx`/`emit_mega_ptx`/`fusion::analyze` are pure host code, so this is CPU-only. The
+    /// counts here are an *upper bound* on the device gates' `covered`/`ran` (a program can still
+    /// mismatch or overflow the print buffer at run time), but measured 2026-08-09 they are exactly
+    /// equal on both hosts, which is why they can ratchet the same constants. It sweeps the corpus
+    /// twice, so it costs ~35 s in a debug build — the price of the floors being checkable at all
+    /// without silicon.
+    #[test]
+    fn corpus_lowering_floors_are_host_vectorizer_invariant() {
+        use crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR;
+
+        let files = corpus_files();
+        let norm = sweep_corpus(&files, true);
+
+        eprintln!(
+            "\n=== corpus lowering (device-free) — normalized, host 256-bit AVX2 vectorizer OFF ===\
+             \n    single: {}/{} programs lowerable (floor {RUN_CORPUS_COVERAGE_FLOOR})\
+             \n    mega:   {} lowerable / {} eligible configs (floor {MEGA_CORPUS_COVERAGE_FLOOR})\
+             \n    programs carrying a VecKernelCall: {} (must be 0)",
+            norm.lowerable.len(),
+            files.len(),
+            norm.mega_lowerable.len(),
+            norm.mega_eligible.len(),
+            norm.veckernel.len(),
+        );
+
+        assert!(
+            norm.hard_errors.is_empty(),
+            "the PTX emitters failed with something other than an `{UNSUPPORTED}` decline. A \
+             decline is coverage this backend honestly lacks; this is a bug, and on a device it \
+             would surface as a corpus FAULT:\n{}",
+            norm.hard_errors.join("\n")
+        );
+        assert!(
+            norm.veckernel.is_empty(),
+            "the corpus sweep's MIR still carries `Op::VecKernelCall` in {} program(s): {}. That op \
+             is emitted only where `wukong_mir::host_supports_vec_kernels()` is true (Win64 only) \
+             and is declined by `lower.rs`, so its presence makes every coverage count below a \
+             property of the HOST CPU instead of this backend. `crate::lower::hostvec::normalized` \
+             is supposed to have suppressed it — restore that rather than adjusting a floor.",
+            norm.veckernel.len(),
+            norm.veckernel.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+
+        // The floors, re-asserted without a GPU. Same constants the device gates ratchet.
+        assert!(
+            norm.lowerable.len() >= RUN_CORPUS_COVERAGE_FLOOR,
+            "gpu-native corpus LOWERING regressed: {} of {} programs still produce a PTX module at \
+             both -O0 and -O3, floor is {RUN_CORPUS_COVERAGE_FLOOR}. This needs no device, so it is \
+             the first thing to fix. If the decline is INTENTIONAL, update the floor in the SAME \
+             commit and say why in its comment.",
+            norm.lowerable.len(),
+            files.len(),
+        );
+        assert!(
+            norm.mega_lowerable.len() >= MEGA_CORPUS_COVERAGE_FLOOR,
+            "megakernel corpus LOWERING regressed: {} of {} eligible program-configs still produce \
+             a mega PTX module, floor is {MEGA_CORPUS_COVERAGE_FLOOR}. Either `fusion::analyze` \
+             stopped accepting programs or `emit_mega_ptx` started declining them — both are silent \
+             on the device gate. If INTENTIONAL, update the floor in the SAME commit.",
+            norm.mega_lowerable.len(),
+            norm.mega_eligible.len(),
+        );
+
+        if !wukong_mir::host_supports_vec_kernels() {
+            eprintln!(
+                "    host-native re-sweep skipped: `host_supports_vec_kernels()` is false on this \
+                 host, so `mir_build` emits no 256-bit recipe and the two sweeps are the same build \
+                 by construction. The attribution half of this gate runs on a Win64 box."
+            );
+            return;
+        }
+
+        // This host DOES have the vectorizer, so it can prove where the difference comes from.
+        let host = sweep_corpus(&files, false);
+        eprintln!(
+            "    host-native re-sweep (this host's own setting):\
+             \n      single: {}/{} lowerable   mega: {} lowerable / {} eligible\
+             \n      programs carrying a VecKernelCall: {}",
+            host.lowerable.len(),
+            files.len(),
+            host.mega_lowerable.len(),
+            host.mega_eligible.len(),
+            host.veckernel.len(),
+        );
+
+        // NON-VACUITY. `norm.veckernel.is_empty()` above is a strong claim only if the corpus can
+        // produce a `VecKernelCall` here in the first place; if it cannot, that assert holds for
+        // free and this whole gate degrades into "two identical sweeps agree". On a host with the
+        // vectorizer the corpus must exercise it, or the normalization is no longer load-bearing
+        // and the floors have quietly gone back to being unattributed numbers.
+        assert!(
+            !host.veckernel.is_empty(),
+            "no `tests/run` program produced an `Op::VecKernelCall` on a host where \
+             `host_supports_vec_kernels()` is true. Either the corpus lost every fixture with a \
+             256-bit-eligible f32 loop, or `mir_build` stopped building the recipe — and until one \
+             of those is understood, this gate's `norm.veckernel.is_empty()` assertion proves \
+             nothing and neither floor is attributed to anything. Do NOT delete this check to get \
+             green; the coverage numbers depend on knowing which side the +18 came from."
+        );
+
+        let lost: Vec<&String> = host.lowerable.difference(&norm.lowerable).collect();
+        assert!(
+            lost.is_empty(),
+            "suppressing the host's 256-bit vectorizer LOST lowering coverage for {:?}. The switch \
+             is documented as result-identical (`wukong_codegen_cranelift`'s \
+             `p4_kill_switch_is_result_identical`), so the 128-bit fallback presenting MIR this \
+             backend cannot lower is a real hole — find it before trusting any coverage number.",
+            lost
+        );
+        let gained: Vec<&String> = norm.lowerable.difference(&host.lowerable).collect();
+        for g in &gained {
+            assert!(
+                host.veckernel.contains(*g),
+                "`{g}` lowers only when the host vectorizer is off, yet its host-native MIR carries \
+                 no `VecKernelCall`. Then the two sweeps differ for some OTHER reason and the \
+                 host-invariance claim behind {RUN_CORPUS_COVERAGE_FLOOR} does not hold — do not \
+                 paper over it by moving the floor."
+            );
+        }
+        let mega_gained: Vec<&String> = norm
+            .mega_lowerable
+            .difference(&host.mega_lowerable)
+            .collect();
+        for g in &mega_gained {
+            let prog = g.split_once("@O").map(|(p, _)| p).unwrap_or(g);
+            assert!(
+                host.veckernel.contains(prog),
+                "mega config `{g}` runs only when the host vectorizer is off, yet `{prog}`'s \
+                 host-native MIR carries no `VecKernelCall` — same problem as above, for \
+                 {MEGA_CORPUS_COVERAGE_FLOOR}."
+            );
+        }
+        eprintln!(
+            "    => the whole difference is the host CPU vectorizer: single +{} programs, mega +{} \
+             configs, all of them VecKernelCall carriers ({} such programs on this host). Without \
+             the normalization the floors would have to be {} / {} here and \
+             {RUN_CORPUS_COVERAGE_FLOOR} / {MEGA_CORPUS_COVERAGE_FLOOR} on Linux.",
+            gained.len(),
+            mega_gained.len(),
+            host.veckernel.len(),
+            host.lowerable.len(),
+            host.mega_lowerable.len(),
+        );
+    }
 
     #[test]
     fn run_corpus_matches_interp_oracle() {
@@ -4277,13 +4763,7 @@ fn main() -> i32 {
         // compute-heavy perf benchmarks — e.g. fib(30) is ~2.7M calls — which the single-thread
         // execution model can't run within the OS GPU watchdog; their *lowering* is correct, but
         // running them needs the grid-parallel perf phase. They are not a lowering-correctness gate.)
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/run");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .expect("read tests/run")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "wk").unwrap_or(false))
-            .collect();
-        files.sort();
+        let files = corpus_files();
 
         let mut covered = 0usize;
         let mut skipped: Vec<String> = Vec::new();
@@ -4394,6 +4874,15 @@ fn main() -> i32 {
             "\n=== gpu-native MIR->PTX coverage: {covered}/{} programs match the interp oracle (-O0==-O3) ===",
             files.len()
         );
+        // The raw count above is over the WHOLE corpus — nothing is excluded from the denominator.
+        // What is normalized is the input: state that, and state the host's own setting, so a reader
+        // comparing this log against a run on another OS knows the two are the same measurement.
+        eprintln!(
+            "    (host 256-bit raw-AVX2 loop vectorizer suppressed for every build in this sweep, \
+             so the count is host-invariant; this host would otherwise emit VecKernelCall: {}. \
+             See `corpus_lowering_floors_are_host_vectorizer_invariant` for the device-free proof.)",
+            wukong_mir::host_supports_vec_kernels()
+        );
         if !skipped.is_empty() {
             eprintln!("-- not yet covered ({}):", skipped.len());
             for s in &skipped {
@@ -4435,12 +4924,14 @@ fn main() -> i32 {
         assert!(
             covered >= RUN_CORPUS_COVERAGE_FLOOR,
             "gpu-native corpus coverage regressed below the recorded floor: {covered} of {} \
-             programs match the oracle, floor is {RUN_CORPUS_COVERAGE_FLOOR} ({} lost). Every \
-             program that stopped running is on the `-- not yet covered` list printed above (re-run \
-             with --nocapture). If the decline is INTENTIONAL, update RUN_CORPUS_COVERAGE_FLOOR in \
-             the SAME commit and say why in its comment. If it is not, you just silently lost \
-             gpu-native corpus coverage — a decline is a skip here, so no other gate in this \
-             workspace would ever have told you.",
+             programs match the oracle, floor is {RUN_CORPUS_COVERAGE_FLOOR} ({} lost). This count \
+             is measured over host-vectorizer-normalized MIR (see `crate::lower::hostvec`), so it \
+             is the SAME number on Windows and on a Linux datacenter box — a shortfall here is a \
+             real lowering regression, never an OS difference. Every program that stopped running \
+             is on the `-- not yet covered` list printed above (re-run with --nocapture). If the \
+             decline is INTENTIONAL, update RUN_CORPUS_COVERAGE_FLOOR in the SAME commit and say \
+             why in its comment. If it is not, you just silently lost gpu-native corpus coverage — \
+             a decline is a skip here, so no other gate in this workspace would ever have told you.",
             files.len(),
             RUN_CORPUS_COVERAGE_FLOOR - covered
         );
