@@ -28,6 +28,28 @@
 //! logical sequence — paging is numerically invisible. The [`crate::paged_attention`] gate proves it
 //! by running the same logical sequence under two different physical block layouts and asserting the
 //! output matches to the bit (the decode analogue of int8 split-K / transpose bit-exactness).
+//!
+//! ### Grouped-query attention (GQA/MQA)
+//! Every Llama-class model attends with **more query heads than KV heads** — Llama-3-8B is 32 q over
+//! 8 kv, Llama-3-70B 64 over 8, Mistral-7B 32 over 8 — and the whole point of that architecture is
+//! that the *cache* shrinks by the group size `g = q_heads / kv_heads`. This module therefore keeps
+//! the two counts strictly apart:
+//!
+//! - **[`KvConfig::heads`] is the KV-head count**, and it is the only head count any slab offset here
+//!   is keyed on ([`layer_plane_elems`](KvConfig::layer_plane_elems),
+//!   [`elem_offset`](KvConfig::elem_offset), [`scale_offset`](KvConfig::scale_offset)). Sizing the
+//!   cache off the *query* head count is exactly the `g`x over-allocation GQA exists to remove.
+//! - **[`GqaConfig`] pairs that cache geometry with `q_heads`** and is the type the attention path
+//!   takes. Its constructor is the one place `q_heads % kv_heads == 0` is enforced, and its fields are
+//!   private so no caller can assemble a geometry that skipped the check.
+//! - `q_heads == kv_heads` ([`GqaConfig::mha`]) is plain multi-head attention and is bit-for-bit the
+//!   behaviour that shipped before GQA existed — the group size is 1 and `kv_head_of(h) == h`.
+//!
+//! **Paging invariance survives GQA**, and it is worth saying explicitly because the change *looks*
+//! like it should break it: the bit-exactness property rests on the lane partition being a function of
+//! the logical position index alone plus a fixed merge order (see [`crate::paged_attention`]). GQA
+//! changes *which head's* K/V a lane reads and nothing else — not which lane a position lands in, not
+//! the merge order. The `paged_gqa_*_invariant_to_block_layout` gates prove it rather than assume it.
 
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
@@ -54,13 +76,22 @@ impl std::error::Error for OutOfBlocks {}
 
 /// The static geometry of a paged KV-cache, shared by [`BlockManager`], [`PagedKvCache`], and the
 /// attention kernel so they agree on every stride. All counts are in elements/tokens, not bytes.
-#[derive(Debug, Clone, Copy)]
+///
+/// This is the **cache** geometry, so every head count in it is a **KV**-head count. The query-head
+/// count is not part of it — it does not size, stride or address anything here — and lives in
+/// [`GqaConfig`], which pairs a `KvConfig` with `q_heads` and validates the grouping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvConfig {
     /// Transformer layers (each layer has its own K and V planes in the slab).
     pub layers: usize,
-    /// KV heads (== query heads here; GQA/MQA would make this smaller).
+    /// **KV heads** — the head count the cache is sized and indexed by. Under GQA/MQA this is
+    /// *smaller* than the query-head count by the group size `g` (Llama-3-8B: 8 here, 32 query
+    /// heads), and that difference is the entire memory win: the slab shrinks by exactly `g`.
+    /// Prefer the named [`kv_heads`](Self::kv_heads) accessor in new code, and reach for
+    /// [`GqaConfig`] whenever the query-head count is also in play.
     pub heads: usize,
-    /// Per-head dimension. `heads * head_dim == D`.
+    /// Per-head dimension. `heads * head_dim` is the **KV** width of one token (`GqaConfig::kv_dim`),
+    /// which equals the model's hidden size `D` only when `q_heads == kv_heads`.
     pub head_dim: usize,
     /// Tokens per physical block.
     pub block_size: usize,
@@ -74,7 +105,21 @@ pub struct KvConfig {
 }
 
 impl KvConfig {
-    /// f16 elements in one layer's K (or V) plane: `num_blocks * block_size * heads * head_dim`.
+    /// The **KV**-head count — the same number as the [`heads`](Self::heads) field, under the name
+    /// that says which of the two head counts it is. Every offset helper below is keyed on it.
+    #[inline]
+    pub fn kv_heads(&self) -> usize {
+        self.heads
+    }
+
+    /// Width in elements of one cached token's K (or V) vector: `kv_heads * head_dim`. Under GQA this
+    /// is `g`x narrower than the model's hidden size, which is where the cache saving comes from.
+    #[inline]
+    pub fn kv_dim(&self) -> usize {
+        self.heads * self.head_dim
+    }
+
+    /// f16 elements in one layer's K (or V) plane: `num_blocks * block_size * kv_heads * head_dim`.
     #[inline]
     pub fn layer_plane_elems(&self) -> usize {
         self.num_blocks * self.block_size * self.heads * self.head_dim
@@ -86,8 +131,10 @@ impl KvConfig {
         self.layers * self.layer_plane_elems()
     }
 
-    /// Flat element offset of `K[layer][phys_block][tok][head][dh]` (row-major), the single indexing
-    /// rule the append and attention kernels both compute. `tok` is the in-block token (`0..block_size`).
+    /// Flat element offset of `K[layer][phys_block][tok][kv_head][dh]` (row-major), the single indexing
+    /// rule the append and attention kernels both compute. `tok` is the in-block token
+    /// (`0..block_size`) and `head` is a **KV** head (`0..kv_heads`) — under GQA a query head `h`
+    /// reaches its row through [`GqaConfig::kv_head_of`], never with `h` itself.
     #[inline]
     pub fn elem_offset(
         &self,
@@ -103,14 +150,14 @@ impl KvConfig {
             + dh
     }
 
-    /// f32 scale entries in one int8 K (or V) **scale slab**: one per `(token, head)` =
-    /// `layers * num_blocks * block_size * heads` — a factor `head_dim` smaller than the value slab.
+    /// f32 scale entries in one int8 K (or V) **scale slab**: one per `(token, kv_head)` =
+    /// `layers * num_blocks * block_size * kv_heads` — a factor `head_dim` smaller than the value slab.
     #[inline]
     pub fn scale_slab_elems(&self) -> usize {
         self.layers * self.num_blocks * self.block_size * self.heads
     }
 
-    /// Flat index of `scale[layer][phys_block][tok][head]` — the per-(token, head) dequant scale the
+    /// Flat index of `scale[layer][phys_block][tok][kv_head]` — the per-(token, KV head) dequant scale the
     /// [int8 attention kernel](crate::paged_attention::paged_attn_decode_int8_ptx) reads. Equals
     /// `elem_offset(..., dh=0) / head_dim`.
     #[inline]
@@ -136,6 +183,9 @@ impl KvConfig {
     /// `max_ctx` tokens simultaneously (the worst case a scheduler must plan for): the block-table
     /// width is `ceil(max_ctx / block_size)` and the pool holds exactly `num_slots` such sequences.
     /// Size the result against the device budget with [`assert_kv_budget`](Self::assert_kv_budget).
+    ///
+    /// `heads` is the **KV**-head count. For a GQA model pass `kv_heads`, not `q_heads` — or, better,
+    /// call [`GqaConfig::for_serving`], which takes both and cannot be given them the wrong way round.
     pub fn for_serving(
         layers: usize,
         heads: usize,
@@ -179,6 +229,9 @@ impl KvConfig {
     /// `for_serving(..)`'s cache still fits `budget_bytes` at `elem_size` bytes/element — the
     /// Bcap↔context trade-off table in one call. Returns 0 if even one block per slot is over budget.
     ///
+    /// `heads` is the **KV**-head count, so a GQA model reaches exactly `g = q_heads / kv_heads` times
+    /// the context of its MHA twin inside the same budget — the serving consequence of the shrink.
+    ///
     /// **Precondition:** every geometry parameter (`layers`, `heads`, `head_dim`, `block_size`,
     /// `num_slots`, `elem_size`) must be non-zero — a zero anywhere makes the divisor zero. Asserted
     /// with a message naming the offending values, rather than surfacing a bare `attempt to divide by
@@ -202,6 +255,165 @@ impl KvConfig {
         );
         let per_slot_blocks = budget_bytes / (per_tok * block_size * num_slots);
         per_slot_blocks * block_size
+    }
+}
+
+/// The **attention head geometry** of a paged cache: `q_heads` query heads reading a [`KvConfig`]
+/// whose `heads` is the `kv_heads` count, with `q_heads % kv_heads == 0`.
+///
+/// This is the type the paged attention path takes, and the *only* place the two head counts are
+/// allowed to meet. Its fields are **private** and its constructors validate, so a `GqaConfig` that
+/// exists is a grouping that passed the check — there is no struct-literal back door the way there is
+/// for `KvConfig`. The two counts do genuinely different jobs and confusing them is silent:
+///
+/// | quantity | keyed on |
+/// |---|---|
+/// | the decode grid, the `(slot, head)` warp assignment, the Q row, the O row | `q_heads` |
+/// | the K/V slabs, the int8 scale slabs, every `elem_offset` / `scale_offset`, the K/V projection width | `kv_heads` |
+///
+/// `q_heads == kv_heads` is multi-head attention: [`group_size`](Self::group_size) is 1,
+/// [`kv_head_of`](Self::kv_head_of) is the identity, and every byte count matches what the cache
+/// allocated before GQA existed.
+///
+/// ```
+/// use wukong_codegen_gpu::paged_kv::GqaConfig;
+/// // Llama-3-8B: 32 query heads over 8 KV heads, head_dim 128.
+/// let g = GqaConfig::for_serving(32, 32, 8, 128, 16, 8, 4096);
+/// assert_eq!(g.group_size(), 4);
+/// assert_eq!(g.kv_head_of(0), 0);
+/// assert_eq!(g.kv_head_of(7), 1); // query heads 4..8 all read KV head 1
+/// // The cache is a quarter of what the same model would need without grouping.
+/// assert_eq!(g.mha_equivalent_kv_bytes(2), 4 * g.kv().kv_bytes(2));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GqaConfig {
+    /// The cache geometry. `kv.heads` is the **KV**-head count.
+    kv: KvConfig,
+    /// Query heads. A whole multiple of `kv.heads`.
+    q_heads: usize,
+}
+
+impl GqaConfig {
+    /// Pair a cache geometry with a query-head count, **validating the grouping loudly**. Panics
+    /// unless `q_heads > 0`, `kv.heads > 0`, `kv.head_dim > 0` and `q_heads % kv.heads == 0` — an
+    /// indivisible pair has no meaning (some KV head would serve a fractional number of query heads)
+    /// and every downstream index would silently address the wrong row rather than fail.
+    ///
+    /// Note `q_heads >= kv_heads` needs no separate check: a positive `q_heads` divisible by
+    /// `kv_heads` is already at least `kv_heads`.
+    pub fn new(kv: KvConfig, q_heads: usize) -> Self {
+        assert!(
+            q_heads > 0 && kv.heads > 0 && kv.head_dim > 0,
+            "GQA geometry: q_heads, kv_heads and head_dim must all be non-zero \
+             (got q_heads={q_heads} kv_heads={} head_dim={})",
+            kv.heads,
+            kv.head_dim
+        );
+        assert!(
+            q_heads.is_multiple_of(kv.heads),
+            "GQA geometry: q_heads ({q_heads}) must be a whole multiple of kv_heads ({}) — every KV \
+             head serves exactly q_heads/kv_heads query heads, so an indivisible pair has no grouping",
+            kv.heads
+        );
+        Self { kv, q_heads }
+    }
+
+    /// Plain multi-head attention over `kv`: `q_heads == kv.heads`, group size 1. Bit-for-bit the
+    /// pre-GQA behaviour, and what every `KvConfig`-taking entry point in this crate assumes.
+    #[inline]
+    pub fn mha(kv: KvConfig) -> Self {
+        Self::new(kv, kv.heads)
+    }
+
+    /// Build a serving geometry directly from a model's head counts — the GQA-aware
+    /// [`KvConfig::for_serving`], which cannot be handed `q_heads` where it wanted `kv_heads`.
+    /// The cache is sized for `kv_heads`, so it is `g`x smaller than the query-head count suggests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_serving(
+        layers: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_slots: usize,
+        max_ctx: usize,
+    ) -> Self {
+        Self::new(
+            KvConfig::for_serving(layers, kv_heads, head_dim, block_size, num_slots, max_ctx),
+            q_heads,
+        )
+    }
+
+    /// The cache geometry (its `heads` is `kv_heads`).
+    #[inline]
+    pub fn kv(&self) -> &KvConfig {
+        &self.kv
+    }
+
+    /// Query heads.
+    #[inline]
+    pub fn q_heads(&self) -> usize {
+        self.q_heads
+    }
+
+    /// KV heads.
+    #[inline]
+    pub fn kv_heads(&self) -> usize {
+        self.kv.heads
+    }
+
+    /// Per-head dimension (shared by Q and KV).
+    #[inline]
+    pub fn head_dim(&self) -> usize {
+        self.kv.head_dim
+    }
+
+    /// `g = q_heads / kv_heads` — how many query heads share each KV head. 1 is MHA; `kv_heads == 1`
+    /// is MQA.
+    #[inline]
+    pub fn group_size(&self) -> usize {
+        self.q_heads / self.kv.heads
+    }
+
+    /// True when there is no grouping (`g == 1`).
+    #[inline]
+    pub fn is_mha(&self) -> bool {
+        self.group_size() == 1
+    }
+
+    /// The KV head query head `q_head` reads: `q_head / group_size`, the **contiguous** grouping
+    /// (query heads `[j*g, (j+1)*g)` all read KV head `j`) that FA2/FA3, cuDNN, vLLM and PyTorch's
+    /// `enable_gqa` all use. This is the one mapping the decode kernel reproduces on device.
+    #[inline]
+    pub fn kv_head_of(&self, q_head: usize) -> usize {
+        debug_assert!(
+            q_head < self.q_heads,
+            "query head {q_head} out of range (q_heads = {})",
+            self.q_heads
+        );
+        q_head / self.group_size()
+    }
+
+    /// Width of one token's **query** row: `q_heads * head_dim` — the model's hidden size `D`, and the
+    /// stride of the `[bcap, D]` Q and output buffers.
+    #[inline]
+    pub fn q_dim(&self) -> usize {
+        self.q_heads * self.kv.head_dim
+    }
+
+    /// Width of one token's **KV** row: `kv_heads * head_dim` — the K/V projection width and the
+    /// per-token cache footprint. `g`x narrower than [`q_dim`](Self::q_dim).
+    #[inline]
+    pub fn kv_dim(&self) -> usize {
+        self.kv.kv_dim()
+    }
+
+    /// K+V bytes the *equivalent MHA* cache would need — the same geometry with `kv_heads` raised to
+    /// `q_heads`. Exactly `group_size()` times [`KvConfig::kv_bytes`], and the number that makes the
+    /// GQA saving quotable instead of implied.
+    #[inline]
+    pub fn mha_equivalent_kv_bytes(&self, elem_size: usize) -> usize {
+        self.group_size() * self.kv.kv_bytes(elem_size)
     }
 }
 
@@ -712,6 +924,301 @@ mod tests {
     #[should_panic(expected = "must all be non-zero")]
     fn zero_geometry_in_max_ctx_within_budget_is_named() {
         KvConfig::max_ctx_within_budget(12, 8, 64, 16, 0, 2, 4usize << 30);
+    }
+
+    // ================== GQA geometry (pure arithmetic — no device, no feature gate) ==================
+
+    /// Real head geometries, as the models ship them: `(name, layers, q_heads, kv_heads, head_dim)`.
+    /// Two GQA models, one MQA-adjacent extreme and one genuine MHA control, so every assertion below
+    /// is exercised at `g = 1` as well as `g > 1`.
+    const MODEL_GEOMETRIES: [(&str, usize, usize, usize, usize); 5] = [
+        ("Llama-3-8B", 32, 32, 8, 128),
+        ("Llama-3-70B", 80, 64, 8, 128),
+        ("Mistral-7B", 32, 32, 8, 128),
+        ("MQA-32x1", 32, 32, 1, 128),
+        ("GPT-2 (MHA control)", 12, 12, 12, 64),
+    ];
+
+    /// The grouping is validated **at construction**, loudly. 32 query heads cannot be split across 7
+    /// KV heads: some KV head would serve a fractional number of query heads, and every index derived
+    /// from `q_head / g` would then be silently wrong rather than absent.
+    #[test]
+    #[should_panic(expected = "must be a whole multiple of kv_heads")]
+    fn gqa_construction_rejects_an_indivisible_grouping() {
+        let kv = KvConfig::for_serving(2, 7, 64, 16, 4, 256);
+        GqaConfig::new(kv, 32);
+    }
+
+    /// A zero head count is named, not surfaced as a divide-by-zero from inside `group_size`.
+    #[test]
+    #[should_panic(expected = "must all be non-zero")]
+    fn gqa_construction_rejects_zero_query_heads() {
+        let kv = KvConfig::for_serving(2, 8, 64, 16, 4, 256);
+        GqaConfig::new(kv, 0);
+    }
+
+    /// `kv_heads > q_heads` is caught by the same divisibility rule (a positive `q_heads` divisible by
+    /// `kv_heads` is necessarily `>= kv_heads`), so there is no second check to forget to write.
+    #[test]
+    #[should_panic(expected = "must be a whole multiple of kv_heads")]
+    fn gqa_construction_rejects_more_kv_heads_than_query_heads() {
+        let kv = KvConfig::for_serving(2, 16, 64, 16, 4, 256);
+        GqaConfig::new(kv, 8);
+    }
+
+    /// **Nothing regresses at `kv_heads == q_heads`.** `GqaConfig::mha` must be the exact identity
+    /// case: group size 1, `kv_head_of` the identity on every head, Q and KV widths equal, and the
+    /// "MHA equivalent" byte count equal to the cache's own — i.e. no saving claimed where none exists.
+    #[test]
+    fn mha_is_the_group_size_one_special_case() {
+        for heads in [1usize, 3, 8, 12, 32] {
+            let kv = KvConfig::for_serving(4, heads, 64, 16, 2, 128);
+            let g = GqaConfig::mha(kv);
+            assert!(g.is_mha(), "heads={heads}");
+            assert_eq!(g.group_size(), 1, "heads={heads}");
+            assert_eq!(g.q_heads(), heads);
+            assert_eq!(g.kv_heads(), heads);
+            assert_eq!(g.q_dim(), g.kv_dim());
+            assert_eq!(g.kv(), &kv, "mha() must not disturb the cache geometry");
+            for h in 0..heads {
+                assert_eq!(g.kv_head_of(h), h, "MHA head mapping must be the identity");
+            }
+            for esz in [1usize, 2, 4] {
+                assert_eq!(g.mha_equivalent_kv_bytes(esz), kv.kv_bytes(esz));
+            }
+        }
+    }
+
+    /// **The headline: a Llama-3-8B KV cache is exactly a quarter of the MHA equivalent.** 32 query
+    /// heads over 8 KV heads is `g = 4`, and the cache — which is what has to fit in device memory —
+    /// shrinks by exactly that factor, at every storage dtype. This is the whole point of the
+    /// architecture, and until `kv_heads` existed as its own quantity Wukong allocated all four
+    /// copies: every capacity, paging and throughput number was being measured on a 4x-too-large
+    /// workload, and no comparison against a vLLM- or TRT-LLM-class peer was measuring the same thing.
+    #[test]
+    fn llama3_8b_kv_cache_is_exactly_a_quarter_of_the_mha_equivalent() {
+        let (layers, q_heads, kv_heads, hd) = (32usize, 32usize, 8usize, 128usize);
+        let (bsz, slots, max_ctx) = (16usize, 8usize, 8192usize);
+        let gqa = GqaConfig::for_serving(layers, q_heads, kv_heads, hd, bsz, slots, max_ctx);
+        // The same pool geometry with the grouping removed — identical everywhere but the head axis.
+        let mha = KvConfig::for_serving(layers, q_heads, hd, bsz, slots, max_ctx);
+
+        assert_eq!(gqa.group_size(), 4);
+        assert_eq!(gqa.q_dim(), 4096, "hidden size is query-headed");
+        assert_eq!(
+            gqa.kv_dim(),
+            1024,
+            "the cached row is KV-headed — a quarter as wide"
+        );
+        // Everything but the head axis must be identical, or the comparison below is not a comparison.
+        assert_eq!(gqa.kv().num_blocks, mha.num_blocks);
+        assert_eq!(gqa.kv().max_blocks_per_seq, mha.max_blocks_per_seq);
+        assert_eq!(gqa.kv().layers, mha.layers);
+
+        // Exactly 4x, in elements and at every dtype — not "about" 4x.
+        assert_eq!(4 * gqa.kv().slab_elems(), mha.slab_elems());
+        assert_eq!(4 * gqa.kv().scale_slab_elems(), mha.scale_slab_elems());
+        for esz in [1usize, 2, 4] {
+            assert_eq!(
+                4 * gqa.kv().kv_bytes(esz),
+                mha.kv_bytes(esz),
+                "f{} KV bytes must be exactly a quarter",
+                esz * 8
+            );
+        }
+        assert_eq!(4 * gqa.kv().kv_bytes_int8(), mha.kv_bytes_int8());
+        // And the config reports the saving itself, so it can be quoted without re-deriving it.
+        assert_eq!(gqa.mha_equivalent_kv_bytes(2), mha.kv_bytes(2));
+
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "Llama-3-8B ({q_heads}q/{kv_heads}kv x {hd}, {layers}L, {slots} slots x {max_ctx} tok): \
+             f16 KV {:.2} GiB with GQA vs {:.2} GiB without = exactly {}x smaller",
+            gib(gqa.kv().kv_bytes(2)),
+            gib(mha.kv_bytes(2)),
+            gqa.group_size()
+        );
+    }
+
+    /// The shrink is `g` for every real geometry, not just Llama-3-8B — including `g = 1`, where it
+    /// must be exactly 1 (an MHA model must not be told it saved anything).
+    #[test]
+    fn every_model_geometry_shrinks_the_cache_by_exactly_its_group_size() {
+        for (name, layers, q_heads, kv_heads, hd) in MODEL_GEOMETRIES {
+            let gqa = GqaConfig::for_serving(layers, q_heads, kv_heads, hd, 16, 8, 4096);
+            let mha = KvConfig::for_serving(layers, q_heads, hd, 16, 8, 4096);
+            let g = gqa.group_size();
+            assert_eq!(g, q_heads / kv_heads, "{name}");
+            assert_eq!(g * gqa.kv().kv_bytes(2), mha.kv_bytes(2), "{name}");
+            assert_eq!(gqa.mha_equivalent_kv_bytes(2), mha.kv_bytes(2), "{name}");
+            assert_eq!(gqa.is_mha(), q_heads == kv_heads, "{name}");
+            eprintln!(
+                "{name}: {q_heads}q/{kv_heads}kv (g={g}) -> KV {:.2} GiB vs {:.2} GiB ungrouped",
+                gqa.kv().kv_bytes(2) as f64 / (1u64 << 30) as f64,
+                mha.kv_bytes(2) as f64 / (1u64 << 30) as f64
+            );
+        }
+    }
+
+    /// `kv_head_of` must be the **contiguous equal partition** every peer uses (FA2/FA3, cuDNN, vLLM,
+    /// PyTorch `enable_gqa`): query heads `[j*g, (j+1)*g)` read KV head `j`. Checked exhaustively over
+    /// every query head of every geometry — monotone, surjective onto `0..kv_heads`, in range, and
+    /// each KV head serving exactly `g` query heads. A round-robin partition (`h % kv_heads`) would
+    /// satisfy "in range" and "surjective" and be wrong; the per-group census is what excludes it.
+    #[test]
+    fn kv_head_mapping_is_a_contiguous_equal_partition() {
+        for (name, layers, q_heads, kv_heads, hd) in MODEL_GEOMETRIES {
+            let gqa = GqaConfig::for_serving(layers, q_heads, kv_heads, hd, 16, 2, 64);
+            let g = gqa.group_size();
+            let mut census = vec![0usize; kv_heads];
+            let mut prev = 0usize;
+            for h in 0..q_heads {
+                let kvh = gqa.kv_head_of(h);
+                assert!(kvh < kv_heads, "{name}: head {h} -> {kvh} out of range");
+                assert!(
+                    kvh >= prev,
+                    "{name}: mapping must be monotone in the query head"
+                );
+                assert_eq!(
+                    kvh,
+                    h / g,
+                    "{name}: head {h} must map to the contiguous group"
+                );
+                census[kvh] += 1;
+                prev = kvh;
+            }
+            for (j, &c) in census.iter().enumerate() {
+                assert_eq!(
+                    c, g,
+                    "{name}: KV head {j} must serve exactly g={g} query heads"
+                );
+            }
+            assert_eq!(gqa.kv_head_of(0), 0, "{name}");
+            assert_eq!(gqa.kv_head_of(q_heads - 1), kv_heads - 1, "{name}");
+        }
+    }
+
+    /// **The slab is KV-sized, so it must be indexed with a KV head.** Exhaustively: every
+    /// `(layer, block, token, kv_head_of(q_head), dh)` offset lands inside `slab_elems()`, and the last
+    /// one lands exactly on the last element. Then the negative half — indexing the same slab with the
+    /// *query* head is not a benign over-count, it is an out-of-bounds device write: at the final
+    /// token the offset for any head `>= kv_heads` is past the end of the slab.
+    #[test]
+    fn gqa_slab_offsets_stay_inside_the_kv_sized_slab() {
+        let gqa = GqaConfig::new(
+            KvConfig {
+                layers: 2,
+                heads: 2, // kv_heads
+                head_dim: 4,
+                block_size: 3,
+                num_blocks: 5,
+                num_slots: 2,
+                max_blocks_per_seq: 3,
+            },
+            8, // q_heads -> g = 4
+        );
+        let cfg = *gqa.kv();
+        assert_eq!(gqa.group_size(), 4);
+        let n = cfg.slab_elems();
+        let mut seen = vec![false; n];
+        for layer in 0..cfg.layers {
+            for blk in 0..cfg.num_blocks {
+                for tok in 0..cfg.block_size {
+                    for q_head in 0..gqa.q_heads() {
+                        for dh in 0..cfg.head_dim {
+                            let off =
+                                cfg.elem_offset(layer, blk as u32, tok, gqa.kv_head_of(q_head), dh);
+                            assert!(
+                                off < n,
+                                "q_head {q_head} escaped the KV slab ({off} >= {n})"
+                            );
+                            seen[off] = true;
+                        }
+                    }
+                }
+            }
+        }
+        // The g query heads of a group share one row, so the mapped offsets cover the slab exactly.
+        assert!(seen.iter().all(|&s| s), "the KV slab must be fully covered");
+        assert_eq!(
+            cfg.elem_offset(
+                cfg.layers - 1,
+                (cfg.num_blocks - 1) as u32,
+                cfg.block_size - 1,
+                cfg.kv_heads() - 1,
+                cfg.head_dim - 1
+            ),
+            n - 1
+        );
+        // Negative: the query head is not a valid slab index once g > 1.
+        for bad_head in cfg.kv_heads()..gqa.q_heads() {
+            let off = cfg.elem_offset(
+                cfg.layers - 1,
+                (cfg.num_blocks - 1) as u32,
+                cfg.block_size - 1,
+                bad_head,
+                0,
+            );
+            assert!(
+                off >= n,
+                "indexing a KV-sized slab with query head {bad_head} must run past its end \
+                 (got {off} < {n}) — this is the out-of-bounds the KV-head axis prevents"
+            );
+        }
+    }
+
+    /// The serving consequence of the shrink: inside one fixed device budget a GQA model reaches
+    /// exactly `g` times the simultaneous context its MHA twin does. `max_ctx_within_budget` takes the
+    /// **KV**-head count, which is what makes that fall out rather than needing a correction factor.
+    #[test]
+    fn gqa_buys_exactly_g_times_the_context_in_one_budget() {
+        let budget = 4usize << 30;
+        let (layers, q_heads, kv_heads, hd, bsz, slots) = (32usize, 32usize, 8usize, 128, 16, 8);
+        let ctx_gqa = KvConfig::max_ctx_within_budget(layers, kv_heads, hd, bsz, slots, 2, budget);
+        let ctx_mha = KvConfig::max_ctx_within_budget(layers, q_heads, hd, bsz, slots, 2, budget);
+        assert!(ctx_mha > 0 && ctx_gqa > 0);
+        assert_eq!(
+            ctx_gqa,
+            (q_heads / kv_heads) * ctx_mha,
+            "GQA must fit exactly g times the context in the same budget"
+        );
+        // And the geometry that claims that context must actually fit the budget it was derived from.
+        let gqa = GqaConfig::for_serving(layers, q_heads, kv_heads, hd, bsz, slots, ctx_gqa);
+        let bytes = gqa.kv().assert_kv_budget(2, budget);
+        eprintln!(
+            "4 GiB KV budget, Llama-3-8B shape: {ctx_gqa} tok/seq x {slots} slots with GQA \
+             ({:.2} GiB used) vs {ctx_mha} tok/seq without",
+            bytes as f64 / (1u64 << 30) as f64
+        );
+    }
+
+    /// The block allocator carries **no** head geometry — it deals in blocks, slots and tokens — so a
+    /// GQA cache and its MHA twin must produce byte-identical block tables and context lengths for the
+    /// same request pattern. The saving is entirely in the slab, and this pins that it is not silently
+    /// also changing paging policy (which would make the two configurations incomparable).
+    #[test]
+    fn the_block_manager_is_head_geometry_free() {
+        let gqa = GqaConfig::for_serving(4, 32, 8, 64, 4, 3, 32);
+        let mha = KvConfig::for_serving(4, 32, 64, 4, 3, 32);
+        let mk = |c: &KvConfig| {
+            BlockManager::new(
+                c.num_blocks,
+                c.block_size,
+                c.num_slots,
+                c.max_blocks_per_seq,
+            )
+        };
+        let (mut a, mut b) = (mk(gqa.kv()), mk(&mha));
+        for (slot, toks) in [(0usize, 9usize), (2, 4), (1, 17)] {
+            assert_eq!(a.reserve(slot, toks), b.reserve(slot, toks));
+        }
+        a.free(2);
+        b.free(2);
+        assert_eq!(a.append(2), b.append(2));
+        assert_eq!(a.flat_block_table(), b.flat_block_table());
+        assert_eq!(a.ctx_lens(), b.ctx_lens());
+        assert_eq!(a.layout_epoch(), b.layout_epoch());
+        assert_eq!(a.free_blocks(), b.free_blocks());
     }
 
     // ---- pure host allocator: runs on a GPU-less box (the policy is device-independent) ----
