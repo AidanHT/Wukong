@@ -1,0 +1,81 @@
+# ---- WUKONG ROUND PROVENANCE (GPU_RETARGET_PLAN.md 6.1) ----
+round_id         : 2026-08-09-l4-s3c-peer-smoke-cudnn
+local_time_start : 2026-08-09T00:05:29.8845934-04:00
+operator         : Aidan (via Claude Code)
+checkout         : C:/Users/Quant/Documents/Programming/Projects/Compiler/Mercury
+git_branch       : main
+git_head         : 14ec4b4b3b06cc9422760a98ee8d306f058b3fec  bench(gpu): 4050 perf-identity round 2 — 6 of 11 certified ties, no regression anywhere
+git_dirty        : NO
+provider / SKU   : Modal / L4    (WK_GPU=L4)
+image tag        : nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
+modal client     : 1.5.3
+command          : modal run ...::bench --name conv_vs_cudnn
+cargo profile    : release
+device           : NVIDIA L4 / sm_89 / 58 SMs / smem_optin 99 KiB / L2 48 MiB   (from S0)
+driver / runtime : 13.0 / 12.9   MIG: N/A   provenance gate: OK   (from S0)
+clock lock       : NONE - container (plan 6.3). ITERATION data, NOT publication data.
+# --------------------------------------------------------------
+
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-5g0fHXmjBsL5BOzr2jp4Pd
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] bench: L4 + 8.0 cpu + 16 GiB = $1.306/hr; timeout 7200s caps this call at $2.61
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --release -- conv_vs_cudnn --ignored --nocapture --test-threads=1[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.58s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-53f0e4b228126785)
+
+running 1 test
+device: NVIDIA L4
+C 64 56x56 K 64 3x3: Wukong(sk6)   9427 GF (  6.6× naive, 205% cuDNN) | db-pipe 0.92× (  8699 GF) | cuDNN   4592 GF [IMPLICIT_PRECOMP_GEMM] | naive  1434 GF
+C128 28x28 K128 3x3: Wukong(sk8)   8792 GF (  7.1× naive, 208% cuDNN) | db-pipe 1.01× (  8891 GF) | cuDNN   4219 GF [IMPLICIT_PRECOMP_GEMM] | naive  1234 GF
+C256 14x14 K256 3x3: Wukong(sk1)   1170 GF (  1.3× naive,  32% cuDNN) | db-pipe 1.22× (  1430 GF) | cuDNN   3637 GF [IMPLICIT_PRECOMP_GEMM] | naive   929 GF
+C 64 56x56 K 64 1x1: Wukong(sk1)   3654 GF (  6.7× naive, 679% cuDNN) | db-pipe 1.32× (  4826 GF) | cuDNN    538 GF [IMPLICIT_PRECOMP_GEMM] | naive   546 GF
+C 32 32x32 K 32 5x5: Wukong(sk1)    790 GF (  1.0× naive,  74% cuDNN) | db-pipe 1.21× (   957 GF) | cuDNN   1065 GF [IMPLICIT_PRECOMP_GEMM] | naive   829 GF
+C  3 64x64 K 64 3x3: Wukong(sk1)   2664 GF (  2.3× naive, 872% cuDNN) | db-pipe 0.97× (  2576 GF) | cuDNN    306 GF [IMPLICIT_PRECOMP_GEMM] | naive  1159 GF
+test gpu::tests::conv_vs_cudnn ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 339 filtered out; finished in 6.72s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m-> ok in 9.6s[0m
+[meter] bench: 12.2s wall = $0.004 (record this in the round log)
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-5g0fHXmjBsL5BOzr2jp4Pd
+wall_time : 39s
+exit_code : 0
