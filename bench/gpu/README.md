@@ -28,6 +28,17 @@ round is superseded by a *later* file plus a sentence in the session summary say
    the exact command, cargo profile, device identity (name / CC / SM count / opt-in SMEM / L2 / VRAM),
    driver + runtime, MIG state, the provenance-gate verdict, clock-lock status, wall time, exit code,
    and cost. A log without it is not evidence.
+
+   The device half of that block is now **emitted by the harness itself** —
+   `wukong_codegen_gpu::bench_instrument`'s `Round::header()` prints device identity, the spec-table
+   verdict, driver, provider/SKU, clock-lock status, clocks/temp/power **before and after**, drift,
+   wall time and cost. A block printed by the code that took the measurements cannot be forgotten by
+   whoever ran it; the shell-side items above (HEAD, dirty state, image tag) still come from the
+   runbook. See [`docs/gpu/README.md`](../../docs/gpu/README.md) for the full contract.
+
+   **A round whose device does not verify against the spec table cannot open**, so it publishes
+   nothing by construction rather than by discipline — but the refusing round still formats a
+   provenance block (`Provenance::header()`), because rule 3 keeps the log.
 2. **HEAD and dirty state are recorded LOCALLY, before the command runs.** The Modal mount ships the
    **working tree, not a commit**, and excludes `.git` — so nothing on the remote side can identify
    the source. **A dirty tree on a metered run is a provenance violation:** its numbers cannot be
