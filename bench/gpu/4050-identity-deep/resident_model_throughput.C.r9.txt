@@ -1,0 +1,11 @@
+
+running 1 test
+resident_model depth=1 S=512 D=64 Dff=256: full 0.534 ms (0.534 ms/layer) | resident 0.251 ms (0.251 ms/layer, 2036372 tok/s)
+resident_model depth=2 S=512 D=64 Dff=256: full 0.670 ms (0.335 ms/layer) | resident 0.503 ms (0.252 ms/layer, 1017438 tok/s)
+resident_model depth=4 S=512 D=64 Dff=256: full 1.086 ms (0.271 ms/layer) | resident 1.008 ms (0.252 ms/layer, 507989 tok/s)
+resident_model depth=8 S=512 D=64 Dff=256: full 2.130 ms (0.266 ms/layer) | resident 2.109 ms (0.264 ms/layer, 242803 tok/s)
+test gpu::tests::resident_model_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 294 filtered out; finished in 14.63s
+
+wall_ms=14655 exit=0 arm=C round=9
