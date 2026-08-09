@@ -1215,6 +1215,23 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Int(0)
                 };
                 let idx = self.memory.len();
+                // An explicit ceiling, because `try_reserve` alone is NOT a portable guard. It
+                // checks the RESERVE; the `resize` below is what COMMITS the pages. Windows does
+                // not overcommit, so an absurd request fails in `try_reserve` and the diagnostic
+                // fires — but under Linux overcommit the same reservation SUCCEEDS and the resize
+                // then faults pages in until the OOM killer takes the process. Observed
+                // 2026-08-08 on a Modal 8-core/16 GiB Linux container: this very arm, reached
+                // from `heap_exhaustion_is_a_diagnostic_not_an_allocator_abort` (a 100e9-element
+                // = 3.2 TB request), stalled >60 s and then SIGKILLed the container with exit 137
+                // — an uncatchable abort, which is the exact outcome this arm exists to prevent.
+                // 2^31 slots is 64 GiB at 32 B/`Value`, far above any real program (GPT-2 124M is
+                // ~124M slots) and far below anything a host can satisfy.
+                const MAX_SLOTS: usize = 1 << 31;
+                if count > MAX_SLOTS {
+                    return Err(format!(
+                        "interpreter heap exhausted allocating {count} element(s)"
+                    ));
+                }
                 self.memory.try_reserve(count).map_err(|_| {
                     format!("interpreter heap exhausted allocating {count} element(s)")
                 })?;

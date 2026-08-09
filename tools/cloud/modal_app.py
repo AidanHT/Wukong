@@ -726,7 +726,19 @@ def build(release: bool = False, driver: bool = True):
                   "--no-run"] + profile, env)
 
         # The CPU-side gate, so a Linux-portability break is caught here and not on metered GPU time.
-        _run(["cargo", "test", "--workspace"] + profile, env, check=False)
+        #
+        # `--test-threads` is MANDATORY here, not tuning. libtest defaults to one thread per core,
+        # and this container has WK_CPU=8 against WK_MEM=16 GiB -- a far tighter memory-per-thread
+        # ratio than the 2-4-core GitHub runners where this same suite is green. The workspace holds
+        # tests that are individually memory-hostile by design: `heap_exhaustion_is_a_diagnostic_
+        # not_an_allocator_abort` asks for `alloc_f32(100000000000)` (400 GB) to prove the
+        # interpreter *reports* exhaustion instead of aborting, and the deep-recursion oracles run
+        # inside `wukong_interp`'s 512 MiB-stack worker threads. Eight of those at once is how a
+        # 2026-08-08 S1a run got SIGKILLed with exit 137 -- three times, because Modal retried it,
+        # for ~2h and ~$1 without ever reaching S1b.
+        threads = os.environ.get("WK_TEST_THREADS", "2")
+        _run(["cargo", "test", "--workspace"] + profile + ["--", "--test-threads", threads],
+             env, check=False)
 
         build_vol.commit()
         print("\nBuild artifacts committed to the 'wukong-build' Volume.")
