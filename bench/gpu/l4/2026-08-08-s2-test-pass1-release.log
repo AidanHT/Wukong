@@ -1,0 +1,1654 @@
+# ---- WUKONG ROUND PROVENANCE (GPU_RETARGET_PLAN.md 6.1) ----
+round_id         : 2026-08-08-l4-s2-test-pass1
+local_time_start : 2026-08-08T21:01:58.5111708-04:00
+operator         : Aidan (via Claude Code)
+checkout         : C:/Users/Quant/Documents/Programming/Projects/Compiler/Mercury   (MAIN checkout, not a worktree)
+git_branch       : main
+git_head         : b7056c93054aecd9f15a524eeef662278dfd91fa  bench(gpu): L4 S1a/S1b CPU builds — Linux suite green; a release-only colreduce break found
+git_dirty        : NO
+provider / SKU   : Modal / L4    (WK_GPU=L4)
+image tag        : nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
+modal client     : 1.5.3
+command          : modal run tools/cloud/modal_app.py::test --release --filter=--nocapture
+cargo profile    : release   (matches S1b, so the GPU box links only -- never compiles)
+env              : WK_TIMEOUT=5400  WUKONG_GPU_REQUIRED=1 (set by ::test)  WUKONG_PEER_REQUIRED=unset
+device           : NVIDIA L4 / sm_89 / 58 SMs / smem_optin 99 KiB / L2 48 MiB / VRAM 22563 MiB   (from S0)
+driver / runtime : 13.0 / 12.9                          (from S0)
+MIG              : N/A                                  (from S0)
+provenance gate  : OK                                   (from S0)
+clock lock       : NONE - Modal is a container (plan 6.3). ITERATION data, NOT publication data.
+# --------------------------------------------------------------
+
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-vJIoGfxBY4tZUOfteA9sfL
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] test: L4 + 8.0 cpu + 16 GiB = $1.306/hr; timeout 7200s caps this call at $2.61
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+Device suite on L4 — GPU_REQUIRED=1, PEER_REQUIRED=0
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --release -- --nocapture[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 22.22s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-53f0e4b228126785)
+
+running 340 tests
+test autotune::tests::a_cache_from_another_device_is_a_miss_not_a_wrong_hit ... ok
+test autotune::tests::cache_text_roundtrip ... ok
+test autotune::tests::regression_decision_both_ways ... ok
+test autotune::tests::stale_cache_tokens_are_not_usable ... ok
+test autotune::tests::cache_save_load_roundtrip_through_a_file ... ok
+test baselines::tests::chain_flash_is_the_wukong_plan ... ok
+test baselines::tests::int8_dequant_chain_peer_ptx_is_floored_and_ascii ... ok
+test cubin::tests::a_pre_change_cache_entry_can_never_be_hit ... ok
+test cubin::tests::cache_key_is_deterministic_and_still_covers_ptx_and_driver ... ok
+test cubin::tests::cache_key_separates_devices_that_share_one_floored_ptx ... ok
+test cubin::tests::cache_path_uses_the_probed_device_arch ... ok
+test fusion::tests::classify_symbols ... ok
+test fusion::tests::data_dependent_control_flow_is_rejected ... ok
+test fusion::tests::parallel_reduce_is_eligible ... ok
+test fusion::tests::parallel_activation_is_eligible ... ok
+test gpu::tests::attn_causal_vs_fused_peer ... ignored, fused-peer causal bench; needs the torch-CUDA venv (set WUKONG_FA2_PYTHON) + a GPU
+test fusion::tests::parallel_twins_classify_like_their_serial_form ... ok
+test gpu::tests::attn_d128_vs_fused_peer ... ignored, fused-peer D=128 bench; needs the torch-CUDA venv (set WUKONG_FA2_PYTHON) + a GPU
+test fusion::tests::pure_scalar_has_no_coop_benefit ... ok
+test gpu::tests::attn_lm_vs_fused_peer ... ignored, fused-peer bench; needs the torch-CUDA venv (set WUKONG_FA2_PYTHON) + a GPU
+test gpu::tests::attn_rope_vs_fused_peer ... ignored, fused-RoPE peer bench; needs the torch-CUDA venv (set WUKONG_FA2_PYTHON) + a GPU
+test gpu::tests::attn_variants_vs_fused_peer ... ignored, fused-peer variant sweep; needs WUKONG_FA2_PYTHON + a GPU
+test gpu::tests::attn_vs_fused_peer ... ignored, fused-peer bench; needs the torch-CUDA venv (set WUKONG_FA2_PYTHON) + a GPU
+test gpu::tests::concurrent_forwards_throughput ... ignored, perf bench; needs a GPU. Run with --ignored --nocapture
+test fusion::tests::matmul_is_eligible_or_pure_general ... ok
+test gpu::tests::conv_affine_vs_cudnn ... ignored, throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly
+test gpu::tests::conv_fused_epi_vs_unfused ... ignored, throughput bench; needs CUDA; run explicitly
+test gpu::tests::conv_splitk_vs_cudnn ... ignored, throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly
+test gpu::tests::conv_vs_cudnn ... ignored, throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly
+test gpu::tests::conv_vs_peers ... ignored, throughput bench; needs CUDA NVRTC redist DLLs on PATH; run explicitly
+test gpu::tests::conv_winograd_vs_cudnn ... ignored, throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly
+test gpu::tests::cubin_cache_compile_latency ... ignored, latency bench; run explicitly
+test gpu::tests::crate_source_list_is_complete ... ok
+test gpu::tests::cublas_chain_layer_matches_reference_within_tol ... ignored, needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::cublas_chain_vs_wukong_layer_throughput ... ignored, needs CUDA redist DLLs on PATH; throughput bench; run explicitly
+test gpu::tests::cublas_chain_vs_wukong_mha_layer_throughput ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::decode_stack_latency ... ignored, perf bench; needs a GPU. Run with --ignored --nocapture
+  candidate s3 : SMEM 49152 B (48 KiB) static   min_k=128
+  candidate s4 : SMEM 65536 B (64 KiB) DYNAMIC  min_k=192
+  candidate s5 : SMEM 81920 B (80 KiB) DYNAMIC  min_k=256
+[gate] int8 search at 256x256x256: 11 candidates, including the dynamic-SMEM rows ["w64_s3", "w64_s4", "w64_s5"]; every one bit-exact against the reference candidate before timing. Order (4050, contended, indicative only, NOT a verdict): ["swz64", "swz64_sk2", "smdb64", "swz64_sk4", "w64_s4", "w64_s5", "swz128", "w64_s3", "w64", "w64_r8", "smdb128"]
+[gate] NVRTC peers compile with --gpu-architecture=compute_89 for NVIDIA L4 ✓
+test autotune::tests::the_dynamic_smem_stage_rows_enter_the_int8_search ... ok
+test baselines::tests::peers_compile_for_the_probed_device ... ok
+[gate] 9 fp8 launchers are capability-gated: ["gpu.rs::fp8_tile", "gpu.rs::gemm_nt_fp8", "gpu.rs::gemm_nt_fp8_pipe", "gpu.rs::gemm_nt_fp8_deep", "gpu.rs::gemm_nt_fp8_pipe_fused_bias", "gpu.rs::gemm_nt_fp8_mma_bias_residual", "gpu.rs::gemm_nt_fp8_gate", "gpu.rs::gemm_nt_fp8_bwd", "gpu.rs::quantize_scaled_fp8"] ✓
+test gpu::tests::every_fp8_module_load_is_capability_gated ... ok
+[gate] dynamic SMEM: requested 65536 B (64 KiB) > the 48 KiB static ceiling, launch OK and exact at slot 16383 (device opt-in budget 101376 B / 99 KiB); the same launch without the opt-in was refused: DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument") ✓
+test gpu::tests::dynamic_smem_window_exceeds_the_static_48_kib_ceiling ... ok
+test gpu::tests::f16_static_vs_dynamic_ab ... ignored, throughput A/B; run explicitly (GPU; no DLLs needed)
+[gate] corrupt cubin at "/persist/cubin-cache/drv13000-sm_89-94-ad7571d39e7e7959.cubin" -> dropped, re-JIT'd, re-persisted ✓
+test cubin::tests::a_corrupt_cache_entry_degrades_to_the_ptx_jit ... ok
+test gpu::tests::ffn_fused_vs_chain_throughput ... ignored, throughput bench; run explicitly
+conv_padded_explicit C16 56x56 K32 3x3 stride1 pad1: P56xQ56 max_abs=4.78e-3 max_rel=1.70e1
+conv_padded_explicit C32 28x28 K64 3x3 stride1 pad1: P28xQ28 max_abs=6.79e-3 max_rel=3.20e0
+conv_padded_explicit C16 56x56 K32 3x3 stride2 pad1: P28xQ28 max_abs=4.65e-3 max_rel=9.74e0
+conv_padded_explicit C3 64x64 K64 7x7 stride2 pad3: P32xQ32 max_abs=4.79e-3 max_rel=1.15e1
+conv_padded_explicit C8 32x32 K48 5x5 stride1 pad2: P32xQ32 max_abs=5.47e-3 max_rel=1.17e1
+test gpu::tests::conv2d_wmma_padded_explicit_matches_reference_within_tol ... ok
+winograd F(2,3) C3 10x10 K8: fro_rel=5.42e-4 (tol 4e-3)  max_abs=2.68e-3
+winograd F(4,3) C3 10x10 K8: fro_rel=2.94e-3 (tol 8e-3)  max_abs=3.87e-2
+winograd F(2,3) C16 16x16 K32: fro_rel=5.30e-4 (tol 4e-3)  max_abs=1.12e-2
+winograd F(4,3) C16 16x16 K32: fro_rel=2.80e-3 (tol 8e-3)  max_abs=1.33e-1
+winograd F(2,3) C8 18x18 K16: fro_rel=5.38e-4 (tol 4e-3)  max_abs=5.63e-3
+winograd F(4,3) C8 18x18 K16: fro_rel=2.77e-3 (tol 8e-3)  max_abs=7.76e-2
+winograd F(2,3) C32 14x14 K32: fro_rel=5.45e-4 (tol 4e-3)  max_abs=1.16e-2
+winograd F(4,3) C32 14x14 K32: fro_rel=2.93e-3 (tol 8e-3)  max_abs=1.48e-1
+winograd F(2,3) C4 9x9 K6: fro_rel=5.28e-4 (tol 4e-3)  max_abs=3.85e-3
+winograd F(4,3) C4 9x9 K6: fro_rel=2.49e-3 (tol 8e-3)  max_abs=2.91e-2
+[gate] cubin cache keys on the probed device arch sm_89 (NVIDIA L4) ✓
+test gpu::tests::conv_winograd_matches_reference_within_tol ... ok
+test cubin::tests::probed_arch_agrees_with_gpu_target ... ok
+test gpu::tests::flash_hs_vs_mp ... ignored, same-run flash A/B bench; needs a GPU
+[autotune] 256x256x256: best = swz64 (8801 GFLOP/s); ranked 11
+[autotune] 64x128x8192: best = swz64_sk8 (18914 GFLOP/s); ranked 5
+[autotune] 128x128x256: best = swz64_sk4 (2706 GFLOP/s); ranked 11
+[autotune] cache keyed to device `sm_89x58`
+[gate] autotune int8: search bit-exact + tuned launch correct + cache round-trip + revalidation well-formed ✓
+test autotune::tests::tune_and_launch_int8_on_device ... ok
+test gpu::tests::flash_lm_vs_mp ... ignored, same-run flash A/B bench; needs a GPU
+test gpu::tests::flash_mma_vs_wmma ... ignored, tuning bench; run explicitly
+test gpu::tests::flash_mp4_vs_mp ... ignored, tuning A/B; run explicitly
+test gpu::tests::flash_mw_vs_mp ... ignored, tuning bench; run explicitly
+test gpu::tests::flash_pipe_vs_mma ... ignored, tuning bench; run explicitly
+conv_strided C16 56x56 K32 3x3 stride2: P27xQ27 max_abs=4.29e-3 max_rel=7.80e1
+conv_strided C32 28x28 K64 3x3 stride2: P13xQ13 max_abs=5.49e-3 max_rel=1.98e0
+conv_strided C8 32x32 K48 5x5 stride2: P14xQ14 max_abs=4.74e-3 max_rel=1.10e0
+conv_strided C64 56x56 K64 1x1 stride2: P28xQ28 max_abs=3.43e-3 max_rel=7.99e0
+conv_strided C16 31x31 K32 3x3 stride3: P10xQ10 max_abs=4.10e-3 max_rel=3.62e-1
+test gpu::tests::conv2d_wmma_strided_matches_reference_within_tol ... ok
+test gpu::tests::flash_single_vs_double ... ignored, same-run flash occupancy probe; needs a GPU
+conv_padded C16 56x56 K32 3x3 stride1 pad1: P56xQ56 max_abs=4.86e-3 max_rel=7.72e0
+conv_padded C32 28x28 K64 3x3 stride1 pad1: P28xQ28 max_abs=6.98e-3 max_rel=2.00e1
+conv_padded C16 56x56 K32 3x3 stride2 pad1: P28xQ28 max_abs=4.05e-3 max_rel=6.56e0
+conv_padded C3 64x64 K64 7x7 stride2 pad3: P32xQ32 max_abs=4.74e-3 max_rel=7.15e1
+conv_padded C8 32x32 K48 5x5 stride1 pad2: P32xQ32 max_abs=5.33e-3 max_rel=8.99e0
+test gpu::tests::conv2d_wmma_padded_matches_reference_within_tol ... ok
+test gpu::tests::flash_sp_vs_mp ... ignored, same-run flash A/B bench; needs a GPU
+test gpu::tests::flash_throughput ... ignored, throughput bench; run explicitly
+test gpu::tests::flash_tiled_vs_untiled ... ignored, tuning bench; run explicitly
+test gpu::tests::flash_vs_gemm_scaling ... ignored, diagnostic bench; run explicitly
+test gpu::tests::flash_vs_peers ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+conv2d C3 16x16 K8 3x3: max_abs=1.43e-6 max_rel=3.69e-5
+conv2d C16 32x32 K4 5x5: max_abs=1.53e-5 max_rel=3.26e-4
+conv2d C8 18x18 K12 3x3: max_abs=2.38e-6 max_rel=1.09e-4
+conv2d C32 28x28 K16 1x1: max_abs=1.43e-6 max_rel=3.31e-3
+conv2d C8 64x64 K16 3x3: max_abs=3.81e-6 max_rel=1.17e-3
+conv2d C4 24x40 K6 3x5: max_abs=2.38e-6 max_rel=1.37e-2
+test gpu::tests::conv2d_matches_reference_within_tol ... ok
+test gpu::tests::flash_wide_vs_mp ... ignored, tuning A/B; run explicitly
+test gpu::tests::flash_ws_vs_mp ... ignored, tuning A/B; run explicitly
+test gpu::tests::copy_v4_is_bit_exact ... ok
+conv2d_wmma_splitk C64 28x28 K64 3x3 sk4: max_abs=8.59e-3 max_rel=2.93e1
+conv2d_wmma_splitk C128 14x14 K128 3x3 sk8: max_abs=1.14e-2 max_rel=1.38e1
+conv2d_wmma_splitk C32 16x16 K32 3x3 sk2: max_abs=5.29e-3 max_rel=5.09e-1
+conv2d_wmma_splitk C64 16x16 K32 1x1 sk4: max_abs=2.64e-3 max_rel=3.69e-1
+conv2d_wmma_splitk C48 18x18 K16 3x3 sk3: max_abs=6.52e-3 max_rel=1.27e1
+test gpu::tests::conv2d_wmma_splitk_matches_reference_within_tol ... ok
+conv_padded_auto C128 28x28 K128 3x3 stride2 pad1 sk1: P14xQ14 max_abs=1.20e-2 max_rel=1.83e0
+conv_padded_auto C256 14x14 K256 3x3 stride1 pad1 sk8: P14xQ14 max_abs=1.84e-2 max_rel=3.02e1
+conv_padded_auto C64 56x56 K64 3x3 stride2 pad1 sk1: P28xQ28 max_abs=8.81e-3 max_rel=1.59e2
+conv_padded_auto C128 28x28 K128 3x3 stride1 pad1 sk8: P28xQ28 max_abs=1.30e-2 max_rel=3.96e1
+conv_padded_auto C64 56x56 K64 3x3 stride1 pad1 sk4: P56xQ56 max_abs=9.16e-3 max_rel=2.57e1
+test gpu::tests::conv2d_wmma_padded_auto_matches_reference_within_tol ... ok
+conv_epi C16 28x28 K32 3x3 bias=true none: max_abs=4.21e-3 max_rel=2.83e0
+conv_epi C16 28x28 K32 3x3 bias=true relu: max_abs=4.21e-3 max_rel=2.95e34
+conv_epi C16 28x28 K32 3x3 bias=false relu: max_abs=4.21e-3 max_rel=7.18e34
+conv_epi C16 28x28 K32 3x3 bias=true silu: max_abs=4.58e-3 max_rel=2.83e0
+conv_epi C16 28x28 K32 3x3 bias=true gelu: max_abs=4.56e-3 max_rel=2.83e0
+conv_epi C32 14x14 K64 3x3 bias=true none: max_abs=6.22e-3 max_rel=2.41e0
+conv_epi C32 14x14 K64 3x3 bias=true relu: max_abs=6.22e-3 max_rel=4.43e34
+conv_epi C32 14x14 K64 3x3 bias=false relu: max_abs=6.22e-3 max_rel=1.71e0
+conv_epi C32 14x14 K64 3x3 bias=true silu: max_abs=6.23e-3 max_rel=2.41e0
+conv_epi C32 14x14 K64 3x3 bias=true gelu: max_abs=6.22e-3 max_rel=2.42e0
+conv_epi C8 16x16 K48 5x5 bias=true none: max_abs=5.56e-3 max_rel=7.84e-1
+conv_epi C8 16x16 K48 5x5 bias=true relu: max_abs=5.56e-3 max_rel=3.46e-1
+conv_epi C8 16x16 K48 5x5 bias=false relu: max_abs=5.56e-3 max_rel=1.00e0
+conv_epi C8 16x16 K48 5x5 bias=true silu: max_abs=4.85e-3 max_rel=7.84e-1
+conv_epi C8 16x16 K48 5x5 bias=true gelu: max_abs=5.45e-3 max_rel=1.00e0
+conv_epi C32 14x14 K64 1x1 bias=true none: max_abs=2.34e-3 max_rel=2.08e0
+conv_epi C32 14x14 K64 1x1 bias=true relu: max_abs=2.34e-3 max_rel=2.98e33
+conv_epi C32 14x14 K64 1x1 bias=false relu: max_abs=2.34e-3 max_rel=2.38e34
+conv_epi C32 14x14 K64 1x1 bias=true silu: max_abs=2.45e-3 max_rel=2.08e0
+conv_epi C32 14x14 K64 1x1 bias=true gelu: max_abs=2.34e-3 max_rel=2.08e0
+test gpu::tests::conv_wmma_epi_matches_reference_within_tol ... ok
+test gpu::tests::cast_f32_to_f16_round_trips_bit_exact ... ok
+[gate] cubin warm branch == cold cubin == PTX JIT, bit-identical (max_abs vs f64 oracle 2.86e-6) ✓
+test gpu::tests::cubin_cache_warm_branch_matches_the_ptx_jit ... ok
+test gpu::tests::cubin_cache_roundtrips_to_loadable_sass ... ok
+conv2d_best C64 56x56 K64 3x3 s1p0 -> winograd: fro_rel=2.95e-3 max_abs=3.25e-1
+conv2d_best C128 28x28 K128 3x3 s1p0 -> winograd: fro_rel=2.88e-3 max_abs=4.32e-1
+conv2d_best C32 64x64 K64 3x3 s1p0 -> valid-auto (C<64): fro_rel=2.63e-4 max_abs=7.60e-3
+conv2d_best C64 56x56 K64 1x1 s1p0 -> valid-auto (1x1): fro_rel=2.62e-4 max_abs=3.39e-3
+conv2d_best C64 56x56 K64 3x3 s2p1 -> affine-auto (s2p1): fro_rel=2.61e-4 max_abs=1.07e-2
+conv2d_best C128 28x28 K128 3x3 s1p1 -> affine-auto (same): fro_rel=2.61e-4 max_abs=1.30e-2
+test gpu::tests::conv2d_best_matches_reference_within_tol ... ok
+test gpu::tests::fp8_pipe_config_sweep_vs_cublaslt ... ignored, throughput sweep; needs cublasLt64_12.dll on PATH; run explicitly
+test gpu::tests::fp8_pipe_m64_vs_default_ab ... ignored, throughput A/B; run explicitly (GPU; no DLLs needed)
+conv2d_wmma C3 32x32 K16 3x3: max_abs=1.95e-3 max_rel=1.81e0
+conv2d_wmma C16 28x28 K32 3x3: max_abs=4.22e-3 max_rel=9.65e1
+conv2d_wmma C8 16x16 K48 5x5: max_abs=7.26e-3 max_rel=4.57e0
+conv2d_wmma C32 14x14 K64 1x1: max_abs=2.17e-3 max_rel=1.33e0
+conv2d_wmma C4 24x24 K24 3x3: max_abs=2.11e-3 max_rel=3.06e0
+test gpu::tests::conv2d_wmma_matches_reference_within_tol ... ok
+conv2d_wmma db==sb C3 32x32 K16 3x3 sk1: bit-identical, max_abs vs f64=1.81e-3
+conv2d_wmma db==sb C16 28x28 K32 3x3 sk1: bit-identical, max_abs vs f64=4.55e-3
+conv2d_wmma db==sb C8 16x16 K48 5x5 sk1: bit-identical, max_abs vs f64=4.34e-3
+conv2d_wmma db==sb C32 14x14 K64 1x1 sk1: bit-identical, max_abs vs f64=2.09e-3
+conv2d_wmma db==sb C64 56x56 K64 3x3 sk1: bit-identical, max_abs vs f64=9.34e-3
+conv2d_wmma db==sb C64 28x28 K64 3x3 sk4: bit-identical, max_abs vs f64=9.37e-3
+conv2d_wmma db==sb C128 14x14 K128 3x3 sk8: bit-identical, max_abs vs f64=1.40e-2
+conv2d_wmma db==sb C48 18x18 K16 3x3 sk3: bit-identical, max_abs vs f64=7.97e-3
+test gpu::tests::conv2d_wmma_db_matches_single_buffer ... ok
+test gpu::tests::fp8_pipe_vs_peers ... ignored, throughput bench; run explicitly
+cublaslt_fp8 128x64x128: max_abs=1.88e-3 max_rel=3.33e-1
+cublaslt_fp8 256x256x256: max_abs=5.19e-3 max_rel=5.00e0
+cublaslt_fp8 128x512x384: max_abs=5.78e-3 max_rel=3.40e0
+test gpu::tests::cublaslt_fp8_matches_reference_within_tol ... ok
+[autotune] w4a16 64x256x1024: best = w4a16_sk8 (4635 GFLOP/s); max_abs=1.1e-5
+[autotune] w4a16 128x128x2048: best = w4a16_sk8 (6568 GFLOP/s); max_abs=2.7e-5
+[gate] autotune w4a16: search tolerance-checked + tuned launch correct + cache round-trip ✓
+test autotune::tests::tune_and_launch_w4a16_on_device ... ok
+test gpu::tests::fp8_vs_cublaslt_pct ... ignored, throughput bench; needs cublasLt64_12.dll on PATH; run explicitly
+test gpu::tests::fused_gemm_activation_vs_chain ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::fused_gemm_bias_act_vs_chain ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::fused_swiglu_gate_vs_chain ... ignored
+test gpu::tests::gemm_cliff_ab ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+[gate] device amax == CPU max-abs (exact) ✓
+[gate] f16 regime bands from probed L2 50331648 B (48.00 MiB): [33554432, 100663296) B = [32, 96) MiB ✓
+test gpu::tests::amax_matches_reference ... ok
+test gpu::tests::gemm_cliff_ptxas_ab ... ignored
+test gpu::tests::f16_regime_thresholds_reproduce_the_4050_literals ... ok
+[gate] fp16 static-shape (64 & 128) bit-exact vs the dynamic _sm kernel ✓
+test gpu::tests::f16_static_matches_reference ... ok
+ffn_fused S=128 D=64 Dff=256 (GPU-resident, 5 launches): max_abs=2.43e-5 max_rel=7.10e-4
+test gpu::tests::ffn_fused_matches_reference_within_tol ... ok
+flash s=128 d=32 [flash_d32]: max_abs=8.94e-8 max_rel=3.02e-4
+flash s=128 d=32 [flash_d32_t]: max_abs=8.94e-8 max_rel=3.02e-4
+flash s=200 d=64 [flash_d64]: max_abs=1.04e-7 max_rel=9.15e-4
+flash s=200 d=64 [flash_d64_t]: max_abs=1.04e-7 max_rel=9.15e-4
+flash s=96 d=128 [flash_d128]: max_abs=1.19e-7 max_rel=4.42e-4
+flash s=96 d=128 [flash_d128_t]: max_abs=1.19e-7 max_rel=4.42e-4
+flash s=130 d=64 [flash_d64]: max_abs=7.45e-8 max_rel=1.02e-3
+flash s=130 d=64 [flash_d64_t]: max_abs=7.45e-8 max_rel=1.02e-3
+flash s=35 d=32 [flash_d32]: max_abs=8.94e-8 max_rel=4.59e-5
+flash s=35 d=32 [flash_d32_t]: max_abs=8.94e-8 max_rel=4.59e-5
+flash s=768 d=64 [flash_d64]: max_abs=1.56e-7 max_rel=1.44e-2
+flash s=768 d=64 [flash_d64_t]: max_abs=1.56e-7 max_rel=1.44e-2
+test gpu::tests::flash_attention_matches_reference_within_tol ... ok
+test gpu::tests::gemm_pipe_sweep ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+flash_d128_mp s=16 d=128: max_abs=1.11e-4 max_rel=6.84e-1
+flash_d128_mp s=64 d=128: max_abs=6.60e-5 max_rel=1.26e0
+flash_d128_mp s=256 d=128: max_abs=3.44e-5 max_rel=4.70e0
+flash_d128_mp s=512 d=128: max_abs=2.43e-5 max_rel=5.46e1
+flash_d128_mpc s=16 d=128: max_abs=1.19e-4 max_rel=3.24e-1
+flash_d128_mpc s=64 d=128: max_abs=1.16e-4 max_rel=4.12e0
+flash_d128_mpc s=256 d=128: max_abs=1.24e-4 max_rel=1.90e0
+flash_d128_mpc s=512 d=128: max_abs=1.44e-4 max_rel=5.32e0
+test gpu::tests::flash_d128_matches_reference ... ok
+test gpu::tests::gemm_throughput ... ignored, throughput bench; run explicitly
+test gpu::tests::gemm_vs_peers ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+flash_d128_hs s=16 d=128: max_abs=1.04e-4 max_rel=3.63e-1
+flash_d128_hs s=64 d=128: max_abs=6.17e-5 max_rel=5.13e0
+flash_d128_hs s=256 d=128: max_abs=3.41e-5 max_rel=3.02e0
+flash_d128_hs s=512 d=128: max_abs=2.48e-5 max_rel=4.27e0
+test gpu::tests::flash_hs_matches_reference ... ok
+flash_d64_mp_lm s=16 d=64: max_abs=1.10e-4 max_rel=1.55e-1
+flash_d64_mp_lm s=64 d=64: max_abs=5.32e-5 max_rel=5.71e-1
+flash_d64_mp_lm s=256 d=64: max_abs=3.21e-5 max_rel=1.99e0
+flash_d64_mp_lm s=512 d=64: max_abs=2.49e-5 max_rel=3.55e0
+flash_d64_mpc_lm s=16 d=64: max_abs=1.47e-4 max_rel=7.33e-2
+flash_d64_mpc_lm s=64 d=64: max_abs=1.32e-4 max_rel=2.37e-1
+flash_d64_mpc_lm s=256 d=64: max_abs=1.43e-4 max_rel=7.48e0
+flash_d64_mpc_lm s=512 d=64: max_abs=1.53e-4 max_rel=1.44e1
+flash_d128_mp_lm s=16 d=128: max_abs=1.03e-4 max_rel=7.18e-1
+flash_d128_mp_lm s=64 d=128: max_abs=5.89e-5 max_rel=2.43e0
+flash_d128_mp_lm s=256 d=128: max_abs=3.17e-5 max_rel=7.79e0
+flash_d128_mp_lm s=512 d=128: max_abs=2.47e-5 max_rel=7.99e0
+flash_d128_mpc_lm s=16 d=128: max_abs=1.19e-4 max_rel=1.35e-1
+flash_d128_mpc_lm s=64 d=128: max_abs=1.16e-4 max_rel=3.92e0
+flash_d128_mpc_lm s=256 d=128: max_abs=1.26e-4 max_rel=3.96e0
+flash_d128_mpc_lm s=512 d=128: max_abs=1.51e-4 max_rel=1.33e1
+test gpu::tests::flash_lm_matches_reference ... ok
+test gpu::tests::hbm_bandwidth ... ignored, throughput bench; run explicitly on a CUDA box
+flash rope s=64: max_abs=5.85e-5 max_rel=1.18e0
+flash rope s=128: max_abs=4.85e-5 max_rel=1.47e0
+flash rope s=512: max_abs=2.36e-5 max_rel=1.43e1
+flash rope s=768: max_abs=2.12e-5 max_rel=2.14e0
+test gpu::tests::flash_rope_matches_reference ... ok
+flash_d64_msp s=16 d=64: max_abs=7.59e-5 max_rel=1.89e-1
+flash_d64_msp s=32 d=64: max_abs=7.48e-5 max_rel=4.63e0
+flash_d64_msp s=64 d=64: max_abs=5.21e-5 max_rel=2.78e0
+flash_d64_msp s=256 d=64: max_abs=3.62e-5 max_rel=3.05e0
+flash_d64_msp s=512 d=64: max_abs=2.77e-5 max_rel=2.61e0
+test gpu::tests::flash_sp_matches_reference ... ok
+test gpu::tests::int4_gemm_vs_peers ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::int4_jit_log ... ignored, diagnostic; prints the driver JIT log for the W4A16 PTX module
+flash wide [flash_d64_mpw2] s=64: max_abs=5.51e-5 max_rel=7.73e0
+flash wide [flash_d64_mpw2] s=128: max_abs=4.06e-5 max_rel=1.42e0
+flash wide [flash_d64_mpw2] s=512: max_abs=2.56e-5 max_rel=8.91e-1
+flash wide [flash_d64_mpw2] s=1024: max_abs=1.54e-5 max_rel=1.93e1
+flash wide [flash_d64_mpw4] s=64: max_abs=5.68e-5 max_rel=7.13e-1
+flash wide [flash_d64_mpw4] s=128: max_abs=4.76e-5 max_rel=1.29e0
+flash wide [flash_d64_mpw4] s=512: max_abs=2.59e-5 max_rel=5.01e0
+flash wide [flash_d64_mpw4] s=1024: max_abs=1.59e-5 max_rel=9.59e0
+test gpu::tests::flash_wide_matches_reference ... ok
+test gpu::tests::int4_splitk_occupancy ... ignored, throughput bench; run explicitly
+test gpu::tests::int8_dequant_fusion ... ignored, throughput bench; run explicitly
+fp8_bwd 32x64x32 (E5M2·E4M3): max_abs=8.54e-4 max_rel=2.58e-2
+fp8_bwd 64x96x64 (E5M2·E4M3): max_abs=2.23e-3 max_rel=1.00e0
+fp8_bwd 96x128x32 (E5M2·E4M3): max_abs=2.14e-3 max_rel=2.38e-1
+[gate] fp8 backward GEMM (E5M2·E4M3) matches f64 reference ✓
+test gpu::tests::fp8_bwd_gemm_matches_reference ... ok
+[gate] fp8 capability: cc 8.9 >= 8.9 -> fp8 dispatch ENABLED, no decline ✓
+[gate] over-budget fp8 deep row declined: fp8 deep pipeline `fp8_deep_128_s2`: needs 655360 B of shared memory per block, but NVIDIA L4 reports a 101376 B opt-in ceiling (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+test gpu::tests::fp8_capability_gate_declines_below_ada ... ok
+test gpu::tests::fp8_deep_declines_over_budget_instead_of_downshifting ... ok
+fp8 deep pipeline on NVIDIA L4 — opt-in SMEM budget 101376 B (99 KiB); static ISA cap 48 KiB
+test gpu::tests::int8_gemm_vs_peers ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::int8_smdb_sweep ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+  fp8_deep_128_s2  128x128 s2 SMEM  40960 B (40 KiB) static   launch_bytes=0      occupancy=2 CTA/SM
+    128x64x128: max_abs=1.71e-3 max_rel=1.00e0 | vs fp8_deep_128_s2: bit-identical
+    256x128x256: max_abs=4.88e-3 max_rel=1.38e1 | vs fp8_deep_128_s2: bit-identical
+    128x256x256: max_abs=9.41e-3 max_rel=1.00e0 | vs fp8_deep_128_s2: bit-identical
+  fp8_deep_128_s3  128x128 s3 SMEM  61440 B (60 KiB) DYNAMIC  launch_bytes=61440  occupancy=1 CTA/SM
+    128x64x128: max_abs=1.65e-3 max_rel=3.33e-1 | vs fp8_deep_128_s2: bit-identical
+    128x128x128: max_abs=3.98e-3 max_rel=1.30e0 | vs fp8_deep_128_s2: bit-identical
+    256x192x256: max_abs=9.93e-3 max_rel=7.00e0 | vs fp8_deep_128_s2: bit-identical
+    128x320x256: max_abs=1.32e-2 max_rel=2.08e34 | vs fp8_deep_128_s2: bit-identical
+  fp8_deep_128_s4  128x128 s4 SMEM  81920 B (80 KiB) DYNAMIC  launch_bytes=81920  occupancy=1 CTA/SM
+    128x64x128: max_abs=1.59e-3 max_rel=7.25e-2 | vs fp8_deep_128_s2: bit-identical
+    128x192x128: max_abs=5.68e-3 max_rel=1.67e0 | vs fp8_deep_128_s2: bit-identical
+    256x256x256: max_abs=1.20e-2 max_rel=5.00e0 | vs fp8_deep_128_s2: bit-identical
+    128x384x256: max_abs=1.38e-2 max_rel=1.57e0 | vs fp8_deep_128_s2: bit-identical
+  fp8_deep_m64_s2  64x128 s2 SMEM  30720 B (30 KiB) static   launch_bytes=0      occupancy=3 CTA/SM
+    64x64x128: max_abs=1.50e-3 max_rel=5.88e-2 | vs fp8_deep_m64_s2: bit-identical
+    128x128x256: max_abs=5.58e-3 max_rel=1.00e0 | vs fp8_deep_m64_s2: bit-identical
+    64x256x256: max_abs=7.71e-3 max_rel=4.22e-1 | vs fp8_deep_m64_s2: bit-identical
+  fp8_deep_m64_s4  64x128 s4 SMEM  61440 B (60 KiB) DYNAMIC  launch_bytes=61440  occupancy=1 CTA/SM
+    64x64x128: max_abs=1.56e-3 max_rel=1.43e-1 | vs fp8_deep_m64_s2: bit-identical
+    64x192x128: max_abs=5.89e-3 max_rel=1.08e-1 | vs fp8_deep_m64_s2: bit-identical
+    128x256x256: max_abs=8.54e-3 max_rel=1.11e0 | vs fp8_deep_m64_s2: bit-identical
+    64x384x256: max_abs=2.27e-2 max_rel=7.00e0 | vs fp8_deep_m64_s2: bit-identical
+  fp8_deep_m64_s6  64x128 s6 SMEM  92160 B (90 KiB) DYNAMIC  launch_bytes=92160  occupancy=1 CTA/SM
+    64x64x128: max_abs=1.50e-3 max_rel=2.27e-2 | vs fp8_deep_m64_s2: bit-identical
+    64x320x128: max_abs=1.24e-2 max_rel=2.73e-1 | vs fp8_deep_m64_s2: bit-identical
+    128x384x256: max_abs=1.64e-2 max_rel=1.00e0 | vs fp8_deep_m64_s2: bit-identical
+    64x512x256: max_abs=2.98e-2 max_rel=2.50e-1 | vs fp8_deep_m64_s2: bit-identical
+[gate] fp8 deep pipeline: 22 K-corner shapes across the 128x128 s2..s4 and 64x128 s2/s4/s6 rows, every one within the E4M3 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the >48 KiB rows ran out of the dynamic SMEM window ✓
+test gpu::tests::fp8_deep_matches_reference_within_tol ... ok
+[gate] device fp8 quantize (hw cvt e5m2x2/e4m3x2) within ULP ✓
+test gpu::tests::fp8_device_quantize_within_ulp ... ok
+test gpu::tests::int8_splitk_occupancy ... ignored, throughput bench; run explicitly
+fp8_gemm 16x32x8 (E4M3 tensor core): max_abs=4.27e-4 max_rel=9.89e-4
+fp8_gemm 64x64x64 (E4M3 tensor core): max_abs=2.01e-3 max_rel=3.45e-2
+fp8_gemm 128x256x64 (E4M3 tensor core): max_abs=8.82e-3 max_rel=2.33e0
+test gpu::tests::fp8_gemm_matches_reference_within_tol ... ok
+test gpu::tests::int8_static_vs_dynamic_ab ... ignored, throughput A/B; run explicitly (GPU; no DLLs needed)
+test gpu::tests::int8_swz_vs_handplaced ... ignored, throughput bench; run explicitly
+test gpu::tests::jit_log ... ignored, diagnostic; prints the driver JIT log for a PTX module
+test gpu::tests::layer_fusion_vs_unfused_throughput ... ignored, throughput bench; run explicitly
+fp8_mma_bias 128x64x128: max_abs=1.37e-3 max_rel=9.72e-2
+fp8_mma_bias_relu 128x64x128: max_abs=1.37e-3 max_rel=7.74e-2
+fp8_mma_bias_silu 128x64x128: max_abs=1.39e-3 max_rel=9.72e-2
+fp8_mma_bias_gelu 128x64x128: max_abs=1.37e-3 max_rel=1.00e0
+fp8_mma_bias 256x128x256: max_abs=5.37e-3 max_rel=7.47e0
+fp8_mma_bias_relu 256x128x256: max_abs=5.37e-3 max_rel=3.04e0
+fp8_mma_bias_silu 256x128x256: max_abs=5.37e-3 max_rel=7.47e0
+fp8_mma_bias_gelu 256x128x256: max_abs=5.37e-3 max_rel=7.47e0
+fp8_mma_bias 128x192x384: max_abs=7.11e-3 max_rel=4.17e0
+fp8_mma_bias_relu 128x192x384: max_abs=7.11e-3 max_rel=7.41e33
+fp8_mma_bias_silu 128x192x384: max_abs=7.11e-3 max_rel=4.17e0
+fp8_mma_bias_gelu 128x192x384: max_abs=7.11e-3 max_rel=4.17e0
+test gpu::tests::fp8_mma_bias_match_reference_within_tol ... ok
+fp8_mma_bias_residual 128x64x128: max_abs=2.08e-3 max_rel=3.63e-1
+fp8_mma_bias_residual 256x128x256: max_abs=5.25e-3 max_rel=3.80e-1
+fp8_mma_bias_residual 128x192x384: max_abs=6.74e-3 max_rel=7.98e0
+test gpu::tests::fp8_mma_bias_residual_match_reference_within_tol ... ok
+fp8_pipe 128x64x128: max_abs=1.74e-3 max_rel=7.32e-2
+fp8_pipe 128x128x128: max_abs=4.59e-3 max_rel=1.00e0
+fp8_pipe 256x256x256: max_abs=1.30e-2 max_rel=1.07e0
+fp8_pipe 128x192x384: max_abs=8.80e-3 max_rel=3.00e0
+test gpu::tests::fp8_pipe_matches_reference_within_tol ... ok
+fp8_pipe_regime 64x128x128 (bm=64): max_abs=4.03e-3
+fp8_pipe_regime 192x128x256 (bm=64): max_abs=5.31e-3
+fp8_pipe_regime 1024x128x256 (bm=128): max_abs=6.53e-3
+fp8_pipe_regime 2304x128x256 (bm=128): max_abs=6.59e-3
+fp8_pipe_regime 2560x64x128 (bm=128): max_abs=2.69e-3
+test gpu::tests::fp8_pipe_regime_matches_reference ... ok
+fp8_gemm_pipe_gate_silu 128x64x128: max_abs=1.12e-2 max_rel=2.50e-1
+fp8_gemm_pipe_gate_gelu 128x64x128: max_abs=1.12e-2 max_rel=1.00e0
+fp8_gemm_pipe_gate_glu 128x64x128: max_abs=1.12e-2 max_rel=2.50e-1
+fp8_gemm_pipe_gate_silu_bias 128x64x128: max_abs=1.14e-2 max_rel=5.49e-1
+fp8_gemm_pipe_gate_gelu_bias 128x64x128: max_abs=1.13e-2 max_rel=1.00e0
+fp8_gemm_pipe_gate_silu 256x128x256: max_abs=3.41e-2 max_rel=3.64e34
+fp8_gemm_pipe_gate_gelu 256x128x256: max_abs=3.41e-2 max_rel=3.64e34
+fp8_gemm_pipe_gate_glu 256x128x256: max_abs=6.44e-2 max_rel=7.29e34
+fp8_gemm_pipe_gate_silu_bias 256x128x256: max_abs=3.38e-2 max_rel=1.26e0
+fp8_gemm_pipe_gate_gelu_bias 256x128x256: max_abs=3.38e-2 max_rel=1.26e0
+fp8_gemm_pipe_gate_silu 128x192x384: max_abs=9.36e-2 max_rel=1.32e0
+fp8_gemm_pipe_gate_gelu 128x192x384: max_abs=9.36e-2 max_rel=1.32e0
+fp8_gemm_pipe_gate_glu 128x192x384: max_abs=9.36e-2 max_rel=1.32e0
+fp8_gemm_pipe_gate_silu_bias 128x192x384: max_abs=9.62e-2 max_rel=8.53e0
+fp8_gemm_pipe_gate_gelu_bias 128x192x384: max_abs=9.62e-2 max_rel=8.54e0
+test gpu::tests::fp8_swiglu_gate_match_reference_within_tol ... ok
+fp8_tile m16n8k32 (E4M3 tensor core): max_abs=0.00e0 max_rel=0.00e0
+test gpu::tests::fp8_tensorcore_tile_matches_reference ... ok
+cliff_swz_s2         256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_w22        256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_pad_w24        256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_s3         256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_s3_r8      256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_s3_r32     256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_s2_mc3     256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_s3_mc2     256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_s2_v2      256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_s2_v2cs    256x256x256: max_abs=2.67e-5 max_rel=3.87e-3
+cliff_swz_s2         256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_w22        256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_pad_w24        256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_s3         256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_s3_r8      256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_s3_r32     256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_s2_mc3     256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_s3_mc2     256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_s2_v2      256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_s2_v2cs    256x160x512: max_abs=1.14e-5 max_rel=1.64e-1
+cliff_swz_s2         512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_w22        512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_pad_w24        512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_s3         512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_s3_r8      512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_s3_r32     512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_s2_mc3     512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_s3_mc2     512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_s2_v2      512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_s2_v2cs    512x128x384: max_abs=7.63e-6 max_rel=1.82e-2
+cliff_swz_s2         128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_swz_w22        128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_pad_w24        128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_swz_s3         128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_swz_s3_r8      128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_swz_s3_r32     128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_swz_s2_mc3     128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_swz_s3_mc2     128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_swz_s2_v2      128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+cliff_swz_s2_v2cs    128x32x2176: max_abs=1.91e-6 max_rel=7.13e-3
+[gate] all 10 CLIFF_VARIANTS entries launched ✓
+test gpu::tests::gemm_cliff_matches_reference ... ok
+test gpu::tests::mma_swizzle_vs_handplaced ... ignored
+f16  w22swz 256x256x256: max_abs=1.91e-5
+bf16 w22swz 256x256x256: max_abs=7.63e-6
+f16  w22swz 384x160x256: max_abs=1.05e-5
+bf16 w22swz 384x160x256: max_abs=4.77e-6
+[gate] over-budget deep row declined: f16 deep pipeline `deep_swz_128_s2`: needs 524288 B of shared memory per block, but NVIDIA L4 reports a 101376 B opt-in ceiling (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+test gpu::tests::gemm_cliff_w22swz_matches_reference ... ok
+f16 deep pipeline on NVIDIA L4 — opt-in SMEM budget 101376 B (99 KiB); static ISA cap 48 KiB
+test gpu::tests::gemm_deep_declines_over_budget_instead_of_downshifting ... ok
+
+thread 'gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch' (164) panicked at crates/wukong_codegen_gpu/src/gpu.rs:2968:14:
+norm op -1 not implemented on GPU yet
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <wukong_codegen_gpu::gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch' (164) panicked at crates/wukong_codegen_gpu/src/gpu.rs:2968:14:
+norm op 3 not implemented on GPU yet
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <wukong_codegen_gpu::gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch' (164) panicked at crates/wukong_codegen_gpu/src/gpu.rs:2968:14:
+norm op 4 not implemented on GPU yet
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <wukong_codegen_gpu::gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch' (164) panicked at crates/wukong_codegen_gpu/src/gpu.rs:2968:14:
+norm op 5 not implemented on GPU yet
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <wukong_codegen_gpu::gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch' (164) panicked at crates/wukong_codegen_gpu/src/gpu.rs:2968:14:
+norm op 6 not implemented on GPU yet
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <wukong_codegen_gpu::gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test gpu::tests::norm_supported_covers_exactly_the_entries_norm_can_launch ... ok
+[gate] .version law: 77/94 modules floored at 7.8; 17 licensed above it: ["fp8::FP8_TILE (.version 8.4, needs `e4m3`)", "fp8::fp8_gemm_ptx (.version 8.4, needs `e4m3`)", "fp8::fp8_gemm_mt_ptx (.version 8.4, needs `e4m3`)", "fp8::fp8_pipe_ptx (.version 8.4, needs `e4m3`)", "fp8::fp8_pipe_w64_ptx (.version 8.4, needs `e4m3`)", "fp8::fp8_pipe_w64_s3_ptx (.version 8.4, needs `e4m3`)", "fp8::fp8_pipe_cfg_ptx (.version 8.4, needs `e4m3`)", "fp8t::fp8_bwd_gemm_ptx (.version 8.4, needs `e4m3`)", "fp8t::fp8_e5m2_gemm_ptx (.version 8.4, needs `e5m2`)", "fp8t::quantize_scaled_e4m3_ptx (.version 8.4, needs `e4m3`)", "fp8t::quantize_scaled_e5m2_ptx (.version 8.4, needs `e5m2`)", "fp8::deep/fp8_deep_128_s2 (.version 8.4, needs `e4m3`)", "fp8::deep/fp8_deep_128_s3 (.version 8.4, needs `e4m3`)", "fp8::deep/fp8_deep_128_s4 (.version 8.4, needs `e4m3`)", "fp8::deep/fp8_deep_m64_s2 (.version 8.4, needs `e4m3`)", "fp8::deep/fp8_deep_m64_s4 (.version 8.4, needs `e4m3`)", "fp8::deep/fp8_deep_m64_s6 (.version 8.4, needs `e4m3`)"] ✓
+test gpu::tests::no_module_declares_a_driver_floor_its_instructions_do_not_need ... ok
+test gpu::tests::nvrtc_wmma_probe ... ignored, capability probe; needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::overlap_throughput ... ignored, perf bench; needs a GPU. Run with --ignored --nocapture
+test gpu::tests::pool_graph_vs_unpooled ... ignored, perf bench; needs a GPU. Run with --ignored --nocapture
+  deep_swz_128_s2      128x128 s2 SMEM 32768 B (32 KiB) static   occupancy=2 CTA/SM
+    128x32x128: max_abs=1.43e-6 max_rel=1.58e-4 | vs s2 max_abs=0.00e0
+    256x64x256: max_abs=4.77e-6 max_rel=7.65e-3 | vs s2 max_abs=0.00e0
+    128x160x256: max_abs=1.34e-5 max_rel=2.86e-3 | vs s2 max_abs=0.00e0
+    128x32x2176: max_abs=1.91e-6 max_rel=8.70e-3 | vs s2 max_abs=0.00e0
+  deep_swz_128_s3      128x128 s3 SMEM 49152 B (48 KiB) static   occupancy=2 CTA/SM
+    128x32x128: max_abs=1.43e-6 max_rel=5.78e-4 | vs s2 max_abs=0.00e0
+    128x64x128: max_abs=2.86e-6 max_rel=1.40e-3 | vs s2 max_abs=0.00e0
+    256x96x256: max_abs=5.72e-6 max_rel=1.32e-3 | vs s2 max_abs=0.00e0
+    128x192x256: max_abs=1.14e-5 max_rel=1.73e-2 | vs s2 max_abs=0.00e0
+    128x32x2176: max_abs=1.43e-6 max_rel=5.27e-3 | vs s2 max_abs=0.00e0
+  deep_swz_128_s4      128x128 s4 SMEM 65536 B (64 KiB) DYNAMIC  occupancy=1 CTA/SM
+    128x32x128: max_abs=1.43e-6 max_rel=6.90e-4 | vs s2 max_abs=0.00e0
+    128x96x128: max_abs=7.63e-6 max_rel=2.81e-4 | vs s2 max_abs=0.00e0
+    256x128x256: max_abs=7.63e-6 max_rel=3.44e-3 | vs s2 max_abs=0.00e0
+    128x224x256: max_abs=1.53e-5 max_rel=4.01e-3 | vs s2 max_abs=0.00e0
+    128x32x2176: max_abs=1.91e-6 max_rel=7.10e-3 | vs s2 max_abs=0.00e0
+  deep_swz_128_s5      128x128 s5 SMEM 81920 B (80 KiB) DYNAMIC  occupancy=1 CTA/SM
+    128x32x128: max_abs=1.43e-6 max_rel=1.87e-4 | vs s2 max_abs=0.00e0
+    128x128x128: max_abs=7.63e-6 max_rel=2.67e-3 | vs s2 max_abs=0.00e0
+    256x160x256: max_abs=1.05e-5 max_rel=1.45e-1 | vs s2 max_abs=0.00e0
+    128x256x256: max_abs=2.10e-5 max_rel=6.73e-2 | vs s2 max_abs=0.00e0
+    128x32x2176: max_abs=2.38e-6 max_rel=8.01e-3 | vs s2 max_abs=0.00e0
+  deep_swz_128x256_s3  128x256 s3 SMEM 73728 B (72 KiB) DYNAMIC  occupancy=1 CTA/SM
+    128x32x256: max_abs=1.43e-6 max_rel=5.29e-1 | vs s2 max_abs=0.00e0
+    128x64x256: max_abs=2.86e-6 max_rel=1.17e-3 | vs s2 max_abs=0.00e0
+    256x96x512: max_abs=6.68e-6 max_rel=1.10e-2 | vs s2 max_abs=0.00e0
+    128x192x512: max_abs=1.72e-5 max_rel=8.63e-3 | vs s2 max_abs=0.00e0
+    128x32x4352: max_abs=1.91e-6 max_rel=5.59e-3 | vs s2 max_abs=0.00e0
+[gate] f16 deep pipeline: 24 K-corner shapes across s2..s5 + the 128x256 tile, every one within fp16 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the >48 KiB rows ran out of the dynamic SMEM window ✓
+test gpu::tests::gemm_deep_matches_reference_within_tol ... ok
+test gpu::tests::quant_fp8_warp_tile_sweep ... ignored, throughput sweep; needs cublasLt64_12.dll on PATH; run explicitly
+gemm_nt 64x64x64: max_abs=2.86e-6 max_rel=9.11e-4
+gemm_nt 100x80x48: max_abs=3.81e-6 max_rel=1.04e-4
+gemm_nt 128x256x192: max_abs=1.34e-5 max_rel=2.57e-3
+test gpu::tests::gemm_matches_reference_within_tol ... ok
+gemm_nt_rb 64x64x64: max_abs=2.86e-6 max_rel=4.42e-4
+gemm_nt_rb 100x80x48: max_abs=3.81e-6 max_rel=1.27e-3
+gemm_nt_rb 130x200x70: max_abs=8.58e-6 max_rel=6.36e-4
+test gpu::tests::gemm_rb_matches_reference_within_tol ... ok
+test gpu::tests::quant_int8_bigtile_sweep ... ignored, throughput sweep; needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::quant_int8_fused_dequant_vs_chain ... ignored, throughput bench; needs CUDA redist DLLs on PATH; run explicitly
+M12: all GPU kernel families bit-identical run-to-run ✓
+GpuTarget {
+  name: "NVIDIA L4"
+  cc: 8.9 (sm_89)
+  sm_count: 58
+  smem_per_block_optin: 101376 B (99.0 KiB)
+  smem_per_sm: 102400 B (100.0 KiB)
+  l2_bytes: 50331648 B (48.00 MiB)
+  total_mem: 23659151360 B (22.03 GiB)
+  driver_version: 13000
+}
+test gpu::tests::gpu_kernels_bit_reproducible ... ok
+test gpu::tests::quant_int8_raster_sweep ... ignored, throughput sweep; needs CUDA redist DLLs on PATH; run explicitly
+[gate] GpuTarget probed: NVIDIA L4 sm_89 | 58 SMs | optin SMEM 99 KiB | L2 48.00 MiB ✓
+test gpu::tests::gpu_target_is_probed_and_sane ... ok
+test gpu::tests::quant_int8_w64_confirm ... ignored, throughput sweep; needs CUDA redist DLLs on PATH; run explicitly
+test gpu::tests::head_transpose_round_trips ... ok
+w4a16 sym  64x128x64: max_abs=5.72e-6 max_rel=2.57e-4
+w4a16 asym 64x128x64: max_abs=4.77e-6 max_rel=1.68e-3
+w4a16 static 64x128x64: bit-identical to dynamic (sym + asym) ✓
+w4a16 sym  64x256x128: max_abs=1.72e-5 max_rel=5.01e-4
+w4a16 asym 64x256x128: max_abs=1.34e-5 max_rel=1.26e-3
+w4a16 static 64x256x128: bit-identical to dynamic (sym + asym) ✓
+w4a16 sym  128x256x256: max_abs=1.34e-5 max_rel=1.29e-1
+w4a16 asym 128x256x256: max_abs=1.53e-5 max_rel=2.16e-3
+w4a16 sym  192x128x64: max_abs=6.68e-6 max_rel=6.94e-3
+w4a16 asym 192x128x64: max_abs=5.72e-6 max_rel=8.05e-4
+w4a16 sym  64x512x192: max_abs=4.58e-5 max_rel=2.37e-3
+w4a16 asym 64x512x192: max_abs=3.05e-5 max_rel=2.19e-2
+w4a16 sym  256x384x128: max_abs=3.05e-5 max_rel=4.47e-3
+w4a16 asym 256x384x128: max_abs=4.01e-5 max_rel=1.81e-2
+test gpu::tests::int4_gemm_matches_reference ... ok
+test gpu::tests::quant_int8_w64_s3_sweep ... ignored, throughput sweep; needs CUDA redist DLLs on PATH; run explicitly
+w4a16 splitk 64x256x64 sk=2: max_abs=5.72e-6 max_rel=3.73e-4; deterministic ✓
+w4a16 splitk 64x512x128 sk=4: max_abs=7.63e-6 max_rel=8.98e-4; deterministic ✓
+w4a16 splitk 128x1024x64 sk=8: max_abs=9.54e-6 max_rel=1.52e-3; deterministic ✓
+test gpu::tests::int4_splitk_matches_reference ... ok
+int8_dequant 64x64x64: fused i32→f32·scale[j] ✓ max_abs=0.00e0 max_rel=0.00e0
+int8_dequant 128x128x128: fused i32→f32·scale[j] ✓ max_abs=0.00e0 max_rel=0.00e0
+int8_dequant 64x256x192: fused i32→f32·scale[j] ✓ max_abs=0.00e0 max_rel=0.00e0
+int8_dequant 64x96x128: fused i32→f32·scale[j] ✓ max_abs=0.00e0 max_rel=0.00e0
+test gpu::tests::int8_dequant_matches_reference ... ok
+test gpu::tests::reproducibility_vs_cublas ... ignored, needs CUDA redist DLLs on PATH; run explicitly
+int8_gemm 16x32x8: bit-exact ✓ (checksum 509077)
+int8_gemm 48x32x40: bit-exact ✓ (checksum 8325321)
+int8_gemm 64x64x64: bit-exact ✓ (checksum 9828056)
+int8_gemm 128x256x96: bit-exact ✓ (checksum 173024973)
+int8_gemm 128x128x128: bit-exact ✓ (checksum -67603966)
+int8_gemm 128x96x128: bit-exact ✓ (checksum 16504067)
+test gpu::tests::int8_gemm_matches_reference ... ok
+[gate] int8 smdb multi-stage s3/s4 (64 & 128) bit-exact vs i32 oracle ✓
+test gpu::tests::int8_smdb_ms_matches_reference ... ok
+[gate] int8 ldmatrix+swizzle smdb_swz (64 & 128) bit-exact vs i32 oracle ✓
+test gpu::tests::int8_smdb_swz_matches_reference ... ok
+test gpu::tests::resident_model_throughput ... ignored, throughput bench; run explicitly
+test gpu::tests::resident_model_vs_cublas_chain_throughput ... ignored, needs CUDA redist DLLs on PATH; throughput bench; run explicitly
+[gate] int8 split-K swz (red.global.add.u32, sk=2/4/8) bit-exact vs i32 oracle ✓
+test gpu::tests::int8_smdb_swz_splitk_matches_reference ... ok
+[gate] int8 static-shape (64 & 128) bit-exact vs i32 oracle AND the dynamic swz kernel ✓
+test gpu::tests::int8_static_matches_reference ... ok
+mma.sync.m16n8k16 fp16 layout VERIFIED: max_abs=0.00e0
+test gpu::tests::mma_m16n8k16_layout_verifies ... ok
+flash_d64_mp s=16 d=64: max_abs=8.12e-5 max_rel=1.32e-1
+flash_d64_mpc s=16 d=64: max_abs=1.23e-4 max_rel=3.21e-2
+flash_d64_mp s=64 d=64: max_abs=5.87e-5 max_rel=1.75e0
+flash_d64_mpc s=64 d=64: max_abs=1.03e-4 max_rel=1.84e-1
+flash_d64_mp s=256 d=64: max_abs=3.36e-5 max_rel=1.38e0
+flash_d64_mpc s=256 d=64: max_abs=1.77e-4 max_rel=7.30e0
+flash_d64_mp s=512 d=64: max_abs=2.45e-5 max_rel=1.03e0
+flash_d64_mpc s=512 d=64: max_abs=1.44e-4 max_rel=6.72e0
+test gpu::tests::mma_pipe_flash_matches_reference_within_tol ... ok
+test gpu::tests::tensorcore_roofline_pct ... ignored, throughput bench; run explicitly
+test gpu::tests::tensorcore_throughput ... ignored, throughput bench; run explicitly
+flash_d64_mp4 s=16 d=64: max_abs=7.98e-5 max_rel=2.42e-1
+flash_d64_mp8 s=16 d=64: max_abs=7.98e-5 max_rel=2.42e-1
+flash_d64_mp4 s=64 d=64: max_abs=6.42e-5 max_rel=4.15e-1
+flash_d64_mp8 s=64 d=64: max_abs=6.42e-5 max_rel=4.15e-1
+flash_d64_mp4 s=256 d=64: max_abs=3.20e-5 max_rel=1.11e1
+flash_d64_mp8 s=256 d=64: max_abs=3.20e-5 max_rel=1.11e1
+flash_d64_mp4 s=512 d=64: max_abs=2.26e-5 max_rel=4.13e0
+flash_d64_mp8 s=512 d=64: max_abs=2.26e-5 max_rel=4.13e0
+test gpu::tests::mma_pipe_mw_flash_matches_reference_within_tol ... ok
+mma_reg causal flash s=16 d=64: max_abs=9.70e-5 max_rel=3.54e-1
+mma_reg causal flash s=64 d=64: max_abs=1.19e-4 max_rel=2.22e1
+mma_reg causal flash s=256 d=64: max_abs=1.28e-4 max_rel=5.44e0
+mma_reg causal flash s=512 d=64: max_abs=1.50e-4 max_rel=4.28e0
+test gpu::tests::mma_reg_flash_causal_matches_reference_within_tol ... ok
+mma_reg flash s=16 d=64: max_abs=8.96e-5 max_rel=1.34e0
+mma_reg flash s=64 d=64: max_abs=6.33e-5 max_rel=4.79e0
+mma_reg flash s=256 d=64: max_abs=3.12e-5 max_rel=4.04e0
+mma_reg flash s=512 d=64: max_abs=2.47e-5 max_rel=3.47e0
+test gpu::tests::mma_reg_flash_matches_reference_within_tol ... ok
+test gpu::tests::transformer_layer_throughput ... ignored, throughput bench; run explicitly
+mh flash H=4 s=64 d=64: max_abs=5.88e-5
+mh flash H=12 s=128 d=64: max_abs=4.74e-5
+mh flash H=8 s=256 d=64: max_abs=3.32e-5
+test gpu::tests::mma_reg_flash_multihead_matches_reference_within_tol ... ok
+mma_swz 128x32x128: max_abs=1.43e-6 max_rel=1.98e-4
+mma_swz 128x64x128: max_abs=2.86e-6 max_rel=2.42e-4
+mma_swz 256x160x256: max_abs=1.34e-5 max_rel=5.77e-3
+mma_swz 128x96x384: max_abs=5.72e-6 max_rel=1.44e-1
+mma_swz 128x32x2176: max_abs=1.91e-6 max_rel=3.67e0
+mma_bf16_swz 128x32x128: max_abs=9.54e-7 max_rel=8.53e-4
+mma_bf16_swz 256x160x256: max_abs=5.72e-6 max_rel=1.39e-3
+mma_bf16_swz 128x96x384: max_abs=2.86e-6 max_rel=6.80e-3
+test gpu::tests::mma_swizzle_matches_reference_within_tol ... ok
+overlap==serial==eager bit-identical: S=64 D=64 Dff=256 heads=1, B=12 (16 KiB I/O per item, pinned, 2-stream)
+overlap==serial==eager bit-identical: S=512 D=128 Dff=512 heads=2, B=12 (256 KiB I/O per item, pinned, 2-stream)
+overlap==serial==eager bit-identical: S=512 D=768 Dff=3072 heads=12, B=12 (1536 KiB I/O per item, pinned, 2-stream)
+norm softmax   : max_abs=1.86e-9 max_rel=7.25e-7
+test gpu::tests::multistream_overlap_matches_serial ... ok
+norm layernorm : max_abs=3.58e-7 max_rel=3.74e-4
+norm rmsnorm   : max_abs=3.58e-7 max_rel=2.38e-7
+test gpu::tests::norms_match_cpu_oracle_within_tol ... ok
+fp8 warp-tile w2×2 (64×64) == w2×4 default: checksum match ✓
+test gpu::tests::quant_fp8_warp_tile_matches ... ok
+int8 big-tile swz (256×128 / 128×256, ±raster): bit-exact ✓
+test gpu::tests::quant_int8_bigtile_matches_reference ... ok
+  int8_swz_256x128_w4x2_s3: SMEM 73728 B (72 KiB) DYNAMIC, occupancy=1 CTA/SM
+[gate] int8_swz_256x128_w4x2_s3: bit-exact at 4 K-corners out of a 73728-B dynamic window ✓
+  int8_swz_128x256_w2x4_s3: SMEM 73728 B (72 KiB) DYNAMIC, occupancy=1 CTA/SM
+[gate] int8_swz_128x256_w2x4_s3: bit-exact at 4 K-corners out of a 73728-B dynamic window ✓
+test gpu::tests::quant_int8_bigtile_stage3_matches_reference ... ok
+int8 raster r=8 128x64x128: bit-exact ✓
+int8 raster r=8 256x128x128: bit-exact ✓
+int8 raster r=4 128x192x384: bit-exact ✓
+int8 raster r=16 384x64x256: bit-exact ✓
+int8 raster r=32 256x256x256: bit-exact ✓
+int8 stage grid on NVIDIA L4 — opt-in SMEM budget 101376 B (99 KiB); the static ISA cap is 48 KiB
+test gpu::tests::quant_int8_raster_matches_reference ... ok
+
+thread 'gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for' (193) panicked at crates/wukong_codegen_gpu/src/gpu.rs:3058:18:
+wmma_flash_entry: no tensor-core flash kernel for head dim 32 (wmma_flash_applies must gate this call)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for
+   3: <wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for' (193) panicked at crates/wukong_codegen_gpu/src/gpu.rs:3058:18:
+wmma_flash_entry: no tensor-core flash kernel for head dim 96 (wmma_flash_applies must gate this call)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for
+   3: <wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for' (193) panicked at crates/wukong_codegen_gpu/src/gpu.rs:3069:5:
+assertion `left == right` failed: wmma_flash_cfg: S=520 must be a multiple of 16 (the kernel's 16-query-row block)
+  left: 8
+ right: 0
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for::{closure#3}
+   5: wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for
+   6: <wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for' (193) panicked at crates/wukong_codegen_gpu/src/gpu.rs:3140:5:
+wmma_flash_plan: no tensor-core flash kernel for (d=32, S=512) — needs D ∈ {64, 128}, S % 16 == 0, S >= 512
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for
+   3: <wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for' (193) panicked at crates/wukong_codegen_gpu/src/gpu.rs:3140:5:
+wmma_flash_plan: no tensor-core flash kernel for (d=64, S=520) — needs D ∈ {64, 128}, S % 16 == 0, S >= 512
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for
+   3: <wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for' (193) panicked at crates/wukong_codegen_gpu/src/gpu.rs:3140:5:
+wmma_flash_plan: no tensor-core flash kernel for (d=64, S=256) — needs D ∈ {64, 128}, S % 16 == 0, S >= 512
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for
+   3: <wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for' (193) panicked at crates/wukong_codegen_gpu/src/gpu.rs:3140:5:
+wmma_flash_plan: no tensor-core flash kernel for (d=96, S=1024) — needs D ∈ {64, 128}, S % 16 == 0, S >= 512
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for
+   3: <wukong_codegen_gpu::gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+[gate] tensor-core flash seam is total on wmma_flash_applies ✓
+test gpu::tests::wmma_flash_seam_rejects_shapes_it_has_no_kernel_for ... ok
+  int8_w64_swz_s2  s2 SMEM 32768 B (32 KiB) static   launch_bytes=0      occupancy=3 CTA/SM
+  int8_w64_swz_s3  s3 SMEM 49152 B (48 KiB) static   launch_bytes=0      occupancy=2 CTA/SM
+  int8_w64_swz_s4  s4 SMEM 65536 B (64 KiB) DYNAMIC  launch_bytes=65536  occupancy=1 CTA/SM
+  int8_w64_swz_s5  s5 SMEM 81920 B (80 KiB) DYNAMIC  launch_bytes=81920  occupancy=1 CTA/SM
+[gate] int8 stage grid s2..s5: 15 K-corner shapes, every one == the i32 oracle AND == the shipped 2-stage kernel, element-wise; s4/s5 ran out of the dynamic SMEM window (>48 KiB static) ✓
+test gpu::tests::quant_int8_stage_grid_matches_reference ... ok
+int8 w64_dequant 128x64x128: ✓ max_abs=0.00e0
+int8 w64_dequant 256x128x256: ✓ max_abs=0.00e0
+int8 w64_dequant 128x256x384: ✓ max_abs=0.00e0
+test gpu::tests::quant_int8_w64_dequant_matches_reference ... ok
+int8 w64_s3 128x128x128: 3-stage == 2-stage == i32 oracle ✓ (16384 elems)
+int8 w64_s3 256x256x256: 3-stage == 2-stage == i32 oracle ✓ (65536 elems)
+int8 w64_s3 128x384x256: 3-stage == 2-stage == i32 oracle ✓ (32768 elems)
+int8 w64_s3 384x256x128: 3-stage == 2-stage == i32 oracle ✓ (49152 elems)
+
+thread 'gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel' (173) panicked at crates/wukong_codegen_gpu/src/gpu.rs:863:5:
+assertion `left == right` failed: reduce: op 0 requires a second operand y
+  left: true
+ right: false
+stack backtrace:
+test gpu::tests::quant_int8_w64_s3_matches_reference ... ok
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<bool, bool>
+   4: wukong_codegen_gpu::gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel::{closure#0}
+   5: <wukong_codegen_gpu::gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel' (173) panicked at crates/wukong_codegen_gpu/src/gpu.rs:863:5:
+assertion `left == right` failed: reduce: op 2 takes no second operand
+  left: false
+ right: true
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<bool, bool>
+   4: wukong_codegen_gpu::gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel::{closure#0}
+   5: <wukong_codegen_gpu::gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel' (173) panicked at crates/wukong_codegen_gpu/src/gpu.rs:874:9:
+assertion `left == right` failed: reduce: x and y must be equal length
+  left: 4
+ right: 2
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: wukong_codegen_gpu::gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel::{closure#0}
+   5: <wukong_codegen_gpu::gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+[gate] reduce launch-arity seam rejects every mismatched (op, y) pair ✓
+test gpu::tests::reduce_rejects_an_operand_list_that_would_not_match_the_kernel ... ok
+reduce sum: gpu=524485.56 cpu=524485.7 ref=524485.597746 rel=6.720e-8
+reduce dot: gpu=262409.78 ref=262409.766822 rel=5.498e-8
+test gpu::tests::reductions_match_reference_within_tol_and_are_deterministic ... ok
+graphed==eager bit-identical & replay deterministic: S=64 D=64 Dff=256 heads=1; one cuGraphLaunch replays the whole resident layer (high-water 232 KiB)
+graphed==eager bit-identical & replay deterministic: S=512 D=128 Dff=512 heads=2; one cuGraphLaunch replays the whole resident layer (high-water 4352 KiB)
+graphed==eager bit-identical & replay deterministic: S=512 D=768 Dff=3072 heads=12; one cuGraphLaunch replays the whole resident layer (high-water 26112 KiB)
+test gpu::tests::resident_layer_graphed_matches_eager ... ok
+pooled==eager bit-identical: S=64 D=64 Dff=256 heads=1; pool high-water 232 KiB across 12 sub-allocs (cap 256 MiB)
+pooled==eager bit-identical: S=512 D=128 Dff=512 heads=2; pool high-water 4352 KiB across 16 sub-allocs (cap 256 MiB)
+pooled==eager bit-identical: S=512 D=768 Dff=3072 heads=12; pool high-water 26112 KiB across 16 sub-allocs (cap 256 MiB)
+test gpu::tests::resident_layer_pooled_matches_eager ... ok
+resident_model_f16 depth=4 S=128 D=64 Dff=256 (whole-model GPU-resident, 4×13 launches, 1 H2D + 1 D2H): max_abs=5.10e-4 max_rel=5.82e0
+test gpu::tests::resident_model_f16_matches_reference_within_tol ... ok
+12-layer stack graphed==eager bit-identical & deterministic (S=64 D=64 Dff=256); whole model = one cuGraphLaunch (high-water 232 KiB, one layer's scratch)
+test gpu::tests::resident_stack_graphed_matches_eager ... ok
+fp16 TC roofline (small probe): 52060 GFLOP/s
+device: NVIDIA L4
+test gpu::tests::roofline_kernel_runs ... ok
+test gpu::tests::saxpy_bit_exact_on_gpu ... ok
+mma_nt_f16_128x64_gate_silu 128x64x128: max_abs=1.91e-5 max_rel=1.79e-3
+mma_nt_f16_128x64_gate_gelu 128x64x128: max_abs=3.81e-5 max_rel=1.00e0
+mma_nt_f16_128x64_gate_glu 128x64x128: max_abs=1.91e-5 max_rel=1.79e-3
+mma_nt_f16_128x64_gate_silu_bias 128x64x128: max_abs=1.91e-5 max_rel=8.81e-4
+mma_nt_f16_128x64_gate_gelu_bias 128x64x128: max_abs=4.77e-5 max_rel=1.00e0
+mma_nt_f16_128x64_gate_silu_swz 128x64x128: max_abs=1.91e-5 max_rel=1.79e-3
+mma_nt_f16_128x64_gate_gelu_swz 128x64x128: max_abs=3.81e-5 max_rel=1.00e0
+mma_nt_f16_128x64_gate_glu_swz 128x64x128: max_abs=1.91e-5 max_rel=1.79e-3
+mma_nt_f16_128x64_gate_silu_bias_swz 128x64x128: max_abs=1.91e-5 max_rel=8.81e-4
+mma_nt_f16_128x64_gate_gelu_bias_swz 128x64x128: max_abs=4.77e-5 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_silu 128x64x128: max_abs=1.14e-5 max_rel=1.05e-2
+mma_nt_bf16_128x64_gate_gelu 128x64x128: max_abs=3.91e-5 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_glu 128x64x128: max_abs=9.54e-6 max_rel=1.05e-2
+mma_nt_bf16_128x64_gate_silu_bias 128x64x128: max_abs=7.63e-6 max_rel=1.88e-3
+mma_nt_bf16_128x64_gate_gelu_bias 128x64x128: max_abs=4.58e-5 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_silu_swz 128x64x128: max_abs=1.14e-5 max_rel=1.05e-2
+mma_nt_bf16_128x64_gate_gelu_swz 128x64x128: max_abs=3.91e-5 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_glu_swz 128x64x128: max_abs=9.54e-6 max_rel=1.05e-2
+mma_nt_bf16_128x64_gate_silu_bias_swz 128x64x128: max_abs=7.63e-6 max_rel=1.88e-3
+mma_nt_bf16_128x64_gate_gelu_bias_swz 128x64x128: max_abs=4.58e-5 max_rel=1.00e0
+mma_nt_f16_128x64_gate_silu 256x128x256: max_abs=1.22e-4 max_rel=1.49e-2
+mma_nt_f16_128x64_gate_gelu 256x128x256: max_abs=1.22e-4 max_rel=1.00e0
+mma_nt_f16_128x64_gate_glu 256x128x256: max_abs=1.22e-4 max_rel=1.49e-2
+mma_nt_f16_128x64_gate_silu_bias 256x128x256: max_abs=1.22e-4 max_rel=1.75e-2
+mma_nt_f16_128x64_gate_gelu_bias 256x128x256: max_abs=1.37e-4 max_rel=1.00e0
+mma_nt_f16_128x64_gate_silu_swz 256x128x256: max_abs=1.22e-4 max_rel=1.49e-2
+mma_nt_f16_128x64_gate_gelu_swz 256x128x256: max_abs=1.22e-4 max_rel=1.00e0
+mma_nt_f16_128x64_gate_glu_swz 256x128x256: max_abs=1.22e-4 max_rel=1.49e-2
+mma_nt_f16_128x64_gate_silu_bias_swz 256x128x256: max_abs=1.22e-4 max_rel=1.75e-2
+mma_nt_f16_128x64_gate_gelu_bias_swz 256x128x256: max_abs=1.37e-4 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_silu 256x128x256: max_abs=4.58e-5 max_rel=5.47e-4
+mma_nt_bf16_128x64_gate_gelu 256x128x256: max_abs=5.72e-5 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_glu 256x128x256: max_abs=4.58e-5 max_rel=5.47e-4
+mma_nt_bf16_128x64_gate_silu_bias 256x128x256: max_abs=4.58e-5 max_rel=5.00e-1
+mma_nt_bf16_128x64_gate_gelu_bias 256x128x256: max_abs=5.84e-5 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_silu_swz 256x128x256: max_abs=4.58e-5 max_rel=5.47e-4
+mma_nt_bf16_128x64_gate_gelu_swz 256x128x256: max_abs=5.72e-5 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_glu_swz 256x128x256: max_abs=4.58e-5 max_rel=5.47e-4
+mma_nt_bf16_128x64_gate_silu_bias_swz 256x128x256: max_abs=4.58e-5 max_rel=5.00e-1
+mma_nt_bf16_128x64_gate_gelu_bias_swz 256x128x256: max_abs=5.84e-5 max_rel=1.00e0
+mma_nt_f16_128x64_gate_silu 128x256x320: max_abs=3.97e-4 max_rel=1.27e-2
+mma_nt_f16_128x64_gate_gelu 128x256x320: max_abs=3.97e-4 max_rel=1.00e0
+mma_nt_f16_128x64_gate_glu 128x256x320: max_abs=3.97e-4 max_rel=1.27e-2
+mma_nt_f16_128x64_gate_silu_bias 128x256x320: max_abs=3.97e-4 max_rel=1.01e-2
+mma_nt_f16_128x64_gate_gelu_bias 128x256x320: max_abs=4.27e-4 max_rel=1.00e0
+mma_nt_f16_128x64_gate_silu_swz 128x256x320: max_abs=3.97e-4 max_rel=1.27e-2
+mma_nt_f16_128x64_gate_gelu_swz 128x256x320: max_abs=3.97e-4 max_rel=1.00e0
+mma_nt_f16_128x64_gate_glu_swz 128x256x320: max_abs=3.97e-4 max_rel=1.27e-2
+mma_nt_f16_128x64_gate_silu_bias_swz 128x256x320: max_abs=3.97e-4 max_rel=1.01e-2
+mma_nt_f16_128x64_gate_gelu_bias_swz 128x256x320: max_abs=4.27e-4 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_silu 128x256x320: max_abs=1.53e-4 max_rel=3.33e-1
+mma_nt_bf16_128x64_gate_gelu 128x256x320: max_abs=1.53e-4 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_glu 128x256x320: max_abs=1.53e-4 max_rel=3.33e-1
+mma_nt_bf16_128x64_gate_silu_bias 128x256x320: max_abs=1.83e-4 max_rel=8.48e-3
+mma_nt_bf16_128x64_gate_gelu_bias 128x256x320: max_abs=1.53e-4 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_silu_swz 128x256x320: max_abs=1.53e-4 max_rel=3.33e-1
+mma_nt_bf16_128x64_gate_gelu_swz 128x256x320: max_abs=1.53e-4 max_rel=1.00e0
+mma_nt_bf16_128x64_gate_glu_swz 128x256x320: max_abs=1.53e-4 max_rel=3.33e-1
+mma_nt_bf16_128x64_gate_silu_bias_swz 128x256x320: max_abs=1.83e-4 max_rel=8.48e-3
+mma_nt_bf16_128x64_gate_gelu_bias_swz 128x256x320: max_abs=1.53e-4 max_rel=1.00e0
+test gpu::tests::swiglu_gate_match_reference_within_tol ... ok
+transformer_layer_f16 S=128 D=64 Dff=256 [f32 flash]: max_abs=1.94e-4 max_rel=3.14e-2
+transformer_layer_f16 S=512 D=64 Dff=256 [wmma flash]: max_abs=2.49e-4 max_rel=2.64e-1
+test gpu::tests::transformer_layer_f16_matches_reference_within_tol ... ok
+transformer_layer S=96 D=64 Dff=256 (GPU-resident): max_abs=5.96e-7 max_rel=2.72e-4
+test gpu::tests::transformer_layer_matches_reference_within_tol ... ok
+transformer_layer_mha S=512 D=768 H=12 dh=64 Dff=1024: max_abs=8.05e-3 max_rel=1.69e2
+test gpu::tests::transformer_layer_mha_matches_reference_within_tol ... ok
+test gpu::tests::vadd_bit_exact_on_gpu ... ok
+test lower::tests::integer_lines_compare_exactly ... ok
+test lower::tests::jit_log_file ... ignored, diagnostic; prints the driver JIT log for a PTX file
+vmath relu    : max_abs=0.000e0 max_rel=0.000e0
+test lower::tests::gpu_native_modules_open_at_the_sm80_floor ... ok
+test lower::tests::vmath_lowp_markers_present ... ok
+vmath exp     : max_abs=1.172e-2 max_rel=5.587e-7
+vmath sigmoid : max_abs=1.788e-7 max_rel=5.844e-7
+vmath tanh    : max_abs=7.629e-6 max_rel=1.359e-4
+vmath silu    : max_abs=1.431e-6 max_rel=6.154e-7
+vmath gelu    : max_abs=5.245e-6 max_rel=1.000e0
+test gpu::tests::vmath_activations_match_cpu_oracle_within_tol ... ok
+wmma_bf16_mma_bias 128x64x128: max_abs=1.91e-6 max_rel=6.27e-5
+wmma_bf16_mma_bias_relu 128x64x128: max_abs=1.91e-6 max_rel=3.44e-5
+wmma_bf16_mma_bias_silu 128x64x128: max_abs=2.86e-6 max_rel=6.28e-5
+wmma_bf16_mma_bias_gelu 128x64x128: max_abs=5.36e-6 max_rel=1.00e0
+wmma_bf16_mma_bias 256x128x256: max_abs=3.81e-6 max_rel=1.36e-3
+wmma_bf16_mma_bias_relu 256x128x256: max_abs=3.81e-6 max_rel=1.02e-3
+wmma_bf16_mma_bias_silu 256x128x256: max_abs=3.81e-6 max_rel=1.36e-3
+wmma_bf16_mma_bias_gelu 256x128x256: max_abs=6.08e-6 max_rel=1.00e0
+wmma_bf16_mma_bias 128x256x512: max_abs=1.14e-5 max_rel=1.64e-3
+wmma_bf16_mma_bias_relu 128x256x512: max_abs=1.14e-5 max_rel=1.64e-3
+wmma_bf16_mma_bias_silu 128x256x512: max_abs=1.14e-5 max_rel=1.64e-3
+wmma_bf16_mma_bias_gelu 128x256x512: max_abs=1.14e-5 max_rel=1.00e0
+test gpu::tests::wmma_bf16_mma_bias_match_reference_within_tol ... ok
+test megakernel::tests::mega_vs_chain_reduce ... ignored, perf bench (M13); run with --ignored --nocapture
+test megakernel::tests::mega_vs_single_gemm ... ignored, perf bench; run with --ignored --nocapture
+test megakernel::tests::mega_vs_single_reduce ... ignored, perf bench; run with --ignored --nocapture
+test megakernel::tests::mega_vs_single_vmath ... ignored, perf bench; run with --ignored --nocapture
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+bf16 mma 128x32x128: max_abs=9.54e-7 max_rel=8.26e-5
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+bf16 mma 128x64x128: max_abs=9.54e-7 max_rel=9.91e-4
+bf16 mma 256x256x256: max_abs=1.14e-5 max_rel=1.80e-2
+bf16 mma 128x160x384: max_abs=4.77e-6 max_rel=3.47e-4
+test gpu::tests::wmma_bf16_pipe_matches_reference_within_tol ... ok
+wmma_bf16_sm_db_bias 64x64x64: max_abs=1.43e-6 max_rel=2.71e-5
+wmma_bf16_sm_db_bias_relu 64x64x64: max_abs=1.43e-6 max_rel=2.71e-5
+wmma_bf16_sm_db_bias_silu 64x64x64: max_abs=1.91e-6 max_rel=2.73e-5
+wmma_bf16_sm_db_bias_gelu 64x64x64: max_abs=5.25e-6 max_rel=1.00e0
+wmma_bf16_sm_db_bias 128x256x128: max_abs=9.54e-6 max_rel=1.26e-2
+wmma_bf16_sm_db_bias_relu 128x256x128: max_abs=9.54e-6 max_rel=1.26e-2
+wmma_bf16_sm_db_bias_silu 128x256x128: max_abs=9.54e-6 max_rel=1.26e-2
+wmma_bf16_sm_db_bias_gelu 128x256x128: max_abs=9.54e-6 max_rel=1.00e0
+wmma_bf16_sm_db_bias 256x128x512: max_abs=4.77e-6 max_rel=2.59e-3
+wmma_bf16_sm_db_bias_relu 256x128x512: max_abs=4.77e-6 max_rel=2.01e-3
+wmma_bf16_sm_db_bias_silu 256x128x512: max_abs=4.77e-6 max_rel=2.59e-3
+wmma_bf16_sm_db_bias_gelu 256x128x512: max_abs=5.96e-6 max_rel=1.00e0
+test gpu::tests::wmma_bf16_sm_db_bias_match_reference_within_tol ... ok
+test paged_attention::tests::paged_attn_jit_log ... ignored, diagnostic; prints the driver JIT log for the paged-attn PTX module
+wmma_bf16_sm_db_relu 64x64x64: max_abs=1.91e-6 max_rel=4.56e-5
+wmma_bf16_sm_db_silu 64x64x64: max_abs=1.91e-6 max_rel=4.56e-5
+wmma_bf16_sm_db_gelu 64x64x64: max_abs=5.25e-6 max_rel=1.00e0
+wmma_bf16_sm_db_relu 128x256x128: max_abs=7.63e-6 max_rel=2.20e-3
+wmma_bf16_sm_db_silu 128x256x128: max_abs=7.63e-6 max_rel=2.20e-3
+wmma_bf16_sm_db_gelu 128x256x128: max_abs=7.63e-6 max_rel=1.00e0
+wmma_bf16_sm_db_relu 256x128x512: max_abs=4.77e-6 max_rel=5.93e-3
+wmma_bf16_sm_db_silu 256x128x512: max_abs=4.77e-6 max_rel=5.93e-3
+wmma_bf16_sm_db_gelu 256x128x512: max_abs=5.72e-6 max_rel=1.00e0
+test gpu::tests::wmma_bf16_sm_db_fused_match_reference_within_tol ... ok
+d128 dispatch [flash_d128_mp_lm] s=512: max_abs=2.58e-5 max_rel=1.14e1
+d128 dispatch [flash_d128_mp_lm] s=1024: max_abs=1.72e-5 max_rel=2.03e2
+test gpu::tests::wmma_flash_dispatch_d128_matches_reference ... ok
+wmma flash s=16 d=64: max_abs=9.79e-5 max_rel=1.12e-1
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+wmma flash s=64 d=64: max_abs=6.16e-5 max_rel=1.73e-1
+wmma4 flash s=64 d=64: max_abs=6.12e-5 max_rel=7.24e-1
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+KV footprint (32L, 8h×128, 4096×16 blocks): f32 16.00 GiB | f16 8.00 GiB | int8 4.12 GiB → 1.94x vs f16, 3.88x vs f32
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+
+thread 'paged_kv::tests::over_budget_kv_config_is_rejected' (232) panicked at crates/wukong_codegen_gpu/src/paged_kv.rs:165:9:
+KV cache needs 4328521728 B (4.03 GiB) for 256 slots x 43 blocks/seq x 12 layers at 2 B/elem — exceeds the 4294967296 B (4.00 GiB) device budget
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::paged_kv::tests::over_budget_kv_config_is_rejected
+   3: <wukong_codegen_gpu::paged_kv::tests::over_budget_kv_config_is_rejected::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+Bcap= 64: max simultaneous ctx  2720 tok/seq → KV 3.98 GiB of 4.0 GiB budget
+Bcap=128: max simultaneous ctx  1360 tok/seq → KV 3.98 GiB of 4.0 GiB budget
+Bcap=256: max simultaneous ctx   672 tok/seq → KV 3.94 GiB of 4.0 GiB budget
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+
+thread 'paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named' (236) panicked at crates/wukong_codegen_gpu/src/paged_kv.rs:197:9:
+max_ctx_within_budget: layers/heads/head_dim/elem_size/block_size/num_slots must all be non-zero (got layers=12 heads=8 head_dim=64 elem_size=2 block_size=16 num_slots=0)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named
+   3: <wukong_codegen_gpu::paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+wmma flash s=256 d=64: max_abs=3.11e-5 max_rel=1.96e0
+test pool::tests::aligned_range_rounds_start_up_and_packs_tightly ... ok
+wmma4 flash s=256 d=64: max_abs=3.42e-5 max_rel=1.83e0
+test ptx::tests::every_dispatched_entry_is_defined_exactly_once ... ok
+test ptx::tests::every_dispatched_ptx_family_is_pure_ascii ... ok
+test ptx::tests::every_dispatched_ptx_family_opens_at_the_sm80_floor ... ok
+test ptx_autodiff_bwd::tests::act_bwd_guard_agrees_with_dispatch ... ok
+wmma flash s=512 d=64: max_abs=2.33e-5 max_rel=1.91e0
+wmma4 flash s=512 d=64: max_abs=2.30e-5 max_rel=2.05e0
+test gpu::tests::wmma_flash_matches_reference_within_tol ... ok
+wmma_f16_mma_bias 128x64x128: max_abs=3.81e-6 max_rel=6.79e-4
+wmma_f16_mma_bias_relu 128x64x128: max_abs=2.86e-6 max_rel=5.53e-4
+wmma_f16_mma_bias_silu 128x64x128: max_abs=2.86e-6 max_rel=6.78e-4
+wmma_f16_mma_bias_gelu 128x64x128: max_abs=5.36e-6 max_rel=1.00e0
+wmma_f16_mma_bias 256x128x256: max_abs=7.63e-6 max_rel=2.59e-3
+wmma_f16_mma_bias_relu 256x128x256: max_abs=7.63e-6 max_rel=6.42e-4
+wmma_f16_mma_bias_silu 256x128x256: max_abs=7.63e-6 max_rel=2.59e-3
+wmma_f16_mma_bias_gelu 256x128x256: max_abs=7.63e-6 max_rel=1.00e0
+wmma_f16_mma_bias 128x256x512: max_abs=2.48e-5 max_rel=8.14e-3
+wmma_f16_mma_bias_relu 128x256x512: max_abs=1.72e-5 max_rel=8.14e-3
+wmma_f16_mma_bias_silu 128x256x512: max_abs=1.72e-5 max_rel=8.14e-3
+wmma_f16_mma_bias_gelu 128x256x512: max_abs=1.72e-5 max_rel=1.00e0
+test gpu::tests::wmma_mma_bias_match_reference_within_tol ... ok
+test ptx_autodiff_bwd::tests::backward_ptx_headers_are_at_the_sm80_floor ... ok
+wmma_f16_mma_bias_residual 128x64x128: max_abs=3.81e-6 max_rel=1.47e-3
+wmma_bf16_mma_bias_residual 128x64x128: max_abs=1.91e-6 max_rel=1.69e-3
+wmma_f16_mma_bias_residual 256x128x256: max_abs=8.58e-6 max_rel=1.06e-2
+wmma_bf16_mma_bias_residual 256x128x256: max_abs=3.81e-6 max_rel=5.81e-3
+wmma_f16_mma_bias_residual 128x256x512: max_abs=2.10e-5 max_rel=2.45e-2
+wmma_bf16_mma_bias_residual 128x256x512: max_abs=8.58e-6 max_rel=3.57e-3
+test gpu::tests::wmma_mma_bias_residual_match_reference_within_tol ... ok
+wmma_f16_pipe64_bias 64x64x128: max_abs=2.86e-6 max_rel=1.80e-3
+wmma_f16_pipe64_bias_relu 64x64x128: max_abs=2.86e-6 max_rel=1.80e-3
+wmma_f16_pipe64_bias_silu 64x64x128: max_abs=3.81e-6 max_rel=1.80e-3
+wmma_f16_pipe64_bias_gelu 64x64x128: max_abs=5.13e-6 max_rel=1.00e0
+wmma_f16_pipe64_bias_residual 64x64x128: max_abs=3.81e-6 max_rel=2.61e-3
+wmma_f16_pipe64_bias 128x256x256: max_abs=2.10e-5 max_rel=2.67e-3
+wmma_f16_pipe64_bias_relu 128x256x256: max_abs=2.10e-5 max_rel=2.67e-3
+wmma_f16_pipe64_bias_silu 128x256x256: max_abs=2.10e-5 max_rel=2.67e-3
+wmma_f16_pipe64_bias_gelu 128x256x256: max_abs=2.10e-5 max_rel=1.00e0
+wmma_f16_pipe64_bias_residual 128x256x256: max_abs=2.29e-5 max_rel=3.77e-3
+wmma_f16_pipe64_bias 512x128x512: max_abs=8.58e-6 max_rel=1.89e-2
+wmma_f16_pipe64_bias_relu 512x128x512: max_abs=8.58e-6 max_rel=1.89e-2
+wmma_f16_pipe64_bias_silu 512x128x512: max_abs=8.58e-6 max_rel=1.89e-2
+wmma_f16_pipe64_bias_gelu 512x128x512: max_abs=8.58e-6 max_rel=1.00e0
+wmma_f16_pipe64_bias_residual 512x128x512: max_abs=9.54e-6 max_rel=5.62e-2
+wmma_nt_f16_pipe_64_s6 64x16x64: max_abs=7.15e-7 max_rel=6.79e-5 (smem=24576B)
+wmma_nt_f16_pipe_64_s6 64x32x64: max_abs=9.54e-7 max_rel=1.03e-4 (smem=24576B)
+test gpu::tests::wmma_pipe64_bias_match_reference_within_tol ... ok
+wmma_nt_f16_pipe_64_s6 128x144x128: max_abs=8.58e-6 max_rel=2.79e-3 (smem=24576B)
+wmma_nt_f16_pipe_64_s6 64x112x192: max_abs=5.72e-6 max_rel=8.66e-4 (smem=24576B)
+wmma_nt_f16_pipe_128_s4 128x16x128: max_abs=9.54e-7 max_rel=7.84e-4 (smem=32768B)
+wmma_nt_f16_pipe_128_s4 128x32x128: max_abs=1.91e-6 max_rel=5.25e-4 (smem=32768B)
+wmma_nt_f16_pipe_128_s4 256x112x256: max_abs=7.15e-6 max_rel=1.80e-3 (smem=32768B)
+wmma_nt_f16_pipe_128_s4 128x80x384: max_abs=4.77e-6 max_rel=4.35e-2 (smem=32768B)
+mma_nt_f16_128_bk32_s2_r16 128x32x128: max_abs=1.43e-6 max_rel=8.30e-3 (smem=40960B)
+mma_nt_f16_128_bk32_s2_r16 128x64x128: max_abs=2.86e-6 max_rel=1.21e-3 (smem=40960B)
+mma_nt_f16_128_bk32_s2_r16 256x160x256: max_abs=1.05e-5 max_rel=8.46e-2 (smem=40960B)
+mma_nt_f16_128_bk32_s2_r16 128x96x384: max_abs=5.72e-6 max_rel=4.73e-3 (smem=40960B)
+mma_nt_f16_128_bk32_s2_r16 128x32x2176: max_abs=1.91e-6 max_rel=1.00e-2 (smem=40960B)
+test gpu::tests::wmma_pipe_matches_reference_within_tol ... ok
+wmma_f16_sm128_db 128x16x128: max_abs=4.77e-7 max_rel=3.34e-4
+wmma_f16_sm128_db 128x128x128: max_abs=7.63e-6 max_rel=1.60e-3
+wmma_f16_sm128_db 256x256x256: max_abs=2.10e-5 max_rel=4.66e-3
+wmma_f16_sm128_db 256x128x512: max_abs=1.14e-5 max_rel=9.02e-3
+wmma_f16_sm128_db 384x160x256: max_abs=1.14e-5 max_rel=1.25e-2
+wmma_f16_sm128_db 512x80x128: max_abs=4.77e-6 max_rel=4.07e-3
+test gpu::tests::wmma_sm128_db_matches_reference_within_tol ... ok
+wmma_f16_sm128 128x16x128: max_abs=4.77e-7 max_rel=5.85e-4
+wmma_f16_sm128 128x128x128: max_abs=6.68e-6 max_rel=2.95e-3
+wmma_f16_sm128 256x256x256: max_abs=2.29e-5 max_rel=1.13e-2
+wmma_f16_sm128 256x128x512: max_abs=8.58e-6 max_rel=2.90e-2
+wmma_f16_sm128 384x160x256: max_abs=1.14e-5 max_rel=4.54e-2
+wmma_f16_sm128 512x80x128: max_abs=4.77e-6 max_rel=1.41e-3
+wmma_f16_sm_db_bias 64x64x64: max_abs=3.34e-6 max_rel=1.35e-4
+test gpu::tests::wmma_sm128_matches_reference_within_tol ... ok
+wmma_f16_sm_db_bias_relu 64x64x64: max_abs=3.34e-6 max_rel=8.24e-5
+wmma_f16_sm_db_bias_silu 64x64x64: max_abs=3.34e-6 max_rel=1.35e-4
+wmma_f16_sm_db_bias_gelu 64x64x64: max_abs=5.25e-6 max_rel=1.00e0
+test ptx_conv::tests::conv_headers_are_at_the_sm80_floor ... ok
+test ptx_conv::tests::every_conv_generator_emits_ascii_ptx ... ok
+test ptx_conv::tests::splitk_factor_picks_reasonable ... ok
+test ptx_flash::tests::every_dispatchable_flash_entry_is_defined ... ok
+wmma_f16_sm_db_bias 128x256x128: max_abs=1.91e-5 max_rel=7.01e-3
+wmma_f16_sm_db_bias_relu 128x256x128: max_abs=1.91e-5 max_rel=6.32e-4
+wmma_f16_sm_db_bias_silu 128x256x128: max_abs=1.91e-5 max_rel=7.01e-3
+wmma_f16_sm_db_bias_gelu 128x256x128: max_abs=1.91e-5 max_rel=1.00e0
+test ptx_flash::tests::flash_ptx_is_pure_ascii ... ok
+test ptx_flash::tests::flash_ptx_is_structurally_well_formed ... ok
+test ptx_flash::tests::flash_ptx_is_tagged_at_the_sm80_floor ... ok
+test ptx_fp8::tests::e4m3_encoding_matches_hand_derived_bits ... ok
+test ptx_fp8::tests::fp8_deep_grid_s2_rows_are_the_shipped_kernels ... ok
+test ptx_fp8::tests::fp8_deep_grid_smem_math_and_modes ... ok
+
+thread 'ptx_fp8::tests::fp8_deep_over_budget_panics_at_generation' (260) panicked at crates/wukong_codegen_gpu/src/ptx_fp8.rs:252:5:
+fp8_deep_probe_s5: fp8 SMEM 102400 B (stages=5, 128x128, ldp=80) exceeds the budget 101376 B
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_fp8::fp8_pipe_entry
+   3: wukong_codegen_gpu::ptx_fp8::fp8_stage_ptx
+   4: <wukong_codegen_gpu::ptx_fp8::tests::fp8_deep_over_budget_panics_at_generation::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_fp8::tests::fp8_deep_over_budget_panics_at_generation - should panic ... ok
+test ptx_fp8::tests::fp8_ptx_is_ascii_and_structural ... ok
+
+thread 'ptx_fp8::tests::pipe_rejects_a_non_power_of_two_warp_grid' (262) panicked at crates/wukong_codegen_gpu/src/ptx_fp8.rs:231:5:
+fp8_gemm_pipe: warp grid must be powers of two (warpRow/warpCol are a shift and a mask)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_fp8::fp8_pipe_entry
+   3: wukong_codegen_gpu::ptx_fp8::fp8_pipe_cfg_ptx
+   4: <wukong_codegen_gpu::ptx_fp8::tests::pipe_rejects_a_non_power_of_two_warp_grid::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_fp8::tests::pipe_rejects_a_non_power_of_two_warp_grid - should panic ... ok
+
+thread 'ptx_fp8::tests::pipe_rejects_a_tile_that_threads16_does_not_divide' (263) panicked at crates/wukong_codegen_gpu/src/ptx_fp8.rs:239:5:
+fp8_gemm_pipe: threads*16 must divide the A/B tile bytes (128-bit cp.async staging)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_fp8::fp8_pipe_entry
+   3: wukong_codegen_gpu::ptx_fp8::fp8_pipe_cfg_ptx
+   4: <wukong_codegen_gpu::ptx_fp8::tests::pipe_rejects_a_tile_that_threads16_does_not_divide::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_fp8::tests::pipe_rejects_a_tile_that_threads16_does_not_divide - should panic ... ok
+test ptx_fp8_train::tests::delayed_scaling_recovers_tensor ... ok
+wmma_f16_sm_db_bias 256x128x512: max_abs=9.54e-6 max_rel=3.01e-3
+wmma_f16_sm_db_bias_relu 256x128x512: max_abs=7.63e-6 max_rel=1.05e-3
+wmma_f16_sm_db_bias_silu 256x128x512: max_abs=9.54e-6 max_rel=3.01e-3
+wmma_f16_sm_db_bias_gelu 256x128x512: max_abs=7.63e-6 max_rel=1.00e0
+test gpu::tests::wmma_sm_db_bias_match_reference_within_tol ... ok
+wmma_f16_sm_db 64x16x64: max_abs=4.77e-7 max_rel=1.53e-5
+test ptx_fp8_train::tests::e5m2_host_roundtrip ... ok
+wmma_f16_sm_db 64x64x64: max_abs=2.86e-6 max_rel=6.02e-4
+test ptx_fp8_train::tests::e5m2_subnormals_and_signed_zero ... ok
+test ptx_fp8_train::tests::every_fp8_train_generator_emits_ascii_ptx ... ok
+test ptx_fp8_train::tests::fp8_train_floors_are_split_by_instruction_mix ... ok
+test ptx_gemm::tests::gemm_rb_module_opens_at_the_sm80_floor ... ok
+test ptx_gemm::tests::gemm_rb_ptx_is_ascii_and_defines_both_entries ... ok
+test ptx_int4::tests::asymmetric_quant_roundtrip_is_faithful ... ok
+test ptx_int4::tests::dequant_follows_zeros_not_the_signed_flag ... ok
+test ptx_int4::tests::symmetric_quant_roundtrip_is_faithful ... ok
+wmma_f16_sm_db 128x256x128: max_abs=1.53e-5 max_rel=6.10e-4
+test ptx_int4::tests::w4a16_ptx_is_ascii_and_complete ... ok
+
+thread 'ptx_int8::tests::hand_placed_generator_rejects_non_square_tile' (276) panicked at crates/wukong_codegen_gpu/src/ptx_int8.rs:1623:5:
+int8_probe_nonsquare: smemA/smemB and the ring pointers are all sized from bm*bk
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_int8::gen_int8_smdb_ms
+   3: <wukong_codegen_gpu::ptx_int8::tests::hand_placed_generator_rejects_non_square_tile::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_int8::tests::hand_placed_generator_rejects_non_square_tile - should panic ... ok
+test ptx_int8::tests::int8_ptx_is_ascii_and_structural ... ok
+wmma_f16_sm_db 128x80x192: max_abs=5.72e-6 max_rel=6.24e-4
+test ptx_int8::tests::int8_stage_grid_s2_s3_are_the_shipped_kernels ... ok
+test ptx_int8::tests::int8_stage_grid_smem_math_and_modes ... ok
+test ptx_int8::tests::int8_stage_modules_are_ascii_at_the_portable_floor ... ok
+
+thread 'ptx_int8::tests::int8_stage_over_budget_panics_at_generation' (281) panicked at crates/wukong_codegen_gpu/src/ptx_int8.rs:663:5:
+int8_probe_over: SMEM 81920 B (stages=5, 128x128, bk=64) exceeds the budget 65536 B
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_int8::gen_int8_smdb_swz_impl
+   3: <wukong_codegen_gpu::ptx_int8::tests::int8_stage_over_budget_panics_at_generation::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_int8::tests::int8_stage_over_budget_panics_at_generation - should panic ... ok
+test ptx_int8::tests::multistage_prologue_is_guarded_against_short_k ... ok
+wmma_f16_sm_db 256x128x512: max_abs=8.58e-6 max_rel=9.86e-2
+test gpu::tests::wmma_sm_db_matches_reference_within_tol ... ok
+wmma_f16_sm_db_relu 64x64x64: max_abs=1.91e-6 max_rel=7.84e-5
+test ptx_norm::tests::norm_module_is_tagged_at_the_sm80_floor ... ok
+wmma_f16_sm_db_relu 128x256x128: max_abs=1.53e-5 max_rel=1.03e-3
+wmma_f16_sm_db_relu 256x128x512: max_abs=8.58e-6 max_rel=2.80e-1
+wmma_f16_sm_db_residual 64x16x64: max_abs=9.54e-7 max_rel=1.54e-4
+test gpu::tests::wmma_sm_db_relu_matches_reference_within_tol ... ok
+wmma_f16_sm_db_residual 64x128x128: max_abs=6.68e-6 max_rel=3.14e-4
+wmma_f16_sm_db_residual 128x256x256: max_abs=2.29e-5 max_rel=2.99e-2
+wmma_f16_sm_db_residual 256x128x192: max_abs=9.54e-6 max_rel=7.60e-3
+test gpu::tests::wmma_sm_db_residual_matches_reference_within_tol ... ok
+wmma_f16_sm_db_silu 64x64x64: max_abs=2.38e-6 max_rel=3.60e-4
+wmma_f16_sm_db_gelu 64x64x64: max_abs=5.25e-6 max_rel=1.00e0
+wmma_f16_sm_db_silu 128x256x128: max_abs=1.34e-5 max_rel=1.11e-3
+wmma_f16_sm_db_gelu 128x256x128: max_abs=1.34e-5 max_rel=1.00e0
+wmma_f16_sm_db_silu 256x128x512: max_abs=8.58e-6 max_rel=7.73e-3
+wmma_f16_sm_db_gelu 256x128x512: max_abs=8.58e-6 max_rel=1.00e0
+test gpu::tests::wmma_sm_db_silu_gelu_match_reference_within_tol ... ok
+wmma_f16_sm 64x64x64: max_abs=2.86e-6 max_rel=1.93e-4
+test ptx_optim::tests::optimizer_ptx_is_ascii ... ok
+wmma_f16_sm 128x128x128: max_abs=7.63e-6 max_rel=2.68e-3
+wmma_f16_sm 128x80x192: max_abs=4.77e-6 max_rel=7.25e-4
+wmma_f16_sm 256x128x512: max_abs=9.54e-6 max_rel=2.14e-2
+test gpu::tests::wmma_sm_matches_reference_within_tol ... ok
+wmma_f16  16x16x16: max_abs=2.38e-7 max_rel=1.10e-5
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+wmma_bf16 16x16x16: max_abs=2.38e-7 max_rel=1.38e-6
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+wmma_f16  64x64x64: max_abs=2.38e-6 max_rel=7.94e-5
+wmma_bf16 64x64x64: max_abs=9.54e-7 max_rel=3.93e-4
+test ptx_winograd::tests::every_winograd_generator_emits_ascii_ptx ... ok
+test ptx_winograd::tests::matmul_and_transpose_sane ... ok
+shape (C,H,W,K)=(1,6,6,1)  P=4 Q=4  f23_err=1.943e-16  f43_err=2.220e-16
+shape (C,H,W,K)=(3,8,8,4)  P=6 Q=6  f23_err=4.163e-16  f43_err=1.665e-15
+shape (C,H,W,K)=(2,9,9,3)  P=7 Q=7  f23_err=2.776e-16  f43_err=1.943e-15
+shape (C,H,W,K)=(4,16,16,8)  P=14 Q=14  f23_err=8.882e-16  f43_err=4.663e-15
+shape (C,H,W,K)=(1,5,5,1)  P=3 Q=3  f23_err=1.110e-16  f43_err=1.665e-16
+WORST f23_err=8.882e-16  WORST f43_err=4.663e-15  (tol=1e-9)
+test ptx_winograd::tests::winograd_matches_direct ... ok
+test ptx_wmma::tests::deep_grid_s2_s3_are_the_shipped_cliff_kernels ... ok
+test ptx_wmma::tests::deep_grid_smem_math_and_window_discipline ... ok
+test ptx_wmma::tests::every_dispatched_tensor_core_entry_is_defined ... ok
+wmma_f16  256x128x512: max_abs=8.58e-6 max_rel=4.63e-3
+test ptx_wmma::tests::every_tensor_core_module_is_pure_ascii ... ok
+test ptx_wmma::tests::every_tensor_core_module_opens_at_the_sm80_floor ... ok
+test ptx_wmma::tests::fused_activation_epilogue_matches_the_standalone_vmath_kernel ... ok
+
+thread 'ptx_wmma::tests::smem_db_tile_smaller_than_one_chunk_per_thread_is_rejected' (302) panicked at crates/wukong_codegen_gpu/src/ptx_wmma.rs:1024:5:
+t_bad_db: A tile 32x16 is not a whole multiple of threads*8 = 1024 (128-bit vectorized staging)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_wmma::entry_smem_db
+   3: <wukong_codegen_gpu::ptx_wmma::tests::smem_db_tile_smaller_than_one_chunk_per_thread_is_rejected::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_wmma::tests::smem_db_tile_smaller_than_one_chunk_per_thread_is_rejected - should panic ... ok
+test ptx_wmma::tests::smem_staging_tiles_the_cta_for_every_generated_shape ... ok
+
+thread 'ptx_wmma::tests::smem_tile_smaller_than_one_chunk_per_thread_is_rejected' (304) panicked at crates/wukong_codegen_gpu/src/ptx_wmma.rs:758:5:
+t_bad_sm: A tile 32x16 is not a whole multiple of threads*8 = 1024 (128-bit vectorized staging)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_wmma::entry_smem
+   3: <wukong_codegen_gpu::ptx_wmma::tests::smem_tile_smaller_than_one_chunk_per_thread_is_rejected::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_wmma::tests::smem_tile_smaller_than_one_chunk_per_thread_is_rejected - should panic ... ok
+
+thread 'ptx_wmma::tests::smem_tile_that_only_partly_tiles_the_cta_is_rejected' (305) panicked at crates/wukong_codegen_gpu/src/ptx_wmma.rs:758:5:
+t_partial_sm: A tile 96x16 is not a whole multiple of threads*8 = 1024 (128-bit vectorized staging)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_wmma::entry_smem
+   3: <wukong_codegen_gpu::ptx_wmma::tests::smem_tile_that_only_partly_tiles_the_cta_is_rejected::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_wmma::tests::smem_tile_that_only_partly_tiles_the_cta_is_rejected - should panic ... ok
+test serving::tests::serving_continuous_batching_goodput ... ignored, perf bench; needs a GPU. Run with --ignored --nocapture
+wmma_bf16 256x128x512: max_abs=3.81e-6 max_rel=4.39e-3
+test gpu::tests::wmma_tensorcore_matches_reference_within_tol ... ok
+test serving::tests::serving_decode_graph_throughput ... ignored, perf bench; needs a GPU. Run with --ignored --nocapture
+flash_d64_ws3 s=16 d=64: max_abs=1.07e-4 max_rel=7.47e-2
+flash_d64_ws3 s=32 d=64: max_abs=6.66e-5 max_rel=8.62e-2
+flash_d64_ws3 s=48 d=64: max_abs=6.09e-5 max_rel=2.82e0
+flash_d64_ws3 s=64 d=64: max_abs=5.44e-5 max_rel=1.26e0
+flash_d64_ws3 s=256 d=64: max_abs=2.80e-5 max_rel=3.08e0
+flash_d64_ws3 s=512 d=64: max_abs=2.22e-5 max_rel=7.64e0
+flash_d64_ws3 s=2048 d=64: max_abs=1.39e-5 max_rel=3.27e2
+flash_d128_ws3_lm s=16 d=128: max_abs=9.96e-5 max_rel=9.89e-1
+flash_d128_ws3_lm s=32 d=128: max_abs=7.82e-5 max_rel=1.43e-1
+flash_d128_ws3_lm s=48 d=128: max_abs=7.22e-5 max_rel=8.06e-1
+flash_d128_ws3_lm s=64 d=128: max_abs=7.20e-5 max_rel=1.15e0
+flash_d128_ws3_lm s=256 d=128: max_abs=3.19e-5 max_rel=1.27e1
+flash_d128_ws3_lm s=512 d=128: max_abs=2.41e-5 max_rel=6.89e0
+flash_d128_ws3_lm s=2048 d=128: max_abs=1.46e-5 max_rel=9.48e1
+ws3-vs-mp full-output d=64 S=2048 H=4: max_abs=0.00e0 max_rel=0.00e0
+ws3-vs-mp full-output d=128 S=2048 H=4: max_abs=0.00e0 max_rel=0.00e0
+flash_d64_ws s=16 d=64: max_abs=9.55e-5 max_rel=3.25e-1
+flash_d64_wsc s=16 d=64: max_abs=1.26e-4 max_rel=6.40e-2
+flash_d64_ws s=32 d=64: max_abs=7.05e-5 max_rel=2.92e-1
+flash_d64_wsc s=32 d=64: max_abs=1.17e-4 max_rel=1.52e-1
+flash_d64_ws s=48 d=64: max_abs=5.94e-5 max_rel=5.03e0
+flash_d64_wsc s=48 d=64: max_abs=1.42e-4 max_rel=1.44e-1
+test gpu::tests::ws3_flash_matches_reference_within_tol ... ok
+flash_d64_ws s=64 d=64: max_abs=6.28e-5 max_rel=5.98e-1
+flash_d64_wsc s=64 d=64: max_abs=1.02e-4 max_rel=1.50e0
+flash_d64_ws s=256 d=64: max_abs=3.05e-5 max_rel=2.35e0
+flash_d64_wsc s=256 d=64: max_abs=1.26e-4 max_rel=7.55e-1
+flash_d64_ws s=512 d=64: max_abs=2.16e-5 max_rel=7.26e0
+flash_d64_wsc s=512 d=64: max_abs=1.15e-4 max_rel=1.10e1
+flash_d64_ws s=2048 d=64: max_abs=1.22e-5 max_rel=4.20e1
+flash_d64_wsc s=2048 d=64: max_abs=1.23e-4 max_rel=7.69e2
+flash_d128_ws_lm s=16 d=128: max_abs=9.78e-5 max_rel=3.27e-1
+flash_d128_wsc_lm s=16 d=128: max_abs=1.16e-4 max_rel=1.22e-1
+flash_d128_ws_lm s=32 d=128: max_abs=6.87e-5 max_rel=7.53e-1
+flash_d128_wsc_lm s=32 d=128: max_abs=1.30e-4 max_rel=1.68e0
+flash_d128_ws_lm s=48 d=128: max_abs=6.76e-5 max_rel=2.27e-1
+flash_d128_wsc_lm s=48 d=128: max_abs=1.25e-4 max_rel=9.83e-1
+flash_d128_ws_lm s=64 d=128: max_abs=5.74e-5 max_rel=7.60e-1
+flash_d128_wsc_lm s=64 d=128: max_abs=1.36e-4 max_rel=1.22e0
+flash_d128_ws_lm s=256 d=128: max_abs=3.39e-5 max_rel=1.99e0
+flash_d128_wsc_lm s=256 d=128: max_abs=1.57e-4 max_rel=2.45e0
+flash_d128_ws_lm s=512 d=128: max_abs=2.32e-5 max_rel=7.89e0
+flash_d128_wsc_lm s=512 d=128: max_abs=1.69e-4 max_rel=2.52e1
+flash_d128_ws_lm s=2048 d=128: max_abs=1.34e-5 max_rel=8.30e1
+flash_d128_wsc_lm s=2048 d=128: max_abs=1.48e-4 max_rel=6.54e1
+ws-vs-mp checksum d=64 S=2048 H=4: mp=5.339419e3 ws=5.339419e3
+ws-vs-mp checksum d=128 S=2048 H=4: mp=1.140978e4 ws=1.140978e4
+test gpu::tests::ws_flash_matches_reference_within_tol ... ok
+paged decode-attn BIT-IDENTICAL across 2 physical block layouts (slot 0: A=[0, 1, 2] vs B=[10, 11, 12]) — paging is numerically invisible
+test paged_attention::tests::paged_attention_invariant_to_block_layout ... ok
+paged decode-attn vs f64 ref: max_abs=5.96e-8 max_rel=1.93e-4 (bcap=6, heads=4, hd=64, ragged ctx [37, 0, 16, 100, 5, 64])
+paged decode-attn vs f64 ref: max_abs=8.94e-8 max_rel=3.45e-4 (bcap=6, heads=4, hd=128, ragged ctx [37, 0, 16, 100, 5, 64])
+test paged_attention::tests::paged_attention_matches_reference ... ok
+int8-KV decode-attn BIT-IDENTICAL across 2 physical block layouts — paging invisible on the quantized path
+test paged_attention::tests::paged_int8_attention_invariant_to_block_layout ... ok
+int8-KV decode-attn vs f64 ref: max_abs=3.00e-3 max_rel=1.75e1 (hd=64, per-(token,head) int8 K/V, f32 Q; ragged ctx [37, 0, 16, 100, 5, 64])
+int8-KV decode-attn vs f64 ref: max_abs=3.27e-3 max_rel=2.24e0 (hd=128, per-(token,head) int8 K/V, f32 Q; ragged ctx [37, 0, 16, 100, 5, 64])
+test paged_attention::tests::paged_int8_attention_matches_reference ... ok
+test ptx_autodiff_bwd::tests::act_bwd_matches_reference ... ok
+test ptx_autodiff_bwd::tests::attention_backward_matches_reference ... ok
+test ptx_autodiff_bwd::tests::fp16_gemm_matches_f64_reference ... ok
+test ptx_autodiff_bwd::tests::norm_bwd_matches_reference ... ok
+test ptx_autodiff_bwd::tests::train_gemm_matches_reference ... ok
+
+thread 'ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch' (249) panicked at crates/wukong_codegen_gpu/src/ptx_autodiff_bwd.rs:1194:5:
+causal_mask_device x: device buffer holds 1024 elements but the launch touches 4096
+stack backtrace:
+test ptx_autodiff_bwd::tests::transpose_matches_reference ... ok
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_autodiff_bwd::causal_mask_device
+   3: wukong_codegen_gpu::ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch::{closure#0}
+   4: <wukong_codegen_gpu::ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch' (249) panicked at crates/wukong_codegen_gpu/src/ptx_autodiff_bwd.rs:884:5:
+gemm_rb C: device buffer holds 512 elements but the launch touches 1024
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_autodiff_bwd::gemm_rb
+   3: wukong_codegen_gpu::ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch::{closure#0}
+   4: <wukong_codegen_gpu::ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch' (249) panicked at crates/wukong_codegen_gpu/src/ptx_autodiff_bwd.rs:1245:5:
+norm_bwd_device dx: device buffer holds 8 elements but the launch touches 128
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_autodiff_bwd::norm_bwd_device
+   3: wukong_codegen_gpu::ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch::{closure#0}
+   4: <wukong_codegen_gpu::ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+[gate] under-sized device buffers rejected on the host (no sticky fault) ✓
+[gate] E5M2 host encoder == device cvt.rn.satfinite.e5m2x2.f32 on 538 values (subnormals and -0.0 included) ✓
+test ptx_autodiff_bwd::tests::undersized_device_buffers_are_rejected_before_launch ... ok
+test ptx_fp8_train::tests::e5m2_host_matches_device_converter ... ok
+test train_resident::tests::m8_gemm_f16_vs_cublas_f16 ... ignored
+test train_resident::tests::m8_gemm_vs_cublas ... ignored
+test train_resident::tests::m8_resident_step_eager_vs_fused ... ignored
+test train_resident::tests::m8_resident_step_f16_vs_f32 ... ignored
+test train_resident::tests::m8_resident_step_throughput ... ignored
+layernorm row 0 mean~0         cond=      0.0: gpu max_abs=1.192e-7 | cpu max_abs=1.192e-7 | tol=1.000e-5
+layernorm row 1 mean~1         cond=      1.7: gpu max_abs=2.384e-7 | cpu max_abs=2.384e-7 | tol=1.000e-5
+layernorm row 2 mean~100       cond=    171.9: gpu max_abs=6.199e-6 | cpu max_abs=7.272e-6 | tol=4.098e-5
+layernorm row 3 mean~1000      cond=   1784.9: gpu max_abs=2.909e-5 | cpu max_abs=1.889e-4 | tol=4.256e-4
+layernorm row 4 mean~10000     cond=  17664.1: gpu max_abs=9.459e-4 | cpu max_abs=7.802e-4 | tol=4.211e-3
+layernorm row 5 mean~10000     cond=  17811.9: gpu max_abs=3.723e-4 | cpu max_abs=3.726e-4 | tol=4.247e-3
+layernorm row 6 mean~100000    cond= 175729.4: gpu max_abs=6.566e-3 | cpu max_abs=6.566e-3 | tol=4.190e-2
+layernorm row 7 mean~1000000   cond=1701965.3: gpu max_abs=1.040e-3 | cpu max_abs=1.040e-3 | tol=4.058e-1
+[gate] gpu layernorm is finite and at the f32 error floor for means 0..1e6 ✓
+test ptx_norm::tests::layernorm_large_mean_matches_f64_reference ... ok
+
+thread 'ptx_optim::tests::adamw_step_device_refuses_n_past_the_buffers' (285) panicked at crates/wukong_codegen_gpu/src/ptx_optim.rs:298:5:
+adamw_step_device: n=257 exceeds a parameter buffer (w=256, grad=256, m=256, v=256)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_optim::adamw_step_device
+   3: <wukong_codegen_gpu::ptx_optim::tests::adamw_step_device_refuses_n_past_the_buffers::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'ptx_optim::tests::adamw_step_device_refuses_n_past_the_buffers' (285) panicked at crates/wukong_codegen_gpu/src/ptx_optim.rs:306:5:
+adamw_step_device: hp has 6 entries, needs >= 7
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_optim::adamw_step_device
+   3: <wukong_codegen_gpu::ptx_optim::tests::adamw_step_device_refuses_n_past_the_buffers::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+[gate] adamw_step_device bounds n by its five device buffers
+test ptx_optim::tests::adamw_step_device_refuses_n_past_the_buffers ... ok
+adamw GPU vs autodiff MIR: 18002/18432 buffer lanes bit-exact across 6 steps
+test ptx_optim::tests::adamw_step_matches_autodiff_reference ... ok
+gpu adamw: loss 1.3645e4 -> 1.9504e-4 over 200 steps
+test ptx_optim::tests::gpu_adamw_decreases_loss ... ok
+test ptx_optim::tests::sgd_step_matches_reference ... ok
+6-layer decode step graphed==eager bit-identical & deterministic (Bcap=64 D=512 Dff=2048); whole decode step = one cuGraphLaunch (~84 launches folded)
+test serving::tests::serving_decode_graph_matches_eager ... ok
+int8-KV decode step vs f64 ref: max_abs=3.18e-4 max_rel=6.04e-2 (Bcap=64, ragged ctx 0..80); cache 3.8 MiB vs f16 7.1 MiB (1.88x)
+test serving::tests::serving_decode_step_int8_matches_reference ... ok
+slot-0 decode output bit-identical: co-batched (64 active) == alone (1 active) — batch composition is invisible
+test serving::tests::serving_decode_step_invariant_to_batch_composition ... ok
+4-layer decode step BIT-IDENTICAL across 2 physical block layouts (Bcap=64) — paging invisible end-to-end
+test serving::tests::serving_decode_step_invariant_to_block_layout ... ok
+decode step vs f64 ref: max_abs=3.53e-4 max_rel=4.74e-1 (Bcap=64, heads=4, hd=64, Dff=256, ragged ctx 0..80)
+test serving::tests::serving_decode_step_matches_reference ... ok
+failed decode advance is atomic: ctx lengths, free blocks (156) and layout epoch (4) all unchanged; masking the capped slot then advances the rest
+test serving::tests::serving_failed_advance_leaves_allocator_unchanged ... ok
+int8 kv_append: 5/8 active slots quantized+scattered EXACTLY (values == host mirror, scales bit-equal); every inactive row skipped
+test serving::tests::serving_kv_append_int8_round_trip_and_mask ... ok
+kv_append mask: 4/8 active slots written; every inactive row skipped (block 0 intact)
+test serving::tests::serving_kv_append_masked_skips_inactive ... ok
+kv_append: 8 slots scattered to their block-table addresses, bit-exact vs f16(input)
+test serving::tests::serving_kv_append_round_trip ... ok
+scheduler drained 240 reqs in 62 steps: 3000 tokens (=Σgen_len), peak batch 64/64, blocks conserved 416→416
+test serving::tests::serving_scheduler_drains_and_conserves_blocks ... ok
+scheduler drain graph-driven == eager: 33 steps, 96 reqs, 1200 tokens — per-step output BIT-IDENTICAL (digest), one capture across admit/evict/growth
+test serving::tests::serving_scheduler_graph_matches_eager ... ok
+gen_len==0 request retired in 1 step, blocks conserved 160->160 (no `remaining` underflow)
+test serving::tests::serving_scheduler_retires_zero_gen_len_request ... ok
+static batching drained 96 reqs in 48 steps across 2 full-drain batches — zero mid-flight refills (the honest peer policy holds)
+test serving::tests::serving_static_batching_admits_only_when_drained ... ok
+TP column-parallel (64×256×256, split N 256→2×128): concat == unsplit BIT-IDENTICAL (no all-reduce needed)
+test serving::tests::tp_column_parallel_gemm_split_is_bit_exact ... ok
+TP row-parallel (64×256×256, split K 256→2×128): summed partials vs unsplit max_abs=1.34e-5 max_rel=2.69e-3 (all-reduce reassociates the K reduction — float, not bit-exact, as a real ring all-reduce)
+test serving::tests::tp_row_parallel_gemm_allreduce_matches ... ok
+test train_resident::tests::resident_mlp_checkpointing_bit_identical ... ok
+test train_resident::tests::resident_mlp_gradients_match_reference ... ok
+test train_resident::tests::resident_mlp_gradients_match_reference_f16 ... ok
+resident MLP: loss 4.1736e2 -> 6.8340e-3 over 300 AdamW steps (0 up-blips)
+test train_resident::tests::resident_mlp_loss_decreases ... ok
+resident MLP (f16): loss 7.9991e4 -> 3.6956e1 over 200 AdamW steps
+test train_resident::tests::resident_mlp_loss_decreases_f16 ... ok
+[gate] @parallel activation cooperative == single == oracle: -719 -1064 -1521 -2060 -2567 -2781 -2271 -551 2658 7238 12753 18726 39198
+test megakernel::tests::mega_parallel_activation_matches_single_and_oracle ... ok
+
+=== megakernel: 90 ran / 103 eligible program-configs match the interp oracle ===
+test megakernel::tests::mega_corpus_matches_oracle ... ok
+
+=== gpu-native MIR->PTX coverage: 235/357 programs match the interp oracle (-O0==-O3) ===
+-- not yet covered (122):
+   alias_slice_params@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   argmax@O0: UNSUPPORTED: call to `wukong_argreduce_f32` not yet lowered to PTX
+   argmax_seed_edges@O0: UNSUPPORTED: call to `wukong_argreduce_f32` not yet lowered to PTX
+   array@O3: UNSUPPORTED: SIMD value v90 used before definition (vector block params not lowered)
+   array_assign_extent@O0: UNSUPPORTED: load of aggregate type Array(I32, 2)
+   atan@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   avgpool@O0: UNSUPPORTED: call to `wukong_avgpool2d_f32` not yet lowered to PTX
+   axpby_half_out@O0: UNSUPPORTED: call to `wukong_axpby_bf16_out` not yet lowered to PTX
+   bias_bcast@O0: UNSUPPORTED: call to `wukong_bias_bcast_f32` not yet lowered to PTX
+   bias_bcast_parallel@O0: UNSUPPORTED: call to `wukong_bias_bcast_f32_parallel` not yet lowered to PTX
+   causal_attention@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   colargmax@O0: UNSUPPORTED: call to `wukong_colargmax_i32` not yet lowered to PTX
+   coll2@O0: UNSUPPORTED: call to `wukong_coll2_f32` not yet lowered to PTX
+   colmax@O0: UNSUPPORTED: call to `wukong_colmax_f32` not yet lowered to PTX
+   colmaxabs@O0: UNSUPPORTED: call to `wukong_colmaxabs_f32` not yet lowered to PTX
+   colmean@O0: UNSUPPORTED: call to `wukong_colmean_f32` not yet lowered to PTX
+   colmin@O0: UNSUPPORTED: call to `wukong_colmin_f32` not yet lowered to PTX
+   colrms@O0: UNSUPPORTED: call to `wukong_colrms_f32` not yet lowered to PTX
+   colsum@O0: UNSUPPORTED: call to `wukong_colsum_f32` not yet lowered to PTX
+   colsumsq@O0: UNSUPPORTED: call to `wukong_colsumsq_f32` not yet lowered to PTX
+   cummax@O0: UNSUPPORTED: call to `wukong_cummax_f32` not yet lowered to PTX
+   cummax_seed_sentinel@O0: UNSUPPORTED: call to `wukong_cummax_f32` not yet lowered to PTX
+   cumprod@O0: UNSUPPORTED: call to `wukong_cumprod_f32` not yet lowered to PTX
+   cumsum@O0: UNSUPPORTED: call to `wukong_cumsum_f32` not yet lowered to PTX
+   decode_attn@O0: UNSUPPORTED: call to `wukong_sgemv_alpha` not yet lowered to PTX
+   dequant@O0: UNSUPPORTED: call to `wukong_dequant_f32` not yet lowered to PTX
+   dequant_perchan@O0: UNSUPPORTED: call to `wukong_dequant_perchan_f32` not yet lowered to PTX
+   dequant_signed@O0: UNSUPPORTED: call to `wukong_dequant_f32` not yet lowered to PTX
+   elementwise_slice@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   elu_softplus_backward@O0: UNSUPPORTED: vmath2 op 7 not yet lowered to PTX
+   embedding@O0: UNSUPPORTED: call to `wukong_embedding_f32` not yet lowered to PTX
+   embedding_alias_parallel@O0: UNSUPPORTED: call to `wukong_embedding_f32_parallel` not yet lowered to PTX
+   entropy@O0: UNSUPPORTED: call to `wukong_entropy_f32` not yet lowered to PTX
+   expm1_log1p@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   for_array@O3: UNSUPPORTED: SIMD value v239 used before definition (vector block params not lowered)
+   for_each_array_of_slices@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   gate@O0: UNSUPPORTED: vmath2 op 9 not yet lowered to PTX
+   gate_backward@O0: UNSUPPORTED: vmath2 op 5 not yet lowered to PTX
+   gelu_backward@O0: UNSUPPORTED: vmath2 op 4 not yet lowered to PTX
+   gemm_fused_bias_slice@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   gemv_f32@O0: UNSUPPORTED: call to `wukong_sgemv` not yet lowered to PTX
+   gemv_parallel@O0: UNSUPPORTED: call to `wukong_sgemv_parallel` not yet lowered to PTX
+   gemv_scaled@O0: UNSUPPORTED: call to `wukong_sgemv_alpha` not yet lowered to PTX
+   gemv_slice@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   generic_shape_runtime@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   gevm_f32@O0: UNSUPPORTED: call to `wukong_sgevm_f32` not yet lowered to PTX
+   glu_gate@O0: UNSUPPORTED: vmath2 op 11 not yet lowered to PTX
+   heap_alloc@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   heap_alloc_fn@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   heap_len@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   heap_zero_init@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   i8_linear_dequant@O0: UNSUPPORTED: call to `wukong_i8gemm_nt_deq` not yet lowered to PTX
+   ihyp@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   import_multi@O0 (frontend rejected)
+   int_literal_widen@O0: UNSUPPORTED: call to `print_u` not yet lowered to PTX
+   int_min_literal@O0: UNSUPPORTED: call to `print_u` not yet lowered to PTX
+   io_missing_file@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   io_partial_read@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   io_roundtrip_f32@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   io_roundtrip_f64@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   io_roundtrip_i32@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   io_roundtrip_i64@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   io_roundtrip_i8@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   io_roundtrip_u8@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   kd_loss@O0: UNSUPPORTED: call to `wukong_kd_loss_f32` not yet lowered to PTX
+   kldiv@O0: UNSUPPORTED: call to `wukong_kldiv_f32` not yet lowered to PTX
+   layernorm_bwd@O0: UNSUPPORTED: call to `wukong_layernorm_bwd_f32` not yet lowered to PTX
+   linear_bf16@O0: UNSUPPORTED: call to `wukong_sgemm_bf16_nt` not yet lowered to PTX
+   linear_bf16_ffn@O0: UNSUPPORTED: call to `wukong_sgemm_bf16_nt_epi` not yet lowered to PTX
+   linear_f16@O0: UNSUPPORTED: call to `wukong_sgemm_f16_nt` not yet lowered to PTX
+   linear_f16_ffn@O0: UNSUPPORTED: call to `wukong_sgemm_f16_nt_epi` not yet lowered to PTX
+   logsumexp@O0: UNSUPPORTED: call to `wukong_logsumexp_f32` not yet lowered to PTX
+   loop_unroll@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   lrscan@O0: UNSUPPORTED: call to `wukong_lrscan_f32` not yet lowered to PTX
+   matmul_bf16_tn@O0: UNSUPPORTED: call to `wukong_sgemm_bf16_tn` not yet lowered to PTX
+   matmul_epilogue_shapes@O0: UNSUPPORTED: call to `wukong_sgemm_nt_alpha` not yet lowered to PTX
+   matmul_f16_tn@O0: UNSUPPORTED: call to `wukong_sgemm_f16_tn` not yet lowered to PTX
+   matmul_tn@O0: UNSUPPORTED: call to `wukong_sgemm_tn` not yet lowered to PTX
+   maxpool@O0: UNSUPPORTED: call to `wukong_maxpool2d_f32` not yet lowered to PTX
+   norm_slice@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   now_ns_monotonic@O0: UNSUPPORTED: call to `wukong_now_ns` not yet lowered to PTX
+   parallel_argmax@O0: UNSUPPORTED: call to `wukong_argreduce_f32_parallel` not yet lowered to PTX
+   recognizer_coeff_capture@O0: UNSUPPORTED: call to `wukong_vhorner_f32` not yet lowered to PTX
+   rmsnorm_bwd@O0: UNSUPPORTED: call to `wukong_rmsnorm_bwd_f32` not yet lowered to PTX
+   rope@O0: UNSUPPORTED: call to `wukong_rope_f32` not yet lowered to PTX
+   rope_bwd@O0: UNSUPPORTED: call to `wukong_rope_bwd_f32` not yet lowered to PTX
+   rowargmax@O0: UNSUPPORTED: call to `wukong_rowargmax_i32` not yet lowered to PTX
+   saxpy@O3: UNSUPPORTED: SIMD value v135 used before definition (vector block params not lowered)
+   scaled_gemm@O0: UNSUPPORTED: call to `wukong_sgemm_nt_alpha` not yet lowered to PTX
+   scaled_gemm_batched@O0: UNSUPPORTED: call to `wukong_sgemm_nt_alpha` not yet lowered to PTX
+   scaled_gemm_parallel@O0: UNSUPPORTED: call to `wukong_sgemm_nt_alpha_parallel` not yet lowered to PTX
+   scan_1d@O0: UNSUPPORTED: call to `wukong_cumsum_f32` not yet lowered to PTX
+   scan_slice@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   scatter_add@O0: UNSUPPORTED: call to `wukong_scatter_add_f32` not yet lowered to PTX
+   sdpa@O0: UNSUPPORTED: call to `wukong_attention_f32` not yet lowered to PTX
+   selective_scan_state@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   silu_backward@O0: UNSUPPORTED: vmath2 op 3 not yet lowered to PTX
+   slice_basics@O3: UNSUPPORTED: SIMD value v217 used before definition (vector block params not lowered)
+   slice_len_loop@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   softmax_bwd@O0: UNSUPPORTED: call to `wukong_softmax_bwd_f32` not yet lowered to PTX
+   softsign_logsigmoid@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   string_literal@O0: UNSUPPORTED: `GlobalAddr` (static string data) not lowered to PTX
+   string_return@O0: UNSUPPORTED: `GlobalAddr` (static string data) not lowered to PTX
+   transpose_bf16@O0: UNSUPPORTED: call to `wukong_transpose_u16` not yet lowered to PTX
+   transpose_f32@O0: UNSUPPORTED: call to `wukong_transpose_f32` not yet lowered to PTX
+   trig_inverse@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   u64_literal@O0: UNSUPPORTED: call to `print_u` not yet lowered to PTX
+   unsigned_print@O0: UNSUPPORTED: call to `print_u` not yet lowered to PTX
+   vec256_while@O3: UNSUPPORTED: SIMD value v275 used before definition (vector block params not lowered)
+   vectorized_declines@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   vectorized_edge_values@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   vectorized_iv_as_value@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   vectorized_lanes@O3: UNSUPPORTED: SIMD value v461 used before definition (vector block params not lowered)
+   vectorized_loops@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   vectorized_row_fused@O3: UNSUPPORTED: SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX
+   vectorized_split_base_guard@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   vectorized_trip_edges@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   vhorner_vector_and_tail@O0: UNSUPPORTED: call to `wukong_vhorner_f32` not yet lowered to PTX
+   vmath_half_out@O0: UNSUPPORTED: call to `wukong_vmath_bf16_out` not yet lowered to PTX
+   vmath_parallel@O0: UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX
+   xent@O0: UNSUPPORTED: call to `wukong_xent_fwd_f32` not yet lowered to PTX
+   xent_bwd@O0: UNSUPPORTED: call to `wukong_xent_bwd_f32` not yet lowered to PTX
+test lower::tests::run_corpus_matches_interp_oracle ... ok
+
+test result: ok. 253 passed; 0 failed; 87 ignored; 0 measured; 0 filtered out; finished in 81.38s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m-> ok in 119.0s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --release -- --nocapture[0m
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 23.31s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_driver-ffe4003ea92460c1)
+
+running 26 tests
+test gpu_accel::tests::norm_gate_covers_only_the_implemented_ptx_entries ... ok
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test grad_cli_tests::cubic_scalar_grad ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+gpu --backend silu[64]: 1 call(s), max_abs=4.77e-7 max_rel=1.88e-7
+gpu --backend dot[1024]: 1 call(s), max_abs=7.15e-7 max_rel=3.23e-7
+gpu --backend softmax[4x16]: 1 call(s), max_abs=2.98e-8 max_rel=3.04e-7
+test gpu_e2e_tests::gpu_backend_activation_reduction_norm_match_interp ... ok
+gpu --backend fused relu 64x16x64: 1 GPU call(s), max_abs=1.42e-3 max_rel=3.00e34
+gpu --backend fused relu 64x32x128: 1 GPU call(s), max_abs=2.23e-3 max_rel=2.58e0
+gpu --backend fused silu 64x16x64: 1 GPU call(s), max_abs=1.48e-3 max_rel=3.67e0
+gpu --backend fused silu 64x32x128: 1 GPU call(s), max_abs=2.25e-3 max_rel=3.07e-1
+gpu --backend fused gelu 64x16x64: 1 GPU call(s), max_abs=1.33e-3 max_rel=9.24e-1
+gpu --backend fused gelu 64x32x128: 1 GPU call(s), max_abs=2.24e-3 max_rel=1.86e0
+test gpu_e2e_tests::gpu_backend_fused_epilogue_matches_interp ... ok
+gpu --backend fused bias none 64x16x64: 1 GPU call(s), max_abs=1.30e-3 max_rel=7.53e0
+gpu --backend fused bias none 64x32x128: 1 GPU call(s), max_abs=2.04e-3 max_rel=6.42e0
+gpu --backend fused bias relu 64x16x64: 1 GPU call(s), max_abs=1.47e-3 max_rel=1.00e0
+gpu --backend fused bias relu 64x32x128: 1 GPU call(s), max_abs=1.74e-3 max_rel=4.52e34
+gpu --backend fused bias silu 64x16x64: 1 GPU call(s), max_abs=1.17e-3 max_rel=6.65e-1
+gpu --backend fused bias silu 64x32x128: 1 GPU call(s), max_abs=2.00e-3 max_rel=3.37e0
+gpu --backend fused bias gelu 64x16x64: 1 GPU call(s), max_abs=1.40e-3 max_rel=2.48e0
+gpu --backend fused bias gelu 64x32x128: 1 GPU call(s), max_abs=2.01e-3 max_rel=1.06e0
+test gpu_e2e_tests::gpu_backend_fused_bias_epilogue_matches_interp ... ok
+test gpu_e2e_tests::gpu_backend_declines_unimplemented_norm_ops_to_cpu ... ok
+gpu --backend linear 8x16x8: 1 GPU call(s), max_abs=0.00e0 max_rel=0.00e0
+gpu --backend linear 16x32x16: 1 GPU call(s), max_abs=0.00e0 max_rel=0.00e0
+gpu --backend linear 32x48x24: 1 GPU call(s), max_abs=0.00e0 max_rel=0.00e0
+test gpu_e2e_tests::gpu_backend_linear_matches_interp_within_tol ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+[1m[92m   Doc-tests[0m wukong_driver
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m-> ok in 43.8s[0m
+
+codegen_gpu: PASS   driver: PASS
+[meter] test: 163.5s wall = $0.059 (record this in the round log)
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-vJIoGfxBY4tZUOfteA9sfL
+wall_time : 187s
+exit_code : 0
