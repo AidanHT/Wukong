@@ -156,36 +156,21 @@ fn launch_mega(
     lower::decode_ctx(&out)
 }
 
+// `pub(crate)` so `MEGA_CORPUS_COVERAGE_FLOOR` has exactly one definition: the device-free
+// invariance gate in `lower.rs` checks the same constant this device gate ratchets on, and two
+// copies of a floor is how a floor silently stops meaning anything.
 #[cfg(all(test, feature = "gpu"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
-    use wukong_span::SourceMap;
 
-    fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
-        let mut sm = SourceMap::new();
-        let id = sm.add("mega_gate.wk".to_string(), src.to_string());
-        let (tokens, ld) = wukong_lexer::tokenize(sm.source(id), id);
-        if ld.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let mut interner = Interner::new();
-        let (module, pd) =
-            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
-        if pd.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let (sema, sd) = wukong_sema::check(&module, &interner);
-        if sd.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
-        if md.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        wukong_opt::optimize(&mut program, opt);
-        Some((program, interner))
-    }
+    // The corpus builder is single-sourced in `lower.rs` and normalizes away the host's 256-bit
+    // raw-AVX2 loop vectorizer. That normalization is what makes `MEGA_CORPUS_COVERAGE_FLOOR` one
+    // number instead of one per operating system (see `crate::lower::hostvec`), and sharing the
+    // function rather than copying it is what keeps this sweep and the single-thread sweep looking
+    // at the same MIR — their floors are asserted together, so a private copy here would let the
+    // two silently diverge while both stayed green.
+    use crate::lower::hostvec::build;
 
     fn line_matches(g: &str, c: &str) -> bool {
         if g == c {
@@ -224,9 +209,21 @@ mod tests {
     /// one floor catches both regressions — an eligibility loss in `fusion::analyze` and a decline at
     /// launch.
     ///
-    /// Recorded 2026-08-06 at `5870053` on an RTX 4050: 87 ran / 103 eligible. Raise it whenever
-    /// coverage grows; lower it ONLY in the same commit as the intentional decline, with the reason.
-    const MEGA_CORPUS_COVERAGE_FLOOR: usize = 87;
+    /// **The count is host-invariant**, which it was not until 2026-08-09. Like its single-thread
+    /// sibling it is measured over MIR built with the host CPU's 256-bit raw-AVX2 loop vectorizer
+    /// suppressed (see [`crate::lower::hostvec`]): that vectorizer exists only on Win64, and
+    /// `lower.rs` declines the `Op::VecKernelCall` it emits, which `try_run` turns into a silent
+    /// `Ok(None)`. The old floor of 87 was a Windows number — the same sweep read 90 on a Modal L4
+    /// only because Linux never emitted the op, so on Linux the ratchet was vacuous.
+    ///
+    /// Recorded 2026-08-09 by this gate on an RTX 4050 / Windows: **90 ran / 103 eligible**
+    /// program-configs. The pre-normalization Modal L4 (Linux) sweep read exactly 90/103, because
+    /// Linux was already in this condition; and the device-free
+    /// `lower::tests::corpus_lowering_floors_are_host_vectorizer_invariant` counts 90 mega-lowerable
+    /// configs normalized against 87 host-native on this Win64 box, which is what attributes the +3
+    /// to the host CPU vectorizer rather than to the megakernel. Raise it whenever coverage grows;
+    /// lower it ONLY in the same commit as the intentional decline, with the reason.
+    pub(crate) const MEGA_CORPUS_COVERAGE_FLOOR: usize = 90;
 
     /// Every **megakernel-eligible** `tests/run` program, run through the cooperative megakernel,
     /// matches the interpreter oracle (tolerance for floats, exact otherwise) at both -O0 and -O3.
@@ -320,6 +317,15 @@ mod tests {
         eprintln!(
             "\n=== megakernel: {ran} ran / {eligible} eligible program-configs match the interp oracle ===",
         );
+        // Both counts are raw — no program-config is excluded from `eligible`. What is normalized is
+        // the MIR presented to the sweep, so this log is comparable line-for-line with a run on
+        // another OS.
+        eprintln!(
+            "    (host 256-bit raw-AVX2 loop vectorizer suppressed for every build in this sweep, \
+             so both counts are host-invariant; this host would otherwise emit VecKernelCall: {}. \
+             See `lower::tests::corpus_lowering_floors_are_host_vectorizer_invariant`.)",
+            wukong_mir::host_supports_vec_kernels()
+        );
         if !faults.is_empty() {
             eprintln!(
                 "-- driver FAULTS ({}, root causes only — no cascade):",
@@ -359,12 +365,14 @@ mod tests {
             ran >= MEGA_CORPUS_COVERAGE_FLOOR,
             "megakernel corpus coverage regressed below the recorded floor: {ran} program-configs \
              ran and matched the oracle (of {eligible} eligible), floor is \
-             {MEGA_CORPUS_COVERAGE_FLOOR} ({} lost). Either `fusion::analyze` stopped finding \
-             programs eligible or the megakernel started declining them at launch — both are silent \
-             here. If the decline is INTENTIONAL, update MEGA_CORPUS_COVERAGE_FLOOR in the SAME \
-             commit and say why in its comment. If it is not, you just silently lost megakernel \
-             corpus coverage — a decline is a skip here, so no other gate in this workspace would \
-             ever have told you.",
+             {MEGA_CORPUS_COVERAGE_FLOOR} ({} lost). This count is measured over \
+             host-vectorizer-normalized MIR (see `crate::lower::hostvec`), so it is the SAME number \
+             on Windows and on a Linux datacenter box — a shortfall here is a real regression, \
+             never an OS difference. Either `fusion::analyze` stopped finding programs eligible or \
+             the megakernel started declining them at launch — both are silent here. If the decline \
+             is INTENTIONAL, update MEGA_CORPUS_COVERAGE_FLOOR in the SAME commit and say why in \
+             its comment. If it is not, you just silently lost megakernel corpus coverage — a \
+             decline is a skip here, so no other gate in this workspace would ever have told you.",
             MEGA_CORPUS_COVERAGE_FLOOR - ran
         );
     }
