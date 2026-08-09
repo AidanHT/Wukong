@@ -6533,9 +6533,11 @@ mod tests {
         ("ptx_norm.rs", include_str!("ptx_norm.rs")),
         ("ptx_optim.rs", include_str!("ptx_optim.rs")),
         ("ptx_target.rs", include_str!("ptx_target.rs")),
+        ("ptx_wgmma.rs", include_str!("ptx_wgmma.rs")),
         ("ptx_winograd.rs", include_str!("ptx_winograd.rs")),
         ("ptx_wmma.rs", include_str!("ptx_wmma.rs")),
         ("serving.rs", include_str!("serving.rs")),
+        ("tma_host.rs", include_str!("tma_host.rs")),
         ("train_resident.rs", include_str!("train_resident.rs")),
     ];
 
