@@ -1,0 +1,12 @@
+
+running 1 test
+module load latency ΓÇö wmma_f16 (1326227 B PTX ΓåÆ 500384 B cubin):
+  cold PTX JIT (first this process) :    5.34 ms
+  PTX load, driver-cache warm       :    4.82 ms  (best/10)
+  cubin load (Wukong cache)        :    0.87 ms  (best/10) | 6.2├ù vs cold-first | 5.6├ù vs PTX-warm
+  vs Triton/Inductor cold 30ΓÇô120 s  : even the cold PTX JIT is ~5623├ùΓÇô22491├ù faster (M10 ΓëÑ100├ù)
+test gpu::tests::cubin_cache_compile_latency ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 294 filtered out; finished in 0.19s
+
+wall_ms=218 exit=0 arm=C round=7

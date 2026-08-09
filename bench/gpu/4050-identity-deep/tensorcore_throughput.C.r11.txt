@@ -1,0 +1,11 @@
+
+running 1 test
+512┬│: f32-rb 1441 | f16-TC 11187 (7.8├ù) | bf16-TC 11142 (7.7├ù) | fp8-TC 6778 (4.7├ù) | fp8-mt 11684 (8.1├ù)  GFLOP/s
+1024┬│: f32-rb 1847 | f16-TC 11289 (6.1├ù) | bf16-TC 11190 (6.1├ù) | fp8-TC 6485 (3.5├ù) | fp8-mt 16801 (9.1├ù)  GFLOP/s
+2048┬│: f32-rb 1480 | f16-TC 10178 (6.9├ù) | bf16-TC 8844 (6.0├ù) | fp8-TC 5799 (3.9├ù) | fp8-mt 14359 (9.7├ù)  GFLOP/s
+4096┬│: f32-rb 1066 | f16-TC 6924 (6.5├ù) | bf16-TC 8543 (8.0├ù) | fp8-TC 6840 (6.4├ù) | fp8-mt 15523 (14.6├ù)  GFLOP/s
+test gpu::tests::tensorcore_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 294 filtered out; finished in 8.72s
+
+wall_ms=8757 exit=0 arm=C round=11

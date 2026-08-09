@@ -1,0 +1,19 @@
+
+running 1 test
+transformer_layer S=256 D=64 Dff=256 (same-run, both Wukong):
+  f32  scalar chain,    full call : 0.875 ms,  292620 tok/s
+  fp16 tensor-core fused, full call : 0.460 ms,  557127 tok/s  ΓåÆ 1.90├ù vs f32
+  fp16 tensor-core fused, RESIDENT  : 0.238 ms, 1075502 tok/s  ΓåÆ 3.68├ù vs f32 (weights+x resident, no D2H)
+transformer_layer S=512 D=64 Dff=256 (same-run, both Wukong):
+  f32  scalar chain,    full call : 1.948 ms,  262891 tok/s
+  fp16 tensor-core fused, full call : 0.539 ms,  950157 tok/s  ΓåÆ 3.61├ù vs f32
+  fp16 tensor-core fused, RESIDENT  : 0.307 ms, 1665962 tok/s  ΓåÆ 6.34├ù vs f32 (weights+x resident, no D2H)
+transformer_layer S=1024 D=64 Dff=256 (same-run, both Wukong):
+  f32  scalar chain,    full call : 2.584 ms,  396243 tok/s
+  fp16 tensor-core fused, full call : 0.566 ms, 1808170 tok/s  ΓåÆ 4.56├ù vs f32
+  fp16 tensor-core fused, RESIDENT  : 0.251 ms, 4077542 tok/s  ΓåÆ 10.29├ù vs f32 (weights+x resident, no D2H)
+test gpu::tests::transformer_layer_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 339 filtered out; finished in 17.25s
+
+wall_ms=17298 exit=0 arm=B round=0

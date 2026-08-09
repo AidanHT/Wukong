@@ -1,0 +1,247 @@
+# GPU perf-identity A/B
+started      : 2026-08-08T23:21:23.5404796-04:00
+arm A (base) : C:\v2bt\release\deps\wukong_codegen_gpu-454bf719eed29436.exe
+             : sha256 7F7CEECBBF412731554AFF52513AD921BE091578DD462ACA8B7289D1BAA8A9DC
+arm C (ctrl) : C:\v2bt\release\deps\wukong_codegen_gpu-454bf719eed29436.exe   <- same binary as A; C/A is this run's noise floor
+arm B (new)  : C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\target\release\deps\wukong_codegen_gpu-454bf719eed29436.exe
+             : sha256 2F0D86A5B5717587F44A8A48392511892A6F3E4C584B51727D4EF6A4C8222CD7
+rounds       : 11 (plus a discarded warm-up round 0)
+benches      : cubin_cache_compile_latency, tensorcore_roofline_pct, tensorcore_throughput, resident_model_throughput, transformer_layer_throughput, int8_swz_vs_handplaced
+power BEFORE : AC, not charging 100%
+gpu   BEFORE : NVIDIA GeForce RTX 4050 Laptop GPU, 210 MHz, 405 MHz, 48, 2.16 W
+
+== warm-up (DISCARDED)  23:21:23
+   cubin_cache_compile_latency      A      395 ms
+   cubin_cache_compile_latency      C      223 ms
+   cubin_cache_compile_latency      B     1178 ms
+   tensorcore_roofline_pct          A     2198 ms
+   tensorcore_roofline_pct          C     1942 ms
+   tensorcore_roofline_pct          B     2163 ms
+   tensorcore_throughput            A     8251 ms
+   tensorcore_throughput            C     7831 ms
+   tensorcore_throughput            B     8273 ms
+   resident_model_throughput        A    16705 ms
+   resident_model_throughput        C    16687 ms
+   resident_model_throughput        B    16260 ms
+   transformer_layer_throughput     A    16827 ms
+   transformer_layer_throughput     C    16754 ms
+   transformer_layer_throughput     B    17298 ms
+   int8_swz_vs_handplaced           A    26049 ms
+   int8_swz_vs_handplaced           C    23178 ms
+   int8_swz_vs_handplaced           B    24012 ms
+== round 1  23:24:50
+   cubin_cache_compile_latency      C      187 ms
+   cubin_cache_compile_latency      B      178 ms
+   cubin_cache_compile_latency      A      170 ms
+   tensorcore_roofline_pct          C     2420 ms
+   tensorcore_roofline_pct          B     2380 ms
+   tensorcore_roofline_pct          A     2299 ms
+   tensorcore_throughput            C     9010 ms
+   tensorcore_throughput            B     8835 ms
+   tensorcore_throughput            A     8894 ms
+   resident_model_throughput        C    15293 ms
+   resident_model_throughput        B    14542 ms
+   resident_model_throughput        A    13558 ms
+   transformer_layer_throughput     C    14945 ms
+   transformer_layer_throughput     B    15925 ms
+   transformer_layer_throughput     A    15633 ms
+   int8_swz_vs_handplaced           C    23623 ms
+   int8_swz_vs_handplaced           B    23498 ms
+   int8_swz_vs_handplaced           A    23196 ms
+== round 2  23:28:04
+   cubin_cache_compile_latency      B      263 ms
+   cubin_cache_compile_latency      A      184 ms
+   cubin_cache_compile_latency      C      181 ms
+   tensorcore_roofline_pct          B     2323 ms
+   tensorcore_roofline_pct          A     2568 ms
+   tensorcore_roofline_pct          C     2333 ms
+   tensorcore_throughput            B     8883 ms
+   tensorcore_throughput            A     8784 ms
+   tensorcore_throughput            C     9163 ms
+   resident_model_throughput        B    14083 ms
+   resident_model_throughput        A    11957 ms
+   resident_model_throughput        C    14142 ms
+   transformer_layer_throughput     B    14914 ms
+   transformer_layer_throughput     A    15442 ms
+   transformer_layer_throughput     C    15199 ms
+   int8_swz_vs_handplaced           B    23888 ms
+   int8_swz_vs_handplaced           A    25035 ms
+   int8_swz_vs_handplaced           C    23796 ms
+== round 3  23:31:17
+   cubin_cache_compile_latency      A      236 ms
+   cubin_cache_compile_latency      C      194 ms
+   cubin_cache_compile_latency      B      226 ms
+   tensorcore_roofline_pct          A     2040 ms
+   tensorcore_roofline_pct          C     2256 ms
+   tensorcore_roofline_pct          B     2068 ms
+   tensorcore_throughput            A     8868 ms
+   tensorcore_throughput            C     8238 ms
+   tensorcore_throughput            B     8135 ms
+   resident_model_throughput        A    13733 ms
+   resident_model_throughput        C    14460 ms
+   resident_model_throughput        B    15162 ms
+   transformer_layer_throughput     A    15395 ms
+   transformer_layer_throughput     C    14810 ms
+   transformer_layer_throughput     B    15279 ms
+   int8_swz_vs_handplaced           A    24109 ms
+   int8_swz_vs_handplaced           C    23558 ms
+   int8_swz_vs_handplaced           B    23720 ms
+== round 4  23:34:30
+   cubin_cache_compile_latency      C      220 ms
+   cubin_cache_compile_latency      B      196 ms
+   cubin_cache_compile_latency      A      177 ms
+   tensorcore_roofline_pct          C     1967 ms
+   tensorcore_roofline_pct          B     2336 ms
+   tensorcore_roofline_pct          A     2223 ms
+   tensorcore_throughput            C     9186 ms
+   tensorcore_throughput            B     8843 ms
+   tensorcore_throughput            A     8452 ms
+   resident_model_throughput        C    12292 ms
+   resident_model_throughput        B    14208 ms
+   resident_model_throughput        A    14692 ms
+   transformer_layer_throughput     C    15165 ms
+   transformer_layer_throughput     B    15499 ms
+   transformer_layer_throughput     A    15588 ms
+   int8_swz_vs_handplaced           C    23333 ms
+   int8_swz_vs_handplaced           B    23283 ms
+   int8_swz_vs_handplaced           A    23401 ms
+== round 5  23:37:41
+   cubin_cache_compile_latency      B      233 ms
+   cubin_cache_compile_latency      A      201 ms
+   cubin_cache_compile_latency      C      194 ms
+   tensorcore_roofline_pct          B     2203 ms
+   tensorcore_roofline_pct          A     2328 ms
+   tensorcore_roofline_pct          C     2443 ms
+   tensorcore_throughput            B     8654 ms
+   tensorcore_throughput            A     8237 ms
+   tensorcore_throughput            C     8263 ms
+   resident_model_throughput        B    14727 ms
+   resident_model_throughput        A    14943 ms
+   resident_model_throughput        C    14605 ms
+   transformer_layer_throughput     B    15537 ms
+   transformer_layer_throughput     A    15524 ms
+   transformer_layer_throughput     C    15488 ms
+   int8_swz_vs_handplaced           B    23513 ms
+   int8_swz_vs_handplaced           A    23557 ms
+   int8_swz_vs_handplaced           C    23525 ms
+== round 6  23:40:55
+   cubin_cache_compile_latency      A      213 ms
+   cubin_cache_compile_latency      C      182 ms
+   cubin_cache_compile_latency      B      167 ms
+   tensorcore_roofline_pct          A     2149 ms
+   tensorcore_roofline_pct          C     2476 ms
+   tensorcore_roofline_pct          B     2372 ms
+   tensorcore_throughput            A     9338 ms
+   tensorcore_throughput            C     8760 ms
+   tensorcore_throughput            B     8526 ms
+   resident_model_throughput        A    14126 ms
+   resident_model_throughput        C    13427 ms
+   resident_model_throughput        B    13887 ms
+   transformer_layer_throughput     A    15022 ms
+   transformer_layer_throughput     C    15069 ms
+   transformer_layer_throughput     B    14125 ms
+   int8_swz_vs_handplaced           A    24053 ms
+   int8_swz_vs_handplaced           C    23646 ms
+   int8_swz_vs_handplaced           B    23280 ms
+== round 7  23:44:06
+   cubin_cache_compile_latency      C      218 ms
+   cubin_cache_compile_latency      B      197 ms
+   cubin_cache_compile_latency      A      177 ms
+   tensorcore_roofline_pct          C     2210 ms
+   tensorcore_roofline_pct          B     2656 ms
+   tensorcore_roofline_pct          A     2303 ms
+   tensorcore_throughput            C     9362 ms
+   tensorcore_throughput            B     8660 ms
+   tensorcore_throughput            A     8695 ms
+   resident_model_throughput        C    14441 ms
+   resident_model_throughput        B    14693 ms
+   resident_model_throughput        A    14645 ms
+   transformer_layer_throughput     C    15154 ms
+   transformer_layer_throughput     B    14511 ms
+   transformer_layer_throughput     A    14903 ms
+   int8_swz_vs_handplaced           C    23643 ms
+   int8_swz_vs_handplaced           B    23167 ms
+   int8_swz_vs_handplaced           A    23935 ms
+== round 8  23:47:20
+   cubin_cache_compile_latency      B      206 ms
+   cubin_cache_compile_latency      A      184 ms
+   cubin_cache_compile_latency      C      175 ms
+   tensorcore_roofline_pct          B     2100 ms
+   tensorcore_roofline_pct          A     2321 ms
+   tensorcore_roofline_pct          C     2317 ms
+   tensorcore_throughput            B     9066 ms
+   tensorcore_throughput            A     8838 ms
+   tensorcore_throughput            C     8264 ms
+   resident_model_throughput        B    14630 ms
+   resident_model_throughput        A    15151 ms
+   resident_model_throughput        C    14697 ms
+   transformer_layer_throughput     B    15318 ms
+   transformer_layer_throughput     A    14725 ms
+   transformer_layer_throughput     C    14414 ms
+   int8_swz_vs_handplaced           B    23478 ms
+   int8_swz_vs_handplaced           A    23808 ms
+   int8_swz_vs_handplaced           C    23402 ms
+== round 9  23:50:33
+   cubin_cache_compile_latency      A      222 ms
+   cubin_cache_compile_latency      C      190 ms
+   cubin_cache_compile_latency      B      186 ms
+   tensorcore_roofline_pct          A     1994 ms
+   tensorcore_roofline_pct          C     2295 ms
+   tensorcore_roofline_pct          B     2265 ms
+   tensorcore_throughput            A     8817 ms
+   tensorcore_throughput            C     8618 ms
+   tensorcore_throughput            B     8786 ms
+   resident_model_throughput        A    14447 ms
+   resident_model_throughput        C    14655 ms
+   resident_model_throughput        B    13995 ms
+   transformer_layer_throughput     A    15239 ms
+   transformer_layer_throughput     C    15175 ms
+   transformer_layer_throughput     B    15534 ms
+   int8_swz_vs_handplaced           A    22907 ms
+   int8_swz_vs_handplaced           C    23057 ms
+   int8_swz_vs_handplaced           B    23133 ms
+== round 10  23:53:45
+   cubin_cache_compile_latency      C      226 ms
+   cubin_cache_compile_latency      B      201 ms
+   cubin_cache_compile_latency      A      187 ms
+   tensorcore_roofline_pct          C     1976 ms
+   tensorcore_roofline_pct          B     2283 ms
+   tensorcore_roofline_pct          A     2210 ms
+   tensorcore_throughput            C     8707 ms
+   tensorcore_throughput            B     8086 ms
+   tensorcore_throughput            A     8182 ms
+   resident_model_throughput        C    14655 ms
+   resident_model_throughput        B    14328 ms
+   resident_model_throughput        A    13816 ms
+   transformer_layer_throughput     C    14533 ms
+   transformer_layer_throughput     B    14876 ms
+   transformer_layer_throughput     A    15618 ms
+   int8_swz_vs_handplaced           C    23867 ms
+   int8_swz_vs_handplaced           B    23650 ms
+   int8_swz_vs_handplaced           A    23787 ms
+== round 11  23:56:56
+   cubin_cache_compile_latency      B      206 ms
+   cubin_cache_compile_latency      A      188 ms
+   cubin_cache_compile_latency      C      165 ms
+   tensorcore_roofline_pct          B     1994 ms
+   tensorcore_roofline_pct          A     2666 ms
+   tensorcore_roofline_pct          C     2596 ms
+   tensorcore_throughput            B     8879 ms
+   tensorcore_throughput            A     8928 ms
+   tensorcore_throughput            C     8757 ms
+   resident_model_throughput        B    15118 ms
+   resident_model_throughput        A    14935 ms
+   resident_model_throughput        C    14644 ms
+   transformer_layer_throughput     B    15459 ms
+   transformer_layer_throughput     A    15800 ms
+   transformer_layer_throughput     C    15149 ms
+   int8_swz_vs_handplaced           B    23744 ms
+   int8_swz_vs_handplaced           A    23812 ms
+   int8_swz_vs_handplaced           C    23665 ms
+
+power AFTER  : AC, not charging 100%
+gpu   AFTER  : NVIDIA GeForce RTX 4050 Laptop GPU, 1740 MHz, 5501 MHz, 66, 38.87 W
+finished     : 2026-08-09T00:00:13.3382609-04:00
+
+Read the per-invocation files in bench\gpu\4050-identity-deep. Compare B/A against the C/A control: a B/A ratio inside
+the C/A spread is a TIE. Publish no size whose range does not clear that floor.

@@ -1,0 +1,9 @@
+
+running 1 test
+2048┬│: fp16 roofline 24207 GFLOP/s | fp16-mt 14454 (60% of fp16 roof) | fp8-mt 17021 (70% of fp16 roof)
+4096┬│: fp16 roofline 24207 GFLOP/s | fp16-mt 8283 (34% of fp16 roof) | fp8-mt 17529 (72% of fp16 roof)
+test gpu::tests::tensorcore_roofline_pct ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 294 filtered out; finished in 1.91s
+
+wall_ms=1942 exit=0 arm=C round=0

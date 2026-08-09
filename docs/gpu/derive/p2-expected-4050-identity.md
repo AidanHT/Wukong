@@ -139,6 +139,51 @@ caveats to note afterwards:
 **Acceptance.** P1 holding across all 11 rows closes plan line 614's timed leg and the Phase-2 exit
 criterion *"4050 identical"*.
 
+## 6. RESULTS (2026-08-08/09) — appended after the fact; §0–§4 are unedited
+
+Two rounds were run. **Nothing in §0–§4 was changed after seeing them.**
+
+| | round 1 | round 2 (deep) |
+|---|---|---|
+| rounds | 5 | 11 |
+| benches | all 11 | the 6 that did not resolve |
+| machine | **not idle** — Modal was streaming a Linux suite locally | idle |
+| power | AC 87% → 97% | AC "not charging" **100% before and after** |
+| invocations / nonzero exits | 165 / **0** | 216 / **0** |
+
+**Six of eleven benches resolved and tied.** Control floor, then B's geomean offset from baseline:
+
+| bench | floor | B off | round |
+|---|---:|---:|---|
+| `mega_vs_single_gemm` | ±0.1% | **0.0%** | 1 |
+| `mega_vs_single_vmath` | ±0.3% | **0.0%** | 1 |
+| `hbm_bandwidth` | ±1.1% | **0.2%** | 1 |
+| `flash_throughput` | ±1.4% | **0.0%** | 1 |
+| `cubin_cache_compile_latency` | ±3.3% | **0.1%** | 2 |
+| `gemm_throughput` | ±3.6% | **0.3%** | 1 |
+
+**Five did not resolve** at P2's ±5% bar, but every one is *consistent with* a tie — B sits far inside
+each bench's own floor: `int8_swz_vs_handplaced` (floor ±6.5%, B 0.2%), `transformer_layer_throughput`
+(±7.0%, 0.6%), `resident_model_throughput` (±7.2%, 0.5%), `tensorcore_roofline_pct` (±8.0%, 1.1%),
+`tensorcore_throughput` (±13.0%, 1.8%).
+
+**Verdict: P1 is substantially demonstrated and there is no evidence of a regression anywhere.**
+Across all eleven benches B's central tendency is within **1.8%** of baseline, and within **0.3%** on
+every bench that resolved. But five benches cannot certify identity at the pre-registered resolution,
+so the honest statement is *"six certified ties, five consistent-with-tie"*, not *"all eleven tie"*.
+
+**P2, P4 and P5 held; P3 was wrong, informatively.** P3 predicted that if anything moved it would be
+a tensor-core family. Nothing moved — instead the tensor-core families turned out to have the
+*widest control floors*. They are the noisiest benches on this machine, not the ones that shifted.
+`hbm_bandwidth`, the canary (P4), stayed put at a 1.1% floor. `cubin_cache_compile_latency` (P5) rose
+0.1%, well under the predicted <1 ms.
+
+**Idleness and round count both mattered, and neither is sufficient.** Going from 5 busy rounds to 11
+idle ones cut most floors roughly in half or better (`int8_swz` ±37% → ±6.5%, `transformer` ±18% →
+±7.0%). But `tensorcore_throughput` barely moved (±15% → ±13.0%) at 2.2x the samples, which says its
+noise is **bench-intrinsic** — autotune variability and in-bench clock ramp — not sampling-limited.
+More rounds will not close that one; the bench would have to change.
+
 ## 5. Smoke run — plumbing only, on battery, NOT a measurement
 
 The instrument was exercised end-to-end on 2026-08-08 at 66% battery, one bench (`hbm_bandwidth`),
