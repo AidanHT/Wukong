@@ -23,6 +23,14 @@ pub const GPU_ENABLED: bool = cfg!(feature = "gpu");
 /// gated family, and its gates run in a plain `cargo test`.
 pub mod ptx_target;
 
+/// The **benchmark instrument** (GPU_RETARGET_PLAN.md §6.1–§6.2): the twin control, the publish
+/// gate and the harness-emitted provenance header. Un-gated for the same reason `ptx_target` is —
+/// the statistics, the rotation driver, the device spec table, the `nvidia-smi` parser, the
+/// provenance formatting and the twin's PTX text are pure functions with no `cudarc` dependency, so
+/// they are unit-tested in a plain, device-free `cargo test`. Only the launch layer (`facts_of`,
+/// `open_round`, `TwinBuffers`, `PtxTwin`'s timing methods, `machine_floor`) is `gpu`-gated within.
+pub mod bench_instrument;
+
 #[cfg(feature = "gpu")]
 pub mod baselines;
 
