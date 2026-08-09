@@ -2,7 +2,20 @@
 
 Phase 0/1 of [`GPU_RETARGET_PLAN.md`](../../GPU_RETARGET_PLAN.md). Nothing here changes compiler
 code — it gets the existing tree onto a real GPU so the ~130 device-executing correctness gates can
-run somewhere other than the dev laptop.
+run somewhere other than the dev laptop, **and it builds the strong peers** so that "better than
+SOTA" is a claim someone can check rather than a claim someone made.
+
+Layout:
+
+| Path | What |
+|---|---|
+| `modal_app.py` | The app: the image, the pins, and every entry point. |
+| `peers/verify_peers.py` | Resolves every strong peer and **exits non-zero** when a declared one is missing. |
+| `peers/smoke_inductor.py` | Proves Inductor really emitted a Triton kernel, and warms the autotune cache once. |
+| `peers/torch_compile_peer.py` | The `torch.compile` framework bar itself: eager / compiled / max-autotune, fairly configured. |
+
+The research behind every command here is [`docs/gpu/derive/D5_peer_builds.md`](../../docs/gpu/derive/D5_peer_builds.md)
+(45 KB, live-verified). **Read that before changing a pin**; nothing here was invented at the keyboard.
 
 ## Why Modal
 
@@ -62,10 +75,15 @@ answers every "does this scale past 20 SMs" question on the same architecture fo
 
 | Command | GPU? | What it does |
 |---|---|---|
-| `::device_info` | yes | §6.1 provenance block: CC, SM count, opt-in SMEM, L2, VRAM, driver, MIG state, and a real `dlopen` of every peer library. Checks the device against a spec table keyed on the **device's own name** and says plainly if it is a slice. |
+| `::device_info` | yes | §6.1 provenance block: CC, SM count, opt-in SMEM, L2, VRAM, driver, MIG state, a real `dlopen` of every peer library, the staged-peer manifest and the strong-peer resolution table. Checks the device against a spec table keyed on the **device's own name** and says plainly if it is a slice. |
 | `::build` | **no** | `cargo check --features gpu --all-targets`, then `cargo test --no-run` for `wukong_codegen_gpu` + `wukong_driver`, then the CPU workspace suite. Writes into the Volume. |
-| `::test` | yes | The device gates with `WUKONG_GPU_REQUIRED=1`. `--peers` also requires NVRTC/cuBLAS/cuBLASLt/cuDNN. `--filter <name>` narrows. |
-| `::bench` | yes | The `#[ignore]`d perf sweeps, release, single-threaded. `--name gemm_pipe_sweep` selects one. **Needs `::build --release` first.** |
+| `::build_peers` | **no** | Stages the heavy strong peers onto the Volume: the CUTLASS profiler, the vLLM (Marlin/Machete) venv, optionally the FA2/FA3 wheels. Idempotent; `--force` rebuilds. |
+| `::peers` | yes | **The strong-peer battery.** Installs any FlashAttention wheel `::build_peers` staged, resolves every peer, proves Inductor emits Triton, runs the in-tree cuBLAS/cuDNN gates with skips escalated, and runs the Rust strong-peer gate. Fails if a `--require`d peer is missing. |
+| `::test` | yes | The device gates with `WUKONG_GPU_REQUIRED=1`. `--peers` also requires NVRTC/cuBLAS/cuBLASLt/cuDNN. `--strong-peers <list>` declares the §0 bar. `--filter <name>` narrows. |
+| `::bench` | yes | The `#[ignore]`d perf sweeps, release, single-threaded. `--name gemm_pipe_sweep` selects one. `--peers` / `--strong-peers` escalate a missing peer to a failure. **Needs `::build --release` first.** |
+| `::framework` | yes | The `torch.compile` bar: eager / compiled / max-autotune over `gemm`, `linear_gelu` or `sdpa`, fastest wins. |
+| `::cutlass` | yes | The CUTLASS-profiler GEMM bar, with cuBLAS as a same-binary control column. **Needs `::build_peers`.** |
+| `::marlin` | yes | The int4 bar: vLLM's own Marlin (Ampere) / Machete (Hopper) kernel benchmarks. **Needs `::build_peers`.** |
 | `::interactive` | yes | Target for `modal shell tools/cloud/modal_app.py::interactive`. |
 
 Options are passed as CLI flags, e.g.:
@@ -73,13 +91,115 @@ Options are passed as CLI flags, e.g.:
 ```powershell
 modal run tools/cloud/modal_app.py::test --peers --filter gemm
 modal run tools/cloud/modal_app.py::build --release
-modal run tools/cloud/modal_app.py::bench --name flash_tiled_vs_untiled
+modal run tools/cloud/modal_app.py::bench --name flash_tiled_vs_untiled --peers
+modal run tools/cloud/modal_app.py::framework --op sdpa --causal --shapes 1x16x2048x128
 modal shell tools/cloud/modal_app.py::interactive
 ```
 
 **Never run two of these concurrently.** They share one Volume, and Modal Volumes are last-write-wins
 on concurrent modification of the same file — two cargos in one target dir is a corruption you would
 pay GPU-minutes to discover.
+
+## The strong peers — what "better than SOTA" has to beat
+
+§0 of the plan sets the bar, and it is not the bar this repo has been publishing against:
+
+| Family | The bar | Where it comes from |
+|---|---|---|
+| GEMM | cuBLAS/cuBLASLt **with fused epilogues**, and the **CUTLASS profiler** | `::cutlass`, and the in-tree cuBLASLt peers |
+| Attention | cuDNN and a **real FlashAttention build** | FA4 in the image (sm_90+), FA2 via torch SDPA's FLASH backend, `::framework --op sdpa` |
+| Framework | **`torch.compile` with Inductor+Triton** | `::framework` |
+| int4 / int8 | **Marlin / Machete-class** kernels | `::marlin` |
+
+Two of those retire claims this repo currently makes:
+
+- **"Beats PyTorch at every S" is an eager-only number** (BENCHMARKS.md:2182,2230), justified by
+  Triton not installing on Windows. On Linux Triton installs, so the excuse expires and the claim has
+  to be re-earned. `::framework` prints eager, `compile(default)` and `compile(max-autotune)` in the
+  same run and takes the **fastest** as the peer, plus an `eager_over_peer` ratio — so the run itself
+  shows how much of the old margin was the peer being weak rather than Wukong being fast.
+- **"No library peer exists" for W4A16** is retired by `::marlin`. Pick the right kernel for the
+  device: Machete is a Hopper kernel and is the H100 bar; Marlin is an Ampere kernel, documented as
+  weak on H100, and is the A100 bar. Reporting either off its own architecture is a strawman, in one
+  direction or the other, and `::marlin` says so out loud when you do it.
+
+### Everything is pinned, and the pins are the point
+
+`modal_app.py`'s pin block is the only place a peer version is decided (torch 2.13.0+cu129,
+flash-attn-4 4.0.0b25, vLLM 0.26.0, CUTLASS v4.6.1, flash-attn 2.8.3.post1). **A peer whose version
+floats is a peer that can change the answer without the benchmark changing** — and this repo has
+already been bitten: `wukong_xbench`'s `detect_torch` picks the *newest* torch on the box by
+`max_by(version_key)`, so two rounds a month apart can silently race two different peers. Nothing
+here works that way: `::build_peers` records what it staged into `/persist/peers.json` and
+`::device_info` prints it, so a round log names the peer it actually ran against.
+
+Every pin is also **verified where it is cheap**: the torch/Triton/FA4 install is asserted at
+image-build time on a CPU builder, so a wrong pin costs a build log rather than a metered hour.
+
+### A missing peer is a failure, not a shrug
+
+Three mechanisms, deliberately distinct:
+
+| Switch | Means | Enforced by |
+|---|---|---|
+| `WUKONG_GPU_REQUIRED=1` | the device gates must run, not skip | `gpu.rs`'s `with_gpu` / `diff::skip_or_fail` |
+| `WUKONG_PEER_REQUIRED=1` | the **dlopen-able** peers (NVRTC/cuBLAS/cuBLASLt/cuDNN) must load | `gpu.rs`'s `peer_gate` |
+| `WUKONG_STRONG_PEERS=<list>` | this round **declares** which §0 bars it is measuring against | `baselines::strong_peer_gate` |
+
+`WUKONG_STRONG_PEERS` is separate from `WUKONG_PEER_REQUIRED` on purpose. The latter already means
+"the libraries must load" and every existing round sets it; overloading it so that it *also* demanded
+a CUTLASS profiler would break every round that legitimately does not need one. The former is a claim
+about what is being measured against, and it is checked: `torch-compile`, `flash-attn`, `cutlass`,
+`marlin`, or `all`. **An unknown name is an error** — a typo that quietly meant "require nothing" is
+exactly the silent skip the mechanism exists to remove.
+
+Neither variable is baked into the image env. Phase 1 §1 requires the first pass to run *without*
+escalation so a missing library is reported rather than failing the whole suite, and a round's peer
+claim is a per-round fact, not a property of an image.
+
+### The order to run things (and what each costs)
+
+```powershell
+# 1. Provenance. Free-ish, seconds. Also prints the peer manifest and the resolution table.
+$env:WK_GPU="L4"; modal run tools/cloud/modal_app.py::device_info
+
+# 2. Compile the workspace on CPU. No GPU attached.
+modal run tools/cloud/modal_app.py::build --release
+
+# 3. Stage the heavy peers on CPU. ~1-2 h of $1/hr CPU, ONCE, then never again.
+#    --cutlass-arch defaults from WK_GPU; 90a for Hopper, 80 for A100, 89 for L4/L40S.
+$env:WK_GPU="H100"; modal run tools/cloud/modal_app.py::build_peers
+
+# 4. Prove the peers on the CHEAPEST device that can do it, and warm the Inductor cache there.
+$env:WK_GPU="L4"; modal run tools/cloud/modal_app.py::peers --require all
+
+# 5. Only now, on the target: the suite, then the numbers.
+$env:WK_GPU="H100"; modal run tools/cloud/modal_app.py::test --release --peers
+$env:WK_GPU="H100"; modal run tools/cloud/modal_app.py::framework --op gemm --shapes 4096x4096x4096
+```
+
+Step 3 is where "never pay twice for the same fact" earns its keep: the CUTLASS profiler is a 20-45
+minute compile and the FlashAttention wheels are 20-90 minutes, **none of which touches a device** —
+nvcc compiles *for* an architecture, it does not need one. On an H100 that same work would cost ~80×
+as much and produce a byte-identical artifact. Step 4 is the other half: `max-autotune` compiles for
+minutes on the first call for each new shape, so pay it at $0.80/hr on an L4 and let
+`TORCHINDUCTOR_CACHE_DIR`/`TRITON_CACHE_DIR` on the Volume make every later round a cache hit.
+
+The first command after this change **rebuilds the image** (the torch + FA4 venv is a new layer, so
+the pull and the ~9 GB install are paid once, on Modal's CPU builder, at $0). Later runs hit the
+layer cache; only a changed pin re-runs that one layer, because it is deliberately last.
+
+**The one trap worth checking by hand:** a `cutlass_profiler` built for the wrong arch still runs and
+still prints numbers. On Hopper a plain-`90` (or an sm_80) build silently omits the wgmma kernels —
+it *understates* the peer and hands Wukong a win it did not earn. `::build_peers` records the arch it
+built and `::peers` refuses to proceed when it does not match the device.
+
+**Where the wheels land.** The torch/Triton/FA4 venv is in the *image*, so every container has it.
+The FA2/FA3 wheels are Volume artifacts, and a container's image filesystem is per-container — so
+they cannot be installed at build time and `::peers` installs them (`--no-deps --no-index`, seconds,
+no network) before it probes. Without that step a `--fa2` build would leave an artifact nothing can
+import while the manifest reported it staged: the bar would *look* present and not be, which is the
+one failure mode this directory exists to prevent.
 
 ## How the cost control works
 
