@@ -31,6 +31,24 @@ pub mod ptx_target;
 /// `open_round`, `TwinBuffers`, `PtxTwin`'s timing methods, `machine_floor`) is `gpu`-gated within.
 pub mod bench_instrument;
 
+/// **The host half of TMA** — building the 128-byte `CUtensorMap` a `cp.async.bulk.tensor` operand
+/// dereferences. Un-gated for the same reason `ptx_target` is: the whole argument bundle
+/// (`TensorMapArgs`) and every precondition the driver documents are pure data and pure predicates,
+/// so they are built and checked in a plain, device-free `cargo test`. Only `TensorMap::encode` —
+/// the one `cuTensorMapEncodeTiled` call — is `gpu`-gated within.
+pub mod tma_host;
+
+/// **The Hopper `wgmma` + TMA GEMM generator** (Act 2 of the datacenter retarget). Un-gated: it is
+/// PTX text plus the arithmetic that feeds it (the 64-bit shared-memory matrix descriptor, the
+/// stage/tile lattice, the register and SMEM budgets), and that arithmetic is the family's only
+/// device-free proof, so its gates must run in a plain `cargo test`. Only `require_sm90a`, which
+/// needs a probed `Gpu`, is `gpu`-gated within.
+///
+/// Emits `.target sm_90a`, which is architecture-**locked**: legal on Hopper and on nothing else, in
+/// either direction. `wgmma_module` therefore takes an `Sm90aLicense` — the capability gate is a
+/// type, so ungated `sm_90a` PTX does not compile rather than merely failing a textual law.
+pub mod ptx_wgmma;
+
 #[cfg(feature = "gpu")]
 pub mod baselines;
 
