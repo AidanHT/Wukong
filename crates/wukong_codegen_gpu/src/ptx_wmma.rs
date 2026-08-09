@@ -532,6 +532,20 @@ pub const CLIFF_VARIANTS: &[CliffCfg] = &[
 /// footprint declines that row at dispatch (`Gpu::smem_budget()`), it does not get a different kernel.
 pub const DEEP_SMEM_BUDGET: usize = 101_376;
 
+/// The SMEM budget the **wide** table ([`PIPE_WIDE_VARIANTS`]) is generated against: the smallest opt-in
+/// carveout among the **datacenter** parts, **A100's 163 KiB**. Its rows are the CTA tiles whose useful
+/// pipeline depths do not fit *any* Ada part (this laptop and the L40S both cap at 99 KiB), so unlike
+/// [`DEEP_SMEM_BUDGET`] this budget cannot promise "loadable everywhere" — it promises the next weaker
+/// and still checkable thing: **every wide row runs on every datacenter part this project targets**
+/// (A100 163 KiB, H100 227 KiB — CUTLASS spells the latter `sm90_smem_capacity_bytes = 232448`).
+///
+/// It is a *binding* guard, not a rubber stamp: 128x256 bk32 costs 24 KiB/stage, so s6 = 144 KiB passes
+/// and s7 = 168 KiB is refused at generation. The device side is already honest without it —
+/// `gemm_nt_f16_deep` compares `smem_bytes()` against the probed `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`
+/// and returns a capability decline naming both numbers, and the deep gate turns that into a
+/// `[skip:capability]` line rather than a pass — so an Ada card refuses these rows loudly.
+pub const WIDE_SMEM_BUDGET: usize = 166_912;
+
 /// **The f16 variable-stage grid — the `mma.sync` pipeline past the 48 KiB static wall.**
 ///
 /// The dispatched workhorse is 2-stage and the deepest thing this crate could previously express was
@@ -545,13 +559,35 @@ pub const DEEP_SMEM_BUDGET: usize = 101_376;
 /// | `deep_swz_128_s3` | 128×128 | 48 KiB | static (== `cliff_swz_s3`) | 2 | 2 | 2 |
 /// | `deep_swz_128_s4` | 128×128 | 64 KiB | **dynamic** | 1 | 2 | 2 |
 /// | `deep_swz_128_s5` | 128×128 | 80 KiB | **dynamic** | 1 | 2 | 2 |
-/// | `deep_swz_128x256_s3` | 128×256 | 72 KiB | **dynamic** | 1 | 2 | 2 |
+/// | `deep_swz_128x256_s2` | 128×256 | 48 KiB | static | 1 | 3 | 4 |
+/// | `deep_swz_128x256_s3` | 128×256 | 72 KiB | **dynamic** | 1 | 2 | 3 |
+/// | `deep_swz_128x256_s4` | 128×256 | 96 KiB | **dynamic** | 1 | 1 | 2 |
+/// | `deep_swz_128x256_s4_mc1` | 128×256 | 96 KiB | **dynamic** | 1 | 1 | 2 |
+/// | `deep_swz_256x128_s2` | 256×128 | 48 KiB | static | 1 | 3 | 4 |
+/// | `deep_swz_256x128_s3` | 256×128 | 72 KiB | **dynamic** | 1 | 2 | 3 |
+/// | `deep_swz_256x128_s4` | 256×128 | 96 KiB | **dynamic** | 1 | 1 | 2 |
 ///
 /// `_s4` is D1's A2 — "the cheapest possible test of the whole dynamic-SMEM capability", one table row.
-/// `_128x256_s3` is D1's #1-ranked Act-1 lever's *shape class* (128×256, where widening N moves the
-/// binding ceiling off L2-fill bandwidth onto the mma issue rate) at the deepest ring a 99 KiB card can
-/// hold; the full A3 config is s6 = 144 KiB and needs an A100/H100 budget, which this same generator
-/// produces unchanged. The s2/s3 rows are the shipped cliff kernels byte for byte
+///
+/// **The 128×256 / 256×128 block is the CTA-tile-width lever** (D1 §2.5). At 128×128 the binding Act-1
+/// ceiling on H100 is **L2→SMEM fill bandwidth** (525 TFLOPS, 73% of cuBLAS@4096³) because CTA
+/// arithmetic intensity is only `bm·bn/(bm+bn)` = **64 FLOP per byte of SMEM filled**. Doubling either
+/// side takes that to **85.33**, which lifts the fill ceiling to ~700 and moves the binding constraint
+/// onto the mma.sync **issue** rate at 642 TFLOPS = **90% of cuBLAS** — +17 points of headroom for no
+/// new instruction, no `wgmma`, no TMA. The two orientations are not redundant: they share `I_cta` but
+/// differ in warp-tile SMEM intensity (`I_wrp` 32.0 for 128×256 vs 25.6 for 256×128, because a B
+/// fragment is 2×b32/lane against A's 4), so an A/B between them separates "CTA area" from "the
+/// B-fragment read path" and tells Act 2 whether to widen `wgmma` N or M first.
+///
+/// Both orientations are generator-legal at `wm2 wn4` (`wmr`/`wnc` ∈ {32,64,128}, all ≡ 0 mod 8) and
+/// carry **128 f32 accumulators per thread** — `tm·tn·4` with (tm,tn) = (4,8) and (8,4) — twice the
+/// 128×128 tile's 64, so the register wall, not SMEM, is what decides whether they hold up
+/// (`wide_tile_lattice_is_generator_legal_and_register_bounded` does that arithmetic; the `_mc1` twin
+/// exists because `.minnctapersm 1` is what lets ptxas spend up to 255 regs/thread instead of guessing).
+/// The rows here are the depths a **99 KiB Ada** part can actually run, so this card gates them on the
+/// metal today; [`PIPE_WIDE_VARIANTS`] carries the deeper datacenter-only rings.
+///
+/// The s2/s3 128×128 rows are the shipped cliff kernels byte for byte
 /// (`deep_grid_s2_s3_are_the_shipped_cliff_kernels`), so they are the equivalence anchor: every deep row
 /// must agree with them, and with the f64 oracle, at the crate's fp16 tolerance.
 pub const PIPE_DEEP_VARIANTS: &[CliffCfg] = &[
@@ -611,6 +647,24 @@ pub const PIPE_DEEP_VARIANTS: &[CliffCfg] = &[
         min_ctas: 0,
         store: Store::Scalar,
     },
+    // ---- The CTA-tile-width lever, N-major (128x256). `_s2` is the one row that needs NO dynamic SMEM
+    // at all (24 KiB/stage x 2 = 48 KiB exactly, the static ISA cap), so it is the cleanest single-
+    // variable A/B in the file: same bk, same warp grid, same depth, same raster as `deep_swz_128_s2`,
+    // and only `bn` doubles. `_s4` is the deepest 128x256 ring a 99 KiB Ada carveout can hold.
+    CliffCfg {
+        name: "deep_swz_128x256_s2",
+        bm: 128,
+        bn: 256,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
     CliffCfg {
         name: "deep_swz_128x256_s3",
         bm: 128,
@@ -625,6 +679,168 @@ pub const PIPE_DEEP_VARIANTS: &[CliffCfg] = &[
         min_ctas: 0,
         store: Store::Scalar,
     },
+    CliffCfg {
+        name: "deep_swz_128x256_s4",
+        bm: 128,
+        bn: 256,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 4,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    // The launch-bounds twin of the row above, and the ONLY thing on this laptop that can answer D1's
+    // open question 3 ("does ptxas spill at 128 accumulators?"). Without a directive ptxas picks the
+    // register count from its own occupancy heuristic and cannot see the dynamic SMEM size (a launch-time
+    // quantity), so it may cap registers for a residency the window will not permit anyway; with
+    // `.minnctapersm 1` it may spend up to 65536/256 = 256 -> the 255/thread ISA limit. Same PTX
+    // arithmetic, same output; only the two directives differ.
+    CliffCfg {
+        name: "deep_swz_128x256_s4_mc1",
+        bm: 128,
+        bn: 256,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 4,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 1,
+        store: Store::Scalar,
+    },
+    // ---- The same lever, M-major (256x128) — identical SMEM and identical CTA intensity, deliberately
+    // different warp-tile intensity (tm=8,tn=4 => I_wrp 25.6 vs the N-major 32.0). Keeping both at every
+    // depth is what makes the orientation A/B a controlled experiment rather than two unrelated points.
+    CliffCfg {
+        name: "deep_swz_256x128_s2",
+        bm: 256,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 2,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "deep_swz_256x128_s3",
+        bm: 256,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 3,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "deep_swz_256x128_s4",
+        bm: 256,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 4,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+];
+
+/// **The datacenter-only wide-tile rings** — the rows of D1 §2.2's feasible lattice that no Ada part can
+/// hold, generated against [`WIDE_SMEM_BUDGET`] instead of [`DEEP_SMEM_BUDGET`].
+///
+/// | row | tile | stages | SMEM | D1 label | CTAs/SM: A100 (163) / H100 (227) |
+/// |---|---|---|---|---|---|
+/// | `wide_swz_128_s7` | 128×128 | 7 | 112 KiB | A2, taken to the datacenter depth | 1 / 2 |
+/// | `wide_swz_128x256_s5_mc1` | 128×256 | 5 | 120 KiB | — (the depth step below A3) | 1 / 1 |
+/// | **`wide_swz_128x256_s6_mc1`** | **128×256** | **6** | **144 KiB** | **A3 — the #1-ranked Act-1 lever** | 1 / 1 |
+/// | **`wide_swz_256x128_s6_mc1`** | **256×128** | **6** | **144 KiB** | **A4 — the M-major twin** | 1 / 1 |
+///
+/// A3/A4 are D1 §4.4 verbatim: `bk32 wm2 wn4 s6 r16 swz pad0 min_ctas1`, 256 threads, 128 accumulator
+/// registers per thread, one CTA per SM. The predicted payoff is **+18 to +25 points of cuBLAS at
+/// 4096³** and the predicted failure mode is equally specific — if A3 loses to the 128×128 base, the
+/// 1-CTA/SM occupancy collapse (8 of H100's 64 warp slots) beats the intensity gain and the answer is
+/// warp specialisation, i.e. Act 2. Either result settles the question, which is why both orientations
+/// are here rather than only the favourite.
+///
+/// These rows live in the **same PTX module** as [`PIPE_DEEP_VARIANTS`] ([`gemm_deep_ptx`]) on purpose.
+/// A dynamic-SMEM entry declares no size in PTX — the window is `.extern` and unsized, and the byte
+/// count is launch-time state — so a module carrying a 144 KiB row still `cuModuleLoadData`s on this
+/// 99 KiB laptop; only a *launch* would be refused, and `gemm_nt_f16_deep` refuses it before touching
+/// the driver. Sharing the module also keeps every textual law that already scans it (the ASCII gate,
+/// the `sm_80` floor law, `gpu.rs`'s `.version` floor law over `device_free_modules`) covering these
+/// rows for free, instead of creating a second module that sits outside all of them.
+pub const PIPE_WIDE_VARIANTS: &[CliffCfg] = &[
+    CliffCfg {
+        name: "wide_swz_128_s7",
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 7,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 0,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "wide_swz_128x256_s5_mc1",
+        bm: 128,
+        bn: 256,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 5,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 1,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "wide_swz_128x256_s6_mc1",
+        bm: 128,
+        bn: 256,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 6,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 1,
+        store: Store::Scalar,
+    },
+    CliffCfg {
+        name: "wide_swz_256x128_s6_mc1",
+        bm: 256,
+        bn: 128,
+        bk: 32,
+        wm: 2,
+        wn: 4,
+        stages: 6,
+        raster: 16,
+        swz: true,
+        pad: 0,
+        min_ctas: 1,
+        store: Store::Scalar,
+    },
 ];
 
 /// Look up a [`PIPE_DEEP_VARIANTS`] row by entry name (a wrong name is a loud panic at the call site,
@@ -636,15 +852,30 @@ pub fn deep_variant(name: &str) -> &'static CliffCfg {
         .unwrap_or_else(|| panic!("unknown deep variant {name:?}"))
 }
 
-/// Emit the **deep** (variable-stage) f16 module: the module-scope dynamic-SMEM window followed by one
-/// `mma.sync` entry per [`PIPE_DEEP_VARIANTS`] row.
+/// Look up a [`PIPE_WIDE_VARIANTS`] row by entry name. Same contract as [`deep_variant`]; both live in
+/// the one [`gemm_deep_ptx`] module, so the row a caller gets back is launchable through
+/// `gpu::gemm_nt_f16_deep` unchanged — which declines loudly if the device's opt-in ceiling is smaller.
+pub fn wide_variant(name: &str) -> &'static CliffCfg {
+    PIPE_WIDE_VARIANTS
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("unknown wide variant {name:?}"))
+}
+
+/// Emit the **deep / wide** (variable-stage, variable-tile) f16 module: the module-scope dynamic-SMEM
+/// window, then one `mma.sync` entry per [`PIPE_DEEP_VARIANTS`] row and one per [`PIPE_WIDE_VARIANTS`]
+/// row. The only difference between the two tables is the budget each is generated against
+/// ([`DEEP_SMEM_BUDGET`] = every part, [`WIDE_SMEM_BUDGET`] = datacenter parts only) — the generator,
+/// the window, the launch path and every textual law are shared.
 ///
 /// One module, one window, many entries — legal and deliberate: `sharedMemBytes` is a *per-launch*
 /// quantity and `cuFuncSetAttribute` is per-`CUfunction`, so each entry sizes its own window
 /// independently even though they share the symbol. Static rows keep their own entry-local `.shared`
 /// arrays alongside it (statics and the window do not alias; the window simply starts after them).
-/// Separate from `gemm_cliff_ptx`/`wmma_f16_ptx` so the deep experiments never perturb the dispatched
-/// modules or their warm cubins.
+/// A row bigger than the running device's carveout costs this module nothing at load time — the
+/// `.extern` window carries no size in PTX — so the wide rows ride along on an Ada card and are refused
+/// only if somebody launches them. Separate from `gemm_cliff_ptx`/`wmma_f16_ptx` so the deep experiments
+/// never perturb the dispatched modules or their warm cubins.
 pub fn gemm_deep_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
@@ -653,30 +884,36 @@ pub fn gemm_deep_ptx() -> &'static str {
         // when some row actually needs it — so a hypothetical all-static table emits historical text.
         if PIPE_DEEP_VARIANTS
             .iter()
+            .chain(PIPE_WIDE_VARIANTS)
             .any(|v| v.smem_mode().is_dynamic())
         {
             m += DSMEM_DECL;
         }
-        for v in PIPE_DEEP_VARIANTS {
-            m += &entry_mma_pipe_budget(
-                v.name,
-                "f16",
-                v.bm,
-                v.bn,
-                v.bk,
-                v.wm,
-                v.wn,
-                v.stages,
-                v.raster,
-                v.pad,
-                Act::None,
-                false,
-                false,
-                v.swz,
-                v.min_ctas,
-                v.store,
-                DEEP_SMEM_BUDGET,
-            );
+        for (table, budget) in [
+            (PIPE_DEEP_VARIANTS, DEEP_SMEM_BUDGET),
+            (PIPE_WIDE_VARIANTS, WIDE_SMEM_BUDGET),
+        ] {
+            for v in table {
+                m += &entry_mma_pipe_budget(
+                    v.name,
+                    "f16",
+                    v.bm,
+                    v.bn,
+                    v.bk,
+                    v.wm,
+                    v.wn,
+                    v.stages,
+                    v.raster,
+                    v.pad,
+                    Act::None,
+                    false,
+                    false,
+                    v.swz,
+                    v.min_ctas,
+                    v.store,
+                    budget,
+                );
+            }
         }
         m
     })
@@ -751,10 +988,12 @@ fn entry_smem(
     // The whole-multiple staging constraint stated above must be CHECKED, not assumed: the division
     // truncates, so a tile that does not tile the CTA emits a kernel that stages only part of A/B (or,
     // at `*_chunks == 0`, nothing at all) while every `bar.sync`/`wmma.load`/`wmma.mma` stays
-    // well-formed — it JITs cleanly and computes C from stale shared memory. LANDMINE: the sibling
-    // generators (`entry_smem_pipe`, `entry_mma_pipe`, `entry_mma_gate`) assert only the `>= 1` half,
-    // so a partial-multiple tile is still generatable there; every dispatched config is an exact
-    // multiple, but a new row in `PIPE_VARIANTS`/`CLIFF_VARIANTS` is not checked for it.
+    // well-formed — it JITs cleanly and computes C from stale shared memory. `entry_mma_pipe_budget`
+    // (the `mma.sync` pipeline every `CliffCfg` row flows through, including the widened 128x256 /
+    // 256x128 tiles) now carries the same whole-multiple guard. LANDMINE: the two remaining siblings
+    // (`entry_smem_pipe`, `entry_mma_gate`) still assert only the `>= 1` half, so a partial-multiple
+    // tile is generatable there; every dispatched config is an exact multiple, but a new row is not
+    // checked for it.
     assert!(
         a_chunks >= 1 && a_chunks * threads * 8 == bm * SM_BK,
         "{name}: A tile {bm}x{SM_BK} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
@@ -1917,11 +2156,25 @@ fn entry_mma_pipe_budget(
         smem_a % 16 == 0,
         "{name}: B slab offset {smem_a} is not 16-B aligned"
     );
+    // The staging loop issues exactly `chunks` 16-byte `cp.async`s per thread, so `bm·bk` and `bn·bk`
+    // must be WHOLE multiples of `threads·8`. Checking only `>= 1` (what this generator did, while every
+    // config in the tree happened to divide exactly) lets a truncating division through: the kernel then
+    // stages a *prefix* of the tile, every `bar.sync`/`ldmatrix`/`mma` stays well-formed, it JITs
+    // cleanly, and it computes C partly from stale shared memory — which reads as a tolerance failure,
+    // not a codegen bug. [`entry_smem`] has carried the whole-multiple form since its own near-miss and
+    // its doc names this generator as the one still missing it. Widening the CTA tile is exactly the
+    // change that stops making the division obvious by inspection, so it gets the guard now.
     let a_chunks = bm * bk / (threads * 8);
     let b_chunks = bn * bk / (threads * 8);
     assert!(
-        a_chunks >= 1 && b_chunks >= 1,
-        "{name}: tile too small for one 128-bit chunk per thread"
+        a_chunks >= 1 && a_chunks * threads * 8 == bm * bk,
+        "{name}: A tile {bm}x{bk} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
+    );
+    assert!(
+        b_chunks >= 1 && b_chunks * threads * 8 == bn * bk,
+        "{name}: B tile {bn}x{bk} is not a whole multiple of threads*8 = {} (128-bit vectorized staging)",
+        threads * 8
     );
     let bk_chunks = bk / 8;
     let row_shift = bk_chunks.trailing_zeros();
@@ -3613,6 +3866,32 @@ mod tests {
         );
     }
 
+    /// The full text of one `.visible .entry` — from its declaration up to the next entry (or the end
+    /// of the module). Entries are emitted back-to-back, so this is an exact slice of what the driver
+    /// JIT sees for that kernel, which is what the byte-identity gates compare.
+    fn entry_of(ptx: &str, name: &str) -> String {
+        let at = ptx
+            .find(&format!(".visible .entry {name}("))
+            .unwrap_or_else(|| panic!("entry `{name}` is not defined in this module"));
+        let rest = &ptx[at..];
+        let end = rest[1..]
+            .find(".visible .entry ")
+            .map_or(rest.len(), |i| i + 1);
+        rest[..end].to_string()
+    }
+
+    /// FNV-1a 64. A pinned `(len, hash)` pair identifies a PTX string as tightly as the string itself
+    /// for regression purposes, and unlike an inline golden copy it costs six lines instead of a
+    /// megabyte. Hand-rolled so the pin needs no dev-dependency and cannot drift with one.
+    fn fnv1a64(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
     /// Every `.visible .entry <name>(` defined in `ptx`, in order.
     fn entry_names(ptx: &str) -> Vec<&str> {
         ptx.match_indices(".visible .entry ")
@@ -3677,17 +3956,6 @@ mod tests {
     #[test]
     fn deep_grid_s2_s3_are_the_shipped_cliff_kernels() {
         let cliff = gemm_cliff_ptx();
-        let entry_of = |ptx: &str, name: &str| -> String {
-            let at = ptx
-                .find(&format!(".visible .entry {name}("))
-                .expect("entry exists");
-            let rest = &ptx[at..];
-            // Entries are emitted back-to-back; take up to the next one (or the module end).
-            let end = rest[1..]
-                .find(".visible .entry ")
-                .map_or(rest.len(), |i| i + 1);
-            rest[..end].to_string()
-        };
         let deep = gemm_deep_ptx();
         for (deep_name, cliff_name) in [
             ("deep_swz_128_s2", "cliff_swz_s2"),
@@ -3708,6 +3976,207 @@ mod tests {
         }
     }
 
+    /// **EVERY ALREADY-SHIPPED CONFIGURATION STILL EMITS BYTE-IDENTICAL PTX.** The sibling test above
+    /// pins two entries against each other *inside this build*, which cannot see a change that moves
+    /// both. This one pins the emitted text against values **recorded from the tree before the CTA tile
+    /// lattice was widened**, so it is a real before/after comparison rather than a self-consistency
+    /// check: `(byte length, FNV-1a 64)` of every dispatched module whole, plus of each pre-existing
+    /// [`PIPE_DEEP_VARIANTS`] entry individually (the deep module's *text* legitimately grows as rows
+    /// are added, so only its entries can be pinned).
+    ///
+    /// Why it matters beyond tidiness: the cubin cache is keyed on PTX text, every published A/B number
+    /// on this card was taken against these exact strings, and the whole promise of "add lattice rows,
+    /// change nothing that ships" is unfalsifiable by inspection — the generator is one 450-line
+    /// function shared by ~24 call sites, and a `tm`/`tn`-dependent edit would move dozens of entries at
+    /// once while every structural gate stayed green.
+    ///
+    /// **Baseline provenance:** printed by a throwaway `#[test]` on the pre-change worktree at
+    /// `fe1502f` (`cargo test -p wukong_codegen_gpu --features gpu --lib -- --nocapture`). Regenerating
+    /// these numbers is how you *lose* the guarantee — a row that changes shipped text must be
+    /// justified in the commit body, not re-pinned quietly.
+    #[test]
+    fn shipped_tensor_core_ptx_is_byte_identical_to_the_pre_widening_baseline() {
+        let s64 = wmma_f16_sm_static_ptx(256, 256, 256, false);
+        let s128 = wmma_f16_sm_static_ptx(256, 256, 256, true);
+        // (what, text, byte length, FNV-1a 64) — whole modules, none of which gained a row.
+        let mut modules = 0usize;
+        let mut pin = |what: &str, ptx: &str, len: usize, hash: u64| {
+            modules += 1;
+            assert_eq!(ptx.len(), len, "{what}: PTX length moved");
+            assert_eq!(
+                fnv1a64(ptx),
+                hash,
+                "{what}: PTX text moved at unchanged length - a shipped kernel was rewritten"
+            );
+        };
+        let (f16m, bf16m) = (wmma_f16_ptx(), wmma_bf16_ptx());
+        let (cliffm, roofm) = (gemm_cliff_ptx(), roofline_f16_ptx());
+        pin("wmma_f16_ptx", f16m, 1_326_227, 0x13ea_55d4_469f_0eb6);
+        pin("wmma_bf16_ptx", bf16m, 1_053_587, 0x8552_1e9a_c047_0e0e);
+        pin("gemm_cliff_ptx", cliffm, 315_085, 0xee75_178c_0983_0e4a);
+        pin("roofline_f16_ptx", roofm, 3_868, 0x429a_caaa_8174_d952);
+        pin("sm_static_ptx/64", &s64, 7_844, 0x796c_f22f_119f_fb37);
+        pin("sm_static_ptx/128", &s128, 12_805, 0xc000_e086_525a_9e5e);
+        // The five deep rows that existed before the widening, entry by entry.
+        let deep = gemm_deep_ptx();
+        let entries: [(&str, usize, u64); 5] = [
+            ("deep_swz_128_s2", 28_447, 0x5375_de64_013e_a40b),
+            ("deep_swz_128_s3", 31_072, 0xfaf1_82c0_5d1a_0efa),
+            ("deep_swz_128_s4", 33_619, 0xc031_3701_f7d7_aef3),
+            ("deep_swz_128_s5", 36_251, 0xf638_f1a2_e57d_6b99),
+            ("deep_swz_128x256_s3", 53_157, 0x3efc_639e_058f_fdaf),
+        ];
+        for (name, len, hash) in entries {
+            let e = entry_of(deep, name);
+            assert_eq!(e.len(), len, "{name}: entry length moved");
+            assert_eq!(fnv1a64(&e), hash, "{name}: entry text moved");
+        }
+        eprintln!(
+            "[gate] {modules} shipped modules + {} pre-existing deep entries are byte-identical to \
+             the pre-widening baseline",
+            entries.len()
+        );
+    }
+
+    /// **The widened CTA tiles are generator-legal, register-bounded, and actually raise the thing they
+    /// were widened for.** Purely arithmetic, so it runs with no device and it runs everywhere.
+    ///
+    /// Three claims, in the order they can kill the lever:
+    ///
+    /// 1. **Legality.** Re-derives the generator's own preconditions per row rather than trusting that
+    ///    a panic would have fired: `swz` needs `bk == 32` exactly (the XOR phase is derived for
+    ///    `nc = bk/8 = 4`) plus `wmr % 8 == 0` and `wnc % 8 == 0` (which is what makes the read-side
+    ///    per-lane phase constant — `warpMrow`/`warpNcol` must vanish under `(·>>1) & 3`);
+    ///    `bm % (16·wm) == 0`; `bn % (8·wn) == 0`; raster needs `bm`,`bn` powers of two; and both
+    ///    staging tiles must be WHOLE multiples of `threads·8`, the truncating division that stages a
+    ///    prefix of the tile and reads as a tolerance failure.
+    /// 2. **The register wall, which is what D1 §2.3 says decides whether a 256-wide tile survives.**
+    ///    `tm·tn·4` f32 accumulators live in registers for the whole mainloop, so a 128×256 or 256×128
+    ///    tile carries **128** of them against the shipped tile's 64. Checked against the three hard ISA
+    ///    limits (255 regs/thread, 65 536 regs/CTA, and the 64 K register file per SM at the row's
+    ///    declared `min_ctas`), with the A/B fragments and a generous scratch allowance included —
+    ///    because "it fits" is the entire premise, and Hopper adds **zero** registers over Ada.
+    /// 3. **Intensity.** The point of the widening: CTA arithmetic intensity `bm·bn/(bm+bn)`, the FLOP
+    ///    per byte of SMEM filled, must strictly exceed the shipped 128×128 tile's 64. Every wide row
+    ///    reaches 85.33, which is what moves the H100 Act-1 binding ceiling off L2 fill (525 TFLOPS,
+    ///    73% of cuBLAS@4096³) and onto the mma.sync issue rate (642, 90%).
+    #[test]
+    fn wide_tile_lattice_is_generator_legal_and_register_bounded() {
+        /// Scratch registers beyond the accumulators and fragments: pointers, indices, predicates,
+        /// swizzle phases and epilogue temporaries. Read off the generator's `.reg` declarations
+        /// (~34 named b32/b64/pred plus the raster block) and rounded UP, so the budget is pessimistic.
+        const SCRATCH: usize = 48;
+        let i_cta = |bm: usize, bn: usize| (bm * bn) as f64 / (bm + bn) as f64;
+        let shipped = i_cta(128, 128); // 64.0 — the tile the H100 ceiling of 73% belongs to
+        let mut widened = 0usize;
+        for (table, budget, label) in [
+            (PIPE_DEEP_VARIANTS, DEEP_SMEM_BUDGET, "deep"),
+            (PIPE_WIDE_VARIANTS, WIDE_SMEM_BUDGET, "wide"),
+        ] {
+            for v in table {
+                let threads = v.threads();
+                let (tm, tn) = (v.bm / (16 * v.wm), v.bn / (8 * v.wn));
+                let (wmr, wnc) = (v.bm / v.wm, v.bn / v.wn);
+                // 1. legality
+                assert!(v.bk % 16 == 0 && (v.bk / 8).is_power_of_two(), "{}", v.name);
+                assert!(v.bm % (16 * v.wm) == 0, "{}: bm % 16*wm", v.name);
+                assert!(v.bn % (8 * v.wn) == 0, "{}: bn % 8*wn", v.name);
+                assert!(v.wn.is_power_of_two(), "{}: warpId>>wn_shift", v.name);
+                if v.swz {
+                    assert_eq!(
+                        v.bk, 32,
+                        "{}: the swz XOR phase is derived for bk=32",
+                        v.name
+                    );
+                    assert_eq!(v.pad, 0, "{}: swz forces ldp = bk", v.name);
+                    assert_eq!(wmr % 8, 0, "{}: warpMrow must vanish under (>>1)&3", v.name);
+                    assert_eq!(wnc % 8, 0, "{}: warpNcol must vanish under (>>1)&3", v.name);
+                }
+                if v.raster > 0 {
+                    assert!(
+                        v.bm.is_power_of_two() && v.bn.is_power_of_two(),
+                        "{}: raster shifts by bm/bn",
+                        v.name
+                    );
+                }
+                for (which, dim) in [("A", v.bm), ("B", v.bn)] {
+                    let chunks = dim * v.bk / (threads * 8);
+                    assert!(
+                        chunks >= 1 && chunks * threads * 8 == dim * v.bk,
+                        "{}: {which} tile {dim}x{} is not a whole multiple of threads*8 = {}",
+                        v.name,
+                        v.bk,
+                        threads * 8
+                    );
+                }
+                assert!(
+                    v.smem_bytes() <= budget,
+                    "{}: {} B exceeds the {label} budget {budget} B",
+                    v.name,
+                    v.smem_bytes()
+                );
+                // 2. the register wall
+                let accum = tm * tn * 4; // f32 D fragments, live across the whole mainloop
+                let frags = tm * 4 + tn * 2; // b32 A (4/lane) + B (2/lane) fragments
+                let per_thread = accum + frags + SCRATCH;
+                assert!(
+                    per_thread <= 255,
+                    "{}: ~{per_thread} regs/thread exceeds the 255/thread ISA limit \
+                     ({accum} accumulators at tm={tm} tn={tn})",
+                    v.name
+                );
+                assert!(
+                    per_thread * threads <= 65_536,
+                    "{}: ~{} regs/CTA exceeds the 65536/CTA limit",
+                    v.name,
+                    per_thread * threads
+                );
+                let want = v.min_ctas.max(1);
+                assert!(
+                    per_thread * threads * want <= 65_536,
+                    "{}: .minnctapersm {} cannot be met — {} threads x ~{per_thread} regs x {want} \
+                     CTAs needs more than the 64K register file per SM, so ptxas would have to spill",
+                    v.name,
+                    v.min_ctas,
+                    threads
+                );
+                // 3. intensity — the reason the tile was widened at all
+                if v.bm.max(v.bn) > 128 {
+                    widened += 1;
+                    assert!(
+                        i_cta(v.bm, v.bn) > shipped,
+                        "{}: I_cta {} does not beat the shipped 128x128 tile's {shipped}",
+                        v.name,
+                        i_cta(v.bm, v.bn)
+                    );
+                    assert_eq!(
+                        accum, 128,
+                        "{}: the wide tiles carry 128 accumulators",
+                        v.name
+                    );
+                }
+                eprintln!(
+                    "  {:<24} {:>3}x{:<3} s{} {:>3} KiB  tm={tm} tn={tn}  accum={accum} \
+                     ~{per_thread} regs/thread  I_cta={:.2}",
+                    v.name,
+                    v.bm,
+                    v.bn,
+                    v.stages,
+                    v.smem_bytes() / 1024,
+                    i_cta(v.bm, v.bn)
+                );
+            }
+        }
+        assert!(
+            widened >= 6,
+            "the CTA-tile-width lever needs both orientations at several depths (only {widened} rows)"
+        );
+        eprintln!(
+            "[gate] {widened} CTA tiles wider than 128 are generator-legal, fit 255 regs/thread at \
+             128 accumulators, and raise I_cta 64.0 -> 85.33"
+        );
+    }
+
     /// **The deep grid's SMEM arithmetic, emission form, and window discipline (no GPU).** The four ways
     /// a dynamic-SMEM kernel goes wrong *silently*, each checked from the emitted text:
     ///   * the closed form `stages·(bm+bn)·(bk+pad)·2` and the 48 KiB boundary that splits the forms;
@@ -3718,8 +4187,15 @@ mod tests {
     ///     ceiling) and a static entry never touches the window;
     ///   * the B ring starts at the constant `stages·tile_a`, and both rings are reached through the
     ///     SYMBOL — the window base is not 0 when an entry also has statics.
-    /// Also pins every row inside [`DEEP_SMEM_BUDGET`], so no row can be born un-loadable on the
-    /// smallest target this project ships to.
+    ///
+    /// Pins every [`PIPE_DEEP_VARIANTS`] row inside [`DEEP_SMEM_BUDGET`] (no row born un-loadable on the
+    /// smallest target this project ships to) and every [`PIPE_WIDE_VARIANTS`] row inside
+    /// [`WIDE_SMEM_BUDGET`] and *outside* the Ada one — a wide row that quietly shrank back under 99 KiB
+    /// belongs in the deep table where this card would gate it on the metal, not here where nothing runs
+    /// it. Also pins the **launch-bounds** discipline the wide tiles introduced: `min_ctas > 0` emits
+    /// exactly `.maxntid {threads},1,1` + `.minnctapersm N`, `min_ctas == 0` emits neither, and the two
+    /// are checked per ENTRY, since a module-wide `contains` cannot see a directive landing on the wrong
+    /// kernel.
     #[test]
     fn deep_grid_smem_math_and_window_discipline() {
         let deep = gemm_deep_ptx();
@@ -3734,16 +4210,39 @@ mod tests {
             decl < first_entry,
             "the window must be declared at MODULE scope, before any entry"
         );
-        let expect: [(&str, usize, bool); 5] = [
+        // (name, SMEM bytes, dynamic?) — the closed form `stages·(bm+bn)·(bk+pad)·2` spelled out, so an
+        // edit to a row's geometry has to be restated here rather than recomputed by the same formula.
+        let deep_expect: [(&str, usize, bool); 11] = [
             ("deep_swz_128_s2", 32768, false),
             ("deep_swz_128_s3", 49152, false),
             ("deep_swz_128_s4", 65536, true),
             ("deep_swz_128_s5", 81920, true),
+            ("deep_swz_128x256_s2", 49152, false),
             ("deep_swz_128x256_s3", 73728, true),
+            ("deep_swz_128x256_s4", 98304, true),
+            ("deep_swz_128x256_s4_mc1", 98304, true),
+            ("deep_swz_256x128_s2", 49152, false),
+            ("deep_swz_256x128_s3", 73728, true),
+            ("deep_swz_256x128_s4", 98304, true),
         ];
-        assert_eq!(PIPE_DEEP_VARIANTS.len(), expect.len());
-        for (v, (name, bytes, dynamic)) in PIPE_DEEP_VARIANTS.iter().zip(expect) {
-            assert_eq!(v.name, name, "deep grid order");
+        let wide_expect: [(&str, usize, bool); 4] = [
+            ("wide_swz_128_s7", 114688, true),
+            ("wide_swz_128x256_s5_mc1", 122880, true),
+            ("wide_swz_128x256_s6_mc1", 147456, true),
+            ("wide_swz_256x128_s6_mc1", 147456, true),
+        ];
+        assert_eq!(PIPE_DEEP_VARIANTS.len(), deep_expect.len());
+        assert_eq!(PIPE_WIDE_VARIANTS.len(), wide_expect.len());
+        let rows = PIPE_DEEP_VARIANTS
+            .iter()
+            .zip(deep_expect.iter().map(|e| (*e, DEEP_SMEM_BUDGET, false)))
+            .chain(
+                PIPE_WIDE_VARIANTS
+                    .iter()
+                    .zip(wide_expect.iter().map(|e| (*e, WIDE_SMEM_BUDGET, true))),
+            );
+        for (v, ((name, bytes, dynamic), budget, datacenter_only)) in rows {
+            assert_eq!(v.name, name, "grid order");
             assert_eq!(v.smem_bytes(), bytes, "{name}: SMEM closed form");
             assert_eq!(
                 v.smem_mode().is_dynamic(),
@@ -3756,40 +4255,66 @@ mod tests {
                 "{name}"
             );
             assert!(
-                v.smem_bytes() <= DEEP_SMEM_BUDGET,
-                "{name}: must fit the smallest target's ceiling"
+                v.smem_bytes() <= budget,
+                "{name}: must fit its table's ceiling {budget} B"
+            );
+            assert_eq!(
+                v.smem_bytes() > DEEP_SMEM_BUDGET,
+                datacenter_only,
+                "{name}: a row is datacenter-only exactly when it does not fit an Ada carveout \
+                 ({DEEP_SMEM_BUDGET} B) — otherwise it belongs in the other table"
             );
             let tile_a = v.bm * (v.bk + v.pad) * 2; // one A buffer of the ring
+            let entry = entry_of(deep, name);
             if dynamic {
                 assert!(
                     !deep.contains(&format!("smemA_{name}")),
                     "{name}: no statics beside the window"
                 );
                 assert!(
-                    deep.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")),
+                    entry.contains(&format!("mov.u32 %bptr,{DSMEM_SYM};")),
                     "{name}: B ring via the symbol"
                 );
                 assert!(
-                    deep.contains(&format!("add.u32 %bptr,%bptr,{};", v.stages * tile_a)),
+                    entry.contains(&format!("add.u32 %bptr,%bptr,{};", v.stages * tile_a)),
                     "{name}: the B ring must start after the whole A ring"
                 );
             } else {
                 assert!(
-                    deep.contains(&format!(
+                    entry.contains(&format!(
                         ".shared .align 16 .b8 smemA_{name}[{}];",
                         v.stages * tile_a
                     )),
                     "{name}: static rows keep their own arrays"
                 );
             }
+            // Launch bounds: present iff the row asks for them, on this entry and nowhere else.
+            let bounds = format!(
+                ".maxntid {}, 1, 1\n.minnctapersm {}\n",
+                v.threads(),
+                v.min_ctas
+            );
+            assert_eq!(
+                entry.contains(&bounds),
+                v.min_ctas > 0,
+                "{name}: min_ctas={} but the `{}` directives are {}",
+                v.min_ctas,
+                bounds.trim().replace('\n', " + "),
+                if v.min_ctas > 0 { "missing" } else { "present" }
+            );
+            assert_eq!(
+                entry.contains(".minnctapersm"),
+                v.min_ctas > 0,
+                "{name}: stray launch-bounds directive"
+            );
             // Every depth keeps `stages-2` cp.async groups in flight and guards each prologue slab.
             assert!(
-                deep.contains(&format!("cp.async.wait_group {};", v.stages - 2)),
+                entry.contains(&format!("cp.async.wait_group {};", v.stages - 2)),
                 "{name}"
             );
             for st in 0..(v.stages - 1) {
                 assert!(
-                    deep.contains(&format!("PRO_{name}_{st}:")),
+                    entry.contains(&format!("PRO_{name}_{st}:")),
                     "{name}: prologue slab {st} unguarded"
                 );
             }
@@ -3865,6 +4390,18 @@ mod tests {
                 "PIPE_DEEP_VARIANTS entry `{}` missing from gemm_deep_ptx",
                 v.name
             );
+            assert_eq!(deep_variant(v.name).name, v.name, "deep_variant round-trip");
+        }
+        // The wide (datacenter-tile) rows share the one deep module, so `gpu::gemm_nt_f16_deep` can
+        // launch them unchanged on a part whose carveout is big enough — but only if the entry the
+        // lookup names is actually in the text the module cache loads.
+        for v in PIPE_WIDE_VARIANTS {
+            assert!(
+                has(deep, v.name),
+                "PIPE_WIDE_VARIANTS entry `{}` missing from gemm_deep_ptx",
+                v.name
+            );
+            assert_eq!(wide_variant(v.name).name, v.name, "wide_variant round-trip");
         }
         assert!(
             has(bf16, PIPE_BF16.name),
