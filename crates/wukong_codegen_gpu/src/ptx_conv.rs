@@ -25,11 +25,40 @@
 //!   ([`conv_wmma_strided_ptx`]), padded ([`conv_wmma_pad_ptx`], [`conv_wmma_pad_splitk_ptx`]) and
 //!   *register*-double-buffered ([`conv_wmma_db_ptx`]) variants, plus the standalone
 //!   [`pad_nchw_copy_ptx`] scatter and the unfused [`bias_relu_ptx`] baseline.
+//!
+//! ## Shared memory: the closed forms, the budget seam, and what actually binds
+//!
+//! Each family's footprint has a closed form, exposed here so the dispatch layer never re-derives a
+//! size the generator already computed: [`tiled_smem_bytes`] for the direct f32 tiled conv and
+//! [`conv_wmma_smem_bytes`] for the implicit-GEMM family. Both the *gate* ([`tiled_applies_budget`],
+//! [`wmma_applies_budget`]) and the *declaration* ([`conv2d_ptx_budget`]) read the same function, so
+//! an admitted footprint and a declared one cannot drift apart.
+//!
+//! `smem_budget` (bytes) is passed **in** by the dispatch layer from `Gpu::smem_budget()` — the
+//! generators stay pure text functions with device-free tests, and an A100/H100 budget is therefore
+//! enumerable on a laptop. Its second job is to select the *emission form* via
+//! [`crate::gpu::smem_mode_for`]: at or below the PTX ISA's 48 KiB **static** `.shared` cap
+//! ([`crate::gpu::STATIC_SMEM_CAP`]) the historical `.shared` array is emitted **byte-identically**;
+//! beyond it the tile is carved out of the one module-scope [`crate::gpu::DSMEM_DECL`] window, which
+//! the launch wrapper must opt into (`Gpu::function_smem` + `dyn_launch_cfg`).
+//!
+//! **What the budget actually buys here is small, and saying so is the point.** With the tile pinned
+//! at [`TILE_P`]×[`TILE_Q`] and [`kblock`] capped at 8, the tiled conv's footprint is bounded by the
+//! *filter*: `((15+R)(15+S) + KB·R·S)·4`. Square filters fit up to `R=S=34` inside the static cap and
+//! only up to 51 / 66 / 78 at the 4050 / A100 / H100 opt-in windows — all far outside any real conv
+//! (7×7 is a ResNet stem, 11×11 an AlexNet conv1). The gate this replaced was 44 KiB, i.e. `R=S≤33`:
+//! **it declined nothing anyone runs.** What binds this family is the 1024-thread block cap
+//! (`TILE_P·TILE_Q` threads) and the `KB` accumulators per thread, not shared memory. The one conv
+//! configuration in this file where a bigger budget is the *only* road is widening the implicit-GEMM
+//! CTA tile: 64×64 costs 20480 B, 128×64 costs 38912 B (still static-legal, so the cheapest widening
+//! needs no window at all), and 128×128 costs 73728 B — over the ISA cap on every target. See
+//! `conv_smem_census_across_target_budgets` in this file's tests for the machine-checked table.
 
 // Every generator in this file opens its module with the shared `sm_80` header. The conv family
 // emits f32 arithmetic, shared memory, `cp.async`, `ldmatrix` and `wmma`/`mma.sync` fragments —
 // all Ampere-legal — and PTX is forward-compatible only, so the module is tagged with the LOWEST
 // legal target, never with the device's own arch (an `sm_89` tag loads on ZERO A100s).
+use crate::gpu::{smem_mode_for, SmemMode, DSMEM_DECL, DSMEM_SYM, STATIC_SMEM_CAP};
 use crate::ptx_target::HDR_SM80;
 
 /// Output-tile height a tiled-conv CTA computes (threads in `y`).
@@ -51,24 +80,95 @@ pub fn kblock(k: usize) -> usize {
     1
 }
 
-/// Whether the SMEM-tiled generator applies to this shape. The staged halo + `KB` weight windows must
-/// fit a conservative shared-memory budget, and `H>=R`, `W>=S` (a valid conv). Falls back to [`CONV2D`]
-/// otherwise so every shape stays runnable.
-pub fn tiled_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> bool {
+/// **The tiled generator's shared-memory footprint in bytes — the single source.**
+///
+/// `((TILE_P+r-1)·(TILE_Q+s-1) + kb·r·s)·4`: the staged input halo (one f32 per element, shared by all
+/// `kb` output channels) plus the `kb` weight windows of `r·s` taps. The gate
+/// ([`tiled_applies_budget`]) and the declaration ([`conv2d_ptx_budget`]) both read *this* function.
+/// They used to be two hand-written copies of the expression, and a desync there is not a build error:
+/// it admits a shape whose entry then declares more shared memory than the gate cleared.
+pub const fn tiled_smem_bytes(kb: usize, r: usize, s: usize) -> usize {
+    ((TILE_P + r - 1) * (TILE_Q + s - 1) + kb * r * s) * 4
+}
+
+/// Whether the SMEM-tiled generator applies to this shape **within `smem_budget` bytes**: a valid conv
+/// (`H>=R`, `W>=S`) whose [`tiled_smem_bytes`] fits. Callers that cannot spend the dynamic window pass
+/// [`STATIC_SMEM_CAP`]; a caller that can pass `Gpu::smem_budget()`. Everything it declines falls back
+/// to [`CONV2D`], so every shape stays runnable either way.
+pub fn tiled_applies_budget(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    smem_budget: usize,
+) -> bool {
     if h < r || w < s || c < 1 || k < 1 {
         return false;
     }
-    let halo = (TILE_P + r - 1) * (TILE_Q + s - 1);
-    let smem_bytes = (halo + kblock(k) * r * s) * 4;
-    // Stay well under the 48 KB default static-SMEM ceiling (no opt-in to the larger Ada banks).
-    smem_bytes <= 44 * 1024
+    tiled_smem_bytes(kblock(k), r, s) <= smem_budget
+}
+
+/// [`tiled_applies_budget`] at the **static** ceiling — the verdict for a launcher that declares its
+/// tile the historical way (`.shared` array, `shared_mem_bytes: 0`), which is every conv launcher in
+/// `gpu.rs` today.
+///
+/// This replaces a hardcoded `44 * 1024` whose comment claimed there was *"no opt-in to the larger Ada
+/// banks"*. That stopped being true when the dynamic-SMEM window landed (`Gpu::function_dyn` /
+/// `Gpu::smem_budget`), and the 44 KiB number never had a mechanism behind it either — the real static
+/// boundary is the PTX ISA's [`STATIC_SMEM_CAP`], and the real device boundary is the opt-in window.
+/// **The only verdict this changes is the 44–48 KiB band**, which at `KB=8` is reached solely by square
+/// filters `R=S=34` (`R=S∈{68,69,70}` at `KB=1`) — shapes that now take the tiled kernel instead of the
+/// naive fallback, computing the identical convolution.
+pub fn tiled_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> bool {
+    tiled_applies_budget(c, h, w, k, r, s, STATIC_SMEM_CAP)
 }
 
 /// Emit the SMEM-tiled, **channel-register-blocked** conv kernel specialized to
-/// `[C,H,W] (*) [K,C,R,S] -> [K,P,Q]`. Entry name is `conv2d`. One CTA computes a `TILE_P×TILE_Q`
-/// output tile for `KB=`[`kblock`]`(K)` output channels at once; each thread holds `KB` f32
-/// accumulators. Launch with block `(TILE_Q, TILE_P, 1)` and grid `(ceil(Q/TQ), ceil(P/TP), K/KB)`.
+/// `[C,H,W] (*) [K,C,R,S] -> [K,P,Q]`, spending at most [`STATIC_SMEM_CAP`] of shared memory. Entry
+/// name is `conv2d`. One CTA computes a `TILE_P×TILE_Q` output tile for `KB=`[`kblock`]`(K)` output
+/// channels at once; each thread holds `KB` f32 accumulators. Launch with block `(TILE_Q, TILE_P, 1)`
+/// and grid `(ceil(Q/TQ), ceil(P/TP), K/KB)`, `shared_mem_bytes: 0` (the tile is a static `.shared`).
+///
+/// Panics if the shape does not fit the static cap — pair it with [`tiled_applies`], or use
+/// [`conv2d_ptx_budget`] to spend a device window.
 pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
+    let (ptx, mode) = conv2d_ptx_budget(c, h, w, k, r, s, STATIC_SMEM_CAP);
+    debug_assert_eq!(
+        mode,
+        SmemMode::Static,
+        "the static cap cannot yield a window"
+    );
+    ptx
+}
+
+/// [`conv2d_ptx`] against an explicit shared-memory budget, returning the module **and the
+/// [`SmemMode`] its launch must honour** (`Gpu::function_smem` consumes exactly this pair, so no
+/// caller re-derives a size the generator already computed).
+///
+/// `smem_budget` is the ceiling this entry may spend — pass [`STATIC_SMEM_CAP`] for the historical
+/// static form, or `Gpu::smem_budget()` (the probed `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`: 99 KiB on this
+/// Ada laptop, 163 on A100, 227 on H100) to let a large-filter shape through. It also selects the
+/// *emission form* via [`smem_mode_for`]: at or below the ISA's static cap the historical
+/// `.shared .align 4 .b8 smem[N]` array is emitted **byte-for-byte**, and only beyond it does the tile
+/// move into the one module-scope [`DSMEM_DECL`] window. Nothing else about the kernel changes — the
+/// generator already forms every shared address as `mov.u32 %r10,<base>` plus a constant offset, so the
+/// window swap is one symbol.
+///
+/// Panics (loudly, at generation) when the footprint exceeds `smem_budget`: the decline belongs in
+/// [`tiled_applies_budget`] at dispatch, and the driver's own rejection
+/// (`ptxas error: Entry function 'conv2d' uses too much shared data`) names neither conv, the shape,
+/// nor the budget.
+pub fn conv2d_ptx_budget(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    smem_budget: usize,
+) -> (String, SmemMode) {
     use std::fmt::Write as _;
     let (tp, tq) = (TILE_P, TILE_Q);
     let kb = kblock(k);
@@ -81,13 +181,30 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let rs = r * s;
     let c_rs = c * rs; // stride between successive output channels in W
     let pq = p * q;
-    let smem_bytes = (halo + kb * rs) * 4;
+    // The one closed form the gate reads too. The 48 KiB ISA cap decides the FORM, the budget the
+    // CEILING — two different boundaries, and conflating them is what the old 44 KiB constant did.
+    let smem_bytes = tiled_smem_bytes(kb, r, s);
+    let mode = smem_mode_for(smem_bytes);
+    assert!(
+        smem_bytes <= smem_budget,
+        "conv2d: SMEM {smem_bytes} B (tile {tp}x{tq}, kblock {kb}, halo {halo_h}x{halo_w}, \
+         R={r} S={s}) exceeds the budget {smem_budget} B"
+    );
+    // Static: the entry's own `.shared` array, the historical spelling emitted verbatim. Dynamic: the
+    // single module-scope `wk_dsmem` window (its base is NOT guaranteed to be 0 — always go through
+    // the symbol, which this generator already did).
+    let sym = if mode.is_dynamic() { DSMEM_SYM } else { "smem" };
     let row_iters = halo_h.div_ceil(tp); // halo rows each thread strides over
     let col_iters = halo_w.div_ceil(tq);
     let w_iters = rs.div_ceil(nthreads); // weight loads per (kk, thread)
 
     let mut b = String::new();
     let _ = writeln!(b, "{HDR_SM80}");
+    if mode.is_dynamic() {
+        // MODULE SCOPE, not inside the entry — the identical line in an entry body is
+        // CUDA_ERROR_INVALID_PTX (measured; D6 §1.1).
+        b.push_str(DSMEM_DECL);
+    }
     let _ = writeln!(
         b,
         "// SMEM-tiled conv2d specialized to C={c} H={h} W={w} K={k} R={r} S={s}"
@@ -106,7 +223,9 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "    .reg .b32  %r<64>;");
     let _ = writeln!(b, "    .reg .f32  %f<32>;");
     let _ = writeln!(b, "    .reg .b64  %rd<12>;");
-    let _ = writeln!(b, "    .shared .align 4 .b8 smem[{smem_bytes}];");
+    if !mode.is_dynamic() {
+        let _ = writeln!(b, "    .shared .align 4 .b8 smem[{smem_bytes}];");
+    }
     let _ = writeln!(b);
     // global base pointers
     let _ = writeln!(b, "    ld.param.u64 %rd1,[pXin];");
@@ -128,7 +247,7 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "    add.s32 %r9,%r7,%r2;         // op = p0+ty");
     let _ = writeln!(
         b,
-        "    mov.u32 %r10,smem;           // smem base addr (shared u32)"
+        "    mov.u32 %r10,{sym};           // smem base addr (shared u32)"
     );
     // compute base addr in smem for this thread's window origin (ty*halo_w + tx)*4
     let _ = writeln!(
@@ -295,7 +414,7 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "RET:");
     let _ = writeln!(b, "    ret;");
     let _ = writeln!(b, "}}");
-    b
+    (b, mode)
 }
 
 /// Standalone **bias + ReLU** pointwise pass `O[i] = max(O[i] + bias[i/(P·Q)], 0)` over `O[K,P,Q]` (f32,
@@ -488,17 +607,57 @@ pub const WMMA_WN: usize = 2;
 /// CTA thread count for the WMMA implicit-GEMM conv (one warp per (WM,WN) cell).
 pub const WMMA_THREADS: usize = WMMA_WM * WMMA_WN * 32;
 
-/// Whether the fp16 tensor-core implicit-GEMM conv is worth dispatching for this shape. It is *correct*
-/// for any valid conv (guards zero-pad partial tiles), but only pays off once the GEMM has enough
-/// reduction depth and output tiles to feed the tensor cores; tiny `GK` makes the per-K-step staging
-/// overhead dominate. Heuristic: reduction `C*R*S >= 16` and a non-trivial spatial extent.
-pub fn wmma_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> bool {
+/// **The implicit-GEMM family's shared-memory footprint in bytes — the single source.**
+///
+/// `bufs·(BM·16·2) + bufs·(16·BN·2) + BM·BN·4`: the staged fp16 `BM×16` weight tile and `16×BN` im2col
+/// tile (`bufs=2` for the register-double-buffered variant, which alternates two of each), plus the f32
+/// `BM×BN` epilogue scratch `smemC`. At the shipped `WMMA_BM=WMMA_BN=64` that is 20480 B single-buffered
+/// and 24576 B double-buffered — 42 %/50 % of the ISA's static cap, so this family has by far the most
+/// headroom in the file, and widening its CTA tile is the only conv configuration here that a bigger
+/// device budget actually unlocks (128×64 = 38912 B still fits the static cap; 128×128 = 73728 B does
+/// not, on any target).
+///
+/// LANDMINE for a future widening: `smemC` is only live *after* the K-loop, so it could alias
+/// `smemA`+`smemB` and cut the 64×64 footprint from 20480 to 16384 B. That is a real lever and a
+/// separate change — it would alter the emitted PTX of every shipped conv, so it does not belong in a
+/// budget-plumbing commit.
+pub const fn conv_wmma_smem_bytes(bm: usize, bn: usize, bufs: usize) -> usize {
+    bufs * (bm * 16 * 2) + bufs * (16 * bn * 2) + bm * bn * 4
+}
+
+/// Whether the fp16 tensor-core implicit-GEMM conv is worth dispatching for this shape **within
+/// `smem_budget` bytes**. It is *correct* for any valid conv (guards zero-pad partial tiles), but only
+/// pays off once the GEMM has enough reduction depth and output tiles to feed the tensor cores; tiny
+/// `GK` makes the per-K-step staging overhead dominate. Heuristic: reduction `C*R*S >= 16` and a
+/// non-trivial spatial extent — plus [`conv_wmma_smem_bytes`] fitting the budget.
+///
+/// The SMEM term is constant today (the CTA tile is [`WMMA_BM`]×[`WMMA_BN`] compile-time constants, so
+/// it is always 20480 B and always fits): it is here so the gate and the generator's assert read the
+/// same closed form, and so a widened tile is declined at *dispatch* rather than at `cuModuleLoadData`.
+pub fn wmma_applies_budget(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    smem_budget: usize,
+) -> bool {
     if h < r || w < s || k < 1 || c < 1 {
+        return false;
+    }
+    if conv_wmma_smem_bytes(WMMA_BM, WMMA_BN, 1) > smem_budget {
         return false;
     }
     let gk = c * r * s;
     let n = (h - r + 1) * (w - s + 1);
     gk >= 16 && n >= 16 && k >= 16
+}
+
+/// [`wmma_applies_budget`] at the **static** ceiling — the verdict for the launchers in `gpu.rs`, all
+/// of which declare their tile as a `.shared` array and launch with `shared_mem_bytes: 0`.
+pub fn wmma_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> bool {
+    wmma_applies_budget(c, h, w, k, r, s, STATIC_SMEM_CAP)
 }
 
 /// Emit the fp16 tensor-core implicit-GEMM conv specialized to `[C,H,W] (*) [K,C,R,S] -> [K,P,Q]`.
@@ -507,7 +666,46 @@ pub fn wmma_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) 
 /// all warps), then every warp computes its `tm×tn` grid of `m16n16k16` tiles out of SMEM. Launch with
 /// block `(WMMA_THREADS,1,1)` and grid `(ceil(N/WMMA_BN), ceil(M/WMMA_BM), 1)` where `M=K`, `N=P*Q`.
 pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false, 1, 0)
+    conv_wmma_ptx_budget(c, h, w, k, r, s, STATIC_SMEM_CAP).0
+}
+
+/// [`conv_wmma_ptx`] against an explicit shared-memory budget, returning the module **and the
+/// [`SmemMode`] its launch must honour** — the seam every other variant in this family routes through
+/// (`conv_wmma_ptx_impl` takes the same budget).
+///
+/// The CTA tile is [`WMMA_BM`]×[`WMMA_BN`] compile-time constants, so the footprint
+/// ([`conv_wmma_smem_bytes`]) is 20480 B for *every* shape and the mode is always
+/// [`SmemMode::Static`] — the budget is a ceiling assert here, not a switch. It exists so that the day
+/// the tile is parameterized (`gpu.rs`'s `conv_wmma_cfg` grid/block must move in the same commit) the
+/// ceiling is already checked at generation instead of surfacing as an opaque
+/// `ptxas error: uses too much shared data` out of `cuModuleLoadData`.
+pub fn conv_wmma_ptx_budget(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    smem_budget: usize,
+) -> (String, SmemMode) {
+    let ptx = conv_wmma_ptx_impl(
+        c,
+        h,
+        w,
+        k,
+        r,
+        s,
+        1,
+        crate::ptx_wmma::Act::None,
+        false,
+        1,
+        0,
+        smem_budget,
+    );
+    (
+        ptx,
+        smem_mode_for(conv_wmma_smem_bytes(WMMA_BM, WMMA_BN, 1)),
+    )
 }
 
 /// **Split-K** variant of [`conv_wmma_ptx`] (entry `conv2d_wmma_splitk`): the `GK=C*R*S` reduction is
@@ -538,6 +736,7 @@ pub fn conv_wmma_splitk_ptx(
         false,
         1,
         0,
+        STATIC_SMEM_CAP,
     )
 }
 
@@ -558,7 +757,7 @@ pub fn conv_wmma_epi_ptx(
     act: crate::ptx_wmma::Act,
     bias: bool,
 ) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, act, bias, 1, 0)
+    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, act, bias, 1, 0, STATIC_SMEM_CAP)
 }
 
 /// **Strided** implicit-GEMM conv (entry `conv2d_wmma`): downsampling conv with `stride>1`, output
@@ -587,6 +786,7 @@ pub fn conv_wmma_strided_ptx(
         false,
         stride,
         0,
+        STATIC_SMEM_CAP,
     )
 }
 
@@ -618,6 +818,7 @@ pub fn conv_wmma_pad_ptx(
         false,
         stride,
         pad,
+        STATIC_SMEM_CAP,
     )
 }
 
@@ -651,6 +852,7 @@ pub fn conv_wmma_pad_splitk_ptx(
         false,
         stride,
         pad,
+        STATIC_SMEM_CAP,
     )
 }
 
@@ -744,6 +946,11 @@ fn conv_wmma_ptx_impl(
     bias: bool,
     stride: usize,
     pad: usize,
+    // The SMEM ceiling this entry may spend, in bytes. Every public wrapper passes `STATIC_SMEM_CAP`
+    // (the PTX ISA's static `.shared` limit); a device budget arrives through `conv_wmma_ptx_budget`.
+    // Constant-footprint today — see `conv_wmma_smem_bytes` — so this is a ceiling assert, kept here
+    // because generation is the only place that can name the family, the tile and the byte count.
+    smem_budget: usize,
 ) -> String {
     use std::fmt::Write as _;
     assert!(stride >= 1, "stride must be >= 1");
@@ -800,6 +1007,20 @@ fn conv_wmma_ptx_impl(
     let smem_a = bm * 16 * 2; // f16 bytes
     let smem_b = 16 * bn * 2;
     let smem_c = bm * bn * 4; // f32 store scratch
+                              // The family's closed form, from the one place both the gate and this declaration read. The
+                              // budget is the CEILING; `STATIC_SMEM_CAP` is the boundary between the two emission forms —
+                              // this family is on the static side at every shipped tile, which the second assert pins.
+    let smem_total = conv_wmma_smem_bytes(bm, bn, 1);
+    debug_assert_eq!(smem_total, smem_a + smem_b + smem_c);
+    assert!(
+        smem_total <= smem_budget,
+        "conv2d_wmma: SMEM {smem_total} B ({bm}x{bn} tile) exceeds the budget {smem_budget} B"
+    );
+    assert!(
+        !smem_mode_for(smem_total).is_dynamic(),
+        "conv2d_wmma: {smem_total} B needs the dynamic window, which this generator does not emit \
+         (widening the CTA tile must land with the `.extern` window AND gpu.rs's conv_wmma_cfg)"
+    );
 
     let veclist = |pre: &str| -> String {
         let regs: Vec<String> = (0..8).map(|i| format!("%{pre}{i}")).collect();
@@ -1325,7 +1546,7 @@ fn splitk_factor_for_n(gk: usize, n: usize, k: usize, sm_count: usize) -> usize 
 /// in-flight slice. Split-K (`sk`) is orthogonal and threaded through identically to the single-buffer
 /// kernel. Requires the per-buffer tile bytes to be powers of two (the buffer toggle is an XOR).
 pub fn conv_wmma_db_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
-    conv_wmma_db_ptx_impl(c, h, w, k, r, s, 1)
+    conv_wmma_db_ptx_impl(c, h, w, k, r, s, 1, STATIC_SMEM_CAP)
 }
 
 /// Split-K variant of [`conv_wmma_db_ptx`] (entry `conv2d_wmma_splitk`) — the double-buffered pipeline
@@ -1339,9 +1560,10 @@ pub fn conv_wmma_db_splitk_ptx(
     s: usize,
     sk: usize,
 ) -> String {
-    conv_wmma_db_ptx_impl(c, h, w, k, r, s, sk)
+    conv_wmma_db_ptx_impl(c, h, w, k, r, s, sk, STATIC_SMEM_CAP)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv_wmma_db_ptx_impl(
     c: usize,
     h: usize,
@@ -1350,6 +1572,9 @@ fn conv_wmma_db_ptx_impl(
     r: usize,
     s: usize,
     sk: usize,
+    // The SMEM ceiling, as in `conv_wmma_ptx_impl` — but over `conv_wmma_smem_bytes(bm, bn, 2)`, since
+    // this variant carries TWO A rings and TWO B rings (the register-double-buffered pipeline).
+    smem_budget: usize,
 ) -> String {
     use std::fmt::Write as _;
     let p = h - r + 1;
@@ -1395,6 +1620,17 @@ fn conv_wmma_db_ptx_impl(
     let smem_a = 2 * tile_a; // double-buffered
     let smem_b = 2 * tile_b;
     let smem_c = bm * bn * 4; // f32 store scratch (single, epilogue-only)
+    let smem_total = conv_wmma_smem_bytes(bm, bn, 2);
+    debug_assert_eq!(smem_total, smem_a + smem_b + smem_c);
+    assert!(
+        smem_total <= smem_budget,
+        "conv2d_wmma (db): SMEM {smem_total} B ({bm}x{bn} tile, 2 buffers) exceeds the budget \
+         {smem_budget} B"
+    );
+    assert!(
+        !smem_mode_for(smem_total).is_dynamic(),
+        "conv2d_wmma (db): {smem_total} B needs the dynamic window, which this generator does not emit"
+    );
 
     let veclist = |pre: &str| -> String {
         let regs: Vec<String> = (0..8).map(|i| format!("%{pre}{i}")).collect();
@@ -1797,6 +2033,28 @@ mod tests {
                 &conv_splitk_reduce_ptx(k * 196, sk),
             );
         }
+        // The budget seam's second emission form: the module-scope `.extern .shared` window. It is a
+        // different text path (an extra declaration line, a different base symbol), so it needs its own
+        // pass through the ASCII gate — the whole point of the gate is that no variant goes unchecked.
+        let window_rows: [(usize, usize, usize, usize, usize, usize, usize); 3] = [
+            (2, 64, 64, 8, 40, 40, 101_376),
+            (4, 96, 96, 8, 48, 48, 166_912),
+            (1, 128, 128, 4, 60, 60, 232_448),
+        ];
+        for (c, h, w, k, r, s, budget) in window_rows {
+            let (ptx, mode) = conv2d_ptx_budget(c, h, w, k, r, s, budget);
+            assert!(mode.is_dynamic(), "this row must exercise the window");
+            assert_ptx_ascii("conv2d_ptx_budget (dynamic window)", &ptx);
+        }
+        // ...and the budget-carrying entry points on the static side.
+        assert_ptx_ascii(
+            "conv2d_ptx_budget (static)",
+            &conv2d_ptx_budget(64, 28, 28, 64, 3, 3, STATIC_SMEM_CAP).0,
+        );
+        assert_ptx_ascii(
+            "conv_wmma_ptx_budget",
+            &conv_wmma_ptx_budget(64, 28, 28, 64, 3, 3, STATIC_SMEM_CAP).0,
+        );
     }
 
     /// **Header-floor gate, device-free.** Every conv module — the `CONV2D` literal included — must
@@ -1859,6 +2117,415 @@ mod tests {
             13,
             "every conv generator must be covered by the header gate"
         );
+    }
+
+    /// FNV-1a 64 over the raw bytes — a dependency-free, deterministic digest of a PTX module.
+    /// Used only by [`shipped_conv_ptx_is_byte_identical`]; it never reaches the device.
+    pub(super) fn ptx_digest(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Every conv module this crate can dispatch today, at the shapes the dispatch tables and benches
+    /// actually use. `(label, ptx)`.
+    pub(super) fn shipped_conv_modules() -> Vec<(String, String)> {
+        use crate::ptx_wmma::Act;
+        let mut out: Vec<(String, String)> = vec![("CONV2D".into(), CONV2D.to_string())];
+        // The bench/dispatch corpus (`gpu.rs` conv_vs_peers): a ResNet-ish 3x3 stack, a 1x1, a 5x5.
+        let corpus = [
+            (3usize, 64usize, 64usize, 64usize, 3usize, 3usize),
+            (64, 56, 56, 64, 3, 3),
+            (128, 28, 28, 128, 3, 3),
+            (256, 14, 14, 256, 3, 3),
+            (32, 32, 32, 32, 5, 5),
+            (64, 56, 56, 64, 1, 1),
+            (8, 16, 16, 48, 5, 5),
+        ];
+        for (c, h, w, k, r, s) in corpus {
+            let tag = format!("C{c}_{h}x{w}_K{k}_{r}x{s}");
+            out.push((format!("conv2d_ptx/{tag}"), conv2d_ptx(c, h, w, k, r, s)));
+            out.push((
+                format!("conv_wmma_ptx/{tag}"),
+                conv_wmma_ptx(c, h, w, k, r, s),
+            ));
+            out.push((
+                format!("conv_wmma_db_ptx/{tag}"),
+                conv_wmma_db_ptx(c, h, w, k, r, s),
+            ));
+            out.push((
+                format!("conv_wmma_strided_ptx.s2/{tag}"),
+                conv_wmma_strided_ptx(c, h, w, k, r, s, 2),
+            ));
+            out.push((
+                format!("conv_wmma_pad_ptx.s1p1/{tag}"),
+                conv_wmma_pad_ptx(c, h, w, k, r, s, 1, 1),
+            ));
+            out.push((
+                format!("conv_wmma_epi_ptx.relu_bias/{tag}"),
+                conv_wmma_epi_ptx(c, h, w, k, r, s, Act::Relu, true),
+            ));
+            out.push((
+                format!("conv_wmma_epi_ptx.silu_nobias/{tag}"),
+                conv_wmma_epi_ptx(c, h, w, k, r, s, Act::Silu, false),
+            ));
+            out.push((
+                format!("bias_relu_ptx/{tag}"),
+                bias_relu_ptx(k, (h - r + 1) * (w - s + 1)),
+            ));
+            out.push((
+                format!("pad_nchw_copy_ptx.p1/{tag}"),
+                pad_nchw_copy_ptx(c, h, w, 1),
+            ));
+        }
+        // Split-K needs sk | GK and GK/sk a multiple of 16, so it carries its own shape list.
+        for (c, h, w, k, r, s, sk) in [
+            (256usize, 14usize, 14usize, 256usize, 3usize, 3usize, 4usize),
+            (128, 28, 28, 128, 1, 1, 2),
+        ] {
+            let tag = format!("C{c}_{h}x{w}_K{k}_{r}x{s}_sk{sk}");
+            out.push((
+                format!("conv_wmma_splitk_ptx/{tag}"),
+                conv_wmma_splitk_ptx(c, h, w, k, r, s, sk),
+            ));
+            out.push((
+                format!("conv_wmma_db_splitk_ptx/{tag}"),
+                conv_wmma_db_splitk_ptx(c, h, w, k, r, s, sk),
+            ));
+            out.push((
+                format!("conv_wmma_pad_splitk_ptx.s1p1/{tag}"),
+                conv_wmma_pad_splitk_ptx(c, h, w, k, r, s, 1, 1, sk),
+            ));
+            out.push((
+                format!("conv_splitk_reduce_ptx/{tag}"),
+                conv_splitk_reduce_ptx(k * (h - r + 1) * (w - s + 1), sk),
+            ));
+        }
+        out
+    }
+
+    /// `(label, byte length, FNV-1a 64)` of every module in [`shipped_conv_modules`], **recorded from
+    /// the binary built at this commit's parent** — i.e. before the budget seam existed. It is the
+    /// "before" half of [`shipped_conv_ptx_is_byte_identical`].
+    #[rustfmt::skip]
+    const SHIPPED_CONV_PTX: &[(&str, usize, u64)] = &[
+        ("CONV2D", 2681, 0x2478944dab44b71b),
+        ("conv2d_ptx/C3_64x64_K64_3x3", 15478, 0xc55713bbeb38db50),
+        ("conv_wmma_ptx/C3_64x64_K64_3x3", 37774, 0x992109419c26dd6b),
+        ("conv_wmma_db_ptx/C3_64x64_K64_3x3", 42524, 0x8b9e4b569acbcf2e),
+        ("conv_wmma_strided_ptx.s2/C3_64x64_K64_3x3", 38093, 0xb4185595828a2946),
+        ("conv_wmma_pad_ptx.s1p1/C3_64x64_K64_3x3", 40366, 0x8795e80d2a84cc97),
+        ("conv_wmma_epi_ptx.relu_bias/C3_64x64_K64_3x3", 43614, 0xecfb044e86e6a5b5),
+        ("conv_wmma_epi_ptx.silu_nobias/C3_64x64_K64_3x3", 42926, 0xde31156424c0589f),
+        ("bias_relu_ptx/C3_64x64_K64_3x3", 848, 0x08ea69e48422d2e8),
+        ("pad_nchw_copy_ptx.p1/C3_64x64_K64_3x3", 1251, 0x2b6f7c61101429ba),
+        ("conv2d_ptx/C64_56x56_K64_3x3", 15489, 0x9d13067b423d3b41),
+        ("conv_wmma_ptx/C64_56x56_K64_3x3", 37801, 0x9f7d0ed3ae661be3),
+        ("conv_wmma_db_ptx/C64_56x56_K64_3x3", 42575, 0xed10b28d61da8ff2),
+        ("conv_wmma_strided_ptx.s2/C64_56x56_K64_3x3", 38120, 0x9ce481ea5e1d625b),
+        ("conv_wmma_pad_ptx.s1p1/C64_56x56_K64_3x3", 40393, 0xbf271347c42407f8),
+        ("conv_wmma_epi_ptx.relu_bias/C64_56x56_K64_3x3", 43641, 0x8dbb2a91bb381b7d),
+        ("conv_wmma_epi_ptx.silu_nobias/C64_56x56_K64_3x3", 42953, 0x2a928ae207aa5aef),
+        ("bias_relu_ptx/C64_56x56_K64_3x3", 848, 0xcdd53372c4b734ed),
+        ("pad_nchw_copy_ptx.p1/C64_56x56_K64_3x3", 1253, 0x72cceabe1c414046),
+        ("conv2d_ptx/C128_28x28_K128_3x3", 15486, 0x602e1a975e40a25e),
+        ("conv_wmma_ptx/C128_28x28_K128_3x3", 37789, 0xe2524f5d6fdf25b1),
+        ("conv_wmma_db_ptx/C128_28x28_K128_3x3", 42579, 0xbebc7d534b8d2878),
+        ("conv_wmma_strided_ptx.s2/C128_28x28_K128_3x3", 38173, 0xfeff07e3e9c6f5bc),
+        ("conv_wmma_pad_ptx.s1p1/C128_28x28_K128_3x3", 40381, 0x9d4698d4ce94a4d3),
+        ("conv_wmma_epi_ptx.relu_bias/C128_28x28_K128_3x3", 43629, 0xd40956a4eb5c71e3),
+        ("conv_wmma_epi_ptx.silu_nobias/C128_28x28_K128_3x3", 42941, 0x80544b88cc3ba3f5),
+        ("bias_relu_ptx/C128_28x28_K128_3x3", 846, 0xfdb8b5b15615b67c),
+        ("pad_nchw_copy_ptx.p1/C128_28x28_K128_3x3", 1251, 0xbaa3e6db29409ad0),
+        ("conv2d_ptx/C256_14x14_K256_3x3", 15485, 0x2b70dae3b35632e0),
+        ("conv_wmma_ptx/C256_14x14_K256_3x3", 37789, 0x45959b6b5991f3a9),
+        ("conv_wmma_db_ptx/C256_14x14_K256_3x3", 42579, 0x4116acfffea063d0),
+        ("conv_wmma_strided_ptx.s2/C256_14x14_K256_3x3", 38084, 0x19a37d642b8e34d9),
+        ("conv_wmma_pad_ptx.s1p1/C256_14x14_K256_3x3", 40381, 0xd7dcf8950d49568a),
+        ("conv_wmma_epi_ptx.relu_bias/C256_14x14_K256_3x3", 43629, 0x51803d1871fe3507),
+        ("conv_wmma_epi_ptx.silu_nobias/C256_14x14_K256_3x3", 42941, 0x0f43d9297846ade5),
+        ("bias_relu_ptx/C256_14x14_K256_3x3", 846, 0x9bdf232b419385b2),
+        ("pad_nchw_copy_ptx.p1/C256_14x14_K256_3x3", 1250, 0xde981de277df1376),
+        ("conv2d_ptx/C32_32x32_K32_5x5", 25088, 0x85d2d4d10d7d3eae),
+        ("conv_wmma_ptx/C32_32x32_K32_5x5", 37744, 0xc24d7c9e2f092193),
+        ("conv_wmma_db_ptx/C32_32x32_K32_5x5", 42526, 0xb33d64987dd50b2e),
+        ("conv_wmma_strided_ptx.s2/C32_32x32_K32_5x5", 38128, 0xf3213daec84745c6),
+        ("conv_wmma_pad_ptx.s1p1/C32_32x32_K32_5x5", 40336, 0x9eae397d9df3cadd),
+        ("conv_wmma_epi_ptx.relu_bias/C32_32x32_K32_5x5", 43584, 0x071f5c3fb5f1dc35),
+        ("conv_wmma_epi_ptx.silu_nobias/C32_32x32_K32_5x5", 42896, 0xde0540107bff7d9f),
+        ("bias_relu_ptx/C32_32x32_K32_5x5", 846, 0x5c16c428cc2b53be),
+        ("pad_nchw_copy_ptx.p1/C32_32x32_K32_5x5", 1252, 0xb99f776ed5978107),
+        ("conv2d_ptx/C64_56x56_K64_1x1", 8522, 0xa36b699f3d3b93c6),
+        ("conv_wmma_ptx/C64_56x56_K64_1x1", 37775, 0x32a1b841b84c1020),
+        ("conv_wmma_db_ptx/C64_56x56_K64_1x1", 42525, 0xec92827e48410e9b),
+        ("conv_wmma_strided_ptx.s2/C64_56x56_K64_1x1", 38094, 0x3c6c81e8b32aa96a),
+        ("conv_wmma_pad_ptx.s1p1/C64_56x56_K64_1x1", 40367, 0x34ca804c7a99c6fd),
+        ("conv_wmma_epi_ptx.relu_bias/C64_56x56_K64_1x1", 43615, 0x85031476cfdc7136),
+        ("conv_wmma_epi_ptx.silu_nobias/C64_56x56_K64_1x1", 42927, 0xb34821c9bfe541dc),
+        ("bias_relu_ptx/C64_56x56_K64_1x1", 848, 0xa286ec87eb8bbb92),
+        ("pad_nchw_copy_ptx.p1/C64_56x56_K64_1x1", 1253, 0x72cceabe1c414046),
+        ("conv2d_ptx/C8_16x16_K48_5x5", 25077, 0x2a050096777c59c1),
+        ("conv_wmma_ptx/C8_16x16_K48_5x5", 37735, 0x5fbe2b7b54483400),
+        ("conv_wmma_db_ptx/C8_16x16_K48_5x5", 42509, 0xaf0a679a363db66f),
+        ("conv_wmma_strided_ptx.s2/C8_16x16_K48_5x5", 38030, 0x2aace79cb0677f76),
+        ("conv_wmma_pad_ptx.s1p1/C8_16x16_K48_5x5", 40327, 0x534bd2bb404263cf),
+        ("conv_wmma_epi_ptx.relu_bias/C8_16x16_K48_5x5", 43575, 0x09cd2bd59ab9d06a),
+        ("conv_wmma_epi_ptx.silu_nobias/C8_16x16_K48_5x5", 42887, 0xce8fa0fd505bff74),
+        ("bias_relu_ptx/C8_16x16_K48_5x5", 845, 0x555ffd2f111d7e21),
+        ("pad_nchw_copy_ptx.p1/C8_16x16_K48_5x5", 1247, 0xe8ccec08f7600aaa),
+        ("conv_wmma_splitk_ptx/C256_14x14_K256_3x3_sk4", 40196, 0x38006233d0e2e3b7),
+        ("conv_wmma_db_splitk_ptx/C256_14x14_K256_3x3_sk4", 44002, 0x574eff00b28b9577),
+        ("conv_wmma_pad_splitk_ptx.s1p1/C256_14x14_K256_3x3_sk4", 42788, 0x5aead7fc27957832),
+        ("conv_splitk_reduce_ptx/C256_14x14_K256_3x3_sk4", 1277, 0x202d6b83efd2def7),
+        ("conv_wmma_splitk_ptx/C128_28x28_K128_1x1_sk2", 40200, 0x150fd26f887ca829),
+        ("conv_wmma_db_splitk_ptx/C128_28x28_K128_1x1_sk2", 43982, 0xe878b3e17fa66807),
+        ("conv_wmma_pad_splitk_ptx.s1p1/C128_28x28_K128_1x1_sk2", 42792, 0x2fe7e7088ba1f6ff),
+        ("conv_splitk_reduce_ptx/C128_28x28_K128_1x1_sk2", 1021, 0xb77596a632faa18c),
+    ];
+
+    /// **The before/after gate for the budget seam, device-free.** Threading `smem_budget` through the
+    /// conv generators must leave every *shipped* module byte-identical: the emission rule is that at or
+    /// below [`STATIC_SMEM_CAP`] the historical static `.shared` spelling is emitted verbatim, and every
+    /// caller in `gpu.rs` passes exactly that. Byte-identity is not cosmetic — it keeps the persistent
+    /// cubin cache (keyed on the PTX hash) warm and makes "no measured conv number moved" a claim about
+    /// the machine rather than about the change.
+    ///
+    /// The pins in [`SHIPPED_CONV_PTX`] were recorded from the binary built at this commit's **parent**,
+    /// so this really is an across-the-change comparison and not a self-consistency tautology. A
+    /// deliberate future change to a generator updates them from the printed table below.
+    #[test]
+    fn shipped_conv_ptx_is_byte_identical() {
+        let got = shipped_conv_modules();
+        let mut bad = Vec::new();
+        assert_eq!(
+            got.len(),
+            SHIPPED_CONV_PTX.len(),
+            "the shipped-module list and its pinned digests must stay in step"
+        );
+        for ((label, ptx), (plabel, plen, pdig)) in got.iter().zip(SHIPPED_CONV_PTX) {
+            assert_eq!(label, plabel, "pin order must match the generated order");
+            let (len, dig) = (ptx.len(), ptx_digest(ptx));
+            if len != *plen || dig != *pdig {
+                bad.push(format!(
+                    "  {label}: pinned ({plen} B, 0x{pdig:016x}) != got ({len} B, 0x{dig:016x})"
+                ));
+            }
+        }
+        if !bad.is_empty() {
+            for (label, ptx) in &got {
+                println!("(\"{label}\", {}, 0x{:016x}),", ptx.len(), ptx_digest(ptx));
+            }
+            panic!(
+                "{} shipped conv module(s) changed byte-for-byte:\n{}\nIf intended, replace \
+                 SHIPPED_CONV_PTX with the table printed above.",
+                bad.len(),
+                bad.join("\n")
+            );
+        }
+    }
+
+    /// Largest square filter `R=S=f` the tiled generator can stage inside `budget` bytes at channel
+    /// block `kb`. Monotone in `f` (the footprint is strictly increasing), so a linear scan is exact.
+    fn max_square_filter(kb: usize, budget: usize) -> usize {
+        (1usize..4096)
+            .take_while(|&f| tiled_smem_bytes(kb, f, f) <= budget)
+            .last()
+            .unwrap_or(0)
+    }
+
+    // The three device budgets: `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`, 99 / 163 / 227 KiB (D6 §1.3 —
+    // the 4050 row is the value probed on this box, the other two are the vendor tuning guides).
+    const OPTIN_ADA_4050: usize = 101_376;
+    const OPTIN_A100: usize = 166_912;
+    const OPTIN_H100: usize = 232_448;
+    // `MAX_SHARED_MEMORY_PER_MULTIPROCESSOR`, 100 / 164 / 228 KiB — the residency *denominator*, and a
+    // different number from the per-block ceiling above. Both are needed: per-block legality uses the
+    // opt-in maximum, residency arithmetic uses the per-SM carveout.
+    const SMEM_SM_ADA_4050: usize = 102_400;
+    const SMEM_SM_A100: usize = 167_936;
+    const SMEM_SM_H100: usize = 233_472;
+    // CUDA reserves 1 KiB of shared memory per block, and it is real in the residency arithmetic
+    // (measured, D6 §3.1 probe 6).
+    const SMEM_RESERVED_PER_BLOCK: usize = 1024;
+
+    /// **The census the budget lift is really about — device-free arithmetic, no sweep.**
+    ///
+    /// Reading it: the retired gate was a hardcoded 44 KiB whose comment claimed the larger banks could
+    /// not be opted into. Both halves are now false, but the honest finding is that **the gate was
+    /// declining nothing anyone runs.** With the tile pinned at 16×16 and `KB ≤ 8`, the tiled conv's
+    /// footprint is bounded by the *filter*, so what the budget buys is bigger `R=S` — and 33 → 34 (the
+    /// ISA cap) → 51 / 66 / 78 (the three device windows) are all far outside the DL envelope, where
+    /// 11×11 is an AlexNet conv1 and 7×7 a ResNet stem. What binds this family is the 1024-thread block
+    /// cap (`TILE_P·TILE_Q` threads) and `KB` accumulators per thread, not shared memory.
+    ///
+    /// The one conv configuration in this file where a bigger budget is the *only* road is widening the
+    /// implicit-GEMM CTA tile, whose `BM·BN·4` epilogue scratch dominates: 64×64 = 20 KiB, 128×64 = 38
+    /// KiB (still static-legal — so the cheapest widening needs no window at all, which is itself the
+    /// evidence that the budget was not the blocker), 128×128 = 72 KiB (over the ISA cap on every
+    /// target, and at 1 CTA/SM on the 4050 vs 2 on A100 and 3 on H100).
+    #[test]
+    fn conv_smem_census_across_target_budgets() {
+        // (1) The direct tiled conv: what each budget admits, in square-filter extent.
+        const RETIRED_GATE: usize = 44 * 1024;
+        let census = [
+            ("retired 44 KiB gate", RETIRED_GATE, 33usize, 67usize),
+            ("PTX ISA static cap", STATIC_SMEM_CAP, 34, 70),
+            ("RTX 4050 opt-in", OPTIN_ADA_4050, 51, 104),
+            ("A100 opt-in", OPTIN_A100, 66, 136),
+            ("H100 opt-in", OPTIN_H100, 78, 162),
+        ];
+        for (what, budget, kb8, kb1) in census {
+            assert_eq!(max_square_filter(8, budget), kb8, "{what}: KB=8 R=S extent");
+            assert_eq!(max_square_filter(1, budget), kb1, "{what}: KB=1 R=S extent");
+            println!("{what:22} {budget:7} B -> R=S<={kb8:3} (KB=8), <={kb1:3} (KB=1)");
+        }
+
+        // (2) ...and none of it reaches a real conv: every shape the dispatch corpus and the benches
+        // use already fits the *static* cap, so the device window frees zero shipped shapes. This is
+        // the negative result, asserted rather than asserted-away.
+        for (c, h, w, k, r, s) in [
+            (3usize, 64usize, 64usize, 64usize, 3usize, 3usize),
+            (64, 56, 56, 64, 3, 3),
+            (128, 28, 28, 128, 3, 3),
+            (256, 14, 14, 256, 3, 3),
+            (32, 32, 32, 32, 5, 5),
+            (64, 56, 56, 64, 1, 1),
+            (8, 16, 16, 48, 5, 5),
+            (3, 224, 224, 64, 7, 7),   // ResNet stem
+            (3, 227, 227, 96, 11, 11), // AlexNet conv1 (the widest filter in common use)
+        ] {
+            assert!(
+                tiled_applies_budget(c, h, w, k, r, s, STATIC_SMEM_CAP),
+                "C{c} {h}x{w} K{k} {r}x{s} should already fit the static cap"
+            );
+            assert!(
+                tiled_smem_bytes(kblock(k), r, s) <= RETIRED_GATE,
+                "C{c} {h}x{w} K{k} {r}x{s} fit even the retired 44 KiB gate"
+            );
+        }
+
+        // (3) The implicit-GEMM family: the tile widths a budget admits, and the residency they imply.
+        assert_eq!(conv_wmma_smem_bytes(WMMA_BM, WMMA_BN, 1), 20480);
+        assert_eq!(conv_wmma_smem_bytes(WMMA_BM, WMMA_BN, 2), 24576); // register-double-buffered
+        assert_eq!(conv_wmma_smem_bytes(128, 64, 1), 38912);
+        assert_eq!(conv_wmma_smem_bytes(128, 128, 1), 73728);
+        assert!(
+            conv_wmma_smem_bytes(128, 64, 1) <= STATIC_SMEM_CAP,
+            "128x64 is static-legal today: the cheapest widening needs no window"
+        );
+        assert!(
+            conv_wmma_smem_bytes(128, 128, 1) > STATIC_SMEM_CAP,
+            "128x128 is the first conv tile that REQUIRES the dynamic window"
+        );
+        for budget in [OPTIN_ADA_4050, OPTIN_A100, OPTIN_H100] {
+            assert!(conv_wmma_smem_bytes(128, 128, 1) <= budget);
+        }
+        // CTAs/SM from the SMEM term alone (D6 §3.1): floor(SMEM_sm / (bytes + reserved)).
+        let ctas = |smem_sm: usize, bytes: usize| smem_sm / (bytes + SMEM_RESERVED_PER_BLOCK);
+        assert_eq!(ctas(SMEM_SM_ADA_4050, 73728), 1, "4050 starves at 128x128");
+        assert_eq!(ctas(SMEM_SM_A100, 73728), 2);
+        assert_eq!(ctas(SMEM_SM_H100, 73728), 3);
+        // The shipped 64x64 tile is nowhere near SMEM-bound on any target.
+        assert_eq!(ctas(SMEM_SM_ADA_4050, 20480), 4);
+        assert_eq!(ctas(SMEM_SM_A100, 20480), 7);
+        assert_eq!(ctas(SMEM_SM_H100, 20480), 10);
+    }
+
+    /// **The window arm, device-free.** Above [`STATIC_SMEM_CAP`] the tile must move into the ONE
+    /// module-scope `.extern .shared` window: declared before the entry (the identical line inside an
+    /// entry body is `CUDA_ERROR_INVALID_PTX`), no static `.shared` array left behind, every address
+    /// still formed through the symbol (the window base is not guaranteed to be 0), and the returned
+    /// [`SmemMode`] carrying the exact byte count the launch must pass.
+    #[test]
+    fn conv2d_ptx_crosses_into_the_dynamic_window_above_the_isa_cap() {
+        // A 40x40 filter at KB=8: 15100 elems -> 60400 B, past the ISA cap, inside the 4050's window.
+        let (c, h, w, k, r, s) = (2usize, 64usize, 64usize, 8usize, 40usize, 40usize);
+        let bytes = tiled_smem_bytes(kblock(k), r, s);
+        assert!(
+            bytes > STATIC_SMEM_CAP && bytes <= OPTIN_ADA_4050,
+            "{bytes}"
+        );
+        assert!(
+            !tiled_applies(c, h, w, k, r, s),
+            "declined by the static gate"
+        );
+        assert!(
+            tiled_applies_budget(c, h, w, k, r, s, OPTIN_ADA_4050),
+            "admitted once the device window is the budget"
+        );
+
+        let (ptx, mode) = conv2d_ptx_budget(c, h, w, k, r, s, OPTIN_ADA_4050);
+        assert_eq!(mode, SmemMode::Dynamic(bytes as u32));
+        assert_eq!(mode.launch_bytes(), bytes);
+        // The window arm is a second text path, so it needs the header floor and the ASCII gate too —
+        // an `sm_89` tag or one non-ASCII byte here would be just as fatal as in the static arm.
+        assert!(
+            ptx.starts_with(HDR_SM80),
+            "the floor still leads the module"
+        );
+        assert!(!ptx.contains(crate::ptx_target::TARGET_SM89));
+        assert_ptx_ascii("conv2d_ptx_budget (dynamic)", &ptx);
+        // The declaration, verbatim and at module scope: the identical line inside an entry body is
+        // CUDA_ERROR_INVALID_PTX, and two module-scope externs would ALIAS (both measured, D6 §1.1).
+        assert!(ptx.contains(DSMEM_DECL), "the exact window declaration");
+        assert_eq!(
+            ptx.matches(".extern .shared").count(),
+            1,
+            "exactly ONE window"
+        );
+        let decl = ptx.find(".extern .shared").expect("window declaration");
+        let entry = ptx.find(".visible .entry").expect("entry");
+        assert!(decl < entry, "the window must be declared at MODULE scope");
+        assert!(
+            !ptx.contains(".shared .align 4 .b8 smem["),
+            "no static array beside the window"
+        );
+        assert!(
+            ptx.contains(&format!("mov.u32 %r10,{DSMEM_SYM};")),
+            "the tile base must come from the window symbol"
+        );
+
+        // ...and the static arm must never touch the window.
+        let (small, small_mode) = conv2d_ptx_budget(64, 28, 28, 64, 3, 3, OPTIN_H100);
+        assert_eq!(small_mode, SmemMode::Static);
+        assert_eq!(
+            small_mode.launch_bytes(),
+            0,
+            "a static tile launches with 0"
+        );
+        assert!(
+            !small.contains(DSMEM_SYM),
+            "static kernels keep their array"
+        );
+        assert_eq!(
+            small,
+            conv2d_ptx(64, 28, 28, 64, 3, 3),
+            "same text either way"
+        );
+    }
+
+    /// An over-budget shape must fail **at generation**, naming the family, the tile and both byte
+    /// counts. The alternative is what the tree had: no assert at all in the generator, one hardcoded
+    /// number in a separate gate function the caller must remember, and — when they forget — a
+    /// `ptxas error: Entry function 'conv2d' uses too much shared data` surfacing as an opaque
+    /// `DriverError` out of `cuModuleLoadData` that names neither conv nor the shape.
+    #[test]
+    #[should_panic(expected = "exceeds the budget")]
+    fn conv2d_ptx_over_budget_panics_at_generation() {
+        // 100x100 at KB=8: (115*115 + 8*10000)*4 = 372900 B — past even the H100 window.
+        let _ = conv2d_ptx_budget(1, 128, 128, 8, 100, 100, OPTIN_H100);
+    }
+
+    /// The same tripwire on the implicit-GEMM family. Its footprint is a compile-time constant today,
+    /// so the only way to reach it is an absurd budget — which is exactly the point: the assert lives
+    /// where a widened CTA tile would first be visible.
+    #[test]
+    #[should_panic(expected = "exceeds the budget")]
+    fn conv_wmma_ptx_over_budget_panics_at_generation() {
+        let _ = conv_wmma_ptx_budget(64, 28, 28, 64, 3, 3, 4096);
     }
 
     #[test]

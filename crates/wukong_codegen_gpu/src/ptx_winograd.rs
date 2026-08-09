@@ -28,10 +28,28 @@
 //! * F(2×2,3×3): `α=4`, `m=2`, input tiles 4×4 → output tiles 2×2.
 //! * F(4×4,3×3): `α=6`, `m=4`, input tiles 6×6 → output tiles 4×4.
 
+//! ## Shared memory
+//!
+//! Three of the four generators use **none**: the filter / input / output transforms are one thread per
+//! `(k,c)` or `(c,tile)` with the whole `α×α` working set in registers. All of this family's shared
+//! memory is [`wino_bgemm_ptx`]'s GEMM tile, whose closed form is [`wino_bgemm_smem_bytes`] — the same
+//! `BM·16·2 + 16·BN·2 + BM·BN·4` as the implicit-GEMM conv it borrows [`crate::ptx_conv::WMMA_BM`] /
+//! [`crate::ptx_conv::WMMA_BN`] from, i.e. **20480 B, constant for every shape**, 42 % of the PTX ISA's
+//! static `.shared` cap. [`wino_bgemm_ptx_budget`] takes the budget the dispatch layer probed and
+//! returns the [`crate::gpu::SmemMode`] its launch must honour.
+//!
+//! **A bigger budget is not the lever this family is missing, and the arithmetic says so.** The bgemm's
+//! reduction length is `GK = C`, the channel count itself, against a 16-wide WMMA K-tile: at `C=3` a
+//! whole staged tile is 13/16 zero padding, so Winograd's 2.25–4× multiply reduction is spent on
+//! padding before it reaches the tensor cores. That is the mechanism behind "F(4×4,3×3) loses at low
+//! channel count", and no amount of shared memory changes it — the fixes are a `C`-packed bgemm (batch
+//! several transform planes into one 16-deep K-tile) or a narrower MMA shape.
+
 // The module header for all four generators, from the single source (`crate::ptx_target`). The
 // Winograd pipeline emits only f32/f16 arithmetic, shared memory and `wmma` fragments — every one of
 // them legal at the `sm_80` floor. PTX is forward-compatible only, so the module is tagged with that
 // floor, never with the device's own arch (an `sm_89` tag loads on ZERO A100s).
+use crate::gpu::{smem_mode_for, SmemMode, STATIC_SMEM_CAP};
 use crate::ptx_target::HDR_SM80;
 
 // ---------------------------------------------------------------------------------------------
@@ -690,8 +708,45 @@ pub fn wino_output_xform_ptx(k: usize, h: usize, w: usize, m: usize) -> String {
 /// each (≈4 on a feature map) and runs them serially — ~idle on a 20-SM GPU — whereas batching puts
 /// `α²·that` CTAs in flight at once. Plane strides (U:`K·C`, V:`C·T`, M:`K·T`) are baked; `M` is **f32**
 /// (read directly by the output transform). Launch: block `(WMMA_THREADS,1,1)`, grid
-/// `(ceil(T/WMMA_BN), ceil(K/WMMA_BM), α²)`.
+/// `(ceil(T/WMMA_BN), ceil(K/WMMA_BM), α²)`, `shared_mem_bytes: 0` (the tile is a static `.shared`).
 pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
+    let (ptx, mode) = wino_bgemm_ptx_budget(c, nt, k, STATIC_SMEM_CAP);
+    debug_assert_eq!(
+        mode,
+        SmemMode::Static,
+        "the static cap cannot yield a window"
+    );
+    ptx
+}
+
+/// **The Winograd batched GEMM's shared-memory footprint in bytes — the single source.**
+///
+/// `BM·16·2 + 16·BN·2 + BM·BN·4` over [`crate::ptx_conv::WMMA_BM`]/[`crate::ptx_conv::WMMA_BN`]: the
+/// staged fp16 `BM×16` `U` tile and `16×BN` `V` tile plus the f32 `BM×BN` epilogue scratch. Identical to
+/// the single-buffered [`crate::ptx_conv::conv_wmma_smem_bytes`] — this kernel *is* that tensor-core
+/// core with the im2col gather replaced by a plain row-major load — so it is 20480 B for every shape.
+pub const fn wino_bgemm_smem_bytes() -> usize {
+    crate::ptx_conv::conv_wmma_smem_bytes(crate::ptx_conv::WMMA_BM, crate::ptx_conv::WMMA_BN, 1)
+}
+
+/// [`wino_bgemm_ptx`] against an explicit shared-memory budget, returning the module **and the
+/// [`SmemMode`] its launch must honour** (`Gpu::function_smem` consumes exactly this pair).
+///
+/// `smem_budget` is the ceiling this entry may spend — [`STATIC_SMEM_CAP`] for the historical static
+/// form, or `Gpu::smem_budget()` (the probed opt-in window) from the dispatch layer. The generator
+/// stays a pure text function: the budget is passed *in*, never probed here, so an A100/H100 budget is
+/// checkable on a laptop with no device.
+///
+/// The CTA tile is a pair of compile-time constants, so [`wino_bgemm_smem_bytes`] is 20480 B for every
+/// shape and the mode is always [`SmemMode::Static`]; the budget is a ceiling assert, positioned so
+/// that a future widening is declined at generation (naming the family, the tile and the byte count)
+/// instead of as an opaque `ptxas error: uses too much shared data` from `cuModuleLoadData`.
+pub fn wino_bgemm_ptx_budget(
+    c: usize,
+    nt: usize,
+    k: usize,
+    smem_budget: usize,
+) -> (String, SmemMode) {
     use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS, WMMA_WM, WMMA_WN};
     use std::fmt::Write as _;
     let m = k; // GEMM M
@@ -715,6 +770,20 @@ pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
     let smem_a = bm * 16 * 2;
     let smem_b = 16 * bn * 2;
     let smem_c = bm * bn * 4;
+    // The closed form, from the one place callers read it. `STATIC_SMEM_CAP` decides the emission FORM
+    // (static `.shared` vs the `.extern` window); `smem_budget` is the ceiling — two boundaries.
+    let smem_total = wino_bgemm_smem_bytes();
+    debug_assert_eq!(smem_total, smem_a + smem_b + smem_c);
+    assert!(
+        smem_total <= smem_budget,
+        "wino_bgemm: SMEM {smem_total} B ({bm}x{bn} tile) exceeds the budget {smem_budget} B"
+    );
+    let mode = smem_mode_for(smem_total);
+    assert!(
+        !mode.is_dynamic(),
+        "wino_bgemm: {smem_total} B needs the dynamic window, which this generator does not emit \
+         (widening the CTA tile must land with the `.extern` window AND gpu.rs's launch config)"
+    );
 
     let veclist = |pre: &str| -> String {
         let regs: Vec<String> = (0..8).map(|i| format!("%{pre}{i}")).collect();
@@ -937,7 +1006,7 @@ pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
         let _ = writeln!(b, "    @%pv st.global.f32 [%ptr],%cf;");
     }
     let _ = writeln!(b, "    ret;\n}}");
-    b
+    (b, mode)
 }
 
 #[cfg(test)]
@@ -1030,6 +1099,12 @@ mod tests {
                     ("wino_input_xform_ptx", wino_input_xform_ptx(c, h, w, m)),
                     ("wino_output_xform_ptx", wino_output_xform_ptx(k, h, w, m)),
                     ("wino_bgemm_ptx", wino_bgemm_ptx(c, nt, k)),
+                    // The budget-carrying entry point is its own text path (it decides the emission
+                    // form), so it gets its own pass — no variant goes unchecked.
+                    (
+                        "wino_bgemm_ptx_budget",
+                        wino_bgemm_ptx_budget(c, nt, k, STATIC_SMEM_CAP).0,
+                    ),
                 ] {
                     if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
                         panic!(
@@ -1054,6 +1129,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// FNV-1a 64 over the raw bytes — a dependency-free, deterministic digest of a PTX module.
+    pub(super) fn ptx_digest(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Every Winograd module this crate can dispatch, at the shapes the dispatch path uses.
+    pub(super) fn shipped_wino_modules() -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for m in [2usize, 4] {
+            for (c, h, w, k) in [
+                (3usize, 32usize, 32usize, 16usize),
+                (64, 14, 14, 64),
+                (128, 28, 28, 128),
+                (8, 9, 9, 32),
+            ] {
+                let (_, _, nt) = wino_ntiles(h, w, m);
+                let tag = format!("C{c}_{h}x{w}_K{k}_m{m}");
+                out.push((
+                    format!("wino_filter_xform_ptx/{tag}"),
+                    wino_filter_xform_ptx(c, k, m),
+                ));
+                out.push((
+                    format!("wino_input_xform_ptx/{tag}"),
+                    wino_input_xform_ptx(c, h, w, m),
+                ));
+                out.push((
+                    format!("wino_output_xform_ptx/{tag}"),
+                    wino_output_xform_ptx(k, h, w, m),
+                ));
+                out.push((format!("wino_bgemm_ptx/{tag}"), wino_bgemm_ptx(c, nt, k)));
+            }
+        }
+        out
+    }
+
+    /// `(label, byte length, FNV-1a 64)` of every module in [`shipped_wino_modules`], **recorded from
+    /// the binary built at this commit's parent** — the "before" half of
+    /// [`shipped_wino_ptx_is_byte_identical`].
+    #[rustfmt::skip]
+    const SHIPPED_WINO_PTX: &[(&str, usize, u64)] = &[
+        ("wino_filter_xform_ptx/C3_32x32_K16_m2", 4842, 0xba73b657911a2f30),
+        ("wino_input_xform_ptx/C3_32x32_K16_m2", 9094, 0x6ddc4a45d488fb05),
+        ("wino_output_xform_ptx/C3_32x32_K16_m2", 4183, 0x74ebabe8289621e6),
+        ("wino_bgemm_ptx/C3_32x32_K16_m2", 30053, 0xda28caf1cf2dfb89),
+        ("wino_filter_xform_ptx/C64_14x14_K64_m2", 4873, 0xc95ed6fb178727c4),
+        ("wino_input_xform_ptx/C64_14x14_K64_m2", 9095, 0x0700054488208d6e),
+        ("wino_output_xform_ptx/C64_14x14_K64_m2", 4173, 0xf874de507b393bf9),
+        ("wino_bgemm_ptx/C64_14x14_K64_m2", 30001, 0xafd21cf8d89eba66),
+        ("wino_filter_xform_ptx/C128_28x28_K128_m2", 4886, 0x3d833fe0d99b7965),
+        ("wino_input_xform_ptx/C128_28x28_K128_m2", 9117, 0x64a7648f875db826),
+        ("wino_output_xform_ptx/C128_28x28_K128_m2", 4194, 0xc3a25506cc203dc6),
+        ("wino_bgemm_ptx/C128_28x28_K128_m2", 30152, 0x0abdda02f5c18117),
+        ("wino_filter_xform_ptx/C8_9x9_K32_m2", 4853, 0x02771c2b49aa5ad9),
+        ("wino_input_xform_ptx/C8_9x9_K32_m2", 9038, 0x18a354f05ec9b52f),
+        ("wino_output_xform_ptx/C8_9x9_K32_m2", 4148, 0x76ee5ed265096f48),
+        ("wino_bgemm_ptx/C8_9x9_K32_m2", 29972, 0x008ad0b39c8cec56),
+        ("wino_filter_xform_ptx/C3_32x32_K16_m4", 11486, 0x61b13dd6c63f5a87),
+        ("wino_input_xform_ptx/C3_32x32_K16_m4", 33812, 0xf5a80b1c29bb3b60),
+        ("wino_output_xform_ptx/C3_32x32_K16_m4", 20506, 0x63d5f5e471f06a2b),
+        ("wino_bgemm_ptx/C3_32x32_K16_m4", 29972, 0xb89728874dd18bc8),
+        ("wino_filter_xform_ptx/C64_14x14_K64_m4", 11557, 0x17e3246ea3bde475),
+        ("wino_input_xform_ptx/C64_14x14_K64_m4", 33829, 0x4cb37deacfbf0f6c),
+        ("wino_output_xform_ptx/C64_14x14_K64_m4", 20489, 0x311ef83afff5182d),
+        ("wino_bgemm_ptx/C64_14x14_K64_m4", 29918, 0xf4811ce80bbf004e),
+        ("wino_filter_xform_ptx/C128_28x28_K128_m4", 11575, 0x8a9bd8819be5079f),
+        ("wino_input_xform_ptx/C128_28x28_K128_m4", 33870, 0xd67a7e5a4b16ef52),
+        ("wino_output_xform_ptx/C128_28x28_K128_m4", 20530, 0xd5f9bc5dccee45b0),
+        ("wino_bgemm_ptx/C128_28x28_K128_m4", 30069, 0x21a607a0f4b6a0aa),
+        ("wino_filter_xform_ptx/C8_9x9_K32_m4", 11513, 0x5b8545bbcba1fde7),
+        ("wino_input_xform_ptx/C8_9x9_K32_m4", 33703, 0x2c256f2f6730c87f),
+        ("wino_output_xform_ptx/C8_9x9_K32_m4", 20419, 0xe4fd35045c8f6889),
+        ("wino_bgemm_ptx/C8_9x9_K32_m4", 29890, 0x700d1335583fdbe2),
+    ];
+
+    /// **The before/after gate for the budget seam, device-free.** Threading `smem_budget` through
+    /// [`wino_bgemm_ptx`] must leave every shipped Winograd module byte-identical: at or below
+    /// [`STATIC_SMEM_CAP`] the historical static `.shared` spelling is emitted verbatim, and every
+    /// caller passes exactly that. The pins were recorded from the binary at this commit's **parent**,
+    /// so this is a real across-the-change comparison, not a self-consistency tautology.
+    #[test]
+    fn shipped_wino_ptx_is_byte_identical() {
+        let got = shipped_wino_modules();
+        assert_eq!(got.len(), SHIPPED_WINO_PTX.len());
+        let mut bad = Vec::new();
+        for ((label, ptx), (plabel, plen, pdig)) in got.iter().zip(SHIPPED_WINO_PTX) {
+            assert_eq!(label, plabel, "pin order must match the generated order");
+            let (len, dig) = (ptx.len(), ptx_digest(ptx));
+            if len != *plen || dig != *pdig {
+                bad.push(format!(
+                    "  {label}: pinned ({plen} B, 0x{pdig:016x}) != got ({len} B, 0x{dig:016x})"
+                ));
+            }
+        }
+        if !bad.is_empty() {
+            for (label, ptx) in &got {
+                println!("(\"{label}\", {}, 0x{:016x}),", ptx.len(), ptx_digest(ptx));
+            }
+            panic!(
+                "{} shipped Winograd module(s) changed byte-for-byte:\n{}\nIf intended, replace \
+                 SHIPPED_WINO_PTX with the table printed above.",
+                bad.len(),
+                bad.join("\n")
+            );
+        }
+    }
+
+    /// **The Winograd half of the shared-memory census, device-free.**
+    ///
+    /// Three of the four kernels use no shared memory at all; the whole family's footprint is the
+    /// bgemm's 20480 B, constant for every shape and 42 % of the PTX ISA's static cap. So a budget lift
+    /// frees exactly nothing here either — and the arithmetic says why the family's real weakness is
+    /// elsewhere: `GK = C`, so a `C=3` first layer feeds a 16-wide WMMA K-tile 3 real channels and 13
+    /// of padding. That is the mechanism behind "F(4×4,3×3) loses at low channel count", and it is a
+    /// K-tile problem, not an SMEM one.
+    #[test]
+    fn wino_smem_census_and_the_low_channel_k_tile() {
+        assert_eq!(wino_bgemm_smem_bytes(), 20480);
+        assert_eq!(
+            wino_bgemm_smem_bytes(),
+            crate::ptx_conv::conv_wmma_smem_bytes(
+                crate::ptx_conv::WMMA_BM,
+                crate::ptx_conv::WMMA_BN,
+                1
+            ),
+            "the bgemm IS the implicit-GEMM tensor-core core with a plain load"
+        );
+        // Constant across every shape the dispatcher can hand it, and always the static form.
+        for (c, nt, k) in [(3usize, 64usize, 16usize), (128, 49, 128), (512, 9, 512)] {
+            let (_, mode) = wino_bgemm_ptx_budget(c, nt, k, STATIC_SMEM_CAP);
+            assert_eq!(mode, SmemMode::Static);
+            assert_eq!(mode.launch_bytes(), 0, "a static tile launches with 0");
+        }
+        // The transforms declare no shared memory whatsoever.
+        for ptx in [
+            wino_filter_xform_ptx(64, 64, 4),
+            wino_input_xform_ptx(64, 14, 14, 4),
+            wino_output_xform_ptx(64, 14, 14, 4),
+        ] {
+            assert!(!ptx.contains(".shared"), "the transforms are register-only");
+        }
+        // The low-channel cliff, as arithmetic: fraction of each staged 16-deep K-tile that is real.
+        for (c, live_frac_pct) in [(3usize, 18usize), (16, 100), (64, 100)] {
+            let padded = c.div_ceil(16) * 16;
+            assert_eq!(c * 100 / padded, live_frac_pct, "C={c} K-tile utilisation");
+        }
+    }
+
+    /// Over-budget generation must fail loudly at generation, naming the family, the tile and both byte
+    /// counts — not as an opaque `ptxas error: uses too much shared data` out of `cuModuleLoadData`.
+    #[test]
+    #[should_panic(expected = "exceeds the budget")]
+    fn wino_bgemm_over_budget_panics_at_generation() {
+        let _ = wino_bgemm_ptx_budget(64, 49, 64, 4096);
     }
 
     /// Spot-check the helpers in isolation.
