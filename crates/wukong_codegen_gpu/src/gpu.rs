@@ -6509,6 +6509,7 @@ mod tests {
     const CRATE_SOURCES: &[(&str, &str)] = &[
         ("autotune.rs", include_str!("autotune.rs")),
         ("baselines.rs", include_str!("baselines.rs")),
+        ("bench_instrument.rs", include_str!("bench_instrument.rs")),
         ("cubin.rs", include_str!("cubin.rs")),
         ("diff.rs", include_str!("diff.rs")),
         ("fusion.rs", include_str!("fusion.rs")),
