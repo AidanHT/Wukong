@@ -43,6 +43,25 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # THE PROFILE IS THE POINT OF THIS STEP. `cargo test` above builds everything at -O0, so
+      # `wukong_runtime` -- the crate whose first invariant is that each AVX2 kernel agrees with its
+      # scalar twin BIT-for-bit -- was only ever verified in the profile where LLVM does the least,
+      # while every performance number this project publishes comes from a release binary. A scalar
+      # twin is precisely the code an optimizer rewrites hardest: at -O3 LLVM auto-vectorizes the
+      # twin's inner loop and may commute a `fadd` (it is commutative in LLVM IR), which changes
+      # which operand is SRC1 and therefore which NaN payload survives. `colreduce` broke that way
+      # and no gate anywhere could see it.
+      #
+      # Scoped to this one crate deliberately. It is the only crate that asserts raw-bit agreement
+      # between two independent implementations of the same arithmetic, which is the property a
+      # legal codegen change can silently alter; a full `--workspace --release` would rebuild
+      # Cranelift and re-run the 357-program corpus under both backends at four -O levels to
+      # re-check tests that are not bit-exactness assertions. Both matrix OSes run it, because the
+      # codegen decision that provokes this is per-target, not universal. `--lib` keeps it to the
+      # unit tests and off the `examples/` measurement instruments.
+      - name: Test (release) - wukong_runtime bit-exactness
+        run: cargo test -p wukong_runtime --release --lib
+
       - name: Smoke-run examples
         run: |
           cargo run -p wukongc -- --run examples/fib.wk
