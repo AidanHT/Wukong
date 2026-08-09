@@ -24,6 +24,18 @@
 //! cross-stripe combine), so each kernel is its own bit-exact oracle (the interpreter marshals the
 //! serial form; the differential gate compares interp vs native, both folding the same
 //! `_mm256_add_ps`/`_mm256_max_ps`/`_mm256_min_ps` lane tree).
+//!
+//! ONE CAVEAT, AND ONLY ONE: **the NaN payload of the additive kinds is not part of the contract.**
+//! Every value that is not a NaN — finite, ±0.0, ±inf — is bit-exact across the AVX2 path, the
+//! scalar twin and the column stripes, and for `Max`/`Min`/`MaxAbs` so is the NaN payload. But
+//! `Sum`/`Mean`/`SumSq`/`L2`/`Rms` fold with `+`, and which of two NaN payloads survives `addps`
+//! depends on which operand the compiler made SRC1. `sfold_add` writes `a + v`, yet `fadd` is
+//! commutative in LLVM IR, so the optimizer may emit `v + a`: at `-O3` it auto-vectorizes the twin's
+//! inner column loop and the vectorized `addps` there *is* commuted (the scalar epilogue is not,
+//! which is why a 37-column case diverged from column 32 on and no lower). IEEE-754 leaves payload
+//! propagation to the implementation, so both answers are correct and neither is worth pinning at
+//! the cost of blocking vectorization of the no-AVX2 fallback. Tests must therefore compare the
+//! additive kinds with `tests::bits_nan_collapsed`, never by payload — see its comment.
 
 /// Which column reduction to fold: `Sum` seeds `0` and folds rows `[0, rows)`; `Max`/`Min`/`MaxAbs`
 /// seed the **first row** (`x[0,j]`, or `|x[0,j]|` for `MaxAbs`) and fold rows `[1, rows)` (idempotent,
@@ -93,7 +105,14 @@ unsafe fn colreduce_finalize(out: *mut f32, j0: usize, j1: usize, rows: usize, k
 /// second hand-written copy is exactly how a twin drifts. `max`/`min` are spelled `(a > v) ? a : v` /
 /// `(a < v) ? a : v` deliberately, NOT `f32::max`/`f32::min`: that is what `_mm256_max_ps` /
 /// `_mm256_min_ps` compute (the second operand wins a tie and any NaN comparison), so the vector and
-/// scalar paths agree on NaN, ±0 and ties.
+/// scalar paths agree on NaN, ±0 and ties. Those two are also the folds whose operand order the
+/// optimizer **cannot** disturb: a select over `a > v` is not commutative, so LLVM must keep `a` as
+/// the `maxps`/`minps` destination (verified in the `-O3` asm of the auto-vectorized twin), and the
+/// payload is fully determined.
+///
+/// `sfold_add`/`sfold_sq` get no such guarantee: `fadd` *is* commutative in LLVM IR, so the order
+/// written here fixes the value but not which operand becomes SRC1 — and therefore not which NaN
+/// payload survives. See the module header; nothing may depend on it.
 #[inline(always)]
 fn sfold_add(a: f32, v: f32) -> f32 {
     a + v
@@ -856,6 +875,50 @@ mod tests {
         v.iter().map(|f| f.to_bits()).collect()
     }
 
+    /// A NaN bit pattern, so it can never collide with the bits of a value that is *not* a NaN —
+    /// which is the whole safety argument for [`bits_nan_collapsed`]. Prints as `4294967295` in a
+    /// failure diff, which is deliberately unmistakable.
+    const NAN_TOKEN: u32 = 0xFFFF_FFFF;
+
+    /// Raw bits, except that **every NaN collapses to one token** — the comparison for the
+    /// ADDITIVE kinds (`Sum`/`Mean`/`SumSq`/`L2`/`Rms`) and for nothing else.
+    ///
+    /// WHY THIS IS NOT A WEAKENING, AND WHY IT MUST NOT BE WIDENED. IEEE-754 specifies the *value*
+    /// of an add exactly, and says nothing about which input NaN's payload comes out of one (§6.2
+    /// makes payload propagation a recommendation, not a requirement). x86 `ADDPS`/`ADDSS` return
+    /// SRC1 when SRC1 is a NaN, so the surviving payload is decided by which operand the compiler
+    /// put in SRC1 — and `fadd` is commutative in LLVM IR, so that is the compiler's choice, not
+    /// ours. At `-O3` LLVM auto-vectorizes [`colreduce_scalar`]'s inner column loop and emits the
+    /// commuted `addps` in the vector body while leaving the scalar epilogue as written; the twin
+    /// then reports a *different* NaN payload from [`colreduce_avx2`] (whose order the intrinsic
+    /// pins) for exactly the columns the vector body covered. Both results are correct. Pinning the
+    /// payload would mean stopping the optimizer from vectorizing the no-AVX2 fallback — real cost,
+    /// for a property no caller can rely on and no other implementation would reproduce.
+    ///
+    /// Everything else stays strict, because for everything else the two paths genuinely must
+    /// agree: a NaN here still has to be a NaN *there* (a NaN against a finite value is still a
+    /// mismatch, so `NaN-in ⇒ NaN-out` and its converse are both pinned), `+0.0` and `-0.0` are
+    /// distinct non-NaN patterns and are compared by bits, and so are ±inf and every finite value.
+    ///
+    /// **Never call this for `Max`/`Min`/`MaxAbs`.** Their fold is `(a > v) ? a : v`, a select the
+    /// optimizer cannot commute, so their payload IS determined and IS the contract — that is the
+    /// repo-wide `_mm256_max_ps`-vs-`f32::max` landmine, and collapsing NaN there would blind the
+    /// only test that catches it.
+    fn bits_nan_collapsed(v: &[f32]) -> Vec<u32> {
+        v.iter()
+            .map(|f| if f.is_nan() { NAN_TOKEN } else { f.to_bits() })
+            .collect()
+    }
+
+    /// The kinds folded with `+` (over `x` or over `x*x`), i.e. the ones whose NaN payload the
+    /// optimizer is free to change. The complement — `Max`/`Min`/`MaxAbs` — is payload-exact.
+    fn is_additive(kind: ColKind) -> bool {
+        matches!(
+            kind,
+            ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms
+        )
+    }
+
     /// The AVX2 tile must equal the un-blocked scalar twin **bit for bit** on ordinary data, over
     /// shapes that straddle every edge the [`COL_RB`] x 32 tile introduced: `rows` below / at / just
     /// past a row block, and `cols` below / at / just past the 32-column tile plus its 8-wide and
@@ -924,6 +987,19 @@ mod tests {
     /// only scalar-twin == AVX2 **by bits**; it deliberately does NOT hard-code which zero or which
     /// NaN payload wins, because that is the hardware's definition, not ours — what must hold is that
     /// both paths agree, at every row-block and column-tile offset.
+    ///
+    /// TWO MATRICES, because the two kind families are held to different strengths (see
+    /// [`bits_nan_collapsed`] for the IEEE argument, and note that this test is *release-only*
+    /// interesting — the divergence it guards needs the optimizer to have vectorized the twin):
+    ///
+    /// * `awkward` carries NaN — two distinct payloads, plus the real-indefinite `0xFFC00000` that
+    ///   `+inf + -inf` manufactures, so three payloads compete — and both infinities.
+    ///   `Max`/`Min`/`MaxAbs` are compared by raw bits here; the additive kinds by collapsed bits.
+    /// * `ordinary` holds the same awkward *non*-NaN values (`±0.0`, exact ties, and a `1e7`/`-1e7`
+    ///   pair against small non-dyadic addends so the additive fold is order-sensitive and a
+    ///   reassociation would still show as a bit mismatch). It contains no NaN and no infinity, so
+    ///   no operation over it can produce a NaN and **every** kind stays a strict bit gate — which
+    ///   is what keeps the additive arm of this test from going vacuous under the collapse.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn nan_signed_zero_and_ties_agree_between_paths() {
@@ -935,7 +1011,7 @@ mod tests {
                                                 // 12 rows (3 full COL_RB blocks) x 37 columns (one 32-tile + a 5-column tail) so the awkward
                                                 // values land in the tiled body, the 8-wide tail and the scalar tail alike.
         let (rows, cols) = (12usize, 37usize);
-        let pool = [
+        let awkward = [
             0.0f32,
             -0.0,
             nan,
@@ -949,46 +1025,71 @@ mod tests {
             2.0,
             2.0, // an exact tie with the entry before it
         ];
-        let mut x = vec![0.0f32; rows * cols];
-        for i in 0..rows {
-            for j in 0..cols {
-                // A shifting permutation so every column sees the awkward values at a different row,
-                // and every (row block, column tile) position sees a NaN / ±0 / tie somewhere.
-                x[i * cols + j] = pool[(i * 5 + j * 7) % pool.len()];
+        // No NaN and no infinity: the pool rotation below puts every entry in every column, so a
+        // single `f32::INFINITY` here would make every additive column `+inf` (or, with `-inf` too,
+        // the indefinite NaN) and cost this matrix the order-sensitivity it exists for.
+        let ordinary = [
+            0.0f32, -0.0, 1.0e7, 0.1, 1.0, -1.0, 3.5, -3.5, -1.0e7, -0.375, 2.0,
+            2.0, // an exact tie with the entry before it
+        ];
+        let build = |pool: &[f32; 12]| {
+            let mut x = vec![0.0f32; rows * cols];
+            for i in 0..rows {
+                for j in 0..cols {
+                    // A shifting permutation so every column sees the awkward values at a different
+                    // row, and every (row block, column tile) position sees one somewhere. `5` is
+                    // coprime with the pool length, so each column is a rotation of the whole pool.
+                    x[i * cols + j] = pool[(i * 5 + j * 7) % pool.len()];
+                }
             }
-        }
-        for kind in [
-            ColKind::Sum,
-            ColKind::Max,
-            ColKind::Min,
-            ColKind::MaxAbs,
-            ColKind::Mean,
-            ColKind::L2,
-            ColKind::Rms,
-            ColKind::SumSq,
+            x
+        };
+        // `ordinary` runs first on purpose: it is the fully strict matrix, so when a change breaks
+        // both it is the more diagnostic failure to see.
+        for (name, x, nan_free) in [
+            ("ordinary", build(&ordinary), true),
+            ("awkward", build(&awkward), false),
         ] {
-            let mut s = vec![0.0f32; cols];
-            let mut v = vec![0.0f32; cols];
-            let mut p = vec![0.0f32; cols];
-            unsafe {
-                colreduce_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, kind);
-                colreduce_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, kind);
-                // …and the two-stripe split, so the parallel entry is held to the same bits.
-                colreduce_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 0, 16, kind);
-                colreduce_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 16, cols, kind);
+            for kind in [
+                ColKind::Sum,
+                ColKind::Max,
+                ColKind::Min,
+                ColKind::MaxAbs,
+                ColKind::Mean,
+                ColKind::L2,
+                ColKind::Rms,
+                ColKind::SumSq,
+            ] {
+                let mut s = vec![0.0f32; cols];
+                let mut v = vec![0.0f32; cols];
+                let mut p = vec![0.0f32; cols];
+                unsafe {
+                    colreduce_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, kind);
+                    colreduce_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, kind);
+                    // …and the two-stripe split, so the parallel entry is held to the same bits.
+                    colreduce_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 0, 16, kind);
+                    colreduce_range(x.as_ptr(), p.as_mut_ptr(), rows, cols, 16, cols, kind);
+                }
+                // Raw bits everywhere except the one place IEEE-754 leaves undefined: the NaN
+                // payload of an additive fold, on the matrix that can actually produce two of them.
+                let cmp: fn(&[f32]) -> Vec<u32> = if nan_free || !is_additive(kind) {
+                    bits
+                } else {
+                    bits_nan_collapsed
+                };
+                assert_eq!(
+                    cmp(&s),
+                    cmp(&v),
+                    "{name} NaN/±0/tie: scalar != avx2, kind={}",
+                    kind as u8
+                );
+                assert_eq!(
+                    cmp(&s),
+                    cmp(&p),
+                    "{name} NaN/±0/tie: scalar != striped, kind={}",
+                    kind as u8
+                );
             }
-            assert_eq!(
-                bits(&s),
-                bits(&v),
-                "NaN/±0/tie: scalar != avx2, kind={}",
-                kind as u8
-            );
-            assert_eq!(
-                bits(&s),
-                bits(&p),
-                "NaN/±0/tie: scalar != striped, kind={}",
-                kind as u8
-            );
         }
     }
 
