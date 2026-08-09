@@ -20,23 +20,355 @@
 //! offload `--backend=gpu` path and plain `cargo test` are untouched. The megakernel is the spine the
 //! op-graph fusion ([`crate::fusion`]) and the resident-chain comparison ([M13]) build on; GEMM, vmath
 //! and norm now have chunked-cooperative bodies (see `lower::lower_call_mega`), so what remains for
-//! later increments is cooperative bodies for the leftover ops (axpby, the bf16/f16 reductions) and
-//! multi-block grid execution.
+//! later increments is cooperative bodies for the leftover ops (axpby, the bf16/f16 reductions).
+//!
+//! ## The multi-CTA increment (this module's launch layer)
+//! One CTA is one SM. On the 20-SM 4050 that leaves 95% of the part idle; on a 132-SM H100 it is
+//! under 1%, which makes "the whole program in one kernel" a claim about a single SM rather than
+//! about the machine. Scaling past that needs three things, and **this module owns all three**:
+//!
+//!  1. [`grid_barrier_ptx`] — a **grid-wide** barrier. `bar.sync` synchronizes a CTA and nothing
+//!     more; across cooperative CTAs the rendezvous is a sense-reversing counter in `.global` plus
+//!     device-scope fences. Its state is a *launch parameter*, never a module-scope `.global`, so it
+//!     cannot inherit a poisoned generation from the previous launch of a cached module.
+//!  2. [`plan_grid`] — the **residency bound**. A cooperative grid must be simultaneously resident or
+//!     the barrier deadlocks the device, so the grid is
+//!     `cuOccupancyMaxActiveBlocksPerMultiprocessor x GpuTarget::sm_count` — a query and a probed
+//!     device fact, never a literal. A grid that will not fit declines to `Ok(None)`.
+//!  3. [`launch_mega`] — the launch itself, through `cuLaunchCooperativeKernel`
+//!     (`LaunchArgs::launch_cooperative`), which is the only launch API that *guarantees* co-residency.
+//!
+//! **The kernel opts in through its own ABI**, read back out of the PTX by [`mega_abi`]: a
+//! block-scoped entry declares `(p_ctx, p_frame)` and is launched with exactly one CTA, exactly as
+//! before; a grid-parallel entry declares `(p_ctx, p_frame, p_gbar)` *and* defines
+//! [`GRID_BARRIER_FN`], and is launched cooperatively across the resident grid. Neither half can
+//! drift: the launcher pushes as many arguments as the entry declares, and the two markers must agree
+//! or the load is a hard error. `lower::emit_mega_ptx` still emits the block-scoped form today, so the
+//! observable behaviour of every corpus program is unchanged — the grid-parallel arm is exercised by
+//! [`tests::grid_barrier_orders_writes_across_cooperative_ctas`], which runs the same barrier over the
+//! full resident grid on the real device.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{sys, CudaFunction, LaunchConfig, PushKernelArg};
 
 use wukong_mir::Program;
 use wukong_span::{Interner, Symbol};
 
 use crate::lower::{self, MEGA_KERNEL_NAME};
 
-/// The block size the megakernel launches: a single CTA of this many threads on one SM. A power of
-/// two (the cooperative reduction tree requires it); 256 is a good occupancy point and matches the
-/// `mrt_red_smem[1024]` scratch ceiling. Multi-block grid execution is a later increment.
+/// The block size the megakernel launches: one CTA of this many threads. A power of two (the
+/// cooperative reduction tree halves the block each step) and at most 1024 (`lower.rs`'s
+/// `mrt_red_smem[1024]` is indexed by `%tid.x`, and 1024 is also the hardware ceiling on a CTA);
+/// 256 is a good occupancy point. How many *CTAs* run is not a constant — see [`plan_grid`].
 pub const MEGA_BLOCK: u32 = 256;
+
+// Both halves of that sentence are load-bearing, and both are cheap to prove here rather than in a
+// `CUDA_ERROR_MISALIGNED_ADDRESS` six calls deep: an odd block size makes the reduction tree drop a
+// lane on its last halving, and a block above 1024 walks `mrt_red_smem` off its end.
+const _: () = assert!(
+    MEGA_BLOCK.is_power_of_two() && MEGA_BLOCK <= 1024,
+    "MEGA_BLOCK must be a power of two <= 1024 (the reduction tree and mrt_red_smem[1024])"
+);
+
+/// The `.func` name of the grid-wide barrier ([`grid_barrier_ptx`]). Its presence in a mega module is
+/// one of the two markers that make the module grid-parallel — see [`mega_abi`].
+pub const GRID_BARRIER_FN: &str = "mrt_grid_barrier";
+
+/// The mega entry's first two parameters, in order: the print/assert/exit record buffer and the
+/// shared `.global` frame. [`launch_mega`] pushes them in this order, so the names are part of the
+/// contract, not decoration — a rename in `lower.rs` without one here is a hard error, by design.
+pub const MEGA_CTX_PARAM: &str = "p_ctx";
+/// See [`MEGA_CTX_PARAM`].
+pub const MEGA_FRAME_PARAM: &str = "p_frame";
+
+/// The mega entry's third parameter: the grid-barrier state pointer. The other marker.
+pub const MEGA_GBAR_PARAM: &str = "p_gbar";
+
+/// Bytes of `.global` state one grid barrier needs: `u32` arrival counter + `u32` generation.
+///
+/// The host allocates it **zeroed, per launch**, and passes it in. A module-scope `.global` would be
+/// the obvious alternative and is wrong here: [`crate::gpu::Gpu::function`] caches modules for the
+/// life of the process, so a kernel that faulted mid-barrier would leave a non-zero counter behind
+/// and hang the *next* program instead of the one with the bug.
+pub const GRID_BARRIER_BYTES: usize = 8;
+
+/// The environment override for the cooperative grid (`WUKONG_MEGA_GRID=<n>`), for SM-scaling sweeps.
+/// A value above the residency bound is a decline, not a clamp: silently shrinking it would report a
+/// measurement for a grid the caller did not ask for.
+pub const GRID_ENV: &str = "WUKONG_MEGA_GRID";
+
+/// **The grid-wide barrier, as PTX.** A `.func` spliced into a mega module (no header of its own —
+/// the module already carries `ptx_target::HDR_SM80`, and every instruction here is Ampere-legal).
+///
+/// ```text
+/// mrt_grid_barrier(state)   // state: .global u32[2] = { arrived, generation }
+/// ```
+///
+/// **Why not `bar.sync`.** `bar.sync` is a CTA rendezvous; it says nothing about the other CTAs of the
+/// grid. The grid-level protocol is the classic sense-reversing counter: each CTA elects thread 0,
+/// which reads the current generation, atomically increments the arrival count, and then either (last
+/// one in) resets the count and publishes `generation + 1`, or spins until it observes the new
+/// generation. Reading the generation *before* arriving is what makes it safe to reuse: the flip
+/// cannot happen until this CTA has arrived, so the value read is always the pre-flip one, and the
+/// count is already back to zero before any CTA can arrive for the next round.
+///
+/// **Why the fences are per-thread and on both sides.** The CUDA-sanctioned shape is
+/// `__syncthreads(); if (tid==0) { __threadfence(); atomic... }`, which leans on `bar.sync` to make
+/// one CTA's writes visible to its own thread 0 and on that thread's fence to push them device-wide.
+/// Every thread here executes `membar.gl` *before* the CTA rendezvous and again after it, which is
+/// strictly stronger and removes the "does a fence by thread 0 order thread 5's stores?" question
+/// entirely — for two extra fences per barrier, on a construct that is already a device-wide spin.
+///
+/// **Deadlock is a residency property, not a code property**: every CTA of the grid must be resident
+/// simultaneously or the spin never ends. That is [`plan_grid`]'s job, and it is why a grid-parallel
+/// module may only be launched through `cuLaunchCooperativeKernel`.
+///
+/// **No geometry precondition.** The arrival target is `nctaid.x*y*z` and the CTA's representative is
+/// thread `(0,0,0)`, not `tid.x == 0` — six extra ALU instructions to make the barrier correct under
+/// any launch shape instead of correct-only-if-the-caller-kept-it-1-D. A barrier whose contract is
+/// "and also please never use a 2-D grid" is a barrier that eventually deadlocks a caller who did.
+pub fn grid_barrier_ptx() -> String {
+    format!(
+        r#".func {GRID_BARRIER_FN} (.param .b64 p_bar)
+{{
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<12>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [p_bar];
+    cvta.to.global.u64 %rd1, %rd0;
+    add.s64 %rd2, %rd1, 4;
+    membar.gl;
+    bar.sync 0;
+    mov.u32 %r0, %tid.x;
+    mov.u32 %r1, %tid.y;
+    or.b32 %r0, %r0, %r1;
+    mov.u32 %r1, %tid.z;
+    or.b32 %r0, %r0, %r1;
+    setp.ne.u32 %p0, %r0, 0;
+    @%p0 bra GB_CTA;
+    ld.volatile.global.u32 %r2, [%rd2];
+    mov.u32 %r3, 1;
+    atom.global.add.u32 %r4, [%rd1], %r3;
+    mov.u32 %r5, %nctaid.x;
+    mov.u32 %r6, %nctaid.y;
+    mul.lo.u32 %r5, %r5, %r6;
+    mov.u32 %r6, %nctaid.z;
+    mul.lo.u32 %r5, %r5, %r6;
+    sub.u32 %r5, %r5, 1;
+    setp.ne.u32 %p1, %r4, %r5;
+    @%p1 bra GB_SPIN;
+    mov.u32 %r7, 0;
+    st.volatile.global.u32 [%rd1], %r7;
+    membar.gl;
+    add.u32 %r8, %r2, 1;
+    st.volatile.global.u32 [%rd2], %r8;
+    bra GB_CTA;
+GB_SPIN:
+    ld.volatile.global.u32 %r9, [%rd2];
+    setp.eq.u32 %p2, %r9, %r2;
+    @%p2 bra GB_SPIN;
+GB_CTA:
+    bar.sync 0;
+    membar.gl;
+    ret;
+}}
+"#
+    )
+}
+
+/// How a mega PTX module wants to be launched, read out of the module text itself.
+///
+/// This exists because of hard rule 2 of this crate: *the argument list pushed must match the
+/// kernel's declared `.param` count derived from the same source as the entry name*. Pushing short
+/// makes the driver read adjacent host stack as a pointer. `lower.rs` decides the entry's shape and
+/// this file decides the launch, so the launch reads the shape back out of the artifact instead of
+/// assuming it — the two files cannot desync silently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MegaAbi {
+    /// The entry's `.param` names, in declaration order.
+    pub params: Vec<String>,
+    /// Is this module safe to run on more than one CTA? True iff it declares [`MEGA_GBAR_PARAM`]
+    /// **and** defines [`GRID_BARRIER_FN`].
+    pub grid_parallel: bool,
+}
+
+/// Read [`MegaAbi`] out of a mega PTX module.
+///
+/// Two recognized shapes, and nothing else:
+///  - `(p_ctx, p_frame)` — **block-scoped**. Side effects are `tid==0`-guarded and recognized ops are
+///    bracketed by `bar.sync`, both of which are per-CTA facts, so a second CTA would duplicate every
+///    `print` and race the shared frame. Exactly one CTA.
+///  - `(p_ctx, p_frame, p_gbar)` + a [`GRID_BARRIER_FN`] definition — **grid-parallel**. Cooperative,
+///    multi-CTA, grid derived from residency.
+///
+/// Anything else is an `Err`, deliberately not a decline: the only way to get here is for `lower.rs`
+/// and this file to disagree about the ABI, and that is precisely the failure a silent fallback would
+/// hide.
+pub fn mega_abi(ptx: &str) -> Result<MegaAbi, String> {
+    let anchor = format!(".visible .entry {MEGA_KERNEL_NAME}");
+    let at = ptx
+        .find(&anchor)
+        .ok_or_else(|| format!("mega PTX declares no `{anchor}`"))?;
+    let after = &ptx[at + anchor.len()..];
+    let open = after
+        .find('(')
+        .ok_or_else(|| format!("mega entry `{MEGA_KERNEL_NAME}` has no parameter list"))?;
+    let close = after
+        .find(')')
+        .ok_or_else(|| format!("mega entry `{MEGA_KERNEL_NAME}` parameter list is unterminated"))?;
+    if close < open {
+        return Err(format!(
+            "mega entry `{MEGA_KERNEL_NAME}` parameter list is malformed"
+        ));
+    }
+    let params: Vec<String> = after[open + 1..close]
+        .split(',')
+        .map(|p| p.split_whitespace().last().unwrap_or("").to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let defines_barrier = ptx.contains(&format!(".func {GRID_BARRIER_FN} "));
+    let head_ok = params.len() >= 2 && params[0] == MEGA_CTX_PARAM && params[1] == MEGA_FRAME_PARAM;
+    let takes_bar = params.len() == 3 && params[2] == MEGA_GBAR_PARAM;
+    match (head_ok, params.len(), takes_bar, defines_barrier) {
+        (true, 2, _, false) => Ok(MegaAbi {
+            params,
+            grid_parallel: false,
+        }),
+        (true, 3, true, true) => Ok(MegaAbi {
+            params,
+            grid_parallel: true,
+        }),
+        _ => Err(format!(
+            "mega PTX ABI is inconsistent: entry params {params:?}, defines `{GRID_BARRIER_FN}` = \
+             {defines_barrier}. The only two shapes are block-scoped `({MEGA_CTX_PARAM}, \
+             {MEGA_FRAME_PARAM})` with no barrier, and grid-parallel `({MEGA_CTX_PARAM}, \
+             {MEGA_FRAME_PARAM}, {MEGA_GBAR_PARAM})` WITH one. Half of a grid-parallel kernel either \
+             deadlocks (a barrier no launch made resident) or duplicates every side effect (a \
+             multi-CTA launch of `tid==0`-guarded stores)."
+        )),
+    }
+}
+
+/// The launch geometry for one mega module: how many CTAs, and by which launch API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridPlan {
+    /// CTAs in the (1-D) grid.
+    pub grid: u32,
+    /// Threads per CTA — always [`MEGA_BLOCK`].
+    pub block: u32,
+    /// Must this go through `cuLaunchCooperativeKernel`? True for every `grid > 1` plan.
+    pub cooperative: bool,
+    /// `cuOccupancyMaxActiveBlocksPerMultiprocessor` for this entry at this block size.
+    pub blocks_per_sm: u32,
+    /// The probed `GpuTarget::sm_count`.
+    pub sm_count: u32,
+    /// `blocks_per_sm * sm_count` — the hard ceiling on a cooperative grid.
+    pub max_resident: u32,
+}
+
+/// Does this device support `cuLaunchCooperativeKernel` at all?
+/// (`CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH`; false on very old parts and under some virtualization.)
+pub fn supports_cooperative_launch(g: &crate::gpu::Gpu) -> bool {
+    let dev = g.ctx.cu_device();
+    let mut v: i32 = 0;
+    let ok = unsafe {
+        sys::cuDeviceGetAttribute(
+            &mut v,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH,
+            dev,
+        )
+        .result()
+    };
+    ok.is_ok() && v != 0
+}
+
+/// **The residency bound**: how many CTAs of `f` at `block` threads can be co-resident on this device.
+///
+/// Returns `(blocks_per_sm, blocks_per_sm * sm_count)`. This is the same product
+/// `cuLaunchCooperativeKernel` itself checks, which is why it is computed here rather than trusted to
+/// the driver's error: a plan that exceeds it must decline *before* anything is allocated or launched,
+/// and having our own number lets a gate assert the two agree.
+pub fn max_resident_ctas(
+    g: &crate::gpu::Gpu,
+    f: &CudaFunction,
+    block: u32,
+) -> Result<(u32, u32), String> {
+    // `cuOccupancyMaxActiveBlocksPerMultiprocessor` needs a context current on THIS thread; libtest
+    // runs these on many threads and `cudarc` binds inside launch/load but not inside the query.
+    let _ = g.ctx.bind_to_thread();
+    let per_sm = f
+        .occupancy_max_active_blocks_per_multiprocessor(block, 0, None)
+        .map_err(|e| format!("cuOccupancyMaxActiveBlocksPerMultiprocessor failed: {e:?}"))?;
+    let sms = u32::try_from(g.target().sm_count)
+        .map_err(|_| format!("probed SM count {} is not usable", g.target().sm_count))?;
+    Ok((per_sm, per_sm.saturating_mul(sms)))
+}
+
+/// Derive the launch geometry for a module of the given [`MegaAbi`].
+///
+/// `Ok(None)` is the clean fallback — the caller declines to `Ok(None)` and the single-thread path
+/// (still the correctness reference) runs the program. It is returned when the module is
+/// grid-parallel but this machine cannot host it: no cooperative-launch support, an occupancy of zero
+/// CTAs per SM, or an explicit [`GRID_ENV`] request above the residency bound.
+///
+/// A block-scoped module always plans `grid = 1` and a plain launch, which is byte-for-byte what this
+/// file did before the multi-CTA work — `desired` is ignored there and saying so is the point: one
+/// CTA is a *correctness* requirement of that ABI, not a tuning default.
+pub fn plan_grid(
+    g: &crate::gpu::Gpu,
+    f: &CudaFunction,
+    grid_parallel: bool,
+    desired: Option<u32>,
+) -> Result<Option<GridPlan>, String> {
+    let (blocks_per_sm, max_resident) = max_resident_ctas(g, f, MEGA_BLOCK)?;
+    let sm_count = u32::try_from(g.target().sm_count).unwrap_or(0);
+    let base = GridPlan {
+        grid: 1,
+        block: MEGA_BLOCK,
+        cooperative: false,
+        blocks_per_sm,
+        sm_count,
+        max_resident,
+    };
+    if !grid_parallel {
+        return Ok(Some(base));
+    }
+    if !supports_cooperative_launch(g) {
+        return Ok(None);
+    }
+    if max_resident == 0 {
+        return Ok(None);
+    }
+    let grid = match desired {
+        // Above the bound the grid cannot be made resident, so the barrier would spin forever.
+        // Decline rather than clamp: a clamped sweep reports a number for a grid nobody asked for.
+        Some(n) if n == 0 || n > max_resident => return Ok(None),
+        Some(n) => n,
+        // The persistent-kernel default: exactly one full wave of CTAs, no more.
+        None => max_resident,
+    };
+    Ok(Some(GridPlan {
+        grid,
+        cooperative: true,
+        ..base
+    }))
+}
+
+/// Parse [`GRID_ENV`], or `None` for "one full resident wave". A malformed value is an error, not a
+/// silently-ignored knob.
+fn env_grid() -> Result<Option<u32>, String> {
+    match std::env::var(GRID_ENV) {
+        Err(_) => Ok(None),
+        Ok(s) => s
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("{GRID_ENV}={s:?} is not a CTA count")),
+    }
+}
 
 /// Report why the megakernel declined, under the existing `WUKONG_GPU_DUMP_PTX` knob, and return the
 /// `Ok(None)` the caller falls back on.
@@ -97,17 +429,37 @@ pub fn try_run(
         // No device: let the single-thread path surface the helpful error.
         return decline("no device");
     };
-    let r = launch_mega(g, &ptx, frame_bytes)?;
-    Ok(Some(r))
+    match launch_mega(g, &ptx, frame_bytes)? {
+        Some(r) => Ok(Some(r)),
+        // The module is grid-parallel but this machine cannot host its grid (no cooperative launch,
+        // or it will not fit resident). Falling back is correct; falling back *silently* is how a
+        // coverage loss hides, so it goes through `decline` like every other one.
+        None => decline("cooperative grid not launchable here (see plan_grid)"),
+    }
 }
 
-/// JIT + launch one mega PTX module as a single block of [`MEGA_BLOCK`] threads, returning the
-/// decoded `(exit_code, stdout)`. The frame buffer is a fresh zeroed `.global` slab the block shares.
+/// JIT + launch one mega PTX module, returning the decoded `(exit_code, stdout)` — or `Ok(None)` if
+/// the module's grid cannot be made resident on this device (the caller declines).
+///
+/// The geometry comes from the module, not from a constant: [`mega_abi`] reads the entry's ABI back
+/// out of the PTX and [`plan_grid`] turns it into a grid. A block-scoped entry runs as one CTA of
+/// [`MEGA_BLOCK`] threads through a plain launch; a grid-parallel entry runs as a full resident wave
+/// through `cuLaunchCooperativeKernel`, with a fresh zeroed [`GRID_BARRIER_BYTES`] state buffer.
+///
+/// **Launch-seam preconditions** (hard rule 2 — the argument list must match the entry's declared
+/// `.param` count, derived from the same source as the entry name):
+///  - the number of arguments pushed equals `abi.params.len()`, and both come from the same parse of
+///    the same PTX text;
+///  - a `grid > 1` plan is always cooperative — a plain multi-CTA launch of a grid-barriered kernel
+///    is the deadlock this whole path exists to avoid.
+///
+/// The grid is emitted 1-D; the barrier does not require that (it counts `nctaid.x*y*z`), but the
+/// chunked-cooperative bodies index work by a flat thread id, so a 1-D launch keeps the two aligned.
 fn launch_mega(
     g: &mut crate::gpu::Gpu,
     ptx: &str,
     frame_bytes: u64,
-) -> Result<(i64, Vec<u8>), String> {
+) -> Result<Option<(i64, Vec<u8>)>, String> {
     let mut h = DefaultHasher::new();
     ptx.hash(&mut h);
     let key: &'static str = Box::leak(format!("mega_{:016x}", h.finish()).into_boxed_str());
@@ -116,6 +468,7 @@ fn launch_mega(
         eprintln!("--- gpu-mega PTX ---\n{ptx}\n--- end PTX ---");
     }
 
+    let abi = mega_abi(ptx)?;
     let f = g.function(key, ptx, MEGA_KERNEL_NAME).map_err(|e| {
         let p = std::env::temp_dir().join(format!("{key}.ptx"));
         let _ = std::fs::write(&p, ptx);
@@ -124,36 +477,91 @@ fn launch_mega(
             p.display()
         )
     })?;
+    let Some(plan) = plan_grid(g, &f, abi.grid_parallel, env_grid()?)? else {
+        return Ok(None);
+    };
+    assert!(
+        plan.grid == 1 || plan.cooperative,
+        "gpu-mega: a {}-CTA grid must be launched cooperatively — a plain launch does not \
+         guarantee co-residency, and a grid barrier without co-residency spins forever",
+        plan.grid
+    );
+    if std::env::var_os("WUKONG_GPU_DUMP_PTX").is_some() {
+        eprintln!(
+            "gpu-mega: grid {}x{} ({}), {} blocks/SM x {} SMs = {} resident max",
+            plan.grid,
+            plan.block,
+            if plan.cooperative {
+                "cooperative"
+            } else {
+                "block-scoped"
+            },
+            plan.blocks_per_sm,
+            plan.sm_count,
+            plan.max_resident
+        );
+    }
 
     let host = lower::new_ctx_host();
     let mut ctx_d = g
         .stream
         .memcpy_stod(&host)
         .map_err(|e| format!("gpu-mega ctx alloc failed: {e:?}"))?;
-    // One shared frame for the whole block (>=8 bytes so a frame-less program still allocs cleanly).
+    // One shared frame for the whole grid (>=8 bytes so a frame-less program still allocs cleanly).
     let mut frame_d = g
         .stream
         .alloc_zeros::<u8>(frame_bytes.max(8) as usize)
         .map_err(|e| format!("gpu-mega frame alloc failed: {e:?}"))?;
+    // Fresh and zeroed per launch — see `GRID_BARRIER_BYTES` for why it is not a module `.global`.
+    // Only for a grid-parallel entry: the block-scoped path must keep its exact per-launch driver
+    // traffic, because `mega_vs_chain_reduce` measures precisely that.
+    let mut bar_d = if abi.grid_parallel {
+        Some(
+            g.stream
+                .alloc_zeros::<u8>(GRID_BARRIER_BYTES)
+                .map_err(|e| format!("gpu-mega barrier alloc failed: {e:?}"))?,
+        )
+    } else {
+        None
+    };
 
     let cfg = LaunchConfig {
-        grid_dim: (1, 1, 1),
-        block_dim: (MEGA_BLOCK, 1, 1),
+        grid_dim: (plan.grid, 1, 1),
+        block_dim: (plan.block, 1, 1),
         shared_mem_bytes: 0,
     };
     let mut b = g.stream.launch_builder(&f);
+    let mut pushed = 0usize;
     b.arg(&mut ctx_d);
+    pushed += 1;
     b.arg(&mut frame_d);
+    pushed += 1;
+    if let Some(bar) = bar_d.as_mut() {
+        b.arg(bar);
+        pushed += 1;
+    }
+    assert_eq!(
+        pushed,
+        abi.params.len(),
+        "gpu-mega: pushed {pushed} kernel arguments for an entry declaring {:?} — a short push makes \
+         the driver read adjacent host stack as a device pointer",
+        abi.params
+    );
     unsafe {
-        b.launch(cfg)
-            .map_err(|e| format!("gpu-mega launch failed: {e:?}"))?;
+        if plan.cooperative {
+            b.launch_cooperative(cfg)
+                .map_err(|e| format!("gpu-mega cooperative launch failed: {e:?}"))?;
+        } else {
+            b.launch(cfg)
+                .map_err(|e| format!("gpu-mega launch failed: {e:?}"))?;
+        }
     }
 
     let out = g
         .stream
         .memcpy_dtov(&ctx_d)
         .map_err(|e| format!("gpu-mega readback failed: {e:?}"))?;
-    lower::decode_ctx(&out)
+    lower::decode_ctx(&out).map(Some)
 }
 
 // `pub(crate)` so `MEGA_CORPUS_COVERAGE_FLOOR` has exactly one definition: the device-free
@@ -863,6 +1271,457 @@ fn main() -> i32 {{
             chain_t * 1e3,
             mega_t * 1e3,
             chain_t / mega_t,
+        );
+    }
+
+    // ==========================================================================================
+    // Multi-CTA: the grid barrier, the residency bound, and the ABI seam between this file and
+    // `lower.rs`. Everything below is about *how* the megakernel is launched, not what it computes.
+    // ==========================================================================================
+
+    /// Rounds the grid-barrier probe runs. Two barriers per round, so 32 rounds is 64 grid
+    /// rendezvous — enough that a barrier which only works once (a counter reset with no generation
+    /// flip) fails on round two rather than passing by luck.
+    const PROBE_ROUNDS: u64 = 32;
+
+    /// A **self-contained cooperative kernel that can only pass if the grid barrier really works.**
+    ///
+    /// Each round `r`, CTA `b` writes `buf[b] = b*1000 + r + 1`, rendezvouses grid-wide, then reads
+    /// **every** slot `buf[c]` and checks it against the exact value CTA `c` must have written *this
+    /// round*. A second barrier closes the round so the next write cannot race the read. `out[b]`
+    /// accumulates mismatches and `out[G+b]` keeps the last value read, so a vacuous pass (nothing
+    /// ran, everything zero) is distinguishable from a real one.
+    ///
+    /// It is a **per-lane** check, deliberately not a checksum: a sum over the slots could cancel a
+    /// CTA that is one round behind against one that is one round ahead, which is exactly the state a
+    /// half-working barrier produces. Every slot is compared to its own closed form instead, so the
+    /// mismatch count is the number of CTAs that were out of step, per round.
+    ///
+    /// A `bar.sync` in place of the grid barrier cannot pass this: it orders CTA `b` against itself
+    /// and says nothing about the other `G-1` CTAs, so the scan lands on stale or unwritten slots.
+    fn gridbar_probe_ptx() -> String {
+        format!(
+            "{}{}{}",
+            crate::ptx_target::HDR_SM80,
+            grid_barrier_ptx(),
+            r#"
+.visible .entry wk_gridbar_probe (
+    .param .u64 p_buf,
+    .param .u64 p_out,
+    .param .u64 p_bar,
+    .param .u64 p_rounds
+)
+{
+    .reg .b64 %rd<12>;
+    .reg .b32 %r<12>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [p_buf];
+    ld.param.u64 %rd1, [p_out];
+    ld.param.u64 %rd2, [p_bar];
+    ld.param.u64 %rd3, [p_rounds];
+    cvta.to.global.u64 %rd4, %rd0;
+    cvta.to.global.u64 %rd5, %rd1;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %nctaid.x;
+    mov.u32 %r2, %tid.x;
+    mul.wide.u32 %rd6, %r0, 4;
+    add.s64 %rd6, %rd4, %rd6;
+    mul.wide.u32 %rd8, %r0, 4;
+    add.s64 %rd8, %rd5, %rd8;
+    add.u32 %r4, %r1, %r0;
+    mul.wide.u32 %rd9, %r4, 4;
+    add.s64 %rd9, %rd5, %rd9;
+    mov.u32 %r5, 0;
+    mov.u32 %r6, 0;
+    mov.b64 %rd10, 0;
+    setp.ne.u32 %p1, %r2, 0;
+GBP_LOOP:
+    setp.ge.s64 %p0, %rd10, %rd3;
+    @%p0 bra GBP_DONE;
+    @%p1 bra GBP_W;
+    cvt.u32.u64 %r7, %rd10;
+    mul.lo.u32 %r8, %r0, 1000;
+    add.u32 %r8, %r8, %r7;
+    add.u32 %r8, %r8, 1;
+    st.global.u32 [%rd6], %r8;
+GBP_W:
+    {
+    .param .b64 _b0;
+    st.param.b64 [_b0], %rd2;
+    call.uni mrt_grid_barrier, (_b0);
+    }
+    @%p1 bra GBP_R;
+    mov.u32 %r3, 0;
+    mov.u64 %rd7, %rd4;
+GBP_SCAN:
+    setp.ge.u32 %p2, %r3, %r1;
+    @%p2 bra GBP_R;
+    ld.global.u32 %r9, [%rd7];
+    cvt.u32.u64 %r7, %rd10;
+    mul.lo.u32 %r10, %r3, 1000;
+    add.u32 %r10, %r10, %r7;
+    add.u32 %r10, %r10, 1;
+    setp.ne.u32 %p3, %r9, %r10;
+    @%p3 add.u32 %r5, %r5, 1;
+    mov.u32 %r6, %r9;
+    add.u32 %r3, %r3, 1;
+    add.s64 %rd7, %rd7, 4;
+    bra GBP_SCAN;
+GBP_R:
+    {
+    .param .b64 _b1;
+    st.param.b64 [_b1], %rd2;
+    call.uni mrt_grid_barrier, (_b1);
+    }
+    add.s64 %rd10, %rd10, 1;
+    bra GBP_LOOP;
+GBP_DONE:
+    @%p1 bra GBP_END;
+    st.global.u32 [%rd8], %r5;
+    st.global.u32 [%rd9], %r6;
+GBP_END:
+    ret;
+}
+"#
+        )
+    }
+
+    /// **The barrier's ASCII + shape law** (crate hard rule 1: one non-ASCII byte anywhere in a PTX
+    /// string is a `ptxas fatal` at `cuModuleLoadData`, and the Rust prose around this generator is
+    /// full of arrows and multiplication signs). Also pins the pieces the protocol cannot lose: the
+    /// two `bar.sync`es that bracket the grid phase, the three device-scope fences, the arrival
+    /// atomic, the CTA count it compares against, and the fact that it is a spliceable `.func`
+    /// fragment with no `.version` header of its own.
+    #[test]
+    fn grid_barrier_ptx_is_pure_ascii_and_ampere_legal() {
+        let p = grid_barrier_ptx();
+        assert!(
+            p.is_ascii(),
+            "grid barrier PTX must be pure ASCII: {:?}",
+            p.chars().find(|c| !c.is_ascii())
+        );
+        assert!(!p.contains('\t'), "PTX must not contain tabs");
+        assert!(p.starts_with(&format!(".func {GRID_BARRIER_FN} (.param .b64 p_bar)")));
+        assert!(
+            !p.contains(".version") && !p.contains(".target"),
+            "the barrier is a fragment spliced into a module that already carries HDR_SM80"
+        );
+        assert_eq!(
+            p.matches("bar.sync 0;").count(),
+            2,
+            "the CTA rendezvous brackets the grid phase on both sides"
+        );
+        assert_eq!(
+            p.matches("membar.gl;").count(),
+            3,
+            "release fence, the last-CTA reset fence, and the acquire fence"
+        );
+        assert!(p.contains("atom.global.add.u32"));
+        // The arrival target is the WHOLE grid and the representative is thread (0,0,0), so the
+        // barrier carries no "must be launched 1-D" precondition for a caller to violate.
+        for d in ["%nctaid.x", "%nctaid.y", "%nctaid.z", "%tid.y", "%tid.z"] {
+            assert!(p.contains(d), "barrier must be geometry-agnostic: missing {d}");
+        }
+        assert_eq!(
+            p.matches("ld.volatile.global.u32").count(),
+            2,
+            "the generation read and the spin load must both be volatile or the JIT hoists them"
+        );
+        // Nothing here postdates PTX ISA 7.8 / sm_80, which is what lets the fragment sit in an
+        // `HDR_SM80` module (see `ptx_target`, and gpu.rs's `.version` law).
+        for above_78 in ["wgmma", "stmatrix", "elect.sync", "cp.async.bulk", "tcgen05"] {
+            assert!(!p.contains(above_78), "{above_78} would raise the ISA floor");
+        }
+    }
+
+    /// **The ABI seam has exactly two legal shapes, and half of one is an error.**
+    ///
+    /// `lower.rs` decides the mega entry's parameter list and this file decides the launch. Hard rule
+    /// 2 says the argument list pushed must be derived from the same source as the entry name, so the
+    /// launcher parses the shape back out of the PTX; this pins that parse, including the two ways
+    /// the halves can drift — a barrier parameter with no barrier `.func` (deadlock: a rendezvous no
+    /// launch made resident) and a barrier `.func` with no parameter (duplicated side effects, since
+    /// the entry's `tid==0` guards are per-CTA).
+    #[test]
+    fn mega_abi_recognizes_exactly_two_shapes() {
+        let block = format!(".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame)\n{{\nret;\n}}\n");
+        let a = mega_abi(&block).expect("block-scoped ABI");
+        assert_eq!(a.params, ["p_ctx", "p_frame"]);
+        assert!(!a.grid_parallel);
+
+        let entry3 = format!(
+            ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame, \
+             .param .u64 {MEGA_GBAR_PARAM})\n{{\nret;\n}}\n"
+        );
+        let grid = format!("{}{}", grid_barrier_ptx(), entry3);
+        let b = mega_abi(&grid).expect("grid-parallel ABI");
+        assert_eq!(b.params, ["p_ctx", "p_frame", MEGA_GBAR_PARAM]);
+        assert!(b.grid_parallel);
+
+        // Half a grid-parallel kernel, both directions.
+        assert!(mega_abi(&entry3).is_err());
+        let func_no_param = format!("{}{}", grid_barrier_ptx(), block);
+        assert!(mega_abi(&func_no_param).is_err());
+
+        // The first two names are the contract, not decoration: the launcher pushes ctx then frame
+        // and nothing downstream would notice them swapped or renamed.
+        let renamed = format!(
+            ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_frame, .param .u64 p_ctx)\n{{\nret;\n}}\n"
+        );
+        assert!(mega_abi(&renamed).is_err());
+
+        assert!(mega_abi("nothing here").is_err());
+    }
+
+    /// **What `lower::emit_mega_ptx` actually emits agrees with what the launcher pushes.**
+    ///
+    /// The ratchet on the seam above: it reads a real emitted module rather than a hand-written
+    /// string, so the day `lower.rs` grows the third parameter this test sees it, and it fails if
+    /// only one of the two markers lands. It deliberately accepts *either* shape — the block-scoped
+    /// one is today's, the grid-parallel one is the follow-up — and pins the invariant that binds
+    /// them: barrier parameter iff barrier `.func`, and one CTA iff block-scoped.
+    #[test]
+    fn emitted_mega_abi_agrees_with_the_launcher() {
+        // The same `@parallel` shape `mega_parallel_activation_matches_single_and_oracle` pins as
+        // eligible (multi-statement body -> `wukong_vmath_f32_parallel`, inlined into `main` at -O2).
+        let src = r#"module abi
+@parallel
+fn act(x: [f32; 256], mut o: [f32; 256], mut tail: [f32; 1]) {
+    for i in 0..256 { o[i] = silu(x[i]); }
+    tail[0] = o[255];
+}
+fn main() -> i32 {
+    let mut x: [f32; 256] = [0.5; 256];
+    let mut o: [f32; 256] = [0.0; 256];
+    let mut tail: [f32; 1] = [0.0; 1];
+    act(x, o, tail);
+    print((tail[0] * 1000.0) as i32);
+    return 0;
+}
+"#;
+        let (program, mut interner) = build(src, 2).expect("frontend ok");
+        let entry = interner.intern("main");
+        assert!(
+            crate::fusion::analyze(&program, entry, &interner).eligible,
+            "the ABI probe program must be megakernel-eligible"
+        );
+        let ptx = lower::emit_mega_ptx(&program, entry, &interner).expect("mega ptx");
+        let abi = mega_abi(&ptx).expect("emitted mega PTX must have a recognized ABI");
+        assert_eq!(
+            abi.grid_parallel,
+            ptx.contains(&format!(".func {GRID_BARRIER_FN} ")),
+            "the two grid-parallel markers must agree"
+        );
+        assert_eq!(abi.params[0], "p_ctx");
+        assert_eq!(abi.params[1], "p_frame");
+        assert_eq!(
+            abi.params.len(),
+            if abi.grid_parallel { 3 } else { 2 },
+            "the launcher pushes ctx + frame (+ barrier state when grid-parallel)"
+        );
+        eprintln!(
+            "[gate] emit_mega_ptx ABI = {:?} (grid_parallel = {})",
+            abi.params, abi.grid_parallel
+        );
+    }
+
+    /// **The grid-wide barrier really orders writes across cooperative CTAs, on the real device.**
+    ///
+    /// This is the correctness risk the whole multi-CTA increment turns on: `bar.sync` synchronizes a
+    /// CTA, a grid barrier is a different construct, and getting it wrong deadlocks the part. The
+    /// probe ([`gridbar_probe_ptx`]) makes every CTA read values only its *peers* can have written
+    /// *this round*, over the **full resident grid** derived from occupancy — 20 SMs is a small
+    /// machine but a genuinely multi-CTA one, and a broken barrier reads the wrong value here exactly
+    /// as it would on 132 SMs.
+    ///
+    /// **The probe is measured to be sensitive, not assumed to be.** Replacing the grid barrier's
+    /// body with a bare `bar.sync 0; ret;` (a CTA rendezvous and nothing more — the construct this
+    /// whole increment exists to replace) and re-running on this 4050 reports *120 of 120 CTAs bad,
+    /// 426961 stale slot-reads of 460800*. So a pass here is a statement about the grid protocol, not
+    /// about 120 CTAs happening to run in lockstep.
+    #[test]
+    fn grid_barrier_orders_writes_across_cooperative_ctas() {
+        let mut guard = crate::gpu::gpu();
+        let Some(g) = guard.as_mut() else {
+            crate::diff::skip_or_fail(
+                "grid_barrier_orders_writes_across_cooperative_ctas",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        };
+        if !supports_cooperative_launch(g) {
+            crate::diff::skip_or_fail(
+                "grid_barrier_orders_writes_across_cooperative_ctas",
+                "device reports no CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH",
+            );
+            return;
+        }
+        let ptx = gridbar_probe_ptx();
+        assert!(ptx.is_ascii(), "probe module must be pure ASCII");
+        assert_eq!(
+            ptx.matches(&format!("call.uni {GRID_BARRIER_FN},")).count(),
+            2,
+            "the probe must call the barrier twice per round"
+        );
+        let f = g
+            .function("mega_gridbar_probe_v1", &ptx, "wk_gridbar_probe")
+            .expect("gridbar probe JIT");
+        let plan = plan_grid(g, &f, true, None)
+            .expect("plan")
+            .expect("a cooperative grid must be plannable on this device");
+        assert!(plan.cooperative);
+        assert_eq!(plan.grid, plan.max_resident);
+        assert!(
+            plan.grid > 1,
+            "a one-CTA grid would make this test vacuous (blocks/SM {} x SMs {})",
+            plan.blocks_per_sm,
+            plan.sm_count
+        );
+        let gsz = plan.grid as usize;
+
+        let mut buf = g.stream.alloc_zeros::<u32>(gsz).expect("buf");
+        let mut out = g.stream.alloc_zeros::<u32>(2 * gsz).expect("out");
+        let mut bar = g
+            .stream
+            .alloc_zeros::<u8>(GRID_BARRIER_BYTES)
+            .expect("barrier state");
+        let rounds: u64 = PROBE_ROUNDS;
+        let cfg = LaunchConfig {
+            grid_dim: (plan.grid, 1, 1),
+            block_dim: (plan.block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        {
+            let mut b = g.stream.launch_builder(&f);
+            b.arg(&mut buf);
+            b.arg(&mut out);
+            b.arg(&mut bar);
+            b.arg(&rounds);
+            unsafe {
+                b.launch_cooperative(cfg)
+                    .expect("cooperative launch of the grid-barrier probe");
+            }
+        }
+        let host = g.stream.memcpy_dtov(&out).expect("readback");
+        let mismatches: u32 = host[..gsz].iter().sum();
+        assert_eq!(
+            mismatches,
+            0,
+            "grid barrier did not order cross-CTA writes: {} of {gsz} CTA(s) saw a stale or \
+             unwritten peer slot while scanning all {gsz} slots over {rounds} rounds ({mismatches} \
+             bad slot-reads in total)",
+            host[..gsz].iter().filter(|&&m| m != 0).count()
+        );
+        // Not-vacuous: every CTA's LAST read is slot G-1 in the LAST round, a value only a real
+        // cross-CTA read after a real rendezvous can produce (0 would mean it never got there).
+        let want = (gsz as u32 - 1) * 1000 + (rounds as u32 - 1) + 1;
+        for b in 0..gsz {
+            assert_eq!(
+                host[gsz + b],
+                want,
+                "CTA {b} last read {} from slot {}, expected {want}",
+                host[gsz + b],
+                gsz - 1
+            );
+        }
+        eprintln!(
+            "[gate] grid barrier: {} cooperative CTAs x {} threads ({} blocks/SM x {} SMs), \
+             {rounds} rounds, every CTA scanned all {} peer slots each round, \
+             0 cross-CTA ordering violations \u{2713}",
+            plan.grid, plan.block, plan.blocks_per_sm, plan.sm_count, plan.grid
+        );
+    }
+
+    /// **The residency bound is enforced before anything is launched, and it is the driver's bound.**
+    ///
+    /// A cooperative grid that is not simultaneously resident does not run slowly — it hangs, because
+    /// the CTAs that never got scheduled never arrive at the barrier. So [`plan_grid`] declines above
+    /// `cuOccupancyMaxActiveBlocksPerMultiprocessor x sm_count` instead of clamping, and this checks
+    /// that our number is the same one `cuLaunchCooperativeKernel` itself validates against.
+    ///
+    /// The over-subscribed launch is run with `rounds = 0`, so the probe calls no barrier at all: if
+    /// some driver were to accept the launch instead of refusing it, the kernel returns immediately
+    /// and this test fails loudly rather than wedging the device.
+    #[test]
+    fn cooperative_grid_declines_above_the_residency_bound() {
+        let mut guard = crate::gpu::gpu();
+        let Some(g) = guard.as_mut() else {
+            crate::diff::skip_or_fail(
+                "cooperative_grid_declines_above_the_residency_bound",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        };
+        if !supports_cooperative_launch(g) {
+            crate::diff::skip_or_fail(
+                "cooperative_grid_declines_above_the_residency_bound",
+                "device reports no CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH",
+            );
+            return;
+        }
+        let ptx = gridbar_probe_ptx();
+        let f = g
+            .function("mega_gridbar_probe_v1", &ptx, "wk_gridbar_probe")
+            .expect("gridbar probe JIT");
+        let (per_sm, max_resident) = max_resident_ctas(g, &f, MEGA_BLOCK).expect("occupancy");
+        assert!(per_sm > 0, "occupancy query returned 0 blocks/SM");
+        assert_eq!(max_resident, per_sm * g.target().sm_count as u32);
+
+        // The plan declines above the bound, and at zero, instead of quietly clamping.
+        assert!(plan_grid(g, &f, true, Some(max_resident + 1))
+            .expect("plan")
+            .is_none());
+        assert!(plan_grid(g, &f, true, Some(0)).expect("plan").is_none());
+        let at = plan_grid(g, &f, true, Some(max_resident))
+            .expect("plan")
+            .expect("exactly the bound must be plannable");
+        assert_eq!(at.grid, max_resident);
+        // A block-scoped module is one CTA regardless of what anyone asks for: that is a correctness
+        // property of `tid==0`-guarded side effects, not a tuning default.
+        let bs = plan_grid(g, &f, false, Some(max_resident))
+            .expect("plan")
+            .expect("block-scoped always plans");
+        assert_eq!((bs.grid, bs.cooperative), (1, false));
+
+        // ...and the driver agrees. `rounds = 0` means the probe never reaches a barrier, so an
+        // unexpectedly-accepted launch terminates instead of hanging.
+        let mut buf = g.stream.alloc_zeros::<u32>(1).expect("buf");
+        let mut out = g.stream.alloc_zeros::<u32>(2).expect("out");
+        let mut bar = g
+            .stream
+            .alloc_zeros::<u8>(GRID_BARRIER_BYTES)
+            .expect("barrier state");
+        let rounds: u64 = 0;
+        let too_big = LaunchConfig {
+            grid_dim: (max_resident + 1, 1, 1),
+            block_dim: (MEGA_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let refused = {
+            let mut b = g.stream.launch_builder(&f);
+            b.arg(&mut buf);
+            b.arg(&mut out);
+            b.arg(&mut bar);
+            b.arg(&rounds);
+            unsafe { b.launch_cooperative(too_big) }
+        };
+        assert!(
+            refused.is_err(),
+            "cuLaunchCooperativeKernel accepted {} CTAs while occupancy says only {max_resident} \
+             fit — our residency bound and the driver's disagree, so a real grid barrier at this \
+             size would hang",
+            max_resident + 1
+        );
+        // The refusal is a launch-validation error, not a sticky fault: the context must still work.
+        g.stream
+            .synchronize()
+            .expect("context healthy after a refused cooperative launch");
+        eprintln!(
+            "[gate] residency bound: {per_sm} blocks/SM x {} SMs = {max_resident} CTAs; \
+             {} refused by the driver ({:?}) \u{2713}",
+            g.target().sm_count,
+            max_resident + 1,
+            refused.unwrap_err()
         );
     }
 }
