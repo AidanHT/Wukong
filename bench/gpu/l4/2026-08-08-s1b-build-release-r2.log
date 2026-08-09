@@ -1,0 +1,1198 @@
+# ---- WUKONG ROUND PROVENANCE (GPU_RETARGET_PLAN.md 6.1) ----
+round_id         : 2026-08-08-l4-s1b-build-release-r2
+local_time_start : 2026-08-08T20:51:25.3439158-04:00
+operator         : Aidan (via Claude Code)
+checkout         : C:/Users/Quant/Documents/Programming/Projects/Compiler/Mercury   (MAIN checkout, not a worktree)
+git_branch       : main
+git_head         : 84a202b8c070cd0b52d15dd17418fc999ccc16a3  fix(interp): cap the alloc arena — try_reserve is not a guard under Linux overcommit
+git_dirty        : YES -- PROVENANCE VIOLATION
+provider / SKU   : Modal / L4    (WK_GPU=L4)  [NO GPU ATTACHED for ::build]
+image tag        : nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
+modal client     : 1.5.3
+command          : modal run tools/cloud/modal_app.py::build --release
+cargo profile    : release
+env              : WK_TIMEOUT=5400
+device           : NVIDIA L4 / sm_89 / 58 SMs / smem_optin 99 KiB / L2 48 MiB / VRAM 22563 MiB   (from S0)
+driver / runtime : 13.0 / 12.9                          (from S0)
+MIG              : N/A                                  (from S0)
+provenance gate  : OK                                   (from S0)
+clock lock       : NONE - Modal is a container (plan 6.3). ITERATION data, NOT publication data.
+# --------------------------------------------------------------
+
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-9R46RkXY52RgSBmEUJxoBJ
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+[src] 798 files stamped; 0 new/changed since the last run (incremental)
+
+[1m$ rustc --version[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+[1m-> ok in 1.3s[0m
+
+[1m$ cargo --version[0m
+cargo 1.97.1 (c980f4866 2026-06-30)
+[1m-> ok in 0.1s[0m
+
+[1m$ cargo check --features gpu --all-targets --release[0m
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m libm v0.2.16
+[1m[92m   Compiling[0m proc-macro2 v1.0.106
+[1m[92m   Compiling[0m quote v1.0.45
+[1m[92m   Compiling[0m unicode-ident v1.0.24
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m   Compiling[0m getrandom v0.3.4
+[1m[92m   Compiling[0m autocfg v1.5.1
+[1m[92m   Compiling[0m crossbeam-utils v0.8.21
+[1m[92m    Checking[0m wukong_span v0.1.0 (/wukong/crates/wukong_span)
+[1m[92m   Compiling[0m rayon-core v1.13.0
+[1m[92m   Compiling[0m cranelift-srcgen v0.124.3
+[1m[92m    Checking[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m cranelift-isle v0.124.3
+[1m[92m   Compiling[0m target-lexicon v0.13.5
+[1m[92m   Compiling[0m cranelift-codegen-shared v0.124.3
+[1m[92m   Compiling[0m heck v0.5.0
+[1m[92m   Compiling[0m anyhow v1.0.102
+[1m[92m   Compiling[0m crc32fast v1.5.0
+[1m[92m   Compiling[0m object v0.37.3
+[1m[92m    Checking[0m hashbrown v0.17.1
+[1m[92m    Checking[0m equivalent v1.0.2
+[1m[92m    Checking[0m foldhash v0.1.5
+[1m[92m    Checking[0m either v1.16.0
+[1m[92m    Checking[0m allocator-api2 v0.2.21
+[1m[92m    Checking[0m cranelift-bitset v0.124.3
+[1m[92m    Checking[0m wukong_types v0.1.0 (/wukong/crates/wukong_types)
+[1m[92m    Checking[0m wukong_diag v0.1.0 (/wukong/crates/wukong_diag)
+[1m[92m    Checking[0m wukong_ast v0.1.0 (/wukong/crates/wukong_ast)
+[1m[92m   Compiling[0m cranelift-assembler-x64-meta v0.124.3
+[1m[92m    Checking[0m hashbrown v0.15.5
+[1m[92m    Checking[0m wukong_mir v0.1.0 (/wukong/crates/wukong_mir)
+[1m[92m    Checking[0m cranelift-entity v0.124.3
+[1m[92m    Checking[0m wukong_lexer v0.1.0 (/wukong/crates/wukong_lexer)
+[1m[92m    Checking[0m log v0.4.32
+[1m[92m    Checking[0m smallvec v1.15.2
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m    Checking[0m arbitrary v1.4.2
+[1m[92m    Checking[0m rustc-hash v2.1.2
+[1m[92m    Checking[0m wukong_parser v0.1.0 (/wukong/crates/wukong_parser)
+[1m[92m    Checking[0m wukong_sema v0.1.0 (/wukong/crates/wukong_sema)
+[1m[92m   Compiling[0m cudarc v0.16.6
+[1m[92m    Checking[0m memchr v2.8.2
+[1m[92m    Checking[0m bitflags v1.3.2
+[1m[92m    Checking[0m wukong_backend v0.1.0 (/wukong/crates/wukong_backend)
+[1m[92m    Checking[0m wukong_opt v0.1.0 (/wukong/crates/wukong_opt)
+[1m[92m    Checking[0m cranelift-bforest v0.124.3
+[1m[92m    Checking[0m bumpalo v3.20.3
+[1m[92m    Checking[0m libloading v0.8.9
+[1m[92m    Checking[0m wukong_mir_build v0.1.0 (/wukong/crates/wukong_mir_build)
+[1m[92m    Checking[0m lazy_static v1.5.0
+[1m[92m    Checking[0m indexmap v2.14.0
+[1m[92m    Checking[0m crossbeam-epoch v0.9.18
+[1m[92m    Checking[0m iced-x86 v1.21.0
+[1m[92m    Checking[0m regalloc2 v0.13.5
+[1m[92m    Checking[0m wukong_autodiff v0.1.0 (/wukong/crates/wukong_autodiff)
+[1m[92m   Compiling[0m cranelift-codegen-meta v0.124.3
+[1m[92m    Checking[0m crossbeam-deque v0.8.6
+[1m[92m   Compiling[0m syn v2.0.117
+[1m[92m    Checking[0m wukong_codegen_llvm v0.1.0 (/wukong/crates/wukong_codegen_llvm)
+[1m[92m    Checking[0m cranelift-control v0.124.3
+[1m[92m    Checking[0m gimli v0.32.3
+[1m[92m    Checking[0m num_cpus v1.17.0
+[1m[92m    Checking[0m region v3.0.2
+[1m[92m    Checking[0m wasmtime-internal-jit-icache-coherence v37.0.3
+[1m[92m    Checking[0m rand_core v0.9.5
+[1m[92m   Compiling[0m matrixmultiply v0.3.10
+[1m[92m    Checking[0m rawpointer v0.2.1
+[1m[92m    Checking[0m rayon v1.12.0
+[1m[92m   Compiling[0m cranelift-assembler-x64 v0.124.3
+[1m[92m    Checking[0m wasmtime-internal-math v37.0.3
+[1m[92m   Compiling[0m cranelift-codegen v0.124.3
+[1m[92m   Compiling[0m zerocopy-derive v0.8.52
+[1m[92m    Checking[0m ppv-lite86 v0.2.21
+[1m[92m    Checking[0m rand_chacha v0.9.0
+[1m[92m    Checking[0m rand v0.9.4
+[1m[92m    Checking[0m rand_distr v0.5.1
+[1m[92m    Checking[0m half v2.7.1
+[1m[92m    Checking[0m wukong_runtime v0.1.0 (/wukong/crates/wukong_runtime)
+[1m[92m    Checking[0m wukong_interp v0.1.0 (/wukong/crates/wukong_interp)
+[1m[92m    Checking[0m wukong_codegen_gpu v0.1.0 (/wukong/crates/wukong_codegen_gpu)
+[1m[92m    Checking[0m cranelift-module v0.124.3
+[1m[92m    Checking[0m cranelift-native v0.124.3
+[1m[92m    Checking[0m cranelift-frontend v0.124.3
+[1m[92m    Checking[0m cranelift-jit v0.124.3
+[1m[92m    Checking[0m cranelift-object v0.124.3
+[1m[92m    Checking[0m wukong_codegen_cranelift v0.1.0 (/wukong/crates/wukong_codegen_cranelift)
+[1m[92m    Checking[0m wukong_driver v0.1.0 (/wukong/crates/wukong_driver)
+[1m[92m    Checking[0m wukong_xbench v0.1.0 (/wukong/crates/wukong_xbench)
+[1m[92m    Checking[0m wukong_bench v0.1.0 (/wukong/crates/wukong_bench)
+[1m[92m    Checking[0m wukongc v0.1.0 (/wukong/crates/wukongc)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 54.93s
+[1m-> ok in 55.1s[0m
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --no-run --release[0m
+[1m[92m   Compiling[0m wukong_span v0.1.0 (/wukong/crates/wukong_span)
+[1m[92m   Compiling[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m either v1.16.0
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m libm v0.2.16
+[1m[92m   Compiling[0m crossbeam-utils v0.8.21
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m   Compiling[0m libloading v0.8.9
+[1m[92m   Compiling[0m wukong_types v0.1.0 (/wukong/crates/wukong_types)
+[1m[92m   Compiling[0m wukong_diag v0.1.0 (/wukong/crates/wukong_diag)
+[1m[92m   Compiling[0m wukong_ast v0.1.0 (/wukong/crates/wukong_ast)
+[1m[92m   Compiling[0m wukong_mir v0.1.0 (/wukong/crates/wukong_mir)
+[1m[92m   Compiling[0m wukong_lexer v0.1.0 (/wukong/crates/wukong_lexer)
+[1m[92m   Compiling[0m crossbeam-epoch v0.9.18
+[1m[92m   Compiling[0m wukong_sema v0.1.0 (/wukong/crates/wukong_sema)
+[1m[92m   Compiling[0m wukong_parser v0.1.0 (/wukong/crates/wukong_parser)
+[1m[92m   Compiling[0m wukong_backend v0.1.0 (/wukong/crates/wukong_backend)
+[1m[92m   Compiling[0m wukong_autodiff v0.1.0 (/wukong/crates/wukong_autodiff)
+[1m[92m   Compiling[0m wukong_opt v0.1.0 (/wukong/crates/wukong_opt)
+[1m[92m   Compiling[0m crossbeam-deque v0.8.6
+[1m[92m   Compiling[0m rayon-core v1.13.0
+[1m[92m   Compiling[0m getrandom v0.3.4
+[1m[92m   Compiling[0m num_cpus v1.17.0
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m   Compiling[0m rand_core v0.9.5
+[1m[92m   Compiling[0m wukong_mir_build v0.1.0 (/wukong/crates/wukong_mir_build)
+[1m[92m   Compiling[0m rayon v1.12.0
+[1m[92m   Compiling[0m ppv-lite86 v0.2.21
+[1m[92m   Compiling[0m rand_chacha v0.9.0
+[1m[92m   Compiling[0m rand v0.9.4
+[1m[92m   Compiling[0m rand_distr v0.5.1
+[1m[92m   Compiling[0m half v2.7.1
+[1m[92m   Compiling[0m wukong_runtime v0.1.0 (/wukong/crates/wukong_runtime)
+[1m[92m   Compiling[0m cudarc v0.16.6
+[1m[92m   Compiling[0m wukong_interp v0.1.0 (/wukong/crates/wukong_interp)
+[1m[92m   Compiling[0m wukong_codegen_gpu v0.1.0 (/wukong/crates/wukong_codegen_gpu)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 2m 16s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-53f0e4b228126785)
+[1m-> ok in 136.2s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu --no-run --release[0m
+[1m[92m   Compiling[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m equivalent v1.0.2
+[1m[92m   Compiling[0m foldhash v0.1.5
+[1m[92m   Compiling[0m allocator-api2 v0.2.21
+[1m[92m   Compiling[0m cranelift-bitset v0.124.3
+[1m[92m   Compiling[0m rustc-hash v2.1.2
+[1m[92m   Compiling[0m arbitrary v1.4.2
+[1m[92m   Compiling[0m log v0.4.32
+[1m[92m   Compiling[0m smallvec v1.15.2
+[1m[92m   Compiling[0m cranelift-codegen-shared v0.124.3
+[1m[92m   Compiling[0m wasmtime-internal-math v37.0.3
+[1m[92m   Compiling[0m target-lexicon v0.13.5
+[1m[92m   Compiling[0m anyhow v1.0.102
+[1m[92m   Compiling[0m cranelift-assembler-x64 v0.124.3
+[1m[92m   Compiling[0m crc32fast v1.5.0
+[1m[92m   Compiling[0m bitflags v1.3.2
+[1m[92m   Compiling[0m memchr v2.8.2
+[1m[92m   Compiling[0m hashbrown v0.15.5
+[1m[92m   Compiling[0m lazy_static v1.5.0
+[1m[92m   Compiling[0m wukong_codegen_llvm v0.1.0 (/wukong/crates/wukong_codegen_llvm)
+[1m[92m   Compiling[0m cranelift-entity v0.124.3
+[1m[92m   Compiling[0m region v3.0.2
+[1m[92m   Compiling[0m iced-x86 v1.21.0
+[1m[92m   Compiling[0m wasmtime-internal-jit-icache-coherence v37.0.3
+[1m[92m   Compiling[0m bumpalo v3.20.3
+[1m[92m   Compiling[0m cranelift-bforest v0.124.3
+[1m[92m   Compiling[0m indexmap v2.14.0
+[1m[92m   Compiling[0m regalloc2 v0.13.5
+[1m[92m   Compiling[0m cranelift-control v0.124.3
+[1m[92m   Compiling[0m gimli v0.32.3
+[1m[92m   Compiling[0m object v0.37.3
+[1m[92m   Compiling[0m cranelift-codegen v0.124.3
+[1m[92m   Compiling[0m cranelift-module v0.124.3
+[1m[92m   Compiling[0m cranelift-native v0.124.3
+[1m[92m   Compiling[0m cranelift-frontend v0.124.3
+[1m[92m   Compiling[0m cranelift-jit v0.124.3
+[1m[92m   Compiling[0m cranelift-object v0.124.3
+[1m[92m   Compiling[0m wukong_codegen_cranelift v0.1.0 (/wukong/crates/wukong_codegen_cranelift)
+[1m[92m   Compiling[0m wukong_driver v0.1.0 (/wukong/crates/wukong_driver)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 1m 22s
+[1m[92m  Executable[0m unittests src/lib.rs (/persist/target/release/deps/wukong_driver-ffe4003ea92460c1)
+[1m-> ok in 82.9s[0m
+
+[1m$ cargo test --workspace --release -- --test-threads 2[0m
+[1m[92m   Compiling[0m wukong_span v0.1.0 (/wukong/crates/wukong_span)
+[1m[92m   Compiling[0m equivalent v1.0.2
+[1m[92m   Compiling[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m foldhash v0.1.5
+[1m[92m   Compiling[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m cranelift-bitset v0.124.3
+[1m[92m   Compiling[0m allocator-api2 v0.2.21
+[1m[92m   Compiling[0m libm v0.2.16
+[1m[92m   Compiling[0m rustc-hash v2.1.2
+[1m[92m   Compiling[0m log v0.4.32
+[1m[92m   Compiling[0m smallvec v1.15.2
+[1m[92m   Compiling[0m arbitrary v1.4.2
+[1m[92m   Compiling[0m cranelift-assembler-x64 v0.124.3
+[1m[92m   Compiling[0m crossbeam-utils v0.8.21
+[1m[92m   Compiling[0m target-lexicon v0.13.5
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m cranelift-codegen-shared v0.124.3
+[1m[92m   Compiling[0m anyhow v1.0.102
+[1m[92m   Compiling[0m either v1.16.0
+[1m[92m   Compiling[0m crc32fast v1.5.0
+[1m[92m   Compiling[0m hashbrown v0.15.5
+[1m[92m   Compiling[0m half v2.7.1
+[1m[92m   Compiling[0m wukong_types v0.1.0 (/wukong/crates/wukong_types)
+[1m[92m   Compiling[0m cranelift-entity v0.124.3
+[1m[92m   Compiling[0m wukong_diag v0.1.0 (/wukong/crates/wukong_diag)
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m   Compiling[0m wukong_ast v0.1.0 (/wukong/crates/wukong_ast)
+[1m[92m   Compiling[0m memchr v2.8.2
+[1m[92m   Compiling[0m bitflags v1.3.2
+[1m[92m   Compiling[0m lazy_static v1.5.0
+[1m[92m   Compiling[0m rawpointer v0.2.1
+[1m[92m   Compiling[0m wukong_codegen_gpu v0.1.0 (/wukong/crates/wukong_codegen_gpu)
+[1m[92m   Compiling[0m wukong_mir v0.1.0 (/wukong/crates/wukong_mir)
+[1m[92m   Compiling[0m iced-x86 v1.21.0
+[1m[92m   Compiling[0m wukong_codegen_llvm v0.1.0 (/wukong/crates/wukong_codegen_llvm)
+[1m[92m   Compiling[0m wukong_lexer v0.1.0 (/wukong/crates/wukong_lexer)
+[1m[92m   Compiling[0m matrixmultiply v0.3.10
+[1m[92m   Compiling[0m wukong_mir_build v0.1.0 (/wukong/crates/wukong_mir_build)
+[1m[92m   Compiling[0m bumpalo v3.20.3
+[1m[92m   Compiling[0m cranelift-bforest v0.124.3
+[1m[92m   Compiling[0m wukong_sema v0.1.0 (/wukong/crates/wukong_sema)
+[1m[92m   Compiling[0m wukong_parser v0.1.0 (/wukong/crates/wukong_parser)
+[1m[92m   Compiling[0m wukong_runtime v0.1.0 (/wukong/crates/wukong_runtime)
+[1m[92m   Compiling[0m crossbeam-epoch v0.9.18
+[1m[92m   Compiling[0m indexmap v2.14.0
+[1m[92m   Compiling[0m wukong_backend v0.1.0 (/wukong/crates/wukong_backend)
+[1m[92m   Compiling[0m wukong_opt v0.1.0 (/wukong/crates/wukong_opt)
+[1m[92m   Compiling[0m wukong_autodiff v0.1.0 (/wukong/crates/wukong_autodiff)
+[1m[92m   Compiling[0m regalloc2 v0.13.5
+[1m[92m   Compiling[0m crossbeam-deque v0.8.6
+[1m[92m   Compiling[0m cranelift-control v0.124.3
+[1m[92m   Compiling[0m rayon-core v1.13.0
+[1m[92m   Compiling[0m num_cpus v1.17.0
+[1m[92m   Compiling[0m wasmtime-internal-math v37.0.3
+[1m[92m   Compiling[0m region v3.0.2
+[1m[92m   Compiling[0m wasmtime-internal-jit-icache-coherence v37.0.3
+[1m[92m   Compiling[0m gimli v0.32.3
+[1m[92m   Compiling[0m rayon v1.12.0
+[1m[92m   Compiling[0m object v0.37.3
+[1m[92m   Compiling[0m wukong_interp v0.1.0 (/wukong/crates/wukong_interp)
+[1m[92m   Compiling[0m wukong_codegen_cranelift v0.1.0 (/wukong/crates/wukong_codegen_cranelift)
+[1m[92m   Compiling[0m wukong_driver v0.1.0 (/wukong/crates/wukong_driver)
+[1m[92m   Compiling[0m wukongc v0.1.0 (/wukong/crates/wukongc)
+[1m[92m   Compiling[0m wukong_bench v0.1.0 (/wukong/crates/wukong_bench)
+[1m[92m   Compiling[0m wukong_xbench v0.1.0 (/wukong/crates/wukong_xbench)
+[1m[92m   Compiling[0m cranelift-codegen v0.124.3
+[1m[92m   Compiling[0m cranelift-module v0.124.3
+[1m[92m   Compiling[0m cranelift-native v0.124.3
+[1m[92m   Compiling[0m cranelift-jit v0.124.3
+[1m[92m   Compiling[0m cranelift-object v0.124.3
+[1m[92m   Compiling[0m cranelift-frontend v0.124.3
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 1m 57s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_ast-3963783b5c324430)
+
+running 8 tests
+test expr::tests::fold_const_len_declines_above_slot_width ... ok
+test expr::tests::fold_const_len_declines_out_of_range_operand ... ok
+test expr::tests::fold_const_len_declines_wrapping ... ok
+test expr::tests::fold_const_len_in_range_is_unchanged ... ok
+test print::tests::empty_module_with_name ... ok
+test expr::tests::fold_const_len_keeps_zero_sentinels ... ok
+test print::tests::payloads_aliases_and_signatures_survive_printing ... ok
+test print::tests::tiled_layout_prints_its_extents ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_autodiff-72a775eaa86575f1)
+
+running 37 tests
+test tests::div_and_sub ... ok
+test tests::adamw_step_matches_reference ... ok
+test tests::kernel_call_with_wrong_arity_declines_loudly ... ok
+test tests::fma_rule ... ok
+test tests::layernorm_dot_vjp ... ok
+test tests::linear_elu_sum_vjp ... ok
+test tests::linear_exp_sum_vjp ... ok
+test tests::linear_gelu_sum_vjp ... ok
+test tests::linear_mse_vjp ... ok
+test tests::linear_relu_sum_vjp ... ok
+test tests::linear_sigmoid_sum_vjp ... ok
+test tests::linear_silu_sum_vjp ... ok
+test tests::linear_softplus_sum_vjp ... ok
+test tests::linear_sum_vjp ... ok
+test tests::linear_tanh_sum_vjp ... ok
+test tests::mlp2_kernel_gradient ... ok
+test tests::mlp2_adamw_decreases_loss ... ok
+test tests::mlp_gradient_matches_finite_difference ... ok
+test tests::mlp_sgd_decreases_loss ... ok
+test tests::parallel_norm_dot_vjp ... ok
+test tests::parallel_region_declines_loudly ... ok
+test tests::mlp2_kernel_sgd_decreases_loss ... ok
+test tests::relu_via_select ... ok
+test tests::prenorm_block_vjp ... ok
+test tests::rmsnorm_dot_vjp ... ok
+test tests::scalar_load_plus_kernel_reduction_declines_loudly ... ok
+test tests::residual_two_linears_vjp ... ok
+test tests::self_dot_sumsq_vjp ... ok
+test tests::sqrt_rule ... ok
+test tests::square_scalar ... ok
+test tests::store_into_live_gradient_buffer_declines_loudly ... ok
+test tests::softmax_dot_vjp ... ok
+test tests::sum_of_squares_vector ... ok
+test tests::veckernel_declines_loudly ... ok
+test tests::two_op_chain ... ok
+test tests::velem_compute_modes_decline_loudly ... ok
+test tests::velem_affine_still_differentiates ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_backend-3a9933aeb212ae38)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/main.rs (/persist/target/release/deps/wukong_bench-88f78c4991eb17d8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_cranelift-e78648f71d81ca4d)
+
+running 147 tests
+test avx2::tests::avx2_kernel_bails_on_register_overflow ... ok
+test avx2::tests::avx2_kernel_bails_on_five_streams ... ok
+test avx2::tests::avx2_kernel_diff_of_squares_p4 ... ok
+test avx2::tests::avx2_kernel_inplace_and_four_streams ... ok
+test avx2::tests::avx2_kernel_relu_cmp_select ... ok
+test avx2::tests::avx2_kernel_neg_signmask ... ok
+test avx2::tests::avx2_kernel_saxpy_all_widths ... ok
+test avx2::tests::avx2_kernel_repeated_operand_frees_once ... ok
+test avx2::tests::avx2_kernel_store_to_load_forward ... ok
+test avx2::tests::avx2_kernel_sqrt_div ... ok
+test avx2::tests::avx2_reduce_fma_fused ... ok
+test avx2::tests::avx2_reduce_fmax_fmin ... ok
+test avx2::tests::avx2_reduce_sum_and_dot ... ok
+test avx2::tests::avx2_reduce_sumsq_and_weighted ... ok
+test avx2::tests::avx2_saxpy_kernel_runs ... ok
+test fuzz::fuzz_full_buffer_i8_interp_vs_native ... ok
+test fuzz::vmath_kernels_match_f64_reference ... ok
+test fuzz_grammar::dump_generated_programs ... ignored
+test fuzz_grammar::fuzz_grammar_differential ... ok
+test tests::affine_norm_dispatch ... ok
+test tests::array_index_and_reduction ... ok
+test tests::backend_compile_ab ... ignored
+test tests::batched_norm_dispatch ... ok
+test tests::bias_bcast_is_correct_across_sizes ... ok
+test tests::bias_bcast_parallel_matches_interp ... ok
+test tests::casts_and_signed_modulo ... ok
+test tests::cranelift_still_rejects_f32x8 ... ok
+test tests::decode_attention_dispatches_all_kernels ... ok
+test tests::dequant_loop_lowers_to_dequant_kernel ... ok
+test tests::differential_against_interpreter ... ok
+test tests::differential_aggregate_literal_adapt ... ok
+test tests::differential_aggregate_value_merge ... ok
+test tests::differential_array_of_aggregate ... ok
+test tests::differential_batched_matmul ... ok
+test tests::differential_bf16_axpby ... ok
+test tests::differential_bf16_reduce ... ok
+test tests::differential_binary_const_adapt ... ok
+test tests::differential_bitwise_not ... ok
+test tests::differential_cast_to_bool ... ok
+test tests::differential_char_literals ... ok
+test tests::differential_char_patterns ... ok
+test tests::differential_char_type ... ok
+test tests::differential_const_array_length ... ok
+test tests::differential_deep_recursion ... ok
+test tests::differential_dequant ... ok
+test tests::differential_dequant_mixed_parallel ... ok
+test tests::differential_dequant_perchan ... ok
+test tests::differential_deref_field_access ... ok
+test tests::differential_embedding ... ok
+test tests::differential_enum ... ok
+test tests::differential_erf ... ok
+test tests::differential_f32_const_fold ... ok
+test tests::differential_float_narrow_int_cast ... ok
+test tests::differential_float_return_type ... ok
+test tests::differential_floats ... ok
+test tests::differential_fmax_fmin_int ... ok
+test tests::differential_for_continue ... ok
+test tests::differential_half_out_axpby ... ok
+test tests::differential_half_out_vmath ... ok
+test tests::differential_heap_alloc ... ok
+test tests::differential_i8gemm ... ok
+test tests::differential_int_literal_widening ... ok
+test tests::differential_int_math_intrinsics ... ok
+test tests::differential_int_to_f32_rounding ... ok
+test tests::differential_labeled_loops ... ok
+test tests::differential_let_destructure ... ok
+test tests::differential_linear_epilogue ... ok
+test tests::differential_loop_wide_bound ... ok
+test tests::differential_match ... ok
+test tests::differential_match_exhaustiveness ... ok
+test tests::differential_match_patterns ... ok
+test tests::differential_mixed_branch_types ... ok
+test tests::differential_nested_struct ... ok
+test tests::differential_nested_tuple_field ... ok
+test fuzz::fuzz_full_buffer_interp_vs_native ... ok
+test tests::differential_parallel_batched_norm ... ok
+test tests::differential_parallel_vmath ... ok
+test tests::differential_pointer ... ok
+test tests::differential_radix_literals ... ok
+test tests::differential_parallel_reduce ... ok
+test tests::differential_return_type_coercion ... ok
+test tests::differential_short_circuit ... ok
+test tests::differential_struct ... ok
+test tests::differential_string_literals ... ok
+test tests::differential_struct_across_fns ... ok
+test tests::differential_struct_assign ... ok
+test tests::differential_struct_return ... ok
+test tests::differential_tensor_1d_kernels ... ok
+test tests::differential_top_level_const ... ok
+test tests::differential_trig ... ok
+test tests::differential_transcendentals ... ok
+test tests::differential_tuple ... ok
+test tests::differential_u64_range_literal ... ok
+test tests::differential_unsigned_print ... ok
+test tests::differential_tuple_match ... ok
+test tests::differential_vmath_dispatch ... ok
+test tests::differential_vectorized_inline_transcendental ... ok
+test tests::embedding_nest_lowers_to_kernel ... ok
+test tests::failed_assert_is_error ... ok
+test tests::embedded_parallel_matmul_dispatches_multicore ... ok
+test tests::float_to_int_saturation_matches_native ... ok
+test tests::float_modulo ... ok
+test tests::for_step_loop ... ok
+test tests::fusion_collapses_adjacent_loops ... ok
+test tests::fma_contraction_is_bit_exact ... ok
+test tests::i8_linear_nest_lowers_to_i8gemm ... ok
+test tests::if_as_expression ... ok
+test tests::gevm_dispatches_and_matches ... ok
+test tests::ijk_dot_product_matmul_recognized ... ok
+test tests::linear_nt_matmul_lowers_and_runs ... ok
+test tests::loop_sum ... ok
+test tests::matmul_accumulate_differential ... ok
+test tests::matmul_is_correct ... ok
+test tests::matmul_nest_lowers_to_sgemm ... ok
+test tests::large_local_array_does_not_smash_stack ... ok
+test tests::negative_float_to_signed_int_cast_is_signed ... ok
+test tests::p4_bench_256_vs_128 ... ignored
+test tests::p4_bench_reduction_256_vs_128 ... ignored
+test tests::matmul_overwrite_differential ... ok
+test tests::p4_counting_while_normalizes_and_matches_interp ... ok
+test tests::p4_kill_switch_is_result_identical ... ok
+test tests::p4_reduction256_gate_and_differential ... ok
+test tests::p4_probe_vec256_ops ... ok
+test tests::p4_reduction_f64_reference ... ok
+test tests::p4_vec256_general_matches_interp ... ok
+test tests::parallel_codegen_error_is_source_ordered ... ok
+test tests::parallel_for_matches_interpreter ... ok
+test tests::parallel_head_region_matches_interpreter ... ok
+test tests::parallel_object_bytes_deterministic ... ok
+test tests::parallel_row_loss_and_gather_nests_reach_their_kernels ... ok
+test tests::print_captures_stdout ... ok
+test tests::recursive_fib ... ok
+test tests::reduction_reassociation_is_backend_consistent ... ok
+test tests::runtime_kernel_with_unhandled_arity_fails_the_compile ... ok
+test tests::scaled_gemv_dispatches_and_matches ... ok
+test tests::serial_parallel_object_bytes_identical ... ok
+test tests::tensor_matmul_accumulate_form ... ok
+test tests::tensor_matmul_is_correct ... ok
+test tests::vector_ops_interp_matches_native ... ok
+test tests::vectorized_int_reduction ... ok
+test tests::vectorized_reductions_are_correct ... ok
+test tests::vectorized_relu6_nested_if ... ok
+test tests::vectorized_relu_is_correct ... ok
+test tests::vectorized_saxpy_is_correct_across_sizes ... ok
+test tests::vectorized_ssd_reduction ... ok
+test tests::verifier_toggle_object_bytes_identical ... ok
+test tests::p4_vec256_coverage_sweep ... ok
+
+test result: ok. 143 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 8.32s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-070c538cd8557e6f)
+
+running 20 tests
+test paged_attention::tests::int8_append_ptx_is_well_formed ... ok
+test paged_attention::tests::kv_append_ptx_is_well_formed ... ok
+test paged_attention::tests::int8_attn_ptx_is_well_formed ... ok
+test paged_attention::tests::reference_zeros_inactive_slots ... ok
+test paged_attention::tests::ptx_generator_is_well_formed ... ok
+test paged_kv::tests::append_allocates_a_new_block_only_on_block_boundary ... ok
+test paged_kv::tests::flat_block_table_is_padded_row_major ... ok
+test paged_kv::tests::free_returns_blocks_and_relayouts_on_reuse ... ok
+test paged_kv::tests::int8_kv_footprint_shrink ... ok
+test paged_kv::tests::kv_config_offset_is_row_major_and_in_bounds ... ok
+test paged_kv::tests::locate_matches_append_addresses ... ok
+test paged_kv::tests::out_of_blocks_is_reported_not_panicked ... ok
+test paged_kv::tests::reserve_bulk_allocates_prefill ... ok
+test paged_kv::tests::serving_bcap_budget_table ... ok
+test paged_kv::tests::table_width_cap_is_enforced ... ok
+test paged_kv::tests::over_budget_kv_config_is_rejected - should panic ... ok
+test paged_kv::tests::zero_geometry_in_max_ctx_within_budget_is_named - should panic ... ok
+test ptx_target::tests::device_arch_flags_spell_like_the_tools_expect ... ok
+test ptx_target::tests::headers_are_ascii_well_formed_and_agree_with_the_builder ... ok
+test ptx_target::tests::only_the_ada_floor_declares_the_r550_driver_version ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_llvm-efdb05f69304b1c3)
+
+running 4 tests
+test tests::emits_function_signature_and_arith ... ok
+test tests::emits_control_flow_and_calls ... ok
+test tests::emits_void_call_for_print_intrinsic ... ok
+test tests::emits_phi_nodes_for_optimized_loops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_diag-df1bd440b5721b29)
+
+running 11 tests
+test catalog::tests::explain_is_case_insensitive ... ok
+test catalog::tests::every_entry_has_a_code_and_body ... ok
+test json::tests::emits_well_formed_json_line ... ok
+test json::tests::escapes_other_control_characters_as_u_escapes ... ok
+test render::tests::color_adds_escapes ... ok
+test json::tests::escapes_special_characters ... ok
+test render::tests::renders_header_location_and_caret ... ok
+test render::tests::renders_without_labels ... ok
+test render::tests::tab_indented_line_aligns_with_its_caret ... ok
+test tests::builder_sets_fields ... ok
+test tests::sink_counts_errors ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/catalog_coverage.rs (/persist/target/release/deps/catalog_coverage-dbca3b7e342e7798)
+
+running 2 tests
+test every_emitted_code_is_catalogued ... ok
+test every_catalogued_code_has_an_emitter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_driver-caa40dfe2684f574)
+
+running 20 tests
+test grad_cli_tests::cubic_scalar_grad ... ok
+test grad_cli_tests::bilinear_two_input_grad ... ok
+test grad_cli_tests::duplicate_grad_wrt_index_is_rejected ... ok
+test grad_cli_tests::default_wrt_is_all_buffers ... ok
+test grad_cli_tests::param_sizes_recovered_from_types ... ok
+test grad_cli_tests::raw_pointer_parameter_grad ... ok
+test grad_cli_tests::linear_mse_from_source ... ok
+test grad_cli_tests::silu_and_gelu_backward_from_source ... ok
+test grad_cli_tests::train_default_wrt_excludes_the_loss_output ... ok
+test grad_cli_tests::train_sgd_loss_strictly_decreases ... ok
+test grad_cli_tests::transformer_ffn_block_from_source ... ok
+test loader::tests::diamond_import_dedups_by_canonical_path ... ok
+test grad_cli_tests::train_adamw_reduces_loss ... ok
+test loader::tests::import_cycle_loads_each_file_once ... ok
+test loader::tests::missing_import_is_e0305 ... ok
+test native_link_tests::the_cc_fallback_links_libm_after_its_objects ... ok
+test native_link_tests::exe_link_inputs_are_generated_outside_the_working_directory ... ok
+test verify_gate_tests::verify_or_ice_accepts_a_real_compiled_program ... ok
+internal compiler error (MIR verify): use of undefined value v0
+test verify_gate_tests::verify_or_ice_reports_an_undefined_value_use ... ok
+test native_link_tests::the_runtime_rlib_is_found_in_the_deps_directory ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_interp-cc010f1fb7f2ad1e)
+
+running 19 tests
+test tests::embedding_gather_reads_live_memory_when_out_aliases_weight ... ok
+test tests::failed_assert_is_an_error ... ok
+test tests::heap_exhaustion_is_a_diagnostic_not_an_allocator_abort ... ok
+test tests::deep_recursion_does_not_overflow_oracle ... ok
+test tests::integer_vector_lanes_wrap_at_lane_width ... ok
+test tests::non_positive_kernel_extent_is_a_no_op ... ok
+test tests::print_intrinsic_captures_stdout ... ok
+test tests::run_kernel_f32_saxpy_and_dot ... ok
+test tests::run_kernel_i8_linear ... ok
+test tests::runs_array_index_and_reduction ... ok
+test tests::runs_array_parameter_by_reference ... ok
+test tests::runs_casts_and_signed_modulo ... ok
+test tests::runs_for_range_with_step ... ok
+test tests::runs_large_array_repeat_fill ... ok
+test tests::runs_loop_sum ... ok
+test tests::runs_recursive_fib ... ok
+test tests::kernel_entry_deep_recursion_does_not_overflow_oracle ... ok
+test tests::vector_op_with_a_scalar_operand_is_an_error_not_a_panic ... ok
+test tests::unbounded_recursion_is_a_diagnostic_not_a_process_abort ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_lexer-13aab92d2db05438)
+
+running 14 tests
+test tests::attribute_sequence ... ok
+test tests::comments_are_skipped ... ok
+test tests::dump_snapshot ... ok
+test tests::empty_char_literal_reports ... ok
+test tests::error_recovery_continues ... ok
+test tests::keyword_tables_agree ... ok
+test tests::multi_codepoint_char_literal_reports_once_and_resyncs ... ok
+test tests::keywords_and_identifiers ... ok
+test tests::numbers ... ok
+test tests::operators ... ok
+test tests::strings_and_chars ... ok
+test tests::unterminated_block_comment_reports ... ok
+test tests::unterminated_char_reports ... ok
+test tests::unterminated_string_reports ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_mir-550bd29c9c13e0a7)
+
+running 21 tests
+test print::tests::builds_and_prints_add ... ok
+test verify::tests::detects_block_param_arity ... ok
+test verify::tests::detects_block_with_inconsistent_id ... ok
+test verify::tests::detects_branch_back_to_the_entry_block ... ok
+test verify::tests::detects_branch_to_nonexistent_block ... ok
+test verify::tests::detects_definition_past_the_end_of_the_value_arena ... ok
+test verify::tests::detects_store_with_a_result ... ok
+test verify::tests::detects_entry_block_params_out_of_sync_with_function_params ... ok
+test verify::tests::detects_type_mismatch ... ok
+test verify::tests::detects_use_before_definition_in_the_same_block ... ok
+test verify::tests::detects_use_not_dominated_by_its_definition ... ok
+test verify::tests::detects_use_of_undefined_value ... ok
+test verify::tests::detects_value_defined_more_than_once ... ok
+test verify::tests::detects_veckernel_index_out_of_range ... ok
+test verify::tests::loop_with_back_edge_still_verifies ... ok
+test verify::tests::program_accepts_external_well_formed_and_discarded_calls ... ok
+test verify::tests::program_detects_call_argument_type_mismatch ... ok
+test verify::tests::program_detects_call_arity_and_void_result_mismatch ... ok
+test verify::tests::unreachable_block_is_not_dominance_checked ... ok
+test verify::tests::valid_function_verifies ... ok
+test verify::tests::void_call_verifies ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_mir_build-32476e75818d0070)
+
+running 24 tests
+test tests::a_const_dimension_dispatches_the_gemm ... ok
+test tests::a_base_whose_operand_is_reassigned_in_the_region_is_not_substituted ... ok
+test tests::a_reassigned_index_base_is_not_substituted ... ok
+test tests::a_shadowed_const_is_not_folded ... ok
+test tests::exp_table_literals_match_kernel_bits ... ok
+test tests::array_parameter_passes_by_pointer ... ok
+test tests::hoisted_row_base_still_dispatches_the_gemm ... ok
+test tests::hoisted_row_base_still_dispatches_the_norm ... ok
+test tests::log_table_literals_match_kernel_bits ... ok
+test tests::lowers_and_verifies_loop_sum ... ok
+test tests::lowers_and_verifies_array_ops ... ok
+test tests::lowers_and_verifies_recursive_fib ... ok
+test tests::multi_dim_tensor_index_lowers_to_row_major_gep ... ok
+test tests::parallel_region_declines_captured_scalar_write ... ok
+test tests::parallel_region_declines_cross_iteration_dep ... ok
+test tests::parallel_region_declines_div_only_and_mod_only ... ok
+test tests::parallel_region_declines_divmod_equal_coefficients ... ok
+test tests::parallel_region_declines_divmod_nonconst_divisor ... ok
+test tests::parallel_region_declines_divmod_overlapping_extent ... ok
+test tests::parallel_region_declines_overlapping_slices ... ok
+test tests::parallel_region_only_under_parallel_attr ... ok
+test tests::parallel_region_outlines_head_loop ... ok
+test tests::parallel_region_outlines_divmod_tiling ... ok
+test tests::sibling_loops_may_reuse_a_base_name ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_opt-6ed2d6d35f58f07e)
+
+running 147 tests
+test alias::tests::distinct_allocas_and_disjoint_constant_offsets_do_not_alias ... ok
+test alias::tests::a_branch_argument_escapes_the_slot_it_carries ... ok
+test alias::tests::fact_stays_one_cache_friendly_record ... ok
+test alias::tests::only_in_bounds_stack_offsets_are_dereferenceable ... ok
+test alias::tests::params_may_alias_each_other_but_never_a_local_slot ... ok
+test alias::tests::provenance_settles_even_when_a_base_is_laid_out_after_its_use ... ok
+test alias::tests::stored_pointer_escapes_its_slot ... ok
+test cse::tests::a_load_is_keyed_by_its_type_not_only_its_address ... ok
+test cse::tests::a_scalar_store_invalidates_a_wider_cached_load ... ok
+test cse::tests::a_store_through_an_unknown_pointer_still_kills_the_header ... ok
+test cse::tests::header_loads_behind_a_gep_survive_a_store_to_a_disjoint_slot ... ok
+test cse::tests::loads_of_different_types_from_one_slot_are_not_forwarded ... ok
+test dse::tests::a_call_keeps_escaped_stores_but_not_private_ones ... ok
+test dse::tests::a_store_through_a_loaded_pointer_is_killed_by_its_overwrite ... ok
+test dse::tests::an_aliasing_read_keeps_the_first_store ... ok
+test inline::tests::cost_model_floor_is_the_old_blanket_limit ... ok
+test inline::tests::cost_model_widens_for_sole_site_loops_and_constants ... ok
+test inline::tests::scc_emits_callees_before_callers ... ok
+test inline::tests::scc_handles_a_self_loop_and_isolated_nodes ... ok
+test licm::tests::a_call_in_the_loop_pins_only_reachable_loads ... ok
+test licm::tests::a_may_aliasing_store_in_the_loop_pins_the_load ... ok
+test licm::tests::a_parameter_load_is_not_speculated_into_the_preheader ... ok
+test licm::tests::a_private_stack_load_is_hoisted_out_of_the_loop ... ok
+test loop_canon::tests::a_conditionally_entered_loop_gets_a_preheader ... ok
+test loop_canon::tests::a_break_spelled_loop_converges_on_the_while_spelling ... ok
+test loop_canon::tests::a_multiply_used_exit_condition_is_left_alone ... ok
+test loop_canon::tests::a_pass_over_canonical_loops_is_a_no_op ... ok
+test loop_canon::tests::header_parameters_are_forwarded_through_the_new_blocks ... ok
+test loop_canon::tests::two_back_edges_are_funnelled_through_one_latch ... ok
+test loop_info::tests::a_call_in_the_loop_forces_a_carried_verdict ... ok
+test loop_info::tests::a_conditional_accumulate_is_not_a_reduction ... ok
+test loop_info::tests::a_constant_offset_shows_up_in_the_index_constant ... ok
+test loop_info::tests::a_contracted_fma_accumulate_is_a_reduction ... ok
+test loop_info::tests::a_data_dependent_index_is_unknown ... ok
+test loop_info::tests::a_float_sum_is_a_non_reassociable_reduction ... ok
+test loop_info::tests::a_loop_with_no_recognizable_exit_test_still_reports_its_iv ... ok
+test loop_info::tests::a_nonzero_distance_on_one_object_is_carried ... ok
+test loop_info::tests::a_read_modify_write_of_one_element_is_independent ... ok
+test loop_info::tests::a_scaled_index_has_the_scaled_stride ... ok
+test loop_info::tests::a_second_counter_is_an_iv_but_not_the_primary ... ok
+test loop_info::tests::a_slice_access_decomposes_to_base_plus_iv ... ok
+test loop_canon::tests::canonicalization_preserves_results ... ok
+test loop_info::tests::a_true_recurrence_is_not_a_reduction ... ok
+test loop_info::tests::affine_expr_algebra ... ok
+test loop_info::tests::an_integer_sum_is_a_reassociable_reduction ... ok
+test loop_info::tests::an_observed_partial_sum_is_not_a_reduction ... ok
+test loop_info::tests::conditional_entry_means_no_preheader ... ok
+test loop_info::tests::basic_iv_step_and_symbolic_trip_count ... ok
+test loop_info::tests::derived_ivs_record_constant_and_symbolic_strides ... ok
+test loop_info::tests::constant_trip_counts_for_every_predicate_and_step ... ok
+test loop_info::tests::finds_a_single_loop ... ok
+test loop_info::tests::finds_nested_loops_and_their_nesting ... ok
+test loop_info::tests::for_range_over_a_constant_is_a_constant_trip_count ... ok
+test loop_info::tests::irreducible_cycle_is_reported_as_no_loop ... ok
+test loop_info::tests::multiple_exits_are_all_reported ... ok
+test loop_info::tests::loop_with_a_conditional_body_keeps_one_header ... ok
+test loop_info::tests::no_loops_in_straight_line_code ... ok
+test loop_info::tests::runtime_step_is_an_iv_with_no_trip_count ... ok
+test loop_info::tests::self_loop_is_its_own_latch ... ok
+test loop_info::tests::two_back_edges_to_one_header_merge_into_one_loop ... ok
+test loop_info::tests::sibling_loops_are_not_nested ... ok
+test loop_info::tests::two_slice_parameters_need_a_runtime_check ... ok
+test loop_info::tests::two_distinct_allocas_are_provably_independent ... ok
+test loop_info::tests::unreachable_blocks_are_ignored ... ok
+test loop_info::tests::zext_is_not_treated_as_transparent ... ok
+test phi::tests::a_live_recurrence_parameter_is_kept ... ok
+test phi::tests::a_dead_parameter_cycle_around_a_loop_nest_is_removed ... ok
+test simplify::tests::a_widened_loop_step_folds_to_a_literal ... ok
+test simplify::tests::int_cast_folding_matches_the_interpreter ... ok
+test tests::a_dead_block_parameter_cycle_is_removed ... ok
+test tests::a_helper_chain_collapses_in_one_sweep ... ok
+test tests::a_non_leaf_helper_is_inlined ... ok
+test simplify::tests::folded_casts_agree_with_the_unoptimized_program ... ok
+test tests::cse_eliminates_redundant_expression ... ok
+test tests::dse_removes_overwritten_store ... ok
+test tests::folds_and_dces_constants ... ok
+test tests::algebraic_identities_preserve_results ... ok
+test tests::inlining_handles_callee_control_flow ... ok
+test tests::inlining_rebases_repeated_and_multiple_kernel_owning_callees ... ok
+test tests::inlining_removes_calls_and_preserves_results ... ok
+test tests::inlining_rebases_a_callee_that_owns_vec_kernels ... ok
+test tests::licm_hoists_invariant_out_of_loop ... ok
+test tests::mem2reg_introduces_a_loop_phi ... ok
+test tests::mem2reg_leaves_arrays_and_address_taken_in_memory ... ok
+test tests::mem2reg_leaves_a_late_initialized_pointer_slot_in_memory ... ok
+test tests::mem2reg_promotes_all_scalar_slots ... ok
+test tests::mem2reg_promotes_an_inlined_callees_pointer_parameter ... ok
+test tests::mem2reg_ptr_promotion_keeps_the_pointee_in_memory ... ok
+test tests::mem2reg_preserves_branchy_dataflow ... ok
+test tests::mutual_recursion_is_not_inlined ... ok
+test tests::narrow_float_constant_compares_are_not_folded ... ok
+test tests::optimization_preserves_results ... ok
+test tests::recursion_is_not_inlined ... ok
+test tests::pointer_parameters_never_reach_a_stack_slot ... ok
+test tests::simplify_cfg_folds_constant_branch_and_prunes ... ok
+test unroll::tests::is_applied_only_once ... ok
+test unroll::tests::limit_is_wrap_guarded ... ok
+test unroll::tests::live_out_header_values_are_repointed ... ok
+test unroll::tests::refuses_a_body_with_a_call ... ok
+test unroll::tests::refuses_a_known_short_trip_count ... ok
+test unroll::tests::refuses_a_negative_step ... ok
+test unroll::tests::unrolled_body_holds_factor_copies ... ok
+test unroll::tests::unrolls_a_canonical_counted_loop ... ok
+test vectorize::tests::a_bf16_loop_is_refused ... ok
+test vectorize::tests::a_compare_against_the_counter_becomes_a_lane_mask ... ok
+test vectorize::tests::a_counter_read_as_a_value_is_widened_through_a_lane_ramp ... ok
+test vectorize::tests::a_counter_whose_lanes_do_not_match_the_data_width_is_declined ... ok
+test vectorize::tests::a_dead_temporary_in_a_nested_body_does_not_block_widening ... ok
+test vectorize::tests::a_derived_index_read_as_a_value_is_declined ... ok
+test vectorize::tests::a_diamond_body_is_if_converted ... ok
+test tests::vector_lane_self_ops_are_not_folded_to_scalar_consts ... ok
+test vectorize::tests::a_float_to_int_cast_widens_only_at_32_bit_lanes ... ok
+test vectorize::tests::a_gathered_index_is_declined ... ok
+test vectorize::tests::a_lane_mask_selects_between_two_splatted_uniform_arms ... ok
+test vectorize::tests::a_float_reduction_is_not_reassociated ... ok
+test vectorize::tests::a_non_unit_stride_is_declined ... ok
+test vectorize::tests::a_prefix_scan_is_declined ... ok
+test vectorize::tests::a_reversed_subtract_is_not_a_reduction ... ok
+test vectorize::tests::a_second_pass_widens_nothing_further ... ok
+test vectorize::tests::a_row_wise_loop_aliasing_itself_computes_the_scalar_answer ... ok
+test vectorize::tests::a_select_with_a_uniform_arm_is_widened ... ok
+test vectorize::tests::a_shift_is_refused_at_every_width ... ok
+test vectorize::tests::a_slice_base_is_read_once_not_once_per_group ... ok
+test vectorize::tests::a_triangle_body_is_if_converted ... ok
+test vectorize::tests::a_true_recurrence_is_declined ... ok
+test vectorize::tests::a_subtract_accumulate_is_a_reduction ... ok
+test vectorize::tests::a_two_dimensional_row_loop_is_widened ... ok
+test vectorize::tests::a_wrapping_integer_reduction_is_exact ... ok
+test vectorize::tests::an_elementwise_float_loop_is_widened_four_lanes ... ok
+test vectorize::tests::an_aliased_call_still_computes_the_scalar_answer ... ok
+test vectorize::tests::an_f64_loop_is_widened_two_lanes ... ok
+test vectorize::tests::an_i32_loop_is_widened_four_lanes ... ok
+test vectorize::tests::an_i8_multiply_is_refused ... ok
+test vectorize::tests::an_i8_product_reduction_folds_serially ... ok
+test vectorize::tests::an_inline_transcendental_body_is_widened ... ok
+test vectorize::tests::an_inner_loop_over_a_row_is_widened ... ok
+test vectorize::tests::an_unpaired_conditional_load_is_declined ... ok
+test vectorize::tests::an_unpaired_conditional_store_is_declined ... ok
+test vectorize::tests::an_inlined_exp_loop_widens_and_agrees_with_the_scalar_loop ... ok
+test vectorize::tests::elementwise_output_matches_the_scalar_loop ... ok
+test vectorize::tests::one_base_read_at_two_row_offsets_is_widened ... ok
+test vectorize::tests::if_converted_output_matches_the_scalar_loop ... ok
+test vectorize::tests::one_base_written_at_two_symbolic_offsets_is_refused ... ok
+test vectorize::tests::two_constant_offsets_on_one_base_are_still_guardable ... ok
+test vectorize::tests::two_row_wise_loops_are_both_widened ... ok
+test vectorize::tests::storing_the_counter_itself_is_widened ... ok
+test vectorize::tests::two_symbolic_offsets_on_one_base_are_guarded_separately ... ok
+
+test result: ok. 147 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_parser-17d2c326f0ae3ad1)
+
+running 22 tests
+test items::tests::extern_attribute_still_parses ... ok
+test items::tests::attribute_missing_value_keeps_the_closing_paren ... ok
+test items::tests::module_and_fn ... ok
+test items::tests::generic_fn_with_tensors ... ok
+test items::tests::stray_at_does_not_consume_the_following_item ... ok
+test items::tests::parallel_for_attribute ... ok
+test items::tests::stray_at_does_not_consume_the_following_statement ... ok
+test items::tests::struct_and_const ... ok
+test items::tests::struct_functional_update_reports_once_and_stays_in_sync ... ok
+test tests::cast_binds_looser_than_prefix_tighter_than_binary ... ok
+test tests::deep_postfix_chain_reports_e0209 ... ok
+test tests::deeply_nested_input_reports_e0209_not_stack_overflow ... ok
+test tests::moderate_nesting_parses_cleanly ... ok
+test tests::multi_index ... ok
+test tests::precedence_and_assoc ... ok
+test tests::radix_and_out_of_range_extents ... ok
+test tests::radix_tuple_field_index ... ok
+test tests::recovers_after_a_bad_item ... ok
+test tests::turbofish_call ... ok
+test tests::types_render ... ok
+test tests::unary_and_postfix ... ok
+test tests::deeply_nested_structural_input_reports_e0209 ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_runtime-38e0d1454dbcaaec)
+
+running 249 tests
+test attention::tests::attention_matches_naive ... ok
+test attention::tests::attention_throughput ... ignored
+test attention::tests::attention_scalar_matches_naive ... ok
+test bias::tests::bias_add_is_exact_f64_reference ... ok
+test bias::tests::bias_parallel_matches_serial ... ok
+test colarg::tests::colarg_matches_naive_and_parallel ... ok
+test colarg::tests::duplicate_extrema_return_lowest_row_index ... ok
+test colarg::tests::early_out_branch_and_nan_signed_zero_match_the_scalar_twin ... ok
+test colarg::tests::rows_past_the_f32_mantissa_limit_keep_the_exact_row_index ... ok
+test colarg::tests::scalar_matches_avx2_bit_for_bit ... ok
+test colreduce::tests::colreduce_matches_naive_and_parallel ... ok
+test colreduce::tests::nan_signed_zero_and_ties_agree_between_paths ... FAILED
+test colreduce::tests::scalar_matches_avx2_bit_for_bit ... ok
+test colreduce::tests::signed_zero_tie_takes_the_newer_row ... ok
+test cumminmax::tests::cummax_cummin_infinities_and_all_nan ... ok
+test cumminmax::tests::cummax_cummin_match_scalar_exact ... ok
+test cumminmax::tests::cummax_cummin_nan_matches_scalar_twin ... ok
+test cumminmax::tests::scan_known_values ... ok
+test cumminmax::tests::serial_equals_parallel ... ok
+test cumminmax::tests::serial_equals_parallel_non_finite ... ok
+test cumprod::tests::cumprod_known_values ... ok
+test cumprod::tests::cumprod_matches_naive ... ok
+test cumprod::tests::serial_equals_parallel_bit_for_bit ... ok
+test cumsum::tests::cumsum_matches_scalar_within_tol ... ok
+test cumsum::tests::cumsum_nan_propagates_like_the_scalar_twin ... ok
+test cumsum::tests::scalar_vs_avx2_lane_shift ... ok
+test cumsum::tests::serial_equals_parallel_bit_for_bit ... ok
+test cumsum::tests::serial_equals_parallel_non_finite ... ok
+test dequant::tests::dequant_matches_rational_reference ... ok
+test dequant::tests::perchan_simd_equals_scalar_twin ... ok
+test bias::tests::bias_scalar_matches_avx ... ok
+test dequant::tests::small_and_degenerate_lengths ... ok
+test embedding::tests::degenerate_shapes_are_noops ... ok
+test embedding::tests::embedding_matches_naive_and_parallel ... ok
+test embedding::tests::negative_extents_are_noops ... ok
+test embedding::tests::out_of_range_ids_zero_the_row ... ok
+test entropy::tests::degenerate_shapes_are_noops ... ok
+test entropy::tests::matches_f64_reference ... ok
+test entropy::tests::scalar_matches_avx2_bit_for_bit ... ok
+test entropy::tests::serial_matches_parallel_bit_for_bit ... ok
+test entropy::tests::uniform_row_entropy_is_log_cols ... ok
+test gemm::tests::blocks_target_grain_policy ... ok
+test gemm::tests::dyn_block_order_is_a_permutation ... ok
+test gemm::tests::epi_throughput ... ignored
+test gemm::tests::gemm_env_knobs_survive_hostile_values ... ok
+test gemm::tests::micro_6x16_avx512_twin ... ok
+test gemm::tests::select_2d_block_shape_policy ... ok
+test gemm::tests::sgemm_2d_blocks_matches_serial ... ok
+test gemm::tests::sgemm_2d_dyn_matches_serial ... ok
+test gemm::tests::sgemm_2d_dyn_thread_sweep ... ok
+test gemm::tests::sgemm_2d_shared_matches_serial ... ok
+test gemm::tests::sgemm_beta_accumulates ... ok
+test gemm::tests::sgemm_lowp_nt_epi_matches_widened_f32 ... ok
+test gemm::tests::sgemm_lowp_nt_matches_widened_f32_and_parallel ... ok
+test gemm::tests::sgemm_lowp_tn_matches_widened_f32_and_parallel ... ok
+test gemm::tests::sgemm_matches_naive_various_sizes ... ok
+test gemm::tests::sgemm_nt_alpha_matches_scaled_nt_and_parallel ... ok
+test gemm::tests::sgemm_nt_epi_matches_reference ... ok
+test gemm::tests::sgemm_nt_epi_parallel_matches_serial ... ok
+test dequant::tests::simd_equals_scalar_twin ... ok
+test gemm::tests::sgemm_parallel_matches_serial ... ok
+test gemm::tests::sgemm_nt_matches_naive ... ok
+test gemm::tests::sgemm_pool_ab ... ignored
+test gemm::tests::sgemm_scalar_fallback_matches_reference ... ok
+test gemm::tests::sgemm_throughput ... ignored
+test gemm::tests::sgemm_tn_matches_naive_and_transposed_nn ... ok
+test gemv::tests::gemv_row_scalar_matches_f64_reference ... ok
+test gemv::tests::sgemv_alpha_matches_scaled_plain_and_parallel ... ok
+test gemv::tests::sgemv_matches_f64_reference_and_parallel ... ok
+test gemv::tests::sgemv_throughput ... ignored
+test gevm::tests::gevm_scalar_matches_the_fma_reference ... ok
+test gevm::tests::sgevm_matches_f64_reference ... ok
+test gevm::tests::sgevm_matches_fma_reference_and_parallel ... ok
+test i8gemm::tests::dot2x4_vnni_matches_scalar_bit_for_bit ... ok
+test i8gemm::tests::dot4_matches_scalar_bit_for_bit ... ok
+test i8gemm::tests::dot4_vnni_matches_scalar_bit_for_bit ... ok
+test i8gemm::tests::i8gemm_deq_matches_unfused_and_parallel ... ok
+test i8gemm::tests::matches_i64_reference ... ok
+test i8gemm::tests::overflow_wraps_consistently ... ok
+test i8gemm::tests::scalar_matches_avx2_bit_for_bit ... ok
+test i8gemm::tests::serial_matches_parallel_bit_for_bit ... ok
+test kd_loss::tests::all_equal_logits_loss_is_log_cols ... ok
+test kd_loss::tests::degenerate_shapes_are_noops ... ok
+test kd_loss::tests::matches_f64_reference ... ok
+test kd_loss::tests::onehot_matches_hard_label_xent ... ok
+test kd_loss::tests::scalar_matches_avx2_bit_for_bit ... ok
+test kd_loss::tests::serial_matches_parallel_bit_for_bit ... ok
+test kldiv::tests::degenerate_shapes_are_noops ... ok
+test kldiv::tests::kl_of_self_is_zero ... ok
+test kldiv::tests::matches_f64_reference ... ok
+test kldiv::tests::scalar_matches_avx2_bit_for_bit ... ok
+test kldiv::tests::serial_matches_parallel_bit_for_bit ... ok
+test layernorm_bwd::tests::layernorm_bwd_matches_reference_and_parallel ... ok
+test layernorm_bwd::tests::matches_f64_reference ... ok
+test layernorm_bwd::tests::scalar_matches_avx2_bit_for_bit ... ok
+test logsoftmax::tests::degenerate_shapes_are_noops ... ok
+test logsoftmax::tests::logsoftmax_in_place_matches_out_of_place ... ok
+test logsoftmax::tests::matches_f64_reference_and_normalizes ... ok
+test logsoftmax::tests::matches_norm_logsoftmax_bit_for_bit ... ok
+test logsoftmax::tests::scalar_matches_avx2_bit_for_bit ... ok
+test logsoftmax::tests::scalar_matches_avx2_on_nan_rows ... ok
+test logsoftmax::tests::serial_matches_parallel_bit_for_bit ... ok
+test lowp::tests::axpby_bf16_bandwidth ... ignored, bandwidth bench; run explicitly in --release
+test lowp::tests::axpby_bf16_within_ulp_of_f64_reference ... ok
+test lowp::tests::axpby_lowp_simd_equals_scalar_twin ... ok
+test gemm::tests::sgemm_persistent_region_matches_serial ... ok
+test lowp::tests::lowp_bandwidth ... ignored, bandwidth bench; run explicitly in --release
+test lowp::tests::narrow_simd_equals_scalar_shim ... ok
+test lowp::tests::parallel_reductions_fork_on_the_unified_pool ... ok
+test lowp::tests::parallel_reductions_match_sequential_chunked ... ok
+test lowp::tests::parallel_reductions_nest_inside_a_pool_worker ... ok
+test lowp::tests::parallel_reductions_within_f64_tolerance ... ok
+test lowp::tests::reduce_bf16_simd_equals_scalar_and_reference ... ok
+test lowp::tests::simd_equals_scalar_twin_bit_for_bit ... ok
+test lowp::tests::axpby_narrow_out_simd_equals_scalar_twin ... ok
+test lowp::tests::within_ulp_tolerance_of_f64_reference ... ok
+test lrscan::tests::lrscan_known_values ... ok
+test lrscan::tests::lrscan_matches_naive ... ok
+test lrscan::tests::serial_equals_parallel_bit_for_bit ... ok
+test norm::tests::affine_gamma1_beta0_matches_plain ... ok
+test norm::tests::affine_matches_f64_reference ... ok
+test norm::tests::affine_scalar_matches_avx2_bit_for_bit ... ok
+test norm::tests::affine_serial_matches_parallel_bit_for_bit ... ok
+test norm::tests::degenerate_shapes_are_noops ... ok
+test norm::tests::in_place_matches_out_of_place ... ok
+test norm::tests::matches_f64_reference ... ok
+test norm::tests::scalar_matches_avx2_bit_for_bit ... ok
+test norm::tests::scalar_matches_avx2_on_nan_rows ... ok
+test norm::tests::serial_matches_parallel_bit_for_bit ... ok
+test pool2d::tests::pool2d_matches_naive_and_parallel ... ok
+test pool2d::tests::pool2d_sw2_avx2_matches_scalar ... ok
+test reduce::tests::argreduce_all_identity_span_returns_index_zero ... ok
+test reduce::tests::argreduce_avx2_lane_ties_and_tails ... ok
+test reduce::tests::argreduce_duplicate_maxima_return_lowest_index ... ok
+test reduce::tests::argreduce_scalar_matches_avx2_bit_for_bit ... ok
+test reduce::tests::argreduce_serial_matches_parallel_and_naive ... ok
+test reduce::tests::scalar_matches_avx2_bit_for_bit ... ok
+test reduce::tests::serial_matches_parallel_bit_for_bit ... ok
+test reduce::tests::within_tolerance_of_f64_reference ... ok
+test rmsnorm_bwd::tests::degenerate_shapes_are_noops ... ok
+test rmsnorm_bwd::tests::gamma_ones_matches_null ... ok
+test rmsnorm_bwd::tests::rmsnorm_bwd_matches_f64_reference ... ok
+test rmsnorm_bwd::tests::rmsnorm_bwd_matches_reference_and_parallel ... ok
+test rmsnorm_bwd::tests::scalar_matches_avx2_bit_for_bit ... ok
+test rope::tests::degenerate_shapes_are_noops ... ok
+test rope::tests::rope_in_place_matches_out_of_place ... ok
+test rope::tests::rope_matches_f64_reference ... ok
+test rope::tests::rope_preserves_pair_norm ... ok
+test rope::tests::scalar_matches_avx2_bit_for_bit ... ok
+test rope::tests::serial_matches_parallel_bit_for_bit ... ok
+test rope_bwd::tests::degenerate_shapes_are_noops ... ok
+test rope_bwd::tests::forward_then_backward_round_trips ... ok
+test rope_bwd::tests::rope_bwd_in_place_matches_out_of_place ... ok
+test rope_bwd::tests::rope_bwd_matches_f64_reference ... ok
+test rope_bwd::tests::rope_bwd_preserves_pair_norm ... ok
+test rope_bwd::tests::scalar_matches_avx2_bit_for_bit ... ok
+test rope_bwd::tests::serial_matches_parallel_bit_for_bit ... ok
+test rowarg::tests::cols_past_the_f32_mantissa_limit_keep_the_exact_column_index ... ok
+test rowarg::tests::duplicate_extrema_across_lanes_and_parallel_threshold ... ok
+test rowarg::tests::duplicate_extrema_return_lowest_index ... ok
+test rowarg::tests::rowarg_matches_naive_and_parallel ... ok
+test rowarg::tests::scalar_matches_avx2_bit_for_bit ... ok
+test scatter::tests::degenerate_shapes_are_noops ... ok
+test scatter::tests::heavy_collisions_serial_equals_parallel ... ok
+test scatter::tests::out_of_range_ids_are_skipped ... ok
+test scatter::tests::scatter_matches_naive_and_parallel ... ok
+test softmax_bwd::tests::matches_f64_reference ... ok
+test softmax_bwd::tests::softmax_bwd_matches_reference_and_parallel ... ok
+test tests::arena_alignment_and_exhaustion ... ok
+test tests::arena_rejects_a_non_power_of_two_align ... ok
+test tests::arena_reset_reuses_storage ... ok
+test tests::bf16_exact_values_roundtrip ... ok
+test tests::bf16_rounds_to_nearest_even ... ok
+test tests::bf16_specials ... ok
+test tests::file_io_roundtrip_f32 ... ok
+test tests::file_io_roundtrip_f64 ... ok
+test tests::file_io_roundtrip_i32 ... ok
+test tests::file_io_roundtrip_i64 ... ok
+test tests::file_io_roundtrip_i8 ... ok
+test tests::file_io_roundtrip_u8 ... ok
+test tests::now_ns_is_monotonic ... ok
+test tests::parallel_for_covers_every_index_once ... ok
+test tests::parallel_for_edge_cases ... ok
+test tests::parallel_for_sequential_reduction ... ok
+test tests::read_honors_min_len_avail ... ok
+test tests::read_ignores_trailing_partial_element ... ok
+test tests::read_nonexistent_returns_minus_one ... ok
+test tests::read_nonpositive_len_returns_zero_without_touching_buf ... ok
+test tests::read_reports_open_failure_even_for_a_nonpositive_len ... ok
+test tests::region_body_survives_a_bare_rayon_fork_first ... ok
+test tests::rt_alloc_degenerate_counts_are_null_and_free_ignores_null ... ok
+test tests::rt_alloc_zeroes_and_frees ... ok
+test tests::the_region_pool_backstop_carries_a_region_frame ... ok
+test tests::write_empty_truncates_and_returns_zero ... ok
+test tests::write_is_little_endian_on_disk ... ok
+test transpose::tests::avx2_tile_moves_the_same_bits_as_the_scalar_block ... ok
+test transpose::tests::transpose_matches_naive_and_parallel ... ok
+test transpose::tests::transpose_u16_matches_naive_and_parallel ... ok
+test velem::tests::serial_matches_parallel_bit_for_bit ... ok
+test velem::tests::velem_div_matches_lanes ... ok
+test velem::tests::velem_saxpy_is_fma ... ok
+test velem::tests::velem_scale_ignores_y ... ok
+test velem::tests::velem_tail_matches_lanes ... ok
+test velem::tests::vhorner_tail_matches_lanes ... ok
+test vmath::tests::vmath2_activation_backward ... ok
+test vmath::tests::vmath2_gate ... ok
+test vmath::tests::vmath2_matches_libm ... ok
+test lowp::tests::vmath_narrow_out_simd_equals_scalar_twin ... ok
+test vmath::tests::vmath2_monomorphized_dispatch_matches_the_function_pointer_path ... ok
+test vmath::tests::vmath2_throughput ... ignored, throughput bench; run explicitly in --release
+test vmath::tests::vmath_erf_known_values ... ok
+test vmath::tests::vmath_exp_boundary_saturation ... ok
+test vmath::tests::vmath_exp_dense_sweep ... ok
+test vmath::tests::vmath_exp_log_exhaustive_ulp ... ignored, exhaustive bit sweep (minutes); run explicitly in --release
+test vmath::tests::vmath2_nt_tail_matches_lanes ... ok
+test vmath::tests::vmath_exp_tables_consistent ... ok
+test vmath::tests::vmath_inverse_hyperbolic ... ok
+test vmath::tests::vmath_inverse_trig ... ok
+test vmath::tests::vmath_log_bucket_boundary_monotone ... ok
+test vmath::tests::vmath_expm1_log1p ... ok
+test vmath::tests::vmath_log_tables_consistent ... ok
+test vmath::tests::vmath_lowp_matches_f32_on_widened ... ok
+test vmath::tests::vmath_matches_libm ... ok
+test vmath::tests::vmath_log_dense_sweep ... ok
+test vmath::tests::vmath_monomorphized_dispatch_matches_the_function_pointer_path ... ok
+test vmath::tests::vmath_op_tables_cover_the_declared_code_space ... ok
+test vmath::tests::vmath_serial_matches_parallel_bit_for_bit ... ok
+test vmath::tests::vmath_tail_matches_lanes ... ok
+test vmath::tests::vmath_throughput ... ignored, throughput bench; run explicitly in --release
+test vmath::tests::vmath_throughput_arms_compute_the_same_function ... ok
+test vmath::tests::vmath_unknown_op_writes_identity_on_every_path ... ok
+test vmath::tests::vmath_unroll6_body_matches_the_shipped_x4_body ... ok
+test xent::tests::all_equal_logits_loss_is_log_cols ... ok
+test xent::tests::degenerate_shapes_are_noops ... ok
+test xent::tests::matches_f64_reference ... ok
+test xent::tests::nan_logit_keeps_scalar_and_avx2_in_agreement ... ok
+test xent::tests::out_of_range_labels_are_nan_serial_and_parallel ... ok
+test xent::tests::past_the_end_target_does_not_gather_past_the_row ... ok
+test xent::tests::scalar_matches_avx2_bit_for_bit ... ok
+test xent::tests::serial_matches_parallel_bit_for_bit ... ok
+test xent_bwd::tests::degenerate_shapes_are_noops ... ok
+test xent_bwd::tests::gradient_sums_to_zero_per_row ... ok
+test xent_bwd::tests::matches_f64_reference ... ok
+test xent_bwd::tests::nan_logit_keeps_scalar_and_avx2_in_agreement ... ok
+test xent_bwd::tests::out_of_range_labels_keep_the_plain_softmax_serial_and_parallel ... ok
+test xent_bwd::tests::past_the_end_target_does_not_write_past_the_row ... ok
+test xent_bwd::tests::scalar_matches_avx2_bit_for_bit ... ok
+test xent_bwd::tests::serial_matches_parallel_bit_for_bit ... ok
+test vmath::tests::vmath_nt_tail_matches_lanes ... ok
+
+failures:
+
+---- colreduce::tests::nan_signed_zero_and_ties_agree_between_paths stdout ----
+
+thread 'colreduce::tests::nan_signed_zero_and_ties_agree_between_paths' (25860) panicked at crates/wukong_runtime/src/colreduce.rs:980:13:
+assertion `left == right` failed: NaN/±0/tie: scalar != avx2, kind=0
+  left: [2143289344, 2143289344, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143289344, 2143289344, 2143289344, 2143289344, 2143289344, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143289344, 2143289344, 2143289344, 2143289344, 2143289344, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 4290772992, 2143294004, 2143294004, 2143294004, 2143294004]
+ right: [2143294004, 2143294004, 2143289344, 2143289344, 2143289344, 2143289344, 2143289344, 2143289344, 4290772992, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143289344, 2143289344, 2143289344, 2143289344, 2143289344, 2143289344, 4290772992, 2143294004, 2143294004, 2143294004, 2143294004, 2143294004, 2143289344, 2143289344, 2143289344, 2143289344, 2143289344, 2143289344, 4290772992, 2143294004, 2143294004, 2143294004, 2143294004]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<alloc::vec::Vec<u32>, alloc::vec::Vec<u32>>
+   4: <wukong_runtime::colreduce::tests::nan_signed_zero_and_ties_agree_between_paths::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    colreduce::tests::nan_signed_zero_and_ties_agree_between_paths
+
+test result: FAILED. 238 passed; 1 failed; 10 ignored; 0 measured; 0 filtered out; finished in 2.77s
+
+[1m[91merror[0m: test failed, to rerun pass `-p wukong_runtime --lib`
+[1m-> FAILED (101) in 130.8s[0m
+
+Build artifacts committed to the 'wukong-build' Volume.
+[meter] build: 407.2s wall = $0.057 (record this in the round log)
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-9R46RkXY52RgSBmEUJxoBJ
+wall_time : 426s
+exit_code : 0
