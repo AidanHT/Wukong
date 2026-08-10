@@ -221,8 +221,13 @@ fn fp8_pipe_entry(
     smem_budget: usize,
 ) -> String {
     use crate::ptx_wmma::Act;
-    assert!(stages >= 2 && bk % 32 == 0 && (bk / 16).is_power_of_two() && pad % 16 == 0);
-    assert!(bm % (16 * warps_m) == 0 && bn % (8 * warps_n) == 0);
+    assert!(
+        stages >= 2
+            && bk.is_multiple_of(32)
+            && (bk / 16).is_power_of_two()
+            && pad.is_multiple_of(16)
+    );
+    assert!(bm.is_multiple_of(16 * warps_m) && bn.is_multiple_of(8 * warps_n));
     assert!(raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()));
     // `warpRow = warpId >> wn_shift` / `warpCol = warpId & (warps_n-1)` only partition the warps when
     // the warp grid is powers of two; with e.g. warps_n=3 the shift is 0, so warpRow is the raw warp id
@@ -237,7 +242,7 @@ fn fp8_pipe_entry(
     // are TRUNCATING divisions: a tile that is not a whole multiple stages only part of itself and
     // feeds uninitialised shared memory straight into `mma.sync` — silently wrong C, no diagnostic.
     assert!(
-        (bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0,
+        (bm * bk).is_multiple_of(threads * 16) && (bn * bk).is_multiple_of(threads * 16),
         "{name}: threads*16 must divide the A/B tile bytes (128-bit cp.async staging)"
     );
     let tm = bm / (16 * warps_m);
@@ -541,8 +546,13 @@ fn fp8_gate_entry(
     bias: bool,
 ) -> String {
     use crate::ptx_wmma::Act;
-    assert!(stages >= 2 && bk % 32 == 0 && (bk / 16).is_power_of_two() && pad % 16 == 0);
-    assert!(bm % (16 * warps_m) == 0 && bn % (8 * warps_n) == 0);
+    assert!(
+        stages >= 2
+            && bk.is_multiple_of(32)
+            && (bk / 16).is_power_of_two()
+            && pad.is_multiple_of(16)
+    );
+    assert!(bm.is_multiple_of(16 * warps_m) && bn.is_multiple_of(8 * warps_n));
     assert!(raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()));
     // Same two preconditions as `fp8_pipe_entry` (this generator mirrors its staging/fragment layout
     // verbatim): the warp grid is addressed by shift+mask, and the cp.async chunk counts truncate.
@@ -552,7 +562,7 @@ fn fp8_gate_entry(
     );
     let threads = warps_m * warps_n * 32;
     assert!(
-        (bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0,
+        (bm * bk).is_multiple_of(threads * 16) && (bn * bk).is_multiple_of(threads * 16),
         "{name}: threads*16 must divide the A/B tile bytes (128-bit cp.async staging)"
     );
     let tm = bm / (16 * warps_m);

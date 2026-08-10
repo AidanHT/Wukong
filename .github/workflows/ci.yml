@@ -76,18 +76,20 @@ jobs:
   # `cargo test --workspace` above NEVER builds the `gpu` feature, so every line of
   # `crates/wukong_codegen_gpu` (and the `gpu`-gated arms of `wukong_driver`/`wukongc`) was invisible
   # to CI: the whole crate could fail to compile and the `test` job would still be green. This job
-  # closes that hole. Type-check only — no GPU tests are run and no device is needed, because
+  # closes that hole. Analysis only — no GPU tests are run and no device is needed, because
   # `cudarc` is built with `dynamic-loading` (it dlopens `nvcuda.dll`/`libcuda.so` at *run* time), so
   # building the feature needs no CUDA toolkit on the runner. Mirrors the second half of the local
   # two-command gate documented in CLAUDE.md.
   gpu-check:
-    name: gpu type-check (no device)
+    name: gpu type-check + clippy (no device)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -103,3 +105,28 @@ jobs:
 
       - name: GPU type-check
         run: cargo check --features gpu --all-targets
+
+      # THE LINT SURFACE IS THE POINT OF THIS STEP. The `test` job's `cargo clippy --workspace
+      # --all-targets` runs WITHOUT `--features gpu`, and without that flag `wukong_codegen_gpu`
+      # compiles to an almost-empty shell (two device-free modules). So the largest crate in the
+      # workspace — ~25k lines of PTX generators, launch wrappers and MIR->PTX lowering — had never
+      # been linted at all. When it first was, it did not merely warn: `absurd_extreme_comparisons`
+      # is deny-by-default and `gpu.rs`'s flash dispatch tripped it, behind 363 warnings. That is the
+      # same shape as the month of unread red ubuntu CI that hid four real Linux defects, one step
+      # earlier — an invisible surface rather than an ignored one.
+      #
+      # It runs `-D warnings` (workflow-level RUSTFLAGS) from day one, deliberately. A warn-only lint
+      # job is strictly worse than an ignored red one: it is never even red, so it decays the moment
+      # it is added. The known hazard is that CI installs *current* stable, which is newer than the
+      # local toolchain, so a locally clean sweep can still go red on a lint that did not exist
+      # locally — but the `test` job's clippy step has taken exactly that risk since it was written,
+      # and the gpu crate is not entitled to an exemption the other 20 crates do not get. Keeping it
+      # a separate job (not a step of `test`) is what makes a toolchain-drift failure attributable at
+      # a glance instead of masking the test signal.
+      #
+      # No `-p`: the `gpu`-gated arms of `wukong_driver` and `wukongc` are part of the same dark
+      # surface (`gpu_accel.rs` had three of the warnings), and scoping to one package would leave
+      # them dark. Ubuntu-only is sufficient here: unlike `wukong_runtime`, this crate has no
+      # `cfg(windows)`/`cfg(unix)` code, so there is no per-OS arm for a second runner to reach.
+      - name: GPU clippy
+        run: cargo clippy --features gpu --all-targets

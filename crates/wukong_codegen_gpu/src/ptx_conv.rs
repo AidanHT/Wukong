@@ -73,7 +73,7 @@ pub const TILE_Q: usize = 16;
 /// (≤8) so the grid divides evenly with no `k` tail.
 pub fn kblock(k: usize) -> usize {
     for kb in [8usize, 4, 2] {
-        if k % kb == 0 {
+        if k.is_multiple_of(kb) {
             return kb;
         }
     }
@@ -968,7 +968,7 @@ fn conv_wmma_ptx_impl(
     let n = p * q; // GEMM N
     let gk = c * r * s; // GEMM K (reduction)
     assert!(
-        sk >= 1 && gk % sk == 0,
+        sk >= 1 && gk.is_multiple_of(sk),
         "split-K factor {sk} must divide GK={gk}"
     );
     // Fusion composes only with the single-pass kernel: a split-K conv writes partial M×N planes that
@@ -981,7 +981,7 @@ fn conv_wmma_ptx_impl(
                           // The K-loop advances in 16-wide WMMA tiles, so each slice must be a whole number of them — else a
                           // slice over-reads into the next slice's range (the staging guards against the full GK, not ktend).
     assert!(
-        sk == 1 || gk_per % 16 == 0,
+        sk == 1 || gk_per.is_multiple_of(16),
         "split-K slice GK/sk={gk_per} must be a multiple of 16"
     );
     let mn = m * n; // one output plane (for the z-plane store offset)
@@ -1511,7 +1511,7 @@ pub fn conv_splitk_factor_affine(
 /// shape whose largest valid split can't even reach `lo` (e.g. a 5×5 with a tiny base) keeps sk=1 —
 /// over-splitting a near-full grid only adds the reduce pass and loses (measured).
 fn splitk_factor_for_n(gk: usize, n: usize, k: usize, sm_count: usize) -> usize {
-    if gk % 16 != 0 {
+    if !gk.is_multiple_of(16) {
         return 1; // can't carve whole 16-wide K-tiles (e.g. C3 R3 S3 -> GK=27)
     }
     let base = k.div_ceil(WMMA_BM) * n.div_ceil(WMMA_BN);
@@ -1524,7 +1524,7 @@ fn splitk_factor_for_n(gk: usize, n: usize, k: usize, sm_count: usize) -> usize 
     let mut best = 1;
     for &sk in &[2usize, 3, 4, 6, 8] {
         let ctas = base * sk;
-        if units16 % sk == 0 && gk / sk >= 64 && (lo..=hi).contains(&ctas) {
+        if units16.is_multiple_of(sk) && gk / sk >= 64 && (lo..=hi).contains(&ctas) {
             best = sk; // ascending ⇒ keeps the largest sk that still lands within one wave
         }
     }
@@ -1583,12 +1583,12 @@ fn conv_wmma_db_ptx_impl(
     let n = p * q; // GEMM N
     let gk = c * r * s; // GEMM K (reduction)
     assert!(
-        sk >= 1 && gk % sk == 0,
+        sk >= 1 && gk.is_multiple_of(sk),
         "split-K factor {sk} must divide GK={gk}"
     );
     let gk_per = gk / sk;
     assert!(
-        sk == 1 || gk_per % 16 == 0,
+        sk == 1 || gk_per.is_multiple_of(16),
         "split-K slice GK/sk={gk_per} must be a multiple of 16"
     );
     let mn = m * n;

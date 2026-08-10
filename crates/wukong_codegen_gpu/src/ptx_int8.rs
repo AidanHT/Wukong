@@ -316,7 +316,7 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
             "{name}: smemA/smemB and the buffer toggle are all sized from bm*bk"
         );
         assert!(
-            threads * 16 <= bm * bk && (bm * bk) % (threads * 16) == 0,
+            threads * 16 <= bm * bk && (bm * bk).is_multiple_of(threads * 16),
             "smdb staging needs threads*16 to divide the tile bytes"
         );
         let a_chunks = bm * bk / (threads * 16); // 16-byte cp.async chunks per thread
@@ -512,7 +512,7 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
                     s += &format!("    cvt.rn.f32.s32 %f3,%d{ti}_{tj}_3;\n    mul.f32 %f3,%f3,%sc1;\n    st.global.f32 [%cp+4],%f3;\n");
                 } else {
                     s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_0;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_1;\n");
-                    s += &format!("    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n");
+                    s += "    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n";
                     s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_2;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_3;\n");
                 }
             }
@@ -637,11 +637,11 @@ fn gen_int8_smdb_swz_impl(
         "{name}: swz swizzle phase is derived for BK=64 (nc=4)"
     );
     assert!(
-        bm % (16 * wm) == 0 && bn % (8 * wn) == 0,
+        bm.is_multiple_of(16 * wm) && bn.is_multiple_of(8 * wn),
         "{name}: bm/bn must tile by 16*wm / 8*wn"
     );
     assert!(
-        wmr % 8 == 0 && wnc % 8 == 0,
+        wmr.is_multiple_of(8) && wnc.is_multiple_of(8),
         "{name}: swz needs per-warp row/col bases = 0 (mod 8)"
     );
     assert!(
@@ -669,12 +669,12 @@ fn gen_int8_smdb_swz_impl(
     // byte-count is a multiple of 1 KiB, so this holds trivially — assert it anyway, because a forgotten
     // offset assert is the one way risk #4 (swizzle/alignment) escapes generation silently.
     assert!(
-        (stages * a_tile) % 16 == 0,
+        (stages * a_tile).is_multiple_of(16),
         "{name}: B slab offset {} is not 16-B aligned",
         stages * a_tile
     );
     assert!(
-        (bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0,
+        (bm * bk).is_multiple_of(threads * 16) && (bn * bk).is_multiple_of(threads * 16),
         "{name}: threads*16 must divide the tile bytes"
     );
     // split-K folds each CTA's partial product into C by `red.global.add.u32` (deterministic for i32 —
@@ -1625,7 +1625,7 @@ fn gen_int8_smdb_ms(
         "{name}: smemA/smemB and the ring pointers are all sized from bm*bk"
     );
     assert!(
-        threads * 16 <= bm * bk && (bm * bk) % (threads * 16) == 0,
+        threads * 16 <= bm * bk && (bm * bk).is_multiple_of(threads * 16),
         "smdb_ms staging needs threads*16 to divide the tile bytes"
     );
     let a_chunks = bm * bk / (threads * 16);
@@ -1822,7 +1822,7 @@ fn gen_int8_smdb_ms(
                 s += &format!("    cvt.rn.f32.s32 %f3,%d{ti}_{tj}_3;\n    mul.f32 %f3,%f3,%sc1;\n    st.global.f32 [%cp+4],%f3;\n");
             } else {
                 s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_0;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_1;\n");
-                s += &format!("    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n");
+                s += "    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n";
                 s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_2;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_3;\n");
             }
         }

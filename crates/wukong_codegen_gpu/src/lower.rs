@@ -147,9 +147,8 @@ pub fn jit_run(
     // and falls through to the correct single-thread lowering below — the universal reference. The
     // `WUKONG_GPU_NO_MEGA` escape hatch forces the single-thread path (for A/B timing / debugging).
     if std::env::var_os("WUKONG_GPU_NO_MEGA").is_none() {
-        match crate::megakernel::try_run(program, entry, interner)? {
-            Some(r) => return Ok(r),
-            None => {}
+        if let Some(r) = crate::megakernel::try_run(program, entry, interner)? {
+            return Ok(r);
         }
     }
 
@@ -4091,11 +4090,13 @@ pub fn mega_frame_bytes(func: &Function) -> u64 {
 /// so [`normalized`] and [`host_native`] take one crate-wide mutex and restore the previous value
 /// on the way out (including on a panic) — two gates can hold opposite settings without racing.
 /// They touch the environment **only where [`switch_can_matter`] holds**; see its comment for why
-/// that is a soundness property and not a shortcut. The one MIR builder in this crate outside the
-/// lock is `fusion.rs`'s test `build`, whose seven tests are eligibility-shape assertions and were
-/// checked to be insensitive to the switch (`cargo test -p wukong_codegen_gpu --features gpu --lib
-/// fusion::` passes 7/7 identically with and without `WUKONG_P4_NO_256=1`). Route any new
-/// MIR-building helper through here rather than re-checking that.
+/// that is a soundness property and not a shortcut. **There is no MIR builder in this crate outside
+/// the lock**: `fusion.rs`'s tests import [`build`]/[`build_in_current_host_mode`] from here, so every
+/// MIR build in the crate is serialized by the one mutex. Their switch-insensitivity is no longer a
+/// manual check either — `fusion::tests::fusion_eligibility_is_host_vectorizer_invariant` runs the
+/// same source through both host-vectorizer modes and asserts the `MegaPlan` is identical, over a
+/// program that genuinely carries an `Op::VecKernelCall` in one mode and not the other. Route any new
+/// MIR-building helper through here rather than re-deriving that.
 #[cfg(all(test, feature = "gpu"))]
 pub(crate) mod hostvec {
     use super::{Interner, Program};

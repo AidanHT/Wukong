@@ -1420,7 +1420,10 @@ GBP_END:
         // The arrival target is the WHOLE grid and the representative is thread (0,0,0), so the
         // barrier carries no "must be launched 1-D" precondition for a caller to violate.
         for d in ["%nctaid.x", "%nctaid.y", "%nctaid.z", "%tid.y", "%tid.z"] {
-            assert!(p.contains(d), "barrier must be geometry-agnostic: missing {d}");
+            assert!(
+                p.contains(d),
+                "barrier must be geometry-agnostic: missing {d}"
+            );
         }
         assert_eq!(
             p.matches("ld.volatile.global.u32").count(),
@@ -1429,8 +1432,17 @@ GBP_END:
         );
         // Nothing here postdates PTX ISA 7.8 / sm_80, which is what lets the fragment sit in an
         // `HDR_SM80` module (see `ptx_target`, and gpu.rs's `.version` law).
-        for above_78 in ["wgmma", "stmatrix", "elect.sync", "cp.async.bulk", "tcgen05"] {
-            assert!(!p.contains(above_78), "{above_78} would raise the ISA floor");
+        for above_78 in [
+            "wgmma",
+            "stmatrix",
+            "elect.sync",
+            "cp.async.bulk",
+            "tcgen05",
+        ] {
+            assert!(
+                !p.contains(above_78),
+                "{above_78} would raise the ISA floor"
+            );
         }
     }
 

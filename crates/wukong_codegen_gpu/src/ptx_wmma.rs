@@ -236,6 +236,7 @@ impl PipeCfg {
 ///     co-scheduled CTAs into a compact L2 footprint cuts effective traffic. `pipe_128_bk32_s2_r8` reached
 ///     ~72% of cuBLAS at 4096³ (vs 56% un-rasterized and the BK=16 pipes' ~27% *collapse*). Bigger
 ///     dynamic-SMEM tiles (256×128, 256×64-bk64) and deeper pipes there *lost* to the occupancy drop.
+///
 /// `gemm_nt_f16` dispatches among these by working-set size; `gemm_pipe_sweep` re-measures them. (~72% is
 /// near the WMMA ceiling on this part; the cuBLAS-class `mma.sync`+`ldmatrix` path is the next lever.)
 pub const PIPE_VARIANTS: &[PipeCfg] = &[
@@ -1600,7 +1601,10 @@ fn entry_smem_pipe(
         stages >= 2,
         "the pipeline needs at least 2 stages (1 prefetch in flight)"
     );
-    assert!(bk % 16 == 0, "bk must be a multiple of the WMMA k16 step");
+    assert!(
+        bk.is_multiple_of(16),
+        "bk must be a multiple of the WMMA k16 step"
+    );
     assert!(
         (bk / 8).is_power_of_two(),
         "bk/8 must be a power of two (shift-based staging address math)"
@@ -1984,6 +1988,7 @@ fn entry_smem_pipe(
 ///   * `V2`     — two `st.global.v2.f32`: half the store instructions / memory transactions.
 ///   * `V2Cs`   — two `st.global.cs.v2.f32`; the `.cs` (cache-streaming, evict-first) hint keeps the
 ///     write-once C stream from evicting the L2-resident A/B raster band it competes with at 4096³.
+///
 /// The pair base is 8-byte aligned (`gcol` is always even and the dispatched tiles have `N` a 128-multiple
 /// ⇒ `(row·N+gcol)·4` is a multiple of 8), so the `v2.f32` stores are legal.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2086,15 +2091,15 @@ fn entry_mma_pipe_budget(
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(
-        bk % 16 == 0 && (bk / 8).is_power_of_two(),
+        bk.is_multiple_of(16) && (bk / 8).is_power_of_two(),
         "bk must be a 16-multiple with bk/8 a power of two"
     );
     assert!(
-        bm % (16 * warps_m) == 0,
+        bm.is_multiple_of(16 * warps_m),
         "{name}: bm must be a multiple of 16·warps_m (m16 sub-tiles)"
     );
     assert!(
-        bn % (8 * warps_n) == 0,
+        bn.is_multiple_of(8 * warps_n),
         "{name}: bn must be a multiple of 8·warps_n (n8 sub-tiles)"
     );
     assert!(
@@ -2114,7 +2119,7 @@ fn entry_mma_pipe_budget(
                             // conflict at stride bk where grp and grp+2 alias). pad=0 keeps the conflict but a smaller footprint ⇒
                             // more CTAs/SM. Pad keeps 16-byte alignment for cp.async. K-offsets stay bk-based.
     assert!(
-        pad % 8 == 0,
+        pad.is_multiple_of(8),
         "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)"
     );
     // The **`swz` (ldmatrix + XOR-swizzle + no-pad)** path drops the padding (smaller footprint ⇒ more
@@ -2132,7 +2137,7 @@ fn entry_mma_pipe_budget(
             "{name}: the swz swizzle phase is derived for bk=32 (nc=4)"
         );
         assert!(
-            wmr % 8 == 0 && wnc % 8 == 0,
+            wmr.is_multiple_of(8) && wnc.is_multiple_of(8),
             "{name}: swz needs warp row/col bases ≡ 0 (mod 8)"
         );
     }
@@ -2153,7 +2158,7 @@ fn entry_mma_pipe_budget(
     // `cp.async …,16` / `ldmatrix` into it assumes 16-B alignment. Loud at generation, because a
     // forgotten offset assert is the one way the swizzle/alignment risk escapes silently.
     assert!(
-        smem_a % 16 == 0,
+        smem_a.is_multiple_of(16),
         "{name}: B slab offset {smem_a} is not 16-B aligned"
     );
     // The staging loop issues exactly `chunks` 16-byte `cp.async`s per thread, so `bm·bk` and `bn·bk`
@@ -2554,15 +2559,15 @@ fn entry_mma_gate(
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(
-        bk % 16 == 0 && (bk / 8).is_power_of_two(),
+        bk.is_multiple_of(16) && (bk / 8).is_power_of_two(),
         "bk must be a 16-multiple with bk/8 a power of two"
     );
     assert!(
-        bm % (16 * warps_m) == 0,
+        bm.is_multiple_of(16 * warps_m),
         "{name}: bm must be a multiple of 16·warps_m"
     );
     assert!(
-        bn % (8 * warps_n) == 0,
+        bn.is_multiple_of(8 * warps_n),
         "{name}: bn must be a multiple of 8·warps_n"
     );
     assert!(
@@ -2570,7 +2575,7 @@ fn entry_mma_gate(
         "{name}: rasterization needs bm,bn powers of two"
     );
     assert!(
-        pad % 8 == 0,
+        pad.is_multiple_of(8),
         "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)"
     );
     let mma_ty = format!("f32.{ty}.{ty}.f32");
@@ -2600,7 +2605,7 @@ fn entry_mma_gate(
             "{name}: the swz swizzle phase is derived for bk=32 (nc=4)"
         );
         assert!(
-            wmr % 8 == 0 && wnc % 8 == 0,
+            wmr.is_multiple_of(8) && wnc.is_multiple_of(8),
             "{name}: swz needs warp row/col bases ≡ 0 (mod 8)"
         );
     }
