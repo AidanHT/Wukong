@@ -318,6 +318,14 @@ pub fn sync_within(stream: &CudaStream, what: &str) -> Result<std::time::Duratio
                  \x20            and every consumer warpgroup spins forever. Run the single-stage\n\
                  \x20            TMA probe first: one copy, one barrier, nothing else.\n\
                  \x20 suspect 2: a bar.sync that some threads of the CTA branch around.\n\
+                 \x20 suspect 3: CLUSTER ONLY (an entry whose name ends `_mc<N>`). Either an\n\
+                 \x20            `empty[s]` initialised for fewer arrivals than the cluster's\n\
+                 \x20            consumer warpgroups actually send (WgmmaCfg::empty_arrivals), a\n\
+                 \x20            `mapa` remote arrival that never lands, or a peer signalling an\n\
+                 \x20            mbarrier before `fence.mbarrier_init.release.cluster` plus the\n\
+                 \x20            opening `barrier.cluster` pair has published its initialisation.\n\
+                 \x20            Run the SAME tile with Multicast::None first: if that retires, the\n\
+                 \x20            cluster is at fault and nothing upstream of it is.\n\
                  \x20 exiting  : the context is wedged; every later driver call would block too, so\n\
                  \x20            ending here is what leaves you this message instead of a timeout.\n\
                  ================================================================\n",
@@ -411,11 +419,34 @@ pub struct Gpu {
     /// it survives every later `load_function` for that entry: it is set once at load and re-set only
     /// if a later caller needs a strictly larger window. See [`Gpu::function_dyn`].
     dyn_smem: HashMap<(&'static str, String), usize>,
+    /// Raw driver handles for entries that must be launched through [`Gpu::cluster_launch`], keyed
+    /// exactly as [`Gpu::function`] keys its own cache. See [`Gpu::raw_function_dyn`] for why a
+    /// second, parallel cache exists at all.
+    raw_fns: HashMap<(&'static str, String), RawEntry>,
     /// Installed driver version — part of the on-disk cubin cache key (a cubin is driver-ABI specific).
     driver_tag: i32,
     /// The probed device identity — see [`GpuTarget`]. Queried once, here, and never re-queried.
     target: GpuTarget,
 }
+
+/// One driver-level `(module, entry)` pair, held raw.
+///
+/// The handles are opaque driver objects owned by this process's primary context; the module is
+/// never unloaded, exactly as cudarc's own `CudaModule` cache keeps its modules for the life of the
+/// context. Nothing here is dereferenced by us — the pointers go straight back to the driver.
+#[derive(Clone, Copy)]
+struct RawEntry {
+    #[allow(dead_code)] // held so the module cannot be reasoned about as unloadable
+    module: sys::CUmodule,
+    func: sys::CUfunction,
+}
+
+// SAFETY: `CUmodule`/`CUfunction` are opaque driver handles, not pointers into this process's
+// address space, and they are valid on any thread that has the owning context current (which every
+// entry point here ensures with `bind_to_thread`). This is the same claim cudarc makes for its own
+// `CudaModule`/`CudaFunction`, and it is needed for the same reason: the process-wide `Gpu` lives in
+// a `static Mutex<Option<Gpu>>`, which requires `Send`.
+unsafe impl Send for RawEntry {}
 
 impl Gpu {
     /// Retain the primary context on device 0 and probe its [`GpuTarget`]. A failed probe is a failed
@@ -429,6 +460,7 @@ impl Gpu {
             stream,
             modules: HashMap::new(),
             dyn_smem: HashMap::new(),
+            raw_fns: HashMap::new(),
             driver_tag: crate::cubin::driver_version(),
             target,
         })
@@ -592,6 +624,189 @@ impl Gpu {
             self.dyn_smem.insert(slot, dyn_smem);
         }
         Ok(f)
+    }
+
+    /// **[`Gpu::function_dyn`] through the RAW driver API**, returning the `CUfunction` itself.
+    ///
+    /// # Why this exists at all
+    ///
+    /// A **cluster launch** is `cuLaunchKernelEx` with a `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION`
+    /// attribute, and cudarc 0.16.6 offers no way to make one: it binds `cuLaunchKernelEx` in its
+    /// `sys` layer but exposes no safe wrapper, and `CudaFunction::cu_function` is `pub(crate)`, so
+    /// the raw handle a `CUlaunchConfig` needs cannot be obtained from a `CudaFunction` at all. The
+    /// choice is therefore between a second load path and no clusters.
+    ///
+    /// # Why the WHOLE wgmma family uses it, not only the clustered rows
+    ///
+    /// Because the clustered and un-clustered rows are the two arms of an A/B, and **an A/B whose
+    /// arms differ in their launch API is measuring two things**. This repo has been burned by
+    /// exactly that shape before (see the "A/B arm hazards" note: two binaries with identical cargo
+    /// hashes, a cold device-keyed cubin cache reading 27x once). One seam, one argument-marshalling
+    /// path, one set of preconditions — and the cluster attribute is simply absent when the plan says
+    /// `1x1x1`, which makes `cuLaunchKernelEx` behave exactly as `cuLaunchKernel`.
+    ///
+    /// # What it gives up
+    ///
+    /// The persistent **cubin cache** ([`Gpu::load_module_cached`]): this path always hands PTX to
+    /// `cuModuleLoadData` and pays the driver JIT once per key per process. That is milliseconds,
+    /// outside every timed region, and both arms pay it identically — whereas a *cached* arm against
+    /// an *uncached* one would not be an A/B at all.
+    ///
+    /// The module-cache rule is unchanged and still sharp: the key alone decides a hit and the PTX is
+    /// never re-examined, so every generated variant needs its own key.
+    pub fn raw_function_dyn(
+        &mut self,
+        key: &'static str,
+        ptx: &str,
+        name: &str,
+        dyn_smem: usize,
+    ) -> Result<sys::CUfunction, GpuError> {
+        assert!(
+            dyn_smem <= self.smem_budget(),
+            "{name}: dynamic SMEM request {dyn_smem} B exceeds the device ceiling {} B \
+             (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN on {})",
+            self.smem_budget(),
+            self.target.name
+        );
+        let slot = (key, name.to_string());
+        if let Some(e) = self.raw_fns.get(&slot) {
+            return Ok(e.func);
+        }
+        // Every raw driver call below needs the context current on THIS thread; libtest runs these
+        // on many threads and cudarc only binds inside its own wrappers.
+        let _ = self.ctx.bind_to_thread();
+        let ptx_c = std::ffi::CString::new(ptx)
+            .map_err(|_| GpuError::Unsupported(format!("{name}: PTX contains an interior NUL")))?;
+        let name_c = std::ffi::CString::new(name)
+            .map_err(|_| GpuError::Unsupported(format!("{name}: entry name contains a NUL")))?;
+        let mut module: sys::CUmodule = std::ptr::null_mut();
+        let mut func: sys::CUfunction = std::ptr::null_mut();
+        // SAFETY: `ptx_c` is a live NUL-terminated image for the duration of the call, which is all
+        // `cuModuleLoadData` requires (it copies what it needs); `module` is a live out-parameter.
+        // The context is current on this thread. A JIT failure is returned, not ignored.
+        unsafe { sys::cuModuleLoadData(&mut module, ptx_c.as_ptr() as *const std::ffi::c_void) }
+            .result()?;
+        // SAFETY: `module` was just loaded successfully and is non-null; `name_c` is a live
+        // NUL-terminated entry name; `func` is a live out-parameter.
+        unsafe { sys::cuModuleGetFunction(&mut func, module, name_c.as_ptr()) }.result()?;
+        if dyn_smem > 0 {
+            // SAFETY: `func` is a live function handle in the current context. The attribute is the
+            // documented dynamic-SMEM ceiling and the value is asserted against the device's own
+            // budget above, so this cannot ask for more than the part grants.
+            unsafe {
+                sys::cuFuncSetAttribute(
+                    func,
+                    sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    dyn_smem as i32,
+                )
+            }
+            .result()?;
+        }
+        self.raw_fns.insert(slot, RawEntry { module, func });
+        Ok(func)
+    }
+
+    /// **Launch `f` through `cuLaunchKernelEx`, optionally inside a thread-block CLUSTER.**
+    ///
+    /// `cluster == (1, 1, 1)` passes no attribute at all, which is `cuLaunchKernel` by another name;
+    /// anything wider passes one `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION`.
+    ///
+    /// # Preconditions, all asserted here (crate hard rule 2)
+    ///
+    /// * **Every grid dimension is a multiple of its cluster dimension.** The driver documents
+    ///   `clusterDim.x` as "in blocks. Must be a divisor of the grid X dimension" (and likewise y, z).
+    ///   There is no partial cluster; a non-divisor grid is a launch rejection whose error code
+    ///   (`CUDA_ERROR_INVALID_CLUSTER_SIZE`, or a bare `CUDA_ERROR_INVALID_VALUE`) names neither the
+    ///   kernel nor the cluster, which is why the check is here and phrased in the caller's terms.
+    /// * **The cluster fits the portable ceiling** (8 CTAs on sm_90). Wider needs
+    ///   `CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED` and an occupancy query; this backend
+    ///   declines rather than opting in blind.
+    /// * `args` has exactly as many entries as the entry declares `.param`s, and each points at
+    ///   storage that outlives the call. **The caller must derive that count from the same text it
+    ///   loaded** — pushing short makes the driver read adjacent host stack as a pointer.
+    /// * `f` was loaded through [`Gpu::raw_function_dyn`] with a dynamic-SMEM ceiling at least
+    ///   `cfg.shared_mem_bytes`.
+    ///
+    /// # Safety
+    ///
+    /// The caller guarantees the argument list matches the kernel's signature in count, order and
+    /// type, that every pointed-to buffer is live for the whole launch, and that the kernel does not
+    /// address outside them. This is the same contract cudarc's own `LaunchArgs::launch` carries.
+    pub unsafe fn cluster_launch(
+        &self,
+        f: sys::CUfunction,
+        what: &str,
+        cfg: LaunchConfig,
+        cluster: (u32, u32, u32),
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<(), GpuError> {
+        let (cx, cy, cz) = cluster;
+        assert!(
+            cx >= 1 && cy >= 1 && cz >= 1,
+            "{what}: a cluster dimension of 0 is not a shape"
+        );
+        let ctas = cx as u64 * cy as u64 * cz as u64;
+        if ctas > 1 {
+            // Clusters are sm_90 hardware. Every caller in this crate is already behind
+            // `ptx_wgmma::require_sm90a`, so this can only fire for a future one that forgot — and
+            // the driver's own answer to a cluster attribute on a pre-Hopper part names neither the
+            // capability nor the kernel.
+            self.require_cap(what, "thread-block clusters (sm_90)", (9, 0))?;
+        }
+        assert!(
+            ctas as usize <= crate::ptx_wgmma::MAX_PORTABLE_CLUSTER_CTAS,
+            "{what}: a {ctas}-CTA cluster is past the portable ceiling of {} on this architecture; \
+             a wider one needs CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED",
+            crate::ptx_wgmma::MAX_PORTABLE_CLUSTER_CTAS
+        );
+        let (gx, gy, gz) = cfg.grid_dim;
+        for (axis, g, c) in [("x", gx, cx), ("y", gy, cy), ("z", gz, cz)] {
+            assert_eq!(
+                g % c,
+                0,
+                "{what}: grid {axis} = {g} is not a multiple of the cluster's {c}. There is no such \
+                 thing as a partial cluster: round the grid up (LaunchPlan::grid does) and let the \
+                 out-of-range CTAs zero-fill and predicate themselves out",
+            );
+        }
+        assert!(!args.is_empty(), "{what}: an empty argument list");
+        let _ = self.ctx.bind_to_thread();
+
+        let mut attrs: [sys::CUlaunchAttribute; 1] = [sys::CUlaunchAttribute {
+            id: sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
+            pad: [0; 4],
+            value: sys::CUlaunchAttributeValue::default(),
+        }];
+        attrs[0].value.clusterDim = sys::CUlaunchAttributeValue_union__bindgen_ty_1 {
+            x: cx,
+            y: cy,
+            z: cz,
+        };
+        // A `1x1x1` cluster is the ABSENCE of a cluster, not a one-CTA one: passing the attribute
+        // anyway would be harmless but would stop the un-clustered arm from being, byte for byte,
+        // the launch it has always been.
+        let num_attrs = u32::from(ctas > 1);
+
+        let lc = sys::CUlaunchConfig {
+            gridDimX: gx,
+            gridDimY: gy,
+            gridDimZ: gz,
+            blockDimX: cfg.block_dim.0,
+            blockDimY: cfg.block_dim.1,
+            blockDimZ: cfg.block_dim.2,
+            sharedMemBytes: cfg.shared_mem_bytes,
+            hStream: self.stream.cu_stream(),
+            attrs: attrs.as_mut_ptr(),
+            numAttrs: num_attrs,
+        };
+        // SAFETY: `lc` is a fully initialised config whose `attrs` points at `attrs`, which is live
+        // for the call and holds `numAttrs` initialised entries. `f` is a live function handle in the
+        // now-current context. `args` is the caller's argument-pointer array, whose length and
+        // contents are this function's documented precondition. `extra` is null, which is what the
+        // driver requires when `kernelParams` is used.
+        unsafe { sys::cuLaunchKernelEx(&lc, f, args.as_mut_ptr(), std::ptr::null_mut()) }
+            .result()?;
+        Ok(())
     }
 
     /// **Load an entry whose SMEM form the generator decided** — the one call a stage-parameterized
@@ -6622,7 +6837,7 @@ pub fn gemm_nt_wgmma(
 ) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_wgmma::WgmmaDtype;
     use crate::tma_host::TensorMap;
-    use cudarc::driver::DevicePtr;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
     // FIRST, before any conversion, any PTX and any module load: is this device Hopper at all? The
     // license is a value, and `wgmma_module` below cannot be called without it.
     let lic = crate::ptx_wgmma::require_sm90a(g, cfg.name)?;
@@ -6709,31 +6924,63 @@ pub fn gemm_nt_wgmma(
         (ma, mb)
     };
 
-    // The entry declares its shared memory as one `.extern` window, so it must be loaded through
-    // `function_dyn` (which opts the function into the ceiling) AND launched with the same byte count.
-    // The plan's key is per generated variant — `Gpu::function` never re-examines PTX on a key hit, so
-    // two rows under one key would share the first's kernel *and* its SMEM ceiling.
-    let f = g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
+    // The entry declares its shared memory as one `.extern` window, so it must be loaded with the
+    // ceiling opted in AND launched with the same byte count. The plan's key is per generated
+    // variant — the cache never re-examines PTX on a key hit, so two rows under one key would share
+    // the first's kernel *and* its SMEM ceiling.
+    let f = g.raw_function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
 
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
-    let mut bld = g.stream.launch_builder(&f);
-    // PARAM_ORDER: (M: u32, N: u32, K: u32, C: ptr, tensorMap A, tensorMap B). A `&TensorMap` pushes
-    // its 128 opaque bytes by value through `DeviceRepr`, which is how a `__grid_constant__ const
-    // CUtensorMap` parameter is passed.
-    bld.arg(&mm)
-        .arg(&nn)
-        .arg(&kk)
-        .arg(&mut c_d)
-        .arg(&map_a)
-        .arg(&map_b);
     let launch = dyn_launch_cfg(plan.grid(m, n), plan.block, plan.dyn_smem_bytes);
-    unsafe { bld.launch(launch)? };
+    {
+        let (c_ptr, _gc) = c_d.device_ptr_mut(&g.stream);
+        let mut args = wgmma_arg_list(&mm, &nn, &kk, &c_ptr, &map_a, &map_b);
+        // SAFETY: `args` is built by the one helper both wgmma launchers use, in PARAM_ORDER, and
+        // its length was checked against the `.param` count of *this* text above. Every pointed-to
+        // value (`mm`/`nn`/`kk`, the `CUdeviceptr`, the two 128-byte maps) is a live local that
+        // outlives the drain below, and `c_d` is a live `m*n` f32 buffer — the extent the epilogue's
+        // own bound checks are derived from. `f` was loaded with a dynamic-SMEM ceiling equal to the
+        // window this config asks for.
+        unsafe { g.cluster_launch(f, cfg.name, launch, plan.cluster, &mut args)? };
+    }
     // TIME-BOXED (WGMMA_DEVICE_VALIDATION item 5). The `memcpy_dtov` below would block in the driver
     // forever if this pipeline deadlocked, and this family has never executed anywhere — so the drain
     // is a polled deadline, not a blocking synchronize. See `sync_within` for why it exits rather
     // than returning an error.
     sync_within(&g.stream, cfg.name)?;
     Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// **The wgmma family's argument list, built once, in `PARAM_ORDER`.**
+///
+/// `(M: u32, N: u32, K: u32, C: ptr, tensorMap A, tensorMap B)`. `cuLaunchKernelEx` takes an array of
+/// *pointers to* the argument values, so a by-value 128-byte `CUtensorMap` parameter is passed by
+/// handing the driver the address of the map — exactly how a `__grid_constant__ const CUtensorMap`
+/// parameter is passed in CUDA C++.
+///
+/// One helper, called by both launchers, because crate hard rule 2's whole point is that the pushed
+/// list is derived from one place: two hand-written copies of a six-entry list can drift, and a short
+/// push makes the driver read adjacent host stack as a pointer.
+///
+/// # Safety
+///
+/// Every reference must outlive the launch. The returned array borrows all six.
+fn wgmma_arg_list(
+    m: &u32,
+    n: &u32,
+    k: &u32,
+    c: &sys::CUdeviceptr,
+    map_a: &crate::tma_host::TensorMap,
+    map_b: &crate::tma_host::TensorMap,
+) -> [*mut std::ffi::c_void; 6] {
+    [
+        m as *const u32 as *mut std::ffi::c_void,
+        n as *const u32 as *mut std::ffi::c_void,
+        k as *const u32 as *mut std::ffi::c_void,
+        c as *const sys::CUdeviceptr as *mut std::ffi::c_void,
+        map_a as *const crate::tma_host::TensorMap as *mut std::ffi::c_void,
+        map_b as *const crate::tma_host::TensorMap as *mut std::ffi::c_void,
+    ]
 }
 
 /// **Time [`gemm_nt_wgmma`]'s steady state**: `iters` resident launches over buffers uploaded once,
@@ -6778,7 +7025,7 @@ pub fn time_gemm_nt_wgmma(
 ) -> Result<f64, GpuError> {
     use crate::ptx_wgmma::WgmmaDtype;
     use crate::tma_host::TensorMap;
-    use cudarc::driver::DevicePtr;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
     // FIRST, before any allocation, any PTX and any module load: is this device Hopper at all?
     let lic = crate::ptx_wgmma::require_sm90a(g, cfg.name)?;
     assert!(iters >= 1, "{}: iters must be >= 1", cfg.name);
@@ -6836,24 +7083,22 @@ pub fn time_gemm_nt_wgmma(
             .map_err(GpuError::Unsupported)?;
         (ma, mb)
     };
-    let f = g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
+    let f = g.raw_function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
     let launch = dyn_launch_cfg(plan.grid(m, n), plan.block, plan.dyn_smem_bytes);
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
 
     // ONE argument list for the warm-up and for the timed region: hard rule 2's whole point is that
     // the pushed list is derived from the entry it is pushed at, and two copies of it can drift.
+    let (c_ptr, _gc) = c_d.device_ptr_mut(&g.stream);
+    let mut args = wgmma_arg_list(&mm, &nn, &kk, &c_ptr, &map_a, &map_b);
     let mut t0 = std::time::Instant::now();
     for i in 0..=iters {
-        let mut bld = g.stream.launch_builder(&f);
-        bld.arg(&mm)
-            .arg(&nn)
-            .arg(&kk)
-            .arg(&mut c_d)
-            .arg(&map_a)
-            .arg(&map_b);
-        unsafe { bld.launch(launch)? };
+        // SAFETY: as in `gemm_nt_wgmma` — `args` is PARAM_ORDER, its length was checked against the
+        // `.param` count of this very text, every pointee is a live local, and `c_d` is a live `m*n`
+        // f32 buffer that outlives the trailing synchronize.
+        unsafe { g.cluster_launch(f, cfg.name, launch, plan.cluster, &mut args)? };
         if i == 0 {
-            // The warm-up: the launch that pays the cubin/JIT cost and the only one that could hang.
+            // The warm-up: the launch that pays the JIT cost and the only one that could hang.
             sync_within(&g.stream, cfg.name)?;
             t0 = std::time::Instant::now();
         }
@@ -7464,6 +7709,11 @@ mod tests {
     /// Every `fn` in scannable code (any visibility, any nesting), as `(name, body)`. A body runs from
     /// the signature line to the first `}` at the signature's own indentation — exact for rustfmt'd
     /// Rust once raw strings are blanked, and it reaches `impl` methods that a column-0 anchor misses.
+    ///
+    /// **The `unsafe fn` forms are in the list deliberately.** They were not, and the blind spot was
+    /// exactly the wrong shape: a law that scans function bodies for a missing capability gate or a
+    /// forbidden drain is a law about the functions that touch the driver, and those are precisely
+    /// the ones declared `unsafe`. Adding them widens every scan here, which is a strict improvement.
     fn scanned_fns(src: &str) -> Vec<(String, String)> {
         let lines: Vec<&str> = src.lines().collect();
         let mut out = Vec::new();
@@ -7473,6 +7723,9 @@ mod tests {
             let Some(sig) = [
                 "pub fn ",
                 "pub(crate) fn ",
+                "pub unsafe fn ",
+                "pub(crate) unsafe fn ",
+                "unsafe fn ",
                 "fn ",
                 "pub async fn ",
                 "async fn ",
@@ -7992,7 +8245,12 @@ mod tests {
         // ASCII rule and the `.version` law must reach them exactly as they reach a shipped row.
         // The TMA probe is licensed by `cp.async.bulk` alone — it deliberately contains no
         // `wgmma`, which is the whole point of it.
-        const EXPECTED_MODULES: usize = 99;
+        // 99 -> 105 with the cluster work: `ptx_wgmma::wgmma_all_emittable` now enumerates the four
+        // shipped rows (W1 f16, W1 bf16, W3c, and W1 with a 2x1x1 cluster + A-multicast) plus the
+        // five sweep-only rows of `WGMMA_SWEEP_GRID` that fit Hopper's carveout — nine instead of
+        // three. Every one of them is text a rented H100 will be handed, which is exactly why they
+        // are in the corpus the `.version`, ASCII and CPU `ptxas` laws scan.
+        const EXPECTED_MODULES: usize = 105;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -17556,14 +17814,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// that lost one, is a driver reading adjacent host stack as a pointer on the first H100 launch.
     #[test]
     fn every_wgmma_entry_declares_exactly_the_parameters_the_launcher_pushes() {
-        use crate::ptx_wgmma::{ParamKind, Sm90aLicense, PARAM_ORDER, WGMMA_VARIANTS};
+        use crate::ptx_wgmma::{wgmma_all_emittable, ParamKind, Sm90aLicense, PARAM_ORDER};
         // A literal `(9, 0)` only ever asserts "this capability is a Hopper one", which is true; the
         // license carries no claim about the machine running the test.
         let lic = Sm90aLicense::for_probed_cc((9, 0)).expect("(9,0) is Hopper");
-        for v in WGMMA_VARIANTS {
+        let rows = wgmma_all_emittable();
+        for v in &rows {
             let plan = v.launch_plan();
             let ptx = crate::ptx_wgmma::wgmma_module(v, &lic)
-                .unwrap_or_else(|e| panic!("shipped row {} must generate: {e}", v.name));
+                .unwrap_or_else(|e| panic!("emittable row {} must generate: {e}", v.name));
             assert_eq!(
                 entry_param_count(&ptx, plan.entry),
                 PARAM_ORDER.len(),
@@ -17599,7 +17858,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         }
         eprintln!(
             "[gate] {} wgmma entries declare exactly PARAM_ORDER ({} params, kinds in order) \u{2713}",
-            WGMMA_VARIANTS.len(),
+            rows.len(),
             PARAM_ORDER.len()
         );
     }
@@ -17786,6 +18045,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         assert_eq!(
             seen_warmup, want_warmup,
             "a warm-up-time-boxed launcher was renamed or removed; the law must follow it"
+        );
+        // The shared raw launch seam both wgmma launchers now go through must NOT drain at all: it
+        // is a launch, and its callers own the drain. A `.synchronize()` added inside it would sit
+        // *inside* `time_gemm_nt_wgmma`'s timed region and quietly turn a throughput measurement
+        // into a latency one, which no arithmetic downstream could detect.
+        let (_, seam) = scanned_fns(&code)
+            .into_iter()
+            .find(|(n, _)| n == "cluster_launch")
+            .expect("cluster_launch is the wgmma family's launch seam");
+        assert!(
+            !seam.contains(".synchronize()") && !seam.contains("sync_within("),
+            "cluster_launch must not drain: it is inside the timed region of time_gemm_nt_wgmma, \
+             and its callers are the ones the drain law is written about"
         );
         // ...and the watchdog's own diagnosis must reach the terminal. `eprintln!` goes into
         // libtest's per-test capture buffer, which libtest prints WHEN THE TEST FINISHES — and a
@@ -18038,19 +18310,27 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             eprintln!(
                 "\n[wgmma-bringup] A. item 2 -- cuModuleLoadData on the generated sm_90a text"
             );
-            let rows: Vec<&WgmmaCfg> = WGMMA_VARIANTS.iter().collect();
+            // Every EMITTABLE row, not just the shipped ones: the sweep-only configurations are
+            // text a rented H100 will be handed too, and the cheapest place to discover a JIT
+            // rejection is a load with no launch behind it. The load goes through the RAW path the
+            // mainloop itself uses (`raw_function_dyn`), so what stage A validates is the module
+            // object production will actually run — not a second copy of the same text.
+            let rows: Vec<&WgmmaCfg> = crate::ptx_wgmma::wgmma_all_emittable();
             for c in &rows {
                 let plan = c.launch_plan();
                 let ptx = wgmma_module(c, &lic)
                     .unwrap_or_else(|e| panic!("item 2 FAIL: {} would not generate: {e}", c.name));
-                g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)
+                g.raw_function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)
                     .unwrap_or_else(|e| {
                         panic!(
                             "item 2 FAIL: {} did not load: {e:?}\n  The module is {} B of sm_90a \
                              text at .version 8.0 asking for {} B of dynamic shared memory (the \
                              device grants {}). A JIT error naming an INSTRUCTION means a spelling \
                              in ptx_wgmma::entry is wrong; one naming the TARGET means the header \
-                             is; CUDA_ERROR_INVALID_VALUE here usually means the SMEM opt-in.",
+                             is; CUDA_ERROR_INVALID_VALUE here usually means the SMEM opt-in. On a \
+                             CLUSTERED row, an error naming a DIRECTIVE is `.explicitcluster` / \
+                             `.reqnctapercluster` -- which the CPU ptxas census assembles first, \
+                             precisely so this cannot be the thing a rented hour discovers.",
                             c.name,
                             ptx.len(),
                             plan.dyn_smem_bytes,
@@ -18058,11 +18338,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         )
                     });
                 eprintln!(
-                    "      {:<34} LOADED   {:>3} thr, {:>6} B dyn smem, {} stages, {}",
+                    "      {:<34} LOADED   {:>3} thr, {:>6} B dyn smem, {} stages, cluster {}x1x1, \
+                     {}",
                     c.name,
                     plan.block.0,
                     plan.dyn_smem_bytes,
                     c.stages,
+                    c.cluster_ctas(),
                     c.layout.label()
                 );
             }
@@ -18736,6 +19018,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                  the descriptor reading is {} \u{2713}",
                 win.layout.label()
             );
+            eprintln!(
+                "[wgmma-bringup] Item 9 (the 2x1x1 cluster + A-multicast) is NOT in this sequence: \
+                 it is its own\n\
+                 \x20               non-ignored gate, because its failure mode -- stale shared \
+                 memory on the M rows a\n\
+                 \x20               CTA did not fetch itself -- needs shapes wide enough for the \
+                 multicast to cross CTAs,\n\
+                 \x20               which the stage E/F/G shapes deliberately are not. Run it as:\n\
+                 \x20                 {}",
+                crate::ptx_wgmma::WGMMA_CLUSTER_GATE_INVOCATION
+            );
             eprintln!("=============================================================\n");
         });
     }
@@ -18745,6 +19038,176 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     // =============================================================================================
 
     use crate::bench_instrument as bi;
+
+    /// **The cluster + A-multicast path is EXACT, on shapes where the multicast actually crosses
+    /// CTAs.** A correctness gate, not a bench: nothing here is timed and nothing is `#[ignore]`d.
+    ///
+    /// # Why the shapes are what they are
+    ///
+    /// A multicast defect is not a crash and not a NaN. Each CTA of the cluster fetches one slice of
+    /// A and multicasts it to the rest, so a wrong `ctaMask`, a wrong slice offset, a missing remote
+    /// `empty` arrival or a missing cluster rendezvous shows up as **stale shared memory on the M
+    /// rows this CTA did not fetch itself** — correct numbers on half the accumulator rows and last
+    /// iteration's numbers on the other half, at full speed, with no error anywhere. A shape whose
+    /// grid is one CTA wide cannot see any of it, because the multicast would be a copy to self.
+    ///
+    /// So every shape below has **at least two N tiles**, i.e. at least one full cluster of two CTAs
+    /// holding *different* B halves of the *same* A rows, and `bringup_operands`' three-digit
+    /// positional ramps make every element distinguishable from every other. Two of them are ragged,
+    /// including one whose N tile count is **odd** — that is the grid-rounding path, where the
+    /// cluster's second CTA is wholly out of range and must contribute nothing while still taking
+    /// part in every barrier.
+    ///
+    /// # Two independent verdicts, both `==`
+    ///
+    /// 1. Against `ref_nt`, an f64 reference that reads the operand arrays and touches no descriptor,
+    ///    encoder or generator. The operands are small integers whose dot product stays under 2^24,
+    ///    so f32 holds every partial sum exactly and reassociation cannot move a bit: the verdict is
+    ///    `==`, not a tolerance.
+    /// 2. Against the **un-clustered row at the same shape**, bit for bit. The two kernels issue the
+    ///    same `wgmma` sequence over the same K order on the same tile and differ only in who copied
+    ///    the bytes, so any difference at all is the cluster machinery and nothing else. This is the
+    ///    sharper of the two: it compares against a kernel the 2026-08-10 round already proved exact.
+    #[test]
+    fn wgmma_cluster_multicast_is_exact() {
+        use crate::ptx_wgmma::{
+            bringup_operands, WGMMA_CLUSTER_GATE_INVOCATION, WGMMA_W1, WGMMA_W1_MC,
+        };
+        with_hopper(
+            "wgmma_cluster_multicast_is_exact",
+            WGMMA_CLUSTER_GATE_INVOCATION,
+            |g, _lic| {
+                let mc = &WGMMA_W1_MC;
+                let plain = &WGMMA_W1;
+                assert_eq!(
+                    mc.cluster_ctas(),
+                    2,
+                    "this gate is written for a 2-CTA cluster"
+                );
+                eprintln!(
+                    "\n[wgmma-cluster] {} vs {} on {}: cluster {}x1x1, A slice {} B of {} B per \
+                     CTA, ctaMask {:#x}, empty[s] takes {} arrivals",
+                    mc.name,
+                    plain.name,
+                    g.device_name(),
+                    mc.cluster_ctas(),
+                    mc.a_slice_bytes(),
+                    mc.tile_a_bytes(),
+                    crate::ptx_wgmma::multicast_cta_mask(mc.cluster_ctas()),
+                    mc.empty_arrivals()
+                );
+                // (M, N, K, what this shape is for)
+                let shapes: &[(usize, usize, usize, &str)] = &[
+                    (
+                        mc.bm,
+                        2 * mc.bn,
+                        mc.bk * mc.stages,
+                        "exactly ONE full cluster: both CTAs carry a real, different N half of the \
+                         same M tile, and each A half arrives by multicast from the other CTA",
+                    ),
+                    (
+                        2 * mc.bm,
+                        4 * mc.bn,
+                        mc.bk * mc.stages,
+                        "four clusters over two M tiles: the cluster-to-tile map, not just one \
+                         cluster",
+                    ),
+                    (
+                        mc.bm,
+                        3 * mc.bn,
+                        mc.bk * (mc.stages + 1),
+                        "an ODD number of N tiles: the grid rounds 3 up to 4 and the pad CTA must \
+                         zero-fill, store nothing, and still take part in every cluster barrier. \
+                         K wraps the ring once, so the pad CTA is not merely a prologue artifact",
+                    ),
+                    (
+                        mc.bm + 7,
+                        2 * mc.bn - 5,
+                        mc.bk * 2 - 16,
+                        "ragged in M, N and K at once, inside a cluster: TMA's zero fill on the A \
+                         SLICE boundary as well as the tile boundary",
+                    ),
+                ];
+                for &(m, n, k, why) in shapes {
+                    let (a, b) = bringup_operands(m, n, k);
+                    let limit = mc.dtype.exact_integer_limit();
+                    assert!(
+                        a.iter().chain(&b).all(|v| v.abs() <= limit),
+                        "the ramp at {m}x{k}x{n} is not exact in {:?} (limit {limit}) — the verdict \
+                         would silently become a tolerance",
+                        mc.dtype
+                    );
+                    let want = ref_nt(&a, &b, m, k, n);
+                    let got = gemm_nt_wgmma(g, mc, &a, &b, m, k, n)
+                        .unwrap_or_else(|e| panic!("{} at {m}x{k}x{n}: {e}", mc.name));
+                    let bad: Vec<usize> = got
+                        .iter()
+                        .zip(&want)
+                        .enumerate()
+                        .filter(|(_, (x, y))| x != y)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !bad.is_empty() {
+                        // A multicast defect has a SHAPE. Report which halves are wrong, because
+                        // "rows >= BM/2 only" is the signature of a slice that never arrived and
+                        // "one N half only" is the signature of a mask that named one CTA.
+                        let rows_lo = bad.iter().filter(|&&i| (i / n) % mc.bm < mc.bm / 2).count();
+                        let cols_lo = bad.iter().filter(|&&i| (i % n) < n / 2).count();
+                        panic!(
+                            "{} is WRONG at {m}x{k}x{n} ({} of {} lanes, max_abs {:.3e}).\n  \
+                             {} wrong lanes are in the TOP half of each CTA's M rows and {} in the \
+                             bottom: a split confined to one half is an A slice that never arrived \
+                             (check the ctaMask {:#x} and the {} B slice offset).\n  {} wrong lanes \
+                             are in the low N half and {} in the high: a split confined to one half \
+                             is a per-CTA fault, not a per-slice one.\n  Shape rationale: {why}",
+                            mc.name,
+                            bad.len(),
+                            want.len(),
+                            crate::diff::err_stats(&got, &want).max_abs,
+                            rows_lo,
+                            bad.len() - rows_lo,
+                            crate::ptx_wgmma::multicast_cta_mask(mc.cluster_ctas()),
+                            mc.a_slice_bytes(),
+                            cols_lo,
+                            bad.len() - cols_lo
+                        );
+                    }
+                    // The sharper verdict: bit-identical to the row that has no cluster in it.
+                    let base = gemm_nt_wgmma(g, plain, &a, &b, m, k, n)
+                        .unwrap_or_else(|e| panic!("{} at {m}x{k}x{n}: {e}", plain.name));
+                    assert_eq!(
+                        got, base,
+                        "{} and {} disagree at {m}x{k}x{n} although they issue the same wgmma \
+                         sequence over the same K order — the difference IS the cluster",
+                        mc.name, plain.name
+                    );
+                    // ...and twice, bit-identically: a barrier race the first launch got away with
+                    // shows up here, and the cluster adds two barriers and a remote arrival.
+                    let again = gemm_nt_wgmma(g, mc, &a, &b, m, k, n).unwrap();
+                    assert_eq!(
+                        got, again,
+                        "{} at {m}x{k}x{n} is not run-to-run reproducible — a cluster-scoped \
+                         producer/consumer race, not a numerics question",
+                        mc.name
+                    );
+                    let p = mc.launch_plan();
+                    let (gx, gy, _) = p.grid(m, n);
+                    eprintln!(
+                        "      {m:>5} x {k:<5} x {n:<5} grid {gx}x{gy} ({} clusters): EXACT, == the \
+                         un-clustered row, reproducible",
+                        gx / p.cluster.0 * gy
+                    );
+                }
+                eprintln!(
+                    "[gate] {} is exact on {} cluster-spanning shapes and bit-identical to {} on \
+                     every one \u{2713}",
+                    mc.name,
+                    shapes.len(),
+                    plain.name
+                );
+            },
+        );
+    }
 
     /// The one field each Act-2 shape records: **milliseconds per launch, lower is better**.
     ///
@@ -18815,9 +19278,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     ///
     /// Printed beside the device block because "W1" is a name in a dossier and this is what the
     /// driver was handed: the tile, the ring depth, the warp-specialisation split, the register
-    /// targets, the descriptor reading, and — stated rather than assumed — that the cluster is
-    /// `1x1x1`, because D1's W1 specifies a `2x1x1` cluster with `.multicast::cluster` on A and this
-    /// row declines it.
+    /// targets, the descriptor reading, and — stated rather than assumed — the **cluster shape**.
+    ///
+    /// That last line is not decoration. The 2026-08-10 Act-2 round published 58.8-67.5% of cuBLAS
+    /// against a 95-108% prediction, and the only reason the round's own log could name the first
+    /// suspect is that this block said, in the provenance, that the measured kernel was D1's W1
+    /// **minus** the cluster the dossier specifies. A provenance block that had merely said "W1"
+    /// would have retracted a prediction that had never been tested.
     fn wgmma_config_block(cfg: &crate::ptx_wgmma::WgmmaCfg) -> String {
         let plan = cfg.launch_plan();
         let mut s = String::new();
@@ -18833,10 +19300,27 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             cfg.consumer_regs,
             cfg.threads()
         );
+        let ctas = cfg.cluster_ctas();
         s += &format!(
-            "schedule       : {:?}; cluster 1x1x1 ({:?} - D1's W1 asks for a 2x1x1 cluster with \
-             .multicast::cluster on A; this row declines it)\n",
-            cfg.schedule, cfg.multicast
+            "schedule       : {:?}; cluster {}x1x1 ({:?}){}\n",
+            cfg.schedule,
+            ctas,
+            cfg.multicast,
+            if ctas > 1 {
+                format!(
+                    " - D1 4.5's W1 AS SPECIFIED: each CTA TMA-loads {} of the {} B A tile and \
+                     .multicast::cluster-s it to both, B stays per-CTA, expect_tx is still {} B per \
+                     destination, empty[s] takes {} arrivals",
+                    cfg.a_slice_bytes(),
+                    cfg.tile_a_bytes(),
+                    cfg.stage_tx_bytes(),
+                    cfg.empty_arrivals()
+                )
+            } else {
+                " - NO cluster: D1's W1 asks for a 2x1x1 cluster with .multicast::cluster on A and \
+                 this row does not carry it"
+                    .to_string()
+            }
         );
         s += &format!("smem layout    : {}\n", cfg.layout.label());
         s += &format!(
@@ -19102,9 +19586,445 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             eprintln!(
                 "\n[{bench}] W3C (128x128x64 s6, D1's moderate-size arm) is NOT in this round: the \
                  instrument has one contender arm, and a second kernel in arm B would be an A/B \
-                 against two different things at once.\n\
+                 against two different things at once. `wgmma_config_sweep` is where it IS a row -- \
+                 there every configuration is scored against the same cuBLAS, which is a different \
+                 and legitimate experiment.\n\
                  =============================================================\n"
             );
+        });
+    }
+
+    /// **ACT 2, ROUND 2: the configuration SWEEP.** One visit, four axes, same-run, one denominator.
+    ///
+    /// # What round 1 left, and why a second single A/B would waste the visit
+    ///
+    /// The 2026-08-10 round measured `WGMMA_W1` at 58.8-67.5% of cuBLAS at 4096-8192 cubed where
+    /// D1 section 4.5 predicts 95-108%. The instrument was clean — control floors +/-0.03-2.19%,
+    /// 0.00% clock drift, a peer at ~85-87% of the part's own spec ceiling — so the number is real.
+    /// Its own provenance line named the first suspect: the measured kernel was W1 **minus the
+    /// `2x1x1` cluster with `.multicast::cluster` on A** that the dossier specifies, so the
+    /// prediction had never actually been tested. That arm now exists ([`crate::ptx_wgmma::WGMMA_W1_MC`]).
+    ///
+    /// A second single A/B would answer one question per rented visit. This answers four:
+    ///
+    /// 1. **cluster off vs cluster `2x1x1`**, same tile, same depth, same layout, same registers —
+    ///    the headline, and one fact different between the arms;
+    /// 2. **pipeline depth**, at BOTH cluster settings, because "deeper helps" and "the cluster
+    ///    helps" would otherwise be confounded;
+    /// 3. **W3c** (128x128x64 s6), which round 1 deliberately excluded;
+    /// 4. **the ceiling on depth** — the two rows that do not fit are kept, and the round prints the
+    ///    byte arithmetic instead of silently omitting them.
+    ///
+    /// The `wgmma` **wait depth is deliberately not an axis**, and the reason is a reading of round
+    /// 1's own PTX dump rather than an omission: the mainloop issues its `BK/16` `wgmma` as one
+    /// group and does `wgmma.wait_group.sync.aligned 0` immediately before releasing the stage's
+    /// `empty` barrier. That `0` is not a knob — the release publishes the buffer to a producer that
+    /// will overwrite it, so it may not precede the last read, and any other depth there is a
+    /// correctness bug rather than a slower or faster kernel. The lever the dump *does* expose is a
+    /// restructuring (commit per K step and defer the release by one stage, so the tensor cores are
+    /// not drained to empty between stages); it is named in the preamble this round prints, and it
+    /// is a follow-up, not a row.
+    ///
+    /// # The instrument is round 1's, unchanged
+    ///
+    /// Same [`bi::TwinPlan`], same [`wgmma_shape_samples`], same cuBLAS-as-both-A-and-C twin control,
+    /// same `analyze`/`Round::publish` pair, same `WGMMA_BENCH_FIELD`, and the shapes are named out
+    /// of `WGMMA_BENCH_GRID` rather than restated — so every row is scored against the same
+    /// denominator round 1 used, at the same iteration counts. Only `%`-of-peer is published;
+    /// absolutes stay in the DIAGNOSTIC block. Nothing here asserts a ratio: a configuration at 60%
+    /// is a finding. The only asserts are the exact-integer correctness gate that precedes ALL
+    /// timing and the structural ones the instrument raises itself.
+    ///
+    /// Run it as [`crate::ptx_wgmma::WGMMA_SWEEP_INVOCATION`], or in the cloud as
+    /// `modal run tools/cloud/modal_app.py::bench --name wgmma_config_sweep --peers`.
+    #[test]
+    #[ignore = "Act-2 round-2 config sweep; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_SWEEP_INVOCATION)"]
+    fn wgmma_config_sweep() {
+        use crate::ptx_wgmma::{
+            bench_iters, bringup_operands, wgmma_sweep_points, SweepRow, WGMMA_SWEEP_GRID,
+            WGMMA_SWEEP_HEADLINE, WGMMA_SWEEP_INVOCATION,
+        };
+        const BENCH: &str = "wgmma_config_sweep";
+        let peer = PeerBar {
+            label: "cuBLAS f16 (f32 out)",
+            once: crate::baselines::cublas_gemm_nt_f16_f32out,
+            time: crate::baselines::time_cublas_gemm_nt_f16_f32out,
+        };
+        with_hopper(BENCH, WGMMA_SWEEP_INVOCATION, |g, _lic| {
+            // --- 0. Hopper first, THEN the peer (see the ordering law below) --------------------
+            if !crate::baselines::peers_available(g) {
+                peer_gate(BENCH);
+                eprintln!(
+                    "[skip] {BENCH}: cuBLAS is not loadable, so this round has no bar.\n{}",
+                    crate::baselines::peer_env_hint()
+                );
+                return;
+            }
+
+            // --- 1. provenance ------------------------------------------------------------------
+            eprintln!("\n================ {BENCH} ================");
+            let prov = bi::Provenance::new(
+                BENCH,
+                bi::facts_of(g),
+                bi::RoundMeta::from_env(),
+                bi::query_smi(),
+            );
+            eprint!("{}", prov.header());
+            eprintln!("peer (arms A,C): {}", peer.label);
+            if !matches!(prov.meta.clock_lock, bi::ClockLock::Locked(_)) {
+                eprintln!(
+                    "*** CLOCKS ARE NOT LOCKED (or the lock is undeclared). Per \
+                     GPU_RETARGET_PLAN.md 6.3 this round is ITERATION data, not publication data."
+                );
+            }
+            let mut round = match bi::Round::open(prov) {
+                Ok(r) => r,
+                Err(why) => {
+                    eprintln!("[skip:provenance] {BENCH}: {why}");
+                    eprintln!("*** THIS ROUND PUBLISHES NOTHING ***");
+                    return;
+                }
+            };
+            let plan = bi::TwinPlan::default();
+            let points = wgmma_sweep_points();
+            eprintln!(
+                "plan           : {} rows x {} shapes, {} recorded rounds + {} warm-up, bar \
+                 +/-{:.2}%, median across rounds",
+                WGMMA_SWEEP_GRID.len(),
+                points.len(),
+                plan.rounds,
+                plan.warmups,
+                plan.bar * 100.0
+            );
+            eprintln!(
+                "wait depth     : NOT an axis. The mainloop's `wgmma.wait_group 0` sits immediately \
+                 before the stage release,\n\
+                 \x20                so its depth is pinned by the release (the buffer may not be \
+                 published before its last read),\n\
+                 \x20                not free. The lever round 1's PTX dump exposes is a \
+                 RESTRUCTURING -- commit per K step and\n\
+                 \x20                defer the release one stage, so the tensor cores are not \
+                 drained to empty between stages --\n\
+                 \x20                plus a vectorized epilogue (128 scalar predicated st.global.f32 \
+                 today, pairs are adjacent).\n\
+                 \x20                Both are follow-ups; neither is a knob this round could sweep."
+            );
+            match bi::machine_floor(g, &plan) {
+                Ok(v) => eprint!("{}", v.table()),
+                Err(e) => eprintln!("[warn] machine-floor probe unavailable: {e}"),
+            }
+
+            // --- 2. the row table, with the budget arithmetic, declines included -----------------
+            eprintln!(
+                "\n---- {BENCH}: the configuration grid ----\n\
+                 smem layout    : {} (every row; the reading the 2026-08-10 sweep settled on \
+                 hardware)\n\
+                 multicast rule : a .multicast::cluster copy of n bytes performs complete-tx of n \
+                 on EVERY destination\n\
+                 \x20                CTA's mbarrier -- it does not divide n among them -- so a \
+                 c-way split multicast of A\n\
+                 \x20                plus one own B tile is still tile_a + tile_b per CTA. The \
+                 clustered and un-clustered\n\
+                 \x20                rows therefore declare the SAME expect_tx, reached by \
+                 different arithmetic.",
+                crate::ptx_wgmma::SHIPPED_LAYOUT.label()
+            );
+            // ONE authority for which rows run: `wgmma_sweep_measurable` is the same filter the
+            // device-free laws check and the same one `wgmma_all_emittable` builds the census corpus
+            // from, so the set the H100 measures cannot differ from the set ptxas already assembled.
+            let live: Vec<&'static SweepRow> = crate::ptx_wgmma::wgmma_sweep_measurable();
+            for r in WGMMA_SWEEP_GRID {
+                let c = r.cfg;
+                match r.generatable() {
+                    Ok(()) => eprintln!(
+                        "  {:<12} {:<34} {}x{}x{} s{} cluster {}x1x1, {} thr, {}p/{}c regs | {}",
+                        r.label,
+                        c.name,
+                        c.bm,
+                        c.bn,
+                        c.bk,
+                        c.stages,
+                        c.cluster_ctas(),
+                        c.threads(),
+                        c.producer_regs,
+                        c.consumer_regs,
+                        r.smem_line()
+                    ),
+                    Err(why) => eprintln!(
+                        "  {:<12} {:<34} DECLINED | {}\n      {why}",
+                        r.label,
+                        c.name,
+                        r.smem_line()
+                    ),
+                }
+                eprintln!("      why {}", r.why);
+            }
+            eprintln!(
+                "  -> {} of {} rows are launchable on this part ({} B carveout). A decline is a \
+                 finding: clustering does\n     not change the ring's size, so the depth axis stops \
+                 at the same place at BOTH cluster settings.",
+                live.len(),
+                WGMMA_SWEEP_GRID.len(),
+                g.smem_budget()
+            );
+
+            // --- 3. correctness gates EVERY row, before ANY timing -------------------------------
+            eprintln!(
+                "\n---- {BENCH}: correctness, before a single timed launch ----\n\
+                 Every row runs at N = 2 x its own BN, so a clustered row's two CTAs hold DIFFERENT \
+                 N halves of the same\nM tile and each of its A halves has to arrive by multicast \
+                 from its peer. A multicast defect is silently\nwrong data on half the accumulator \
+                 rows, so the verdict is `==` against an f64 reference over exact-integer\noperands, \
+                 never a tolerance. A fast wrong kernel must not post a timing."
+            );
+            for r in &live {
+                let c = r.cfg;
+                let (m, n, k) = (c.bm, 2 * c.bn, c.bk * c.stages);
+                let (a, b) = bringup_operands(m, n, k);
+                let limit = c.dtype.exact_integer_limit();
+                assert!(
+                    a.iter().chain(&b).all(|v| v.abs() <= limit),
+                    "{}: the ramp at K={k} is not exact in {:?} (limit {limit})",
+                    r.label,
+                    c.dtype
+                );
+                let want = ref_nt(&a, &b, m, k, n);
+                let got = gemm_nt_wgmma(g, c, &a, &b, m, k, n)
+                    .unwrap_or_else(|e| panic!("{BENCH}: {} at {m}x{k}x{n}: {e}", r.label));
+                let bad = got.iter().zip(&want).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    bad,
+                    0,
+                    "{BENCH}: row {} ({}) is WRONG at {m}x{k}x{n} ({bad} of {} lanes, max_abs \
+                     {:.3e}) -- a wrong configuration must never post a timing",
+                    r.label,
+                    c.name,
+                    want.len(),
+                    crate::diff::err_stats(&got, &want).max_abs
+                );
+                let p = c.launch_plan();
+                let (gx, gy, _) = p.grid(m, n);
+                eprintln!(
+                    "  {:<12} {m}x{k}x{n} grid {gx}x{gy} ({} cluster(s)): EXACT on all {} lanes",
+                    r.label,
+                    gx / p.cluster.0 * gy,
+                    want.len()
+                );
+            }
+            // ...and the peer, through the SAME reference, once: a transpose slip in the bar would
+            // hand every row a win (or a loss) it did not earn.
+            {
+                let (m, n, k) = (128usize, 512usize, 256usize);
+                let (a, b) = bringup_operands(m, n, k);
+                let want = ref_nt(&a, &b, m, k, n);
+                let pg = (peer.once)(g, &a, &b, m, k, n)
+                    .unwrap_or_else(|e| panic!("{BENCH}: {} one-shot failed: {e}", peer.label));
+                let ps = crate::diff::assert_close(
+                    &format!("{} {m}x{k}x{n}", peer.label),
+                    &pg,
+                    &want,
+                    5e-2,
+                    2e-2,
+                );
+                eprintln!(
+                    "  {:<12} {m}x{k}x{n}: matches the same f64 reference (max_abs {:.2e}) \u{2713}",
+                    "peer",
+                    ps.max_abs
+                );
+            }
+
+            // --- 4. the sweep --------------------------------------------------------------------
+            eprintln!(
+                "\n---- {BENCH}: sweeping {} rows x {} shapes; arms A and C are BOTH {} (the peer \
+                 twin), arm B is the row ----",
+                live.len(),
+                points.len(),
+                peer.label
+            );
+            for p in &points {
+                eprintln!(
+                    "  {:<15} {:>18}  {} launches/region  [{}]",
+                    p.label,
+                    p.dims(),
+                    bench_iters(p),
+                    p.why
+                );
+            }
+            // (row, shape, verdict, iters)
+            type Cell = (
+                &'static SweepRow,
+                &'static crate::ptx_wgmma::GemmPoint,
+                bi::BenchVerdict,
+                usize,
+            );
+            let mut cells: Vec<Cell> = Vec::new();
+            for r in &live {
+                for p in &points {
+                    let iters = bench_iters(p);
+                    let label = format!("{BENCH}@{}/{}", r.label, p.label);
+                    let cfg = r.cfg;
+                    let (samples, fail) = wgmma_shape_samples(&label, &plan, |arm| match arm {
+                        bi::Arm::Baseline | bi::Arm::Control => {
+                            (peer.time)(g, p.m, p.k, p.n, iters as u32).map_err(|e| e.to_string())
+                        }
+                        bi::Arm::Contender => time_gemm_nt_wgmma(g, cfg, p.m, p.k, p.n, iters)
+                            .map_err(|e| e.to_string()),
+                    });
+                    if let Some(why) = &fail {
+                        eprintln!("    [warn] {label}: {why} — this cell publishes nothing");
+                    }
+                    cells.push((r, p, bi::analyze(&samples, plan.bar), iters));
+                }
+            }
+
+            // --- 5. close, then the gate decides -------------------------------------------------
+            round.close(bi::query_smi());
+            eprintln!("\n---- {BENCH}: round close ----");
+            eprint!("{}", round.header());
+
+            eprintln!("\n---- {BENCH}: per-cell verdicts ----");
+            for (r, p, v, _) in &cells {
+                eprintln!("[{}/{}]", r.label, p.label);
+                eprint!("{}", v.table());
+            }
+
+            // The published table: %-of-peer only, one row per configuration, one column per shape.
+            eprintln!(
+                "\n---- {BENCH}: the published table (% of {}; higher is better) ----",
+                peer.label
+            );
+            let mut head = format!("  {:<12} {:<34}", "row", "kernel");
+            for p in &points {
+                head += &format!(" {:>22}", p.label);
+            }
+            eprintln!("{head}");
+            // `ratio` is B/A on a MILLISECOND field, so it is < 1 when we are faster and the
+            // throughput percentage is its reciprocal. Polarity is owned here and nowhere else.
+            let pct = |v: &bi::BenchVerdict| -> Option<f64> {
+                round
+                    .publish(v, WGMMA_BENCH_FIELD)
+                    .ok()
+                    .map(|pubd| 100.0 / pubd.ratio())
+            };
+            let mut ranked: Vec<(&'static SweepRow, Option<f64>)> = Vec::new();
+            for r in &live {
+                let mut line = format!("  {:<12} {:<34}", r.label, r.cfg.name);
+                for p in &points {
+                    let cell = cells
+                        .iter()
+                        .find(|(rr, pp, _, _)| rr.label == r.label && pp.label == p.label);
+                    let text = match cell {
+                        Some((_, _, v, _)) => match round.publish(v, WGMMA_BENCH_FIELD) {
+                            Ok(pubd) => format!(
+                                "{:.1}% ({}, +/-{:.2}%)",
+                                100.0 / pubd.ratio(),
+                                if pubd.is_tie() { "tie" } else { "moved" },
+                                pubd.floor() * 100.0
+                            ),
+                            Err(_) => "-- unresolved".to_string(),
+                        },
+                        None => "-- absent".to_string(),
+                    };
+                    line += &format!(" {text:>22}");
+                }
+                eprintln!("{line}");
+                let headline = cells
+                    .iter()
+                    .find(|(rr, pp, _, _)| rr.label == r.label && pp.label == WGMMA_SWEEP_HEADLINE)
+                    .and_then(|(_, _, v, _)| pct(v));
+                ranked.push((r, headline));
+            }
+            for r in WGMMA_SWEEP_GRID {
+                if let Err(why) = r.generatable() {
+                    eprintln!("  {:<12} {:<34} {:>22}", r.label, r.cfg.name, "DECLINED");
+                    eprintln!("      {}  |  {why}", r.smem_line());
+                }
+            }
+
+            // --- 6. the ranked table and the per-row verdict ---------------------------------------
+            eprintln!(
+                "\n---- {BENCH}: RANKED at {WGMMA_SWEEP_HEADLINE} (the first of D1 4.5's two \
+                 prediction points) ----"
+            );
+            ranked.sort_by(|a, b| {
+                b.1.unwrap_or(f64::NEG_INFINITY)
+                    .partial_cmp(&a.1.unwrap_or(f64::NEG_INFINITY))
+                    .expect("finite or -inf")
+            });
+            let best = ranked.first().and_then(|(_, x)| *x);
+            for (i, (r, x)) in ranked.iter().enumerate() {
+                let verdict = match (x, best) {
+                    (Some(v), Some(b)) if b > 0.0 => {
+                        let rel = 100.0 * (v / b - 1.0);
+                        if i == 0 {
+                            "BEST of this round".to_string()
+                        } else {
+                            format!("{rel:+.1}% vs the best row")
+                        }
+                    }
+                    _ => "unresolved (the control floor did not clear the bar)".to_string(),
+                };
+                eprintln!(
+                    "  {:>2}. {:<12} {:>7}  {}",
+                    i + 1,
+                    r.label,
+                    match x {
+                        Some(v) => format!("{v:.1}%"),
+                        None => "--".to_string(),
+                    },
+                    verdict
+                );
+            }
+            // The headline A/B, stated as one line so a reader does not have to diff two rows.
+            let of = |label: &str| {
+                ranked
+                    .iter()
+                    .find(|(r, _)| r.label == label)
+                    .and_then(|(_, x)| *x)
+            };
+            match (of("w1_s4_off"), of("w1_s4_mc2")) {
+                (Some(a), Some(b)) => eprintln!(
+                    "\n  HEADLINE: the 2x1x1 cluster with .multicast::cluster on A takes W1 from \
+                     {a:.1}% to {b:.1}% of {} at {WGMMA_SWEEP_HEADLINE} ({:+.1} points). D1 4.5 \
+                     predicts 95-108%.",
+                    peer.label,
+                    b - a
+                ),
+                _ => eprintln!(
+                    "\n  HEADLINE: UNRESOLVED -- one or both arms of the cluster A/B failed to \
+                     publish, so this round says nothing about the cluster."
+                ),
+            }
+
+            // --- 7. DIAGNOSTIC absolutes ------------------------------------------------------------
+            eprintln!(
+                "\n---- {BENCH}: DIAGNOSTIC absolutes (NOT publishable; clock-dependent) ----"
+            );
+            eprintln!(
+                "  {:<12} {:<10} {:>12} {:>12} {:>12} {:>12}",
+                "row", "shape", "peer ms", "ours ms", "peer TFLOP/s", "ours TFLOP/s"
+            );
+            for (r, p, v, _) in &cells {
+                let f = v.field(WGMMA_BENCH_FIELD);
+                let ms = |x: Option<f64>| match x {
+                    Some(v) if v > 0.0 => format!("{v:.4}"),
+                    _ => "n/a".to_string(),
+                };
+                let tf = |x: Option<f64>| match x {
+                    Some(v) if v > 0.0 => format!("{:.1}", p.flop() / (v * 1e-3) / 1e12),
+                    _ => "n/a".to_string(),
+                };
+                eprintln!(
+                    "  {:<12} {:<10} {:>12} {:>12} {:>12} {:>12}",
+                    r.label,
+                    p.label,
+                    ms(f.and_then(|x| x.a)),
+                    ms(f.and_then(|x| x.b)),
+                    tf(f.and_then(|x| x.a)),
+                    tf(f.and_then(|x| x.b))
+                );
+            }
+            eprintln!("=============================================================\n");
         });
     }
 
@@ -19178,23 +20098,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             .find(|(n, _)| *n == "gpu.rs")
             .expect("gpu.rs is in CRATE_SOURCES")
             .1;
-        let at = src
-            .find("fn wgmma_peer_round(")
-            .expect("the shared Act-2 round body must exist");
-        let rest = &src[at..];
-        let hopper = rest
-            .find("with_hopper(")
-            .expect("the Act-2 round must go through with_hopper");
-        let peer = rest
-            .find("peers_available(")
-            .expect("the Act-2 round must probe for its peer");
-        assert!(
-            hopper < peer,
-            "wgmma_peer_round probes for cuBLAS before it checks the device is Hopper — under \
-             WUKONG_PEER_REQUIRED=1 that turns a correct capability skip into a failure on every \
-             part that could never have run sm_90a in the first place"
-        );
-        for name in ["fn wgmma_vs_cublas()", "fn wgmma_bf16_vs_cublas()"] {
+        // Both Act-2 round bodies: the shared f16/bf16 one, and the round-2 configuration sweep,
+        // which has its own body because it drives a table of contenders rather than one.
+        for body_of in ["fn wgmma_peer_round(", "fn wgmma_config_sweep()"] {
+            let at = src
+                .find(body_of)
+                .unwrap_or_else(|| panic!("{body_of} must exist"));
+            let rest = &src[at..];
+            let hopper = rest
+                .find("with_hopper(")
+                .unwrap_or_else(|| panic!("{body_of} must go through with_hopper"));
+            let peer = rest
+                .find("peers_available(")
+                .unwrap_or_else(|| panic!("{body_of} must probe for its peer"));
+            assert!(
+                hopper < peer,
+                "{body_of} probes for cuBLAS before it checks the device is Hopper — under \
+                 WUKONG_PEER_REQUIRED=1 that turns a correct capability skip into a failure on \
+                 every part that could never have run sm_90a in the first place"
+            );
+        }
+        for name in [
+            "fn wgmma_vs_cublas()",
+            "fn wgmma_bf16_vs_cublas()",
+            "fn wgmma_config_sweep()",
+        ] {
             let i = src
                 .find(name)
                 .unwrap_or_else(|| panic!("{name} must exist"));
@@ -19933,9 +20861,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         {
             let license = crate::ptx_wgmma::Sm90aLicense::for_probed_cc((9, 0))
                 .expect("(9, 0) is Hopper, so the license is unconditional here");
-            for c in crate::ptx_wgmma::WGMMA_VARIANTS {
+            for c in crate::ptx_wgmma::wgmma_all_emittable() {
                 let ptx = crate::ptx_wgmma::wgmma_module(c, &license).unwrap_or_else(|e| {
-                    panic!("shipped wgmma variant {} must generate: {e}", c.name)
+                    panic!("emittable wgmma variant {} must generate: {e}", c.name)
                 });
                 modules.push(Module {
                     label: format!("ptx_wgmma::{}", c.name),
@@ -20232,7 +21160,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             crate::ptx_wmma::PIPE_DEEP_VARIANTS.len()
                 + crate::ptx_wmma::PIPE_WIDE_VARIANTS.len()
                 + crate::ptx_flash::FLASH_STAGE_VARIANTS.len()
-                + crate::ptx_wgmma::WGMMA_VARIANTS.len()
+                + crate::ptx_wgmma::wgmma_all_emittable().len()
                 // + the descriptor sweep probe, + the TMA stage probe
                 + 2,
             "every row of every table must appear in the report, or the gate is measuring a subset \
