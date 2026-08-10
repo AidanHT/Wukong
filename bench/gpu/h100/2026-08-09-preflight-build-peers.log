@@ -1,0 +1,1253 @@
+# ---- WUKONG ROUND PROVENANCE (GPU_RETARGET_PLAN.md 6.1) ----
+round_id         : 2026-08-09-preflight-build-peers
+local_time_start : 2026-08-09T20:14:12-04:00
+operator         : Aidan (via Claude Code)
+git_head         : 5ebb41b9e4d810b0cafd3fe1e1bbfc7fbcaa00e9  Merge branch 'gpu/norm-sm-fill'
+git_dirty        : 1 files
+command          : WK_GPU=H100 modal run ::build_peers --cutlass-arch 90a
+device           : NONE - CPU container (16 cores / 32 GiB). nvcc compiles FOR an arch,
+                   it does not need one. This is plan 0's never-pay-twice rule.
+note             : 90a NOT 90 - a plain-90 profiler has no wgmma/TMA and is a WEAKENED peer
+                   at exactly the shapes the Act-2 decision rests on.
+# --------------------------------------------------------------
++- Error ---------------------------------------------------------------------+
+| 'charmap' codec can't encode character '\u2713' in position 0: character    |
+| maps to <undefined>                                                         |
++-----------------------------------------------------------------------------+
+PREFLIGHT_EXIT=1
+
+# RETRY after a LOCAL cp1252 console failure: modal streams container stdout to the local
+#   terminal, and a single U+2713 in that stream killed the CLI with exit 1 while the
+#   container was live. PYTHONIOENCODING=utf-8 is REQUIRED on this Windows box.
+retry_time_start : 2026-08-09T20:15:16-04:00
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-ZDPqkWYxKqqfFgx7rFkIkD
+Building image im-gIQL5I98e8F1EKv5rNKkiU
+
+=> Step 0: FROM base
+
+=> Step 1: RUN apt-get update
+Get:1 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease [1581 B]
+Get:2 http://archive.ubuntu.com/ubuntu jammy InRelease [270 kB]
+Get:3 http://security.ubuntu.com/ubuntu jammy-security InRelease [129 kB]
+Get:4 http://archive.ubuntu.com/ubuntu jammy-updates InRelease [128 kB]
+Get:5 http://archive.ubuntu.com/ubuntu jammy-backports InRelease [127 kB]
+Get:6 http://security.ubuntu.com/ubuntu jammy-security/multiverse amd64 Packages [84.1 kB]
+Get:7 http://archive.ubuntu.com/ubuntu jammy/universe amd64 Packages [17.5 MB]
+Get:8 http://security.ubuntu.com/ubuntu jammy-security/restricted amd64 Packages [7545 kB]
+Get:9 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  Packages [2899 kB]
+Get:10 http://archive.ubuntu.com/ubuntu jammy/multiverse amd64 Packages [266 kB]
+Get:11 http://security.ubuntu.com/ubuntu jammy-security/main amd64 Packages [4190 kB]
+Get:12 http://archive.ubuntu.com/ubuntu jammy/restricted amd64 Packages [164 kB]
+Get:13 http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages [1792 kB]
+Get:14 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 Packages [1616 kB]
+Get:15 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 Packages [4524 kB]
+Get:16 http://security.ubuntu.com/ubuntu jammy-security/universe amd64 Packages [1314 kB]
+Get:17 http://archive.ubuntu.com/ubuntu jammy-updates/restricted amd64 Packages [7836 kB]
+Get:18 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 Packages [92.7 kB]
+Get:19 http://archive.ubuntu.com/ubuntu jammy-backports/universe amd64 Packages [35.6 kB]
+Get:20 http://archive.ubuntu.com/ubuntu jammy-backports/main amd64 Packages [82.8 kB]
+Fetched 50.6 MB in 6s (8252 kB/s)
+Reading package lists...
+
+=> Step 2: RUN apt-get install -y curl ca-certificates build-essential pkg-config git cmake ninja-build python3-venv python3-dev
+Reading package lists...
+Building dependency tree...
+Reading state information...
+build-essential is already the newest version (12.9ubuntu3).
+build-essential set to manually installed.
+The following additional packages will be installed:
+  cmake-data dh-elpa-helper emacsen-common git-man javascript-common less
+  libarchive13 libbrotli1 libbsd0 libcbor0.8 libcurl3-gnutls libcurl4 libedit2
+  liberror-perl libexpat1 libexpat1-dev libfido2-1 libglib2.0-0
+  libglib2.0-data libicu70 libjs-jquery libjs-sphinxdoc libjs-underscore
+  libjsoncpp25 libmd0 libmpdec3 libnghttp2-14 libpsl5 libpython3-dev
+  libpython3-stdlib libpython3.10 libpython3.10-dev libpython3.10-minimal
+  libpython3.10-stdlib librhash0 librtmp1 libssh-4 libuv1 libx11-6 libx11-data
+  libxau6 libxcb1 libxdmcp6 libxext6 libxml2 libxmuu1 media-types
+  openssh-client publicsuffix python3 python3-distutils python3-lib2to3
+  python3-minimal python3-pip-whl python3-setuptools-whl python3.10
+  python3.10-dev python3.10-minimal python3.10-venv shared-mime-info xauth
+  xdg-user-dirs zlib1g-dev
+Suggested packages:
+  cmake-doc cmake-format gettext-base git-daemon-run | git-daemon-sysvinit
+  git-doc git-email git-gui gitk gitweb git-cvs git-mediawiki git-svn apache2
+  | lighttpd | httpd lrzip keychain libpam-ssh monkeysphere ssh-askpass
+  python3-doc python3-tk python3.10-doc binfmt-support
+The following NEW packages will be installed:
+  cmake cmake-data curl dh-elpa-helper emacsen-common git git-man
+  javascript-common less libarchive13 libbrotli1 libbsd0 libcbor0.8
+  libcurl3-gnutls libcurl4 libedit2 liberror-perl libexpat1 libexpat1-dev
+  libfido2-1 libglib2.0-0 libglib2.0-data libicu70 libjs-jquery
+  libjs-sphinxdoc libjs-underscore libjsoncpp25 libmd0 libmpdec3 libnghttp2-14
+  libpsl5 libpython3-dev libpython3-stdlib libpython3.10 libpython3.10-dev
+  libpython3.10-minimal libpython3.10-stdlib librhash0 librtmp1 libssh-4
+  libuv1 libx11-6 libx11-data libxau6 libxcb1 libxdmcp6 libxext6 libxml2
+  libxmuu1 media-types ninja-build openssh-client pkg-config publicsuffix
+  python3 python3-dev python3-distutils python3-lib2to3 python3-minimal
+  python3-pip-whl python3-setuptools-whl python3-venv python3.10
+  python3.10-dev python3.10-minimal python3.10-venv shared-mime-info xauth
+  xdg-user-dirs zlib1g-dev
+The following packages will be upgraded:
+  ca-certificates
+1 upgraded, 70 newly installed, 0 to remove and 39 not upgraded.
+Need to get 45.8 MB of archives.
+After this operation, 167 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libpython3.10-minimal amd64 3.10.12-1~22.04.16 [817 kB]
+Get:2 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libexpat1 amd64 2.4.7-1ubuntu0.7 [92.1 kB]
+Get:3 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3.10-minimal amd64 3.10.12-1~22.04.16 [2254 kB]
+Get:4 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3-minimal amd64 3.10.6-1~22.04.1 [24.3 kB]
+Get:5 http://archive.ubuntu.com/ubuntu jammy/main amd64 media-types all 7.0.0 [25.5 kB]
+Get:6 http://archive.ubuntu.com/ubuntu jammy/main amd64 libmpdec3 amd64 2.5.1-2build2 [86.8 kB]
+Get:7 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libpython3.10-stdlib amd64 3.10.12-1~22.04.16 [1850 kB]
+Get:8 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3.10 amd64 3.10.12-1~22.04.16 [508 kB]
+Get:9 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libpython3-stdlib amd64 3.10.6-1~22.04.1 [6812 B]
+Get:10 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3 amd64 3.10.6-1~22.04.1 [22.8 kB]
+Get:11 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 ca-certificates all 20260601~22.04.1 [141 kB]
+Get:12 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 less amd64 590-1ubuntu0.22.04.3 [142 kB]
+Get:13 http://archive.ubuntu.com/ubuntu jammy/main amd64 libmd0 amd64 1.0.4-1build1 [23.0 kB]
+Get:14 http://archive.ubuntu.com/ubuntu jammy/main amd64 libbsd0 amd64 0.11.5-1 [44.8 kB]
+Get:15 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libglib2.0-0 amd64 2.72.4-0ubuntu2.9 [1467 kB]
+Get:16 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libglib2.0-data all 2.72.4-0ubuntu2.9 [5088 B]
+Get:17 http://archive.ubuntu.com/ubuntu jammy/main amd64 libicu70 amd64 70.1-2 [10.6 MB]
+Get:18 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libxml2 amd64 2.9.13+dfsg-1ubuntu0.12 [765 kB]
+Get:19 http://archive.ubuntu.com/ubuntu jammy/main amd64 shared-mime-info amd64 2.1-2 [454 kB]
+Get:20 http://archive.ubuntu.com/ubuntu jammy/main amd64 xdg-user-dirs amd64 0.17-2ubuntu4 [53.9 kB]
+Get:21 http://archive.ubuntu.com/ubuntu jammy/main amd64 libcbor0.8 amd64 0.8.0-2ubuntu1 [24.6 kB]
+Get:22 http://archive.ubuntu.com/ubuntu jammy/main amd64 libedit2 amd64 3.1-20210910-1build1 [96.8 kB]
+Get:23 http://archive.ubuntu.com/ubuntu jammy/main amd64 libfido2-1 amd64 1.10.0-1 [82.8 kB]
+Get:24 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libnghttp2-14 amd64 1.43.0-1ubuntu0.4 [76.9 kB]
+Get:25 http://archive.ubuntu.com/ubuntu jammy/main amd64 libpsl5 amd64 0.21.0-1.2build2 [58.4 kB]
+Get:26 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libuv1 amd64 1.43.0-1ubuntu0.1 [92.7 kB]
+Get:27 http://archive.ubuntu.com/ubuntu jammy/main amd64 libxau6 amd64 1:1.0.9-1build5 [7634 B]
+Get:28 http://archive.ubuntu.com/ubuntu jammy/main amd64 libxdmcp6 amd64 1:1.1.3-0ubuntu5 [10.9 kB]
+Get:29 http://archive.ubuntu.com/ubuntu jammy/main amd64 libxcb1 amd64 1.14-3ubuntu3 [49.0 kB]
+Get:30 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libx11-data all 2:1.7.5-1ubuntu0.3 [120 kB]
+Get:31 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libx11-6 amd64 2:1.7.5-1ubuntu0.3 [667 kB]
+Get:32 http://archive.ubuntu.com/ubuntu jammy/main amd64 libxext6 amd64 2:1.3.4-1build1 [31.8 kB]
+Get:33 http://archive.ubuntu.com/ubuntu jammy/main amd64 libxmuu1 amd64 2:1.1.3-3 [10.2 kB]
+Get:34 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 openssh-client amd64 1:8.9p1-3ubuntu0.16 [904 kB]
+Get:35 http://archive.ubuntu.com/ubuntu jammy/main amd64 publicsuffix all 20211207.1025-1 [129 kB]
+Get:36 http://archive.ubuntu.com/ubuntu jammy/main amd64 xauth amd64 1:1.1-1build2 [27.5 kB]
+Get:37 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libarchive13 amd64 3.6.0-1ubuntu1.8 [368 kB]
+Get:38 http://archive.ubuntu.com/ubuntu jammy/main amd64 libbrotli1 amd64 1.0.9-2build6 [315 kB]
+Get:39 http://archive.ubuntu.com/ubuntu jammy/main amd64 librtmp1 amd64 2.4+20151223.gitfa8646d.1-2build4 [58.2 kB]
+Get:40 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libssh-4 amd64 0.9.6-2ubuntu0.22.04.7 [187 kB]
+Get:41 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libcurl4 amd64 7.81.0-1ubuntu1.25 [291 kB]
+Get:42 http://archive.ubuntu.com/ubuntu jammy/main amd64 libjsoncpp25 amd64 1.9.5-3 [80.0 kB]
+Get:43 http://archive.ubuntu.com/ubuntu jammy/main amd64 librhash0 amd64 1.4.2-1ubuntu1 [125 kB]
+Get:44 http://archive.ubuntu.com/ubuntu jammy/main amd64 dh-elpa-helper all 2.0.9ubuntu1 [7610 B]
+Get:45 http://archive.ubuntu.com/ubuntu jammy/main amd64 emacsen-common all 3.0.4 [14.9 kB]
+Get:46 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 cmake-data all 3.22.1-1ubuntu1.22.04.2 [1913 kB]
+Get:47 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 cmake amd64 3.22.1-1ubuntu1.22.04.2 [5010 kB]
+Get:48 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 curl amd64 7.81.0-1ubuntu1.25 [194 kB]
+Get:49 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libcurl3-gnutls amd64 7.81.0-1ubuntu1.25 [284 kB]
+Get:50 http://archive.ubuntu.com/ubuntu jammy/main amd64 liberror-perl all 0.17029-1 [26.5 kB]
+Get:51 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git-man all 1:2.34.1-1ubuntu1.17 [954 kB]
+Get:52 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git amd64 1:2.34.1-1ubuntu1.17 [3174 kB]
+Get:53 http://archive.ubuntu.com/ubuntu jammy/main amd64 javascript-common all 11+nmu1 [5936 B]
+Get:54 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libexpat1-dev amd64 2.4.7-1ubuntu0.7 [148 kB]
+Get:55 http://archive.ubuntu.com/ubuntu jammy/main amd64 libjs-jquery all 3.6.0+dfsg+~3.5.13-1 [321 kB]
+Get:56 http://archive.ubuntu.com/ubuntu jammy/main amd64 libjs-underscore all 1.13.2~dfsg-2 [118 kB]
+Get:57 http://archive.ubuntu.com/ubuntu jammy/main amd64 libjs-sphinxdoc all 4.3.2-1 [139 kB]
+Get:58 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libpython3.10 amd64 3.10.12-1~22.04.16 [1950 kB]
+Get:59 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 zlib1g-dev amd64 1:1.2.11.dfsg-2ubuntu9.2 [164 kB]
+Get:60 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libpython3.10-dev amd64 3.10.12-1~22.04.16 [4766 kB]
+Get:61 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libpython3-dev amd64 3.10.6-1~22.04.1 [7064 B]
+Get:62 http://archive.ubuntu.com/ubuntu jammy/universe amd64 ninja-build amd64 1.10.1-1 [111 kB]
+Get:63 http://archive.ubuntu.com/ubuntu jammy/main amd64 pkg-config amd64 0.29.2-1ubuntu3 [48.2 kB]
+Get:64 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3.10-dev amd64 3.10.12-1~22.04.16 [508 kB]
+Get:65 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3-lib2to3 all 3.10.8-1~22.04 [77.6 kB]
+Get:66 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3-distutils all 3.10.8-1~22.04 [139 kB]
+Get:67 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3-dev amd64 3.10.6-1~22.04.1 [26.0 kB]
+Get:68 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 python3-pip-whl all 22.0.2+dfsg-1ubuntu0.7 [1683 kB]
+Get:69 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 python3-setuptools-whl all 59.6.0-1.2ubuntu0.22.04.3 [789 kB]
+Get:70 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 python3.10-venv amd64 3.10.12-1~22.04.16 [5724 B]
+Get:71 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 python3-venv amd64 3.10.6-1~22.04.1 [1042 B]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 45.8 MB in 8s (5591 kB/s)
+Selecting previously unselected package libpython3.10-minimal:amd64.
+(Reading database ... 
+[1A(Reading database ... 5%
+[1A(Reading database ... 10%
+[1A(Reading database ... 15%
+[1A(Reading database ... 20%
+[1A(Reading database ... 25%
+[1A(Reading database ... 30%
+[1A(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%
+[1A(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%
+[1A(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%
+[1A(Reading database ... 15135 files and directories currently installed.)
+Preparing to unpack .../libpython3.10-minimal_3.10.12-1~22.04.16_amd64.deb ...
+Unpacking libpython3.10-minimal:amd64 (3.10.12-1~22.04.16) ...
+Selecting previously unselected package libexpat1:amd64.
+Preparing to unpack .../libexpat1_2.4.7-1ubuntu0.7_amd64.deb ...
+Unpacking libexpat1:amd64 (2.4.7-1ubuntu0.7) ...
+Selecting previously unselected package python3.10-minimal.
+Preparing to unpack .../python3.10-minimal_3.10.12-1~22.04.16_amd64.deb ...
+Unpacking python3.10-minimal (3.10.12-1~22.04.16) ...
+Setting up libpython3.10-minimal:amd64 (3.10.12-1~22.04.16) ...
+Setting up libexpat1:amd64 (2.4.7-1ubuntu0.7) ...
+Setting up python3.10-minimal (3.10.12-1~22.04.16) ...
+Selecting previously unselected package python3-minimal.
+(Reading database ... 
+[1A(Reading database ... 5%
+[1A(Reading database ... 10%
+[1A(Reading database ... 15%
+[1A(Reading database ... 20%
+[1A(Reading database ... 25%
+[1A(Reading database ... 30%
+[1A(Reading database ... 35%(Reading database ... 40%
+[1A(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%
+[1A(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%
+[1A(Reading database ... 100%(Reading database ... 15439 files and directories currently installed.)
+Preparing to unpack .../0-python3-minimal_3.10.6-1~22.04.1_amd64.deb ...
+Unpacking python3-minimal (3.10.6-1~22.04.1) ...
+Selecting previously unselected package media-types.
+Preparing to unpack .../1-media-types_7.0.0_all.deb ...
+Unpacking media-types (7.0.0) ...
+Selecting previously unselected package libmpdec3:amd64.
+Preparing to unpack .../2-libmpdec3_2.5.1-2build2_amd64.deb ...
+Unpacking libmpdec3:amd64 (2.5.1-2build2) ...
+Selecting previously unselected package libpython3.10-stdlib:amd64.
+Preparing to unpack .../3-libpython3.10-stdlib_3.10.12-1~22.04.16_amd64.deb ...
+Unpacking libpython3.10-stdlib:amd64 (3.10.12-1~22.04.16) ...
+Selecting previously unselected package python3.10.
+Preparing to unpack .../4-python3.10_3.10.12-1~22.04.16_amd64.deb ...
+Unpacking python3.10 (3.10.12-1~22.04.16) ...
+Selecting previously unselected package libpython3-stdlib:amd64.
+Preparing to unpack .../5-libpython3-stdlib_3.10.6-1~22.04.1_amd64.deb ...
+Unpacking libpython3-stdlib:amd64 (3.10.6-1~22.04.1) ...
+Setting up python3-minimal (3.10.6-1~22.04.1) ...
+Selecting previously unselected package python3.
+(Reading database ... 
+[1A(Reading database ... 5%
+[1A(Reading database ... 10%
+[1A(Reading database ... 15%
+[1A(Reading database ... 20%
+[1A(Reading database ... 25%
+[1A(Reading database ... 30%
+[1A(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%
+[1A(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%
+[1A(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%
+[1A(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 15840 files and directories currently installed.)
+Preparing to unpack .../00-python3_3.10.6-1~22.04.1_amd64.deb ...
+Unpacking python3 (3.10.6-1~22.04.1) ...
+Preparing to unpack .../01-ca-certificates_20260601~22.04.1_all.deb ...
+Unpacking ca-certificates (20260601~22.04.1) over (20240203~22.04.1) ...
+Selecting previously unselected package less.
+Preparing to unpack .../02-less_590-1ubuntu0.22.04.3_amd64.deb ...
+Unpacking less (590-1ubuntu0.22.04.3) ...
+Selecting previously unselected package libmd0:amd64.
+Preparing to unpack .../03-libmd0_1.0.4-1build1_amd64.deb ...
+Unpacking libmd0:amd64 (1.0.4-1build1) ...
+Selecting previously unselected package libbsd0:amd64.
+Preparing to unpack .../04-libbsd0_0.11.5-1_amd64.deb ...
+Unpacking libbsd0:amd64 (0.11.5-1) ...
+Selecting previously unselected package libglib2.0-0:amd64.
+Preparing to unpack .../05-libglib2.0-0_2.72.4-0ubuntu2.9_amd64.deb ...
+Unpacking libglib2.0-0:amd64 (2.72.4-0ubuntu2.9) ...
+Selecting previously unselected package libglib2.0-data.
+Preparing to unpack .../06-libglib2.0-data_2.72.4-0ubuntu2.9_all.deb ...
+Unpacking libglib2.0-data (2.72.4-0ubuntu2.9) ...
+Selecting previously unselected package libicu70:amd64.
+Preparing to unpack .../07-libicu70_70.1-2_amd64.deb ...
+Unpacking libicu70:amd64 (70.1-2) ...
+Selecting previously unselected package libxml2:amd64.
+Preparing to unpack .../08-libxml2_2.9.13+dfsg-1ubuntu0.12_amd64.deb ...
+Unpacking libxml2:amd64 (2.9.13+dfsg-1ubuntu0.12) ...
+Selecting previously unselected package shared-mime-info.
+Preparing to unpack .../09-shared-mime-info_2.1-2_amd64.deb ...
+Unpacking shared-mime-info (2.1-2) ...
+Selecting previously unselected package xdg-user-dirs.
+Preparing to unpack .../10-xdg-user-dirs_0.17-2ubuntu4_amd64.deb ...
+Unpacking xdg-user-dirs (0.17-2ubuntu4) ...
+Selecting previously unselected package libcbor0.8:amd64.
+Preparing to unpack .../11-libcbor0.8_0.8.0-2ubuntu1_amd64.deb ...
+Unpacking libcbor0.8:amd64 (0.8.0-2ubuntu1) ...
+Selecting previously unselected package libedit2:amd64.
+Preparing to unpack .../12-libedit2_3.1-20210910-1build1_amd64.deb ...
+Unpacking libedit2:amd64 (3.1-20210910-1build1) ...
+Selecting previously unselected package libfido2-1:amd64.
+Preparing to unpack .../13-libfido2-1_1.10.0-1_amd64.deb ...
+Unpacking libfido2-1:amd64 (1.10.0-1) ...
+Selecting previously unselected package libnghttp2-14:amd64.
+Preparing to unpack .../14-libnghttp2-14_1.43.0-1ubuntu0.4_amd64.deb ...
+Unpacking libnghttp2-14:amd64 (1.43.0-1ubuntu0.4) ...
+Selecting previously unselected package libpsl5:amd64.
+Preparing to unpack .../15-libpsl5_0.21.0-1.2build2_amd64.deb ...
+Unpacking libpsl5:amd64 (0.21.0-1.2build2) ...
+Selecting previously unselected package libuv1:amd64.
+Preparing to unpack .../16-libuv1_1.43.0-1ubuntu0.1_amd64.deb ...
+Unpacking libuv1:amd64 (1.43.0-1ubuntu0.1) ...
+Selecting previously unselected package libxau6:amd64.
+Preparing to unpack .../17-libxau6_1%3a1.0.9-1build5_amd64.deb ...
+Unpacking libxau6:amd64 (1:1.0.9-1build5) ...
+Selecting previously unselected package libxdmcp6:amd64.
+Preparing to unpack .../18-libxdmcp6_1%3a1.1.3-0ubuntu5_amd64.deb ...
+Unpacking libxdmcp6:amd64 (1:1.1.3-0ubuntu5) ...
+Selecting previously unselected package libxcb1:amd64.
+Preparing to unpack .../19-libxcb1_1.14-3ubuntu3_amd64.deb ...
+Unpacking libxcb1:amd64 (1.14-3ubuntu3) ...
+Selecting previously unselected package libx11-data.
+Preparing to unpack .../20-libx11-data_2%3a1.7.5-1ubuntu0.3_all.deb ...
+Unpacking libx11-data (2:1.7.5-1ubuntu0.3) ...
+Selecting previously unselected package libx11-6:amd64.
+Preparing to unpack .../21-libx11-6_2%3a1.7.5-1ubuntu0.3_amd64.deb ...
+Unpacking libx11-6:amd64 (2:1.7.5-1ubuntu0.3) ...
+Selecting previously unselected package libxext6:amd64.
+Preparing to unpack .../22-libxext6_2%3a1.3.4-1build1_amd64.deb ...
+Unpacking libxext6:amd64 (2:1.3.4-1build1) ...
+Selecting previously unselected package libxmuu1:amd64.
+Preparing to unpack .../23-libxmuu1_2%3a1.1.3-3_amd64.deb ...
+Unpacking libxmuu1:amd64 (2:1.1.3-3) ...
+Selecting previously unselected package openssh-client.
+Preparing to unpack .../24-openssh-client_1%3a8.9p1-3ubuntu0.16_amd64.deb ...
+Unpacking openssh-client (1:8.9p1-3ubuntu0.16) ...
+Selecting previously unselected package publicsuffix.
+Preparing to unpack .../25-publicsuffix_20211207.1025-1_all.deb ...
+Unpacking publicsuffix (20211207.1025-1) ...
+Selecting previously unselected package xauth.
+Preparing to unpack .../26-xauth_1%3a1.1-1build2_amd64.deb ...
+Unpacking xauth (1:1.1-1build2) ...
+Selecting previously unselected package libarchive13:amd64.
+Preparing to unpack .../27-libarchive13_3.6.0-1ubuntu1.8_amd64.deb ...
+Unpacking libarchive13:amd64 (3.6.0-1ubuntu1.8) ...
+Selecting previously unselected package libbrotli1:amd64.
+Preparing to unpack .../28-libbrotli1_1.0.9-2build6_amd64.deb ...
+Unpacking libbrotli1:amd64 (1.0.9-2build6) ...
+Selecting previously unselected package librtmp1:amd64.
+Preparing to unpack .../29-librtmp1_2.4+20151223.gitfa8646d.1-2build4_amd64.deb ...
+Unpacking librtmp1:amd64 (2.4+20151223.gitfa8646d.1-2build4) ...
+Selecting previously unselected package libssh-4:amd64.
+Preparing to unpack .../30-libssh-4_0.9.6-2ubuntu0.22.04.7_amd64.deb ...
+Unpacking libssh-4:amd64 (0.9.6-2ubuntu0.22.04.7) ...
+Selecting previously unselected package libcurl4:amd64.
+Preparing to unpack .../31-libcurl4_7.81.0-1ubuntu1.25_amd64.deb ...
+Unpacking libcurl4:amd64 (7.81.0-1ubuntu1.25) ...
+Selecting previously unselected package libjsoncpp25:amd64.
+Preparing to unpack .../32-libjsoncpp25_1.9.5-3_amd64.deb ...
+Unpacking libjsoncpp25:amd64 (1.9.5-3) ...
+Selecting previously unselected package librhash0:amd64.
+Preparing to unpack .../33-librhash0_1.4.2-1ubuntu1_amd64.deb ...
+Unpacking librhash0:amd64 (1.4.2-1ubuntu1) ...
+Selecting previously unselected package dh-elpa-helper.
+Preparing to unpack .../34-dh-elpa-helper_2.0.9ubuntu1_all.deb ...
+Unpacking dh-elpa-helper (2.0.9ubuntu1) ...
+Selecting previously unselected package emacsen-common.
+Preparing to unpack .../35-emacsen-common_3.0.4_all.deb ...
+Unpacking emacsen-common (3.0.4) ...
+Selecting previously unselected package cmake-data.
+Preparing to unpack .../36-cmake-data_3.22.1-1ubuntu1.22.04.2_all.deb ...
+Unpacking cmake-data (3.22.1-1ubuntu1.22.04.2) ...
+Selecting previously unselected package cmake.
+Preparing to unpack .../37-cmake_3.22.1-1ubuntu1.22.04.2_amd64.deb ...
+Unpacking cmake (3.22.1-1ubuntu1.22.04.2) ...
+Selecting previously unselected package curl.
+Preparing to unpack .../38-curl_7.81.0-1ubuntu1.25_amd64.deb ...
+Unpacking curl (7.81.0-1ubuntu1.25) ...
+Selecting previously unselected package libcurl3-gnutls:amd64.
+Preparing to unpack .../39-libcurl3-gnutls_7.81.0-1ubuntu1.25_amd64.deb ...
+Unpacking libcurl3-gnutls:amd64 (7.81.0-1ubuntu1.25) ...
+Selecting previously unselected package liberror-perl.
+Preparing to unpack .../40-liberror-perl_0.17029-1_all.deb ...
+Unpacking liberror-perl (0.17029-1) ...
+Selecting previously unselected package git-man.
+Preparing to unpack .../41-git-man_1%3a2.34.1-1ubuntu1.17_all.deb ...
+Unpacking git-man (1:2.34.1-1ubuntu1.17) ...
+Selecting previously unselected package git.
+Preparing to unpack .../42-git_1%3a2.34.1-1ubuntu1.17_amd64.deb ...
+Unpacking git (1:2.34.1-1ubuntu1.17) ...
+Selecting previously unselected package javascript-common.
+Preparing to unpack .../43-javascript-common_11+nmu1_all.deb ...
+Unpacking javascript-common (11+nmu1) ...
+Selecting previously unselected package libexpat1-dev:amd64.
+Preparing to unpack .../44-libexpat1-dev_2.4.7-1ubuntu0.7_amd64.deb ...
+Unpacking libexpat1-dev:amd64 (2.4.7-1ubuntu0.7) ...
+Selecting previously unselected package libjs-jquery.
+Preparing to unpack .../45-libjs-jquery_3.6.0+dfsg+~3.5.13-1_all.deb ...
+Unpacking libjs-jquery (3.6.0+dfsg+~3.5.13-1) ...
+Selecting previously unselected package libjs-underscore.
+Preparing to unpack .../46-libjs-underscore_1.13.2~dfsg-2_all.deb ...
+Unpacking libjs-underscore (1.13.2~dfsg-2) ...
+Selecting previously unselected package libjs-sphinxdoc.
+Preparing to unpack .../47-libjs-sphinxdoc_4.3.2-1_all.deb ...
+Unpacking libjs-sphinxdoc (4.3.2-1) ...
+Selecting previously unselected package libpython3.10:amd64.
+Preparing to unpack .../48-libpython3.10_3.10.12-1~22.04.16_amd64.deb ...
+Unpacking libpython3.10:amd64 (3.10.12-1~22.04.16) ...
+Selecting previously unselected package zlib1g-dev:amd64.
+Preparing to unpack .../49-zlib1g-dev_1%3a1.2.11.dfsg-2ubuntu9.2_amd64.deb ...
+Unpacking zlib1g-dev:amd64 (1:1.2.11.dfsg-2ubuntu9.2) ...
+Selecting previously unselected package libpython3.10-dev:amd64.
+Preparing to unpack .../50-libpython3.10-dev_3.10.12-1~22.04.16_amd64.deb ...
+Unpacking libpython3.10-dev:amd64 (3.10.12-1~22.04.16) ...
+Selecting previously unselected package libpython3-dev:amd64.
+Preparing to unpack .../51-libpython3-dev_3.10.6-1~22.04.1_amd64.deb ...
+Unpacking libpython3-dev:amd64 (3.10.6-1~22.04.1) ...
+Selecting previously unselected package ninja-build.
+Preparing to unpack .../52-ninja-build_1.10.1-1_amd64.deb ...
+Unpacking ninja-build (1.10.1-1) ...
+Selecting previously unselected package pkg-config.
+Preparing to unpack .../53-pkg-config_0.29.2-1ubuntu3_amd64.deb ...
+Unpacking pkg-config (0.29.2-1ubuntu3) ...
+Selecting previously unselected package python3.10-dev.
+Preparing to unpack .../54-python3.10-dev_3.10.12-1~22.04.16_amd64.deb ...
+Unpacking python3.10-dev (3.10.12-1~22.04.16) ...
+Selecting previously unselected package python3-lib2to3.
+Preparing to unpack .../55-python3-lib2to3_3.10.8-1~22.04_all.deb ...
+Unpacking python3-lib2to3 (3.10.8-1~22.04) ...
+Selecting previously unselected package python3-distutils.
+Preparing to unpack .../56-python3-distutils_3.10.8-1~22.04_all.deb ...
+Unpacking python3-distutils (3.10.8-1~22.04) ...
+Selecting previously unselected package python3-dev.
+Preparing to unpack .../57-python3-dev_3.10.6-1~22.04.1_amd64.deb ...
+Unpacking python3-dev (3.10.6-1~22.04.1) ...
+Selecting previously unselected package python3-pip-whl.
+Preparing to unpack .../58-python3-pip-whl_22.0.2+dfsg-1ubuntu0.7_all.deb ...
+Unpacking python3-pip-whl (22.0.2+dfsg-1ubuntu0.7) ...
+Selecting previously unselected package python3-setuptools-whl.
+Preparing to unpack .../59-python3-setuptools-whl_59.6.0-1.2ubuntu0.22.04.3_all.deb ...
+Unpacking python3-setuptools-whl (59.6.0-1.2ubuntu0.22.04.3) ...
+Selecting previously unselected package python3.10-venv.
+Preparing to unpack .../60-python3.10-venv_3.10.12-1~22.04.16_amd64.deb ...
+Unpacking python3.10-venv (3.10.12-1~22.04.16) ...
+Selecting previously unselected package python3-venv.
+Preparing to unpack .../61-python3-venv_3.10.6-1~22.04.1_amd64.deb ...
+Unpacking python3-venv (3.10.6-1~22.04.1) ...
+Setting up media-types (7.0.0) ...
+Setting up javascript-common (11+nmu1) ...
+Setting up libxau6:amd64 (1:1.0.9-1build5) ...
+Setting up python3-setuptools-whl (59.6.0-1.2ubuntu0.22.04.3) ...
+Setting up libpsl5:amd64 (0.21.0-1.2build2) ...
+Setting up xdg-user-dirs (0.17-2ubuntu4) ...
+Setting up libglib2.0-0:amd64 (2.72.4-0ubuntu2.9) ...
+No schema files found: doing nothing.
+Setting up libcbor0.8:amd64 (0.8.0-2ubuntu1) ...
+Setting up libbrotli1:amd64 (1.0.9-2build6) ...
+Setting up libnghttp2-14:amd64 (1.43.0-1ubuntu0.4) ...
+Setting up less (590-1ubuntu0.22.04.3) ...
+Setting up ninja-build (1.10.1-1) ...
+Setting up liberror-perl (0.17029-1) ...
+Setting up ca-certificates (20260601~22.04.1) ...
+debconf: unable to initialize frontend: Dialog
+debconf: (No usable dialog-like program is installed, so the dialog based frontend cannot be used. at /usr/share/perl5/Debconf/FrontEnd/Dialog.pm line 78.)
+debconf: falling back to frontend: Readline
+Updating certificates in /etc/ssl/certs...
+rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL
+14 added, 39 removed; done.
+Setting up libglib2.0-data (2.72.4-0ubuntu2.9) ...
+Setting up libuv1:amd64 (1.43.0-1ubuntu0.1) ...
+Setting up libexpat1-dev:amd64 (2.4.7-1ubuntu0.7) ...
+Setting up emacsen-common (3.0.4) ...
+Setting up libx11-data (2:1.7.5-1ubuntu0.3) ...
+Setting up librtmp1:amd64 (2.4+20151223.gitfa8646d.1-2build4) ...
+Setting up dh-elpa-helper (2.0.9ubuntu1) ...
+Setting up libjsoncpp25:amd64 (1.9.5-3) ...
+Setting up pkg-config (0.29.2-1ubuntu3) ...
+Setting up libssh-4:amd64 (0.9.6-2ubuntu0.22.04.7) ...
+Setting up zlib1g-dev:amd64 (1:1.2.11.dfsg-2ubuntu9.2) ...
+Setting up libmd0:amd64 (1.0.4-1build1) ...
+Setting up librhash0:amd64 (1.4.2-1ubuntu1) ...
+Setting up libmpdec3:amd64 (2.5.1-2build2) ...
+Setting up libcurl4:amd64 (7.81.0-1ubuntu1.25) ...
+Setting up git-man (1:2.34.1-1ubuntu1.17) ...
+Setting up cmake-data (3.22.1-1ubuntu1.22.04.2) ...
+Setting up curl (7.81.0-1ubuntu1.25) ...
+Setting up libjs-jquery (3.6.0+dfsg+~3.5.13-1) ...
+Setting up libfido2-1:amd64 (1.10.0-1) ...
+Setting up libbsd0:amd64 (0.11.5-1) ...
+Setting up publicsuffix (20211207.1025-1) ...
+Setting up libjs-underscore (1.13.2~dfsg-2) ...
+Setting up libicu70:amd64 (70.1-2) ...
+Setting up libxdmcp6:amd64 (1:1.1.3-0ubuntu5) ...
+Setting up libxcb1:amd64 (1.14-3ubuntu3) ...
+Setting up python3-pip-whl (22.0.2+dfsg-1ubuntu0.7) ...
+Setting up libedit2:amd64 (3.1-20210910-1build1) ...
+Setting up libcurl3-gnutls:amd64 (7.81.0-1ubuntu1.25) ...
+Setting up libpython3.10-stdlib:amd64 (3.10.12-1~22.04.16) ...
+Setting up git (1:2.34.1-1ubuntu1.17) ...
+Setting up libjs-sphinxdoc (4.3.2-1) ...
+Setting up libx11-6:amd64 (2:1.7.5-1ubuntu0.3) ...
+Setting up libxml2:amd64 (2.9.13+dfsg-1ubuntu0.12) ...
+Setting up libxmuu1:amd64 (2:1.1.3-3) ...
+Setting up libpython3-stdlib:amd64 (3.10.6-1~22.04.1) ...
+Setting up libpython3.10:amd64 (3.10.12-1~22.04.16) ...
+Setting up python3.10 (3.10.12-1~22.04.16) ...
+Setting up libarchive13:amd64 (3.6.0-1ubuntu1.8) ...
+Setting up openssh-client (1:8.9p1-3ubuntu0.16) ...
+update-alternatives: using /usr/bin/ssh to provide /usr/bin/rsh (rsh) in auto mode
+update-alternatives: warning: skip creation of /usr/share/man/man1/rsh.1.gz because associated file /usr/share/man/man1/ssh.1.gz (of link group rsh) doesn't exist
+update-alternatives: using /usr/bin/slogin to provide /usr/bin/rlogin (rlogin) in auto mode
+update-alternatives: warning: skip creation of /usr/share/man/man1/rlogin.1.gz because associated file /usr/share/man/man1/slogin.1.gz (of link group rlogin) doesn't exist
+update-alternatives: using /usr/bin/scp to provide /usr/bin/rcp (rcp) in auto mode
+update-alternatives: warning: skip creation of /usr/share/man/man1/rcp.1.gz because associated file /usr/share/man/man1/scp.1.gz (of link group rcp) doesn't exist
+Setting up libxext6:amd64 (2:1.3.4-1build1) ...
+Setting up python3 (3.10.6-1~22.04.1) ...
+running python rtupdate hooks for python3.10...
+running python post-rtupdate hooks for python3.10...
+Setting up shared-mime-info (2.1-2) ...
+Setting up libpython3.10-dev:amd64 (3.10.12-1~22.04.16) ...
+Setting up python3.10-dev (3.10.12-1~22.04.16) ...
+Setting up xauth (1:1.1-1build2) ...
+Setting up cmake (3.22.1-1ubuntu1.22.04.2) ...
+Setting up python3-lib2to3 (3.10.8-1~22.04) ...
+Setting up python3-distutils (3.10.8-1~22.04) ...
+Setting up libpython3-dev:amd64 (3.10.6-1~22.04.1) ...
+Setting up python3.10-venv (3.10.12-1~22.04.16) ...
+Setting up python3-venv (3.10.6-1~22.04.1) ...
+Setting up python3-dev (3.10.6-1~22.04.1) ...
+Processing triggers for libc-bin (2.35-0ubuntu3.13) ...
+Processing triggers for ca-certificates (20260601~22.04.1) ...
+Updating certificates in /etc/ssl/certs...
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+Saving image...
+Image saved, took 2.50s
+
+Built image im-gIQL5I98e8F1EKv5rNKkiU in 42.78s
+
+
+Building image im-mOS5VvIbA6cgmNg14UYI4T
+
+=> Step 0: FROM base
+
+=> Step 1: RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /root/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+
+  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.1 (8bab26f4f 2026-07-14)
+
+
+Rust is installed now. Great!
+
+To get started you may need to restart your current shell.
+This would reload your PATH environment variable to include
+Cargo's bin directory ($HOME/.cargo/bin).
+
+To configure your current shell, you need to source
+the corresponding env file under $HOME/.cargo.
+
+This is usually done by running one of the following (note the leading DOT):
+. "$HOME/.cargo/env"            # For sh/bash/zsh/ash/dash/pdksh
+source "$HOME/.cargo/env.fish"  # For fish
+source "~/.cargo/env.nu"  # For nushell
+source "$HOME/.cargo/env.tcsh"  # For tcsh
+. "$HOME/.cargo/env.ps1"        # For pwsh
+source "$HOME/.cargo/env.xsh"   # For xonsh
+
+=> Step 2: RUN if [ ! -e /usr/lib/x86_64-linux-gnu/libcudnn.so ] &&    [ -e /usr/lib/x86_64-linux-gnu/libcudnn.so.9 ]; then   ln -s libcudnn.so.9 /usr/lib/x86_64-linux-gnu/libcudnn.so; fi; ldconfig
+
+=> Step 3: RUN set -eu; PY="$(command -v python3.12 || command -v python3.11 || command -v python3)"; "$PY" -V; "$PY" -m venv /opt/torch-venv && /opt/torch-venv/bin/pip install --no-cache-dir -U pip && /opt/torch-venv/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu129 torch==2.13.0+cu129 && /opt/torch-venv/bin/pip install --no-cache-dir numpy ninja packaging && /opt/torch-venv/bin/pip install --no-cache-dir --pre flash-attn-4==4.0.0b25 && /opt/torch-venv/bin/python -c "import torch,triton,importlib.metadata as m;print('torch',torch.__version__,'cuda',torch.version.cuda,'triton',triton.__version__,'fa4',m.version('flash-attn-4'))"
+Python 3.11.5
+Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+Requirement already satisfied: pip in /opt/torch-venv/lib/python3.11/site-packages (23.2.1)
+Collecting pip
+  Obtaining dependency information for pip from http://pypi-mirror.modal.local:5555/simple/pip/pip-26.2.1-py3-none-any.whl.metadata
+  Downloading http://pypi-mirror.modal.local:5555/simple/pip/pip-26.2.1-py3-none-any.whl.metadata (4.6 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/pip/pip-26.2.1-py3-none-any.whl (1.8 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.8/1.8 MB 385.9 MB/s eta 0:00:00
+Installing collected packages: pip
+  Attempting uninstall: pip
+    Found existing installation: pip 23.2.1
+    Uninstalling pip-23.2.1:
+      Successfully uninstalled pip-23.2.1
+Successfully installed pip-26.2.1
+Looking in indexes: https://download.pytorch.org/whl/cu129
+Collecting torch==2.13.0+cu129
+  Downloading torch-2.13.0%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl.metadata (38 kB)
+Collecting filelock (from torch==2.13.0+cu129)
+  Downloading filelock-3.29.0-py3-none-any.whl.metadata (2.0 kB)
+Collecting typing-extensions>=4.10.0 (from torch==2.13.0+cu129)
+  Downloading typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting setuptools>=77.0.3 (from torch==2.13.0+cu129)
+  Downloading setuptools-78.1.0-py3-none-any.whl.metadata (6.6 kB)
+Collecting sympy>=1.13.3 (from torch==2.13.0+cu129)
+  Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch==2.13.0+cu129)
+  Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+Collecting jinja2 (from torch==2.13.0+cu129)
+  Downloading jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch==2.13.0+cu129)
+  Downloading fsspec-2026.4.0-py3-none-any.whl.metadata (10 kB)
+Collecting cuda-toolkit==12.9.1 (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading cuda_toolkit-12.9.1-py2.py3-none-any.whl (2.3 kB)
+Collecting cuda-bindings<13,>=12.9.4 (from torch==2.13.0+cu129)
+  Downloading cuda_bindings-12.9.4-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (2.6 kB)
+Collecting nvidia-cudnn-cu12==9.20.0.48 (from torch==2.13.0+cu129)
+  Downloading nvidia_cudnn_cu12-9.20.0.48-py3-none-manylinux_2_27_x86_64.whl (657.9 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 657.9/657.9 MB 118.2 MB/s  0:00:05
+Collecting nvidia-cusparselt-cu12==0.8.1 (from torch==2.13.0+cu129)
+  Downloading nvidia_cusparselt_cu12-0.8.1-py3-none-manylinux2014_x86_64.whl (239.3 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 239.3/239.3 MB 99.4 MB/s  0:00:02
+Collecting nvidia-nccl-cu12==2.29.7 (from torch==2.13.0+cu129)
+  Downloading nvidia_nccl_cu12-2.29.7-py3-none-manylinux_2_18_x86_64.whl (293.6 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 293.6/293.6 MB 118.3 MB/s  0:00:02
+Collecting nvidia-nvshmem-cu12==3.4.5 (from torch==2.13.0+cu129)
+  Downloading nvidia_nvshmem_cu12-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (139.1 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 139.1/139.1 MB 120.6 MB/s  0:00:01
+Collecting triton==3.7.1 (from torch==2.13.0+cu129)
+  Downloading triton-3.7.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (1.7 kB)
+Collecting nvidia-cublas-cu12==12.9.1.4.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_cublas_cu12-12.9.1.4-py3-none-manylinux_2_27_x86_64.whl (581.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 581.2/581.2 MB 150.5 MB/s  0:00:04
+Collecting nvidia-cuda-runtime-cu12==12.9.79.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (3.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.5/3.5 MB 161.7 MB/s  0:00:00
+Collecting nvidia-cufft-cu12==11.4.1.4.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_cufft_cu12-11.4.1.4-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (200.9 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 200.9/200.9 MB 128.6 MB/s  0:00:01
+Collecting nvidia-cufile-cu12==1.14.1.1.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_cufile_cu12-1.14.1.1-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (1.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.2/1.2 MB 209.4 MB/s  0:00:00
+Collecting nvidia-cuda-cupti-cu12==12.9.79.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_cuda_cupti_cu12-12.9.79-py3-none-manylinux_2_25_x86_64.whl (10.8 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.8/10.8 MB 78.8 MB/s  0:00:00
+Collecting nvidia-curand-cu12==10.3.10.19.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_curand_cu12-10.3.10.19-py3-none-manylinux_2_27_x86_64.whl (68.3 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 68.3/68.3 MB 103.6 MB/s  0:00:00
+Collecting nvidia-cusolver-cu12==11.7.5.82.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_cusolver_cu12-11.7.5.82-py3-none-manylinux_2_27_x86_64.whl (338.1 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 338.1/338.1 MB 124.2 MB/s  0:00:02
+Collecting nvidia-cusparse-cu12==12.5.10.65.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_cusparse_cu12-12.5.10.65-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (366.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 366.5/366.5 MB 129.5 MB/s  0:00:02
+Collecting nvidia-nvjitlink-cu12==12.9.86.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_nvjitlink_cu12-12.9.86-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (39.7 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 39.7/39.7 MB 126.3 MB/s  0:00:00
+Collecting nvidia-cuda-nvrtc-cu12==12.9.86.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_cuda_nvrtc_cu12-12.9.86-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (89.6 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 89.6/89.6 MB 103.5 MB/s  0:00:00
+Collecting nvidia-nvtx-cu12==12.9.79.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch==2.13.0+cu129)
+  Downloading nvidia_nvtx_cu12-12.9.79-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl (85 kB)
+Collecting cuda-pathfinder~=1.1 (from cuda-bindings<13,>=12.9.4->torch==2.13.0+cu129)
+  Downloading cuda_pathfinder-1.2.2-py3-none-any.whl.metadata (3.2 kB)
+Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch==2.13.0+cu129)
+  Downloading mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch==2.13.0+cu129)
+  Downloading markupsafe-3.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.7 kB)
+Downloading torch-2.13.0%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl (929.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 929.6/929.6 MB 173.6 MB/s  0:00:05
+Downloading triton-3.7.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (197.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 197.1/197.1 MB 169.2 MB/s  0:00:01
+Downloading cuda_bindings-12.9.4-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (12.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12.2/12.2 MB 23.1 MB/s  0:00:00
+Downloading cuda_pathfinder-1.2.2-py3-none-any.whl (23 kB)
+Downloading fsspec-2026.4.0-py3-none-any.whl (203 kB)
+Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 154.7 MB/s  0:00:00
+Downloading setuptools-78.1.0-py3-none-any.whl (1.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.3/1.3 MB 193.8 MB/s  0:00:00
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 186.3 MB/s  0:00:00
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 172.0 MB/s  0:00:00
+Downloading typing_extensions-4.15.0-py3-none-any.whl (44 kB)
+Downloading filelock-3.29.0-py3-none-any.whl (39 kB)
+Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+Downloading markupsafe-3.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
+Installing collected packages: nvidia-cusparselt-cu12, mpmath, cuda-toolkit, typing-extensions, triton, sympy, setuptools, nvidia-nvtx-cu12, nvidia-nvshmem-cu12, nvidia-nvjitlink-cu12, nvidia-nccl-cu12, nvidia-curand-cu12, nvidia-cufile-cu12, nvidia-cuda-runtime-cu12, nvidia-cuda-nvrtc-cu12, nvidia-cuda-cupti-cu12, nvidia-cublas-cu12, networkx, MarkupSafe, fsspec, filelock, cuda-pathfinder, nvidia-cusparse-cu12, nvidia-cufft-cu12, nvidia-cudnn-cu12, jinja2, cuda-bindings, nvidia-cusolver-cu12, torch
+  Attempting uninstall: setuptools
+    Found existing installation: setuptools 65.5.0
+    Uninstalling setuptools-65.5.0:
+      Successfully uninstalled setuptools-65.5.0
+
+Successfully installed MarkupSafe-3.0.3 cuda-bindings-12.9.4 cuda-pathfinder-1.2.2 cuda-toolkit-12.9.1 filelock-3.29.0 fsspec-2026.4.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 nvidia-cublas-cu12-12.9.1.4 nvidia-cuda-cupti-cu12-12.9.79 nvidia-cuda-nvrtc-cu12-12.9.86 nvidia-cuda-runtime-cu12-12.9.79 nvidia-cudnn-cu12-9.20.0.48 nvidia-cufft-cu12-11.4.1.4 nvidia-cufile-cu12-1.14.1.1 nvidia-curand-cu12-10.3.10.19 nvidia-cusolver-cu12-11.7.5.82 nvidia-cusparse-cu12-12.5.10.65 nvidia-cusparselt-cu12-0.8.1 nvidia-nccl-cu12-2.29.7 nvidia-nvjitlink-cu12-12.9.86 nvidia-nvshmem-cu12-3.4.5 nvidia-nvtx-cu12-12.9.79 setuptools-78.1.0 sympy-1.14.0 torch-2.13.0+cu129 triton-3.7.1 typing-extensions-4.15.0
+Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+Collecting numpy
+  Downloading numpy-2.4.6-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (6.6 kB)
+Collecting ninja
+  Downloading ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (5.1 kB)
+Collecting packaging
+  Downloading packaging-26.3-py3-none-any.whl.metadata (3.5 kB)
+Downloading numpy-2.4.6-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (16.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 16.9/16.9 MB 554.8 MB/s  0:00:00
+Downloading ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (180 kB)
+Downloading packaging-26.3-py3-none-any.whl (129 kB)
+Installing collected packages: packaging, numpy, ninja
+
+Successfully installed ninja-1.13.0 numpy-2.4.6 packaging-26.3
+Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+Collecting flash-attn-4==4.0.0b25
+  Downloading flash_attn_4-4.0.0b25-py3-none-any.whl.metadata (1.9 kB)
+Collecting nvidia-cutlass-dsl==4.6.0.dev0 (from flash-attn-4==4.0.0b25)
+  Downloading nvidia_cutlass_dsl-4.6.0.dev0-py3-none-any.whl.metadata (2.8 kB)
+Requirement already satisfied: torch in ./opt/torch-venv/lib/python3.11/site-packages (from flash-attn-4==4.0.0b25) (2.13.0+cu129)
+Collecting einops (from flash-attn-4==4.0.0b25)
+  Downloading einops-0.9.0.dev0-py3-none-any.whl.metadata (13 kB)
+Requirement already satisfied: typing_extensions in ./opt/torch-venv/lib/python3.11/site-packages (from flash-attn-4==4.0.0b25) (4.15.0)
+Collecting apache-tvm-ffi<0.2,>=0.1.12 (from flash-attn-4==4.0.0b25)
+  Downloading apache_tvm_ffi-0.1.13.post2-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (6.2 kB)
+Collecting torch-c-dlpack-ext (from flash-attn-4==4.0.0b25)
+  Downloading torch_c_dlpack_ext-0.1.5-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (14 kB)
+Collecting quack-kernels>=0.5.3 (from flash-attn-4==4.0.0b25)
+  Downloading quack_kernels-0.6.4-py3-none-any.whl.metadata (838 bytes)
+Collecting nvidia-cutlass-dsl-libs-base==4.6.0.dev0 (from nvidia-cutlass-dsl==4.6.0.dev0->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cutlass_dsl_libs_base-4.6.0.dev0-cp311-cp311-manylinux_2_28_x86_64.whl.metadata (2.7 kB)
+Requirement already satisfied: numpy in ./opt/torch-venv/lib/python3.11/site-packages (from nvidia-cutlass-dsl-libs-base==4.6.0.dev0->nvidia-cutlass-dsl==4.6.0.dev0->flash-attn-4==4.0.0b25) (2.4.6)
+Collecting cuda-python>=12.8 (from nvidia-cutlass-dsl-libs-base==4.6.0.dev0->nvidia-cutlass-dsl==4.6.0.dev0->flash-attn-4==4.0.0b25)
+  Downloading cuda_python-13.3.1-py3-none-any.whl.metadata (7.0 kB)
+Collecting protobuf<7,>=6.30.2 (from nvidia-cutlass-dsl-libs-base==4.6.0.dev0->nvidia-cutlass-dsl==4.6.0.dev0->flash-attn-4==4.0.0b25)
+  Downloading protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl.metadata (593 bytes)
+Collecting cuda-bindings~=13.3.1 (from cuda-python>=12.8->nvidia-cutlass-dsl-libs-base==4.6.0.dev0->nvidia-cutlass-dsl==4.6.0.dev0->flash-attn-4==4.0.0b25)
+  Downloading cuda_bindings-13.3.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (2.5 kB)
+Collecting cuda-core~=1.0.0 (from cuda-python>=12.8->nvidia-cutlass-dsl-libs-base==4.6.0.dev0->nvidia-cutlass-dsl==4.6.0.dev0->flash-attn-4==4.0.0b25)
+  Downloading cuda_core-1.0.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (3.2 kB)
+Requirement already satisfied: cuda-pathfinder~=1.1 in ./opt/torch-venv/lib/python3.11/site-packages (from cuda-python>=12.8->nvidia-cutlass-dsl-libs-base==4.6.0.dev0->nvidia-cutlass-dsl==4.6.0.dev0->flash-attn-4==4.0.0b25) (1.2.2)
+Collecting cuda-pathfinder~=1.1 (from cuda-python>=12.8->nvidia-cutlass-dsl-libs-base==4.6.0.dev0->nvidia-cutlass-dsl==4.6.0.dev0->flash-attn-4==4.0.0b25)
+  Downloading cuda_pathfinder-1.6.0-py3-none-any.whl.metadata (1.9 kB)
+INFO: pip is looking at multiple versions of quack-kernels to determine which version is compatible with other requirements. This could take a while.
+Collecting quack-kernels>=0.5.3 (from flash-attn-4==4.0.0b25)
+  Downloading quack_kernels-0.6.3-py3-none-any.whl.metadata (838 bytes)
+  Downloading quack_kernels-0.6.2-py3-none-any.whl.metadata (838 bytes)
+  Downloading quack_kernels-0.6.1-py3-none-any.whl.metadata (800 bytes)
+  Downloading quack_kernels-0.6.0-py3-none-any.whl.metadata (800 bytes)
+  Downloading quack_kernels-0.5.3-py3-none-any.whl.metadata (810 bytes)
+Requirement already satisfied: filelock in ./opt/torch-venv/lib/python3.11/site-packages (from torch->flash-attn-4==4.0.0b25) (3.29.0)
+Requirement already satisfied: setuptools>=77.0.3 in ./opt/torch-venv/lib/python3.11/site-packages (from torch->flash-attn-4==4.0.0b25) (78.1.0)
+Requirement already satisfied: sympy>=1.13.3 in ./opt/torch-venv/lib/python3.11/site-packages (from torch->flash-attn-4==4.0.0b25) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in ./opt/torch-venv/lib/python3.11/site-packages (from torch->flash-attn-4==4.0.0b25) (3.6.1)
+Requirement already satisfied: jinja2 in ./opt/torch-venv/lib/python3.11/site-packages (from torch->flash-attn-4==4.0.0b25) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in ./opt/torch-venv/lib/python3.11/site-packages (from torch->flash-attn-4==4.0.0b25) (2026.4.0)
+Requirement already satisfied: cuda-toolkit==12.9.1 in ./opt/torch-venv/lib/python3.11/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25) (12.9.1)
+INFO: pip is looking at multiple versions of torch to determine which version is compatible with other requirements. This could take a while.
+Collecting torch (from flash-attn-4==4.0.0b25)
+  Downloading torch-2.13.0-cp311-cp311-manylinux_2_28_x86_64.whl.metadata (38 kB)
+Collecting cuda-toolkit==13.0.3 (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading cuda_toolkit-13.0.3.0-py2.py3-none-any.whl.metadata (17 kB)
+Collecting nvidia-cudnn-cu13==9.20.0.48 (from torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cudnn_cu13-9.20.0.48-py3-none-manylinux_2_27_x86_64.whl.metadata (1.9 kB)
+Collecting nvidia-cusparselt-cu13==0.8.1 (from torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_x86_64.whl.metadata (12 kB)
+Collecting nvidia-nccl-cu13==2.29.7 (from torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_nccl_cu13-2.29.7-py3-none-manylinux_2_18_x86_64.whl.metadata (2.1 kB)
+Collecting nvidia-nvshmem-cu13==3.4.5 (from torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (2.1 kB)
+Requirement already satisfied: triton==3.7.1 in ./opt/torch-venv/lib/python3.11/site-packages (from torch->flash-attn-4==4.0.0b25) (3.7.1)
+Collecting nvidia-cublas==13.1.1.3.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cublas-13.1.1.3-py3-none-manylinux_2_27_x86_64.whl.metadata (1.8 kB)
+Collecting nvidia-cuda-nvrtc==13.0.88.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl.metadata (1.7 kB)
+Collecting nvidia-cuda-runtime==13.0.96.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cuda_runtime-13.0.96-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (1.7 kB)
+Collecting nvidia-cufft==12.0.0.61.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cufft-12.0.0.61-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (1.8 kB)
+Collecting nvidia-nvjitlink<14,>=13.0.88 (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_nvjitlink-13.4.46rc1-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl.metadata (1.8 kB)
+Collecting nvidia-cufile==1.15.1.6.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cufile-1.15.1.6-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (1.7 kB)
+Collecting nvidia-cuda-cupti==13.0.85.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cuda_cupti-13.0.85-py3-none-manylinux_2_25_x86_64.whl.metadata (1.7 kB)
+Collecting nvidia-curand==10.4.0.35.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_curand-10.4.0.35-py3-none-manylinux_2_27_x86_64.whl.metadata (1.7 kB)
+Collecting nvidia-cusolver==12.0.4.66.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cusolver-12.0.4.66-py3-none-manylinux_2_27_x86_64.whl.metadata (1.8 kB)
+Collecting nvidia-cusparse==12.6.3.3.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_cusparse-12.6.3.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (1.8 kB)
+Collecting nvidia-nvtx==13.0.85.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3; platform_system == "Linux"->torch->flash-attn-4==4.0.0b25)
+  Downloading nvidia_nvtx-13.0.85-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl.metadata (1.8 kB)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in ./opt/torch-venv/lib/python3.11/site-packages (from sympy>=1.13.3->torch->flash-attn-4==4.0.0b25) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in ./opt/torch-venv/lib/python3.11/site-packages (from jinja2->torch->flash-attn-4==4.0.0b25) (3.0.3)
+Downloading flash_attn_4-4.0.0b25-py3-none-any.whl (398 kB)
+Downloading nvidia_cutlass_dsl-4.6.0.dev0-py3-none-any.whl (10 kB)
+Downloading nvidia_cutlass_dsl_libs_base-4.6.0.dev0-cp311-cp311-manylinux_2_28_x86_64.whl (90.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 90.6/90.6 MB 11.6 MB/s  0:00:07
+Downloading apache_tvm_ffi-0.1.13.post2-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (3.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.0/3.0 MB 486.9 MB/s  0:00:00
+Downloading protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl (323 kB)
+Downloading cuda_python-13.3.1-py3-none-any.whl (8.3 kB)
+Downloading cuda_bindings-13.3.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (6.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.7/6.7 MB 565.9 MB/s  0:00:00
+Downloading cuda_core-1.0.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (5.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5.1/5.1 MB 404.4 MB/s  0:00:00
+Downloading cuda_pathfinder-1.6.0-py3-none-any.whl (54 kB)
+Downloading quack_kernels-0.5.3-py3-none-any.whl (338 kB)
+Downloading einops-0.9.0.dev0-py3-none-any.whl (67 kB)
+Downloading torch-2.13.0-cp311-cp311-manylinux_2_28_x86_64.whl (526.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 526.6/526.6 MB 607.2 MB/s  0:00:00
+Downloading cuda_toolkit-13.0.3.0-py2.py3-none-any.whl (2.5 kB)
+Downloading nvidia_cudnn_cu13-9.20.0.48-py3-none-manylinux_2_27_x86_64.whl (366.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 366.2/366.2 MB 600.9 MB/s  0:00:00
+Downloading nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_x86_64.whl (170.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 170.1/170.1 MB 611.1 MB/s  0:00:00
+Downloading nvidia_nccl_cu13-2.29.7-py3-none-manylinux_2_18_x86_64.whl (206.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 206.0/206.0 MB 582.3 MB/s  0:00:00
+Downloading nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (60.4 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 60.4/60.4 MB 582.6 MB/s  0:00:00
+Downloading nvidia_cublas-13.1.1.3-py3-none-manylinux_2_27_x86_64.whl (423.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 423.1/423.1 MB 616.8 MB/s  0:00:00
+Downloading nvidia_cuda_cupti-13.0.85-py3-none-manylinux_2_25_x86_64.whl (10.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.7/10.7 MB 667.0 MB/s  0:00:00
+Downloading nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (90.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 90.2/90.2 MB 590.8 MB/s  0:00:00
+Downloading nvidia_cuda_runtime-13.0.96-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (2.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.2/2.2 MB 699.3 MB/s  0:00:00
+Downloading nvidia_cufft-12.0.0.61-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (214.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 214.1/214.1 MB 623.9 MB/s  0:00:00
+Downloading nvidia_cufile-1.15.1.6-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (1.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.2/1.2 MB 876.5 MB/s  0:00:00
+Downloading nvidia_curand-10.4.0.35-py3-none-manylinux_2_27_x86_64.whl (59.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 59.5/59.5 MB 616.6 MB/s  0:00:00
+Downloading nvidia_cusolver-12.0.4.66-py3-none-manylinux_2_27_x86_64.whl (200.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 200.9/200.9 MB 610.7 MB/s  0:00:00
+Downloading nvidia_cusparse-12.6.3.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (145.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 145.9/145.9 MB 571.4 MB/s  0:00:00
+Downloading nvidia_nvjitlink-13.4.46rc1-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (42.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 42.5/42.5 MB 39.2 MB/s  0:00:01
+Downloading nvidia_nvtx-13.0.85-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl (148 kB)
+Downloading torch_c_dlpack_ext-0.1.5-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (897 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 897.8/897.8 kB 895.9 MB/s  0:00:00
+Installing collected packages: nvidia-cusparselt-cu13, cuda-toolkit, protobuf, nvidia-nvtx, nvidia-nvshmem-cu13, nvidia-nvjitlink, nvidia-nccl-cu13, nvidia-curand, nvidia-cufile, nvidia-cuda-runtime, nvidia-cuda-nvrtc, nvidia-cuda-cupti, einops, cuda-pathfinder, apache-tvm-ffi, nvidia-cusparse, nvidia-cufft, nvidia-cublas, cuda-core, cuda-bindings, nvidia-cusolver, nvidia-cudnn-cu13, cuda-python, nvidia-cutlass-dsl-libs-base, torch, nvidia-cutlass-dsl, torch-c-dlpack-ext, quack-kernels, flash-attn-4
+  Attempting uninstall: cuda-toolkit
+    Found existing installation: cuda-toolkit 12.9.1
+    Uninstalling cuda-toolkit-12.9.1:
+      Successfully uninstalled cuda-toolkit-12.9.1
+  Attempting uninstall: cuda-pathfinder
+    Found existing installation: cuda-pathfinder 1.2.2
+    Uninstalling cuda-pathfinder-1.2.2:
+      Successfully uninstalled cuda-pathfinder-1.2.2
+  Attempting uninstall: cuda-bindings
+    Found existing installation: cuda-bindings 12.9.4
+    Uninstalling cuda-bindings-12.9.4:
+      Successfully uninstalled cuda-bindings-12.9.4
+  Attempting uninstall: torch
+    Found existing installation: torch 2.13.0+cu129
+    Uninstalling torch-2.13.0+cu129:
+      Successfully uninstalled torch-2.13.0+cu129
+
+Successfully installed apache-tvm-ffi-0.1.13.post2 cuda-bindings-13.3.1 cuda-core-1.0.1 cuda-pathfinder-1.6.0 cuda-python-13.3.1 cuda-toolkit-13.0.3.0 einops-0.9.0.dev0 flash-attn-4-4.0.0b25 nvidia-cublas-13.1.1.3 nvidia-cuda-cupti-13.0.85 nvidia-cuda-nvrtc-13.0.88 nvidia-cuda-runtime-13.0.96 nvidia-cudnn-cu13-9.20.0.48 nvidia-cufft-12.0.0.61 nvidia-cufile-1.15.1.6 nvidia-curand-10.4.0.35 nvidia-cusolver-12.0.4.66 nvidia-cusparse-12.6.3.3 nvidia-cusparselt-cu13-0.8.1 nvidia-cutlass-dsl-4.6.0.dev0 nvidia-cutlass-dsl-libs-base-4.6.0.dev0 nvidia-nccl-cu13-2.29.7 nvidia-nvjitlink-13.4.46rc1 nvidia-nvshmem-cu13-3.4.5 nvidia-nvtx-13.0.85 protobuf-6.33.6 quack-kernels-0.5.3 torch-2.13.0 torch-c-dlpack-ext-0.1.5
+torch 2.13.0+cu130 cuda 13.0 triton 3.7.1 fa4 4.0.0b25
+Saving image...
+Image saved, took 15.29s
+
+Built image im-mOS5VvIbA6cgmNg14UYI4T in 252.08s
+
+
+Building image im-SclEBbGqYBtwfytydHEllq
+
+=> Step 0: FROM base
+
+=> Step 1: ENV PATH=/root/.cargo/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+=> Step 2: ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+
+=> Step 3: ENV WK_GPU=H100
+
+=> Step 4: ENV CARGO_TERM_COLOR=always
+
+=> Step 5: ENV RUST_BACKTRACE=1
+
+=> Step 6: ENV WUKONG_TORCH_PYTHON=/opt/torch-venv/bin/python
+
+=> Step 7: ENV WUKONG_FA2_PYTHON=/opt/torch-venv/bin/python
+
+=> Step 8: ENV WUKONG_FA2_PEER=/wukong/tools/fa2_sdpa_peer.py
+
+=> Step 9: ENV WUKONG_CUTLASS_PROFILER=/persist/bin/cutlass_profiler
+
+=> Step 10: ENV WUKONG_VLLM_PYTHON=/persist/vllm-venv/bin/python
+
+=> Step 11: ENV WUKONG_VLLM_BENCH_DIR=/persist/vllm-src/benchmarks/kernels
+
+=> Step 12: ENV TORCHINDUCTOR_CACHE_DIR=/persist/inductor-cache
+
+=> Step 13: ENV TRITON_CACHE_DIR=/persist/triton-cache
+Saving image...
+Image saved, took 627.12ms
+
+Built image im-SclEBbGqYBtwfytydHEllq in 2.66s
+
+
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function build_peers.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+├── 🔨 Created function peers.
+├── 🔨 Created function cutlass.
+├── 🔨 Created function marlin.
+├── 🔨 Created function framework.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[meter] build_peers: CPU-only (8.0 cpu + 16 GiB) = $0.506/hr; timeout 7200s caps this call at $1.01
+
+[1m$ bash -c set -eux
+df -h /tmp
+rm -rf /tmp/cutlass
+git clone --depth 1 --branch v4.6.1   https://github.com/NVIDIA/cutlass /tmp/cutlass
+mkdir -p /tmp/cutlass/build
+cd /tmp/cutlass/build
+export CUDACXX=/usr/local/cuda/bin/nvcc
+cmake .. -DCUTLASS_NVCC_ARCHS=90a -DCUTLASS_ENABLE_TESTS=OFF -DCUTLASS_UNITY_BUILD_ENABLED=ON -DCUTLASS_LIBRARY_OPERATIONS=gemm -DCUTLASS_LIBRARY_KERNELS='cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16*,cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32*' -DCMAKE_BUILD_TYPE=Release
+make cutlass_profiler -j $(nproc)
+cp /tmp/cutlass/build/tools/profiler/cutlass_profiler /persist/bin/cutlass_profiler-sm90a
+chmod +x /persist/bin/cutlass_profiler-sm90a
+rm -rf /tmp/cutlass
+[0m
++ df -h /tmp
+Filesystem      Size  Used Avail Use% Mounted on
+none            8.0E  4.7M  8.0E   1% /
++ rm -rf /tmp/cutlass
++ git clone --depth 1 --branch v4.6.1 https://github.com/NVIDIA/cutlass /tmp/cutlass
+Cloning into '/tmp/cutlass'...
+Note: switching to 'e05f953a5b3d38adc240df2ff928e0421c2abba3'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+Updating files:  74% (5354/7140)
+[1AUpdating files:  75% (5355/7140)
+[1AUpdating files:  76% (5427/7140)
+[1AUpdating files:  77% (5498/7140)
+[1AUpdating files:  78% (5570/7140)
+[1AUpdating files:  79% (5641/7140)
+[1AUpdating files:  80% (5712/7140)
+[1AUpdating files:  81% (5784/7140)
+[1AUpdating files:  82% (5855/7140)
+[1AUpdating files:  83% (5927/7140)
+[1AUpdating files:  84% (5998/7140)
+[1AUpdating files:  85% (6069/7140)
+[1AUpdating files:  86% (6141/7140)
+[1AUpdating files:  87% (6212/7140)
+[1AUpdating files:  88% (6284/7140)
+[1AUpdating files:  89% (6355/7140)
+[1AUpdating files:  90% (6426/7140)
+[1AUpdating files:  91% (6498/7140)
+[1AUpdating files:  92% (6569/7140)
+[1AUpdating files:  93% (6641/7140)
+[1AUpdating files:  94% (6712/7140)
+[1AUpdating files:  95% (6783/7140)
+[1AUpdating files:  96% (6855/7140)
+[1AUpdating files:  97% (6926/7140)
+[1AUpdating files:  98% (6998/7140)
+[1AUpdating files:  99% (7069/7140)
+[1AUpdating files: 100% (7140/7140)Updating files: 100% (7140/7140), done.
++ mkdir -p /tmp/cutlass/build
++ cd /tmp/cutlass/build
++ export CUDACXX=/usr/local/cuda/bin/nvcc
++ CUDACXX=/usr/local/cuda/bin/nvcc
++ cmake .. -DCUTLASS_NVCC_ARCHS=90a -DCUTLASS_ENABLE_TESTS=OFF -DCUTLASS_UNITY_BUILD_ENABLED=ON -DCUTLASS_LIBRARY_OPERATIONS=gemm '-DCUTLASS_LIBRARY_KERNELS=cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16*,cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32*' -DCMAKE_BUILD_TYPE=Release
+-- CMake Version: 3.22.1
+-- CUTLASS 4.6.1
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- The CUDA compiler identification is NVIDIA 12.9.86
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/local/cuda/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found CUDAToolkit: /usr/local/cuda/include (found version "12.9.86") 
+-- Looking for C++ include pthread.h
+-- Looking for C++ include pthread.h - found
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE  
+-- CUDART: /usr/local/cuda/lib64/libcudart.so
+-- CUDA Driver: /usr/local/cuda/lib64/stubs/libcuda.so
+-- NVRTC: /usr/local/cuda/lib64/libnvrtc.so
+-- Default Install Location: install
+-- Found Python3: /usr/local/bin/python3 (found suitable version "3.11.5", minimum required is "3.5") found components: Interpreter
+-- CUDA Compilation Architectures: 90a
+-- Enable caching of reference results in conv unit tests
+-- Enable rigorous conv problem sizes in conv unit tests
+-- Grid Dependency Control (GDC) is enabled for SM100 kernels (required for programmatic dependent launches).
+-- Using the following NVCC flags: 
+  --expt-relaxed-constexpr
+  -ftemplate-backtrace-limit=0
+  -DCUTLASS_TEST_LEVEL=0
+  -DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1
+  -DCUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED=1
+  -DCUTLASS_DEBUG_TRACE_LEVEL=0
+  -Xcompiler=-Wconversion
+  -Xcompiler=-fno-strict-aliasing
+-- Configuring cublas ...
+-- cuBLAS Disabled.
+-- Configuring cuBLAS ... done.
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_objs.unity.0d5bb3ba97a2.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_objs.unity.2517cc6c388e.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_objs.unity.2ddb221102ee.cu
+-- CUTLASS: Applying -mcmodel=medium for large library support (Linux x86_64, GNU)
+-- Completed generation of library instances. See /tmp/cutlass/build/tools/library/library_instance_generation.log for more information.
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_objs.unity.de4fe0c29640.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.5c2cb7a1beb4.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.62100012fa51.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.2b045d7d6bd4.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.5f48df426108.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.a34f6fb5fec0.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.6e45a93979e0.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.2eaf3d5ba569.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.68b2b7bf4223.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.1e0143dcd4c6.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.8701c72216e7.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.b872b60da94b.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.890e0c34360c.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.8b892ca07e02.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.a1c811fc2073.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.8b059e8d1a53.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.bf42cf6de062.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.3ec2b7c6fdbf.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.0e366389cf45.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.756710023a6f.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.692281eb131a.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.29c9d422eefb.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.0611f1e6858b.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.2c955b9659c2.cu
+-- Generating /tmp/cutlass/build/tools/library/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.c8d67e2e2d19.cu
+-- CUTLASS: Applying -mcmodel=medium for large library support (Linux x86_64, GNU)
+-- Generating /tmp/cutlass/build/tools/profiler/cutlass_profiler.unity.1f651d759988.cu
+-- Generating /tmp/cutlass/build/tools/profiler/cutlass_profiler.unity.11cb496d74c1.cu
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /tmp/cutlass/build
+++ nproc
++ make cutlass_profiler -j 16
+[  0%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.5c2cb7a1beb4.cu.o
+[  5%] Building CXX object tools/library/CMakeFiles/cutlass_library_objs.dir/src/manifest.cpp.o
+[ 11%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.62100012fa51.cu.o
+[ 11%] Building CUDA object tools/library/CMakeFiles/cutlass_library_objs.dir/cutlass_library_objs.unity.0d5bb3ba97a2.cu.o
+[ 11%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.2b045d7d6bd4.cu.o
+[ 17%] Building CUDA object tools/library/CMakeFiles/cutlass_library_objs.dir/cutlass_library_objs.unity.2517cc6c388e.cu.o
+[ 23%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.5f48df426108.cu.o
+[ 23%] Building CUDA object tools/library/CMakeFiles/cutlass_library_objs.dir/cutlass_library_objs.unity.2ddb221102ee.cu.o
+[ 23%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.a34f6fb5fec0.cu.o
+[ 23%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.6e45a93979e0.cu.o
+[ 23%] Building CXX object tools/library/CMakeFiles/cutlass_library_objs.dir/generated/initialize_all.cpp.o
+[ 29%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.2eaf3d5ba569.cu.o
+[ 35%] Building CUDA object tools/library/CMakeFiles/cutlass_library_objs.dir/cutlass_library_objs.unity.de4fe0c29640.cu.o
+[ 35%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.68b2b7bf4223.cu.o
+[ 35%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.1e0143dcd4c6.cu.o
+[ 41%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.8701c72216e7.cu.o
+[ 41%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.b872b60da94b.cu.o
+[ 47%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.890e0c34360c.cu.o
+[ 47%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.8b892ca07e02.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI118cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_tnn_align8_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+[ 47%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.a1c811fc2073.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI124cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ntn_align8_stream_k_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI127cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ntn_align8_stream_k_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ntn_align8_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+[ 52%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.8b059e8d1a53.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI118cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ntn_align8_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI124cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_nnn_align8_stream_k_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+[ 52%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.bf42cf6de062.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_128x256x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI127cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_nnn_align8_stream_k_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_nnn_align8_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_128x256x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI118cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_nnn_align8_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI124cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ttn_align8_stream_k_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+[ 52%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.3ec2b7c6fdbf.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI127cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ttn_align8_stream_k_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+[ 58%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.0e366389cf45.cu.o
+[ 58%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.756710023a6f.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ttn_align8_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+[ 64%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.692281eb131a.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI118cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ttn_align8_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+[ 64%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.29c9d422eefb.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI124cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_tnn_align8_stream_k_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+[ 64%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.0611f1e6858b.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI127cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_tnn_align8_stream_k_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_2x1x1_0_tnn_align8_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+[ 70%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.2c955b9659c2.cu.o
+[ 70%] Building CUDA object tools/library/CMakeFiles/cutlass_library_gemm_sm90_void_gemm_f16_objs.dir/cutlass_library_gemm_sm90_void_gemm_f16_objs.unity.c8d67e2e2d19.cu.o
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI127cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ttn_align8_stream_k_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ttn_align8_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI118cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ttn_align8_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI124cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_nnn_align8_stream_k_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI127cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_nnn_align8_stream_k_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI124cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_tnn_align8_stream_k_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_nnn_align8_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_2x1x1_0_ttn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI118cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_nnn_align8_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI127cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_tnn_align8_stream_k_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_tnn_align8_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI118cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_tnn_align8_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_2x1x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_tnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_2x1x1_0_ntn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI124cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ntn_align8_stream_k_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI127cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ntn_align8_stream_k_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x128x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ntn_align8_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI118cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ntn_align8_warpspecialized_cooperative_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI115cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ntn_align8_warpspecialized_pingpong_epi_nosmemEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI112cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32_256x128x64_2x1x1_0_nnn_align8_warpspecialized_pingpong_epi_tmaEEvNT_6ParamsE'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_ZN7cutlass13device_kernelI124cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16_256x256x64_1x2x1_0_ttn_align8_stream_k_warpspecialized_cooperative_epi_tmaEEvNT_6ParamsE'
+[ 70%] Built target cutlass_library_gemm_sm90_void_gemm_f16_objs
+[ 70%] Linking CUDA shared library libcutlass_gemm_sm90_void_gemm_f16.so
+[ 70%] Built target cutlass_library_gemm_sm90_void_gemm_f16
+[ 70%] Built target cutlass_library_objs
+[ 76%] Linking CXX shared library libcutlass.so
+[ 76%] Built target cutlass_library
+[ 76%] Building CXX object tools/profiler/CMakeFiles/cutlass_profiler.dir/src/main.cpp.o
+[ 82%] Building CXX object tools/profiler/CMakeFiles/cutlass_profiler.dir/src/performance_report.cpp.o
+[ 82%] Building CXX object tools/profiler/CMakeFiles/cutlass_profiler.dir/src/enumerated_types.cpp.o
+[ 88%] Building CXX object tools/profiler/CMakeFiles/cutlass_profiler.dir/src/gpu_timer.cpp.o
+[ 88%] Building CXX object tools/profiler/CMakeFiles/cutlass_profiler.dir/src/cudnn_helpers.cpp.o
+[ 88%] Building CXX object tools/profiler/CMakeFiles/cutlass_profiler.dir/src/problem_space.cpp.o
+[ 94%] Building CUDA object tools/profiler/CMakeFiles/cutlass_profiler.dir/cutlass_profiler.unity.1f651d759988.cu.o
+[ 94%] Building CUDA object tools/profiler/CMakeFiles/cutlass_profiler.dir/cutlass_profiler.unity.11cb496d74c1.cu.o
+[100%] Linking CXX executable cutlass_profiler
+[100%] Built target cutlass_profiler
++ cp /tmp/cutlass/build/tools/profiler/cutlass_profiler /persist/bin/cutlass_profiler-sm90a
++ chmod +x /persist/bin/cutlass_profiler-sm90a
++ rm -rf /tmp/cutlass
+[1m-> ok in 1836.9s[0m
+[peers] cutlass_profiler sm90a (v4.6.1) -> /persist/bin/cutlass_profiler-sm90a
+
+[1m$ bash -c set -eux
+rm -rf /persist/vllm-venv
+PY="$(command -v python3.12 || command -v python3.11 || command -v python3)"; "$PY" -V
+"$PY" -m venv --copies /persist/vllm-venv
+/persist/vllm-venv/bin/pip install --no-cache-dir -U pip
+/persist/vllm-venv/bin/pip install --no-cache-dir vllm==0.26.0
+/persist/vllm-venv/bin/python -c "import importlib.metadata as m,torch;print('vllm',m.version('vllm'),'torch',torch.__version__)"
+[0m
++ rm -rf /persist/vllm-venv
+++ command -v python3.12
+++ command -v python3.11
++ PY=/usr/local/bin/python3.11
++ /usr/local/bin/python3.11 -V
+Python 3.11.5
++ /usr/local/bin/python3.11 -m venv --copies /persist/vllm-venv
+Error: Command '['/persist/vllm-venv/bin/python3.11', '-m', 'ensurepip', '--upgrade', '--default-pip']' returned non-zero exit status 127.
+[1m-> FAILED (1) in 0.2s[0m
+[meter] build_peers: 1837.0s wall = $0.258 (record this in the round log)
+Traceback (most recent call last):
+  File "/pkg/modal/_runtime/container_io_manager.py", line 894, in handle_input_exception
+    yield
+  File "/pkg/modal/_container_entrypoint.py", line 187, in run_input_sync
+    values = io_context.call_function_sync()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/pkg/modal/_runtime/container_io_manager.py", line 215, in call_function_sync
+    expected_value_or_values = self.finalized_function.callable(*args, **kwargs)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/modal_app.py", line 1142, in build_peers
+    _run(["bash", "-c", script], env, cwd="/tmp")
+  File "/root/modal_app.py", line 570, in _run
+    sys.exit(proc.returncode)
+SystemExit: 1
+Stopping app - uncaught exception raised in remote container: SystemExit(1).
+Runner terminated.
+PREFLIGHT_EXIT=1
