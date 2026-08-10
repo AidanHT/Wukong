@@ -2928,8 +2928,21 @@ pub fn wmma_roofline_f16(
 }
 
 /// Fused row-wise normalization on the GPU — the GPU twin of `wukong_norm_f32`. `op` is a `NORM_*`
-/// code (softmax / layernorm / rmsnorm); `x` is `rows×cols` row-major. One warp per row; the row
-/// reductions are warp-butterfly all-reduces (deterministic order). Tolerance-gated.
+/// code (softmax / layernorm / rmsnorm); `x` is `rows×cols` row-major. The row reductions are
+/// warp-butterfly all-reduces (deterministic order), plus — when more than one warp shares a row — a
+/// fully unrolled fold over a shared slate, also deterministic. Tolerance-gated.
+///
+/// **The entry AND the geometry come from [`crate::ptx_norm::norm_launch`]**, which reads the probed
+/// [`Gpu::sm_count`]. One row per CTA means the CTA count *is* the row count, so a launch with few
+/// rows leaves most of the machine idle at one warp per SM; the planner widens the row across
+/// `W ∈ {1,2,4,8}` warps and picks the `_w{W}` entry for it. The measured win is the **underfill**
+/// regime (`rows=64, cols=8192` swept 2.8–3.5x on this card); the covered regime is bandwidth-bound
+/// on Ada and swept 1.00–1.16x.
+///
+/// **`W == 1` is byte-for-byte today's launch**: the shipped entry, `grid = rows`, `block = 32`, and
+/// deliberately **uncapped**. Capping the grid and grid-striding at one warp measured 0.90–1.00x —
+/// a loss, because it removes the independent CTAs the scheduler was using to hide latency. So this
+/// wiring is provably a no-op for every shape it does not intend to change.
 ///
 /// Panics on a `NORM_*` code with no PTX entry (log-softmax, l2norm) — the right assertion for a
 /// direct library caller, but the `--backend=gpu` offload must consult [`norm_supported`] first and
@@ -2943,14 +2956,26 @@ pub fn norm(
     eps: f32,
 ) -> Result<Vec<f32>, DriverError> {
     assert_eq!(x.len(), rows * cols);
-    let entry = norm_entry(op);
-    let f = g.function("norm", crate::ptx_norm::norm_ptx(), entry)?;
+    let plan = crate::ptx_norm::norm_launch(norm_entry(op), g.sm_count(), rows, cols);
+    // Launch-seam precondition, read back out of the entry NAME the module load uses rather than from
+    // a second parameter. A `_w{W}` entry stages one f32 per warp in a `4*W`-byte shared slate and
+    // every warp executes `shfl.sync.bfly ... 0xffffffff`: a CTA wider than `32*W` folds a slot no
+    // warp wrote, a narrower one leaves a slot stale, and both are silent.
+    assert_eq!(
+        plan.block,
+        32 * crate::ptx_norm::entry_width(&plan.entry).unwrap_or(1),
+        "{}: the CTA must be exactly the width its own entry name encodes",
+        plan.entry
+    );
+    assert!(plan.grid >= 1, "{}: empty grid", plan.entry);
+    let f = g.function("norm", crate::ptx_norm::norm_ptx(), &plan.entry)?;
     let x_d = g.stream.memcpy_stod(x)?;
     let mut out_d = g.stream.memcpy_stod(&vec![0f32; x.len()])?;
     let (r, c) = (rows as u32, cols as u32);
     let cfg = LaunchConfig {
-        grid_dim: (r, 1, 1),
-        block_dim: (32, 1, 1),
+        grid_dim: (plan.grid, 1, 1),
+        block_dim: (plan.block, 1, 1),
+        // The `_w{W}` slate is a static `.shared` inside the entry, so the launch adds nothing.
         shared_mem_bytes: 0,
     };
     let mut bld = g.stream.launch_builder(&f);
@@ -3205,6 +3230,147 @@ pub(crate) fn flash_attn_run(
         .arg(&mut o_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&o_d)
+}
+
+/// Parameters every `mma.sync` flash entry declares: `(S: u32, scale: f32, Q, K, V, O)`.
+pub(crate) const FLASH_ENTRY_PARAMS: usize = 6;
+
+/// Launch one **f16 single-head flash entry** over already-f16 Q/K/V, returning O as f32.
+///
+/// The seam every `mma.sync` flash kernel in this crate shares: one warp per 16-query-row block, grid
+/// `S/16`, and the six-parameter list above. It exists so the depth-grid launcher
+/// ([`flash_attn_stage`]) and anything comparing it against a shipped sibling cannot disagree about
+/// the geometry — two derivations of one launch is how a truncated grid silently drops the tail rows.
+///
+/// # Preconditions (crate hard rule 2)
+///
+/// * `q16.len() == k16.len() == v16.len() == seq * d` — the kernel strides Q/K/V/O by `d` and offsets
+///   heads by `ctaid.y * S * d`, so a short buffer reads (and O writes) past the allocation.
+/// * `seq % 16 == 0`: the grid is `S/16` 16-query-row blocks, and a truncated grid leaves the tail
+///   rows at whatever O was initialised to — a plausible-looking wrong answer, not a crash.
+/// * The pushed argument count equals the `.param` count of *this* entry in *this* module text.
+/// * `mode` comes from the generator that produced `ptx`; `function_smem` turns it into the load form
+///   and the launch byte count together, so no caller re-derives a window size.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flash_f16_launch(
+    g: &mut Gpu,
+    key: &'static str,
+    ptx: &str,
+    entry: &str,
+    q16: &[u16],
+    k16: &[u16],
+    v16: &[u16],
+    seq: usize,
+    d: usize,
+    scale: f32,
+    threads: u32,
+    mode: SmemMode,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(q16.len(), seq * d, "{entry}: Q must be seq*d f16");
+    assert_eq!(k16.len(), seq * d, "{entry}: K must be seq*d f16");
+    assert_eq!(v16.len(), seq * d, "{entry}: V must be seq*d f16");
+    assert_eq!(
+        seq % 16,
+        0,
+        "{entry}: S={seq} must be a multiple of the kernel's 16-query-row block, or the S/16 grid \
+         truncates and the tail rows are never written"
+    );
+    assert_eq!(
+        entry_param_count(ptx, entry),
+        FLASH_ENTRY_PARAMS,
+        "{entry}: the entry's own declaration must match the {FLASH_ENTRY_PARAMS} arguments pushed \
+         below — pushing short makes the driver read adjacent host stack as a pointer"
+    );
+    let (f, dyn_bytes) = g.function_smem(key, ptx, entry, mode)?;
+    let q_d = g.stream.memcpy_stod(q16)?;
+    let k_d = g.stream.memcpy_stod(k16)?;
+    let v_d = g.stream.memcpy_stod(v16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(seq * d)?;
+    let s32 = seq as u32;
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&s32)
+        .arg(&scale)
+        .arg(&q_d)
+        .arg(&k_d)
+        .arg(&v_d)
+        .arg(&mut o_d);
+    let cfg = dyn_launch_cfg(((seq / 16) as u32, 1, 1), (threads, 1, 1), dyn_bytes);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// Single-head flash attention through one [`FLASH_STAGE_VARIANTS`](crate::ptx_flash::FLASH_STAGE_VARIANTS)
+/// row — the **depth × staging-width grid**, whose deeper `cp.async` rings live in the dynamic
+/// shared-memory window because the PTX ISA's 48 KiB *static* cap cannot express them at these
+/// `(D, BK)` tiles on any device.
+///
+/// Q/K/V arrive as f32 and are rounded to f16 on the host (the tensor-core dtype, exactly as the other
+/// `mma.sync` flash paths do); O comes back f32.
+///
+/// # Preconditions
+///
+/// * `q/k/v.len() == seq * row.d`.
+/// * `seq` is a non-zero multiple of the staged key block `BK = 16 * nkb`. The cooperative stage
+///   writes exactly `BK*D/256` **unguarded** 16-byte chunks per lane, so a partial final key block
+///   would leave the tail of the slab unwritten and the kernel would score against whatever was
+///   there.
+/// * The row fits this device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`. A row that does not is a
+///   **capability decline** returned here, before generation: `flash_stage_ptx` panics on an
+///   over-budget row on purpose, because a clamped launch would compute with a truncated ring and
+///   still return `Ok`.
+///
+/// One row = one key = one entry = one module (hard rule 4): `Gpu::function` never re-examines PTX on
+/// a key hit, so two depths under one key would run the first's ring with the second's launch window.
+pub fn flash_attn_stage(
+    g: &mut Gpu,
+    row: &crate::ptx_flash::FlashStageCfg,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    scale: f32,
+) -> Result<Vec<f32>, GpuError> {
+    use half::f16;
+    let (d, bk) = (row.d, row.bk());
+    assert_eq!(q.len(), seq * d, "{}: Q must be seq*{d}", row.name);
+    assert_eq!(k.len(), seq * d, "{}: K must be seq*{d}", row.name);
+    assert_eq!(v.len(), seq * d, "{}: V must be seq*{d}", row.name);
+    assert!(
+        seq >= bk && seq.is_multiple_of(bk),
+        "{}: S={seq} must be a non-zero multiple of the staged key block BK={bk} — the cooperative \
+         stage is an exact, unguarded {}-chunk-per-lane copy, so a partial block would leave the \
+         tail of the slab unwritten",
+        row.name,
+        bk * d / 256
+    );
+    if !row.fits(g.smem_budget()) {
+        return Err(GpuError::Unsupported(format!(
+            "flash depth grid `{}`: needs {} B of shared memory per block ({} stages x BK={bk} x \
+             D={d}), but {} reports a {} B opt-in ceiling (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+            row.name,
+            row.smem_bytes(),
+            row.stages,
+            g.target.name,
+            g.smem_budget()
+        )));
+    }
+    let (ptx, mode) = crate::ptx_flash::flash_stage_ptx(row, g.smem_budget());
+    debug_assert_eq!(mode, row.smem_mode(), "{}: emission form", row.name);
+    let to16 = |x: &[f32]| -> Vec<u16> { x.iter().map(|&t| f16::from_f32(t).to_bits()).collect() };
+    Ok(flash_f16_launch(
+        g,
+        row.name,
+        &ptx,
+        row.name,
+        &to16(q),
+        &to16(k),
+        &to16(v),
+        seq,
+        d,
+        scale,
+        row.threads(),
+        mode,
+    )?)
 }
 
 /// Launch grid/block for the SMEM-tiled conv: one CTA per `TILE_P×TILE_Q` output tile per channel `k`
@@ -6237,6 +6403,178 @@ pub fn quantize_scaled_fp8(
     Ok(g.stream.memcpy_dtov(&o_d)?)
 }
 
+/// **How many `.param`s the entry `entry` declares in `ptx`** — the launch-seam check crate hard rule
+/// 2 asks for, read out of *the module text about to be loaded* rather than from an independent
+/// constant a later edit could leave behind.
+///
+/// The trailing `(` in the search key is load-bearing: entry names in this crate are prefixes of one
+/// another (`flash_d64_mp` of `flash_d64_mp_lm` and `flash_d64_mp4`), so a bare name would count some
+/// other kernel's parameters and pass.
+///
+/// Panics if the module has no such entry, which is a generator/dispatch desync and not a runtime
+/// condition — the driver's own report for it is `CUDA_ERROR_NOT_FOUND` at exactly the one shape that
+/// reaches it.
+fn entry_param_count(ptx: &str, entry: &str) -> usize {
+    ptx.split_once(&format!(".visible .entry {entry}("))
+        .unwrap_or_else(|| panic!("{entry}: no such entry in the module being loaded"))
+        .1
+        .split_once(')')
+        .expect("an entry declaration closes its parameter list")
+        .0
+        .matches(".param ")
+        .count()
+}
+
+/// `C = A·Bᵀ` (f16/bf16 in, f32 out) through the **Hopper warpgroup-MMA + TMA** family
+/// ([`crate::ptx_wgmma`]) — "Act 2", the only configuration in this backend whose derived ceiling
+/// clears cuBLAS on an H100 (D1 §2.5: 128×128 `mma.sync` binds at 73%, the widest Act-1 tile at 90%,
+/// `wgmma.m64n256k16` at ~123%).
+///
+/// **The capability gate is a type, and it is the first statement.** [`crate::ptx_wgmma::wgmma_module`]
+/// cannot be called without an `Sm90aLicense`, and the only way to obtain one here is
+/// [`crate::ptx_wgmma::require_sm90a`] — so an ungated `sm_90a` emission does not compile. The check is
+/// `cc.0 == 9`, deliberately **not** `>= (9,0)`: `sm_90a` is an architecture LOCK, so the module fails to
+/// load on `sm_100` exactly as it fails on this `sm_89` laptop, and a `>=` gate would blame the JIT.
+/// **On every non-Hopper part this function declines here and does nothing else** — no host conversion,
+/// no PTX, no tensor map, no module load.
+///
+/// # Preconditions this asserts at the launch seam (crate hard rule 2)
+///
+/// * `a.len() == m*k`, `b.len() == n*k`, and the allocated `C` is `m*n` — the tensor maps are built from
+///   those extents and the epilogue addresses `C` from them.
+/// * `k >= 1`. At `k == 0` no `wgmma` issues, the accumulators are never written and the kernel skips
+///   the epilogue rather than storing uninitialised registers, so `C` would come back as the zeros this
+///   function allocated — a silently wrong "result". Rejected instead.
+/// * `m*n <= u32::MAX`: the epilogue computes its element index with `mad.lo.s32` before widening.
+/// * `plan.dyn_smem_bytes <= g.smem_budget()` — the ring lives in the `.extern` window, and a launch
+///   that asked for more than the device grants is `CUDA_ERROR_INVALID_VALUE` naming neither.
+/// * **The pushed argument count equals the `.param` count of the entry we are about to load**, counted
+///   out of *that generated text* rather than from an independent constant. Pushing short makes the
+///   driver read adjacent host stack as a pointer.
+///
+/// Every geometric fact comes from [`crate::ptx_wgmma::LaunchPlan`] (entry, module key, block, window
+/// size, grid, parameter order) — never re-derived here, because two derivations of one geometry is how
+/// a truncated grid returns pre-zeroed rows and calls them results.
+pub fn gemm_nt_wgmma(
+    g: &mut Gpu,
+    cfg: &crate::ptx_wgmma::WgmmaCfg,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
+    use crate::ptx_wgmma::WgmmaDtype;
+    use crate::tma_host::TensorMap;
+    use cudarc::driver::DevicePtr;
+    // FIRST, before any conversion, any PTX and any module load: is this device Hopper at all? The
+    // license is a value, and `wgmma_module` below cannot be called without it.
+    let lic = crate::ptx_wgmma::require_sm90a(g, cfg.name)?;
+    assert_eq!(a.len(), m * k, "{}: A must be m*k", cfg.name);
+    assert_eq!(b.len(), n * k, "{}: B must be n*k (A*Bt)", cfg.name);
+    assert!(
+        k >= 1,
+        "{}: K must be >= 1 — at K == 0 the kernel issues no wgmma, never writes the accumulators, \
+         and deliberately skips the epilogue, so C would be returned untouched",
+        cfg.name
+    );
+    assert!(
+        (m as u64) * (n as u64) <= u32::MAX as u64,
+        "{}: M*N = {}*{} overflows the u32 element index the epilogue forms with mad.lo.s32",
+        cfg.name,
+        m,
+        n
+    );
+    let plan = cfg.launch_plan();
+    assert!(
+        plan.dyn_smem_bytes <= g.smem_budget(),
+        "{}: the pipeline needs {} B of dynamic shared memory, but {} grants {} B per block \
+         (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+        cfg.name,
+        plan.dyn_smem_bytes,
+        g.target.name,
+        g.smem_budget()
+    );
+    // A shape the generator cannot express is a decline, never plausible-but-wrong PTX.
+    let ptx = crate::ptx_wgmma::wgmma_module(cfg, &lic).map_err(GpuError::Unsupported)?;
+    // Hard rule 2: the argument count must come from the SAME source as the entry name — so count the
+    // `.param` declarations out of the very text about to be loaded, before anything is uploaded.
+    assert_eq!(
+        entry_param_count(&ptx, plan.entry),
+        plan.params.len(),
+        "{}: the entry's own declaration and PARAM_ORDER disagree — the launch argument list is built \
+         from the latter, and pushing short makes the driver read adjacent host stack as a pointer",
+        plan.entry
+    );
+
+    // Operands go to the device in the kernel's own 16-bit dtype; `wgmma` is precision-generic across
+    // f16/bf16 and only the operand-type token differs, so one launcher covers both rows.
+    let (a16, b16): (Vec<u16>, Vec<u16>) = match cfg.dtype {
+        WgmmaDtype::F16 => (
+            a.iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect(),
+            b.iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect(),
+        ),
+        WgmmaDtype::Bf16 => (
+            a.iter()
+                .map(|&x| half::bf16::from_f32(x).to_bits())
+                .collect(),
+            b.iter()
+                .map(|&x| half::bf16::from_f32(x).to_bits())
+                .collect(),
+        ),
+    };
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    assert_eq!(a_d.len(), m * k, "{}: A device buffer", cfg.name);
+    assert_eq!(b_d.len(), n * k, "{}: B device buffer", cfg.name);
+    assert_eq!(c_d.len(), m * n, "{}: C device buffer", cfg.name);
+
+    // The two tensor maps. A is `M x K` row-major, B is `N x K` row-major (the NT layout this backend
+    // already stores), and both are K-major in shared memory — which is what `wgmma` wants at
+    // `imm-trans-b = 0`, so neither operand needs a transpose flag.
+    // Scoped: `device_ptr`'s `SyncOnDrop` guard borrows the stream, and `function_dyn` below needs
+    // `&mut Gpu`. The maps themselves are plain 128-byte values that outlive the guards.
+    let (map_a, map_b) = {
+        let (a_ptr, _ga) = a_d.device_ptr(&g.stream);
+        let (b_ptr, _gb) = b_d.device_ptr(&g.stream);
+        // SAFETY: `a_d`/`b_d` are live `CudaSlice`s of exactly `m*k` / `n*k` 16-bit elements —
+        // asserted above — which is the byte length each geometry implies, and both outlive the
+        // launch below (they are dropped at the end of this function, after `memcpy_dtov` has
+        // synchronized the stream).
+        let ma = unsafe { TensorMap::encode(&cfg.tensor_map_a(m, k), a_ptr) }
+            .map_err(GpuError::Unsupported)?;
+        let mb = unsafe { TensorMap::encode(&cfg.tensor_map_b(n, k), b_ptr) }
+            .map_err(GpuError::Unsupported)?;
+        (ma, mb)
+    };
+
+    // The entry declares its shared memory as one `.extern` window, so it must be loaded through
+    // `function_dyn` (which opts the function into the ceiling) AND launched with the same byte count.
+    // The plan's key is per generated variant — `Gpu::function` never re-examines PTX on a key hit, so
+    // two rows under one key would share the first's kernel *and* its SMEM ceiling.
+    let f = g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
+
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    // PARAM_ORDER: (M: u32, N: u32, K: u32, C: ptr, tensorMap A, tensorMap B). A `&TensorMap` pushes
+    // its 128 opaque bytes by value through `DeviceRepr`, which is how a `__grid_constant__ const
+    // CUtensorMap` parameter is passed.
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&mut c_d)
+        .arg(&map_a)
+        .arg(&map_b);
+    let launch = dyn_launch_cfg(plan.grid(m, n), plan.block, plan.dyn_smem_bytes);
+    unsafe { bld.launch(launch)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7050,6 +7388,12 @@ mod tests {
             let (name, ptx) = int8::int8_gemm_swz_tile_ptx(bm, bn, wm2, wn2, 0);
             v.push((format!("int8::swz_tile/{name}"), ptx));
         }
+        // The Hopper wgmma + TMA family. Its generator is device-free (an `Sm90aLicense` for a literal
+        // `(9, 0)` is simply the true statement "this capability is a Hopper one"), so its three modules
+        // join the crate-wide `.version`/`.target` law here rather than being covered only by the
+        // family's own copy of it. Every one names `wgmma` and `cp.async.bulk`, so all three are
+        // licensed above 7.8 and `floored` is unchanged.
+        v.extend(crate::ptx_wgmma::wgmma_device_free_modules());
         v
     }
 
@@ -7124,7 +7468,9 @@ mod tests {
         // EXACT, so a module leaving the enumeration is as loud as one arriving. Update deliberately.
         // 88 -> 94 with the six `FP8_DEEP_VARIANTS` rows; the fp8-licensed count rises 11 -> 17 with
         // them, since every one issues the `e4m3` mma that genuinely earns the `.version 8.4` floor.
-        const EXPECTED_MODULES: usize = 94;
+        // 94 -> 97 with the three `WGMMA_VARIANTS` rows, which are licensed at `.version 8.0` by
+        // `wgmma` + `cp.async.bulk` (both "Introduced in PTX ISA version 8.0"); `floored` is unchanged.
+        const EXPECTED_MODULES: usize = 97;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -9576,6 +9922,81 @@ E_FILL:\n\
         });
     }
 
+    /// **The norm dispatcher now picks a width — and every width it can pick still computes the norm.**
+    ///
+    /// `ptx_norm::norm_launch` / `warps_per_row` were written and swept but nothing called them:
+    /// `gpu::norm` hardcoded `grid = rows, block = 32`, so the nine `_w{W}` entries were unreachable
+    /// from the dispatcher (and therefore from `wukong_driver::gpu_accel`, the only production caller),
+    /// and the measured 2.8–3.5x underfill win was available to no one.
+    ///
+    /// The kernels themselves are already gated in `ptx_norm`
+    /// (`sm_filling_norms_match_the_f64_reference_at_every_width`,
+    /// `one_warp_entries_are_bit_identical_to_the_shipped_kernel`). What is gated **here** is the
+    /// seam: that the shapes a real caller passes actually reach each width, that the geometry the
+    /// planner returns is the one that entry needs, and that the result still matches the CPU runtime
+    /// kernel `gpu::norm` is the GPU twin of.
+    ///
+    /// The width each shape must select is asserted against this device's own SM count rather than
+    /// assumed — a heuristic change that silently stopped reaching `W = 8` would otherwise leave this
+    /// test green having exercised one geometry four times. The last shape has `rows` past the
+    /// planner's `32 * SM` grid cap, so it also drives the row grid-stride, which the shipped entries
+    /// structurally cannot do (they read `%ctaid.x` as *the* row and never advance it).
+    #[test]
+    fn norm_dispatch_reaches_every_planner_width_and_matches_the_cpu_oracle() {
+        use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
+        with_gpu("norm_dispatch", |g| {
+            let sm = g.sm_count();
+            let mut rng = crate::diff::Rng::new(0x5031_F111);
+            let eps = 1e-5f32;
+            // (rows, cols) — one per regime the planner documents, plus a grid-stride shape.
+            let shapes: &[(usize, usize)] = &[
+                (40, 128),    // W=1: a short row keeps the shipped launch, untouched
+                (128, 1024),  // W=2: the covered regime at the common transformer width
+                (37, 2048),   // W=4: underfill, rows a multiple of nothing
+                (64, 8192),   // W=8: the underfill regime the sweep measured 2.8-3.5x
+                (1600, 2048), // W capped at 4 AND rows > 32*SM CTAs: the row grid-stride
+            ];
+            let mut widths: Vec<u32> = Vec::new();
+            for &(rows, cols) in shapes {
+                let x = rng.vec(rows * cols, -3.0, 3.0);
+                for (op, label) in [
+                    (NORM_SOFTMAX, "softmax"),
+                    (NORM_LAYERNORM, "layernorm"),
+                    (NORM_RMSNORM, "rmsnorm"),
+                ] {
+                    let p = crate::ptx_norm::norm_launch(label, sm, rows, cols);
+                    widths.push(p.warps_per_row);
+                    let got = norm(g, op, &x, rows, cols, eps).unwrap();
+                    let oracle = cpu_norm(op, &x, rows, cols, eps);
+                    let s = crate::diff::assert_close(
+                        &format!("{label} {rows}x{cols} [{}]", p.entry),
+                        &got,
+                        &oracle,
+                        1e-4,
+                        1e-3,
+                    );
+                    eprintln!(
+                        "  {label:10} {rows:>5}x{cols:<5} -> {:<14} grid={:<5} block={:<3} \
+                         max_abs={:.2e} max_rel={:.2e}",
+                        p.entry, p.grid, p.block, s.max_abs, s.max_rel
+                    );
+                }
+            }
+            widths.sort_unstable();
+            widths.dedup();
+            assert_eq!(
+                widths,
+                crate::ptx_norm::MW_WIDTHS.to_vec(),
+                "the shape list must reach every generated width on this {sm}-SM device, or this \
+                 gate is quietly testing one geometry over and over"
+            );
+            eprintln!(
+                "[gate] gpu::norm dispatches through norm_launch: widths {widths:?} all reached on \
+                 {sm} SMs, every one within tolerance of the CPU runtime kernel \u{2713}"
+            );
+        });
+    }
+
     /// f64 reference for single-head attention `O = softmax(scale·Q·Kᵀ)·V`, all `[seq, d]`. The
     /// non-flash (materialized, two-pass softmax) form: an independent oracle for the fused kernel.
     fn ref_attn(q: &[f32], k: &[f32], v: &[f32], seq: usize, d: usize, scale: f32) -> Vec<f32> {
@@ -10098,6 +10519,248 @@ E_FILL:\n\
                     );
                 }
             }
+        });
+    }
+
+    /// **THE FLASH DEPTH x STAGING-WIDTH GATE — every `FLASH_STAGE_VARIANTS` row, on the metal.**
+    ///
+    /// Until this ran, not one of the 13 rows had ever been launched: the grid was generated and its
+    /// *text* was gated, but there was no launcher and no device path, and the row author's stated
+    /// condition for dispatching any of them was exactly this test. All 13 fit this Ada part's 99 KiB
+    /// opt-in (the largest, `flash_d128_mpw4_lm_s3`, is 98304 B), so nothing here is skipped on this
+    /// card — and the skip accounting below asserts that rather than assuming it.
+    ///
+    /// **What only a device can settle.** The deep ring's correctness argument rests on
+    /// `cp.async.commit_group` creating an **empty** group when no copies are pending: the guarded
+    /// prologue slabs and the tail bodies commit nothing, and `wait_group stages-1` is only the right
+    /// depth if those empty commits still advance the group index. If they did not, `wait_group` would
+    /// return before the buffer landed and the kernel would score against stale K/V — plausible
+    /// output, wrong numbers, no error anywhere. `ptx_flash::flash_stage_grid_ring_discipline` can only
+    /// prove the commits are *present in the text*.
+    ///
+    /// Shapes are the ring's S-corners, each chosen for a specific failure:
+    ///   * `S == BK` — one key block, so *every* prologue slab is out of range and must be guarded;
+    ///   * `S == (stages-1)*BK` — the prologue exactly fills the ring; the body never prefetches;
+    ///   * `S == (stages-2)*BK` — the prologue is **partially** guarded. This is the case that catches
+    ///     a wrong empty-group count, because the guarded slabs commit nothing and every later group
+    ///     index would shift;
+    ///   * `S >> stages*BK` — steady state, several wraps of the add+wrap cursor;
+    ///   * causal rows also `stages*BK` and `(stages+2)*BK`, where CTA `c` stops at key block `c`, so
+    ///     the diagonal terminates the loop at every slot of the ring rather than only past its end.
+    ///
+    /// Two oracles, because a float kernel has no bit-exact one *against the CPU*:
+    ///   * the independent f64 `ref_attn` / `ref_attn_causal` over the same f16-rounded inputs, at the
+    ///     family's fp16 flash tolerance (abs 2e-3, rel 2e-2 — the bound
+    ///     `mma_pipe_flash_matches_reference_within_tol` uses for the identical math);
+    ///   * **bit-exact equality with the shipped 2-stage kernel** of the same `(D, causal, feed)`
+    ///     wherever `flash_ptx()` defines one (10 of the 13 rows; the three D=128 wide rows have no
+    ///     2-stage sibling in that module). Depth changes only *when* a slab is staged — key order,
+    ///     mma sequence and the per-output f32 accumulation order are identical — so this is `==`, not
+    ///     a tolerance, and it is the instrument that would catch a stale read the oracle band might
+    ///     absorb.
+    #[test]
+    fn flash_stage_grid_matches_reference_within_tol() {
+        use crate::ptx_flash::{flash_ptx, FLASH_STAGE_VARIANTS};
+        use half::f16;
+        use std::collections::HashMap;
+        with_gpu("flash_stage_grid", |g| {
+            let budget = g.smem_budget();
+            eprintln!(
+                "flash depth x width grid on {} — opt-in SMEM budget {budget} B ({} KiB); static ISA \
+                 cap {} KiB",
+                g.device_name(),
+                budget / 1024,
+                STATIC_SMEM_CAP / 1024
+            );
+            // Inputs are a pure function of (d, seq), so a row's verdict does not depend on the order
+            // rows run in, and the O(S^2 D) f64 oracle is computed once per (d, seq, causal).
+            let mut data: HashMap<(usize, usize), (Vec<f32>, Vec<f32>, Vec<f32>)> = HashMap::new();
+            let mut oracles: HashMap<(usize, usize, bool), Vec<f32>> = HashMap::new();
+            let (mut ran, mut peered) = (0usize, 0usize);
+            let mut no_peer: Vec<&str> = Vec::new();
+            let mut skipped: Vec<&str> = Vec::new();
+            for row in FLASH_STAGE_VARIANTS {
+                if !row.fits(budget) {
+                    eprintln!(
+                        "[skip:capability] {}: {} B > this device's opt-in ceiling {budget} B",
+                        row.name,
+                        row.smem_bytes()
+                    );
+                    skipped.push(row.name);
+                    continue;
+                }
+                let (d, bk) = (row.d, row.bk());
+                // The shipped 2-stage sibling is the row name minus its `_s{stages}` tail — exactly
+                // how the generator spells `stages == 2`. Absent for the D=128 wide rows.
+                let peer = row
+                    .name
+                    .strip_suffix(&format!("_s{}", row.stages))
+                    .expect("every grid row is stages >= 3 and carries the suffix");
+                let has_peer = flash_ptx().contains(&format!(".visible .entry {peer}("));
+                if !has_peer {
+                    no_peer.push(row.name);
+                }
+                let mut shapes = vec![
+                    bk,                                       // one block: every prologue slab guarded
+                    (row.stages - 1) * bk,                    // prologue exactly fills the ring
+                    row.stages.saturating_sub(2) * bk,        // prologue PARTIALLY guarded
+                    (4 * row.stages * bk).min(768 / bk * bk), // steady state, several wraps
+                ];
+                if row.causal {
+                    shapes.push(row.stages * bk);
+                    shapes.push((row.stages + 2) * bk);
+                }
+                shapes.retain(|&s| s >= bk);
+                shapes.sort_unstable();
+                shapes.dedup();
+                eprintln!(
+                    "  {:<22} D={d:<3} BK={bk:<2} s{} SMEM {:>5} B {:<7} peer={:<20} S={shapes:?}",
+                    row.name,
+                    row.stages,
+                    row.smem_bytes(),
+                    if row.smem_mode().is_dynamic() {
+                        "DYNAMIC"
+                    } else {
+                        "static"
+                    },
+                    if has_peer { peer } else { "-" }
+                );
+                for seq in shapes {
+                    let (qf, kf, vf) = data
+                        .entry((d, seq))
+                        .or_insert_with(|| {
+                            let mut rng = crate::diff::Rng::new(
+                                0xF1A5_0DEE ^ ((d as u64) << 32) ^ seq as u64,
+                            );
+                            let r16 = |x: Vec<f32>| -> Vec<f32> {
+                                x.into_iter().map(|v| f16::from_f32(v).to_f32()).collect()
+                            };
+                            (
+                                r16(rng.vec(seq * d, -1.0, 1.0)),
+                                r16(rng.vec(seq * d, -1.0, 1.0)),
+                                r16(rng.vec(seq * d, -1.0, 1.0)),
+                            )
+                        })
+                        .clone();
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let oracle = oracles
+                        .entry((d, seq, row.causal))
+                        .or_insert_with(|| {
+                            if row.causal {
+                                ref_attn_causal(&qf, &kf, &vf, seq, d, scale)
+                            } else {
+                                ref_attn(&qf, &kf, &vf, seq, d, scale)
+                            }
+                        })
+                        .clone();
+                    let got = flash_attn_stage(g, row, &qf, &kf, &vf, seq, scale).unwrap();
+                    let s = crate::diff::assert_close(
+                        &format!("{} S={seq}", row.name),
+                        &got,
+                        &oracle,
+                        2e-3,
+                        2e-2,
+                    );
+                    let peer_note = if has_peer {
+                        let to16 = |x: &[f32]| -> Vec<u16> {
+                            x.iter().map(|&t| f16::from_f32(t).to_bits()).collect()
+                        };
+                        let want = flash_f16_launch(
+                            g,
+                            "flash",
+                            flash_ptx(),
+                            peer,
+                            &to16(&qf),
+                            &to16(&kf),
+                            &to16(&vf),
+                            seq,
+                            d,
+                            scale,
+                            row.threads(),
+                            SmemMode::Static,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            got, want,
+                            "{} S={seq}: a deeper ring stages the SAME key blocks in the SAME order, \
+                             so it must be BIT-identical to the shipped {peer}; a difference is a \
+                             stale or half-filled buffer, not rounding",
+                            row.name
+                        );
+                        peered += 1;
+                        format!(" | == {peer}")
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "    S={seq:<5} max_abs={:.2e} max_rel={:.2e}{peer_note}",
+                        s.max_abs, s.max_rel
+                    );
+                    ran += 1;
+                }
+            }
+            // A skip must be the SMEM ceiling and nothing else, in both directions.
+            let over: Vec<&str> = FLASH_STAGE_VARIANTS
+                .iter()
+                .filter(|v| v.smem_bytes() > budget)
+                .map(|v| v.name)
+                .collect();
+            assert_eq!(
+                skipped, over,
+                "a row was skipped for something other than this device's opt-in ceiling, or an \
+                 over-budget row was launched anyway"
+            );
+            assert!(
+                ran >= 40,
+                "the grid must actually have run (only {ran} shapes)"
+            );
+            assert!(
+                peered >= 30,
+                "the bit-exact arm must have run (only {peered} peer comparisons); rows with no \
+                 2-stage sibling in flash_ptx(): {no_peer:?}"
+            );
+            eprintln!(
+                "[gate] flash depth grid: {ran} ring-corner shapes across {} rows within fp16 \
+                 tolerance of the f64 oracle, {peered} of them BIT-IDENTICAL to their shipped \
+                 2-stage sibling — so cp.async's empty commit_group does advance the group index and \
+                 `wait_group stages-1` retires the copy that filled the buffer being read \u{2713}",
+                FLASH_STAGE_VARIANTS.len() - skipped.len()
+            );
+        });
+    }
+
+    /// **A flash grid row that does not fit the device declines LOUDLY**, before generation — it never
+    /// runs a shallower ring the caller did not ask for, and it never reaches
+    /// `flash_stage_ptx`, which panics on an over-budget row on purpose. Probed with a fabricated
+    /// 12-stage D=128 BK=64 row (393216 B) so the check fires on every card, H100 included.
+    #[test]
+    fn flash_stage_declines_over_budget_instead_of_downshifting() {
+        use crate::ptx_flash::FlashStageCfg;
+        with_gpu("flash_stage_decline", |g| {
+            let budget = g.smem_budget();
+            let over = FlashStageCfg {
+                name: "flash_probe_over_budget",
+                d: 128,
+                nkb: 4,
+                stages: 12,
+                causal: false,
+                pv_ldmatrix: true,
+            };
+            assert!(
+                over.smem_bytes() > budget,
+                "the probe row must exceed the device ceiling"
+            );
+            let (seq, d) = (over.bk(), over.d);
+            let zero = vec![0f32; seq * d];
+            let err = flash_attn_stage(g, &over, &zero, &zero, &zero, seq, 0.125).unwrap_err();
+            let msg = err
+                .unsupported()
+                .expect("an over-budget row must be a CAPABILITY decline, not a driver error");
+            assert!(
+                msg.contains("shared memory") && msg.contains(&budget.to_string()),
+                "the decline must name what was refused and the ceiling: {msg}"
+            );
+            eprintln!("[gate] over-budget flash row declined: {msg}");
         });
     }
 
@@ -10821,6 +11484,103 @@ E_FILL:\n\
             }
         }
         o
+    }
+
+    /// **The conv dynamic-SMEM window, handed to a driver for the first time.**
+    ///
+    /// `ptx_conv`'s window arm is a second, fully separate text path — one module-scope
+    /// `.extern .shared` declaration instead of an entry-local `.shared` array — and until this test
+    /// nothing had ever passed it to `cuModuleLoadData`. Its textual gate
+    /// (`ptx_conv::conv2d_ptx_crosses_into_the_dynamic_window_above_the_isa_cap`) proves the
+    /// declaration is at module scope, unique, ASCII and `sm_80`-floored. It cannot prove the module
+    /// **loads**, that the entry accepts the `cuFuncSetAttribute` opt-in, or that the launch is not
+    /// `CUDA_ERROR_INVALID_VALUE` — the three things this does.
+    ///
+    /// The shape is the one that motivates the window at all: a 40x40 filter at `KB=8` stages
+    /// `55x55 + 8*1600` f32 = **63300 B**, past the PTX ISA's 48 KiB *static* cap (so `tiled_applies`
+    /// declines it and the public [`conv2d`] falls back to the naive kernel) and inside this card's
+    /// 99 KiB opt-in (so `tiled_applies_budget` admits it once the device window is the budget). Both
+    /// verdicts are asserted, because their disagreement is the reason the two paths exist.
+    ///
+    /// Two oracles: the f64 `ref_conv2d`, and the naive `CONV2D` kernel reached through [`conv2d`] —
+    /// a different kernel summing the same convolution in a different order on the same device, so a
+    /// shared mistake cannot hide in both.
+    #[test]
+    fn conv2d_dynamic_smem_window_loads_and_computes() {
+        use crate::ptx_conv::{conv2d_ptx_budget, tiled_applies, tiled_applies_budget};
+        with_gpu("conv2d_dyn_window", |g| {
+            // A 40x40 filter at KB=8 stages (16+39)^2 + 8*1600 f32 = 63300 B.
+            let (c, h, w, k, r, s) = (2usize, 64usize, 64usize, 8usize, 40usize, 40usize);
+            const WINDOW: usize = 63_300;
+            let budget = g.smem_budget();
+            if budget < WINDOW {
+                eprintln!(
+                    "[skip:capability] conv2d window needs {WINDOW} B, this device's opt-in ceiling \
+                     is only {budget} B"
+                );
+                return;
+            }
+            // The two verdicts that are the whole reason the window arm exists.
+            assert!(
+                !tiled_applies(c, h, w, k, r, s),
+                "the PTX ISA's 48 KiB static cap must decline this shape"
+            );
+            assert!(
+                tiled_applies_budget(c, h, w, k, r, s, budget),
+                "the device's opt-in window must admit it"
+            );
+            let (ptx, mode) = conv2d_ptx_budget(c, h, w, k, r, s, budget);
+            assert_eq!(mode, SmemMode::Dynamic(WINDOW as u32));
+            assert_eq!(
+                entry_param_count(&ptx, "conv2d"),
+                3,
+                "conv2d takes (Xin, Wt, Out)"
+            );
+
+            let mut rng = crate::diff::Rng::new(0xC0_4D_D7);
+            let x = rng.vec(c * h * w, -1.0, 1.0);
+            let wt = rng.vec(k * c * r * s, -1.0, 1.0);
+            let (p, q) = (h - r + 1, w - s + 1);
+
+            // One key for this one generated shape (hard rule 4: the cache never re-examines PTX).
+            let f = g
+                .function_dyn("conv2d_dyn_2x64x64_k8_r40", &ptx, "conv2d", WINDOW)
+                .unwrap();
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let w_d = g.stream.memcpy_stod(&wt).unwrap();
+            let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+            // Grid and block from the one geometry source the static arm uses; only the window size
+            // is new, and it must be the SAME count `function_dyn` opted the entry into.
+            let base = conv_tiled_cfg(h, w, k, r, s);
+            unsafe {
+                bld.launch(dyn_launch_cfg(base.grid_dim, base.block_dim, WINDOW))
+                    .unwrap()
+            };
+            let got = g.stream.memcpy_dtov(&o_d).unwrap();
+
+            let oracle = ref_conv2d(&x, &wt, c, h, w, k, r, s);
+            // c*sqrt(C*R*S)*eps over a 3200-term reduction, with an absolute cushion sized to the
+            // same depth (the sibling gate's 1e-4 is calibrated for <= 400 terms).
+            let rel = ((8.0 * ((c * r * s) as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+            let a = crate::diff::assert_close("conv2d window vs f64", &got, &oracle, 1e-3, rel);
+            // `conv2d` itself declines this shape to the naive CONV2D kernel (the static cap says no),
+            // so this second oracle is a different kernel summing in a different order on the same
+            // device — a shared mistake cannot hide in both.
+            let naive = conv2d(g, &x, &wt, c, h, w, k, r, s).unwrap();
+            let b = crate::diff::assert_close("conv2d window vs CONV2D", &got, &naive, 1e-3, rel);
+            eprintln!(
+                "[gate] conv2d {WINDOW} B extern-window kernel LOADED and launched on {} (opt-in \
+                 {budget} B): vs the f64 reference max_abs={:.2e} max_rel={:.2e}; vs the naive \
+                 CONV2D max_abs={:.2e} max_rel={:.2e} \u{2713}",
+                g.device_name(),
+                a.max_abs,
+                a.max_rel,
+                b.max_abs,
+                b.max_rel
+            );
+        });
     }
 
     #[test]
@@ -16055,12 +16815,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
-    /// **THE f16 DEEP-PIPELINE GATE — `mma.sync` rings past the 48 KiB static wall.**
+    /// **THE f16 DEEP/WIDE-PIPELINE GATE — `mma.sync` rings past the 48 KiB static wall.**
     ///
-    /// Three of the five [`PIPE_DEEP_VARIANTS`](crate::ptx_wmma::PIPE_DEEP_VARIANTS) rows (s4 = 64 KiB,
-    /// s5 = 80 KiB, 128×256 s3 = 72 KiB) **cannot be declared statically on any device** — the 48 KiB cap
-    /// is a PTX ISA rule about static `.shared`, not a device fact — so they exist only through the
-    /// module-scope `.extern .shared` window plus `cuFuncSetAttribute`. This runs them, on the metal.
+    /// Most of the 11 [`PIPE_DEEP_VARIANTS`](crate::ptx_wmma::PIPE_DEEP_VARIANTS) rows (every s4/s5 at
+    /// 128×128, and every 128×256 / 256×128 row past s2) **cannot be declared statically on any
+    /// device** — the 48 KiB cap is a PTX ISA rule about static `.shared`, not a device fact — so they
+    /// exist only through the module-scope `.extern .shared` window plus `cuFuncSetAttribute`. This
+    /// runs them, on the metal.
+    ///
+    /// **It also sweeps [`PIPE_WIDE_VARIANTS`](crate::ptx_wmma::PIPE_WIDE_VARIANTS).** Those four rows
+    /// (112–144 KiB) are the datacenter-only rings: no Ada part can hold them, so on this laptop each
+    /// one is a **capability skip** and nothing else. Chaining them in here rather than leaving them
+    /// ungated means the A100/H100 round costs zero new code — the wide table's D1 §4.4 rows (A3/A4,
+    /// the #1-ranked Act-1 lever) get gated by the same shapes, the same two oracles and the same skip
+    /// accounting the moment a part that can hold them runs this test. The accounting below is what
+    /// keeps the skip honest in both directions: the set skipped must be EXACTLY the set over budget,
+    /// so a row that quietly stopped running, or one launched despite being over budget, fails.
     ///
     /// Two oracles, because a float kernel has no bit-exact one:
     ///   * the **f16-rounded f64 reference** at the crate's fp16 GEMM tolerance (abs 1e-2, rel 2e-3) —
@@ -16077,7 +16847,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// device's opt-in ceiling is a **capability skip**, never a silent pass.
     #[test]
     fn gemm_deep_matches_reference_within_tol() {
-        use crate::ptx_wmma::PIPE_DEEP_VARIANTS;
+        use crate::ptx_wmma::{PIPE_DEEP_VARIANTS, PIPE_WIDE_VARIANTS};
         use half::f16;
         with_gpu("gemm_deep", |g| {
             let budget = g.smem_budget();
@@ -16090,13 +16860,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let base = crate::ptx_wmma::deep_variant("deep_swz_128_s2");
             let mut rng = crate::diff::Rng::new(0x0DEE_9176);
             let mut ran = 0usize;
-            for v in PIPE_DEEP_VARIANTS {
+            let mut skipped: Vec<&str> = Vec::new();
+            for v in PIPE_DEEP_VARIANTS.iter().chain(PIPE_WIDE_VARIANTS) {
                 if v.smem_bytes() > budget {
                     eprintln!(
                         "[skip:capability] {}: {} B > this device's opt-in ceiling {budget} B",
                         v.name,
                         v.smem_bytes()
                     );
+                    skipped.push(v.name);
                     continue;
                 }
                 // The occupancy the depth actually buys/costs on THIS card — a device fact, printed as
@@ -16181,14 +16953,33 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     ran += 1;
                 }
             }
+            // A capability skip must be the SMEM ceiling and nothing else, in BOTH directions: every
+            // over-budget row skipped, and no other row skipped. On this 99 KiB Ada part that is
+            // exactly PIPE_WIDE_VARIANTS (112–144 KiB) and no deep row; on an A100/H100 it is none of
+            // them and the whole wide table runs through this same gate with no code change.
+            let over: Vec<&str> = PIPE_DEEP_VARIANTS
+                .iter()
+                .chain(PIPE_WIDE_VARIANTS)
+                .filter(|v| v.smem_bytes() > budget)
+                .map(|v| v.name)
+                .collect();
+            assert_eq!(
+                skipped, over,
+                "a row was skipped for something other than this device's opt-in ceiling, or an \
+                 over-budget row was launched anyway"
+            );
             assert!(
                 ran >= 10,
                 "the deep grid must actually have run (only {ran} shapes)"
             );
             eprintln!(
-                "[gate] f16 deep pipeline: {ran} K-corner shapes across s2..s5 + the 128x256 tile, every one \
-                 within fp16 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the >48 KiB rows \
-                 ran out of the dynamic SMEM window ✓"
+                "[gate] f16 deep/wide pipeline: {ran} K-corner shapes across {} of {} rows, every one \
+                 within fp16 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the \
+                 >48 KiB rows ran out of the dynamic SMEM window. {} capability-skipped as too wide \
+                 for this device's {budget} B opt-in: {skipped:?} \u{2713}",
+                PIPE_DEEP_VARIANTS.len() + PIPE_WIDE_VARIANTS.len() - skipped.len(),
+                PIPE_DEEP_VARIANTS.len() + PIPE_WIDE_VARIANTS.len(),
+                skipped.len()
             );
         });
     }
@@ -16228,6 +17019,120 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 "the decline must name the ceiling: {msg}"
             );
             eprintln!("[gate] over-budget deep row declined: {msg}");
+        });
+    }
+
+    /// **The launcher pushes exactly as many arguments as the entry declares** — for every shipped
+    /// `wgmma` row, on any box, with no device.
+    ///
+    /// `gemm_nt_wgmma` re-derives this at run time from the module it is about to load (hard rule 2:
+    /// the count must come from the same source as the entry name), but on this machine that code path
+    /// is unreachable — `require_sm90a` declines first and forever. So the same equality is checked
+    /// here, device-free, out of the generated text: an entry that grew a parameter, or a `PARAM_ORDER`
+    /// that lost one, is a driver reading adjacent host stack as a pointer on the first H100 launch.
+    #[test]
+    fn every_wgmma_entry_declares_exactly_the_parameters_the_launcher_pushes() {
+        use crate::ptx_wgmma::{ParamKind, Sm90aLicense, PARAM_ORDER, WGMMA_VARIANTS};
+        // A literal `(9, 0)` only ever asserts "this capability is a Hopper one", which is true; the
+        // license carries no claim about the machine running the test.
+        let lic = Sm90aLicense::for_probed_cc((9, 0)).expect("(9,0) is Hopper");
+        for v in WGMMA_VARIANTS {
+            let plan = v.launch_plan();
+            let ptx = crate::ptx_wgmma::wgmma_module(v, &lic)
+                .unwrap_or_else(|e| panic!("shipped row {} must generate: {e}", v.name));
+            assert_eq!(
+                entry_param_count(&ptx, plan.entry),
+                PARAM_ORDER.len(),
+                "{}: declared params vs PARAM_ORDER — the launch argument list is built from the \
+                 latter, so a mismatch is a short push",
+                plan.entry
+            );
+            let decl = ptx
+                .split_once(&format!(".visible .entry {}(", plan.entry))
+                .unwrap_or_else(|| panic!("{}: no such entry in its own module", plan.entry))
+                .1
+                .split_once(')')
+                .expect("an entry declaration closes its parameter list")
+                .0;
+            // …and each declaration's *kind*, in order, so a u32/pointer swap is caught too.
+            for (i, (kind, decl)) in PARAM_ORDER
+                .iter()
+                .zip(decl.split(".param ").skip(1))
+                .enumerate()
+            {
+                let want = match kind {
+                    ParamKind::U32 => ".u32",
+                    ParamKind::GlobalPtr => ".u64",
+                    ParamKind::TensorMap => ".align 64 .b8",
+                };
+                assert!(
+                    decl.trim_start().starts_with(want),
+                    "{}: param {i} is {kind:?} in PARAM_ORDER but the entry declares `{}`",
+                    plan.entry,
+                    decl.trim().trim_end_matches(',')
+                );
+            }
+        }
+        eprintln!(
+            "[gate] {} wgmma entries declare exactly PARAM_ORDER ({} params, kinds in order) \u{2713}",
+            WGMMA_VARIANTS.len(),
+            PARAM_ORDER.len()
+        );
+    }
+
+    /// **Every `wgmma` path declines LOUDLY on a part that is not Hopper — and declines FIRST.**
+    ///
+    /// `sm_90a` is an architecture *lock*, not a floor: the module fails to load on `sm_100` exactly as
+    /// it fails on this `sm_89` laptop, so the gate rejects in both directions and this test asserts the
+    /// decline names the capability, the entry and the probed capability rather than dying inside
+    /// `cuModuleLoadData` naming an instruction.
+    ///
+    /// **The operands are deliberately EMPTY at a non-empty shape.** `gemm_nt_wgmma`'s `a.len() == m*k`
+    /// assert would fire on `&[]` at `128x64`, so this test *panics* if the capability gate is ever
+    /// moved after the precondition asserts — which is the ordering the family's whole design rests on
+    /// (no host conversion, no PTX text, no tensor map, no module load before the capability is known).
+    /// That ordering is otherwise unobservable, since a decline and an early panic both "fail".
+    ///
+    /// On a Hopper part the decline arm is structurally unreachable, so the test prints the family's own
+    /// bring-up list instead of pretending to have proven something.
+    #[test]
+    fn wgmma_declines_on_every_part_that_is_not_hopper() {
+        use crate::ptx_wgmma::{WGMMA_DEVICE_VALIDATION, WGMMA_VARIANTS};
+        with_gpu("wgmma_decline", |g| {
+            let cc = g.target().cc();
+            let dev = g.device_name();
+            if cc.0 == 9 {
+                eprintln!(
+                    "[skip:capability] {dev} is cc {}.{} — the sm_90a DECLINE cannot be exercised on a \
+                     Hopper part, and this gate is not a substitute for bring-up. Work the list:",
+                    cc.0, cc.1
+                );
+                for item in WGMMA_DEVICE_VALIDATION {
+                    eprintln!("  {item}");
+                }
+                return;
+            }
+            for v in WGMMA_VARIANTS {
+                let err = gemm_nt_wgmma(g, v, &[], &[], 128, 64, 256)
+                    .expect_err("a non-Hopper part must never produce an sm_90a launch");
+                let msg = err
+                    .unsupported()
+                    .expect("an sm_90a refusal is a CAPABILITY decline, not a driver error");
+                for want in ["wgmma", v.name, &format!("{}.{}", cc.0, cc.1)] {
+                    assert!(
+                        msg.contains(want),
+                        "the decline must name {want:?} (the capability, the entry and what was \
+                         probed): {msg}"
+                    );
+                }
+            }
+            eprintln!(
+                "[gate] all {} wgmma rows decline at require_sm90a on {dev} (cc {}.{}), before any \
+                 operand conversion, PTX text, tensor map or module load \u{2713}",
+                WGMMA_VARIANTS.len(),
+                cc.0,
+                cc.1
+            );
         });
     }
 
