@@ -42,6 +42,36 @@ That is the only step that needs you rather than me. Sign in with GitHub or Goog
 required for the Starter plan's free credit. Set the workspace budget cap at
 <https://modal.com/settings/usage> **before the first metered run** (plan §11 item 2).
 
+### ⚠ On Windows, `PYTHONIOENCODING=utf-8` is REQUIRED on every `modal run`
+
+Not cosmetic — it decides whether a metered round produces a log at all.
+
+Modal streams the container's stdout to your local terminal, and a Windows console is **cp1252**.
+One non-ASCII byte in that stream kills the CLI:
+
+```
+'charmap' codec can't encode character '✓' in position 0: character maps to <undefined>
+```
+
+**The container keeps running and the meter keeps billing** — you have simply lost the output, the
+provenance block and the results. On a CPU staging run that costs cents; measured live on
+2026-08-09 it killed `::build_peers` at exit 1. On an H100 at $3.95/hr it costs the round.
+
+This is reachable from several directions and will stay reachable: `modal_app.py` alone carries 112
+non-ASCII lines, and the crate's own device gates print `✓` in their `[gate]` messages by design.
+So the fix belongs at the call site, not in a promise to keep output ASCII:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"        # once per shell
+```
+
+```sh
+PYTHONIOENCODING=utf-8 modal run tools/cloud/modal_app.py::device_info    # or per-command
+```
+
+Treat it as the console-output sibling of the crate's **"PTX must be pure ASCII"** law: same class
+of defect (one character, a hard failure far from its cause), different pipe.
+
 ## The first session (~2 minutes of GPU time, free)
 
 Run these from the repo root. `WK_GPU` picks the SKU; it is read at import time because Modal binds
