@@ -11486,6 +11486,103 @@ E_FILL:\n\
         o
     }
 
+    /// **The conv dynamic-SMEM window, handed to a driver for the first time.**
+    ///
+    /// `ptx_conv`'s window arm is a second, fully separate text path — one module-scope
+    /// `.extern .shared` declaration instead of an entry-local `.shared` array — and until this test
+    /// nothing had ever passed it to `cuModuleLoadData`. Its textual gate
+    /// (`ptx_conv::conv2d_ptx_crosses_into_the_dynamic_window_above_the_isa_cap`) proves the
+    /// declaration is at module scope, unique, ASCII and `sm_80`-floored. It cannot prove the module
+    /// **loads**, that the entry accepts the `cuFuncSetAttribute` opt-in, or that the launch is not
+    /// `CUDA_ERROR_INVALID_VALUE` — the three things this does.
+    ///
+    /// The shape is the one that motivates the window at all: a 40x40 filter at `KB=8` stages
+    /// `55x55 + 8*1600` f32 = **63300 B**, past the PTX ISA's 48 KiB *static* cap (so `tiled_applies`
+    /// declines it and the public [`conv2d`] falls back to the naive kernel) and inside this card's
+    /// 99 KiB opt-in (so `tiled_applies_budget` admits it once the device window is the budget). Both
+    /// verdicts are asserted, because their disagreement is the reason the two paths exist.
+    ///
+    /// Two oracles: the f64 `ref_conv2d`, and the naive `CONV2D` kernel reached through [`conv2d`] —
+    /// a different kernel summing the same convolution in a different order on the same device, so a
+    /// shared mistake cannot hide in both.
+    #[test]
+    fn conv2d_dynamic_smem_window_loads_and_computes() {
+        use crate::ptx_conv::{conv2d_ptx_budget, tiled_applies, tiled_applies_budget};
+        with_gpu("conv2d_dyn_window", |g| {
+            // A 40x40 filter at KB=8 stages (16+39)^2 + 8*1600 f32 = 63300 B.
+            let (c, h, w, k, r, s) = (2usize, 64usize, 64usize, 8usize, 40usize, 40usize);
+            const WINDOW: usize = 63_300;
+            let budget = g.smem_budget();
+            if budget < WINDOW {
+                eprintln!(
+                    "[skip:capability] conv2d window needs {WINDOW} B, this device's opt-in ceiling \
+                     is only {budget} B"
+                );
+                return;
+            }
+            // The two verdicts that are the whole reason the window arm exists.
+            assert!(
+                !tiled_applies(c, h, w, k, r, s),
+                "the PTX ISA's 48 KiB static cap must decline this shape"
+            );
+            assert!(
+                tiled_applies_budget(c, h, w, k, r, s, budget),
+                "the device's opt-in window must admit it"
+            );
+            let (ptx, mode) = conv2d_ptx_budget(c, h, w, k, r, s, budget);
+            assert_eq!(mode, SmemMode::Dynamic(WINDOW as u32));
+            assert_eq!(
+                entry_param_count(&ptx, "conv2d"),
+                3,
+                "conv2d takes (Xin, Wt, Out)"
+            );
+
+            let mut rng = crate::diff::Rng::new(0xC0_4D_D7);
+            let x = rng.vec(c * h * w, -1.0, 1.0);
+            let wt = rng.vec(k * c * r * s, -1.0, 1.0);
+            let (p, q) = (h - r + 1, w - s + 1);
+
+            // One key for this one generated shape (hard rule 4: the cache never re-examines PTX).
+            let f = g
+                .function_dyn("conv2d_dyn_2x64x64_k8_r40", &ptx, "conv2d", WINDOW)
+                .unwrap();
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let w_d = g.stream.memcpy_stod(&wt).unwrap();
+            let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+            // Grid and block from the one geometry source the static arm uses; only the window size
+            // is new, and it must be the SAME count `function_dyn` opted the entry into.
+            let base = conv_tiled_cfg(h, w, k, r, s);
+            unsafe {
+                bld.launch(dyn_launch_cfg(base.grid_dim, base.block_dim, WINDOW))
+                    .unwrap()
+            };
+            let got = g.stream.memcpy_dtov(&o_d).unwrap();
+
+            let oracle = ref_conv2d(&x, &wt, c, h, w, k, r, s);
+            // c*sqrt(C*R*S)*eps over a 3200-term reduction, with an absolute cushion sized to the
+            // same depth (the sibling gate's 1e-4 is calibrated for <= 400 terms).
+            let rel = ((8.0 * ((c * r * s) as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+            let a = crate::diff::assert_close("conv2d window vs f64", &got, &oracle, 1e-3, rel);
+            // `conv2d` itself declines this shape to the naive CONV2D kernel (the static cap says no),
+            // so this second oracle is a different kernel summing in a different order on the same
+            // device — a shared mistake cannot hide in both.
+            let naive = conv2d(g, &x, &wt, c, h, w, k, r, s).unwrap();
+            let b = crate::diff::assert_close("conv2d window vs CONV2D", &got, &naive, 1e-3, rel);
+            eprintln!(
+                "[gate] conv2d {WINDOW} B extern-window kernel LOADED and launched on {} (opt-in \
+                 {budget} B): vs the f64 reference max_abs={:.2e} max_rel={:.2e}; vs the naive \
+                 CONV2D max_abs={:.2e} max_rel={:.2e} \u{2713}",
+                g.device_name(),
+                a.max_abs,
+                a.max_rel,
+                b.max_abs,
+                b.max_rel
+            );
+        });
+    }
+
     #[test]
     fn conv2d_matches_reference_within_tol() {
         with_gpu("conv2d", |g| {
