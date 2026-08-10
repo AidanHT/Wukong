@@ -9,10 +9,10 @@
 //!   The Q/K/V/O projections and the FFN are the *same* tuned WMMA f16 GEMMs the prefill layer uses
 //!   (M = `Bcap`, a fixed multiple of 64 ⇒ static shapes, graph-capturable, matching how real engines
 //!   bucket batch sizes). The new step: the projected K/V are **appended to the paged cache**
-//!   ([`crate::paged_attention::launch_kv_append`]) and attention is the **paged decode kernel**
-//!   ([`crate::paged_attention::launch_paged_attn_decode`]) over each sequence's ragged context — *not*
-//!   a full-sequence flash. Selective batching (Orca): the token-wise ops batch across all sequences,
-//!   attention is per-sequence against its own block table.
+//!   ([`crate::paged_attention::launch_kv_append_gqa`]) and attention is the **paged decode kernel**
+//!   ([`crate::paged_attention::launch_paged_attn_decode_gqa`]) over each sequence's ragged context —
+//!   *not* a full-sequence flash. Selective batching (Orca): the token-wise ops batch across all
+//!   sequences, attention is per-sequence against its own block table.
 //! - [`DecodeModel`] — an `N`-layer stack owning the [`PagedKvCache`], a [`DevicePool`] for per-layer
 //!   scratch, the per-step block-table / context-length / write-position device buffers, and the
 //!   `[Bcap,D]` ping-pong activations. One [`step_on`](DecodeModel::step_on) advances every active
@@ -31,6 +31,39 @@
 //!
 //! Pooled + on-an-explicit-stream throughout ([`DecodeLayer::forward_step_on`]) so the whole decode
 //! step records cleanly into one [`crate::graph::Graph`] (no synchronizing alloc inside the capture).
+//!
+//! ## Grouped-query attention: the serving stack is [`GqaConfig`]-shaped
+//!
+//! Every Llama-class model this stack exists to serve has **more query heads than KV heads**, and the
+//! entire point of that is that the *cache* — the thing that has to fit in device memory — shrinks by
+//! the group size `g = q_heads / kv_heads`. [`crate::paged_kv`] holds the two counts apart
+//! ([`KvConfig::heads`] **is** the KV-head count; [`GqaConfig`] pairs it with `q_heads` behind a
+//! validating constructor) and [`crate::paged_attention`] has the `*_gqa` launcher pair. This module
+//! carries that geometry the rest of the way: [`DecodeLayer`] and [`DecodeModel`] own a `GqaConfig`,
+//! so a GQA model is expressible end to end and allocates the cache its architecture actually asks
+//! for.
+//!
+//! Which head count sizes what, inside one decode layer:
+//!
+//! | tensor | width | head count |
+//! |---|---|---|
+//! | the activation `x`, `Wq`, `Wo`, the Q row, the attention output, the FFN | `D = q_heads*head_dim` | **query** |
+//! | `Wk`, `Wv`, the projected K/V, every cache slab and scale slab | `kv_dim = kv_heads*head_dim` | **KV** |
+//!
+//! **The old MHA entry points are unchanged and byte-identical.** [`DecodeLayer::new`] /
+//! [`DecodeModel::new`] still take a bare [`KvConfig`] and mean `GqaConfig::mha(cfg)` — group size 1,
+//! `Wk`/`Wv` back at `[D, D]`, every existing gate in this file untouched. The grouped forms are
+//! [`DecodeLayer::new_gqa`] / [`DecodeModel::new_gqa`].
+//!
+//! **The silent-misuse hazard, and where it now stops.** Nothing in a `KvConfig` can tell you whether
+//! its `heads` was meant as `q_heads`: a caller who writes `heads: 32` for a 32q/8kv model gets a
+//! perfectly correct MHA cache that is 4x too large, and no assertion in `paged_kv` can see it. What
+//! *can* see it is the **K/V projection weight**: an MHA layer demands `Wk` at `[D, D]`, and a real
+//! grouped-query checkpoint's `Wk` is `[kv_dim, D]` — exactly `g` times smaller.
+//! [`check_decode_weight_lens`] therefore does not just report "wk wrong size": when the shortfall is
+//! an exact whole factor of a multi-head layer's expectation it names `g`, names the cache
+//! over-allocation, and points at `new_gqa`. That turns the one mistake this design cannot prevent
+//! into a loud failure at model construction.
 
 use std::sync::Arc;
 
@@ -41,12 +74,12 @@ use half::f16;
 
 use crate::gpu::{Gpu, TransformerWeights};
 use crate::paged_attention::{
-    kv_append_int8_ptx, kv_append_ptx, launch_kv_append, launch_kv_append_int8,
-    launch_paged_attn_decode, launch_paged_attn_decode_int8, paged_attn_decode_int8_ptx,
+    kv_append_int8_ptx, kv_append_ptx, launch_kv_append_gqa, launch_kv_append_int8_gqa,
+    launch_paged_attn_decode_gqa, launch_paged_attn_decode_int8_gqa, paged_attn_decode_int8_ptx,
     paged_attn_decode_ptx, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY, PAGED_ATTN_ENTRY,
     PAGED_ATTN_INT8_ENTRY,
 };
-use crate::paged_kv::{KvConfig, KvDtype, KvStorage, PagedKvCache};
+use crate::paged_kv::{GqaConfig, KvConfig, KvDtype, KvStorage, PagedKvCache};
 use crate::pool::{DevicePool, PoolBuf};
 
 /// Launch config for the shared-memory-staged WMMA kernels (`*_sm_db`), one CTA per `SM_BM×SM_BN`
@@ -60,9 +93,129 @@ fn wmma_sm_cfg(m: usize, n: usize) -> LaunchConfig {
     }
 }
 
+/// The six weight extents a [`DecodeLayer`] of this head geometry and FFN inner dim requires, as
+/// `(name, elements)` in `TransformerWeights` field order. **Pure geometry — no device, no
+/// allocation**, so a serving config can be validated (and its footprint quoted) long before a `Gpu`
+/// exists.
+///
+/// `Wq`/`Wo` are square in the hidden size `D = q_heads*head_dim`; the FFN is `D`-wide on one side.
+/// **`Wk`/`Wv` are the odd ones out**: they project `D` down to `kv_dim = kv_heads*head_dim`, so under
+/// GQA they are `g` times smaller than `Wq`, not equal to it. That asymmetry is the whole
+/// architecture, and it is the property [`check_decode_weight_lens`] uses to catch a query-headed
+/// cache geometry.
+pub fn decode_weight_extents(gqa: &GqaConfig, dff: usize) -> [(&'static str, usize); 6] {
+    let (d, kvd) = (gqa.q_dim(), gqa.kv_dim());
+    [
+        ("wq", d * d),
+        ("wk", kvd * d),
+        ("wv", kvd * d),
+        ("wo", d * d),
+        ("w1", dff * d),
+        ("w2", d * dff),
+    ]
+}
+
+/// Assert the tiling/shape preconditions a [`DecodeLayer`] of this geometry needs, **without a
+/// device**: the 64x64 WMMA tile divides every GEMM the layer issues, and the paged-attention kernels
+/// exist at this `head_dim`.
+///
+/// `kv_dim % 64` is the one that is new with GQA and the one a caller will hit first: the K/V
+/// projections are `[Bcap, D] x [kv_dim, D]^T`, so their `N` is `kv_dim`, not `D`. A 32q/4kv model at
+/// `head_dim = 64` has `kv_dim = 256` and is fine; the same model at `kv_heads = 1` would need a
+/// `head_dim >= 64`, which the head-dim rule already forces. Panics (a geometry mistake is a caller
+/// logic bug, not a `DriverError`), naming the offending quantity.
+pub fn assert_decode_geometry(gqa: &GqaConfig, dff: usize) {
+    let (d, kvd) = (gqa.q_dim(), gqa.kv_dim());
+    let bcap = gqa.kv().num_slots;
+    assert!(
+        d % 64 == 0,
+        "D = q_heads*head_dim must be a multiple of 64 (WMMA N tile); got q_heads={} head_dim={} D={d}",
+        gqa.q_heads(),
+        gqa.head_dim()
+    );
+    assert!(
+        kvd % 64 == 0,
+        "kv_dim = kv_heads*head_dim must be a multiple of 64 (the K/V projections' WMMA N tile); \
+         got kv_heads={} head_dim={} kv_dim={kvd}",
+        gqa.kv_heads(),
+        gqa.head_dim()
+    );
+    assert!(
+        dff % 64 == 0,
+        "Dff must be a multiple of 64 (WMMA N tile); got {dff}"
+    );
+    assert!(
+        bcap % 64 == 0,
+        "Bcap (num_slots) must be a multiple of 64 (WMMA M tile); got {bcap}"
+    );
+    assert!(
+        matches!(gqa.head_dim(), 64 | 128),
+        "head_dim must be 64 or 128 (the generated paged-attn kernels); got {}",
+        gqa.head_dim()
+    );
+}
+
+/// Validate the six weight extents of a [`DecodeLayer`] against [`decode_weight_extents`], returning
+/// a message naming the first offender. Split out of the constructor so it needs **no device and no
+/// weight buffers** — a serving config can be checked, and this crate's gates can assert the wording,
+/// on any box.
+///
+/// **The GQA hint is the point.** A caller who builds a grouped-query model's cache with
+/// `heads = q_heads` gets a `g`x-too-large cache that is numerically correct and therefore invisible
+/// — no assertion in [`crate::paged_kv`] can distinguish it from an honest MHA model. But such a
+/// caller then hands the layer a real checkpoint's `Wk`, which is `[kv_dim, D]` and so exactly `g`
+/// times shorter than the `[D, D]` a multi-head layer demands. When the shortfall on a `Wk`/`Wv` of
+/// an `is_mha()` layer is an exact whole factor, this says so, names the implied `kv_heads` and the
+/// cache over-allocation, and points at `new_gqa` — instead of "wk wrong size", which sends the
+/// reader looking at their weight loader.
+pub fn check_decode_weight_lens(
+    gqa: &GqaConfig,
+    dff: usize,
+    lens: [usize; 6],
+) -> Result<(), String> {
+    for (i, (name, want)) in decode_weight_extents(gqa, dff).into_iter().enumerate() {
+        let got = lens[i];
+        if got == want {
+            continue;
+        }
+        let mut msg = format!(
+            "{name}: expected {want} elements for a {}q/{}kv x {} layer (D={}, kv_dim={}, Dff={dff}), got {got}",
+            gqa.q_heads(),
+            gqa.kv_heads(),
+            gqa.head_dim(),
+            gqa.q_dim(),
+            gqa.kv_dim(),
+        );
+        // The grouped-query tell: only `wk`/`wv` narrow under GQA, and only a layer that currently
+        // believes it is multi-head can be the victim of the `heads = q_heads` mistake.
+        if matches!(name, "wk" | "wv") && gqa.is_mha() && got > 0 && want % got == 0 && want > got {
+            let g = want / got;
+            msg += &format!(
+                ". That is exactly {g}x smaller — the shape of a GROUPED-QUERY K/V projection \
+                 [kv_heads*head_dim, D] with kv_heads={}. This layer was built multi-head \
+                 (q_heads == kv_heads == {}), so its KV cache is also {g}x larger than the model \
+                 needs: {} B of K+V at f16 instead of {} B. Build it with \
+                 `DecodeLayer::new_gqa`/`DecodeModel::new_gqa` over \
+                 `GqaConfig::for_serving(layers, q_heads, kv_heads, ..)` instead of passing the \
+                 query-head count as `KvConfig::heads`",
+                gqa.kv_heads() / g,
+                gqa.q_heads(),
+                gqa.kv().kv_bytes(2),
+                gqa.kv().kv_bytes(2) / g,
+            );
+        }
+        return Err(msg);
+    }
+    Ok(())
+}
+
 /// One pre-norm transformer **decode** layer: RMSNorm → Q/K/V proj → append-to-cache → paged attention
 /// → O-proj(+residual) → RMSNorm → SiLU FFN-up → FFN-down(+residual), all on a batch of `Bcap` rows.
 /// Weights upload (f16) and kernels load once at construction.
+///
+/// The layer's head geometry is a [`GqaConfig`], so `Wk`/`Wv` are `[kv_dim, D]` and the cache is
+/// KV-headed. [`new`](Self::new) keeps the multi-head `KvConfig` signature (it means
+/// `GqaConfig::mha`); [`new_gqa`](Self::new_gqa) is the grouped form.
 pub struct DecodeLayer {
     f_norm: CudaFunction,
     f_cast: CudaFunction,
@@ -77,7 +230,8 @@ pub struct DecodeLayer {
     wo: CudaSlice<f16>,
     w1: CudaSlice<f16>,
     w2: CudaSlice<f16>,
-    cfg: KvConfig,
+    /// Head geometry: `gqa.kv()` is the cache config (KV-headed), `gqa.q_heads()` the query heads.
+    gqa: GqaConfig,
     dff: usize,
     eps: f32,
     scale: f32,
@@ -87,21 +241,35 @@ pub struct DecodeLayer {
 }
 
 impl DecodeLayer {
-    /// `D = heads * head_dim` (the hidden size).
+    /// `D = q_heads * head_dim` — the hidden size, and the width of `x`, Q, the attention output and
+    /// every FFN row. **Not** the cached row width under GQA; that is [`kv_dim`](Self::kv_dim).
     #[inline]
     pub fn d(&self) -> usize {
-        self.cfg.heads * self.cfg.head_dim
+        self.gqa.q_dim()
+    }
+    /// `kv_dim = kv_heads * head_dim` — the K/V projection width and the per-token cache footprint.
+    /// Equals [`d`](Self::d) exactly when the layer is multi-head.
+    #[inline]
+    pub fn kv_dim(&self) -> usize {
+        self.gqa.kv_dim()
+    }
+    /// The layer's head geometry (query heads, KV heads, and the cache config).
+    #[inline]
+    pub fn gqa(&self) -> &GqaConfig {
+        &self.gqa
     }
     /// `Bcap` — the fixed decode batch (== cache slots).
     #[inline]
     pub fn bcap(&self) -> usize {
-        self.cfg.num_slots
+        self.gqa.kv().num_slots
     }
 
     /// Upload the weights (narrowed to f16) and load every kernel for **f16 cache storage** (the
-    /// default, bit-exact path). `cfg` is the cache geometry; `dff` the FFN inner dim. Requires
-    /// `D % 64 == 0`, `Dff % 64 == 0`, `Bcap % 64 == 0` (the 64×64 WMMA tile), and
-    /// `head_dim ∈ {64, 128}` (the generated paged-attn kernels).
+    /// default, bit-exact path) — the **multi-head** entry point, kept exactly as it was: `cfg` is the
+    /// cache geometry and its `heads` is taken as both head counts, i.e. this is
+    /// [`new_gqa`](Self::new_gqa) at `GqaConfig::mha(cfg)`. `dff` is the FFN inner dim. See
+    /// [`assert_decode_geometry`] for the shape rules and [`decode_weight_extents`] for the weight
+    /// sizes (here: `Wk`/`Wv` square at `[D, D]`).
     pub fn new(
         g: &mut Gpu,
         w: &TransformerWeights,
@@ -121,28 +289,49 @@ impl DecodeLayer {
         dff: usize,
         dtype: KvDtype,
     ) -> Result<Self, DriverError> {
-        let d = cfg.heads * cfg.head_dim;
-        assert!(
-            d % 64 == 0 && dff % 64 == 0,
-            "D and Dff must be multiples of 64 (WMMA tile)"
-        );
-        assert!(
-            cfg.num_slots % 64 == 0,
-            "Bcap (num_slots) must be a multiple of 64 (WMMA M tile)"
-        );
-        assert!(
-            matches!(cfg.head_dim, 64 | 128),
-            "head_dim must be 64 or 128 (generated paged-attn kernels)"
-        );
-        for (name, wt, len) in [
-            ("wq", w.wq, d * d),
-            ("wk", w.wk, d * d),
-            ("wv", w.wv, d * d),
-            ("wo", w.wo, d * d),
-            ("w1", w.w1, dff * d),
-            ("w2", w.w2, d * dff),
-        ] {
-            assert_eq!(wt.len(), len, "{name} wrong size");
+        Self::new_gqa_with_dtype(g, w, &GqaConfig::mha(cfg), dff, dtype)
+    }
+
+    /// **The grouped-query entry point.** Build the layer for `gqa`'s head geometry with f16 cache
+    /// storage: the cache, `Wk`, `Wv` and the appended K/V are KV-headed (`kv_dim` wide), while `x`,
+    /// `Wq`, `Wo`, Q, the attention output and the whole FFN are query-headed (`D` wide). `q_heads ==
+    /// kv_heads` is MHA and is bit-for-bit [`new`](Self::new).
+    pub fn new_gqa(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        gqa: &GqaConfig,
+        dff: usize,
+    ) -> Result<Self, DriverError> {
+        Self::new_gqa_with_dtype(g, w, gqa, dff, KvDtype::F16)
+    }
+
+    /// [`new_gqa`](Self::new_gqa) with an explicit cache storage dtype — the one real constructor;
+    /// the other three delegate here.
+    pub fn new_gqa_with_dtype(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        gqa: &GqaConfig,
+        dff: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
+        let cfg = *gqa.kv();
+        assert_decode_geometry(gqa, dff);
+        // A weight-extent mismatch is a caller logic bug, not a driver failure — and for `wk`/`wv`
+        // it is the one observable symptom of a query-headed cache geometry, so the message is
+        // load-bearing (see `check_decode_weight_lens`).
+        if let Err(e) = check_decode_weight_lens(
+            gqa,
+            dff,
+            [
+                w.wq.len(),
+                w.wk.len(),
+                w.wv.len(),
+                w.wo.len(),
+                w.w1.len(),
+                w.w2.len(),
+            ],
+        ) {
+            panic!("DecodeLayer weights: {e}");
         }
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
@@ -207,7 +396,7 @@ impl DecodeLayer {
             wo,
             w1,
             w2,
-            cfg,
+            gqa: *gqa,
             dff,
             eps: 1e-5,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
@@ -240,7 +429,7 @@ impl DecodeLayer {
             kv.dtype(),
             "cache storage dtype must match the layer's kernels"
         );
-        let (bcap, d, dff, eps) = (self.bcap(), self.d(), self.dff, self.eps);
+        let (bcap, d, kvd, dff, eps) = (self.bcap(), self.d(), self.kv_dim(), self.dff, self.eps);
         debug_assert_eq!(x_d.len(), bcap * d);
         debug_assert_eq!(out.len(), bcap * d);
         let norm_cfg = LaunchConfig {
@@ -312,8 +501,11 @@ impl DecodeLayer {
         let h1 = norm(pool, x_d, bcap)?;
         let h1_16 = cast(pool, &h1, bcap * d)?;
         let q = gemm16(pool, &self.f_gemm, &h1_16, &self.wq, bcap, d, d)?;
-        let k = gemm16(pool, &self.f_gemm, &h1_16, &self.wk, bcap, d, d)?;
-        let v = gemm16(pool, &self.f_gemm, &h1_16, &self.wv, bcap, d, d)?;
+        // The K/V projections narrow to `kv_dim` — `g` times fewer output columns than Q under GQA,
+        // and the only place the two head counts diverge inside the layer. `kv_dim == d` at MHA, so
+        // this is byte-identical to the pre-GQA code there.
+        let k = gemm16(pool, &self.f_gemm, &h1_16, &self.wk, bcap, d, kvd)?;
+        let v = gemm16(pool, &self.f_gemm, &h1_16, &self.wv, bcap, d, kvd)?;
         // Append the new token's K/V into this layer's cache plane at each slot's write position,
         // then paged decode attention over the (now-updated) cache — the one dtype-dispatched pair.
         // `attn` is pooled *before* the match so the bump sequence is identical on both arms (a
@@ -321,7 +513,7 @@ impl DecodeLayer {
         let mut attn = pool.alloc::<f32>(bcap * d)?;
         match kv {
             KvStorage::F16 { k: kc, v: vc } => {
-                launch_kv_append(
+                launch_kv_append_gqa(
                     stream,
                     &self.f_append,
                     &k,
@@ -331,11 +523,11 @@ impl DecodeLayer {
                     bt_d,
                     wpos_d,
                     active_d,
-                    &self.cfg,
+                    &self.gqa,
                     layer,
                     bcap,
                 )?;
-                launch_paged_attn_decode(
+                launch_paged_attn_decode_gqa(
                     stream,
                     &self.f_attn,
                     &q,
@@ -344,7 +536,7 @@ impl DecodeLayer {
                     &mut attn,
                     bt_d,
                     cl_d,
-                    &self.cfg,
+                    &self.gqa,
                     layer,
                     bcap,
                     self.scale,
@@ -356,7 +548,7 @@ impl DecodeLayer {
                 ksc,
                 vsc,
             } => {
-                launch_kv_append_int8(
+                launch_kv_append_int8_gqa(
                     stream,
                     &self.f_append,
                     &k,
@@ -368,11 +560,11 @@ impl DecodeLayer {
                     bt_d,
                     wpos_d,
                     active_d,
-                    &self.cfg,
+                    &self.gqa,
                     layer,
                     bcap,
                 )?;
-                launch_paged_attn_decode_int8(
+                launch_paged_attn_decode_int8_gqa(
                     stream,
                     &self.f_attn,
                     &q,
@@ -383,7 +575,7 @@ impl DecodeLayer {
                     &mut attn,
                     bt_d,
                     cl_d,
-                    &self.cfg,
+                    &self.gqa,
                     layer,
                     bcap,
                     self.scale,
@@ -429,7 +621,9 @@ pub struct DecodeModel {
     active_d: CudaSlice<u32>,
     /// `[Bcap,D]` ping-pong activations between layers (persistent — outside the pool).
     bufs: [CudaSlice<f32>; 2],
-    cfg: KvConfig,
+    /// Head geometry, shared by every layer. `gqa.kv()` is the cache config the metadata buffers and
+    /// the [`PagedKvCache`] are sized from; `gqa.q_heads()` sizes the activations.
+    gqa: GqaConfig,
     /// [`BlockManager::layout_epoch`](crate::paged_kv::BlockManager::layout_epoch) at the last
     /// `bt_d` upload (`None` = never uploaded). A steady-state decode step whose appends stay
     /// inside their current blocks leaves the epoch unchanged, so
@@ -439,15 +633,25 @@ pub struct DecodeModel {
 }
 
 impl DecodeModel {
-    /// `D = heads*head_dim`.
+    /// `D = q_heads*head_dim` — the hidden size (the `[Bcap,D]` activation width).
     #[inline]
     pub fn d(&self) -> usize {
-        self.cfg.heads * self.cfg.head_dim
+        self.gqa.q_dim()
+    }
+    /// `kv_dim = kv_heads*head_dim` — the cached row width. Equals [`d`](Self::d) at MHA.
+    #[inline]
+    pub fn kv_dim(&self) -> usize {
+        self.gqa.kv_dim()
+    }
+    /// The model's head geometry (query heads, KV heads, cache config).
+    #[inline]
+    pub fn gqa(&self) -> &GqaConfig {
+        &self.gqa
     }
     /// Decode batch (== cache slots).
     #[inline]
     pub fn bcap(&self) -> usize {
-        self.cfg.num_slots
+        self.gqa.kv().num_slots
     }
     /// Layer count.
     #[inline]
@@ -488,16 +692,44 @@ impl DecodeModel {
         pool_bytes: usize,
         dtype: KvDtype,
     ) -> Result<Self, DriverError> {
+        Self::new_gqa_with_dtype(g, weights, &GqaConfig::mha(cfg), dff, pool_bytes, dtype)
+    }
+
+    /// **The grouped-query entry point.** Build the stack for `gqa`'s head geometry with f16 cache
+    /// storage: the [`PagedKvCache`] and every layer's `Wk`/`Wv` are KV-headed, the `[Bcap,D]`
+    /// ping-pong activations are query-headed. A Llama-3-8B geometry
+    /// (`GqaConfig::for_serving(32, 32, 8, 128, ..)`) allocates exactly a quarter of the cache the
+    /// same model would need ungrouped.
+    pub fn new_gqa(
+        g: &mut Gpu,
+        weights: &[TransformerWeights],
+        gqa: &GqaConfig,
+        dff: usize,
+        pool_bytes: usize,
+    ) -> Result<Self, DriverError> {
+        Self::new_gqa_with_dtype(g, weights, gqa, dff, pool_bytes, KvDtype::F16)
+    }
+
+    /// [`new_gqa`](Self::new_gqa) with an explicit cache storage dtype — the one real constructor.
+    pub fn new_gqa_with_dtype(
+        g: &mut Gpu,
+        weights: &[TransformerWeights],
+        gqa: &GqaConfig,
+        dff: usize,
+        pool_bytes: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
+        let cfg = *gqa.kv();
         assert!(!weights.is_empty(), "model needs at least one layer");
         assert_eq!(
             weights.len(),
             cfg.layers,
             "cfg.layers must equal the number of weight sets"
         );
-        let d = cfg.heads * cfg.head_dim;
+        let d = gqa.q_dim();
         let mut layers = Vec::with_capacity(weights.len());
         for w in weights {
-            layers.push(DecodeLayer::new_with_dtype(g, w, cfg, dff, dtype)?);
+            layers.push(DecodeLayer::new_gqa_with_dtype(g, w, gqa, dff, dtype)?);
         }
         let cache = PagedKvCache::new_with_dtype(g.stream.clone(), cfg, dtype)?;
         let pool = DevicePool::new(g.stream.clone(), pool_bytes)?;
@@ -520,7 +752,7 @@ impl DecodeModel {
             wpos_d,
             active_d,
             bufs,
-            cfg,
+            gqa: *gqa,
             uploaded_epoch: None,
         })
     }
@@ -536,7 +768,7 @@ impl DecodeModel {
         x_d: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
-        let active = vec![true; self.cfg.num_slots];
+        let active = vec![true; self.bcap()];
         self.advance_and_upload_masked(stream, &active)?;
         self.run_layers_on(stream, x_d, out)
     }
@@ -618,7 +850,7 @@ impl DecodeModel {
         &mut self,
         stream: &Arc<CudaStream>,
     ) -> Result<Vec<u32>, DriverError> {
-        let active = vec![true; self.cfg.num_slots];
+        let active = vec![true; self.bcap()];
         self.advance_and_upload_masked(stream, &active)
     }
 
@@ -638,7 +870,7 @@ impl DecodeModel {
         stream: &Arc<CudaStream>,
         active: &[bool],
     ) -> Result<Vec<u32>, DriverError> {
-        let bcap = self.cfg.num_slots;
+        let bcap = self.bcap();
         assert_eq!(active.len(), bcap, "active mask must be one bool per slot");
         // **Feasibility pre-pass — the advance must be all-or-nothing.** The loop below mutates the
         // host allocator slot by slot, but the four device metadata uploads happen only after it
@@ -698,10 +930,10 @@ impl DecodeModel {
         wpos: &[u32],
         active: &[u32],
     ) -> Result<(), DriverError> {
-        let bcap = self.cfg.num_slots;
+        let bcap = self.bcap();
         assert_eq!(
             table.len(),
-            bcap * self.cfg.max_blocks_per_seq,
+            bcap * self.gqa.kv().max_blocks_per_seq,
             "flat block table must be [Bcap, max_blocks_per_seq]"
         );
         assert_eq!(cl.len(), bcap, "context lengths must be one per slot");
@@ -1010,7 +1242,7 @@ mod tests {
     use super::*;
     use crate::paged_attention::{
         kv_append_int8_ptx, kv_append_ptx, launch_kv_append, launch_kv_append_int8,
-        quantize_kv_int8, reference_decode_attn, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY,
+        quantize_kv_int8, reference_decode_attn_gqa, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY,
     };
     use crate::paged_kv::BlockManager;
 
@@ -1077,12 +1309,20 @@ mod tests {
     ) -> Vec<f32> {
         // f16 cache: the new token's K/V round through f16 on the way into the cache.
         let f16_row = |row: &[f32]| -> Vec<f32> { row.iter().map(|&z| f16r(z)).collect() };
-        ref_decode_step_with(x, w, past_k, past_v, ctx0, heads, hd, dff, eps, &f16_row)
+        ref_decode_step_with(
+            x, w, past_k, past_v, ctx0, heads, heads, hd, dff, eps, &f16_row,
+        )
     }
 
     /// [`ref_decode_step`] with the **cache rounding of the new token** as a parameter: the f16 path
     /// rounds through f16, the int8 path quantizes/dequantizes per (token, head) — `past_k`/`past_v`
     /// carry whatever effective (already-rounded/dequantized) values the cache stores for the past.
+    ///
+    /// **Grouped-query aware**, and the head counts are what make it an independent oracle of the
+    /// GQA path: the Q/O projections and the row width are `q_heads`-sized, the K/V projections and
+    /// the cached rows are `kv_heads`-sized, and the head mapping comes from
+    /// [`reference_decode_attn_gqa`] (which re-derives it from the definition rather than calling
+    /// `GqaConfig::kv_head_of`). `past_k`/`past_v[b]` are `[ctx0[b], kv_heads, head_dim]`.
     #[allow(clippy::too_many_arguments)]
     fn ref_decode_step_with(
         x: &[f32],
@@ -1090,29 +1330,41 @@ mod tests {
         past_k: &[Vec<f32>],
         past_v: &[Vec<f32>],
         ctx0: &[usize],
-        heads: usize,
+        q_heads: usize,
+        kv_heads: usize,
         hd: usize,
         dff: usize,
         eps: f32,
         cache_round: &dyn Fn(&[f32]) -> Vec<f32>,
     ) -> Vec<f32> {
         let bcap = ctx0.len();
-        let d = heads * hd;
+        let d = q_heads * hd;
+        let kvd = kv_heads * hd;
         let scale = 1.0 / (hd as f32).sqrt();
         let mut out = vec![0f32; bcap * d];
         for b in 0..bcap {
             let xb = &x[b * d..(b + 1) * d];
             let h1 = ref_rmsnorm_row(xb, eps);
             let q = ref_nt_f16(&h1, w.wq, 1, d, d);
-            let kk = ref_nt_f16(&h1, w.wk, 1, d, d);
-            let vv = ref_nt_f16(&h1, w.wv, 1, d, d);
+            // K/V project D -> kv_dim (`Wk`/`Wv` are `[kv_dim, D]`), which is `g`x narrower than Q.
+            let kk = ref_nt_f16(&h1, w.wk, 1, d, kvd);
+            let vv = ref_nt_f16(&h1, w.wv, 1, d, kvd);
             // Full attention context: the cached past ++ the new token (rounded as the cache stores).
             let ctx = ctx0[b];
             let mut kfull = past_k[b].clone();
             let mut vfull = past_v[b].clone();
             kfull.extend(cache_round(&kk));
             vfull.extend(cache_round(&vv));
-            let attn = reference_decode_attn(&q, &[kfull], &[vfull], &[ctx + 1], heads, hd, scale);
+            let attn = reference_decode_attn_gqa(
+                &q,
+                &[kfull],
+                &[vfull],
+                &[ctx + 1],
+                q_heads,
+                kv_heads,
+                hd,
+                scale,
+            );
             let o = ref_nt_f16(&attn, w.wo, 1, d, d);
             let x1: Vec<f32> = xb.iter().zip(&o).map(|(&a, &b)| a + b).collect();
             let h2 = ref_rmsnorm_row(&x1, eps);
@@ -1124,6 +1376,155 @@ mod tests {
             }
         }
         out
+    }
+
+    // ================== GQA serving geometry (pure arithmetic — no device needed) ==================
+
+    /// **A Llama-3-8B decode stack is expressible, and its cache is exactly a quarter.**
+    ///
+    /// 32 query heads over 8 KV heads at head_dim 128 is the geometry every Llama-class serving peer
+    /// (vLLM, TRT-LLM, SGLang) is measured on, and until `serving.rs` carried a query-head count it
+    /// could not be *stated* here at all: `DecodeLayer` read `KvConfig::heads` as the hidden size, so
+    /// the only way to get D = 4096 was `heads = 32`, which allocates all four copies of the KV cache
+    /// the architecture exists to avoid. Every capacity, paging and goodput number would then have
+    /// been measured on a 4x-too-large workload.
+    ///
+    /// This asserts the whole geometry rather than around it: the layer shape rules accept it, the six
+    /// weight extents are the real checkpoint's (`Wk`/`Wv` at `[1024, 4096]`, a quarter of `Wq`), and
+    /// the K+V cache is **exactly** `1/g` of the same pool geometry ungrouped, at every dtype.
+    ///
+    /// Device-free by necessity as well as by preference: the weights alone are ~10 GB at 32 layers,
+    /// so a real Llama-3-8B `DecodeModel` cannot be constructed on the 6 GB part this crate develops
+    /// against. The runtime half of the claim is
+    /// [`serving_decode_step_gqa_matches_reference`], which runs the same `g = 4` grouping at a
+    /// scaled-down width against an f64 oracle.
+    #[test]
+    fn llama3_8b_decode_geometry_is_expressible_at_a_quarter_of_the_mha_cache() {
+        // Llama-3-8B: 32 layers, 32 q-heads / 8 kv-heads x 128, FFN 14336. Bcap 64 (the WMMA M tile),
+        // 8k context per slot.
+        let (layers, q_heads, kv_heads, hd, dff) = (32usize, 32usize, 8usize, 128usize, 14336usize);
+        let (bsz, slots, max_ctx) = (16usize, 64usize, 8192usize);
+        let gqa = GqaConfig::for_serving(layers, q_heads, kv_heads, hd, bsz, slots, max_ctx);
+        let g = gqa.group_size();
+        assert_eq!(g, 4);
+        assert_eq!(gqa.q_dim(), 4096, "hidden size is query-headed");
+        assert_eq!(gqa.kv_dim(), 1024, "the cached row is KV-headed");
+
+        // 1. The layer's own shape rules accept it (this panics if they do not).
+        assert_decode_geometry(&gqa, dff);
+
+        // 2. The six weight extents are a real checkpoint's — Wk/Wv narrow, everything else square.
+        let (d, kvd) = (gqa.q_dim(), gqa.kv_dim());
+        assert_eq!(
+            decode_weight_extents(&gqa, dff),
+            [
+                ("wq", d * d),
+                ("wk", kvd * d),
+                ("wv", kvd * d),
+                ("wo", d * d),
+                ("w1", dff * d),
+                ("w2", d * dff),
+            ]
+        );
+        for (name, want) in [("wk", kvd * d), ("wv", kvd * d)] {
+            assert_eq!(
+                g * want,
+                d * d,
+                "{name} must be exactly {g}x smaller than the ungrouped [D, D]"
+            );
+        }
+        // And a weight set of exactly those extents passes the check the constructor runs.
+        let lens: [usize; 6] = decode_weight_extents(&gqa, dff).map(|(_, n)| n);
+        assert_eq!(check_decode_weight_lens(&gqa, dff, lens), Ok(()));
+
+        // 3. THE CACHE. Same pool geometry with the grouping removed — identical in every axis but
+        //    the head count, so this is a comparison and not a coincidence.
+        let mha = KvConfig::for_serving(layers, q_heads, hd, bsz, slots, max_ctx);
+        assert_eq!(gqa.kv().num_blocks, mha.num_blocks);
+        assert_eq!(gqa.kv().max_blocks_per_seq, mha.max_blocks_per_seq);
+        assert_eq!(gqa.kv().layers, mha.layers);
+        assert_eq!(g * gqa.kv().slab_elems(), mha.slab_elems());
+        for esz in [1usize, 2, 4] {
+            assert_eq!(
+                g * gqa.kv().kv_bytes(esz),
+                mha.kv_bytes(esz),
+                "f{} K+V bytes must be exactly a quarter",
+                esz * 8
+            );
+        }
+        assert_eq!(g * gqa.kv().kv_bytes_int8(), mha.kv_bytes_int8());
+        assert_eq!(gqa.mha_equivalent_kv_bytes(2), mha.kv_bytes(2));
+
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "Llama-3-8B decode stack ({q_heads}q/{kv_heads}kv x {hd}, {layers}L, D={d} kv_dim={kvd} \
+             Dff={dff}, Bcap={slots} x {max_ctx} tok): Wk/Wv [{kvd}, {d}] = {g}x smaller than Wq; \
+             f16 KV cache {:.2} GiB with GQA vs {:.2} GiB without = exactly {g}x",
+            gib(gqa.kv().kv_bytes(2)),
+            gib(mha.kv_bytes(2))
+        );
+    }
+
+    /// **The one GQA mistake the type system cannot prevent must not be silent.**
+    ///
+    /// Nothing in a [`KvConfig`] says whether its `heads` was meant as the query- or the KV-head
+    /// count, so a caller who writes `heads: 32` for a 32q/8kv model gets a correct-but-4x cache and
+    /// no assertion anywhere in [`crate::paged_kv`] can see it. The observable consequence is the K/V
+    /// **projection weight**: that caller then loads a real checkpoint whose `Wk` is `[1024, 4096]`,
+    /// while the multi-head layer they asked for wants `[4096, 4096]`.
+    ///
+    /// So the check must not merely say "wk wrong size" — that sends the reader to their weight
+    /// loader. It must name the exact factor, the implied `kv_heads`, the cache over-allocation in
+    /// bytes, and the constructor to use instead. This pins that wording; without it the message
+    /// would drift back to a bare `assert_eq!` on the next edit and the diagnosis would be lost.
+    #[test]
+    fn a_query_headed_cache_geometry_is_named_by_the_weight_check() {
+        let (layers, q_heads, kv_heads, hd, dff) = (32usize, 32usize, 8usize, 128usize, 14336usize);
+        let (bsz, slots, max_ctx) = (16usize, 64usize, 8192usize);
+        // The MISTAKE: the cache built with the QUERY head count. Correct, and 4x too large.
+        let wrong = GqaConfig::mha(KvConfig::for_serving(
+            layers, q_heads, hd, bsz, slots, max_ctx,
+        ));
+        // The real checkpoint's extents (Wk/Wv KV-headed) — what such a caller actually hands over.
+        let right = GqaConfig::for_serving(layers, q_heads, kv_heads, hd, bsz, slots, max_ctx);
+        let lens: [usize; 6] = decode_weight_extents(&right, dff).map(|(_, n)| n);
+
+        let err = check_decode_weight_lens(&wrong, dff, lens)
+            .expect_err("a GQA checkpoint must not satisfy a multi-head layer's weight extents");
+        for needle in [
+            "wk",
+            "exactly 4x smaller",
+            "GROUPED-QUERY",
+            "kv_heads=8",
+            "new_gqa",
+        ] {
+            assert!(
+                err.contains(needle),
+                "the diagnosis must name {needle:?} — a bare size mismatch does not identify the \
+                 cause. Got: {err}"
+            );
+        }
+        // It must also quote the two cache sizes, so the 4x waste is in the message and not implied.
+        assert!(
+            err.contains(&format!("{} B", wrong.kv().kv_bytes(2)))
+                && err.contains(&format!("{} B", right.kv().kv_bytes(2))),
+            "the message must quote the over-allocated and the needed KV byte counts. Got: {err}"
+        );
+        // The correctly-built layer accepts exactly the same weights.
+        assert_eq!(check_decode_weight_lens(&right, dff, lens), Ok(()));
+        // And an honest MHA model is untouched: no GQA hint where there is no grouping to suggest.
+        let mha_lens: [usize; 6] = decode_weight_extents(&wrong, dff).map(|(_, n)| n);
+        assert_eq!(check_decode_weight_lens(&wrong, dff, mha_lens), Ok(()));
+        let mut off_by_one = mha_lens;
+        off_by_one[1] -= 1; // wk one element short: a real bug, but not a grouping
+        let plain = check_decode_weight_lens(&wrong, dff, off_by_one).expect_err("must reject");
+        assert!(
+            !plain.contains("GROUPED-QUERY"),
+            "an arbitrary wrong size must not be blamed on GQA. Got: {plain}"
+        );
+        eprintln!(
+            "query-headed cache geometry is diagnosed at construction, not tolerated:\n  {err}"
+        );
     }
 
     /// **KV-append scatter correctness.** Appending the new token's K/V via the kernel, then reading the
@@ -1195,7 +1596,8 @@ mod tests {
         });
     }
 
-    /// Build `n` independent layers' weights (owned) + a `TransformerWeights` view per layer.
+    /// Build `n` independent **multi-head** layers' weights (owned) + a `TransformerWeights` view
+    /// per layer. `Wk`/`Wv` square at `[D, D]`.
     #[allow(clippy::type_complexity)]
     fn layer_weights(
         rng: &mut crate::diff::Rng,
@@ -1203,12 +1605,26 @@ mod tests {
         d: usize,
         dff: usize,
     ) -> Vec<[Vec<f32>; 6]> {
+        layer_weights_gqa(rng, n, d, d, dff)
+    }
+
+    /// [`layer_weights`] for a **grouped-query** layer: `Wk`/`Wv` are `[kv_dim, D]`, the shape
+    /// [`decode_weight_extents`] demands and the `g`x-narrower projection a real GQA checkpoint
+    /// ships. Passing `kvd == d` is exactly the multi-head case.
+    #[allow(clippy::type_complexity)]
+    fn layer_weights_gqa(
+        rng: &mut crate::diff::Rng,
+        n: usize,
+        d: usize,
+        kvd: usize,
+        dff: usize,
+    ) -> Vec<[Vec<f32>; 6]> {
         (0..n)
             .map(|_| {
                 [
                     rng.vec(d * d, -0.1, 0.1),
-                    rng.vec(d * d, -0.1, 0.1),
-                    rng.vec(d * d, -0.1, 0.1),
+                    rng.vec(kvd * d, -0.1, 0.1),
+                    rng.vec(kvd * d, -0.1, 0.1),
                     rng.vec(d * d, -0.1, 0.1),
                     rng.vec(dff * d, -0.1, 0.1),
                     rng.vec(d * dff, -0.1, 0.1),
@@ -1232,6 +1648,10 @@ mod tests {
 
     /// Populate a 1-layer model's cache plane with each slot's f16-rounded past context, returning the
     /// `(past_k, past_v)` the reference reuses. Reserves `ctx0[b]` tokens per slot first.
+    ///
+    /// `heads` here is the **KV**-head count — the cache has no query-head axis. A GQA caller passes
+    /// `gqa.kv_heads()` and gets back `[ctx0[b], kv_heads, head_dim]` rows, exactly the layout
+    /// [`reference_decode_attn_gqa`] wants.
     fn populate_one_layer(
         g: &mut Gpu,
         model: &mut DecodeModel,
@@ -1327,6 +1747,180 @@ mod tests {
             eprintln!(
                 "decode step vs f64 ref: max_abs={:.2e} max_rel={:.2e} (Bcap={bcap}, heads={heads}, hd={hd}, Dff={dff}, ragged ctx 0..80)",
                 s.max_abs, s.max_rel
+            );
+        });
+    }
+
+    /// **The GQA decode step, end to end, against an f64 oracle.** The device half of the
+    /// Llama-3-8B claim: the same `g = 4` grouping (8 query heads over 2 KV heads) at a width that
+    /// fits a 6 GB laptop part, run through the real [`DecodeModel`] — RMSNorm, the query-headed Q
+    /// projection *and the KV-headed K/V projections*, the KV-headed append, grouped paged
+    /// attention, the query-headed O-proj and FFN — and compared against
+    /// [`reference_decode_attn_gqa`], which re-derives the head mapping from the definition of GQA
+    /// and shares no code with the launch path.
+    ///
+    /// This is the gate that catches the mistake the refactor could actually make: projecting K/V to
+    /// `D` instead of `kv_dim`. That is not a crash — the append kernel would happily read the first
+    /// `kv_dim` columns of a `D`-wide row and cache a plausible-looking wrong tensor — so only an
+    /// independent oracle at `g > 1` can see it. It also pins the payoff: the allocated cache is
+    /// **exactly** `g`x smaller than the same model ungrouped, measured on the real
+    /// [`PagedKvCache::footprint_bytes`], not on a config.
+    #[test]
+    fn serving_decode_step_gqa_matches_reference() {
+        with_gpu("serving_decode_step_gqa_matches_reference", |g| {
+            // Llama-3-8B's grouping (32/8 = 4) at a laptop-sized width: D = 512, kv_dim = 128.
+            let (q_heads, kv_heads, hd, dff, bsz, bcap) =
+                (8usize, 2usize, 64usize, 256usize, 16usize, 64usize);
+            let (d, kvd) = (q_heads * hd, kv_heads * hd);
+            let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 13) % 81).collect(); // ragged incl. 0
+            let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 8;
+            let kv = KvConfig {
+                layers: 1,
+                heads: kv_heads, // the cache is KV-headed
+                head_dim: hd,
+                block_size: bsz,
+                num_blocks,
+                num_slots: bcap,
+                max_blocks_per_seq: max_bps,
+            };
+            let gqa = GqaConfig::new(kv, q_heads);
+            assert_eq!(gqa.group_size(), 4);
+
+            let mut rng = crate::diff::Rng::new(0x67A0);
+            let wdata = layer_weights_gqa(&mut rng, 1, d, kvd, dff);
+            let weights = weights_view(&wdata);
+            let mut model = DecodeModel::new_gqa(g, &weights, &gqa, dff, 64 * 1024 * 1024).unwrap();
+            assert_eq!(model.d(), d);
+            assert_eq!(model.kv_dim(), kvd);
+
+            // The cache is KV-headed, so `populate_one_layer` is handed `kv_heads`.
+            let (past_k, past_v) = populate_one_layer(g, &mut model, &ctx0, kv_heads, hd, 0x1234);
+            let x = rng.vec(bcap * d, -1.0, 1.0);
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+            model.step_on(&g.stream.clone(), &x_d, &mut out_d).unwrap();
+            g.stream.synchronize().unwrap();
+            let got = g.stream.memcpy_dtov(&out_d).unwrap();
+
+            let f16_row = |row: &[f32]| -> Vec<f32> { row.iter().map(|&z| f16r(z)).collect() };
+            let refv = ref_decode_step_with(
+                &x,
+                &weights[0],
+                &past_k,
+                &past_v,
+                &ctx0,
+                q_heads,
+                kv_heads,
+                hd,
+                dff,
+                1e-5,
+                &f16_row,
+            );
+            let s = crate::diff::assert_close("decode_step_gqa", &got, &refv, 5e-2, 5e-2);
+
+            // The payoff, measured on the allocated slabs: exactly `g`x less KV than the same pool
+            // geometry with the grouping removed.
+            let mha = KvConfig {
+                heads: q_heads,
+                ..kv
+            };
+            let (have, ungrouped) = (model.cache().footprint_bytes(), mha.kv_bytes(2));
+            assert_eq!(
+                gqa.group_size() * have,
+                ungrouped,
+                "the allocated f16 KV cache must be exactly {}x smaller than the ungrouped twin",
+                gqa.group_size()
+            );
+            eprintln!(
+                "GQA decode step ({q_heads}q/{kv_heads}kv x {hd}, g={}, D={d} kv_dim={kvd} Dff={dff}, \
+                 Bcap={bcap}, ragged ctx 0..80) vs f64 GQA ref: max_abs={:.2e} max_rel={:.2e}; \
+                 allocated KV {:.2} MiB vs {:.2} MiB ungrouped = exactly {}x",
+                gqa.group_size(),
+                s.max_abs,
+                s.max_rel,
+                have as f64 / (1 << 20) as f64,
+                ungrouped as f64 / (1 << 20) as f64,
+                gqa.group_size()
+            );
+        });
+    }
+
+    /// **A grouped-query model drives the whole serving stack.** The geometry has to survive
+    /// [`Scheduler`] admission, ragged masked advances, eviction and block recycling — not just one
+    /// `step_on` — or "GQA is supported" means only that one kernel takes two head counts. Drives a
+    /// `g = 4` model to drain: every request completes, useful tokens == Σ gen_len, every KV block
+    /// returns to the pool, and the cache stayed the KV-headed (quarter-sized) one throughout.
+    #[test]
+    fn serving_gqa_scheduler_drains_and_conserves_blocks() {
+        with_gpu("serving_gqa_scheduler_drains_and_conserves_blocks", |g| {
+            let (q_heads, kv_heads, hd, dff, bsz, bcap) =
+                (8usize, 2usize, 64usize, 256usize, 16usize, 64usize);
+            let (d, kvd) = (q_heads * hd, kv_heads * hd);
+            let max_bps = (40usize + 24).div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 32;
+            let gqa = GqaConfig::new(
+                KvConfig {
+                    layers: 2,
+                    heads: kv_heads,
+                    head_dim: hd,
+                    block_size: bsz,
+                    num_blocks,
+                    num_slots: bcap,
+                    max_blocks_per_seq: max_bps,
+                },
+                q_heads,
+            );
+            let mut rng = crate::diff::Rng::new(0x67A1);
+            let wdata = layer_weights_gqa(&mut rng, 2, d, kvd, dff);
+            let weights = weights_view(&wdata);
+            let x = rng.vec(bcap * d, -1.0, 1.0);
+
+            const NREQ: usize = 96;
+            let reqs: Vec<Request> = (0..NREQ)
+                .map(|i| Request {
+                    prompt_len: 1 + (i * 7) % 40,
+                    gen_len: 1 + (i * 5) % 24,
+                })
+                .collect();
+            let total_gen: usize = reqs.iter().map(|r| r.gen_len).sum();
+
+            let model = DecodeModel::new_gqa(g, &weights, &gqa, dff, 64 * 1024 * 1024).unwrap();
+            assert_eq!(model.gqa().group_size(), 4);
+            let init_free = model.cache().manager_ref().free_blocks();
+            let footprint = model.cache().footprint_bytes();
+            let mut sched = Scheduler::new(model);
+            for &r in &reqs {
+                sched.enqueue(r);
+            }
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+            let mut out = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+            let (mut steps, mut peak) = (0usize, 0usize);
+            while !sched.is_idle() {
+                peak = peak.max(sched.step(&g.stream.clone(), &x_d, &mut out).unwrap());
+                steps += 1;
+                assert!(steps < 100_000, "GQA scheduler failed to drain (liveness)");
+            }
+            g.stream.synchronize().unwrap();
+            assert_eq!(sched.completed(), NREQ, "every request completes");
+            assert_eq!(sched.emitted(), total_gen, "useful tokens == Σ gen_len");
+            assert_eq!(
+                sched.free_blocks(),
+                init_free,
+                "all KV blocks returned to the pool (no leak)"
+            );
+            // The cache never stopped being the KV-headed one: a quarter of the query-headed twin.
+            let ungrouped = KvConfig {
+                heads: q_heads,
+                ..*gqa.kv()
+            };
+            assert_eq!(4 * footprint, ungrouped.kv_bytes(2));
+            eprintln!(
+                "GQA scheduler ({q_heads}q/{kv_heads}kv, g=4, 2 layers) drained {NREQ} reqs in {steps} steps: \
+                 {total_gen} tokens, peak batch {peak}/{bcap}, blocks conserved {init_free}, \
+                 KV {:.2} MiB (a quarter of the {:.2} MiB ungrouped twin)",
+                footprint as f64 / (1 << 20) as f64,
+                ungrouped.kv_bytes(2) as f64 / (1 << 20) as f64
             );
         });
     }
@@ -1561,6 +2155,7 @@ mod tests {
                 &past_v,
                 &ctx0,
                 heads,
+                heads, // MHA: q_heads == kv_heads
                 hd,
                 dff,
                 1e-5,
