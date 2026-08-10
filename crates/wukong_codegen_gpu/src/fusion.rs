@@ -374,33 +374,19 @@ pub fn analyze(program: &Program, entry: Symbol, interner: &Interner) -> MegaPla
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
-    use wukong_span::SourceMap;
-
-    /// Build a program from `.wk` source at `opt` (lex -> parse -> sema -> mir_build -> opt).
-    fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
-        let mut sm = SourceMap::new();
-        let id = sm.add("fusion_gate.wk".to_string(), src.to_string());
-        let (tokens, ld) = wukong_lexer::tokenize(sm.source(id), id);
-        if ld.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let mut interner = Interner::new();
-        let (module, pd) =
-            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
-        if pd.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let (sema, sd) = wukong_sema::check(&module, &interner);
-        if sd.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
-        if md.iter().any(|d| d.is_error()) {
-            return None;
-        }
-        wukong_opt::optimize(&mut program, opt);
-        Some((program, interner))
-    }
+    // **The one MIR builder in this crate that used to sit outside the environment lock.** This
+    // module had its own private copy of the lex->parse->sema->mir_build->opt pipeline, which meant
+    // a `build` here could run concurrently with `hostvec::normalized`'s `setenv(WUKONG_P4_NO_256)`
+    // in another test thread. On Windows that is merely serialized by the OS; on glibc `setenv`
+    // racing a concurrent `getenv` is a genuine data race (Rust made `std::env::set_var` `unsafe`
+    // in edition 2024 for exactly this), and `mir_build` calls `var_os(VAR)` at both 256-bit recipe
+    // sites. The seven gates below happen to be switch-insensitive today — proven, not assumed, by
+    // `fusion_eligibility_is_host_vectorizer_invariant` at the bottom of this module — so nothing
+    // was failing; the hazard was that the *next* sensitive fusion gate would become flaky with a
+    // failure that pointed nowhere near its cause. Routing through the shared builder puts every
+    // MIR build in this crate under one lock and, on hosts where the switch can matter, in one
+    // normalized condition.
+    use crate::lower::hostvec::{build, build_in_current_host_mode};
 
     fn plan(src: &str, opt: u8) -> (MegaPlan, Program, Interner) {
         let (program, mut interner) = build(src, opt).expect("frontend ok");
@@ -453,16 +439,13 @@ mod tests {
         }
     }
 
-    /// The **`@parallel` activation shape** is megakernel-eligible. In a *multi-statement* `@parallel`
-    /// function the region runs with `parallel_fn = true`, so at -O2 mir_build interns
-    /// `wukong_vmath_f32_parallel` and inlines it into `main` (verified with `wukongc --emit=mir -O2`;
-    /// the same twin `tests/run/vmath_parallel.wk` gates on the CPU). Before the classification fix
-    /// that name reached `CallClass::Other`, so `analyze` refused the whole program with "entry calls
-    /// unrecognized `wukong_vmath_f32_parallel`" and the megakernel silently declined.
-    #[test]
-    fn parallel_activation_is_eligible() {
+    /// The `@parallel` elementwise-activation shape, `N` large enough that `mir_build`'s 256-bit
+    /// recipe site is reachable. A function rather than a `const` because it interpolates `N`.
+    /// Shared with [`parallel_activation_is_eligible`] and the host-vectorizer invariance gate
+    /// below, which needs the *same* program under both switch settings.
+    fn src_parallel_activation() -> String {
         const N: usize = 1024;
-        let src = format!(
+        format!(
             r#"module t
 @parallel
 fn act(x: [f32; {N}], mut o: [f32; {N}], mut tail: [f32; 1]) {{
@@ -480,7 +463,35 @@ fn main() -> i32 {{
 }}
 "#,
             last = N - 1
-        );
+        )
+    }
+
+    /// The `@parallel` recognized-reduction shape (the other `mir_build` 256-bit recipe site).
+    const SRC_PARALLEL_REDUCE: &str = r#"module t
+@parallel
+fn dotp(x: [f32; 256], y: [f32; 256], mut o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..256 { s = s + x[k] * y[k]; }
+    o[0] = s;
+}
+fn main() -> i32 {
+    let mut x: [f32; 256] = [2.0; 256];
+    let mut y: [f32; 256] = [3.0; 256];
+    let mut o: [f32; 1] = [0.0; 1];
+    dotp(x, y, o); print((o[0]) as i32);
+    return 0;
+}
+"#;
+
+    /// The **`@parallel` activation shape** is megakernel-eligible. In a *multi-statement* `@parallel`
+    /// function the region runs with `parallel_fn = true`, so at -O2 mir_build interns
+    /// `wukong_vmath_f32_parallel` and inlines it into `main` (verified with `wukongc --emit=mir -O2`;
+    /// the same twin `tests/run/vmath_parallel.wk` gates on the CPU). Before the classification fix
+    /// that name reached `CallClass::Other`, so `analyze` refused the whole program with "entry calls
+    /// unrecognized `wukong_vmath_f32_parallel`" and the megakernel silently declined.
+    #[test]
+    fn parallel_activation_is_eligible() {
+        let src = src_parallel_activation();
         let (p, _prog, _i) = plan(&src, 2);
         assert!(p.eligible, "expected eligible, got: {}", p.reason);
         assert!(
@@ -500,22 +511,7 @@ fn main() -> i32 {{
     /// become `wukong_sreduce_f32_parallel` and `main` inlines them.)
     #[test]
     fn parallel_reduce_is_eligible() {
-        let src = r#"module t
-@parallel
-fn dotp(x: [f32; 256], y: [f32; 256], mut o: [f32; 1]) {
-    let mut s: f32 = 0.0;
-    for k in 0..256 { s = s + x[k] * y[k]; }
-    o[0] = s;
-}
-fn main() -> i32 {
-    let mut x: [f32; 256] = [2.0; 256];
-    let mut y: [f32; 256] = [3.0; 256];
-    let mut o: [f32; 1] = [0.0; 1];
-    dotp(x, y, o); print((o[0]) as i32);
-    return 0;
-}
-"#;
-        let (p, _prog, _i) = plan(src, 2);
+        let (p, _prog, _i) = plan(SRC_PARALLEL_REDUCE, 2);
         assert!(p.eligible, "expected eligible, got: {}", p.reason);
         assert!(
             p.coop_ops.iter().any(|c| c.kind == CoopKind::Reduce),
@@ -594,6 +590,158 @@ fn main() -> i32 {
             p.reason.contains("no recognized cooperative op"),
             "reason: {}",
             p.reason
+        );
+    }
+
+    /// **Every gate in this module is host-vectorizer invariant — proven, not asserted.**
+    ///
+    /// The gates above now build their MIR through [`crate::lower::hostvec`], which on a host with
+    /// the raw-AVX2 256-bit loop vectorizer (Win64 only) forces `WUKONG_P4_NO_256=1` so the corpus
+    /// numbers are one number per project rather than one per operating system. That normalization
+    /// is *safe* here only if the eligibility analysis cannot see the switch — and until now that
+    /// was a claim in a comment in `lower.rs`, backed by a one-off manual run someone did once.
+    ///
+    /// A comment is not a gate. `mir_build` reads `WUKONG_P4_NO_256` at exactly two sites — the
+    /// elementwise and the reduction 256-bit `VecKernel` recipes — and both are on the recognized
+    /// `@parallel` paths this module classifies, so a future widening of either recipe (a new
+    /// recognized symbol, a different call shape, a lane-width-dependent inline decision) is
+    /// precisely the change that would make one of these programs eligible under one setting and
+    /// not the other. This sweeps both recipe shapes plus the recognized GEMM under
+    /// [`hostvec::normalized`] and [`hostvec::host_native`] and requires the whole [`MegaPlan`] to
+    /// agree: eligibility, decline reason, and the cooperative-op inventory in order.
+    ///
+    /// Where the switch cannot matter (any non-Win64 host — `switch_can_matter()` is false, the
+    /// environment is never touched, and both wrappers reduce to calling `f`) the two arms are the
+    /// same run by construction, so the invariance half degenerates to running each program twice
+    /// and the non-vacuity half is skipped with a note, exactly as `lower.rs`'s corpus gate does.
+    ///
+    /// **Non-vacuity.** "Both arms agree" is worth nothing if both arms are the same MIR. The
+    /// `MIXED` program below exists for that: a recognized `@parallel` dot (so it is *eligible*,
+    /// not just trivially rejected) beside a 4096-trip `b[i] = a[i]*c[i] + d[i]` loop, which the
+    /// recognizers do **not** claim (`velem` wants `a*x + b*y + c` with scalar coefficients) and
+    /// the 256-bit recipe therefore does. Measured on this host: 1 `Op::VecKernelCall` host-native,
+    /// 0 normalized — genuinely different MIR into `analyze`, identical `MegaPlan` out.
+    #[test]
+    fn fusion_eligibility_is_host_vectorizer_invariant() {
+        use crate::lower::hostvec;
+
+        /// Eligible **and** a 256-bit-recipe carrier — see the non-vacuity note above.
+        const MIXED: &str = r#"module t
+@parallel
+fn dotp(x: [f32; 256], y: [f32; 256], mut o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..256 { s = s + x[k] * y[k]; }
+    o[0] = s;
+}
+fn main() -> i32 {
+    let mut a: [f32; 4096] = [1.0; 4096];
+    let mut b: [f32; 4096] = [0.0; 4096];
+    let mut c: [f32; 4096] = [2.0; 4096];
+    let mut d: [f32; 4096] = [3.0; 4096];
+    for i in 0..4096 { b[i] = a[i] * c[i] + d[i]; }
+    let mut x: [f32; 256] = [2.0; 256];
+    let mut y: [f32; 256] = [3.0; 256];
+    let mut o: [f32; 1] = [0.0; 1];
+    dotp(x, y, o);
+    print((o[0] + b[7]) as i32);
+    return 0;
+}
+"#;
+
+        /// `(MegaPlan, VecKernelCall carriers)` for one arm — the plan is what must match, the
+        /// count is what proves the two arms were fed different MIR. It takes
+        /// [`build_in_current_host_mode`] and never [`build`]: `hostvec`'s `ENV_LOCK` is a plain
+        /// non-reentrant `Mutex`, and this runs *inside* a `normalized`/`host_native` window, so
+        /// calling `build` here would deadlock against itself (the trap `lower.rs`'s corpus
+        /// invariance gate documents at its own sweep).
+        fn probe(src: &str, opt: u8) -> (MegaPlan, usize) {
+            let (program, mut interner) =
+                build_in_current_host_mode(src, opt).expect("frontend ok");
+            let vk = program
+                .funcs
+                .iter()
+                .flat_map(|f| f.blocks.iter())
+                .flat_map(|b| b.insts.iter())
+                .filter(|i| matches!(i.op, Op::VecKernelCall { .. }))
+                .count();
+            let entry = interner.intern("main");
+            (analyze(&program, entry, &interner), vk)
+        }
+
+        let act = src_parallel_activation();
+        let matmul = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/run/matmul_f32.wk"),
+        )
+        .unwrap();
+        let corpus: [(&str, &str); 4] = [
+            ("parallel_activation", act.as_str()),
+            ("parallel_reduce", SRC_PARALLEL_REDUCE),
+            ("matmul_f32", matmul.as_str()),
+            ("mixed_reduce_plus_general_loop", MIXED),
+        ];
+        let ops = |p: &MegaPlan| -> Vec<(CoopKind, String)> {
+            p.coop_ops
+                .iter()
+                .map(|c| (c.kind, c.name.clone()))
+                .collect()
+        };
+        let mut native_carriers = 0usize;
+        let mut norm_carriers = 0usize;
+        for (name, src) in corpus {
+            for opt in [0u8, 2u8] {
+                let (norm, nvk) = hostvec::normalized(|| probe(src, opt));
+                let (native, hvk) = hostvec::host_native(|| probe(src, opt));
+                norm_carriers += nvk;
+                native_carriers += hvk;
+                assert_eq!(
+                    norm.eligible, native.eligible,
+                    "{name}@O{opt}: eligibility depends on the host 256-bit vectorizer \
+                     (normalized {} vs host-native {}) — every gate in this module is built under \
+                     `hostvec::normalized`, so the switch is not allowed to be visible here. Fix \
+                     the analysis or stop normalizing; do not delete this gate.",
+                    norm.eligible, native.eligible
+                );
+                assert_eq!(
+                    norm.reason, native.reason,
+                    "{name}@O{opt}: the decline reason depends on the host 256-bit vectorizer"
+                );
+                assert_eq!(
+                    ops(&norm),
+                    ops(&native),
+                    "{name}@O{opt}: the cooperative-op inventory depends on the host 256-bit \
+                     vectorizer"
+                );
+            }
+        }
+        if !wukong_mir::host_supports_vec_kernels() {
+            eprintln!(
+                "fusion host-vectorizer invariance: {} programs x 2 opt levels agree; non-vacuity \
+                 check skipped — `host_supports_vec_kernels()` is false here, so `mir_build` emits \
+                 no 256-bit recipe and the two arms are the same build by construction.",
+                corpus.len()
+            );
+            return;
+        }
+        assert_eq!(
+            norm_carriers, 0,
+            "the NORMALIZED arm still built {norm_carriers} `Op::VecKernelCall`(s) — \
+             `hostvec::normalized` is supposed to suppress the 256-bit recipe outright, so this \
+             module's gates are not running in the condition they claim to."
+        );
+        assert!(
+            native_carriers > 0,
+            "no program in this gate's corpus produced an `Op::VecKernelCall` on a host where \
+             `host_supports_vec_kernels()` is true, so both arms were handed identical MIR and \
+             'they agree' proves nothing. `MIXED` is the program that is supposed to carry one; \
+             either the recognizers now claim its `a[i]*c[i] + d[i]` loop or the recipe changed. \
+             Find a carrier again rather than deleting this assertion."
+        );
+        eprintln!(
+            "fusion host-vectorizer invariance: {} programs x 2 opt levels, MegaPlan identical \
+             (eligibility, reason, coop-op inventory) — and NON-VACUOUS: the host-native arm built \
+             {native_carriers} `Op::VecKernelCall`(s) the normalized arm did not, so the two arms \
+             really did analyze different MIR.",
+            corpus.len()
         );
     }
 }
