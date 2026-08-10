@@ -2991,8 +2991,10 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
                        + ["--"] + extra, env, check=False)
 
         build_vol.commit()
+        # Parenthesize: with `--no-driver`, rc2 is 0 by construction and the unparenthesized
+        # conditional printed "driver: PASS" for a suite that never ran.
         print(f"\ncodegen_gpu: {'PASS' if rc1 == 0 else 'FAIL'}   "
-              f"driver: {'PASS' if rc2 == 0 else 'FAIL' if driver else 'skipped'}")
+              f"driver: {('PASS' if rc2 == 0 else 'FAIL') if driver else 'skipped'}")
         if rc1 or rc2:
             sys.exit(1)
 
