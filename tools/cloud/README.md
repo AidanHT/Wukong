@@ -146,7 +146,7 @@ answers every "does this scale past 20 SMs" question on the same architecture fo
 | `::ptxas` | **no** | The register / SMEM / spill census, **at every arch**. Resolves `ptxas`, self-tests each target, runs the crate's audit test behind a capture shim, then **recompiles every captured module for each requested arch**, prints the per-arch matrix and writes the raw `ptxas -v` into `/persist/rounds/`. |
 | `::peers` | yes | **The strong-peer battery.** Installs any FlashAttention wheel `::build_peers` staged, resolves every peer, proves Inductor emits Triton, runs the in-tree cuBLAS/cuDNN gates with skips escalated, and runs the Rust strong-peer gate. Fails if a `--require`d peer is missing. |
 | `::test` | yes | The device gates with `WUKONG_GPU_REQUIRED=1`. `--peers` also requires NVRTC/cuBLAS/cuBLASLt/cuDNN. `--strong-peers <list>` declares the §0 bar. `--filter <name>` narrows — and it whitespace-splits, so it can carry libtest *flags* too: the wgmma bring-up gate needs `--filter "--nocapture --test-threads=1 wgmma_hopper_bringup"` because its verdicts are printed, not asserted. |
-| `::bench` | yes | The `#[ignore]`d perf sweeps, release, single-threaded. `--name gemm_pipe_sweep` selects one. `--peers` / `--strong-peers` escalate a missing peer to a failure. **Needs `::build --release` first.** |
+| `::bench` | yes | The `#[ignore]`d perf sweeps, release, single-threaded. `--name gemm_pipe_sweep` selects one. `--peers` / `--strong-peers` escalate a missing peer to a failure. **Needs `::build --release` first.** `--name` is a libtest *substring* filter, so `--name wgmma` runs **both** Act-2 rounds (`wgmma_vs_cublas` + `wgmma_bf16_vs_cublas`) and nothing else — `wgmma_hopper_bringup` is not `#[ignore]`d, so `--ignored` never reaches it. |
 | `::framework` | yes | The `torch.compile` bar: eager / compiled / max-autotune over `gemm`, `linear_gelu` or `sdpa`, fastest wins. |
 | `::cutlass` | yes | The CUTLASS-profiler GEMM bar, with cuBLAS as a same-binary control column. **Needs `::build_peers`.** |
 | `::marlin` | yes | The int4 bar: vLLM's own Marlin (Ampere) / Machete (Hopper) kernel benchmarks. **Needs `::build_peers`.** |
@@ -158,6 +158,7 @@ Options are passed as CLI flags, e.g.:
 modal run tools/cloud/modal_app.py::test --peers --filter gemm
 modal run tools/cloud/modal_app.py::build --release
 modal run tools/cloud/modal_app.py::bench --name flash_tiled_vs_untiled --peers
+modal run tools/cloud/modal_app.py::bench --name wgmma_vs_cublas --peers      # Act 2, item 8 (f16)
 modal run tools/cloud/modal_app.py::framework --op sdpa --causal --shapes 1x16x2048x128
 modal run tools/cloud/modal_app.py::ptxas --archs sm_80,sm_90,sm_90a
 modal shell tools/cloud/modal_app.py::interactive
