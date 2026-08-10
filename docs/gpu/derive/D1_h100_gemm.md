@@ -1,3 +1,20 @@
+> **CORRECTIONS (2026-08-09, after Phase 2 and Waves 1–3 landed).** Several §1.7 / §5 / §6 defects
+> this dossier names were **already fixed by Phase 2 before anyone read it**, and two §7 open
+> questions are now answered. The original text stands with the correction beside it. Index:
+>
+> | Where | Original | Status at HEAD |
+> |---|---|---|
+> | §1.7, §5.1, §5.2, §6 row 8 | *"literal 16 MiB / 48 MiB"* f16 regime thresholds | **CLOSED for f16** — `f16_regime_thresholds(l2_bytes) = (l2*2/3, l2*2)` (`gpu.rs:1039`), machine-checked to reproduce the old literals at the probed 24 MiB by `f16_regime_thresholds_reproduce_the_4050_literals`. **Still literal in the bf16 twin** (`gpu.rs:2494`) — see §5.1's note. |
+> | §1.7, §5.1 | *"`l2_cache_size()` … its only consumer is a bench print"* | **CLOSED** — L2 is probed once into `GpuTarget::l2_bytes` and feeds dispatch through `f16_regime_thresholds`; `l2_cache_size()` reads the descriptor and is cross-checked against it by a device gate (`gpu.rs:7570`). |
+> | §1.7 | *"`sm_count()` falls back to `.unwrap_or(20)`"* | **CLOSED** — every `GpuTarget` field is a driver query with **no defaults**; an unqueryable SM count fails `Gpu::new` (`gpu.rs:26-28`, `:130-131`, `:563`). |
+> | §1.7 | *"Static 48 KiB asserts"* at eight sites | **CLOSED** — replaced by an explicit `smem_budget` parameter and the named `gpu::STATIC_SMEM_CAP`; D6 §5 is landed. |
+> | §6 row 7 | generalise the `swz` XOR phase off `bk == 32` | **STILL OPEN** — `ptx_wmma.rs:2131` / `:2599` still `assert_eq!(bk, 32)`. Re-verified 2026-08-09. |
+> | §7 Q2 | *"Does the driver accept a >48 KiB `.extern .shared` allocation … after `cuFuncSetAttribute`?"* | **ANSWERED, at home, $0** — see the §7 note. |
+> | §7 Q3 | ptxas register allocation for A3/A4 | **Downgraded from "rented GPU" to "CPU container"**, with independent corroboration from NVIDIA's own CUTLASS build — see §2.3 and the §7 note. |
+>
+> Re-verify before spending money: these were checked by reading the current files on 2026-08-09,
+> not by a fresh device round.
+
 > **COORDINATOR CORRECTION (2026-08-06, before commit):** this dossier derives the L2 regime
 > thresholds as `1.33x/4x` of probed L2 — arithmetic that assumed the RTX 4050's L2 is 12 MiB
 > (the spec-sheet figure). The B0 device probe reads `l2_bytes = 25165824` (24 MiB) on the
@@ -213,6 +230,16 @@ Verbatim from PTX ISA §5.1.7 (Shared State Space):
 | `l2_cache_size()` probe exists but feeds only a bench print | `gpu.rs:118`, consumer `gpu.rs:12228` |
 | `sm_count()` falls back to `.unwrap_or(20)` | `gpu.rs:111` |
 
+> **CORRECTION (2026-08-09) — the last four rows are the defects §5 and §6 build on, and Phase 2
+> closed three and a half of them before this dossier was read. Do not re-fix them.**
+>
+> | Row | Status at HEAD, with the citation |
+> |---|---|
+> | Static 48 KiB asserts | **CLOSED.** Every generator that declares `.shared` now takes an explicit `smem_budget: usize` (e.g. `entry_mma_pipe` `ptx_wmma.rs:2085`, assert `:2148`; the whole `ptx_conv` `*_budget` family). The static boundary has a name, `gpu::STATIC_SMEM_CAP` (`gpu.rs:160`), and above it the generator emits the one module-scope `.extern` window (`gpu::DSMEM_DECL`, `:174`) and returns `SmemMode::Dynamic(n)`. D6 §5 is landed. |
+> | 16 MiB / 48 MiB literals | **CLOSED for f16, OPEN for bf16.** `gemm_nt_f16` now derives its bands from the probed L2 via `f16_regime_thresholds` (`gpu.rs:1039`, call site `:1107`). **`gemm_nt_bf16` still branches on a literal `16 * 1024 * 1024` (`gpu.rs:2494`)** — the bf16 twin was not de-literaled, so on a 48 MiB-L2 part it takes the large-GEMM arm at a working set the f16 path calls L2-resident. Found by re-reading the tree on 2026-08-09; no code change was made here (this is a docs-only branch). |
+> | `l2_cache_size()` feeds only a bench print | **CLOSED.** `GpuTarget::l2_bytes` is probed once at `Gpu` construction (`gpu.rs:46-47`) and is a dispatch input; `l2_cache_size()` now reads the descriptor (`gpu.rs:572`) and a device gate asserts the two agree (`gpu.rs:7570`, *"l2_cache_size() diverged from the target"*). |
+> | `sm_count()` `.unwrap_or(20)` | **CLOSED.** `GpuTarget` has **no defaults** — *"a made-up device fact is worse than no device"* (`gpu.rs:26-28`); a non-positive `MULTIPROCESSOR_COUNT` fails `Gpu::new` (`:130-131`), and `sm_count()` reads the descriptor (`:563`). It now feeds real dispatch: `ptx_norm::norm_launch` (`gpu.rs:2959`) and `conv_splitk_factor` (`:3595`). |
+
 ---
 
 ## 2. DERIVED — the SMEM / stage / occupancy lattice
@@ -309,6 +336,30 @@ Hard limits applied: 65 536 regs/SM, 65 536 regs/CTA, 255 regs/thread, 64 warps/
 > runs a warp-specialised persistent kernel with a 4-deep TMA pipeline. **The 4050's occupancy A/B
 > verdicts (`_mc3` lost, `w22` a tie, s3 "measured NEGATIVE") were all taken under a 48 KiB static cap
 > that no longer binds; every one of them must be re-taken, and their sign may flip.**
+
+**CORROBORATION (added 2026-08-09, and it is not ours) — the register wall this section names is
+real at exactly the tile sizes A3/A4 target, and NVIDIA's own kernels hit it.** Building the CUTLASS
+`sm90a` profiler (v4.6.1) on a CPU-only Modal container emitted **112** copies of
+
+```
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized
+                due to insufficient register resources for the wgmma pipeline in the function
+                '..cutlass3x_sm90_tensorop_gemm_f16_f16_f32_.._256x128x64_.._warpspecialized_pingpong..'
+```
+
+— all in the `f16_f16_f32` family, distributed **48 at `256x256x64`, 32 at `256x128x64`, 32 at
+`128x256x64`**, and by scheduler **80 warp-specialised pingpong / 32 warp-specialised cooperative**.
+Log: `bench/gpu/h100/2026-08-09-preflight-build-peers.log:1074-1185`.
+
+This is independent evidence for §2.3's claim, from a different toolchain and a different code
+generator: at 256-wide CTA tiles the Hopper register file is the binding resource even for a library
+that was designed around it and is using warp specialisation to escape exactly this. Two
+consequences. (1) A3/A4's stated kill condition — *"if A3 loses to the 128×128 base, the 1-CTA/SM
+occupancy collapse beats the intensity gain"* — is not hypothetical. (2) **Act 2 does not make the
+wall go away**: `wgmma` moves the accumulator problem, it does not delete it, so §4's "the wgmma
+business case is a predicted 1.4–1.6×" must be read as **conditional on register pressure**, and the
+first Act-2 measurement to take is `ptxas -v` regs/thread, not TFLOPS. (This is corroboration of a
+mechanism, not a measurement of Wukong's kernels — §7 Q3 is still the experiment that settles ours.)
 
 ### 2.4 Wave quantization at 132 SMs
 
@@ -663,6 +714,26 @@ Both readings give the same *shape* of answer, which is why the conclusion is ro
 | if 4050 L2 = 12 MiB | **1.33 × L2** | **4.00 × L2** |
 | if 4050 L2 = 24 MiB | 0.67 × L2 | 2.00 × L2 |
 
+> **STATUS 2026-08-09 — the f16 half of this defect is FIXED, the 24-vs-12 question is settled at
+> 24 MiB by the probe, and the tree therefore took the SECOND row of that table.** `gemm_nt_f16`
+> reads `f16_regime_thresholds(g.target().l2_bytes)` (`gpu.rs:1107`) and the function is
+> `(l2*2/3, l2*2)` (`gpu.rs:1039`) — **not** the 1.33×/4× reading §5.2 recommends below, because that
+> reading assumes a 12 MiB L2 the probe refutes. At the probed 25 165 824 B the pair is exactly
+> `(16 777 216, 50 331 648)` = the old 16/48 MiB literals, so the 4050 dispatch census did not move:
+> `f16_regime_thresholds_reproduce_the_4050_literals` machine-checks that identity, pins the `·2/3`
+> evaluation order (`/3·2` truncates first and gives a different band edge whenever `l2 % 3 == 2`),
+> and its device arm re-confirms the probe on the metal.
+>
+> **The bf16 twin is still literal.** `gemm_nt_bf16` (`gpu.rs:2494`) computes the same `ws_bytes` and
+> compares it against a hardcoded `16 * 1024 * 1024`. On a 48 MiB-L2 part (L4 / L40S) or a 50 MiB one
+> (H100) that arm fires at a working set the f16 path now correctly calls L2-resident, so **the
+> training-precision GEMM would carry the 4050's tuning verdict onto every datacenter card**.
+> Recorded here, unfixed: this is a docs-only branch and `gpu.rs` has one owner.
+>
+> **`l2_cache_size()` is no longer dead:** L2 is a probed `GpuTarget` field (`gpu.rs:46-47`) that
+> feeds dispatch, and `l2_cache_size()` (`gpu.rs:572`) reads that descriptor, gated against it at
+> `gpu.rs:7570`.
+
 ### 5.2 The de-literaled rule and its H100 values
 
 Replace the literals with multiples of the probed `l2_bytes`. Recommended (taking the 12 MiB reading,
@@ -683,6 +754,42 @@ streaming-C (.cs) arm : ws_bytes >= 4 * l2_bytes              // 4.00 x L2
 
 (`ws = 4N²` bytes for a square f16 GEMM, so every threshold moves as `√(L2_new/L2_old)` in N:
 **H100 shifts every crossover up by √(50/12) = 2.04× in N.**)
+
+> **CORRECTION (2026-08-09) — the shipped rule is `2/3×` and `2×`, not `1.33×` and `4×`, and the
+> table above is therefore wrong in its numbers while right in its shape.** The 1.33/4 reading is
+> the one that assumes a 12 MiB 4050 L2; the device probe reads **24 MiB**, and the top-of-file
+> coordinator correction already said so. `f16_regime_thresholds` (`gpu.rs:1039`) implements
+> `(l2·2/3, l2·2)`. Recomputed against the same `ws = 4N²`:
+>
+> | device | probed/spec L2 | `2/3 × L2` | ⇒ square N | `2 × L2` | ⇒ square N |
+> |---|---|---|---|---|---|
+> | RTX 4050 (probed) | 24 MiB | 16 MiB | **2048** | 48 MiB | **3547** |
+> | **L4 (probed on the metal)** | **48 MiB** | **32 MiB** | **≈ 2896** | **96 MiB** | **≈ 5017** |
+> | **H100** | **50 MiB** | **33.3 MiB** | **≈ 2956** | **100 MiB** | **5120** |
+> | A100 | 40 MiB | 26.7 MiB | ≈ 2644 | 80 MiB | ≈ 4580 |
+>
+> The 4050 row is exactly the old literals, which is the point (§5.1's status note). **The L4 row is
+> measured, not derived**: the Phase-1 L4 round probed L2 = 48 MiB and the harness printed the bands
+> as `[32, 96) MiB` — *"A tree still carrying the old hardcoded literals would have mis-dispatched
+> every f16 GEMM on this card"* (`bench/gpu/l4/2026-08-09-session.md`). The A100/H100 rows remain
+> DERIVED. H100's crossovers move up by `√(50/24) = 1.44×` in N from the 4050, not 2.04×.
+>
+> §5.3's shape table below is keyed to the **old** 1.33×/4× crossovers; its `× 50 MiB L2` column is
+> still correct (it is a ratio), but read the "regime" column against **0.67× and 2.0×**, not 1.33×
+> and 4×. Four rows move, and the *sign* of the headline row inverts:
+>
+> | shape | ×L2 | §5.3 says | under the shipped rule |
+> |---|---|---|---|
+> | **4096³** | 1.28× | "just under the raster crossover" | **over it — raster** |
+> | GPT d=1024, M=16384 | 0.80× | L2-resident | **raster** |
+> | GPT d=4096, M=2048 | 2.88× | raster | **raster + streaming C** |
+> | GPT d=4096, M=4096 | 3.20× | raster | **raster + streaming C** |
+>
+> `GPT d=768, M=16384` (0.57×) does **not** move — it stays under `2/3 × L2` — so §5.3's structural
+> note 1 (A+B and C cross L2 at different shapes; the tree conflates them) survives the correction
+> unchanged, and is still the open design item. Note 2 (raster width should key on `sm_count`, not a
+> literal) is also still open: `sm_count()` is now a real probe, but the raster width `r16` is still
+> a constant in the variant tables.
 
 ### 5.3 Where the requested shapes land on H100 (DERIVED)
 
@@ -719,6 +826,20 @@ streaming-C (.cs) arm : ws_bytes >= 4 * l2_bytes              // 4.00 x L2
 
 ## 6. What this changes in `GPU_RETARGET_PLAN.md`
 
+> **STATUS 2026-08-09 — five of these ten are now landed or answered. Read the ledger before acting
+> on a row.**
+>
+> | Row | Status at HEAD |
+> |---|---|
+> | 1 (dynamic SMEM is the only unlock; two `.shared` arrays must become one `.extern`) | **LANDED.** One module-scope window (`gpu::DSMEM_DECL`), per-slab constant offsets, `SmemMode`, `Gpu::function_dyn` / `function_smem` / `dyn_launch_cfg`. Proven on the metal by `dynamic_smem_window_exceeds_the_static_48_kib_ceiling`; D6 §5 carries the seam's design. |
+> | 3 (`sm_90a` is architecture-locked; the emission rule needs a third category) | **LANDED as a rule.** Module headers come from `ptx_target` at per-family floors — `sm_80` for the Ampere-legal families, `sm_89` only for fp8 — enforced crate-wide by the textual law `ptx::every_dispatched_ptx_family_opens_at_the_sm80_floor`, and the fp8 launchers are capability-gated through `Gpu::require_fp8` (`gpu.rs:410`). **The architecture-locked third category this row asked for exists**: `ptx_target::HDR_SM90A_V80` / `TARGET_SM90A`, documented as *"`sm_80`/`sm_89` are floors, `sm_90a` is a lock"*, used by the `ptx_wgmma` family and guarded by a test for the one-byte `sm_90` vs `sm_90a` trap. |
+> | 7 (generalise the `swz` XOR phase off `bk == 32`) | **STILL OPEN**, re-verified: `assert_eq!(bk, 32)` at `ptx_wmma.rs:2131` and `:2599`. Still $0 and still PTX-text-gateable; still a prerequisite for CUTLASS's BK=64 tile. |
+> | 8 (the 16/48 MiB literals) | **HALF LANDED.** f16 derives from probed L2; **bf16 still carries the literal** (`gpu.rs:2494`). The inputs-vs-output predicate split is **not** landed. See §5.1/§5.2's notes. |
+> | 9 (`GpuTarget` must carry a *probed* `smem_per_block_optin`) | **LANDED.** `GpuTarget::smem_per_block_optin` is a driver query with no default; `Gpu::smem_budget()` is what dispatch declines against, and the wide tiles capability-skip loudly on a part that cannot hold them. |
+>
+> Rows 2, 4, 5, 6 and 10 are unchanged predictions/observations; row 5's Act-2 business case should
+> now be read with §2.3's C7511 corroboration attached.
+
 | # | Finding | Plan impact |
 |---|---|---|
 | 1 | **The 48 KiB static-SMEM cap is a PTX-ISA rule for non-`a` targets (§1.6), not a 4050 fact.** | §2.3 calls it a "capability gap" — correct, but the plan implies retagging helps. It does not. **Only the dynamic-SMEM path (Phase 2 step 4) unlocks it on plain `sm_90`.** Phase 2 step 4 is therefore not optional for *any* datacenter tile work. Also: the two `.shared` arrays must become one `.extern` array with computed A/B offsets — a real generator change for C2/C3, not a launch-config change. |
@@ -743,10 +864,48 @@ streaming-C (.cs) arm : ws_bytes >= 4 * l2_bytes              // 4.00 x L2
    module after `cuFuncSetAttribute`?** The PTX ISA text (§1.6) is explicit only about *static* SMEM.
    This is the single assumption Phase 2 step 4 rests on. **It is testable on the 4050 today** (99 KB
    opt-in on `sm_89`) for $0 — do that before renting anything.
+
+   > **ANSWERED — YES, at home, for $0 (2026-08-09).** The permanent gate is
+   > **`gpu.rs::dynamic_smem_window_exceeds_the_static_48_kib_ceiling`**, and it proves it **in both
+   > directions**, which a one-directional test could not:
+   > * **with** the opt-in — a `.extern .shared` window of **64 KiB** (WANT = `64 * 1024`, well past
+   >   the 48 KiB static ISA ceiling) is requested through `Gpu::function_dyn` + `dyn_launch_cfg`,
+   >   the launch succeeds, and every lane is asserted **exact at the far end of the window** (each
+   >   thread reads a slot near the top, so a window that is not really that large cannot pass);
+   > * **without** it — the identical PTX under a second module key, so a fresh `CUfunction` with no
+   >   attribute set, and the identical launch is **refused by the driver**. That is what proves
+   >   step 1 was bought by `cuFuncSetAttribute` and not by some default.
+   >
+   > The probe is tagged at the **`sm_80` floor** (`HDR_SM80`), so the proof is Ampere-legal, not an
+   > Ada special case. It also carries a legitimate capability skip for a device whose opt-in budget
+   > is under 64 KiB. Caveat, stated rather than glossed: this is measured on `sm_89`; the question
+   > as posed said *"plain `.target sm_90`"*, and no `sm_90` device has been touched. The ISA
+   > argument (§1.6: the 48 KiB rule is about *static* SMEM only) plus D6 §1's device mechanics are
+   > what carry it across, and the first H100 hour confirms it for free — every deep row is a
+   > dynamic-window launch.
 3. **Actual registers/thread ptxas allocates for A3/A4.** §2.3's estimates (~185) are derived from the
    generator's declarations, not from `cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS)`. If ptxas
    spills at 128 accumulators, A3 collapses and A2 becomes the top lever. **`--emit`-and-`ptxas`-check
    is free at home** (`WUKONG_PTXAS` env knob already exists).
+
+   > **RECLASSIFIED (2026-08-09): this needs a CPU container, not a rented GPU — and not "home"
+   > either.** Two corrections in one:
+   > * *"free at home"* is **wrong on this box**: there is no `ptxas`, `nvcc` or `nvrtc` installed
+   >   here, so `gemm_cliff_ptxas_ab`'s `WUKONG_PTXAS` knob has nothing to point at and the test
+   >   takes its skip branch (`gpu.rs:17393-17399`). The production path compiles PTX→SASS with the
+   >   *driver's embedded* ptxas via `cuLink`, which is not the standalone tool and does not print
+   >   `-v` register counts.
+   > * **`ptxas` compiles FOR an arch without needing one, and the CUDA devel image has it.** Proven,
+   >   not assumed: `::build_peers --cutlass-arch 90a` built the **CUTLASS `sm90a` profiler (v4.6.1)**
+   >   to completion on a **CPU-only Modal container** — *"device: NONE - CPU container (16 cores /
+   >   32 GiB). nvcc compiles FOR an arch, it does not need one"* — in 1836.9 s for **$0.258** total
+   >   (`bench/gpu/h100/2026-08-09-preflight-build-peers.log`; the metered line reads
+   >   `[meter] build_peers: 1837.0s wall = $0.258`).
+   >
+   > So the honest cost of answering Q3 is **a CPU container**, roughly a rounding error against one
+   > H100 minute, and it should be answered **before** any Act-1/Act-2 GPU hour is bought. The same
+   > build already produced the answer's shape for the peer: 112 `(C7511)` register-pressure
+   > warnings at 256-wide tiles — see §2.3's corroboration note.
 4. **cuBLAS's absolute TFLOPS at 1024³ and 2048³ on the rented part.** §4's percentages at those two
    sizes rest on a predicted denominator. Recording it costs seconds and anchors four predictions.
 5. **Risk #2 (the "legacy 8×`.b32`" f16 WMMA fragment spelling on sm_90 JIT).** A1 at 1024³ dispatches

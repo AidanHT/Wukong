@@ -1,5 +1,30 @@
 # P1 — predict-before-measure: what the device suite should do on a Modal L4
 
+> **STATUS UPDATE (2026-08-09): MEASURED. The round ran on 2026-08-08/09 and Phase 1's L4 bring-up
+> is complete and green.** §0–§6 below are the *pre-registration* and are unedited; the results and
+> the cost ledger live in **`bench/gpu/l4/2026-08-09-session.md`** with the raw logs beside it
+> (`2026-08-08-s0-device-info.log` … `2026-08-09-s3c-peer-smoke-cudnn.log`). Read that file against
+> this one. Headlines, so nobody re-derives them:
+>
+> | Prediction | Outcome |
+> |---|---|
+> | `wukong_codegen_gpu` = **253 / 0 / 87**, counts OS-independent (§0) | **HELD** — 253 passed / 0 failed / 87 ignored, byte-identical split, **zero `[skip]` lines** under `WUKONG_GPU_REQUIRED=1` |
+> | `wukong_driver` = **24 / 0** (§0) | **MISSED, benignly** — read **26**; the +2 are the clippy-campaign regression tests added after this document was written |
+> | `sm_count` = **58**, `cc` = **8.9**, `smem_per_block_optin` = **101 376** (§3.1) | **HELD** — 58 SMs, sm_89, 48 KiB static / **99 KiB opt-in** / 100 KiB per SM |
+> | `l2_bytes` = **50 331 648 (48 MiB)** ⇒ bands `[32, 96) MiB` (§3.2) | **HELD, and load-bearing** — *"A tree still carrying the old hardcoded literals would have mis-dispatched every f16 GEMM on this card"* |
+> | cudarc's CUDA-12 bindings on an r580 / CUDA-13 host (§4, plan risk #3) | **HELD** — driver API **13.0**, runtime 12.9, no diagnostic; plan risk #3 answered for free |
+> | Peer tier resolves from the devel image | **HELD** — cuBLAS + cuBLASLt + NVRTC + cuDNN, zero `peer_gate` skips |
+>
+> Four findings the pre-registration did not anticipate are in the session file: the corpus coverage
+> floors are Windows numbers and L4 reads *higher* for a reason that is an artifact (the Win64-only
+> 256-bit vectorizer), `try_reserve` is not a guard under Linux overcommit (cost ~$1 and two OOM
+> retries), a **release-only** bit-exactness break in `wukong_runtime` that no gate anywhere could
+> see, and the runbook's own logging protocol aborting every run. Total spend **≈$1.26**; ~80% of it
+> was the one avoidable failure.
+>
+> Container round ⇒ **iteration data, not publication data** (plan §6.3). Nothing timed there is
+> quotable.
+
 **Status: PREDICTION. Nothing here was measured on an L4.** Produced 2026-08-07 against the tree at
 `d10d868` (branch `retarget/p1d-expectations`), entirely off-device, per `GPU_RETARGET_PLAN.md` §0
 *"Write down the number you expect and why, then measure."* This document is the **acceptance

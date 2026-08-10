@@ -1,3 +1,19 @@
+> **CORRECTIONS (2026-08-09, after Phase 2 and Waves 1–3 landed).** This dossier was written
+> 2026-08-06 against `0e1b2ea`. Three things have since been *measured* or *machine-checked* and the
+> original text is left standing with the correction beside it, per this repo's retraction habit:
+>
+> | § | Original claim | Status |
+> |---|---|---|
+> | §4.2 row 6 | conv: raising the 44 KiB gate "frees declined shapes" | **REFUTED** — the machine-checked census (`ptx_conv.rs::conv_smem_census_across_target_budgets`, commit `d69e4da`) shows it declined only square filters `R=S>=34`; AlexNet conv1 (11x11) and the ResNet stem (7x7) fit even the *retired* gate. See the note at that row. |
+> | §2, conv row | *"gated `<= 45056` (44 KiB), 'no opt-in to the larger Ada banks'"* | **SUPERSEDED** at `d69e4da` — the gate is now `STATIC_SMEM_CAP` (48 KiB) with a `smem_budget` parameter and a dynamic-window arm. |
+> | §4.1 caveat | *"The residency-dependent verdicts need L40S (142 SMs, Phase 1) or the target itself"* | **HALF WRONG** — the L40S is Ada and has the *same* per-SM SMEM and the same ~99 KiB opt-in as the dev 4050, so no residency verdict moves there. It answers **SM scaling at the same ISA** only. See the note at that paragraph. |
+> | §5 (the whole migration design) | proposal for C2/C3 | **LANDED** — `smem_budget` parameters, `SmemMode`, `DSMEM_DECL`, `Gpu::function_dyn` / `function_smem` / `smem_budget` / `dyn_launch_cfg` all exist. See the §5 status note. |
+>
+> Nothing in §1 changed: the on-device mechanics it proved by scratchpad probe are now a permanent
+> in-tree gate, `gpu.rs::dynamic_smem_window_exceeds_the_static_48_kib_ceiling`, which asserts the
+> window **in both directions** (64 KiB launches and is exact at the far end; the identical launch
+> without `cuFuncSetAttribute` is refused by the driver).
+
 # D6 — Dynamic shared memory: mechanics, closed forms, the decision model, candidates, and the C2/C3 migration design
 
 **Wave 0, GPU retarget campaign** (`GPU_RETARGET_PLAN.md` §0, §2.3 first row, §5 Phase 2 step 4).
@@ -154,7 +170,7 @@ re-derives them).
 | **int8 swz** `gen_int8_smdb_swz_impl` (`ptx_int8.rs:548,575-576`) | `s·(BM+BN)·64` (BK=64 pinned, no pad — the XOR swizzle is the conflict fix) | w64 128×128 s2 = 32768; s3 = 49152 (measured NEGATIVE on 4050, `ptx_int8.rs:941`); 256×128 s2 = 49152 (48 KiB exactly, `ptx_int8.rs:906`) |
 | **int4 W4A16** `entry_w4a16` (`ptx_int4.rs:279-280,303-304`) | `(BM+BN)·16·2` single-stage | small (≤ a few KiB) — not SMEM-bound |
 | **flash pipe family** (`ptx_flash.rs:906-907,958-959`; wide `:1809-1810`; ws3 `:2535-2536,2575`) | `n_buf · 2 · (16·nkb · D · 2)` = `64·n_buf·nkb·D` (K-slab + V-slab per buffer; keys/stage = 16·nkb) | D=64 db = 8192; D=128 db = 16384; D=128 ws3 = 24576; `_mpw{nkb}` scales by nkb |
-| **conv tiled f32** (`ptx_conv.rs:55-58,78,100`) | `((TP+r−1)(TQ+s−1) + KB·r·s)·4`, TP=TQ=16, KB≤8 | gated `≤ 45056` (44 KiB), *"no opt-in to the larger Ada banks"* (`ptx_conv.rs:57`) |
+| **conv tiled f32** (`ptx_conv.rs:55-58,78,100`) | `((TP+r−1)(TQ+s−1) + KB·r·s)·4`, TP=TQ=16, KB≤8 | ~~gated `≤ 45056` (44 KiB), *"no opt-in to the larger Ada banks"* (`ptx_conv.rs:57`)~~ **SUPERSEDED `d69e4da`**: the formula is now the single source `tiled_smem_bytes`, the gate is `tiled_applies_budget(.., smem_budget)` at `STATIC_SMEM_CAP` = 49152 by default, and above that the tile moves into the `.extern` window. The 44 KiB number never had a mechanism behind it. |
 | **conv WMMA implicit-GEMM** (`ptx_conv.rs:642-644,672-674`) | `BM·16·2 + 16·BN·2 + BM·BN·4` — **single-buffered, un-pipelined** | 64×64 ⇒ 4096+16384 = 20480 |
 | megakernel / paged_attention / `ptx.rs` reductions | small statics (≤4 KiB) | out of scope — stay static |
 
@@ -167,6 +183,12 @@ Cross-checks (DERIVED, all match the in-tree comments): mma s2 padded = 40 KiB �
 `conv_tiled_cfg` — whose comment `gpu.rs:2242` states the static-array convention). The ceiling
 test is `gpu.rs:5586-5591` (asserts every `PIPE_VARIANTS` row ≤ 48 KiB inside
 `wmma_pipe_matches_reference_within_tol`).
+
+> **STATUS 2026-08-09 — no longer true, by design.** `Gpu::dyn_launch_cfg` exists (`gpu.rs:223`) and
+> the dynamic families route their launches through it; `STATIC_SMEM_CAP` (`gpu.rs:160`) and
+> `DSMEM_DECL` (`gpu.rs:174`) are the named constants the generators share. `shared_mem_bytes: 0`
+> remains correct for every **static** entry and that is a contract, not an oversight — see §5.2's
+> LANDMINE.
 
 ---
 
@@ -274,8 +296,30 @@ Ranked by information value **for the datacenter targets** (the flag column):
 
 **Explicit 4050 caveat**: the 100 KiB budget does NOT let the 4050 imitate A100 residency (e.g.
 int8 s3 still drops to 2 CTAs locally; on A100 it keeps 3). The 4050's job is #1–#3: correctness,
-mechanism isolation, fp8. The residency-dependent verdicts need L40S (142 SMs, Phase 1) or the
-target itself.
+mechanism isolation, fp8. ~~The residency-dependent verdicts need L40S (142 SMs, Phase 1) or the
+target itself.~~
+
+> **CORRECTION (2026-08-09) — an L40S cannot answer a residency or a wide-tile question.** The L40S
+> is **Ada, cc 8.9**, with the *same* per-SM shared memory and the *same* ~99 KiB per-block opt-in as
+> the dev 4050 (`ptx_wmma.rs`, `WIDE_SMEM_BUDGET`'s doc: *"this laptop and the L40S both cap at
+> 99 KiB"*; D2 §1's device table lists 4050 / L4 / L40S as one `sm_89` column). Per-SM SMEM,
+> warps/SM (48), blocks/SM and the register file are Ada's on both parts, so **every residency
+> verdict the 4050 produces, the L40S reproduces** — `int8 s3` drops to the same CTAs/SM there.
+>
+> What an L40S *does* answer, and it is the only thing: **SM scaling at a fixed ISA** — 142 SMs
+> against the 4050's 20, same PTX, same per-SM limits. That isolates wave quantization, grid sizing,
+> split-K/stream-K and any `sm_count()`-derived launch geometry from every other variable. The L4
+> round already exercised the identity path at 58 SMs (`bench/gpu/l4/2026-08-09-session.md`).
+>
+> The wide tiles are **datacenter-only by construction**: `PIPE_WIDE_VARIANTS` (112–144 KiB) is
+> generated against `WIDE_SMEM_BUDGET = 166912` (A100's opt-in), and on any 99 KiB Ada part every one
+> of its four rows is a **`[skip:capability]`** line in `gpu.rs::gemm_deep_matches_reference_within_tol`
+> — the gate asserts that the skipped set is *exactly* the over-budget set, in both directions. So
+> **only A100 or H100 can run A3/A4.** Renting an L40S to answer a wide-tile question buys four skip
+> lines.
+
+**Correspondingly, the residency-dependent verdicts need the target itself** (A100 or H100), not an
+intermediate Ada part.
 
 ### 4.2 Budget 163 KiB — A100 (no fp8 — capability-gated off; bf16/int8 carry low-precision)
 
@@ -286,7 +330,35 @@ target itself.
 | 3 | **f16/bf16 swz 128×128 s4–s5** (64–80 KiB) at 2 CTAs | 64–80 KiB | 2 | PREDICTION: modest gain at HBM-bound sizes (s* rises with per-SM balance); bf16 twin matters most (training GEMMs, `PIPE_BF16`) |
 | 4 | **f16 CUTLASS-shape 256×128 BK=64 s3** = 144 KiB | 144 KiB | 1 | the known-good A100 shape (CUTLASS default) — but **requires re-deriving the XOR swizzle for BK=64** (the phase is pinned to bk=32, `ptx_wmma.rs:1304`) → this is codegen work, not a budget flip; schedule behind #1–#3 |
 | 5 | flash D=128 mp8 + nkb=2 (33 KiB → 5 CTAs·8 warps = 40 of 64 warps) | 33 KiB | 5 | PREDICTION: the flash lever on A100 is warps-per-CTA × staging width, not raw depth; norm/flash small-S underfill is the §2.7-flagged risk direction |
-| 6 | conv tiled: raise the 44 KiB gate to the budget − epsilon; admit KB=8 at large r·s and 32-wide tiles | ≤160 KiB | — | frees declined shapes; low effort, low risk (single formula + gate change, `ptx_conv.rs:51-59`) |
+| 6 | conv tiled: raise the 44 KiB gate to the budget − epsilon; admit KB=8 at large r·s and 32-wide tiles | ≤160 KiB | — | ~~frees declined shapes; low effort, low risk (single formula + gate change, `ptx_conv.rs:51-59`)~~ **REFUTED — see below** |
+
+> **CORRECTION to row 6 (2026-08-09).** *"Frees declined shapes"* is **wrong**, and the commit that
+> retired the gate says so: `d69e4da` — *"gpu(conv): retire the 44 KiB SMEM gate for a real budget
+> seam — and report that it was declining nothing"*. The deliverable there is a **negative result**,
+> machine-checked by `ptx_conv.rs::conv_smem_census_across_target_budgets`:
+>
+> | budget | bytes | KB=8 | KB=1 |
+> |---|---:|---|---|
+> | retired 44 KiB gate | 45056 | `R=S<=33` | `R=S<=67` |
+> | PTX ISA static cap | 49152 | `R=S<=34` | `R=S<=70` |
+> | RTX 4050 opt-in | 101376 | `R=S<=51` | `R=S<=104` |
+> | A100 opt-in | 166912 | `R=S<=66` | `R=S<=136` |
+> | H100 opt-in | 232448 | `R=S<=78` | `R=S<=162` |
+>
+> With the tile pinned at 16x16 and `kblock <= 8`, the tiled conv's footprint is
+> `((15+R)(15+S) + KB*R*S)*4` — bounded by the **filter**, not by C, H, W or K. So the 44 KiB gate
+> declined exactly the square filters `R=S>=34`, and no convolution anyone runs lives in that band:
+> the same test asserts that AlexNet conv1 (11x11) and the ResNet stem (7x7) fit **even the retired
+> gate**. What actually binds this family is the **1024-thread block cap** (`TILE_P*TILE_Q` threads)
+> and the per-thread `KB` accumulators — neither of which a shared-memory budget touches.
+>
+> **Where a budget IS the only road, and this row should have named it:** the implicit-GEMM CTA
+> tile, whose `BM*BN*4` epilogue scratch dominates. 64x64 = 20480 B, **128x64 = 38912 B — still
+> static-legal, so the cheapest widening needs no window at all**, and 128x128 = 73728 B, over the
+> ISA cap on every target (1 CTA/SM on the 4050, 2 on A100, 3 on H100; all asserted in the same
+> census test). The *replacement* row 6, therefore: **conv implicit-GEMM 128x128 (73728 B)**, ≤163
+> KiB, 2 CTAs/SM on A100 — predicted a loss on the 4050 at 1 CTA/SM and a win on A100/H100, and
+> reachable only through the window.
 
 ### 4.3 Budget 227 KiB — H100 (Act 1: Ampere-class kernels forward-JITted; wgmma is Phase 4)
 
@@ -301,6 +373,20 @@ target itself.
 ---
 
 ## 5. MIGRATION DESIGN for C2/C3 (Phase 2.4)
+
+> **STATUS 2026-08-09: LANDED, essentially as designed.** Kept verbatim because it is the rationale
+> for a seam that now exists, and the "why" is not recorded anywhere else. What shipped, with the
+> in-tree names to grep for:
+>
+> | §5 item | In the tree at HEAD |
+> |---|---|
+> | 5.1 explicit `smem_budget: usize` parameter, generators never read `GpuTarget` | `entry_mma_pipe(.., smem_budget)` (`ptx_wmma.rs:2085`, assert at `:2148`); `conv2d_ptx_budget` / `tiled_applies_budget` / `conv_wmma_ptx_budget` (`ptx_conv.rs`); the 8 hardcoded `48*1024` asserts are gone, replaced by the budget or by `gpu::STATIC_SMEM_CAP` |
+> | 5.2 static ≤ 48 KiB stays byte-identical; window only beyond | `smem_mode_for` + `SmemMode::{Static,Dynamic}`, one module-scope `DSMEM_DECL` (`gpu.rs:174`). Byte-identity is pinned by digest tests (`shipped_conv_ptx_is_byte_identical`, `shipped_wino_ptx_is_byte_identical`, `shipped_entries_are_byte_identical`, `deep_grid_s2_s3_are_the_shipped_cliff_kernels`) |
+> | 5.3 `function_dyn` chokepoint next to `Gpu::function` | `Gpu::function_dyn` (`gpu.rs:462`) and `Gpu::function_smem` (`:503`), plus `Gpu::smem_budget` (`:443`) and `dyn_launch_cfg` (`:223`). The over-budget request is a **loud assert at the seam**, naming the kernel, the request and the device ceiling — the driver's own rejection names none of them |
+> | 5.4 tests | `dynamic_smem_window_exceeds_the_static_48_kib_ceiling` (both directions, on the metal); `gemm_deep_matches_reference_within_tol` (deep + wide rows, with a two-directional capability-skip accounting); `gemm_deep_declines_over_budget_instead_of_downshifting`; `conv2d_ptx_crosses_into_the_dynamic_window_above_the_isa_cap` (device-free) |
+>
+> One item is **not** landed and is deliberately still open: the `_dyn` variants do not change the
+> shipped dispatch on Ada — the wide rows capability-skip there (see §4.1's correction).
 
 ### 5.1 The API decision: **explicit budget parameter — recommended**
 
