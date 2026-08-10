@@ -193,6 +193,19 @@ pub fn require_sm90a(
     })
 }
 
+/// **The one place in this crate that spells the `sm_90a` module header**, and the reason the
+/// capability law stays a one-line scan even though this file now emits *two* Hopper module families
+/// (the GEMM mainloop and the TMA bring-up probe).
+///
+/// Taking the license by reference is not decoration: it makes "produce an `sm_90a` header" a
+/// privileged operation in the type system, so a third emitter added later inherits the gate by
+/// construction. `every_sm90a_emitter_demands_the_license` pins both halves — that
+/// [`HDR_SM90A_V80`] is named nowhere else, and that every function reaching this one carries the
+/// witness in its own signature.
+fn sm90a_header(_license: &Sm90aLicense) -> &'static str {
+    HDR_SM90A_V80
+}
+
 // --- the wgmma shape menu -------------------------------------------------------------------------
 
 /// The input element type. `.dtype` for f16 inputs may be `.f16` or `.f32`; for bf16 it is `.f32`
@@ -220,6 +233,19 @@ impl WgmmaDtype {
     }
     pub const fn size(self) -> usize {
         2
+    }
+
+    /// **The largest integer this input type holds exactly** — 2048 for f16 (11 significand bits),
+    /// **256** for bf16 (8).
+    ///
+    /// The two are the same width and are eight bits apart in precision, which is the trap: a
+    /// bring-up ramp calibrated on f16 runs on the bf16 twin, rounds, and turns an exact `==` verdict
+    /// into an unexplained near-miss. `bringup_operands` is checked against this per row.
+    pub const fn exact_integer_limit(self) -> f32 {
+        match self {
+            WgmmaDtype::F16 => 2048.0,
+            WgmmaDtype::Bf16 => 256.0,
+        }
     }
 }
 
@@ -385,6 +411,29 @@ pub enum DescOrder {
     MnLeading,
 }
 
+impl DescOrder {
+    /// Both readings, in the order the bring-up gate reports them. Exactly one of the two is what
+    /// the silicon does; there is no third possibility and no partial credit.
+    pub const BOTH: [DescOrder; 2] = [DescOrder::KLeading, DescOrder::MnLeading];
+
+    /// The other reading — the one-token A/B `WGMMA_DEVICE_VALIDATION` item 1 is about.
+    pub const fn flipped(self) -> Self {
+        match self {
+            DescOrder::KLeading => DescOrder::MnLeading,
+            DescOrder::MnLeading => DescOrder::KLeading,
+        }
+    }
+
+    /// The spelling a bring-up log prints. ASCII, stable, and the same token a human would type
+    /// into `desc_order:` if the round says this one won.
+    pub const fn label(self) -> &'static str {
+        match self {
+            DescOrder::KLeading => "DescOrder::KLeading",
+            DescOrder::MnLeading => "DescOrder::MnLeading",
+        }
+    }
+}
+
 impl SmemDesc {
     /// The descriptor for a **K-major tile of 16-bit elements** whose rows are `row_bytes` apart --
     /// i.e. exactly what a TMA tiled copy of a row-major `rows x bk` operand leaves in shared memory.
@@ -466,6 +515,23 @@ impl SmemDesc {
             | (encode_desc_field(self.sbo) << 32)
             | ((self.base_offset as u64) << 49)
             | ((self.swizzle as u64) << 62))
+    }
+
+    /// **Where the hardware fetches core matrix `(row_group, k_group)` from**, in bytes, given this
+    /// descriptor's two offset fields.
+    ///
+    /// One formula covers both readings, deliberately. The hardware's reconstruction is fixed --
+    /// it multiplies one field by the row-group index and the other by the k-group index -- and
+    /// [`DescOrder`] decides which of the two geometric distances [`SmemDesc::k_major`] *put* in
+    /// each field. So swapping the order swaps the result of this function, which is precisely the
+    /// statement "the two readings address different elements", and precisely why the wrong one is
+    /// silently wrong data rather than a fault: both land inside the same tile.
+    ///
+    /// This is a **model**, used only to prove the bring-up probe is sensitive enough to tell the
+    /// two apart (`the_two_desc_orders_address_different_elements`). The device verdict does not
+    /// consult it: that is an f64 reference against the launched kernel, and nothing else.
+    pub const fn core_matrix_offset(&self, row_group: u64, k_group: u64) -> u64 {
+        self.start_addr + row_group * self.sbo + k_group * self.lbo
     }
 
     /// The descriptor with its start-address field zeroed -- the part the host can fold into an
@@ -905,9 +971,329 @@ pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[WGMMA_W1, WGMMA_W1_BF16, WGMMA_W3C];
 pub fn wgmma_variant(name: &str) -> &'static WgmmaCfg {
     WGMMA_VARIANTS
         .iter()
+        .chain(WGMMA_BRINGUP_VARIANTS)
         .find(|v| v.name == name)
         .unwrap_or_else(|| panic!("unknown wgmma variant {name:?}"))
 }
+
+// --- bring-up: the DescOrder A/B ------------------------------------------------------------------
+
+/// **[`WGMMA_W1`] with the descriptor's two offset fields swapped** — the second arm of the one-visit
+/// `DescOrder` A/B, and the *only* reason this row exists.
+///
+/// `WGMMA_DEVICE_VALIDATION` item 1 as originally written was "run W1; if it is wrong, flip
+/// `desc_order` and rerun". On rented silicon that is two visits for a coin flip, and
+/// `GPU_RETARGET_PLAN.md` section 0 forbids interactive debugging on metered time. So both readings
+/// are *built* here, both are loaded and launched in the same round, and the hardware picks. The
+/// entry name and the module-cache key both carry the `_mn` suffix, because `Gpu::function` keys on
+/// the string alone and never re-examines the PTX — two descriptor constants under one key would
+/// silently be one kernel, run twice, agreeing perfectly, and the round would "settle" nothing.
+///
+/// This is a **bring-up row, not a shipped one**: it is deliberately outside [`WGMMA_VARIANTS`] so a
+/// launcher cannot pick it by iterating the shipped table. Once the round names a winner, the winner
+/// becomes `WGMMA_W1`'s `desc_order` and this row's job is done.
+pub const WGMMA_W1_MN: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mn",
+    key: "wgmma_nt_f16_128x256x64_s4_mn",
+    desc_order: DescOrder::MnLeading,
+    ..WGMMA_W1
+};
+
+/// Every configuration that exists **only** to be run on the first Hopper part. Kept apart from
+/// [`WGMMA_VARIANTS`] so "what ships" and "what bring-up launches" cannot be confused, and joined to
+/// it wherever a law needs the union (the ASCII, `.target` and `.version` gates all scan both).
+pub const WGMMA_BRINGUP_VARIANTS: &[WgmmaCfg] = &[WGMMA_W1_MN];
+
+/// The two arms of the `DescOrder` A/B, in report order: the shipped reading first.
+///
+/// A launcher that runs both and compares each against an f64 reference settles item 1 in one visit.
+/// **Exactly one must match.** Two matching would mean the probe cannot tell the readings apart at
+/// that geometry (a ramp too symmetric — see [`bringup_operands`]); zero matching means the fault is
+/// somewhere else entirely and the round must say so rather than guess.
+pub const WGMMA_DESC_ORDER_AB: &[&WgmmaCfg] = &[&WGMMA_W1, &WGMMA_W1_MN];
+
+// --- bring-up: operands whose permutation is visible ----------------------------------------------
+
+/// The largest partial sum the bring-up reference may reach and still be an **exact** f32 integer.
+///
+/// f32 represents every integer up to 2^24 exactly, so a dot product of exact-f16 integers whose
+/// running total never passes this bound is computed identically by the tensor cores, by the f64
+/// reference and by any reassociation of either. That turns the `DescOrder` verdict from "within
+/// tolerance" into `==`, which is the difference between a settled question and an argument about
+/// whether 3e-3 is noise.
+pub const BRINGUP_EXACT_LIMIT: f64 = 16_777_216.0;
+
+/// The radix of the bring-up positional code at K = `k`: the largest power of two `w` in `2..=8` for
+/// which `k * w^6 <= 2^24`.
+///
+/// Each operand value is at most `w^3` (three base-`w` digits), so the dot product of `k` terms is
+/// bounded by `k * w^6`. Wide K therefore gets a narrower code — the alternative is a reference that
+/// is only *approximately* right, which is the one thing a bring-up round cannot afford.
+pub fn ramp_radix(k: usize) -> usize {
+    [8usize, 4, 2]
+        .into_iter()
+        .find(|w| (k as f64) * (w.pow(6) as f64) <= BRINGUP_EXACT_LIMIT)
+        .unwrap_or(2)
+}
+
+/// One bring-up operand value: a **three-digit positional code** in base `w`, offset by one so no
+/// value is zero (a zero lane cannot distinguish a wrong address from a right one).
+///
+/// `1 + d0 + w*d1 + w*w*d2`, so a permutation that moves *any* of the three digits changes the value.
+const fn ramp_code(w: usize, d0: usize, d1: usize, d2: usize) -> f32 {
+    (1 + d0 % w + w * (d1 % w) + w * w * (d2 % w)) as f32
+}
+
+/// **The bring-up operands: `A` (`m x k`) and `B` (`n x k`), with ramps a descriptor misreading
+/// cannot hide.**
+///
+/// `WGMMA_DEVICE_VALIDATION` item 1 asks for "distinguishable ramps in A and B", and the word is
+/// load-bearing. The failure being probed permutes which shared-memory *core matrix* an operand
+/// element is fetched from, so an operand that is constant along either core-grid axis — a plain
+/// `A[m][k] = m`, say — produces the identical product under both readings and the round settles
+/// nothing while looking clean. Each value here therefore encodes three positions at three different
+/// digit weights:
+///
+/// | digit | A | B |
+/// |---|---|---|
+/// | `d0` (weight 1) | position *inside* the core matrix | position inside the core matrix, mixed differently |
+/// | `d1` (weight `w`) | core-grid **row** index `m / 8` | core-grid **k** index `k / 8` |
+/// | `d2` (weight `w^2`) | core-grid **k** index `k / 8` | core-grid **row** index `n / 8` |
+///
+/// A and B put the two core-grid indices at *opposite* weights on purpose: a swap that accidentally
+/// left A's product unchanged could not also leave B's unchanged.
+///
+/// Every value is a small integer, hence exactly representable in f16 (integers through 2048 are),
+/// hence the tensor cores multiply exactly what the reference multiplies. [`ramp_radix`] keeps the
+/// accumulation inside [`BRINGUP_EXACT_LIMIT`], so the comparison is `==` rather than a tolerance —
+/// both properties are asserted device-free by `the_bringup_operands_are_exact_in_f16_and_f32`.
+pub fn bringup_operands(m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
+    let w = ramp_radix(k);
+    let mut a = Vec::with_capacity(m * k);
+    for row in 0..m {
+        for col in 0..k {
+            a.push(ramp_code(w, (row % 8) + (col % 8), row / 8, col / 8));
+        }
+    }
+    let mut b = Vec::with_capacity(n * k);
+    for row in 0..n {
+        for col in 0..k {
+            b.push(ramp_code(w, 3 * (row % 8) + (col % 8), col / 8, row / 8));
+        }
+    }
+    (a, b)
+}
+
+/// **The operand the hardware would see**, element by element, when the descriptor's two offset
+/// fields are exchanged (`swapped = true`) or not (`swapped = false`).
+///
+/// This is the descriptor arithmetic run backwards on the host. For a K-major tile of 16-bit
+/// elements whose rows are `row_bytes = 2 * k` apart, a `wgmma` at K step `j0` builds its descriptor
+/// at `slab_base + 32 * j0` and the hardware reconstructs core matrix `(i, j)` — row group `i`, k
+/// group `j` — at `+ i * <one field> + j * <the other>`. Within a core matrix, element `(r, c)` is at
+/// `+ r * row_bytes + 2 * c`, which the two fields do not describe and a swap therefore cannot move.
+/// Substituting the two distances [`SmemDesc::k_major`] derives (`16` and `8 * row_bytes`) gives:
+///
+/// ```text
+/// unswapped: o = 32*j0 + i*8*row_bytes + j*16          + r*row_bytes + 2*c   (the identity)
+/// swapped:   o = 32*j0 + i*16          + j*8*row_bytes + r*row_bytes + 2*c
+/// ```
+///
+/// `rows_per_desc` is how many rows one descriptor covers: 64 for A, where each consumer warpgroup
+/// owns its own `m64` slab, and the full tile height for B, whose `N x 16` operand is described in
+/// one piece. Reads past the operand return **zero**, matching TMA's fill past the last real row.
+///
+/// **This is a model, and it exists to prove the bring-up probe is sensitive — nothing else.** No
+/// device verdict consults it. Its own honesty check is that `swapped = false` must reproduce the
+/// input exactly (`the_two_desc_orders_address_different_elements`): a model that cannot express
+/// "correct" is not modelling the right thing.
+pub fn desc_read(
+    x: &[f32],
+    rows: usize,
+    k: usize,
+    rows_per_desc: usize,
+    swapped: bool,
+) -> Vec<f32> {
+    assert_eq!(x.len(), rows * k, "operand is rows*k");
+    assert!(
+        rows_per_desc.is_multiple_of(8) && k.is_multiple_of(WgmmaShape::K),
+        "the core-matrix grid needs 8 rows and the wgmma K step needs {} elements",
+        WgmmaShape::K
+    );
+    let row_bytes = 2 * k;
+    let mut out = vec![0f32; rows * k];
+    for dst_row in 0..rows {
+        let base_row = (dst_row / rows_per_desc) * rows_per_desc;
+        let (i, r) = ((dst_row - base_row) / 8, (dst_row - base_row) % 8);
+        for dst_col in 0..k {
+            let (j0, rem) = (dst_col / WgmmaShape::K, dst_col % WgmmaShape::K);
+            let (j, c) = (rem / 8, rem % 8);
+            let (fi, fj) = if swapped {
+                (16, 8 * row_bytes)
+            } else {
+                (8 * row_bytes, 16)
+            };
+            let o = 32 * j0 + i * fi + j * fj + r * row_bytes + 2 * c;
+            let (src_row, src_col) = (base_row + o / row_bytes, (o % row_bytes) / 2);
+            out[dst_row * k + dst_col] = if src_row < rows && src_col < k {
+                x[src_row * k + src_col]
+            } else {
+                0.0
+            };
+        }
+    }
+    out
+}
+
+// --- bring-up: the single-stage TMA probe ---------------------------------------------------------
+
+/// Threads the TMA probe launches: one warpgroup, so it exercises the same 128-thread shape the
+/// mainloop's producer does, with nothing else in the kernel.
+pub const TMA_PROBE_THREADS: u32 = 128;
+
+/// The TMA probe's entry symbol.
+///
+/// Deliberately **not** spelled `wgmma_...`: the probe's whole value is that it contains no `wgmma`,
+/// and two laws read that as a substring — `the_tma_stage_probe_is_structurally_a_single_stage_load`
+/// asserts the instruction is absent, and the crate-wide `.version` law licenses a module's ISA floor
+/// by finding an above-7.8 instruction in its text. A name carrying `wgmma` would satisfy both by
+/// accident, which is the quietest way for a law to stop meaning anything. This module earns its
+/// `.version 8.0` from `cp.async.bulk`, honestly.
+pub const TMA_PROBE_ENTRY: &str = "wk_tma_stage_probe";
+
+/// The TMA probe's `Gpu::function` module-cache key. **One key is correct here** precisely because
+/// the kernel is geometry-generic: the transaction size, the tile coordinates and the readback
+/// length are all run-time parameters, so every geometry runs the *same* compiled module rather than
+/// needing a key each (`Gpu::function`'s landmine, from the other direction).
+pub const TMA_PROBE_KEY: &str = "wk_tma_stage_probe";
+
+/// Everything a launcher needs for [`tma_stage_probe_module`], as pure data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TmaProbePlan {
+    pub entry: &'static str,
+    pub module_key: &'static str,
+    pub block: (u32, u32, u32),
+    /// Dynamic shared memory for a tile of `tx_bytes`: the tile itself plus the 8-byte mbarrier that
+    /// sits immediately after it.
+    pub dyn_smem_bytes: usize,
+    /// The `expect_tx` byte count, which must equal `TensorMapArgs::transaction_bytes()` of the map
+    /// being probed. If the two disagree the barrier never completes — this is the cheapest kernel in
+    /// the family on which to find that out.
+    pub tx_bytes: usize,
+}
+
+/// The probe's launch plan for a tile of `tx_bytes`. Declines rather than rounds: a transaction that
+/// is not a multiple of 16 could not have come from a legal TMA box in the first place.
+pub fn tma_probe_plan(tx_bytes: usize) -> Result<TmaProbePlan, String> {
+    if tx_bytes == 0 || !tx_bytes.is_multiple_of(16) {
+        return Err(format!(
+            "{UNSUPPORTED}: TMA probe transaction {tx_bytes} B must be a non-zero multiple of 16"
+        ));
+    }
+    if tx_bytes + 8 > HOPPER_SMEM_PER_CTA {
+        return Err(format!(
+            "{UNSUPPORTED}: TMA probe tile {tx_bytes} B + 8 B barrier exceeds the \
+             {HOPPER_SMEM_PER_CTA} B per-CTA ceiling"
+        ));
+    }
+    Ok(TmaProbePlan {
+        entry: TMA_PROBE_ENTRY,
+        module_key: TMA_PROBE_KEY,
+        block: (TMA_PROBE_THREADS, 1, 1),
+        dyn_smem_bytes: tx_bytes + 8,
+        tx_bytes,
+    })
+}
+
+/// **`WGMMA_DEVICE_VALIDATION` item 4, as a kernel: one TMA tile in, the same bytes out.**
+///
+/// The mainloop asks four things of the hardware at once — a tensor map the driver accepted, a
+/// transaction count that matches what two copies move, a barrier that completes, and a `wgmma` that
+/// reads the tile back through a descriptor. When the answer is wrong, all four are suspects. This
+/// kernel removes three of them: it issues **one** `cp.async.bulk.tensor.2d` against **one** mbarrier,
+/// waits, and copies the raw 16-bit shared bytes straight to global. Compared against a host copy of
+/// the same tile it isolates the descriptor and the transaction count completely, and it does so on a
+/// kernel with no `wgmma`, no warp specialisation, no `setmaxnreg` and no pipeline in it at all.
+///
+/// It is also the right kernel to meet a **hang** on. The `expect_tx` count is the one parameter
+/// whose mismatch does not fail but waits forever, and finding that out here costs one launch of the
+/// simplest module in the family rather than a wedged context.
+///
+/// Geometry-generic on purpose: the transaction size and the tile coordinates are parameters, so one
+/// module and one cache key cover the A tile, the B tile and any ragged corner of either.
+///
+/// Parameter order is `(txBytes: u32, coord0: u32, coord1: u32, out: ptr, tensorMap)`. **`coord0` is
+/// the CONTIGUOUS axis** (`k`, for the row-major operands this family loads) and `coord1` is the row
+/// — dimension 0 is the fastest-varying axis of the descriptor, per `tma_host`'s one memorable fact.
+pub fn tma_stage_probe_module(license: &Sm90aLicense) -> Result<String, String> {
+    let name = TMA_PROBE_ENTRY;
+    let mut s = String::from(sm90a_header(license));
+    s += WGMMA_DSMEM_DECL;
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pTx,\n    .param .u32 pC0,\n\
+         \x20   .param .u32 pC1,\n    .param .u64 pOut,\n    {}\n)\n.maxntid {TMA_PROBE_THREADS}, 1, 1\n{{\n",
+        ptx_param_decl("tmap")
+    );
+    s += "    .reg .pred %p0,%p1;\n";
+    s += "    .reg .b16 %h;\n";
+    s += "    .reg .b32 %tx,%c0,%c1,%lin,%nthr,%i,%elems,%ph;\n";
+    s += "    .reg .b64 %rdOut,%rdS,%rdBar,%rdT,%rdA,%rdTm,%rdSt;\n\n";
+    s += "    ld.param.u32 %tx,[pTx];\n    ld.param.u32 %c0,[pC0];\n    ld.param.u32 %c1,[pC1];\n";
+    s += "    ld.param.u64 %rdOut,[pOut];\n    cvta.to.global.u64 %rdOut,%rdOut;\n";
+    s += &ptx_param_address("%rdTm", "tmap");
+    s += &format!("    mov.u64 %rdS,{WGMMA_DSMEM_SYM};\n");
+    // The barrier sits immediately after the tile, so one parameter fixes the whole layout.
+    s += "    cvt.u64.u32 %rdT,%tx;\n    add.s64 %rdBar,%rdS,%rdT;\n";
+    s += "    shr.u32 %elems,%tx,1;\n";
+    s += "    mov.u32 %lin,%tid.x;\n    mov.u32 %nthr,%ntid.x;\n";
+    // Phase parity lives in a REGISTER, set before any branch, even though it is the constant 0 for
+    // the whole kernel. Not style: the ptxas census (2026-08-10) assembled `try_wait.parity` with a
+    // register operand and `arrive.expect_tx` with an immediate one, so those two operand forms are
+    // the ones this family has evidence for. The probe needs the transaction count to be a register
+    // (that is what makes one module cover every geometry), which leaves the parity as the only
+    // operand it could take on faith -- and an operand form ptxas rejects would fail stage A of the
+    // bring-up and cost the whole visit. A register is legal wherever an immediate is; the converse
+    // is not guaranteed, so the probe spends one `mov` and takes nothing on faith.
+    s += "    mov.u32 %ph,0;\n";
+    s += "    setp.eq.u32 %p0,%lin,0;\n";
+    s += &format!("    @!%p0 bra PROBE_INITED_{name};\n");
+    s += "    mbarrier.init.shared::cta.b64 [%rdBar],1;\n";
+    // Every thread executes the `bar.sync`, which is why the init branch rejoins ABOVE it: a
+    // `bar.sync` some threads skip is a hang, and this kernel exists to not have one.
+    s += &format!("PROBE_INITED_{name}:\n    bar.sync 0;\n");
+    s += &format!("    @!%p0 bra PROBE_WAIT_{name};\n");
+    s += "    mbarrier.arrive.expect_tx.shared::cta.b64 %rdSt,[%rdBar],%tx;\n";
+    s += "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes \
+          [%rdS],[%rdTm,{%c0,%c1}],[%rdBar];\n";
+    // Phase parity 0: a freshly initialised barrier is in parity 0, so this completes exactly when
+    // the transaction does. Same convention, and the same operand form, as the mainloop's consumer.
+    s += &format!("PROBE_WAIT_{name}:\n");
+    s += "    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%ph;\n";
+    s += &format!("    @!%p1 bra PROBE_WAIT_{name};\n");
+    s += "    mov.u32 %i,%lin;\n";
+    s += &format!("PROBE_COPY_{name}:\n");
+    s += &format!("    setp.ge.u32 %p0,%i,%elems;\n    @%p0 bra PROBE_EXIT_{name};\n");
+    s += "    mul.wide.u32 %rdT,%i,2;\n    add.s64 %rdA,%rdS,%rdT;\n";
+    s += "    ld.shared.b16 %h,[%rdA];\n";
+    s += "    add.s64 %rdA,%rdOut,%rdT;\n    st.global.b16 [%rdA],%h;\n";
+    s += "    add.u32 %i,%i,%nthr;\n";
+    s += &format!("    bra PROBE_COPY_{name};\n");
+    s += &format!("PROBE_EXIT_{name}:\n    ret;\n}}\n");
+    Ok(s)
+}
+
+// --- bring-up: the operator's invocation ----------------------------------------------------------
+
+/// **The exact command the first Hopper round runs.** Kept as data so the decline gate on a
+/// non-Hopper part can print it, and so it cannot drift from the test it names.
+///
+/// `--test-threads=1` is not optional: the bring-up gate is a *sequence* whose whole value is that a
+/// failure names which checklist item failed, and libtest interleaves output from concurrent tests.
+/// `--nocapture` is not optional either — libtest swallows a passing test's stderr, and every verdict
+/// this round produces is printed, not asserted.
+pub const WGMMA_BRINGUP_INVOCATION: &str =
+    "WUKONG_GPU_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu \
+     -- --nocapture --test-threads=1 wgmma_hopper_bringup";
 
 /// **What the first H100 hour must confirm, in priority order** -- this family's own list of claims
 /// no test in this repo can reach, kept as data so a bring-up script can print it.
@@ -916,27 +1302,43 @@ pub fn wgmma_variant(name: &str) -> &'static WgmmaCfg {
 /// this environment, so everything below is unproven text until it runs. Work down the list; each
 /// item's failure mode is stated because several of them are silent.
 pub const WGMMA_DEVICE_VALIDATION: &[&str] = &[
-    "1. DescOrder. Run W1 at M=N=K=64 against an f64 reference with distinguishable ramps in A and \
-     B. If it is wrong, flip `desc_order` to DescOrder::MnLeading and rerun. Nothing downstream \
-     means anything until this is settled, and the wrong choice is silently wrong data, not a JIT \
-     error: it is the one place the ISA's naming of the descriptor's two offset fields was read \
-     from a figure rather than confirmed.",
-    "2. The module loads at all -- cuModuleLoadData on the generated text. First check of the \
-     `.target sm_90a` header, of `.version 8.0`, and of every instruction spelling in the family.",
+    "1. DescOrder, settled in ONE visit. `wgmma_hopper_bringup` stage D launches BOTH readings -- \
+     W1 (KLeading) and WGMMA_W1_MN (MnLeading), separate entries under separate module keys -- at \
+     M=N=K=64 against an f64 reference over `bringup_operands`, whose three-digit positional ramps \
+     make a core-matrix permutation visible in A and in B. Exactly one must match, bit-exactly \
+     (the operands are exact in f16 and the dot product stays under 2^24, so the verdict is `==`, \
+     not a tolerance). Two matching means the probe cannot tell the readings apart; zero matching \
+     means the fault is elsewhere and the round says so. Nothing downstream means anything until \
+     this is settled, and the wrong choice is silently wrong data, not a JIT error: it is the one \
+     place the ISA's naming of the descriptor's two offset fields was read from a figure rather \
+     than confirmed.",
+    "2. The module loads at all -- cuModuleLoadData on the generated text (`wgmma_hopper_bringup` \
+     stage A, which loads every shipped row AND both A/B arms AND the TMA probe before launching \
+     anything). First check of the `.target sm_90a` header, of `.version 8.0`, and of every \
+     instruction spelling in the family.",
     "3. setmaxnreg and the register split -- cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS) plus a \
      spill check (ptxas -v via WUKONG_PTXAS, or the JIT log). If ptxas cannot fit a consumer's 128 \
      accumulators plus addressing inside 232 registers, consumer_regs must rise and producer_regs \
      fall; the budget assert in WgmmaCfg::validate will keep the pair honest.",
-    "4. The TMA descriptors -- cuTensorMapEncodeTiled succeeding for the A and B geometries at each \
-     benched shape, then a single-stage load compared against a host copy of the same tile.",
-    "5. The pipeline does not hang. The expect_tx count is WgmmaCfg::stage_tx_bytes; if it \
+    "4. The TMA descriptors (`wgmma_hopper_bringup` stage B) -- cuTensorMapEncodeTiled succeeding \
+     for the A and B geometries at each benched shape, then `tma_stage_probe_module`: a \
+     single-stage load compared against a host copy of the same tile, on a kernel with no wgmma, no \
+     warp specialisation and no pipeline in it, so a mismatch accuses the descriptor and nothing \
+     else.",
+    "5. The pipeline does not hang (`wgmma_hopper_bringup` stage C, and the time-box that wraps \
+     every launch in this family). The expect_tx count is WgmmaCfg::stage_tx_bytes; if it \
      disagrees with what the two copies actually move, the barrier never completes and every \
-     consumer waits forever. Time-box the first launch.",
+     consumer waits forever. `gpu::sync_within` polls cuStreamQuery to a deadline and ENDS THE \
+     PROCESS with a diagnosis rather than billing rented silicon until the container timeout; \
+     WUKONG_GPU_LAUNCH_TIMEOUT_MS tunes it.",
     "6. The producer warpgroup returns with copies possibly still in flight (CUTLASS's producer \
      tail exists for barrier lifetime, which a CTA whose consumers are still running does not \
-     need). Confirm no hang and no early SMEM reclaim.",
-    "7. Ragged shapes -- M, N and K each not a multiple of the tile, against the f64 reference, to \
-     confirm TMA's zero fill and the predicated epilogue together cover the edges.",
+     need). `wgmma_hopper_bringup` stage E sweeps K across the ring depth -- fewer K tiles than \
+     stages (the producer exits while consumers still wait), exactly as many, and several wraps -- \
+     confirming no hang and no early SMEM reclaim, against the reference each time.",
+    "7. Ragged shapes (`wgmma_hopper_bringup` stage F) -- M, N and K each not a multiple of the \
+     tile, against the f64 reference, to confirm TMA's zero fill and the predicated epilogue \
+     together cover the edges.",
     "8. Only then, performance: same-run adjacent A/B against cuBLAS at 4096 and 8192 cubed, with \
      bench_instrument's twin control passing.",
 ];
@@ -948,9 +1350,9 @@ pub const WGMMA_DEVICE_VALIDATION: &[&str] = &[
 /// Requires an [`Sm90aLicense`]: `sm_90a` text cannot be produced by a path that has not established
 /// the device is Hopper. Returns `Err` with an [`UNSUPPORTED`]-prefixed message for any shape this
 /// generator cannot express -- **never** plausible-but-wrong PTX.
-pub fn wgmma_module(cfg: &WgmmaCfg, _license: &Sm90aLicense) -> Result<String, String> {
+pub fn wgmma_module(cfg: &WgmmaCfg, license: &Sm90aLicense) -> Result<String, String> {
     let shape = cfg.validate()?;
-    let mut m = String::from(HDR_SM90A_V80);
+    let mut m = String::from(sm90a_header(license));
     m += WGMMA_DSMEM_DECL;
     m += &entry(cfg, shape)?;
     Ok(m)
@@ -1192,21 +1594,36 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
 /// and ASCII laws scan.
 ///
 /// It is shaped as a `Vec<(String, String)>` on purpose: that is the exact shape of
-/// `gpu.rs`'s `device_free_modules()`, so the wiring commit splices this family into the crate-wide
-/// `.version` law with one line (`v.extend(crate::ptx_wgmma::wgmma_device_free_modules());`) and one
-/// number (`EXPECTED_MODULES += 3`). Until then, `the_family_declares_no_floor_it_does_not_need`
-/// below applies the identical rule over the identical corpus, so the family is covered rather than
-/// invisible.
+/// `gpu.rs`'s `device_free_modules()`, which splices this family into the crate-wide `.version` law
+/// with one line (`v.extend(crate::ptx_wgmma::wgmma_device_free_modules());`) and one number
+/// (`EXPECTED_MODULES`). `the_family_declares_no_floor_it_does_not_need` below applies the identical
+/// rule over the identical corpus.
+///
+/// **The bring-up modules are in it too**, deliberately: the `MnLeading` A/B arm and the TMA stage
+/// probe are text this backend will hand to `cuModuleLoadData` on rented silicon, so the ASCII rule,
+/// the `sm_90a` floor and the `.version` law must reach them exactly as they reach a shipped row. A
+/// module that only bring-up loads is still a module that can be one stray `->` away from a
+/// `ptxas fatal` at the worst possible moment.
 pub fn wgmma_device_free_modules() -> Vec<(String, String)> {
     let license = Sm90aLicense::for_probed_cc((9, 0)).expect("(9,0) is Hopper");
-    WGMMA_VARIANTS
+    let mut v: Vec<(String, String)> = WGMMA_VARIANTS
         .iter()
         .map(|c| {
             let ptx = wgmma_module(c, &license)
                 .unwrap_or_else(|e| panic!("shipped variant {} must generate: {e}", c.name));
             (format!("wgmma::{}", c.name), ptx)
         })
-        .collect()
+        .collect();
+    for c in WGMMA_BRINGUP_VARIANTS {
+        let ptx = wgmma_module(c, &license)
+            .unwrap_or_else(|e| panic!("bring-up variant {} must generate: {e}", c.name));
+        v.push((format!("wgmma::bringup/{}", c.name), ptx));
+    }
+    v.push((
+        format!("wgmma::bringup/{TMA_PROBE_ENTRY}"),
+        tma_stage_probe_module(&license).expect("the TMA stage probe must generate"),
+    ));
+    v
 }
 
 #[cfg(test)]
@@ -1242,10 +1659,14 @@ mod tests {
     }
 
     /// **The textual half of the capability law.** The structural half is the type: [`wgmma_module`]
-    /// takes an `&Sm90aLicense`, so ungated `sm_90a` PTX does not compile. This scan closes the one
-    /// remaining hole -- a *new* function in this file that builds a header string itself instead of
-    /// going through the generator -- by requiring that any function naming the `sm_90a` header also
-    /// names the license.
+    /// and [`tma_stage_probe_module`] take an `&Sm90aLicense`, so ungated `sm_90a` PTX does not
+    /// compile. This scan closes the one remaining hole -- a *new* function in this file that builds
+    /// a header string itself instead of going through [`sm90a_header`].
+    ///
+    /// The law is stated over the funnel rather than over one named generator, because the family now
+    /// emits two module shapes and will emit more. Two clauses: [`HDR_SM90A_V80`] is named nowhere
+    /// but the `use` and [`sm90a_header`]'s body, and **every** function that calls `sm90a_header`
+    /// carries the witness in its own signature.
     #[test]
     fn every_sm90a_emitter_demands_the_license() {
         let src = include_str!("ptx_wgmma.rs");
@@ -1253,25 +1674,57 @@ mod tests {
             .split("\n#[cfg(test)]")
             .next()
             .expect("the test module is cut off at its column-0 attribute");
-        // The header constant is referenced exactly once outside the tests: in `wgmma_module`, whose
-        // signature carries the license.
+        // Prose is not code: a doc comment naming `fn ` or the header constant must not satisfy or
+        // trip the scan.
+        let code: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let uses: Vec<&str> = code
             .lines()
-            .filter(|l| l.contains("HDR_SM90A_V80") && !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("HDR_SM90A_V80"))
             .collect();
         assert_eq!(
             uses.len(),
             2,
-            "expected exactly the `use` and the single emission site; found {uses:#?}"
+            "expected exactly the `use` and the single site inside `sm90a_header`; found {uses:#?}"
         );
-        let generator = code
-            .split_once("pub fn wgmma_module(")
-            .expect("wgmma_module must exist")
+        let funnel = code
+            .split_once("fn sm90a_header(")
+            .expect("the single header site must exist")
             .1;
-        let sig = generator.split_once(')').unwrap().0;
         assert!(
-            sig.contains("Sm90aLicense"),
-            "the only sm_90a emitter must take a capability witness: {sig}"
+            funnel.split_once(')').unwrap().0.contains("Sm90aLicense"),
+            "the header funnel itself must demand the witness"
+        );
+        // Every function whose body reaches the funnel takes the license. `fn ` splits cleanly here:
+        // comments are gone and no signature in this file contains a brace.
+        let mut emitters: Vec<String> = Vec::new();
+        for chunk in code.split("fn ").skip(1) {
+            let (sig, after) = match chunk.split_once('{') {
+                Some(p) => p,
+                None => continue,
+            };
+            let body = after.split("\n}").next().unwrap_or(after);
+            if body.contains("sm90a_header(") {
+                let name = sig.split('(').next().unwrap_or(sig).trim().to_string();
+                assert!(
+                    sig.contains("Sm90aLicense"),
+                    "`{name}` emits an sm_90a header without a capability witness in its signature: \
+                     {sig}"
+                );
+                emitters.push(name);
+            }
+        }
+        emitters.sort();
+        assert_eq!(
+            emitters,
+            vec![
+                "tma_stage_probe_module".to_string(),
+                "wgmma_module".to_string()
+            ],
+            "the set of sm_90a emitters changed -- add the new one deliberately"
         );
         // And nothing else in the file may spell the target directly.
         assert!(
@@ -1724,7 +2177,12 @@ mod tests {
             "e5m2",
         ];
         let mods = wgmma_device_free_modules();
-        assert_eq!(mods.len(), 3, "W1 f16, W1 bf16, W3c");
+        assert_eq!(
+            mods.len(),
+            WGMMA_VARIANTS.len() + WGMMA_BRINGUP_VARIANTS.len() + 1,
+            "W1 f16, W1 bf16, W3c, the MnLeading A/B arm, and the TMA stage probe"
+        );
+        assert_eq!(mods.len(), 5);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -2145,6 +2603,12 @@ mod tests {
 
     /// The unproven-claims list is the honest half of this module and must not quietly empty out or
     /// lose its head item. It is also printed into bring-up logs, so it stays ASCII.
+    ///
+    /// Every item except 3 and 8 must now name the gate that discharges it. Item 3 (registers and
+    /// spills) is already answered by the CPU ptxas census at `sm_90a` -- 168 regs whole-CTA and zero
+    /// spills on all three rows, which `setmaxnreg` then splits 32p/232c on the two 128x256 s4 rows
+    /// and 32p/168c on the 128x128 s6 one -- and item 8 (performance vs cuBLAS) is explicitly
+    /// downstream of correctness. An item that names no gate is an item nobody will run.
     #[test]
     fn the_device_validation_list_is_intact() {
         assert_eq!(WGMMA_DEVICE_VALIDATION.len(), 8);
@@ -2152,6 +2616,386 @@ mod tests {
         for item in WGMMA_DEVICE_VALIDATION {
             assert!(item.is_ascii(), "{item}");
             assert!(item.len() > 40);
+        }
+        for i in [0usize, 1, 3, 4, 5, 6] {
+            assert!(
+                WGMMA_DEVICE_VALIDATION[i].contains("wgmma_hopper_bringup"),
+                "item {} names no gate: {}",
+                i + 1,
+                WGMMA_DEVICE_VALIDATION[i]
+            );
+        }
+        assert!(
+            WGMMA_DEVICE_VALIDATION[2].contains("ptxas"),
+            "item 3 is answered by the CPU ptxas census and must say so"
+        );
+    }
+
+    /// The operator's invocation is data, so it cannot drift from the gate it names.
+    #[test]
+    fn the_bringup_invocation_names_the_gate_and_the_flags_it_needs() {
+        let inv = WGMMA_BRINGUP_INVOCATION;
+        assert!(inv.is_ascii());
+        for need in [
+            "WUKONG_GPU_REQUIRED=1",
+            "--features gpu",
+            "--nocapture",
+            "--test-threads=1",
+            "wgmma_hopper_bringup",
+        ] {
+            assert!(
+                inv.contains(need),
+                "the invocation must carry {need:?}: {inv}"
+            );
+        }
+    }
+
+    // --- bring-up: the DescOrder A/B is a real A/B ------------------------------------------------
+
+    /// f64 reference for `C = A.Bt`, independent of every descriptor, encoder and generator in this
+    /// file -- it reads the operand arrays and nothing else.
+    fn ref_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0f32; m * n];
+        for (i, crow) in c.chunks_exact_mut(n).enumerate() {
+            for (j, cij) in crow.iter_mut().enumerate() {
+                let mut acc = 0f64;
+                for kk in 0..k {
+                    acc += a[i * k + kk] as f64 * b[j * k + kk] as f64;
+                }
+                *cij = acc as f32;
+            }
+        }
+        c
+    }
+
+    /// **The probe must be able to tell the two readings apart.** This is the device-free half of
+    /// `WGMMA_DEVICE_VALIDATION` item 1: if the two `DescOrder`s addressed the same elements, or if
+    /// the ramps were symmetric enough that the permutation cancelled, the H100 round would report
+    /// "both matched" and settle nothing while looking perfect.
+    ///
+    /// Three clauses, increasingly concrete: the packed descriptors differ; the two readings fetch
+    /// core matrix `(i, j)` from different addresses whenever `i != j`; and applying the resulting
+    /// permutation to the actual bring-up operands changes almost every lane of the product.
+    #[test]
+    fn the_two_desc_orders_address_different_elements() {
+        // BK = 64 f16 -> 128-byte rows, the geometry every shipped row uses.
+        let row_bytes = 128u64;
+        let k = SmemDesc::k_major(0, row_bytes, DescOrder::KLeading, SmemSwizzle::None);
+        let m = SmemDesc::k_major(0, row_bytes, DescOrder::MnLeading, SmemSwizzle::None);
+        assert_ne!(k.pack().unwrap(), m.pack().unwrap());
+        assert_ne!(k.const_part().unwrap(), m.const_part().unwrap());
+        assert_eq!(DescOrder::KLeading.flipped(), DescOrder::MnLeading);
+        assert_eq!(DescOrder::MnLeading.flipped(), DescOrder::KLeading);
+        assert_eq!(DescOrder::BOTH, [DescOrder::KLeading, DescOrder::MnLeading]);
+
+        // Core matrix (i, j) of a 64-row A slice: 8 row groups x 8 k groups.
+        let mut same = 0usize;
+        for i in 0..8u64 {
+            for j in 0..8u64 {
+                let (ka, ma) = (k.core_matrix_offset(i, j), m.core_matrix_offset(i, j));
+                if i == j {
+                    assert_eq!(ka, ma, "the diagonal is fixed by any swap");
+                    same += 1;
+                } else {
+                    assert_ne!(
+                        ka, ma,
+                        "core matrix ({i},{j}) must move when the two offset fields swap"
+                    );
+                }
+                // Both stay inside the 64x64 f16 slice, which is exactly why the wrong reading is
+                // silently wrong data and not a fault.
+                assert!(ka < 64 * row_bytes && ma < 64 * row_bytes);
+            }
+        }
+        assert_eq!(same, 8);
+
+        // ...and the ramps make that visible in the product. `desc_read` is the descriptor
+        // arithmetic run backwards on the host: the device verdict never consults it, but the
+        // probe's SENSITIVITY does, and an over-simple model would overstate that sensitivity.
+        //
+        // Per-descriptor row counts matter. A is described one consumer m64 slab at a time; B's
+        // `N x 16` operand is described in one piece over the CTA tile's full width.
+        let (m64, n64, k64) = (64usize, 64usize, 64usize);
+        let (a_rows_per_desc, b_rows_per_desc) = (WGMMA_W1.bm / WGMMA_W1.consumer_wgs, WGMMA_W1.bn);
+        assert_eq!(a_rows_per_desc, WgmmaShape::M);
+        let (a, b) = bringup_operands(m64, n64, k64);
+
+        // The model's own honesty check: with the fields as written it must reproduce the operand
+        // exactly. A model that cannot express "correct" is not modelling the descriptor.
+        assert_eq!(
+            desc_read(&a, m64, k64, a_rows_per_desc, false),
+            a,
+            "A, fields as written"
+        );
+        assert_eq!(
+            desc_read(&b, n64, k64, b_rows_per_desc, false),
+            b,
+            "B, fields as written"
+        );
+
+        let want = ref_nt(&a, &b, m64, k64, n64);
+        let a_sw = desc_read(&a, m64, k64, a_rows_per_desc, true);
+        let b_sw = desc_read(&b, n64, k64, b_rows_per_desc, true);
+        assert_ne!(a_sw, a, "the swap must move A");
+        assert_ne!(b_sw, b, "the swap must move B");
+        let got = ref_nt(&a_sw, &b_sw, m64, k64, n64);
+        let differing = want.iter().zip(&got).filter(|(x, y)| x != y).count();
+        assert_eq!(
+            differing,
+            want.len(),
+            "EVERY lane must move under the swap, else a device MATCH would prove nothing about the \
+             lanes that did not: {differing}/{} moved",
+            want.len()
+        );
+        // And each operand carries signal on its own, so neither is doing all the work.
+        for (label, at, bt) in [("A only", &a_sw, &b), ("B only", &a, &b_sw)] {
+            let one = ref_nt(at, bt, m64, k64, n64);
+            assert!(
+                one.iter().zip(&want).filter(|(x, y)| x != y).count() * 2 > want.len(),
+                "{label}: a permutation of one operand must be visible on its own"
+            );
+        }
+    }
+
+    /// **The bring-up verdict is `==`, and this is why.** Every operand value is a small integer, so
+    /// it survives the host's f32 -> f16 conversion unchanged (f16 holds every integer through 2048),
+    /// and [`ramp_radix`] keeps the whole dot product inside [`BRINGUP_EXACT_LIMIT`], where f32 holds
+    /// every integer exactly. Tensor-core reassociation therefore cannot move a bit, and a mismatch
+    /// on the device is a *fact*, not a tolerance argument.
+    #[test]
+    fn the_bringup_operands_are_exact_in_f16_and_f32() {
+        for (m, n, k) in [
+            (64usize, 64usize, 64usize),
+            (128, 256, 64),
+            (128, 256, 256),
+            (128, 256, 1024),
+            (129, 257, 176),
+            (17, 33, 16),
+        ] {
+            let w = ramp_radix(k);
+            assert!(w.is_power_of_two() && (2..=8).contains(&w), "radix {w}");
+            let (a, b) = bringup_operands(m, n, k);
+            assert_eq!(a.len(), m * k);
+            assert_eq!(b.len(), n * k);
+            for (what, v) in [("A", &a), ("B", &b)] {
+                for &x in v.iter() {
+                    assert_eq!(x.fract(), 0.0, "{what}: {x} is not an integer");
+                    assert!(x >= 1.0, "{what}: {x} -- a zero lane distinguishes nothing");
+                    assert!(
+                        x <= 2048.0,
+                        "{what}: {x} is past the largest integer f16 holds exactly"
+                    );
+                }
+            }
+            // The worst-case dot product, computed in f64 over the real operands.
+            let mut worst = 0f64;
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f64;
+                    for kk in 0..k {
+                        acc += a[i * k + kk] as f64 * b[j * k + kk] as f64;
+                    }
+                    worst = worst.max(acc);
+                }
+            }
+            assert!(
+                worst <= BRINGUP_EXACT_LIMIT,
+                "{m}x{k}x{n}: worst dot product {worst} exceeds the exact-f32 integer limit \
+                 {BRINGUP_EXACT_LIMIT} -- the verdict would silently become a tolerance"
+            );
+            // And the reference really is exact: recomputing it in f32 order changes nothing.
+            let r = ref_nt(&a, &b, m, k, n);
+            for (i, &c) in r.iter().enumerate() {
+                assert_eq!(
+                    c.fract(),
+                    0.0,
+                    "lane {i} of the reference is not an integer"
+                );
+            }
+        }
+        // The radix narrows monotonically as K grows, and never below 2.
+        let mut last = usize::MAX;
+        for k in [16usize, 64, 256, 1024, 4096, 65536, 1 << 20] {
+            let w = ramp_radix(k);
+            assert!(w <= last, "radix must not widen with K");
+            assert!(w >= 2);
+            last = w;
+        }
+    }
+
+    /// **The A/B arms are two kernels, not one kernel run twice.**
+    ///
+    /// `Gpu::function` keys on the module-cache string alone and never re-examines the PTX, so two
+    /// descriptor readings sharing a key would be one compiled module launched twice -- agreeing
+    /// perfectly, matching or missing together, and "settling" item 1 with no information at all.
+    /// So: distinct entry names, distinct keys, and text that differs in *exactly* the descriptor
+    /// immediates once the entry name is accounted for.
+    #[test]
+    fn the_desc_order_ab_arms_are_two_kernels_not_one() {
+        assert_eq!(WGMMA_DESC_ORDER_AB.len(), 2);
+        let (kl, mn) = (WGMMA_DESC_ORDER_AB[0], WGMMA_DESC_ORDER_AB[1]);
+        assert_eq!(kl.desc_order, DescOrder::KLeading);
+        assert_eq!(mn.desc_order, DescOrder::MnLeading);
+        assert_ne!(kl.name, mn.name);
+        assert_ne!(kl.key, mn.key);
+        // Same tile, same schedule, same dtype -- only the descriptor reading differs.
+        assert_eq!(
+            (kl.bm, kl.bn, kl.bk, kl.stages),
+            (mn.bm, mn.bn, mn.bk, mn.stages)
+        );
+        assert_eq!(kl.dtype, mn.dtype);
+        assert_eq!(kl.smem_bytes(), mn.smem_bytes());
+        // The bring-up row is deliberately NOT in the shipped table, and no key collides with one.
+        assert!(!WGMMA_VARIANTS.iter().any(|v| v.name == mn.name));
+        assert!(!WGMMA_VARIANTS.iter().any(|v| v.key == mn.key));
+        assert_eq!(wgmma_variant(mn.name).name, mn.name);
+
+        let lic = license();
+        let a = wgmma_module(kl, &lic).unwrap();
+        let b = wgmma_module(mn, &lic).unwrap();
+        let a_renamed = a.replace(kl.name, mn.name);
+        assert_ne!(a_renamed, b, "the two arms must not be the same text");
+        let diffs: Vec<(&str, &str)> = a_renamed
+            .lines()
+            .zip(b.lines())
+            .filter(|(x, y)| x != y)
+            .collect();
+        assert_eq!(
+            a_renamed.lines().count(),
+            b.lines().count(),
+            "the arms must differ only in immediates, not in structure"
+        );
+        assert!(!diffs.is_empty());
+        for (x, y) in &diffs {
+            assert!(
+                x.contains("or.b64 %desc") && y.contains("or.b64 %desc"),
+                "the only difference may be the descriptor constant: {x:?} vs {y:?}"
+            );
+        }
+        // The two immediates, hand-computed: BK=64 f16 gives 128-byte rows, so the k-adjacent
+        // distance is 16 (-> 1) and the row-group-adjacent one is 1024 (-> 64); the reading decides
+        // which lands in the leading field at bit 16 and which in the stride field at bit 32.
+        assert!(a.contains(&format!("{:#x}", (1u64 << 16) | (64u64 << 32))));
+        assert!(b.contains(&format!("{:#x}", (64u64 << 16) | (1u64 << 32))));
+    }
+
+    // --- bring-up: the single-stage TMA probe -----------------------------------------------------
+
+    /// The probe is the *simplest possible* consumer of a tensor map, and its value is entirely in
+    /// what it does NOT contain: no `wgmma`, no `setmaxnreg`, no second barrier, no pipeline. If the
+    /// probe grew any of that it would stop isolating the descriptor, which is its only job.
+    #[test]
+    fn the_tma_stage_probe_is_structurally_a_single_stage_load() {
+        let ptx = tma_stage_probe_module(&license()).unwrap();
+        assert!(ptx.is_ascii(), "PTX must be pure ASCII");
+        assert!(ptx.starts_with(HDR_SM90A_V80));
+        assert!(ptx.contains(WGMMA_DSMEM_DECL));
+        assert_eq!(
+            ptx.matches(&format!(".visible .entry {TMA_PROBE_ENTRY}("))
+                .count(),
+            1
+        );
+        assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
+        // exactly one copy, one barrier, one transaction declaration -- and the transaction is a
+        // REGISTER, which is what lets one module and one cache key cover every geometry.
+        assert_eq!(
+            ptx.matches(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+            )
+            .count(),
+            1
+        );
+        assert_eq!(
+            ptx.matches("mbarrier.init.shared::cta.b64 [%rdBar],1;")
+                .count(),
+            1
+        );
+        assert_eq!(
+            ptx.matches("mbarrier.arrive.expect_tx.shared::cta.b64 %rdSt,[%rdBar],%tx;")
+                .count(),
+            1,
+            "the transaction count must be the run-time parameter, not an immediate"
+        );
+        // ...and the phase parity is a REGISTER, set before any branch. The probe's operand forms are
+        // exactly the two the 2026-08-10 ptxas census already assembled in the mainloop, so stage A
+        // of the bring-up cannot fail on an operand class nothing has ever put through an assembler.
+        assert_eq!(
+            ptx.matches("mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%ph;")
+                .count(),
+            1
+        );
+        let (before_branch, _) = ptx
+            .split_once("    @!%p0 bra ")
+            .expect("the probe branches on thread 0");
+        assert!(
+            before_branch.contains("    mov.u32 %ph,0;\n"),
+            "the parity register must be initialised before the first branch, or the threads that \
+             take it read an undefined register"
+        );
+        assert_eq!(ptx.matches("bar.sync 0;").count(), 1);
+        for banned in ["wgmma", "setmaxnreg", "multicast"] {
+            assert!(!ptx.contains(banned), "the probe must not contain {banned}");
+        }
+        // the by-value tensor map and its generic address
+        assert_eq!(ptx.matches(".param .align 64 .b8 tmap").count(), 1);
+        assert_eq!(ptx.matches("cvta.param.u64").count(), 1);
+        assert_eq!(ptx.matches(".param ").count(), 5, "(tx, c0, c1, out, tmap)");
+        assert!(ptx.contains(&format!(".maxntid {TMA_PROBE_THREADS}, 1, 1")));
+        // Every branch target is defined, is branched to, and is entry-scoped (PTX labels are
+        // module-scoped, so an un-prefixed one collides the day two entries share a module).
+        let defined: Vec<&str> = ptx
+            .lines()
+            .filter(|l| !l.starts_with(' ') && l.ends_with(':'))
+            .map(|l| l.trim_end_matches(':'))
+            .collect();
+        let used: Vec<&str> = ptx
+            .lines()
+            .filter_map(|l| {
+                l.find("bra ")
+                    .map(|i| l[i + 4..].trim().trim_end_matches(';'))
+            })
+            .collect();
+        assert_eq!(defined.len(), 4, "INITED, WAIT, COPY, EXIT");
+        assert!(!used.is_empty());
+        for u in &used {
+            assert!(defined.contains(u), "branch to undefined `{u}`");
+            assert!(
+                u.ends_with(TMA_PROBE_ENTRY),
+                "label `{u}` is not entry-scoped"
+            );
+        }
+        for d in &defined {
+            assert!(
+                used.contains(d),
+                "label `{d}` is defined but never branched to"
+            );
+        }
+    }
+
+    /// The probe's plan is derived from the transaction, and a transaction that could not have come
+    /// from a legal TMA box declines rather than being rounded into one.
+    #[test]
+    fn tma_probe_plan_matches_the_geometry_it_probes() {
+        for c in WGMMA_VARIANTS {
+            for (what, tx) in [("A", c.tile_a_bytes()), ("B", c.tile_b_bytes())] {
+                let p = tma_probe_plan(tx).unwrap_or_else(|e| panic!("{} {what}: {e}", c.name));
+                assert_eq!(p.tx_bytes, tx);
+                assert_eq!(p.dyn_smem_bytes, tx + 8);
+                assert_eq!(p.entry, TMA_PROBE_ENTRY);
+                assert_eq!(p.module_key, TMA_PROBE_KEY);
+                assert_eq!(p.block, (TMA_PROBE_THREADS, 1, 1));
+                assert!(p.dyn_smem_bytes <= HOPPER_SMEM_PER_CTA);
+            }
+            // The A and B transactions are exactly what the mainloop declares between them.
+            assert_eq!(
+                tma_probe_plan(c.tile_a_bytes()).unwrap().tx_bytes
+                    + tma_probe_plan(c.tile_b_bytes()).unwrap().tx_bytes,
+                c.stage_tx_bytes()
+            );
+        }
+        for bad in [0usize, 8, 24, HOPPER_SMEM_PER_CTA] {
+            let e = tma_probe_plan(bad).unwrap_err();
+            assert!(e.starts_with(UNSUPPORTED), "{bad}: {e}");
         }
     }
 
@@ -2171,13 +3015,22 @@ mod tests {
     /// Print a variant's PTX, for eyeballing it and for feeding it to a real `ptxas` on a machine
     /// that has one. Not a gate -- `#[ignore]`d like every other inspection helper in this crate.
     ///
+    /// `WUKONG_WGMMA_VARIANT` names any shipped or bring-up row, or [`TMA_PROBE_ENTRY`] for the
+    /// single-stage TMA probe -- the module the H100 round loads first, and the one worth reading by
+    /// eye before it is loaded anywhere.
+    ///
     /// ```text
     /// cargo test -p wukong_codegen_gpu --lib dump_wgmma_ptx -- --ignored --nocapture
+    /// WUKONG_WGMMA_VARIANT=wk_tma_stage_probe cargo test ... dump_wgmma_ptx -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "inspection helper, not a gate"]
     fn dump_wgmma_ptx() {
         let name = std::env::var("WUKONG_WGMMA_VARIANT").unwrap_or_else(|_| WGMMA_W1.name.into());
+        if name == TMA_PROBE_ENTRY {
+            println!("{}", tma_stage_probe_module(&license()).unwrap());
+            return;
+        }
         let cfg = wgmma_variant(&name);
         println!("{}", wgmma_module(cfg, &license()).unwrap());
     }
