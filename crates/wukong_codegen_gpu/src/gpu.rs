@@ -6827,6 +6827,139 @@ pub fn tma_stage_probe(
     Ok(g.stream.memcpy_dtov(&out_d)?)
 }
 
+/// **`WGMMA_DEVICE_VALIDATION` item 1: ONE launch of the descriptor sweep probe.**
+///
+/// Runs `C = A·Bᵀ` at `64 x k x 64` through [`crate::ptx_wgmma::desc_sweep_probe_module`] under one
+/// [`crate::ptx_wgmma::DescCandidate`], and returns the 4096 f32 lanes. Everything the candidate
+/// varies — the two descriptor templates, the matrix offsets, the per-K-step base advance, the SMEM
+/// staging mode and the tensor maps' swizzle — is a **run-time argument**, so every candidate reuses
+/// the one module this function loads under [`crate::ptx_wgmma::DESC_SWEEP_KEY`]. That is the whole
+/// design: one `cuModuleLoadData` on rented silicon, then a host loop that reads in seconds.
+///
+/// The operands are always the full `64 x 64` square with columns past `k` zeroed, so **one tensor-map
+/// geometry covers every K value** and no launch ever asks the driver for a box wider than the
+/// tensor. The caller's reference must be computed over those same padded arrays.
+///
+/// # Preconditions this asserts at the launch seam (crate hard rule 2)
+///
+/// * The device is Hopper — the probe is `sm_90a`, so `require_sm90a` is the first statement.
+/// * `a.len() == b.len() == 64 * 64` and `k` is a non-zero multiple of the `wgmma` K step (16) that
+///   does not exceed the staged width. `k / 16` is the number of `wgmma` the kernel issues; at zero
+///   it would publish accumulators no `wgmma` ever wrote.
+/// * The candidate packs (`template()`), and its tensor maps validate at the swizzle it names.
+/// * `plan.dyn_smem_bytes <= g.smem_budget()`, and the pushed argument count equals the `.param`
+///   count counted out of the very text about to be loaded.
+pub fn wgmma_desc_sweep(
+    g: &mut Gpu,
+    cand: &crate::ptx_wgmma::DescCandidate,
+    a: &[f32],
+    b: &[f32],
+    k: usize,
+) -> Result<Vec<f32>, GpuError> {
+    use crate::ptx_wgmma as w;
+    use crate::tma_host::{TensorMap, TensorMapArgs, TmaDataType};
+    use cudarc::driver::DevicePtr;
+    let lic = w::require_sm90a(g, w::DESC_SWEEP_ENTRY)?;
+    let plan = w::desc_sweep_plan();
+    let (rows, cols) = plan.operand;
+    assert_eq!(a.len(), rows * cols, "the sweep A operand is 64x64 padded");
+    assert_eq!(b.len(), rows * cols, "the sweep B operand is 64x64 padded");
+    assert!(
+        k > 0 && k.is_multiple_of(crate::ptx_wgmma::WgmmaShape::K) && k <= cols,
+        "{}: K={k} must be a non-zero multiple of {} and at most the staged width {cols} — the \
+         kernel issues K/16 wgmma and would publish unwritten accumulators at zero",
+        w::DESC_SWEEP_ENTRY,
+        crate::ptx_wgmma::WgmmaShape::K
+    );
+    assert!(
+        plan.dyn_smem_bytes <= g.smem_budget(),
+        "{}: the probe needs {} B of dynamic shared memory, but {} grants {} B per block",
+        plan.entry,
+        plan.dyn_smem_bytes,
+        g.target.name,
+        g.smem_budget()
+    );
+    let tmpl_a = cand.template().map_err(GpuError::Unsupported)?;
+    let tmpl_b = tmpl_a;
+
+    let a16: Vec<u16> = a
+        .iter()
+        .map(|&x| half::f16::from_f32(x).to_bits())
+        .collect();
+    let b16: Vec<u16> = b
+        .iter()
+        .map(|&x| half::f16::from_f32(x).to_bits())
+        .collect();
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g
+        .stream
+        .memcpy_stod(&vec![0f32; w::DESC_SWEEP_M * w::DESC_SWEEP_N])?;
+
+    // One geometry, at the swizzle this candidate's descriptor names. The two encodings of that one
+    // choice are translated by `SmemSwizzle::to_tma` and never cast.
+    let args = TensorMapArgs::tiled_2d_row_major(
+        TmaDataType::F16,
+        rows as u64,
+        cols as u64,
+        cols as u64,
+        rows as u32,
+        cols as u32,
+        cand.tma_swizzle(),
+    );
+    args.validate().map_err(GpuError::Unsupported)?;
+    assert_eq!(
+        2 * args.transaction_bytes(),
+        plan.tx_bytes,
+        "the kernel's expect_tx is an immediate; a geometry that moves other than {} B would hang",
+        plan.tx_bytes
+    );
+    let (map_a, map_b) = {
+        let (ap, _ga) = a_d.device_ptr(&g.stream);
+        let (bp, _gb) = b_d.device_ptr(&g.stream);
+        // SAFETY: `a_d`/`b_d` are live `CudaSlice`s of exactly `rows * cols` 16-bit elements
+        // (asserted above), which is the byte length this geometry implies, and both outlive the
+        // launch below — they are dropped at the end of this function, after `memcpy_dtov` has
+        // synchronized the stream.
+        let ma = unsafe { TensorMap::encode(&args, ap) }.map_err(GpuError::Unsupported)?;
+        let mb = unsafe { TensorMap::encode(&args, bp) }.map_err(GpuError::Unsupported)?;
+        (ma, mb)
+    };
+
+    let ptx = w::desc_sweep_probe_module(&lic).map_err(GpuError::Unsupported)?;
+    // Hard rule 2: the argument count comes from the SAME text as the entry name.
+    assert_eq!(
+        entry_param_count(&ptx, plan.entry),
+        10,
+        "{}: (K, C, descA, descB, aOff, bOff, kStep, stage, tmapA, tmapB) — pushing short makes the \
+         driver read adjacent host stack as a pointer",
+        plan.entry
+    );
+    let f = g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
+
+    let (a_off, b_off) = cand.operand_offsets();
+    let (kk, aoff, boff) = (k as u32, a_off as u32, b_off as u32);
+    let (kstep, stage) = (cand.k_step_bytes, cand.staging as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&kk)
+        .arg(&mut c_d)
+        .arg(&tmpl_a)
+        .arg(&tmpl_b)
+        .arg(&aoff)
+        .arg(&boff)
+        .arg(&kstep)
+        .arg(&stage)
+        .arg(&map_a)
+        .arg(&map_b);
+    let launch = dyn_launch_cfg((1, 1, 1), plan.block, plan.dyn_smem_bytes);
+    unsafe { bld.launch(launch)? };
+    // Time-boxed like every other launch in this family: a descriptor that reads out of the window
+    // is wrong data, but a transaction count that does not match is a hang, and this probe runs
+    // dozens of times in one round.
+    sync_within(&g.stream, plan.entry)?;
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7722,10 +7855,11 @@ mod tests {
         // them, since every one issues the `e4m3` mma that genuinely earns the `.version 8.4` floor.
         // 94 -> 97 with the three `WGMMA_VARIANTS` rows, which are licensed at `.version 8.0` by
         // `wgmma` + `cp.async.bulk` (both "Introduced in PTX ISA version 8.0"); `floored` is unchanged.
-        // 97 -> 99 with the two Hopper BRING-UP modules: the `MnLeading` A/B arm (`WGMMA_W1_MN`) and
-        // the single-stage TMA probe. Both are text this backend hands to `cuModuleLoadData` on rented
-        // silicon, so the ASCII rule and the `.version` law must reach them exactly as they reach a
-        // shipped row. The probe is licensed by `cp.async.bulk` alone — it deliberately contains no
+        // 97 -> 99 with the two Hopper BRING-UP probes: the single-stage TMA probe and (since
+        // 2026-08-10) the descriptor sweep probe, which replaced the `MnLeading` A/B arm one for
+        // one. Both are text this backend hands to `cuModuleLoadData` on rented silicon, so the
+        // ASCII rule and the `.version` law must reach them exactly as they reach a shipped row.
+        // The TMA probe is licensed by `cp.async.bulk` alone — it deliberately contains no
         // `wgmma`, which is the whole point of it.
         const EXPECTED_MODULES: usize = 99;
         assert_eq!(
@@ -17357,10 +17491,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// something. That gate is [`wgmma_hopper_bringup`]; this one has never been a substitute for it.
     #[test]
     fn wgmma_declines_on_every_part_that_is_not_hopper() {
-        use crate::ptx_wgmma::{
-            WGMMA_BRINGUP_INVOCATION, WGMMA_BRINGUP_VARIANTS, WGMMA_DEVICE_VALIDATION,
-            WGMMA_VARIANTS,
-        };
+        use crate::ptx_wgmma::{WGMMA_BRINGUP_INVOCATION, WGMMA_DEVICE_VALIDATION, WGMMA_VARIANTS};
         with_gpu("wgmma_decline", |g| {
             let cc = g.target().cc();
             let dev = g.device_name();
@@ -17376,12 +17507,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
                 return;
             }
-            // The bring-up rows are launchable code too, so they decline on the same terms — an
-            // sm_90a module that only bring-up loads must still never reach a non-Hopper driver.
-            let all: Vec<&crate::ptx_wgmma::WgmmaCfg> = WGMMA_VARIANTS
-                .iter()
-                .chain(WGMMA_BRINGUP_VARIANTS)
-                .collect();
+            let all: Vec<&crate::ptx_wgmma::WgmmaCfg> = WGMMA_VARIANTS.iter().collect();
             for v in &all {
                 let err = gemm_nt_wgmma(g, v, &[], &[], 128, 64, 256)
                     .expect_err("a non-Hopper part must never produce an sm_90a launch");
@@ -17416,9 +17542,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     .expect("an sm_90a refusal is a CAPABILITY decline, not a driver error");
                 assert!(msg.contains(crate::ptx_wgmma::TMA_PROBE_ENTRY), "{msg}");
             }
+            // ...and so does the descriptor sweep probe. Its operands are the right LENGTH at a
+            // deliberately illegal K, so the test panics rather than passing if the capability gate
+            // is ever moved after the precondition asserts.
+            {
+                let n = crate::ptx_wgmma::DESC_SWEEP_M * crate::ptx_wgmma::DESC_SWEEP_BK;
+                let zero = vec![0f32; n];
+                let cand = crate::ptx_wgmma::desc_sweep_candidates()[0];
+                let err = wgmma_desc_sweep(g, &cand, &zero, &zero, 0)
+                    .expect_err("a non-Hopper part must never launch the sm_90a sweep probe");
+                let msg = err
+                    .unsupported()
+                    .expect("an sm_90a refusal is a CAPABILITY decline, not a driver error");
+                assert!(msg.contains(crate::ptx_wgmma::DESC_SWEEP_ENTRY), "{msg}");
+            }
             eprintln!(
-                "[gate] all {} wgmma rows + the TMA probe decline at require_sm90a on {dev} \
-                 (cc {}.{}), before any operand conversion, PTX text, tensor map or module load \u{2713}",
+                "[gate] all {} wgmma rows + the TMA probe + the descriptor sweep probe decline \
+                 at require_sm90a on {dev} (cc {}.{}), before any operand conversion, PTX text, \
+                 tensor map or module load \u{2713}",
                 all.len(),
                 cc.0,
                 cc.1
@@ -17448,7 +17589,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             DEFAULT_LAUNCH_TIMEOUT_MS >= 1_000,
             "a sub-second launch deadline would report a slow first JIT as a hang"
         );
-        const MUST_TIME_BOX: &[&str] = &["gemm_nt_wgmma", "tma_stage_probe"];
+        const MUST_TIME_BOX: &[&str] = &["gemm_nt_wgmma", "tma_stage_probe", "wgmma_desc_sweep"];
         let code = scannable_source("gpu.rs", include_str!("gpu.rs"));
         let mut seen: Vec<&str> = Vec::new();
         for (name, body) in scanned_fns(&code) {
@@ -17570,11 +17711,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// The **other** candidate shared-memory layout: each 8-row x 16-byte core matrix stored as 128
     /// contiguous bytes, core matrices in row-major core-grid order.
     ///
-    /// This is not a layout the backend believes in — it is the leading *alternative* hypothesis, and
-    /// having it in hand turns "item 4 failed" into "item 4 failed AND here is what the hardware
-    /// actually wrote", inside the same metered visit. It is also the assumption `SmemDesc::k_major`'s
-    /// `8 * row_bytes` distance would be wrong under, so if the tile comes back in THIS order the
-    /// `DescOrder` question below is moot and the descriptor arithmetic is what needs re-cutting.
+    /// It is what the wgmma descriptor's *canonical* layout ([`crate::ptx_wgmma::SmemLayout::
+    /// CanonicalNone`]) requires, and the 2026-08-10 round proved TMA does **not** write it: stage B
+    /// came back plain row-major within the box, byte for byte. The reindex is kept anyway, as one of
+    /// stage B's four named hypotheses -- if a future geometry ever comes back in THIS order, the
+    /// staging changed under the descriptor and stage D's whole candidate set is answering the wrong
+    /// question. Costs one host reindex; costs nothing to keep.
     fn host_tile_core_contiguous(
         row_major_tile: &[u16],
         box_rows: usize,
@@ -17590,6 +17732,49 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
         }
         t
+    }
+
+    /// **The lane signature, as an 8x8 map over the OUTPUT's core matrices.**
+    ///
+    /// The bring-up operands are three-digit positional codes, so a descriptor that reads the wrong
+    /// core matrix produces a *structured* error, not noise — and the structure names the field.
+    /// Reading the map: a uniform exact count in every block is a WITHIN-core-matrix stride error
+    /// (the 2026-08-10 signature, 1 lane of 64 per block); a count that decays along a row is an LBO
+    /// error; one that decays down a column is an SBO error; an all-zero row or column is a base
+    /// address that left the tile.
+    ///
+    /// Returns one string per block-row, so a caller can indent them into a log.
+    fn core_matrix_map(got: &[f32], want: &[f32], m: usize, n: usize) -> Vec<String> {
+        assert_eq!(got.len(), m * n);
+        assert_eq!(want.len(), m * n);
+        let (bi, bj) = (m / 8, n / 8);
+        let mut out = Vec::with_capacity(bi + 1);
+        out.push(format!(
+            "{:>4} {}",
+            "n/8",
+            (0..bj)
+                .map(|j| format!("{j:^13}"))
+                .collect::<Vec<_>>()
+                .join("")
+        ));
+        for i in 0..bi {
+            let mut cells = String::new();
+            for j in 0..bj {
+                let (mut ex, mut mx) = (0usize, 0f32);
+                for r in 0..8 {
+                    for c in 0..8 {
+                        let idx = (i * 8 + r) * n + j * 8 + c;
+                        if got[idx] == want[idx] {
+                            ex += 1;
+                        }
+                        mx = mx.max((got[idx] - want[idx]).abs());
+                    }
+                }
+                cells += &format!("{:>3}/64 {:>6.0e} ", ex, mx);
+            }
+            out.push(format!("m/8={i:<2} {cells}"));
+        }
+        out
     }
 
     /// **THE HOPPER BRING-UP GATE — what the first rented H100 hour runs.**
@@ -17613,10 +17798,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// * **C (item 5) — the pipeline completes.** The first full mainloop launch, time-boxed, at the
     ///   shape where the ring is exactly filled. A *liveness* claim only — it does not check numbers,
     ///   because at this point nobody knows which descriptor reading is right.
-    /// * **D (item 1) — DescOrder, both readings, one visit.** The two arms are separate entries under
-    ///   separate module keys, launched in the same round against an f64 reference. **Exactly one must
-    ///   match**, bit-exactly. This is the rung the whole family waits on, and it is deliberately
-    ///   *after* liveness so a hang cannot be mistaken for a wrong reading.
+    /// * **D (item 1) — THE DESCRIPTOR SWEEP, one module, one visit.** Every row of
+    ///   `desc_sweep_candidates` is launched at K=16 and K=64 against an f64 reference, through the
+    ///   ONE module stage A loaded — the templates, offsets, K-step advance and SMEM staging mode are
+    ///   all run-time arguments. **Exactly one arm production could ship must be exact**, bit-exactly,
+    ///   at both K passes. The two readings the 2026-08-10 round already scored are in the set as
+    ///   controls; the canonical core-matrix arms are diagnostics that name the fix if no shippable
+    ///   arm wins. This is the rung the whole family waits on, and it is deliberately *after* liveness
+    ///   so a hang cannot be mistaken for a wrong reading.
     /// * **E (item 6) — the K sweep.** Fewer K tiles than stages (the producer exits while consumers
     ///   still wait — the producer-tail case), exactly as many, and several wraps; each against the
     ///   reference, and each shape run twice to catch a race the first run got away with.
@@ -17639,9 +17828,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     fn wgmma_hopper_bringup() {
         use crate::ptx_wgmma::{
-            bringup_operands, tma_stage_probe_module, wgmma_module, TmaProbePlan, WgmmaCfg,
-            TMA_PROBE_ENTRY, TMA_PROBE_KEY, WGMMA_BRINGUP_VARIANTS, WGMMA_DESC_ORDER_AB,
-            WGMMA_VARIANTS, WGMMA_W1_BF16, WGMMA_W3C,
+            bringup_operands, desc_sweep_candidates, desc_sweep_plan, desc_sweep_probe_module,
+            tma_stage_probe_module, wgmma_module, DescCandidate, SmemLayout, SweepStaging,
+            TmaProbePlan, WgmmaCfg, DESC_SWEEP_ENTRY, DESC_SWEEP_KS, DESC_SWEEP_M, DESC_SWEEP_N,
+            SHIPPED_LAYOUT, TMA_PROBE_ENTRY, TMA_PROBE_KEY, WGMMA_VARIANTS, WGMMA_W1,
+            WGMMA_W1_BF16, WGMMA_W3C,
         };
         with_hopper("wgmma_hopper_bringup", |g, lic| {
             let dev = g.device_name();
@@ -17665,10 +17856,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             eprintln!(
                 "\n[wgmma-bringup] A. item 2 -- cuModuleLoadData on the generated sm_90a text"
             );
-            let rows: Vec<&WgmmaCfg> = WGMMA_VARIANTS
-                .iter()
-                .chain(WGMMA_BRINGUP_VARIANTS)
-                .collect();
+            let rows: Vec<&WgmmaCfg> = WGMMA_VARIANTS.iter().collect();
             for c in &rows {
                 let plan = c.launch_plan();
                 let ptx = wgmma_module(c, &lic)
@@ -17693,7 +17881,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     plan.block.0,
                     plan.dyn_smem_bytes,
                     c.stages,
-                    c.desc_order.label()
+                    c.layout.label()
                 );
             }
             // The probe, opted into the widest tile any row will ask it for -- over BOTH operands,
@@ -17718,7 +17906,23 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 "      {:<34} LOADED   {:>3} thr, {:>6} B dyn smem (geometry-generic)",
                 TMA_PROBE_ENTRY, probe_plan.block.0, probe_plan.dyn_smem_bytes
             );
-            eprintln!("   -> item 2 PASS: {} modules loaded", rows.len() + 1);
+            // ...and the descriptor sweep probe, the module stage D spends its whole budget in. It
+            // is loaded HERE, with the others, so a JIT rejection of `fence.proxy.async.shared::cta`
+            // or of a `wgmma` inside a run-time loop is found before any launch has happened.
+            let sweep_plan = desc_sweep_plan();
+            let sweep_ptx = desc_sweep_probe_module(&lic).expect("the sweep probe must generate");
+            g.function_dyn(
+                sweep_plan.module_key,
+                &sweep_ptx,
+                sweep_plan.entry,
+                sweep_plan.dyn_smem_bytes,
+            )
+            .unwrap_or_else(|e| panic!("item 2 FAIL: {DESC_SWEEP_ENTRY} did not load: {e:?}"));
+            eprintln!(
+                "      {:<34} LOADED   {:>3} thr, {:>6} B dyn smem (one module, every candidate)",
+                DESC_SWEEP_ENTRY, sweep_plan.block.0, sweep_plan.dyn_smem_bytes
+            );
+            eprintln!("   -> item 2 PASS: {} modules loaded", rows.len() + 2);
 
             // ---- B. item 4: tensor maps, then one staged tile vs a host copy ---------------------
             eprintln!(
@@ -17806,12 +18010,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                                  the buffer that was uploaded -- suspect TensorMap::encode's base \
                                  pointer, not the SMEM layout."
                             } else if got == alt {
-                                "AND THE TILE IS IN CORE-MATRIX-CONTIGUOUS ORDER. That is the other \
-                                 candidate layout: each 8-row x 16-byte core matrix stored as 128 \
-                                 contiguous bytes. If this is what the hardware writes, then \
-                                 SmemDesc::k_major's `8 * row_bytes` stride-dimension distance is \
-                                 wrong for BOTH DescOrder readings and stage D below cannot settle \
-                                 anything -- re-cut the descriptor distances first."
+                                "AND THE TILE IS IN CORE-MATRIX-CONTIGUOUS ORDER, which the \
+                                 2026-08-10 round proved it is NOT. If TMA has started writing the \
+                                 canonical layout, stage D's candidate set is asking the wrong \
+                                 question: its `AsWritten` arms assume row-major-within-box and its \
+                                 repack arms would be repacking an already-packed tile. Re-derive \
+                                 the staging before reading any verdict below."
                             } else if got == swapped_coords {
                                 "AND IT MATCHES THE TILE AT THE TRANSPOSED ORIGIN. The SMEM layout \
                                  is right and the COORDINATE ORDER is backwards: dimension 0 of a \
@@ -17855,7 +18059,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
             );
             {
-                let w1 = WGMMA_DESC_ORDER_AB[0];
+                let w1 = &WGMMA_W1;
                 let (m, n, k) = (w1.bm, w1.bn, w1.bk * w1.stages); // ring exactly filled
                 let (a, b) = bringup_operands(m, n, k);
                 let t0 = Instant::now();
@@ -17886,82 +18090,291 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                  \x20     (No correctness claim yet -- which descriptor reading is right is stage D.)"
             );
 
-            // ---- D. item 1: DescOrder, both readings, ONE visit ----------------------------------
+            // ---- D. item 1: THE DESCRIPTOR SWEEP -- one module, every candidate ------------------
+            //
+            // The 2026-08-10 round spent the two-arm A/B and both arms lost, because the ambiguity
+            // was never the axis naming: an SS operand is a grid of core matrices packed at 128
+            // contiguous bytes, so a plain row-major tile is unrepresentable. This stage therefore
+            // asks the whole question at once. ONE module is loaded (stage A did it); every
+            // candidate's descriptor template, matrix offsets, K-step advance and SMEM staging mode
+            // arrive as run-time arguments; and the host loops.
+            let cands: Vec<DescCandidate> = desc_sweep_candidates();
             eprintln!(
-                "\n[wgmma-bringup] D. item 1 -- DescOrder: BOTH readings, same round, f64 reference"
+                "\n[wgmma-bringup] D. item 1 -- the DESCRIPTOR SWEEP: {} candidates x K in {:?}, \
+                 all through ONE module ({DESC_SWEEP_ENTRY})",
+                cands.len(),
+                DESC_SWEEP_KS
             );
-            let (m, n, k) = (64usize, 64usize, 64usize);
-            let (a, b) = bringup_operands(m, n, k);
-            let want = ref_nt(&a, &b, m, k, n);
-            let mut winners: Vec<&WgmmaCfg> = Vec::new();
-            for arm in WGMMA_DESC_ORDER_AB {
-                let limit = arm.dtype.exact_integer_limit();
-                assert!(
-                    a.iter().chain(&b).all(|v| v.abs() <= limit),
-                    "the ramp is not exact in {:?} (limit {limit}) — the verdict would silently \
-                     become a tolerance",
-                    arm.dtype
-                );
-                let t0 = Instant::now();
-                let got = gemm_nt_wgmma(g, arm, &a, &b, m, k, n)
-                    .unwrap_or_else(|e| panic!("item 1 FAIL: {} at {m}x{k}x{n}: {e}", arm.name));
-                let ms = t0.elapsed().as_secs_f64() * 1e3;
-                let exact = got.iter().zip(&want).filter(|(x, y)| x == y).count();
-                let s = crate::diff::err_stats(&got, &want);
-                let matched = exact == want.len();
-                if matched {
-                    winners.push(arm);
+            let (sm, sn) = (DESC_SWEEP_M, DESC_SWEEP_N);
+            let sbk = sweep_plan.operand.1;
+            // The operands are the full square, zeroed past the K under test, so ONE tensor-map
+            // geometry covers both passes and no launch asks the driver for a box wider than the
+            // tensor it describes.
+            let (a_full, b_full) = bringup_operands(sm, sn, sbk);
+            let limit = WGMMA_W1.dtype.exact_integer_limit();
+            assert!(
+                a_full.iter().chain(&b_full).all(|v| v.abs() <= limit),
+                "the ramp is not exact in f16 (limit {limit}) — the verdict would silently become a \
+                 tolerance rather than `==`"
+            );
+            let masked = |x: &[f32], k: usize| -> Vec<f32> {
+                let mut v = x.to_vec();
+                for (i, e) in v.iter_mut().enumerate() {
+                    if i % sbk >= k {
+                        *e = 0.0;
+                    }
+                }
+                v
+            };
+            // (candidate index, K) -> (exact lanes, max_abs, ms, optional decline)
+            let mut score: Vec<Vec<(usize, f64, f64, Option<String>)>> = Vec::new();
+            let mut worst_lanes: Vec<Option<Vec<f32>>> = Vec::new();
+            let mut references: Vec<Vec<f32>> = Vec::new();
+            for &k in DESC_SWEEP_KS {
+                let (ak, bk_) = (masked(&a_full, k), masked(&b_full, k));
+                references.push(ref_nt(&ak, &bk_, sm, sbk, sn));
+            }
+            eprintln!(
+                "      {:<28} {:<14} {:>9} {:>9} {:>11}",
+                "candidate", "arm", "exact@K16", "exact@K64", "max_abs@K64"
+            );
+            for c in &cands {
+                let mut row = Vec::new();
+                let mut last: Option<Vec<f32>> = None;
+                for (ki, &k) in DESC_SWEEP_KS.iter().enumerate() {
+                    let (ak, bk_) = (masked(&a_full, k), masked(&b_full, k));
+                    let t0 = Instant::now();
+                    match wgmma_desc_sweep(g, c, &ak, &bk_, k) {
+                        Ok(got) => {
+                            let ms = t0.elapsed().as_secs_f64() * 1e3;
+                            let want = &references[ki];
+                            let exact = got.iter().zip(want).filter(|(x, y)| x == y).count();
+                            let st = crate::diff::err_stats(&got, want);
+                            row.push((exact, st.max_abs, ms, None));
+                            last = Some(got);
+                        }
+                        Err(e) => {
+                            // A decline is information, not a round-ender: record it and keep going.
+                            row.push((0, f64::NAN, 0.0, Some(e.to_string())));
+                        }
+                    }
                 }
                 eprintln!(
-                    "      {:<22} {:<34} {ms:>6.2} ms  exact {exact:>5}/{:<5}  max_abs {:.3e}   {}",
-                    arm.desc_order.label(),
-                    arm.name,
-                    want.len(),
-                    s.max_abs,
-                    if matched { "MATCH" } else { "no" }
+                    "      {:<28} {:<14} {:>9} {:>9} {:>11.3e}{}",
+                    c.label,
+                    c.arm(),
+                    row[0].0,
+                    row[1].0,
+                    row[1].1,
+                    match &row[1].3 {
+                        Some(e) => format!("   DECLINED: {e}"),
+                        None => String::new(),
+                    }
+                );
+                score.push(row);
+                worst_lanes.push(last);
+            }
+            for c in &cands {
+                eprintln!("        why {:<26} {}", c.label, c.why);
+            }
+
+            // A candidate wins only if it is exact at BOTH K passes. K=16 issues one wgmma and
+            // never advances the descriptor's start address; K=64 issues four and does. Exact at 16
+            // and wrong at 64 is a K-STEP defect and nothing else -- a diagnosis that would
+            // otherwise cost a second rental.
+            let lanes = sm * sn;
+            // Rows are found by LABEL, never by index: a candidate inserted into the middle of the
+            // set must not silently retarget a control.
+            let by_label = |l: &str| cands.iter().position(|c| c.label == l).expect(l);
+            let (ctl_k, ctl_mn) = (
+                by_label("ctl/rowmajor-k-leading"),
+                by_label("ctl/rowmajor-mn-leading"),
+            );
+            let cpy = by_label("copy/rowmajor-k-leading");
+            let exact_both: Vec<usize> = (0..cands.len())
+                .filter(|&i| score[i].iter().all(|r| r.0 == lanes))
+                .collect();
+            let k16_only: Vec<&str> = (0..cands.len())
+                .filter(|&i| score[i][0].0 == lanes && score[i][1].0 != lanes)
+                .map(|i| cands[i].label)
+                .collect();
+            if !k16_only.is_empty() {
+                eprintln!(
+                    "      NOTE: {k16_only:?} are exact at K=16 and wrong at K=64 -- the fields are \
+                     right and the PER-K-STEP BASE ADVANCE is not. Re-cut `DescFields::k_step_bytes` \
+                     for that layout (or move the step into the descriptor's base_offset phase); \
+                     nothing else in the reading is implicated."
                 );
             }
-            match winners.len() {
-                1 => {
-                    let w = winners[0];
+            // The verdict is stated over ARMS -- which BYTES are in shared memory -- not over rows,
+            // and only over the arms production could ship. Two rows of one arm can legitimately
+            // both be exact when they differ in a field that mode ignores; two production ARMS
+            // being exact would mean two different shared-memory images both read correctly, which
+            // is the "settles nothing" failure. The repack arms are DIAGNOSTIC: they stage a layout
+            // no single tiled TMA copy writes, so their success does not compete for what ships --
+            // it names the fix when nothing else works.
+            let mut prod_arms: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+            let mut other_exact: Vec<String> = Vec::new();
+            // Exact rows that stage the tile BY HAND. Their success does not ship, but it is the
+            // difference between "the fix is named" and "the round ends in another mystery".
+            let mut repack_exact: Vec<&str> = Vec::new();
+            for &i in &exact_both {
+                if cands[i].production_viable() {
+                    prod_arms
+                        .entry(cands[i].arm())
+                        .or_default()
+                        .push(cands[i].label);
+                } else {
+                    other_exact.push(format!("{} ({})", cands[i].label, cands[i].arm()));
+                }
+                if cands[i].staging != SweepStaging::AsWritten {
+                    repack_exact.push(cands[i].label);
+                }
+            }
+            // The 8x8 per-core-matrix map for the most informative rows: the best four by exact
+            // count. The operands are positional codes, so the map says WHICH stride is wrong.
+            let mut ranked: Vec<usize> = (0..cands.len()).collect();
+            ranked.sort_by_key(|&i| std::cmp::Reverse(score[i][1].0));
+            let mut shown = 0usize;
+            for &i in ranked.iter() {
+                if shown >= 4 {
+                    break;
+                }
+                let Some(got) = &worst_lanes[i] else { continue };
+                eprintln!(
+                    "\n      lane map for {} ({}) at K=64 -- per output core matrix, exact/64 and \
+                     max_abs:",
+                    cands[i].label,
+                    cands[i].arm()
+                );
+                for line in core_matrix_map(got, &references[1], sm, sn) {
+                    eprintln!("        {line}");
+                }
+                shown += 1;
+            }
+            eprintln!();
+            if !other_exact.is_empty() {
+                eprintln!(
+                    "      Also exact at both K passes, but NOT something production ships as \
+                     generated: {other_exact:?}. A hand-staged arm says what the fix IS; a \
+                     non-standard field encoding or a base-offset phase says which field the \
+                     hardware actually reads."
+                );
+            }
+            // The controls are the sweep's own witness. They are not asserted (the hardware, not
+            // this file, is the authority) but a disagreement with the log is printed loudly.
+            for (i, expect) in [(ctl_k, 64usize), (ctl_mn, 0)] {
+                if score[i][1].0 != expect {
                     eprintln!(
-                        "   -> item 1 SETTLED: the hardware confirms {}.",
-                        w.desc_order.label()
+                        "      WARNING: control `{}` scored {}/{lanes} at K=64; the 2026-08-10 log \
+                         recorded {expect}/{lanes} for the same reading. The sweep and the previous \
+                         round disagree -- reconcile before trusting the verdict below.",
+                        cands[i].label, score[i][1].0
                     );
-                    if w.desc_order == crate::ptx_wgmma::WGMMA_W1.desc_order {
+                }
+            }
+            // The verbatim-copy control: it and `ctl/rowmajor-k-leading` run the same descriptor
+            // over the same bytes, one repacked verbatim, so they must score the same. If
+            // they do not, the probe's repack loop is not a faithful copier and every canonical arm
+            // is uninterpretable — which is worth saying before anyone reads the verdict.
+            if score[cpy][1].0 != score[ctl_k][1].0 {
+                eprintln!(
+                    "      WARNING: `copy/rowmajor-k-leading` scored {} where the identical \
+                     descriptor over the un-repacked tile scored {} -- the probe's REPACK LOOP is \
+                     not a faithful copy, so every canonical arm above is uninterpretable.",
+                    score[cpy][1].0, score[ctl_k][1].0
+                );
+            }
+
+            match prod_arms.len() {
+                1 => {
+                    let (arm, rows) = prod_arms.iter().next().expect("exactly one");
+                    eprintln!(
+                        "   -> item 1 SETTLED: the winning production arm is `{arm}`, rows {rows:?}."
+                    );
+                    if rows.len() > 1 {
                         eprintln!(
-                            "      ACTION: none. WGMMA_W1 / WGMMA_W1_BF16 / WGMMA_W3C already ship \
-                             that reading; delete WGMMA_W1_MN and the A/B when convenient."
-                        );
-                    } else {
-                        eprintln!(
-                            "      ACTION: set `desc_order: {}` on WGMMA_W1 (WGMMA_W1_BF16 and \
-                             WGMMA_W3C inherit it), then delete WGMMA_W1_MN. The shipped rows are \
-                             currently WRONG and stage G below will not run them.",
-                            w.desc_order.label()
+                            "      (More than one field spelling is exact in that arm, which is \
+                             itself a finding: the mode IGNORES the field they differ in.)"
                         );
                     }
                 }
-                0 => panic!(
-                    "item 1 FAIL: NEITHER descriptor reading matches the f64 reference at \
-                     {m}x{k}x{n}.\n  Both arms loaded, launched and returned finite numbers, so the \
-                     fault is not the shape menu, the barrier or the epilogue predication — it is \
-                     what the descriptor's two offset fields MEAN. The leading suspect is \
-                     SmemDesc::k_major's pair of distances themselves (16 and 8*row_bytes), which \
-                     assume the tile is plain row-major in shared memory; stage B above says which \
-                     layout TMA actually wrote. Read that line first, then re-cut k_major.",
-                ),
+                0 => {
+                    let named = if repack_exact.is_empty() {
+                        "and NO diagnostic arm went exact either, so the fault is not the layout \
+                         alone. Read the per-core-matrix maps above: a map whose exact count is \
+                         uniform across every block is a WITHIN-core-matrix stride error, one that \
+                         decays along a row is an LBO error, one that decays down a column is an \
+                         SBO error, and an all-zero row or column is a base address that left the \
+                         tile."
+                    } else {
+                        "BUT A DIAGNOSTIC ARM DID, so the production fix is now NAMED: the \
+                         descriptor model is right and the SHARED-MEMORY LAYOUT is what has to \
+                         change. Either make TMA write the canonical core-matrix layout (BK/8 tiled \
+                         copies per operand per stage, or a shared-memory repack in the consumer \
+                         like this probe's), or move the family to a swizzle mode whose canonical \
+                         layout coincides with what one TMA copy already writes."
+                    };
+                    panic!(
+                        "item 1 FAIL: no arm production could ship is exact at both K=16 and K=64 \
+                         over {} candidates, {named}\n  Controls: `{}` scored {}/{lanes} and `{}` \
+                         scored {}/{lanes} at K=64; the 2026-08-10 H100 log recorded 64 and 0 for \
+                         exactly those two readings, so if these agree the sweep measured what it \
+                         set out to.\n  Hand-staged rows that WERE exact: {:?}.",
+                        cands.len(),
+                        cands[ctl_k].label,
+                        score[ctl_k][1].0,
+                        cands[ctl_mn].label,
+                        score[ctl_mn][1].0,
+                        repack_exact
+                    )
+                }
                 _ => panic!(
-                    "item 1 FAIL: BOTH descriptor readings match at {m}x{k}x{n}, so this probe \
-                     cannot tell them apart and the round has settled nothing.\n  That should be \
-                     impossible: `the_two_desc_orders_address_different_elements` proves the two \
-                     orders address different core matrices and that the ramps make it visible in \
-                     7/8 of the output. If both match here, either the kernel is not reading the \
-                     descriptor's offset fields at all, or the operands are not what that test \
-                     thinks they are."
+                    "item 1 FAIL: {} production arms are exact at both K passes ({:?}), so two \
+                     different shared-memory images both read correctly and the probe has settled \
+                     nothing.\n  That should be impossible -- the arms stage DIFFERENT BYTES into \
+                     shared memory. Either a staging mode did not run (compare \
+                     `copy/rowmajor-k-leading` with `ctl/rowmajor-k-leading`: they must agree) or \
+                     the operands are too symmetric to tell the images apart.",
+                    prod_arms.len(),
+                    prod_arms.keys().collect::<Vec<_>>()
                 ),
             }
-            let win: &WgmmaCfg = winners[0];
+
+            // Which reading now ships: the first exact, production-viable row of the winning arm.
+            let arm = prod_arms.keys().next().expect("exactly one arm").clone();
+            let winner: &DescCandidate = cands
+                .iter()
+                .filter(|c| c.arm() == arm && exact_both.iter().any(|&i| cands[i].label == c.label))
+                .find(|c| c.production_viable())
+                .expect("the arm was built out of production-viable rows");
+            let win_layout: SmemLayout =
+                winner.layout.expect("a production-viable row has a layout");
+            eprintln!(
+                "      the production reading is `{}` (candidate {})",
+                win_layout.label(),
+                winner.label
+            );
+            if win_layout != SHIPPED_LAYOUT {
+                panic!(
+                    "item 1 SETTLED, and the shipped rows are WRONG.\n  ACTION, one token: set\n\
+                     \x20     pub const SHIPPED_LAYOUT: SmemLayout = {};\n\
+                     \x20 in ptx_wgmma.rs (WGMMA_W1, WGMMA_W1_BF16 and WGMMA_W3C all read it), then \
+                     rerun this gate. Stages E, F and G are NOT run here: `Gpu::function` keys the \
+                     module cache on the entry name alone, so launching the shipped key with a \
+                     different layout would silently rerun the module stage A already loaded.\n  \
+                     Everything above this line is confirmed hardware fact and does not need \
+                     rerunning: {} was measured exact at K=16 and at K=64.",
+                    win_layout.label(),
+                    winner.label
+                );
+            }
+            eprintln!(
+                "      ACTION: none. SHIPPED_LAYOUT already carries that reading, so WGMMA_W1 / \
+                 WGMMA_W1_BF16 / WGMMA_W3C are correct as generated and stages E-G below run them."
+            );
+            eprintln!("   -> item 1 PASS: the descriptor reading is settled ON HARDWARE.");
+            let win: &WgmmaCfg = &WGMMA_W1;
 
             // ---- E. item 6: K across the ring depth (producer tail, and wraps) --------------------
             eprintln!(
@@ -18097,12 +18510,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
             // ---- G. the sibling shipped rows ------------------------------------------------------
             eprintln!("\n[wgmma-bringup] G. the other shipped rows, on the confirmed reading");
-            let mut deferred: Vec<&str> = Vec::new();
             for (c, k) in [(&WGMMA_W1_BF16, 256usize), (&WGMMA_W3C, 6 * 64)] {
-                if c.desc_order != win.desc_order {
-                    deferred.push(c.name);
-                    continue;
-                }
+                // Both inherit `SHIPPED_LAYOUT` from W1, and stage D would have panicked before
+                // reaching here if that reading were not the confirmed one -- so this is an
+                // invariant, not a filter.
+                assert_eq!(
+                    c.layout, win.layout,
+                    "{}: a shipped row that does not carry the confirmed reading must not be run                      and believed",
+                    c.name
+                );
                 let (m, n) = (c.bm, c.bn);
                 let (a, b) = bringup_operands(m, n, k);
                 let limit = c.dtype.exact_integer_limit();
@@ -18132,19 +18548,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     c.name, c.dtype, c.stages
                 );
             }
-            if !deferred.is_empty() {
-                eprintln!(
-                    "      DEFERRED {deferred:?}: they ship {}, which the hardware just rejected. \
-                     Re-cut their desc_order and rerun -- running them now would only re-prove the \
-                     wrong reading is wrong.",
-                    crate::ptx_wgmma::WGMMA_W1.desc_order.label()
-                );
-            }
 
             eprintln!(
                 "\n[gate] wgmma Hopper bring-up on {dev}: items 2, 4, 5, 1, 6, 7 PASS in that order; \
-                 DescOrder = {} \u{2713}",
-                win.desc_order.label()
+                 the descriptor reading is {} \u{2713}",
+                win.layout.label()
             );
             eprintln!("=============================================================\n");
         });
@@ -18763,30 +19171,28 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }],
                 });
             }
-            // 3b. The two BRING-UP modules. They are not shipped rows, so they carry no register
+            // 3b. The two BRING-UP PROBES. They are not shipped rows, so they carry no register
             //     budget worth reporting -- but they are text `wgmma_hopper_bringup` hands to
             //     `cuModuleLoadData` on rented silicon, and stage A of that round would otherwise be
             //     the first assembler either has ever seen. Assembling them here costs a CPU
             //     container; discovering an instruction spelling or an operand form ptxas rejects
-            //     during the H100 hour costs the hour. The probe is the one that needs it: it is the
-            //     only module in the family with no `wgmma` in it at all, so nothing about it was
-            //     covered by the 2026-08-10 census of the three shipped rows.
-            for c in crate::ptx_wgmma::WGMMA_BRINGUP_VARIANTS {
-                let ptx = crate::ptx_wgmma::wgmma_module(c, &license).unwrap_or_else(|e| {
-                    panic!("bring-up wgmma variant {} must generate: {e}", c.name)
-                });
-                modules.push(Module {
-                    label: format!("ptx_wgmma::bringup/{}", c.name),
-                    ptx,
-                    rows: vec![Row {
-                        family: "wgmma-bringup",
-                        entry: c.name.to_string(),
-                        threads: c.threads(),
-                        smem_gen: c.smem_bytes(),
-                        derived: Some(format!("{}p/{}c", c.producer_regs, c.consumer_regs)),
-                    }],
-                });
-            }
+            //     during the H100 hour costs the hour. Both need it for a reason of their own: the
+            //     TMA probe is the only module in the family with no `wgmma` in it at all, and the
+            //     descriptor sweep probe is the only one that spells `fence.proxy.async.shared::cta`
+            //     and puts a `wgmma` inside a run-time loop -- neither was covered by the 2026-08-10
+            //     census of the three shipped rows.
+            modules.push(Module {
+                label: format!("ptx_wgmma::bringup/{}", crate::ptx_wgmma::DESC_SWEEP_ENTRY),
+                ptx: crate::ptx_wgmma::desc_sweep_probe_module(&license)
+                    .expect("the descriptor sweep probe must generate"),
+                rows: vec![Row {
+                    family: "wgmma-bringup",
+                    entry: crate::ptx_wgmma::DESC_SWEEP_ENTRY.to_string(),
+                    threads: crate::ptx_wgmma::DESC_SWEEP_THREADS as usize,
+                    smem_gen: crate::ptx_wgmma::DESC_SWEEP_SMEM,
+                    derived: None,
+                }],
+            });
             let probe = crate::ptx_wgmma::tma_probe_plan(
                 crate::ptx_wgmma::WGMMA_VARIANTS
                     .iter()
@@ -19049,9 +19455,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 + crate::ptx_wmma::PIPE_WIDE_VARIANTS.len()
                 + crate::ptx_flash::FLASH_STAGE_VARIANTS.len()
                 + crate::ptx_wgmma::WGMMA_VARIANTS.len()
-                // + the MnLeading A/B arm, + the TMA stage probe
-                + crate::ptx_wgmma::WGMMA_BRINGUP_VARIANTS.len()
-                + 1,
+                // + the descriptor sweep probe, + the TMA stage probe
+                + 2,
             "every row of every table must appear in the report, or the gate is measuring a subset \
              and calling it the lattice"
         );

@@ -171,6 +171,30 @@ and text-extracted; quotes verbatim).
 - **SMEM matrix descriptor** = a 64-bit register: bits 13–0 start address, 29–16 leading-dim byte
   offset, 45–32 stride-dim byte offset, 51–49 base offset, 63–62 swizzle mode
   (`0` none, `1` 128-B, `2` 64-B, `3` 32-B), all encoded as `(x & 0x3FFFF) >> 4`.
+
+> **CORRECTION, 2026-08-10 (measured on an H100, `bench/gpu/h100/2026-08-10-h100-s2a-bringup.log`).**
+> The two offset fields above were "read from a figure rather than confirmed", and the figure was
+> read as if the operand were a monolithic strided tile. It is not. An SS operand is a grid of
+> **core matrices**, and for a 16-bit type one core matrix is `8 rows x 16 bytes` stored as **128
+> CONTIGUOUS bytes**. The hardware's address for element `(r, c)` of core matrix `(i, j)` is
+> `start + i*SBO + j*LBO + r*16 + c*elem` at `SWIZZLE_NONE` — the within-core-matrix row stride is the
+> fixed **16**, not the tile's row pitch. LBO is the distance between **K-adjacent** core matrices and
+> SBO between **MN-adjacent** ones.
+>
+> Consequence: a plain row-major SMEM tile whose rows are wider than 16 bytes (any `BK > 8` for a
+> 16-bit type) is **describable by no `(LBO, SBO)` pair at all**, which is why the first H100 round
+> scored the shipped reading at exactly 64 of 4096 output lanes exact — only rows with `m % 8 == 0`
+> (and columns with `n % 8 == 0`) have `r == 0`. Both arms of the two-arm A/B lost for the same
+> reason, and neither was the axis-naming coin flip the round had budgeted for.
+>
+> The fix the crate now ships is **`CU_TENSOR_MAP_SWIZZLE_128B`**: at `BK = 64` for a 16-bit type the
+> SMEM row is exactly 128 B = the swizzle atom, and the ISA's canonical 128-B-swizzle K-major layout
+> is precisely plain row-major (row stride 128, k-group stride 16, `SBO = 8 * 128`) composed with
+> `Swizzle<3,4,3>` — which is precisely what a 128-B-swizzled TMA copy writes. No repack, no extra
+> copies. That is also why CUTLASS pins `BK = 64` with SW128 on every SM90 16-bit mainloop.
+> **Still unconfirmed on silicon**; `wgmma_hopper_bringup` stage D is a one-visit sweep
+> (`ptx_wgmma::desc_sweep_candidates`) that carries this reading, the canonical no-swizzle
+> alternative and both of the readings the log already scored, as controls.
 - Async proxy ops: `wgmma.fence`, `wgmma.commit_group`, `wgmma.wait_group`.
 - **PTX ISA Notes: "Introduced in PTX ISA version 8.0." Target ISA Notes: "Requires `sm_90a`."**
 
