@@ -6237,6 +6237,178 @@ pub fn quantize_scaled_fp8(
     Ok(g.stream.memcpy_dtov(&o_d)?)
 }
 
+/// **How many `.param`s the entry `entry` declares in `ptx`** — the launch-seam check crate hard rule
+/// 2 asks for, read out of *the module text about to be loaded* rather than from an independent
+/// constant a later edit could leave behind.
+///
+/// The trailing `(` in the search key is load-bearing: entry names in this crate are prefixes of one
+/// another (`flash_d64_mp` of `flash_d64_mp_lm` and `flash_d64_mp4`), so a bare name would count some
+/// other kernel's parameters and pass.
+///
+/// Panics if the module has no such entry, which is a generator/dispatch desync and not a runtime
+/// condition — the driver's own report for it is `CUDA_ERROR_NOT_FOUND` at exactly the one shape that
+/// reaches it.
+fn entry_param_count(ptx: &str, entry: &str) -> usize {
+    ptx.split_once(&format!(".visible .entry {entry}("))
+        .unwrap_or_else(|| panic!("{entry}: no such entry in the module being loaded"))
+        .1
+        .split_once(')')
+        .expect("an entry declaration closes its parameter list")
+        .0
+        .matches(".param ")
+        .count()
+}
+
+/// `C = A·Bᵀ` (f16/bf16 in, f32 out) through the **Hopper warpgroup-MMA + TMA** family
+/// ([`crate::ptx_wgmma`]) — "Act 2", the only configuration in this backend whose derived ceiling
+/// clears cuBLAS on an H100 (D1 §2.5: 128×128 `mma.sync` binds at 73%, the widest Act-1 tile at 90%,
+/// `wgmma.m64n256k16` at ~123%).
+///
+/// **The capability gate is a type, and it is the first statement.** [`crate::ptx_wgmma::wgmma_module`]
+/// cannot be called without an `Sm90aLicense`, and the only way to obtain one here is
+/// [`crate::ptx_wgmma::require_sm90a`] — so an ungated `sm_90a` emission does not compile. The check is
+/// `cc.0 == 9`, deliberately **not** `>= (9,0)`: `sm_90a` is an architecture LOCK, so the module fails to
+/// load on `sm_100` exactly as it fails on this `sm_89` laptop, and a `>=` gate would blame the JIT.
+/// **On every non-Hopper part this function declines here and does nothing else** — no host conversion,
+/// no PTX, no tensor map, no module load.
+///
+/// # Preconditions this asserts at the launch seam (crate hard rule 2)
+///
+/// * `a.len() == m*k`, `b.len() == n*k`, and the allocated `C` is `m*n` — the tensor maps are built from
+///   those extents and the epilogue addresses `C` from them.
+/// * `k >= 1`. At `k == 0` no `wgmma` issues, the accumulators are never written and the kernel skips
+///   the epilogue rather than storing uninitialised registers, so `C` would come back as the zeros this
+///   function allocated — a silently wrong "result". Rejected instead.
+/// * `m*n <= u32::MAX`: the epilogue computes its element index with `mad.lo.s32` before widening.
+/// * `plan.dyn_smem_bytes <= g.smem_budget()` — the ring lives in the `.extern` window, and a launch
+///   that asked for more than the device grants is `CUDA_ERROR_INVALID_VALUE` naming neither.
+/// * **The pushed argument count equals the `.param` count of the entry we are about to load**, counted
+///   out of *that generated text* rather than from an independent constant. Pushing short makes the
+///   driver read adjacent host stack as a pointer.
+///
+/// Every geometric fact comes from [`crate::ptx_wgmma::LaunchPlan`] (entry, module key, block, window
+/// size, grid, parameter order) — never re-derived here, because two derivations of one geometry is how
+/// a truncated grid returns pre-zeroed rows and calls them results.
+pub fn gemm_nt_wgmma(
+    g: &mut Gpu,
+    cfg: &crate::ptx_wgmma::WgmmaCfg,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
+    use crate::ptx_wgmma::WgmmaDtype;
+    use crate::tma_host::TensorMap;
+    use cudarc::driver::DevicePtr;
+    // FIRST, before any conversion, any PTX and any module load: is this device Hopper at all? The
+    // license is a value, and `wgmma_module` below cannot be called without it.
+    let lic = crate::ptx_wgmma::require_sm90a(g, cfg.name)?;
+    assert_eq!(a.len(), m * k, "{}: A must be m*k", cfg.name);
+    assert_eq!(b.len(), n * k, "{}: B must be n*k (A*Bt)", cfg.name);
+    assert!(
+        k >= 1,
+        "{}: K must be >= 1 — at K == 0 the kernel issues no wgmma, never writes the accumulators, \
+         and deliberately skips the epilogue, so C would be returned untouched",
+        cfg.name
+    );
+    assert!(
+        (m as u64) * (n as u64) <= u32::MAX as u64,
+        "{}: M*N = {}*{} overflows the u32 element index the epilogue forms with mad.lo.s32",
+        cfg.name,
+        m,
+        n
+    );
+    let plan = cfg.launch_plan();
+    assert!(
+        plan.dyn_smem_bytes <= g.smem_budget(),
+        "{}: the pipeline needs {} B of dynamic shared memory, but {} grants {} B per block \
+         (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+        cfg.name,
+        plan.dyn_smem_bytes,
+        g.target.name,
+        g.smem_budget()
+    );
+    // A shape the generator cannot express is a decline, never plausible-but-wrong PTX.
+    let ptx = crate::ptx_wgmma::wgmma_module(cfg, &lic).map_err(GpuError::Unsupported)?;
+    // Hard rule 2: the argument count must come from the SAME source as the entry name — so count the
+    // `.param` declarations out of the very text about to be loaded, before anything is uploaded.
+    assert_eq!(
+        entry_param_count(&ptx, plan.entry),
+        plan.params.len(),
+        "{}: the entry's own declaration and PARAM_ORDER disagree — the launch argument list is built \
+         from the latter, and pushing short makes the driver read adjacent host stack as a pointer",
+        plan.entry
+    );
+
+    // Operands go to the device in the kernel's own 16-bit dtype; `wgmma` is precision-generic across
+    // f16/bf16 and only the operand-type token differs, so one launcher covers both rows.
+    let (a16, b16): (Vec<u16>, Vec<u16>) = match cfg.dtype {
+        WgmmaDtype::F16 => (
+            a.iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect(),
+            b.iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect(),
+        ),
+        WgmmaDtype::Bf16 => (
+            a.iter()
+                .map(|&x| half::bf16::from_f32(x).to_bits())
+                .collect(),
+            b.iter()
+                .map(|&x| half::bf16::from_f32(x).to_bits())
+                .collect(),
+        ),
+    };
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    assert_eq!(a_d.len(), m * k, "{}: A device buffer", cfg.name);
+    assert_eq!(b_d.len(), n * k, "{}: B device buffer", cfg.name);
+    assert_eq!(c_d.len(), m * n, "{}: C device buffer", cfg.name);
+
+    // The two tensor maps. A is `M x K` row-major, B is `N x K` row-major (the NT layout this backend
+    // already stores), and both are K-major in shared memory — which is what `wgmma` wants at
+    // `imm-trans-b = 0`, so neither operand needs a transpose flag.
+    // Scoped: `device_ptr`'s `SyncOnDrop` guard borrows the stream, and `function_dyn` below needs
+    // `&mut Gpu`. The maps themselves are plain 128-byte values that outlive the guards.
+    let (map_a, map_b) = {
+        let (a_ptr, _ga) = a_d.device_ptr(&g.stream);
+        let (b_ptr, _gb) = b_d.device_ptr(&g.stream);
+        // SAFETY: `a_d`/`b_d` are live `CudaSlice`s of exactly `m*k` / `n*k` 16-bit elements —
+        // asserted above — which is the byte length each geometry implies, and both outlive the
+        // launch below (they are dropped at the end of this function, after `memcpy_dtov` has
+        // synchronized the stream).
+        let ma = unsafe { TensorMap::encode(&cfg.tensor_map_a(m, k), a_ptr) }
+            .map_err(GpuError::Unsupported)?;
+        let mb = unsafe { TensorMap::encode(&cfg.tensor_map_b(n, k), b_ptr) }
+            .map_err(GpuError::Unsupported)?;
+        (ma, mb)
+    };
+
+    // The entry declares its shared memory as one `.extern` window, so it must be loaded through
+    // `function_dyn` (which opts the function into the ceiling) AND launched with the same byte count.
+    // The plan's key is per generated variant — `Gpu::function` never re-examines PTX on a key hit, so
+    // two rows under one key would share the first's kernel *and* its SMEM ceiling.
+    let f = g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
+
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    // PARAM_ORDER: (M: u32, N: u32, K: u32, C: ptr, tensorMap A, tensorMap B). A `&TensorMap` pushes
+    // its 128 opaque bytes by value through `DeviceRepr`, which is how a `__grid_constant__ const
+    // CUtensorMap` parameter is passed.
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&mut c_d)
+        .arg(&map_a)
+        .arg(&map_b);
+    let launch = dyn_launch_cfg(plan.grid(m, n), plan.block, plan.dyn_smem_bytes);
+    unsafe { bld.launch(launch)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7050,6 +7222,12 @@ mod tests {
             let (name, ptx) = int8::int8_gemm_swz_tile_ptx(bm, bn, wm2, wn2, 0);
             v.push((format!("int8::swz_tile/{name}"), ptx));
         }
+        // The Hopper wgmma + TMA family. Its generator is device-free (an `Sm90aLicense` for a literal
+        // `(9, 0)` is simply the true statement "this capability is a Hopper one"), so its three modules
+        // join the crate-wide `.version`/`.target` law here rather than being covered only by the
+        // family's own copy of it. Every one names `wgmma` and `cp.async.bulk`, so all three are
+        // licensed above 7.8 and `floored` is unchanged.
+        v.extend(crate::ptx_wgmma::wgmma_device_free_modules());
         v
     }
 
@@ -7124,7 +7302,9 @@ mod tests {
         // EXACT, so a module leaving the enumeration is as loud as one arriving. Update deliberately.
         // 88 -> 94 with the six `FP8_DEEP_VARIANTS` rows; the fp8-licensed count rises 11 -> 17 with
         // them, since every one issues the `e4m3` mma that genuinely earns the `.version 8.4` floor.
-        const EXPECTED_MODULES: usize = 94;
+        // 94 -> 97 with the three `WGMMA_VARIANTS` rows, which are licensed at `.version 8.0` by
+        // `wgmma` + `cp.async.bulk` (both "Introduced in PTX ISA version 8.0"); `floored` is unchanged.
+        const EXPECTED_MODULES: usize = 97;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -16228,6 +16408,120 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 "the decline must name the ceiling: {msg}"
             );
             eprintln!("[gate] over-budget deep row declined: {msg}");
+        });
+    }
+
+    /// **The launcher pushes exactly as many arguments as the entry declares** — for every shipped
+    /// `wgmma` row, on any box, with no device.
+    ///
+    /// `gemm_nt_wgmma` re-derives this at run time from the module it is about to load (hard rule 2:
+    /// the count must come from the same source as the entry name), but on this machine that code path
+    /// is unreachable — `require_sm90a` declines first and forever. So the same equality is checked
+    /// here, device-free, out of the generated text: an entry that grew a parameter, or a `PARAM_ORDER`
+    /// that lost one, is a driver reading adjacent host stack as a pointer on the first H100 launch.
+    #[test]
+    fn every_wgmma_entry_declares_exactly_the_parameters_the_launcher_pushes() {
+        use crate::ptx_wgmma::{ParamKind, Sm90aLicense, PARAM_ORDER, WGMMA_VARIANTS};
+        // A literal `(9, 0)` only ever asserts "this capability is a Hopper one", which is true; the
+        // license carries no claim about the machine running the test.
+        let lic = Sm90aLicense::for_probed_cc((9, 0)).expect("(9,0) is Hopper");
+        for v in WGMMA_VARIANTS {
+            let plan = v.launch_plan();
+            let ptx = crate::ptx_wgmma::wgmma_module(v, &lic)
+                .unwrap_or_else(|e| panic!("shipped row {} must generate: {e}", v.name));
+            assert_eq!(
+                entry_param_count(&ptx, plan.entry),
+                PARAM_ORDER.len(),
+                "{}: declared params vs PARAM_ORDER — the launch argument list is built from the \
+                 latter, so a mismatch is a short push",
+                plan.entry
+            );
+            let decl = ptx
+                .split_once(&format!(".visible .entry {}(", plan.entry))
+                .unwrap_or_else(|| panic!("{}: no such entry in its own module", plan.entry))
+                .1
+                .split_once(')')
+                .expect("an entry declaration closes its parameter list")
+                .0;
+            // …and each declaration's *kind*, in order, so a u32/pointer swap is caught too.
+            for (i, (kind, decl)) in PARAM_ORDER
+                .iter()
+                .zip(decl.split(".param ").skip(1))
+                .enumerate()
+            {
+                let want = match kind {
+                    ParamKind::U32 => ".u32",
+                    ParamKind::GlobalPtr => ".u64",
+                    ParamKind::TensorMap => ".align 64 .b8",
+                };
+                assert!(
+                    decl.trim_start().starts_with(want),
+                    "{}: param {i} is {kind:?} in PARAM_ORDER but the entry declares `{}`",
+                    plan.entry,
+                    decl.trim().trim_end_matches(',')
+                );
+            }
+        }
+        eprintln!(
+            "[gate] {} wgmma entries declare exactly PARAM_ORDER ({} params, kinds in order) \u{2713}",
+            WGMMA_VARIANTS.len(),
+            PARAM_ORDER.len()
+        );
+    }
+
+    /// **Every `wgmma` path declines LOUDLY on a part that is not Hopper — and declines FIRST.**
+    ///
+    /// `sm_90a` is an architecture *lock*, not a floor: the module fails to load on `sm_100` exactly as
+    /// it fails on this `sm_89` laptop, so the gate rejects in both directions and this test asserts the
+    /// decline names the capability, the entry and the probed capability rather than dying inside
+    /// `cuModuleLoadData` naming an instruction.
+    ///
+    /// **The operands are deliberately EMPTY at a non-empty shape.** `gemm_nt_wgmma`'s `a.len() == m*k`
+    /// assert would fire on `&[]` at `128x64`, so this test *panics* if the capability gate is ever
+    /// moved after the precondition asserts — which is the ordering the family's whole design rests on
+    /// (no host conversion, no PTX text, no tensor map, no module load before the capability is known).
+    /// That ordering is otherwise unobservable, since a decline and an early panic both "fail".
+    ///
+    /// On a Hopper part the decline arm is structurally unreachable, so the test prints the family's own
+    /// bring-up list instead of pretending to have proven something.
+    #[test]
+    fn wgmma_declines_on_every_part_that_is_not_hopper() {
+        use crate::ptx_wgmma::{WGMMA_DEVICE_VALIDATION, WGMMA_VARIANTS};
+        with_gpu("wgmma_decline", |g| {
+            let cc = g.target().cc();
+            let dev = g.device_name();
+            if cc.0 == 9 {
+                eprintln!(
+                    "[skip:capability] {dev} is cc {}.{} — the sm_90a DECLINE cannot be exercised on a \
+                     Hopper part, and this gate is not a substitute for bring-up. Work the list:",
+                    cc.0, cc.1
+                );
+                for item in WGMMA_DEVICE_VALIDATION {
+                    eprintln!("  {item}");
+                }
+                return;
+            }
+            for v in WGMMA_VARIANTS {
+                let err = gemm_nt_wgmma(g, v, &[], &[], 128, 64, 256)
+                    .expect_err("a non-Hopper part must never produce an sm_90a launch");
+                let msg = err
+                    .unsupported()
+                    .expect("an sm_90a refusal is a CAPABILITY decline, not a driver error");
+                for want in ["wgmma", v.name, &format!("{}.{}", cc.0, cc.1)] {
+                    assert!(
+                        msg.contains(want),
+                        "the decline must name {want:?} (the capability, the entry and what was \
+                         probed): {msg}"
+                    );
+                }
+            }
+            eprintln!(
+                "[gate] all {} wgmma rows decline at require_sm90a on {dev} (cc {}.{}), before any \
+                 operand conversion, PTX text, tensor map or module load \u{2713}",
+                WGMMA_VARIANTS.len(),
+                cc.0,
+                cc.1
+            );
         });
     }
 
