@@ -2213,8 +2213,171 @@ pub const WGMMA_DEVICE_VALIDATION: &[&str] = &[
      tile, against the f64 reference, to confirm TMA's zero fill and the predicated epilogue \
      together cover the edges.",
     "8. Only then, performance: same-run adjacent A/B against cuBLAS at 4096 and 8192 cubed, with \
-     bench_instrument's twin control passing.",
+     bench_instrument's twin control passing. The gates are `wgmma_vs_cublas` (WGMMA_W1, f16) and \
+     `wgmma_bf16_vs_cublas` (WGMMA_W1_BF16), both `#[ignore]`d benches in gpu.rs, both sweeping \
+     `WGMMA_BENCH_GRID` -- D1 section 4.4's confirmation grid plus the skinny-N companion -- and \
+     both routing every arm through `bench_instrument`: a pre-registered TwinPlan, `run_rotated` \
+     with the cuBLAS peer as BOTH the A and the C arm (the cuBLAS-called-twice control plan \
+     section 6.2 asks for, so C/A is the peer's own noise floor and B/A is the claim), `analyze` \
+     for the per-shape floor, and `Round::publish` as the only way a number leaves the round. They \
+     PRINT a table and assert NOTHING about speed -- a slow result is a finding, not a test \
+     failure; the only asserts are the exact-integer correctness spot-check that gates the timing \
+     and the structural ones. Run them as WGMMA_BENCH_INVOCATION.",
 ];
+
+// --- Act 2: the performance grid --------------------------------------------------------------------
+
+/// **The exact command the Act-2 performance round runs**, as data, for the same reason
+/// [`WGMMA_BRINGUP_INVOCATION`] is data: the benches print their tables rather than asserting them,
+/// so a run without `--nocapture` throws away everything the rented minutes produced.
+///
+/// `--release` is load-bearing here and is not in the bring-up invocation: a debug host loop makes
+/// the peer's and our own launch overhead dominate a 25-microsecond kernel, and this crate's own
+/// history has a debug-build measurement artifact in it. `--ignored` is how libtest reaches an
+/// `#[ignore]`d bench at all. The cloud form is
+/// `modal run tools/cloud/modal_app.py::bench --name wgmma_vs_cublas --peers`, which sets
+/// `WUKONG_GPU_REQUIRED=1` + `WUKONG_PEER_REQUIRED=1` and adds exactly these libtest flags.
+pub const WGMMA_BENCH_INVOCATION: &str =
+    "WUKONG_GPU_REQUIRED=1 WUKONG_PEER_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu \
+     --release -- --ignored --nocapture --test-threads=1 wgmma_vs_cublas";
+
+/// One point of the Act-2 performance grid: an `M x N x K` row-major NT GEMM (`C = A * Bt`), with
+/// the reason D1 lists it.
+///
+/// The grid is **data**, not a literal inside a bench body, for three reasons: a device-free gate can
+/// check every point is launchable by every shipped row before an hour is rented
+/// (`the_bench_grid_is_launchable_by_every_shipped_row`); the round log can print *why* a row is in
+/// the table without a reader opening the dossier; and the two benches (f16 and bf16) provably sweep
+/// the same shapes, which a copy-pasted array would not guarantee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmPoint {
+    /// Round-log row name and `bench_instrument` sample-label suffix. ASCII, no whitespace.
+    pub label: &'static str,
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    /// Why D1 lists this shape, in one line.
+    pub why: &'static str,
+}
+
+impl GemmPoint {
+    /// `2*M*N*K` -- the FLOP count, for turning seconds/launch into a rate. **Diagnostic only**: a
+    /// rate is an absolute, and this repo publishes ratios (see `docs/metrics.md`).
+    pub fn flop(&self) -> f64 {
+        2.0 * self.m as f64 * self.n as f64 * self.k as f64
+    }
+
+    /// Device bytes one arm's three buffers occupy: A and B at `elem` bytes, C at 4 (f32 accumulate,
+    /// which both our epilogue and the f32-out cuBLAS peer store).
+    pub fn device_bytes(&self, elem: usize) -> usize {
+        (self.m * self.k + self.n * self.k) * elem + self.m * self.n * 4
+    }
+
+    /// `M x N x K`, for a log line.
+    pub fn dims(&self) -> String {
+        format!("{}x{}x{}", self.m, self.n, self.k)
+    }
+}
+
+/// **D1 section 4.4's confirmation grid**, plus one derived companion, as the shapes the Act-2 peer
+/// rounds sweep.
+///
+/// D1 asks for `1024 / 2048 / 4096 / 8192` cubed "+ GPT (M=4096, N=4d, K=d) at d in {1024, 4096}",
+/// and section 5.3 tabulates where each lands against a 50 MiB L2. The four cubes and the two GPT
+/// rows below are those points verbatim.
+///
+/// **`gpt_d1024_down` is the one row the dossier does not list**, and it is here because section 4.4's
+/// A4 hypothesis is explicitly about *which way* a tile should be widened: A3 (128x256) and A4
+/// (256x128) have identical CTA intensity and deliberately different warp-tile intensity, so the
+/// question "does widening N buy reuse more cheaply than widening M" needs an `N << M` shape as well
+/// as the listed `N >> M` one. It is the FFN **down**-projection twin of the listed `d=1024`
+/// up-projection: same layer, same `d`, the other GEMM. Labelled as derived rather than quoted.
+pub const WGMMA_BENCH_GRID: &[GemmPoint] = &[
+    GemmPoint {
+        label: "sq1024",
+        m: 1024,
+        n: 1024,
+        k: 1024,
+        why: "D1 5.3: 4 MiB working set, 0.08x L2 -- deeply L2-resident, and only 32 CTAs of a \
+              128x256 tile, so this row is about wave quantization, not bandwidth",
+    },
+    GemmPoint {
+        label: "sq2048",
+        m: 2048,
+        n: 2048,
+        k: 2048,
+        why: "D1 5.3: 16 MiB, 0.32x L2 -- L2-resident. D1 4.5 puts W3 (128x128) here because a \
+              256-wide tile quantizes below M*N = 4.3e6; W1 is measured here anyway, as the \
+              evidence for that claim",
+    },
+    GemmPoint {
+        label: "sq4096",
+        m: 4096,
+        n: 4096,
+        k: 4096,
+        why: "D1 5.3: 64 MiB, 1.28x L2 -- the raster crossover, and the first of the two shapes \
+              D1 4.5 predicts W1 at 95-108% of cuBLAS on",
+    },
+    GemmPoint {
+        label: "sq8192",
+        m: 8192,
+        n: 8192,
+        k: 8192,
+        why: "D1 5.3: 256 MiB, 5.12x L2 -- raster plus streaming C, and the second 95-108% point",
+    },
+    GemmPoint {
+        label: "gpt_d1024_up",
+        m: 4096,
+        n: 4096,
+        k: 1024,
+        why: "SKINNY-K. GPT d=1024 FFN up-projection (M=4096, N=4d, K=d). D1 4.3.2: ws is exactly \
+              16.0 MiB, which trips the Act-1 dispatcher's 16 MiB literal into the raster arm \
+              although 0.32x L2 is deeply L2-resident",
+    },
+    GemmPoint {
+        label: "gpt_d1024_down",
+        m: 4096,
+        n: 1024,
+        k: 4096,
+        why: "SKINNY-N (derived, not in D1's table): the down-projection twin of the row above. \
+              D1 4.4's A4 asks whether widening N or widening M buys reuse; W1 is N-major, so the \
+              N << M shape is where that costs something",
+    },
+    GemmPoint {
+        label: "gpt_d4096_up",
+        m: 4096,
+        n: 16384,
+        k: 4096,
+        why: "GPT d=4096 FFN up-projection. D1 5.3: 160 MiB, 3.20x L2 -- raster, and the widest \
+              N the epilogue's u32 element index still holds (M*N = 67.1e6)",
+    },
+];
+
+/// **The FLOP budget one timed region aims at**: roughly 20 TFLOP, which at a Hopper-class rate is
+/// tens of milliseconds -- long enough that the host clock resolves it and short enough that a
+/// seven-shape, three-arm, six-round sweep is seconds of rented time rather than minutes.
+pub const BENCH_TARGET_FLOP: f64 = 2.0e13;
+
+/// Floor on [`bench_iters`]. A timed region of one launch is a lone timing, which this repo does not
+/// treat as a measurement.
+pub const BENCH_MIN_ITERS: usize = 16;
+
+/// Ceiling on [`bench_iters`]. At the small end the kernel is launch-bound, and past this the extra
+/// launches buy resolution the host clock already has.
+pub const BENCH_MAX_ITERS: usize = 1000;
+
+/// Launches per timed region at this shape: [`BENCH_TARGET_FLOP`] worth of work, clamped.
+///
+/// Pure and device-free so the whole grid's cost is knowable before an hour is rented, and so the
+/// two benches provably use the same count at the same shape -- an A/B whose two arms ran a
+/// different number of launches would divide by a different denominator.
+pub fn bench_iters(p: &GemmPoint) -> usize {
+    let want = (BENCH_TARGET_FLOP / p.flop()).round();
+    if !want.is_finite() || want <= BENCH_MIN_ITERS as f64 {
+        return BENCH_MIN_ITERS;
+    }
+    (want as usize).min(BENCH_MAX_ITERS)
+}
 
 // --- the generator --------------------------------------------------------------------------------
 
@@ -3631,6 +3794,178 @@ mod tests {
             WGMMA_DEVICE_VALIDATION[2].contains("ptxas"),
             "item 3 is answered by the CPU ptxas census and must say so"
         );
+        // Item 8 has a gate now. It must name both benches, the instrument they run through and the
+        // fact that they do not assert a ratio -- the three things a reader needs before spending an
+        // hour on it, and the three that would rot silently if only prose carried them.
+        for need in [
+            "wgmma_vs_cublas",
+            "wgmma_bf16_vs_cublas",
+            "bench_instrument",
+            "WGMMA_BENCH_GRID",
+            "WGMMA_BENCH_INVOCATION",
+        ] {
+            assert!(
+                WGMMA_DEVICE_VALIDATION[7].contains(need),
+                "item 8 must name {need:?}: {}",
+                WGMMA_DEVICE_VALIDATION[7]
+            );
+        }
+    }
+
+    // --- Act 2: the performance grid ---------------------------------------------------------------
+
+    /// The operator's Act-2 invocation is data too, and it needs three flags the bring-up one does
+    /// not: `--release` (a debug host loop mismeasures a 25-microsecond kernel), `--ignored` (the
+    /// benches are `#[ignore]`d) and `WUKONG_PEER_REQUIRED=1` (a round that cannot reach cuBLAS has
+    /// no bar and must fail rather than print `[skip]` and report green).
+    #[test]
+    fn the_bench_invocation_names_the_bench_and_the_flags_it_needs() {
+        let inv = WGMMA_BENCH_INVOCATION;
+        assert!(inv.is_ascii());
+        for need in [
+            "WUKONG_GPU_REQUIRED=1",
+            "WUKONG_PEER_REQUIRED=1",
+            "--features gpu",
+            "--release",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+            "wgmma_vs_cublas",
+        ] {
+            assert!(
+                inv.contains(need),
+                "the Act-2 invocation must carry {need:?}: {inv}"
+            );
+        }
+    }
+
+    /// **Every grid point must be launchable by every shipped row, and that is knowable with no
+    /// device.**
+    ///
+    /// The point of checking it here rather than discovering it in the round is cost: a shape whose
+    /// tensor map does not encode, whose epilogue index overflows `u32`, or whose ring does not fit
+    /// Hopper's 227 KiB carveout is a rented minute spent on a panic. Every predicate below is one
+    /// `gemm_nt_wgmma`/`time_gemm_nt_wgmma` asserts at the launch seam, evaluated ahead of time.
+    #[test]
+    fn the_bench_grid_is_launchable_by_every_shipped_row() {
+        assert!(!WGMMA_BENCH_GRID.is_empty());
+        let mut seen: Vec<&str> = Vec::new();
+        for p in WGMMA_BENCH_GRID {
+            assert!(p.label.is_ascii() && !p.label.contains(char::is_whitespace));
+            assert!(
+                !seen.contains(&p.label),
+                "duplicate grid label {:?}",
+                p.label
+            );
+            seen.push(p.label);
+            assert!(p.why.is_ascii() && p.why.len() > 40, "{}", p.label);
+            assert!(p.m > 0 && p.n > 0 && p.k > 0);
+            // The epilogue forms its element index with `mad.lo.s32` before widening.
+            assert!(
+                (p.m as u64) * (p.n as u64) <= u32::MAX as u64,
+                "{}: M*N overflows the u32 element index",
+                p.label
+            );
+            // A tensor map needs a global row stride that is a multiple of 16 B, and K is the
+            // contiguous axis of both NT operands -- so `K % 8 != 0` is unencodable, not ragged.
+            assert!(
+                p.k.is_multiple_of(8),
+                "{}: K={} gives a {} B row stride, which cuTensorMapEncodeTiled rejects",
+                p.label,
+                p.k,
+                p.k * 2
+            );
+            let iters = bench_iters(p);
+            assert!(
+                (BENCH_MIN_ITERS..=BENCH_MAX_ITERS).contains(&iters),
+                "{}: {iters} iters is outside the clamp",
+                p.label
+            );
+            for cfg in WGMMA_VARIANTS {
+                cfg.tensor_map_a(p.m, p.k)
+                    .validate()
+                    .unwrap_or_else(|e| panic!("{} A map at {}: {e}", cfg.name, p.label));
+                cfg.tensor_map_b(p.n, p.k)
+                    .validate()
+                    .unwrap_or_else(|e| panic!("{} B map at {}: {e}", cfg.name, p.label));
+                let plan = cfg.launch_plan();
+                assert!(
+                    plan.dyn_smem_bytes <= HOPPER_SMEM_PER_CTA,
+                    "{}: {} B ring exceeds Hopper's {HOPPER_SMEM_PER_CTA} B carveout",
+                    cfg.name,
+                    plan.dyn_smem_bytes
+                );
+                let (gx, gy, gz) = plan.grid(p.m, p.n);
+                assert!(gx > 0 && gy > 0 && gz == 1, "{}: empty grid", p.label);
+            }
+        }
+    }
+
+    /// D1 section 4.4 names the grid; the constant must actually carry it, and must carry the two
+    /// rectangular classes the task of measuring W1 turns on.
+    #[test]
+    fn the_bench_grid_carries_d1s_points_and_both_rectangular_classes() {
+        let has = |m: usize, n: usize, k: usize| {
+            WGMMA_BENCH_GRID
+                .iter()
+                .any(|p| p.m == m && p.n == n && p.k == k)
+        };
+        for sz in [1024usize, 2048, 4096, 8192] {
+            assert!(has(sz, sz, sz), "D1 4.4 asks for {sz} cubed");
+        }
+        // GPT (M=4096, N=4d, K=d) at d in {1024, 4096} -- D1 4.4, verbatim.
+        assert!(has(4096, 4096, 1024), "GPT d=1024 up-projection missing");
+        assert!(has(4096, 16384, 4096), "GPT d=4096 up-projection missing");
+        // A skinny-K point (K far below M and N) and a skinny-N point (N far below M and K).
+        assert!(
+            WGMMA_BENCH_GRID
+                .iter()
+                .any(|p| p.k * 2 <= p.m.min(p.n) && p.m > 1024),
+            "the grid has no skinny-K point"
+        );
+        assert!(
+            WGMMA_BENCH_GRID
+                .iter()
+                .any(|p| p.n * 2 <= p.m.min(p.k) && p.m > 1024),
+            "the grid has no skinny-N point"
+        );
+    }
+
+    /// The iteration rule is the A/B's denominator, so it must be a pure function of the shape --
+    /// never of the arm, and never of anything measured. It also has to be monotone: a bigger shape
+    /// may not ask for *more* launches, or the sweep's cost stops being predictable.
+    #[test]
+    fn the_iteration_count_is_a_clamped_monotone_function_of_the_shape() {
+        let mut ordered: Vec<&GemmPoint> = WGMMA_BENCH_GRID.iter().collect();
+        ordered.sort_by(|a, b| a.flop().partial_cmp(&b.flop()).expect("finite"));
+        let mut prev = usize::MAX;
+        for p in &ordered {
+            let it = bench_iters(p);
+            assert!(
+                it <= prev,
+                "{}: {it} iters at {:.3e} FLOP is more than the smaller shape's {prev}",
+                p.label,
+                p.flop()
+            );
+            prev = it;
+        }
+        // The clamp holds at both ends, including for shapes no grid row has.
+        let tiny = GemmPoint {
+            label: "tiny",
+            m: 8,
+            n: 8,
+            k: 8,
+            why: "",
+        };
+        let huge = GemmPoint {
+            label: "huge",
+            m: 65536,
+            n: 65536,
+            k: 65536,
+            why: "",
+        };
+        assert_eq!(bench_iters(&tiny), BENCH_MAX_ITERS);
+        assert_eq!(bench_iters(&huge), BENCH_MIN_ITERS);
     }
 
     /// The operator's invocation is data, so it cannot drift from the gate it names.

@@ -6736,6 +6736,137 @@ pub fn gemm_nt_wgmma(
     Ok(g.stream.memcpy_dtov(&c_d)?)
 }
 
+/// **Time [`gemm_nt_wgmma`]'s steady state**: `iters` resident launches over buffers uploaded once,
+/// returning **seconds per launch**. `WGMMA_DEVICE_VALIDATION` item 8's contender arm.
+///
+/// # Why this exists instead of timing `gemm_nt_wgmma` in a loop
+///
+/// [`gemm_nt_wgmma`] is the *correctness* entry point: it takes host `f32`, converts every element to
+/// the kernel's 16-bit dtype on the CPU, uploads A and B, launches once, and copies `C` back. At
+/// 8192-cubed that is 134 million host conversions and half a gigabyte of PCIe traffic around a
+/// 1.4-millisecond kernel — timing it would measure the host, and it would measure a host cost the
+/// cuBLAS peer ([`crate::baselines::time_cublas_gemm_nt_f16_f32out`]) does not pay, because that peer
+/// does exactly what this function does: allocate, fill, warm up, then time launches only.
+///
+/// **The allocation discipline is deliberately identical to the peer's**, down to the shape of it:
+/// both allocate their own buffers per call, both fill with a constant, both discard one warm-up
+/// call, both bracket `iters` calls with `Instant` and one trailing `synchronize`. An A/B whose two
+/// arms allocate differently is measuring allocation.
+///
+/// # Why the warm-up drains through [`sync_within`] and the timed region does not
+///
+/// The polled watchdog exists because a `wgmma` pipeline whose `expect_tx` disagrees with its copies
+/// hangs forever, and on rented silicon a blocking `cuStreamSynchronize` bills the rest of the hour
+/// with no log. But it polls with a nap that grows to 2 ms, which is a quantum the size of the thing
+/// being measured. So the *first* launch at each shape — the one that could hang — is drained through
+/// the watchdog, and the timed region, whose shape has by then completed once, uses the plain
+/// blocking synchronize the peer uses. A hang cannot appear in the timed region without having
+/// appeared in the warm-up.
+///
+/// # Preconditions this asserts at the launch seam (crate hard rule 2)
+///
+/// The same set [`gemm_nt_wgmma`] asserts — Hopper first and before anything else, `k >= 1`,
+/// `m*n <= u32::MAX`, the ring inside `g.smem_budget()`, and the pushed argument count counted out of
+/// the very text about to be loaded — plus `iters >= 1` (a zero divisor).
+pub fn time_gemm_nt_wgmma(
+    g: &mut Gpu,
+    cfg: &crate::ptx_wgmma::WgmmaCfg,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: usize,
+) -> Result<f64, GpuError> {
+    use crate::ptx_wgmma::WgmmaDtype;
+    use crate::tma_host::TensorMap;
+    use cudarc::driver::DevicePtr;
+    // FIRST, before any allocation, any PTX and any module load: is this device Hopper at all?
+    let lic = crate::ptx_wgmma::require_sm90a(g, cfg.name)?;
+    assert!(iters >= 1, "{}: iters must be >= 1", cfg.name);
+    assert!(
+        k >= 1,
+        "{}: K must be >= 1 — at K == 0 the kernel issues no wgmma and skips the epilogue",
+        cfg.name
+    );
+    assert!(
+        (m as u64) * (n as u64) <= u32::MAX as u64,
+        "{}: M*N = {}*{} overflows the u32 element index the epilogue forms with mad.lo.s32",
+        cfg.name,
+        m,
+        n
+    );
+    let plan = cfg.launch_plan();
+    assert!(
+        plan.dyn_smem_bytes <= g.smem_budget(),
+        "{}: the pipeline needs {} B of dynamic shared memory, but {} grants {} B per block",
+        cfg.name,
+        plan.dyn_smem_bytes,
+        g.target.name,
+        g.smem_budget()
+    );
+    let ptx = crate::ptx_wgmma::wgmma_module(cfg, &lic).map_err(GpuError::Unsupported)?;
+    assert_eq!(
+        entry_param_count(&ptx, plan.entry),
+        plan.params.len(),
+        "{}: the entry's own declaration and PARAM_ORDER disagree — pushing short makes the driver \
+         read adjacent host stack as a pointer",
+        plan.entry
+    );
+
+    // A constant operand in the kernel's own 16-bit dtype, matching the peer's `0.01` fill. Timing
+    // reads no value; what matters is that both arms move the same bytes with the same dtype width.
+    let fill: u16 = match cfg.dtype {
+        WgmmaDtype::F16 => half::f16::from_f32(WGMMA_TIMING_FILL).to_bits(),
+        WgmmaDtype::Bf16 => half::bf16::from_f32(WGMMA_TIMING_FILL).to_bits(),
+    };
+    let a_d = g.stream.memcpy_stod(&vec![fill; m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![fill; n * k])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    assert_eq!(a_d.len(), m * k, "{}: A device buffer", cfg.name);
+    assert_eq!(b_d.len(), n * k, "{}: B device buffer", cfg.name);
+    assert_eq!(c_d.len(), m * n, "{}: C device buffer", cfg.name);
+
+    let (map_a, map_b) = {
+        let (a_ptr, _ga) = a_d.device_ptr(&g.stream);
+        let (b_ptr, _gb) = b_d.device_ptr(&g.stream);
+        // SAFETY: as in `gemm_nt_wgmma` — `a_d`/`b_d` are live `CudaSlice`s of exactly the element
+        // counts each geometry implies (asserted above), and both outlive every launch below.
+        let ma = unsafe { TensorMap::encode(&cfg.tensor_map_a(m, k), a_ptr) }
+            .map_err(GpuError::Unsupported)?;
+        let mb = unsafe { TensorMap::encode(&cfg.tensor_map_b(n, k), b_ptr) }
+            .map_err(GpuError::Unsupported)?;
+        (ma, mb)
+    };
+    let f = g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
+    let launch = dyn_launch_cfg(plan.grid(m, n), plan.block, plan.dyn_smem_bytes);
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+
+    // ONE argument list for the warm-up and for the timed region: hard rule 2's whole point is that
+    // the pushed list is derived from the entry it is pushed at, and two copies of it can drift.
+    let mut t0 = std::time::Instant::now();
+    for i in 0..=iters {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&mm)
+            .arg(&nn)
+            .arg(&kk)
+            .arg(&mut c_d)
+            .arg(&map_a)
+            .arg(&map_b);
+        unsafe { bld.launch(launch)? };
+        if i == 0 {
+            // The warm-up: the launch that pays the cubin/JIT cost and the only one that could hang.
+            sync_within(&g.stream, cfg.name)?;
+            t0 = std::time::Instant::now();
+        }
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+/// The constant both timing arms fill their operands with. Matches
+/// [`crate::baselines::time_cublas_gemm_nt_f16_f32out`]'s `0.01` exactly: denormals and NaNs can
+/// change a tensor core's throughput, so the two arms must not disagree about what they multiply.
+pub const WGMMA_TIMING_FILL: f32 = 0.01;
+
 /// **`WGMMA_DEVICE_VALIDATION` item 4b: one TMA tile in, the same bytes out.**
 ///
 /// Encodes `args` over `src` with the driver's own `cuTensorMapEncodeTiled`, launches
@@ -17578,9 +17709,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// must drain through [`sync_within`], and this scan says so out of the source rather than
     /// trusting that a future edit remembers.
     ///
-    /// It is deliberately a whitelist of two rather than "every launcher in the crate": the Ampere
-    /// and Ada families have executed thousands of times and their blocking drains are load-bearing
-    /// in benches that measure them. Widen it when a third hang-capable family lands.
+    /// It is deliberately a whitelist rather than "every launcher in the crate": the Ampere and Ada
+    /// families have executed thousands of times and their blocking drains are load-bearing in
+    /// benches that measure them. Widen it when a third hang-capable family lands.
+    ///
+    /// # The second list, and why a *timing* launcher is allowed a blocking drain
+    ///
+    /// [`time_gemm_nt_wgmma`] cannot use the watchdog for the region it measures: `sync_within` polls
+    /// with a nap that grows to 2 ms, and 2 ms is the size of the thing being timed at 8192-cubed, so
+    /// a watchdog-drained timed region would quantize the measurement it exists to protect. The
+    /// resolution is ordering, not exemption — the **warm-up** launch is the one that could hang (it
+    /// is the first launch of that shape) and it drains through the watchdog; the timed region runs
+    /// only afterwards, on a shape already proven to retire. `MUST_TIME_BOX_WARMUP` pins exactly that:
+    /// `sync_within` present, and present *before* the first blocking `.synchronize()`.
     #[test]
     fn every_sm90a_launcher_bounds_its_drain() {
         // A compile-time item, the idiom `ptx_wgmma` already uses: a sub-second default would turn
@@ -17590,9 +17731,33 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             "a sub-second launch deadline would report a slow first JIT as a hang"
         );
         const MUST_TIME_BOX: &[&str] = &["gemm_nt_wgmma", "tma_stage_probe", "wgmma_desc_sweep"];
+        const MUST_TIME_BOX_WARMUP: &[&str] = &["time_gemm_nt_wgmma"];
         let code = scannable_source("gpu.rs", include_str!("gpu.rs"));
         let mut seen: Vec<&str> = Vec::new();
+        let mut seen_warmup: Vec<&str> = Vec::new();
         for (name, body) in scanned_fns(&code) {
+            if let Some(which) = MUST_TIME_BOX_WARMUP.iter().find(|w| **w == name) {
+                let boxed = body.find("sync_within(").unwrap_or_else(|| {
+                    panic!(
+                        "{name} launches an sm_90a kernel but never drains through `sync_within` — \
+                         its warm-up is the first launch of a shape and is exactly where a hang \
+                         appears"
+                    )
+                });
+                let blocking = body.find(".synchronize()").unwrap_or_else(|| {
+                    panic!(
+                        "{name} is a TIMING launcher and must end its timed region with the plain \
+                         blocking synchronize the peer uses; a polled drain quantizes the reading"
+                    )
+                });
+                assert!(
+                    boxed < blocking,
+                    "{name}: the blocking synchronize comes BEFORE the watchdog drain, so the first \
+                     launch of a shape is not time-boxed and a deadlock bills with no log"
+                );
+                seen_warmup.push(which);
+                continue;
+            }
             let Some(which) = MUST_TIME_BOX.iter().find(|w| **w == name) else {
                 continue;
             };
@@ -17614,6 +17779,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         assert_eq!(
             seen, want,
             "a time-boxed launcher was renamed or removed; the law must follow it"
+        );
+        seen_warmup.sort_unstable();
+        let mut want_warmup = MUST_TIME_BOX_WARMUP.to_vec();
+        want_warmup.sort_unstable();
+        assert_eq!(
+            seen_warmup, want_warmup,
+            "a warm-up-time-boxed launcher was renamed or removed; the law must follow it"
         );
         // ...and the watchdog's own diagnosis must reach the terminal. `eprintln!` goes into
         // libtest's per-test capture buffer, which libtest prints WHEN THE TEST FINISHES — and a
@@ -17653,7 +17825,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// rule is [`with_cap`]'s, unchanged: skipping on a part that is not Hopper is the CORRECT
     /// outcome and must never fail, but a skip on a device that IS Hopper is a bug in the gate and
     /// escalates under `WUKONG_GPU_REQUIRED=1`.
-    fn with_hopper(name: &str, body: impl FnOnce(&mut Gpu, crate::ptx_wgmma::Sm90aLicense)) {
+    ///
+    /// `invocation` is the command the skipping operator should actually run on a Hopper part. It is
+    /// a parameter rather than a constant because there are now two: the bring-up gate
+    /// (`WGMMA_BRINGUP_INVOCATION`, correctness) and the Act-2 peer rounds
+    /// (`WGMMA_BENCH_INVOCATION`, item 8), and printing the wrong one at a skip sends a reader to
+    /// the wrong round.
+    fn with_hopper(
+        name: &str,
+        invocation: &str,
+        body: impl FnOnce(&mut Gpu, crate::ptx_wgmma::Sm90aLicense),
+    ) {
         with_gpu(name, |g| {
             let cc = g.target().cc();
             match crate::ptx_wgmma::require_sm90a(g, name) {
@@ -17673,8 +17855,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     eprintln!("[skip:capability] {why}");
                     eprintln!(
                         "[skip:capability] {name}: correct on a part that is not Hopper. The round \
-                         this gate exists for is:\n    {}",
-                        crate::ptx_wgmma::WGMMA_BRINGUP_INVOCATION
+                         this gate exists for is:\n    {invocation}"
                     );
                 }
             }
@@ -17834,7 +18015,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             SHIPPED_LAYOUT, TMA_PROBE_ENTRY, TMA_PROBE_KEY, WGMMA_VARIANTS, WGMMA_W1,
             WGMMA_W1_BF16, WGMMA_W3C,
         };
-        with_hopper("wgmma_hopper_bringup", |g, lic| {
+        let inv = crate::ptx_wgmma::WGMMA_BRINGUP_INVOCATION;
+        with_hopper("wgmma_hopper_bringup", inv, |g, lic| {
             let dev = g.device_name();
             let t = g.target().clone();
             eprintln!("\n================ wgmma / TMA Hopper bring-up ================");
@@ -18556,6 +18738,602 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             );
             eprintln!("=============================================================\n");
         });
+    }
+
+    // =============================================================================================
+    // ACT 2, ITEM 8 — the wgmma family against cuBLAS, through `bench_instrument`
+    // =============================================================================================
+
+    use crate::bench_instrument as bi;
+
+    /// The one field each Act-2 shape records: **milliseconds per launch, lower is better**.
+    ///
+    /// One field, not two. `bench_instrument` is unit-agnostic and takes `max |C/A - 1|` over the
+    /// live fields as the floor, so adding a FLOP/s column — an exact reciprocal of this one — would
+    /// contribute a second, redundant term to the floor and make the gate marginally *stricter* for
+    /// no new information. The rate is printed as a diagnostic, derived from the same medians.
+    const WGMMA_BENCH_FIELD: &str = "gemm_ms";
+
+    /// One arm-`A` peer: the library bar this contender is scored against.
+    ///
+    /// A struct of two function pointers rather than a generic, because the f16 and bf16 rounds are
+    /// the *same* round with a different dtype and must not drift into two bodies.
+    #[derive(Clone, Copy)]
+    struct PeerBar {
+        /// What the round log calls it.
+        label: &'static str,
+        /// One-shot host-in/host-out call, for the correctness spot-check.
+        once: fn(
+            &mut Gpu,
+            &[f32],
+            &[f32],
+            usize,
+            usize,
+            usize,
+        ) -> Result<Vec<f32>, crate::baselines::PeerError>,
+        /// Resident timing call: `(g, m, k, n, iters) -> seconds/call`.
+        time: fn(&mut Gpu, usize, usize, usize, u32) -> Result<f64, crate::baselines::PeerError>,
+    }
+
+    /// **The instrument wiring for ONE shape, with the device factored out of the signature.**
+    ///
+    /// `measure(arm)` returns that arm's seconds/launch. `bench_instrument::run_rotated` drives it
+    /// over the warm-up and recorded rounds, rotating which arm leads, and this wrapper turns each
+    /// reading into the single [`WGMMA_BENCH_FIELD`] sample and latches the first failure.
+    ///
+    /// Factored out for two reasons. (1) A failure must poison the whole shape rather than silently
+    /// shorten one arm's sample vector: once `fail` is set every later arm reports nothing, every
+    /// field length disagrees with the plan, and `analyze` returns `Cell::Malformed` — an instrument
+    /// failure, which is what it is. (2) It is the *only* path either bench takes to a
+    /// `BenchSamples`, so a device-free gate can feed it synthetic numbers and check the verdicts the
+    /// real round would reach (`the_act2_round_wiring_publishes_only_what_the_control_resolves`).
+    fn wgmma_shape_samples<F>(
+        label: &str,
+        plan: &bi::TwinPlan,
+        mut measure: F,
+    ) -> (bi::BenchSamples, Option<String>)
+    where
+        F: FnMut(bi::Arm) -> Result<f64, String>,
+    {
+        let mut fail: Option<String> = None;
+        let samples = bi::run_rotated(label, plan, |arm| {
+            if fail.is_some() {
+                return Vec::new();
+            }
+            match measure(arm) {
+                Ok(secs) => vec![bi::read(WGMMA_BENCH_FIELD, secs * 1e3)],
+                Err(e) => {
+                    fail = Some(format!("arm {} failed: {e}", arm.tag()));
+                    Vec::new()
+                }
+            }
+        });
+        (samples, fail)
+    }
+
+    /// **The module and launch configuration actually launched**, as a provenance block.
+    ///
+    /// Printed beside the device block because "W1" is a name in a dossier and this is what the
+    /// driver was handed: the tile, the ring depth, the warp-specialisation split, the register
+    /// targets, the descriptor reading, and — stated rather than assumed — that the cluster is
+    /// `1x1x1`, because D1's W1 specifies a `2x1x1` cluster with `.multicast::cluster` on A and this
+    /// row declines it.
+    fn wgmma_config_block(cfg: &crate::ptx_wgmma::WgmmaCfg) -> String {
+        let plan = cfg.launch_plan();
+        let mut s = String::new();
+        s += &format!("kernel         : {} ({:?})\n", cfg.name, cfg.dtype);
+        s += &format!(
+            "tile / stages  : {}x{}x{}, {} stages, {} B ring (dynamic .extern window)\n",
+            cfg.bm, cfg.bn, cfg.bk, cfg.stages, plan.dyn_smem_bytes
+        );
+        s += &format!(
+            "warp spec      : 1 producer wg @ {} regs + {} consumer wg @ {} regs = {} threads\n",
+            cfg.producer_regs,
+            cfg.consumer_wgs,
+            cfg.consumer_regs,
+            cfg.threads()
+        );
+        s += &format!(
+            "schedule       : {:?}; cluster 1x1x1 ({:?} - D1's W1 asks for a 2x1x1 cluster with \
+             .multicast::cluster on A; this row declines it)\n",
+            cfg.schedule, cfg.multicast
+        );
+        s += &format!("smem layout    : {}\n", cfg.layout.label());
+        s += &format!(
+            "wgmma          : {} per staged K tile, {} accumulator regs/thread\n",
+            cfg.wgmma_per_stage(),
+            cfg.shape().map(|sh| sh.accum_regs()).unwrap_or(0)
+        );
+        s
+    }
+
+    /// **The shared body of both Act-2 peer rounds** — `WGMMA_DEVICE_VALIDATION` item 8.
+    ///
+    /// # What this is, and what it deliberately is not
+    ///
+    /// It is the first real consumer of [`crate::bench_instrument`]. Every arm goes through it:
+    /// `Provenance` + `Round::open` (the device spec check, which a MIG slice or a cut PCIe part
+    /// fails outright), `TwinPlan` pre-registered before a number is seen, `machine_floor` as cheap
+    /// triage, `run_rotated` with the **cuBLAS peer as both the A and the C arm** — plan §6.2's
+    /// "cuBLAS-called-twice control", so `C/A` is the peer's own noise floor and `B/A` is the claim —
+    /// `analyze` for the per-shape verdict, and `Round::publish` as the only way a number leaves.
+    ///
+    /// It is **not** a pass/fail test of speed. Nothing here asserts a ratio: a wgmma kernel at 60%
+    /// of cuBLAS is a finding that Act 2 needs, not a broken build. The only asserts are the
+    /// exact-integer correctness spot-check that gates the timing, and the structural ones the
+    /// instrument raises itself.
+    ///
+    /// # The one thing that WILL fail the test
+    ///
+    /// A wrong kernel posting a timing. Before any shape is timed, both the contender and the peer
+    /// run `ptx_wgmma::bringup_operands` at the config's own tile through `ref_nt`, and the contender
+    /// must be **bit-exact** — the operands are small integers whose dot product stays under 2^24, so
+    /// reassociation cannot move a bit and the verdict is `==` rather than an argument about
+    /// tolerances. A fast wrong kernel is the one outcome a perf round must never publish.
+    ///
+    /// # Rounds are ITERATION data in a container
+    ///
+    /// `GPU_RETARGET_PLAN.md` §6.3: clocks cannot be locked inside Modal/RunPod/Vast, so a container
+    /// round is iteration data and a root-VM round with `nvidia-smi -lgc` is publication data. The
+    /// round log says which it was, from `WUKONG_GPU_CLOCK_LOCK`, and warns when it is neither.
+    fn wgmma_peer_round(
+        bench: &'static str,
+        cfg: &'static crate::ptx_wgmma::WgmmaCfg,
+        peer: PeerBar,
+    ) {
+        use crate::ptx_wgmma::{
+            bench_iters, bringup_operands, WGMMA_BENCH_GRID, WGMMA_BENCH_INVOCATION,
+        };
+        with_hopper(bench, WGMMA_BENCH_INVOCATION, |g, _lic| {
+            // --- 0. the peer, before anything else that costs time -----------------------------
+            if !crate::baselines::peers_available(g) {
+                peer_gate(bench);
+                eprintln!(
+                    "[skip] {bench}: cuBLAS is not loadable, so this round has no bar.\n{}",
+                    crate::baselines::peer_env_hint()
+                );
+                return;
+            }
+
+            // --- 1. provenance, emitted by the harness (plan 6.1) -------------------------------
+            eprintln!("\n================ {bench} ================");
+            let prov = bi::Provenance::new(
+                bench,
+                bi::facts_of(g),
+                bi::RoundMeta::from_env(),
+                bi::query_smi(),
+            );
+            eprint!("{}", prov.header());
+            eprint!("{}", wgmma_config_block(cfg));
+            eprintln!("peer (arms A,C): {}", peer.label);
+            if !matches!(prov.meta.clock_lock, bi::ClockLock::Locked(_)) {
+                eprintln!(
+                    "*** CLOCKS ARE NOT LOCKED (or the lock is undeclared). A shared container \
+                     cannot run `nvidia-smi -lgc`,\n\
+                     *** so per GPU_RETARGET_PLAN.md 6.3 this round is ITERATION data, not \
+                     publication data. Publication\n\
+                     *** rounds need a root VM with the clocks pinned below throttle; set \
+                     WUKONG_GPU_CLOCK_LOCK to declare it."
+                );
+            }
+            let mut round = match bi::Round::open(prov) {
+                Ok(r) => r,
+                Err(why) => {
+                    // A refusing round is still logged: bench/gpu/README.md rule 3.
+                    eprintln!("[skip:provenance] {bench}: {why}");
+                    eprintln!("*** THIS ROUND PUBLISHES NOTHING ***");
+                    return;
+                }
+            };
+
+            // --- 2. the plan, pre-registered ----------------------------------------------------
+            let plan = bi::TwinPlan::default();
+            eprintln!(
+                "plan           : {} recorded rounds + {} discarded warm-up, bar +/-{:.2}%, \
+                 median across rounds",
+                plan.rounds,
+                plan.warmups,
+                plan.bar * 100.0
+            );
+
+            // --- 3. machine floor: triage, not a substitute for the bench's own control ----------
+            match bi::machine_floor(g, &plan) {
+                Ok(v) => eprint!("{}", v.table()),
+                Err(e) => eprintln!("[warn] machine-floor probe unavailable: {e}"),
+            }
+
+            // --- 4. correctness gates the timing ------------------------------------------------
+            {
+                let (cm, cn, ck) = (cfg.bm, cfg.bn, cfg.bk * cfg.stages);
+                let (a, b) = bringup_operands(cm, cn, ck);
+                let limit = cfg.dtype.exact_integer_limit();
+                assert!(
+                    a.iter().chain(&b).all(|v| v.abs() <= limit),
+                    "{}: the ramp at K={ck} is not exact in {:?} (limit {limit}) — the verdict \
+                     below would silently become a tolerance",
+                    cfg.name,
+                    cfg.dtype
+                );
+                let want = ref_nt(&a, &b, cm, ck, cn);
+                let got = gemm_nt_wgmma(g, cfg, &a, &b, cm, ck, cn)
+                    .unwrap_or_else(|e| panic!("{bench}: {} at {cm}x{ck}x{cn}: {e}", cfg.name));
+                let bad = got.iter().zip(&want).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    bad,
+                    0,
+                    "{bench}: {} is WRONG at {cm}x{ck}x{cn} ({bad} of {} lanes, max_abs {:.3e}) — \
+                     a wrong kernel must never post a timing",
+                    cfg.name,
+                    want.len(),
+                    crate::diff::err_stats(&got, &want).max_abs
+                );
+                // The peer, through the SAME reference: a transpose slip in the bar would hand the
+                // contender a win (or a loss) it did not earn.
+                let pg = (peer.once)(g, &a, &b, cm, ck, cn)
+                    .unwrap_or_else(|e| panic!("{bench}: {} one-shot failed: {e}", peer.label));
+                let ps = crate::diff::assert_close(
+                    &format!("{} {cm}x{ck}x{cn}", peer.label),
+                    &pg,
+                    &want,
+                    5e-2,
+                    2e-2,
+                );
+                let pexact = pg.iter().zip(&want).filter(|(x, y)| x == y).count();
+                eprintln!(
+                    "[gate] {} is EXACT on all {} lanes; {} matches the same f64 reference \
+                     ({pexact}/{} lanes exact, max_abs {:.2e}) \u{2713}",
+                    cfg.name,
+                    want.len(),
+                    peer.label,
+                    want.len(),
+                    ps.max_abs
+                );
+            }
+
+            // --- 5. the sweep: one rotated round per shape ---------------------------------------
+            eprintln!(
+                "\n[{bench}] sweeping {} shapes; arms A and C are BOTH {} (the peer twin), arm B \
+                 is {}.\n\
+                 [{bench}] READ THE FLOOR CORRECTLY: C/A is the PEER's own run-to-run spread \
+                 through a second handle and\n\
+                 [{bench}] its own buffers, which is what plan 6.2 asks a peer round for. It is the \
+                 noise floor of the\n\
+                 [{bench}] DENOMINATOR, not of our kernel; a contender whose own spread is wider \
+                 than the peer's would\n\
+                 [{bench}] clear this bar while still being unresolved. Treat a barely-cleared \
+                 effect as unresolved.",
+                WGMMA_BENCH_GRID.len(),
+                peer.label,
+                cfg.name
+            );
+            let mut rows: Vec<(&crate::ptx_wgmma::GemmPoint, bi::BenchVerdict, usize)> = Vec::new();
+            for p in WGMMA_BENCH_GRID {
+                let iters = bench_iters(p);
+                let label = format!("{bench}@{}", p.label);
+                eprintln!(
+                    "  {:<15} {:>18}  {} launches/region, {:.1} MiB of device operands  [{}]",
+                    p.label,
+                    p.dims(),
+                    iters,
+                    p.device_bytes(cfg.dtype.size()) as f64 / (1024.0 * 1024.0),
+                    p.why
+                );
+                let (samples, fail) = wgmma_shape_samples(&label, &plan, |arm| match arm {
+                    bi::Arm::Baseline | bi::Arm::Control => {
+                        (peer.time)(g, p.m, p.k, p.n, iters as u32).map_err(|e| e.to_string())
+                    }
+                    bi::Arm::Contender => {
+                        time_gemm_nt_wgmma(g, cfg, p.m, p.k, p.n, iters).map_err(|e| e.to_string())
+                    }
+                });
+                if let Some(why) = &fail {
+                    eprintln!("    [warn] {label}: {why} — this shape publishes nothing");
+                }
+                rows.push((p, bi::analyze(&samples, plan.bar), iters));
+            }
+
+            // --- 6. close, then the gate decides --------------------------------------------------
+            round.close(bi::query_smi());
+            eprintln!("\n---- {bench}: round close ----");
+            eprint!("{}", round.header());
+
+            eprintln!("\n---- {bench}: per-shape verdicts ----");
+            for (_, v, _) in &rows {
+                eprint!("{}", v.table());
+            }
+
+            eprintln!(
+                "\n---- {bench}: the published table ({} vs {}) ----",
+                cfg.name, peer.label
+            );
+            eprintln!(
+                "  {:<15} {:>18} {:>10}  headline",
+                "shape", "MxNxK", "iters"
+            );
+            for (p, v, iters) in &rows {
+                let head = match round.publish(v, WGMMA_BENCH_FIELD) {
+                    // `ratio` is B/A on a MILLISECOND field, so it is < 1 when we are faster and the
+                    // throughput percentage is its reciprocal. `bench_instrument` is unit-agnostic
+                    // and will not catch a ratio quoted the wrong way round; this is where polarity
+                    // is owned.
+                    Ok(pubd) => format!(
+                        "{:.1}% of {} ({:.4}x its ms, {}, floor +/-{:.2}%)",
+                        100.0 / pubd.ratio(),
+                        peer.label,
+                        pubd.ratio(),
+                        if pubd.is_tie() { "tie" } else { "moved" },
+                        pubd.floor() * 100.0
+                    ),
+                    Err(why) => format!("-- ({why})"),
+                };
+                eprintln!("  {:<15} {:>18} {:>10}  {head}", p.label, p.dims(), iters);
+            }
+
+            // Absolute rates, DIAGNOSTIC only. `docs/metrics.md` keeps absolute GFLOP/s out of the
+            // committed tables — the clock swings, so an absolute is a statement about this minute's
+            // boost state. They are here because D1 §7 asks for cuBLAS's own absolute number as the
+            // anchor for four predictions, and a round log is the right place for it.
+            eprintln!(
+                "\n---- {bench}: DIAGNOSTIC absolutes (NOT publishable; clock-dependent) ----"
+            );
+            eprintln!(
+                "  {:<15} {:>12} {:>12} {:>12} {:>12}",
+                "shape", "peer ms", "ours ms", "peer TFLOP/s", "ours TFLOP/s"
+            );
+            for (p, v, _) in &rows {
+                let f = v.field(WGMMA_BENCH_FIELD);
+                let ms = |x: Option<f64>| match x {
+                    Some(v) if v > 0.0 => format!("{v:.4}"),
+                    _ => "n/a".to_string(),
+                };
+                let tf = |x: Option<f64>| match x {
+                    Some(v) if v > 0.0 => format!("{:.1}", p.flop() / (v * 1e-3) / 1e12),
+                    _ => "n/a".to_string(),
+                };
+                eprintln!(
+                    "  {:<15} {:>12} {:>12} {:>12} {:>12}",
+                    p.label,
+                    ms(f.and_then(|x| x.a)),
+                    ms(f.and_then(|x| x.b)),
+                    tf(f.and_then(|x| x.a)),
+                    tf(f.and_then(|x| x.b))
+                );
+            }
+            eprintln!(
+                "\n[{bench}] W3C (128x128x64 s6, D1's moderate-size arm) is NOT in this round: the \
+                 instrument has one contender arm, and a second kernel in arm B would be an A/B \
+                 against two different things at once.\n\
+                 =============================================================\n"
+            );
+        });
+    }
+
+    /// **Act 2, item 8 (f16): `WGMMA_W1` against cuBLAS on D1 §4.4's grid.**
+    ///
+    /// D1 §4.5 predicts this row at **95–108% of cuBLAS at 4096³–8192³** — the single number the
+    /// whole Act-2 business case rests on, and the one thing the bring-up round deliberately did not
+    /// measure. Nothing in this bench asserts that prediction; it prints what the hardware says.
+    ///
+    /// The peer is [`crate::baselines::time_cublas_gemm_nt_f16_f32out`], **not** the f16-out
+    /// `time_cublas_gemm_nt_f16`: our epilogue stores `C` as f32, and an f16-out peer writes half the
+    /// epilogue bytes we do (32 MiB against 64 MiB at 4096³), which is a real advantage that has
+    /// nothing to do with GEMM quality. Same dtype in, same dtype out, same accumulate.
+    ///
+    /// Run it as [`crate::ptx_wgmma::WGMMA_BENCH_INVOCATION`], or in the cloud as
+    /// `modal run tools/cloud/modal_app.py::bench --name wgmma_vs_cublas --peers`.
+    #[test]
+    #[ignore = "Act-2 perf round; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_BENCH_INVOCATION)"]
+    fn wgmma_vs_cublas() {
+        wgmma_peer_round(
+            "wgmma_vs_cublas",
+            &crate::ptx_wgmma::WGMMA_W1,
+            PeerBar {
+                label: "cuBLAS f16 (f32 out)",
+                once: crate::baselines::cublas_gemm_nt_f16_f32out,
+                time: crate::baselines::time_cublas_gemm_nt_f16_f32out,
+            },
+        );
+    }
+
+    /// **Act 2, item 8 (bf16): `WGMMA_W1_BF16` against a bf16 cuBLAS bar.**
+    ///
+    /// bf16 is the dominant *training* precision, and `wgmma` is precision-generic across the two
+    /// 16-bit types — one operand-type token apart — so the bf16 row gets W1's tile with no second
+    /// mainloop. The peer is [`crate::baselines::time_cublas_gemm_nt_bf16_f32out`], added alongside
+    /// the f16 one rather than reusing it: `cublasGemmEx` is also one `cudaDataType_t` apart, but
+    /// "one token apart" does not mean cuBLAS picks the same kernel, and an unstated dtype mismatch
+    /// under a published ratio is the kind of thing this repo has retracted claims over. Same honest-
+    /// peer conventions as its f16 sibling: warmed handle, resident buffers, library free to choose
+    /// its own algorithm, f32 accumulate and f32 `C`.
+    #[test]
+    #[ignore = "Act-2 perf round; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_BENCH_INVOCATION)"]
+    fn wgmma_bf16_vs_cublas() {
+        wgmma_peer_round(
+            "wgmma_bf16_vs_cublas",
+            &crate::ptx_wgmma::WGMMA_W1_BF16,
+            PeerBar {
+                label: "cuBLAS bf16 (f32 out)",
+                once: crate::baselines::cublas_gemm_nt_bf16_f32out,
+                time: crate::baselines::time_cublas_gemm_nt_bf16_f32out,
+            },
+        );
+    }
+
+    /// **The Act-2 benches must decline on a non-Hopper part BEFORE they look for a peer** — a
+    /// textual law, because the ordering is invisible in a diff and the consequence is a red gate on
+    /// this laptop.
+    ///
+    /// `sm_90a` is an architecture LOCK, so on the 4050 (and on a Blackwell part) the correct outcome
+    /// is `[skip:capability]` and nothing else. But the campaign's own invocation sets
+    /// `WUKONG_PEER_REQUIRED=1`, under which `peer_gate` turns a missing cuBLAS into a **failure** —
+    /// so a round that probed for the peer first would fail on every box without the redist DLLs
+    /// including ones that could never have run the kernel anyway. `with_hopper` first, peer second.
+    ///
+    /// Also pins that both benches are `#[ignore]`d: an Act-2 sweep that ran inside a plain
+    /// `cargo test` would spend rented minutes on every unrelated gate run.
+    #[test]
+    fn the_act2_peer_benches_gate_on_hopper_before_they_gate_on_a_peer() {
+        let src = CRATE_SOURCES
+            .iter()
+            .find(|(n, _)| *n == "gpu.rs")
+            .expect("gpu.rs is in CRATE_SOURCES")
+            .1;
+        let at = src
+            .find("fn wgmma_peer_round(")
+            .expect("the shared Act-2 round body must exist");
+        let rest = &src[at..];
+        let hopper = rest
+            .find("with_hopper(")
+            .expect("the Act-2 round must go through with_hopper");
+        let peer = rest
+            .find("peers_available(")
+            .expect("the Act-2 round must probe for its peer");
+        assert!(
+            hopper < peer,
+            "wgmma_peer_round probes for cuBLAS before it checks the device is Hopper — under \
+             WUKONG_PEER_REQUIRED=1 that turns a correct capability skip into a failure on every \
+             part that could never have run sm_90a in the first place"
+        );
+        for name in ["fn wgmma_vs_cublas()", "fn wgmma_bf16_vs_cublas()"] {
+            let i = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let head = &src[i.saturating_sub(220)..i];
+            assert!(
+                head.contains("#[ignore"),
+                "{name} must be #[ignore]d — it is a rented-hour perf sweep, not a gate"
+            );
+        }
+        // Both benches must go through the ONE shared body, which is what makes them provably sweep
+        // the same `WGMMA_BENCH_GRID` at the same `bench_iters` through the same instrument. Two
+        // hand-written sweeps would be two chances to disagree about the denominator.
+        let fns = scanned_fns(src);
+        for name in ["wgmma_vs_cublas", "wgmma_bf16_vs_cublas"] {
+            let (_, body) = fns
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            assert!(
+                body.contains("wgmma_peer_round("),
+                "{name} must run through the shared Act-2 body, not a sweep of its own"
+            );
+        }
+    }
+
+    /// **The instrument wiring, exercised with synthetic samples and no device.**
+    ///
+    /// This drives the *same* [`wgmma_shape_samples`] the two benches drive, and the same
+    /// `analyze`/`Round::publish` pair, so what it proves is not "bench_instrument works" (its own
+    /// module proves that) but "the wiring in this file reaches the verdicts it should". Three cases,
+    /// each the shape of a real round outcome:
+    ///
+    /// * a clean round — a tight peer twin and a contender well clear of it — publishes a `Moved`
+    ///   cell whose ratio is the millisecond ratio the round log quotes;
+    /// * a noisy round — the peer twin spread wider than the pre-registered bar — publishes
+    ///   **nothing**, and the refusal names the floor, even though the contender "won" by 20%;
+    /// * a broken arm publishes nothing, as a `Malformed` field rather than a short average.
+    #[test]
+    fn the_act2_round_wiring_publishes_only_what_the_control_resolves() {
+        let plan = bi::TwinPlan::new(5, 1, bi::DEFAULT_CONTROL_BAR).expect("a valid plan");
+        // A synthetic H100 that passes the spec table, with clock evidence at both ends.
+        let facts = bi::DeviceFacts {
+            name: "NVIDIA H100 80GB HBM3".to_string(),
+            cc_major: 9,
+            cc_minor: 0,
+            sm_count: 132,
+            smem_per_block_optin: 232448,
+            l2_bytes: 52428800,
+            total_mem: 85520809984,
+            driver_version: 12090,
+        };
+        let smi = bi::SmiSample {
+            driver: "580.95.05".to_string(),
+            sm_clock_mhz: 1755.0,
+            mem_clock_mhz: Some(2619.0),
+            temp_c: Some(41.0),
+            power_w: Some(96.0),
+        };
+        let open = |name: &str| {
+            let mut r = bi::Round::open(bi::Provenance::new(
+                name,
+                facts.clone(),
+                bi::RoundMeta::default(),
+                Some(smi.clone()),
+            ))
+            .expect("a spec-matching H100 opens");
+            r.close(Some(smi.clone()));
+            r
+        };
+
+        // (1) A clean round: the peer twin within 0.4%, the contender 12% faster.
+        let mut call = 0usize;
+        let (s, fail) = wgmma_shape_samples("synthetic@clean", &plan, |arm| {
+            call += 1;
+            let jitter = 1.0 + 0.002 * ((call % 3) as f64 - 1.0);
+            Ok(match arm {
+                bi::Arm::Baseline => 1.000e-3 * jitter,
+                bi::Arm::Control => 1.002e-3 * jitter,
+                bi::Arm::Contender => 0.880e-3 * jitter,
+            })
+        });
+        assert!(fail.is_none());
+        let v = bi::analyze(&s, plan.bar);
+        assert!(v.blocked.is_none(), "clean round blocked: {:?}", v.blocked);
+        let clean = open("synthetic-clean");
+        let p = clean
+            .publish(&v, WGMMA_BENCH_FIELD)
+            .expect("a clean round publishes");
+        assert!(!p.is_tie(), "a 12% effect over a sub-1% floor is not a tie");
+        assert!(
+            (p.ratio() - 0.88).abs() < 0.01,
+            "ratio {} should be the ms ratio",
+            p.ratio()
+        );
+        // Polarity, owned here and nowhere else: the headline is the reciprocal of a ms ratio.
+        assert!((100.0 / p.ratio() - 113.6).abs() < 1.0);
+        assert!(clean.cell(&v, WGMMA_BENCH_FIELD).contains("gemm_ms"));
+
+        // (2) A noisy round: the twin alone spreads +/-9%, past the +/-5% bar. The contender is 20%
+        // "faster" and it still publishes nothing.
+        let mut call = 0usize;
+        let (s, _) = wgmma_shape_samples("synthetic@noisy", &plan, |arm| {
+            call += 1;
+            Ok(match arm {
+                bi::Arm::Baseline => 1.000e-3,
+                bi::Arm::Control => 1.090e-3 + 1e-9 * call as f64,
+                bi::Arm::Contender => 0.800e-3,
+            })
+        });
+        let v = bi::analyze(&s, plan.bar);
+        assert!(matches!(v.blocked, Some(bi::Refusal::FloorAboveBar { .. })));
+        let noisy = open("synthetic-noisy");
+        let cell = noisy.cell(&v, WGMMA_BENCH_FIELD);
+        assert!(cell.starts_with("--"), "{cell}");
+        assert!(cell.contains("control floor"), "{cell}");
+        assert!(
+            noisy.publish(&v, WGMMA_BENCH_FIELD).is_err(),
+            "an unresolved round must not mint a number"
+        );
+
+        // (3) A broken arm poisons the shape rather than shortening one sample vector.
+        let mut call = 0usize;
+        let (s, fail) = wgmma_shape_samples("synthetic@broken", &plan, |arm| {
+            call += 1;
+            if call == 7 {
+                return Err("CUDA_ERROR_OUT_OF_MEMORY".to_string());
+            }
+            Ok(match arm {
+                bi::Arm::Contender => 0.9e-3,
+                _ => 1.0e-3,
+            })
+        });
+        let why = fail.expect("the failure must be latched, not swallowed");
+        assert!(why.contains("CUDA_ERROR_OUT_OF_MEMORY"), "{why}");
+        let v = bi::analyze(&s, plan.bar);
+        assert!(matches!(v.blocked, Some(bi::Refusal::MalformedField(_))));
+        assert!(open("synthetic-broken")
+            .publish(&v, WGMMA_BENCH_FIELD)
+            .is_err());
     }
 
     /// **Correctness gate for the dispatched w22 swizzle workhorses** (`mma_nt_{f16,bf16}_128_bk32_s2_r16_
