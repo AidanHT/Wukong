@@ -1,0 +1,871 @@
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-oBpFkGaO5yR5QvxaQqS5bG
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function build_peers.
+├── 🔨 Created function ptxas.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+├── 🔨 Created function peers.
+├── 🔨 Created function cutlass.
+├── 🔨 Created function marlin.
+├── 🔨 Created function framework.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] bench: H100! + 8.0 cpu + 16 GiB = $4.456/hr; timeout 7200s caps this call at $8.91
+[src] 805 files stamped; 1 new/changed since the last run (incremental)
+Sweep on H100! — PEER_REQUIRED=1, STRONG_PEERS=(none declared)
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --release -- wgmma --ignored --nocapture --test-threads=1[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 1.48s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-53f0e4b228126785)
+
+running 3 tests
+
+================ wgmma_bf16_vs_cublas ================
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_bf16_vs_cublas
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 24.0 C  power 113.1 W
+kernel         : wgmma_nt_bf16_128x256x64_s4 (Bf16)
+tile / stages  : 128x256x64, 4 stages, 196672 B ring (dynamic .extern window)
+warp spec      : 1 producer wg @ 32 regs + 2 consumer wg @ 232 regs = 384 threads
+schedule       : Cooperative; cluster 1x1x1 (None - D1's W1 asks for a 2x1x1 cluster with .multicast::cluster on A; this row declines it)
+smem layout    : SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+wgmma          : 4 per staged K tile, 128 accumulator regs/thread
+peer (arms A,C): cuBLAS bf16 (f32 out)
+*** CLOCKS ARE NOT LOCKED (or the lock is undeclared). A shared container cannot run `nvidia-smi -lgc`,
+*** so per GPU_RETARGET_PLAN.md 6.3 this round is ITERATION data, not publication data. Publication
+*** rounds need a root VM with the clocks pinned below throttle; set WUKONG_GPU_CLOCK_LOCK to declare it.
+plan           : 5 recorded rounds + 1 discarded warm-up, bar +/-5.00%, median across rounds
+bench machine_floor: floor +1.85% (bar +/-5.00%), median of 5 rounds  [GATE SHUT: control-only round: the floor is measured, but there is no contender arm to publish]
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  probe_us                      11.352450      11.562900            n/a     +1.85%        n/a  no-contender
+[gate] wgmma_nt_bf16_128x256x64_s4 is EXACT on all 32768 lanes; cuBLAS bf16 (f32 out) matches the same f64 reference (32768/32768 lanes exact, max_abs 0.00e0) ✓
+
+[wgmma_bf16_vs_cublas] sweeping 7 shapes; arms A and C are BOTH cuBLAS bf16 (f32 out) (the peer twin), arm B is wgmma_nt_bf16_128x256x64_s4.
+[wgmma_bf16_vs_cublas] READ THE FLOOR CORRECTLY: C/A is the PEER's own run-to-run spread through a second handle and
+[wgmma_bf16_vs_cublas] its own buffers, which is what plan 6.2 asks a peer round for. It is the noise floor of the
+[wgmma_bf16_vs_cublas] DENOMINATOR, not of our kernel; a contender whose own spread is wider than the peer's would
+[wgmma_bf16_vs_cublas] clear this bar while still being unresolved. Treat a barely-cleared effect as unresolved.
+  sq1024              1024x1024x1024  1000 launches/region, 8.0 MiB of device operands  [D1 5.3: 4 MiB working set, 0.08x L2 -- deeply L2-resident, and only 32 CTAs of a 128x256 tile, so this row is about wave quantization, not bandwidth]
+  sq2048              2048x2048x2048  1000 launches/region, 32.0 MiB of device operands  [D1 5.3: 16 MiB, 0.32x L2 -- L2-resident. D1 4.5 puts W3 (128x128) here because a 256-wide tile quantizes below M*N = 4.3e6; W1 is measured here anyway, as the evidence for that claim]
+  sq4096              4096x4096x4096  146 launches/region, 128.0 MiB of device operands  [D1 5.3: 64 MiB, 1.28x L2 -- the raster crossover, and the first of the two shapes D1 4.5 predicts W1 at 95-108% of cuBLAS on]
+  sq8192              8192x8192x8192  18 launches/region, 512.0 MiB of device operands  [D1 5.3: 256 MiB, 5.12x L2 -- raster plus streaming C, and the second 95-108% point]
+  gpt_d1024_up        4096x4096x1024  582 launches/region, 80.0 MiB of device operands  [SKINNY-K. GPT d=1024 FFN up-projection (M=4096, N=4d, K=d). D1 4.3.2: ws is exactly 16.0 MiB, which trips the Act-1 dispatcher's 16 MiB literal into the raster arm although 0.32x L2 is deeply L2-resident]
+  gpt_d1024_down      4096x1024x4096  582 launches/region, 56.0 MiB of device operands  [SKINNY-N (derived, not in D1's table): the down-projection twin of the row above. D1 4.4's A4 asks whether widening N or widening M buys reuse; W1 is N-major, so the N << M shape is where that costs something]
+  gpt_d4096_up       4096x16384x4096  36 launches/region, 416.0 MiB of device operands  [GPT d=4096 FFN up-projection. D1 5.3: 160 MiB, 3.20x L2 -- raster, and the widest N the epilogue's u32 element index still holds (M*N = 67.1e6)]
+
+---- wgmma_bf16_vs_cublas: round close ----
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_bf16_vs_cublas
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 24.0 C  power 113.1 W
+clocks after   : sm 1980 MHz  mem 2619.0 MHz  temp 30.0 C  power 177.3 W
+sm clock drift : +0.00% (bar +/-5.00%)
+wall           : 17.5 s
+cost estimate  : n/a (set WUKONG_GPU_USD_PER_HR)
+publish gate   : OPEN (round level)
+
+---- wgmma_bf16_vs_cublas: per-shape verdicts ----
+bench wgmma_bf16_vs_cublas@sq1024: floor +0.50% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.006976       0.006941       0.021730     -0.50%   +211.47%  moved
+bench wgmma_bf16_vs_cublas@sq2048: floor +2.19% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025070       0.025619       0.039323     +2.19%    +56.86%  moved
+bench wgmma_bf16_vs_cublas@sq4096: floor +0.03% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.164187       0.164140       0.242760     -0.03%    +47.86%  moved
+bench wgmma_bf16_vs_cublas@sq8192: floor +0.70% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.263272       1.272174       2.126854     +0.70%    +68.36%  moved
+bench wgmma_bf16_vs_cublas@gpt_d1024_up: floor +0.04% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.057912       0.057938       0.105970     +0.04%    +82.98%  moved
+bench wgmma_bf16_vs_cublas@gpt_d1024_down: floor +0.12% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.044450       0.044505       0.057547     +0.12%    +29.46%  moved
+bench wgmma_bf16_vs_cublas@gpt_d4096_up: floor +0.00% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.673600       0.673582       1.572771     -0.00%   +133.49%  moved
+
+---- wgmma_bf16_vs_cublas: the published table (wgmma_nt_bf16_128x256x64_s4 vs cuBLAS bf16 (f32 out)) ----
+  shape                        MxNxK      iters  headline
+  sq1024              1024x1024x1024       1000  32.1% of cuBLAS bf16 (f32 out) (3.1147x its ms, moved, floor +/-0.50%)
+  sq2048              2048x2048x2048       1000  63.8% of cuBLAS bf16 (f32 out) (1.5686x its ms, moved, floor +/-2.19%)
+  sq4096              4096x4096x4096        146  67.6% of cuBLAS bf16 (f32 out) (1.4786x its ms, moved, floor +/-0.03%)
+  sq8192              8192x8192x8192         18  59.4% of cuBLAS bf16 (f32 out) (1.6836x its ms, moved, floor +/-0.70%)
+  gpt_d1024_up        4096x4096x1024        582  54.6% of cuBLAS bf16 (f32 out) (1.8298x its ms, moved, floor +/-0.04%)
+  gpt_d1024_down      4096x1024x4096        582  77.2% of cuBLAS bf16 (f32 out) (1.2946x its ms, moved, floor +/-0.12%)
+  gpt_d4096_up       4096x16384x4096         36  42.8% of cuBLAS bf16 (f32 out) (2.3349x its ms, moved, floor +/-0.00%)
+
+---- wgmma_bf16_vs_cublas: DIAGNOSTIC absolutes (NOT publishable; clock-dependent) ----
+  shape                peer ms      ours ms peer TFLOP/s ours TFLOP/s
+  sq1024                0.0070                  436.9
+  sq4096                      837.1     566.2  sq8192                 2.1269   
+            0.1060           324.2  gpt_d1024_down     0.0445    0.0575           597.1
+  gpt_d4096_up       0.6736    1.5728         
+wgmma_bf16_vs_cublas] W3C (128x128x64 s6, D1's moderate-size arm) is NOT in this round: the instrument has one contender arm, and a second kernel in arm B would be an A/B against two different things at once.
+=============================================================
+
+test gpu::tests::wgmma_bf16_vs_cublas ... ok
+
+================ wgmma_vs_cublas ================
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_vs_cublas
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 27.0 C  power 167.8 W
+kernel         : wgmma_nt_f16_128x256x64_s4 (F16)
+tile / stages  : 128x256x64, 4 stages, 196672 B ring (dynamic .extern window)
+warp spec      : 1 producer wg @ 32 regs + 2 consumer wg @ 232 regs = 384 threads
+schedule       : Cooperative; cluster 1x1x1 (None - D1's W1 asks for a 2x1x1 cluster with .multicast::cluster on A; this row declines it)
+smem layout    : SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+wgmma          : 4 per staged K tile, 128 accumulator regs/thread
+peer (arms A,C): cuBLAS f16 (f32 out)
+*** CLOCKS ARE NOT LOCKED (or the lock is undeclared). A shared container cannot run `nvidia-smi -lgc`,
+*** so per GPU_RETARGET_PLAN.md 6.3 this round is ITERATION data, not publication data. Publication
+*** rounds need a root VM with the clocks pinned below throttle; set WUKONG_GPU_CLOCK_LOCK to declare it.
+plan           : 5 recorded rounds + 1 discarded warm-up, bar +/-5.00%, median across rounds
+bench machine_floor: floor +1.04% (bar +/-5.00%), median of 5 rounds  [GATE SHUT: control-only round: the floor is measured, but there is no contender arm to publish]
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  probe_us                      11.362900      11.480650            n/a     +1.04%        n/a  no-contender
+[gate] wgmma_nt_f16_128x256x64_s4 is EXACT on all 32768 lanes; cuBLAS f16 (f32 out) matches the same f64 reference (32768/32768 lanes exact, max_abs 0.00e0) ✓
+
+[wgmma_vs_cublas] sweeping 7 shapes; arms A and C are BOTH cuBLAS f16 (f32 out) (the peer twin), arm B is wgmma_nt_f16_128x256x64_s4.
+[wgmma_vs_cublas] READ THE FLOOR CORRECTLY: C/A is the PEER's own run-to-run spread through a second handle and
+[wgmma_vs_cublas] its own buffers, which is what plan 6.2 asks a peer round for. It is the noise floor of the
+[wgmma_vs_cublas] DENOMINATOR, not of our kernel; a contender whose own spread is wider than the peer's would
+[wgmma_vs_cublas] clear this bar while still being unresolved. Treat a barely-cleared effect as unresolved.
+  sq1024              1024x1024x1024  1000 launches/region, 8.0 MiB of device operands  [D1 5.3: 4 MiB working set, 0.08x L2 -- deeply L2-resident, and only 32 CTAs of a 128x256 tile, so this row is about wave quantization, not bandwidth]
+  sq2048              2048x2048x2048  1000 launches/region, 32.0 MiB of device operands  [D1 5.3: 16 MiB, 0.32x L2 -- L2-resident. D1 4.5 puts W3 (128x128) here because a 256-wide tile quantizes below M*N = 4.3e6; W1 is measured here anyway, as the evidence for that claim]
+  sq4096              4096x4096x4096  146 launches/region, 128.0 MiB of device operands  [D1 5.3: 64 MiB, 1.28x L2 -- the raster crossover, and the first of the two shapes D1 4.5 predicts W1 at 95-108% of cuBLAS on]
+  sq8192              8192x8192x8192  18 launches/region, 512.0 MiB of device operands  [D1 5.3: 256 MiB, 5.12x L2 -- raster plus streaming C, and the second 95-108% point]
+  gpt_d1024_up        4096x4096x1024  582 launches/region, 80.0 MiB of device operands  [SKINNY-K. GPT d=1024 FFN up-projection (M=4096, N=4d, K=d). D1 4.3.2: ws is exactly 16.0 MiB, which trips the Act-1 dispatcher's 16 MiB literal into the raster arm although 0.32x L2 is deeply L2-resident]
+  gpt_d1024_down      4096x1024x4096  582 launches/region, 56.0 MiB of device operands  [SKINNY-N (derived, not in D1's table): the down-projection twin of the row above. D1 4.4's A4 asks whether widening N or widening M buys reuse; W1 is N-major, so the N << M shape is where that costs something]
+  gpt_d4096_up       4096x16384x4096  36 launches/region, 416.0 MiB of device operands  [GPT d=4096 FFN up-projection. D1 5.3: 160 MiB, 3.20x L2 -- raster, and the widest N the epilogue's u32 element index still holds (M*N = 67.1e6)]
+
+---- wgmma_vs_cublas: round close ----
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_vs_cublas
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 27.0 C  power 167.8 W
+clocks after   : sm 1980 MHz  mem 2619.0 MHz  temp 27.0 C  power 160.5 W
+sm clock drift : +0.00% (bar +/-5.00%)
+wall           : 19.9 s
+cost estimate  : n/a (set WUKONG_GPU_USD_PER_HR)
+publish gate   : OPEN (round level)
+
+---- wgmma_vs_cublas: per-shape verdicts ----
+bench wgmma_vs_cublas@sq1024: floor +0.07% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.006957       0.006952       0.021511     -0.07%   +209.20%  moved
+bench wgmma_vs_cublas@sq2048: floor +1.18% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.026683       0.026367       0.039137     -1.18%    +46.67%  moved
+bench wgmma_vs_cublas@sq4096: floor +0.07% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163879       0.164001       0.242873     +0.07%    +48.20%  moved
+bench wgmma_vs_cublas@sq8192: floor +0.04% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.272190       1.271686       2.162736     -0.04%    +70.00%  moved
+bench wgmma_vs_cublas@gpt_d1024_up: floor +0.32% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.058110       0.058298       0.106050     +0.32%    +82.50%  moved
+bench wgmma_vs_cublas@gpt_d1024_down: floor +0.34% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.044847       0.045000       0.057497     +0.34%    +28.21%  moved
+bench wgmma_vs_cublas@gpt_d4096_up: floor +0.45% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.673404       0.676466       1.572156     +0.45%   +133.46%  moved
+
+---- wgmma_vs_cublas: the published table (wgmma_nt_f16_128x256x64_s4 vs cuBLAS f16 (f32 out)) ----
+  shape                        MxNxK      iters  headline
+  sq1024              1024x1024x1024       1000  32.3% of cuBLAS f16 (f32 out) (3.0920x its ms, moved, floor +/-0.07%)
+  sq2048              2048x2048x2048       1000  68.2% of cuBLAS f16 (f32 out) (1.4667x its ms, moved, floor +/-1.18%)
+  sq4096              4096x4096x4096        146  67.5% of cuBLAS f16 (f32 out) (1.4820x its ms, moved, floor +/-0.07%)
+  sq8192              8192x8192x8192         18  58.8% of cuBLAS f16 (f32 out) (1.7000x its ms, moved, floor +/-0.04%)
+  gpt_d1024_up        4096x4096x1024        582  54.8% of cuBLAS f16 (f32 out) (1.8250x its ms, moved, floor +/-0.32%)
+  gpt_d1024_down      4096x1024x4096        582  78.0% of cuBLAS f16 (f32 out) (1.2821x its ms, moved, floor +/-0.34%)
+  gpt_d4096_up       4096x16384x4096         36  42.8% of cuBLAS f16 (f32 out) (2.3346x its ms, moved, floor +/-0.45%)
+
+---- wgmma_vs_cublas: DIAGNOSTIC absolutes (NOT publishable; clock-dependent) ----
+  shape                peer ms      ours ms peer TFLOP/s ours TFLOP/s
+  sq1024                0.0070       0.0215        308.7         99.8
+  sq2048                0.0267       0.0391        643.9        439.0
+  sq4096                0.1639       0.2429        838.7        565.9
+  sq8192                1.2722       2.1627        864.3        508.4
+  gpt_d1024_up          0.0581       0.1060        591.3        324.0
+  gpt_d1024_down        0.0448       0.0575        766.1        597.6
+  gpt_d4096_up          0.6734       1.5722        816.4        349.7
+
+[wgmma_vs_cublas] W3C (128x128x64 s6, D1's moderate-size arm) is NOT in this round: the instrument has one contender arm, and a second kernel in arm B would be an A/B against two different things at once.
+=============================================================
+
+test gpu::tests::wgmma_vs_cublas ... ok
+test ptx_wgmma::tests::dump_wgmma_ptx ... .version 8.0
+.target sm_90a
+.address_size 64
+.extern .shared .align 1024 .b8 wk_dsmem[];
+.visible .entry wgmma_nt_f16_128x256x64_s4(
+    .param .u32 pM,
+    .param .u32 pN,
+    .param .u32 pK,
+    .param .u64 pC,
+    .param .align 64 .b8 tmapA[128],
+    .param .align 64 .b8 tmapB[128]
+)
+.maxntid 384, 1, 1
+{
+    .reg .pred %p0,%p1,%p2,%q0,%q1,%q2,%q3,%pd0,%pd1,%ptrue,%pfirst;
+    .reg .b32 %M,%N,%K,%lin,%wgi,%lane,%wrp,%kt,%ktiles,%stg,%phf,%phe,%tmp,%tmp2,%row0,%row1,%col,%col1,%colb,%ctam,%ctan,%cwg;
+    .reg .b64 %rdC,%rdS,%rdT,%rdA,%rdB,%rdBar,%rdBarF,%rdTmA,%rdTmB,%rdAddr,%rdOffA,%descA,%descB,%rdSt;
+    .reg .f32 %acc<128>;
+
+    ld.param.u32 %M,[pM];
+    ld.param.u32 %N,[pN];
+    ld.param.u32 %K,[pK];
+    ld.param.u64 %rdC,[pC];
+    cvta.to.global.u64 %rdC,%rdC;
+    mov.b64 %rdTmA,tmapA;
+    cvta.param.u64 %rdTmA,%rdTmA;
+    mov.b64 %rdTmB,tmapB;
+    cvta.param.u64 %rdTmB,%rdTmB;
+    mov.u64 %rdS,wk_dsmem;
+    mov.u32 %lin,%tid.x;
+    shr.u32 %wgi,%lin,7;
+    mov.u32 %lane,%laneid;
+    mov.u32 %tmp,%ctaid.x;
+    mul.lo.s32 %ctan,%tmp,256;
+    mov.u32 %tmp,%ctaid.y;
+    mul.lo.s32 %ctam,%tmp,128;
+    add.u32 %tmp,%K,63;
+    shr.u32 %ktiles,%tmp,6;
+    setp.eq.u32 %p0,%lin,0;
+    @!%p0 bra INIT_DONE_wgmma_nt_f16_128x256x64_s4;
+    add.s64 %rdBar,%rdS,196608;
+    mbarrier.init.shared::cta.b64 [%rdBar],1;
+    add.s64 %rdBar,%rdS,196640;
+    mbarrier.init.shared::cta.b64 [%rdBar],2;
+    add.s64 %rdBar,%rdS,196616;
+    mbarrier.init.shared::cta.b64 [%rdBar],1;
+    add.s64 %rdBar,%rdS,196648;
+    mbarrier.init.shared::cta.b64 [%rdBar],2;
+    add.s64 %rdBar,%rdS,196624;
+    mbarrier.init.shared::cta.b64 [%rdBar],1;
+    add.s64 %rdBar,%rdS,196656;
+    mbarrier.init.shared::cta.b64 [%rdBar],2;
+    add.s64 %rdBar,%rdS,196632;
+    mbarrier.init.shared::cta.b64 [%rdBar],1;
+    add.s64 %rdBar,%rdS,196664;
+    mbarrier.init.shared::cta.b64 [%rdBar],2;
+INIT_DONE_wgmma_nt_f16_128x256x64_s4:
+    bar.sync 0;
+    setp.eq.u32 %p0,%wgi,0;
+    @!%p0 bra CONSUMER_wgmma_nt_f16_128x256x64_s4;
+    setmaxnreg.dec.sync.aligned.u32 32;
+    setp.eq.u32 %p0,%lin,0;
+    @!%p0 bra EXIT_wgmma_nt_f16_128x256x64_s4;
+    mov.u32 %kt,0;
+    mov.u32 %stg,0;
+    mov.u32 %phe,1;
+PLOOP_wgmma_nt_f16_128x256x64_s4:
+    setp.ge.u32 %p0,%kt,%ktiles;
+    @%p0 bra EXIT_wgmma_nt_f16_128x256x64_s4;
+    mul.wide.u32 %rdT,%stg,8;
+    add.s64 %rdBar,%rdS,%rdT;
+    add.s64 %rdBar,%rdBar,196640;
+PWAIT_wgmma_nt_f16_128x256x64_s4:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%phe;
+    @!%p1 bra PWAIT_wgmma_nt_f16_128x256x64_s4;
+    mul.wide.u32 %rdT,%stg,8;
+    add.s64 %rdBarF,%rdS,%rdT;
+    add.s64 %rdBarF,%rdBarF,196608;
+    mbarrier.arrive.expect_tx.shared::cta.b64 %rdSt,[%rdBarF],49152;
+    mul.wide.u32 %rdT,%stg,16384;
+    add.s64 %rdA,%rdS,%rdT;
+    mul.wide.u32 %rdT,%stg,32768;
+    add.s64 %rdB,%rdS,%rdT;
+    add.s64 %rdB,%rdB,65536;
+    mul.lo.s32 %tmp,%kt,64;
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%rdA],[%rdTmA,{%tmp,%ctam}],[%rdBarF];
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%rdB],[%rdTmB,{%tmp,%ctan}],[%rdBarF];
+    add.u32 %kt,%kt,1;
+    add.u32 %stg,%stg,1;
+    setp.lt.u32 %p1,%stg,4;
+    @%p1 bra PLOOP_wgmma_nt_f16_128x256x64_s4;
+    mov.u32 %stg,0;
+    xor.b32 %phe,%phe,1;
+    bra PLOOP_wgmma_nt_f16_128x256x64_s4;
+CONSUMER_wgmma_nt_f16_128x256x64_s4:
+    setmaxnreg.inc.sync.aligned.u32 232;
+    sub.u32 %cwg,%wgi,1;
+    mul.lo.s32 %tmp,%cwg,8192;
+    cvt.u64.u32 %rdOffA,%tmp;
+    mov.u32 %kt,0;
+    mov.u32 %stg,0;
+    mov.u32 %phf,0;
+    setp.eq.u32 %ptrue,0,0;
+CLOOP_wgmma_nt_f16_128x256x64_s4:
+    setp.ge.u32 %p0,%kt,%ktiles;
+    @%p0 bra CEND_wgmma_nt_f16_128x256x64_s4;
+    mul.wide.u32 %rdT,%stg,8;
+    add.s64 %rdBar,%rdS,%rdT;
+    add.s64 %rdBar,%rdBar,196608;
+CWAIT_wgmma_nt_f16_128x256x64_s4:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%phf;
+    @!%p1 bra CWAIT_wgmma_nt_f16_128x256x64_s4;
+    mul.wide.u32 %rdT,%stg,16384;
+    add.s64 %rdA,%rdS,%rdT;
+    add.s64 %rdA,%rdA,%rdOffA;
+    mul.wide.u32 %rdT,%stg,32768;
+    add.s64 %rdB,%rdS,%rdT;
+    add.s64 %rdB,%rdB,65536;
+    setp.ne.u32 %pfirst,%kt,0;
+    wgmma.fence.sync.aligned;
+    add.s64 %rdAddr,%rdA,0;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descA,%rdT,0x4000004000010000;
+    add.s64 %rdAddr,%rdB,0;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descB,%rdT,0x4000004000010000;
+    wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%acc8,%acc9,%acc10,%acc11,%acc12,%acc13,%acc14,%acc15,%acc16,%acc17,%acc18,%acc19,%acc20,%acc21,%acc22,%acc23,%acc24,%acc25,%acc26,%acc27,%acc28,%acc29,%acc30,%acc31,%acc32,%acc33,%acc34,%acc35,%acc36,%acc37,%acc38,%acc39,%acc40,%acc41,%acc42,%acc43,%acc44,%acc45,%acc46,%acc47,%acc48,%acc49,%acc50,%acc51,%acc52,%acc53,%acc54,%acc55,%acc56,%acc57,%acc58,%acc59,%acc60,%acc61,%acc62,%acc63,%acc64,%acc65,%acc66,%acc67,%acc68,%acc69,%acc70,%acc71,%acc72,%acc73,%acc74,%acc75,%acc76,%acc77,%acc78,%acc79,%acc80,%acc81,%acc82,%acc83,%acc84,%acc85,%acc86,%acc87,%acc88,%acc89,%acc90,%acc91,%acc92,%acc93,%acc94,%acc95,%acc96,%acc97,%acc98,%acc99,%acc100,%acc101,%acc102,%acc103,%acc104,%acc105,%acc106,%acc107,%acc108,%acc109,%acc110,%acc111,%acc112,%acc113,%acc114,%acc115,%acc116,%acc117,%acc118,%acc119,%acc120,%acc121,%acc122,%acc123,%acc124,%acc125,%acc126,%acc127}, %descA, %descB, %pfirst, 1, 1, 0, 0;
+    add.s64 %rdAddr,%rdA,32;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descA,%rdT,0x4000004000010000;
+    add.s64 %rdAddr,%rdB,32;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descB,%rdT,0x4000004000010000;
+    wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%acc8,%acc9,%acc10,%acc11,%acc12,%acc13,%acc14,%acc15,%acc16,%acc17,%acc18,%acc19,%acc20,%acc21,%acc22,%acc23,%acc24,%acc25,%acc26,%acc27,%acc28,%acc29,%acc30,%acc31,%acc32,%acc33,%acc34,%acc35,%acc36,%acc37,%acc38,%acc39,%acc40,%acc41,%acc42,%acc43,%acc44,%acc45,%acc46,%acc47,%acc48,%acc49,%acc50,%acc51,%acc52,%acc53,%acc54,%acc55,%acc56,%acc57,%acc58,%acc59,%acc60,%acc61,%acc62,%acc63,%acc64,%acc65,%acc66,%acc67,%acc68,%acc69,%acc70,%acc71,%acc72,%acc73,%acc74,%acc75,%acc76,%acc77,%acc78,%acc79,%acc80,%acc81,%acc82,%acc83,%acc84,%acc85,%acc86,%acc87,%acc88,%acc89,%acc90,%acc91,%acc92,%acc93,%acc94,%acc95,%acc96,%acc97,%acc98,%acc99,%acc100,%acc101,%acc102,%acc103,%acc104,%acc105,%acc106,%acc107,%acc108,%acc109,%acc110,%acc111,%acc112,%acc113,%acc114,%acc115,%acc116,%acc117,%acc118,%acc119,%acc120,%acc121,%acc122,%acc123,%acc124,%acc125,%acc126,%acc127}, %descA, %descB, %ptrue, 1, 1, 0, 0;
+    add.s64 %rdAddr,%rdA,64;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descA,%rdT,0x4000004000010000;
+    add.s64 %rdAddr,%rdB,64;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descB,%rdT,0x4000004000010000;
+    wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%acc8,%acc9,%acc10,%acc11,%acc12,%acc13,%acc14,%acc15,%acc16,%acc17,%acc18,%acc19,%acc20,%acc21,%acc22,%acc23,%acc24,%acc25,%acc26,%acc27,%acc28,%acc29,%acc30,%acc31,%acc32,%acc33,%acc34,%acc35,%acc36,%acc37,%acc38,%acc39,%acc40,%acc41,%acc42,%acc43,%acc44,%acc45,%acc46,%acc47,%acc48,%acc49,%acc50,%acc51,%acc52,%acc53,%acc54,%acc55,%acc56,%acc57,%acc58,%acc59,%acc60,%acc61,%acc62,%acc63,%acc64,%acc65,%acc66,%acc67,%acc68,%acc69,%acc70,%acc71,%acc72,%acc73,%acc74,%acc75,%acc76,%acc77,%acc78,%acc79,%acc80,%acc81,%acc82,%acc83,%acc84,%acc85,%acc86,%acc87,%acc88,%acc89,%acc90,%acc91,%acc92,%acc93,%acc94,%acc95,%acc96,%acc97,%acc98,%acc99,%acc100,%acc101,%acc102,%acc103,%acc104,%acc105,%acc106,%acc107,%acc108,%acc109,%acc110,%acc111,%acc112,%acc113,%acc114,%acc115,%acc116,%acc117,%acc118,%acc119,%acc120,%acc121,%acc122,%acc123,%acc124,%acc125,%acc126,%acc127}, %descA, %descB, %ptrue, 1, 1, 0, 0;
+    add.s64 %rdAddr,%rdA,96;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descA,%rdT,0x4000004000010000;
+    add.s64 %rdAddr,%rdB,96;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descB,%rdT,0x4000004000010000;
+    wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%acc8,%acc9,%acc10,%acc11,%acc12,%acc13,%acc14,%acc15,%acc16,%acc17,%acc18,%acc19,%acc20,%acc21,%acc22,%acc23,%acc24,%acc25,%acc26,%acc27,%acc28,%acc29,%acc30,%acc31,%acc32,%acc33,%acc34,%acc35,%acc36,%acc37,%acc38,%acc39,%acc40,%acc41,%acc42,%acc43,%acc44,%acc45,%acc46,%acc47,%acc48,%acc49,%acc50,%acc51,%acc52,%acc53,%acc54,%acc55,%acc56,%acc57,%acc58,%acc59,%acc60,%acc61,%acc62,%acc63,%acc64,%acc65,%acc66,%acc67,%acc68,%acc69,%acc70,%acc71,%acc72,%acc73,%acc74,%acc75,%acc76,%acc77,%acc78,%acc79,%acc80,%acc81,%acc82,%acc83,%acc84,%acc85,%acc86,%acc87,%acc88,%acc89,%acc90,%acc91,%acc92,%acc93,%acc94,%acc95,%acc96,%acc97,%acc98,%acc99,%acc100,%acc101,%acc102,%acc103,%acc104,%acc105,%acc106,%acc107,%acc108,%acc109,%acc110,%acc111,%acc112,%acc113,%acc114,%acc115,%acc116,%acc117,%acc118,%acc119,%acc120,%acc121,%acc122,%acc123,%acc124,%acc125,%acc126,%acc127}, %descA, %descB, %ptrue, 1, 1, 0, 0;
+    wgmma.commit_group.sync.aligned;
+    wgmma.wait_group.sync.aligned 0;
+    mul.wide.u32 %rdT,%stg,8;
+    add.s64 %rdBar,%rdS,%rdT;
+    add.s64 %rdBar,%rdBar,196640;
+    and.b32 %tmp,%lin,127;
+    setp.eq.u32 %p2,%tmp,0;
+    @%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];
+    add.u32 %kt,%kt,1;
+    add.u32 %stg,%stg,1;
+    setp.lt.u32 %p1,%stg,4;
+    @%p1 bra CLOOP_wgmma_nt_f16_128x256x64_s4;
+    mov.u32 %stg,0;
+    xor.b32 %phf,%phf,1;
+    bra CLOOP_wgmma_nt_f16_128x256x64_s4;
+CEND_wgmma_nt_f16_128x256x64_s4:
+    setp.eq.u32 %p0,%ktiles,0;
+    @%p0 bra EXIT_wgmma_nt_f16_128x256x64_s4;
+    wgmma.wait_group.sync.aligned 0;
+    and.b32 %tmp,%lin,127;
+    shr.u32 %wrp,%tmp,5;
+    shl.b32 %wrp,%wrp,4;
+    shr.u32 %tmp2,%lane,2;
+    add.u32 %row0,%wrp,%tmp2;
+    mul.lo.s32 %tmp,%cwg,64;
+    add.u32 %row0,%row0,%tmp;
+    add.u32 %row0,%row0,%ctam;
+    add.u32 %row1,%row0,8;
+    and.b32 %colb,%lane,3;
+    shl.b32 %colb,%colb,1;
+    add.u32 %colb,%colb,%ctan;
+    setp.lt.u32 %pd0,%row0,%M;
+    setp.lt.u32 %pd1,%row1,%M;
+    mad.lo.s32 %tmp,%row0,%N,%colb;
+    mul.wide.u32 %rdT,%tmp,4;
+    add.s64 %rdA,%rdC,%rdT;
+    mad.lo.s32 %tmp,%row1,%N,%colb;
+    mul.wide.u32 %rdT,%tmp,4;
+    add.s64 %rdB,%rdC,%rdT;
+    add.u32 %col,%colb,0;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+0],%acc0;
+    @%q1 st.global.f32 [%rdA+4],%acc1;
+    @%q2 st.global.f32 [%rdB+0],%acc2;
+    @%q3 st.global.f32 [%rdB+4],%acc3;
+    add.u32 %col,%colb,8;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+32],%acc4;
+    @%q1 st.global.f32 [%rdA+36],%acc5;
+    @%q2 st.global.f32 [%rdB+32],%acc6;
+    @%q3 st.global.f32 [%rdB+36],%acc7;
+    add.u32 %col,%colb,16;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+64],%acc8;
+    @%q1 st.global.f32 [%rdA+68],%acc9;
+    @%q2 st.global.f32 [%rdB+64],%acc10;
+    @%q3 st.global.f32 [%rdB+68],%acc11;
+    add.u32 %col,%colb,24;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+96],%acc12;
+    @%q1 st.global.f32 [%rdA+100],%acc13;
+    @%q2 st.global.f32 [%rdB+96],%acc14;
+    @%q3 st.global.f32 [%rdB+100],%acc15;
+    add.u32 %col,%colb,32;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+128],%acc16;
+    @%q1 st.global.f32 [%rdA+132],%acc17;
+    @%q2 st.global.f32 [%rdB+128],%acc18;
+    @%q3 st.global.f32 [%rdB+132],%acc19;
+    add.u32 %col,%colb,40;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+160],%acc20;
+    @%q1 st.global.f32 [%rdA+164],%acc21;
+    @%q2 st.global.f32 [%rdB+160],%acc22;
+    @%q3 st.global.f32 [%rdB+164],%acc23;
+    add.u32 %col,%colb,48;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+192],%acc24;
+    @%q1 st.global.f32 [%rdA+196],%acc25;
+    @%q2 st.global.f32 [%rdB+192],%acc26;
+    @%q3 st.global.f32 [%rdB+196],%acc27;
+    add.u32 %col,%colb,56;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+224],%acc28;
+    @%q1 st.global.f32 [%rdA+228],%acc29;
+    @%q2 st.global.f32 [%rdB+224],%acc30;
+    @%q3 st.global.f32 [%rdB+228],%acc31;
+    add.u32 %col,%colb,64;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+256],%acc32;
+    @%q1 st.global.f32 [%rdA+260],%acc33;
+    @%q2 st.global.f32 [%rdB+256],%acc34;
+    @%q3 st.global.f32 [%rdB+260],%acc35;
+    add.u32 %col,%colb,72;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+288],%acc36;
+    @%q1 st.global.f32 [%rdA+292],%acc37;
+    @%q2 st.global.f32 [%rdB+288],%acc38;
+    @%q3 st.global.f32 [%rdB+292],%acc39;
+    add.u32 %col,%colb,80;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+320],%acc40;
+    @%q1 st.global.f32 [%rdA+324],%acc41;
+    @%q2 st.global.f32 [%rdB+320],%acc42;
+    @%q3 st.global.f32 [%rdB+324],%acc43;
+    add.u32 %col,%colb,88;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+352],%acc44;
+    @%q1 st.global.f32 [%rdA+356],%acc45;
+    @%q2 st.global.f32 [%rdB+352],%acc46;
+    @%q3 st.global.f32 [%rdB+356],%acc47;
+    add.u32 %col,%colb,96;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+384],%acc48;
+    @%q1 st.global.f32 [%rdA+388],%acc49;
+    @%q2 st.global.f32 [%rdB+384],%acc50;
+    @%q3 st.global.f32 [%rdB+388],%acc51;
+    add.u32 %col,%colb,104;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+416],%acc52;
+    @%q1 st.global.f32 [%rdA+420],%acc53;
+    @%q2 st.global.f32 [%rdB+416],%acc54;
+    @%q3 st.global.f32 [%rdB+420],%acc55;
+    add.u32 %col,%colb,112;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+448],%acc56;
+    @%q1 st.global.f32 [%rdA+452],%acc57;
+    @%q2 st.global.f32 [%rdB+448],%acc58;
+    @%q3 st.global.f32 [%rdB+452],%acc59;
+    add.u32 %col,%colb,120;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+480],%acc60;
+    @%q1 st.global.f32 [%rdA+484],%acc61;
+    @%q2 st.global.f32 [%rdB+480],%acc62;
+    @%q3 st.global.f32 [%rdB+484],%acc63;
+    add.u32 %col,%colb,128;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+512],%acc64;
+    @%q1 st.global.f32 [%rdA+516],%acc65;
+    @%q2 st.global.f32 [%rdB+512],%acc66;
+    @%q3 st.global.f32 [%rdB+516],%acc67;
+    add.u32 %col,%colb,136;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+544],%acc68;
+    @%q1 st.global.f32 [%rdA+548],%acc69;
+    @%q2 st.global.f32 [%rdB+544],%acc70;
+    @%q3 st.global.f32 [%rdB+548],%acc71;
+    add.u32 %col,%colb,144;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+576],%acc72;
+    @%q1 st.global.f32 [%rdA+580],%acc73;
+    @%q2 st.global.f32 [%rdB+576],%acc74;
+    @%q3 st.global.f32 [%rdB+580],%acc75;
+    add.u32 %col,%colb,152;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+608],%acc76;
+    @%q1 st.global.f32 [%rdA+612],%acc77;
+    @%q2 st.global.f32 [%rdB+608],%acc78;
+    @%q3 st.global.f32 [%rdB+612],%acc79;
+    add.u32 %col,%colb,160;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+640],%acc80;
+    @%q1 st.global.f32 [%rdA+644],%acc81;
+    @%q2 st.global.f32 [%rdB+640],%acc82;
+    @%q3 st.global.f32 [%rdB+644],%acc83;
+    add.u32 %col,%colb,168;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+672],%acc84;
+    @%q1 st.global.f32 [%rdA+676],%acc85;
+    @%q2 st.global.f32 [%rdB+672],%acc86;
+    @%q3 st.global.f32 [%rdB+676],%acc87;
+    add.u32 %col,%colb,176;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+704],%acc88;
+    @%q1 st.global.f32 [%rdA+708],%acc89;
+    @%q2 st.global.f32 [%rdB+704],%acc90;
+    @%q3 st.global.f32 [%rdB+708],%acc91;
+    add.u32 %col,%colb,184;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+736],%acc92;
+    @%q1 st.global.f32 [%rdA+740],%acc93;
+    @%q2 st.global.f32 [%rdB+736],%acc94;
+    @%q3 st.global.f32 [%rdB+740],%acc95;
+    add.u32 %col,%colb,192;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+768],%acc96;
+    @%q1 st.global.f32 [%rdA+772],%acc97;
+    @%q2 st.global.f32 [%rdB+768],%acc98;
+    @%q3 st.global.f32 [%rdB+772],%acc99;
+    add.u32 %col,%colb,200;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+800],%acc100;
+    @%q1 st.global.f32 [%rdA+804],%acc101;
+    @%q2 st.global.f32 [%rdB+800],%acc102;
+    @%q3 st.global.f32 [%rdB+804],%acc103;
+    add.u32 %col,%colb,208;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+832],%acc104;
+    @%q1 st.global.f32 [%rdA+836],%acc105;
+    @%q2 st.global.f32 [%rdB+832],%acc106;
+    @%q3 st.global.f32 [%rdB+836],%acc107;
+    add.u32 %col,%colb,216;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+864],%acc108;
+    @%q1 st.global.f32 [%rdA+868],%acc109;
+    @%q2 st.global.f32 [%rdB+864],%acc110;
+    @%q3 st.global.f32 [%rdB+868],%acc111;
+    add.u32 %col,%colb,224;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+896],%acc112;
+    @%q1 st.global.f32 [%rdA+900],%acc113;
+    @%q2 st.global.f32 [%rdB+896],%acc114;
+    @%q3 st.global.f32 [%rdB+900],%acc115;
+    add.u32 %col,%colb,232;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+928],%acc116;
+    @%q1 st.global.f32 [%rdA+932],%acc117;
+    @%q2 st.global.f32 [%rdB+928],%acc118;
+    @%q3 st.global.f32 [%rdB+932],%acc119;
+    add.u32 %col,%colb,240;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+960],%acc120;
+    @%q1 st.global.f32 [%rdA+964],%acc121;
+    @%q2 st.global.f32 [%rdB+960],%acc122;
+    @%q3 st.global.f32 [%rdB+964],%acc123;
+    add.u32 %col,%colb,248;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+992],%acc124;
+    @%q1 st.global.f32 [%rdA+996],%acc125;
+    @%q2 st.global.f32 [%rdB+992],%acc126;
+    @%q3 st.global.f32 [%rdB+996],%acc127;
+EXIT_wgmma_nt_f16_128x256x64_s4:
+    ret;
+}
+
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 522 filtered out; finished in 39.24s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+Stopping app - local entrypoint completed.
+[1m-> ok in 44.5s[0m
+[meter] bench: 45.3s wall = $0.056 (record this in the round log)
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-oBpFkGaO5yR5QvxaQqS5bG
+PIPELINE_DONE
