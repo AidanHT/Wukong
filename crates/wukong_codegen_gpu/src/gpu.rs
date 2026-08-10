@@ -3207,6 +3207,147 @@ pub(crate) fn flash_attn_run(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// Parameters every `mma.sync` flash entry declares: `(S: u32, scale: f32, Q, K, V, O)`.
+pub(crate) const FLASH_ENTRY_PARAMS: usize = 6;
+
+/// Launch one **f16 single-head flash entry** over already-f16 Q/K/V, returning O as f32.
+///
+/// The seam every `mma.sync` flash kernel in this crate shares: one warp per 16-query-row block, grid
+/// `S/16`, and the six-parameter list above. It exists so the depth-grid launcher
+/// ([`flash_attn_stage`]) and anything comparing it against a shipped sibling cannot disagree about
+/// the geometry — two derivations of one launch is how a truncated grid silently drops the tail rows.
+///
+/// # Preconditions (crate hard rule 2)
+///
+/// * `q16.len() == k16.len() == v16.len() == seq * d` — the kernel strides Q/K/V/O by `d` and offsets
+///   heads by `ctaid.y * S * d`, so a short buffer reads (and O writes) past the allocation.
+/// * `seq % 16 == 0`: the grid is `S/16` 16-query-row blocks, and a truncated grid leaves the tail
+///   rows at whatever O was initialised to — a plausible-looking wrong answer, not a crash.
+/// * The pushed argument count equals the `.param` count of *this* entry in *this* module text.
+/// * `mode` comes from the generator that produced `ptx`; `function_smem` turns it into the load form
+///   and the launch byte count together, so no caller re-derives a window size.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flash_f16_launch(
+    g: &mut Gpu,
+    key: &'static str,
+    ptx: &str,
+    entry: &str,
+    q16: &[u16],
+    k16: &[u16],
+    v16: &[u16],
+    seq: usize,
+    d: usize,
+    scale: f32,
+    threads: u32,
+    mode: SmemMode,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(q16.len(), seq * d, "{entry}: Q must be seq*d f16");
+    assert_eq!(k16.len(), seq * d, "{entry}: K must be seq*d f16");
+    assert_eq!(v16.len(), seq * d, "{entry}: V must be seq*d f16");
+    assert_eq!(
+        seq % 16,
+        0,
+        "{entry}: S={seq} must be a multiple of the kernel's 16-query-row block, or the S/16 grid \
+         truncates and the tail rows are never written"
+    );
+    assert_eq!(
+        entry_param_count(ptx, entry),
+        FLASH_ENTRY_PARAMS,
+        "{entry}: the entry's own declaration must match the {FLASH_ENTRY_PARAMS} arguments pushed \
+         below — pushing short makes the driver read adjacent host stack as a pointer"
+    );
+    let (f, dyn_bytes) = g.function_smem(key, ptx, entry, mode)?;
+    let q_d = g.stream.memcpy_stod(q16)?;
+    let k_d = g.stream.memcpy_stod(k16)?;
+    let v_d = g.stream.memcpy_stod(v16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(seq * d)?;
+    let s32 = seq as u32;
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&s32)
+        .arg(&scale)
+        .arg(&q_d)
+        .arg(&k_d)
+        .arg(&v_d)
+        .arg(&mut o_d);
+    let cfg = dyn_launch_cfg(((seq / 16) as u32, 1, 1), (threads, 1, 1), dyn_bytes);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// Single-head flash attention through one [`FLASH_STAGE_VARIANTS`](crate::ptx_flash::FLASH_STAGE_VARIANTS)
+/// row — the **depth × staging-width grid**, whose deeper `cp.async` rings live in the dynamic
+/// shared-memory window because the PTX ISA's 48 KiB *static* cap cannot express them at these
+/// `(D, BK)` tiles on any device.
+///
+/// Q/K/V arrive as f32 and are rounded to f16 on the host (the tensor-core dtype, exactly as the other
+/// `mma.sync` flash paths do); O comes back f32.
+///
+/// # Preconditions
+///
+/// * `q/k/v.len() == seq * row.d`.
+/// * `seq` is a non-zero multiple of the staged key block `BK = 16 * nkb`. The cooperative stage
+///   writes exactly `BK*D/256` **unguarded** 16-byte chunks per lane, so a partial final key block
+///   would leave the tail of the slab unwritten and the kernel would score against whatever was
+///   there.
+/// * The row fits this device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`. A row that does not is a
+///   **capability decline** returned here, before generation: `flash_stage_ptx` panics on an
+///   over-budget row on purpose, because a clamped launch would compute with a truncated ring and
+///   still return `Ok`.
+///
+/// One row = one key = one entry = one module (hard rule 4): `Gpu::function` never re-examines PTX on
+/// a key hit, so two depths under one key would run the first's ring with the second's launch window.
+pub fn flash_attn_stage(
+    g: &mut Gpu,
+    row: &crate::ptx_flash::FlashStageCfg,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    scale: f32,
+) -> Result<Vec<f32>, GpuError> {
+    use half::f16;
+    let (d, bk) = (row.d, row.bk());
+    assert_eq!(q.len(), seq * d, "{}: Q must be seq*{d}", row.name);
+    assert_eq!(k.len(), seq * d, "{}: K must be seq*{d}", row.name);
+    assert_eq!(v.len(), seq * d, "{}: V must be seq*{d}", row.name);
+    assert!(
+        seq >= bk && seq.is_multiple_of(bk),
+        "{}: S={seq} must be a non-zero multiple of the staged key block BK={bk} — the cooperative \
+         stage is an exact, unguarded {}-chunk-per-lane copy, so a partial block would leave the \
+         tail of the slab unwritten",
+        row.name,
+        bk * d / 256
+    );
+    if !row.fits(g.smem_budget()) {
+        return Err(GpuError::Unsupported(format!(
+            "flash depth grid `{}`: needs {} B of shared memory per block ({} stages x BK={bk} x \
+             D={d}), but {} reports a {} B opt-in ceiling (MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+            row.name,
+            row.smem_bytes(),
+            row.stages,
+            g.target.name,
+            g.smem_budget()
+        )));
+    }
+    let (ptx, mode) = crate::ptx_flash::flash_stage_ptx(row, g.smem_budget());
+    debug_assert_eq!(mode, row.smem_mode(), "{}: emission form", row.name);
+    let to16 = |x: &[f32]| -> Vec<u16> { x.iter().map(|&t| f16::from_f32(t).to_bits()).collect() };
+    Ok(flash_f16_launch(
+        g,
+        row.name,
+        &ptx,
+        row.name,
+        &to16(q),
+        &to16(k),
+        &to16(v),
+        seq,
+        d,
+        scale,
+        row.threads(),
+        mode,
+    )?)
+}
+
 /// Launch grid/block for the SMEM-tiled conv: one CTA per `TILE_P×TILE_Q` output tile per channel `k`
 /// (`grid = (ceil(Q/TQ), ceil(P/TP), K)`, `block = (TQ, TP, 1)`). Shared mem is the kernel's own static
 /// `.shared` array, so `shared_mem_bytes = 0`. Shared by the launcher and the `conv_vs_peers` bench.
@@ -10278,6 +10419,248 @@ E_FILL:\n\
                     );
                 }
             }
+        });
+    }
+
+    /// **THE FLASH DEPTH x STAGING-WIDTH GATE — every `FLASH_STAGE_VARIANTS` row, on the metal.**
+    ///
+    /// Until this ran, not one of the 13 rows had ever been launched: the grid was generated and its
+    /// *text* was gated, but there was no launcher and no device path, and the row author's stated
+    /// condition for dispatching any of them was exactly this test. All 13 fit this Ada part's 99 KiB
+    /// opt-in (the largest, `flash_d128_mpw4_lm_s3`, is 98304 B), so nothing here is skipped on this
+    /// card — and the skip accounting below asserts that rather than assuming it.
+    ///
+    /// **What only a device can settle.** The deep ring's correctness argument rests on
+    /// `cp.async.commit_group` creating an **empty** group when no copies are pending: the guarded
+    /// prologue slabs and the tail bodies commit nothing, and `wait_group stages-1` is only the right
+    /// depth if those empty commits still advance the group index. If they did not, `wait_group` would
+    /// return before the buffer landed and the kernel would score against stale K/V — plausible
+    /// output, wrong numbers, no error anywhere. `ptx_flash::flash_stage_grid_ring_discipline` can only
+    /// prove the commits are *present in the text*.
+    ///
+    /// Shapes are the ring's S-corners, each chosen for a specific failure:
+    ///   * `S == BK` — one key block, so *every* prologue slab is out of range and must be guarded;
+    ///   * `S == (stages-1)*BK` — the prologue exactly fills the ring; the body never prefetches;
+    ///   * `S == (stages-2)*BK` — the prologue is **partially** guarded. This is the case that catches
+    ///     a wrong empty-group count, because the guarded slabs commit nothing and every later group
+    ///     index would shift;
+    ///   * `S >> stages*BK` — steady state, several wraps of the add+wrap cursor;
+    ///   * causal rows also `stages*BK` and `(stages+2)*BK`, where CTA `c` stops at key block `c`, so
+    ///     the diagonal terminates the loop at every slot of the ring rather than only past its end.
+    ///
+    /// Two oracles, because a float kernel has no bit-exact one *against the CPU*:
+    ///   * the independent f64 `ref_attn` / `ref_attn_causal` over the same f16-rounded inputs, at the
+    ///     family's fp16 flash tolerance (abs 2e-3, rel 2e-2 — the bound
+    ///     `mma_pipe_flash_matches_reference_within_tol` uses for the identical math);
+    ///   * **bit-exact equality with the shipped 2-stage kernel** of the same `(D, causal, feed)`
+    ///     wherever `flash_ptx()` defines one (10 of the 13 rows; the three D=128 wide rows have no
+    ///     2-stage sibling in that module). Depth changes only *when* a slab is staged — key order,
+    ///     mma sequence and the per-output f32 accumulation order are identical — so this is `==`, not
+    ///     a tolerance, and it is the instrument that would catch a stale read the oracle band might
+    ///     absorb.
+    #[test]
+    fn flash_stage_grid_matches_reference_within_tol() {
+        use crate::ptx_flash::{flash_ptx, FLASH_STAGE_VARIANTS};
+        use half::f16;
+        use std::collections::HashMap;
+        with_gpu("flash_stage_grid", |g| {
+            let budget = g.smem_budget();
+            eprintln!(
+                "flash depth x width grid on {} — opt-in SMEM budget {budget} B ({} KiB); static ISA \
+                 cap {} KiB",
+                g.device_name(),
+                budget / 1024,
+                STATIC_SMEM_CAP / 1024
+            );
+            // Inputs are a pure function of (d, seq), so a row's verdict does not depend on the order
+            // rows run in, and the O(S^2 D) f64 oracle is computed once per (d, seq, causal).
+            let mut data: HashMap<(usize, usize), (Vec<f32>, Vec<f32>, Vec<f32>)> = HashMap::new();
+            let mut oracles: HashMap<(usize, usize, bool), Vec<f32>> = HashMap::new();
+            let (mut ran, mut peered) = (0usize, 0usize);
+            let mut no_peer: Vec<&str> = Vec::new();
+            let mut skipped: Vec<&str> = Vec::new();
+            for row in FLASH_STAGE_VARIANTS {
+                if !row.fits(budget) {
+                    eprintln!(
+                        "[skip:capability] {}: {} B > this device's opt-in ceiling {budget} B",
+                        row.name,
+                        row.smem_bytes()
+                    );
+                    skipped.push(row.name);
+                    continue;
+                }
+                let (d, bk) = (row.d, row.bk());
+                // The shipped 2-stage sibling is the row name minus its `_s{stages}` tail — exactly
+                // how the generator spells `stages == 2`. Absent for the D=128 wide rows.
+                let peer = row
+                    .name
+                    .strip_suffix(&format!("_s{}", row.stages))
+                    .expect("every grid row is stages >= 3 and carries the suffix");
+                let has_peer = flash_ptx().contains(&format!(".visible .entry {peer}("));
+                if !has_peer {
+                    no_peer.push(row.name);
+                }
+                let mut shapes = vec![
+                    bk,                                       // one block: every prologue slab guarded
+                    (row.stages - 1) * bk,                    // prologue exactly fills the ring
+                    row.stages.saturating_sub(2) * bk,        // prologue PARTIALLY guarded
+                    (4 * row.stages * bk).min(768 / bk * bk), // steady state, several wraps
+                ];
+                if row.causal {
+                    shapes.push(row.stages * bk);
+                    shapes.push((row.stages + 2) * bk);
+                }
+                shapes.retain(|&s| s >= bk);
+                shapes.sort_unstable();
+                shapes.dedup();
+                eprintln!(
+                    "  {:<22} D={d:<3} BK={bk:<2} s{} SMEM {:>5} B {:<7} peer={:<20} S={shapes:?}",
+                    row.name,
+                    row.stages,
+                    row.smem_bytes(),
+                    if row.smem_mode().is_dynamic() {
+                        "DYNAMIC"
+                    } else {
+                        "static"
+                    },
+                    if has_peer { peer } else { "-" }
+                );
+                for seq in shapes {
+                    let (qf, kf, vf) = data
+                        .entry((d, seq))
+                        .or_insert_with(|| {
+                            let mut rng = crate::diff::Rng::new(
+                                0xF1A5_0DEE ^ ((d as u64) << 32) ^ seq as u64,
+                            );
+                            let r16 = |x: Vec<f32>| -> Vec<f32> {
+                                x.into_iter().map(|v| f16::from_f32(v).to_f32()).collect()
+                            };
+                            (
+                                r16(rng.vec(seq * d, -1.0, 1.0)),
+                                r16(rng.vec(seq * d, -1.0, 1.0)),
+                                r16(rng.vec(seq * d, -1.0, 1.0)),
+                            )
+                        })
+                        .clone();
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let oracle = oracles
+                        .entry((d, seq, row.causal))
+                        .or_insert_with(|| {
+                            if row.causal {
+                                ref_attn_causal(&qf, &kf, &vf, seq, d, scale)
+                            } else {
+                                ref_attn(&qf, &kf, &vf, seq, d, scale)
+                            }
+                        })
+                        .clone();
+                    let got = flash_attn_stage(g, row, &qf, &kf, &vf, seq, scale).unwrap();
+                    let s = crate::diff::assert_close(
+                        &format!("{} S={seq}", row.name),
+                        &got,
+                        &oracle,
+                        2e-3,
+                        2e-2,
+                    );
+                    let peer_note = if has_peer {
+                        let to16 = |x: &[f32]| -> Vec<u16> {
+                            x.iter().map(|&t| f16::from_f32(t).to_bits()).collect()
+                        };
+                        let want = flash_f16_launch(
+                            g,
+                            "flash",
+                            flash_ptx(),
+                            peer,
+                            &to16(&qf),
+                            &to16(&kf),
+                            &to16(&vf),
+                            seq,
+                            d,
+                            scale,
+                            row.threads(),
+                            SmemMode::Static,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            got, want,
+                            "{} S={seq}: a deeper ring stages the SAME key blocks in the SAME order, \
+                             so it must be BIT-identical to the shipped {peer}; a difference is a \
+                             stale or half-filled buffer, not rounding",
+                            row.name
+                        );
+                        peered += 1;
+                        format!(" | == {peer}")
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "    S={seq:<5} max_abs={:.2e} max_rel={:.2e}{peer_note}",
+                        s.max_abs, s.max_rel
+                    );
+                    ran += 1;
+                }
+            }
+            // A skip must be the SMEM ceiling and nothing else, in both directions.
+            let over: Vec<&str> = FLASH_STAGE_VARIANTS
+                .iter()
+                .filter(|v| v.smem_bytes() > budget)
+                .map(|v| v.name)
+                .collect();
+            assert_eq!(
+                skipped, over,
+                "a row was skipped for something other than this device's opt-in ceiling, or an \
+                 over-budget row was launched anyway"
+            );
+            assert!(
+                ran >= 40,
+                "the grid must actually have run (only {ran} shapes)"
+            );
+            assert!(
+                peered >= 30,
+                "the bit-exact arm must have run (only {peered} peer comparisons); rows with no \
+                 2-stage sibling in flash_ptx(): {no_peer:?}"
+            );
+            eprintln!(
+                "[gate] flash depth grid: {ran} ring-corner shapes across {} rows within fp16 \
+                 tolerance of the f64 oracle, {peered} of them BIT-IDENTICAL to their shipped \
+                 2-stage sibling — so cp.async's empty commit_group does advance the group index and \
+                 `wait_group stages-1` retires the copy that filled the buffer being read \u{2713}",
+                FLASH_STAGE_VARIANTS.len() - skipped.len()
+            );
+        });
+    }
+
+    /// **A flash grid row that does not fit the device declines LOUDLY**, before generation — it never
+    /// runs a shallower ring the caller did not ask for, and it never reaches
+    /// `flash_stage_ptx`, which panics on an over-budget row on purpose. Probed with a fabricated
+    /// 12-stage D=128 BK=64 row (393216 B) so the check fires on every card, H100 included.
+    #[test]
+    fn flash_stage_declines_over_budget_instead_of_downshifting() {
+        use crate::ptx_flash::FlashStageCfg;
+        with_gpu("flash_stage_decline", |g| {
+            let budget = g.smem_budget();
+            let over = FlashStageCfg {
+                name: "flash_probe_over_budget",
+                d: 128,
+                nkb: 4,
+                stages: 12,
+                causal: false,
+                pv_ldmatrix: true,
+            };
+            assert!(
+                over.smem_bytes() > budget,
+                "the probe row must exceed the device ceiling"
+            );
+            let (seq, d) = (over.bk(), over.d);
+            let zero = vec![0f32; seq * d];
+            let err = flash_attn_stage(g, &over, &zero, &zero, &zero, seq, 0.125).unwrap_err();
+            let msg = err
+                .unsupported()
+                .expect("an over-budget row must be a CAPABILITY decline, not a driver error");
+            assert!(
+                msg.contains("shared memory") && msg.contains(&budget.to_string()),
+                "the decline must name what was refused and the ceiling: {msg}"
+            );
+            eprintln!("[gate] over-budget flash row declined: {msg}");
         });
     }
 
