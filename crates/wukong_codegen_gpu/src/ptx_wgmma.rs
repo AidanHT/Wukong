@@ -77,6 +77,37 @@
 //! **Both are still unconfirmed on silicon**, which is what `wgmma_hopper_bringup` stage D -- the
 //! one-visit descriptor sweep over [`desc_sweep_candidates`] -- exists to settle.
 //!
+//! # The sixth fact, added 2026-08-10 evening: THE CLUSTER IS A CORRECTNESS PROTOCOL
+//!
+//! [`Multicast::ClusterA`] used to be an [`UNSUPPORTED`] decline. It is now generated, because the
+//! Act-2 round measured W1 **minus its cluster** at 58.8-67.5% of cuBLAS against a 95-108%
+//! prediction and named the missing cluster as the first suspect in its own provenance line. What
+//! the arm costs is four mechanisms, each of whose failure mode is silence or a hang rather than an
+//! error, so each is stated here and gated separately:
+//!
+//! 1. **The A tile is SPLIT, not leader-loaded.** Each CTA of the cluster TMA-loads
+//!    `BM / cluster_ctas` rows of A and multicasts them to the whole cluster, so the issue work is
+//!    balanced and the assembled SMEM image is byte-for-byte the image one unclustered copy would
+//!    have written. That is what leaves the descriptor, the per-consumer `m64` slabs and the
+//!    epilogue completely unchanged -- the cluster is a *traffic* change, not a layout change.
+//! 2. **The transaction count is PER DESTINATION.** A multicast copy of `n` bytes performs a
+//!    `complete-tx` of `n` on the mbarrier of *every* destination CTA; it does not divide `n` among
+//!    them. So each CTA still declares `tile_a + tile_b` -- see [`WgmmaCfg::stage_tx_bytes`], which
+//!    carries the rule. A count that disagrees with the copies hangs; it does not fail.
+//! 3. **The `empty` barrier becomes cluster-scoped.** A producer overwrites an A slice every CTA in
+//!    the cluster reads, so it may not recycle a stage until every consumer *in the cluster* is
+//!    done. Consumers therefore arrive at each CTA's `empty[s]` through `mapa.shared::cluster`, and
+//!    the barrier is initialised with [`WgmmaCfg::empty_arrivals`] rather than `consumer_wgs`.
+//! 4. **Two cluster rendezvous bracket the kernel.** One after `mbarrier.init` (plus
+//!    `fence.mbarrier_init.release.cluster`), because a peer may not signal a barrier that is not
+//!    yet initialised; one before `ret`, because a CTA that has exited has no shared memory for a
+//!    peer to write into.
+//!
+//! None of it can be executed on this machine. What *can* be proven here is the mask arithmetic, the
+//! transaction arithmetic, the slice geometry, the grid divisibility and the emitted text; the
+//! device claim is `gpu::tests::wgmma_cluster_multicast_is_exact`, which demands `==` on a shape
+//! whose two cluster CTAs hold different N halves before anything is timed.
+//!
 //! # The capability gate is a TYPE, not a convention
 //!
 //! The fp8 families are gated by a textual law (`every_fp8_module_load_is_capability_gated`): every
@@ -91,12 +122,6 @@
 //!
 //! # What is NOT built here, and declines loudly rather than guessing
 //!
-//! * **Cluster multicast** (`.multicast::cluster`, D1's W1 as specified). Multicasting the A tile to
-//!   both CTAs of a 2x1x1 cluster halves A's L2 traffic, but it makes the *empty* half of the
-//!   pipeline cluster-scoped: consumers in CTA 1 must signal a barrier in CTA 0 through `mapa`, and
-//!   the CTA mask has to be derived from `%cluster_ctarank`. That is real machinery with a deadlock
-//!   as its failure mode, and none of it can be executed here. [`Multicast::ClusterA`] therefore
-//!   returns an [`UNSUPPORTED`] decline instead of plausible PTX.
 //! * **A layout TMA cannot write.** [`SmemLayout::CanonicalNone`] needs the 8 rows of every core
 //!   matrix packed into 128 contiguous bytes, which one tiled TMA copy of a row-major operand does
 //!   not produce (it would take `BK / 8` copies per operand per stage, or an SMEM repack). The
@@ -757,9 +782,49 @@ pub enum Schedule {
 pub enum Multicast {
     /// No cluster, no multicast: every CTA loads both of its own tiles.
     None,
-    /// D1's W1 as specified: a 2x1x1 cluster with `.multicast::cluster` on A. **Declined** -- see the
-    /// module docs.
+    /// **D1's W1 as specified**: a `2x1x1` cluster along the N axis with `.multicast::cluster` on A.
+    ///
+    /// The two CTAs of a cluster hold adjacent N tiles of the **same** M tile, so they want the
+    /// *same* A rows and different B columns. Each CTA TMA-loads `BM / 2` rows of A and multicasts
+    /// them to both, so A crosses L2 once per cluster instead of once per CTA; B stays per-CTA and
+    /// unmulticast. See [`WgmmaCfg::cluster_ctas`] for the arithmetic and the generator's
+    /// `cluster` section for the barrier protocol.
     ClusterA,
+}
+
+impl Multicast {
+    /// CTAs per cluster. `1` for [`Multicast::None`] -- i.e. no cluster at all, which is the
+    /// launch's `1x1x1` and the absence of every directive, register and barrier below.
+    pub const fn ctas(self) -> usize {
+        match self {
+            Multicast::None => 1,
+            Multicast::ClusterA => 2,
+        }
+    }
+}
+
+/// **The portable ceiling on CTAs per cluster.** The CUDA programming guide guarantees a maximum
+/// cluster size of 8 on every part that supports clusters; anything larger is "non-portable" and
+/// needs `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED)` plus a device
+/// query. This family declines past it rather than opting in blind.
+pub const MAX_PORTABLE_CLUSTER_CTAS: usize = 8;
+
+/// **The `ctaMask` operand of a `.multicast::cluster` copy**: bit `r` set iff the CTA whose
+/// `%cluster_ctarank` is `r` is a destination.
+///
+/// This family always multicasts to the *whole* cluster (every CTA of the cluster wants the same A
+/// rows), so the mask is the low `ctas` bits. It is a function rather than a literal because the
+/// mask and the cluster shape are two views of one fact: a `2x1x1` cluster with a `0x1` mask would
+/// load A into one CTA and leave the other's half of the ring holding whatever the previous
+/// iteration left there -- wrong numbers, no error, on exactly half the accumulator rows.
+///
+/// The operand is 16 bits wide, which is also the hardware ceiling on cluster size.
+pub fn multicast_cta_mask(ctas: usize) -> u16 {
+    assert!(
+        (1..=16).contains(&ctas),
+        "multicast_cta_mask: {ctas} CTAs cannot be addressed by a 16-bit ctaMask"
+    );
+    (((1u32 << ctas) - 1) & 0xffff) as u16
 }
 
 /// One `wgmma` GEMM configuration. The generator, every gate and the launch plan all read this one
@@ -817,10 +882,61 @@ impl WgmmaCfg {
     pub const fn tile_b_bytes(&self) -> usize {
         self.bn * self.bk * self.dtype.size()
     }
-    /// Bytes one TMA stage moves -- the `expect_tx` count. A + B together, since one barrier covers
-    /// both copies.
+    /// CTAs per cluster (1 = no cluster). One accessor, so nothing re-derives it from `multicast`.
+    pub const fn cluster_ctas(&self) -> usize {
+        self.multicast.ctas()
+    }
+    /// **Rows of A one CTA's TMA copy fetches** -- the whole CTA tile without a cluster, and
+    /// `BM / cluster_ctas` with one, because each CTA fetches a `1/cluster_ctas` slice of the shared
+    /// A tile and multicasts it to the rest. This is the A tensor map's `box_rows`, so the
+    /// descriptor and the copy cannot disagree about it.
+    pub const fn a_box_rows(&self) -> usize {
+        self.bm / self.cluster_ctas()
+    }
+    /// Bytes of the A slice ONE CTA fetches and multicasts (`tile_a_bytes` without a cluster).
+    pub const fn a_slice_bytes(&self) -> usize {
+        self.tile_a_bytes() / self.cluster_ctas()
+    }
+    /// Byte offset, inside every cluster CTA's identical A stage, at which cluster rank `r` lands
+    /// its multicast slice. Slices are laid down in rank order, so the SMEM image of A is exactly
+    /// the image one un-clustered copy would have written -- which is why the descriptor, the
+    /// per-consumer `m64` slabs and the epilogue's row arithmetic are all unchanged by clustering.
+    pub const fn a_slice_off(&self, rank: usize) -> usize {
+        rank * self.a_slice_bytes()
+    }
+    /// **Bytes one TMA stage delivers INTO ONE CTA -- the `expect_tx` count.**
+    ///
+    /// # The multicast transaction rule (PTX ISA 9.7.9, mbarrier `complete-tx`)
+    ///
+    /// A transaction count is **per destination CTA**, never divided among them. A
+    /// `.multicast::cluster` copy of `n` bytes signals `complete-tx n` on the mbarrier of *every*
+    /// destination CTA -- the ISA multicasts the barrier signal to the same CTA-relative offset as
+    /// the data -- so a `cluster_ctas`-way split multicast of A delivers
+    /// `cluster_ctas * (tile_a / cluster_ctas) = tile_a` bytes into each CTA, and B delivers its own
+    /// `tile_b`. The count is therefore `tile_a + tile_b` **whether or not there is a cluster**: the
+    /// same number, reached by different arithmetic, which is exactly the kind of coincidence worth
+    /// stating rather than leaving for a reader to re-derive.
+    ///
+    /// What DOES change with a cluster is how many copies reach that count (`cluster_ctas + 1`
+    /// instead of 2) and who issues them. A count that disagrees with what the copies move does not
+    /// fail -- the barrier never completes and every consumer warpgroup spins forever
+    /// (`gpu::sync_within` exists for exactly that).
     pub const fn stage_tx_bytes(&self) -> usize {
         self.tile_a_bytes() + self.tile_b_bytes()
+    }
+    /// Copies that must complete before one stage's `full` barrier does, from this CTA's point of
+    /// view: one multicast A slice per cluster CTA, plus this CTA's own B tile.
+    pub const fn stage_copies_per_cta(&self) -> usize {
+        self.cluster_ctas() + 1
+    }
+    /// **Arrivals one stage's `empty` barrier is initialised with.**
+    ///
+    /// Without a cluster: one per consumer warpgroup of this CTA. With one: one per consumer
+    /// warpgroup **of the whole cluster**, because a CTA's producer overwrites an A slice that every
+    /// CTA in the cluster reads, so it may not recycle the stage until all of them are done. Every
+    /// consumer therefore arrives at every cluster CTA's `empty[s]` through `mapa`.
+    pub const fn empty_arrivals(&self) -> usize {
+        self.cluster_ctas() * self.consumer_wgs
     }
     /// Byte offset of the A tile for stage `s`.
     pub const fn a_off(&self, s: usize) -> usize {
@@ -857,13 +973,17 @@ impl WgmmaCfg {
     }
 
     /// The TMA descriptor geometry for the A operand of an `M x K` row-major matrix.
+    ///
+    /// The box is [`WgmmaCfg::a_box_rows`] tall, not `BM`: under a cluster each CTA fetches only its
+    /// own `1 / cluster_ctas` slice of the shared tile and multicasts it, so the descriptor
+    /// describes the SLICE. Without a cluster the two are the same number.
     pub fn tensor_map_a(&self, m: usize, k: usize) -> TensorMapArgs {
         TensorMapArgs::tiled_2d_row_major(
             self.dtype.tma(),
             m as u64,
             k as u64,
             k as u64,
-            self.bm as u32,
+            self.a_box_rows() as u32,
             self.bk as u32,
             self.layout.tma_swizzle(),
         )
@@ -892,6 +1012,9 @@ impl WgmmaCfg {
             block: (self.threads() as u32, 1, 1),
             dyn_smem_bytes: self.smem_bytes(),
             params: PARAM_ORDER,
+            // The cluster is along X, which is the N axis of the grid, because the CTAs that share
+            // an A tile are the ones that share an M tile and differ in N.
+            cluster: (self.cluster_ctas() as u32, 1, 1),
         }
     }
 
@@ -1008,16 +1131,13 @@ impl WgmmaCfg {
                 self.consumer_regs
             ));
         }
-        if self.multicast != Multicast::None {
-            return Err(format!(
-                "{UNSUPPORTED}: {}: cluster multicast ({:?}) is not implemented. It needs \
-                 cluster-scoped empty-barrier arrivals through `mapa.shared::cluster`, a CTA mask \
-                 derived from %cluster_ctarank, and a `.reqnctapercluster` entry directive; none of \
-                 it can be executed on this machine and its failure mode is a deadlock. Run the \
-                 non-multicast arm first.",
-                self.name, self.multicast
-            ));
-        }
+        validate_cluster(
+            self.name,
+            self.cluster_ctas(),
+            self.bm,
+            self.bk * self.dtype.size(),
+            align,
+        )?;
         if !self.layout.tma_writable() {
             return Err(format!(
                 "{UNSUPPORTED}: {}: {} needs every core matrix packed into 128 contiguous bytes, \
@@ -1048,6 +1168,72 @@ impl WgmmaCfg {
         self.tensor_map_b(4096, 4096).validate()?;
         Ok(shape)
     }
+}
+
+/// **The cluster's own preconditions, as a pure function of the numbers.**
+///
+/// A free function rather than a block inside [`WgmmaCfg::validate`] for one reason: today's
+/// [`Multicast`] menu can only produce `ctas` of 1 or 2, so several of these arms are unreachable
+/// from any shipped row -- and a validator whose negative arms are untested is a validator that
+/// passes everything. Stated over plain numbers, every arm is reachable from a device-free test
+/// (`the_cluster_preconditions_reject_every_way_a_slice_can_be_wrong`), and each stays a guard
+/// against the day the menu grows.
+///
+/// `row_bytes` is the shared row pitch of one A slice (`BK * elem`) and `align` the alignment the
+/// descriptor's swizzle mode requires. Each rule's failure is silent, not loud:
+///
+/// * a cluster past the portable ceiling is a launch-time rejection that names no kernel;
+/// * a `BM` the cluster does not divide leaves A rows nobody fetched -- stale shared memory, read as
+///   operands, on a fraction of the accumulator rows;
+/// * a slice boundary off the 8-row core matrix puts the 128-B XOR swizzle out of phase between the
+///   halves of one stage, and the descriptor undoes exactly one phase;
+/// * a slice past TMA's box limit is a descriptor `cuTensorMapEncodeTiled` refuses, an hour later.
+fn validate_cluster(
+    name: &str,
+    ctas: usize,
+    bm: usize,
+    row_bytes: usize,
+    align: usize,
+) -> Result<(), String> {
+    if ctas <= 1 {
+        return Ok(());
+    }
+    if ctas > MAX_PORTABLE_CLUSTER_CTAS {
+        return Err(format!(
+            "{UNSUPPORTED}: {name}: a {ctas}-CTA cluster is past the portable ceiling of \
+             {MAX_PORTABLE_CLUSTER_CTAS}; anything wider needs \
+             CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED and a device query, which this \
+             family does not opt into blind"
+        ));
+    }
+    if !bm.is_multiple_of(ctas) {
+        return Err(format!(
+            "{UNSUPPORTED}: {name}: CTA-M {bm} does not divide by the {ctas}-CTA cluster, so the \
+             multicast A slices would not tile the shared A stage"
+        ));
+    }
+    let box_rows = bm / ctas;
+    if !box_rows.is_multiple_of(8) {
+        return Err(format!(
+            "{UNSUPPORTED}: {name}: the multicast A slice is {box_rows} rows, not a multiple of the \
+             8-row core matrix / swizzle period, so the slices of one stage would carry different \
+             swizzle phases"
+        ));
+    }
+    if box_rows > crate::tma_host::TMA_MAX_BOX_DIM as usize {
+        return Err(format!(
+            "{UNSUPPORTED}: {name}: the A slice is {box_rows} rows, past TMA's {} element box limit",
+            crate::tma_host::TMA_MAX_BOX_DIM
+        ));
+    }
+    let slice_bytes = box_rows * row_bytes;
+    if !slice_bytes.is_multiple_of(align) {
+        return Err(format!(
+            "{UNSUPPORTED}: {name}: one multicast A slice is {slice_bytes} B, not a multiple of the \
+             {align} B alignment the descriptor's swizzle requires"
+        ));
+    }
+    Ok(())
 }
 
 /// A kernel parameter's kind, in declaration order -- the contract between the generated `.entry`
@@ -1107,16 +1293,48 @@ pub struct LaunchPlan {
     /// address in the mainloop is out of range.
     pub dyn_smem_bytes: usize,
     pub params: &'static [ParamKind],
+    /// **The cluster shape, in CTAs.** `(1, 1, 1)` means no cluster and no launch attribute; a
+    /// wider X means the entry carries `.reqnctapercluster` and MUST be launched through
+    /// `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION` set to exactly this, because
+    /// a compiled cluster requirement the launch does not match is a launch failure.
+    pub cluster: (u32, u32, u32),
 }
 
 impl LaunchPlan {
+    /// CTAs per cluster -- the product of the cluster shape.
+    pub fn cluster_ctas(&self) -> u32 {
+        self.cluster.0 * self.cluster.1 * self.cluster.2
+    }
+
     /// The CTA grid for an `M x N` output: x indexes N tiles, y indexes M tiles.
     ///
     /// Ragged edges need no special case. TMA fills out-of-range elements with zero
     /// ([`crate::tma_host::TmaOobFill::Zero`]), so a partial tile accumulates nothing, and the
     /// epilogue predicates every store on `row < M && col < N`.
+    ///
+    /// # The cluster rounds the grid up, and that is the same discipline
+    ///
+    /// **There is no such thing as a partial cluster.** Every grid dimension must be a multiple of
+    /// its cluster dimension, so an odd number of N tiles under a `2x1x1` cluster gets one extra
+    /// CTA. That CTA is not a special case either: its `ctan = ctaid.x * BN` is `>= N`, so every
+    /// element of its B tile is out of range and TMA zero-fills it, every accumulator it computes is
+    /// zero, and every store it attempts fails the epilogue's `col < N` predicate. It participates
+    /// in the cluster's barriers -- which it must, since the cluster is fixed -- and writes nothing.
+    /// Rounding and predicating is exactly what the ragged **edge** already does; the cluster just
+    /// makes the rounding coarser.
+    ///
+    /// **The pad CTA still issues its A multicast, and that is load-bearing, not waste.** Its A
+    /// slice is the same M rows as its peer's -- genuinely in range -- and the peer's half of the
+    /// stage comes from it. Skipping the copies of an out-of-range CTA would leave the *real* CTA of
+    /// that cluster with half an A tile: correct numbers on the rows it fetched itself and stale
+    /// shared memory on the rest. Nothing in the generated producer is predicated on `ctan < N` for
+    /// exactly this reason.
     pub fn grid(&self, m: usize, n: usize) -> (u32, u32, u32) {
-        (n.div_ceil(self.bn) as u32, m.div_ceil(self.bm) as u32, 1)
+        let cx = self.cluster.0.max(1) as usize;
+        let x = n.div_ceil(self.bn).div_ceil(cx) * cx;
+        let cy = self.cluster.1.max(1) as usize;
+        let y = m.div_ceil(self.bm).div_ceil(cy) * cy;
+        (x as u32, y as u32, 1)
     }
 }
 
@@ -1133,9 +1351,11 @@ impl LaunchPlan {
 /// independent sources landing on the same point is the strongest prior available, and D1 predicts
 /// 95-108% of cuBLAS at 4096-8192 cubed for the full form.
 ///
-/// **This row is the full form minus cluster multicast** ([`Multicast::None`]), which is the right
-/// bring-up order anyway: multicast is a traffic optimisation whose failure mode is a deadlock, and
-/// the kernel is correct without it.
+/// **This row is the full form minus cluster multicast** ([`Multicast::None`]), which was the right
+/// bring-up order: multicast is a traffic optimisation whose failure mode is a deadlock, and the
+/// kernel is correct without it. It is now also the **control arm** of the cluster A/B --
+/// [`WGMMA_W1_MC`] is the same tile, the same stage depth and the same descriptor reading with the
+/// cluster switched on, so the two differ in one fact.
 ///
 /// # The `layout` field is the 2026-08-10 correction, and is AWAITING CONFIRMATION
 ///
@@ -1202,9 +1422,42 @@ pub const WGMMA_W3C: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1
 };
 
+/// **W1 as D1 section 4.5 actually specifies it: the `2x1x1` cluster with `.multicast::cluster` on
+/// A.**
+///
+/// The 2026-08-10 Act-2 round measured [`WGMMA_W1`] at 58.8-67.5% of cuBLAS at 4096-8192 cubed
+/// against a D1 prediction of 95-108%, on a clean instrument (floors +/-0.03-2.19%, 0.00% clock
+/// drift, a healthy peer). That round's own provenance line names the first suspect: it measured W1
+/// **minus its cluster**, so the prediction had never been tested. This row is the missing arm.
+///
+/// # What the cluster buys, and why it is the dossier's named lever
+///
+/// On an H100 the binding constraint for this tile is the L2 -> SMEM fill path. Two CTAs holding
+/// adjacent N tiles of the same M tile read the *same* A rows, so without a cluster A crosses L2
+/// twice. In a `2x1x1` cluster each CTA TMA-loads half the A tile and multicasts it to both, which
+/// halves A's L2 traffic and leaves B untouched (each CTA has its own N half). Nothing else about
+/// the kernel changes: same tile, same 4 stages, same `SHIPPED_LAYOUT`, same register split, same
+/// epilogue. That is deliberate -- it is an A/B, and an A/B whose arms differ in two things measures
+/// neither.
+///
+/// # Its own failure mode, and how the gates cover it
+///
+/// A wrong `ctaMask`, a wrong slice offset or a missed remote arrival is not a crash: it is correct
+/// numbers on the rows this CTA fetched itself and stale ones on the rows its peer was supposed to
+/// multicast in -- silently, on half the accumulator rows. So the correctness gate
+/// (`gpu::tests::wgmma_cluster_multicast_is_exact`) runs shapes wide enough that the cluster spans
+/// two CTAs with *different* B halves and both A halves come from a multicast, and demands `==`
+/// against the f64 reference before anything is timed.
+pub const WGMMA_W1_MC: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mc2",
+    key: "wgmma_nt_f16_128x256x64_s4_mc2",
+    multicast: Multicast::ClusterA,
+    ..WGMMA_W1
+};
+
 /// Every shipped configuration. The generator, the gates and the device-free module enumeration all
 /// iterate this table.
-pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[WGMMA_W1, WGMMA_W1_BF16, WGMMA_W3C];
+pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[WGMMA_W1, WGMMA_W1_BF16, WGMMA_W3C, WGMMA_W1_MC];
 
 /// Look up a variant by entry name; panics loudly rather than mis-dispatching.
 pub fn wgmma_variant(name: &str) -> &'static WgmmaCfg {
@@ -1212,6 +1465,260 @@ pub fn wgmma_variant(name: &str) -> &'static WgmmaCfg {
         .iter()
         .find(|v| v.name == name)
         .unwrap_or_else(|| panic!("unknown wgmma variant {name:?}"))
+}
+
+// --- Act 2 round 2: the CONFIG SWEEP table --------------------------------------------------------
+
+/// One row of [`WGMMA_SWEEP_GRID`]: a configuration, a stable label, and the question it answers.
+///
+/// A row that **declines** is still a row. `WgmmaCfg::validate` is the authority on what fits, and a
+/// depth that does not fit Hopper's carveout is a finding the round should print (with the budget
+/// arithmetic) rather than a row quietly missing from the table.
+#[derive(Clone, Copy, Debug)]
+pub struct SweepRow {
+    /// Round-log row name and `bench_instrument` sample-label component. ASCII, no whitespace.
+    pub label: &'static str,
+    pub cfg: &'static WgmmaCfg,
+    /// What this row is in the table to answer, in one line.
+    pub why: &'static str,
+}
+
+impl SweepRow {
+    /// `Ok(())` iff this row can be generated at all -- i.e. it will be measured rather than
+    /// declined. The message is `WgmmaCfg::validate`'s own, so the reason a row is absent from the
+    /// ranked table is the generator's reason and not a second opinion.
+    pub fn generatable(&self) -> Result<(), String> {
+        self.cfg.validate().map(|_| ())
+    }
+    /// The shared-memory budget line the round prints for every row, declined or not:
+    /// `stages x per-stage + barriers = total of the Hopper carveout`.
+    pub fn smem_line(&self) -> String {
+        let c = self.cfg;
+        format!(
+            "{} stages x {} B + {} B barriers = {} B of {} B ({:.1}%)",
+            c.stages,
+            c.stage_tx_bytes(),
+            2 * c.stages * 8,
+            c.smem_bytes(),
+            HOPPER_SMEM_PER_CTA,
+            100.0 * c.smem_bytes() as f64 / HOPPER_SMEM_PER_CTA as f64
+        )
+    }
+}
+
+/// 128x256x64 at **2** stages, no cluster -- the shallow end of the depth axis.
+pub const WGMMA_W1_S2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s2",
+    key: "wgmma_nt_f16_128x256x64_s2",
+    stages: 2,
+    ..WGMMA_W1
+};
+/// 128x256x64 at 2 stages **with** the cluster.
+pub const WGMMA_W1_MC_S2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s2_mc2",
+    key: "wgmma_nt_f16_128x256x64_s2_mc2",
+    stages: 2,
+    ..WGMMA_W1_MC
+};
+/// 128x256x64 at 3 stages, no cluster.
+pub const WGMMA_W1_S3: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s3",
+    key: "wgmma_nt_f16_128x256x64_s3",
+    stages: 3,
+    ..WGMMA_W1
+};
+/// 128x256x64 at 3 stages **with** the cluster.
+pub const WGMMA_W1_MC_S3: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s3_mc2",
+    key: "wgmma_nt_f16_128x256x64_s3_mc2",
+    stages: 3,
+    ..WGMMA_W1_MC
+};
+/// 128x256x64 at 5 stages. **Does not fit** -- kept so the round prints why the depth axis stops.
+pub const WGMMA_W1_MC_S5: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s5_mc2",
+    key: "wgmma_nt_f16_128x256x64_s5_mc2",
+    stages: 5,
+    ..WGMMA_W1_MC
+};
+/// 128x256x64 at 6 stages. **Does not fit** either, by a wider margin.
+pub const WGMMA_W1_MC_S6: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s6_mc2",
+    key: "wgmma_nt_f16_128x256x64_s6_mc2",
+    stages: 6,
+    ..WGMMA_W1_MC
+};
+/// [`WGMMA_W3C`] with the cluster: does the lever transfer to the narrower tile?
+pub const WGMMA_W3C_MC: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x128x64_s6_mc2",
+    key: "wgmma_nt_f16_128x128x64_s6_mc2",
+    multicast: Multicast::ClusterA,
+    ..WGMMA_W3C
+};
+
+/// **The Act-2 round-2 configuration sweep, as data.**
+///
+/// Round 1 was a single A/B: one kernel against cuBLAS on seven shapes. It produced a number
+/// (58.8-67.5% of cuBLAS where D1 section 4.5 predicted 95-108%) and one named suspect -- the
+/// cluster its own provenance line said the row declined. A second single A/B would answer one
+/// question per rented visit. This table answers four in one, with cuBLAS as the same-run yardstick
+/// for every row, so a row's verdict is against the *same* denominator every other row is scored on:
+///
+/// * **the cluster**, at a fixed tile and depth (`w1_s4_off` vs `w1_s4_mc2`) -- the headline;
+/// * **the pipeline depth**, at BOTH cluster settings, so "deeper is better" and "the cluster is
+///   better" cannot be confounded with one another;
+/// * **the tile**, via D1's moderate-size W3c arm, which round 1 deliberately excluded because a
+///   second kernel in the contender arm would have been an A/B against two things at once -- here it
+///   is its own row against the same peer, which is a different and legitimate experiment;
+/// * **the ceiling on depth**, by keeping the two rows that do not fit and printing the arithmetic.
+///
+/// **The `wgmma` wait depth is deliberately NOT an axis.** The generated mainloop issues its `BK/16`
+/// `wgmma` as one group and then `wgmma.wait_group.sync.aligned 0` immediately before releasing the
+/// stage's `empty` barrier. That 0 is not a tuning knob: the release publishes the buffer to the
+/// producer, so it may not precede the last read of it, and any depth above 0 there would be a
+/// correctness bug rather than a slower or faster kernel. The real lever the round-1 PTX dump
+/// exposes is a *restructuring* -- commit per K step and defer the stage release by one, so the
+/// tensor cores are not drained to empty between stages -- which is a follow-up, not a sweep row.
+/// It is named in the round's own preamble so the log carries the finding.
+pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
+    SweepRow {
+        label: "w1_s4_off",
+        cfg: &WGMMA_W1,
+        why: "THE CONTROL. Round 1's measured row, unchanged: 128x256x64 s4, cluster 1x1x1. Its \
+              headline here must land near round 1's 67.5% at sq4096 / 58.8% at sq8192, or the \
+              instrument moved and no other row is readable",
+    },
+    SweepRow {
+        label: "w1_s4_mc2",
+        cfg: &WGMMA_W1_MC,
+        why: "THE HEADLINE. The same tile, depth, layout and register split with a 2x1x1 cluster \
+              and .multicast::cluster on A -- D1 4.5's W1 as specified. One fact different from the \
+              control, so the difference is the cluster",
+    },
+    SweepRow {
+        label: "w1_s3_off",
+        cfg: &WGMMA_W1_S3,
+        why: "Depth 3 without the cluster: the control arm of the depth axis",
+    },
+    SweepRow {
+        label: "w1_s3_mc2",
+        cfg: &WGMMA_W1_MC_S3,
+        why: "Depth 3 with the cluster. Halving A's L2 traffic shortens the fill the ring is hiding, \
+              so the depth that was right at full traffic need not be right at half",
+    },
+    SweepRow {
+        label: "w1_s2_off",
+        cfg: &WGMMA_W1_S2,
+        why: "Depth 2 without the cluster -- the shallow end, and the row that says how much of the \
+              deficit is fill latency at all",
+    },
+    SweepRow {
+        label: "w1_s2_mc2",
+        cfg: &WGMMA_W1_MC_S2,
+        why: "Depth 2 with the cluster. Pairing every measurable depth at both settings is what \
+              keeps 'deeper is better' and 'clustered is better' from being one measurement",
+    },
+    SweepRow {
+        label: "w1_s5_mc2",
+        cfg: &WGMMA_W1_MC_S5,
+        why: "Depth 5 at 128x256. EXPECTED TO DECLINE on shared memory -- and the decline is the \
+              point: the cluster does not change the ring's size, so the depth axis stops at 4 for \
+              this tile at BOTH cluster settings",
+    },
+    SweepRow {
+        label: "w1_s6_mc2",
+        cfg: &WGMMA_W1_MC_S6,
+        why: "Depth 6 at 128x256. Expected to decline by a wider margin, which pins the ceiling \
+              rather than leaving it at one data point",
+    },
+    SweepRow {
+        label: "w3c_s6_off",
+        cfg: &WGMMA_W3C,
+        why: "D1's moderate-size arm (128x128x64 s6), which round 1 excluded because a second \
+              kernel in ITS contender arm would have been an A/B against two things at once. Here \
+              every row is scored against the same cuBLAS, so it is a row",
+    },
+    SweepRow {
+        label: "w3c_s6_mc2",
+        cfg: &WGMMA_W3C_MC,
+        why: "The narrow tile WITH the cluster: does the A-multicast lever transfer to a tile whose \
+              per-CTA A traffic is already amortised over half as many output columns?",
+    },
+];
+
+/// The sweep rows that generate, in table order -- what the round will actually launch.
+pub fn wgmma_sweep_measurable() -> Vec<&'static SweepRow> {
+    WGMMA_SWEEP_GRID
+        .iter()
+        .filter(|r| r.generatable().is_ok())
+        .collect()
+}
+
+/// **The shapes the config sweep measures, named out of [`WGMMA_BENCH_GRID`] rather than restated.**
+///
+/// Selecting by label rather than by literal is the point: these are the *same* [`GemmPoint`]
+/// objects, with the same [`bench_iters`], that `wgmma_vs_cublas` swept on 2026-08-10, so a row's
+/// number here and that round's number are comparable without an argument about denominators.
+///
+/// Three, not seven. The sweep's cost is `rows x shapes`, and these three carry the whole question:
+/// `sq4096` and `sq8192` are the two points D1 section 4.5 predicts W1 at 95-108% on (and the two
+/// round 1 measured at 67.5% and 58.8%), and `sq2048` is the tile-quantization point D1 puts W3c at.
+/// The full seven-shape grid remains `wgmma_vs_cublas`'s job -- once this round says which
+/// configuration to run, that bench runs it everywhere.
+pub const WGMMA_SWEEP_SHAPES: &[&str] = &["sq2048", "sq4096", "sq8192"];
+
+/// The headline shape of the ranked table: the first of D1 4.5's two prediction points.
+pub const WGMMA_SWEEP_HEADLINE: &str = "sq4096";
+
+/// [`WGMMA_SWEEP_SHAPES`], resolved. Panics loudly on a label no grid row carries -- a sweep that
+/// silently measured six shapes because one name was misspelled would be worse than one that failed.
+pub fn wgmma_sweep_points() -> Vec<&'static GemmPoint> {
+    WGMMA_SWEEP_SHAPES
+        .iter()
+        .map(|l| {
+            WGMMA_BENCH_GRID
+                .iter()
+                .find(|p| p.label == *l)
+                .unwrap_or_else(|| {
+                    panic!("WGMMA_SWEEP_SHAPES names {l:?}, which is not a grid row")
+                })
+        })
+        .collect()
+}
+
+/// **The command that discharges validation item 9's correctness half.**
+///
+/// Unlike the two round invocations this one names a *gate*, not a bench: it is not `#[ignore]`d and
+/// it runs inside a plain `cargo test -p wukong_codegen_gpu --features gpu` on a Hopper part. The
+/// spelled-out form exists so the skip message on every other part sends the operator to the right
+/// test rather than to the bring-up sequence, which does not exercise a cluster at all.
+pub const WGMMA_CLUSTER_GATE_INVOCATION: &str =
+    "WUKONG_GPU_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu \
+     -- --nocapture --test-threads=1 wgmma_cluster_multicast_is_exact";
+
+/// **The exact command the Act-2 round-2 configuration sweep runs.** Data, for the same reason
+/// [`WGMMA_BENCH_INVOCATION`] is: the sweep prints a table and asserts no ratio, so a run without
+/// `--nocapture` throws away everything the rented minutes produced.
+pub const WGMMA_SWEEP_INVOCATION: &str =
+    "WUKONG_GPU_REQUIRED=1 WUKONG_PEER_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu \
+     --release -- --ignored --nocapture --test-threads=1 wgmma_config_sweep";
+
+/// **Every distinct configuration this family can emit a module for**, shipped rows first, then the
+/// sweep-only rows that generate -- deduplicated by module key.
+///
+/// This is the corpus the ASCII rule, the `.version` law and the **ptxas census** all scan, which is
+/// the point: a sweep row whose PTX a rented H100 is the first assembler ever to see is exactly the
+/// failure the CPU-priced census exists to prevent. `Gpu::function` keys on the module key alone and
+/// never re-examines the text, so the dedup is by key and a duplicate key is a bug the launch-plan
+/// gate catches.
+pub fn wgmma_all_emittable() -> Vec<&'static WgmmaCfg> {
+    let mut v: Vec<&'static WgmmaCfg> = WGMMA_VARIANTS.iter().collect();
+    for r in WGMMA_SWEEP_GRID {
+        if r.generatable().is_ok() && !v.iter().any(|c| c.key == r.cfg.key) {
+            v.push(r.cfg);
+        }
+    }
+    v
 }
 
 // --- bring-up: operands whose permutation is visible ----------------------------------------------
@@ -2223,6 +2730,22 @@ pub const WGMMA_DEVICE_VALIDATION: &[&str] = &[
      PRINT a table and assert NOTHING about speed -- a slow result is a finding, not a test \
      failure; the only asserts are the exact-integer correctness spot-check that gates the timing \
      and the structural ones. Run them as WGMMA_BENCH_INVOCATION.",
+    "9. THE CLUSTER. The 2026-08-10 Act-2 round measured 58.8-67.5% of cuBLAS where D1 4.5 \
+     predicts 95-108%, on a clean instrument, and its own provenance line named the reason it \
+     could not be the whole story: the measured kernel was W1 MINUS the 2x1x1 cluster with \
+     .multicast::cluster on A. WGMMA_W1_MC is that arm. Four mechanisms are unproven and each \
+     fails silently or hangs rather than erroring: the ctaMask and the per-rank A slice (a wrong \
+     one is stale shared memory on the M rows this CTA did not fetch itself); the per-destination \
+     transaction count (a wrong one hangs); the cluster-scoped empty-barrier arrivals through \
+     mapa (a missing one lets a producer overwrite a slice a peer is still reading); and the two \
+     barrier.cluster rendezvous, without which a peer signals an uninitialised mbarrier or writes \
+     the shared memory of a CTA that has exited. `wgmma_cluster_multicast_is_exact` in gpu.rs is \
+     the correctness gate -- four shapes that each span at least one full two-CTA cluster, \
+     including one with an ODD N tile count so the rounded grid's pad CTA is exercised, each \
+     verified `==` against the f64 reference AND bit-identical to the un-clustered row. \
+     `wgmma_config_sweep` is the performance round (WGMMA_SWEEP_INVOCATION): cluster off vs on at \
+     a fixed tile and depth, the depth axis at BOTH cluster settings so the two are not \
+     confounded, W3c as its own row, and the two over-budget depths kept as printed declines.",
 ];
 
 // --- Act 2: the performance grid --------------------------------------------------------------------
@@ -2407,6 +2930,15 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     let empty_base = cfg.empty_off(0);
     let per_consumer_a = 64 * bk * cfg.dtype.size(); // bytes of A one consumer's m64 slice starts at
     let bk_shift = bk.trailing_zeros();
+    // --- the cluster, if there is one -------------------------------------------------------------
+    // EVERY line below is conditional on `clustered`, deliberately: at `Multicast::None` this
+    // generator must emit the byte-identical text the 2026-08-10 Act-2 round measured, so that row
+    // remains the control arm of the cluster A/B rather than a second thing that also changed.
+    let ctas = cfg.cluster_ctas();
+    let clustered = ctas > 1;
+    let a_slice = cfg.a_slice_bytes();
+    let a_box_rows = cfg.a_box_rows();
+    let cmask = multicast_cta_mask(ctas);
 
     // The two descriptor constants: everything but the start address, which the kernel folds in at
     // run time. Both come from `desc_fields`, the single authority the sweep candidates read too,
@@ -2434,10 +2966,30 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     let mut s = String::with_capacity(64 * 1024);
     s += &format!(
         ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n\
-         \x20   .param .u64 pC,\n    {},\n    {}\n)\n.maxntid {threads}, 1, 1\n{{\n",
+         \x20   .param .u64 pC,\n    {},\n    {}\n)\n.maxntid {threads}, 1, 1\n",
         ptx_param_decl("tmapA"),
         ptx_param_decl("tmapB")
     );
+    if clustered {
+        // **The cluster shape is COMPILED IN, not merely requested at launch.** PTX ISA 11.7:
+        // "For kernels with .reqnctapercluster directive specified, runtime will use the specified
+        // values for configuring the launch if the same are not specified at launch time ... If
+        // cluster dimension is explicitly specified at launch time, it should be equal to the values
+        // specified in this directive." That is the safety net that matters here: this kernel `mapa`s
+        // to rank 1 and multicasts to a two-bit ctaMask, so a `1x1x1` launch of it would be silently
+        // WRONG rather than merely unoptimised -- and with this directive such a launch fails
+        // instead. `.explicitcluster` closes the other side ("must be launched with cluster dimension
+        // explicitly specified, either at launch time or via .reqnctapercluster").
+        //
+        // The order and the three-operand spelling are nvcc's own for `__cluster_dims__(2,1,1)`:
+        // `.maxntid` then `.explicitcluster` then `.reqnctapercluster nx, ny, nz`, all between the
+        // parameter list and the body. (`.maxclusterrank` is the one directive that may NOT appear
+        // with `.reqnctapercluster`; it does not.) The host passes
+        // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION anyway -- see `gpu::cluster_launch` -- and the
+        // CPU-priced `ptxas` census assembles this text before any H100 sees it.
+        s += &format!(".explicitcluster\n.reqnctapercluster {ctas}, 1, 1\n");
+    }
+    s += "{\n";
 
     // Registers. NB: never name one %tid/%ctaid/%laneid etc -- those are PTX special registers.
     s += "    .reg .pred %p0,%p1,%p2,%q0,%q1,%q2,%q3,%pd0,%pd1,%ptrue,%pfirst;\n";
@@ -2445,6 +2997,13 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
           %row0,%row1,%col,%col1,%colb,%ctam,%ctan,%cwg;\n";
     s += "    .reg .b64 %rdC,%rdS,%rdT,%rdA,%rdB,%rdBar,%rdBarF,%rdTmA,%rdTmB,%rdAddr,%rdOffA,\
           %descA,%descB,%rdSt;\n";
+    if clustered {
+        // `%crank` is this CTA's rank in its cluster; `%sbar`/`%rbar` are 32-bit SHARED addresses
+        // (the width `mapa.shared::cluster` and a `.shared::cluster` mbarrier operand take), and
+        // `%cmask` is the 16-bit multicast destination mask.
+        s += "    .reg .b32 %crank,%sbar,%rbar;\n";
+        s += "    .reg .b16 %cmask;\n";
+    }
     s += &format!("    .reg .f32 %acc<{nacc}>;\n\n");
 
     // --- parameters -------------------------------------------------------------------------------
@@ -2458,6 +3017,12 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     s += "    mov.u32 %lin,%tid.x;\n";
     s += "    shr.u32 %wgi,%lin,7;\n"; // warpgroup index = tid / 128
     s += "    mov.u32 %lane,%laneid;\n";
+    if clustered {
+        // This CTA's rank in its cluster. Every cluster-relative decision below reads THIS and never
+        // `%ctaid.x % ctas`: the two agree for a 1-D cluster along x, and only one of them keeps
+        // agreeing when the cluster shape changes.
+        s += "    mov.u32 %crank,%cluster_ctarank;\n";
+    }
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %ctan,%tmp,{bn};\n");
     s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %ctam,%tmp,{bm};\n");
     // ktiles = ceil(K / BK); BK is a power of two (validated), so the divide is a shift.
@@ -2479,10 +3044,23 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         s += &format!(
             "    add.s64 %rdBar,%rdS,{};\n    mbarrier.init.shared::cta.b64 [%rdBar],{};\n",
             cfg.empty_off(st),
-            cfg.consumer_wgs
+            cfg.empty_arrivals()
         );
     }
+    if clustered {
+        // The mbarriers this CTA just initialised are written by OTHER CTAs (a peer's multicast
+        // completes this CTA's `full[s]`; a peer's consumers arrive at this CTA's `empty[s]`), and an
+        // `mbarrier.init` is not ordered against a remote access by anything weaker than this. It is
+        // the ISA's own fence for exactly this hazard and it is executed by the initialising thread,
+        // inside the same guarded region, before the rendezvous below.
+        s += "    fence.mbarrier_init.release.cluster;\n";
+    }
     s += &format!("INIT_DONE_{name}:\n    bar.sync 0;\n");
+    if clustered {
+        // `bar.sync` is CTA-scoped, so it says nothing about the peer's barriers being ready. No CTA
+        // may touch a peer's shared memory until every CTA in the cluster has passed this point.
+        s += "    barrier.cluster.arrive.aligned;\n    barrier.cluster.wait.aligned;\n";
+    }
 
     // --- role split -------------------------------------------------------------------------------
     s += "    setp.eq.u32 %p0,%wgi,0;\n";
@@ -2498,6 +3076,11 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     );
     s += "    setp.eq.u32 %p0,%lin,0;\n";
     s += &format!("    @!%p0 bra EXIT_{name};\n");
+    if clustered {
+        // Every CTA of the cluster is a destination of every A multicast, so the mask is the low
+        // `ctas` bits and is loop-invariant. Bit `r` names the CTA whose `%cluster_ctarank` is `r`.
+        s += &format!("    mov.u16 %cmask,{cmask};\n");
+    }
     s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n";
     // The empty-phase parity starts at 1 so the first `stages` acquisitions pass immediately: a
     // freshly initialised barrier is in phase parity 0, and `try_wait.parity 1` completes at once
@@ -2520,13 +3103,36 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         cfg.stage_tx_bytes()
     );
     s += &format!("    mul.wide.u32 %rdT,%stg,{tile_a};\n    add.s64 %rdA,%rdS,%rdT;\n");
+    if clustered {
+        // This rank's slice of the shared A tile, at the SAME CTA-relative offset in every
+        // destination -- which is what makes the assembled SMEM image identical to the one an
+        // unclustered copy of the whole tile would have written, and therefore leaves the
+        // descriptor, the per-consumer m64 slabs and the epilogue untouched.
+        s += &format!("    mul.lo.s32 %tmp,%crank,{a_slice};\n    cvt.u64.u32 %rdOffA,%tmp;\n");
+        s += "    add.s64 %rdA,%rdA,%rdOffA;\n";
+    }
     s += &format!("    mul.wide.u32 %rdT,%stg,{tile_b};\n    add.s64 %rdB,%rdS,%rdT;\n");
     s += &format!("    add.s64 %rdB,%rdB,{};\n", cfg.b_off(0));
     // The K coordinate, in elements. Tensor coordinates are `{dim0, dim1}` = `{k, row}`, because
     // dimension 0 is the contiguous axis of the descriptor (see `tma_host`).
     s += &format!("    mul.lo.s32 %tmp,%kt,{bk};\n");
-    s += "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes \
-          [%rdA],[%rdTmA,{%tmp,%ctam}],[%rdBarF];\n";
+    if clustered {
+        // ...and the global row this rank's slice starts at. The A tensor map's box is
+        // `a_box_rows` tall (WgmmaCfg::tensor_map_a), so the slices tile the CTA's M range exactly.
+        s +=
+            &format!("    mul.lo.s32 %tmp2,%crank,{a_box_rows};\n    add.u32 %tmp2,%tmp2,%ctam;\n");
+        // A, multicast to the whole cluster. `ctaMask` is the last operand; the hardware writes the
+        // slice into every destination CTA at the same CTA-relative offset as `%rdA` AND signals the
+        // barrier at the same CTA-relative offset as `%rdBarF` in each of them -- which is why every
+        // CTA declares the FULL `stage_tx_bytes` and none of them divides it.
+        s += "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes\
+              .multicast::cluster [%rdA],[%rdTmA,{%tmp,%tmp2}],[%rdBarF],%cmask;\n";
+    } else {
+        s +=
+            "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes \
+              [%rdA],[%rdTmA,{%tmp,%ctam}],[%rdBarF];\n";
+    }
+    // B is never multicast: the CTAs of a cluster hold DIFFERENT N halves, so they share no B bytes.
     s += "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes \
           [%rdB],[%rdTmB,{%tmp,%ctan}],[%rdBarF];\n";
     s += "    add.u32 %kt,%kt,1;\n    add.u32 %stg,%stg,1;\n";
@@ -2584,7 +3190,25 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     s += "    mul.wide.u32 %rdT,%stg,8;\n    add.s64 %rdBar,%rdS,%rdT;\n";
     s += &format!("    add.s64 %rdBar,%rdBar,{empty_base};\n");
     s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
-    s += "    @%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];\n";
+    if clustered {
+        // This warpgroup releases the stage in EVERY CTA of the cluster, not just its own: the A
+        // slice it just finished reading was multicast in by a peer's producer, and that producer
+        // may not overwrite it until every consumer in the cluster is done. `empty[s]` is therefore
+        // initialised with `cluster_ctas * consumer_wgs` arrivals (WgmmaCfg::empty_arrivals) and gets
+        // one from every consumer warpgroup in the cluster.
+        //
+        // `mapa` takes a 32-bit SHARED address, not the 64-bit generic one the rest of this mainloop
+        // computes, and an mbarrier arrival at `.shared::cluster` scope cannot return a state token
+        // (hence the `_` sink) -- both are the CUTLASS idiom verbatim.
+        s += "    cvta.to.shared.u64 %rdT,%rdBar;\n    cvt.u32.u64 %sbar,%rdT;\n";
+        for r in 0..ctas {
+            s += &format!("    mov.u32 %tmp2,{r};\n");
+            s += "    mapa.shared::cluster.u32 %rbar,%sbar,%tmp2;\n";
+            s += "    @%p2 mbarrier.arrive.shared::cluster.b64 _,[%rbar];\n";
+        }
+    } else {
+        s += "    @%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];\n";
+    }
     s += "    add.u32 %kt,%kt,1;\n    add.u32 %stg,%stg,1;\n";
     s += &format!(
         "    setp.lt.u32 %p1,%stg,{};\n    @%p1 bra CLOOP_{name};\n",
@@ -2632,7 +3256,20 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
             4 * j + 3
         );
     }
-    s += &format!("EXIT_{name}:\n    ret;\n}}\n");
+    if clustered {
+        // **No CTA may retire while a peer can still touch its shared memory.** A peer's producer
+        // multicasts into this CTA's ring and a peer's consumers arrive at this CTA's `empty`
+        // barriers; a CTA that exited has no shared memory to write. Every thread of every CTA
+        // reaches this label -- the producer's 127 idle threads immediately, its issuing thread when
+        // the K loop ends, the consumers after the epilogue (or straight from `ktiles == 0`) -- so
+        // the `.aligned` claim holds and the wait cannot be the deadlock.
+        s += &format!(
+            "EXIT_{name}:\n    barrier.cluster.arrive.aligned;\n    barrier.cluster.wait.aligned;\n\
+             \x20   ret;\n}}\n"
+        );
+    } else {
+        s += &format!("EXIT_{name}:\n    ret;\n}}\n");
+    }
     Ok(s)
 }
 
@@ -2652,11 +3289,11 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
 /// `ptxas fatal` at the worst possible moment.
 pub fn wgmma_device_free_modules() -> Vec<(String, String)> {
     let license = Sm90aLicense::for_probed_cc((9, 0)).expect("(9,0) is Hopper");
-    let mut v: Vec<(String, String)> = WGMMA_VARIANTS
-        .iter()
+    let mut v: Vec<(String, String)> = wgmma_all_emittable()
+        .into_iter()
         .map(|c| {
             let ptx = wgmma_module(c, &license)
-                .unwrap_or_else(|e| panic!("shipped variant {} must generate: {e}", c.name));
+                .unwrap_or_else(|e| panic!("emittable variant {} must generate: {e}", c.name));
             (format!("wgmma::{}", c.name), ptx)
         })
         .collect();
@@ -3324,10 +3961,15 @@ mod tests {
         let mods = wgmma_device_free_modules();
         assert_eq!(
             mods.len(),
-            WGMMA_VARIANTS.len() + 2,
-            "W1 f16, W1 bf16, W3c, the TMA stage probe, and the descriptor sweep probe"
+            wgmma_all_emittable().len() + 2,
+            "every emittable configuration, plus the TMA stage probe and the descriptor sweep probe"
         );
-        assert_eq!(mods.len(), 5);
+        // 4 shipped rows (W1 f16, W1 bf16, W3c, W1 f16 + 2x1x1 cluster) + the 5 sweep-only rows that
+        // fit shared memory (128x256 at s2/s3 in both cluster settings, and W3c clustered) + the two
+        // bring-up probes. The two 128x256 rows at s5 and s6 are deliberately NOT here: they decline
+        // in `WgmmaCfg::validate` on the carveout, and the sweep prints the arithmetic rather than
+        // emitting a module nothing can launch.
+        assert_eq!(mods.len(), 11);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -3352,7 +3994,7 @@ mod tests {
     /// two TMA copies per iteration, and the register split.
     #[test]
     fn the_mainloop_is_structurally_what_the_design_says() {
-        for c in WGMMA_VARIANTS {
+        for c in wgmma_all_emittable() {
             let ptx = wgmma_module(c, &license()).unwrap();
             let shape = c.shape().unwrap();
             assert_eq!(
@@ -3392,11 +4034,11 @@ mod tests {
             assert_eq!(
                 ptx.matches(&format!(
                     "mbarrier.init.shared::cta.b64 [%rdBar],{};",
-                    c.consumer_wgs
+                    c.empty_arrivals()
                 ))
                 .count(),
                 c.stages,
-                "{}: the empty barrier expects one arrival per consumer warpgroup",
+                "{}: the empty barrier expects one arrival per consumer warpgroup IN THE CLUSTER",
                 c.name
             );
             assert_eq!(
@@ -3415,17 +4057,89 @@ mod tests {
                 "mbarrier.arrive.expect_tx.shared::cta.b64 %rdSt,[%rdBarF],{};",
                 c.stage_tx_bytes()
             )));
-            // two TMA copies per iteration, both against the full barrier
+            // Two TMA copies per iteration, both against the full barrier -- A (multicast under a
+            // cluster) and B (never multicast, because cluster peers share no B bytes).
             assert_eq!(
                 ptx.matches("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes")
                     .count(),
                 2
             );
-            assert!(
-                !ptx.contains("multicast"),
-                "{}: no cluster arm is emitted",
-                c.name
-            );
+            if c.cluster_ctas() > 1 {
+                // --- the cluster arm ----------------------------------------------------------
+                assert_eq!(
+                    ptx.matches(
+                        ".multicast::cluster [%rdA],[%rdTmA,{%tmp,%tmp2}],[%rdBarF],%cmask;"
+                    )
+                    .count(),
+                    1,
+                    "{}: A must be the multicast copy, with the ctaMask as its last operand",
+                    c.name
+                );
+                assert!(
+                    ptx.contains("bytes [%rdB],[%rdTmB,{%tmp,%ctan}],[%rdBarF];"),
+                    "{}: B must NOT be multicast -- cluster peers hold different N halves",
+                    c.name
+                );
+                assert!(ptx.contains(&format!(
+                    "mov.u16 %cmask,{};",
+                    multicast_cta_mask(c.cluster_ctas())
+                )));
+                // nvcc's own order and spelling for `__cluster_dims__`, right after `.maxntid`.
+                assert!(ptx.contains(&format!(
+                    ".maxntid {}, 1, 1\n.explicitcluster\n.reqnctapercluster {}, 1, 1\n{{\n",
+                    c.threads(),
+                    c.cluster_ctas()
+                )));
+                assert!(
+                    !ptx.contains(".maxclusterrank"),
+                    "{}: .maxclusterrank may not appear with .reqnctapercluster",
+                    c.name
+                );
+                assert!(ptx.contains("mov.u32 %crank,%cluster_ctarank;"));
+                // The slice geometry, in the two places it appears.
+                assert!(ptx.contains(&format!("mul.lo.s32 %tmp,%crank,{};", c.a_slice_bytes())));
+                assert!(ptx.contains(&format!("mul.lo.s32 %tmp2,%crank,{};", c.a_box_rows())));
+                // One remote-capable arrival per cluster CTA, per consumer warpgroup.
+                assert_eq!(
+                    ptx.matches("mbarrier.arrive.shared::cluster.b64 _,[%rbar];")
+                        .count(),
+                    c.cluster_ctas(),
+                    "{}: every CTA of the cluster must be released",
+                    c.name
+                );
+                assert_eq!(
+                    ptx.matches("mapa.shared::cluster.u32 %rbar,%sbar,%tmp2;")
+                        .count(),
+                    c.cluster_ctas()
+                );
+                assert!(
+                    !ptx.contains("mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];"),
+                    "{}: the CTA-local-only release would let a producer recycle a stage a peer is \
+                     still reading",
+                    c.name
+                );
+                // Both rendezvous, and the init fence that makes the first one mean something.
+                assert!(ptx.contains("fence.mbarrier_init.release.cluster;"));
+                assert_eq!(ptx.matches("barrier.cluster.arrive.aligned;").count(), 2);
+                assert_eq!(ptx.matches("barrier.cluster.wait.aligned;").count(), 2);
+                assert!(
+                    ptx.contains("barrier.cluster.wait.aligned;\n    ret;"),
+                    "{}: a CTA must not retire while a peer can still write its shared memory",
+                    c.name
+                );
+            } else {
+                assert!(
+                    !ptx.contains("multicast")
+                        && !ptx.contains("cluster_ctarank")
+                        && !ptx.contains("reqnctapercluster")
+                        && !ptx.contains("barrier.cluster")
+                        && !ptx.contains("mapa"),
+                    "{}: an un-clustered row must emit NO cluster machinery -- it is the control arm \
+                     of the cluster A/B and its text must stay the text the 2026-08-10 round measured",
+                    c.name
+                );
+                assert!(ptx.contains("@%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];"));
+            }
             // the register split
             assert!(ptx.contains(&format!(
                 "setmaxnreg.dec.sync.aligned.u32 {};",
@@ -3575,12 +4289,9 @@ mod tests {
         let lic = license();
         let cases: Vec<(&str, WgmmaCfg, &str)> = vec![
             (
-                "cluster multicast",
-                WgmmaCfg {
-                    multicast: Multicast::ClusterA,
-                    ..WGMMA_W1
-                },
-                "cluster multicast",
+                "a clustered row too deep for the carveout",
+                WGMMA_W1_MC_S5,
+                "exceeds the 232448 B per-CTA ceiling",
             ),
             (
                 "a layout no tiled TMA copy writes",
@@ -3664,6 +4375,79 @@ mod tests {
         }
     }
 
+    /// **Every way a multicast slice can be wrong, rejected by name.**
+    ///
+    /// Stated over numbers rather than over `WgmmaCfg`s because today's [`Multicast`] menu can only
+    /// produce a 2-CTA cluster, so most of these arms are unreachable from a shipped row -- and an
+    /// unreachable guard that has never been executed is a guard nobody has read. The `align` is the
+    /// 128-B swizzle's, which is what every shipped row carries.
+    #[test]
+    fn the_cluster_preconditions_reject_every_way_a_slice_can_be_wrong() {
+        let ok = |ctas, bm, row_bytes| validate_cluster("row", ctas, bm, row_bytes, 128);
+        // No cluster: nothing to check, whatever the rest says.
+        ok(1, 129, 3).unwrap();
+        // The shipped geometry: 2 CTAs, CTA-M 128, a 128 B shared row.
+        ok(2, 128, 128).unwrap();
+        ok(8, 128, 128).unwrap();
+
+        let e = ok(16, 128, 128).unwrap_err();
+        assert!(
+            e.starts_with(UNSUPPORTED) && e.contains("portable ceiling"),
+            "{e}"
+        );
+        let e = ok(3, 128, 128).unwrap_err();
+        assert!(e.contains("does not divide by the 3-CTA cluster"), "{e}");
+        // 128 rows over 8 CTAs is 16 rows each (legal); over 32 it would be 4 -- but 32 trips the
+        // portable ceiling first, so the swizzle-phase arm needs a divisible-but-unaligned split.
+        let e = ok(2, 4, 128).unwrap_err();
+        assert!(e.contains("8-row core matrix"), "{e}");
+        // A slice taller than TMA's box limit: 2048 rows over 2 CTAs is 1024 each.
+        let e = ok(2, 2048, 128).unwrap_err();
+        assert!(e.contains("element box limit"), "{e}");
+        // A legal row count whose bytes do not reach the descriptor's alignment.
+        let e = ok(2, 16, 8).unwrap_err();
+        assert!(e.contains("not a multiple of the 128 B alignment"), "{e}");
+
+        // ...and the two arms that ARE reachable from the table: the deep clustered rows decline on
+        // shared memory, with the arithmetic in the message, and every other sweep row generates.
+        for r in WGMMA_SWEEP_GRID {
+            match r.generatable() {
+                Ok(()) => assert!(
+                    r.cfg.smem_bytes() <= HOPPER_SMEM_PER_CTA,
+                    "{}: generates but does not fit?",
+                    r.label
+                ),
+                Err(e) => {
+                    assert!(e.starts_with(UNSUPPORTED), "{}: {e}", r.label);
+                    assert!(e.contains("per-CTA ceiling"), "{}: {e}", r.label);
+                    assert!(r.cfg.smem_bytes() > HOPPER_SMEM_PER_CTA);
+                }
+            }
+            assert!(r.smem_line().is_ascii());
+        }
+        // The budget arithmetic itself, at the two ends of the depth axis, spelled out -- so a
+        // refactor that changes what a stage costs cannot quietly move where the axis stops.
+        // Clustering does NOT change the ring: the A tile is still staged whole in every CTA, it
+        // just arrives in `cluster_ctas` multicast pieces instead of one local copy.
+        assert_eq!(WGMMA_W1.stage_tx_bytes(), 49152);
+        assert_eq!(WGMMA_W1_MC.stage_tx_bytes(), WGMMA_W1.stage_tx_bytes());
+        assert_eq!(WGMMA_W1_MC.smem_bytes(), WGMMA_W1.smem_bytes());
+        assert_eq!(WGMMA_W1_MC_S2.smem_bytes(), 2 * 49152 + 2 * 2 * 8);
+        assert_eq!(WGMMA_W1_MC_S3.smem_bytes(), 3 * 49152 + 2 * 3 * 8);
+        assert_eq!(WGMMA_W1_MC_S5.smem_bytes(), 5 * 49152 + 2 * 5 * 8);
+        assert!(WGMMA_W1_MC_S3.smem_bytes() <= HOPPER_SMEM_PER_CTA);
+        assert!(WGMMA_W1_MC_S5.smem_bytes() > HOPPER_SMEM_PER_CTA);
+        assert_eq!(WGMMA_W3C_MC.stage_tx_bytes(), 32768);
+        assert_eq!(WGMMA_W3C_MC.smem_bytes(), WGMMA_W3C.smem_bytes());
+        // The multicast slice arithmetic of every clustered row, at the same two ends.
+        for c in [&WGMMA_W1_MC, &WGMMA_W3C_MC] {
+            assert_eq!(c.a_box_rows(), c.bm / 2);
+            assert_eq!(c.a_slice_bytes() * 2, c.tile_a_bytes());
+            assert_eq!(c.empty_arrivals(), 2 * c.consumer_wgs);
+            assert_eq!(c.stage_copies_per_cta(), 3);
+        }
+    }
+
     /// A BK whose contiguous extent overflows the TMA box rule is caught by the descriptor
     /// validator, before any PTX exists -- the two halves of the family agree on the same geometry.
     #[test]
@@ -3731,27 +4515,123 @@ mod tests {
         );
     }
 
-    /// The TMA descriptors the launcher must build, and the transaction count the kernel declares,
-    /// are the same fact viewed twice. A mismatch does not fail -- it hangs.
+    /// **The TMA descriptors the launcher builds and the transaction count the kernel declares are
+    /// the same fact viewed twice, and multicast does not divide it.** A mismatch does not fail --
+    /// it hangs, which on rented silicon is the whole rest of the hour.
+    ///
+    /// The clustered rows are where this stops being a restatement. Each CTA fetches
+    /// `1 / cluster_ctas` of A and multicasts it, so its A descriptor moves `tile_a / cluster_ctas`
+    /// bytes -- but the copy performs a `complete-tx` of that amount on *every* destination CTA's
+    /// barrier, so `cluster_ctas` such copies plus one own B tile land the full `tile_a + tile_b` in
+    /// each CTA. The arithmetic below is that sentence.
     #[test]
-    fn the_declared_transaction_equals_what_the_two_copies_move() {
-        for c in WGMMA_VARIANTS {
+    fn the_declared_transaction_equals_what_the_copies_move_per_destination_cta() {
+        for c in wgmma_all_emittable() {
             let a = c.tensor_map_a(4096, 4096);
             let b = c.tensor_map_b(4096, 4096);
             a.validate().unwrap();
             b.validate().unwrap();
+            let ctas = c.cluster_ctas();
             assert_eq!(
-                a.transaction_bytes() + b.transaction_bytes(),
+                ctas * a.transaction_bytes() + b.transaction_bytes(),
                 c.stage_tx_bytes(),
-                "{}: expect_tx must equal what the two tensor copies move",
+                "{}: expect_tx must equal what {ctas} multicast A slices plus one B tile deliver \
+                 into ONE CTA",
                 c.name
             );
-            assert_eq!(a.transaction_bytes(), c.tile_a_bytes());
+            assert_eq!(a.transaction_bytes(), c.a_slice_bytes());
             assert_eq!(b.transaction_bytes(), c.tile_b_bytes());
             assert_eq!(a.box_dim[0] as usize, c.bk);
-            assert_eq!(a.box_dim[1] as usize, c.bm);
+            assert_eq!(a.box_dim[1] as usize, c.a_box_rows());
             assert_eq!(b.box_dim[1] as usize, c.bn);
+            // The count is the SAME number with and without a cluster -- that is the claim
+            // `WgmmaCfg::stage_tx_bytes` makes, and it is worth checking rather than believing.
+            assert_eq!(c.stage_tx_bytes(), c.tile_a_bytes() + c.tile_b_bytes());
+            // ...and the slices tile the A stage exactly, in rank order, with no gap and no overlap.
+            assert_eq!(c.a_slice_off(0), 0);
+            assert_eq!(c.a_slice_off(ctas), c.tile_a_bytes());
+            assert_eq!(c.stage_copies_per_cta(), ctas + 1);
         }
+    }
+
+    /// **The multicast destination mask.** It is a pure function of the cluster size and it is the
+    /// only thing standing between "A reaches both CTAs" and "half the accumulator rows read
+    /// whatever the previous iteration left in shared memory".
+    #[test]
+    fn the_multicast_mask_names_every_cta_of_the_cluster() {
+        assert_eq!(multicast_cta_mask(1), 0b1);
+        assert_eq!(multicast_cta_mask(2), 0b11);
+        assert_eq!(multicast_cta_mask(4), 0b1111);
+        assert_eq!(multicast_cta_mask(8), 0xff);
+        assert_eq!(multicast_cta_mask(16), 0xffff);
+        for ctas in 1..=16usize {
+            let m = multicast_cta_mask(ctas);
+            assert_eq!(m.count_ones() as usize, ctas, "{ctas} CTAs, mask {m:#x}");
+            for r in 0..ctas {
+                assert_ne!(m & (1 << r), 0, "rank {r} is not a destination");
+            }
+            for r in ctas..16 {
+                assert_eq!(m & (1 << r), 0, "rank {r} is not in the cluster");
+            }
+        }
+        // The shipped cluster row's own mask, spelled out: both CTAs of a 2x1x1 cluster.
+        assert_eq!(multicast_cta_mask(WGMMA_W1_MC.cluster_ctas()), 3);
+        assert_eq!(multicast_cta_mask(WGMMA_W1.cluster_ctas()), 1);
+    }
+
+    /// A cluster is a fixed shape, so the grid must be a multiple of it in every axis. The extra
+    /// CTAs an odd tile count produces are the ragged edge one notch coarser -- wholly out of range,
+    /// zero-filled by TMA, and predicated out of the epilogue -- and never a partial cluster.
+    #[test]
+    fn the_grid_is_cluster_divisible_and_still_covers_the_output() {
+        for c in wgmma_all_emittable() {
+            let p = c.launch_plan();
+            let (cx, cy) = (p.cluster.0 as usize, p.cluster.1 as usize);
+            assert_eq!(p.cluster_ctas() as usize, c.cluster_ctas());
+            assert!(p.cluster_ctas() >= 1 && p.cluster.2 == 1);
+            for (m, n) in [
+                (1usize, 1usize),
+                (128, 256),
+                (129, 257),
+                (4096, 4096),
+                (8192, 8192),
+                (4096, 1024),
+                // The interesting one: an ODD number of N tiles under a 2-CTA cluster.
+                (128, 3 * c.bn),
+                (2 * c.bm + 1, 5 * c.bn - 1),
+            ] {
+                let (gx, gy, gz) = p.grid(m, n);
+                assert_eq!(gz, 1);
+                assert_eq!(
+                    gx as usize % cx,
+                    0,
+                    "{}: grid x {gx} is not a multiple of the cluster's {cx} -- there is no such \
+                     thing as a partial cluster",
+                    c.name
+                );
+                assert_eq!(
+                    gy as usize % cy,
+                    0,
+                    "{}: grid y {gy} vs cluster {cy}",
+                    c.name
+                );
+                assert!(
+                    (gx as usize) * p.bn >= n && (gy as usize) * p.bm >= m,
+                    "{}: grid {gx}x{gy} does not cover {m}x{n}",
+                    c.name
+                );
+                // Rounding is bounded: never more than one cluster of slack in either axis.
+                assert!(
+                    (gx as usize) * p.bn < n + cx * p.bn,
+                    "{}: grid x {gx} overshoots {n} by more than one cluster",
+                    c.name
+                );
+            }
+        }
+        // ...and the rounding is exactly the cluster's, not a blanket round-up: the un-clustered row
+        // still launches the tight grid the 2026-08-10 round measured.
+        assert_eq!(WGMMA_W1.launch_plan().grid(128, 3 * 256), (3, 1, 1));
+        assert_eq!(WGMMA_W1_MC.launch_plan().grid(128, 3 * 256), (4, 1, 1));
     }
 
     /// The unproven-claims list is the honest half of this module and must not quietly empty out or
@@ -3764,7 +4644,7 @@ mod tests {
     /// downstream of correctness. An item that names no gate is an item nobody will run.
     #[test]
     fn the_device_validation_list_is_intact() {
-        assert_eq!(WGMMA_DEVICE_VALIDATION.len(), 8);
+        assert_eq!(WGMMA_DEVICE_VALIDATION.len(), 9);
         // Item 1 is the head item and must name the mechanism that discharges it -- the sweep, and
         // the two controls that make the sweep self-validating.
         for need in [
@@ -3809,6 +4689,116 @@ mod tests {
                 "item 8 must name {need:?}: {}",
                 WGMMA_DEVICE_VALIDATION[7]
             );
+        }
+        // Item 9 is the cluster. It must name the four mechanisms that fail silently, the
+        // correctness gate that settles them and the performance round that follows -- an item
+        // that names no gate is an item nobody will run, and this one's failure mode is a hang.
+        for need in [
+            "ctaMask",
+            "mapa",
+            "barrier.cluster",
+            "transaction count",
+            "wgmma_cluster_multicast_is_exact",
+            "wgmma_config_sweep",
+            "WGMMA_SWEEP_INVOCATION",
+            "WGMMA_W1_MC",
+        ] {
+            assert!(
+                WGMMA_DEVICE_VALIDATION[8].contains(need),
+                "item 9 must name {need:?}: {}",
+                WGMMA_DEVICE_VALIDATION[8]
+            );
+        }
+    }
+
+    /// The round-2 sweep's own invocation and shape selection, checked device-free -- a misspelled
+    /// shape label would otherwise be a rented minute spent on a panic, and a missing `--release`
+    /// would mismeasure a 25-microsecond kernel with a debug host loop.
+    #[test]
+    fn the_sweep_invocation_and_shapes_name_things_that_exist() {
+        let gate = WGMMA_CLUSTER_GATE_INVOCATION;
+        assert!(gate.is_ascii());
+        assert!(gate.contains("wgmma_cluster_multicast_is_exact"));
+        assert!(
+            !gate.contains("--ignored"),
+            "the cluster gate is a GATE, not a bench: it runs in a plain `cargo test`"
+        );
+        let inv = WGMMA_SWEEP_INVOCATION;
+        assert!(inv.is_ascii());
+        for need in [
+            "WUKONG_GPU_REQUIRED=1",
+            "WUKONG_PEER_REQUIRED=1",
+            "--features gpu",
+            "--release",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+            "wgmma_config_sweep",
+        ] {
+            assert!(
+                inv.contains(need),
+                "the sweep invocation must carry {need:?}: {inv}"
+            );
+        }
+        // Every shape is a real grid row, so the sweep and `wgmma_vs_cublas` share denominators.
+        let pts = wgmma_sweep_points();
+        assert_eq!(pts.len(), WGMMA_SWEEP_SHAPES.len());
+        assert!(pts.iter().any(|p| p.label == WGMMA_SWEEP_HEADLINE));
+        assert!(
+            WGMMA_SWEEP_SHAPES.contains(&"sq4096") && WGMMA_SWEEP_SHAPES.contains(&"sq8192"),
+            "the sweep must measure both of D1 4.5's prediction points"
+        );
+        // Every row's label is a usable log/sample-label token, and unique.
+        let mut labels: Vec<&str> = WGMMA_SWEEP_GRID.iter().map(|r| r.label).collect();
+        let n = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), n, "duplicate sweep row label");
+        for r in WGMMA_SWEEP_GRID {
+            assert!(r.label.is_ascii() && !r.label.contains(char::is_whitespace));
+            assert!(r.why.is_ascii() && r.why.len() > 40, "{}", r.label);
+        }
+        // The headline A/B exists, is one fact apart, and both arms are in the table.
+        let by = |l: &str| {
+            WGMMA_SWEEP_GRID
+                .iter()
+                .find(|r| r.label == l)
+                .unwrap_or_else(|| panic!("the sweep must carry the row {l:?}"))
+        };
+        let (off, mc) = (by("w1_s4_off").cfg, by("w1_s4_mc2").cfg);
+        assert_eq!(off.cluster_ctas(), 1);
+        assert_eq!(mc.cluster_ctas(), 2);
+        for (what, a, b) in [
+            ("bm", off.bm, mc.bm),
+            ("bn", off.bn, mc.bn),
+            ("bk", off.bk, mc.bk),
+            ("stages", off.stages, mc.stages),
+            ("consumer_wgs", off.consumer_wgs, mc.consumer_wgs),
+            ("threads", off.threads(), mc.threads()),
+            ("smem", off.smem_bytes(), mc.smem_bytes()),
+        ] {
+            assert_eq!(
+                a, b,
+                "the cluster A/B's arms differ in {what} as well as the cluster"
+            );
+        }
+        assert_eq!(off.layout, mc.layout);
+        assert_eq!(off.consumer_regs, mc.consumer_regs);
+        assert_eq!(off.producer_regs, mc.producer_regs);
+        // ...and the depth axis is paired at every measurable depth, so "deeper" and "clustered"
+        // cannot be confounded with one another.
+        for depth in [2usize, 3, 4] {
+            for want_cluster in [1usize, 2] {
+                assert!(
+                    WGMMA_SWEEP_GRID.iter().any(|r| {
+                        r.cfg.stages == depth
+                            && r.cfg.cluster_ctas() == want_cluster
+                            && r.cfg.bn == 256
+                            && r.generatable().is_ok()
+                    }),
+                    "the depth axis is missing 128x256 at {depth} stages, cluster {want_cluster}"
+                );
+            }
         }
     }
 
