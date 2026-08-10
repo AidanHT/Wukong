@@ -1876,11 +1876,11 @@ impl CublasChainLayer {
             assert_eq!(wt.len(), len, "{name} wrong size");
         }
         assert!(
-            s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
+            s.is_multiple_of(64) && d.is_multiple_of(64) && dff.is_multiple_of(64),
             "CublasChainLayer needs S,D,Dff multiples of 64 (to match the WMMA peer's tiles)"
         );
         assert!(
-            heads >= 1 && d % heads == 0,
+            heads >= 1 && d.is_multiple_of(heads),
             "d={d} must be divisible by heads={heads}"
         );
         let dh = d / heads;
@@ -2848,8 +2848,11 @@ impl Fp8LtPlan {
     fn new(g: &mut Gpu, m: usize, k: usize, n: usize) -> Result<Self, PeerError> {
         // E4M3 leading dims are 1 byte; cuBLASLt wants 16-byte-aligned lda/ldb ⇒ K%16, and the f32 C
         // ld=N must be 4-element (16-byte) aligned ⇒ N%4. Wukong's m16n8k32 tiles satisfy both.
-        assert!(k % 16 == 0, "cuBLASLt fp8 needs K%16==0 (got K={k})");
-        assert!(n % 4 == 0, "cuBLASLt fp8 needs N%4==0 (got N={n})");
+        assert!(
+            k.is_multiple_of(16),
+            "cuBLASLt fp8 needs K%16==0 (got K={k})"
+        );
+        assert!(n.is_multiple_of(4), "cuBLASLt fp8 needs N%4==0 (got N={n})");
         let stream = g.stream.clone();
 
         let handle = cublaslt_result::create_handle()?;
@@ -3931,7 +3934,7 @@ mod tests {
         // A package dir with no shared objects must NOT be reported: nothing could load from it.
         std::fs::create_dir_all(t.0.join("nvidia/cuda_runtime/include")).expect("mkdir");
 
-        let issues = split_redist_on_loader_path(&[on.clone()]);
+        let issues = split_redist_on_loader_path(std::slice::from_ref(&on));
         assert_eq!(issues.len(), 1, "one tree, one issue: {issues:?}");
         let what = &issues[0].what;
         for m in [&missing_nvrtc, &missing_cudnn] {

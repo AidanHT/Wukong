@@ -460,7 +460,7 @@ mod tests {
                 let hpv = make_hp(lr, b1, b2, eps, wd, t);
 
                 // CPU reference: run the emitted AdamW MIR on the interpreter.
-                let mut bufs = vec![
+                let mut bufs = [
                     cw.clone(),
                     grad.clone(),
                     cm.clone(),

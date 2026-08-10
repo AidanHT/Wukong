@@ -2427,7 +2427,9 @@ mod tests {
 
         // Both conditions genuinely hold, or this gate proves nothing.
         assert!(
-            v.floor.expect("a control-only round still measures a floor") > DEFAULT_CONTROL_BAR,
+            v.floor
+                .expect("a control-only round still measures a floor")
+                > DEFAULT_CONTROL_BAR,
             "the floor must exceed the bar for this test to exercise the interaction"
         );
         assert_eq!(v.field("us").unwrap().cell, Cell::NoContender);

@@ -163,7 +163,7 @@ pub const FLASH_TILE_MIN: usize = 0;
 /// Generate the **untiled** flash kernel for head dim `d` (multiple of 32). Name = `flash_d{d}`.
 /// `warps` independent query-row warps per CTA (occupancy packing; the launcher must match).
 fn entry_untiled(d: usize, warps: u32) -> String {
-    assert!(d % 32 == 0, "D must be a multiple of 32");
+    assert!(d.is_multiple_of(32), "D must be a multiple of 32");
     let r = d / 32; // values per lane
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
     let name = format!("flash_d{d}");
@@ -255,7 +255,7 @@ fn entry_untiled(d: usize, warps: u32) -> String {
 /// Name = `flash_d{d}_t`. `warps` query-row warps per CTA cooperatively stage a `BK = 1024/D` key block
 /// into shared memory and reuse it (the launcher must match the block dim `32·warps`).
 fn entry_tiled(d: usize, warps: u32) -> String {
-    assert!(d % 32 == 0, "D must be a multiple of 32");
+    assert!(d.is_multiple_of(32), "D must be a multiple of 32");
     assert!(
         1024 % d == 0,
         "D must divide 1024 (key-block tiling: BK = 1024/D)"
@@ -391,7 +391,7 @@ fn frag(pfx: &str, n: usize) -> String {
 /// (nn WMMA) → `smemPV`, then `smemO = smemO·corr + smemPV`. Final `O = smemO / l`. Tolerance-gated;
 /// f16 inputs mean a looser tol than the f32 kernels (consistent with the fp16 WMMA layer).
 fn entry_wmma(d: usize) -> String {
-    assert!(d % 16 == 0, "WMMA flash needs D % 16 == 0");
+    assert!(d.is_multiple_of(16), "WMMA flash needs D % 16 == 0");
     let kt = d / 16; // Q·Kᵀ contraction tiles (over the head dim) AND P·V output n-tiles (over D)
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
     let name = format!("flash_d{d}_w");
@@ -561,7 +561,7 @@ fn entry_wmma(d: usize) -> String {
 /// occupancy, so the net is an empirical A/B (`flash_tiled_vs_untiled`). Requires `S % WK == 0` (no
 /// ragged key tail) — fine for the layer, whose WMMA path is already `S % 64 == 0`.
 fn entry_wmma_wide(d: usize, nkb: usize) -> String {
-    assert!(d % 16 == 0, "WMMA flash needs D % 16 == 0");
+    assert!(d.is_multiple_of(16), "WMMA flash needs D % 16 == 0");
     assert!(nkb >= 1, "nkb must be >= 1");
     let kt = d / 16; // Q·Kᵀ contraction tiles (over the head dim) AND P·V output n-tiles (over D)
     let wk = 16 * nkb; // keys staged + softmaxed per KB step
@@ -752,8 +752,9 @@ fn entry_wmma_wide(d: usize, nkb: usize) -> String {
 ///  4. `O += P·V`: `D/8` output n-tiles of `mma.sync` accumulate directly into the register O. V is the
 ///     `.col` B operand `[hdim][key]` (the transpose of V's natural layout), so each B-fragment is two
 ///     `u16` loads packed — the only uncoalesced cost, removed by the SMEM stage later.
-///  Final `O[row][c] = o / l_row`. Tolerance-gated vs `ref_attn` (f16 in ⇒ same ~2e-2 rel as the WMMA
-///  flash; a mis-mapped fragment would scatter O(0.1+), which the gate catches).
+///
+/// Final `O[row][c] = o / l_row`. Tolerance-gated vs `ref_attn` (f16 in ⇒ same ~2e-2 rel as the WMMA
+/// flash; a mis-mapped fragment would scatter O(0.1+), which the gate catches).
 ///
 /// **Causal** (`flash_d{d}_mc`): a decoder masks key `j > query i`. Two parts — (a) **skip** every key
 /// block strictly above the query block's diagonal (the loop stops at `kb == row`, the ~½-work FA2 win
@@ -761,7 +762,7 @@ fn entry_wmma_wide(d: usize, nkb: usize) -> String {
 /// exceeds their query (a `setp`/`selp` per score); the online softmax then drops them (`ex2(-inf)=0`).
 /// Every query keeps its diagonal key (`key = query`), so `l > 0` always. Gated vs `ref_attn_causal`.
 fn entry_mma_reg(d: usize, causal: bool) -> String {
-    assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
     let ktq = d / 16; // Q·Kᵀ contraction tiles (over hdim)
     let nto = d / 8; // P·V output n-tiles (over hdim)
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
@@ -1017,7 +1018,7 @@ fn entry_mma_reg_pipe(
     stages: usize,
     smem_budget: usize,
 ) -> String {
-    assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
     assert!(stages >= 1, "flash pipeline needs >= 1 buffer");
     let single_buf = stages == 1;
     assert!(
@@ -1415,7 +1416,7 @@ fn entry_mma_reg_pipe(
 /// as the overlap saves. So the long-S ceiling is not closable by software-pipelining a single warp's QKᵀ;
 /// it joins `mp4`/`mpw` as a measured occupancy/overlap negative. Non-causal; not extended, given the wash.
 fn entry_mma_reg_pipe_sp(d: usize) -> String {
-    assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
     let ktq = d / 16;
     let nto = d / 8;
     let ksz = 16 * d * 2; // one tensor's 16-key slab (K slab == V slab)
@@ -1638,7 +1639,7 @@ fn entry_mma_reg_pipe_sp(d: usize) -> String {
 /// but a cross-warp partial-score exchange) is not pursued given this evidence. The banked D=128 win
 /// stays the `ldmatrix` SMEM-feed (`flash_d128_mp_lm`), which beats cutlass-efficient ≤1024.
 fn entry_mma_reg_pipe_hs(d: usize) -> String {
-    assert!(d % 32 == 0, "head-split needs (d/2) % 16 == 0");
+    assert!(d.is_multiple_of(32), "head-split needs (d/2) % 16 == 0");
     let ktq = d / 16; // full QKᵀ contraction tiles (both warps compute these, redundantly)
     let hh = d / 2; // head-dim half each warp owns
     let nto = hh / 8; // PV n-tiles per warp (half the output)
@@ -1829,7 +1830,7 @@ fn entry_mma_reg_pipe_hs(d: usize) -> String {
 /// `warps ∤ S/16`) still stages and still hits the barrier. Non-causal only (a causal CTA would need its
 /// warps to diverge on the key range, breaking the shared barrier); causal stays on `flash_d64_mpc`.
 fn entry_mma_reg_pipe_mw(d: usize, warps: usize) -> String {
-    assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
     assert!(warps >= 1, "warps must be >= 1");
     let ktq = d / 16;
     let nto = d / 8;
@@ -2053,13 +2054,13 @@ fn entry_mma_reg_pipe_wide(
     pv_ldmatrix: bool,
     smem_budget: usize,
 ) -> String {
-    assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
     assert!(nkb >= 1, "nkb must be >= 1");
     assert!(stages >= 2, "the wide flash ring needs >= 2 buffers");
     // The cooperative stage is an exact, unguarded `cpl = BK·D/256` 16-byte chunks per lane; a
     // non-integral count would silently leave the tail of every staged slab unwritten.
     assert!(
-        (16 * nkb * d) % 256 == 0,
+        (16 * nkb * d).is_multiple_of(256),
         "flash_d{d}_mpw{nkb}: BK*D must be a multiple of 256 (32 lanes x 16-byte cp.async chunks)"
     );
     let ktq = d / 16; // Q·Kt contraction tiles (over hdim)
@@ -2370,7 +2371,7 @@ fn entry_mma_reg_pipe_wide(
 /// `cos`/`sin` tables are exact (host f64→f32), so the only error vs a CPU `rope→attention` oracle is the
 /// f16 fragment round-trip + tensor-core accumulation — gated to the same f16 tolerance.
 fn entry_mma_reg_pipe_rope(d: usize) -> String {
-    assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
     let ktq = d / 16; // Q·Kt contraction tiles (over hdim)
     let nto = d / 8; // P·V output n-tiles (over hdim)
     let half = d / 2; // rotary pairs per head
@@ -2490,7 +2491,7 @@ fn entry_mma_reg_pipe_rope(d: usize) -> String {
             s += &format!("    mov.f32 %s{nk}_{r},0f00000000;\n");
         }
         s += &format!("    add.u32 %lkey,%grp,{};\n", nk * 8);
-        s += &format!("    add.u32 %kpos,%kb,%lkey;\n");
+        s += "    add.u32 %kpos,%kb,%lkey;\n";
         for kt in 0..ktq {
             s += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n", kt * 16);
             s += "    ld.shared.b32 %b0,[%sbase];\n    ld.shared.b32 %b1,[%sbase+16];\n";
@@ -2609,7 +2610,7 @@ fn entry_mma_reg_pipe_rope(d: usize) -> String {
 /// K via `ldmatrix.x2`, V via `ldmatrix.x2.trans`, exactly as [`entry_mma_reg_pipe`]'s `_lm` variants.
 fn entry_mma_reg_pipe_ws(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
     assert!(
-        d % 32 == 0,
+        d.is_multiple_of(32),
         "ws flash needs D % 32 == 0 (64-thread cooperative stage)"
     );
     let ktq = d / 16; // Q.Kt contraction tiles (over hdim)
@@ -2847,28 +2848,28 @@ fn entry_mma_reg_pipe_ws(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
     s += &format!("    @!%pc bra AQ_{name};\n");
     s += &qk;
     s += &format!("AQ_{name}:\n");
-    s += &format!("    bar.sync 1,64;\n");
+    s += "    bar.sync 1,64;\n";
     s += &stage_next;
     s += &format!("    @!%pc bra AS_{name};\n");
     s += &sm;
     s += &pv;
     s += &format!("AS_{name}:\n");
     s += "    cp.async.wait_group 0;\n";
-    s += &format!("    bar.sync 2,64;\n");
+    s += "    bar.sync 2,64;\n";
     s += swap;
     s += &format!("    bra LOOPA_{name};\n");
 
     // ===== WARP B (warpid 1): bar1 | stage | QK(i) SM(i) | wait | bar2.arrive | PV(i) | swap =====
     s += &format!("LOOPB_{name}:\n    setp.ge.u32 %p0,%kb,%kend;\n    @%p0 bra STORE_{name};\n");
     s += &setpc;
-    s += &format!("    bar.sync 1,64;\n");
+    s += "    bar.sync 1,64;\n";
     s += &stage_next;
     s += &format!("    @!%pc bra BQ_{name};\n");
     s += &qk;
     s += &sm;
     s += &format!("BQ_{name}:\n");
     s += "    cp.async.wait_group 0;\n";
-    s += &format!("    bar.arrive 2,64;\n");
+    s += "    bar.arrive 2,64;\n";
     s += &format!("    @!%pc bra BP_{name};\n");
     s += &pv;
     s += &format!("BP_{name}:\n");
@@ -2904,7 +2905,7 @@ fn entry_mma_reg_pipe_ws(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
 /// (`bufc←bufp←bufn←bufc`). Non-causal only (the A/B probe regime); causal follows if the ring wins.
 fn entry_mma_reg_pipe_ws3(d: usize, pv_ldmatrix: bool) -> String {
     assert!(
-        d % 32 == 0,
+        d.is_multiple_of(32),
         "ws3 flash needs D % 32 == 0 (64-thread cooperative stage)"
     );
     let ktq = d / 16; // Q.Kt contraction tiles (over hdim)
