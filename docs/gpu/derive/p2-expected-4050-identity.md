@@ -1,5 +1,19 @@
 # P2 — predict-before-measure: the 4050 perf-identity leg
 
+> **STATUS UPDATE (2026-08-09): MEASURED — the results are in §6 of this file, and the status line
+> immediately below is stale.** Two rounds ran on 2026-08-08/09 (5 rounds of all 11 benches, then 11
+> rounds of the 6 that did not resolve); raw logs at `bench/gpu/4050-identity/round.log` and
+> `bench/gpu/4050-identity-deep/round.log`, with a per-invocation file per arm/round beside each.
+> **381 invocations, 0 nonzero exits.** Verdict, quoted from §6: *"six certified ties, five
+> consistent-with-tie"* — B's central tendency within **1.8%** of baseline everywhere and within
+> **0.3%** on every bench that resolved, with no evidence of a regression. P2/P4/P5 held; **P3 was
+> wrong, informatively** (the tensor-core families did not shift — they turned out to have the
+> *widest* control floors, i.e. they are the noisiest benches on this machine).
+>
+> §0–§5 are the unedited pre-registration. Note the section order: **§6 (results) sits before §5
+> (the battery smoke run)** because §6 was appended without renumbering — §5 is still plumbing-only
+> and still not a measurement.
+
 **Status: PREDICTION. Nothing here has been measured.** Written 2026-08-08 against `8c66dc0`, on a
 machine that was **on battery at the time of writing** and therefore could not time anything.
 Per `GPU_RETARGET_PLAN.md` §0 — *write down the number you expect and why, then measure*.
