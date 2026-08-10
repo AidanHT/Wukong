@@ -46,7 +46,7 @@ use cudarc::driver::{
     LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
-use half::f16;
+use half::{bf16, f16};
 
 use crate::gpu::{Gpu, TransformerWeights};
 
@@ -1698,6 +1698,79 @@ unsafe fn gemm_ex_nt_f16_f32out(
     k: usize,
     n: usize,
 ) -> Result<(), PeerError> {
+    gemm_ex_nt_16bit_f32out(
+        blas,
+        stream,
+        cudaDataType_t::CUDA_R_16F,
+        a_d,
+        b_d,
+        c_d,
+        m,
+        k,
+        n,
+    )
+}
+
+/// The **bf16** twin of [`gemm_ex_nt_f16_f32out`] (`CUDA_R_16BF` data, f32 C, `CUBLAS_COMPUTE_32F`).
+///
+/// `wgmma` is precision-generic across the two 16-bit types — only the operand-type token in the
+/// instruction changes — and so is `cublasGemmEx`: one `cudaDataType_t` apart, same tensor cores,
+/// same f32 accumulate. Which is exactly why this exists rather than the bf16 kernel being scored
+/// against the f16 peer: the two library paths are *not* guaranteed to pick the same kernel, so
+/// "close enough, same tensor cores" would be an assumption sitting under a published ratio, and
+/// bf16 is the dominant training precision that deserves its own bar.
+///
+/// # Safety
+/// As [`gemm_ex_nt_f16_f32out`]: `a_d`, `b_d`, `c_d` must be valid device buffers of length `m*k`,
+/// `n*k`, `m*n`, and the handle and stream must be live.
+unsafe fn gemm_ex_nt_bf16_f32out(
+    blas: &CudaBlas,
+    stream: &Arc<CudaStream>,
+    a_d: &CudaSlice<bf16>,
+    b_d: &CudaSlice<bf16>,
+    c_d: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), PeerError> {
+    gemm_ex_nt_16bit_f32out(
+        blas,
+        stream,
+        cudaDataType_t::CUDA_R_16BF,
+        a_d,
+        b_d,
+        c_d,
+        m,
+        k,
+        n,
+    )
+}
+
+/// The one `cublasGemmEx` call both 16-bit f32-out peers make, so the column-major transpose
+/// identity exists **once**.
+///
+/// The f16 and bf16 peers differ in a single `cudaDataType_t` token and in nothing else. Writing the
+/// call twice would put the `Cᵀ = B̌ᵀ·Ǎ` operand swap in two places, and a transpose identity that
+/// exists twice is a transpose identity that can be fixed once — the failure would not be a compile
+/// error, it would be a peer computing the wrong thing at full speed.
+///
+/// # Safety
+/// `a_d`, `b_d`, `c_d` must be valid device buffers of length `m*k`, `n*k`, `m*n` **whose element
+/// type is the one `dt` names** (the driver reads the buffers through `dt`, not through `T`), the
+/// cuBLAS handle in `blas` and `stream` must be live, and `dt` must be a 16-bit type `cublasGemmEx`
+/// accepts with `CUBLAS_COMPUTE_32F`. The device-pointer guards are held across the call.
+unsafe fn gemm_ex_nt_16bit_f32out<T>(
+    blas: &CudaBlas,
+    stream: &Arc<CudaStream>,
+    dt: cudaDataType_t,
+    a_d: &CudaSlice<T>,
+    b_d: &CudaSlice<T>,
+    c_d: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), PeerError> {
+    debug_assert_eq!(std::mem::size_of::<T>(), 2, "a 16-bit operand type");
     let alpha = 1.0f32;
     let beta = 0.0f32;
     let (ap, _ra) = a_d.device_ptr(stream);
@@ -1712,10 +1785,10 @@ unsafe fn gemm_ex_nt_f16_f32out(
         k as i32,
         (&alpha) as *const f32 as *const _,
         bp as *const _,
-        cudaDataType_t::CUDA_R_16F,
+        dt,
         k as i32, // lda: B̌ is K×N col-major
         ap as *const _,
-        cudaDataType_t::CUDA_R_16F,
+        dt,
         k as i32, // ldb: Ǎ is K×M col-major
         (&beta) as *const f32 as *const _,
         cp as *mut _,
@@ -1774,6 +1847,62 @@ pub fn time_cublas_gemm_nt_f16_f32out(
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
         unsafe { gemm_ex_nt_f16_f32out(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? };
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+/// One-shot correctness-gate entry for [`gemm_ex_nt_bf16_f32out`] — the bf16 twin of
+/// [`cublas_gemm_nt_f16_f32out`]. Host f32 `A`,`B` in (rounded to bf16, the price the bf16 path
+/// pays), f32 `C` out, cross-checked against the same f64 reference.
+///
+/// **bf16 keeps eight significand bits, not eleven.** A gate that feeds it operands calibrated for
+/// f16 gets a rounded input and an unexplained near-miss; `ptx_wgmma::WgmmaDtype::exact_integer_limit`
+/// is the number that keeps a caller honest about it (256, against f16's 2048).
+pub fn cublas_gemm_nt_bf16_f32out(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
+    let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let stream = g.stream.clone();
+    unsafe { gemm_ex_nt_bf16_f32out(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Time cuBLAS **bf16** GEMM with an f32 output — the apples-to-apples peer for Wukong's bf16
+/// tensor-core GEMMs, which accumulate and store C as f32.
+///
+/// Byte-for-byte the same timing shape as [`time_cublas_gemm_nt_f16_f32out`]: buffers resident,
+/// handle warmed, one discarded warm-up call, `iters` calls, one trailing sync, seconds per call. So
+/// the f16 and bf16 bars are directly comparable to each other as well as to Wukong.
+pub fn time_cublas_gemm_nt_bf16_f32out(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let a_d = g.stream.memcpy_stod(&vec![bf16::from_f32(0.01); m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![bf16::from_f32(0.01); n * k])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let stream = g.stream.clone();
+    unsafe { gemm_ex_nt_bf16_f32out(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? }; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe { gemm_ex_nt_bf16_f32out(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? };
     }
     g.stream.synchronize()?;
     Ok(t0.elapsed().as_secs_f64() / iters as f64)
