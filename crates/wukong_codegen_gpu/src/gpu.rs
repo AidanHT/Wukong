@@ -16618,12 +16618,22 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
-    /// **THE f16 DEEP-PIPELINE GATE — `mma.sync` rings past the 48 KiB static wall.**
+    /// **THE f16 DEEP/WIDE-PIPELINE GATE — `mma.sync` rings past the 48 KiB static wall.**
     ///
-    /// Three of the five [`PIPE_DEEP_VARIANTS`](crate::ptx_wmma::PIPE_DEEP_VARIANTS) rows (s4 = 64 KiB,
-    /// s5 = 80 KiB, 128×256 s3 = 72 KiB) **cannot be declared statically on any device** — the 48 KiB cap
-    /// is a PTX ISA rule about static `.shared`, not a device fact — so they exist only through the
-    /// module-scope `.extern .shared` window plus `cuFuncSetAttribute`. This runs them, on the metal.
+    /// Most of the 11 [`PIPE_DEEP_VARIANTS`](crate::ptx_wmma::PIPE_DEEP_VARIANTS) rows (every s4/s5 at
+    /// 128×128, and every 128×256 / 256×128 row past s2) **cannot be declared statically on any
+    /// device** — the 48 KiB cap is a PTX ISA rule about static `.shared`, not a device fact — so they
+    /// exist only through the module-scope `.extern .shared` window plus `cuFuncSetAttribute`. This
+    /// runs them, on the metal.
+    ///
+    /// **It also sweeps [`PIPE_WIDE_VARIANTS`](crate::ptx_wmma::PIPE_WIDE_VARIANTS).** Those four rows
+    /// (112–144 KiB) are the datacenter-only rings: no Ada part can hold them, so on this laptop each
+    /// one is a **capability skip** and nothing else. Chaining them in here rather than leaving them
+    /// ungated means the A100/H100 round costs zero new code — the wide table's D1 §4.4 rows (A3/A4,
+    /// the #1-ranked Act-1 lever) get gated by the same shapes, the same two oracles and the same skip
+    /// accounting the moment a part that can hold them runs this test. The accounting below is what
+    /// keeps the skip honest in both directions: the set skipped must be EXACTLY the set over budget,
+    /// so a row that quietly stopped running, or one launched despite being over budget, fails.
     ///
     /// Two oracles, because a float kernel has no bit-exact one:
     ///   * the **f16-rounded f64 reference** at the crate's fp16 GEMM tolerance (abs 1e-2, rel 2e-3) —
@@ -16640,7 +16650,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// device's opt-in ceiling is a **capability skip**, never a silent pass.
     #[test]
     fn gemm_deep_matches_reference_within_tol() {
-        use crate::ptx_wmma::PIPE_DEEP_VARIANTS;
+        use crate::ptx_wmma::{PIPE_DEEP_VARIANTS, PIPE_WIDE_VARIANTS};
         use half::f16;
         with_gpu("gemm_deep", |g| {
             let budget = g.smem_budget();
@@ -16653,13 +16663,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let base = crate::ptx_wmma::deep_variant("deep_swz_128_s2");
             let mut rng = crate::diff::Rng::new(0x0DEE_9176);
             let mut ran = 0usize;
-            for v in PIPE_DEEP_VARIANTS {
+            let mut skipped: Vec<&str> = Vec::new();
+            for v in PIPE_DEEP_VARIANTS.iter().chain(PIPE_WIDE_VARIANTS) {
                 if v.smem_bytes() > budget {
                     eprintln!(
                         "[skip:capability] {}: {} B > this device's opt-in ceiling {budget} B",
                         v.name,
                         v.smem_bytes()
                     );
+                    skipped.push(v.name);
                     continue;
                 }
                 // The occupancy the depth actually buys/costs on THIS card — a device fact, printed as
@@ -16744,14 +16756,33 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     ran += 1;
                 }
             }
+            // A capability skip must be the SMEM ceiling and nothing else, in BOTH directions: every
+            // over-budget row skipped, and no other row skipped. On this 99 KiB Ada part that is
+            // exactly PIPE_WIDE_VARIANTS (112–144 KiB) and no deep row; on an A100/H100 it is none of
+            // them and the whole wide table runs through this same gate with no code change.
+            let over: Vec<&str> = PIPE_DEEP_VARIANTS
+                .iter()
+                .chain(PIPE_WIDE_VARIANTS)
+                .filter(|v| v.smem_bytes() > budget)
+                .map(|v| v.name)
+                .collect();
+            assert_eq!(
+                skipped, over,
+                "a row was skipped for something other than this device's opt-in ceiling, or an \
+                 over-budget row was launched anyway"
+            );
             assert!(
                 ran >= 10,
                 "the deep grid must actually have run (only {ran} shapes)"
             );
             eprintln!(
-                "[gate] f16 deep pipeline: {ran} K-corner shapes across s2..s5 + the 128x256 tile, every one \
-                 within fp16 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the >48 KiB rows \
-                 ran out of the dynamic SMEM window ✓"
+                "[gate] f16 deep/wide pipeline: {ran} K-corner shapes across {} of {} rows, every one \
+                 within fp16 tolerance of the f64 oracle AND of the shipped 2-stage kernel; the \
+                 >48 KiB rows ran out of the dynamic SMEM window. {} capability-skipped as too wide \
+                 for this device's {budget} B opt-in: {skipped:?} \u{2713}",
+                PIPE_DEEP_VARIANTS.len() + PIPE_WIDE_VARIANTS.len() - skipped.len(),
+                PIPE_DEEP_VARIANTS.len() + PIPE_WIDE_VARIANTS.len(),
+                skipped.len()
             );
         });
     }
