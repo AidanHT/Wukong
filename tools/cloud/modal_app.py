@@ -2974,7 +2974,13 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
             env["WUKONG_STRONG_PEERS"] = strong_peers
             print(f"Strong-peer bar declared: {strong_peers}")
         profile = ["--release"] if release else []
-        extra = ([filter] if filter else [])
+        # Whitespace-split so `--filter` can carry libtest FLAGS, not just one name.
+        # The wgmma bring-up gate's exact invocation (ptx_wgmma::WGMMA_BRINGUP_INVOCATION)
+        # is `--nocapture --test-threads=1 wgmma_hopper_bringup`: `--nocapture` is
+        # mandatory because every verdict is PRINTED, not asserted — a passing run
+        # without it swallows the DescOrder answer the rented minutes exist to produce.
+        # A single bare test name still works exactly as before.
+        extra = filter.split()
 
         print(f"Device suite on {WK_GPU} — GPU_REQUIRED=1, PEER_REQUIRED={'1' if peers else '0'}")
         rc1 = _run(["cargo", "test", "-p", "wukong_codegen_gpu", "--features", "gpu"] + profile
