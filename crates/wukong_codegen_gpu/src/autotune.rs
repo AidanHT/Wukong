@@ -243,7 +243,11 @@ fn int8_candidates() -> Vec<Int8Cand> {
 /// unhelpful `CUDA_ERROR_INVALID_VALUE`. `min_k` additionally drops depths whose buffers cannot fill at
 /// this K — correct but pure waste, and a wasted round is a worse measurement for everything else.
 fn applicable(c: &Int8Cand, m: usize, n: usize, k: usize, budget: usize) -> bool {
-    m % c.bm == 0 && n % c.bn == 0 && k % c.k_mult == 0 && k >= c.min_k && c.smem <= budget
+    m.is_multiple_of(c.bm)
+        && n.is_multiple_of(c.bn)
+        && k.is_multiple_of(c.k_mult)
+        && k >= c.min_k
+        && c.smem <= budget
 }
 
 /// Load a candidate, returning its function and **the shared-memory bytes its launch must carry** — 0
@@ -266,7 +270,7 @@ fn launch_cfg(c: &Int8Cand, m: usize, n: usize, dyn_smem: usize) -> LaunchConfig
     // (whatever the caller pre-filled, typically zeros). Reject it here rather than return a partial
     // answer: `applicable` is the contract, and every caller must have checked it.
     assert!(
-        m % c.bm == 0 && n % c.bn == 0,
+        m.is_multiple_of(c.bm) && n.is_multiple_of(c.bn),
         "autotune: candidate `{}` tiles {}x{} and cannot cover M={m}, N={n} — a truncated grid \
          would leave part of C unwritten",
         c.name,
@@ -695,7 +699,7 @@ fn w4a16_token_usable(token: &str, k: usize) -> bool {
     let sk = w4a16_sk_of(token);
     (token == "w4a16" || token == w4a16_token(sk))
         && W4A16_SK_CANDS.contains(&sk)
-        && k % (sk * crate::ptx_int4::GROUP_SIZE) == 0
+        && k.is_multiple_of(sk * crate::ptx_int4::GROUP_SIZE)
 }
 
 /// **Search the W4A16 split counts for `m×n×k` and rank them.** sk=1 (un-split) vs split-K (sk∈{2,4,8}:
@@ -720,7 +724,7 @@ pub fn tune_w4a16_gemm(
         "w4a16 autotune is the symmetric split-K path"
     );
     assert!(
-        m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
+        m.is_multiple_of(W4_BM) && n.is_multiple_of(W4_BN) && k.is_multiple_of(GROUP_SIZE),
         "w4a16 tune needs M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
     );
     let a: Vec<f16> = (0..m * k)
@@ -756,7 +760,7 @@ pub fn tune_w4a16_gemm(
     let mut ranked: Vec<Ranked> = Vec::new();
     for &sk in W4A16_SK_CANDS
         .iter()
-        .filter(|&&sk| k % (sk * GROUP_SIZE) == 0)
+        .filter(|&&sk| k.is_multiple_of(sk * GROUP_SIZE))
     {
         let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
         let (out, secs) = if sk == 1 {
@@ -1095,6 +1099,7 @@ mod tests {
     ///     came back as the zeros `launch_int8_tuned` pre-filled. `Ok`, 25% of the output silently zero.
     ///   * `int8 256 256 256 = swz64_sk16 1.0` — a token from a hypothetical older candidate set;
     ///     `launch_int8_tuned`'s `.expect(..)` panicked.
+    ///
     /// Both are now "not usable at this shape" → a miss → re-tune.
     #[test]
     fn stale_cache_tokens_are_not_usable() {

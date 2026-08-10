@@ -995,13 +995,13 @@ fn wmma_nt_device(
 ) -> Result<(), DriverError> {
     use crate::ptx_wmma::{wmma_f16_ptx, SM_BM, SM_BN, SM_THREADS};
     assert!(
-        m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
+        m.is_multiple_of(16) && n.is_multiple_of(16) && k.is_multiple_of(16),
         "wmma_nt_device needs 16-multiple dims"
     );
     need_len("wmma_nt_device A", a16, m * k);
     need_len("wmma_nt_device B", b16, n * k);
     need_len("wmma_nt_device C", c, m * n);
-    let (entry, cfg) = if m % SM_BM == 0 && n % SM_BN == 0 {
+    let (entry, cfg) = if m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) {
         (
             "wmma_nt_f16_sm_db",
             LaunchConfig {
@@ -1036,6 +1036,7 @@ fn wmma_nt_device(
 ///   * NT (`A·Bᵀ`): narrow A, B → one WMMA.
 ///   * NN (`A·B`):  narrow A; transpose-narrow B (`[k×n]→[n×k]`); WMMA.
 ///   * TN (`Aᵀ·B`): transpose-narrow A (`[k×m]→[m×k]`) and B (`[k×n]→[n×k]`); WMMA.
+///
 /// The transposes are O(elements) (memory-bound, « the O(mnk) GEMM). Dims that aren't 16-multiples
 /// fall back to the (correct, slower) f32 [`gemm_device`]. Master weights/grads stay f32 → no loss
 /// scaling. Tolerance-gated vs cuBLAS-fp16 and vs the f32 closed-form MLP backprop at f16 tolerance.
@@ -1051,7 +1052,7 @@ pub fn gemm_device_f16(
     n: usize,
     k: usize,
 ) -> Result<(), DriverError> {
-    if m % 16 != 0 || n % 16 != 0 || k % 16 != 0 {
+    if !m.is_multiple_of(16) || !n.is_multiple_of(16) || !k.is_multiple_of(16) {
         return gemm_device(g, ta, tb, a, b, c, m, n, k);
     }
     match (ta, tb) {

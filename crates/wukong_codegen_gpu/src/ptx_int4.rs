@@ -123,9 +123,12 @@ fn pack_nibble(out: &mut u32, kk: usize, u: i32) {
 /// `group`, and `group` a multiple of 8.
 pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) -> QuantWeight {
     assert_eq!(w.len(), n * k, "weight must be N*K");
-    assert!(k % group == 0, "K={k} must be a multiple of group={group}");
     assert!(
-        group % 8 == 0,
+        k.is_multiple_of(group),
+        "K={k} must be a multiple of group={group}"
+    );
+    assert!(
+        group.is_multiple_of(8),
         "group={group} must be a multiple of 8 (nibble packing)"
     );
     let kg = k / group;
@@ -173,9 +176,12 @@ pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) ->
 /// `(q - zero)` subtract is one extra instruction on the unpack path.
 pub fn quantize_weight_asymmetric(w: &[f32], n: usize, k: usize, group: usize) -> QuantWeight {
     assert_eq!(w.len(), n * k, "weight must be N*K");
-    assert!(k % group == 0, "K={k} must be a multiple of group={group}");
     assert!(
-        group % 8 == 0,
+        k.is_multiple_of(group),
+        "K={k} must be a multiple of group={group}"
+    );
+    assert!(
+        group.is_multiple_of(8),
         "group={group} must be a multiple of 8 (nibble packing)"
     );
     let kg = k / group;
@@ -310,7 +316,7 @@ fn entry_w4a16(
     splitk: bool,
 ) -> String {
     assert!(
-        group.is_power_of_two() && group % BK == 0,
+        group.is_power_of_two() && group.is_multiple_of(BK),
         "group must be a power of two ≥ {BK}"
     );
     assert!(

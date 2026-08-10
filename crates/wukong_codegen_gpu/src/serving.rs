@@ -141,11 +141,11 @@ pub fn assert_decode_geometry(gqa: &GqaConfig, dff: usize) {
         gqa.head_dim()
     );
     assert!(
-        dff % 64 == 0,
+        dff.is_multiple_of(64),
         "Dff must be a multiple of 64 (WMMA N tile); got {dff}"
     );
     assert!(
-        bcap % 64 == 0,
+        bcap.is_multiple_of(64),
         "Bcap (num_slots) must be a multiple of 64 (WMMA M tile); got {bcap}"
     );
     assert!(
@@ -1192,7 +1192,7 @@ impl Scheduler {
         let (xp, op) = {
             let (xp, _gx) = x_d.device_ptr(stream);
             let (op, _go) = out.device_ptr(stream);
-            (xp as u64, op as u64)
+            (xp, op)
         };
         if let Some((graph, gx, go)) = &self.graph {
             assert_eq!(
