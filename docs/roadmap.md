@@ -3,6 +3,16 @@
 Wukong is built openly and incrementally. This page is an honest snapshot of what works, what is
 checked-but-not-executed, and what is planned — so expectations match reality.
 
+> **Scope of every performance figure quoted on this page.** CPU numbers are one Windows 11 laptop's
+> (Intel Core Ultra 7 155H, AVX2/FMA + AVX-VNNI, **no AVX-512**), and GPU numbers are one **NVIDIA
+> RTX 4050 Laptop GPU**'s (`sm_89`, 20 SMs, 6 GB, ~192 GB/s, Windows/WDDM) against the peers that box
+> can host. Several families additionally have an **open measurement debt** — an end-to-end model
+> ratio that is an upper bound pending re-measurement, ~40 rows whose Rust column needs re-measuring
+> after a `noalias` fix, a C++ column that only ever existed in three sections, a general-code suite
+> whose tables are superseded with no replacement, and a GPU framework comparison that is against
+> **eager** PyTorch rather than `torch.compile`. `BENCHMARKS.md` opens with a per-family standing
+> index that says, for any number, whether it currently stands; read it before quoting one from here.
+
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
 Two CPU execution backends now run the full language and agree bit-for-bit (a differential gate proves
@@ -437,12 +447,34 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 
 ## GPU backend (NVIDIA RTX 4050, behind `--features gpu`)
 
-> **Device scope (2026-08-06):** every figure in this section was measured on an **NVIDIA RTX 4050
-> Laptop GPU** (`sm_89`, 20 SMs, 6 GB, ~192 GB/s) under **Windows/WDDM**, with the peers available on
-> that box (notably: PyTorch in **eager** mode — Triton does not install on Windows — and no CUDA
-> toolkit). These are properties of that instrument; **do not extrapolate them to datacenter parts.**
-> The datacenter retarget, including re-measurement against stronger peers (`torch.compile`, CUTLASS,
-> FlashAttention), is tracked in `GPU_RETARGET_PLAN.md`.
+> **Device scope (2026-08-06, extended 2026-08-09):** every figure in this section was measured on an
+> **NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**, power-capped
+> ~30–50 W) under **Windows/WDDM**, with only the peers that box can host: cuBLAS / IMMA / cuBLASLt
+> and cuDNN through the redistributable DLLs, NVRTC-compiled CUDA-C, PyTorch in **eager** mode
+> (Triton does not install on Windows), and **no CUDA toolkit** — hence no CUTLASS, FlashAttention,
+> Marlin or vLLM peer. These are properties of that instrument; **do not extrapolate them to
+> datacenter parts.** The datacenter retarget, including re-measurement against the peers a Linux
+> cloud box can build, is `GPU_RETARGET_PLAN.md`.
+>
+> **Three families here need more than a scope note** — `BENCHMARKS.md`'s standing index has the full
+> text:
+>
+> 1. **"Beats PyTorch at every S" is against EAGER PyTorch and is not re-earned against the real
+>    bar.** `torch.compile` (Inductor+Triton) is the framework bar and is native on Linux; the
+>    tooling to build and verify it landed 2026-08-09 under `tools/cloud/peers/`.
+> 2. **The CUDA-graph launch-overhead multiples are Windows/WDDM numbers** and should be expected to
+>    shrink on the Linux driver before the GPU changes at all.
+> 3. **The long-context flash loss is diagnosed as structural "on 20 SMs"** — a premise that
+>    dissolves at 108/132 SMs, with the direction there unknown; and the *short*-context occupancy
+>    wins rest on 20 SMs being easy to fill and may **invert** on a larger part.
+>
+> **Retarget status (Phase 0 + Phase 2 landed on `main`).** The backend is no longer fused to this
+> card: PTX headers come from `wukong_codegen_gpu::ptx_target` at per-family floors (`sm_80` for the
+> Ampere-legal majority, `sm_89` only where fp8 genuinely needs it, `sm_90a` for the wgmma family),
+> device identity is probed once into `Gpu::target()` instead of assumed, fp8 is capability-gated
+> before any module load, the cubin and autotune caches are device-keyed, and dynamic shared memory
+> is plumbed end to end. What that changes for *this* section is only scope, not numbers: the 4050
+> behaviour is pinned byte-identical, and every figure below is still a 4050 figure.
 
 A GPU backend, `wukong_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
 it via `cudarc`** (`cuModuleLoadData` — the driver's built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA
@@ -526,16 +558,27 @@ megakernel stores pointer values homed in the shared frame **unconditionally** r
 `tid==0`-guarded — a frame pointer slot is uniform across the SPMD threads, and the old guard left
 threads ≠ 0 loading a zero-initialized slot and dereferencing null in non-recognized scalar loops
 (the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus standing is printed by the gates
-themselves, over every fixture in `tests/run` (333 today): `lower::tests::run_corpus_matches_interp_oracle`
+themselves, over every fixture in `tests/run` (357 today — `ls tests/run/*.wk | wc -l`;
+this line has gone stale before): `lower::tests::run_corpus_matches_interp_oracle`
 sweeps each program at `-O0` and `-O3`, requires zero mismatches and zero device faults and non-zero
 coverage, and reports the rest as honest `UNSUPPORTED:` skips; `megakernel::tests::mega_corpus_matches_oracle`
 does the same over the megakernel-eligible subset, counting (program, opt-level) configs and treating a
 launch-time `Ok(None)` decline as neither coverage nor a miscompile. Re-run them for the current
-numbers — they are a function of the corpus, not a fixed figure.
+numbers — they are a function of the corpus, not a fixed figure. Both now **ratchet** a floor, so a
+construct that silently starts declining goes red rather than quietly shrinking coverage, and both
+are **host-vectorizer-invariant** (2026-08-09): they normalize through the documented,
+result-identical 128-bit CLIF fallback before lowering, because the general 256-bit AVX2 recipe is
+Win64-only and `lower.rs` declines the op it produces — so before the fix the *same commit* read a
+higher coverage number on Linux than on Windows, and the metric conflated "what gpu-native can lower"
+with "did the host CPU vectorizer fire".
 Both gates now also **isolate device faults**: a genuine `ILLEGAL_ADDRESS` poisons the CUDA state
 **process-fatally** — measured on this driver (RTX 4050, Windows/WDDM), `cuDevicePrimaryCtxReset`
 returns Ok but re-retaining the primary context still returns error 700, and cudarc exposes no
-non-primary `cuCtxCreate`, so in-process recovery is impossible. `crate::gpu::reset_gpu` therefore
+non-primary `cuCtxCreate`, so in-process recovery is impossible. *(Scope: that is a measurement of
+**one driver on WDDM**, not a CUDA law. The record-and-skip policy it justifies is correct either
+way — a lost device must never be reported as passing — but the underlying "recovery is impossible"
+finding is on the Phase-1 list to re-measure on the Linux driver, where it may relax;
+`GPU_RETARGET_PLAN.md` §2.6.)* `crate::gpu::reset_gpu` therefore
 degrades to marking the device **lost**; the gates record the root fault on a loud ledger and
 report every later program as NOT RUN (never as passed, never as spuriously failed) — one faulting
 program can no longer cascade into ~100 false failures across both gates.
