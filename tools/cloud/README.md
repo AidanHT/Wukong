@@ -72,6 +72,41 @@ PYTHONIOENCODING=utf-8 modal run tools/cloud/modal_app.py::device_info    # or p
 Treat it as the console-output sibling of the crate's **"PTX must be pure ASCII"** law: same class
 of defect (one character, a hard failure far from its cause), different pipe.
 
+### ⚠ Killing a `modal run` does NOT stop the container, and it keeps billing
+
+The clause above — *"the container keeps running and the meter keeps billing"* — is not specific to
+the encoding crash. It is true of **every** way the local CLI can die: Ctrl-C, a closed terminal, a
+killed background job, a dropped network. `modal run` is a client watching a remote container; the
+container's life is bounded by `WK_TIMEOUT`, not by yours.
+
+Measured on 2026-08-10, in this repo's own session: two background `modal run` invocations were
+killed from the driving session, and `modal app list` then showed an `ephemeral` app with a **live
+task still charging at $0.506/hr** against the 7200 s ceiling — i.e. up to **$1.01 of nothing**, per
+orphan, and there is no console message telling you it is there.
+
+**So: after any interruption, check.**
+
+```powershell
+modal app list                                     # look for `ephemeral` apps with live tasks
+modal app stop <app-id>                            # only after reading the paragraph below
+```
+
+**Stopping is not automatically the right move**, and this is the part worth internalising: *know
+where the Volume commit sits in the entry point you interrupted.* Kill a run just before its commit
+and you throw away work you have already paid for.
+
+| Entry point | Where it commits | What an interruption costs |
+|---|---|---|
+| `::build` | **once, at the very end**, after the CPU workspace suite | kill it mid-suite and the *whole* `--features gpu` compile it already paid for is discarded. Let it finish. |
+| `::build_peers` | after **each** artifact (CUTLASS, then vLLM, then at the end) | safe-ish: whatever already printed `[peers] ... ->` is on the Volume and a re-run skips it. |
+| `::ptxas` | inside `flush()`, which runs **before every abort path** | safe: the round log, the JSON and the PTX archive survive any failure the function itself detects. |
+| `::test` / `::bench` / `::peers` / `::cutlass` / `::marlin` / `::framework` | at the end of the function | the round's results are the stdout you are watching; the commit only persists caches. |
+
+Modal's own background commits ("every few seconds", plus a final snapshot on container shutdown)
+soften this — a *killed* container still flushes `target/`. The explicit `commit()` calls are what
+make a **named artifact** (a profiler binary, a round log, a manifest entry) atomic and findable, and
+those are the ones whose position above is worth knowing before you press Ctrl-C.
+
 ## The first session (~2 minutes of GPU time, free)
 
 Run these from the repo root. `WK_GPU` picks the SKU; it is read at import time because Modal binds
@@ -108,7 +143,7 @@ answers every "does this scale past 20 SMs" question on the same architecture fo
 | `::device_info` | yes | §6.1 provenance block: CC, SM count, opt-in SMEM, L2, VRAM, driver, MIG state, a real `dlopen` of every peer library, the staged-peer manifest and the strong-peer resolution table. Checks the device against a spec table keyed on the **device's own name** and says plainly if it is a slice. |
 | `::build` | **no** | `cargo check --features gpu --all-targets`, then `cargo test --no-run` for `wukong_codegen_gpu` + `wukong_driver`, then the CPU workspace suite. Writes into the Volume. |
 | `::build_peers` | **no** | Stages the heavy strong peers onto the Volume: the CUTLASS profiler, the vLLM (Marlin/Machete) venv, optionally the FA2/FA3 wheels. Idempotent; `--force` rebuilds. |
-| `::ptxas` | **no** | The register / SMEM / spill census. Resolves `ptxas`, self-tests each target, runs the crate's ptxas audit test once per arch with `WUKONG_PTXAS` set, prints the table and writes the raw `ptxas -v` into `/persist/rounds/`. |
+| `::ptxas` | **no** | The register / SMEM / spill census, **at every arch**. Resolves `ptxas`, self-tests each target, runs the crate's audit test behind a capture shim, then **recompiles every captured module for each requested arch**, prints the per-arch matrix and writes the raw `ptxas -v` into `/persist/rounds/`. |
 | `::peers` | yes | **The strong-peer battery.** Installs any FlashAttention wheel `::build_peers` staged, resolves every peer, proves Inductor emits Triton, runs the in-tree cuBLAS/cuDNN gates with skips escalated, and runs the Rust strong-peer gate. Fails if a `--require`d peer is missing. |
 | `::test` | yes | The device gates with `WUKONG_GPU_REQUIRED=1`. `--peers` also requires NVRTC/cuBLAS/cuBLASLt/cuDNN. `--strong-peers <list>` declares the §0 bar. `--filter <name>` narrows. |
 | `::bench` | yes | The `#[ignore]`d perf sweeps, release, single-threaded. `--name gemm_pipe_sweep` selects one. `--peers` / `--strong-peers` escalate a missing peer to a failure. **Needs `::build --release` first.** |
@@ -124,7 +159,7 @@ modal run tools/cloud/modal_app.py::test --peers --filter gemm
 modal run tools/cloud/modal_app.py::build --release
 modal run tools/cloud/modal_app.py::bench --name flash_tiled_vs_untiled --peers
 modal run tools/cloud/modal_app.py::framework --op sdpa --causal --shapes 1x16x2048x128
-modal run tools/cloud/modal_app.py::ptxas --archs sm_90a,sm_80
+modal run tools/cloud/modal_app.py::ptxas --archs sm_80,sm_90,sm_90a
 modal shell tools/cloud/modal_app.py::interactive
 ```
 
@@ -150,57 +185,115 @@ register resources` at 256x128x64, which is exactly the tile class the wide-tile
 expressible.
 
 ```powershell
-modal run tools/cloud/modal_app.py::ptxas                       # sm_89, sm_80, sm_90a
-modal run tools/cloud/modal_app.py::ptxas --archs sm_90a --filter wgmma_ptxas_audit
-modal run tools/cloud/modal_app.py::ptxas --once --require-archs
+modal run tools/cloud/modal_app.py::ptxas                        # sm_80, sm_89, sm_90, sm_90a
+modal run tools/cloud/modal_app.py::ptxas --archs sm_80,sm_90,sm_100
+modal run tools/cloud/modal_app.py::ptxas --sweep-from /persist/ptx-archive/20260810-041627
+modal run tools/cloud/modal_app.py::ptxas --require-archs
 ```
 
-Four steps, in this order, and every one of them is designed so an empty answer cannot look like a
+Five steps, in this order, and every one of them is designed so an empty answer cannot look like a
 clean one:
 
 1. **Resolve `ptxas` and record `--version`** in the round log. Not finding one is a hard failure —
    a `-devel` image must have it, and a `-runtime` value of `WK_CUDA_TAG` would not.
-2. **Self-test every requested arch** on a minimal generated kernel. This proves *this* ptxas accepts
-   the `--gpu-name` **and** validates the output parser against *this* ptxas's `-v` format — so an
-   empty census table can never be misread as "nothing spills". If *every* arch is rejected the probe
-   kernel is blamed, not the toolkit; if only some are, that is a real finding and the run fails.
-3. **Run the crate's audit test**, `WUKONG_PTXAS` pointing at the resolved binary, `--include-ignored
-   --nocapture --test-threads=1`. One pass, then one more for each requested arch that pass did not
-   produce — so a test that sweeps its own arch set is not run three redundant times, and one that
-   honours the hint still gets every arch.
-4. **Print the census and write everything raw** to `/persist/rounds/ptxas-*.log` (+ a parsed
-   `.json`). The log is written **before** every abort path, so a failed audit still leaves its
-   evidence on the Volume.
+2. **Write and self-test a capture shim** (below). It must be byte-for-byte transparent *and* must
+   demonstrably record; both are checked on a throwaway kernel before the census runs.
+3. **Self-test every requested arch** on a minimal generated kernel, through the shim. This proves
+   *this* ptxas accepts the `--gpu-name` **and** validates the output parser against *this* ptxas's
+   `-v` format — so an empty census table can never be misread as "nothing spills". If *every* arch
+   is rejected the probe kernel is blamed, not the toolkit; if only some are, that is a real finding
+   and the run fails.
+4. **Run the crate's audit test once**, `WUKONG_PTXAS` pointing at the shim, `--include-ignored
+   --nocapture --test-threads=1`, then **recompile every module the shim captured at every requested
+   arch**. Step 4b is the measurement the census was missing.
+5. **Print the census, the per-arch matrix and the coverage report, and write everything raw** to
+   `/persist/rounds/ptxas-*.log` (+ a parsed `.json`, + the captured PTX under
+   `/persist/ptx-archive/<stamp>/`). The log is written **before** every abort path, so a failed
+   audit still leaves its evidence on the Volume.
 
-### The contract with the crate
+### What the 2026-08-10 round exposed, and what changed
 
-`::ptxas` deliberately knows nothing about how the audit test is written. It touches it through two
-things and no more:
+The first census ran on a CPU container for **$0.025** and answered D1 §7.3 — 31 kernels, zero spill
+stores, zero spill loads, zero stack, no `(C7511)`, including the four 254-register wide tiles and
+all three wgmma configs. It also exited 1, with `no ptxas records parsed`, and both of its gaps came
+from the same under-specified contract:
+
+| Gap | Cause | Fix |
+|---|---|---|
+| The harness could not verify its own numbers | The contract pinned the *invocation* (`WUKONG_PTXAS` + a name filter) and left the *output format* open. The audit test prints its own already-parsed table, so there was no raw `ptxas -v` to parse. | `WUKONG_PTXAS` now points at a **capture shim**, so raw `-v` reaches the round log regardless of what the test prints. |
+| Every number was measured at `sm_80` | The test compiles each module at the module's **own** declared `.target`, and treats `WUKONG_PTXAS_ARCH` as advisory. Asking for three arches changed nothing. | A **per-arch sweep** recompiles the captured PTX with `--gpu-name`, so `sm_90` is measured rather than assumed. |
+
+The second gap is the one that mattered. **An H100 driver JITs `sm_80`-tagged PTX for `sm_90`**, and
+register allocation is per-arch — so the H100 register cost of the 128x256 / 256x128 wide tiles, the
+tiles whose entire value rests on fitting, had never been measured. Now it is a cell in a table.
+
+### The contract with the crate, and why it is a shim
+
+`::ptxas` still knows nothing about how the audit test is written. It touches it through:
 
 | | |
 |---|---|
-| `WUKONG_PTXAS` | absolute path to the resolved binary. The knob already exists (`gpu.rs`'s `gemm_cliff_ptxas_ab`, `ptx_wgmma.rs`'s verification list) and the test skips when it is unset. |
+| `WUKONG_PTXAS` | absolute path to an executable — which is why a **transparent wrapper** can go there. The knob already exists (`gpu.rs`'s `gemm_cliff_ptxas_ab`, `ptx_wgmma.rs`'s verification list). |
+| `WUKONG_PTXAS_REQUIRED=1` | the crate's own knob turning "no ptxas, so I measured nothing and reported ok" into a failure. On a container whose whole purpose is that it *has* a ptxas, a skip is never the answer. |
 | a libtest substring filter | default `ptxas`, i.e. **the audit test's name must contain `ptxas`**. Override with `--filter <substring>`. |
 
-`WUKONG_PTXAS_ARCH` (this pass's arch) and `WUKONG_PTXAS_ARCHS` (the whole list) are also exported,
-but they are **advisory** — a test that ignores them is not broken. Every reported row's arch is read
-out of ptxas's own `Compiling entry function '<e>' for '<arch>'` line, never out of what was asked
-for, which is why the pass loop can be adaptive and the coverage report can be trusted.
+The shim runs the real `ptxas` with argv untouched, returns stdout/stderr/exit-status byte-for-byte
+(the crate's own parse is unaffected and stays the crate's), and on the side writes **every raw `-v`
+byte** and **the exact PTX the crate handed it**, keyed by content hash. It never writes to stdout or
+stderr itself; capture failures go to `capture-errors.log` and are reported by the harness. Recording
+must never change what is being recorded.
 
-Three targets by default, because **register allocation is per-arch and that is the whole question**:
-`sm_89` (the dev 4050 and L4/L40S), `sm_80` (A100), `sm_90a` (Hopper, and the only target `wgmma` is
-legal on).
+Two independent readings of the same run therefore exist — this harness's parse of raw `ptxas -v`,
+and the crate's own printed table read back column-by-column — and where they overlap they are
+**cross-checked**. A disagreement is a finding, not a tie-break: one of the two numbers this campaign
+is about to size tiles with would be wrong.
 
-Two failure modes are made loud on purpose, because both would otherwise be green:
+`WUKONG_PTXAS_ARCH` / `WUKONG_PTXAS_ARCHS` are still exported and still **advisory**. The first round
+proved this crate ignores them (three passes, three byte-identical tables, three times the money for
+one fact), so the extra hint passes are now opt-in behind `--hint-passes`. Every reported row's arch
+is read out of ptxas's own `Compiling entry function '<e>' for '<arch>'` line, never out of what was
+asked for.
+
+### The per-arch sweep
+
+Four targets by default, because **register allocation is per-arch and that is the whole question**:
+
+| | |
+|---|---|
+| `sm_80` | A100, and the floor every Ampere-legal module is tagged at |
+| `sm_89` | the dev RTX 4050, L4, L40S |
+| `sm_90` | **what an H100 driver actually JITs that `sm_80` PTX for** |
+| `sm_90a` | Hopper's arch-specific target, and the only one `wgmma` is legal on |
+
+Every (module, arch) pair is **attempted** — the harness predicts which ones should be refused
+(an older-than-declared target; an `sm_90a`-only module at anything else) and prints the prediction
+beside what ptxas actually did, but it never uses the prediction as a filter. "I did not try it
+because I thought it would fail" is how a harness ends up reporting a conclusion it never measured.
+
+The output is a matrix: one row per kernel, one column per arch, `-` where ptxas declined and `!`
+where a cell spills, plus an explicit list of the entries whose register cost **moves** between
+targets. That list is the reason the sweep exists.
+
+`--sweep-from <dir>` re-runs the sweep alone over PTX a previous census archived under
+`/persist/ptx-archive/<stamp>/`: adding `sm_100` to the question later costs a CPU minute, no cargo
+build, and re-measures the *same bytes* a named round measured rather than whatever the tree says
+today.
+
+Failure modes made loud on purpose, because all of them would otherwise be green:
 
 - **a filter that selects nothing** — libtest reports `0 passed; 0 failed` and exits 0. The run
   aborts instead, and names the test names it did find.
-- **an arch that never appears in the output** — reported as `MISSING` with the reminder that a
-  conclusion for one arch does not transfer to another; `--require-archs` turns it into an error.
+- **a shim that does not record** — caught by its own self-test, before the census.
+- **an arch with nothing measured** — split into two lines that are *different facts*: `DECLINED`
+  (every module refused it for a documented reason, e.g. `sm_90a`-only modules at `sm_80` — not a
+  gap in the harness) and `MISSING` (nothing was measured and nothing explains why — always a
+  failure). `--require-archs` escalates `DECLINED` too.
+- **the two parsers disagreeing** — a failure, with the offending fields named.
 
 Cost: CPU only, the same ~$0.51/hr container `::build` uses. It compiles the gpu feature if the
 Volume has none (pass `--prebuilt` to refuse instead — there is no cost argument for refusing here
-the way there is on a GPU box, only a provenance one).
+the way there is on a GPU box, only a provenance one). The sweep itself is 17 modules × 4 targets of
+`ptxas`, i.e. a minute or two of the same CPU.
 
 **Never run two of these concurrently.** They share one Volume, and Modal Volumes are last-write-wins
 on concurrent modification of the same file — two cargos in one target dir is a corruption you would
@@ -276,8 +369,9 @@ modal run tools/cloud/modal_app.py::build --release
 #    --cutlass-arch defaults from WK_GPU; 90a for Hopper, 80 for A100, 89 for L4/L40S.
 $env:WK_GPU="H100"; modal run tools/cloud/modal_app.py::build_peers
 
-# 3b. The register/SMEM/spill census. Also CPU, also cents, and it decides tile shape BEFORE
-#     anything is rented -- ptxas compiles for an arch, it does not need one.
+# 3b. The register/SMEM/spill census, at sm_80/sm_89/sm_90/sm_90a. Also CPU, also cents, and it
+#     decides tile shape BEFORE anything is rented -- ptxas compiles for an arch, it does not
+#     need one, and it will compile an sm_80-tagged module for sm_90 exactly as an H100 driver does.
 modal run tools/cloud/modal_app.py::ptxas
 
 # 4. Prove the peers on the CHEAPEST device that can do it, and warm the Inductor cache there.
@@ -339,24 +433,45 @@ image's* interpreter. `--copies` removed a symlink while leaving the image depen
 for, and paid for it with a hard failure. The symlink spelling depends on strictly less.
 
 Since that is a diagnosis and not a measurement — it cannot be tested from Windows, and each attempt
-costs the orchestrator — the staging path is a **verified fallback chain**. Every spelling is created
-`--without-pip`, then the interpreter is actually **executed** before it is accepted, then pip is
-bootstrapped separately:
+costs the orchestrator — the staging path is a **verified fallback chain**. Each venv spelling is
+created `--without-pip` and has pip bootstrapped separately afterwards; in every route, including
+the venv-free one, the resulting interpreter is actually **executed** before it is accepted:
 
 | # | spelling | why it is there |
 |---|---|---|
 | 1 | `venv` (symlinks) | correct for a shared-libpython standalone build; what every standard tool does |
 | 2 | `venv --copies` + libpython copied into `venv/lib` and `venv/bin` | the `--copies` spelling with its actual defect repaired, for the case where a Volume cannot store symlinks |
-| 3 | `/usr/bin/python3` (distro) with `--copies` | a distro build links its libpython from an absolute system path, so the whole `$ORIGIN` class disappears. Last, because it is older (3.10 on 22.04). |
+| 3 | `/usr/bin/python3` (distro) with `--copies` | a distro build links its libpython from an absolute system path, so the whole `$ORIGIN` class disappears. Older (3.10 on 22.04), which is why it is not first. |
+| 4 | **no venv at all**: `pip install --target /persist/vllm-pkgs` behind a two-line `/bin/sh` launcher that exports `PYTHONPATH` + `PIP_TARGET` and `exec`s the image interpreter | routes 1–3 are three *spellings of one mechanism* and share its failure modes. Route 4 removes the mechanism: no `pyvenv.cfg`, no relocated interpreter, no RPATH question, no symlink for the Volume to lose. Everything downstream still sees a working `<venv>/bin/python`, because the launcher **is** one. |
 
 Splitting venv creation from pip installation is the other half of the fix: the original failure was
 *reported* as an ensurepip error when the interpreter itself was what could not run. Now the round
-log names which of the two broke.
+log names which of the two broke. (Route 4 needs no bootstrap — the image interpreter already has
+pip, and `PIP_TARGET` is what redirects it into the prefix.)
 
-The winning spelling is recorded in the Volume manifest (`venv_mode`), `::device_info` prints it, and
-**both `::build_peers` and `::marlin` verify the staged interpreter executes before trusting it** —
-"the file exists" is exactly the check that would have called that broken venv staged. `::marlin`
-does it in the first second of a metered call, so a bad venv costs seconds, not the round.
+What route 4 costs is isolation — the launcher *adds* the prefix to the base interpreter's import
+path instead of replacing it. That is acceptable here and only here: nothing installs into the
+image's `python3.11` site-packages (torch lives in its own venv at `/opt/torch-venv`, which the
+launcher does not touch), and vLLM's pinned torch cannot reach the `torch.compile` bar because that
+bar is a different interpreter entirely.
+
+`--vllm-mode <symlinks|copies|system|prefix>` pins one spelling instead of walking the chain. Use it
+only once a round log has named the winner: skipping the verified chain to save a minute is exactly
+how the `--copies` failure happened.
+
+Every attempt's outcome — not just the winner's — is recorded in the Volume manifest
+(`vllm.attempts`, or `vllm_staging_failed.attempts` when all four lose), and `_venv_evidence` dumps
+the accepted spelling's `pyvenv.cfg` and `bin/` listing into the build log. None of this is testable
+off Modal and every attempt costs the orchestrator, so the next fix has to be derivable from a round
+log without re-deriving any of the above.
+
+The winning spelling is recorded as `venv_mode`, `::device_info` prints it, and **both
+`::build_peers` and `::marlin` verify the staged interpreter executes before trusting it** — "the
+file exists" is exactly the check that would have called that broken venv staged. `::build_peers`
+additionally `import vllm`s rather than only reading its metadata (a `--target` prefix can record a
+distribution the launcher's `PYTHONPATH` does not actually reach; "installed" is not the claim, "the
+int4 bar will run" is). `::marlin` re-checks in the first second of a metered call, so a bad venv
+costs seconds, not the round.
 
 ## How the cost control works
 
