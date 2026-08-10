@@ -108,6 +108,7 @@ answers every "does this scale past 20 SMs" question on the same architecture fo
 | `::device_info` | yes | §6.1 provenance block: CC, SM count, opt-in SMEM, L2, VRAM, driver, MIG state, a real `dlopen` of every peer library, the staged-peer manifest and the strong-peer resolution table. Checks the device against a spec table keyed on the **device's own name** and says plainly if it is a slice. |
 | `::build` | **no** | `cargo check --features gpu --all-targets`, then `cargo test --no-run` for `wukong_codegen_gpu` + `wukong_driver`, then the CPU workspace suite. Writes into the Volume. |
 | `::build_peers` | **no** | Stages the heavy strong peers onto the Volume: the CUTLASS profiler, the vLLM (Marlin/Machete) venv, optionally the FA2/FA3 wheels. Idempotent; `--force` rebuilds. |
+| `::ptxas` | **no** | The register / SMEM / spill census. Resolves `ptxas`, self-tests each target, runs the crate's ptxas audit test once per arch with `WUKONG_PTXAS` set, prints the table and writes the raw `ptxas -v` into `/persist/rounds/`. |
 | `::peers` | yes | **The strong-peer battery.** Installs any FlashAttention wheel `::build_peers` staged, resolves every peer, proves Inductor emits Triton, runs the in-tree cuBLAS/cuDNN gates with skips escalated, and runs the Rust strong-peer gate. Fails if a `--require`d peer is missing. |
 | `::test` | yes | The device gates with `WUKONG_GPU_REQUIRED=1`. `--peers` also requires NVRTC/cuBLAS/cuBLASLt/cuDNN. `--strong-peers <list>` declares the §0 bar. `--filter <name>` narrows. |
 | `::bench` | yes | The `#[ignore]`d perf sweeps, release, single-threaded. `--name gemm_pipe_sweep` selects one. `--peers` / `--strong-peers` escalate a missing peer to a failure. **Needs `::build --release` first.** |
@@ -123,8 +124,83 @@ modal run tools/cloud/modal_app.py::test --peers --filter gemm
 modal run tools/cloud/modal_app.py::build --release
 modal run tools/cloud/modal_app.py::bench --name flash_tiled_vs_untiled --peers
 modal run tools/cloud/modal_app.py::framework --op sdpa --causal --shapes 1x16x2048x128
+modal run tools/cloud/modal_app.py::ptxas --archs sm_90a,sm_80
 modal shell tools/cloud/modal_app.py::interactive
 ```
+
+## `::ptxas` — the one measurement that needs no GPU at all
+
+`ptxas` compiles **for** an architecture; it does not need one. The `nvidia/cuda:*-devel` image
+already ships it, and `::build_peers` proved the point on 2026-08-09 by building the CUTLASS
+profiler for `sm90a` on a **CPU container** for $0.258.
+
+That makes the campaign's most load-bearing unknown answerable for cents.
+[`docs/gpu/derive/D1_h100_gemm.md`](../../docs/gpu/derive/D1_h100_gemm.md) §7 item 3:
+
+> **Actual registers/thread ptxas allocates for A3/A4.** §2.3's estimates (~185) are derived from the
+> generator's declarations, not from `cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS)`. If ptxas
+> spills at 128 accumulators, **A3 collapses and A2 becomes the top lever.**
+
+[`D2_h100_attention.md`](../../docs/gpu/derive/D2_h100_attention.md) §4.2 ranks the same census
+**first of its five experiments** ("$0, NO GPU, runs in CI"), and
+[`D3_a100.md`](../../docs/gpu/derive/D3_a100.md) §7 asks for it on `sm_80`. Every register number in
+this campaign is currently derived from `.reg` declarations rather than measured — and NVIDIA's own
+CUTLASS build emits `(C7511) ... wgmma.mma_async instructions are serialized due to insufficient
+register resources` at 256x128x64, which is exactly the tile class the wide-tile work made
+expressible.
+
+```powershell
+modal run tools/cloud/modal_app.py::ptxas                       # sm_89, sm_80, sm_90a
+modal run tools/cloud/modal_app.py::ptxas --archs sm_90a --filter wgmma_ptxas_audit
+modal run tools/cloud/modal_app.py::ptxas --once --require-archs
+```
+
+Four steps, in this order, and every one of them is designed so an empty answer cannot look like a
+clean one:
+
+1. **Resolve `ptxas` and record `--version`** in the round log. Not finding one is a hard failure —
+   a `-devel` image must have it, and a `-runtime` value of `WK_CUDA_TAG` would not.
+2. **Self-test every requested arch** on a minimal generated kernel. This proves *this* ptxas accepts
+   the `--gpu-name` **and** validates the output parser against *this* ptxas's `-v` format — so an
+   empty census table can never be misread as "nothing spills". If *every* arch is rejected the probe
+   kernel is blamed, not the toolkit; if only some are, that is a real finding and the run fails.
+3. **Run the crate's audit test**, `WUKONG_PTXAS` pointing at the resolved binary, `--include-ignored
+   --nocapture --test-threads=1`. One pass, then one more for each requested arch that pass did not
+   produce — so a test that sweeps its own arch set is not run three redundant times, and one that
+   honours the hint still gets every arch.
+4. **Print the census and write everything raw** to `/persist/rounds/ptxas-*.log` (+ a parsed
+   `.json`). The log is written **before** every abort path, so a failed audit still leaves its
+   evidence on the Volume.
+
+### The contract with the crate
+
+`::ptxas` deliberately knows nothing about how the audit test is written. It touches it through two
+things and no more:
+
+| | |
+|---|---|
+| `WUKONG_PTXAS` | absolute path to the resolved binary. The knob already exists (`gpu.rs`'s `gemm_cliff_ptxas_ab`, `ptx_wgmma.rs`'s verification list) and the test skips when it is unset. |
+| a libtest substring filter | default `ptxas`, i.e. **the audit test's name must contain `ptxas`**. Override with `--filter <substring>`. |
+
+`WUKONG_PTXAS_ARCH` (this pass's arch) and `WUKONG_PTXAS_ARCHS` (the whole list) are also exported,
+but they are **advisory** — a test that ignores them is not broken. Every reported row's arch is read
+out of ptxas's own `Compiling entry function '<e>' for '<arch>'` line, never out of what was asked
+for, which is why the pass loop can be adaptive and the coverage report can be trusted.
+
+Three targets by default, because **register allocation is per-arch and that is the whole question**:
+`sm_89` (the dev 4050 and L4/L40S), `sm_80` (A100), `sm_90a` (Hopper, and the only target `wgmma` is
+legal on).
+
+Two failure modes are made loud on purpose, because both would otherwise be green:
+
+- **a filter that selects nothing** — libtest reports `0 passed; 0 failed` and exits 0. The run
+  aborts instead, and names the test names it did find.
+- **an arch that never appears in the output** — reported as `MISSING` with the reminder that a
+  conclusion for one arch does not transfer to another; `--require-archs` turns it into an error.
+
+Cost: CPU only, the same ~$0.51/hr container `::build` uses. It compiles the gpu feature if the
+Volume has none (pass `--prebuilt` to refuse instead — there is no cost argument for refusing here
+the way there is on a GPU box, only a provenance one).
 
 **Never run two of these concurrently.** They share one Volume, and Modal Volumes are last-write-wins
 on concurrent modification of the same file — two cargos in one target dir is a corruption you would
@@ -200,6 +276,10 @@ modal run tools/cloud/modal_app.py::build --release
 #    --cutlass-arch defaults from WK_GPU; 90a for Hopper, 80 for A100, 89 for L4/L40S.
 $env:WK_GPU="H100"; modal run tools/cloud/modal_app.py::build_peers
 
+# 3b. The register/SMEM/spill census. Also CPU, also cents, and it decides tile shape BEFORE
+#     anything is rented -- ptxas compiles for an arch, it does not need one.
+modal run tools/cloud/modal_app.py::ptxas
+
 # 4. Prove the peers on the CHEAPEST device that can do it, and warm the Inductor cache there.
 $env:WK_GPU="L4"; modal run tools/cloud/modal_app.py::peers --require all
 
@@ -230,6 +310,53 @@ they cannot be installed at build time and `::peers` installs them (`--no-deps -
 no network) before it probes. Without that step a `--fa2` build would leave an artifact nothing can
 import while the manifest reported it staged: the bar would *look* present and not be, which is the
 one failure mode this directory exists to prevent.
+
+### The vLLM venv (the Marlin/Machete int4 bar) — why `--copies` was the bug
+
+The 2026-08-09 `::build_peers` run staged CUTLASS `sm90a` and then died staging vLLM:
+
+```
++ /usr/local/bin/python3.11 -m venv --copies /persist/vllm-venv
+Error: Command '['/persist/vllm-venv/bin/python3.11', '-m', 'ensurepip', '--upgrade',
+'--default-pip']' returned non-zero exit status 127
+```
+
+That is a `CalledProcessError`, not an `OSError`: `venv._call_new_python` passes
+`executable=os.path.realpath(...)`, so a missing or non-executable file would have raised
+`FileNotFoundError`/`PermissionError`. The copied interpreter **started** and exited 127 — and 127 is
+what the dynamic loader exits with when it cannot resolve a NEEDED shared object.
+
+`/usr/local/bin/python3.11` is Modal's `add_python="3.11"`, a python-build-standalone
+`install_only` CPython. Those are built `--enable-shared`: the binary NEEDs `libpython3.11.so.1.0`
+and finds it through `RPATH=$ORIGIN/../lib`, where `$ORIGIN` is the realpath of the running image.
+So a **symlinked** venv resolves to `/usr/local/lib` and loads; a **copied** one resolves to
+`/persist/vllm-venv/lib`, finds nothing, and the loader exits 127 before `ensurepip` ever runs.
+
+The `--copies` rationale — *"so nothing depends on a symlink surviving the Volume"* — does not
+survive contact: a copied venv still records `home = /usr/local/bin` in `pyvenv.cfg` and still finds
+its stdlib there, which is why the same comment already required the venv to be built from *this
+image's* interpreter. `--copies` removed a symlink while leaving the image dependency it stood in
+for, and paid for it with a hard failure. The symlink spelling depends on strictly less.
+
+Since that is a diagnosis and not a measurement — it cannot be tested from Windows, and each attempt
+costs the orchestrator — the staging path is a **verified fallback chain**. Every spelling is created
+`--without-pip`, then the interpreter is actually **executed** before it is accepted, then pip is
+bootstrapped separately:
+
+| # | spelling | why it is there |
+|---|---|---|
+| 1 | `venv` (symlinks) | correct for a shared-libpython standalone build; what every standard tool does |
+| 2 | `venv --copies` + libpython copied into `venv/lib` and `venv/bin` | the `--copies` spelling with its actual defect repaired, for the case where a Volume cannot store symlinks |
+| 3 | `/usr/bin/python3` (distro) with `--copies` | a distro build links its libpython from an absolute system path, so the whole `$ORIGIN` class disappears. Last, because it is older (3.10 on 22.04). |
+
+Splitting venv creation from pip installation is the other half of the fix: the original failure was
+*reported* as an ensurepip error when the interpreter itself was what could not run. Now the round
+log names which of the two broke.
+
+The winning spelling is recorded in the Volume manifest (`venv_mode`), `::device_info` prints it, and
+**both `::build_peers` and `::marlin` verify the staged interpreter executes before trusting it** —
+"the file exists" is exactly the check that would have called that broken venv staged. `::marlin`
+does it in the first second of a metered call, so a bad venv costs seconds, not the round.
 
 ## How the cost control works
 
