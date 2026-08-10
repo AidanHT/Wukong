@@ -7,13 +7,47 @@ It is the north star for optimization work: a change that doesn't move one of th
 `BENCHMARKS.md` and `prompts/results/*`; absolute GFLOP/s are deliberately absent (this
 hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-roofline are stable).
 
-> **Device scope (2026-08-06):** every GPU figure in this document (they appear under M1, M2, M4, M7
-> and the improvement targets) was measured on an **NVIDIA RTX 4050 Laptop GPU** (`sm_89`, 20 SMs,
-> 6 GB, ~192 GB/s) under **Windows/WDDM**, with the peers available on that box (notably: PyTorch in
-> **eager** mode — Triton does not install on Windows — and no CUDA toolkit). These are properties of
-> that instrument; **do not extrapolate them to datacenter parts.** The datacenter retarget,
-> including re-measurement against stronger peers (`torch.compile`, CUTLASS, FlashAttention), is
-> tracked in `GPU_RETARGET_PLAN.md`.
+> **Device scope (2026-08-06, extended 2026-08-09):** every GPU figure in this document (they appear
+> under M1, M2, M4, M7 and the improvement targets) was measured on an **NVIDIA RTX 4050 Laptop GPU**
+> (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**, power-capped ~30–50 W) under **Windows/WDDM**, with
+> only the peers that box can host: cuBLAS / IMMA / cuBLASLt and cuDNN via the redistributable DLLs,
+> NVRTC-compiled CUDA-C, PyTorch in **eager** mode (Triton does not install on Windows), and **no
+> CUDA toolkit** — hence no CUTLASS, FlashAttention, Marlin/Machete or vLLM peer. These are
+> properties of that instrument; **do not extrapolate them to datacenter parts.** The datacenter
+> retarget, including re-measurement against the peers a Linux cloud box can build, is
+> `GPU_RETARGET_PLAN.md`.
+>
+> **Three GPU families need more than a scope note; `BENCHMARKS.md`'s standing index has the full
+> text.** (1) Every **PyTorch** comparison here is against **eager**, which this document's own M2
+> rule says does not count — it is **not re-earned** against `torch.compile`, and the tooling to
+> build and verify that peer landed 2026-08-09 (`tools/cloud/peers/`). (2) The **CUDA-graph**
+> launch-overhead multiples under M2/M7 are **Windows/WDDM** numbers and should be expected to shrink
+> on the Linux driver before the GPU changes at all. (3) M1's attention verdict — the long-S cuDNN
+> gap called *"structural: SFU/serial-softmax bound on 20 SMs"* and *"honestly bounded, not closable
+> by scheduling"* — **is bounded only for 20 SMs.** At 108/132 SMs the premise dissolves and the
+> direction is unknown; and the *short*-S wins recorded beside it (fused-RoPE S≤512, causal D=64
+> S=512, D=128 ldmatrix S≤1024) rest on 20 SMs being easy to fill and may **invert** on a part a
+> small problem cannot fill. The same applies to int8's *"96–105% at 2048³ (beats IMMA)"*: it is an
+> occupancy crossover the 64×64 warp tile wins **because** the part has 20 SMs.
+>
+> **Standing of the CPU figures in this document.** They are recorded ratios from `BENCHMARKS.md`
+> and inherit its open debts, which are currently the larger ones: the **M2** end-to-end model
+> ratios vs C are an **upper bound** pending re-measurement (the `c_model` peer was not
+> `restrict`-qualified until 2026-08-05); every **"vs Rust"** figure on roughly forty rows needs
+> re-measurement after the 2026-08-06 `noalias` fix; the **"vs C++"** column only ever existed in
+> three sections and is an unproven assertion everywhere else; and the whole **general-code**
+> (outside-the-recognizer-dialect) family is **superseded with no replacement published** — its
+> tables' timing columns were taken by an instrument with no control column in it. Per-family
+> statuses are in `BENCHMARKS.md`'s standing index.
+>
+> **M7's corpus-coverage counts are stale.** The figures quoted there predate both the corpus growth
+> and the 2026-08-09 platform-invariance fix; the live values are the ratcheted floors
+> `RUN_CORPUS_COVERAGE_FLOOR` (`crates/wukong_codegen_gpu/src/lower.rs`) and
+> `MEGA_CORPUS_COVERAGE_FLOOR` (`megakernel.rs`), which the gates print. Those floors are now
+> **host-vectorizer-invariant** — before the fix, Windows and Linux read different coverage from the
+> same commit because the Win64-only 256-bit AVX2 recipe suppressed lowering on one of them, so the
+> metric conflated "what gpu-native can lower" with "did the host CPU vectorizer fire". Re-run the
+> gates rather than reading a count out of prose.
 
 ## Who the metrics serve
 
@@ -57,7 +91,10 @@ Current standing (recorded):
   2048³; the 4096³ GEMM ships the v2cs streaming epilogue at 76.8% of cuBLAS-f16 / 80.4% of the
   honest f32-out peer** (a SASS-level loss past the prior 77% PTX ceiling — see below); int8 GEMM
   **96–105% at 2048³ (beats IMMA), 86–88% at 1024³, ~70% at 4096³** (HBM-bound loss); fused int8
-  GEMM+dequant **1.1–2.2×** the cuBLAS chain; int4 W4A16 documented lead (no library peer exists);
+  GEMM+dequant **1.1–2.2×** the cuBLAS chain; int4 W4A16 documented lead over the *naive* Tier-A
+  peer — ~~no library peer exists~~ **no library peer is bindable on this toolkit-free box**;
+  Marlin/Machete are the real W4A16 bar and are buildable on a Linux box with the toolkit
+  (`docs/gpu/derive/D5_peer_builds.md`), so this lead is over a naive kernel, not over the field;
   attention **0.37–0.66× cuDNN at S≥2048** (loss — structural: SFU/serial-softmax bound on 20
   SMs; the FA2-style warp-specialized kernels were built and measured 2026-07-09 and win only
   **4–6% at S=4096**, now the default route there, tie at 2048, lose at ≤1024 — so the cuDNN

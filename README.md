@@ -109,12 +109,30 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   int8 GEMM **~180–237× naive CUDA-C**, **95.7% of the 192 GB/s HBM peak**, and **0.76 ms cold GPU
   compile vs Triton's 30–120 s**.
 
-  > **Device scope (2026-08-06):** every GPU figure in the bullet above was measured on an **NVIDIA
-  > RTX 4050 Laptop GPU** (`sm_89`, 20 SMs, 6 GB, ~192 GB/s) under **Windows/WDDM**, with the peers
-  > available on that box (notably: PyTorch in **eager** mode — Triton does not install on Windows —
-  > and no CUDA toolkit). These are properties of that instrument; **do not extrapolate them to
-  > datacenter parts.** The datacenter retarget, including re-measurement against stronger peers
-  > (`torch.compile`, CUTLASS, FlashAttention), is tracked in `GPU_RETARGET_PLAN.md`.
+  > **Device scope (2026-08-06, extended 2026-08-09):** every GPU figure in the bullet above was
+  > measured on an **NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**,
+  > power-capped ~30–50 W) under **Windows/WDDM**, with only the peers that box can host — cuBLAS /
+  > IMMA / cuBLASLt and cuDNN via the redistributable DLLs, NVRTC-compiled CUDA-C, and PyTorch in
+  > **eager** mode (Triton does not install on Windows); **no CUDA toolkit**, so no CUTLASS,
+  > FlashAttention, Marlin or vLLM build was possible. Every tile, stage depth and occupancy
+  > crossover behind those figures was swept against those twenty SMs. These are properties of that
+  > instrument; **do not extrapolate them to datacenter parts.** The datacenter retarget, including
+  > re-measurement against the peers a Linux cloud box can build, is `GPU_RETARGET_PLAN.md`.
+  >
+  > Three of the claims above need more than a scope note, and `BENCHMARKS.md`'s standing index
+  > carries them in full: the **PyTorch** comparison is against **eager** and is *not re-earned*
+  > against `torch.compile`, which is the real framework bar and is native on Linux; the **flash
+  > standings** — the long-context loss *and* the short-context wins — are occupancy verdicts on
+  > 20 SMs and may move in **either** direction elsewhere; and the **CUDA-graph** launch-overhead
+  > multiples are Windows/WDDM numbers that should be expected to shrink on Linux before the GPU
+  > changes at all. "No CUDA toolkit" describes what *Wukong* needs to build and run — it is never a
+  > claim that no stronger peer exists.
+  >
+  > **The CPU figures on this page carry their own open debts** — an end-to-end model ratio that is
+  > an upper bound pending re-measurement, ~40 rows whose Rust column needs re-measuring after a
+  > `noalias` fix, a C++ column that only ever existed in three sections, and a general-code suite
+  > whose tables are superseded with no replacement. `BENCHMARKS.md` opens with a per-family standing
+  > index; read it before quoting any number from this README.
 
 The domain-aware paths (GEMM, the `vmath` transcendentals, the `velem` streaming elementwise, the
 fused norms) emit **true 256-bit AVX2/FMA** via hand-written runtime microkernels — and the
