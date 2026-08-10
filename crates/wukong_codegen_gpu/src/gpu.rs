@@ -2928,8 +2928,21 @@ pub fn wmma_roofline_f16(
 }
 
 /// Fused row-wise normalization on the GPU — the GPU twin of `wukong_norm_f32`. `op` is a `NORM_*`
-/// code (softmax / layernorm / rmsnorm); `x` is `rows×cols` row-major. One warp per row; the row
-/// reductions are warp-butterfly all-reduces (deterministic order). Tolerance-gated.
+/// code (softmax / layernorm / rmsnorm); `x` is `rows×cols` row-major. The row reductions are
+/// warp-butterfly all-reduces (deterministic order), plus — when more than one warp shares a row — a
+/// fully unrolled fold over a shared slate, also deterministic. Tolerance-gated.
+///
+/// **The entry AND the geometry come from [`crate::ptx_norm::norm_launch`]**, which reads the probed
+/// [`Gpu::sm_count`]. One row per CTA means the CTA count *is* the row count, so a launch with few
+/// rows leaves most of the machine idle at one warp per SM; the planner widens the row across
+/// `W ∈ {1,2,4,8}` warps and picks the `_w{W}` entry for it. The measured win is the **underfill**
+/// regime (`rows=64, cols=8192` swept 2.8–3.5x on this card); the covered regime is bandwidth-bound
+/// on Ada and swept 1.00–1.16x.
+///
+/// **`W == 1` is byte-for-byte today's launch**: the shipped entry, `grid = rows`, `block = 32`, and
+/// deliberately **uncapped**. Capping the grid and grid-striding at one warp measured 0.90–1.00x —
+/// a loss, because it removes the independent CTAs the scheduler was using to hide latency. So this
+/// wiring is provably a no-op for every shape it does not intend to change.
 ///
 /// Panics on a `NORM_*` code with no PTX entry (log-softmax, l2norm) — the right assertion for a
 /// direct library caller, but the `--backend=gpu` offload must consult [`norm_supported`] first and
@@ -2943,14 +2956,26 @@ pub fn norm(
     eps: f32,
 ) -> Result<Vec<f32>, DriverError> {
     assert_eq!(x.len(), rows * cols);
-    let entry = norm_entry(op);
-    let f = g.function("norm", crate::ptx_norm::norm_ptx(), entry)?;
+    let plan = crate::ptx_norm::norm_launch(norm_entry(op), g.sm_count(), rows, cols);
+    // Launch-seam precondition, read back out of the entry NAME the module load uses rather than from
+    // a second parameter. A `_w{W}` entry stages one f32 per warp in a `4*W`-byte shared slate and
+    // every warp executes `shfl.sync.bfly ... 0xffffffff`: a CTA wider than `32*W` folds a slot no
+    // warp wrote, a narrower one leaves a slot stale, and both are silent.
+    assert_eq!(
+        plan.block,
+        32 * crate::ptx_norm::entry_width(&plan.entry).unwrap_or(1),
+        "{}: the CTA must be exactly the width its own entry name encodes",
+        plan.entry
+    );
+    assert!(plan.grid >= 1, "{}: empty grid", plan.entry);
+    let f = g.function("norm", crate::ptx_norm::norm_ptx(), &plan.entry)?;
     let x_d = g.stream.memcpy_stod(x)?;
     let mut out_d = g.stream.memcpy_stod(&vec![0f32; x.len()])?;
     let (r, c) = (rows as u32, cols as u32);
     let cfg = LaunchConfig {
-        grid_dim: (r, 1, 1),
-        block_dim: (32, 1, 1),
+        grid_dim: (plan.grid, 1, 1),
+        block_dim: (plan.block, 1, 1),
+        // The `_w{W}` slate is a static `.shared` inside the entry, so the launch adds nothing.
         shared_mem_bytes: 0,
     };
     let mut bld = g.stream.launch_builder(&f);
@@ -9894,6 +9919,81 @@ E_FILL:\n\
                     s.max_abs, s.max_rel
                 );
             }
+        });
+    }
+
+    /// **The norm dispatcher now picks a width — and every width it can pick still computes the norm.**
+    ///
+    /// `ptx_norm::norm_launch` / `warps_per_row` were written and swept but nothing called them:
+    /// `gpu::norm` hardcoded `grid = rows, block = 32`, so the nine `_w{W}` entries were unreachable
+    /// from the dispatcher (and therefore from `wukong_driver::gpu_accel`, the only production caller),
+    /// and the measured 2.8–3.5x underfill win was available to no one.
+    ///
+    /// The kernels themselves are already gated in `ptx_norm`
+    /// (`sm_filling_norms_match_the_f64_reference_at_every_width`,
+    /// `one_warp_entries_are_bit_identical_to_the_shipped_kernel`). What is gated **here** is the
+    /// seam: that the shapes a real caller passes actually reach each width, that the geometry the
+    /// planner returns is the one that entry needs, and that the result still matches the CPU runtime
+    /// kernel `gpu::norm` is the GPU twin of.
+    ///
+    /// The width each shape must select is asserted against this device's own SM count rather than
+    /// assumed — a heuristic change that silently stopped reaching `W = 8` would otherwise leave this
+    /// test green having exercised one geometry four times. The last shape has `rows` past the
+    /// planner's `32 * SM` grid cap, so it also drives the row grid-stride, which the shipped entries
+    /// structurally cannot do (they read `%ctaid.x` as *the* row and never advance it).
+    #[test]
+    fn norm_dispatch_reaches_every_planner_width_and_matches_the_cpu_oracle() {
+        use wukong_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
+        with_gpu("norm_dispatch", |g| {
+            let sm = g.sm_count();
+            let mut rng = crate::diff::Rng::new(0x5031_F111);
+            let eps = 1e-5f32;
+            // (rows, cols) — one per regime the planner documents, plus a grid-stride shape.
+            let shapes: &[(usize, usize)] = &[
+                (40, 128),    // W=1: a short row keeps the shipped launch, untouched
+                (128, 1024),  // W=2: the covered regime at the common transformer width
+                (37, 2048),   // W=4: underfill, rows a multiple of nothing
+                (64, 8192),   // W=8: the underfill regime the sweep measured 2.8-3.5x
+                (1600, 2048), // W capped at 4 AND rows > 32*SM CTAs: the row grid-stride
+            ];
+            let mut widths: Vec<u32> = Vec::new();
+            for &(rows, cols) in shapes {
+                let x = rng.vec(rows * cols, -3.0, 3.0);
+                for (op, label) in [
+                    (NORM_SOFTMAX, "softmax"),
+                    (NORM_LAYERNORM, "layernorm"),
+                    (NORM_RMSNORM, "rmsnorm"),
+                ] {
+                    let p = crate::ptx_norm::norm_launch(label, sm, rows, cols);
+                    widths.push(p.warps_per_row);
+                    let got = norm(g, op, &x, rows, cols, eps).unwrap();
+                    let oracle = cpu_norm(op, &x, rows, cols, eps);
+                    let s = crate::diff::assert_close(
+                        &format!("{label} {rows}x{cols} [{}]", p.entry),
+                        &got,
+                        &oracle,
+                        1e-4,
+                        1e-3,
+                    );
+                    eprintln!(
+                        "  {label:10} {rows:>5}x{cols:<5} -> {:<14} grid={:<5} block={:<3} \
+                         max_abs={:.2e} max_rel={:.2e}",
+                        p.entry, p.grid, p.block, s.max_abs, s.max_rel
+                    );
+                }
+            }
+            widths.sort_unstable();
+            widths.dedup();
+            assert_eq!(
+                widths,
+                crate::ptx_norm::MW_WIDTHS.to_vec(),
+                "the shape list must reach every generated width on this {sm}-SM device, or this \
+                 gate is quietly testing one geometry over and over"
+            );
+            eprintln!(
+                "[gate] gpu::norm dispatches through norm_launch: widths {widths:?} all reached on \
+                 {sm} SMs, every one within tolerance of the CPU runtime kernel \u{2713}"
+            );
         });
     }
 
