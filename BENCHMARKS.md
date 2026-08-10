@@ -10,7 +10,65 @@ language, so a miscompiled kernel is caught, not silently mis-measured. **C++ (`
 GCC front end, cross-checked bit-for-bit against the C column, with a "vs C++" ratio printed beside
 every "vs C" ratio.
 
-> **⚠ The C++ ratios in the tables below are NOT yet from that harness.** Until 2026-08-05 only the
+## ⚠ READ FIRST — the standing index: does the number you are about to read still stand?
+
+This document is kept as a **ledger, not a brochure**. A figure that stopped being true is struck
+through with the correction beside it rather than deleted, and every retraction keeps its reasoning.
+That is deliberate and it is why the file is long — but it also makes the *current* standing of any
+individual number hard to see at a glance. This index is the answer, family by family. **It contains
+no measurement**: it re-states the status the banners and sections below already establish, adds the
+device scope every GPU figure needs, and moves no figure in either direction.
+
+**Three statuses are used.** *STANDS* — measured against a peer this document still considers fair,
+and nothing has since invalidated the instrument or the peer. *CORRECTED* — the published figure was
+wrong, the corrected one is in the table, and the struck value is kept beside it. *NOT CURRENTLY
+LOAD-BEARING* — do not cite it: either the peer moved, the instrument had no control in it, or the
+number was measured on hardware that does not generalize the way the sentence around it implies.
+
+### CPU — currently the larger debt
+
+| family | standing |
+|---|---|
+| f32 GEMM / `nn.Linear` / fused FFN, the 35-op transcendental family, the fused row norms, **row**-argmax | **STANDS.** Named by the 2026-08-04 peer audit as the wins that did not move when every peer got `__restrict__` and its natural loop order — i.e. the ones that were real. |
+| weight-gradient GEMM, column reductions, column argmax/argmin, transpose, bf16 reductions, GEMV, conv2d, cumsum | **CORRECTED 2026-08-04/05, downward — some to ties, some to losses.** The corrected figures stand; the struck ones are kept for the record and must never be re-quoted. See [Corrected peer measurements](#corrected-peer-measurements-2026-08-04) and [Where Wukong does NOT win](#honest-summary). Transpose carries a *further* flag: both its rounds were power-of-two shapes only and neither reproduces on the current tree, so it is **unverified**, not merely corrected. |
+| **every "vs Rust" column on roughly forty rows** | **NOT CURRENTLY LOAD-BEARING — needs re-measurement.** The 2026-08-06 audit found the Rust peers never received the `noalias` fix the C and C++ peers got on 2026-08-04 (rustc emits LLVM `noalias` on reference parameters only, never on a raw pointer); the exact affected/unaffected split is the table in the *"Follow-up correction — 2026-08-06: the RUST peers never got defect #1 either"* banner below. Direction is known (the Rust peers get faster, so Wukong's Rust ratios get worse); magnitude is not, because every round available was on battery or flapping AC. |
+| **every "vs C++" column outside three sections** | **NOT CURRENTLY LOAD-BEARING.** Only the elementwise/reduction battery, `dequant` and the opt-in `general` suite ever compiled a g++ peer; for the other ~37 families the "vs C++" figure is the C figure restated under an assertion no run could falsify. `wukong_xbench` now measures the column everywhere, and the numbers await a full AC+full-power round. |
+| **end-to-end 12-layer transformer stack, vs C** | **UPPER BOUND pending re-measurement.** The `c_model` peer kept 24 unqualified pointer parameters until 2026-08-05, so the published 1-core and multicore ratios were measured against exactly the may-alias peer this document had already declared invalid everywhere else. Direction of the correction is known (down); magnitude is not. Its **Rust** column additionally sits in the row above. |
+| **general code — everything outside the recognizer dialect** | **SUPERSEDED 2026-08-06, with no replacement published.** Both columns moved out from under the tables: the dispatch census is stale (the recognizers widened), and the timing columns were taken by an instrument with no control in it — with the `C(twin)` control carried and the timing thread pinned, the "spread across five spellings" headline reads *below the run's own noise floor*. Run the suite and read its `DISPATCH CENSUS` block for census facts; there are no current timing figures for this section. |
+| the `torch.compile` CPU columns | **STANDS as measured**, with one standing hazard disclosed rather than fixed: the harness's `detect_torch` selects the *newest* torch among `python` on `PATH` and `tools/torch-venv`, so the peer can change without the benchmark changing. Record the version with the round. |
+| every absolute GFLOP/s, `% of roofline` and scaling factor | **round-local by construction**, never comparable across rounds — this laptop is three different machines by power state, a fourth by thermal history, and a fifth by which core class the scheduler parks a single-threaded row on. |
+
+### GPU — every figure is one laptop card's
+
+**Every GPU number in this document was measured on an NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`,
+20 SMs, 6 GB, ~192 GB/s, power-capped ~30–50 W) **under Windows/WDDM**, against only the peers that
+box can host. It is a *dev target*, not a datacenter part, and several of its most quotable numbers
+are properties of that instrument rather than of the compiler. The retarget — including
+re-measurement against the peers a Linux cloud box can build — is `GPU_RETARGET_PLAN.md`.
+
+| family | standing |
+|---|---|
+| the fp16/bf16/fp8/int8/int4 GEMM standings, flash-attention, conv, the resident layer, HBM bandwidth, compile latency, the serving stack | **STANDS *for the RTX 4050*.** Same-run, clock-invariant, and gated against an oracle — but 20 SMs, this card's L2 and 192 GB/s decided every tile, stage depth, regime threshold and occupancy crossover in them. None of it predicts an A100 or an H100, in either direction. One extra scope note on **serving**: those rounds predate grouped-query support, so their KV cache was sized for `q_heads`. The internal ratios (goodput vs fill=1, graph-driven scheduler vs static batching, int8-KV footprint) are self-consistent at the MHA geometry they were taken at — but they are **not** a Llama-class geometry, and a future vLLM/TRT-LLM comparison must be run at the GQA shape those peers actually serve. |
+| **"Wukong beats PyTorch at every S"** | **NOT RE-EARNED AGAINST THE REAL BAR.** The peer is **eager** PyTorch, and the only justification ever given is that Triton does not install on Windows. On Linux the honest peer is `torch.compile` with Inductor+Triton, and the tooling to build it landed 2026-08-09 (`tools/cloud/peers/`, pinned in the Modal image, with `smoke_inductor.py` asserting a Triton kernel was actually generated so an ATen fallback cannot wear the framework bar's name, and `verify_peers.py` failing loudly rather than shrugging when a declared peer is missing). Until that round runs, treat this claim as **on notice**: eager is not a bar. |
+| **the CUDA-graph launch-overhead wins** | **EXPECT SHRINKAGE BEFORE THE GPU EVEN CHANGES.** They were measured under **Windows/WDDM**, whose kernel-launch cost is several times the Linux driver's. The multiple is a ratio of *overhead removed* to *overhead present*, so a cheaper launch shrinks the numerator directly. That is a re-scoping to expect, not a regression to explain. |
+| **the long-S flash loss called "structural on 20 SMs"** | **PREMISE IS DEVICE-SPECIFIC; DIRECTION UNKNOWN.** The diagnosis (SFU / serial-softmax bound on 20 SMs) is a statement about *this* part's SM count, and it simply dissolves at 108 or 132 SMs — it must be re-diagnosed there, and it may improve or may not. The converse is the sharper risk: the **small-S occupancy *wins*** (multi-head filling the device; the flash regimes that beat cuDNN/cutlass at S≤512) depend on 20 SMs being *easy* to fill, and those may **invert** on a part a small problem cannot fill. |
+| the "no honest peer is buildable here" framings — a fused FA2-class CUDA-C kernel, a library int4 W4A16 decode GEMM, vLLM/TRT-LLM | **EXPIRING.** They are true of a *toolkit-free Windows laptop* and false of a cloud box: NVRTC there has headers, and CUTLASS, FlashAttention, Marlin/Machete and vLLM are buildable (recipes: `docs/gpu/derive/D5_peer_builds.md`; staging: `tools/cloud/modal_app.py ::build_peers`). Read them as "not available on this instrument", never as "no honest peer exists". |
+| the GPU corpus-coverage counts quoted in prose | **superseded by the gates' own ratcheted floors.** `RUN_CORPUS_COVERAGE_FLOOR` (`crates/wukong_codegen_gpu/src/lower.rs`) and `MEGA_CORPUS_COVERAGE_FLOOR` (`megakernel.rs`) are the live figures, and since 2026-08-09 both are **host-vectorizer-invariant**: the sweeps normalize through the documented 128-bit CLIF fallback, so Windows and Linux read the same number instead of the Win64-only AVX2 recipe silently inflating the Linux one. Re-run the gates; do not read a count out of prose. |
+
+**What "toolkit-free" does and does not mean.** Wukong needs no `nvcc`/`ptxas`/CUDA toolkit to build
+or run its GPU path — that is a real property of emitting PTX and driver-JIT-loading it, and it holds
+on every box. It is **not** a statement about the world's peers. On a machine that has the toolkit
+the honest bar goes *up*, and this project's job is to meet the higher one.
+
+**How a future round earns its way back into this file.** The GPU instrument is now code rather than
+discipline (`crates/wukong_codegen_gpu/src/bench_instrument.rs`, 2026-08-09): a `PtxTwin` control
+column (one PTX text, two module handles, expected ratio 1.00), a `Round`/`Published` gate that
+refuses to mint a number at all when the device fails its provenance check or the round's own
+measured floor exceeds the pre-registered bar, and a provenance header emitted by the harness rather
+than by a human. A bench whose floor swallows its effect reports `Unresolved`, never a tie.
+
+> **⚠ The C++ ratios in the tables below are NOT yet from the harness described at the top of this
+> document.** Until 2026-08-05 only the
 > elementwise/reduction battery, `dequant` and the opt-in `general` suite compiled a g++ peer; the
 > other ~37 families printed "vs C" alone, and this document covered the gap with an *assertion* —
 > "g++ and gcc share a backend, so on identical kernel code C++ tracks C to within a few percent, and
@@ -277,7 +335,12 @@ reduction, a tie at best and a 1.8× **loss** at worst. It is kept in the table,
 rather than quietly deleted.
 
 **GPU backend** (`--features gpu`, mobile RTX 4050, same-run clock-invariant ratios — full section
-[below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): fp16 tensor-core GEMM reaches **cuBLAS parity
+[below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)). **Device scope, before the numbers:** every
+figure in this paragraph is an **RTX 4050 Laptop** figure (`sm_89`, 20 SMs, 6 GB, ~192 GB/s,
+Windows/WDDM) against the peers that box can host — PyTorch here is **eager**, and there is no
+CUTLASS/FlashAttention/Marlin build. Do not generalize any of it to another part; see the
+[standing index](#-read-first--the-standing-index-does-the-number-you-are-about-to-read-still-stand)
+for the three families that need more than a scope note. fp16 tensor-core GEMM reaches **cuBLAS parity
 (~101%) at ≤1024³**, and the ldmatrix+XOR-swizzle workhorse lifts the large regime to **~87–90% at
 2048³** (past the prior 77% PTX ceiling) and, with the shipped **v2cs streaming epilogue**, **76.8%
 of cuBLAS-f16 / 80.4% of the honest f32-out peer at 4096³**;
@@ -298,7 +361,24 @@ oracle — the wins are correct, not miscompiles.
 
 A six-slice campaign (2026-06-25) measured Wukong against the hand-tuned vendor libraries it had not
 yet been compared to — oneMKL, cuBLAS, cuBLAS IMMA / cuBLASLt, cuDNN, and a genuinely *fused*
-FlashAttention-class peer — and closed or beat them where the measurement is honest. Every standing is
+FlashAttention-class peer — and closed or beat them where the measurement is honest.
+
+> **⚠ Scope of the four GPU rows in this table (2026-08-09):** the fp16/bf16 GEMM, int8/fp8 GEMM,
+> Attention and Conv rows — and the GPU half of the Serving row — are **RTX 4050 Laptop** standings
+> (`sm_89`, 20 SMs, Windows/WDDM), against the peers that box can host. Three specific caveats the
+> row text does not carry on its own: the Attention row's *"the loss is structural (SFU/serial-softmax
+> on 20 SMs)"* is a diagnosis **about this card's SM count** and must be re-derived on a datacenter
+> part, where the direction is unknown; the int8 row's *"beats IMMA"* is an occupancy crossover the
+> 64×64 warp tile wins **because** the part has 20 SMs, and is explicitly named in
+> `GPU_RETARGET_PLAN.md` §8 (risk 5) as a win that may not transfer; and the Serving row's
+> *"no vLLM/TRT-LLM installable"* is true of this box only — both are installable on a cloud box, and
+> the paged-KV stack has since gained the **grouped-query geometry** a Llama-class peer comparison
+> requires (before that, the cache was sized for `q_heads`, i.e. `g` times the real workload, so a
+> capacity or goodput number was not comparing the same thing a GQA peer computes). The CPU rows
+> (CPU GEMM, CPU vmath, CPU end-to-end model) are laptop-scoped but not device-retargeted; their
+> standing is in the [index above](#-read-first--the-standing-index-does-the-number-you-are-about-to-read-still-stand).
+
+Every standing is
 **same-run** (the 4050's ~7× clock swing makes absolute GFLOP/s meaningless; only the ratio and the
 win/lose *direction* are stable across ≥3 re-runs). Full per-slice findings, including the **measured
 negative results**, live in [`prompts/results/`](prompts/results/).
@@ -1855,12 +1935,32 @@ column pairs with `C`, never with `C(fast)`.
 
 ## GPU backend (NVIDIA RTX 4050 Laptop, `sm_89`)
 
-> **⚠ Device scope (2026-08-06):** every figure in this section was measured on an **NVIDIA RTX 4050
-> Laptop GPU** (`sm_89`, 20 SMs, 6 GB, ~192 GB/s) under **Windows/WDDM**, with the peers available on
-> that box (notably: PyTorch in **eager** mode — Triton does not install on Windows — and no CUDA
-> toolkit). These are properties of that instrument; **do not extrapolate them to datacenter parts.**
-> The datacenter retarget, including re-measurement against stronger peers (`torch.compile`, CUTLASS,
-> FlashAttention), is tracked in `GPU_RETARGET_PLAN.md`.
+> **⚠ Device scope (2026-08-06, extended 2026-08-09):** every figure in this section was measured on
+> an **NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**, power-capped
+> ~30–50 W) under **Windows/WDDM**, with only the peers that box can host: cuBLAS / cuBLAS IMMA /
+> cuBLASLt and cuDNN through the redistributable DLLs, NVRTC-compiled CUDA-C, PyTorch in **eager**
+> mode (Triton does not install on Windows), and **no CUDA toolkit** — so no CUTLASS build, no
+> FlashAttention build, no Marlin/Machete, no vLLM/TRT-LLM. Every tile, warp tile, stage depth,
+> raster width, regime threshold and occupancy crossover in this section was swept against those
+> twenty SMs. These are properties of **that instrument**; **do not extrapolate them to datacenter
+> parts.** The datacenter retarget — and re-measurement against the peers a Linux cloud box can
+> actually build — is `GPU_RETARGET_PLAN.md`.
+>
+> **Three families in this section need more than a scope banner.** Their status, in full, is in the
+> [standing index](#-read-first--the-standing-index-does-the-number-you-are-about-to-read-still-stand)
+> at the top of this document; in one line each:
+>
+> 1. **"Beats PyTorch at every S" is measured against EAGER PyTorch and is NOT re-earned against the
+>    real bar.** `torch.compile` (Inductor+Triton) is the honest framework peer and works natively on
+>    Linux; the tooling to build and *verify* it landed 2026-08-09 (`tools/cloud/peers/`). Eager is
+>    not a bar. Treat the claim as on notice until that round runs.
+> 2. **The CUDA-graph launch-overhead multiples are Windows/WDDM numbers.** Linux launch cost is
+>    several times lower, so the multiple should be expected to shrink *before the GPU changes at
+>    all*. That is re-scoping, not regression.
+> 3. **The long-S flash loss is called "structural on 20 SMs" — and that premise dissolves at 108 or
+>    132 SMs.** It must be re-diagnosed there and the direction is genuinely unknown. Conversely the
+>    small-S occupancy *wins* here depend on 20 SMs being easy to fill and may **invert** on a part
+>    that a small problem cannot fill.
 
 Wukong has a **GPU backend** (`wukong_codegen_gpu`, behind `--features gpu`). Being a compiler, it
 **emits PTX text** and **driver-JIT-loads it via `cudarc`** (`cuModuleLoadData` — the NVIDIA driver's
@@ -2058,6 +2158,26 @@ fp16-mt GEMM sits at ~25–72% of it and fp8-mt at ~75–100% of it across 2048�
 power-capped — and, as the cuBLAS column shows, it is ≈ the cuBLAS-achievable rate, not a kernel-bounding
 wall. Reproduce: `tensorcore_roofline_pct`.
 
+> **⚠ THE FLASH STANDINGS ARE OCCUPANCY VERDICTS ON 20 SMs, IN BOTH DIRECTIONS (2026-08-09).** Read
+> the losses *and* the wins below as measurements of how a problem of a given size maps onto twenty
+> Ada SMs, because that is what they are.
+>
+> - **The long-S loss is diagnosed as "structural (SFU/serial-softmax on 20 SMs)". That diagnosis is
+>   a statement about this part's SM count and does not survive the retarget** — at 108 (A100) or 132
+>   (H100) SMs the premise simply dissolves and the loss must be re-diagnosed from scratch. Its
+>   direction there is **unknown**: more SMs may hide it, or a different bound may replace it.
+> - **The wins are the sharper risk.** The small-S standings — multi-head `grid.y = H` "filling" the
+>   device, the causal-D64-S=512 and fused-RoPE-S≤512 regimes that beat cuDNN and cutlass, the
+>   S≥4096 warp-specialization route, the untiled kernel's `FLASH_WARPS` (computed from the target's
+>   blocks-per-SM cap, so it is *2* precisely because this is cc 8.9), and every A/B that shelved a
+>   variant — all rest on **20 SMs being easy to fill**. On a part that a small problem *cannot*
+>   fill, several of them may **invert**. None of them is retracted; none of them may be quoted as a
+>   property of the compiler rather than of this card.
+> - The peer set is also this box's: cuDNN and cutlass mem-efficient fMHA reached through PyTorch's
+>   SDPA backends. **A real FlashAttention build was never a peer here** — the section says so
+>   below, correctly, as a fact about a toolkit-free box. It is buildable on a cloud box, and the
+>   pinned recipe is staged (`docs/gpu/derive/D5_peer_builds.md`, `tools/cloud/modal_app.py`).
+
 **Flash-attention — register-resident `mma.sync` (the FlashAttention-2 form).** `flash_d64_m` runs the
 online-softmax attention on the Ada tensor cores with the output `O`, the running max `m`, and the
 denominator `l` held in **registers** across the whole K-loop — *no* per-step SMEM round-trip. It is built
@@ -2186,7 +2306,29 @@ epilogues the add/SiLU cuBLAS structurally can't fold in add ~1.08–1.09×.) Th
 pre-register-flash) showed the ratio **widening with depth** 1.20→1.32× as the fixed per-layer overhead
 amortises. Run: `… --ignored --nocapture cublas_chain_vs_wukong` / `resident_model_vs_cublas`.
 
-**PyTorch (Tier C) — Wukong now wins at EVERY S, including S=4096.** The same layer in PyTorch
+**PyTorch (Tier C) — Wukong now wins at EVERY S, including S=4096.**
+
+> **⚠ ON NOTICE — this claim is against EAGER PyTorch and is not re-earned against the real bar
+> (2026-08-09).** The framework bar is **`torch.compile` with Inductor+Triton**, not eager — a rule
+> this repo already applies on the CPU side, where `README.md` and `docs/metrics.md` both state that
+> beating eager does *not* count and the end-to-end model section leads with the **compiled** peer,
+> quoting eager only as a secondary "also". The GPU side got an exception for one reason only —
+> `torch.compile` raised `Cannot find a working triton installation` on Windows — and that reason
+> **expires on Linux, where Triton is native.** The tooling to build and *verify* the strong peer
+> landed 2026-08-09: `tools/cloud/peers/torch_compile_peer.py` reports eager, `compile(default)` and
+> `compile(max-autotune)` side by side and takes the **fastest** as the peer (plus an
+> `eager_over_peer` ratio, so the round itself measures how much of this margin was the peer being
+> weak); `smoke_inductor.py` asserts a Triton kernel was actually generated, because a
+> `torch.compile` that silently fell back to ATen is cuBLAS wearing the framework bar's name; and
+> `verify_peers.py` exits non-zero when a *declared* peer does not resolve.
+>
+> **Nothing below is retracted** — the eager numbers are what they are, and the table is kept — but
+> **"beats PyTorch" may not be cited without the word "eager" in the same sentence**, and the margin
+> should be expected to shrink, possibly to a loss, against the compiled peer. The same caveat
+> attaches to every restatement of this row: the headline bullet at the top of this document and the
+> [Honest summary](#honest-summary) bullet at the bottom.
+
+The same layer in PyTorch
 (`bench/pytorch/transformer_layer_peer.py`, fp16 eager — tensor-core matmuls + fused **SDPA flash
 attention**, f32 norm/softmax, f64-verified on the same RTX 4050) is **overhead-bound** (~15 eager kernel
 launches + Python dispatch per layer), so its time barely tracks the compute. Wukong is **resident and
@@ -2266,7 +2408,18 @@ run-to-run (M12).
 
 **No robust library int4-decode GEMM is bindable on this box** (cuBLASLt offers no general W4A16 decode),
 so M4 is a *documented lead*, stated honestly: the Tier-A peer is a **naive CUDA-C W4A16** kernel (NVRTC,
-one thread/output with an on-the-fly unpack). One representative back-to-back run (`int4_gemm_vs_peers`,
+one thread/output with an on-the-fly unpack).
+
+> **⚠ "Bindable on this box" — and the box is about to change (2026-08-09).** The sentence is true of
+> a toolkit-free Windows laptop and is **not** a statement that no honest int4 peer exists:
+> **Marlin** and **Machete** are the real bar for W4A16 decode and have been for some time, both
+> reachable through a vLLM install on a Linux box with the toolkit. The pinned build recipe is in
+> `docs/gpu/derive/D5_peer_builds.md` and the staging entry point is
+> `tools/cloud/modal_app.py ::build_peers` / `::marlin`. Until that round runs, the "documented lead"
+> below is a lead over a **naive** peer — the Tier-A bar — and must not be read as a lead over the
+> field. `GPU_RETARGET_PLAN.md` §0 lists this among the four peers that were never strong enough.
+
+One representative back-to-back run (`int4_gemm_vs_peers`,
 clock-warmed, best-of-4, checksum-cross-checked vs the naive peer):
 
 | shape (M×K×N) | Wukong W4A16 | × vs naive CUDA-C | × vs Wukong fp16 (same tile) | weight HBM/pass |
@@ -2308,6 +2461,17 @@ fired* and that outputs match within `c·√K·ε` (GEMM bit-exact; silu ~5e-7, 
 abs on this box). A device error surfaces as an error, never a silent CPU fallback.
 
 ### M7 runtime — device memory pool + CUDA graphs + multi-stream (decode/small-batch latency)
+
+> **⚠ WINDOWS/WDDM SCOPE — expect these multiples to shrink on Linux, before the GPU changes at all
+> (2026-08-09).** Every ratio in this subsection is *overhead removed ÷ overhead present*, and the
+> overhead in the denominator is a **Windows/WDDM kernel-launch cost**, which is several times the
+> Linux driver's. A cheaper launch shrinks the numerator directly, so the graph multiples are partly
+> a measurement of this operating system. The **direction** of the finding is robust and is not in
+> question — folding a whole stack's launches into one `cuGraphLaunch` cannot be slower, and the row
+> with little overhead to remove (the compute-bound GPT-2 shape) correctly shows almost no gain — but
+> the *sizes* are WDDM sizes. Re-measure on the Linux driver before quoting a multiple. Listed in
+> advance as expected shrinkage in `GPU_RETARGET_PLAN.md` §2.7 and §8 risk 5, so that when it happens
+> it is reported as re-scoping rather than as a regression.
 
 A resident transformer layer is ~13–16 individual kernel launches, each touching a few KB at decode
 sizes; per-op `cuMemAllocAsync`/free and per-kernel `cuLaunchKernel` then dominate. The Phase-7 runtime
@@ -2429,6 +2593,13 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
 
 ## Honest summary
 
+> **This summary restates figures from the sections above and inherits every one of their caveats.**
+> Before quoting a bullet, check its family in the
+> [standing index](#-read-first--the-standing-index-does-the-number-you-are-about-to-read-still-stand)
+> at the top: several bullets here restate a **CPU** figure whose Rust or C++ column needs
+> re-measurement, or an **upper bound** (the end-to-end model), and the GPU bullet restates figures
+> measured on one **RTX 4050 Laptop** against **eager** PyTorch.
+
 - **Every win below is a win IN THE RECOGNIZER DIALECT — read this first.** The kernels in this
   document are written in the syntactic loop shapes `wukong_mir_build` pattern-matches; that is what
   makes them dispatch to the tuned AVX2 kernels the rest of this summary describes. Outside those
@@ -2543,6 +2714,11 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
   (matching a CPU f64 reference to max_rel 2.7e-4, deterministic run-to-run) and now **beats PyTorch eager
   at every S, including S=4096 (1.35×)**. Numbers are honest for a power-capped 6 GB
   mobile GPU, not a datacenter part. The CPU↔GPU differential is a `c·√K·ε` tolerance over the full output.
+  **Three scope flags on this bullet** (full text in the [standing index](#-read-first--the-standing-index-does-the-number-you-are-about-to-read-still-stand)):
+  the PyTorch comparison is **eager only** and is not re-earned against `torch.compile`, which is the
+  real framework bar and works natively on Linux; the flash standings — the long-S loss *and* the
+  short-S wins — are **occupancy verdicts on 20 SMs** that may move in either direction on a
+  datacenter part; and "no CUDA toolkit" describes what *Wukong* needs, never what peers exist.
 - **Safety:** Wukong checks tensor **shapes at compile time** (in the type system), a class of bug
   C/C++/Rust-with-raw-pointers cannot catch.
 

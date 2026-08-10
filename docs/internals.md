@@ -664,9 +664,28 @@ accumulation (the parallel kernel is bit-identical to the serial one by construc
 
 ## GPU backend
 
+> **This section describes structure, not performance — and structure is now device-parameterized.**
+> No figure here is a benchmark; for those see `BENCHMARKS.md`, every GPU number in which is an
+> **RTX 4050 Laptop** (`sm_89`, 20 SMs, Windows/WDDM) number and must not be generalized. What
+> matters architecturally is that the backend no longer *assumes* that card: PTX module headers come
+> from one authority (`wukong_codegen_gpu::ptx_target`) at the **lowest legal floor per instruction
+> family** — `sm_80` for the Ampere-legal majority, `sm_89` only where `e4m3`/`e5m2` genuinely
+> exist, and `sm_90a` for the wgmma/TMA family, which is architecture-*locked* rather than floored
+> and is therefore gated by an `Sm90aLicense` type a launcher cannot skip — while **device identity
+> is probed once** into `Gpu::target()` (compute capability, SM count, opt-in shared-memory budget,
+> L2, VRAM, driver) instead of being hardcoded. The two directions are deliberately opposite and
+> both correct: **peers compile for the device, modules tag the floor.** Caches are keyed by device
+> accordingly (cubin SASS by arch, autotune by arch + SM count), because a cross-arch cubin load can
+> succeed silently under forward-minor compatibility. The retarget's plan and status are
+> `GPU_RETARGET_PLAN.md`.
+
 `wukong_codegen_gpu` (behind `--features gpu`) is a third execution path: being a compiler, it
 **emits PTX text** and **driver-JIT-loads it via `cudarc`**, so no `nvcc`/CUDA toolkit is needed — only
-the NVIDIA driver. Module loading goes through a persistent **cubin cache**: `Gpu::load_module_cached`
+the NVIDIA driver. (That is a statement about what *Wukong* requires, not about the wider world: on a
+box that does have the toolkit the available peers get stronger, and this backend's job is to meet
+the stronger bar. Read "toolkit-free" as **toolkit-optional**.)
+
+Module loading goes through a persistent **cubin cache**: `Gpu::load_module_cached`
 loads a previously compiled SASS image for this PTX hash + driver version when one exists, otherwise
 drives the driver's own in-process `cuLink*` JIT once, persists the cubin and loads that, and degrades
 to a plain PTX `cuModuleLoadData` on any failure (no linker, unwritable cache directory, a stale or
@@ -699,15 +718,41 @@ one block of `MEGA_BLOCK` (256) threads, with the alloca frame in one shared `.g
 effects `tid == 0`-guarded. `WUKONG_GPU_NO_MEGA=1` forces the single-thread path for A/B timing and
 debugging.
 
+A **cooperative multi-CTA launch path** exists beside that single-block form, because "the whole
+program in one kernel" on a one-CTA grid is a statement about one SM rather than about the machine —
+which matters little on a 20-SM laptop and makes the result meaningless on a 132-SM part. The launch
+layer therefore has three pieces the block-scoped path does not use: `grid_barrier_ptx`, a
+sense-reversing grid-wide arrival counter in `.global` with device-scope fences (a `bar.sync` is a
+CTA rendezvous and says nothing about the other CTAs), whose state is a launch *parameter* rather
+than a module-scope global so a kernel that faults mid-barrier cannot hang the next program;
+`plan_grid`, which derives the grid from `cuOccupancyMaxActiveBlocksPerMultiprocessor` × the probed
+`GpuTarget::sm_count` — never a literal — and returns `Ok(None)` when the request would not be
+simultaneously resident, because a cooperative grid that is not co-resident does not run slowly, it
+hangs; and `launch_mega`, which goes through `cuLaunchCooperativeKernel`, the only launch API that
+guarantees co-residency. A kernel opts in through its own **ABI**, read back out of the emitted PTX
+by `mega_abi`: a block-scoped entry declares `(p_ctx, p_frame)` and is pinned to one CTA, while a
+grid-parallel entry declares `(p_ctx, p_frame, p_gbar)` *and* defines `mrt_grid_barrier`. Half of
+either shape is a hard error rather than a decline, because the two halves fail in opposite and
+equally silent ways — a barrier no launch made resident deadlocks, and a multi-CTA launch of
+`tid == 0`-guarded stores duplicates every `print` and races the shared frame. `lower::emit_mega_ptx`
+still emits the block-scoped form, so every corpus program is launched exactly as before.
+
 The CPU↔GPU boundary is **tolerance-gated** (`c·√K·ε`) rather than bit-exact — the GPU analogue of the
-CPU differential oracle — and the path stays optimization-invariant (`-O0` ≡ `-O3`). Every module except
-`paged_kv` and `paged_attention` is behind the feature, so a plain `cargo test` compiles an almost-empty
-crate and the toolchain-free core is unaffected. Those two are deliberately un-gated: their host-only
-contents (the KV block allocator and geometry, the paged-decode PTX generators, the int8 quantizer, the
-f64 reference) need no device, so their shape and PTX-ASCII gates run in the default build; only the
-launchers and device caches inside them are feature-gated. The flip side is that `cargo test` does not
-type-check the GPU backend at all — `cargo check --features gpu --all-targets` is the check that does,
-and it is a required half of the repo gate.
+CPU differential oracle — and the path stays optimization-invariant (`-O0` ≡ `-O3`). Nearly every
+module is behind the feature, so a plain `cargo test` compiles an almost-empty crate and the
+toolchain-free core is unaffected. A short list is deliberately **un-gated**, on one consistent rule:
+*whatever is pure host-side data or arithmetic gates in the default build, and only the launch layer
+inside it is `#[cfg(feature = "gpu")]`.* Today that is `ptx_target` (the header-floor authority),
+`paged_kv` and `paged_attention` (the KV block allocator and geometry, the paged-decode PTX
+generators, the int8 quantizer, the f64 reference), `bench_instrument` (the statistics, spec table,
+`nvidia-smi` parser, provenance formatting and publish gate), `tma_host` (the `cuTensorMap` argument
+bundle and its preconditions — only the one `cuTensorMapEncodeTiled` call is gated), and `ptx_wgmma`
+(whose `sm_90a` capability check is an `Sm90aLicense` *type*, so an ungated emitter fails to compile
+rather than merely failing a textual scan). A new `src/*.rs` must also be added to `CRATE_SOURCES` in
+`gpu.rs`, the corpus every textual law scans — a file outside it is invisible to the ASCII, header-
+floor and `.version` laws. The flip side of the feature gate is that `cargo test` does not type-check
+the GPU backend at all — `cargo check --features gpu --all-targets` is the check that does, and it is
+a required half of the repo gate.
 
 Beyond the two CLI backends the crate holds device infrastructure and whole stacks that are **library
 surface**, exercised by its own `--features gpu` tests and benches rather than reachable from `wukongc`:
@@ -722,7 +767,8 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
 ## Testing strategy
 
 - **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).
-- **End-to-end** (`tests/run/*.wk`, 333 fixtures): the real `wukongc` binary compiles and runs each
+- **End-to-end** (`tests/run/*.wk`, 357 fixtures — count it with `ls tests/run/*.wk | wc -l` rather
+  than trusting this line, which has gone stale before): the real `wukongc` binary compiles and runs each
   program; stdout/exit are checked against the `// EXPECT-EXIT:` / `// EXPECT-OUT:` directives embedded
   in the file, and a `// RUN:` directive replaces the default `--run` argument list (a fixture that must
   pin the *native* side carries `// RUN: --run --backend=native`). Placement rule: everything here must
@@ -772,8 +818,30 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
   suite, and `--emit=mir-high|mir|llvm-ir` over the run suite at -O0 and -O2 — which is also what keeps
   the MIR verifier and the pretty-printers honest.
 
-All of the above runs with `cargo test` and needs no C or LLVM toolchain (Cranelift is a pure-Rust
-crate). Two suites are conditional and say so out loud: the `--emit=exe` gate needs either `rustc` with
+- **GPU corpus coverage** (`--features gpu`, device required): `lower.rs` and `megakernel.rs` each
+  sweep the whole `tests/run` corpus against the interpreter oracle at two `-O` levels and assert a
+  **ratcheted floor**, so a construct that silently starts declining goes red instead of quietly
+  shrinking coverage. Both sweeps normalize their input through the documented, result-identical
+  128-bit CLIF fallback (`lower::hostvec::build`, i.e. `WUKONG_P4_NO_256=1`) before lowering. That is
+  not a detail: the general 256-bit AVX2 recipe is Win64-only, `lower.rs` declines the op it
+  produces, and so before the normalization the *same commit* read a higher coverage number on Linux
+  than on Windows — the metric conflated "what gpu-native can lower" with "did the host CPU
+  vectorizer fire", and one hardcoded floor could only ever ratchet one of the two readings. A
+  device-free gate proves the normalization is both effective and complete by re-sweeping
+  host-native and attributing every gained program to a vectorizer recipe.
+
+Everything above **except the GPU corpus gate** runs with plain `cargo test` and needs no C or LLVM
+toolchain (Cranelift is a pure-Rust crate).
+
+One profile caveat, learned the hard way: `wukong_runtime`'s first invariant is that each AVX2 kernel
+agrees **bit-for-bit** with its scalar twin, and that is a property a legal optimizer choice can
+break — a `colreduce` divergence reproduced byte-identically on Windows and Linux in release while
+passing in debug, because it needed LLVM to have auto-vectorized the *scalar twin* before it could
+exist at all. Debug-only checking of that crate was therefore checking the wrong profile, since every
+performance number the project publishes comes from a release binary; CI now also runs
+`cargo test -p wukong_runtime --release --lib`.
+
+Two suites are conditional and say so out loud: the `--emit=exe` gate needs either `rustc` with
 a `wukong_runtime` rlib reachable from the compiler binary (see `runtime_rlib_in` above) or a working
 `cc`/`$CC`, and prints why it skipped otherwise — and it fails outright if it linked *nothing*, so it
 cannot go dark; and the GPU suites need `--features gpu` plus a reachable device — plain `cargo test` does not
