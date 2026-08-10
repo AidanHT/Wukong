@@ -233,6 +233,110 @@ pub fn dyn_launch_cfg(
     }
 }
 
+/// **The default deadline for a time-boxed launch**, milliseconds.
+///
+/// Absurdly generous next to anything this backend launches (the widest GEMM here is milliseconds),
+/// because the number is not a performance budget — it is the line between "slow" and "never".
+pub const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 30_000;
+
+/// The launch deadline in force, or `None` if the watchdog is switched off.
+///
+/// `WUKONG_GPU_LAUNCH_TIMEOUT_MS` overrides [`DEFAULT_LAUNCH_TIMEOUT_MS`]; `0` disables the watchdog
+/// entirely and falls back to a plain blocking `cuStreamSynchronize`. Read once, so every call site
+/// in a process agrees.
+pub fn launch_timeout() -> Option<std::time::Duration> {
+    static T: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *T.get_or_init(|| {
+        let ms = std::env::var("WUKONG_GPU_LAUNCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LAUNCH_TIMEOUT_MS);
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
+/// **Drain `stream`, but never wait forever.** Returns how long the drain took.
+///
+/// `cuStreamSynchronize` has exactly one failure mode this backend cannot survive: a kernel that
+/// never retires. A `wgmma` mainloop whose `expect_tx` count disagrees with what its two TMA copies
+/// actually move does precisely that — the transaction barrier never reaches its byte count, every
+/// consumer warpgroup spins in `mbarrier.try_wait`, and the host blocks in the driver until the
+/// process is killed from outside. On a laptop that is an annoyance. On rented silicon it is the
+/// whole rest of the hour, billed, with no log: `GPU_RETARGET_PLAN.md` section 0's worst case.
+///
+/// So the drain is a **poll**, not a block: `cuStreamQuery` is non-blocking and returns
+/// `CUDA_ERROR_NOT_READY` while work is outstanding, so the deadline is enforceable from the host
+/// with no cooperation from the kernel.
+///
+/// # Why the deadline ENDS THE PROCESS
+///
+/// Returning `Err` would be tidier and would be a lie. The kernel is still running: the context is
+/// wedged, every later driver call on it blocks or fails, and the CUDA context teardown at process
+/// exit blocks too — so a "clean" error return still ends in the same silent hang, just further from
+/// the evidence. Reporting the diagnosis and exiting is the only outcome that leaves a log. The exit
+/// is loud, names the kernel and the deadline, and is switchable off with
+/// `WUKONG_GPU_LAUNCH_TIMEOUT_MS=0`.
+///
+/// # Why the diagnosis is written to the stderr HANDLE and not with `eprintln!`
+///
+/// `eprintln!` routes through `std::io::_eprint`, which libtest intercepts into a per-test capture
+/// buffer it prints **when the test finishes**. This message is emitted immediately before
+/// `process::exit`, so the test never finishes and the buffer is never printed: under a plain
+/// `cargo test` — no `--nocapture` — the watchdog would kill the process in total silence, which is
+/// the exact outcome it exists to prevent. Writing to the `Stderr` handle bypasses the capture (a
+/// macro-level mechanism in `std`, not an fd redirection) and reaches the terminal either way.
+pub fn sync_within(stream: &CudaStream, what: &str) -> Result<std::time::Duration, GpuError> {
+    let t0 = std::time::Instant::now();
+    let Some(budget) = launch_timeout() else {
+        stream.synchronize()?;
+        return Ok(t0.elapsed());
+    };
+    let mut nap = std::time::Duration::from_micros(50);
+    loop {
+        // SAFETY: a non-blocking status read of a live stream owned by the caller's `Gpu`. It takes
+        // no pointers, writes nothing, and returns a status code; `CUDA_ERROR_NOT_READY` is the
+        // documented "still running" answer and is not an error here.
+        let r = unsafe { sys::cuStreamQuery(stream.cu_stream()) };
+        match r {
+            sys::CUresult::CUDA_SUCCESS => return Ok(t0.elapsed()),
+            sys::CUresult::CUDA_ERROR_NOT_READY => {}
+            other => return Err(GpuError::Driver(DriverError(other))),
+        }
+        let waited = t0.elapsed();
+        if waited >= budget {
+            let diagnosis = format!(
+                "\n========= LAUNCH DEADLINE EXCEEDED - the kernel is hung =========\n\
+                 \x20 kernel   : {what}\n\
+                 \x20 waited   : {:.1} s (deadline {:.1} s; WUKONG_GPU_LAUNCH_TIMEOUT_MS to change, \
+                 0 to disable)\n\
+                 \x20 meaning  : cuStreamQuery still reports CUDA_ERROR_NOT_READY. The launch was\n\
+                 \x20            accepted, so this is not a JIT or an argument error - something on\n\
+                 \x20            the device is waiting for an event that will not arrive.\n\
+                 \x20 suspect 1: an mbarrier transaction count that does not match what the copies\n\
+                 \x20            move (ptx_wgmma::WgmmaCfg::stage_tx_bytes vs the two tensor maps'\n\
+                 \x20            TensorMapArgs::transaction_bytes) - the barrier never completes\n\
+                 \x20            and every consumer warpgroup spins forever. Run the single-stage\n\
+                 \x20            TMA probe first: one copy, one barrier, nothing else.\n\
+                 \x20 suspect 2: a bar.sync that some threads of the CTA branch around.\n\
+                 \x20 exiting  : the context is wedged; every later driver call would block too, so\n\
+                 \x20            ending here is what leaves you this message instead of a timeout.\n\
+                 ================================================================\n",
+                waited.as_secs_f64(),
+                budget.as_secs_f64()
+            );
+            // The handle, not the macro — see this function's doc. A `let _ =` on each: there is
+            // nothing useful to do about a failed write on the way out, and unwrapping here would
+            // replace the diagnosis with a panic message about the diagnosis.
+            let mut err = std::io::stderr();
+            let _ = std::io::Write::write_all(&mut err, diagnosis.as_bytes());
+            let _ = std::io::Write::flush(&mut err);
+            std::process::exit(70);
+        }
+        std::thread::sleep(nap.min(budget.saturating_sub(waited)));
+        nap = (nap * 2).min(std::time::Duration::from_millis(2));
+    }
+}
+
 /// A GPU call's failure — either the driver said no, or **this device cannot run this kernel family
 /// at all**.
 ///
@@ -6624,7 +6728,103 @@ pub fn gemm_nt_wgmma(
         .arg(&map_b);
     let launch = dyn_launch_cfg(plan.grid(m, n), plan.block, plan.dyn_smem_bytes);
     unsafe { bld.launch(launch)? };
+    // TIME-BOXED (WGMMA_DEVICE_VALIDATION item 5). The `memcpy_dtov` below would block in the driver
+    // forever if this pipeline deadlocked, and this family has never executed anywhere — so the drain
+    // is a polled deadline, not a blocking synchronize. See `sync_within` for why it exits rather
+    // than returning an error.
+    sync_within(&g.stream, cfg.name)?;
     Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// **`WGMMA_DEVICE_VALIDATION` item 4b: one TMA tile in, the same bytes out.**
+///
+/// Encodes `args` over `src` with the driver's own `cuTensorMapEncodeTiled`, launches
+/// [`crate::ptx_wgmma::tma_stage_probe_module`] — one `cp.async.bulk.tensor.2d` against one mbarrier,
+/// nothing else — and returns the `transaction_bytes / 2` sixteen-bit elements the copy left in
+/// shared memory, in shared-memory order.
+///
+/// The caller compares that against a host copy of the same tile. Nothing in this function builds
+/// that expectation, so the comparison is not circular (`bb52f08`): the tensor map comes from the
+/// driver, the tile comes from the hardware, and the reference is the caller's own indexing of `src`.
+///
+/// # Preconditions this asserts at the launch seam (crate hard rule 2)
+///
+/// * The device is Hopper — the probe module is `sm_90a`, so [`crate::ptx_wgmma::require_sm90a`] is
+///   the first statement, before any encode, upload or module load.
+/// * `args` is a rank-2 descriptor over 16-bit elements, and passes its own `validate()`.
+/// * `src.len()` is exactly the tensor the descriptor describes (`rows * row_stride_elems`), because
+///   `TensorMap::encode`'s safety contract is that the allocation covers the geometry and a
+///   `CUdeviceptr` carries no length.
+/// * `plan.dyn_smem_bytes <= g.smem_budget()`, and the pushed argument count equals the `.param`
+///   count counted out of the very text about to be loaded.
+pub fn tma_stage_probe(
+    g: &mut Gpu,
+    args: &crate::tma_host::TensorMapArgs,
+    src: &[u16],
+    coord0: u32,
+    coord1: u32,
+) -> Result<Vec<u16>, GpuError> {
+    use crate::tma_host::TensorMap;
+    use cudarc::driver::DevicePtr;
+    let lic = crate::ptx_wgmma::require_sm90a(g, crate::ptx_wgmma::TMA_PROBE_ENTRY)?;
+    assert_eq!(args.rank, 2, "the TMA probe covers rank-2 descriptors");
+    assert_eq!(
+        args.data_type.size(),
+        2,
+        "the TMA probe reads back 16-bit elements"
+    );
+    args.validate().map_err(GpuError::Unsupported)?;
+    let row_stride_elems = args.global_strides[0] as usize / 2;
+    assert_eq!(
+        src.len(),
+        args.global_dim[1] as usize * row_stride_elems,
+        "the host allocation must be exactly the tensor the descriptor describes — \
+         cuTensorMapEncodeTiled takes a bare pointer and will happily read past a short one"
+    );
+    let plan = crate::ptx_wgmma::tma_probe_plan(args.transaction_bytes())
+        .map_err(GpuError::Unsupported)?;
+    assert!(
+        plan.dyn_smem_bytes <= g.smem_budget(),
+        "{}: the probe needs {} B of dynamic shared memory, but {} grants {} B per block",
+        plan.entry,
+        plan.dyn_smem_bytes,
+        g.target.name,
+        g.smem_budget()
+    );
+    let elems = plan.tx_bytes / 2;
+
+    let src_d = g.stream.memcpy_stod(src)?;
+    let mut out_d = g.stream.memcpy_stod(&vec![0u16; elems])?;
+    let map = {
+        let (p, _guard) = src_d.device_ptr(&g.stream);
+        // SAFETY: `src_d` is a live `CudaSlice` of exactly the element count the geometry implies
+        // (asserted above), and it outlives the launch below — it is dropped at the end of this
+        // function, after `memcpy_dtov` has synchronized the stream.
+        unsafe { TensorMap::encode(args, p) }.map_err(GpuError::Unsupported)?
+    };
+    let ptx = crate::ptx_wgmma::tma_stage_probe_module(&lic).map_err(GpuError::Unsupported)?;
+    // Hard rule 2: the argument count comes from the SAME text as the entry name.
+    assert_eq!(
+        entry_param_count(&ptx, plan.entry),
+        5,
+        "{}: (txBytes, coord0, coord1, out, tensorMap) — pushing short makes the driver read \
+         adjacent host stack as a pointer",
+        plan.entry
+    );
+    let f = g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)?;
+    let tx = plan.tx_bytes as u32;
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&tx)
+        .arg(&coord0)
+        .arg(&coord1)
+        .arg(&mut out_d)
+        .arg(&map);
+    let launch = dyn_launch_cfg((1, 1, 1), plan.block, plan.dyn_smem_bytes);
+    unsafe { bld.launch(launch)? };
+    // Time-boxed for the same reason the mainloop is: a transaction count that disagrees with what
+    // the copy moves does not fail, it waits. This kernel is the cheapest place to find that out.
+    sync_within(&g.stream, plan.entry)?;
+    Ok(g.stream.memcpy_dtov(&out_d)?)
 }
 
 #[cfg(test)]
@@ -7522,7 +7722,12 @@ mod tests {
         // them, since every one issues the `e4m3` mma that genuinely earns the `.version 8.4` floor.
         // 94 -> 97 with the three `WGMMA_VARIANTS` rows, which are licensed at `.version 8.0` by
         // `wgmma` + `cp.async.bulk` (both "Introduced in PTX ISA version 8.0"); `floored` is unchanged.
-        const EXPECTED_MODULES: usize = 97;
+        // 97 -> 99 with the two Hopper BRING-UP modules: the `MnLeading` A/B arm (`WGMMA_W1_MN`) and
+        // the single-stage TMA probe. Both are text this backend hands to `cuModuleLoadData` on rented
+        // silicon, so the ASCII rule and the `.version` law must reach them exactly as they reach a
+        // shipped row. The probe is licensed by `cp.async.bulk` alone — it deliberately contains no
+        // `wgmma`, which is the whole point of it.
+        const EXPECTED_MODULES: usize = 99;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -17148,25 +17353,36 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// That ordering is otherwise unobservable, since a decline and an early panic both "fail".
     ///
     /// On a Hopper part the decline arm is structurally unreachable, so the test prints the family's own
-    /// bring-up list instead of pretending to have proven something.
+    /// bring-up list — and names the gate that now discharges it — instead of pretending to have proven
+    /// something. That gate is [`wgmma_hopper_bringup`]; this one has never been a substitute for it.
     #[test]
     fn wgmma_declines_on_every_part_that_is_not_hopper() {
-        use crate::ptx_wgmma::{WGMMA_DEVICE_VALIDATION, WGMMA_VARIANTS};
+        use crate::ptx_wgmma::{
+            WGMMA_BRINGUP_INVOCATION, WGMMA_BRINGUP_VARIANTS, WGMMA_DEVICE_VALIDATION,
+            WGMMA_VARIANTS,
+        };
         with_gpu("wgmma_decline", |g| {
             let cc = g.target().cc();
             let dev = g.device_name();
             if cc.0 == 9 {
                 eprintln!(
                     "[skip:capability] {dev} is cc {}.{} — the sm_90a DECLINE cannot be exercised on a \
-                     Hopper part, and this gate is not a substitute for bring-up. Work the list:",
-                    cc.0, cc.1
+                     Hopper part. The gate that DOES run here is `wgmma_hopper_bringup`:\n    {}\n\
+                     The list it works, for reference:",
+                    cc.0, cc.1, WGMMA_BRINGUP_INVOCATION
                 );
                 for item in WGMMA_DEVICE_VALIDATION {
                     eprintln!("  {item}");
                 }
                 return;
             }
-            for v in WGMMA_VARIANTS {
+            // The bring-up rows are launchable code too, so they decline on the same terms — an
+            // sm_90a module that only bring-up loads must still never reach a non-Hopper driver.
+            let all: Vec<&crate::ptx_wgmma::WgmmaCfg> = WGMMA_VARIANTS
+                .iter()
+                .chain(WGMMA_BRINGUP_VARIANTS)
+                .collect();
+            for v in &all {
                 let err = gemm_nt_wgmma(g, v, &[], &[], 128, 64, 256)
                     .expect_err("a non-Hopper part must never produce an sm_90a launch");
                 let msg = err
@@ -17180,13 +17396,757 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     );
                 }
             }
+            // ...and so does the TMA probe, whose module is `sm_90a` for the same reason. Its
+            // operands are deliberately EMPTY at a non-empty geometry, so the test panics rather than
+            // passing if the capability gate is ever moved after the precondition asserts.
+            {
+                let args = crate::tma_host::TensorMapArgs::tiled_2d_row_major(
+                    crate::tma_host::TmaDataType::F16,
+                    128,
+                    64,
+                    64,
+                    128,
+                    64,
+                    crate::tma_host::TmaSwizzle::None,
+                );
+                let err = tma_stage_probe(g, &args, &[], 0, 0)
+                    .expect_err("a non-Hopper part must never launch the sm_90a TMA probe");
+                let msg = err
+                    .unsupported()
+                    .expect("an sm_90a refusal is a CAPABILITY decline, not a driver error");
+                assert!(msg.contains(crate::ptx_wgmma::TMA_PROBE_ENTRY), "{msg}");
+            }
             eprintln!(
-                "[gate] all {} wgmma rows decline at require_sm90a on {dev} (cc {}.{}), before any \
-                 operand conversion, PTX text, tensor map or module load \u{2713}",
-                WGMMA_VARIANTS.len(),
+                "[gate] all {} wgmma rows + the TMA probe decline at require_sm90a on {dev} \
+                 (cc {}.{}), before any operand conversion, PTX text, tensor map or module load \u{2713}",
+                all.len(),
                 cc.0,
                 cc.1
             );
+        });
+    }
+
+    /// **Every Hopper-family launcher bounds its drain.** A textual law, because the failure it
+    /// guards is invisible in a diff and catastrophic in a rented hour.
+    ///
+    /// `wgmma` and TMA are the first two mechanisms in this backend whose *misconfiguration* is a
+    /// hang rather than an error: an `expect_tx` byte count that disagrees with what the copies move
+    /// leaves the transaction barrier permanently short, and every consumer warpgroup waits forever.
+    /// A launcher that ends in a blocking `memcpy_dtov` or `stream.synchronize()` then blocks the
+    /// host with it, produces no output, and bills until the container is killed. So both launchers
+    /// must drain through [`sync_within`], and this scan says so out of the source rather than
+    /// trusting that a future edit remembers.
+    ///
+    /// It is deliberately a whitelist of two rather than "every launcher in the crate": the Ampere
+    /// and Ada families have executed thousands of times and their blocking drains are load-bearing
+    /// in benches that measure them. Widen it when a third hang-capable family lands.
+    #[test]
+    fn every_sm90a_launcher_bounds_its_drain() {
+        // A compile-time item, the idiom `ptx_wgmma` already uses: a sub-second default would turn
+        // a slow first JIT into a false hang, and there is no reason to learn that at run time.
+        const _: () = assert!(
+            DEFAULT_LAUNCH_TIMEOUT_MS >= 1_000,
+            "a sub-second launch deadline would report a slow first JIT as a hang"
+        );
+        const MUST_TIME_BOX: &[&str] = &["gemm_nt_wgmma", "tma_stage_probe"];
+        let code = scannable_source("gpu.rs", include_str!("gpu.rs"));
+        let mut seen: Vec<&str> = Vec::new();
+        for (name, body) in scanned_fns(&code) {
+            let Some(which) = MUST_TIME_BOX.iter().find(|w| **w == name) else {
+                continue;
+            };
+            assert!(
+                body.contains("sync_within("),
+                "{name} launches an sm_90a kernel but does not drain through `sync_within` — a \
+                 deadlocked pipeline would block the host in the driver with no log at all"
+            );
+            assert!(
+                !body.contains(".synchronize()"),
+                "{name} must not fall back to a blocking synchronize: that is the call the deadline \
+                 exists to replace"
+            );
+            seen.push(which);
+        }
+        seen.sort_unstable();
+        let mut want = MUST_TIME_BOX.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            seen, want,
+            "a time-boxed launcher was renamed or removed; the law must follow it"
+        );
+        // ...and the watchdog's own diagnosis must reach the terminal. `eprintln!` goes into
+        // libtest's per-test capture buffer, which libtest prints WHEN THE TEST FINISHES — and a
+        // test the watchdog `process::exit`s never finishes. A plain `cargo test` would then die in
+        // silence at exactly the moment the message matters most, so the write goes to the `Stderr`
+        // handle, which the capture (a `std` macro mechanism, not an fd redirection) does not touch.
+        let (_, watchdog) = scanned_fns(&code)
+            .into_iter()
+            .find(|(n, _)| n == "sync_within")
+            .expect("sync_within must exist for the launchers to drain through");
+        assert!(
+            watchdog.contains("std::process::exit("),
+            "the watchdog must end the process: the context is wedged and an Err return would hang \
+             in teardown instead"
+        );
+        assert!(
+            watchdog.contains("Write::write_all(&mut err"),
+            "the hang diagnosis must be written to the stderr HANDLE"
+        );
+        assert!(
+            !watchdog.contains("eprintln!"),
+            "the hang diagnosis must not use `eprintln!` — libtest buffers it until a test that will \
+             never finish finishes, so the watchdog would kill the process with no output at all"
+        );
+        eprintln!(
+            "[gate] {} sm_90a launchers drain through sync_within (default deadline {} ms) \u{2713}",
+            want.len(),
+            DEFAULT_LAUNCH_TIMEOUT_MS
+        );
+    }
+
+    /// **[`with_cap`] for Hopper — a fourth skip shape, because `sm_90a` is a LOCK, not a floor.**
+    ///
+    /// [`with_cap`] asks `cc >= min`, which is right for every other family and wrong for this one: an
+    /// `sm_90a` module fails to load on `sm_100` exactly as it fails on `sm_89`, so the decision has
+    /// to be the production gate's (`require_sm90a`, `cc.0 == 9`) and not a comparison. The escalation
+    /// rule is [`with_cap`]'s, unchanged: skipping on a part that is not Hopper is the CORRECT
+    /// outcome and must never fail, but a skip on a device that IS Hopper is a bug in the gate and
+    /// escalates under `WUKONG_GPU_REQUIRED=1`.
+    fn with_hopper(name: &str, body: impl FnOnce(&mut Gpu, crate::ptx_wgmma::Sm90aLicense)) {
+        with_gpu(name, |g| {
+            let cc = g.target().cc();
+            match crate::ptx_wgmma::require_sm90a(g, name) {
+                Ok(lic) => body(g, lic),
+                Err(e) => {
+                    let why = e.to_string();
+                    if cc.0 == 9 {
+                        crate::diff::skip_or_fail(
+                            name,
+                            &format!(
+                                "the sm_90a gate declined ({why}) although the device IS Hopper \
+                                 (cc {}.{}) — the GATE is wrong, not the hardware",
+                                cc.0, cc.1
+                            ),
+                        );
+                    }
+                    eprintln!("[skip:capability] {why}");
+                    eprintln!(
+                        "[skip:capability] {name}: correct on a part that is not Hopper. The round \
+                         this gate exists for is:\n    {}",
+                        crate::ptx_wgmma::WGMMA_BRINGUP_INVOCATION
+                    );
+                }
+            }
+        });
+    }
+
+    /// The tile a TMA copy of `box_rows x box_cols` at element coords `(row0, col0)` must leave in
+    /// shared memory, for the **unswizzled row-major-within-box** layout — derived by indexing the
+    /// source matrix and applying TMA's documented zero fill, and by nothing else.
+    ///
+    /// Deliberately not built from `TensorMapArgs`, `SmemDesc` or any generator: `bb52f08` is this
+    /// crate's own record of an oracle that agreed with the kernel because it *was* the kernel.
+    fn host_tile_rowmajor(
+        src: &[u16],
+        rows: usize,
+        cols: usize,
+        box_rows: usize,
+        box_cols: usize,
+        row0: usize,
+        col0: usize,
+    ) -> Vec<u16> {
+        let mut t = vec![0u16; box_rows * box_cols];
+        for r in 0..box_rows {
+            for c in 0..box_cols {
+                let (gr, gc) = (row0 + r, col0 + c);
+                if gr < rows && gc < cols {
+                    t[r * box_cols + c] = src[gr * cols + gc];
+                }
+            }
+        }
+        t
+    }
+
+    /// The **other** candidate shared-memory layout: each 8-row x 16-byte core matrix stored as 128
+    /// contiguous bytes, core matrices in row-major core-grid order.
+    ///
+    /// This is not a layout the backend believes in — it is the leading *alternative* hypothesis, and
+    /// having it in hand turns "item 4 failed" into "item 4 failed AND here is what the hardware
+    /// actually wrote", inside the same metered visit. It is also the assumption `SmemDesc::k_major`'s
+    /// `8 * row_bytes` distance would be wrong under, so if the tile comes back in THIS order the
+    /// `DescOrder` question below is moot and the descriptor arithmetic is what needs re-cutting.
+    fn host_tile_core_contiguous(
+        row_major_tile: &[u16],
+        box_rows: usize,
+        box_cols: usize,
+    ) -> Vec<u16> {
+        assert_eq!(row_major_tile.len(), box_rows * box_cols);
+        let gj = box_cols / 8;
+        let mut t = vec![0u16; box_rows * box_cols];
+        for r in 0..box_rows {
+            for c in 0..box_cols {
+                let idx = ((r / 8) * gj + c / 8) * 64 + (r % 8) * 8 + (c % 8);
+                t[idx] = row_major_tile[r * box_cols + c];
+            }
+        }
+        t
+    }
+
+    /// **THE HOPPER BRING-UP GATE — what the first rented H100 hour runs.**
+    ///
+    /// `ptx_wgmma::WGMMA_DEVICE_VALIDATION` is the author's own list of claims this repo cannot
+    /// reach; this is that list, executed, in an order chosen so a failure names *which* claim broke.
+    /// Item 3 (registers and spills) is already answered by the CPU ptxas census and is cited, not
+    /// re-derived. Item 8 (performance vs cuBLAS) is deliberately not here: correctness first.
+    ///
+    /// # Why the stages are in this order
+    ///
+    /// Each rung adds exactly one mechanism, so the first rung that fails is the mechanism at fault.
+    ///
+    /// * **A (item 2) — the modules load.** Pure `cuModuleLoadData`, no launch. If `.target sm_90a`,
+    ///   `.version 8.0` or any instruction spelling in the family is wrong, it fails here with a JIT
+    ///   message and nothing downstream has run.
+    /// * **B (item 4) — the tensor maps, then one staged tile.** `cuTensorMapEncodeTiled` for the A
+    ///   and B geometries, then the single-stage probe compared against a host copy. No `wgmma`, no
+    ///   warp specialisation, no pipeline: a mismatch accuses the descriptor and nothing else. It is
+    ///   also the cheapest kernel in the family to discover a hang on.
+    /// * **C (item 5) — the pipeline completes.** The first full mainloop launch, time-boxed, at the
+    ///   shape where the ring is exactly filled. A *liveness* claim only — it does not check numbers,
+    ///   because at this point nobody knows which descriptor reading is right.
+    /// * **D (item 1) — DescOrder, both readings, one visit.** The two arms are separate entries under
+    ///   separate module keys, launched in the same round against an f64 reference. **Exactly one must
+    ///   match**, bit-exactly. This is the rung the whole family waits on, and it is deliberately
+    ///   *after* liveness so a hang cannot be mistaken for a wrong reading.
+    /// * **E (item 6) — the K sweep.** Fewer K tiles than stages (the producer exits while consumers
+    ///   still wait — the producer-tail case), exactly as many, and several wraps; each against the
+    ///   reference, and each shape run twice to catch a race the first run got away with.
+    /// * **F (item 7) — ragged M, N and K**, so TMA's zero fill and the predicated epilogue are both
+    ///   exercised at once.
+    /// * **G — the sibling shipped rows** (bf16, and the 128x128 six-stage tile), but only if they
+    ///   carry the reading the hardware just confirmed. If they do not, that is reported as work to
+    ///   do rather than run and believed.
+    ///
+    /// # Why the verdicts are `==` and not a tolerance
+    ///
+    /// CPU/GPU agreement in this crate is normally `c*sqrt(K)*eps`, because the GPU reassociates. Here
+    /// it does not have to be: `ptx_wgmma::bringup_operands` are small integers, exactly representable
+    /// in the input type, whose dot product stays under 2^24 — where f32 holds every integer exactly.
+    /// Reassociation therefore cannot move a bit, and a mismatch is a fact rather than an argument
+    /// about whether 3e-3 is noise. The reference is `ref_nt`, which reads the operand arrays and
+    /// touches no descriptor, encoder or generator on the launch path.
+    ///
+    /// Run it as `ptx_wgmma::WGMMA_BRINGUP_INVOCATION`.
+    #[test]
+    fn wgmma_hopper_bringup() {
+        use crate::ptx_wgmma::{
+            bringup_operands, tma_stage_probe_module, wgmma_module, TmaProbePlan, WgmmaCfg,
+            TMA_PROBE_ENTRY, TMA_PROBE_KEY, WGMMA_BRINGUP_VARIANTS, WGMMA_DESC_ORDER_AB,
+            WGMMA_VARIANTS, WGMMA_W1_BF16, WGMMA_W3C,
+        };
+        with_hopper("wgmma_hopper_bringup", |g, lic| {
+            let dev = g.device_name();
+            let t = g.target().clone();
+            eprintln!("\n================ wgmma / TMA Hopper bring-up ================");
+            eprintln!(
+                "[wgmma-bringup] device: {dev} (cc {}.{}, {} SMs, opt-in SMEM {} B, driver {})",
+                t.cc_major, t.cc_minor, t.sm_count, t.smem_per_block_optin, t.driver_version
+            );
+            eprintln!(
+                "[wgmma-bringup] item 3 (registers / spills) is ALREADY ANSWERED, on a CPU, by the\n\
+                 \x20               2026-08-10 ptxas census at sm_90a, logged in\n\
+                 \x20               bench/gpu/h100/2026-08-10-ptxas-census.log: all three wgmma rows\n\
+                 \x20               report 168 regs whole-CTA, 0 spill stores, 0 spill loads, 0 stack\n\
+                 \x20               (setmaxnreg then redistributes: 32p/232c for the two 128x256 s4\n\
+                 \x20               rows, 32p/168c for the 128x128 s6 row). Not re-derived here.\n\
+                 \x20               item 8 (vs cuBLAS) is NOT in this gate: correctness first."
+            );
+
+            // ---- A. item 2: every module loads ---------------------------------------------------
+            eprintln!(
+                "\n[wgmma-bringup] A. item 2 -- cuModuleLoadData on the generated sm_90a text"
+            );
+            let rows: Vec<&WgmmaCfg> = WGMMA_VARIANTS
+                .iter()
+                .chain(WGMMA_BRINGUP_VARIANTS)
+                .collect();
+            for c in &rows {
+                let plan = c.launch_plan();
+                let ptx = wgmma_module(c, &lic)
+                    .unwrap_or_else(|e| panic!("item 2 FAIL: {} would not generate: {e}", c.name));
+                g.function_dyn(plan.module_key, &ptx, plan.entry, plan.dyn_smem_bytes)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "item 2 FAIL: {} did not load: {e:?}\n  The module is {} B of sm_90a \
+                             text at .version 8.0 asking for {} B of dynamic shared memory (the \
+                             device grants {}). A JIT error naming an INSTRUCTION means a spelling \
+                             in ptx_wgmma::entry is wrong; one naming the TARGET means the header \
+                             is; CUDA_ERROR_INVALID_VALUE here usually means the SMEM opt-in.",
+                            c.name,
+                            ptx.len(),
+                            plan.dyn_smem_bytes,
+                            g.smem_budget()
+                        )
+                    });
+                eprintln!(
+                    "      {:<34} LOADED   {:>3} thr, {:>6} B dyn smem, {} stages, {}",
+                    c.name,
+                    plan.block.0,
+                    plan.dyn_smem_bytes,
+                    c.stages,
+                    c.desc_order.label()
+                );
+            }
+            // The probe, opted into the widest tile any row will ask it for -- over BOTH operands,
+            // not just B. It happens that `bn >= bm` on every row today so B is always the wider,
+            // and `function_dyn` would raise the opt-in on demand anyway; taking the max of both is
+            // what makes the claim in this comment true of a table nobody has written yet.
+            let widest = rows
+                .iter()
+                .flat_map(|c| [c.tile_a_bytes(), c.tile_b_bytes()])
+                .max()
+                .unwrap();
+            let probe_plan: TmaProbePlan = crate::ptx_wgmma::tma_probe_plan(widest).unwrap();
+            let probe_ptx = tma_stage_probe_module(&lic).expect("the probe must generate");
+            g.function_dyn(
+                TMA_PROBE_KEY,
+                &probe_ptx,
+                TMA_PROBE_ENTRY,
+                probe_plan.dyn_smem_bytes,
+            )
+            .unwrap_or_else(|e| panic!("item 2 FAIL: {TMA_PROBE_ENTRY} did not load: {e:?}"));
+            eprintln!(
+                "      {:<34} LOADED   {:>3} thr, {:>6} B dyn smem (geometry-generic)",
+                TMA_PROBE_ENTRY, probe_plan.block.0, probe_plan.dyn_smem_bytes
+            );
+            eprintln!("   -> item 2 PASS: {} modules loaded", rows.len() + 1);
+
+            // ---- B. item 4: tensor maps, then one staged tile vs a host copy ---------------------
+            eprintln!(
+                "\n[wgmma-bringup] B. item 4 -- cuTensorMapEncodeTiled, then ONE staged tile vs a \
+                 host copy"
+            );
+            let mut tiles = 0usize;
+            for c in WGMMA_VARIANTS {
+                for (what, box_rows, box_cols) in [("A", c.bm, c.bk), ("B", c.bn, c.bk)] {
+                    // A matrix a little larger than one tile in each axis, so the second tile in
+                    // each direction is ragged and TMA's zero fill is exercised on both edges.
+                    // `+8` on the contiguous axis, not `+7`: the row stride in BYTES must be a
+                    // multiple of 16 (`TensorMapArgs::validate`), so an odd number of 16-bit columns
+                    // is not an encodable tensor at all and would fail this stage for a reason that
+                    // has nothing to do with the hardware.
+                    let (mrows, mcols) = (box_rows + 7, box_cols + 8);
+                    // Raw 16-bit codes, unique across the whole matrix: this stage is about which
+                    // BYTES land where, so uniqueness beats representability. TMA is a copy engine —
+                    // the descriptor's data type sets the element size and the OOB fill, not an
+                    // interpretation of the payload.
+                    let src: Vec<u16> = (0..mrows * mcols)
+                        .map(|i| (i as u16).wrapping_add(1))
+                        .collect();
+                    let args = crate::tma_host::TensorMapArgs::tiled_2d_row_major(
+                        c.dtype.tma(),
+                        mrows as u64,
+                        mcols as u64,
+                        mcols as u64,
+                        box_rows as u32,
+                        box_cols as u32,
+                        crate::tma_host::TmaSwizzle::None,
+                    );
+                    args.validate().unwrap_or_else(|e| {
+                        panic!(
+                            "item 4 FAIL: {} {what} geometry is not encodable: {e}",
+                            c.name
+                        )
+                    });
+                    // Four origins: aligned; past the last full row (ragged in M/N); past the last
+                    // full column (ragged in K); and an offset tile that is wholly in range, which
+                    // checks the coordinate arithmetic rather than the fill. `col0` is 8 elements =
+                    // 16 bytes on purpose — the contiguous coordinate must keep the copy 16-byte
+                    // aligned, so 7 would be testing a different thing by accident.
+                    for (row0, col0) in [(0usize, 0usize), (box_rows, 0), (0, box_cols), (3, 8)] {
+                        let got = tma_stage_probe(g, &args, &src, col0 as u32, row0 as u32)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "item 4 FAIL: {} {what} {box_rows}x{box_cols} at ({row0},{col0}): \
+                                     {e}\n  cuTensorMapEncodeTiled or the single-stage copy failed. \
+                                     This kernel has no wgmma in it, so the descriptor, the \
+                                     expect_tx count ({} B) or the mbarrier is at fault — not the \
+                                     mainloop.",
+                                    c.name,
+                                    args.transaction_bytes()
+                                )
+                            });
+                        let want =
+                            host_tile_rowmajor(&src, mrows, mcols, box_rows, box_cols, row0, col0);
+                        assert_eq!(got.len(), want.len());
+                        if got != want {
+                            let bad = got
+                                .iter()
+                                .zip(&want)
+                                .enumerate()
+                                .filter(|(_, (x, y))| x != y)
+                                .take(6)
+                                .map(|(i, (x, y))| format!("[{i}] got {x} want {y}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            // Four hypotheses, cheapest first, so the round ends with a NAMED cause
+                            // rather than a tile to read by eye next visit. Each is one host
+                            // reindex of `want`; none of them costs a launch.
+                            let alt = host_tile_core_contiguous(&want, box_rows, box_cols);
+                            // The coordinate order is the OTHER thing in this path that was read
+                            // from documentation rather than confirmed: `{%c0,%c1}` puts the
+                            // contiguous axis first. A swap is invisible at origin (0,0), which is
+                            // exactly why the three ragged origins are here.
+                            let swapped_coords = host_tile_rowmajor(
+                                &src, mrows, mcols, box_rows, box_cols, col0, row0,
+                            );
+                            let verdict = if got.iter().all(|&v| v == 0) {
+                                "AND THE TILE CAME BACK ENTIRELY ZERO, which is TMA's out-of-bounds \
+                                 fill over the whole box. The copy ran and the barrier completed, so \
+                                 the descriptor's global address or its global_dim is not describing \
+                                 the buffer that was uploaded -- suspect TensorMap::encode's base \
+                                 pointer, not the SMEM layout."
+                            } else if got == alt {
+                                "AND THE TILE IS IN CORE-MATRIX-CONTIGUOUS ORDER. That is the other \
+                                 candidate layout: each 8-row x 16-byte core matrix stored as 128 \
+                                 contiguous bytes. If this is what the hardware writes, then \
+                                 SmemDesc::k_major's `8 * row_bytes` stride-dimension distance is \
+                                 wrong for BOTH DescOrder readings and stage D below cannot settle \
+                                 anything -- re-cut the descriptor distances first."
+                            } else if got == swapped_coords {
+                                "AND IT MATCHES THE TILE AT THE TRANSPOSED ORIGIN. The SMEM layout \
+                                 is right and the COORDINATE ORDER is backwards: dimension 0 of a \
+                                 tensor map is the fastest-varying axis, so the pair must be \
+                                 {contiguous, row}. Swap the two arguments at the tma_stage_probe \
+                                 call and in ptx_wgmma::entry's producer, and rerun -- nothing about \
+                                 the descriptor arithmetic is implicated."
+                            } else {
+                                "and it is NEITHER row-major-within-box, NOR core-matrix-contiguous, \
+                                 NOR the tile at the transposed origin. Dump it and read it before \
+                                 spending another launch."
+                            };
+                            panic!(
+                                "item 4 FAIL: {} {what} tile {box_rows}x{box_cols} at ({row0},{col0}) \
+                                 does not match the host copy ({} of {} elements differ: {bad}) \
+                                 {verdict}",
+                                c.name,
+                                got.iter().zip(&want).filter(|(x, y)| x != y).count(),
+                                want.len()
+                            );
+                        }
+                        tiles += 1;
+                    }
+                    eprintln!(
+                        "      {:<30} {what} box {box_rows}x{box_cols} ({:>6} B): encode OK, 4 tiles \
+                         (incl. 3 ragged) MATCH the host copy",
+                        c.name,
+                        args.transaction_bytes()
+                    );
+                }
+            }
+            eprintln!("   -> item 4 PASS: {tiles} staged tiles byte-identical to the host copy");
+
+            // ---- C. item 5: the pipeline completes, time-boxed ------------------------------------
+            let budget = crate::gpu::launch_timeout();
+            eprintln!(
+                "\n[wgmma-bringup] C. item 5 -- the mainloop completes (deadline {})",
+                match budget {
+                    Some(b) => format!("{:.0} s", b.as_secs_f64()),
+                    None => "DISABLED by WUKONG_GPU_LAUNCH_TIMEOUT_MS=0 — a hang will bill".into(),
+                }
+            );
+            {
+                let w1 = WGMMA_DESC_ORDER_AB[0];
+                let (m, n, k) = (w1.bm, w1.bn, w1.bk * w1.stages); // ring exactly filled
+                let (a, b) = bringup_operands(m, n, k);
+                let t0 = Instant::now();
+                let c = gemm_nt_wgmma(g, w1, &a, &b, m, k, n)
+                    .unwrap_or_else(|e| panic!("item 5 FAIL: {} at {m}x{k}x{n}: {e}", w1.name));
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                assert_eq!(c.len(), m * n);
+                let finite = c.iter().filter(|v| v.is_finite()).count();
+                assert_eq!(
+                    finite,
+                    m * n,
+                    "item 5 FAIL: {} of {} output lanes are not finite — the pipeline returned, but \
+                     with NaN/Inf, which points at uninitialised accumulators rather than a hang",
+                    m * n - finite,
+                    m * n
+                );
+                eprintln!(
+                    "      {} {m}x{k}x{n} ({} K tiles = {} stages): returned in {ms:.2} ms, all \
+                     {} lanes finite",
+                    w1.name,
+                    k / w1.bk,
+                    w1.stages,
+                    m * n
+                );
+            }
+            eprintln!(
+                "   -> item 5 PASS: the producer/consumer pipeline completes and does not deadlock.\n\
+                 \x20     (No correctness claim yet -- which descriptor reading is right is stage D.)"
+            );
+
+            // ---- D. item 1: DescOrder, both readings, ONE visit ----------------------------------
+            eprintln!(
+                "\n[wgmma-bringup] D. item 1 -- DescOrder: BOTH readings, same round, f64 reference"
+            );
+            let (m, n, k) = (64usize, 64usize, 64usize);
+            let (a, b) = bringup_operands(m, n, k);
+            let want = ref_nt(&a, &b, m, k, n);
+            let mut winners: Vec<&WgmmaCfg> = Vec::new();
+            for arm in WGMMA_DESC_ORDER_AB {
+                let limit = arm.dtype.exact_integer_limit();
+                assert!(
+                    a.iter().chain(&b).all(|v| v.abs() <= limit),
+                    "the ramp is not exact in {:?} (limit {limit}) — the verdict would silently \
+                     become a tolerance",
+                    arm.dtype
+                );
+                let t0 = Instant::now();
+                let got = gemm_nt_wgmma(g, arm, &a, &b, m, k, n)
+                    .unwrap_or_else(|e| panic!("item 1 FAIL: {} at {m}x{k}x{n}: {e}", arm.name));
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let exact = got.iter().zip(&want).filter(|(x, y)| x == y).count();
+                let s = crate::diff::err_stats(&got, &want);
+                let matched = exact == want.len();
+                if matched {
+                    winners.push(arm);
+                }
+                eprintln!(
+                    "      {:<22} {:<34} {ms:>6.2} ms  exact {exact:>5}/{:<5}  max_abs {:.3e}   {}",
+                    arm.desc_order.label(),
+                    arm.name,
+                    want.len(),
+                    s.max_abs,
+                    if matched { "MATCH" } else { "no" }
+                );
+            }
+            match winners.len() {
+                1 => {
+                    let w = winners[0];
+                    eprintln!(
+                        "   -> item 1 SETTLED: the hardware confirms {}.",
+                        w.desc_order.label()
+                    );
+                    if w.desc_order == crate::ptx_wgmma::WGMMA_W1.desc_order {
+                        eprintln!(
+                            "      ACTION: none. WGMMA_W1 / WGMMA_W1_BF16 / WGMMA_W3C already ship \
+                             that reading; delete WGMMA_W1_MN and the A/B when convenient."
+                        );
+                    } else {
+                        eprintln!(
+                            "      ACTION: set `desc_order: {}` on WGMMA_W1 (WGMMA_W1_BF16 and \
+                             WGMMA_W3C inherit it), then delete WGMMA_W1_MN. The shipped rows are \
+                             currently WRONG and stage G below will not run them.",
+                            w.desc_order.label()
+                        );
+                    }
+                }
+                0 => panic!(
+                    "item 1 FAIL: NEITHER descriptor reading matches the f64 reference at \
+                     {m}x{k}x{n}.\n  Both arms loaded, launched and returned finite numbers, so the \
+                     fault is not the shape menu, the barrier or the epilogue predication — it is \
+                     what the descriptor's two offset fields MEAN. The leading suspect is \
+                     SmemDesc::k_major's pair of distances themselves (16 and 8*row_bytes), which \
+                     assume the tile is plain row-major in shared memory; stage B above says which \
+                     layout TMA actually wrote. Read that line first, then re-cut k_major.",
+                ),
+                _ => panic!(
+                    "item 1 FAIL: BOTH descriptor readings match at {m}x{k}x{n}, so this probe \
+                     cannot tell them apart and the round has settled nothing.\n  That should be \
+                     impossible: `the_two_desc_orders_address_different_elements` proves the two \
+                     orders address different core matrices and that the ramps make it visible in \
+                     7/8 of the output. If both match here, either the kernel is not reading the \
+                     descriptor's offset fields at all, or the operands are not what that test \
+                     thinks they are."
+                ),
+            }
+            let win: &WgmmaCfg = winners[0];
+
+            // ---- E. item 6: K across the ring depth (producer tail, and wraps) --------------------
+            eprintln!(
+                "\n[wgmma-bringup] E. item 6 -- K swept across the {} -stage ring (producer tail + \
+                 wrap), on the winning reading",
+                win.stages
+            );
+            let (m, n) = (win.bm, win.bn);
+            for tiles_k in [1usize, 2, win.stages, win.stages + 1, 4 * win.stages] {
+                let k = tiles_k * win.bk;
+                let (a, b) = bringup_operands(m, n, k);
+                assert!(
+                    a.iter()
+                        .chain(&b)
+                        .all(|v| v.abs() <= win.dtype.exact_integer_limit()),
+                    "ramp not exact in {:?} at K={k}",
+                    win.dtype
+                );
+                let want = ref_nt(&a, &b, m, k, n);
+                let t0 = Instant::now();
+                let got = gemm_nt_wgmma(g, win, &a, &b, m, k, n)
+                    .unwrap_or_else(|e| panic!("item 6 FAIL: {} at K={k}: {e}", win.name));
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let bad = got.iter().zip(&want).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    bad,
+                    0,
+                    "item 6 FAIL: {} at {m}x{k}x{n} ({tiles_k} K tiles vs {} stages): {bad} of {} \
+                     lanes wrong (max_abs {:.3e}). Fewer K tiles than stages exercises the producer \
+                     TAIL (it exits while consumers still wait); more exercises the ring WRAP and \
+                     the empty-barrier phase parity.",
+                    win.name,
+                    win.stages,
+                    want.len(),
+                    crate::diff::err_stats(&got, &want).max_abs
+                );
+                // Twice, bit-identically: a race the first launch got away with shows up here.
+                let again = gemm_nt_wgmma(g, win, &a, &b, m, k, n).unwrap();
+                assert_eq!(
+                    got, again,
+                    "item 6 FAIL: {} at K={k} is not run-to-run reproducible — a producer/consumer \
+                     race, not a numerics question",
+                    win.name
+                );
+                eprintln!(
+                    "      K={k:<6} ({tiles_k:>2} tiles {} {} stages): {ms:>6.2} ms  EXACT, and \
+                     bit-identical on a second run",
+                    match tiles_k.cmp(&win.stages) {
+                        std::cmp::Ordering::Less => "<",
+                        std::cmp::Ordering::Equal => "==",
+                        std::cmp::Ordering::Greater => ">",
+                    },
+                    win.stages
+                );
+            }
+            eprintln!(
+                "   -> item 6 PASS: producer tail, exact fill and repeated wraps all correct, \
+                 reproducibly"
+            );
+
+            // ---- F. item 7: ragged M, N and K -----------------------------------------------------
+            eprintln!(
+                "\n[wgmma-bringup] F. item 7 -- ragged M, N and K (TMA zero fill + predicated \
+                 epilogue)"
+            );
+            // K is ragged against the 64-element BK but is always a multiple of 8, because the
+            // *global row stride in bytes* must be a multiple of 16 for a tensor map to exist at all
+            // — K is the contiguous axis of both NT operands, so `K % 8 != 0` is not a ragged shape,
+            // it is an unencodable one. That boundary is checked explicitly below rather than tripped
+            // over here.
+            for (m, n, k) in [
+                (1usize, 1usize, 8usize),
+                (17, 33, 24),
+                (65, 300, 104),
+                (win.bm + 1, win.bn + 1, 3 * win.bk - 16),
+                (2 * win.bm - 3, 2 * win.bn - 5, 5 * win.bk + 48),
+            ] {
+                let (a, b) = bringup_operands(m, n, k);
+                assert!(a
+                    .iter()
+                    .chain(&b)
+                    .all(|v| v.abs() <= win.dtype.exact_integer_limit()));
+                let want = ref_nt(&a, &b, m, k, n);
+                let t0 = Instant::now();
+                let got = gemm_nt_wgmma(g, win, &a, &b, m, k, n)
+                    .unwrap_or_else(|e| panic!("item 7 FAIL: {} at {m}x{k}x{n}: {e}", win.name));
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let bad = got.iter().zip(&want).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    bad,
+                    0,
+                    "item 7 FAIL: {} at {m}x{k}x{n}: {bad} of {} lanes wrong (max_abs {:.3e}). M%BM \
+                     = {}, N%BN = {}, K%BK = {} — a whole-edge failure is TMA's zero fill, a \
+                     one-row/one-column failure is the epilogue's `row < M && col < N` predicate.",
+                    win.name,
+                    want.len(),
+                    crate::diff::err_stats(&got, &want).max_abs,
+                    m % win.bm,
+                    n % win.bn,
+                    k % win.bk
+                );
+                eprintln!(
+                    "      {m:>5} x {k:<5} x {n:<5} (M%BM={:>3} N%BN={:>3} K%BK={:>3}): {ms:>6.2} ms  EXACT",
+                    m % win.bm,
+                    n % win.bn,
+                    k % win.bk
+                );
+            }
+            // The other edge of item 7: a K the descriptor cannot describe must DECLINE, not launch.
+            // `K % 8 != 0` makes the global row stride an odd multiple of 2 bytes, which
+            // `cuTensorMapEncodeTiled` rejects — and a family whose answer to an unrepresentable
+            // shape is a clean capability decline is the crate's `UNSUPPORTED:`-means-SKIP rule.
+            {
+                let (m, n, k) = (64usize, 64usize, 100usize);
+                let (a, b) = bringup_operands(m, n, k);
+                let err = gemm_nt_wgmma(g, win, &a, &b, m, k, n).expect_err(
+                    "K=100 makes the row stride 200 B, which is not a multiple of 16 — a tensor map \
+                     for it cannot exist, so this must decline rather than launch",
+                );
+                let msg = err.unsupported().expect(
+                    "an unencodable descriptor is a capability decline, not a driver error",
+                );
+                assert!(
+                    msg.contains("multiple of 16"),
+                    "the decline must name the rule it broke: {msg}"
+                );
+                eprintln!("      K=100 (row stride 200 B): DECLINED cleanly -- \"{msg}\"");
+            }
+            eprintln!(
+                "   -> item 7 PASS: every ragged edge covered by zero fill + predication, and an \
+                 unencodable K declines instead of launching"
+            );
+
+            // ---- G. the sibling shipped rows ------------------------------------------------------
+            eprintln!("\n[wgmma-bringup] G. the other shipped rows, on the confirmed reading");
+            let mut deferred: Vec<&str> = Vec::new();
+            for (c, k) in [(&WGMMA_W1_BF16, 256usize), (&WGMMA_W3C, 6 * 64)] {
+                if c.desc_order != win.desc_order {
+                    deferred.push(c.name);
+                    continue;
+                }
+                let (m, n) = (c.bm, c.bn);
+                let (a, b) = bringup_operands(m, n, k);
+                let limit = c.dtype.exact_integer_limit();
+                assert!(
+                    a.iter().chain(&b).all(|v| v.abs() <= limit),
+                    "{}: the ramp at K={k} is not exact in {:?} (limit {limit}) — bf16 keeps only 8 \
+                     significand bits, so a ramp calibrated for f16 rounds",
+                    c.name,
+                    c.dtype
+                );
+                let want = ref_nt(&a, &b, m, k, n);
+                let t0 = Instant::now();
+                let got = gemm_nt_wgmma(g, c, &a, &b, m, k, n)
+                    .unwrap_or_else(|e| panic!("row {} FAIL at {m}x{k}x{n}: {e}", c.name));
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let bad = got.iter().zip(&want).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    bad,
+                    0,
+                    "row {} FAIL at {m}x{k}x{n}: {bad} of {} lanes wrong (max_abs {:.3e})",
+                    c.name,
+                    want.len(),
+                    crate::diff::err_stats(&got, &want).max_abs
+                );
+                eprintln!(
+                    "      {:<34} {m}x{k}x{n} ({:?}, {} stages): {ms:>6.2} ms  EXACT",
+                    c.name, c.dtype, c.stages
+                );
+            }
+            if !deferred.is_empty() {
+                eprintln!(
+                    "      DEFERRED {deferred:?}: they ship {}, which the hardware just rejected. \
+                     Re-cut their desc_order and rerun -- running them now would only re-prove the \
+                     wrong reading is wrong.",
+                    crate::ptx_wgmma::WGMMA_W1.desc_order.label()
+                );
+            }
+
+            eprintln!(
+                "\n[gate] wgmma Hopper bring-up on {dev}: items 2, 4, 5, 1, 6, 7 PASS in that order; \
+                 DescOrder = {} \u{2713}",
+                win.desc_order.label()
+            );
+            eprintln!("=============================================================\n");
         });
     }
 
@@ -17803,6 +18763,50 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     }],
                 });
             }
+            // 3b. The two BRING-UP modules. They are not shipped rows, so they carry no register
+            //     budget worth reporting -- but they are text `wgmma_hopper_bringup` hands to
+            //     `cuModuleLoadData` on rented silicon, and stage A of that round would otherwise be
+            //     the first assembler either has ever seen. Assembling them here costs a CPU
+            //     container; discovering an instruction spelling or an operand form ptxas rejects
+            //     during the H100 hour costs the hour. The probe is the one that needs it: it is the
+            //     only module in the family with no `wgmma` in it at all, so nothing about it was
+            //     covered by the 2026-08-10 census of the three shipped rows.
+            for c in crate::ptx_wgmma::WGMMA_BRINGUP_VARIANTS {
+                let ptx = crate::ptx_wgmma::wgmma_module(c, &license).unwrap_or_else(|e| {
+                    panic!("bring-up wgmma variant {} must generate: {e}", c.name)
+                });
+                modules.push(Module {
+                    label: format!("ptx_wgmma::bringup/{}", c.name),
+                    ptx,
+                    rows: vec![Row {
+                        family: "wgmma-bringup",
+                        entry: c.name.to_string(),
+                        threads: c.threads(),
+                        smem_gen: c.smem_bytes(),
+                        derived: Some(format!("{}p/{}c", c.producer_regs, c.consumer_regs)),
+                    }],
+                });
+            }
+            let probe = crate::ptx_wgmma::tma_probe_plan(
+                crate::ptx_wgmma::WGMMA_VARIANTS
+                    .iter()
+                    .flat_map(|c| [c.tile_a_bytes(), c.tile_b_bytes()])
+                    .max()
+                    .expect("the shipped table is not empty"),
+            )
+            .expect("a shipped tile is a legal TMA transaction");
+            modules.push(Module {
+                label: format!("ptx_wgmma::bringup/{}", crate::ptx_wgmma::TMA_PROBE_ENTRY),
+                ptx: crate::ptx_wgmma::tma_stage_probe_module(&license)
+                    .expect("the TMA stage probe must generate"),
+                rows: vec![Row {
+                    family: "wgmma-bringup",
+                    entry: crate::ptx_wgmma::TMA_PROBE_ENTRY.to_string(),
+                    threads: crate::ptx_wgmma::TMA_PROBE_THREADS as usize,
+                    smem_gen: probe.dyn_smem_bytes,
+                    derived: None,
+                }],
+            });
         }
 
         // Device-free half of the gate, and the half that actually runs on this box. Two properties,
@@ -18044,7 +19048,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             crate::ptx_wmma::PIPE_DEEP_VARIANTS.len()
                 + crate::ptx_wmma::PIPE_WIDE_VARIANTS.len()
                 + crate::ptx_flash::FLASH_STAGE_VARIANTS.len()
-                + crate::ptx_wgmma::WGMMA_VARIANTS.len(),
+                + crate::ptx_wgmma::WGMMA_VARIANTS.len()
+                // + the MnLeading A/B arm, + the TMA stage probe
+                + crate::ptx_wgmma::WGMMA_BRINGUP_VARIANTS.len()
+                + 1,
             "every row of every table must appear in the report, or the gate is measuring a subset \
              and calling it the lattice"
         );
