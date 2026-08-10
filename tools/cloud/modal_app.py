@@ -50,6 +50,7 @@ Usage (see tools/cloud/README.md for the full walkthrough):
     WK_GPU=L4    modal run tools/cloud/modal_app.py::device_info
                  modal run tools/cloud/modal_app.py::build          # no GPU attached
                  modal run tools/cloud/modal_app.py::build_peers    # no GPU attached
+                 modal run tools/cloud/modal_app.py::ptxas          # no GPU attached
     WK_GPU=L4    modal run tools/cloud/modal_app.py::peers
     WK_GPU=L4    modal run tools/cloud/modal_app.py::test
     WK_GPU=H100  modal run tools/cloud/modal_app.py::framework --op gemm     # torch.compile bar
@@ -88,6 +89,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -196,9 +198,12 @@ every GPU container needs it, and an image layer is cached per worker while a Vo
 
 VLLM_VENV = f"{PERSIST}/vllm-venv"
 VLLM_SRC = f"{PERSIST}/vllm-src"
-"""On the VOLUME, not in the image: ~9 GB that exactly one entry point uses. Created with
-`venv --copies` so nothing depends on a symlink surviving the Volume, and from the *same image's*
-interpreter, so the recorded `home =` in `pyvenv.cfg` resolves identically in every container."""
+"""On the VOLUME, not in the image: ~9 GB that exactly one entry point uses. Built from the *same
+image's* interpreter, so the recorded `home =` in `pyvenv.cfg` resolves identically in every
+container -- which is also why `--copies` is no longer the default spelling: it removed a symlink
+without removing that image dependency, and on a standalone CPython it removed the interpreter's own
+`$ORIGIN/../lib` libpython too (exit 127, measured 2026-08-09). See `_stage_vllm_venv`, which tries
+each spelling and *verifies* it before accepting it."""
 
 PEER_MANIFEST = f"{PERSIST}/peers.json"
 """What is actually staged, and at which version — written by `::build_peers`, printed by
@@ -898,6 +903,536 @@ def _install_staged_wheels(env: dict) -> list:
 
 
 # --------------------------------------------------------------------------------------------
+# The vLLM venv (the Marlin / Machete int4 bar) -- staged in a VERIFIED fallback chain
+# --------------------------------------------------------------------------------------------
+#
+# THE DEFECT, measured live on 2026-08-09. `::build_peers` staged the CUTLASS sm90a profiler and
+# then died here:
+#
+#     + /usr/local/bin/python3.11 -m venv --copies /persist/vllm-venv
+#     Error: Command '['/persist/vllm-venv/bin/python3.11', '-m', 'ensurepip', '--upgrade',
+#     '--default-pip']' returned non-zero exit status 127
+#
+# THE DIAGNOSIS. That is a `CalledProcessError`, not an `OSError`: `venv._call_new_python` passes
+# `executable=os.path.realpath(context.env_exec_cmd)` to `subprocess.check_output`, so a
+# non-existent or non-executable file would have raised `FileNotFoundError`/`PermissionError`
+# instead. The copied interpreter therefore DID start and exited 127 -- and 127 is what the dynamic
+# loader exits with when it cannot resolve a NEEDED shared object ("error while loading shared
+# libraries: ... cannot open shared object file").
+#
+# Which library? `/usr/local/bin/python3.11` is Modal's `add_python="3.11"`, i.e. a
+# python-build-standalone `install_only` distribution. Those are built `--enable-shared`:
+# `bin/python3.11` is a real ELF that NEEDs `libpython3.11.so.1.0` and finds it through an RPATH of
+# `$ORIGIN/../lib`. `$ORIGIN` is derived from the realpath of the running image, so:
+#
+#   * a SYMLINKED venv -- `venv/bin/python3.11 -> /usr/local/bin/python3.11` -- resolves `$ORIGIN`
+#     to `/usr/local/bin`, `$ORIGIN/../lib` to `/usr/local/lib`, and loads;
+#   * a COPIED venv resolves `$ORIGIN` to `/persist/vllm-venv/bin`, looks in
+#     `/persist/vllm-venv/lib`, finds no libpython, and the loader exits 127.
+#
+# `--copies` is therefore not a neutral hardening choice on this image: it is the direct cause.
+#
+# WHY THE `--copies` RATIONALE DOES NOT SURVIVE CONTACT. Its comment says "so nothing depends on a
+# symlink surviving the Volume". But a copied venv is not image-independent either: `pyvenv.cfg`
+# still records `home = /usr/local/bin`, and that is where the interpreter finds its stdlib -- which
+# is exactly why the same comment block already requires the venv to be built "from the *same
+# image's* interpreter". So `--copies` removes a symlink while leaving the image dependency it was
+# meant to stand in for, and buys that with a hard failure. The symlink spelling depends on strictly
+# less: one absolute path into the image that a copied venv depends on anyway.
+#
+# WHY THIS IS A CHAIN AND NOT A ONE-LINE REVERT. The above is a diagnosis, not a measurement -- it
+# cannot be tested from Windows, and the orchestrator pays for each attempt. So every spelling is
+# tried in order and each one is VERIFIED by actually executing the resulting interpreter before it
+# is accepted, which is the step whose absence let the original failure surface three layers away
+# from its cause:
+#
+#   1. `venv` (symlinks)            -- correct for a shared-libpython standalone build.
+#   2. `venv --copies` + the libpython copied into `venv/lib` and `venv/bin` -- the `--copies`
+#      spelling with its actual defect repaired, for the case where a Volume cannot store symlinks.
+#   3. the system interpreter (`/usr/bin/python3`, apt `python3-venv`) with `--copies` -- a distro
+#      build links its libpython from an absolute system path, so the whole RPATH class disappears.
+#
+# Every attempt is created `--without-pip` and has pip bootstrapped explicitly afterwards. That is
+# deliberate: the original failure came out of venv's *internal* ensurepip child, which conflated
+# "the interpreter cannot run" with "pip could not be installed". Separating them means the next
+# round's log names which of the two actually broke.
+
+_VLLM_VENV_MODES = ("symlinks", "copies", "system")
+
+
+def _python_runs(py: str, env: dict, label: str) -> bool:
+    """Does this interpreter actually execute? The check whose absence caused the 127.
+
+    Prints the loader's own error on failure -- `error while loading shared libraries: ...` is the
+    difference between "the venv spelling is wrong" and "the package install failed", and those two
+    have nothing to do with each other.
+    """
+    if not os.path.exists(py):
+        print(f"[vllm] {label}: {py} does not exist")
+        return False
+    try:
+        p = subprocess.run([py, "-c", "import sys; print(sys.executable); print(sys.version)"],
+                           capture_output=True, text=True, env=env)
+    except OSError as e:
+        # execve itself refused (EACCES on a noexec mount, ENOEXEC on a truncated copy). Distinct
+        # from the 127 case below, and worth saying so: 127 means the process STARTED.
+        print(f"[vllm] {label}: {py} could not be executed at all: {e}")
+        return False
+    if p.returncode != 0:
+        print(f"[vllm] {label}: {py} exited {p.returncode} -- NOT USABLE")
+        for stream in (p.stdout, p.stderr):
+            if stream.strip():
+                print("       " + _ascii(stream.strip())[:600])
+        if p.returncode == 127:
+            print("       127 == the dynamic loader could not resolve a NEEDED library "
+                  "(classically libpython for a --copies venv over a standalone CPython).")
+        return False
+    print(f"[vllm] {label}: OK -- {_ascii(' / '.join(p.stdout.split()))[:200]}")
+    return True
+
+
+def _diagnose_interpreter(py: str, env: dict) -> None:
+    """Record HOW this interpreter finds its libpython, before choosing a venv spelling.
+
+    Pure evidence, no decisions: the next round's log should be able to confirm or refute the
+    diagnosis above without anyone re-deriving it.
+    """
+    script = (
+        "set +e\n"
+        f"echo '--- {py} ---'\n"
+        f"ls -l {py}\n"
+        f"head -c 4 {py} | od -c | head -1\n"
+        f"command -v file >/dev/null && file {py}\n"
+        f"ldd {py} 2>&1 | head -20\n"
+        f"command -v readelf >/dev/null && readelf -d {py} 2>/dev/null | "
+        "grep -E 'RPATH|RUNPATH|NEEDED' | head -10\n"
+        "true\n"
+    )
+    _run(["bash", "-c", script], env, cwd="/", check=False)
+
+
+def _copy_libpython(base_py: str, venv: str, env: dict) -> list:
+    """Put the interpreter's shared libpython where a COPIED venv binary will look for it.
+
+    A python-build-standalone `bin/python3.11` carries `RPATH=$ORIGIN/../lib`. Copy it into a venv
+    and `$ORIGIN/../lib` becomes `<venv>/lib`, which holds no libpython -- so the loader exits 127
+    before `ensurepip` gets a chance to run. Copying the `.so` into BOTH `<venv>/lib` (the RPATH
+    target) and `<venv>/bin` (in case the RPATH is a bare `$ORIGIN`) repairs that at its cause and
+    needs no `LD_LIBRARY_PATH` at any later call site -- which matters, because the one thing this
+    file must never encourage anyone to edit casually is a loader path near CUDA.
+
+    ~20-40 MB on the Volume, paid once, only on the `--copies` route. An empty return means the
+    interpreter is statically linked -- in which case `--copies` was never the problem and the log
+    should say so rather than imply a fix that did nothing.
+    """
+    srcs: list = []
+    probe = subprocess.run(
+        [base_py, "-c",
+         "import sysconfig as s\n"
+         "print(s.get_config_var('LIBDIR') or '')\n"
+         "print(s.get_config_var('INSTSONAME') or '')\n"
+         "print(s.get_config_var('LDLIBRARY') or '')\n"],
+        capture_output=True, text=True, env=env, check=False)
+    if probe.returncode == 0:
+        cols = (probe.stdout.splitlines() + ["", "", ""])[:3]
+        libdir, soname, ldlibrary = (c.strip() for c in cols)
+        for name in (soname, ldlibrary):
+            if libdir and name and os.path.isfile(os.path.join(libdir, name)):
+                srcs.append(os.path.join(libdir, name))
+        if libdir:
+            srcs += [p for p in sorted(glob.glob(os.path.join(libdir, "libpython*.so*")))
+                     if os.path.isfile(p)]
+    # `ldd` is the ground truth for what the loader actually wants; sysconfig is only what the build
+    # recorded. Take both, in that order of trust. `ldd` is absent on some minimal images, so its
+    # absence must not become the reason the venv could not be staged.
+    try:
+        ldd = subprocess.run(["ldd", base_py], capture_output=True, text=True, env=env, check=False)
+        ldd_out = ldd.stdout
+    except OSError as e:
+        print(f"[vllm] ldd unavailable ({e}); relying on sysconfig for the libpython location.")
+        ldd_out = ""
+    for line in ldd_out.splitlines():
+        if "libpython" in line and "=>" in line:
+            path = line.split("=>", 1)[1].strip().split(" ")[0]
+            if os.path.isfile(path):
+                srcs.append(path)
+
+    copied = []
+    for dst_dir in (f"{venv}/lib", f"{venv}/bin"):
+        os.makedirs(dst_dir, exist_ok=True)
+        for src in dict.fromkeys(srcs):
+            dst = os.path.join(dst_dir, os.path.basename(src))
+            if os.path.exists(dst):
+                continue
+            try:
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+                copied.append(dst)
+            except OSError as e:
+                print(f"[vllm] could not copy {src} -> {dst}: {e}")
+    if copied:
+        print(f"[vllm] staged libpython for the --copies venv: {', '.join(copied)}")
+    else:
+        print("[vllm] no shared libpython found next to this interpreter (statically linked?) -- "
+              "if the --copies route still fails, the 127 has a different cause than the RPATH.")
+    return copied
+
+
+def _bootstrap_pip(venv_py: str, env: dict) -> bool:
+    """Install pip into a `--without-pip` venv, ensurepip first, network get-pip.py second.
+
+    Kept separate from venv creation on purpose (see the block comment): the original failure was
+    reported as an ensurepip error when the interpreter itself was what could not run.
+    """
+    if _run([venv_py, "-m", "ensurepip", "--upgrade", "--default-pip"], env,
+            cwd="/tmp", check=False) != 0:
+        print("[vllm] ensurepip failed; falling back to bootstrap.pypa.io/get-pip.py "
+              "(this builder has network).")
+        if _run(["bash", "-c",
+                 "set -eux\n"
+                 "curl -sSfL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py\n"
+                 f"{venv_py} /tmp/get-pip.py\n"], env, cwd="/tmp", check=False) != 0:
+            return False
+    _run([venv_py, "-m", "pip", "install", "--no-cache-dir", "-U", "pip"], env,
+         cwd="/tmp", check=False)
+    return _run([venv_py, "-m", "pip", "--version"], env, cwd="/tmp", check=False) == 0
+
+
+def _stage_vllm_venv(env: dict, base_py: str) -> tuple:
+    """Create `/persist/vllm-venv` by the first spelling that DEMONSTRABLY works.
+
+    Returns (interpreter path, mode).
+
+    Each attempt is: wipe, create `--without-pip`, repair if the spelling needs it, execute the
+    interpreter, bootstrap pip, execute pip. Only a spelling that clears all five is accepted, and
+    the winner is recorded in the Volume manifest so a round log names how its int4 bar was staged.
+    """
+    # `/usr/bin/python3` by absolute path, NOT `which("python3")`: Modal's `add_python` puts its
+    # standalone CPython on `/usr/local/bin`, which is earlier on PATH, so `which` would hand this
+    # route the very interpreter the route exists to avoid. The distro build is the point -- it
+    # resolves its libpython through an absolute system path with no `$ORIGIN` in sight. It is also
+    # older (3.10 on Ubuntu 22.04), which is why it is last and not first.
+    system_py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else ""
+    errors = []
+    for mode in _VLLM_VENV_MODES:
+        src_py = base_py if mode != "system" else system_py
+        if mode == "system" and (not src_py
+                                 or os.path.realpath(src_py) == os.path.realpath(base_py)):
+            print("[vllm] skipping the 'system' route: no distinct distro interpreter here.")
+            continue
+        print(f"\n[vllm] === venv attempt: {mode} (from {src_py}) ===")
+        shutil.rmtree(VLLM_VENV, ignore_errors=True)
+        cmd = [src_py, "-m", "venv"]
+        if mode != "symlinks":
+            cmd.append("--copies")
+        cmd += ["--without-pip", VLLM_VENV]
+        if _run(cmd, env, cwd="/tmp", check=False) != 0:
+            errors.append(f"{mode}: `python -m venv` itself failed")
+            continue
+        if mode != "symlinks":
+            _copy_libpython(src_py, VLLM_VENV, env)
+        venv_py = f"{VLLM_VENV}/bin/python"
+        if not _python_runs(venv_py, env, f"venv/{mode}"):
+            errors.append(f"{mode}: the created interpreter does not execute")
+            continue
+        if not _bootstrap_pip(venv_py, env):
+            errors.append(f"{mode}: pip could not be bootstrapped")
+            continue
+        print(f"[vllm] venv spelling '{mode}' works; using it.")
+        return venv_py, mode
+
+    shutil.rmtree(VLLM_VENV, ignore_errors=True)
+    sys.exit(
+        "Could not create a working vLLM venv by any spelling:\n  "
+        + "\n  ".join(errors)
+        + "\nThe Marlin/Machete int4 bar cannot be staged, so nothing should be published against "
+          "it. The diagnostics above (ldd/RPATH of the base interpreter, and each attempt's exit "
+          "code) are what the next fix should be derived from -- 127 means the dynamic loader, "
+          "not a missing file."
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# ptxas: the CPU-only register / SMEM / spill audit
+# --------------------------------------------------------------------------------------------
+#
+# `ptxas` compiles FOR an architecture; it does not need one. The `nvidia/cuda:*-devel` image
+# already ships it, and `::build_peers` proved on 2026-08-09 that a CPU container can build CUTLASS
+# for `sm90a` for $0.258. So the question D1_h100_gemm.md section 7 item 3 leaves open --
+#
+#     "Actual registers/thread ptxas allocates for A3/A4. Section 2.3's estimates (~185) are derived
+#      from the generator's declarations, not from cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS).
+#      If ptxas spills at 128 accumulators, A3 collapses and A2 becomes the top lever."
+#
+# -- is answerable here for cents rather than on a rented H100. D2_h100_attention.md section 4.2
+# ranks the same census FIRST of its five experiments ("$0, NO GPU, runs in CI") and D3_a100.md
+# section 7 asks for it on sm_80. It is load-bearing: every register number in this campaign is
+# derived from `.reg` declarations, and NVIDIA's own CUTLASS build emitted
+# `(C7511) ... wgmma.mma_async instructions are serialized due to insufficient register resources`
+# at 256x128x64 -- the tile class the wide-tile work just made expressible.
+#
+# THE CONTRACT WITH THE CRATE. This entry point does not know, and must not know, how the audit test
+# is written. It touches it through exactly two things:
+#
+#   * `WUKONG_PTXAS` -- absolute path to the resolved ptxas. The knob already exists (`gpu.rs`
+#     `gemm_cliff_ptxas_ab`, `ptx_wgmma.rs`'s list) and the test skips when it is unset.
+#   * a libtest substring filter, default `ptxas` -- i.e. the audit test's NAME MUST CONTAIN
+#     "ptxas". Override with `--filter` if it does not.
+#
+# `WUKONG_PTXAS_ARCH` / `WUKONG_PTXAS_ARCHS` are also exported, but they are ADVISORY: a test that
+# ignores them is not broken, it just sweeps its own arch set, and the coverage report below reads
+# the arch out of ptxas's own `Compiling entry function '<e>' for '<arch>'` line rather than out of
+# what we asked for. That is why the pass loop is adaptive -- one pass, then a second pass per arch
+# that pass did not produce.
+#
+# Everything else here is independent of the test on purpose: the self-test proves this ptxas
+# accepts each `--gpu-name` before the census runs, and validates the output parser against this
+# ptxas's actual `-v` format, so an empty table can never be mistaken for "no spills".
+
+_PTXAS_ARCHS_DEFAULT = "sm_89,sm_80,sm_90a"
+"""sm_89 = the dev RTX 4050 and L4/L40S; sm_80 = A100; sm_90a = Hopper AND the only target wgmma is
+legal on. Register allocation is per-arch, which is the entire reason this is a sweep and not a
+single number."""
+
+# Minimum PTX ISA version each target needs. sm_90/sm_90a arrived in ISA 8.0; the Blackwell families
+# in 8.7. Too LOW a `.version` for the requested target is a ptxas error, so the self-test picks per
+# arch rather than assuming one version is universally accepted.
+_PTX_ISA_FOR_ARCH = {
+    "sm_75": "7.0", "sm_80": "7.0", "sm_86": "7.0", "sm_87": "7.4", "sm_89": "7.8",
+    "sm_90": "8.0", "sm_90a": "8.0", "sm_100": "8.7", "sm_100a": "8.7",
+    "sm_103": "8.8", "sm_103a": "8.8", "sm_120": "8.7", "sm_120a": "8.7",
+}
+
+# Register file per SM (32-bit registers) and the hardware warp-slot cap, for the occupancy estimate
+# next to each row. Both are architecture facts, not device bins: GA100/GH100 give 64 warp slots,
+# GA10x/AD10x give 48, and every one of these families has a 64 K-register file per SM.
+_REGS_PER_SM = 65536
+_MAX_WARPS_PER_SM = {
+    "sm_75": 32, "sm_80": 64, "sm_86": 48, "sm_87": 64, "sm_89": 48,
+    "sm_90": 64, "sm_90a": 64, "sm_100": 64, "sm_100a": 64,
+    "sm_103": 64, "sm_103a": 64, "sm_120": 48, "sm_120a": 48,
+}
+
+
+def _ascii(s: str) -> str:
+    """ASCII-fold a line that is about to be printed to the operator's console.
+
+    The console-output sibling of the crate's "PTX must be pure ASCII" law: a Windows console is
+    cp1252, Modal streams the container's stdout through the local CLI, and one non-ASCII byte kills
+    that CLI while the container keeps billing (README, measured 2026-08-09). The crate's gates
+    print `[gate] ...` marks with non-ASCII characters by design, so anything we echo from a cargo
+    run gets folded. The round-log FILE on the Volume keeps the bytes unchanged.
+    """
+    return s.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _run_tee(cmd: list, env: dict, cwd: str = REMOTE_SRC) -> tuple:
+    """`_run`, but the output is captured as well as echoed. Returns (rc, text).
+
+    Needed because this entry point's whole deliverable IS the text: it has to be parsed into a
+    table and written into the round log, while still streaming live so a metered run shows
+    progress.
+    """
+    print(f"\n$ {' '.join(cmd)}", flush=True)
+    t0 = time.time()
+    buf = []
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1)
+    for line in proc.stdout:
+        buf.append(line)
+        print(_ascii(line.rstrip("\n")), flush=True)
+    proc.wait()
+    dt = time.time() - t0
+    status = "ok" if proc.returncode == 0 else "FAILED (%d)" % proc.returncode
+    print(f"-> {status} in {dt:.1f}s", flush=True)
+    return proc.returncode, "".join(buf)
+
+
+def _resolve_ptxas(explicit: str = "") -> str:
+    """Find `ptxas` in this image, in order of how explicit the instruction was.
+
+    Deliberately NOT a silent skip: the whole point of this entry point is that the image has a
+    ptxas, so not finding one is a hard, cheap, CPU-priced failure.
+    """
+    cands = []
+    if explicit:
+        cands.append(explicit)
+    if os.environ.get("WUKONG_PTXAS"):
+        cands.append(os.environ["WUKONG_PTXAS"])
+    which = shutil.which("ptxas")
+    if which:
+        cands.append(which)
+    cands.append("/usr/local/cuda/bin/ptxas")
+    cands += sorted(glob.glob("/usr/local/cuda-*/bin/ptxas"), reverse=True)
+    cands += sorted(glob.glob("/opt/nvidia/*/bin/ptxas"), reverse=True)
+    seen = set()
+    for c in cands:
+        if c in seen:
+            continue
+        seen.add(c)
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.realpath(c)
+    sys.exit(
+        "No usable `ptxas` in this image. Tried: " + ", ".join(sorted(seen)) + "\n"
+        "The image is nvidia/cuda:" + WK_CUDA_TAG + ", which is a `-devel` tag and must ship one; "
+        "a `-runtime` value of WK_CUDA_TAG would not. Pass --ptxas-bin <path> or fix WK_CUDA_TAG."
+    )
+
+
+def _selftest_ptx(arch: str) -> str:
+    """A minimal, pure-ASCII kernel used to prove this ptxas accepts `--gpu-name <arch>`.
+
+    It also pins the `-v` output format down for the parser below: if the parser cannot read THIS,
+    an empty census table means "the parser does not understand this ptxas", not "no spills".
+    """
+    return (
+        ".version " + _PTX_ISA_FOR_ARCH.get(arch, "8.0") + "\n"
+        ".target " + arch + "\n"
+        ".address_size 64\n"
+        "\n"
+        ".visible .entry wk_ptxas_selftest(\n"
+        "    .param .u64 wk_p\n"
+        ")\n"
+        "{\n"
+        "    .reg .b32   %r<3>;\n"
+        "    .reg .f32   %f<4>;\n"
+        "    .reg .b64   %rd<4>;\n"
+        "\n"
+        "    ld.param.u64 %rd1, [wk_p];\n"
+        "    cvta.to.global.u64 %rd2, %rd1;\n"
+        "    mov.u32 %r1, %tid.x;\n"
+        "    mul.wide.u32 %rd3, %r1, 4;\n"
+        "    add.s64 %rd2, %rd2, %rd3;\n"
+        "    ld.global.f32 %f1, [%rd2];\n"
+        "    mov.f32 %f2, 0f3F800000;\n"
+        "    fma.rn.f32 %f3, %f1, %f2, %f2;\n"
+        "    st.global.f32 [%rd2], %f3;\n"
+        "    ret;\n"
+        "}\n"
+    )
+
+
+_RE_ENTRY = re.compile(r"Compiling entry function '([^']+)' for '([^']+)'")
+_RE_PROPS = re.compile(r"Function properties for (\S+)")
+_RE_STACK = re.compile(r"(\d+)\s+bytes stack frame")
+_RE_SPILL_ST = re.compile(r"(\d+)\s+bytes spill stores")
+_RE_SPILL_LD = re.compile(r"(\d+)\s+bytes spill loads")
+_RE_REGS = re.compile(r"Used\s+(\d+)\s+registers")
+_RE_BARRIERS = re.compile(r"used\s+(\d+)\s+barriers")
+_RE_SMEM = re.compile(r"(\d+)\s+bytes\s+smem")
+_RE_TESTRESULT = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored")
+
+
+def _warps_reg_limited(arch: str, regs):
+    """Warps/SM the register allocation alone permits. Estimate, and labelled as one in the table.
+
+    Registers are allocated per warp in units of 8 per thread on every family in the table above, so
+    the honest formula is `floor(regfile / (roundup8(R) * 32))`, capped by the hardware warp slots.
+    SMEM and the CTA-per-SM cap can only push it lower, never higher -- so this column is an upper
+    bound on occupancy, which is exactly the direction the D2 section 2.2 table needed checking in.
+    """
+    if not regs:
+        return None
+    alloc = ((int(regs) + 7) // 8) * 8
+    if alloc <= 0:
+        return None
+    return min(_REGS_PER_SM // (alloc * 32), _MAX_WARPS_PER_SM.get(arch, 64))
+
+
+def _parse_ptxas_v(text: str, source: str) -> list:
+    """Rows out of raw `ptxas -v` output.
+
+    The arch on each row comes from ptxas's own `Compiling entry function '<e>' for '<arch>'` line,
+    never from what we asked for -- so a test that sweeps its own arch set is reported truthfully
+    rather than mislabelled with our hint.
+
+    `Function properties` blocks are emitted for non-inlined `.func`s too, so stack/spill numbers
+    are attributed to the entry only when the property block names the entry itself; a spill inside
+    a helper is carried separately as `spill_any` rather than silently dropped or silently
+    attributed.
+    """
+    rows: list = []
+    cur = None
+    prop_name = ""
+    for line in text.splitlines():
+        m = _RE_ENTRY.search(line)
+        if m:
+            if cur:
+                rows.append(cur)
+            cur = {"source": source, "entry": m.group(1), "arch": m.group(2), "regs": None,
+                   "smem": 0, "stack": 0, "spill_st": 0, "spill_ld": 0, "spill_any": 0,
+                   "barriers": None}
+            prop_name = ""
+            continue
+        if cur is None:
+            continue
+        mp = _RE_PROPS.search(line)
+        if mp:
+            prop_name = mp.group(1)
+            continue
+        own = (prop_name == cur["entry"]) or (prop_name == "")
+        ms = _RE_SPILL_ST.search(line)
+        if ms:
+            val = int(ms.group(1))
+            cur["spill_any"] = max(cur["spill_any"], val)
+            if own:
+                cur["spill_st"] = max(cur["spill_st"], val)
+        ml = _RE_SPILL_LD.search(line)
+        if ml and own:
+            cur["spill_ld"] = max(cur["spill_ld"], int(ml.group(1)))
+        mk = _RE_STACK.search(line)
+        if mk and own:
+            cur["stack"] = max(cur["stack"], int(mk.group(1)))
+        mr = _RE_REGS.search(line)
+        if mr:
+            cur["regs"] = int(mr.group(1))
+        mb = _RE_BARRIERS.search(line)
+        if mb:
+            cur["barriers"] = int(mb.group(1))
+        mm = _RE_SMEM.search(line)
+        if mm:
+            cur["smem"] = max(cur["smem"], int(mm.group(1)))
+    if cur:
+        rows.append(cur)
+    return rows
+
+
+def _print_ptxas_table(rows: list) -> None:
+    """The census, grouped by arch, worst register pressure first."""
+    if not rows:
+        print("  (no `ptxas -v` records parsed)")
+        return
+    hdr = ("%-46s %6s %9s %9s %7s %9s %9s %5s"
+           % ("entry", "regs", "warps/SM", "smem", "stack", "spill_st", "spill_ld", "barr"))
+    for arch in sorted({r["arch"] for r in rows}):
+        group = [r for r in rows if r["arch"] == arch]
+        group.sort(key=lambda r: (-(r["regs"] or 0), r["entry"]))
+        print(f"\n  --- {arch} ({len(group)} entries) ---")
+        print("  " + hdr)
+        print("  " + "-" * len(hdr))
+        for r in group:
+            warps = _warps_reg_limited(arch, r["regs"])
+            if r["spill_st"] or r["spill_ld"]:
+                flag = "  <== SPILLS"
+            elif r["spill_any"]:
+                # Reported, not folded into the entry's own columns: a spill inside a non-inlined
+                # helper is a real finding with a different fix from a spilling mainloop.
+                flag = "  <== %d B spilled in a helper .func" % r["spill_any"]
+            else:
+                flag = ""
+            name = r["entry"] if len(r["entry"]) <= 46 else r["entry"][:43] + "..."
+            print("  %-46s %6s %9s %9s %7s %9s %9s %5s%s" % (
+                name,
+                "?" if r["regs"] is None else r["regs"],
+                "?" if warps is None else warps,
+                r["smem"], r["stack"], r["spill_st"], r["spill_ld"],
+                "-" if r["barriers"] is None else r["barriers"], flag))
+    print("\n  warps/SM is an UPPER BOUND from the register allocation alone "
+          "(64K regfile, 8-reg granularity, hardware warp-slot cap); SMEM and the CTA cap can only "
+          "lower it.")
+
+
+# --------------------------------------------------------------------------------------------
 # Functions
 # --------------------------------------------------------------------------------------------
 
@@ -1120,26 +1655,34 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
             os.chmod(f"{PERSIST}/bin/cutlass_profiler", 0o755)
             staged["cutlass"] = {"tag": WK_CUTLASS_TAG, "arch": arch, "path": out}
             print(f"[peers] cutlass_profiler sm{arch} ({WK_CUTLASS_TAG}) -> {out}")
+            # Record it NOW rather than at the end. On 2026-08-09 the sm90a profiler compiled
+            # successfully and then the vLLM venv aborted the function, so the manifest never
+            # learned about a 45-minute artifact that was sitting on the Volume. The manifest is
+            # what `::device_info` prints and what `::peers` checks the arch against, so losing it
+            # is losing the peer. `_write_manifest` merges, so calling it per artifact is free.
+            _write_manifest(staged)
+            build_vol.commit()
 
         if vllm:
             py = f"{VLLM_VENV}/bin/python"
-            if os.path.isfile(py) and not force:
-                print(f"[peers] vLLM venv already staged at {VLLM_VENV} (--force rebuilds)")
+            mode = (_read_manifest().get("vllm") or {}).get("venv_mode", "unknown")
+            # Idempotence keys on "does the staged interpreter RUN", not on "does the file exist".
+            # The 2026-08-09 failure left a `/persist/vllm-venv/bin/python3.11` on the Volume that
+            # existed and could not execute; `os.path.isfile` would have called that staged.
+            if not force and os.path.exists(py) and _python_runs(py, env, "already-staged venv"):
+                print(f"[peers] vLLM venv already staged at {VLLM_VENV}, mode={mode} "
+                      f"(--force rebuilds)")
             else:
-                # `--copies` so `bin/python` is a real file: this venv lives on a network Volume and
-                # nothing here should depend on a symlink surviving it. Its `home =` still points at
-                # the image's interpreter, which is why it must be built from THIS image.
-                script = (
-                    f"set -eux\n"
-                    f"rm -rf {VLLM_VENV}\n"
-                    f'{_PICK_PY}\n'
-                    f'"$PY" -m venv --copies {VLLM_VENV}\n'
-                    f"{VLLM_VENV}/bin/pip install --no-cache-dir -U pip\n"
-                    f"{VLLM_VENV}/bin/pip install --no-cache-dir vllm=={WK_VLLM}\n"
-                    f"{VLLM_VENV}/bin/python -c \"import importlib.metadata as m,torch;"
-                    f"print('vllm',m.version('vllm'),'torch',torch.__version__)\"\n"
-                )
-                _run(["bash", "-c", script], env, cwd="/tmp")
+                base_py = shutil.which("python3.12") or shutil.which("python3.11") \
+                    or shutil.which("python3") or sys.executable
+                print(f"[vllm] base interpreter for the venv: {base_py}")
+                _diagnose_interpreter(base_py, env)
+                py, mode = _stage_vllm_venv(env, base_py)
+                _run([py, "-m", "pip", "install", "--no-cache-dir", f"vllm=={WK_VLLM}"],
+                     env, cwd="/tmp")
+                _run([py, "-c", "import importlib.metadata as m,torch;"
+                                "print('vllm',m.version('vllm'),'torch',torch.__version__)"],
+                     env, cwd="/tmp")
             if not os.path.isdir(f"{VLLM_SRC}/benchmarks/kernels") or force:
                 # `benchmark_marlin.py` / `benchmark_machete.py` import only the prebuilt wheel's
                 # `_custom_ops`, so no source *build* is needed — but the scripts themselves ship in
@@ -1152,8 +1695,11 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
                 if not os.path.isfile(f"{VLLM_SRC}/benchmarks/kernels/{s}"):
                     sys.exit(f"vLLM v{WK_VLLM} has no benchmarks/kernels/{s} — the int4 bar would be "
                              f"unmeasurable. Check the tag before spending GPU time.")
-            staged["vllm"] = {"version": WK_VLLM, "venv": VLLM_VENV, "src": VLLM_SRC}
-            print(f"[peers] vLLM {WK_VLLM} -> {VLLM_VENV}")
+            staged["vllm"] = {"version": WK_VLLM, "venv": VLLM_VENV, "src": VLLM_SRC,
+                              "venv_mode": mode, "python": py}
+            print(f"[peers] vLLM {WK_VLLM} -> {VLLM_VENV} (venv mode: {mode})")
+            _write_manifest(staged)
+            build_vol.commit()
 
         if fa2:
             # No prebuilt flash-attn wheel exists for torch 2.13 (assets stop at torch 2.8/cu12 and
@@ -1208,6 +1754,305 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
         print(json.dumps(m, indent=2, sort_keys=True))
         print(f"\nStaged to the 'wukong-build' Volume. Every later round reads these for free; "
               f"nothing above ever runs on metered silicon again.")
+
+
+@app.function(image=image, cpu=WK_CPU, memory=WK_MEM_MIB, timeout=WK_TIMEOUT,
+              volumes={PERSIST: build_vol})
+def ptxas(archs: str = _PTXAS_ARCHS_DEFAULT, filter: str = "", skip: str = "gemm_cliff_ptxas_ab",
+          ptxas_bin: str = "", package: str = "wukong_codegen_gpu", release: bool = False,
+          prebuilt: bool = False, self_test: bool = True, require_archs: bool = False,
+          once: bool = False, tag: str = ""):
+    """The register / SMEM / spill census. **NO GPU is attached -- that is the entire point.**
+
+    `ptxas` compiles *for* an architecture; it does not need one. So the campaign's most
+    load-bearing unknown -- D1_h100_gemm.md section 7 item 3, "if ptxas spills at 128 accumulators,
+    A3 collapses and A2 becomes the top lever" -- costs cents on a CPU container, not an hour. D2's
+    section 4.2 ranks the same census first of five experiments; D3 wants it for sm_80.
+
+    What it does, in order:
+
+      1. resolves `ptxas` in the image and records `ptxas --version` in the round log;
+      2. self-tests each requested arch on a minimal kernel, which proves this ptxas accepts the
+         `--gpu-name` AND validates the output parser against this ptxas's actual `-v` format;
+      3. runs the crate's ptxas audit test with `WUKONG_PTXAS` pointed at the resolved binary, once,
+         then again for any requested arch that first pass did not produce;
+      4. prints the census table and writes every raw byte into `/persist/rounds/ptxas-*.log`.
+
+    The only coupling to the crate is `WUKONG_PTXAS` plus a libtest substring filter (default
+    `ptxas`, i.e. the audit test's name must contain that). `WUKONG_PTXAS_ARCH`/`_ARCHS` are also
+    exported but advisory; the arch on every reported row is read out of ptxas's own output.
+
+        modal run tools/cloud/modal_app.py::ptxas
+        modal run tools/cloud/modal_app.py::ptxas --archs sm_90a --filter wgmma_ptxas_audit
+        modal run tools/cloud/modal_app.py::ptxas --once --require-archs
+
+    Cost: CPU only. The first run compiles the gpu feature if `::build` has not; pass `--prebuilt`
+    to refuse to compile instead (there is no cost argument for that here the way there is on a GPU
+    box -- this is the same ~$0.4/hr container `::build` itself uses -- but it keeps the census
+    honest about running the same binary a `::test` round ran).
+    """
+    with _meter("ptxas", gpu=False):
+        env = _prepare_cargo()
+        # No device is attached, so escalation would fail every gate that legitimately cannot run
+        # here. The audit test is device-free by construction; nothing else in this run should be
+        # allowed to pretend otherwise, in either direction.
+        env.pop("WUKONG_GPU_REQUIRED", None)
+        env.pop("WUKONG_PEER_REQUIRED", None)
+        env.pop("WUKONG_STRONG_PEERS", None)
+
+        arch_list = [a.strip() for a in archs.split(",") if a.strip()]
+        if not arch_list:
+            sys.exit("--archs is empty; nothing to audit.")
+        skip_list = [s.strip() for s in skip.split(",") if s.strip()]
+
+        bin_path = _resolve_ptxas(ptxas_bin)
+        env["WUKONG_PTXAS"] = bin_path
+        ver = subprocess.run([bin_path, "--version"], capture_output=True, text=True, env=env)
+        version_text = (ver.stdout or "") + (ver.stderr or "")
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        os.makedirs(f"{PERSIST}/rounds", exist_ok=True)
+        log_path = f"{PERSIST}/rounds/ptxas-{tag or 'audit'}-{stamp}.log"
+        json_path = f"{PERSIST}/rounds/ptxas-{tag or 'audit'}-{stamp}.json"
+        log = [
+            "=" * 78,
+            "WUKONG ptxas AUDIT (CPU container, no GPU attached)",
+            "=" * 78,
+            f"utc            : {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}",
+            f"image          : nvidia/cuda:{WK_CUDA_TAG}",
+            f"ptxas          : {bin_path}",
+            f"archs          : {', '.join(arch_list)}",
+            f"filter         : {filter or '(auto: substring `ptxas`)'}",
+            f"skip           : {', '.join(skip_list) or '(none)'}",
+            f"package        : {package} ({'release' if release else 'debug'})",
+            "note           : the source tree is mounted WITHOUT .git, so identify the tree by the",
+            "                 local commit the operator ran this from.",
+            "",
+            "--- ptxas --version ---",
+            version_text.rstrip(),
+            "",
+        ]
+        print("=" * 78)
+        print("WUKONG ptxas AUDIT -- CPU container, no GPU attached")
+        print("=" * 78)
+        print(f"ptxas: {bin_path}")
+        print(_ascii(version_text.rstrip()))
+
+        failures: list = []
+        rows: list = []
+        observed: list = []
+        chosen = filter
+
+        def flush():
+            """Write the round log before anything else happens, including before an abort.
+
+            The log IS the deliverable. Every abort below happens after this has run, so a failed
+            audit still leaves the ptxas version, the arch self-test and whatever raw output it did
+            get on the Volume -- otherwise the cheap failure modes would cost the evidence too.
+            """
+            body = log + ["", "--- parsed census ---"]
+            body += [json.dumps(r, sort_keys=True) for r in rows]
+            pathlib.Path(log_path).write_text("\n".join(body), encoding="utf-8", errors="replace")
+            pathlib.Path(json_path).write_text(json.dumps(
+                {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "ptxas": bin_path, "ptxas_version": version_text.strip(),
+                 "image_cuda_tag": WK_CUDA_TAG, "archs_requested": arch_list,
+                 "archs_observed": observed, "filter": chosen, "rows": rows},
+                indent=2, sort_keys=True))
+            # One line, the release line if ptxas printed one -- the manifest is read by a human in
+            # a provenance block, and "Cuda compilation tools, release 12.9, V12.9.86" is the fact
+            # a round log needs to name. The full text is in the log either way.
+            vlines = [ln.strip() for ln in version_text.splitlines() if ln.strip()]
+            vline = next((ln for ln in vlines if "release" in ln), vlines[-1] if vlines else "")
+            _write_manifest({"ptxas": {"path": bin_path, "archs": arch_list,
+                                       "log": log_path, "json": json_path, "version": vline}})
+            build_vol.commit()
+            print(f"\nraw ptxas -v output -> {log_path}")
+            print(f"parsed census       -> {json_path}")
+
+        def die(msg: str):
+            flush()
+            sys.exit(msg)
+
+        # 1. Does THIS ptxas accept each requested target, and can the parser read its output?
+        if self_test:
+            print("\n--- arch self-test (a minimal kernel per target) ---")
+            os.makedirs("/tmp/ptxas-selftest", exist_ok=True)
+            rejected, unparsed = [], []
+            for arch in arch_list:
+                src = f"/tmp/ptxas-selftest/{arch}.ptx"
+                pathlib.Path(src).write_text(_selftest_ptx(arch))
+                proc = subprocess.run(
+                    [bin_path, "-v", "-O3", f"--gpu-name={arch}",
+                     "-o", f"/tmp/ptxas-selftest/{arch}.cubin", src],
+                    capture_output=True, text=True, env=env, check=False)
+                text = (proc.stdout or "") + (proc.stderr or "")
+                log += [f"--- self-test {arch} (rc={proc.returncode}) ---",
+                        _selftest_ptx(arch), text.rstrip(), ""]
+                parsed = _parse_ptxas_v(text, f"selftest:{arch}")
+                if proc.returncode != 0:
+                    print(f"  {arch:<8} REJECTED by this ptxas (rc={proc.returncode})")
+                    print("    " + _ascii(text.strip())[:400])
+                    rejected.append(arch)
+                    continue
+                if not parsed:
+                    print(f"  {arch:<8} accepted, but the `-v` output did not parse -- the census "
+                          f"table below may be empty for a PARSER reason, not a spill-free one.")
+                    unparsed.append(arch)
+                    continue
+                r = parsed[0]
+                print(f"  {arch:<8} accepted; parser reads regs={r['regs']} smem={r['smem']} "
+                      f"spill_st={r['spill_st']}")
+            # A target this ptxas does not know is a real finding and must stop the round; ALL of
+            # them failing identically is far more likely to be the probe kernel than the toolkit,
+            # and that must not be reported as "this CUDA 12.9 ptxas cannot target sm_80".
+            if rejected and len(rejected) == len(arch_list):
+                print("  !! every target was rejected -- suspect the self-test kernel above, not "
+                      "the toolkit. The census below is unaffected; re-run with --no-self-test to "
+                      "silence this.")
+            elif rejected:
+                failures.append("self-test rejected: " + ",".join(rejected))
+            if unparsed:
+                failures.append("parser vs " + ",".join(unparsed))
+
+        # 2. Which test are we actually running? Discover rather than assume a name.
+        profile = ["--release"] if release else []
+        if prebuilt:
+            _require_prebuilt(package, release)
+        elif not glob.glob(f"{PERSIST}/target/{'release' if release else 'debug'}/deps/"
+                           f"{package}-*"):
+            print(f"\nnote: no prebuilt {package} test binary on the Volume, so this run will "
+                  f"compile it. That is CPU-priced here and warms the same Volume `::build` uses; "
+                  f"pass --prebuilt to refuse instead.")
+
+        base_cargo = ["cargo", "test", "-p", package, "--features", "gpu"] + profile
+        if not chosen:
+            rc, listing = _run_tee(base_cargo + ["--", "--list"], env)
+            log += ["--- cargo test -- --list ---", listing, ""]
+            if rc != 0:
+                die("`cargo test -- --list` failed; the crate does not build here. Fix that "
+                    "first -- this run cannot audit a tree that does not compile.")
+            names = [ln.rsplit(":", 1)[0].strip() for ln in listing.splitlines()
+                     if ln.strip().endswith(": test")]
+            cands = [n for n in names if "ptxas" in n and n not in skip_list]
+            if not cands:
+                sample = [n for n in names if "wgmma" in n or "flash" in n or "audit" in n][:20]
+                die(
+                    "No test name contains `ptxas`, so the audit test could not be selected.\n"
+                    "The contract is one env var (WUKONG_PTXAS) plus a libtest substring filter;\n"
+                    "if the test was named without `ptxas` in it, pass --filter <substring>.\n"
+                    "Names that looked related: " + (", ".join(sample) or "(none)") + "\n"
+                    f"{len(names)} tests were listed in total."
+                )
+            chosen = "ptxas"
+            print(f"\nAudit tests selected by the substring `ptxas`: {', '.join(cands)}")
+
+        # 3. The census passes. One pass, then one more for any arch it did not produce -- so a test
+        #    that sweeps arches itself is not run three redundant times, and a test that honours the
+        #    hint still gets every arch.
+        def one_pass(hint: str, hint_all: str):
+            cmd = base_cargo + ["--", chosen, "--include-ignored", "--nocapture",
+                                "--test-threads=1"]
+            for s in skip_list:
+                cmd += ["--skip", s]
+            passenv = dict(env)
+            passenv["WUKONG_PTXAS_ARCH"] = hint
+            passenv["WUKONG_PTXAS_ARCHS"] = hint_all
+            rc, text = _run_tee(cmd, passenv)
+            log.append(f"--- census pass: WUKONG_PTXAS_ARCH={hint} "
+                       f"WUKONG_PTXAS_ARCHS={hint_all} (rc={rc}) ---")
+            log.append(text)
+            log.append("")
+            ran = sum(int(m.group(1)) + int(m.group(2))
+                      for m in _RE_TESTRESULT.finditer(text))
+            return rc, text, ran
+
+        all_hint = ",".join(arch_list)
+        rc, text, ran = one_pass(arch_list[0], all_hint)
+        if rc != 0:
+            failures.append(f"census pass {arch_list[0]}")
+        rows += _parse_ptxas_v(text, f"pass:{arch_list[0]}")
+        if ran == 0:
+            die(
+                f"The filter {chosen!r} selected no test that actually ran (libtest reported 0 "
+                f"passed and 0 failed).\nThat is the silent-skip failure mode this entry point "
+                f"exists to remove: an empty audit reported as a green run.\n"
+                f"Pass --filter with the real substring, or check that the audit test landed "
+                f"in {package}."
+            )
+        print(f"[ptxas] pass 1 ran {ran} test(s) and produced {len(rows)} ptxas record(s).")
+
+        if not once:
+            for arch in arch_list[1:]:
+                if any(r["arch"] == arch for r in rows):
+                    print(f"[ptxas] {arch} already covered by an earlier pass; not re-running.")
+                    continue
+                rc, text, ran = one_pass(arch, arch)
+                if rc != 0:
+                    failures.append(f"census pass {arch}")
+                rows += _parse_ptxas_v(text, f"pass:{arch}")
+
+        # Deduplicate: if the test sweeps its own arch set and ignores the hint, the extra passes
+        # produce byte-identical records. Keep the first of each (arch, entry).
+        seen = set()
+        uniq = []
+        for r in rows:
+            key = (r["arch"], r["entry"])
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
+        dropped = len(rows) - len(uniq)
+        rows = [r for r in uniq if not r["source"].startswith("selftest:")]
+
+        # 4. The table, the answer, and the log.
+        print("\n" + "=" * 78)
+        print("REGISTER / SMEM / SPILL CENSUS")
+        print("=" * 78)
+        if dropped:
+            print(f"({dropped} duplicate (arch, entry) records across passes were collapsed.)")
+        _print_ptxas_table(rows)
+
+        observed = sorted({r["arch"] for r in rows})
+        missing = [a for a in arch_list if a not in observed]
+        print("\n--- coverage ---")
+        print(f"  requested: {', '.join(arch_list)}")
+        print(f"  observed : {', '.join(observed) or '(none)'}")
+        if missing:
+            print(f"  MISSING  : {', '.join(missing)} -- the audit test did not emit these. "
+                  f"Register allocation is per-arch, so a conclusion for one arch does not carry. "
+                  f"Re-run with --filter/--archs, or --require-archs to make this an error.")
+            if require_archs:
+                failures.append("arch coverage: " + ",".join(missing))
+
+        spillers = [r for r in rows if r["spill_st"] or r["spill_ld"] or r["spill_any"]]
+        print("\n--- D1 section 7 item 3: does ptxas spill? ---")
+        if not rows:
+            print("  UNANSWERED -- no raw `ptxas -v` records were parsed out of the audit test's "
+                  "output.")
+            print(f"  If the test prints its own summary instead of ptxas's `-v` text, its numbers "
+                  f"are in the test output above and in {log_path}; this exit code then means only "
+                  f"that THIS harness could not verify them, not that the audit found nothing.")
+            failures.append("no ptxas records parsed")
+        elif spillers:
+            print(f"  YES for {len(spillers)} of {len(rows)} entries:")
+            for r in sorted(spillers, key=lambda r: -(r["spill_st"] + r["spill_ld"])):
+                print(f"    {r['arch']:<8} {r['entry']:<46} regs={r['regs']} "
+                      f"spill_st={r['spill_st']} spill_ld={r['spill_ld']} "
+                      f"spill_in_helpers={r['spill_any']}")
+            print("  A spilling accumulator tile is the case D1 says collapses A3 and promotes A2.")
+        else:
+            print(f"  NO -- 0 of {len(rows)} entries spill. Highest pressure per arch:")
+            for arch in observed:
+                worst = max((r for r in rows if r["arch"] == arch),
+                            key=lambda r: (r["regs"] or 0))
+                print(f"    {arch:<8} {worst['regs']} regs "
+                      f"({_warps_reg_limited(arch, worst['regs'])} warps/SM max) in "
+                      f"{worst['entry']}")
+
+        flush()
+        if failures:
+            sys.exit("ptxas audit incomplete: " + "; ".join(failures))
 
 
 @app.function(image=image, gpu=WK_GPU, cpu=WK_CPU, memory=WK_MEM_MIB, timeout=WK_TIMEOUT,
@@ -1446,6 +2291,19 @@ def marlin(kernel: str = "", models: str = "", batch_sizes: str = "1 16 128",
             sys.exit(
                 f"No vLLM venv on the Volume ({VLLM_VENV}). Stage it on CPU first:\n"
                 f"    modal run tools/cloud/modal_app.py::build_peers"
+            )
+        # Existing != usable. The venv is a Volume artifact created in a different container, and
+        # its interpreter can be present and unable to load (that is exactly how the 2026-08-09
+        # staging failed: exit 127 from the dynamic loader). Checking costs a second HERE and saves
+        # the whole metered call, so it happens before anything else touches the device.
+        mode = (_read_manifest().get("vllm") or {}).get("venv_mode", "unknown")
+        print(f"[marlin] staged venv mode: {mode}")
+        if not _python_runs(py, _torch_env(env), "staged vLLM venv"):
+            sys.exit(
+                f"The staged vLLM interpreter ({py}) does not execute in this container, so the "
+                f"int4 bar cannot run. Re-stage it on CPU -- the staging path tries several venv "
+                f"spellings and verifies each:\n"
+                f"    modal run tools/cloud/modal_app.py::build_peers --force --no-cutlass"
             )
         cc = _cc_for_sku(WK_GPU)
         which = kernel or ("machete" if cc == "sm_90" else "marlin")
