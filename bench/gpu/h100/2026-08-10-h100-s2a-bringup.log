@@ -1,0 +1,183 @@
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-04XztxmQOItXIKoMuAKLK6
+Building image im-xtagRJRoSPye1IRJKmq3Sq
+
+=> Step 0: FROM base
+
+=> Step 1: ENV PATH=/root/.cargo/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+=> Step 2: ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+
+=> Step 3: ENV WK_GPU='H100!'
+
+=> Step 4: ENV CARGO_TERM_COLOR=always
+
+=> Step 5: ENV RUST_BACKTRACE=1
+
+=> Step 6: ENV WUKONG_TORCH_PYTHON=/opt/torch-venv/bin/python
+
+=> Step 7: ENV WUKONG_FA2_PYTHON=/opt/torch-venv/bin/python
+
+=> Step 8: ENV WUKONG_FA2_PEER=/wukong/tools/fa2_sdpa_peer.py
+
+=> Step 9: ENV WUKONG_CUTLASS_PROFILER=/persist/bin/cutlass_profiler
+
+=> Step 10: ENV WUKONG_VLLM_PYTHON=/persist/vllm-venv/bin/python
+
+=> Step 11: ENV WUKONG_VLLM_BENCH_DIR=/persist/vllm-src/benchmarks/kernels
+
+=> Step 12: ENV TORCHINDUCTOR_CACHE_DIR=/persist/inductor-cache
+
+=> Step 13: ENV TRITON_CACHE_DIR=/persist/triton-cache
+Saving image...
+Image saved, took 1.01s
+
+Built image im-xtagRJRoSPye1IRJKmq3Sq in 3.36s
+
+
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function build_peers.
+├── 🔨 Created function ptxas.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+├── 🔨 Created function peers.
+├── 🔨 Created function cutlass.
+├── 🔨 Created function marlin.
+├── 🔨 Created function framework.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] test: H100! + 8.0 cpu + 16 GiB = $4.456/hr; timeout 7200s caps this call at $8.91
+[src] 805 files stamped; 2 new/changed since the last run (incremental)
+Device suite on H100! — GPU_REQUIRED=1, PEER_REQUIRED=0
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu -- --nocapture --test-threads=1 wgmma_hopper_bringup[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_runtime-1h1dgdclho9l2/s-hl7b5l4kb4-0ecdo03-working`[0m
+
+[1m[33mwarning[0m: `wukong_runtime` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_interp-3cliahzxsxav8/s-hl7b6ohmxz-13di61h-working`[0m
+
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-26y6ft8l794cr/s-hl7u8ovtqe-0qvpxq8-working`[0m
+
+[1m[33mwarning[0m: `wukong_interp` (lib) generated 1 warning
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-04tzhcvmx7xy3/s-hl7u8ow7ei-001ldgb-working`[0m
+
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib test) generated 1 warning
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 22.17s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+
+running 1 test
+
+================ wgmma / TMA Hopper bring-up ================
+[wgmma-bringup] device: NVIDIA H100 80GB HBM3 (cc 9.0, 132 SMs, opt-in SMEM 232448 B, driver 13000)
+[wgmma-bringup] item 3 (registers / spills) is ALREADY ANSWERED, on a CPU, by the
+                2026-08-10 ptxas census at sm_90a, logged in
+                bench/gpu/h100/2026-08-10-ptxas-census.log: all three wgmma rows
+                report 168 regs whole-CTA, 0 spill stores, 0 spill loads, 0 stack
+                (setmaxnreg then redistributes: 32p/232c for the two 128x256 s4
+                rows, 32p/168c for the 128x128 s6 row). Not re-derived here.
+                item 8 (vs cuBLAS) is NOT in this gate: correctness first.
+
+[wgmma-bringup] A. item 2 -- cuModuleLoadData on the generated sm_90a text
+      wgmma_nt_f16_128x256x64_s4         LOADED   384 thr, 196672 B dyn smem, 4 stages, DescOrder::KLeading
+      wgmma_nt_bf16_128x256x64_s4        LOADED   384 thr, 196672 B dyn smem, 4 stages, DescOrder::KLeading
+      wgmma_nt_f16_128x128x64_s6         LOADED   384 thr, 196704 B dyn smem, 6 stages, DescOrder::KLeading
+      wgmma_nt_f16_128x256x64_s4_mn      LOADED   384 thr, 196672 B dyn smem, 4 stages, DescOrder::MnLeading
+      wk_tma_stage_probe                 LOADED   128 thr,  32776 B dyn smem (geometry-generic)
+   -> item 2 PASS: 5 modules loaded
+
+[wgmma-bringup] B. item 4 -- cuTensorMapEncodeTiled, then ONE staged tile vs a host copy
+      wgmma_nt_f16_128x256x64_s4     A box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x256x64_s4     B box 256x64 ( 32768 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_bf16_128x256x64_s4    A box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_bf16_128x256x64_s4    B box 256x64 ( 32768 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x128x64_s6     A box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x128x64_s6     B box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+   -> item 4 PASS: 24 staged tiles byte-identical to the host copy
+
+[wgmma-bringup] C. item 5 -- the mainloop completes (deadline 30 s)
+      wgmma_nt_f16_128x256x64_s4 128x256x256 (4 K tiles = 4 stages): returned in 5.95 ms, all 32768 lanes finite
+   -> item 5 PASS: the producer/consumer pipeline completes and does not deadlock.
+      (No correctness claim yet -- which descriptor reading is right is stage D.)
+
+[wgmma-bringup] D. item 1 -- DescOrder: BOTH readings, same round, f64 reference
+      DescOrder::KLeading    wgmma_nt_f16_128x256x64_s4           1.84 ms  exact    64/4096   max_abs 2.625e5   no
+      DescOrder::MnLeading   wgmma_nt_f16_128x256x64_s4_mn        1.26 ms  exact     0/4096   max_abs 8.235e6   no
+
+thread 'gpu::tests::wgmma_hopper_bringup' (70) panicked at crates/wukong_codegen_gpu/src/gpu.rs:17945:22:
+item 1 FAIL: NEITHER descriptor reading matches the f64 reference at 64x64x64.
+  Both arms loaded, launched and returned finite numbers, so the fault is not the shape menu, the barrier or the epilogue predication — it is what the descriptor's two offset fields MEAN. The leading suspect is SmemDesc::k_major's pair of distances themselves (16 and 8*row_bytes), which assume the tile is plain row-major in shared memory; stage B above says which layout TMA actually wrote. Read that line first, then re-cut k_major.
+stack backtrace:
+test gpu::tests::wgmma_hopper_bringup ...    0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0}
+             at ./src/gpu.rs:17945:22
+   3: wukong_codegen_gpu::gpu::tests::with_hopper::<wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0}>::{closure#0}
+             at ./src/gpu.rs:17519:28
+   4: wukong_codegen_gpu::gpu::tests::with_gpu::<wukong_codegen_gpu::gpu::tests::with_hopper<wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0}>::{closure#0}>
+             at ./src/gpu.rs:6940:24
+   5: wukong_codegen_gpu::gpu::tests::with_hopper::<wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0}>
+             at ./src/gpu.rs:17516:9
+   6: wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup
+             at ./src/gpu.rs:17646:9
+   7: wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0}
+             at ./src/gpu.rs:17640:30
+   8: <wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+   9: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    gpu::tests::wgmma_hopper_bringup
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 511 filtered out; finished in 8.09s
+
+[1m[91merror[0m: test failed, to rerun pass `-p wukong_codegen_gpu --lib`
+[1m-> FAILED (101) in 36.5s[0m
+
+Stopping app - uncaught exception raised in remote container: SystemExit(1).
+codegen_gpu: FAIL   driver: PASS
+[meter] test: 41.8s wall = $0.052 (record this in the round log)
+Traceback (most recent call last):
+  File "/pkg/modal/_runtime/container_io_manager.py", line 894, in handle_input_exception
+    yield
+  File "/pkg/modal/_container_entrypoint.py", line 187, in run_input_sync
+    values = io_context.call_function_sync()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/pkg/modal/_runtime/container_io_manager.py", line 215, in call_function_sync
+    expected_value_or_values = self.finalized_function.callable(*args, **kwargs)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/modal_app.py", line 2997, in test
+    sys.exit(1)
+SystemExit: 1
+PIPELINE_DONE
