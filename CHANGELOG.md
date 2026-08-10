@@ -5,6 +5,217 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Documentation — every published claim is scoped to the device and the peer it was measured against
+`GPU_RETARGET_PLAN.md` §10 asks for "no published claim anywhere in the repo that silently
+generalizes a 4050 number to other hardware". This closes that for the doc set, and adds the CPU
+side, which is currently the larger debt. **No measured figure was added, altered or removed** — the
+measurement docs change only with a fresh same-run measurement behind them, and there is none here.
+The only numeric edits anywhere in this change are two stale `tests/run` fixture counts, which are
+tree facts rather than measurements and are verifiable with `ls tests/run/*.wk | wc -l`.
+
+- `BENCHMARKS.md` opens with a **standing index**: for every family, whether its numbers *stand*,
+  were *corrected* (with the struck value kept beside the correction, as this document's style
+  requires), or are *not currently load-bearing*. It covers the CPU debts explicitly — the
+  general-code tables **superseded with no replacement**, ~40 rows whose **Rust** column needs
+  re-measuring after the 2026-08-06 `noalias` finding, a **C++** column that only ever existed in
+  three sections, and the end-to-end model ratios as an **upper bound** pending re-measurement — as
+  well as the GPU device scope.
+- The **three GPU families that need more than a banner** are flagged where a reader meets them, not
+  only in the index: *"beats PyTorch at every S"* is against **eager** and is **not re-earned**
+  against `torch.compile`, which is native on Linux and now buildable and *verifiable*
+  (`tools/cloud/peers/`); the **CUDA-graph** launch-overhead multiples are **Windows/WDDM** numbers
+  that should shrink on the Linux driver before the GPU changes at all; and the long-context flash
+  loss diagnosed as *"structural on 20 SMs"* rests on a premise that dissolves at 108/132 SMs, with
+  the direction unknown — while the *short*-context occupancy **wins** rest on 20 SMs being easy to
+  fill and may **invert**.
+- *"No CUDA toolkit"* is reframed throughout as **toolkit-optional**: it says what Wukong needs to
+  build and run, never that no stronger peer exists. The "no honest peer is buildable" framings
+  (fused FA2-class CUDA-C, a library int4 W4A16 decode GEMM, vLLM/TRT-LLM) are marked as true of a
+  toolkit-free Windows laptop and **expiring** on a cloud box.
+- `README.md`, `docs/roadmap.md`, `docs/metrics.md` and `docs/internals.md` carry matching scope, and
+  `docs/internals.md` gains the structural facts that moved with the retarget: per-family PTX header
+  floors from one authority, probed device identity, the un-gated-module rule and `CRATE_SOURCES`,
+  the megakernel's cooperative multi-CTA launch layer, and the host-vectorizer-invariant corpus
+  floors. Two stale `tests/run` fixture counts (`docs/internals.md`, `docs/roadmap.md`) are corrected
+  against `ls tests/run/*.wk | wc -l` and now say to count rather than trust the line.
+- Repairs a heading this file lost: `d10d868` overwrote
+  `### Benchmark instrument — a byte-identical control column, a bias fix, and one retraction`
+  while inserting the section above it, leaving that section's body running on out of the GPU
+  retarget's bullet list with no title.
+
+### GPU — the datacenter codegen wave: wgmma + TMA, wide CTA tiles, a cooperative megakernel, GQA, SM-derived norms
+Five independent generator/launch capabilities, each landed on its own branch behind the two-part
+gate plus the device suite. None changes a language or CLI surface, and none is a performance claim
+in this file — the measured evidence for each is in its commit body.
+
+- **A Hopper `wgmma` + TMA GEMM family** (`ptx_wgmma.rs`, `tma_host.rs`) — `wgmma.mma_async` in the
+  SS form, TMA-filled shared memory behind `mbarrier` transaction barriers, warp-specialised
+  cooperative with a producer warpgroup at `setmaxnreg 32` and two consumers at 232. `sm_90a` is
+  architecture-**locked**, not a floor: such a module loads on Hopper and nowhere else, in either
+  direction, so the gate is a **type** — `wgmma_module` demands an `Sm90aLicense` that only a probed
+  `GpuTarget` can mint, and a launcher that skips it fails to compile rather than merely failing a
+  textual scan. This is also the crate's first `cuTensorMap` surface. **Nothing dispatches to it and
+  nothing here is proven to run**: there is no Hopper part on this machine and `sm_90a` cannot be
+  JITed, emulated or `ptxas`-checked locally. What *is* proven device-free is enumerated in the
+  module's own `WGMMA_DEVICE_VALIDATION`, in the order it should be re-checked on first contact with
+  silicon — starting with the shared-memory matrix descriptor's field naming, whose two offset
+  fields were read from a figure rather than confirmed, and whose swizzle enum is numbered in the
+  **opposite direction** from `CUtensorMapSwizzle`, so the obvious cast between them silently swaps
+  the widest and narrowest modes.
+- **The Act-1 CTA tile can finally be wider than 128** (`ptx_wmma.rs`): six `PIPE_DEEP_VARIANTS` rows
+  at 128×256 and 256×128, at every depth an Ada opt-in carveout can hold, plus four
+  `PIPE_WIDE_VARIANTS` rows budgeted against A100's 163 KiB so each loads on both datacenter
+  targets. The generator was always tile-generic; what blocked it was that 128×256 costs 24 KiB per
+  stage and every useful depth exceeds the PTX ISA's 48 KiB **static** `.shared` cap — so this is the
+  dynamic-SMEM window from Phase 2 paying off. On this card all six new tiles are **bit-identical**
+  to the shipped 2-stage kernel (`max_abs = 0`), not merely within tolerance, because CTA tiling
+  changes neither the mma sequence nor the f32 accumulation order per output element. The four
+  `WIDE` rows exceed this card's carveout and are proven textually only; they need an A100 or H100.
+  Dispatch is deliberately unchanged — being able to express a tile is a separate decision from
+  selecting one.
+- **The megakernel has a cooperative multi-CTA launch path.** It launched a `(1,1,1)` grid through a
+  plain launch, so "the whole program in one kernel" described one SM. Three new pieces:
+  `grid_barrier_ptx` (a sense-reversing grid-wide counter with device-scope fences, its state a
+  launch *parameter* so a kernel that faults mid-barrier cannot hang the next program), `plan_grid`
+  (grid derived from `cuOccupancyMaxActiveBlocksPerMultiprocessor` × the probed SM count, declining
+  when the request would not be co-resident — a cooperative grid that is not co-resident does not
+  run slowly, it hangs), and `launch_mega` through `cuLaunchCooperativeKernel`. A kernel opts in via
+  its **ABI**, read back out of the emitted PTX; half of either shape is a hard error, because the
+  two halves fail in opposite and equally silent ways. `lower::emit_mega_ptx` still emits the
+  block-scoped form, so every corpus program launches exactly as before.
+- **Grouped-query geometry in the paged KV cache.** `KvConfig` had one head count and assumed
+  `kv_heads == q_heads`, so for every Llama-class model the stack allocated `g` copies of a cache the
+  model needs one of — which silently made every capacity, paging and throughput figure a
+  measurement of a workload `g` times too large, and meant a vLLM/TRT-LLM-class comparison was not
+  comparing the same thing. `KvConfig.heads` is now *defined* as the KV-head count (what every offset
+  helper already meant by it) and the query count lives in a `GqaConfig` that enforces
+  `q_heads % kv_heads == 0` behind private fields. The load-bearing gate is exact rather than
+  tolerant: a grouped cache must give **bit-for-bit** what an ungrouped cache gives over the same K/V
+  with each head replicated `g` times — which is what GQA *means*, and which a round-robin
+  `h % kv_heads` mapping would fail while still passing a tolerance gate on random data. Every
+  existing entry point keeps its signature and delegates at `GqaConfig::mha`, bit-for-bit the
+  pre-GQA behaviour.
+- **The norms take their launch geometry from the SM count.** `ptx_norm.rs` shipped one warp per row
+  at `grid = (rows,1,1)`, and since the kernel reads `%ctaid.x` as *the* row index and never advances
+  it, that was the only legal geometry: the row count alone decided both the CTA count and the
+  per-row parallelism. `{softmax,layernorm,rmsnorm}_w{1,2,4,8}` add W-warp cooperation plus a
+  grid-stride over rows, and `norm_launch` sizes both from a probed `sm_count`. Three findings the
+  design did not predict are recorded at the site: baking W into the entry beats reading it from
+  `%ntid.x` (a register induction step defeats ptxas's unroller and its immediate-offset folding, so
+  the "more general" spelling started the whole family in the hole); W == 1 returns *exactly* today's
+  launch uncapped, so wiring it in is provably a no-op for shapes it does not intend to change; and
+  the covered regime is nearly tapped out on Ada — the occupancy headroom is real and the bandwidth
+  headroom is not, against a written prediction that said otherwise. LayerNorm's variance stays the
+  two-pass form, with a structural gate: widening a reduction is exactly the edit that tempts the
+  one-pass `E[x²] − mean²`, which cancels in f32 and NaNs whole rows.
+
+### GPU — flash and conv join the dynamic-SMEM window, and a 44 KiB gate that was declining nothing
+Phase 2 landed the dynamic-SMEM path and the int8/fp8 families already routed through it; these two
+did not.
+
+- **`ptx_flash`** declared its K/V ring as a static `.shared` array with no budget parameter, so the
+  whole family sat under the PTX ISA's 48 KiB cap on *statically declared* shared memory — a rule
+  about the declaration, not a device fact, and identically 48 KiB on this Ada card's carveout, on
+  A100's 164 and on H100's 228. The generators now take a `stages` count and an SMEM budget and
+  select their emission form through `smem_mode_for`; at depth ≥ 3 the two-buffer swap becomes an
+  add-and-wrap ring, with the `cp.async` commit/`wait_group` bookkeeping stated at the site as the
+  correctness argument. Over budget is a loud panic at generation naming the kernel and the ceiling;
+  a dispatcher's decline point is `FlashStageCfg::fits`, checked before generation, never a clamped
+  launch. This is what unlocks the deeper rings, wider K/V staging and D=128 long-S configurations
+  the datacenter derivations rank.
+- **`ptx_conv`**'s shared-memory footprint was written twice — once in a `tiled_applies` gate a
+  caller had to remember to call, once in the generator — and a desync between them was not a build
+  error but an entry that declares more shared memory than the gate cleared, surfacing as an opaque
+  driver error naming neither the family, the shape nor a budget. The implicit-GEMM and Winograd
+  bgemm paths had no ceiling check at all. There is now one closed form per family, a real budget
+  seam, and a generation-time panic that names both byte counts. The retired bound was a hardcoded
+  `44 * 1024` whose comment read "no opt-in to the larger Ada banks" — untrue since the dynamic
+  window landed, and never backed by a mechanism: the static boundary is the ISA's 48 KiB and the
+  device boundary is the opt-in carveout, and the old gate conflated the two. **It was declining
+  nothing**, and the commit says so rather than claiming a win.
+
+### Measurement — the GPU instrument is code now, and the strong peers are buildable off the meter
+This project has retracted four published claims and every one traced to an instrument that could not
+resolve what it claimed. Before this, the GPU side's control column lived in a human's memory and its
+provenance block lived in a PowerShell runbook.
+
+- **`bench_instrument.rs`**: a `PtxTwin` control (one PTX text, two module handles, timed as two
+  columns — it *refuses* equal module keys, because module caching would make two arms one
+  `CUfunction` and every row would tie having compared nothing); a `prime` step that loads and
+  warm-launches both handles before anything is timed, because byte-identical PTX means both arms
+  share one on-disk cubin entry and cold-vs-warm is not a twin; a rotating multi-round driver that
+  discards at least one warm-up; ratios over **medians**, with the round's floor taken as the largest
+  control deviation over its live fields; and `Round`/`Published` as a **gate function rather than a
+  convention** — a MIG slice, a vGPU profile, an SM count off spec or an unknown part cannot mint a
+  number at all, and a bench whose floor exceeds the pre-registered bar yields `Unresolved`, never a
+  tie. The provenance header is emitted by the harness, and a declared clock lock the readings
+  contradict is printed as a contradiction rather than believed. Two findings the work produced
+  rather than assumed are gated: **module-load latency has no in-process twin** (byte-identical PTX,
+  a discarded warm-up, and the second arm still read tens of percent faster across two days and two
+  drivers, because the driver keeps a JIT cache neither of ours controls — so `time_module_load` now
+  refuses a second call per process), and a signed field with a non-positive median is `Degenerate`,
+  not `Constant`, so the log names the right cause. A follow-up put the file under the crate's
+  source-scanning laws, which it had been invisible to.
+- **The strong peers are buildable, pinned, and verified — from a CPU container.** `nvcc` compiles
+  *for* an architecture; it does not need one, so the multi-GB, multi-hour artifacts stage onto a
+  volume off the meter: the CUTLASS profiler (filtered kernel set — an unfiltered SM90 build is a
+  multi-hour, >100 GB mistake by NVIDIA's own documentation), a vLLM venv carrying Marlin and
+  Machete, optional FlashAttention wheels, and a torch venv with Triton pinned and *asserted at image
+  build time*. `torch_compile_peer.py` reports eager, `compile(default)` and `compile(max-autotune)`
+  side by side and takes the **fastest** as the peer, with an `eager_over_peer` ratio so the round
+  itself measures how much of the retracted margin was the peer being weak. A missing declared peer
+  is a **failure, not a shrug**: `verify_peers.py` exits non-zero, an unknown peer name is an error
+  rather than a token that quietly requires nothing, and `smoke_inductor.py` asserts a Triton kernel
+  was actually generated — a `torch.compile` that fell back to ATen is cuBLAS wearing the framework
+  bar's name. Every version is pinned in one block and recorded to a manifest, because this repo has
+  already been bitten by a floating peer.
+
+### Fixed — two gates that were measuring the host instead of the thing under test
+- **`wukong_runtime` is now verified in release, the profile its contract ships in.** No gate in this
+  repo had ever run `cargo test --release`, so the crate whose first invariant is that every AVX2
+  kernel agrees **bit-for-bit** with its scalar twin was only ever checked in the profile where LLVM
+  does the least — while every performance number the project publishes comes from a release binary.
+  That is backwards, and it was not hypothetical: a `colreduce` NaN-payload divergence reproduced
+  byte-identically on Windows and Linux in release and passed in debug, because it needs the
+  optimizer to have auto-vectorized the *scalar twin* before it can exist at all. The assertion
+  itself was the bug — it pinned a NaN payload IEEE-754 never promised, and the `-O3` asm shows the
+  scalar twin's auto-vectorized body loading `x[i][j]` into the destination register (i.e. commuting
+  the `fadd`, which is legal), with the divergence boundary landing exactly where the vector body
+  ends and the scalar epilogue begins. The gate is scoped to this one crate deliberately: it is the
+  only one that asserts raw-bit agreement between two independent implementations of the same
+  arithmetic.
+- **The gpu-native corpus floors measure the backend, not the host CPU.** Both floors were Windows
+  numbers, and the same two sweeps read higher on a Linux L4 from the same commit — not because the
+  backend lowered more, but because the general 256-bit AVX2 vectorizer is Win64-only
+  (`host_supports_vec_kernels`), `lower.rs` declines the op it produces, and fewer such ops means
+  more programs lower. So one hardcoded floor could only ever ratchet one of two readings, and on
+  Linux it passed with enough slack to never catch a regression — on precisely the fleet the
+  datacenter round is paid to run on. The fix normalizes the *input*: both sweeps build through the
+  documented, result-identical 128-bit CLIF fallback, so one constant is live on both operating
+  systems and Windows gains real device coverage rather than the floor being relaxed. A device-free
+  gate proves the normalization is effective (non-vacuously — the host-native re-sweep must find a
+  carrier) and complete (it reproduces the old numbers exactly, every gained program is a carrier,
+  none are lost), so a lowering regression is now catchable on a box with no card.
+- **The interpreter's allocation arena is capped explicitly.** `try_reserve` guards the *reserve*,
+  not the *commit*: under Linux overcommit an absurd request succeeds and the subsequent resize gets
+  the process OOM-killed. Cap before asking the allocator.
+
+### Infrastructure — the Phase-1 cloud harness, and a clippy sweep that turned CI green on all three jobs
+- **`tools/cloud/`** (a Modal app plus a `nvidia/cuda:*-devel` image) is the entry point for every
+  rented-GPU session: build, device suite, corpus gates, benches and peer staging, each a named
+  command so a metered session never pays for a decision. Written and reviewed **before** any GPU was
+  rented — with the round's expectations pre-registered in `docs/gpu/derive/` so a result cannot be
+  rationalized after the fact — and hardened against five ways the harness itself would have burned
+  metered time (including one where the runbook's own logging aborted every run). Session ledgers and
+  raw round logs are committed under `bench/gpu/` as artifacts, so no fact is paid for twice.
+- **A workspace-wide clippy sweep under `-D warnings`** closed a month of unread red on the ubuntu
+  job. The red was hiding four real Linux defects, not lint noise: `--backend=native` was broken for
+  any program with a vectorizable f32 loop, the `--emit=exe` gate was dark, the `cc` fallback could
+  not link, and one test was vacuous — the first three are the two sections below and the fourth is
+  fixed with them. Two process notes worth keeping: CI installs a **newer** stable rustc than this
+  box, so a locally clean sweep can still turn all three jobs red; and `clippy --fix` broke a
+  bit-exactness contract in one hunk, so every hunk of an automated fix needs reading.
+
 ### Fixed — `--emit=exe` takes its preferred link path on any cargo-built compiler, and the `cc` fallback links libm
 Two independent link-path defects, both of which made `--emit=exe` quietly worse than it looks. They
 were found together because the AOT gate (`crates/wukongc/tests/exe.rs`) reported them as a single
@@ -97,6 +308,8 @@ here is a performance claim).
   CI job that finally type-checks the `gpu` feature, and six derivation dossiers committed under
   `docs/gpu/derive/` for the rented-silicon phases. `docs/internals.md` and this changelog were
   de-duplicated from concatenated copies (with content-loss proofs).
+
+### Benchmark instrument — a byte-identical control column, a bias fix, and one retraction
 `wukong_xbench`'s opt-in `general` suite only. No kernel, no peer source and no compiler crate is
 touched — `wukong_xbench` is a leaf binary crate nothing depends on, so `wukongc` is byte-identical
 and no program's dispatch set can move. That makes the dispatch census a **non-regression argument
