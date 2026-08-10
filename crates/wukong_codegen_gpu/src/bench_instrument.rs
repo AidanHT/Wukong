@@ -585,19 +585,38 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
         };
     }
 
+    // Refusal precedence: instrument-is-broken first, then STRUCTURAL, then QUALITY.
+    //
+    // `aliased` / `malformed` / `NoControl` say the round itself is invalid, so they outrank
+    // everything. After those, `!has_contender` must be tested BEFORE `!resolved`, and the order is
+    // load-bearing rather than stylistic.
+    //
+    // A control-only round (`machine_floor`) has no contender by construction: the floor IS its
+    // result, not an obstacle to one. "The floor is too wide to resolve the effect" is a category
+    // error when there is no effect under test, and `FloorAboveBar`'s message goes on to advise
+    // "re-run rather than reporting a wide tie as a tie" — actively wrong for a round that was never
+    // going to publish a tie. Worse, it made the verdict self-contradictory: the per-field cell
+    // already reported `Cell::NoContender` while the round-level refusal said `FloorAboveBar`.
+    //
+    // The reversed order was invisible to the synthetic unit tests because they use clean numbers —
+    // `a_control_only_round_measures_a_floor_and_publishes_nothing` feeds 10.0 vs 10.05, a ~0.5%
+    // floor, so `resolved` is true there and the two conditions never overlap. It surfaced only on a
+    // real box noisy enough for both to hold at once (this 4050 read a +10.21% floor against the
+    // +/-5% bar). `both_refusals_true_reports_the_structural_one` now pins the interaction with no
+    // device at all.
     let blocked = if aliased {
         Some(Refusal::AliasedArms)
     } else if let Some(f) = malformed {
         Some(Refusal::MalformedField(f))
     } else if floor.is_none() {
         Some(Refusal::NoControl)
+    } else if !has_contender {
+        Some(Refusal::NoContenderArm)
     } else if !resolved {
         Some(Refusal::FloorAboveBar {
             floor: floor.unwrap_or(f64::NAN),
             bar,
         })
-    } else if !has_contender {
-        Some(Refusal::NoContenderArm)
     } else {
         None
     };
@@ -2372,6 +2391,54 @@ mod tests {
             "the floor is the point of a control-only round"
         );
         assert_eq!(v.field("us").unwrap().cell, Cell::NoContender);
+        assert!(matches!(
+            round.publish(&v, "us").unwrap_err(),
+            Refusal::NoContenderArm
+        ));
+    }
+
+    /// **When "no contender" and "floor above bar" are BOTH true, the structural one is reported.**
+    ///
+    /// The sibling above cannot see this: it feeds 10.0 vs 10.05, a ~0.5% floor, so `resolved` holds
+    /// and only one refusal is ever live. Clean synthetic numbers hid a real precedence bug —
+    /// `analyze` tested `!resolved` first and so reported `FloorAboveBar` for a control-only round,
+    /// contradicting the per-field `Cell::NoContender` it had already assigned and printing
+    /// "re-run rather than reporting a wide tie as a tie" at a round with no tie to report.
+    ///
+    /// It surfaced only on a box noisy enough for both conditions to hold at once: the dev 4050 read
+    /// a **+10.21%** floor against the +/-5% bar and
+    /// `the_machine_floor_measures_this_box_and_publishes_nothing` failed with
+    /// `FloorAboveBar { floor: 0.1020..., bar: 0.05 }` where it expected `NoContenderArm`. This gate
+    /// reproduces that state with no device and no noise: a **13% control gap and an empty B arm**.
+    #[test]
+    fn both_refusals_true_reports_the_structural_one() {
+        let round = open_ok("wide-control-only");
+        let s = samples_of(
+            "wide-control-only",
+            5,
+            &[(
+                "us",
+                vec![100.0, 100.0, 100.0, 100.0, 100.0],
+                vec![113.0, 113.0, 113.0, 113.0, 113.0], // 13% floor: well past the +/-5% bar
+                vec![],                                  // ...and no contender arm at all
+            )],
+        );
+        let v = analyze(&s, DEFAULT_CONTROL_BAR);
+
+        // Both conditions genuinely hold, or this gate proves nothing.
+        assert!(
+            v.floor.expect("a control-only round still measures a floor") > DEFAULT_CONTROL_BAR,
+            "the floor must exceed the bar for this test to exercise the interaction"
+        );
+        assert_eq!(v.field("us").unwrap().cell, Cell::NoContender);
+
+        // The round-level refusal must agree with the per-field cell, not contradict it.
+        assert!(
+            matches!(v.blocked, Some(Refusal::NoContenderArm)),
+            "a control-only round reports the structural refusal even when its floor is wide, \
+             got {:?}",
+            v.blocked
+        );
         assert!(matches!(
             round.publish(&v, "us").unwrap_err(),
             Refusal::NoContenderArm
